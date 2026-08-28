@@ -93,6 +93,7 @@ class OmniModelConfig(ModelConfig):
          hf_text_config: The sub text_config of the model's hf_config (default: None)
          stage_id: Identifier for the stage in a multi-stage pipeline (default: 0)
          async_chunk: If set to True, perform async chunk
+         session_mode: Request lifecycle mode, either turn-based or duplex
          model_stage: Stage type identifier, e.g., "thinker" or "talker"
              (default: "thinker")
          model_arch: Model architecture name
@@ -121,6 +122,7 @@ class OmniModelConfig(ModelConfig):
 
     stage_id: int = 0
     async_chunk: bool = False
+    session_mode: str = "turn"
     retains_state_across_chunks: bool = False
     # Stage-1 active stream slots; 0 keeps legacy chunk-level round-robin.
     active_stream_window: int = 0
@@ -129,6 +131,9 @@ class OmniModelConfig(ModelConfig):
     model_arch: str | None = None
     worker_type: str | None = None
     engine_output_type: str | None = None
+    # Optional dotted path of a per-stage pooling-output decoder applied
+    # worker-side before IPC. Read by the AR scheduler.
+    pooling_output_decoder: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     stage_connector_config: dict[str, Any] = field(
@@ -138,11 +143,18 @@ class OmniModelConfig(ModelConfig):
         }
     )
     subtalker_sampling_params: dict[str, Any] | None = None
+    silence_ban_frames: int = 0
     omni_kv_config: dict | None = None
     codec_frame_rate_hz: float | None = None
     task_type: str | None = None
     enable_sleep_mode: bool = False
     has_sampling_extra_args: bool = False
+    # Key names (not values) of the stage's default sampling ``extra_args``.
+    # Engine-core code runs before any request arrives, so this is the only
+    # place it can learn which request-shaping conventions a stage uses (e.g.
+    # ``cfg_role`` for classifier-free-guidance request pairs).
+    sampling_extra_args_keys: tuple[str, ...] = ()
+    requires_full_payload_input: bool = False
 
     @property
     def registry(self):

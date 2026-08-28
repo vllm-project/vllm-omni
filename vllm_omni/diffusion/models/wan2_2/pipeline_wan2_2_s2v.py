@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Wan2.2 Speech-to-Video (S2V) Pipeline for vLLM-Omni.
@@ -22,7 +22,6 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from torchvision import transforms
 from transformers import AutoTokenizer, UMT5Config, UMT5EncoderModel, Wav2Vec2ForCTC, Wav2Vec2Processor
-from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.multimodal.media.audio import load_audio
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -36,6 +35,7 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     load_transformer_config,
+    load_wan_weights_with_optional_gate,
     retrieve_latents,
 )
 from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
@@ -43,7 +43,7 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
@@ -61,6 +61,30 @@ _S2V_DEFAULT_NEG_PROMPT = (
 # ---------------------------------------------------------------------------
 
 _AUDIO_VIDEO_RATE = 30
+
+
+def _s2v_audio_condition_key(audio: str | np.ndarray | None) -> tuple[Any, ...]:
+    if isinstance(audio, str):
+        # File paths are deliberately conservative: two different files may
+        # have different durations even when their request metadata matches.
+        return ("path", audio)
+    if isinstance(audio, np.ndarray):
+        return ("array", tuple(audio.shape), str(audio.dtype))
+    return (type(audio).__name__,)
+
+
+def _make_clip_generators(
+    seeds: list[int | None],
+    request_generators: list[torch.Generator | None],
+    clip_index: int,
+    device: torch.device,
+) -> list[torch.Generator | None]:
+    return [
+        torch.Generator(device=device).manual_seed((seed if seed is not None else 0) + clip_index)
+        if seed is not None or request_generator is None
+        else request_generator
+        for seed, request_generator in zip(seeds, request_generators)
+    ]
 
 
 def _linear_interpolation(
@@ -337,6 +361,12 @@ def get_wan22_s2v_pre_process_func(
         prompt["additional_information"]["init_first_frame"] = (
             multi_modal_data.get("init_first_frame", False) if multi_modal_data is not None else False
         )
+        request.batch_compatibility_key = (
+            "wan22_s2v_condition",
+            bool(prompt["additional_information"]["init_first_frame"]),
+            prompt["additional_information"].get("num_repeat"),
+            _s2v_audio_condition_key(raw_audio),
+        )
         request.prompt = prompt
 
         return request
@@ -486,6 +516,7 @@ class Wan22S2VPipeline(
     """
 
     # Default config values from Wan2.2/wan/configs/wan_s2v_14B.py
+    supports_request_batch = True
     _DEFAULT_MOTION_FRAMES = 73
     _DEFAULT_INFER_FRAMES = 80
     _DEFAULT_FPS = 16
@@ -942,7 +973,6 @@ class Wan22S2VPipeline(
         """Forward pass through the S2V transformer to predict noise.
 
         With return_dict=False, the model returns (output,) where output is [B, C, T, H, W].
-        We squeeze batch dim since S2V processes one sample at a time.
         """
         if current_model is None:
             current_model = self.transformer
@@ -952,8 +982,8 @@ class Wan22S2VPipeline(
         if isinstance(result, list):
             return result[0]
         if isinstance(result, tuple):
-            return result[0].squeeze(0)
-        return result.sample.squeeze(0)
+            return result[0]
+        return result.sample
 
     def diffuse(
         self,
@@ -962,7 +992,7 @@ class Wan22S2VPipeline(
         prompt_embeds: torch.Tensor,
         negative_prompt_embeds: torch.Tensor | None,
         guidance_scale: float,
-        clip_generator: torch.Generator,
+        clip_generator: torch.Generator | list[torch.Generator] | None,
         dtype: torch.dtype,
         device: torch.device,
         max_seq_len: int,
@@ -971,13 +1001,13 @@ class Wan22S2VPipeline(
         ref_latents: torch.Tensor,
         motion_frames: list[int],
         drop_first_motion: bool,
-        positive_audio_emb: torch.Tensor,
-        negative_audio_emb: torch.Tensor | None,
+        positive_audio_emb: dict[str, torch.Tensor],
+        negative_audio_emb: dict[str, torch.Tensor] | None,
     ) -> torch.Tensor:
-        """Denoising diffusion loop for one S2V clip.
+        """Denoising diffusion loop for a batch of compatible S2V clips.
 
         Args:
-            latents: Initial noise tensor [C, T, H, W]
+            latents: Initial noise tensor [B, C, T, H, W]
             timesteps: Denoising timesteps
             prompt_embeds: Text embeddings [1, seq_len, dim]
             negative_prompt_embeds: Negative text embeddings (optional)
@@ -995,7 +1025,7 @@ class Wan22S2VPipeline(
             negative_audio_emb: Precomputed audio embeddings for negative prompt (optional)
 
         Returns:
-            Denoised latents [C, T, H, W]
+            Denoised latents [B, C, T, H, W]
         """
         do_true_cfg = self.do_classifier_free_guidance and negative_prompt_embeds is not None
 
@@ -1004,13 +1034,13 @@ class Wan22S2VPipeline(
                 self._current_timestep = t
                 self.record_denoise_step(step_idx, t)
 
-                latent_model_input = [latents.to(device)]
-                timestep = t.unsqueeze(0).to(device) if t.dim() == 0 else t.to(device)
+                latent_model_input = latents.to(device)
+                timestep = t.expand(latents.shape[0]).to(device)
 
                 positive_kwargs = {
                     "hidden_states": latent_model_input,
                     "timestep": timestep,
-                    "encoder_hidden_states": prompt_embeds[0:1],
+                    "encoder_hidden_states": prompt_embeds,
                     "cond_states": cond_latents,
                     "motion_latents": input_motion_latents,
                     "ref_latents": ref_latents,
@@ -1023,7 +1053,7 @@ class Wan22S2VPipeline(
                     negative_kwargs = {
                         "hidden_states": latent_model_input,
                         "timestep": timestep,
-                        "encoder_hidden_states": negative_prompt_embeds[0:1],
+                        "encoder_hidden_states": negative_prompt_embeds,
                         "cond_states": cond_latents,
                         "motion_latents": input_motion_latents,
                         "ref_latents": ref_latents,
@@ -1044,12 +1074,12 @@ class Wan22S2VPipeline(
 
                 # Scheduler step
                 latents = self.scheduler.step(
-                    noise_pred.unsqueeze(0),
+                    noise_pred,
                     t,
-                    latents.unsqueeze(0),
+                    latents,
                     return_dict=False,
-                    generator=clip_generator,
-                )[0].squeeze(0)
+                    generator=clip_generator if isinstance(clip_generator, torch.Generator) else None,
+                )[0]
 
                 pbar.update()
 
@@ -1080,111 +1110,178 @@ class Wan22S2VPipeline(
         prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,
         **kwargs,
-    ) -> DiffusionOutput:
+    ) -> list[DiffusionOutput]:
         """Run S2V generation — may produce multiple autoregressive clips.
 
         This method mirrors ``WanS2V.generate()``, reorganized into the
         vLLM-Omni pipeline structure.
         """
-        # ---- Extract params from request ----
-        if len(req.prompts) > 1:
-            raise ValueError("S2V only supports a single prompt per request.")
+        sampling_params_list = req.sampling_params_list
+        common = sampling_params_list[0]
+        prompt_fields = DiffusionRequestBatch.collate_prompt_field_map(
+            req.prompts,
+            {
+                "prompt_embeds": prompt_embeds,
+                "negative_prompt_embeds": negative_prompt_embeds,
+            },
+        )
+        prompt_embeds = prompt_fields["prompt_embeds"]
+        negative_prompt_embeds = prompt_fields["negative_prompt_embeds"]
 
-        if len(req.prompts) == 1:
-            prompt_data = req.prompts[0]
-            prompt = prompt_data if isinstance(prompt_data, str) else prompt_data.get("prompt")
-            negative_prompt = None if isinstance(prompt_data, str) else prompt_data.get("negative_prompt")
-
+        prompt_texts: list[str] = []
+        negative_prompts: list[str] = []
+        images: list[PIL.Image.Image | None] = []
+        audio_paths: list[str | np.ndarray | None] = []
+        requested_repeats: list[int | None] = []
+        init_first_frames: list[bool] = []
+        for prompt_data in req.prompts:
             multi_modal_data = prompt_data.get("multi_modal_data", {}) if not isinstance(prompt_data, str) else {}
             additional_info = prompt_data.get("additional_information", {}) if not isinstance(prompt_data, str) else {}
 
-            if image is None:
-                raw_image = multi_modal_data.get("image", None)
-                if isinstance(raw_image, str):
-                    image = PIL.Image.open(raw_image).convert("RGB")
-                elif isinstance(raw_image, PIL.Image.Image):
-                    image = raw_image
+            prompt_texts.append(
+                prompt_data if isinstance(prompt_data, str) else (prompt_data.get("prompt") or prompt or "")
+            )
+            request_negative_prompt = (
+                negative_prompt if isinstance(prompt_data, str) else prompt_data.get("negative_prompt", negative_prompt)
+            )
+            negative_prompts.append(request_negative_prompt or _S2V_DEFAULT_NEG_PROMPT)
 
-            if audio_path is None:
-                audio_path = additional_info.get("audio_path")
-                if audio_path is None:
-                    audio_path = multi_modal_data.get("audio")
+            raw_image = multi_modal_data.get("image", image)
+            if isinstance(raw_image, list):
+                raw_image = raw_image[0] if raw_image else None
+            if isinstance(raw_image, str):
+                raw_image = PIL.Image.open(raw_image).convert("RGB")
+            images.append(raw_image if isinstance(raw_image, PIL.Image.Image) else None)
 
-            if pose_video is None:
-                pose_video = additional_info.get("pose_video")
+            request_audio_path = additional_info.get("audio_path", audio_path)
+            if request_audio_path is None:
+                request_audio_path = multi_modal_data.get("audio")
+            audio_paths.append(request_audio_path)
+            requested_repeats.append(additional_info.get("num_repeat", num_repeat))
+            init_first_frames.append(additional_info.get("init_first_frame", init_first_frame))
 
-            init_first_frame = additional_info.get("init_first_frame", init_first_frame)
-
-        if negative_prompt is None:
-            negative_prompt = _S2V_DEFAULT_NEG_PROMPT
-
-        height = req.sampling_params.height or height
-        width = req.sampling_params.width or width
+        height = common.height or height
+        width = common.width or width
         # num_frames defaults to 1 (image-model sentinel); S2V needs many frames.
-        req_num_frames = req.sampling_params.num_frames
+        req_num_frames = common.num_frames
         infer_frames = (
             infer_frames
             or (req_num_frames if req_num_frames and req_num_frames > 1 else None)
             or self._DEFAULT_INFER_FRAMES
         )
-        num_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_steps = common.num_inference_steps or num_inference_steps
+        num_outputs_per_prompt = common.num_outputs_per_prompt or 1
 
-        if req.sampling_params.guidance_scale_provided:
-            guidance_scale = req.sampling_params.guidance_scale
+        if common.guidance_scale_provided:
+            guidance_scale = common.guidance_scale
 
         self._guidance_scale = guidance_scale
 
         # ---- Validate ----
-        self.check_inputs(prompt, image, audio_path, height, width, prompt_embeds)
+        if len(set(init_first_frames)) != 1:
+            raise ValueError("Batched S2V requests must have matching init_first_frame values.")
+        init_first_frame = init_first_frames[0]
+        for request_prompt, request_image, request_audio_path in zip(prompt_texts, images, audio_paths):
+            self.check_inputs(
+                request_prompt if prompt_embeds is None else None,
+                request_image,
+                request_audio_path,
+                height,
+                width,
+                prompt_embeds,
+            )
 
         device = self.device
         dtype = self.transformer.dtype if hasattr(self.transformer, "dtype") else torch.bfloat16
-
-        if generator is None:
-            generator = req.sampling_params.generator
-        seed = req.sampling_params.seed
-        if generator is None and seed is not None:
-            generator = torch.Generator(device=device).manual_seed(seed)
-        if seed is None:
-            seed = 0
+        request_generators = req.collate_request_generators(num_outputs_per_prompt, None)
+        batch_size = req.num_reqs * num_outputs_per_prompt
+        if isinstance(request_generators, list):
+            generators = request_generators
+        else:
+            generators = [request_generators] * batch_size
+        seeds = [sampling.seed for sampling in sampling_params_list for _ in range(num_outputs_per_prompt)]
+        request_latents = req.collate_request_tensors("latents", None)
 
         # ---- 1. Text encoding ----
         if prompt_embeds is None:
             prompt_embeds, negative_prompt_embeds = self.encode_prompt(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
+                prompt=prompt_texts,
+                negative_prompt=negative_prompts,
                 do_classifier_free_guidance=self.do_classifier_free_guidance,
-                num_videos_per_prompt=1,
-                max_sequence_length=512,
+                num_videos_per_prompt=num_outputs_per_prompt,
+                max_sequence_length=common.max_sequence_length or 512,
                 device=device,
                 dtype=dtype,
             )
         else:
             prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
+            prompt_embeds = prompt_embeds.repeat_interleave(num_outputs_per_prompt, dim=0)
             if negative_prompt_embeds is not None:
                 negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=dtype)
+                negative_prompt_embeds = negative_prompt_embeds.repeat_interleave(num_outputs_per_prompt, dim=0)
 
         # ---- 2. Audio encoding ----
-        audio_emb, audio_num_repeat, target_video_frames = self.encode_audio(
-            audio_path, infer_frames=infer_frames, device=device, dtype=dtype
-        )
-        if num_repeat is None or num_repeat > audio_num_repeat:
-            num_repeat = audio_num_repeat
+        audio_embeddings: list[torch.Tensor] = []
+        effective_repeats: list[int] = []
+        target_video_frames: list[int] = []
+        for request_audio_path, requested_repeat in zip(audio_paths, requested_repeats):
+            assert request_audio_path is not None
+            audio_emb, audio_num_repeat, request_target_video_frames = self.encode_audio(
+                request_audio_path, infer_frames=infer_frames, device=device, dtype=dtype
+            )
+            audio_embeddings.append(audio_emb.repeat_interleave(num_outputs_per_prompt, dim=0))
+            effective_repeats.append(
+                audio_num_repeat
+                if requested_repeat is None or requested_repeat > audio_num_repeat
+                else requested_repeat
+            )
+            target_video_frames.append(request_target_video_frames)
+
+        if len(set(effective_repeats)) != 1:
+            raise ValueError(f"Batched S2V requests must have matching num_repeat values, got {effective_repeats}.")
+        if len(set(target_video_frames)) != 1:
+            raise ValueError(
+                "Batched S2V requests must have matching audio embedding time lengths; "
+                f"got target video frames {target_video_frames}."
+            )
+        num_repeat = effective_repeats[0]
+        audio_emb = DiffusionRequestBatch.collate_tensors(audio_embeddings, "S2V audio embeddings", None)
+        assert audio_emb is not None
 
         # Load raw audio waveform for muxing into output video
-        if isinstance(audio_path, np.ndarray):
-            raw_audio_waveform = audio_path.astype(np.float32)
-            raw_audio_sr = 16000
-        else:
-            raw_audio_waveform, raw_audio_sr = load_audio(audio_path, sr=None, mono=True)
+        raw_audio_waveforms: list[np.ndarray] = []
+        raw_audio_sample_rates: list[int] = []
+        for request_audio_path in audio_paths:
+            assert request_audio_path is not None
+            if isinstance(request_audio_path, np.ndarray):
+                raw_audio_waveforms.append(request_audio_path.astype(np.float32, copy=False))
+                raw_audio_sample_rates.append(16000)
+            else:
+                raw_audio_waveform, raw_audio_sr = load_audio(request_audio_path, sr=None, mono=True)
+                raw_audio_waveforms.append(raw_audio_waveform)
+                raw_audio_sample_rates.append(raw_audio_sr)
+        if len(set(raw_audio_sample_rates)) != 1 or len({waveform.shape for waveform in raw_audio_waveforms}) != 1:
+            raise ValueError("Batched S2V requests must have matching raw audio shapes and sample rates.")
+        raw_audio_sr = raw_audio_sample_rates[0]
 
         # ---- 3. Reference image encoding ----
-        ref_latents = self.encode_ref_image(image, height, width, device=device).to(dtype=dtype)
+        ref_latents = DiffusionRequestBatch.collate_tensors(
+            [
+                self.encode_ref_image(request_image, height, width, device=device)
+                .to(dtype=dtype)
+                .repeat_interleave(num_outputs_per_prompt, dim=0)
+                for request_image in images
+                if request_image is not None
+            ],
+            "S2V reference image latents",
+            None,
+        )
+        assert ref_latents is not None
 
         # ---- 4. Initial motion latents (zeros) ----
         motion_frames = min(self.motion_frames, infer_frames - 1)
         motion_pixels = torch.zeros(
-            [1, 3, motion_frames, height, width],
+            [batch_size, 3, motion_frames, height, width],
             dtype=dtype,
             device=device,
         )
@@ -1193,8 +1290,11 @@ class Wan22S2VPipeline(
             drop_first_motion = False
             # Place reference image in the last 6 frames of motion
             tensor_trans = transforms.ToTensor()
-            ref_tensor = tensor_trans(image).to(device=device, dtype=dtype) * 2 - 1.0  # [C, H, W]
-            motion_pixels[:, :, -6:] = ref_tensor.unsqueeze(0).unsqueeze(2).expand(-1, -1, 6, -1, -1)
+            ref_tensors = torch.stack(
+                [tensor_trans(request_image) for request_image in images if request_image is not None]
+            ).to(device=device, dtype=dtype)
+            ref_tensors = ref_tensors.repeat_interleave(num_outputs_per_prompt, dim=0) * 2 - 1.0
+            motion_pixels[:, :, -6:] = ref_tensors.unsqueeze(2).expand(-1, -1, 6, -1, -1)
 
         motion_latents = self.prepare_motion_latents(motion_pixels, device=device).to(dtype=dtype)
 
@@ -1211,24 +1311,29 @@ class Wan22S2VPipeline(
         clips: list[torch.Tensor] = []
         # Keep a pixel-space buffer of the trailing motion_frames for the
         # autoregressive connection between clips.
-        videos_last_frames = torch.zeros([1, 3, motion_frames, height, width], dtype=dtype, device=device)
+        videos_last_frames = torch.zeros([batch_size, 3, motion_frames, height, width], dtype=dtype, device=device)
 
         for r in range(num_repeat):
-            # Per-clip seed
-            clip_seed = seed + r
-            clip_generator = torch.Generator(device=device).manual_seed(clip_seed)
-
+            clip_generators = _make_clip_generators(seeds, generators, r, device)
             # -- Noise --
-            latents = self.prepare_latents(
-                infer_frames=infer_frames,
-                height=height,
-                width=width,
-                motion_frames=motion_frames,
-                lat_motion_frames=lat_motion_frames,
-                dtype=dtype,
-                device=device,
-                generator=clip_generator,
-            )
+            if r == 0 and request_latents is not None:
+                latents = request_latents.to(device=device, dtype=dtype)
+            else:
+                latents = torch.stack(
+                    [
+                        self.prepare_latents(
+                            infer_frames=infer_frames,
+                            height=height,
+                            width=width,
+                            motion_frames=motion_frames,
+                            lat_motion_frames=lat_motion_frames,
+                            dtype=dtype,
+                            device=device,
+                            generator=clip_generator,
+                        )
+                        for clip_generator in clip_generators
+                    ]
+                )
 
             # -- Scheduler --
             self.scheduler.set_timesteps(num_steps, device=device)
@@ -1242,11 +1347,11 @@ class Wan22S2VPipeline(
 
             # -- Pose condition for this clip --
             # Default: zero condition (no pose driving)
-            # Shape: [B=1, C=16, T, H, W] — passed to transformer which iterates over batch dim
+            # Shape: [B, C=16, T, H, W]
             lat_h = height // self.vae_scale_factor_spatial
             lat_w = width // self.vae_scale_factor_spatial
             lat_target_frames = (infer_frames + 3 + motion_frames) // 4 - lat_motion_frames
-            cond_latents = torch.zeros([1, 16, lat_target_frames, lat_h, lat_w], dtype=dtype, device=device)
+            cond_latents = torch.zeros([batch_size, 16, lat_target_frames, lat_h, lat_w], dtype=dtype, device=device)
 
             # -- Clone motion latents for this clip --
             input_motion_latents = motion_latents.clone()
@@ -1282,7 +1387,7 @@ class Wan22S2VPipeline(
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
                 guidance_scale=guidance_scale,
-                clip_generator=clip_generator,
+                clip_generator=clip_generators,
                 dtype=dtype,
                 device=device,
                 max_seq_len=max_seq_len,
@@ -1300,11 +1405,10 @@ class Wan22S2VPipeline(
                 self.transformer.to("cpu")
                 current_omni_platform.empty_cache()
 
-            latents_for_decode = latents.unsqueeze(0)  # [1, C, T, H, W]
             if not (drop_first_motion and r == 0):
-                decode_latents = torch.cat([motion_latents, latents_for_decode], dim=2)
+                decode_latents = torch.cat([motion_latents, latents], dim=2)
             else:
-                decode_latents = torch.cat([ref_latents, latents_for_decode], dim=2)
+                decode_latents = torch.cat([ref_latents, latents], dim=2)
 
             decode_latents = self._denormalize_latents(decode_latents)
             decode_latents = decode_latents.to(self.vae.dtype)
@@ -1321,7 +1425,7 @@ class Wan22S2VPipeline(
 
                 # Create buffer for broadcast
                 clip_video = torch.empty(
-                    (1, 3, total_frames, height, width),
+                    (batch_size, 3, total_frames, height, width),
                     device=decode_latents.device,
                     dtype=decode_latents.dtype,
                 )
@@ -1356,14 +1460,19 @@ class Wan22S2VPipeline(
                 current_omni_platform.empty_cache()
 
         # ---- Concatenate all clips ----
-        output = torch.cat(clips, dim=2)  # [1, C, T_total, H, W]
+        output = torch.cat(clips, dim=2)  # [B, C, T_total, H, W]
 
-        return DiffusionOutput(
-            output=(output, raw_audio_waveform, raw_audio_sr),
-            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        outputs = split_diffusion_output_by_request(
+            DiffusionOutput(
+                output=output,
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            ),
+            req,
+            num_outputs_per_prompt=num_outputs_per_prompt,
         )
+        for request_output, raw_audio_waveform in zip(outputs, raw_audio_waveforms):
+            request_output.output = (request_output.output, raw_audio_waveform, raw_audio_sr)
+        return outputs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights using AutoWeightsLoader for vLLM integration."""
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return load_wan_weights_with_optional_gate(self, weights)

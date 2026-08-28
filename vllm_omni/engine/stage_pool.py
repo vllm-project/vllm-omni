@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unified stage-local runtime abstraction for vLLM-Omni."""
 
 from __future__ import annotations
@@ -94,6 +97,16 @@ class StagePool:
 
     DISPATCH_WAIT_TIMEOUT_S: float = 10.0
     DISPATCH_RETRY_INTERVAL_S: float = 0.1
+    # Only these EngineCore helpers may skip collective_rpc_async. A generic
+    # ``{method}_async`` on AsyncMPClient must not silently drop timeout.
+    _ENGINE_CORE_CONTROL_ASYNC_METHODS = frozenset(
+        {
+            "pause_scheduler",
+            "resume_scheduler",
+            "sleep",
+            "wake_up",
+        }
+    )
 
     def __init__(
         self,
@@ -643,16 +656,16 @@ class StagePool:
         )
         image_pixels = self._count_image_pixels(request_outputs) if output_unit_type == "image" else 0
         num_inference_steps = coerce_positive_int_scalar(getattr(sampling_params, "num_inference_steps", None)) or 0
-        denoise_step_latency_ms = (
-            defs.compute_denoise_step_latency(stage_gen_time_ms, num_inference_steps)
-            if output_unit_type == "image"
-            else 0.0
-        )
         has_output_timestamps = bool(output_timestamps)
         first_ts = output_timestamps[0] if has_output_timestamps else now
         serving_time_to_first_output_ms = (
             max((non_empty_first_output_ts - request_timestamp) * 1000.0, 0.0)
             if non_empty_first_output_ts is not None
+            else 0.0
+        )
+        image_time_to_first_output_ms = (
+            max((non_empty_first_output_ts - submit_ts) * 1000.0, 0.0)
+            if non_empty_first_output_ts is not None and output_unit_type == "image"
             else 0.0
         )
         remaining_ms = max((now - first_ts) * 1000.0, 0.0)
@@ -699,10 +712,11 @@ class StagePool:
             audio_sample_rate=audio_sample_rate,
             audio_duration_s=audio_duration_s,
             image_pixels=image_pixels,
-            denoise_step_latency_ms=denoise_step_latency_ms,
+            num_inference_steps=num_inference_steps,
             output_unit_type=output_unit_type,
             output_unit_count=output_unit_count,
             serving_time_to_first_output_ms=serving_time_to_first_output_ms,
+            image_time_to_first_output_ms=image_time_to_first_output_ms,
             time_per_output_unit_ms=time_per_output_unit_ms,
             inter_output_latency_ms=inter_output_latency_ms,
             inter_output_latencies_ms=inter_output_latencies_ms,
@@ -1214,6 +1228,7 @@ class StagePool:
         kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any] | Any:
         """Dispatch a stage-scoped control-plane RPC to one physical route."""
+        args = tuple(args or ())
         kwargs = dict(kwargs or {})
         client = self.clients[replica_id]
         if client is None:
@@ -1222,6 +1237,14 @@ class StagePool:
                 "error": f"stage {self.stage_id} replica {replica_id} is not attached",
             }
         try:
+            if self.stage_type != "diffusion" and method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS:
+                client_method = getattr(client, f"{method}_async", None)
+                if callable(client_method):
+                    result = client_method(*args, **kwargs)
+                    if timeout is not None:
+                        return await asyncio.wait_for(result, timeout=timeout)
+                    return await result
+
             return await client.collective_rpc_async(
                 method=method,
                 timeout=timeout,

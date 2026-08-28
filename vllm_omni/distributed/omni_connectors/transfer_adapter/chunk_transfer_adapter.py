@@ -1,14 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import copy
 import importlib
+import inspect
+import threading
+import time
 from collections import defaultdict, deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 import torch
 from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.utils import ConstantList
 
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
 
@@ -19,6 +24,14 @@ from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
 
 logger = get_connector_logger(__name__)
+
+
+class _SenderGeneration:
+    """Fence one external request generation without blocking cleanup."""
+
+    def __init__(self) -> None:
+        self.in_flight = False
+        self.cancelled = False
 
 
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
@@ -41,6 +54,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     def __init__(self, vllm_config: Any):
         model_config = vllm_config.model_config
+        # The base constructor starts the save thread, so sender-generation
+        # state must exist before it can observe an enqueued task. The global
+        # lock only protects this map and short state transitions. Slow payload
+        # construction and connector writes never hold it.
+        self._sender_state_lock = threading.Lock()
+        self._sender_tokens: dict[str, _SenderGeneration] = {}
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         active_stream_window = int(getattr(model_config, "active_stream_window", 0) or 0)
         model_max_num_seqs = int(getattr(model_config, "max_num_seqs", self.scheduler_max_num_seqs) or 0)
@@ -67,6 +86,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             module_path, func_name = custom_process_next_stage_input_func.rsplit(".", 1)
             module = importlib.import_module(module_path)
             self.custom_process_next_stage_input_func = getattr(module, func_name)
+        self._processor_accepts_step_tokens: dict[Callable[..., Any], bool] = {}
         # mapping for request id and chunk id
         self.put_req_chunk: dict[str, int] = defaultdict(int)
         self.get_req_chunk: dict[str, int] = defaultdict(int)
@@ -74,6 +94,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # but popped at segment boundaries (unlike put_req_chunk which is
         # request-global for connector key continuity).
         self.ramp_chunk_count: dict[str, int] = defaultdict(int)
+        self._adaptive_states: dict[str, Any] = {}
         self.upstream_exhausted_requests: set[str] = set()
         self.segment_finished_requests: set[str] = set()
         self.request_payload = {}
@@ -83,6 +104,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
         self.requests_with_ready_chunks = set()
+        self.replaced_streaming_prompt_ids: set[str] = set()
         self.requests_origin_status = {}
         self._active_streams: dict[str, Any] = {}
         # Private hold-queue for non-active running requests. Restored to
@@ -94,6 +116,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._held_non_active: deque[Any] = deque()
         self.requests_num_chunks_sent: dict[str, int] = defaultdict(int)
         self._pending_streaming_prefills: dict[str, dict] = {}
+        # Monotonic timestamp of when each request last began waiting for a
+        # chunk, refreshed every time one arrives.  Read by
+        # collect_timed_out_request_ids() so a stream that stops advancing
+        # becomes a client-visible error instead of parking forever.  Mirrors
+        # OmniSchedulingCoordinator._waiting_since on the full-payload path.
+        self._waiting_since: dict[str, float] = {}
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
@@ -109,6 +137,38 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         num_computed = int(getattr(request, "num_computed_tokens", 0))
         num_placeholders = int(getattr(request, "num_output_placeholders", 0) or 0)
         return max(0, num_computed - num_placeholders)
+
+    @staticmethod
+    def _snapshot_processor_request(request: Request) -> Request:
+        """Snapshot mutable processor inputs at save-queue admission time."""
+
+        def snapshot_container(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {key: snapshot_container(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [snapshot_container(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(snapshot_container(item) for item in value)
+            return value
+
+        snapshot = copy.copy(request)
+        for name in (
+            "additional_information",
+            "prompt_token_ids",
+        ):
+            if hasattr(request, name):
+                setattr(snapshot, name, snapshot_container(getattr(request, name)))
+
+        for private_name, public_name in (
+            ("_all_token_ids", "all_token_ids"),
+            ("_output_token_ids", "output_token_ids"),
+        ):
+            token_ids = getattr(request, private_name, None)
+            if isinstance(token_ids, list):
+                frozen_ids = token_ids.copy()
+                setattr(snapshot, private_name, frozen_ids)
+                setattr(snapshot, public_name, ConstantList(frozen_ids))
+        return snapshot
 
     @staticmethod
     def _refresh_generation_chunk_prefill_state(request: Request) -> None:
@@ -156,11 +216,29 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         with self._recv_cond:
             self._recv_cond.notify()
 
+    def _accepts_new_token_ids(self, processor: Callable[..., Any]) -> bool:
+        cached = self._processor_accepts_step_tokens.get(processor)
+        if cached is not None:
+            return cached
+        try:
+            parameters = inspect.signature(processor).parameters.values()
+        except (TypeError, ValueError):
+            accepts = False
+        else:
+            accepts = any(
+                parameter.name == "new_token_ids" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        self._processor_accepts_step_tokens[processor] = accepts
+        return accepts
+
     def save_async(
         self,
         multimodal_output: dict[str, Any] | None = None,
         request: Request | None = None,
         is_segment_finished: bool = False,
+        new_token_ids: Iterable[int] | None = None,
+        confirmed_num_computed_tokens: int | None = None,
     ):
         """Build and enqueue one chunk for asynchronous sending.
 
@@ -178,29 +256,56 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             multimodal_output: Per-request multimodal output dictionary
             request: Request object
             is_segment_finished: whether the segment of request is finished
+            new_token_ids: immutable snapshot of tokens generated by this
+                scheduler step, before resumable cleanup mutates the request
+            confirmed_num_computed_tokens: committed token count captured
+                before a streaming transition can mutate ``request``
         """
         is_finished = request.is_finished() and not request.resumable
-
-        confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
-
-        # If the request is preempted, skip the already saved chunks.
-        if confirmed_num_computed_tokens < self.requests_num_chunks_sent.get(request.external_req_id, 0):
-            logger.warning(
-                f"Enqueue save_async for request {request.external_req_id}, "
-                f"request.num_computed_tokens={request.num_computed_tokens}, "
-                f"request.num_output_placeholders={getattr(request, 'num_output_placeholders', 0)}, "
-                f"previous_chunks_sent={self.requests_num_chunks_sent.get(request.external_req_id, 0)}"
-            )
-            return
-
-        self.requests_num_chunks_sent[request.external_req_id] = confirmed_num_computed_tokens
+        external_req_id = request.external_req_id
+        if confirmed_num_computed_tokens is None:
+            confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
+        processor_request = (
+            self._snapshot_processor_request(request) if self.custom_process_next_stage_input_func else request
+        )
         task = {
             "multimodal_output": multimodal_output,
-            "request": request,
+            "request": processor_request,
             "is_finished": is_finished,
             "is_segment_finished": is_segment_finished,
+            "new_token_ids": tuple(int(token_id) for token_id in (new_token_ids or ())),
         }
-        self._pending_save_reqs.append(task)
+
+        reject_reason = None
+        with self._sender_state_lock:
+            sender_token = self._sender_tokens.get(external_req_id)
+            if sender_token is not None and sender_token.cancelled:
+                reject_reason = "previous sender generation is still draining"
+            # If the request is preempted, skip the already saved chunks.
+            elif confirmed_num_computed_tokens < self.requests_num_chunks_sent.get(external_req_id, 0):
+                logger.warning(
+                    f"Enqueue save_async for request {external_req_id}, "
+                    f"request.num_computed_tokens={request.num_computed_tokens}, "
+                    f"request.num_output_placeholders={getattr(request, 'num_output_placeholders', 0)}, "
+                    f"previous_chunks_sent={self.requests_num_chunks_sent.get(external_req_id, 0)}"
+                )
+                return
+
+            else:
+                self.requests_num_chunks_sent[external_req_id] = confirmed_num_computed_tokens
+                if sender_token is None:
+                    sender_token = _SenderGeneration()
+                    self._sender_tokens[external_req_id] = sender_token
+                task["sender_token"] = sender_token
+                self._pending_save_reqs.append(task)
+                if is_segment_finished:
+                    # The queued FIFO item now owns the old segment. Start the next
+                    # segment's deduplication watermark before the worker sends it.
+                    self.requests_num_chunks_sent.pop(external_req_id, None)
+        if reject_reason is not None:
+            logger.error("Cannot enqueue %s: %s", external_req_id, reject_reason)
+            self.record_send_failure(request.request_id, reject_reason)
+            return
         with self._save_cond:
             self._save_cond.notify()
 
@@ -239,7 +344,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 replace_prompt = meta.get("replace_streaming_prompt") is True
                 if getattr(request, "resumable", False) and (chunk_id > 0 or replace_prompt):
                     # For new streaming input segment, we should update prompt from payload
-                    construct_next_stage_streaming_input_prompt(payload_data, request)
+                    replaced = construct_next_stage_streaming_input_prompt(payload_data, request)
+                    if replaced:
+                        self.replaced_streaming_prompt_ids.add(req_id)
 
                 if payload_finished:
                     self.upstream_exhausted_requests.add(req_id)
@@ -268,15 +375,26 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 else:
                     prompt_token_ids = new_ids
                 request.prompt_token_ids = prompt_token_ids
+                # Full-snapshot producers opt in explicitly; generation and
+                # diffusion models keep their existing incremental merge.
                 prev_info = getattr(request, "additional_information", None)
-                info = dict(prev_info) if isinstance(prev_info, dict) else {}
+                replace_snapshot = meta.get("replace_runtime_additional_information") is True
+                info = {} if replace_snapshot else (dict(prev_info) if isinstance(prev_info, dict) else {})
                 for key, value in payload_data.items():
                     if key == "codes":
-                        if use_tensor_codes and isinstance(value, dict):
+                        if isinstance(value, dict):
                             existing_sub = info.get(key)
                             merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
-                            merged_sub.update(value)
-                            info[key] = merged_sub
+                            for subkey, subvalue in value.items():
+                                # A 1-D audio tensor is represented by the
+                                # placeholder prompt above, but sibling fields
+                                # such as the reference voice still belong in
+                                # the current runtime snapshot.
+                                if subkey == "audio" and not use_tensor_codes:
+                                    continue
+                                merged_sub[subkey] = subvalue
+                            if merged_sub:
+                                info[key] = merged_sub
                         continue
                     if isinstance(value, dict):
                         existing_sub = info.get(key)
@@ -313,6 +431,44 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return False
 
     def _send_single_request(self, task: dict):
+        request = task["request"]
+        external_req_id = request.external_req_id
+        sender_token = task.get("sender_token")
+        if sender_token is None:
+            self._send_single_request_for_generation(task)
+            return
+        with self._sender_state_lock:
+            is_current = self._sender_tokens.get(external_req_id) is sender_token
+            if is_current and not sender_token.cancelled:
+                sender_token.in_flight = True
+            else:
+                is_current = False
+        if not is_current:
+            logger.debug("Discarding stale queued chunk for aborted request %s", external_req_id)
+            return
+        try:
+            self._send_single_request_for_generation(task, sender_token)
+        finally:
+            with self._sender_state_lock:
+                if self._sender_tokens.get(external_req_id) is sender_token:
+                    sender_token.in_flight = False
+                    if sender_token.cancelled:
+                        self._sender_tokens.pop(external_req_id, None)
+                        self._clear_sender_state_locked(external_req_id)
+
+    def _sender_generation_is_active(
+        self,
+        external_req_id: str,
+        sender_token: _SenderGeneration,
+    ) -> bool:
+        with self._sender_state_lock:
+            return self._sender_tokens.get(external_req_id) is sender_token and not sender_token.cancelled
+
+    def _send_single_request_for_generation(
+        self,
+        task: dict,
+        sender_token: _SenderGeneration | None = None,
+    ):
         raw_mm = task["multimodal_output"]
         multimodal_output = unflatten_payload(raw_mm) if isinstance(raw_mm, Mapping) else raw_mm
         request = task["request"]
@@ -327,10 +483,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         payload_data: OmniPayloadStruct | None = None
         if self.custom_process_next_stage_input_func:
             try:
-                payload_data = self.custom_process_next_stage_input_func(
-                    transfer_manager=self,
-                    multimodal_output=multimodal_output,
-                    request=request,
+                processor = self.custom_process_next_stage_input_func
+                processor_kwargs = {
+                    "transfer_manager": self,
+                    "multimodal_output": multimodal_output,
+                    "request": request,
                     # Existing processors use is_finished as a flush signal.
                     # Terminal stops no longer count as segment boundaries
                     # (is_segment_finished is False when the request finishes,
@@ -338,8 +495,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # accumulated tail on the terminal chunk — otherwise the
                     # downstream stage receives the finished marker without
                     # the final payload (#5413).
-                    is_finished=is_segment_finished or is_finished,
-                )
+                    "is_finished": is_segment_finished or is_finished,
+                }
+                if self._accepts_new_token_ids(processor):
+                    processor_kwargs["new_token_ids"] = task.get("new_token_ids", ())
+                payload_data = processor(**processor_kwargs)
 
             except Exception as e:
                 logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
@@ -352,9 +512,22 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             payload_data = OmniPayloadStruct()
         if payload_data.meta is None:
             payload_data.meta = MetaStruct()
-        payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
+        # A model-native codec stream may span many resumable scheduler
+        # requests.  Its processor is the only layer that knows whether a
+        # request finish is a transport wake or the lifetime of the codec
+        # state itself.  Preserve an explicit streaming lifetime decision;
+        # all ordinary producers keep the scheduler-derived default.
+        processor_controls_codec_lifetime = payload_data.meta.finished is not None and self._is_truthy_scalar(
+            payload_data.meta.codec_streaming
+        )
+        if not processor_controls_codec_lifetime:
+            payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
         if payload_data.meta.is_segment_finished is None:
             payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
+
+        if sender_token is not None and not self._sender_generation_is_active(external_req_id, sender_token):
+            logger.debug("Skipping cancelled chunk for request %s before connector put", external_req_id)
+            return
 
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
@@ -362,6 +535,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             put_key=connector_put_key,
             data=payload_data,
         )
+
+        if sender_token is not None and not self._sender_generation_is_active(external_req_id, sender_token):
+            # cleanup_sender() may cancel this generation while put() is
+            # blocked. Do not let that stale completion recreate state for a
+            # request whose cleanup is already in progress.
+            logger.debug("Ignoring completed put for cancelled request %s", external_req_id)
+            return
 
         if success:
             self.put_req_chunk[external_req_id] += 1
@@ -383,11 +563,29 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # has been sent successfully. This avoids cleanup->save races.
             if is_payload_finished:
                 self.cleanup(request.request_id, external_req_id)
+        else:
+            # R1.2 of #4855. connector.put returning False is a silent drop: no
+            # exception, no retry, and the caller's `if success:` block simply
+            # does not run. /dev/shm exhaustion in SharedMemoryConnector.put is
+            # one way to get here. Record it so the request fails now rather
+            # than parking in WAITING_FOR_CHUNK until the deadline.
+            logger.error(
+                "Chunk send failed for %s (stage %s -> %s); giving up on this chunk",
+                external_req_id,
+                stage_id,
+                next_stage_id,
+            )
+            # Key on the scheduler-side id. `external_req_id` is the user-facing id
+            # (InputProcessor renames request_id to an internal UUID and keeps the
+            # original in external_req_id, see async_omni_engine.py), while
+            # `self.requests` -- and therefore `finish_requests` -- is keyed by the
+            # internal one.
+            self.record_send_failure(request.request_id, "connector.put reported failure")
 
         if is_segment_finished:
             self.code_prompt_token_ids.pop(external_req_id, None)
-            self.requests_num_chunks_sent.pop(external_req_id, None)
             self.ramp_chunk_count.pop(external_req_id, None)
+            self._adaptive_states.pop(external_req_id, None)
             cached_ic = getattr(self, "_cached_ic", None)
             if cached_ic is not None:
                 cached_ic.pop(external_req_id, None)
@@ -430,6 +628,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.segment_finished_requests.discard(request_id)
         self.get_req_chunk.pop(request_id, None)
         self.requests_with_ready_chunks.discard(request_id)
+        self.replaced_streaming_prompt_ids.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
         self.requests_origin_status.pop(request_id, None)
         self._discard_from_chunk_deque(self.waiting_for_chunk_waiting_requests, request_id)
@@ -438,6 +637,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
+        self._waiting_since.pop(request_id, None)
 
     @staticmethod
     def _discard_from_chunk_deque(deque_list: deque[Any], request_id: str) -> None:
@@ -451,16 +651,35 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     def cleanup_sender(self, external_req_id: str) -> None:
         """Reclaim sender-side per-request state (keyed by external id).
 
-        Must only be called after the terminal chunk has actually been
-        sent (i.e. from ``_send_single_request``), not before.
+        Called after a terminal chunk is sent or when the scheduler aborts the
+        request before a terminal chunk can be produced. In-flight sends are
+        cancelled here and reclaim their own state in ``finally``; cleanup
+        never waits for connector I/O on the scheduler thread.
 
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
+        with self._sender_state_lock:
+            sender_token = self._sender_tokens.get(external_req_id)
+            if sender_token is None:
+                self._clear_sender_state_locked(external_req_id)
+                return
+            sender_token.cancelled = True
+            if sender_token.in_flight:
+                # The sender's finally block is the first point where no
+                # in-flight code can mutate this request's state. Let it own
+                # cleanup without making the scheduler wait for connector I/O.
+                return
+            self._sender_tokens.pop(external_req_id, None)
+            self._clear_sender_state_locked(external_req_id)
+
+    def _clear_sender_state_locked(self, external_req_id: str) -> None:
+        """Clear sender state while ``_sender_state_lock`` is held."""
         self.put_req_chunk.pop(external_req_id, None)
         self.request_payload.pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
         self.requests_num_chunks_sent.pop(external_req_id, None)
         self.ramp_chunk_count.pop(external_req_id, None)
+        self._adaptive_states.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
 
         cached_ic = getattr(self, "_cached_ic", None)
@@ -538,6 +757,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 RequestStatus.RUNNING,
                 self._finished_load_reqs,
             )
+            self._requeue_replaced_prompts(waiting_queue, running_queue)
             while len(running_queue) > self.scheduler_max_num_seqs:
                 request = running_queue.pop()
                 request.status = RequestStatus.PREEMPTED
@@ -552,8 +772,23 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._process_chunk_queue(
             running_queue, self.waiting_for_chunk_running_requests, RequestStatus.RUNNING, self._finished_load_reqs
         )
+        self._requeue_replaced_prompts(waiting_queue, running_queue)
         self._promote_active_streams(waiting_queue)
         self._preempt_non_active_running(waiting_queue, running_queue)
+
+    def _requeue_replaced_prompts(self, waiting_queue: Any, running_queue: list[Request]) -> None:
+        """Move a replaced running prompt back through scheduler admission."""
+        for request in list(running_queue):
+            request_id = request.request_id
+            if (
+                request_id not in self.replaced_streaming_prompt_ids
+                or request_id not in self.requests_with_ready_chunks
+            ):
+                continue
+            running_queue.remove(request)
+            request.status = RequestStatus.WAITING
+            self.requests_origin_status[request_id] = RequestStatus.WAITING
+            waiting_queue.add_request(request)
 
     def _promote_active_streams(self, queue: Any) -> None:
         if len(self._active_streams) >= self._active_window:
@@ -578,6 +813,42 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return False
         self._active_streams[request_id] = request
         return True
+
+    def collect_timed_out_request_ids(self, timeout_s: float) -> set[str]:
+        """Return IDs whose chunk wait has exceeded *timeout_s*.
+
+        The async-chunk path had no deadline of any kind: a request parks in
+        ``WAITING_FOR_CHUNK`` and the receiver re-queues it on every failed
+        poll (``transfer_adapter/base.py``) with no attempt counter, so a
+        producer that crashed, gave up after its send retries, or simply never
+        emitted a terminal chunk left the request waiting forever
+        (vllm-project/vllm-omni#3833).  The full-payload path has had a net
+        since ``OmniSchedulingCoordinator.collect_timed_out_request_ids``; this
+        is its async-chunk counterpart, and both are driven by the same
+        ``VLLM_OMNI_INPUT_WAIT_TIMEOUT_S``.
+
+        The clock measures *stall* time, not stream lifetime: it starts when a
+        request begins waiting for a chunk and resets each time one arrives, so
+        a long but healthy stream is never failed.
+
+        Clears ``_waiting_since`` for the expired IDs.  The caller marks them
+        ``FINISHED_ERROR`` via the scheduler's ``finish_requests``, which routes
+        back through this adapter's own ``finish_requests`` and releases the
+        rest of the per-request state.
+        """
+        if timeout_s <= 0 or not self._waiting_since:
+            return set()
+        now = time.monotonic()
+        timed_out_ids = {req_id for req_id, started in self._waiting_since.items() if now - started > timeout_s}
+        for req_id in timed_out_ids:
+            self._waiting_since.pop(req_id, None)
+            logger.warning(
+                "[Stage-%s] Request %s timed out waiting for a chunk (stalled > %.0fs)",
+                self.connector.stage_id,
+                req_id,
+                timeout_s,
+            )
+        return timed_out_ids
 
     @property
     def num_running_waiting_for_chunk(self) -> int:
@@ -624,11 +895,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 # Requests that waiting for chunk
                 self.load_async(request)
                 request.status = RequestStatus.WAITING_FOR_CHUNK
+                self._waiting_since.setdefault(request.request_id, time.monotonic())
             else:
                 if request.request_id in finished_load_reqs:
                     request.status = target_status
                     finished_load_reqs.remove(request.request_id)
                     self.requests_with_ready_chunks.add(request.request_id)
+                    # A chunk landed: restart the clock for the next one, so the
+                    # deadline measures stall time rather than total stream time.
+                    self._waiting_since.pop(request.request_id, None)
                     continue
             queue.remove(request)
             self.requests_origin_status[request.request_id] = target_status
@@ -767,11 +1042,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 # Requests that waiting for chunk
                 self.load_async(request)
                 request.status = RequestStatus.WAITING_FOR_CHUNK
+                self._waiting_since.setdefault(request.request_id, time.monotonic())
             else:
                 if request.request_id in finished_load_reqs:
                     request.status = target_status
                     finished_load_reqs.remove(request.request_id)
                     self.requests_with_ready_chunks.add(request.request_id)
+                    # A chunk landed: restart the clock for the next one, so the
+                    # deadline measures stall time rather than total stream time.
+                    self._waiting_since.pop(request.request_id, None)
                     continue
             queue.remove(request)
             self.requests_origin_status[request.request_id] = target_status
@@ -782,6 +1061,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             for req_data in scheduler_output.scheduled_new_reqs:
                 if req_data.req_id in self.requests_with_ready_chunks:
                     self.requests_with_ready_chunks.remove(req_data.req_id)
+                if req_data.req_id in self.replaced_streaming_prompt_ids:
+                    external_req_id = self.request_ids_mapping.get(req_data.req_id)
+                    if external_req_id is not None:
+                        self.requests_num_chunks_sent.pop(external_req_id, None)
+                    self.replaced_streaming_prompt_ids.remove(req_data.req_id)
 
         if scheduler_output.scheduled_cached_reqs:
             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
@@ -799,16 +1083,45 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         else:
             request_ids = requests.keys()
 
+        connector_owned_ids = {
+            request.request_id
+            for queue in (
+                self.waiting_for_chunk_waiting_requests,
+                self.waiting_for_chunk_running_requests,
+                self._held_non_active,
+            )
+            for request in queue
+        }
+
         # First pass: collect requests to remove from queues
+        request_ids = set(request_ids)
         for req_id in request_ids:
             request = requests.get(req_id) if requests else None
-            if request is None or request.is_finished():
+            if request is None:
                 # Invalid request ID.
                 continue
-            if req_id in self.requests_origin_status:
+            resumable_segment_stop = bool(
+                getattr(request, "resumable", False) and request.status == RequestStatus.FINISHED_STOPPED
+            )
+            if request.is_finished() and not resumable_segment_stop:
+                continue
+            # Once restored to a scheduler queue, the saved origin is stale and
+            # must not overwrite statuses such as WAITING_FOR_STREAMING_REQ.
+            if req_id in self.requests_origin_status and req_id in connector_owned_ids:
                 request.status = self.requests_origin_status.pop(req_id)
 
-        request_ids = set(request_ids)
+        # An abort can terminate a long-lived native codec stream before it
+        # emits a terminal payload. Reclaim both sides of the adapter so a
+        # later request reusing the same external id starts with empty state.
+        for req_id in request_ids:
+            request = requests.get(req_id) if requests else None
+            external_req_id = (
+                getattr(request, "external_req_id", None)
+                if request is not None
+                else self.request_ids_mapping.get(req_id)
+            ) or req_id
+            self.cleanup_receiver(req_id)
+            self.cleanup_sender(external_req_id)
 
         self.waiting_for_chunk_waiting_requests = deque(
             request for request in self.waiting_for_chunk_waiting_requests if request.request_id not in request_ids
@@ -821,10 +1134,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
 
         for req_id in request_ids:
-            self._active_streams.pop(req_id, None)
-            self.requests_with_ready_chunks.discard(req_id)
-            self.upstream_exhausted_requests.discard(req_id)
-            self._finished_load_reqs.discard(req_id)
-            self._cancelled_load_reqs.add(req_id)
+            self.cleanup_receiver(req_id)
 
         return []

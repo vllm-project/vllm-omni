@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Reusable Realtime WebSocket, PCM, and event helpers for MiniCPM-o demos."""
 
 from __future__ import annotations
@@ -8,7 +11,7 @@ import json
 import math
 import time
 import wave
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -25,9 +28,30 @@ except ImportError as exc:  # pragma: no cover - example dependency
 PCM16_SAMPLE_RATE = 16_000
 PCM16_BYTES_PER_SAMPLE = 2
 
+# Server-side model unit boundaries, in cumulative appended audio.
+# Stage0 configures the streaming mel processor with first_chunk_ms=1035 and
+# chunk_ms=1000; the processor aligns the first chunk down to a hop_length (160
+# samples) multiple, so unit 0 closes at 16480 samples and every later unit
+# closes 16000 samples after it. Camera frames must ride the append that closes
+# a unit, otherwise Stage0 cannot bind them to that unit's audio.
+DUPLEX_FIRST_UNIT_MS = 1030
+DUPLEX_UNIT_MS = 1000
+
+
+def duplex_unit_boundary_ms(unit_index: int) -> int:
+    """Cumulative appended audio, in ms, that closes model unit ``unit_index``."""
+    return DUPLEX_FIRST_UNIT_MS + max(0, int(unit_index)) * DUPLEX_UNIT_MS
+
 
 def _rounded_ms(value: float) -> float:
     return round(float(value), 3)
+
+
+def _finite_number(value: object, *, nonnegative: bool = False) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    parsed = float(value)
+    return parsed if math.isfinite(parsed) and (not nonnegative or parsed >= 0) else None
 
 
 def _interval_summary(values: list[float]) -> dict[str, float | int]:
@@ -56,11 +80,7 @@ def summarize_session_request_metrics(
     """Average client-observed metrics across turns that emitted audio."""
 
     def mean(metric: str, *, digits: int = 3) -> float | None:
-        values = [
-            float(request[metric])
-            for request in request_metrics
-            if isinstance(request.get(metric), int | float) and math.isfinite(float(request[metric]))
-        ]
+        values = [value for request in request_metrics if (value := _finite_number(request.get(metric))) is not None]
         return round(sum(values) / len(values), digits) if values else None
 
     return {
@@ -93,22 +113,55 @@ def _event_stage_metrics(event: dict[str, object]) -> dict[str, object] | None:
 
 def build_realtime_url(
     url: str,
-    model: str,
+    model: str | None,
     *,
     autostart: bool | None = None,
+    native_duplex: bool | None = True,
     session_id: str | None = None,
 ) -> str:
     """Add the explicit native-duplex query parameters to a Realtime URL."""
     parts = urlsplit(url)
+    if parts.scheme in {"http", "https"}:
+        parts = parts._replace(scheme="ws" if parts.scheme == "http" else "wss")
+    if parts.scheme not in {"ws", "wss"} or not parts.netloc:
+        raise ValueError(f"Unsupported Realtime URL: {url!r}")
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    query.setdefault("duplex", "1")
-    query.setdefault("model", model)
-    query.setdefault("minicpmo45_native_duplex", "1")
+    query["duplex"] = "1"
+    if model:
+        query["model"] = model
+    if native_duplex is not None:
+        query["minicpmo45_native_duplex"] = "1" if native_duplex else "0"
     if autostart is not None:
-        query.setdefault("autostart", "1" if autostart else "0")
+        query["autostart"] = "1" if autostart else "0"
     if session_id:
-        query.setdefault("session_id", session_id)
+        query["session_id"] = session_id
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def reference_audio_data_url(path: str | None) -> str | None:
+    """Encode a local reference WAV for a Realtime session update."""
+    if path is None:
+        return None
+    audio = Path(path).expanduser().resolve()
+    if not audio.is_file():
+        raise FileNotFoundError(f"Reference audio does not exist: {audio}")
+    return "data:audio/wav;base64," + base64.b64encode(audio.read_bytes()).decode("ascii")
+
+
+def chunk_period_ms(events: list[dict[str, object]], *, default: int = 1000) -> int:
+    """Read the negotiated native-duplex model-unit duration."""
+    for event in reversed(events):
+        session = event.get("session")
+        capabilities = session.get("capabilities") if isinstance(session, dict) else None
+        value = capabilities.get("chunk_period_ms") if isinstance(capabilities, dict) else None
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return default
+
+
+def has_residual_model_unit(pcm16: bytes, *, chunk_period_ms: int) -> bool:
+    unit_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_period_ms // 1000
+    return bool(unit_bytes and len(pcm16) % unit_bytes)
 
 
 def read_pcm16_wav(path: Path) -> bytes:
@@ -202,6 +255,20 @@ class RealtimeEventCollector:
             chunk for response_id in self.response_ids for chunk in self.response_audio.get(response_id, ())
         )
 
+    def response_text(self, response_id: str) -> str:
+        """Join all text/transcript deltas for one response identity."""
+        return "".join(
+            str(event.get("delta") or "")
+            for event in self.events
+            if self.response_id(event) == response_id
+            and event.get("type")
+            in {
+                "response.audio_transcript.delta",
+                "response.output_text.delta",
+                "response.text.delta",
+            }
+        )
+
     def errors(self) -> list[dict[str, object]]:
         return [event for event in self.events if event.get("type") == "error"]
 
@@ -282,15 +349,16 @@ class RealtimeEventCollector:
         if stage0_metrics is not None:
             raw_itls = stage0_metrics.get("vllm_itls_ms")
             itls = (
-                [float(value) for value in raw_itls if isinstance(value, int | float)]
+                [parsed for value in raw_itls if (parsed := _finite_number(value, nonnegative=True)) is not None]
                 if isinstance(raw_itls, list)
                 else []
             )
             result["stage0_tokens"] = {
                 "source": "engine_stage_metrics",
-                "output_token_count": int(stage0_metrics.get("num_tokens_out") or 0),
-                "ttft_ms": float(stage0_metrics.get("vllm_ttft_ms") or 0.0),
-                "tpot_ms": float(stage0_metrics.get("vllm_tpot_ms") or 0.0),
+                "output_token_count": int(_finite_number(stage0_metrics.get("num_tokens_out"), nonnegative=True) or 0),
+                "ttft_ms": _finite_number(stage0_metrics.get("vllm_ttft_ms"), nonnegative=True) or 0.0,
+                "tpot_ms": _finite_number(stage0_metrics.get("vllm_tpot_ms"), nonnegative=True),
+                "itls_ms": itls,
                 "inter_token_interval_ms": _interval_summary(itls),
             }
 
@@ -368,15 +436,27 @@ class RealtimeEventCollector:
 class RealtimeDuplexClient:
     """Small async client used by the user demo and reusable smoke probes."""
 
-    def __init__(self, url: str, *, max_size: int = 64 * 1024 * 1024) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        max_size: int = 64 * 1024 * 1024,
+        additional_headers: dict[str, str] | None = None,
+    ) -> None:
         self.url = url
         self.max_size = max_size
+        self.additional_headers = additional_headers
         self.events = RealtimeEventCollector()
         self._ws: Any = None
         self._reader_task: asyncio.Task[None] | None = None
+        self._media_clock_ms = 0
 
     async def __aenter__(self) -> RealtimeDuplexClient:
-        self._ws = await websockets.connect(self.url, max_size=self.max_size)
+        self._ws = await websockets.connect(
+            self.url,
+            max_size=self.max_size,
+            additional_headers=self.additional_headers,
+        )
         self._reader_task = asyncio.create_task(self._read_events())
         return self
 
@@ -398,12 +478,26 @@ class RealtimeDuplexClient:
                     continue
                 event = json.loads(raw)
                 if isinstance(event, dict):
+                    event.setdefault("_media_clock_ms", self._media_clock_ms)
                     self.events.add(event)
         except ConnectionClosed:
             return
 
     async def send(self, event: dict[str, object]) -> None:
         await self._ws.send(json.dumps(event))
+
+    def raise_if_reader_stopped(self) -> None:
+        """Fail a caller waiting on events after the WebSocket reader exits."""
+
+        task = self._reader_task
+        if task is None or not task.done():
+            return
+        if task.cancelled():
+            raise ConnectionError("Realtime WebSocket reader was cancelled")
+        error = task.exception()
+        if error is not None:
+            raise ConnectionError("Realtime WebSocket reader failed") from error
+        raise ConnectionError("Realtime WebSocket closed before the requested event arrived")
 
     async def configure(
         self,
@@ -417,7 +511,9 @@ class RealtimeDuplexClient:
         auto_response: bool = True,
         temperature: float | None = None,
         extra_body: dict[str, object] | None = None,
+        turn_detection: dict[str, object] | None = None,
         session_id: str | None = None,
+        idle_timeout_s: float | None = None,
         timeout_s: float = 20.0,
     ) -> None:
         session_extra_body = dict(extra_body or {})
@@ -436,8 +532,12 @@ class RealtimeDuplexClient:
             "modalities": ["audio", "text"],
             "input_audio_format": "pcm16",
             "output_audio_format": output_audio_format,
-            "turn_detection": None,
-            "overlap_policy": "listen_only",
+            "turn_detection": dict(turn_detection) if turn_detection is not None else None,
+            "overlap_policy": (
+                "barge_in_on_speech"
+                if turn_detection is not None and turn_detection.get("interrupt_response", True) is True
+                else "listen_only"
+            ),
             "playback_commit_policy": "ack_only",
             "extra_body": session_extra_body,
         }
@@ -448,14 +548,23 @@ class RealtimeDuplexClient:
         if instructions is not None:
             session["instructions"] = instructions
         if initial_user_text is not None:
-            extra_body = session["extra_body"]
-            assert isinstance(extra_body, dict)
-            extra_body["duplex_initial_user_text"] = initial_user_text
+            session_extra = session["extra_body"]
+            assert isinstance(session_extra, dict)
+            session_extra["duplex_initial_user_text"] = initial_user_text
         if session_id:
             session["session_id"] = session_id
+        if idle_timeout_s is not None:
+            session["idle_timeout_s"] = idle_timeout_s
         await self.send({"type": "session.update", "session": session})
+
+        def session_created() -> bool:
+            if self.events.count("session.created") > 0:
+                return True
+            self.raise_if_reader_stopped()
+            return False
+
         await wait_for(
-            lambda: self.events.count("session.created") > 0,
+            session_created,
             timeout_s=timeout_s,
             label="session.created",
         )
@@ -466,28 +575,97 @@ class RealtimeDuplexClient:
         *,
         chunk_ms: int = 200,
         realtime: bool = True,
-    ) -> None:
+        video_frames: Sequence[str] | None = None,
+        stacked_video_frames: Sequence[str | None] | None = None,
+    ) -> int:
+        """Append PCM16 audio, optionally interleaving omni camera frames.
+
+        ``video_frames`` holds base64 JPEG/PNG frames in capture order, one per
+        second of the clip. Frame ``k`` rides the append that closes model unit
+        ``k`` (see ``duplex_unit_boundary_ms``), which reproduces the official
+        ``streaming_prefill(audio_waveform=<1 s>, frame_list=[frame])`` pairing:
+        a second of audio and the picture captured during it enter the same
+        unit. Sending on whole-second boundaries instead would strand frame 0 on
+        an append that cannot close a unit yet, and shift every later frame one
+        unit ahead of its audio.
+
+        ``stacked_video_frames`` is the optional parallel track of composites
+        built by ``video_stacking.concat_frames``: entry ``k`` tiles the
+        sub-frames captured *inside* unit ``k``, and rides the same append right
+        after the base frame, giving the official ``frame_list=[base,
+        composite]``. The audio is untouched — a unit stays one second however
+        many sub-frames the composite carries. ``None`` entries send the base
+        frame alone.
+
+        Returns the number of base frames actually sent (a clip shorter than the
+        frame list leaves the tail unsent).
+        """
         chunk_bytes = max(
             PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_ms // 1000,
             PCM16_BYTES_PER_SAMPLE,
         )
+        frames = list(video_frames or [])
+        stacked = list(stacked_video_frames or [])
+
+        def units() -> Iterator[tuple[bytes, list[str] | None]]:
+            audio_end_ms = 0
+            frames_sent = 0
+            for offset in range(0, len(pcm16), chunk_bytes):
+                chunk = pcm16[offset : offset + chunk_bytes]
+                audio_end_ms += len(chunk) * 1000 // (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
+                if not frames or audio_end_ms < duplex_unit_boundary_ms(frames_sent):
+                    yield chunk, None
+                    continue
+                # A video advances one frame per unit and holds its last frame
+                # when the audio outlives the clip; a still image is a
+                # one-element list and therefore repeats.
+                index = min(frames_sent, len(frames) - 1)
+                composite = stacked[index] if index < len(stacked) else None
+                frames_sent += 1
+                yield chunk, [frames[index]] if composite is None else [frames[index], composite]
+
+        return await self.stream_av_units(units(), realtime=realtime)
+
+    async def stream_av_units(
+        self,
+        units: Any,
+        *,
+        realtime: bool = True,
+    ) -> int:
+        """Stream PCM16 units, optionally attaching camera frames to each unit.
+
+        A unit's frame slot takes a single JPEG/PNG (raw bytes or base64) or a
+        sequence of them, which the Realtime wire caps at two per append.
+        Returns the number of appends that carried at least one frame.
+        """
         audio_end_ms = 0
-        for offset in range(0, len(pcm16), chunk_bytes):
-            chunk = pcm16[offset : offset + chunk_bytes]
+        frames_sent = 0
+        for chunk, frame in units:
+            if not chunk:
+                continue
             duration_ms = len(chunk) * 1000 // (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
             audio_end_ms += duration_ms
-            await self.send(
-                {
-                    "type": "input_audio_buffer.append",
-                    "audio": base64.b64encode(chunk).decode("ascii"),
-                    "input_audio_format": "pcm16",
-                    "sample_rate_hz": PCM16_SAMPLE_RATE,
-                    "duration_ms": duration_ms,
-                    "audio_end_ms": audio_end_ms,
-                }
-            )
+            self._media_clock_ms = audio_end_ms
+            event: dict[str, object] = {
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(chunk).decode("ascii"),
+                "input_audio_format": "pcm16",
+                "sample_rate_hz": PCM16_SAMPLE_RATE,
+                "duration_ms": duration_ms,
+                "audio_end_ms": audio_end_ms,
+            }
+            encoded_frames = [
+                base64.b64encode(item).decode("ascii") if isinstance(item, bytes | bytearray) else item
+                for item in (frame if isinstance(frame, list | tuple) else [frame])
+                if item is not None
+            ]
+            if encoded_frames:
+                event["video_frames"] = encoded_frames
+                frames_sent += 1
+            await self.send(event)
             if realtime:
                 await asyncio.sleep(duration_ms / 1000)
+        return frames_sent
 
     async def commit(self) -> None:
         await self.send({"type": "input_audio_buffer.commit", "final": True})
@@ -498,20 +676,31 @@ class RealtimeDuplexClient:
             if not pcm16:
                 continue
             played_ms = len(pcm16) * 1000 // (self.events.output_sample_rate_hz * PCM16_BYTES_PER_SAMPLE)
-            await self.send(
-                {
-                    "type": "playback.ack",
-                    "response_id": response_id,
-                    "item_id": f"item_{response_id}",
-                    "played_ms": played_ms,
-                    "committed_ms": played_ms,
-                }
-            )
+            await self.send_playback_ack(response_id, played_ms)
+
+    async def send_playback_ack(self, response_id: str, played_ms: int) -> None:
+        await self.send(
+            {
+                "type": "playback.ack",
+                "response_id": response_id,
+                "item_id": f"item_{response_id}",
+                "played_ms": played_ms,
+                "committed_ms": played_ms,
+            }
+        )
 
     async def close_session(self, *, timeout_s: float = 20.0) -> None:
+        from_index = len(self.events.events)
         await self.send({"type": "session.close"})
+
+        def session_closed() -> bool:
+            if any(event.get("type") == "session.closed" for event in self.events.events[from_index:]):
+                return True
+            self.raise_if_reader_stopped()
+            return False
+
         await wait_for(
-            lambda: self.events.count("session.closed") > 0,
+            session_closed,
             timeout_s=timeout_s,
             label="session.closed",
         )

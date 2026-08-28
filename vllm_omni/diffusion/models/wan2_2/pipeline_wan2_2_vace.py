@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 VACE (Video Creation and Editing) Pipeline for WAN models.
@@ -22,12 +22,12 @@ import PIL.Image
 import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     Wan22Pipeline,
+    load_wan_weights_with_optional_gate,
     retrieve_latents,
 )
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
@@ -35,11 +35,25 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
 )
 from vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer import WanVACETransformer3DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+
+def _vace_condition_structure(value: object) -> tuple:
+    if value is None:
+        return ("none",)
+    if isinstance(value, str):
+        return ("path", value)
+    if isinstance(value, PIL.Image.Image):
+        return ("image", value.size)
+    if isinstance(value, torch.Tensor):
+        return ("tensor", tuple(value.shape), str(value.dtype))
+    if isinstance(value, list):
+        return ("list", tuple(_vace_condition_structure(item) for item in value))
+    return (type(value).__name__,)
 
 
 def create_vace_transformer_from_config(
@@ -104,6 +118,7 @@ def get_wan22_vace_pre_process_func(od_config: OmniDiffusionConfig):
             prompt["additional_information"] = {}
 
         if not multi_modal_data:
+            request.batch_compatibility_key = ("wan22_vace_condition", ("none",), ("none",), ("none",))
             request.prompt = prompt
             return request
 
@@ -154,6 +169,13 @@ def get_wan22_vace_pre_process_func(od_config: OmniDiffusionConfig):
             elif isinstance(mask, PIL.Image.Image):
                 mask = [mask]
             prompt["additional_information"]["mask"] = mask
+
+        request.batch_compatibility_key = (
+            "wan22_vace_condition",
+            _vace_condition_structure(ref_images),
+            _vace_condition_structure(source_video),
+            _vace_condition_structure(mask),
+        )
 
         request.prompt = prompt
         return request
@@ -482,7 +504,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         attention_kwargs: dict | None = None,
         vace_context_scale: float | list[float] = 1.0,
         **kwargs,
-    ) -> DiffusionOutput:
+    ) -> list[DiffusionOutput]:
         """Generate or edit video using VACE.
 
         The mode is determined by which inputs are provided in the request:
@@ -507,47 +529,48 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             attention_kwargs: Additional kwargs for attention layers.
             vace_context_scale: VACE conditioning strength.
         """
-        # Get parameters from request or arguments
-        if len(req.prompts) > 1:
-            raise ValueError(
-                "This model only supports a single prompt, not a batched request. "
-                "Please pass in a single prompt object or string, or a single-item list."
-            )
-
-        reference_images = None
-        source_video = None
-        source_mask = None
-
-        if len(req.prompts) == 1:
-            first_prompt = req.prompts[0]
-            if isinstance(first_prompt, str):
-                prompt = first_prompt
-            else:
-                prompt = first_prompt.get("prompt")
-                negative_prompt = negative_prompt or first_prompt.get("negative_prompt")
-                prompt_embeds = prompt_embeds if prompt_embeds is not None else first_prompt.get("prompt_embeds")
-                negative_prompt_embeds = (
-                    negative_prompt_embeds
-                    if negative_prompt_embeds is not None
-                    else first_prompt.get("negative_prompt_embeds")
-                )
-
-                additional_info = first_prompt.get("additional_information", {})
-                reference_images = additional_info.get("reference_images")
-                source_video = additional_info.get("source_video")
-                source_mask = additional_info.get("mask")
-
-        if prompt is None and prompt_embeds is None:
+        sampling_params_list = req.sampling_params_list
+        common = sampling_params_list[0]
+        prompt_texts = [item if isinstance(item, str) else (item.get("prompt") or "") for item in req.prompts]
+        negative_prompts = [None if isinstance(item, str) else item.get("negative_prompt") for item in req.prompts]
+        prompt_fields = DiffusionRequestBatch.collate_prompt_field_map(
+            req.prompts,
+            {
+                "prompt_embeds": prompt_embeds,
+                "negative_prompt_embeds": negative_prompt_embeds,
+            },
+        )
+        prompt_embeds = prompt_fields["prompt_embeds"]
+        negative_prompt_embeds = prompt_fields["negative_prompt_embeds"]
+        prompt = prompt_texts if prompt_embeds is None else None
+        negative_prompt = None
+        if negative_prompt_embeds is None and any(value is not None for value in negative_prompts):
+            negative_prompt = [value or "" for value in negative_prompts]
+        if prompt is not None and not all(prompt):
             raise ValueError("Prompt or prompt_embeds is required for VACE generation.")
 
-        height = req.sampling_params.height or height
-        width = req.sampling_params.width or width
-        num_frames = req.sampling_params.num_frames or frame_num
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
-        generator = req.sampling_params.generator or generator
+        reference_images_list = []
+        source_videos = []
+        source_masks = []
+        for request_prompt in req.prompts:
+            additional_info = (
+                request_prompt.get("additional_information", {}) if not isinstance(request_prompt, str) else {}
+            )
+            reference_images_list.append(additional_info.get("reference_images"))
+            source_videos.append(additional_info.get("source_video"))
+            source_masks.append(additional_info.get("mask"))
 
-        if req.sampling_params.guidance_scale_provided:
-            guidance_scale = req.sampling_params.guidance_scale
+        height = common.height or height
+        width = common.width or width
+        num_frames = common.num_frames or frame_num
+        num_inference_steps = common.num_inference_steps or num_inference_steps
+        num_outputs_per_prompt = common.num_outputs_per_prompt or 1
+        generator = req.collate_request_generators(num_outputs_per_prompt, None)
+        request_latents = req.collate_request_tensors("latents", None)
+        output_type = common.output_type or output_type
+
+        if common.guidance_scale_provided:
+            guidance_scale = common.guidance_scale
 
         # Ensure dimensions are compatible with VAE and patch size
         mod_value = self.vae_scale_factor_spatial * 2  # 8 * 2 = 16
@@ -558,47 +581,47 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
         num_frames = max(num_frames, 1)
 
-        self.check_inputs(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=height,
-            width=width,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            video=source_video,
-            mask=source_mask,
-            reference_images=reference_images,
-        )
+        for index in range(req.num_reqs):
+            self.check_inputs(
+                prompt=None if prompt is None else prompt[index],
+                negative_prompt=None if negative_prompt is None else negative_prompt[index],
+                height=height,
+                width=width,
+                prompt_embeds=None if prompt_embeds is None else prompt_embeds[index],
+                negative_prompt_embeds=None if negative_prompt_embeds is None else negative_prompt_embeds[index],
+                video=source_videos[index],
+                mask=source_masks[index],
+                reference_images=reference_images_list[index],
+            )
 
         device = self.device
         self._guidance_scale = guidance_scale
         dtype = self.transformer.dtype if self.transformer is not None else torch.bfloat16
 
-        if generator is None and req.sampling_params.seed is not None:
-            generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
-
         # Encode prompts
         if prompt_embeds is None:
-            if prompt is None:
-                raise ValueError("Either prompt or prompt_embeds must be provided.")
             prompt_embeds, negative_prompt_embeds = self.encode_prompt(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
                 do_classifier_free_guidance=guidance_scale > 1.0,
-                num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
-                max_sequence_length=req.sampling_params.max_sequence_length or 512,
+                num_videos_per_prompt=num_outputs_per_prompt,
+                max_sequence_length=common.max_sequence_length or 512,
                 device=device,
                 dtype=dtype,
             )
         else:
             prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
+            prompt_embeds = prompt_embeds.repeat_interleave(num_outputs_per_prompt, dim=0)
             if negative_prompt_embeds is not None:
                 negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=dtype)
+                negative_prompt_embeds = negative_prompt_embeds.repeat_interleave(num_outputs_per_prompt, dim=0)
             elif guidance_scale > 1.0:
                 _, negative_prompt_embeds = self.encode_prompt(
-                    prompt="",
-                    negative_prompt=None,
+                    prompt=[""] * req.num_reqs,
+                    negative_prompt=negative_prompt,
                     do_classifier_free_guidance=True,
+                    num_videos_per_prompt=num_outputs_per_prompt,
+                    max_sequence_length=common.max_sequence_length or 512,
                     device=device,
                     dtype=dtype,
                 )
@@ -608,24 +631,43 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         # so read it from whichever transformer exists.
         active_transformer = self.transformer if self.transformer is not None else self.transformer_2
         if active_transformer.vace_patch_embedding is not None:
-            video, mask, ref_images_processed = self.preprocess_conditions(
-                video=source_video,
-                mask=source_mask,
-                reference_images=reference_images,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                dtype=dtype,
-                device=device,
-            )
+            contexts = []
+            reference_counts = []
+            for index, (source_video, source_mask, reference_images) in enumerate(
+                zip(source_videos, source_masks, reference_images_list)
+            ):
+                video, mask, ref_images_processed = self.preprocess_conditions(
+                    video=source_video,
+                    mask=source_mask,
+                    reference_images=reference_images,
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    dtype=dtype,
+                    device=device,
+                )
+                request_generator = sampling_params_list[index].generator
+                if isinstance(request_generator, list):
+                    request_generator = request_generator[0]
+                conditioning_latents = self.prepare_video_latents(
+                    video,
+                    mask,
+                    ref_images_processed,
+                    request_generator,
+                    device,
+                )
+                mask_encoded = self.prepare_masks(mask, ref_images_processed)
+                context = torch.cat([conditioning_latents, mask_encoded], dim=1)
+                contexts.append(context.repeat_interleave(num_outputs_per_prompt, dim=0))
+                reference_counts.append(len(ref_images_processed[0]) if ref_images_processed else 0)
 
-            conditioning_latents = self.prepare_video_latents(video, mask, ref_images_processed, generator, device)
-            mask_encoded = self.prepare_masks(mask, ref_images_processed)
-
-            # Unified VACE context: [video_latents, mask] along channels -> [B, C, T, H, W]
-            vace_context = torch.cat([conditioning_latents, mask_encoded], dim=1)
-
-            num_reference_images = len(ref_images_processed[0]) if ref_images_processed else 0
+            if len(set(reference_counts)) != 1:
+                raise ValueError(
+                    f"Batched VACE conditions must have the same number of reference images; got {reference_counts}."
+                )
+            vace_context = DiffusionRequestBatch.collate_tensors(contexts, "VACE condition", None)
+            assert vace_context is not None
+            num_reference_images = reference_counts[0]
         else:
             vace_context = None
 
@@ -641,7 +683,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             dtype=torch.float32,
             device=device,
             generator=generator,
-            latents=req.sampling_params.latents,
+            latents=request_latents,
         )
 
         # Set up scheduler
@@ -654,9 +696,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         # stays None and diffuse() uses the same transformer for every step.
         boundary_timestep = None
         if self.transformer_2 is not None:
-            boundary_ratio = (
-                self.boundary_ratio if self.boundary_ratio is not None else req.sampling_params.boundary_ratio
-            )
+            boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else common.boundary_ratio
             if boundary_ratio is None:
                 boundary_ratio = 0.875
                 logger.warning_once("boundary_ratio is required for Wan2.2 VACE generation. using default value 0.875")
@@ -700,9 +740,11 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             latents = latents / latents_std + latents_mean
             output = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(output=output)
+        return split_diffusion_output_by_request(
+            DiffusionOutput(output=output),
+            req,
+            num_outputs_per_prompt=num_outputs_per_prompt,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights using AutoWeightsLoader for vLLM integration."""
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return load_wan_weights_with_optional_gate(self, weights)

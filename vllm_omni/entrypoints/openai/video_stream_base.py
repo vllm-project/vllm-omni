@@ -870,7 +870,7 @@ class OmniStreamingVideoHandler:
     @staticmethod
     def _get_audio_data(result: OmniRequestOutput):
         """Navigate OmniRequestOutput → multimodal_output['audio']. None on miss."""
-        request_output = getattr(result, "request_output", None)
+        request_output = result
         if request_output is None:
             return None
         outputs = getattr(request_output, "outputs", None)
@@ -1000,7 +1000,7 @@ class OmniStreamingVideoHandler:
         if result.final_output_type != "text":
             return "", previous_text
 
-        request_output = getattr(result, "request_output", None)
+        request_output = result
         if request_output is None:
             return "", previous_text
 

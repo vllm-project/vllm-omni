@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Stage Diffusion Client for vLLM-Omni multi-stage runtime.
 
 Owns the frontend-side ZMQ sockets for StageDiffusionProc and exposes the
@@ -30,6 +33,7 @@ from vllm_omni.distributed.omni_connectors.utils.serialization import (
 )
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
+from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
@@ -154,6 +158,7 @@ class StageDiffusionClient(StageClientBase):
         self.final_output_type = metadata.final_output_type
         self.model_stage = metadata.model_stage
         self.default_sampling_params = metadata.default_sampling_params
+        self.prompt_transform_func = metadata.prompt_transform_func
         self.prompt_expand_func = metadata.prompt_expand_func
         self.requires_multimodal_data = getattr(metadata, "requires_multimodal_data", False)
         self.custom_process_input_func = getattr(metadata, "custom_process_input_func", None)
@@ -240,6 +245,14 @@ class StageDiffusionClient(StageClientBase):
 
             if msg_type == "result":
                 self._output_queue.put_nowait(msg["output"])
+            elif msg_type == "metrics":
+                self._output_queue.put_nowait(
+                    OmniRequestOutput(
+                        request_id=DIFFUSION_METRICS_ONLY_REQUEST_ID,
+                        finished=True,
+                        metrics=msg.get("metrics") or {},
+                    )
+                )
             elif msg_type == "rpc_result":
                 self._rpc_results[msg["rpc_id"]] = msg["result"]
             elif msg_type == "error":
@@ -264,14 +277,14 @@ class StageDiffusionClient(StageClientBase):
                 # Route request errors as error outputs so the Orchestrator
                 # sees the request complete (instead of hanging forever).
                 if req_id is not None:
-                    self._output_queue.put_nowait(
-                        OmniRequestOutput.from_error(
-                            req_id,
-                            error_msg,
-                            status_code=status_code,
-                            error_type=error_type,
-                        )
+                    error_output = OmniRequestOutput.from_error(
+                        req_id,
+                        error_msg,
+                        status_code=status_code,
+                        error_type=error_type,
                     )
+                    error_output.metrics.update(msg.get("metrics") or {})
+                    self._output_queue.put_nowait(error_output)
 
     # Fields that are subprocess-local and cannot be serialized across
     # process boundaries.  They are recreated in the subprocess with

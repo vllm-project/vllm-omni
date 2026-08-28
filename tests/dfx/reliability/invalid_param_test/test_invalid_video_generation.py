@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """HTTP video job routes (live ``Wan-AI/Wan2.2-T2V-A14B-Diffusers``).
 
 WebSocket ``/v1/video/chat/stream`` and ``/v1/realtime`` invalid-input checks live in
@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 
 pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
 
@@ -54,12 +54,12 @@ def _minimal_video_form_data() -> dict[str, str]:
 @pytest.mark.parametrize("omni_server", _WAN_T2V, indirect=True)
 def test_post_videos_invalid_requests(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
     form_extra: dict[str, str] | None,
     err_message: str | tuple[str, ...],
 ) -> None:
     data: dict[str, str] = {} if form_extra is None else {**_minimal_video_form_data(), **form_extra}
-    openai_client.send_videos_create_http_request(
+    online_client.send_videos_create_http_request(
         {"data": data, "timeout": 120, "err_code": 400, "err_message": err_message}
     )
 
@@ -85,12 +85,12 @@ def test_post_videos_invalid_requests(
 @pytest.mark.parametrize("omni_server", _WAN_T2V, indirect=True)
 def test_post_videos_sync_invalid_requests(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
     form_extra: dict[str, str] | None,
     err_message: str | tuple[str, ...],
 ) -> None:
     data: dict[str, str] = {} if form_extra is None else {**_minimal_video_form_data(), **form_extra}
-    openai_client.send_videos_sync_http_request(
+    online_client.send_videos_sync_http_request(
         {"data": data, "timeout": 120, "err_code": 400, "err_message": err_message}
     )
 
@@ -111,11 +111,11 @@ def test_post_videos_sync_invalid_requests(
 @pytest.mark.parametrize("omni_server", _WAN_T2V, indirect=True)
 def test_get_videos_list_invalid_requests(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
     params: dict[str, Any],
     err_message: str | tuple[str, ...],
 ) -> None:
-    openai_client.send_videos_list_http_request(
+    online_client.send_videos_list_http_request(
         {"params": params, "timeout": 120, "err_code": 400, "err_message": err_message}
     )
 
@@ -126,8 +126,8 @@ def test_get_videos_list_invalid_requests(
 
 
 @pytest.mark.parametrize("omni_server", _WAN_T2V, indirect=True)
-def test_get_video_invalid_requests(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
-    openai_client.send_video_retrieve_http_request(
+def test_get_video_invalid_requests(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:
+    online_client.send_video_retrieve_http_request(
         {
             "video_id": "does-not-exist",
             "timeout": 120,
@@ -143,8 +143,8 @@ def test_get_video_invalid_requests(omni_server: OmniServer, openai_client: Open
 
 
 @pytest.mark.parametrize("omni_server", _WAN_T2V, indirect=True)
-def test_delete_video_invalid_requests(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
-    openai_client.send_video_delete_http_request(
+def test_delete_video_invalid_requests(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:
+    online_client.send_video_delete_http_request(
         {
             "video_id": "does-not-exist",
             "timeout": 120,
@@ -160,8 +160,8 @@ def test_delete_video_invalid_requests(omni_server: OmniServer, openai_client: O
 
 
 @pytest.mark.parametrize("omni_server", _WAN_T2V, indirect=True)
-def test_get_video_content_invalid_requests(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
-    openai_client.send_video_content_http_request(
+def test_get_video_content_invalid_requests(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:
+    online_client.send_video_content_http_request(
         {
             "video_id": "does-not-exist",
             "timeout": 120,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -76,7 +76,7 @@ def test_formatter_preserves_single_video_audio_actions_and_metadata(
     result = results[0]
     assert result.images == ["frame-0"]
     assert result.prompt == "prompt-0"
-    assert result.final_output_type == "image"
+    assert result.final_output_type == "video"
     assert result.multimodal_output == {
         "metadata": {
             "audio": {"sample_rate": 48000},
@@ -95,6 +95,7 @@ def test_formatter_preserves_single_video_audio_actions_and_metadata(
         "resolution": 512,
         "width": None,
         "height": None,
+        "num_inference_steps": 1,
     }
 
 
@@ -314,7 +315,7 @@ def test_formatter_preserves_audio_model_video_audio_and_actions(
 
     assert result.images == ["frame-0"]
     assert result.prompt == "watch and listen"
-    assert result.final_output_type == "image"
+    assert result.final_output_type == "video"
     assert result.multimodal_output == {
         "metadata": {
             "audio": {"sample_rate": 16000},

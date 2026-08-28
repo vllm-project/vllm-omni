@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for error propagation paths within the Orchestrator.
 
 Covers:
@@ -16,7 +16,9 @@ from types import SimpleNamespace
 
 import janus
 import pytest
+from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.serial_utils import MsgpackEncoder
 
 from vllm_omni.engine.messages import (
     AddCompanionRequestMessage,
@@ -25,7 +27,11 @@ from vllm_omni.engine.messages import (
     ShutdownRequestMessage,
     StageSubmissionMessage,
 )
-from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
+from vllm_omni.engine.orchestrator import (
+    Orchestrator,
+    OrchestratorRequestState,
+    cleanup_request_artifact_dirs,
+)
 from vllm_omni.engine.stage_pool import StageUnavailableError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -42,12 +48,22 @@ from .test_orchestrator import (
     _wait_for,
 )
 
+
+def test_request_artifact_cleanup_is_idempotent(tmp_path):
+    artifact_dir = tmp_path / "request-artifacts"
+    artifact_dir.mkdir()
+    (artifact_dir / "prepared.mp4").touch()
+
+    cleanup_request_artifact_dirs([str(artifact_dir)])
+    cleanup_request_artifact_dirs([str(artifact_dir)])
+
+    assert not artifact_dir.exists()
+
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _sampling_params(max_tokens: int = 4):
-    from vllm.sampling_params import SamplingParams
-
     return SamplingParams(max_tokens=max_tokens)
 
 
@@ -186,6 +202,45 @@ class _UnavailableDiffusionStageClient(FakeStageClient):
 
     async def add_request_async(self, *args, **kwargs) -> None:
         raise StageUnavailableError(f"stage {self.stage_id} has no live replica")
+
+
+class _OverflowOnEncodeStageClient(FakeStageClient):
+    """Msgpack-encodes the request's sampling params on dispatch, as the real
+    StageEngineCoreClient does. We use this to make sure overflow sampling params
+    do not break the orchestrator."""
+
+    async def add_request_async(self, request, *args, **kwargs) -> None:
+        MsgpackEncoder().encode(request.sampling_params)
+        await super().add_request_async(request, *args, **kwargs)  # unreachable
+
+
+@pytest.mark.asyncio
+async def test_encode_overflow_should_fail_request_not_loop(orchestrator_factory) -> None:
+    """Regression test for over-range seed handling."""
+    stage0 = _OverflowOnEncodeStageClient(stage_type="llm", final_output=True)
+    orchestrator_fixture = orchestrator_factory([stage0])
+
+    # seed > 2**63-1 cannot be msgpack-serialized -> the malicious input under test.
+    overflow_params = SamplingParams(seed=2**70)
+
+    await _enqueue_add_request(
+        orchestrator_fixture,
+        request_id="req-overflow",
+        prompt=SimpleNamespace(
+            request_id="req-overflow",
+            prompt_token_ids=[1, 2],
+            sampling_params=overflow_params,
+        ),
+        original_prompt={"prompt": "hi"},
+        sampling_params_list=[overflow_params],
+        final_stage_id=0,
+    )
+
+    error_msg = await _wait_for_error_message(orchestrator_fixture, request_id="req-overflow")
+    assert error_msg.fatal is False
+    assert error_msg.status_code == 400
+    assert orchestrator_fixture.thread.is_alive()
+    assert "req-overflow" not in orchestrator_fixture.orchestrator.request_states
 
 
 @pytest.mark.asyncio
@@ -404,6 +459,51 @@ async def test_async_chunk_prewarm_failure_reports_failing_downstream_stage(orch
 
         # Stage 1 prewarm ran before the stage-2 failure; server stays up.
         assert len(stage1.add_request_calls) == 1
+        assert orchestrator_fixture.thread.is_alive()
+    finally:
+        if orchestrator_fixture.thread.is_alive():
+            orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+            orchestrator_fixture.thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_prewarm_without_prompt_token_ids_fails_only_that_request(
+    orchestrator_factory,
+) -> None:
+    """R1.3 of #4855: an async-chunk request whose stage-0 prompt carries no
+    token ids cannot prewarm anything, so it must fail with a client error
+    instead of stalling.
+
+    Non-fatal is the point: ``fatal=True`` reads as "the engine died" and the
+    entrypoints act on it (``OmniLLM.generate`` raises out of its batch loop,
+    the serving layer calls ``terminate_if_errored``). One client's embeds-only
+    prompt must not reach other requests.
+    """
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True)
+    orchestrator_fixture = orchestrator_factory([stage0, stage1], async_chunk=True)
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-embeds",
+            # No prompt_token_ids: what an embeds-only prompt looks like here.
+            prompt=SimpleNamespace(request_id="req-embeds"),
+            original_prompt={"prompt": "embeds only"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+
+        error_msg = await _wait_for_error_message(orchestrator_fixture, request_id="req-embeds")
+        assert error_msg.fatal is False
+        assert error_msg.status_code == 400
+        assert error_msg.error_type == "BadRequestError"
+        assert error_msg.stage_id == 0
+        assert "prompt_token_ids" in error_msg.error
+
+        # Nothing was prewarmed downstream, and the request is gone.
+        assert stage1.add_request_calls == []
+        await _wait_for(lambda: "req-embeds" not in orchestrator_fixture.orchestrator.request_states)
         assert orchestrator_fixture.thread.is_alive()
     finally:
         if orchestrator_fixture.thread.is_alive():
@@ -833,6 +933,36 @@ async def test_diffusion_client_error_output_propagates_status_code(orchestrator
     finally:
         orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
         orchestrator_fixture.thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_duplex_input_processor_failure_is_request_scoped(orchestrator_factory, monkeypatch) -> None:
+    class FailingStage(FakeStageClient):
+        def process_engine_inputs(self, *_args, **_kwargs):
+            raise ValueError("No latent or hidden_states found in thinker output")
+
+    fixture = orchestrator_factory(
+        [FakeStageClient(stage_type="llm"), FailingStage(stage_type="llm", final_output=True)]
+    )
+    state = OrchestratorRequestState(
+        request_id="bad",
+        prompt=SimpleNamespace(request_id="bad", prompt_token_ids=[1]),
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+        duplex_identity=SimpleNamespace(),
+    )
+
+    async def no_cleanup(*_args, **_kwargs):
+        pass
+
+    monkeypatch.setattr(fixture.orchestrator, "_cleanup_request_ids", no_cleanup)
+    try:
+        await fixture.orchestrator._forward_to_next_stage_unguarded("bad", 0, _build_request_output("raw"), state)
+        error = await _wait_for_error_message(fixture, request_id="bad")
+        assert error.fatal is False
+    finally:
+        fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+        fixture.thread.join(timeout=5)
 
 
 @pytest.mark.asyncio

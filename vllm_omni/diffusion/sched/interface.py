@@ -88,9 +88,10 @@ class RequestBatchSamplingParamsKey:
     """Request level Batch-compatibility key derived from ``OmniDiffusionSamplingParams``.
 
     Only request-batch-wide fields belong here. Request-local values such as
-    seeds, generators, latent tensors, timesteps, and pipeline-specific
+    seeds, generators, latent tensors, timesteps, and request-local
     ``extra_args`` are read per request from
-    ``DiffusionRequestBatch.sampling_params_list``.
+    ``DiffusionRequestBatch.sampling_params_list``. Structural ``extra_args``
+    that affect batching are listed explicitly below.
     """
 
     # Spatial / temporal shape.
@@ -131,6 +132,16 @@ class RequestBatchSamplingParamsKey:
     # the model and must remain distinct from explicit ``lossless``.
     quality: str | None = None
 
+    # Wan scheduler structure is carried through extra_args. Requests using
+    # different solvers or flow shifts must not share a request batch.
+    sample_solver: str | None = None
+    flow_shift: float | None = None
+
+    # Pipeline-specific condition structure populated during preprocessing.
+    # It prevents independently valid requests with incompatible conditions
+    # from being admitted to the same request batch.
+    condition_key: tuple[Any, ...] | None = None
+
     # LoRA identity.
     lora_int_id: int | None = None
     lora_scale: float = 1.0
@@ -146,6 +157,7 @@ class SchedulerRequestState:
     diffusion_kv_requests: tuple[DiffusionKVRequest, ...] = ()
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
+    queued_at: float = 0.0
 
     def is_finished(self) -> bool:
         return DiffusionRequestStatus.is_finished(self.status)

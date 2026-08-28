@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import glob
 import os
 from collections.abc import Iterable
@@ -19,9 +22,6 @@ from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
 )
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
-from vllm.model_executor.models.vision import (
-    get_llm_pos_ids_for_vision,
-)
 
 # from vllm.model_executor.models.qwen2_code2wav_dit import Qwen2Code2wav
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -33,6 +33,9 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
+from vllm_omni.model_executor.layers.rotary_embedding.mrope import (
+    OmniMRotaryEmbedding,
+)
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
@@ -42,6 +45,11 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, split_list_into_ranges
 from vllm_omni.platforms import current_omni_platform
+
+# `get_llm_pos_ids_for_vision` was removed from upstream vLLM (commit
+# 0cf49a5d15); vllm-omni keeps an identical copy as a static method on
+# OmniMRotaryEmbedding. Bind it at module level to keep call sites unchanged.
+get_llm_pos_ids_for_vision = OmniMRotaryEmbedding._get_llm_pos_ids_for_vision
 
 TALKER_CODEC_EOS_TOKEN_ID = 8294
 TALKER_CODEC_BOS_TOKEN_ID = 8293
@@ -76,7 +84,14 @@ class Qwen2_5OmniForConditionalGeneration(
         talker_config: Qwen2_5OmniTalkerConfig = config.talker_config
         self.talker_config = talker_config
 
-        self.model_stage = vllm_config.model_config.model_stage
+        # See qwen3_omni for the full rationale. model_stage is only set by omni's
+        # staged startup; this class is now also constructed for non-staged runs
+        # (its arch overrides upstream's in the registry), where reading the
+        # attribute directly raises AttributeError during engine-core init.
+        # Default to the thinker — the text-generation stage. Note there is no
+        # else-branch below, so an unset stage would otherwise build no submodule
+        # at all and fail later at self.thinker.
+        self.model_stage = getattr(vllm_config.model_config, "model_stage", None) or "thinker"
         if self.model_stage == "thinker":
             # Initialize thinker model (multimodal processing)
             self.thinker = init_vllm_registered_model(

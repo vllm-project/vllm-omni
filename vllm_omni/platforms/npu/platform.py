@@ -36,6 +36,9 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         from vllm_ascend.utils import adapt_patch
 
         from vllm_omni.platforms.npu._310p import apply_patches as apply_310p_patches
+        from vllm_omni.platforms.npu.models.minicpmo_4_5_code2wav import (
+            apply_minicpmo_4_5_code2wav_patch,
+        )
         from vllm_omni.platforms.npu.models.qwen3_tts_code2wav import (
             apply_qwen3_tts_code2wav_patch,
         )
@@ -44,6 +47,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         )
 
         adapt_patch(is_global_patch=True)
+        apply_minicpmo_4_5_code2wav_patch()
         apply_qwen3_tts_code2wav_patch()
         apply_qwen3_tts_tokenizer_v2_patch()
         apply_310p_patches()
@@ -77,9 +81,45 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         init_ascend_config(vllm_config)
 
     @classmethod
+    def get_diffusion_kv_block_tables_cls(cls) -> type:
+        from vllm_ascend.worker.v2.block_table import AscendBlockTables
+
+        return AscendBlockTables
+
+    @classmethod
+    def build_diffusion_kv_attn_metadata(cls, **kwargs: Any) -> dict[str, Any]:
+        """Build the Ascend metadata required by the native NPU backend."""
+        from vllm_ascend.attention.attention_v1 import AscendAttentionState
+        from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
+
+        kwargs = dict(kwargs)
+        seq_lens_cpu = kwargs.pop("seq_lens_cpu")
+        kwargs["seq_lens_np"] = seq_lens_cpu.detach().cpu().numpy()
+        # The diffusion adapter always supplies a paged cache and the current
+        # K/V write span. ChunkedPrefill is Ascend's cache-backed FIA state for
+        # both multi-token updates and single-token updates in this path.
+        kwargs["attn_state"] = AscendAttentionState.ChunkedPrefill
+        return build_attn_metadata(**kwargs)
+
+    @classmethod
     def init_diffusion_model_runner_runtime(cls, vllm_config: Any, od_config: Any, device: torch.device) -> None:
         from vllm_ascend.ascend_forward_context import set_mc2_mask, set_mc2_tokens_capacity
 
+        from vllm_omni.platforms.npu.models.minimax_h3 import (
+            apply_minimax_h3_qwen3vl_patch,
+            apply_minimax_h3_qwen3vl_sdpa_patch,
+            apply_minimax_h3_qwen3vl_swiglu_patch,
+        )
+
+        # These patches import the MiniMax encoder package, whose __init__ loads
+        # pipeline_minimax_h3 → diffusion.data. Doing that during platform
+        # construction races vllm_omni/__init__.py (patch before config) and
+        # closes a cycle through pipeline_registry → PI0_PIPELINE →
+        # DiffusionOutput. Apply them only after the platform exists, before
+        # the diffusion pipeline is loaded.
+        apply_minimax_h3_qwen3vl_patch()
+        apply_minimax_h3_qwen3vl_sdpa_patch()
+        apply_minimax_h3_qwen3vl_swiglu_patch()
         set_mc2_tokens_capacity(vllm_config, od_config.max_num_seqs, 1)
         set_mc2_mask(vllm_config, device)
 
@@ -139,10 +179,15 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
                 )
                 backend_upper = "FLASH_ATTN"
 
-            if backend_upper == "FLASH_ATTN" and find_spec("mindiesd"):
-                # The NPU FLASH_ATTN backend imports mindiesd lazily at first
-                # forward, but CANN snapshots the custom-op registry at the
-                # first custom-op regInfo lookup in the process (e.g. a
+            if backend_upper in ("FLASH_ATTN", "RAINFUSION_ATTN") and find_spec("mindiesd"):
+                # Eager-import mindiesd only for backends that actually reach
+                # mindiesd kernels: FLASH_ATTN directly, and RAINFUSION_ATTN
+                # via its dense FlashAttention fallback (used before
+                # start_step and on any layer without a sparsifiable video
+                # segment). Other backends (e.g. TORCH_SDPA) never touch
+                # mindiesd, so a broken optional install must not block them.
+                # CANN snapshots the custom-op registry at the first
+                # custom-op regInfo lookup in the process (e.g. a
                 # vllm-ascend custom op during model load/warmup). Import
                 # mindiesd here so its env.py prepends the mindiesd vendor
                 # dirs (aie_ascendc etc.) to ASCEND_CUSTOM_OPP_PATH before

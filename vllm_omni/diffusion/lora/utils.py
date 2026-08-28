@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import torch.nn as nn
 from transformers import PretrainedConfig
+from vllm.config.lora import LoRAConfig
 
-from vllm_omni.config.lora import LoRAConfig
 from vllm_omni.diffusion.lora.layers import (
     DiffusionColumnParallelLinearWithLoRA,
     DiffusionMergedColumnParallelLinearWithLoRA,

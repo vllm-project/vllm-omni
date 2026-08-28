@@ -12,12 +12,13 @@ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.config.stage_config import StageConfig
 from vllm_omni.engine.async_omni_engine import StageRuntimeInfo
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni import Omni
-from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
+from vllm_omni.entrypoints.omni_base import OmniBase, OmniEngineDeadError
 from vllm_omni.errors import (
     OmniClientError,
     client_error_from_metadata,
@@ -72,8 +73,8 @@ def make_output_msg(
         final_output_type=final_output_type,
         images=images or [],
         stage_durations={},
+        outputs=[SimpleNamespace(text=payload, index=0)],
     )
-    engine_output.payload = payload
     return OutputMessage(
         request_id=request_id,
         stage_id=stage_id,
@@ -188,12 +189,37 @@ def _patch_engine(monkeypatch: pytest.MonkeyPatch, engine: FakeAsyncOmniEngine) 
 
 
 def _make_base():
-    from vllm_omni.entrypoints.omni_base import OmniBase
-
     obj = object.__new__(OmniBase)
     obj.engine = MagicMock()
     obj.request_states = {}
     return obj
+
+
+def test_resolve_sampling_params_list_preserves_stage_constraints():
+    base = _make_base()
+    base.engine.num_stages = 1
+    base.default_sampling_params_list = [SamplingParams(max_tokens=1000, detokenize=False, stop_token_ids=[42])]
+    base.engine.stage_configs = [
+        StageConfig(
+            stage_id=0,
+            model_stage="dummy-model",
+            sampling_constraints={"detokenize": False, "stop_token_ids": [42]},
+        ).to_omegaconf()
+    ]
+    base.sampling_constraints_list = base._get_sampling_constraints_list(base.engine.stage_configs)
+    assert base.sampling_constraints_list == [{"detokenize": False, "stop_token_ids": [42]}]
+    caller_params = SamplingParams(seed=1234, max_tokens=7, detokenize=True, stop_token_ids=[7])
+
+    resolved = base.resolve_sampling_params_list(caller_params)
+
+    assert resolved[0] is not caller_params
+    assert resolved[0].seed == 1234
+    assert resolved[0].max_tokens == 7
+    assert resolved[0].detokenize is False
+    assert resolved[0].stop_token_ids == [42]
+    assert 42 in resolved[0]._all_stop_token_ids
+    assert caller_params.detokenize is True
+    assert caller_params.stop_token_ids == [7]
 
 
 def _stage_spec(
@@ -474,7 +500,7 @@ async def test_async_omni_yields_only_final_stage_outputs(monkeypatch: pytest.Mo
         app.shutdown()
 
     assert [output.stage_id for output in outputs] == [2]
-    assert [output.request_output.payload for output in outputs] == ["final"]
+    assert [output.outputs[0].text for output in outputs] == ["final"]
     assert "req-1" not in app.request_states
 
 
@@ -492,7 +518,7 @@ async def test_async_omni_accepts_multiple_final_stage_streams(monkeypatch: pyte
         app.shutdown()
 
     assert [output.stage_id for output in outputs] == [0, 0, 0, 2, 2, 2]
-    assert [output.request_output.payload for output in outputs] == [
+    assert [output.outputs[0].text for output in outputs] == [
         "req-1-stage0-0",
         "req-1-stage0-1",
         "req-1-stage0-2",
@@ -517,7 +543,7 @@ async def test_async_omni_stops_on_final_stage_finished(monkeypatch: pytest.Monk
     finally:
         app.shutdown()
 
-    assert [output.request_output.payload for output in outputs] == [
+    assert [output.outputs[0].text for output in outputs] == [
         "req-1-stage0",
         "req-1-stage2-final",
     ]
@@ -544,7 +570,7 @@ async def test_async_omni_diffusion_only_yields_single_image_output(monkeypatch:
     assert outputs[0].stage_id == 0
     assert outputs[0].final_output_type == "image"
     assert outputs[0].images == ["req-1-image"]
-    assert outputs[0].request_output.payload == "req-1-diffusion-final"
+    assert outputs[0].outputs[0].text == "req-1-diffusion-final"
 
 
 @pytest.mark.asyncio
@@ -565,7 +591,7 @@ async def test_async_omni_llm_diffusion_yields_text_stream_then_image(monkeypatc
 
     assert [output.stage_id for output in outputs] == [0, 0, 0, 1]
     assert [output.final_output_type for output in outputs] == ["text", "text", "text", "image"]
-    assert [output.request_output.payload for output in outputs] == [
+    assert [output.outputs[0].text for output in outputs] == [
         "req-1-text-0",
         "req-1-text-1",
         "req-1-text-2",
@@ -585,7 +611,13 @@ async def test_async_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPat
     # external ID to avoid collisions, so this also tests mapping
     external_req_id = "req-1"
     req_id = "req-1-12345678"
+    recorded_failures = []
     try:
+        monkeypatch.setattr(
+            app,
+            "_record_request_failure_once",
+            lambda request_id, reason: recorded_failures.append((request_id, reason)),
+        )
         app.request_states[req_id] = ClientRequestState(
             request_id=req_id,
             external_request_id=external_req_id,
@@ -596,6 +628,7 @@ async def test_async_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPat
 
     assert engine.aborted == [[req_id]]
     assert external_req_id not in app.request_states
+    assert recorded_failures == [(req_id, "client_abort")]
 
 
 @pytest.mark.asyncio
@@ -695,7 +728,7 @@ def test_omni_generate_py_generator_yields_final_outputs_for_each_request(monkey
 
     assert len(outputs) == 4
     assert [output.stage_id for output in outputs] == [0, 2, 0, 2]
-    assert [output.request_output.payload for output in outputs] == [
+    assert [output.outputs[0].text for output in outputs] == [
         f"{engine.submitted[0]['request_id']}-stage0-0",
         f"{engine.submitted[0]['request_id']}-stage2-final",
         f"{engine.submitted[1]['request_id']}-stage0-0",
@@ -739,7 +772,7 @@ def test_omni_generate_diffusion_only_yields_single_image_per_request(monkeypatc
     assert len(outputs) == 2
     assert [output.stage_id for output in outputs] == [0, 0]
     assert [output.final_output_type for output in outputs] == ["image", "image"]
-    assert [output.request_output.payload for output in outputs] == [
+    assert [output.outputs[0].text for output in outputs] == [
         f"{engine.submitted[0]['request_id']}-diffusion-final",
         f"{engine.submitted[1]['request_id']}-diffusion-final",
     ]
@@ -767,7 +800,7 @@ def test_omni_generate_llm_diffusion_yields_final_text_then_image_per_request(
     assert len(outputs) == 4
     assert [output.stage_id for output in outputs] == [0, 1, 0, 1]
     assert [output.final_output_type for output in outputs] == ["text", "image", "text", "image"]
-    assert [output.request_output.payload for output in outputs] == [
+    assert [output.outputs[0].text for output in outputs] == [
         f"{engine.submitted[0]['request_id']}-text-0",
         f"{engine.submitted[0]['request_id']}-image-final",
         f"{engine.submitted[1]['request_id']}-text-0",
@@ -788,7 +821,13 @@ def test_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPatch):
     _patch_engine(monkeypatch, engine)
 
     app = Omni("dummy-model")
+    recorded_failures = []
     try:
+        monkeypatch.setattr(
+            app,
+            "_record_request_failure_once",
+            lambda request_id, reason: recorded_failures.append((request_id, reason)),
+        )
         app.request_states["req-1"] = object()
         app.abort("req-1")
     finally:
@@ -796,6 +835,7 @@ def test_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPatch):
 
     assert engine.aborted == [["req-1"]]
     assert "req-1" not in app.request_states
+    assert recorded_failures == [("req-1", "client_abort")]
 
 
 def test_omni_forces_final_only_on_llm_stages(monkeypatch: pytest.MonkeyPatch):
@@ -1046,7 +1086,6 @@ def _enqueue_stage_error(
     if kill_engine:
         engine._alive = False
     engine_output = OmniRequestOutput.from_error(msg["request_id"], error_text)
-    engine_output.payload = ""
     engine.output_q.put_nowait(
         OutputMessage(
             request_id=msg["request_id"],

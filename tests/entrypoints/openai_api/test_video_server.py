@@ -16,15 +16,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import av
+import httpx
 import numpy as np
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
 from pytest_mock import MockerFixture
+from vllm import envs
 
 from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
-from vllm_omni.entrypoints.openai import api_server
+from vllm_omni.entrypoints.openai import api_server, video_api_utils
 from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoGenerationRequest,
@@ -32,7 +34,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoParams,
     VideoResponse,
 )
-from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
+from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
 from vllm_omni.entrypoints.openai.storage import LocalStorageManager
 from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
 from vllm_omni.errors import GuardrailViolationError
@@ -62,7 +64,13 @@ class MockVideoResult:
 
 class FakeAsyncOmni:
     def __init__(self):
-        self.stage_configs = [SimpleNamespace(stage_type="diffusion")]
+        self.stage_configs = [
+            SimpleNamespace(
+                stage_type="diffusion",
+                final_output=True,
+                final_output_type="video",
+            )
+        ]
         self.default_sampling_params_list = [OmniDiffusionSamplingParams()]
         self.model_class_name = "WanPipeline"
         self.captured_prompt = None
@@ -85,6 +93,56 @@ class FakeAsyncOmni:
         num_outputs = sampling_params_list[0].num_outputs_per_prompt
         videos = [object() for _ in range(num_outputs)]
         yield MockVideoResult(videos)
+
+
+def test_raw_and_base64_encoders_receive_no_policy_config(mocker: MockerFixture):
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        engine,
+        model_name="test-model",
+    )
+    raw_encoder = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"encoded-video",
+    )
+    base64_encoder = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="encoded-video",
+    )
+
+    async def _generate_both_response_types():
+        request = VideoGenerationRequest(prompt="test prompt")
+        await handler.generate_video_bytes(request, "raw-request")
+        await handler.generate_videos(request, "base64-request")
+
+    asyncio.run(_generate_both_response_types())
+
+    assert "encoding_config" not in raw_encoder.call_args.kwargs
+    assert "encoding_config" not in base64_encoder.call_args.kwargs
+
+
+def test_resolve_diffusion_od_config_falls_back_to_attribute():
+    od_config = SimpleNamespace(model_class_name="WanPipeline")
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        SimpleNamespace(od_config=od_config),
+        model_name="test-model",
+    )
+
+    assert handler._resolve_diffusion_od_config() is od_config
+
+
+def test_resolve_diffusion_od_config_prefers_getter_over_attribute():
+    attribute_config = SimpleNamespace(model_class_name="WanPipeline")
+    getter_config = SimpleNamespace(model_class_name="MiniMaxH3Pipeline")
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        SimpleNamespace(
+            od_config=attribute_config,
+            get_diffusion_od_config=lambda: getter_config,
+        ),
+        model_name="test-model",
+    )
+
+    assert handler._resolve_diffusion_od_config() is getter_config
 
 
 class BlockingVideoHandler:
@@ -461,6 +519,51 @@ def test_i2v_video_generation_resizes_input_to_requested_dimensions(test_client,
     assert input_image.size == (96, 64)
 
 
+def test_i2v_resize_policy_can_defer_to_pipeline(monkeypatch):
+    engine = FakeAsyncOmni()
+    engine.get_diffusion_od_config = lambda: SimpleNamespace(
+        model="org/model",
+        model_class_name="ExamplePipeline",
+        revision="pinned-revision",
+    )
+    captured = {}
+
+    def fake_policy(model_class_name, *, model, revision=None):
+        captured.update(
+            model_class_name=model_class_name,
+            model=model,
+            revision=revision,
+        )
+        return True
+
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.openai.serving_video.should_preserve_reference_image_size",
+        fake_policy,
+    )
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        diffusion_engine=engine,
+        model_name="fallback/model",
+    )
+    image = Image.new("RGB", (48, 32))
+
+    asyncio.run(
+        handler._run_and_extract(
+            VideoGenerationRequest(prompt="A bear playing with yarn.", width=96, height=64),
+            "pipeline-owned-resize",
+            reference_image=ReferenceImage(image),
+        )
+    )
+
+    input_image = engine.captured_prompt["multi_modal_data"]["image"]
+    assert isinstance(input_image, Image.Image)
+    assert input_image.size == (48, 32)
+    assert captured == {
+        "model_class_name": "ExamplePipeline",
+        "model": "org/model",
+        "revision": "pinned-revision",
+    }
+
+
 def test_i2v_extra_params_dimensions_preserve_input_image_geometry(test_client, mocker: MockerFixture):
     image_bytes = _make_test_image_bytes((48, 48))
     mocker.patch(
@@ -550,6 +653,45 @@ def test_i2v_video_generation_with_image_reference_form(test_client, mocker: Moc
     engine = test_client.app.state.openai_serving_video._engine_client
     prompt = engine.captured_prompt
     input_image = prompt["multi_modal_data"]["image"]
+    assert isinstance(input_image, Image.Image)
+    assert input_image.size == (40, 24)
+
+
+def test_i2v_video_generation_follows_allowed_image_redirect(test_client, mocker: MockerFixture, monkeypatch):
+    requested_paths = []
+    async_client = httpx.AsyncClient
+
+    def _handler(request):
+        requested_paths.append(request.url.path)
+        if request.url.path == "/redirect.png":
+            return httpx.Response(302, headers={"location": "/image.png"})
+        return httpx.Response(200, content=_make_test_image_bytes((40, 24)))
+
+    def _client_factory(*args, **kwargs):
+        return async_client(*args, transport=httpx.MockTransport(_handler), **kwargs)
+
+    monkeypatch.setattr(envs, "VLLM_MEDIA_URL_ALLOW_REDIRECTS", True)
+    monkeypatch.setattr(video_api_utils.httpx, "AsyncClient", _client_factory)
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "A fox running through snow.",
+            "image_reference": json.dumps({"image_url": "https://example.com/redirect.png"}),
+        },
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    assert requested_paths == ["/redirect.png", "/image.png"]
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    input_image = engine.captured_prompt["multi_modal_data"]["image"]
     assert isinstance(input_image, Image.Image)
     assert input_image.size == (40, 24)
 
@@ -690,6 +832,18 @@ def test_multi_video_generation_preserves_uploaded_files_until_generation(
     assert isinstance(engine.captured_prompt["multi_modal_data"]["audio"], str)
     assert engine.captured_sampling_params_list[0].extra_args["task"] == "ref2va"
     assert engine.captured_sampling_params_list[0].extra_args["duration"] == 15.0
+
+
+def test_mixed_reference_capability_uses_model_metadata_when_config_defaults_false(test_client):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = None
+    handler._engine_client.stage_configs = [
+        SimpleNamespace(engine_args={"model_class_name": "MiniMaxH3TextEncoder"}),
+        SimpleNamespace(engine_args={"model_class_name": "MiniMaxH3Pipeline"}),
+    ]
+    handler._stage_configs = handler._engine_client.stage_configs
+
+    assert handler.supports_mixed_reference_inputs
 
 
 def test_decode_video_bytes_can_keep_first_frames():
@@ -1071,7 +1225,13 @@ def test_worker_fps_multiplier_is_applied_to_async_encoding(test_client, mocker:
 def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFixture):
     audio_sample_rates = []
 
-    def _fake_encode(video, fps, audio=None, audio_sample_rate=None, video_codec_options=None):
+    def _fake_encode(
+        video,
+        fps,
+        audio=None,
+        audio_sample_rate=None,
+        video_codec_options=None,
+    ):
         del video, fps, audio, video_codec_options
         audio_sample_rates.append(audio_sample_rate)
         return b"fake-video"
@@ -2080,6 +2240,31 @@ def test_sync_sampling_params_pass_through(test_client, mocker: MockerFixture):
     assert captured.guidance_scale == 6.5
     assert captured.seed == 42
     assert captured.quality == "high"
+
+
+def test_sync_sana_wm_extra_params_payload_passes_to_engine_prompt(test_client, mocker: MockerFixture):
+    _mock_encode_video_bytes(mocker)
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "drive forward",
+            "extra_params": json.dumps(
+                {
+                    "sana_wm": {"action": "d-4", "rotation_speed_deg": 1.5},
+                    "sana_wm_native_max_tokens": 30000,
+                }
+            ),
+        },
+    )
+
+    assert response.status_code == 200
+    engine = test_client.app.state.openai_serving_video._engine_client
+    captured_params = engine.captured_sampling_params_list[0]
+    # The camera block reaches the model through extra_args; the Sana preprocess
+    # hook is what lifts it onto the prompt.
+    assert captured_params.extra_args["sana_wm"]["action"] == "d-4"
+    assert captured_params.extra_args["sana_wm"]["rotation_speed_deg"] == 1.5
+    assert captured_params.extra_args["sana_wm_native_max_tokens"] == 30000
 
 
 def test_sync_frame_interpolation_params_pass_to_sampling_params(test_client, mocker: MockerFixture):

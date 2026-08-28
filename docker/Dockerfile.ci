@@ -1,7 +1,27 @@
-# Target vllm version: v0.26.0 (releases/v0.26.0 branch).
+# Target vllm version: v0.28.0 (tag v0.28.0 @ 2cf0a6915ce5).
 # Keep VLLM_BASE_TAG aligned with the target vLLM release on every rebase.
+#
+# Release-boundary form: there is no precompiled-wheel pin here, because the
+# base image already ships exactly the target vLLM. Everything the runtime
+# needs — torch, flashinfer, nvJitLink, numpy — comes from that image as one
+# self-consistent set.
+#
+# This block reappears only when the rebase targets a vLLM commit that is NOT a
+# released tag. During the 0.27 rebase, targeting v0.27.0rc1 on top of the
+# v0.26.0 base image required reinstalling vLLM from wheels.vllm.ai and then
+# hand-repairing the fallout: pinning torch ahead of flashinfer (installing it
+# after bound flashinfer's TVM FFI runtime to the old torch and aborted engine
+# core init), registering libnvJitLink.so.13 with ldconfig, and re-pinning numpy
+# under numba's ceiling. All of it was compensation for a base image and a vLLM
+# that disagreed. At a real release boundary they agree, so none of it is
+# needed. The 0.28 rebase repeated the cycle: the v0.28.0rc / final-tag wheels
+# rode on the v0.27.0 base image with the full reinstall block until the
+# official v0.28.0 image shipped, at which point this file dropped back to the
+# form you are reading. If you pin an untagged commit again, restore the
+# reinstall block — agent/tasks/20_update_wheel_url.sh fails the run rather
+# than letting the Dockerfile silently ship the wrong vLLM.
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai
-ARG VLLM_BASE_TAG=v0.26.0
+ARG VLLM_BASE_TAG=v0.28.0
 
 # We use registry-based layer caching for the dependencies,
 # where the tag is determined based on the hash of the contents

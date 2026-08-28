@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for CosyVoice3 components."""
 
 from types import SimpleNamespace
@@ -9,8 +9,39 @@ import torch
 import torch.nn as nn
 
 from tests.helpers.mark import hardware_test
+from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
+    CausalHiFTGenerator,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture
+def causal_hift():
+    return CausalHiFTGenerator(
+        base_channels=32,
+        upsample_rates=[2, 2],
+        upsample_kernel_sizes=[4, 4],
+        source_resblock_kernel_sizes=[3, 3],
+        source_resblock_dilation_sizes=[[1, 3, 5], [1, 3, 5]],
+    )
+
+
+def test_causal_hift_moves_stft_window_with_model(causal_hift):
+    assert causal_hift.get_buffer("stft_window") is causal_hift.stft_window
+    assert "stft_window" not in causal_hift.state_dict()
+    causal_hift.to(dtype=torch.float64)
+    assert causal_hift.stft_window.dtype == torch.float64
+
+
+def test_causal_hift_stft_moves_window_to_input_device(causal_hift):
+    waveform = torch.empty((1, 64), device="meta")
+
+    real, imag = causal_hift._stft(waveform)
+
+    assert real.device == waveform.device
+    assert imag.device == waveform.device
+    assert causal_hift.stft_window.device == waveform.device
 
 
 class TestPreLookaheadLayer:
@@ -249,6 +280,153 @@ class TestCFM:
         out, _ = cfm(mu, mask, n_timesteps=2, spks=spks, cond=cond)
 
         assert out.shape == mu.shape
+
+    @pytest.mark.core_model
+    @pytest.mark.cpu
+    def test_trt_estimator_uses_stream_dependencies(self, monkeypatch):
+        from omegaconf import DictConfig
+
+        from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import ConditionalCFM
+
+        class FakeStream:
+            def __init__(self, name, state):
+                self.name = name
+                self.state = state
+                self.cuda_stream = hash(name)
+                self.synchronize_calls = 0
+                self.waited_on = []
+
+            def synchronize(self):
+                self.synchronize_calls += 1
+
+            def wait_stream(self, stream):
+                self.waited_on.append(stream)
+
+        class FakeStreamContext:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                self.previous = self.stream.state.current
+                self.stream.state.current = self.stream
+                return self.stream
+
+            def __exit__(self, exc_type, exc, traceback):
+                self.stream.state.current = self.previous
+
+        state = SimpleNamespace(current=None)
+        caller_stream = FakeStream("caller", state)
+        estimator_stream = FakeStream("estimator", state)
+        state.current = caller_stream
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda *args, **kwargs: state.current)
+        stream_contexts = []
+
+        def stream_context(stream):
+            stream_contexts.append(stream)
+            return FakeStreamContext(stream)
+
+        monkeypatch.setattr(torch.cuda, "stream", stream_context)
+
+        class FakeContext:
+            def __init__(self):
+                self.execute_stream = None
+
+            def set_input_shape(self, name, shape):
+                pass
+
+            def set_tensor_address(self, name, address):
+                pass
+
+            def execute_async_v3(self, stream):
+                self.execute_stream = stream
+                return True
+
+        class FakeEngine:
+            @staticmethod
+            def get_tensor_name(index):
+                return f"tensor_{index}"
+
+        context = FakeContext()
+
+        class FakeEstimatorPool:
+            io_dtype = torch.float32
+
+            def __init__(self):
+                self.released = []
+
+            def acquire_estimator(self):
+                return [context, estimator_stream], FakeEngine()
+
+            def release_estimator(self, released_context, released_stream):
+                self.released.append((released_context, released_stream))
+
+        estimator_pool = FakeEstimatorPool()
+        cfm = ConditionalCFM(
+            in_channels=80,
+            cfm_params=DictConfig(
+                {
+                    "sigma_min": 1e-6,
+                    "solver": "euler",
+                    "t_scheduler": "cosine",
+                    "training_cfg_rate": 0.2,
+                    "inference_cfg_rate": 0.7,
+                }
+            ),
+            n_spks=1,
+            spk_emb_dim=80,
+            estimator=estimator_pool,
+        )
+
+        x = torch.randn(2, 80, 4)
+        mask = torch.ones(2, 1, 4)
+        mu = torch.randn(2, 80, 4)
+        timestep = torch.randn(2)
+        speakers = torch.randn(2, 80)
+        condition = torch.randn(2, 80, 4)
+
+        output = cfm.forward_estimator(x, mask, mu, timestep, speakers, condition)
+
+        assert output.shape == x.shape
+        assert caller_stream.synchronize_calls == 0
+        assert estimator_stream.synchronize_calls == 0
+        assert estimator_stream.waited_on == [caller_stream]
+        assert caller_stream.waited_on == [estimator_stream]
+        assert stream_contexts == [estimator_stream]
+        assert context.execute_stream == estimator_stream.cuda_stream
+        assert estimator_pool.released == [(context, estimator_stream)]
+
+    @pytest.mark.core_model
+    @pytest.mark.cpu
+    def test_trt_context_pool_stores_cuda_stream(self, monkeypatch):
+        from vllm_omni.model_executor.models.cosyvoice3.flow_estimator_trt import TrtContextWrapper
+
+        execution_context = object()
+
+        class FakeEngine:
+            @staticmethod
+            def create_execution_context():
+                return execution_context
+
+        cuda_stream = object()
+        monkeypatch.setattr(torch.cuda, "Stream", lambda device: cuda_stream)
+
+        def reject_stream_context(stream):
+            pytest.fail("TrtContextWrapper must store the CUDA stream, not a StreamContext")
+
+        monkeypatch.setattr(torch.cuda, "stream", reject_stream_context)
+
+        engine = FakeEngine()
+        wrapper = TrtContextWrapper(engine, device="cuda:0")
+        [context, stream], acquired_engine = wrapper.acquire_estimator()
+
+        assert context is execution_context
+        assert stream is cuda_stream
+        assert acquired_engine is engine
+
+        wrapper.release_estimator(context, stream)
+        [reused_context, reused_stream], _ = wrapper.acquire_estimator()
+        assert reused_context is context
+        assert reused_stream is stream
 
 
 class TestSDPAFallback:

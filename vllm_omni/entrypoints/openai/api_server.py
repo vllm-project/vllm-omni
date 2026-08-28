@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import asyncio
 import base64
 import dataclasses
@@ -43,6 +43,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
+from vllm.entrypoints.openai.cli_args import make_arg_parser
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -63,6 +64,7 @@ from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAISer
 from vllm.entrypoints.pooling.pooling.serving import ServingPooling
 from vllm.entrypoints.pooling.scoring.serving import ServingScores
 from vllm.entrypoints.scale_out.token_in_token_out.serving import ServingTokens
+from vllm.entrypoints.serve import create_error_response
 
 # vLLM moved `base` from openai.basic.api_router to serve.instrumentator.basic.
 # Keep a fallback for older/newer upstream layouts during rebase windows.
@@ -74,7 +76,6 @@ from vllm.entrypoints.serve.utils.api_utils import (
     validate_json_request,
     with_cancellation,
 )
-from vllm.entrypoints.serve.utils.error_response import create_error_response
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.serve.utils.server_utils import get_uvicorn_log_config
@@ -152,6 +153,7 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
     decode_input_reference,
 )
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
+from vllm_omni.entrypoints.utils import PureDiffusionLauncherAdapter
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.utils.forced_aligner import build_forced_aligner_config
@@ -538,6 +540,8 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
         if _should_enable_profiler_endpoints(stage_configs):
             logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
+            _remove_route_from_app(app, "/start_profile", frozenset({"POST"}))
+            _remove_route_from_app(app, "/stop_profile", frozenset({"POST"}))
             app.include_router(profiler_router)
 
         vllm_config = await _get_vllm_config(engine_client)
@@ -548,6 +552,16 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             logger.info(
                 "Starting vLLM API server (pure diffusion mode) on %s",
                 listen_address,
+            )
+            # The vLLM 0.27 launcher's shutdown path reads
+            # engine_client.vllm_config.shutdown_timeout; AsyncOmni.vllm_config
+            # is None for pure diffusion (no comprehension stage), which would
+            # crash handle_shutdown and hang teardown. Wrap app.state.engine_client
+            # with a shim that only overrides vllm_config and forwards everything
+            # else (get_vllm_config still returns None for pure-diffusion detection).
+            app.state.engine_client = PureDiffusionLauncherAdapter(
+                engine_client,
+                shutdown_timeout=getattr(args, "shutdown_timeout", 0),
             )
         else:
             logger.info(
@@ -668,7 +682,7 @@ async def build_async_omni_from_stage_config(
         EngineClient instance (AsyncOmni) ready for use
 
     Note:
-        Stage configurations are loaded from args.stage_configs_path if provided,
+        Stage configurations are loaded from ``args.deploy_config`` when provided,
         otherwise from the model's default configuration.
     """
 
@@ -985,8 +999,9 @@ async def omni_init_app_state(
     )
 
     # Warm up chat template processing to avoid first-request latency
-    if state.openai_serving_chat is not None:
-        state.openai_serving_chat.warmup()
+    # Upstream f5ffc59b6a removed OpenAIServingChat.warmup() and moved the
+    # warmup onto the renderer (OnlineRenderer.warmup()); mirror upstream.
+    state.online_renderer.warmup()
 
     state.openai_serving_completion = (
         OpenAIServingCompletion(
@@ -1113,7 +1128,11 @@ async def omni_init_app_state(
         state.openai_serving_models,
         request_logger=request_logger,
         model_name=model_name,
-        forced_aligner_config=build_forced_aligner_config(args),
+        forced_aligner_enabled=build_forced_aligner_config(
+            getattr(args, "forced_aligner", None),
+            getattr(args, "forced_aligner_config", None),
+        )
+        is not None,
     )
 
     # Warm up speech pipeline (CUDA Graph capture, torch.compile) so the first
@@ -1138,7 +1157,7 @@ async def omni_init_app_state(
     state.openai_serving_duplex = None
     if state.openai_serving_chat is not None and should_enable_duplex_endpoint(
         state.stage_configs,
-        config_path=getattr(args, "stage_configs_path", None) or getattr(args, "deploy_config", None),
+        config_path=getattr(args, "deploy_config", None),
     ):
         from vllm_omni.experimental.fullduplex.openai.serving import OmniDuplexSessionHandler
 
@@ -1463,8 +1482,7 @@ async def list_voices(raw_request: Request):
             status_code=HTTPStatus.NOT_FOUND,
         )
 
-    # Get all speakers (both model built-in and uploaded)
-    speakers = sorted(handler.supported_speakers) if handler.supported_speakers else []
+    speakers = sorted(handler._get_available_voices())
 
     # Get uploaded speakers details
     uploaded_speakers = []
@@ -2359,7 +2377,7 @@ async def edit_images(
                     status_code=generation_result.error.code if generation_result.error else 400,
                     detail=generation_result.message,
                 )
-            images, _, _, cot_output = generation_result
+            images, stage_durations, peak_memory_mb, cot_output = generation_result
         else:
             # Single-stage diffusion: use the direct path.
             result = await _generate_with_async_omni(
@@ -2370,6 +2388,8 @@ async def edit_images(
                 request_id=request_id,
             )
             images = _extract_images_from_result(result)
+            stage_durations = getattr(result, "stage_durations", None)
+            peak_memory_mb = getattr(result, "peak_memory_mb", None)
 
         logger.debug(f"Successfully generated {len(images)} image(s)")
 
@@ -2390,6 +2410,10 @@ async def edit_images(
             output_format=output_format,
             size=size_str,
             cot_output=cot_output,
+            metrics={
+                "stage_durations": stage_durations or None,
+                "peak_memory_mb": float(peak_memory_mb) if peak_memory_mb else None,
+            },
         )
 
     except (EngineGenerateError, EngineDeadError) as exc:
@@ -2631,12 +2655,6 @@ def _extract_images_from_result(result: Any) -> list[Any]:
     images = []
     if hasattr(result, "images") and result.images:
         images = result.images
-    elif hasattr(result, "request_output"):
-        request_output = result.request_output
-        if isinstance(request_output, dict) and request_output.get("images"):
-            images = request_output["images"]
-        elif hasattr(request_output, "images") and request_output.images:
-            images = request_output.images
     # Handle when generate more than one image
     if images and isinstance(images[0], np.ndarray) and images[0].shape[0] > 1 and images[0].ndim == 5:
         # Unwrap batch: (N, T, H, W, C) -> [img1, img2, ...]
@@ -3814,26 +3832,16 @@ async def omni_wakeup(request: OmniWakeupRequest, raw_request: Request):
 
 
 if __name__ == "__main__":
-    import asyncio
-
-    from vllm.entrypoints.openai.cli_args import make_arg_parser
-
     parser = TrackingArgumentParser(description="vLLM-Omni OpenAI-Compatible REST API server")
     parser = make_arg_parser(parser)
-    registered_flags = set()
-    for action in parser._actions:
-        registered_flags.update(action.option_strings)
-
-    # FIXME - this is broken on `main`. `make_arg_parser` does not handle omni engine args properly.
-    if "--omni" not in registered_flags:
-        parser.add_argument("--omni", action="store_true", default=False, help="Enable vLLM-Omni mode.")
-    if "--enable-sleep-mode" not in registered_flags:
-        parser.add_argument(
-            "--enable-sleep-mode", action="store_true", default=False, help="Enable GPU memory pool for sleep mode."
-        )
+    # Ensure that passing --omni won't crash the server.
+    # NOTE: the value here does not matter since we are always running the Omni server
+    # when __main__ is called, i.e., --omni is only used when called through the entrypoints.
+    parser.add_argument("--omni", action="store_true", default=False)
     args = parser.parse_args()
-    if not hasattr(args, "model_tag"):
-        setattr(args, "model_tag", args.model)
-    if hasattr(args, "model_tag") and args.model_tag is None:
-        args.model_tag = args.model
+    # sync args.model to model_tag, because if we pass the model positionally,
+    # args.model will be the default from vLLM's ModelConfig (currently
+    # Qwen/Qwen3-0.6B) and crash cryptically.
+    if args.model_tag is not None:
+        args.model = args.model_tag
     asyncio.run(omni_run_server(args))
