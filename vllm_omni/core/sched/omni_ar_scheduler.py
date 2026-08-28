@@ -222,14 +222,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             dtps_cfg = dict(dtps_cfg.items())
         else:
             return
+        stage_id: int = getattr(self.vllm_config.model_config, "stage_id", 0) if hasattr(self, "vllm_config") else 0
         try:
-            self._dtps = DTPSScheduler.from_config(dtps_cfg)
+            self._dtps = DTPSScheduler.from_config(dtps_cfg, stage_id=stage_id)
             logger.info(
                 "[OmniDTPS] AR stage %s: aging_threshold=%.1fs, "
                 "dit_load_threshold=%d, "
                 "idle when any replica waiting < threshold, "
                 "busy when all replicas waiting >= threshold)",
-                getattr(self.vllm_config.model_config, "stage_id", 0),
+                stage_id,
                 self._dtps.i2t_aging_s,
                 self._dtps.dit_load_threshold,
             )
@@ -238,7 +239,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # failure break the AR scheduler. Fall back to pure FCFS.
             logger.exception(
                 "[OmniDTPS] Failed to construct DTPSScheduler; falling back to FCFS on AR stage %s",
-                getattr(self.vllm_config.model_config, "stage_id", 0),
+                stage_id,
             )
             self._dtps = None
 

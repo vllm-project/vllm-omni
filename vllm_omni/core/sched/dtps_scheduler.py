@@ -10,15 +10,15 @@ The scheduler receives the DiT stage's real-time queue depth via a UTILITY
 ZMQ push from the Orchestrator. It then categorizes tasks into three dynamic
 priority tiers per batch:
 
-  1. L0 (Highest: Starving AR): `ar_only` tasks that exceed the aging threshold. Anti-starvation
+  1. L0 (Highest: Starving AR): ``ar_only`` tasks that exceed the aging threshold. Anti-starvation
      strictly overrides all load-awareness logic.
-  2. L1 (High: Budgeted DiT): When DiT is hungry (`min_waiting < threshold`), a dynamic admission
-     budget is granted. `ar_downstream` tasks within this budget are prioritized to feed the downstream.
-  3. L2 (Normal: Standard AR): Standard `ar_only` tasks. When DiT is busy or the budget is exhausted,
+  2. L1 (High: Budgeted DiT): When DiT is hungry (``min_waiting < threshold``), a dynamic admission
+     budget is granted. ``ar_downstream`` tasks within this budget are prioritized to feed the downstream.
+  3. L2 (Normal: Standard AR): Standard ``ar_only`` tasks. When DiT is busy or the budget is exhausted,
      these tasks are prioritized. This allows AR to crunch through its own workloads instead of
      piling tasks onto an already overloaded DiT queue.
 
-Over-budget `ar_downstream` tasks are demoted below L2 to prevent downstream pile-ups.
+Over-budget ``ar_downstream`` tasks are demoted below L2 to prevent downstream pile-ups.
 
 [Intra-Tier Sorting]
 - All tiers use FCFS (first-come-first-served) based on the ``waiting`` queue
@@ -49,12 +49,6 @@ class _InflightEntry(NamedTuple):
 
     added_mono: float
 
-
-# i2t / t2t finish at the AR stage -> ar_only; t2i / it2i -> ar_downstream.
-_AR_ONLY_TASKS: frozenset[str] = frozenset({"i2t", "t2t"})
-_AR_DOWNSTREAM_TASKS: frozenset[str] = frozenset({"t2i", "it2i"})
-
-
 class DTPSScheduler:
     """A single instance is owned by ``OmniARScheduler`` (one per AR stage replica)
     and invoked once per ``schedule()`` cycle via :meth:`maybe_reorder_waiting`.
@@ -63,9 +57,11 @@ class DTPSScheduler:
     def __init__(
         self,
         *,
+        stage_id: int = 0,
         i2t_aging_s: float = _DEFAULT_I2T_AGING_S,
         dit_load_threshold: int = _DEFAULT_DIT_LOAD_THRESHOLD,
     ) -> None:
+        self._stage_id: int = stage_id
         self.i2t_aging_s: float = i2t_aging_s
         try:
             self.dit_load_threshold: int = int(dit_load_threshold)
@@ -78,7 +74,7 @@ class DTPSScheduler:
         self._last_phase_stats: dict[str, int | bool] = {}
 
     @classmethod
-    def from_config(cls, dtps_cfg: Any) -> DTPSScheduler:
+    def from_config(cls, dtps_cfg: Any, *, stage_id: int = 0) -> DTPSScheduler:
         # Build a DTPSScheduler from the ``omni_dtps_config`` block.
         if isinstance(dtps_cfg, dict):
             cfg_get = dtps_cfg.get
@@ -104,11 +100,12 @@ class DTPSScheduler:
             dit_load_threshold = _DEFAULT_DIT_LOAD_THRESHOLD
 
         return cls(
+            stage_id=stage_id,
             dit_load_threshold=dit_load_threshold,
         )
 
     # ------------------------------------------------------------------ #
-    #  Task classification (model-agnostic)
+    #  Task classification (model-agnostic, topology-resolved)
     # ------------------------------------------------------------------ #
 
     @staticmethod
@@ -128,32 +125,15 @@ class DTPSScheduler:
             return None
         return info if isinstance(info, dict) else None
 
-    def _classify_task(self, req: Request) -> str:
-        """Classify a request by task type: i2t / t2i / it2i / t2t / unknown.
-
-        Primary signal: ``additional_information["omni_task_type"]`` (stamped
-        at the API entry).
+    def _request_is_ar_only(self, req: Request) -> bool:
+        """Return True when the request terminates at this AR stage.
         """
         info = self._deserialize_info(req)
         if info is None:
-            return "unknown"
-        tag = info.get("omni_task_type")
-        if isinstance(tag, str) and tag:
-            return tag
-        return "unknown"
-
-    @staticmethod
-    def _task_bucket(task: str) -> str:
-        """Map a task type to its DTPS bucket: ``ar_only`` or ``ar_downstream``.
-
-        unknown / unrecognized -> ``ar_downstream`` (conservative: never starve
-        the downstream stage).
-        """
-        if task in _AR_ONLY_TASKS:
-            return "ar_only"
-        if task in _AR_DOWNSTREAM_TASKS:
-            return "ar_downstream"
-        return "ar_downstream"
+            return False
+        final_stage_id = info.get("omni_final_stage_id")
+        force_kv = bool(info.get("omni_force_kv_transfer", False))
+        return final_stage_id == self._stage_id and not force_kv
 
     def update_dit_load(self, snapshot: DitLoadSnapshot) -> None:
         """Receive DiT load snapshot from the Orchestrator via UTILITY ZMQ.
@@ -166,11 +146,12 @@ class DTPSScheduler:
         self._dit_load_snapshot = snapshot
 
     def register_finished_downstream(self, request_id: str) -> None:
-        """Record that a downstream (t2i/it2i) request just finished AR.
+        """Record that a downstream request just finished AR.
 
-        Called from ``OmniARScheduler._free_request`` at the top of the KV-
-        transfer block (so only downstream requests register). The id lives
-        in ``_dit_inflight_ids`` until a DiT poll reports it (de-duped out)
+        Called from ``OmniARScheduler._free_request`` only when
+        ``_should_transfer_kv_for_request`` is True (i.e. the request
+        actually needs downstream KV transfer). The id lives in
+        ``_dit_inflight_ids`` until a DiT poll reports it (de-duped out)
         or it times out (age cap). Idempotent: re-registering an id already
         tracked does NOT reset its age.
         """
@@ -183,7 +164,7 @@ class DTPSScheduler:
     def _dit_phase(self, inflight: int = 0) -> str:
         """Return the DiT-load phase: ``"idle"`` or ``"busy"``.
 
-        ``inflight`` is the Fix-B feed-forward count of downstream (t2i/it2i)
+        ``inflight`` is the Fix-B feed-forward count of downstream
         requests currently RUNNING on this AR stage — AR knows they will land
         on DiT once they finish here but the polled DiT-load report hasn't
         reflected them yet. ``_dit_inflight_ids`` is the blind-spot set: ids
@@ -273,33 +254,16 @@ class DTPSScheduler:
     ) -> None:
         """Reorder the AR ``waiting`` queue by DTPS priority layers.
 
-        Must be called after ``process_pending_chunks`` /
-        ``_consume_pending_connector_output`` (so only genuinely schedulable
-        WAITING requests remain) and before ``super().schedule()`` (so the
-        admission order follows the reorder).
-
-        ``running`` is the AR stage's current running set; its downstream
-        (t2i/it2i) members are fed forward as anticipated DiT load (see
-        :meth:`_dit_phase`) so the phase decision isn't fooled by the
-        poll-lagged DiT-load report. ``None`` -> the running term is 0.
-
         Priority layers (smaller layer = admitted first):
           L0 — ``ar_only`` requests waiting longer than ``i2t_aging_s``
                (starving; aging boost to prevent starvation). ALWAYS highest.
           L1 — ``ar_downstream`` within the DiT admission budget (FCFS)
           L2 — remaining ``ar_only`` requests (FCFS)
           L3 — ``ar_downstream`` beyond the budget (FCFS)
-
-        Within each layer, FCFS follows the ``waiting`` queue order
-        (``arrival_time`` is only read for the L0 starving check).
-
-        ``ar_proxy`` and arrival are read-only; only queue order is mutated.
-        FCFSRequestQueue (a deque subclass) is reordered via clear()+extend();
-        any other queue type falls back to remove_requests()+add_request().
         """
         inflight_running = 0
         if running is not None:
-            inflight_running = sum(1 for r in running if self._task_bucket(self._classify_task(r)) == "ar_downstream")
+            inflight_running = sum(1 for r in running if not self._request_is_ar_only(r))
         self._dit_phase(inflight_running)
         if self.dit_load_threshold <= 0:
             budget_raw: int | None = None
@@ -316,11 +280,10 @@ class DTPSScheduler:
         now = time.time()
 
         for req in list(waiting):
-            task = self._classify_task(req)
-            bucket = self._task_bucket(task)
+            is_ar_only = self._request_is_ar_only(req)
             arrival = getattr(req, "arrival_time", None)
             wait = (now - arrival) if arrival is not None else 0.0
-            if bucket == "ar_only":
+            if is_ar_only:
                 starving = wait > aging_threshold
                 if starving:
                     starving_ar_only.append(req)
