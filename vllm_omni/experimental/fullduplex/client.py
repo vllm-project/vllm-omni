@@ -514,7 +514,9 @@ class RealtimeEventCollector:
                 if stage0_metrics is not None:
                     request_metrics = result["request_metrics"]
                     assert isinstance(request_metrics, dict)
-                    request_metrics["tpot_ms"] = float(stage0_metrics.get("vllm_tpot_ms") or 0.0)
+                    request_metrics["tpot_ms"] = (
+                        _finite_number(stage0_metrics.get("vllm_tpot_ms"), nonnegative=True) or 0.0
+                    )
         return result
 
 
@@ -743,12 +745,14 @@ class RealtimeDuplexClient:
             await self.send_playback_ack(rid, played_ms)
             if timeout_s <= 0:
                 continue
+
+            def playback_acknowledged() -> bool:
+                if wait_for_history_committed:
+                    return self._playback_history_committed(rid, after_count=before_ack)
+                return self._playback_ack_event(rid, after_count=before_ack) is not None
+
             await wait_for(
-                lambda rid=rid, before_ack=before_ack: (
-                    self._playback_history_committed(rid, after_count=before_ack)
-                    if wait_for_history_committed
-                    else self._playback_ack_event(rid, after_count=before_ack) is not None
-                ),
+                playback_acknowledged,
                 timeout_s=timeout_s,
                 label=f"playback.acknowledged for {rid}",
             )

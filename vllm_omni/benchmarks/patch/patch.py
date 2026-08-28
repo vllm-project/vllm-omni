@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
-import contextlib
 import io
 import json
 import mimetypes
@@ -14,12 +13,12 @@ import time
 import traceback
 import uuid
 import wave
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Literal
+from typing import Any, Literal, TypeGuard, cast
 
 import aiohttp
 import numpy as np
@@ -336,9 +335,13 @@ def _prepare_omniinteract_batch(input_requests: list[SampleRequest]) -> None:
     for sample in input_requests:
         if not isinstance(sample, OmniInteractSampleRequest):
             continue
-        root = sample.omniinteract_options.output_root.resolve()
+        options = sample.omniinteract_options
+        case = sample.omniinteract_case
+        if not isinstance(options, OmniInteractSessionOptions) or case is None:
+            raise RuntimeError("OmniInteract sample is missing its dataset session layout")
+        root = options.output_root.resolve()
         roots.add(root)
-        clear_case_artifacts(sample.omniinteract_options.output_root, sample.omniinteract_case)
+        clear_case_artifacts(options.output_root, case)
     for root in roots:
         clear_batch_artifacts(root)
 
@@ -641,7 +644,7 @@ datasets.get_samples = get_samples
 
 _serve_mod = sys.modules.get("vllm.benchmarks.serve")
 if _serve_mod is not None:
-    _serve_mod.get_samples = get_samples
+    setattr(_serve_mod, "get_samples", get_samples)
 
 
 @dataclass
@@ -1496,8 +1499,12 @@ def _realtime_websocket_url(api_url: str) -> str:
     return build_realtime_url(api_url, None, native_duplex=None)
 
 
-def _nonnegative_number(value: object) -> bool:
+def _nonnegative_number(value: object) -> TypeGuard[int | float]:
     return isinstance(value, int | float) and not isinstance(value, bool) and np.isfinite(value) and value >= 0
+
+
+def _number_or_zero(value: object) -> float:
+    return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else 0.0
 
 
 async def _async_request_omniinteract(
@@ -1543,9 +1550,9 @@ async def _async_request_omniinteract(
         output.audio_duration = case_result.audio_bytes / (24_000 * 2)
         output.audio_frames = case_result.audio_bytes // 2
         session_metrics = case_result.duplex_session_metrics
-        output.ttft = float(session_metrics.get("mean_ttft_ms") or 0.0) / 1000.0
-        output.audio_ttfp = float(session_metrics.get("mean_ttfp_ms") or 0.0) / 1000.0
-        output.audio_rtf = float(session_metrics.get("mean_rtf") or 0.0)
+        output.ttft = _number_or_zero(session_metrics.get("mean_ttft_ms")) / 1000.0
+        output.audio_ttfp = _number_or_zero(session_metrics.get("mean_ttfp_ms")) / 1000.0
+        output.audio_rtf = _number_or_zero(session_metrics.get("mean_rtf"))
         stages: list[tuple[int, dict[str, object]]] = []
         for request_metric in case_result.duplex_request_metrics:
             stage0 = request_metric.get("stage0_tokens")
@@ -1565,12 +1572,23 @@ async def _async_request_omniinteract(
             and all(_nonnegative_number(value) for value in values)
             for intervals, stage in timed
         )
-        output.itl = [float(value) / 1000.0 for _, stage in timed for value in stage["itls_ms"]] if exact else []
+        output.itl = (
+            [
+                float(value) / 1000.0
+                for _, stage in timed
+                for value in cast(list[object], stage["itls_ms"])
+                if _nonnegative_number(value)
+            ]
+            if exact
+            else []
+        )
         if output.itl:
             output.text_latency = output.ttft + sum(output.itl)
         elif complete and timed and all(_nonnegative_number(stage.get("tpot_ms")) for _, stage in timed):
             intervals = sum(count for count, _ in timed)
-            weighted_tpot = sum(float(stage["tpot_ms"]) * count for count, stage in timed) / intervals / 1000.0
+            weighted_tpot = (
+                sum(_number_or_zero(stage.get("tpot_ms")) * count for count, stage in timed) / intervals / 1000.0
+            )
             output.text_latency = output.ttft + weighted_tpot * (output.output_tokens - 1)
         else:
             output.text_latency = output.ttft
@@ -1728,11 +1746,11 @@ async def async_request_openai_realtime_tts(
             await client.close_session(timeout_s=30.0)
 
             output.generated_text = " ".join(filter(None, turn_transcripts))
-            output.ttft = float(session_metrics.get("mean_ttft_ms") or 0.0) / 1000.0
-            output.audio_ttfp = float(session_metrics.get("mean_ttfp_ms") or 0.0) / 1000.0
-            output.audio_rtf = float(session_metrics.get("mean_rtf") or 0.0)
+            output.ttft = _number_or_zero(session_metrics.get("mean_ttft_ms")) / 1000.0
+            output.audio_ttfp = _number_or_zero(session_metrics.get("mean_ttfp_ms")) / 1000.0
+            output.audio_rtf = _number_or_zero(session_metrics.get("mean_rtf"))
             output.audio_duration = (
-                sum(float(metric.get("audio_duration_ms") or 0.0) for metric in turn_metrics) / 1000.0
+                sum(_number_or_zero(metric.get("audio_duration_ms")) for metric in turn_metrics) / 1000.0
             )
             output.audio_frames = int(output.audio_duration * client.events.output_sample_rate_hz)
             output.latency = request_finished_at - output.start_time
@@ -2000,11 +2018,11 @@ async def async_request_openai_realtime_duplex(
             await client.close_session(timeout_s=30.0)
 
             output.generated_text = " ".join(filter(None, turn_transcripts))
-            output.ttft = float(session_metrics.get("mean_ttft_ms") or 0.0) / 1000.0
-            output.audio_ttfp = float(session_metrics.get("mean_ttfp_ms") or 0.0) / 1000.0
-            output.audio_rtf = float(session_metrics.get("mean_rtf") or 0.0)
+            output.ttft = _number_or_zero(session_metrics.get("mean_ttft_ms")) / 1000.0
+            output.audio_ttfp = _number_or_zero(session_metrics.get("mean_ttfp_ms")) / 1000.0
+            output.audio_rtf = _number_or_zero(session_metrics.get("mean_rtf"))
             output.audio_duration = (
-                sum(float(metric.get("audio_duration_ms") or 0.0) for metric in turn_metrics) / 1000.0
+                sum(_number_or_zero(metric.get("audio_duration_ms")) for metric in turn_metrics) / 1000.0
             )
             output.audio_frames = int(output.audio_duration * client.events.output_sample_rate_hz)
             output.latency = request_finished_at - output.start_time
@@ -2013,7 +2031,7 @@ async def async_request_openai_realtime_duplex(
                 for timing in turn_timings
                 if isinstance((stage0 := timing.get("stage0_tokens")), dict)
             )
-            mean_tpot_s = float(session_metrics.get("mean_tpot_ms") or 0.0) / 1000.0
+            mean_tpot_s = _number_or_zero(session_metrics.get("mean_tpot_ms")) / 1000.0
             if output.output_tokens > 1 and mean_tpot_s > 0:
                 output.text_latency = output.ttft + mean_tpot_s * (output.output_tokens - 1)
             else:
@@ -2197,10 +2215,12 @@ async def benchmark(
     if num_warmups > 0:
         print(f"Warming up with {num_warmups} requests...")
         warmup_pbar = None if disable_tqdm else tqdm(total=num_warmups)
-        warmup_semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
+        warmup_semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
         warmup_tasks = []
 
         async def warmup_limited_request_func():
+            if warmup_semaphore is None:
+                return await request_func(request_func_input=test_input, session=session, pbar=warmup_pbar)
             async with warmup_semaphore:
                 return await request_func(request_func_input=test_input, session=session, pbar=warmup_pbar)
 
@@ -2215,12 +2235,13 @@ async def benchmark(
 
     print("Starting main benchmark run...")
 
+    lora_module_iter: Iterator[str] | None = None
     if lora_modules:
         lora_modules_list = list(lora_modules)
         if lora_assignment == "round-robin":
-            lora_modules = iter([lora_modules_list[i % len(lora_modules_list)] for i in range(len(input_requests))])
+            lora_module_iter = iter([lora_modules_list[i % len(lora_modules_list)] for i in range(len(input_requests))])
         else:
-            lora_modules = iter([random.choice(lora_modules_list) for _ in range(len(input_requests))])
+            lora_module_iter = iter([random.choice(lora_modules_list) for _ in range(len(input_requests))])
 
     if profile:
         print("Starting profiler...")
@@ -2259,9 +2280,11 @@ async def benchmark(
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
-    semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
+    semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
 
     async def limited_request_func(request_func_input, session, pbar):
+        if semaphore is None:
+            return await request_func(request_func_input=request_func_input, session=session, pbar=pbar)
         async with semaphore:
             return await request_func(request_func_input=request_func_input, session=session, pbar=pbar)
 
@@ -2330,8 +2353,8 @@ async def benchmark(
         )
         per_request_extra_body = _merge_overrides(extra_body, request.request_overrides)
         req_model_id, req_model_name = model_id, model_name
-        if lora_modules:
-            req_lora_module = next(lora_modules)
+        if lora_module_iter is not None:
+            req_lora_module = next(lora_module_iter)
             req_model_id, req_model_name = req_lora_module, req_lora_module
 
         request_func_input = RequestFuncInput(
@@ -2368,6 +2391,8 @@ async def benchmark(
 
     omniinteract_summary = _finalize_omniinteract_batch(input_requests, outputs)
 
+    metrics: Any
+    actual_output_lens: Any
     if task_type == TaskType.GENERATION:
         metrics, actual_output_lens = calculate_metrics(
             input_requests=input_requests,
@@ -2392,6 +2417,7 @@ async def benchmark(
         actual_output_lens = 0
 
     if isinstance(metrics, MultiModalsBenchmarkMetrics):
+        multimodal_metrics = cast(Any, metrics)
 
         def measured_ttft(output: RequestFuncOutput) -> float | None:
             session_metrics = getattr(output, "duplex_session_metrics", None)
@@ -2401,21 +2427,21 @@ async def benchmark(
 
         result = {
             "duration": benchmark_duration,
-            "completed": metrics.completed,
-            "failed": metrics.failed,
-            "total_input_tokens": metrics.total_input,
-            "total_output_tokens": metrics.total_output,
-            "request_throughput": metrics.request_throughput,
-            "request_goodput": metrics.request_goodput if goodput_config_dict else None,
-            "output_throughput": metrics.output_throughput,
-            "total_token_throughput": metrics.total_token_throughput,
-            defs.TOTAL_AUDIO_DURATION_S: getattr(metrics, defs.TOTAL_AUDIO_DURATION_S),
-            defs.TOTAL_AUDIO_FRAMES: getattr(metrics, defs.TOTAL_AUDIO_FRAMES),
-            defs.AUDIO_THROUGHPUT: getattr(metrics, defs.AUDIO_THROUGHPUT),
-            defs.TOTAL_IMAGES: getattr(metrics, defs.TOTAL_IMAGES),
-            defs.IMAGE_THROUGHPUT: getattr(metrics, defs.IMAGE_THROUGHPUT),
-            defs.AVERAGE_PIXELS_PER_IMAGE: getattr(metrics, defs.AVERAGE_PIXELS_PER_IMAGE),
-            defs.MEAN_DENOISE_STEP_LATENCY_MS: getattr(metrics, defs.MEAN_DENOISE_STEP_LATENCY_MS),
+            "completed": multimodal_metrics.completed,
+            "failed": multimodal_metrics.failed,
+            "total_input_tokens": multimodal_metrics.total_input,
+            "total_output_tokens": multimodal_metrics.total_output,
+            "request_throughput": multimodal_metrics.request_throughput,
+            "request_goodput": multimodal_metrics.request_goodput if goodput_config_dict else None,
+            "output_throughput": multimodal_metrics.output_throughput,
+            "total_token_throughput": multimodal_metrics.total_token_throughput,
+            defs.TOTAL_AUDIO_DURATION_S: getattr(multimodal_metrics, defs.TOTAL_AUDIO_DURATION_S),
+            defs.TOTAL_AUDIO_FRAMES: getattr(multimodal_metrics, defs.TOTAL_AUDIO_FRAMES),
+            defs.AUDIO_THROUGHPUT: getattr(multimodal_metrics, defs.AUDIO_THROUGHPUT),
+            defs.TOTAL_IMAGES: getattr(multimodal_metrics, defs.TOTAL_IMAGES),
+            defs.IMAGE_THROUGHPUT: getattr(multimodal_metrics, defs.IMAGE_THROUGHPUT),
+            defs.AVERAGE_PIXELS_PER_IMAGE: getattr(multimodal_metrics, defs.AVERAGE_PIXELS_PER_IMAGE),
+            defs.MEAN_DENOISE_STEP_LATENCY_MS: getattr(multimodal_metrics, defs.MEAN_DENOISE_STEP_LATENCY_MS),
             "input_lens": [output.prompt_len for output in outputs],
             "start_times": [output.start_time for output in outputs],
             "output_lens": actual_output_lens,
@@ -2423,9 +2449,9 @@ async def benchmark(
             "itls": [output.itl for output in outputs],
             "generated_texts": [output.generated_text for output in outputs],
             "errors": [output.error for output in outputs],
-            "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
-            "max_concurrent_requests": metrics.max_concurrent_requests,
-            "rtfx": metrics.rtfx,
+            "max_output_tokens_per_s": multimodal_metrics.max_output_tokens_per_s,
+            "max_concurrent_requests": multimodal_metrics.max_concurrent_requests,
+            "rtfx": multimodal_metrics.rtfx,
         }
     else:
         result = {

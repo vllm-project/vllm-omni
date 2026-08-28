@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Seed-TTS zero-shot evaluation-style prompts for ``vllm bench serve``.
 
 Loads rows from the `meta.lst` format used in `BytedanceSpeech/seed-tts-eval`_ (or any
@@ -22,7 +25,7 @@ import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from vllm.benchmarks.datasets import BenchmarkDataset, SampleRequest
 from vllm.tokenizers import TokenizerLike
@@ -351,6 +354,8 @@ class SeedTTSDesignDataset(SeedTTSDataset):
     ``ref_audio`` / ``ref_text``.  Speaker-similarity (SIM) is not computed.
     """
 
+    _design_rows: list[_SeedTTSDesignRow]
+
     def load_data(self) -> None:
         # Does NOT call super().load_data() — the format is different (5 fields,
         # no wav file).  self._rows is intentionally left empty; the parent
@@ -374,7 +379,7 @@ class SeedTTSDesignDataset(SeedTTSDataset):
         self._design_rows = design_rows
         # Keep self._rows empty — parent sample() is overridden.
         self._rows = []
-        self.data = self._design_rows
+        self.data = cast(Any, self._design_rows)
         logger.info(
             "Loaded Seed-TTS-Design: root=%s locale=%s rows=%d",
             self._root,
