@@ -103,17 +103,6 @@ def test_lingbot_preset_matches_lingbot_defaults() -> None:
     }
 
 
-def test_cache_dit_uses_lingbot_quality_preset_without_sharing_mutable_state() -> None:
-    mod = _load_text_to_video()
-    lingbot = mod._cache_dit_config("/models/custom", "CustomLingBotVideoPipeline")
-    default = mod._cache_dit_config("Wan-AI/Wan2.2-T2V-A14B", "WanPipeline")
-
-    assert lingbot == mod._LINGBOT_CACHE_DIT_BALANCED_CONFIG
-    assert default == mod._DEFAULT_CACHE_DIT_CONFIG
-    lingbot["Fn_compute_blocks"] = 99
-    assert mod._LINGBOT_CACHE_DIT_BALANCED_CONFIG["Fn_compute_blocks"] == 4
-
-
 def test_extract_output_metadata_for_reporting_and_export() -> None:
     mod = _load_text_to_video()
     output = SimpleNamespace(

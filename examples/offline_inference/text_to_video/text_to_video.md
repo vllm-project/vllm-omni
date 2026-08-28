@@ -60,98 +60,38 @@ python text_to_video.py \
 
 ### LingBot-Video
 
-The shared runner recognizes the official dense and MoE checkpoint IDs, selects
-`LingBotVideoPipeline`, and builds the canonical video request envelope:
+The runner recognizes the official Dense and MoE checkpoint IDs, selects
+`LingBotVideoPipeline`, and applies the small smoke-test defaults shown above.
 
 ```bash
 python text_to_video.py \
   --model robbyant/lingbot-video-dense-1.3b \
   --prompt "a robotic arm picks up a red block" \
-  --height 192 --width 320 --num-frames 9 --num-inference-steps 2 \
-  --guidance-scale 3.0 --flow-shift 3.0 --fps 24 \
   --output lingbot_t2v.mp4
 ```
 
-Use the same command with `robbyant/lingbot-video-moe-30b-a3b` for the MoE
-checkpoint. Requested frame counts are rounded upward to the causal
-VAE's `4n+1` grid. For a local checkpoint path whose name does not contain
-`lingbot`, pass `--model-class-name LingBotVideoPipeline`.
+Use `robbyant/lingbot-video-moe-30b-a3b` for the MoE checkpoint. For local
+paths that do not contain `lingbot`, pass
+`--model-class-name LingBotVideoPipeline`. Frame counts are rounded upward
+to the causal VAE's `4n+1` grid.
 
-LingBot-only options such as `batch_cfg` and `output_type` use the shared
-model-extra channel, for example:
+Optional features use the same command:
 
-```bash
-python text_to_video.py \
-  --model robbyant/lingbot-video-dense-1.3b \
-  --extra-body '{"batch_cfg": true, "output_type": "np"}'
-```
+- **Cache-DiT:** add `--cache-backend cache_dit --enforce-eager`. It requires
+  sequential CFG and cannot be combined with HSDP or other distributed/model-
+  parallel modes. Use `--prompt-json` for official structured prompt JSON files.
+- **Refiner:** enable it at startup and request it per generation:
 
-Enable Cache-DiT on the dense Base model with sequential two-pass CFG:
-
-```bash
-python examples/offline_inference/text_to_video/text_to_video.py \
-  --model robbyant/lingbot-video-dense-1.3b \
-  --cache-backend cache_dit --enforce-eager \
-  --prompt-json /path/to/lingbot-video/assets/cases/t2v/example_1/prompt.json \
-  --height 480 --width 832 --num-frames 121 --num-inference-steps 40 \
-  --guidance-scale 3.0 --output lingbot_cache_dit_t2v.mp4
-```
-
-The example applies a balanced Dense T2V preset (`Fn=4`, eight warmup steps,
-at most 16 cached steps, residual threshold `0.12`, medium dynamic SCM, and no
-consecutive cached steps). It was selected using LingBot-Video's official
-five-second `example_1` prompt. Tune these values and recheck output quality for
-other prompts, checkpoints, resolutions, frame counts, or step counts.
-
-Cache-DiT requires `guidance_scale > 1` and cannot use
-`--extra-body '{"batch_cfg": true}'`.
-When Refiner is loaded, Base and Refiner are cached and refreshed separately.
-CPU offload and ordinary layerwise offload remain available, but Cache-DiT
-cannot be combined with HSDP or distributed/model parallel execution.
-
-The official MoE package also contains an optional second 30B-A3B Transformer
-under `refiner/`. Enable it through `--model-config`, then opt into it for a
-request through `--extra-body`. For a single-GPU capacity smoke,
-use sequential CPU offload and move the shared VAE out during both denoise
-stages:
-
-```bash
-python examples/offline_inference/text_to_video/text_to_video.py \
-  --model robbyant/lingbot-video-moe-30b-a3b \
+  ```bash
   --model-config '{"lingbot_refiner":{"enabled":true,"default_run":false,"offload_vae_during_denoise":true}}' \
-  --extra-body '{"run_refiner":true,"offload_vae_during_denoise":true,"refiner_height":192,"refiner_width":320,"refiner_steps":2}' \
-  --enable-cpu-offload \
-  --enforce-eager \
-  --height 192 --width 320 --num-frames 9 --num-inference-steps 2 \
-  --output lingbot_moe_refined_t2v.mp4
-```
+  --extra-body '{"run_refiner":true,"refiner_height":192,"refiner_width":320,"refiner_steps":2}'
+  ```
 
-Base and Refiner use independent schedulers and random generators while
-sharing one text encoder, processor, and VAE. The small Refiner dimensions in
-this command are for functional validation; the official high-resolution
-default is `1920x1088`. CPU offload is a capacity feature and adds large
-host-to-device transfers between the two DiTs.
-
-The MoE checkpoint can shard each complete transformer block across two GPUs
-with HSDP. Grouped expert weights stay inside their owning block and are not
-nested-sharded separately:
-
-```bash
-python examples/offline_inference/text_to_video/text_to_video.py \
-  --model robbyant/lingbot-video-moe-30b-a3b \
-  --use-hsdp --hsdp-shard-size 2 \
-  --height 192 --width 320 --num-frames 9 --num-inference-steps 2 \
-  --output lingbot_moe_hsdp_t2v.mp4
-```
-
-HSDP reduces per-GPU transformer weight residency but adds per-block
-all-gather communication. It cannot be combined with tensor parallelism.
-Use `--enforce-eager` when comparing HSDP output against a single-GPU
-correctness baseline; compiled single-GPU and HSDP execution use different
-Inductor graphs and are not expected to be bitwise identical. Enabling the
-Refiner through `--model-config` makes the same HSDP topology shard both
-outermost DiTs; it does not create a separate Refiner-specific sharding
-implementation.
+  The low resolution above is for smoke testing. Add `--enable-cpu-offload`
+  when Base and Refiner do not fit together on one GPU.
+- **HSDP:** for the MoE checkpoint, add
+  `--use-hsdp --hsdp-shard-size 2`. HSDP shards both loaded DiTs and cannot
+  be combined with tensor parallelism or Cache-DiT.
 
 ### LTX-2
 

@@ -127,38 +127,12 @@ _MODEL_PRESETS = {
     "sana_720p": {
         "height": 704,
         "width": 1280,
-        "num_frames": 121,
+        "num_frames": 81,
         "num_inference_steps": 50,
         "guidance_scale": 6.0,
         "fps": 16,
         "output": "sana_video_720p.mp4",
     },
-}
-
-_LINGBOT_CACHE_DIT_BALANCED_CONFIG = {
-    "Fn_compute_blocks": 4,
-    "Bn_compute_blocks": 0,
-    "max_warmup_steps": 8,
-    "max_cached_steps": 16,
-    "residual_diff_threshold": 0.12,
-    "max_continuous_cached_steps": 1,
-    "enable_taylorseer": False,
-    "taylorseer_order": 1,
-    "scm_steps_mask_policy": "medium",
-    "scm_steps_policy": "dynamic",
-}
-
-_DEFAULT_CACHE_DIT_CONFIG = {
-    "Fn_compute_blocks": 1,
-    "Bn_compute_blocks": 0,
-    "max_warmup_steps": 4,
-    "max_cached_steps": 20,
-    "residual_diff_threshold": 0.24,
-    "max_continuous_cached_steps": 3,
-    "enable_taylorseer": False,
-    "taylorseer_order": 1,
-    "scm_steps_mask_policy": None,
-    "scm_steps_policy": "dynamic",
 }
 
 
@@ -188,10 +162,6 @@ def _detect_preset(model: str, model_class_name: str | None = None) -> dict:
     if "helios" in model_lower or "helios" in class_lower:
         return _MODEL_PRESETS["helios"]
     return _MODEL_PRESETS["wan"]
-
-
-def _is_lingbot(model: str, model_class_name: str | None) -> bool:
-    return "lingbot" in model.lower() or "lingbotvideo" in (model_class_name or "").lower()
 
 
 def build_text_to_video_prompt(prompt: Any, negative_prompt: str | None) -> dict[str, Any]:
@@ -253,11 +223,6 @@ def _load_prompt_json(path: Path) -> dict[str, Any]:
     if not isinstance(prompt, dict):
         raise ValueError("--prompt-json must contain one structured prompt object")
     return prompt
-
-
-def _cache_dit_config(model: str, model_class_name: str | None) -> dict[str, Any]:
-    config = _LINGBOT_CACHE_DIT_BALANCED_CONFIG if _is_lingbot(model, model_class_name) else _DEFAULT_CACHE_DIT_CONFIG
-    return dict(config)
 
 
 def _unwrap_first(output: Any) -> Any:
@@ -555,10 +520,21 @@ def main():
     model_class_name = args.model_class_name
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
-    # Cache-DiT config. LingBot uses its quality-validated balanced preset.
+    # Cache-DiT config.
     cache_config = None
     if args.cache_backend == "cache_dit":
-        cache_config = _cache_dit_config(args.model, model_class_name)
+        cache_config = {
+            "Fn_compute_blocks": 1,
+            "Bn_compute_blocks": 0,
+            "max_warmup_steps": 4,
+            "max_cached_steps": 20,
+            "residual_diff_threshold": 0.24,
+            "max_continuous_cached_steps": 3,
+            "enable_taylorseer": False,
+            "taylorseer_order": 1,
+            "scm_steps_mask_policy": None,
+            "scm_steps_policy": "dynamic",
+        }
 
     profiler_enabled = args.profiler_config is not None
 
