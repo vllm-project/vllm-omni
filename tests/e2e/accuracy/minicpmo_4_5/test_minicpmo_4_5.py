@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """MiniCPM-o 4.5 Daily-Omni + Seed-TTS + Video-MME accuracy regression coverage.
 
-Daily-Omni settings follow the MiniCPM interleaved AV recipe that reaches
-~78% overall accuracy on Daily-Omni (``minicpm-interleave``, ``temperature=0``,
-text modalities with ``use_tts_template``, and server ``--interleave-mm-strings``
-+ 1fps / 128-frame media-io kwargs, also pinned in ``minicpmo_4_5.yaml``).
+Daily-Omni settings follow the MiniCPM interleaved AV recipe (``minicpm-interleave``,
+``temperature=0``, text modalities with ``use_tts_template``, and server
+``--interleave-mm-strings`` + 1fps / 128-frame media-io kwargs, also pinned in
+``minicpmo_4_5.yaml``). Baseline **79.5**; gate **77.5** (drop ≤ 2pp).
 
 Video-MME settings follow OpenBMB OmniEvalKit MiniCPM ``videomme`` (w/o subs):
 ``minicpm-frames``, ``max_frames=96``, ``temperature=0``, ``output_len=128``.
-Official MiniCPM-o 4.5 reports **70.4**; the gate is **0.68** (~2pp margin).
+Baseline **69.0**; gate **67.0** (drop ≤ 2pp).
+
+Seed-TTS (zh, seed-tts-eval protocol): WER baseline **1.414%** / gate **≤ 1.56%**
+(+10%); ASV similarity remains gated at **0.689** by the Ultra coverage.
 """
 
 from __future__ import annotations
@@ -26,7 +29,6 @@ from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
     find_vllm_cli,
 )
 from tests.helpers.mark import hardware_test
-from tests.helpers.minicpmo_4_5_duplex import SERVER_PARAMS as DUPLEX_TEST_PARAMS
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
@@ -39,9 +41,10 @@ _RESULT_DIR = Path(
     )
 )
 
-_MIN_DAILY_OMNI_ACCURACY = 0.78
-# MiniCPM-o 4.5 reports 70.4 on Video-MME (w/o subs); ~2pp margin like Daily-Omni.
-_MIN_VIDEOMME_ACCURACY = float(os.environ.get("ACC_BENCH_MIN_VIDEOMME_ACCURACY", "0.68"))
+# Accuracy gates: baseline minus allowed drop (≤2pp / ≤10% WER).
+_MIN_DAILY_OMNI_ACCURACY = 0.775  # 79.5 - 2pp
+_MIN_VIDEOMME_ACCURACY = float(os.environ.get("ACC_BENCH_MIN_VIDEOMME_ACCURACY", "0.67"))
+# jiwer reports a 0-1 ratio; table 1.414 / 1.56 is percent → 0.0156.
 _MAX_SEED_TTS_MEAN_WER = 0.0156
 _MIN_SEED_TTS_MEAN_SIM = 0.689
 # Full Seed-TTS zh split (seed-tts-eval/zh/meta.lst) is 2020 rows.
@@ -214,7 +217,7 @@ def test_minicpmo_4_5_daily_omni_accuracy_bench(omni_server) -> None:
     assert _acc_bench.run_acc_benchmark(_acc_bench.parse_acc_benchmark_args(argv)) == 0
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", videomme_test_params, indirect=True)
 def test_minicpmo_4_5_videomme_accuracy_bench(omni_server) -> None:
     """Gate MiniCPM-o 4.5 Video-MME (w/o subs) overall accuracy at the OmniEvalKit recipe."""

@@ -86,12 +86,27 @@ steps:
           - export SEED_TTS_WER_EVAL=1
           - export SEED_TTS_SIM_EVAL=1
           - export SEED_TTS_EVAL_DEVICE=npu:1
+          - |
+            set +e
+            pytest -s -v tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py -k "not videomme" -m "full_model and npu and A3" --run-level full_model
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/e2e/accuracy/minicpmo_4_5/results/*.json"
+            exit $$EXIT
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Video-MME Accuracy Test"
+        key: nightly-omni-accuracy-minicpmo-4-5-videomme-npu
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          HF_TOKEN: "${HF_TOKEN}"
+        commands:
           # Video-MME needs no repo override here: the NPU runners pre-stage the dataset under
           # the lmms-eval mirror, which is now VIDEOMME_DEFAULT_HF_REPO, so snapshot_download
           # resolves it straight out of the hub cache.
           - |
             set +e
-            pytest -s -v tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py -m "full_model and npu and A3" --run-level full_model
+            pytest -s -v tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py -k videomme -m "full_model and npu and A3" --run-level full_model
             EXIT=$$?
             buildkite-agent artifact upload "tests/e2e/accuracy/minicpmo_4_5/results/*.json"
             exit $$EXIT
