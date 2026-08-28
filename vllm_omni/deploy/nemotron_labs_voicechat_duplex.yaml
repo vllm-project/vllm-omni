@@ -15,14 +15,19 @@
 # edits for the eager fp32 reference execution.
 #
 # Native-talker semantics:
-#   * stage 1 sets max_num_batched_tokens: 1 — the per-frame code feedback is
-#     strictly sequential, so coalesced chunks must be consumed one engine
-#     position per step (the speaker prefill chunks through
-#     hf_overrides.talker_init_len single steps at session start, ~0.2 s
-#     once).
+#   * stage 1 sets max_num_batched_tokens: 64 so the speaker-prompt prefill
+#     (hf_overrides.talker_init_len positions, embeddings precomputed — no
+#     step-to-step feedback) runs as ONE chunked prefill at session start.
+#     The per-frame code feedback IS strictly sequential, so the
+#     thinker->talker producer ships at most one new timeline token per
+#     chunk (drip; see thinker2talker_async_chunk) — at most one timeline
+#     position is ever schedulable per engine step.
 #   * the connector extra `native_talker: true` makes the thinker->talker
 #     producer append one engine position PER NEW timeline token (engine
 #     positions map 1:1 onto timeline steps).
+#   * matching NeMo's realtime pipeline, the talker never sees the system
+#     prompt (it conditions the thinker only); the duplex timeline is one
+#     anchor PAD + the per-frame text tokens.
 #   * classifier-free guidance is OFF by default (measured ASR-equivalent at
 #     this checkpoint's guidance_scale=0.2); opt in via
 #     hf_overrides.native_talker_guidance below (duplex pacing stays
@@ -73,7 +78,7 @@ stages:
     # hf_overrides block (and the connector's native_talker flag above) for
     # the vendored eager talker of the reference duplex deployment.
     enforce_eager: false
-    max_num_batched_tokens: 1
+    max_num_batched_tokens: 64
     hf_overrides:
       use_native_talker: true
       talker_init_len: 37

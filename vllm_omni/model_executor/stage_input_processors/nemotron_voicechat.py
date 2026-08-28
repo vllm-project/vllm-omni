@@ -164,11 +164,14 @@ def thinker2talker_async_chunk(
     generated_now = [int(token_id) for token_id in (getattr(request, "output_token_ids", None) or [])]
     prompt_ids = list(getattr(request, "prompt_token_ids", None) or [])
     if is_duplex:
-        runtime_config = duplex_info.get("runtime_config")
-        runtime_prompt = runtime_config.get("nvc_prompt_token_ids") if isinstance(runtime_config, dict) else None
-        if not isinstance(runtime_prompt, list | tuple) or not runtime_prompt:
-            raise ValueError("Nemotron VoiceChat duplex stage transfer lacks nvc_prompt_token_ids")
-        logical_prompt_len = len(runtime_prompt)
+        # NeMo's realtime pipeline never feeds the system prompt to the TTS
+        # model — the prompt conditions the thinker's KV only, and the talker
+        # sees just the speaker prefill plus the per-frame text tokens. A
+        # single leading PAD anchors timeline position 0 (the NeMo per-frame
+        # loop reads timeline[t-1] as the previous subword at t=1). The
+        # OFFLINE pipelines keep the full PAD prompt region for bit parity
+        # with NeMo's offline recipe.
+        logical_prompt_len = 1
         previous = list(state.get("nvc_duplex_text_tokens", ())) if isinstance(state, dict) else []
         if has_step_snapshot:
             generated = previous + generated_delta
@@ -188,9 +191,31 @@ def thinker2talker_async_chunk(
         pad_id = int(reported_pad)
     timeline = [pad_id] * logical_prompt_len + generated
 
+    # The NATIVE talker (connector extra ``native_talker: true``, matching the
+    # stage's hf_overrides.use_native_talker) maps engine positions 1:1 onto
+    # timeline steps and consumes them strictly sequentially (per-frame code
+    # feedback), so a chunk must never make more than ONE new timeline step
+    # schedulable at once when the stage batches prompt tokens
+    # (max_num_batched_tokens > 1 lets the speaker prefill run as one chunked
+    # prefill). The vendored talker drains chunks model-side instead.
+    connector = getattr(transfer_manager, "connector", None)
+    raw_cfg = getattr(connector, "config", {}) or {}
+    cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
+    native_talker = bool(cfg.get("native_talker", False))
+
     # Skip no-progress wakeups (same length as the last emitted chunk).
     last_len = int(state.get("nvc_timeline_len", -1)) if isinstance(state, dict) else -1
-    if len(timeline) <= last_len and not is_finished:
+    if is_duplex and native_talker:
+        # Drip: ship at most one NEW timeline token per producer invocation.
+        # The producer fires on every thinker step (one per 80 ms frame, and
+        # the duplex thinker never stops emitting), so a save-thread burst
+        # that coalesced K thinker steps drains within K subsequent wakes —
+        # audio trails text by at most one frame per coalesced token.
+        ship_len = min(len(timeline), max(last_len, logical_prompt_len) + 1)
+        if ship_len <= last_len and not is_finished:
+            return None
+        timeline = timeline[:ship_len]
+    elif len(timeline) <= last_len and not is_finished:
         return None
     transfer_manager.request_payload[request_id] = {
         "nvc_timeline_len": len(timeline),
@@ -209,22 +234,13 @@ def thinker2talker_async_chunk(
         if max_tokens is not None:
             expected_total = logical_prompt_len + int(max_tokens)
 
-    # The NATIVE talker (connector extra ``native_talker: true``, matching the
-    # stage's hf_overrides.use_native_talker) maps engine positions 1:1 onto
-    # timeline steps, so each chunk must append exactly as many placeholder
-    # positions as it carries NEW timeline tokens (a coalesced chunk would
-    # otherwise leave the audio permanently behind the text). The vendored
-    # talker drains model-side and keeps the 1-position default.
-    connector = getattr(transfer_manager, "connector", None)
-    raw_cfg = getattr(connector, "config", {}) or {}
-    cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
-    native_talker = bool(cfg.get("native_talker", False))
     new_positions = 1
     if native_talker:
         # A timeline of length L needs L-1 engine positions (the NeMo loop
         # starts at t=1), so grow by new_len - previous_len against a baseline
-        # of 1 for the first chunk.
-        new_positions = max(len(timeline) - max(last_len, 1), 1)
+        # of logical_prompt_len for the first chunk. Under the duplex drip
+        # above this is exactly 1 per chunk.
+        new_positions = max(len(timeline) - max(last_len, logical_prompt_len), 1)
 
     return OmniPayloadStruct(
         ids=IdsStruct(all=timeline, prompt=[0]),

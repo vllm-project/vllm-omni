@@ -603,9 +603,9 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
                     f"NemotronVoiceChat native talker got a span [{offset}, {offset + span}) crossing "
                     f"the speaker-prompt boundary ({init_len}); the stage prompt must be exactly "
                     f"{init_len} placeholder tokens (set hf_overrides.talker_init_len / "
-                    f"async_chunk_prewarm_prompt_len to {init_len} in the deploy yaml) "
-                    "and duplex configs must schedule one timeline position per step "
-                    "(max_num_batched_tokens: 1 on this stage)."
+                    f"async_chunk_prewarm_prompt_len to {init_len} in the deploy yaml). A timeline "
+                    "chunk extended this request before its speaker prefill finished — timeline "
+                    "positions are strictly sequential and cannot share a step with the prefill."
                 )
             prefill: torch.Tensor = session["prefill_embeds"]
             return input_ids, prefill[offset : offset + span].to(self._dtype), {}
@@ -613,8 +613,10 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         if span != 1:
             raise RuntimeError(
                 f"NemotronVoiceChat native talker was scheduled {span} timeline positions in one "
-                "step; the per-frame code feedback is strictly sequential. Duplex/async configs "
-                "must set max_num_batched_tokens: 1 on this stage."
+                "step; the per-frame code feedback is strictly sequential. The duplex producer "
+                "drips one new timeline token per chunk — more than one schedulable position "
+                "means chunks outpaced engine steps (raise the frame budget or investigate the "
+                "engine stall)."
             )
         t = offset - init_len + 1
         total = int(session["timeline"].numel())
@@ -1018,4 +1020,19 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
                     "using the eager per-frame step.",
                     reason,
                 )
+        if self._use_native_backbone:
+            # Capture the per-frame MoG sampling graph at load time; a lazy
+            # first-frame capture would otherwise cost the first session a
+            # few hundred ms of first-packet latency.
+            from vllm_omni.model_executor.models.nemotron_voicechat.talker_native import (
+                MoGStepGraph,
+            )
+
+            mog_batch = 2 if self._native_guidance else 1
+            self._mog_graph = MoGStepGraph(
+                self.tts.tts_model,
+                self.tts._get_generation_config(self._native_guidance),
+                batch=mog_batch,
+            )
+            self._mog_graph.ensure_captured(torch.zeros(mog_batch, 1, self._hidden, dtype=self._dtype, device=device))
         return {name for name, _ in self.named_parameters()}
