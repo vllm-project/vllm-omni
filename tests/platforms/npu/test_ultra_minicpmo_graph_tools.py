@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -169,6 +169,61 @@ def test_graph_limit_keeps_unseen_signatures_on_eager(monkeypatch):
     torch.testing.assert_close(unseen[0], torch.tensor([2.0, 3.0]))
 
 
+def test_run_with_info_reports_capture_replay_and_bounded_fallback(monkeypatch):
+    runner = NPUExactGraphRunner(max_graphs=1)
+
+    class _FunctionalGraph:
+        tensor_workspace_bytes = 64
+
+        def __init__(self, compute):
+            self.compute = compute
+
+        def replay(self, inputs):
+            return self.compute(*inputs)
+
+    monkeypatch.setattr(runner, "_eligible", lambda inputs: True)
+    monkeypatch.setattr(
+        runner,
+        "capture",
+        lambda inputs, compute: _FunctionalGraph(compute),
+    )
+
+    first, capture = runner.run_with_info(
+        "unit",
+        (torch.tensor([1.0]),),
+        ("bucket",),
+        lambda value: (value + 1,),
+    )
+    second, replay = runner.run_with_info(
+        "unit",
+        (torch.tensor([2.0]),),
+        ("bucket",),
+        lambda value: (value + 1,),
+    )
+    fallback, miss = runner.run_with_info(
+        "unit",
+        (torch.tensor([3.0, 4.0]),),
+        ("other",),
+        lambda value: (value + 100,),
+        fallback_compute=lambda value: (value - 1,),
+    )
+
+    torch.testing.assert_close(first[0], torch.tensor([2.0]))
+    torch.testing.assert_close(second[0], torch.tensor([3.0]))
+    torch.testing.assert_close(fallback[0], torch.tensor([2.0, 3.0]))
+    assert (capture.mode, capture.reason, capture.workspace_bytes) == ("capture", "signature_miss", 64)
+    assert (replay.mode, replay.reason, replay.workspace_bytes) == ("replay", None, 64)
+    assert (miss.mode, miss.reason, miss.workspace_bytes) == ("fallback", "graph_capacity", 0)
+    assert runner.telemetry == {
+        "captures": 1,
+        "failed": 0,
+        "hits": 1,
+        "misses": 2,
+        "fallbacks": 1,
+        "workspace_bytes": 64,
+    }
+
+
 @pytest.mark.parametrize(
     ("additional_config", "environment", "expected"),
     [
@@ -189,6 +244,53 @@ def test_graph_settings_prioritize_stage_config(monkeypatch, additional_config, 
 
     assert enabled is expected
     assert max_graphs == 32
+
+
+@pytest.mark.parametrize(
+    ("additional_config", "environment", "expected"),
+    [
+        ({"code2wav_enable_cfm_loop_npu_graph": False}, "1", False),
+        ({"code2wav_enable_cfm_loop_npu_graph": True}, "0", True),
+        ({}, "1", True),
+        ({}, None, False),
+    ],
+)
+def test_cfm_loop_graph_is_opt_in_and_config_wins(
+    monkeypatch,
+    additional_config,
+    environment,
+    expected,
+):
+    if environment is None:
+        monkeypatch.delenv(code2wav_patch._LOOP_ENABLE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(code2wav_patch._LOOP_ENABLE_ENV, environment)
+    monkeypatch.delenv(code2wav_patch._LOOP_MAX_GRAPHS_ENV, raising=False)
+    model = SimpleNamespace(vllm_config=SimpleNamespace(additional_config=additional_config))
+
+    enabled, max_graphs = code2wav_patch._cfm_loop_graph_settings(model)
+
+    assert enabled is expected
+    assert max_graphs == 8
+
+
+@pytest.mark.parametrize("value", ["invalid", "", "2", -1, 2])
+def test_cfm_loop_graph_rejects_invalid_boolean(monkeypatch, value):
+    monkeypatch.setenv(code2wav_patch._LOOP_ENABLE_ENV, str(value))
+    model = SimpleNamespace(vllm_config=SimpleNamespace(additional_config={}))
+
+    with pytest.raises(ValueError, match="explicit boolean"):
+        code2wav_patch._cfm_loop_graph_settings(model)
+
+
+@pytest.mark.parametrize("value", ["invalid", "-1", "9"])
+def test_cfm_loop_graph_rejects_invalid_capacity(monkeypatch, value):
+    monkeypatch.setenv(code2wav_patch._LOOP_ENABLE_ENV, "1")
+    monkeypatch.setenv(code2wav_patch._LOOP_MAX_GRAPHS_ENV, value)
+    model = SimpleNamespace(vllm_config=SimpleNamespace(additional_config={}))
+
+    with pytest.raises(ValueError, match=r"integer in \[0, 8\]"):
+        code2wav_patch._cfm_loop_graph_settings(model)
 
 
 def test_code2wav_runtime_disables_internal_format_and_jit(monkeypatch):
@@ -344,3 +446,160 @@ def test_estimator_graph_dispatch_separates_fp16_and_fallback_epochs(monkeypatch
     dispatch()
 
     assert constants == [(False, "float16"), (False, "float32")]
+
+
+@pytest.mark.parametrize("mode", ["capture", "replay"])
+def test_cfm_loop_graph_dispatch_uses_exact_bucket_and_single_clone_boundary(monkeypatch, mode):
+    calls = []
+    timeline = []
+
+    class _Backend:
+        _npu_flow_float16_requested = False
+        _npu_autocast_available = None
+        _cfm_loop_bucket = "first"
+        n_timesteps = 6
+        flow = SimpleNamespace(decoder=SimpleNamespace(estimator=object()))
+
+        def _emit_timeline(self, event, **kwargs):
+            timeline.append((event, kwargs))
+
+    class _Runner:
+        telemetry = {
+            "captures": 1,
+            "failed": 0,
+            "hits": int(mode == "replay"),
+            "misses": 1,
+            "fallbacks": 0,
+            "workspace_bytes": 128,
+        }
+
+        def run_with_info(self, operation, inputs, constants, compute, *, fallback_compute):
+            del fallback_compute
+            calls.append((operation, constants, len(inputs)))
+            return compute(*inputs), SimpleNamespace(
+                mode=mode,
+                reason="signature_miss" if mode == "capture" else None,
+                workspace_bytes=128,
+            )
+
+    backend = _Backend()
+    code2wav_patch._backend_loop_graph_runners[backend] = _Runner()
+    monkeypatch.setattr(code2wav_patch, "_original_decode_cfm", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        code2wav_patch,
+        "_cfm_loop_constants",
+        lambda *args, **kwargs: SimpleNamespace(num_bytes=16),
+    )
+    monkeypatch.setattr(
+        code2wav_patch,
+        "_graphable_cfm_loop",
+        lambda instance, estimator, loop_constants, **kwargs: (
+            kwargs["mu"] + 1,
+            kwargs["mu"].new_zeros(1),
+            kwargs["mu"].new_zeros(1),
+        ),
+    )
+    value = torch.tensor([[[2.0]]])
+
+    outputs = code2wav_patch._patched_decode_cfm(
+        backend,
+        value,
+        torch.tensor([[1.0]]),
+        value,
+        cnn_cache=None,
+        att_cache=None,
+    )
+
+    torch.testing.assert_close(outputs[0], torch.tensor([[[3.0]]]))
+    assert calls == [("cfm_loop:first", (False, 6, "float32"), 3)]
+    assert timeline[0][0] == f"cfm_loop_graph_{mode}"
+    assert timeline[0][1]["details"]["bucket"] == "first"
+
+
+def test_cfm_loop_capacity_falls_back_to_estimator_graph(monkeypatch):
+    original_calls = []
+
+    class _Backend:
+        _npu_flow_float16_requested = False
+        _npu_autocast_available = None
+        n_timesteps = 10
+        flow = SimpleNamespace(decoder=SimpleNamespace(estimator=object()))
+
+        def _emit_timeline(self, *args, **kwargs):
+            pass
+
+    class _Runner:
+        telemetry = {
+            "captures": 8,
+            "failed": 0,
+            "hits": 0,
+            "misses": 9,
+            "fallbacks": 1,
+            "workspace_bytes": 128,
+        }
+
+        def run_with_info(self, operation, inputs, constants, compute, *, fallback_compute):
+            del operation, constants, compute
+            return fallback_compute(*inputs), SimpleNamespace(
+                mode="fallback",
+                reason="graph_capacity",
+                workspace_bytes=0,
+            )
+
+    def original(instance, mu, speakers, cond, *, cnn_cache, att_cache):
+        del instance, speakers, cond, cnn_cache, att_cache
+        original_calls.append(True)
+        return mu - 1, mu.new_zeros(1), mu.new_zeros(1)
+
+    backend = _Backend()
+    code2wav_patch._backend_loop_graph_runners[backend] = _Runner()
+    monkeypatch.setattr(code2wav_patch, "_original_decode_cfm", original)
+    value = torch.tensor([[[2.0]]])
+
+    outputs = code2wav_patch._patched_decode_cfm(
+        backend,
+        value,
+        torch.tensor([[1.0]]),
+        value,
+        cnn_cache=None,
+        att_cache=None,
+    )
+
+    assert original_calls == [True]
+    torch.testing.assert_close(outputs[0], torch.tensor([[[1.0]]]))
+
+
+@pytest.mark.parametrize(
+    ("speech_width", "last_chunk", "expected"),
+    [(0, False, "first"), (2, False, "steady"), (0, True, "tail")],
+)
+def test_decode_wrapper_labels_first_steady_and_tail_buckets(
+    monkeypatch,
+    speech_width,
+    last_chunk,
+    expected,
+):
+    seen = []
+
+    class _Backend:
+        pass
+
+    def original(instance, *args, **kwargs):
+        seen.append(instance._cfm_loop_bucket)
+        return [], []
+
+    backend = _Backend()
+    state = SimpleNamespace(hift_cache={"speech": torch.zeros(1, speech_width)})
+    monkeypatch.setattr(code2wav_patch, "_original_decode_batch", original)
+    monkeypatch.setattr(code2wav_patch, "_flow_execution_context", lambda *args, **kwargs: nullcontext())
+
+    code2wav_patch._patched_decode_batch(
+        backend,
+        torch.zeros(1, 1),
+        object(),
+        [state],
+        last_chunk=last_chunk,
+    )
+
+    assert seen == [expected]
+    assert not hasattr(backend, "_cfm_loop_bucket")

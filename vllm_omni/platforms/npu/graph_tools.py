@@ -24,6 +24,11 @@ class CapturedDeviceGraph:
     static_inputs: tuple[torch.Tensor, ...]
     static_outputs: tuple[torch.Tensor, ...]
 
+    @property
+    def tensor_workspace_bytes(self) -> int:
+        """Host-computable size of graph-owned static tensor storage."""
+        return sum(value.numel() * value.element_size() for value in (*self.static_inputs, *self.static_outputs))
+
     def replay(self, inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
         with torch.inference_mode():
             for static, current in zip(self.static_inputs, inputs, strict=True):
@@ -34,8 +39,21 @@ class CapturedDeviceGraph:
             return tuple(output.detach().clone() for output in self.static_outputs)
 
 
+@dataclass(frozen=True)
+class GraphRunInfo:
+    """Selection metadata for one exact-graph invocation."""
+
+    mode: str
+    reason: str | None
+    workspace_bytes: int
+
+
 def _tensor_signature(value: torch.Tensor) -> tuple[tuple[int, ...], str, str]:
     return tuple(value.shape), str(value.dtype), str(value.device)
+
+
+def _graph_workspace_bytes(graph: object) -> int:
+    return int(getattr(graph, "tensor_workspace_bytes", 0))
 
 
 class NPUExactGraphRunner:
@@ -55,6 +73,8 @@ class NPUExactGraphRunner:
         self._graphs: dict[tuple[object, ...], CapturedDeviceGraph] = {}
         self._failed_keys: set[tuple[object, ...]] = set()
         self._hits = 0
+        self._misses = 0
+        self._fallbacks = 0
         self._graph_pool: object | None = None
 
     @staticmethod
@@ -90,12 +110,35 @@ class NPUExactGraphRunner:
             and not self._stream_is_capturing()
         )
 
+    def _ineligible_reason(self, inputs: tuple[torch.Tensor, ...]) -> str | None:
+        if not self._enabled:
+            return "disabled"
+        if not inputs:
+            return "empty_inputs"
+        if not all(value.device.type == "npu" for value in inputs):
+            return "non_npu"
+        if not self.is_supported():
+            return "unsupported_api"
+        if self._stream_is_capturing():
+            return "nested_capture"
+        return None
+
     @property
     def stats(self) -> dict[str, int]:
         return {
             "captures": len(self._graphs),
             "failed": len(self._failed_keys),
             "hits": self._hits,
+        }
+
+    @property
+    def telemetry(self) -> dict[str, int]:
+        """Extended Host-only counters without changing the legacy stats API."""
+        return {
+            **self.stats,
+            "misses": self._misses,
+            "fallbacks": self._fallbacks,
+            "workspace_bytes": sum(_graph_workspace_bytes(graph) for graph in self._graphs.values()),
         }
 
     def capture(
@@ -127,13 +170,37 @@ class NPUExactGraphRunner:
         constants: tuple[object, ...],
         compute: Callable[..., tuple[torch.Tensor, ...]],
     ) -> tuple[torch.Tensor, ...]:
+        outputs, _ = self.run_with_info(operation, inputs, constants, compute)
+        return outputs
+
+    def run_with_info(
+        self,
+        operation: str,
+        inputs: tuple[torch.Tensor, ...],
+        constants: tuple[object, ...],
+        compute: Callable[..., tuple[torch.Tensor, ...]],
+        *,
+        fallback_compute: Callable[..., tuple[torch.Tensor, ...]] | None = None,
+    ) -> tuple[tuple[torch.Tensor, ...], GraphRunInfo]:
+        """Run an exact graph and expose capture/replay/fallback selection.
+
+        ``fallback_compute`` is used only when graph execution is ineligible or
+        the bounded cache is full. Capture failures remain fatal because the
+        torch-npu allocator/capture state cannot be assumed reusable.
+        """
         if self._failed_keys:
             raise RuntimeError(
                 f"{self.component_name} cannot continue after a failed NPUGraph capture; "
                 f"restart the stage process and {self.disable_config_hint} before retrying."
             )
         if not self._eligible(inputs):
-            return compute(*inputs)
+            self._fallbacks += 1
+            fallback = compute if fallback_compute is None else fallback_compute
+            return fallback(*inputs), GraphRunInfo(
+                mode="fallback",
+                reason=self._ineligible_reason(inputs) or "ineligible",
+                workspace_bytes=0,
+            )
 
         key = (
             operation,
@@ -145,18 +212,30 @@ class NPUExactGraphRunner:
             self._hits += 1
             if self._hits == 1:
                 logger.info("%s started NPUGraph replay", self.component_name)
-            return graph.replay(inputs)
+            return graph.replay(inputs), GraphRunInfo(
+                mode="replay",
+                reason=None,
+                workspace_bytes=_graph_workspace_bytes(graph),
+            )
 
-        # Prime lazy kernels and allocator state before capture. The current
-        # call returns eager outputs; the next exact signature replays the graph.
-        eager_outputs = compute(*inputs)
+        self._misses += 1
         if len(self._graphs) >= self.max_graphs:
+            self._fallbacks += 1
             logger.warning_once(
                 "%s reached the %d-entry NPUGraph limit; new tensor shapes will use eager execution.",
                 self.component_name,
                 self.max_graphs,
             )
-            return eager_outputs
+            fallback = compute if fallback_compute is None else fallback_compute
+            return fallback(*inputs), GraphRunInfo(
+                mode="fallback",
+                reason="graph_capacity",
+                workspace_bytes=0,
+            )
+
+        # Prime lazy kernels and allocator state before capture. The current
+        # call returns eager outputs; the next exact signature replays the graph.
+        eager_outputs = compute(*inputs)
         try:
             self._graphs[key] = self.capture(inputs, compute)
         except Exception as exc:
@@ -180,4 +259,9 @@ class NPUExactGraphRunner:
             self.max_graphs,
             operation,
         )
-        return eager_outputs
+        captured = self._graphs[key]
+        return eager_outputs, GraphRunInfo(
+            mode="capture",
+            reason="signature_miss",
+            workspace_bytes=_graph_workspace_bytes(captured),
+        )
