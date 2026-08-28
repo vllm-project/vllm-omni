@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Structured payload types for inter-stage communication.
 
 Categories under ``OmniPayload``:
@@ -12,11 +12,15 @@ Categories under ``OmniPayload``:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import msgspec
 import numpy as np
 import torch
+
+REQUEST_ARTIFACT_DIRS_KEY = "_omni_request_artifact_dirs"
+TRANSFORM_OWNED_META_KEYS = frozenset({"minimax_h3_prepared_reference_videos"})
 
 if TYPE_CHECKING:
     from vllm_omni.engine import AdditionalInformationEntry, AdditionalInformationPayload
@@ -75,6 +79,7 @@ class OmniPayloadMeta(TypedDict, total=False):
     num_processed_tokens: int
     next_stage_prompt_len: int
     replace_streaming_prompt: bool
+    replace_runtime_additional_information: bool
     ar_width: int
     eol_token_id: int
     visual_token_start_id: int
@@ -96,6 +101,8 @@ class OmniPayloadMeta(TypedDict, total=False):
     # reproducible, and the producing stage's SamplingParams do not travel
     # with the payload.
     audio_seed: int
+    token_role_ids: torch.Tensor
+    minimax_h3_prepared_reference_videos: str
 
 
 class OmniPayload(TypedDict, total=False):
@@ -116,7 +123,9 @@ class OmniPayload(TypedDict, total=False):
 # ── msgspec.Struct mirror of the TypedDicts (runtime-validated) ──
 
 
-class _StructBase(msgspec.Struct, omit_defaults=True, kw_only=True, forbid_unknown_fields=True):
+class _StructBase(  # type: ignore[call-arg]
+    msgspec.Struct, omit_defaults=True, kw_only=True, forbid_unknown_fields=True
+):
     pass
 
 
@@ -175,6 +184,7 @@ class MetaStruct(_StructBase):
     num_processed_tokens: int | None = None
     next_stage_prompt_len: int | None = None
     replace_streaming_prompt: bool | None = None
+    replace_runtime_additional_information: bool | None = None
     ar_width: int | None = None
     eol_token_id: int | None = None
     visual_token_start_id: int | None = None
@@ -195,6 +205,8 @@ class MetaStruct(_StructBase):
     code_flat_numel: int | None = None
     omni_final_stage_id: int | None = None
     audio_seed: int | None = None
+    token_role_ids: torch.Tensor | None = None
+    minimax_h3_prepared_reference_videos: str | None = None
 
 
 class OmniPayloadStruct(_StructBase):
@@ -308,7 +320,7 @@ def _dtype_to_name(dtype: torch.dtype) -> str:
 _NESTED_KEYS = frozenset({"hidden_states", "embed", "ids", "codes", "meta"})
 
 
-def flatten_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def flatten_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Flatten a nested ``OmniPayload`` to dotted keys.
 
     Nested sub-dicts under ``_NESTED_KEYS`` are expanded:
@@ -359,17 +371,25 @@ def _serialize_tensor(t: torch.Tensor) -> AdditionalInformationEntry:
 
     t_cpu = t.detach().to("cpu").contiguous()
     return AdditionalInformationEntry(
-        tensor_data=t_cpu.numpy().tobytes(),
+        tensor_data=t_cpu.flatten().view(torch.uint8).numpy().tobytes(),
         tensor_shape=list(t_cpu.shape),
         tensor_dtype=_dtype_to_name(t_cpu.dtype),
     )
 
 
 def _deserialize_tensor(entry: AdditionalInformationEntry) -> torch.Tensor:
-    dt = np.dtype(entry.tensor_dtype or "float32")
-    arr = np.frombuffer(entry.tensor_data, dtype=dt)  # type: ignore[arg-type]
-    arr = arr.reshape(entry.tensor_shape)
-    return torch.from_numpy(arr.copy())
+    dtype_name = entry.tensor_dtype or "float32"
+    dtype = getattr(torch, dtype_name, None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"Unsupported tensor dtype: {dtype_name}")
+
+    if entry.tensor_shape is None:
+        raise ValueError("Tensor shape is required")
+    if not entry.tensor_data:
+        return torch.empty(0, dtype=dtype).reshape(entry.tensor_shape)
+
+    data = torch.frombuffer(bytearray(entry.tensor_data), dtype=torch.uint8)
+    return data.view(dtype).reshape(entry.tensor_shape)
 
 
 def serialize_payload(

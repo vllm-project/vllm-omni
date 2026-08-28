@@ -1,7 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
+import time
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 import numpy as np
@@ -104,6 +108,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         # Cache per-request flag to avoid repeated deserialization of additional_information
         self._omits_kv_transfer_cache: dict[str, bool] = {}
+
+        # KV-wait start ts for the vllm_omni:kv_wait_s metric; see
+        # _emit_kv_wait_output for the engine-core → orchestrator carry.
+        self._kv_wait_start_ts: dict[str, float] = {}
         self._init_omni_io_scheduling_state()
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
@@ -112,6 +120,70 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
         # Output placeholders are zero when async scheduling isn't used
         return request.num_computed_tokens - request.num_output_placeholders
+
+    def _resolve_kv_connector_type(self) -> str:
+        """Connector backend name for the ``kv_wait_s`` label, or ``unknown``."""
+        connector_cfg = self._get_omni_kv_config_value("connector_config")
+        if isinstance(connector_cfg, dict):
+            c_type = connector_cfg.get("type")
+            if isinstance(c_type, str) and c_type:
+                return c_type
+        return "unknown"
+
+    def _emit_kv_wait_output(
+        self,
+        outputs: dict[int, list[OmniEngineCoreOutput]],
+        req_id: str,
+        req: Request,
+    ) -> None:
+        """Carry the KV-wait duration for ``req_id`` across the process boundary.
+
+        Pops the start ts recorded at ENTER (``_free_request``); skips silently
+        when none was recorded. The wait rides ``kv_transfer_params`` to the
+        orchestrator, which calls ``observe_kv_wait``.
+        """
+        start_ts = self._kv_wait_start_ts.pop(req_id, None)
+        if start_ts is None:
+            return
+        kv_wait_s = max(time.monotonic() - start_ts, 0.0)
+        outputs.setdefault(req.client_index, []).append(
+            OmniEngineCoreOutput(
+                request_id=req_id,
+                new_token_ids=[],
+                kv_transfer_params={
+                    "kv_wait_s": kv_wait_s,
+                    "connector_type": self._resolve_kv_connector_type(),
+                },
+            )
+        )
+
+    def _clear_kv_wait_starts(self, request_ids: Iterable[str]) -> None:
+        """Drop incomplete KV-wait measurements for terminal requests."""
+        wait_starts = getattr(self, "_kv_wait_start_ts", None)
+        if wait_starts is None:
+            return
+        for request_id in request_ids:
+            wait_starts.pop(request_id, None)
+
+    def finish_requests(
+        self,
+        request_ids: str | Iterable[str] | None,
+        finished_status: RequestStatus,
+    ) -> list[Request]:
+        """Finish requests and discard any incomplete KV-wait timing."""
+        if isinstance(request_ids, str):
+            cleanup_ids = (request_ids,)
+            finish_request_ids: str | tuple[str, ...] | None = request_ids
+        elif request_ids is None:
+            cleanup_ids = ()
+            finish_request_ids = None
+        else:
+            finish_request_ids = list(request_ids) if isinstance(request_ids, Iterator) else request_ids
+            cleanup_ids = tuple(finish_request_ids)
+
+        finished = super().finish_requests(finish_request_ids, finished_status)
+        self._clear_kv_wait_starts(cleanup_ids)
+        return finished
 
     def _get_kv_transfer_criteria(self) -> dict | None:
         return self._get_omni_kv_config_value("kv_transfer_criteria")
@@ -223,7 +295,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
         # requests in the waiting/running queues temporarily.
-        for queue in (self.waiting, self.running):
+        waiting = getattr(self, "waiting")
+        running = getattr(self, "running")
+        for queue in (waiting, running):
             for req in list(queue):
                 if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
                     queue.remove(req)
@@ -231,7 +305,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         original_waiting = None
         if self._should_defer_waiting_admission():
-            original_waiting = self.waiting
+            original_waiting = waiting
             self.waiting = create_request_queue(self.policy)
 
         try:
@@ -270,7 +344,24 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         inter_stage_outputs = getattr(model_runner_output, "inter_stage_outputs", None)
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
+        ec_connector_output = getattr(model_runner_output, "ec_connector_output", None)
         cudagraph_stats: CUDAGraphStat | None = model_runner_output.cudagraph_stats
+
+        # Every GPU write enqueued by this and earlier steps has completed, so
+        # it is safe to return deferred-free blocks to the pool. This is the
+        # update-side half of the upstream v0.28 deferred-free fence; the schedule
+        # half advances sched_step_seq inside super().schedule().
+        # getattr: __new__-constructed test schedulers carry no
+        # defer_block_free attribute.
+        if (
+            getattr(self, "defer_block_free", False)
+            # getattr again: SchedulerOutput is mocked field-by-field in the
+            # scheduler unit tests, and dataclass fields without defaults are
+            # invisible to MagicMock(spec=...).
+            and getattr(scheduler_output, "total_num_scheduled_tokens", 0) > 0
+        ):
+            self.processed_step_seq += 1
+            self._drain_deferred_frees()
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -306,6 +397,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                                 kv_transfer_params={"kv_ready": True},
                             )
                         )
+                    # EXIT: extraction ack ends the wait — carry the duration.
+                    # req is still alive here (the del happens in the cleanup
+                    # loop below); skip if it was already freed upstream.
+                    if req is not None:
+                        self._emit_kv_wait_output(outputs, req_id, req)
                 except Exception:
                     init_logger(__name__).exception("Failed to pre-process KV extraction for %s", req_id)
 
@@ -412,6 +508,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             mm_output = mm_outputs[req_index] if mm_outputs else None
             inter_stage_output = inter_stage_outputs[req_index] if inter_stage_outputs else None
             kv_transfer_params = None
+            ec_transfer_params = None
             finish_reason = None
             routed_experts = None
 
@@ -463,7 +560,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request.resumable = False
                     stopped = True
 
+            # Finalize prefill stats BEFORE stop handling (upstream v0.28
+            # order): _free_request below releases the KV blocks, after which
+            # estimate_cached_tokens(request) reports 0. kv_transfer_params is
+            # omitted from the emission predicate here because it only becomes
+            # non-None when stopped is already True.
+            prefill_stats = None
+            if new_token_ids or mm_output is not None or pooler_output is not None or stopped:
+                prefill_stats = request.take_prefill_stats()
+                if prefill_stats is not None:
+                    prefill_stats.finalize(self.kv_cache_manager.estimate_cached_tokens(request))
+
+            confirmed_num_computed_tokens = None
             if stopped:
+                if self.chunk_transfer_adapter is not None:
+                    confirmed_num_computed_tokens = self.chunk_transfer_adapter._confirmed_num_computed_tokens(request)
                 if model_runner_output.routed_experts is not None:
                     routed_experts = omni_routed_experts_for_request(model_runner_output.routed_experts, request)
 
@@ -478,9 +589,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     # for streaming input request only
                     if self.chunk_transfer_adapter:
                         if self.vllm_config.model_config.stage_id != 0:
-                            # Downstream async-chunk stages receive real payloads from the
-                            # connector. This update only resumes polling for the next segment.
-                            self.chunk_transfer_adapter.segment_finished_requests.discard(request.request_id)
+                            # Only a connector-fed receiver in native duplex can
+                            # poll the next segment without an external update.
+                            # Sender-only and turn-mode stages remain parked.
+                            self._resume_downstream_chunk_receiver(request)
                     outstanding_async_tokens = request.num_output_placeholders
                     # Always record the discard signal (0 when nothing is in
                     # flight). Upstream a0c092ee72 removed the
@@ -499,8 +611,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     # valid new-segment frames or underflowed the drain
                     # assert whenever placeholder counts diverged from
                     # scheduled counts (spec drafts, in-flight prefill).
+                    # Assign, never accumulate: _handle_stopped_request above
+                    # may already have fenced the same in-flight tokens through
+                    # a queued streaming update, and adding twice swallows the
+                    # next duplex unit's listen/speak under async scheduling.
                     if request.num_in_flight_tokens > 0:
-                        request.num_stale_output_tokens += request.num_in_flight_tokens
+                        request.num_stale_output_tokens = request.num_in_flight_tokens
                     if outstanding_async_tokens > 0:
                         # Discard only outputs that are already in flight and
                         # roll back their optimistic computed-token accounting.
@@ -509,7 +625,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request.spec_token_ids = []
                     request._output_token_ids.clear()
                 if finished:
-                    kv_transfer_params, _ = self._free_request(request)
+                    kv_transfer_params, ec_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
                 elif status_before_stop == RequestStatus.WAITING_FOR_CHUNK:
@@ -537,8 +653,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     pooling_output=pooling_output_payload,
                     multimodal_output=mm_output,
                     stop_reason=request.stop_reason,
-                    prefill_stats=request.take_prefill_stats(),
+                    prefill_stats=prefill_stats,
                     kv_transfer_params=kv_transfer_params,
+                    ec_transfer_params=ec_transfer_params,
                     routed_experts=routed_experts,
                     num_nans_in_logits=request.num_nans_in_logits,
                     is_segment_finished=is_segment_finished,
@@ -555,6 +672,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     inter_stage_output,
                     request,
                     is_segment_finished,
+                    new_token_ids=new_token_ids,
+                    confirmed_num_computed_tokens=confirmed_num_computed_tokens,
                 )
 
         self._remove_stopped_requests_from_queues(
@@ -575,6 +694,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
+
+        # EC Connector: update state from worker-side EC connector output.
+        # Use getattr for safety with test __new__/SimpleNamespace code paths.
+        if getattr(self, "ec_connector", None) is not None and ec_connector_output:
+            self.ec_connector.update_connector_output(ec_connector_output)
 
         kv_connector_stats = self._aggregate_kv_connector_stats(kv_connector_output)
         self._publish_kv_cache_events()
@@ -635,10 +759,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # pre-replacement frame will drain, so the counter reaches exactly
         # zero and the new segment's frames are never swallowed. This also
         # covers an in-flight prefill chunk, which carries no placeholders
-        # but must still have its late output dropped.
+        # but must still have its late output dropped. Assign, never
+        # accumulate: update_from_output fences the same in-flight tokens when
+        # a resumable stop applies a queued update through this helper.
         in_flight_tokens = int(getattr(session, "num_in_flight_tokens", 0) or 0)
         if in_flight_tokens > 0:
-            session.num_stale_output_tokens += in_flight_tokens
+            session.num_stale_output_tokens = in_flight_tokens
         if outstanding_async_tokens > 0:
             # Async scheduling may already have sampled the previous
             # segment's next token. Drop that late token instead of
@@ -679,6 +805,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             for info in update_infos
         )
         if replace_streaming_prompt:
+            self._release_replaced_streaming_prompt_cache(session)
             self._replace_streaming_session(session, update)
             return
         super()._update_request_as_session(session, update)
@@ -701,6 +828,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         # 1. Standard cleanup parts from base _free_request
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+
+        # EC Connector: mirror the KV hook (upstream v0.28 _free_request).
+        # The contract requires firing before the encoder cache is freed so
+        # the connector can inspect per-request state (e.g. which mm_hashes
+        # it recorded during save_caches()) and emit ec_transfer_params for
+        # the response body. getattr: __new__-constructed test schedulers
+        # carry no ec_connector attribute.
+        ec_xfer_params: dict[str, Any] | None = None
+        if getattr(self, "ec_connector", None) is not None:
+            ec_delay_free, ec_xfer_params = self.ec_connector.request_finished(request)
+            connector_delay_free_blocks |= ec_delay_free
 
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
@@ -725,11 +863,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         # It triggered but hasn't finished yet. We MUST wait.
                         logger.debug(f"[Omni] Request {request_id} finished but transfer is still ACTIVE. Waiting.")
                         self.waiting_for_transfer_free.add(request_id)
+                        self._kv_wait_start_ts[request_id] = time.monotonic()
                         kv_xfer_params = None
-                        return kv_xfer_params, None
+                        return kv_xfer_params, ec_xfer_params
                     elif request_id in self.waiting_for_transfer_free:
                         # Blocks held until KV extraction completes in a future step.
-                        return None, None
+                        return None, ec_xfer_params
                     else:
                         logger.debug(
                             f"[Omni] Request {request_id} finished and transfer no longer ACTIVE (extracted/acked). "
@@ -737,6 +876,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         )
                 else:
                     self.waiting_for_transfer_free.add(request_id)
+                    self._kv_wait_start_ts[request_id] = time.monotonic()
                     confirmed_computed = self._get_confirmed_num_computed_tokens(request)
                     self._mark_request_for_kv_transfer(request_id, confirmed_computed)
                     # Return KV transfer metadata so it propagates to RequestOutput
@@ -766,14 +906,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         if isinstance(add_info, dict):
                             add_info.update(kv_xfer_params)
 
-                    return kv_xfer_params, None
+                    return kv_xfer_params, ec_xfer_params
 
             # 3. Standard Freeing
             delay_free_blocks |= connector_delay_free_blocks
             if not delay_free_blocks:
                 self._free_blocks(request)
 
-            return kv_xfer_params, None
+            return kv_xfer_params, ec_xfer_params
         finally:
             self._free_input_coordinator_request(request_id)
             # Normal completion runs through here, not finish_requests()

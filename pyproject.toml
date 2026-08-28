@@ -41,8 +41,10 @@ dev = [
     "pytest-cov==7.1.0",
     "pytest-mock==3.15.1",
     "pytest-shard==0.1.2",
+    "pytest-xdist==3.8.0",
     "websockets==16.1",
     "pytest-subtests==0.15.0",
+    "filelock>=3.16.1,<4",
     "datasets==3.6.0",
     "mypy==1.11.1",
     "pre-commit==4.0.1",
@@ -69,9 +71,11 @@ dev = [
     "voxcpm==2.0.3", # for VoxCPM2 path-locating in tests
     "torchdiffeq==0.2.5", # for covo_audio Test
     "FlagEmbedding==1.4.0", # for hunyuan_image3 tests
-    "kernels==0.14.1", # for accuracy tests comparison with diffusers output (0.15.0 incompatible with diffusers 0.38.0)
     "s3tokenizer==0.3.0", # for tts test
+    # Provides top-level cosyvoice2; do not co-install stepaudio2-minicpmo,
+    # whose top-level stepaudio2 package conflicts with this distribution.
     "step-audio2==1.0.0", # Step-Audio2 / MiniCPM-o 4.5 Token2Wav (flashcosyvoice / hyperpyyaml)
+    "silero-vad==6.1", # Realtime server-VAD duplex E2E
 ]
 
 demo = [
@@ -79,6 +83,10 @@ demo = [
     "opencv-python>=4.12.0.88",  # cli/stream_client frame reading
     "requests>=2.28.0",  # cli/stream_client HTTP
     "cn2an>=0.5.22",  # Chinese number normalization for TTS (e.g. "1次" -> "一次")
+]
+
+server-vad = [
+    "silero-vad==6.1",
 ]
 
 forced-aligner = [
@@ -133,13 +141,6 @@ docs = [
     "pydantic",
 ]
 
-soulx-svs = [
-    "funasr>=1.0.0",
-    "g2pM>=0.1.2.5",
-    "g2p-en>=2.1.0",
-    "ToJyutping>=3.2.0",
-]
-
 [project.urls]
 Homepage = "https://github.com/vllm-project/vllm-omni"
 Repository = "https://github.com/vllm-project/vllm-omni"
@@ -190,6 +191,7 @@ select = [
     "N",      # pep8-naming
     "UP",     # pyupgrade
     "TID251", # flake8-tidy-imports.banned-api
+    "TC004",  # flake8-type-checking: runtime-used imports
 ]
 ignore = [
     "E203",  # whitespace before ':' (conflicts with black)
@@ -225,19 +227,14 @@ ignore = [
 "torch.cuda.synchronize".msg = "Use torch.accelerator.synchronize"
 
 [tool.mypy]
-python_version = "3.12, 3.13"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = true
-disallow_incomplete_defs = true
+python_version = "3.12"
+# Align with vLLM: silent follow for library code; missing third-party stubs
+# are ignored everywhere (including tests). tests/ still get
+# --follow-imports skip from tools/pre_commit/mypy.py.
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
 check_untyped_defs = true
-disallow_untyped_decorators = true
-no_implicit_optional = true
-warn_redundant_casts = true
-warn_unused_ignores = true
-warn_no_return = true
-warn_unreachable = true
-strict_equality = true
+follow_imports = "silent"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -247,7 +244,8 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = [
     "--strict-markers",
-    "--strict-config"
+    "--strict-config",
+    "--dist=loadgroup"
 ]
 markers = [
     # ci/cd required
@@ -274,6 +272,7 @@ markers = [
     # specified computation resources marks (auto-added)
     # Tag with [hardware-resource] for tests.helpers.mark.get_hardware_mark_list().
     "H100: [hardware-resource] Tests that require H100 GPU",
+    "H800: [hardware-resource] Tests that require H800 GPU",
     "H200: [hardware-resource] Tests that require H200 GPU",
     "L4: [hardware-resource] Tests that require L4 GPU",
     "B200: [hardware-resource] Tests that require B200 GPU",
@@ -296,6 +295,7 @@ markers = [
     "sp: Sequence parallelism tests (multi-GPU)",
     "slow: Slow tests (may skip in quick CI)",
     "benchmark: Benchmark tests",
+    "xdist: xdist-parallelizable tests",
 ]
 filterwarnings = [
     "ignore:.*does not have '__test__' attribute.*:UserWarning",
@@ -343,6 +343,8 @@ extend-ignore-identifiers-re = [
 ]
 extend-ignore-re = [
     "\\.\\.\\.n,d->\\.\\.\\.nd",
+    # setuptools-scm / git-describe local versions, e.g. 0.26.1.dev14+gae6577ea
+    "\\+g[0-9a-f]{7,}",
 ]
 [tool.typos.default.extend-words]
 ue = "ue"
@@ -367,3 +369,5 @@ Leary = "Leary"
 fo = "fo"
 ba = "ba"
 SER = "SER"
+# NumPy ndarray.flags.writeable (canonical flag name, not "writable").
+writeable = "writeable"

@@ -1,6 +1,6 @@
 # adapted from sglang and fastvideo
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -15,6 +15,25 @@ if TYPE_CHECKING:
 
 DUMMY_DIFFUSION_REQUEST_ID = "dummy_req_id"
 _DUMMY_DIFFUSION_REQUEST_ID_PREFIX = f"{DUMMY_DIFFUSION_REQUEST_ID}/"
+
+
+def resolve_video_num_frames(
+    num_frames: int | None,
+    *,
+    default_num_frames: int,
+    is_dummy_run: bool,
+) -> int:
+    """Resolve the shared image-model frame sentinel for a video pipeline.
+
+    ``OmniDiffusionSamplingParams`` defaults ``num_frames`` to one for image
+    models, so an omitted video API field reaches model code as ``1``. Video
+    pipelines with a different default must materialize it at their boundary.
+    Startup profiling intentionally requests one frame, however, and must stay
+    lightweight.
+    """
+    if num_frames is None or (num_frames == 1 and not is_dummy_run):
+        return default_num_frames
+    return num_frames
 
 
 @dataclass
@@ -48,6 +67,11 @@ class OmniDiffusionRequest:
     # This is populated by a pipeline preprocessor before the request reaches
     # the scheduler; ``None`` keeps the default behavior for other pipelines.
     batch_compatibility_key: tuple[Any, ...] | None = None
+    # KV-recv wall-clock (ms), set by the runner's _prepare_request_for_forward
+    # and carried to DiffusionOutput for the vllm_omni:diffusion_kv_load_s metric.
+    kv_recv_ms: float = 0.0
+    # Time spent waiting for initial admission by the diffusion scheduler.
+    scheduler_queue_wait_ms: float | None = None
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Code2Wav GPU Model Runner for vLLM-Omni.
 
 Handles direct conversion from codec codes to audio waveforms for Qwen3 Omni MoE Code2Wav.
@@ -35,12 +38,14 @@ from vllm.v1.worker.gpu_model_runner import (
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
-from vllm_omni.distributed.omni_connectors.utils.config import get_stage_connector_role
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_payload_list
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
-from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
+from vllm_omni.worker.omni_connector_model_runner_mixin import (
+    OmniConnectorModelRunnerMixin,
+    needs_omni_connector,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,27 +61,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
-        # Mirrors the init allowlist in gpu_ar_model_runner.py.
-        _OMNI_CONNECTOR_INIT_ARCHS = {
-            "Qwen3OmniMoeForConditionalGeneration",
-            "Qwen2_5OmniForConditionalGeneration",
-            "CovoAudioForConditionalGeneration",
-            "MiMoAudioModel",
-            "Qwen3TTSTalkerForConditionalGeneration",
-            "Qwen3TTSCode2Wav",
-            "AudexCode2Wav",
-            "AudexXCodec1",
-            "CosyVoice3Model",
-            "DyninOmniForConditionalGeneration",
-            "IndexTTS2S2MelDecoder",
-            # nemotron_voicechat: code2wav (stage 2) consumes the talker's
-            # full-payload code stacks.
-            "NemotronVoiceChatCode2Wav",
-        }
-        if (
-            getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS
-            or get_stage_connector_role(self.model_config) is not None
-        ):
+        if needs_omni_connector(self.model_config):
             self.init_omni_connectors(
                 model_config=self.model_config,
             )
@@ -167,10 +152,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
                 self.model.on_requests_finished(scheduler_output.finished_req_ids)
 
-            # `<= 0`: upstream can schedule a negative span, which is truthy (#5196).
-            if scheduler_output.total_num_scheduled_tokens <= 0:
-                return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
-
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
                     scheduler_output,
@@ -179,7 +160,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                     self._execute_mm_encoder(scheduler_output)
                     return self.attach_omni_connector_output(make_empty_encoder_model_runner_output(scheduler_output))
 
-            if not num_scheduled_tokens:
+            # OMNI: keep this block in lock-step with the same block in
+            # GPUARModelRunner.execute_model.
+            # `<= 0`: upstream can schedule a negative span, which is truthy (#5196).
+            if num_scheduled_tokens <= 0:
                 if (
                     self.parallel_config.distributed_executor_backend == "external_launcher"
                     and self.parallel_config.data_parallel_size > 1
@@ -211,9 +195,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
-            logits_indices, spec_decode_metadata = self._prepare_inputs(
-                scheduler_output,
-                num_scheduled_tokens_np,
+            logits_indices, spec_decode_metadata, max_num_sampled_tokens = self._prepare_inputs(
+                scheduler_output, num_scheduled_tokens_np
             )
 
             cascade_attn_prefix_lens = None
@@ -297,6 +280,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 max_query_len=max_num_scheduled_tokens,
                 ubatch_slices=ubatch_slices_attn,
                 logits_indices=logits_indices,
+                max_num_sampled_tokens=max_num_sampled_tokens,
                 use_spec_decode=use_spec_decode,
                 num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                 cascade_attn_prefix_lens=cascade_attn_prefix_lens,
@@ -327,14 +311,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             model_kwargs["seq_token_counts"] = tokens
             if getattr(self.model, "requires_request_ids", False):
                 model_kwargs["request_ids"] = list(req_ids)
-
-        # Set cudagraph mode to none if calc_kv_scales is true.
-        # KV scales calculation involves dynamic operations that are incompatible
-        # with CUDA graph capture.
-        if self.calculate_kv_scales:
-            cudagraph_mode = CUDAGraphMode.NONE
-            # Mark KV scales as calculated after the first forward pass
-            self.calculate_kv_scales = False
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -439,16 +415,29 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         # pooler_output is no longer used for multimodal data.
         per_req_payloads: list[dict[str, object]] = []
         if isinstance(multimodal_outputs_raw, torch.Tensor):
-            assert multimodal_outputs_raw.shape[0] == 1, (
-                "model should return a single tensor, to return multiple tensors, use a dict"
-            )
-            assert multimodal_outputs_raw.shape[0] == self.input_batch.num_reqs
-            for i in range(self.input_batch.num_reqs):
+            # One row per request. The old asserts (`shape[0] == 1` AND
+            # `shape[0] == num_reqs`) jointly forced num_reqs == 1, silently
+            # rejecting batched steps the generation scheduler does admit.
+            num_reqs = self.input_batch.num_reqs
+            if multimodal_outputs_raw.shape[0] != num_reqs:
+                raise ValueError(
+                    f"Multimodal output tensor has leading dim {multimodal_outputs_raw.shape[0]} "
+                    f"but the batch has {num_reqs} requests (one row per request; "
+                    "to return multiple tensors per request, use a dict)."
+                )
+            for i in range(num_reqs):
                 per_req_payloads.append({"model_outputs": multimodal_outputs_raw[i].detach().to("cpu").contiguous()})
         elif isinstance(multimodal_outputs_raw, list):
-            assert len(multimodal_outputs_raw) == 1, (
-                "model should return a single list, to return multiple lists, use a dict"
-            )
+            # One entry per request. The old `len == 1` assert did not check
+            # num_reqs, so a batched step built a length-1 payload list that
+            # misaligned with `req_ids` downstream.
+            num_reqs = self.input_batch.num_reqs
+            if len(multimodal_outputs_raw) != num_reqs:
+                raise ValueError(
+                    f"Multimodal output list has length {len(multimodal_outputs_raw)} "
+                    f"but the batch has {num_reqs} requests (one entry per request; "
+                    "to return multiple lists per request, use a dict)."
+                )
             for out in multimodal_outputs_raw:
                 per_req_payloads.append(
                     {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
@@ -794,6 +783,11 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 input_ids = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
                 model_kwargs = self._init_model_kwargs()
+            elif getattr(getattr(self, "model", None), "has_preprocess", False):
+                # Capture CUDA graph with inputs_embeds path so replay reads
+                # from the same buffer that _preprocess writes into.
+                input_ids = self.input_ids.gpu[:num_tokens_padded]
+                inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
             else:
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None

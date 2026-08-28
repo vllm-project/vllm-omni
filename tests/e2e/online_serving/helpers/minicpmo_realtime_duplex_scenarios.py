@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Strict MiniCPM-o 4.5 Realtime duplex E2E scenario harness.
 
 This script is intentionally scenario-based instead of a generic chat client.
@@ -34,8 +37,10 @@ import json
 import sys
 import time
 import wave
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(_REPO_ROOT) not in sys.path:
@@ -52,19 +57,100 @@ from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
     PCM16_SAMPLE_RATE,
     RealtimeEventCollector,
     build_realtime_url,
+    duplex_unit_boundary_ms,
     read_pcm16_wav,
     summarize_session_request_metrics,
+)
+from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
+    reference_audio_data_url as _ref_audio_data_url,
+)
+from vllm_omni.experimental.fullduplex.video_stacking import (  # noqa: E402
+    concat_frames_b64,
+    unit_subframe_offsets,
 )
 
 _url_with_model = build_realtime_url
 _read_wav_pcm16 = read_pcm16_wav
+DemoArgs = argparse.Namespace | SimpleNamespace
 
 
-def _ref_audio_data_url(path: str | None) -> str | None:
-    if path is None:
-        return None
-    ref_path = Path(path).expanduser()
-    return "data:audio/wav;base64," + base64.b64encode(ref_path.read_bytes()).decode("ascii")
+def _video_frames_from_file(
+    path: Path,
+    *,
+    fps: float = 1.0,
+    jpeg_quality: int = 70,
+    stack_frames: int = 1,
+) -> tuple[list[str], list[str | None]]:
+    """Decode ``path`` into base64 JPEG frames at the omni duplex cadence.
+
+    One frame per second matches what the realtime web client captures, so the
+    stream stays representative of a live camera. ``stack_frames > 1`` also
+    samples each unit's interior sub-frames and tiles them into one composite,
+    the official way to raise visual refresh rate without changing the audio
+    cadence. Returns ``(base_frames, stacked_frames)`` with the tracks parallel.
+    """
+    import cv2
+
+    offsets = unit_subframe_offsets(stack_frames)
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        raise ValueError(f"cannot open video: {path}")
+
+    def encode(frame_bgr, index: int) -> str:
+        ok, jpeg = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
+        if not ok:
+            raise ValueError(f"cannot JPEG-encode frame {index} of {path}")
+        return base64.b64encode(jpeg.tobytes()).decode("ascii")
+
+    try:
+        source_fps = capture.get(cv2.CAP_PROP_FPS) or 0.0
+        stride = max(1, round(source_fps / fps)) if source_fps > 0 else 1
+        # Sub-frame k of a unit sits ``offset * stride`` frames past its base.
+        sub_strides = {max(1, round(offset * stride)): position for position, offset in enumerate(offsets)}
+        frames: list[str] = []
+        interiors: list[list[str]] = []
+        index = 0
+        while True:
+            ok, frame_bgr = capture.read()
+            if not ok:
+                break
+            position, within_unit = divmod(index, stride)
+            if within_unit == 0:
+                frames.append(encode(frame_bgr, index))
+                interiors.append([])
+            elif within_unit in sub_strides and position < len(interiors):
+                interiors[position].append(encode(frame_bgr, index))
+            index += 1
+    finally:
+        capture.release()
+    if not frames:
+        raise ValueError(f"video has no decodable frames: {path}")
+    stacked = [concat_frames_b64(interior) if interior else None for interior in interiors]
+    return frames, stacked
+
+
+def _resolve_video_frames(args: DemoArgs) -> tuple[list[str], list[str | None]]:
+    """Base64 JPEG frames for the duplex camera track, newest last.
+
+    Returns the base track plus the parallel stacked composites. Only a video
+    source has sub-frames to stack; an explicit frame list or a still image
+    stacks nothing.
+    """
+    frames = list(getattr(args, "video_frames_b64", None) or [])
+    if frames:
+        stacked = list(getattr(args, "video_stacked_frames_b64", None) or [])
+        stacked += [None] * (len(frames) - len(stacked))
+        return frames, stacked[: len(frames)]
+    input_video = getattr(args, "input_video", None)
+    if input_video:
+        return _video_frames_from_file(
+            Path(input_video).expanduser(),
+            stack_frames=max(1, int(getattr(args, "stack_frames", 1) or 1)),
+        )
+    frame_image = getattr(args, "frame_image", None)
+    if frame_image:
+        return [base64.b64encode(Path(frame_image).expanduser().read_bytes()).decode("ascii")], [None]
+    return [], []
 
 
 @dataclass
@@ -374,17 +460,20 @@ class DemoState:
         commit_indices = [
             index for index, event in enumerate(self.events) if event.get("type") == "input_audio_buffer.committed"
         ]
-        decision_indices = [
-            index
-            for index, event in enumerate(self.events)
-            if event.get("type") == "response.created"
-            or (
-                event.get("type") == "response.listen"
-                and isinstance(event.get("response"), dict)
-                and isinstance(event["response"].get("metadata"), dict)
-                and event["response"]["metadata"].get("model_listen") is True
-            )
-        ]
+        decision_indices: list[int] = []
+        for index, event in enumerate(self.events):
+            event_type = event.get("type")
+            if event_type == "response.created":
+                decision_indices.append(index)
+                continue
+            if event_type != "response.listen":
+                continue
+            response = event.get("response")
+            if not isinstance(response, dict):
+                continue
+            metadata = response.get("metadata")
+            if isinstance(metadata, dict) and metadata.get("model_listen") is True:
+                decision_indices.append(index)
         first_input_index = self.first_index("input_audio_buffer.speech_started")
         if first_input_index is None:
             first_input_index = commit_indices[0] if commit_indices else None
@@ -501,7 +590,7 @@ class DemoState:
         return stale
 
 
-def _session_update_event(args: argparse.Namespace) -> dict[str, object]:
+def _session_update_event(args: DemoArgs) -> dict[str, object]:
     session_payload: dict[str, object] = {
         "model": args.model,
         "modalities": ["audio", "text"],
@@ -837,7 +926,8 @@ async def _send_pcm16(
     hints: dict[str, object] | None = None,
     first_chunk_hints: dict[str, object] | None = None,
     on_model_unit_ready=None,
-    frame_b64: str | None = None,
+    frames_b64: Sequence[str] | None = None,
+    stacked_frames_b64: Sequence[str | None] | None = None,
 ) -> None:
     hints = hints or {}
     first_chunk_hints = first_chunk_hints or {}
@@ -845,6 +935,8 @@ async def _send_pcm16(
     model_unit_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE
     audio_ms = 0
     next_model_unit_bytes = model_unit_bytes
+    frames = list(frames_b64 or [])
+    stacked = list(stacked_frames_b64 or [])
     frames_sent = 0
     for offset in range(0, len(pcm16), chunk_bytes):
         chunk = pcm16[offset : offset + chunk_bytes]
@@ -853,9 +945,18 @@ async def _send_pcm16(
         chunk_hints = dict(hints)
         if offset == 0:
             chunk_hints.update(first_chunk_hints)
-        if frame_b64 is not None and audio_ms > frames_sent * 1000:
-            # Omni duplex cadence: one camera frame per 1 s of audio.
-            chunk_hints["video_frames"] = [frame_b64]
+        if frames and audio_ms >= duplex_unit_boundary_ms(frames_sent):
+            # Omni duplex cadence: one camera frame per model unit, riding the
+            # append that closes it, so the frame and the second of audio it was
+            # captured during enter the same unit. A video advances one frame per
+            # unit and holds its last frame when the audio outlives the clip; a
+            # still image is a one-element list and therefore repeats.
+            # A stacked composite of that unit's interior sub-frames rides the
+            # same append right after the base frame (wire maximum of 2).
+            index = min(frames_sent, len(frames) - 1)
+            composite = stacked[index] if index < len(stacked) else None
+            base = frames[index]
+            chunk_hints["video_frames"] = [base] if composite is None else [base, composite]
             frames_sent += 1
         await ws.send(
             json.dumps(
@@ -936,7 +1037,8 @@ async def _send_clean_turn(
     realtime_input: bool = False,
     model_policy_settle_s: float = 2.0,
     commit_input: bool = True,
-    frame_b64: str | None = None,
+    frames_b64: Sequence[str] | None = None,
+    stacked_frames_b64: Sequence[str | None] | None = None,
 ) -> tuple[str | None, str]:
     before_created = state.count("response.created")
     before_model_listen = state.model_listen_count
@@ -958,7 +1060,8 @@ async def _send_clean_turn(
         chunk_ms=chunk_ms,
         realtime_delay=realtime_input,
         hints={"transcript": transcript} if send_transcript_hint else {},
-        frame_b64=frame_b64,
+        frames_b64=frames_b64,
+        stacked_frames_b64=stacked_frames_b64,
     )
     if commit_input:
         state.input_commit_sent_at_s.append(time.monotonic())
@@ -1164,7 +1267,8 @@ async def _send_listen_only_overlap_pair(
     model_policy_settle_s: float,
     validation_mode: str,
     silence_ms: int,
-    frame_b64: str | None = None,
+    frames_b64: Sequence[str] | None = None,
+    stacked_frames_b64: Sequence[str | None] | None = None,
 ) -> tuple[list[str | None], list[str], bool]:
     if not realtime_input:
         raise ValueError("listen-only-overlap requires --realtime-input")
@@ -1195,7 +1299,8 @@ async def _send_listen_only_overlap_pair(
         realtime_delay=True,
         hints={"transcript": transcripts[0]} if send_transcript_hint else {},
         on_model_unit_ready=continue_until_first_speak,
-        frame_b64=frame_b64,
+        frames_b64=frames_b64,
+        stacked_frames_b64=stacked_frames_b64,
     )
     state.input_commit_sent_at_s.append(time.monotonic())
     await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
@@ -1234,7 +1339,8 @@ async def _send_listen_only_overlap_pair(
         realtime_delay=True,
         hints={"transcript": transcripts[1]} if send_transcript_hint else {},
         on_model_unit_ready=record_model_unit_ready,
-        frame_b64=frame_b64,
+        frames_b64=frames_b64,
+        stacked_frames_b64=stacked_frames_b64,
     )
     state.input_commit_sent_at_s.append(time.monotonic())
     await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
@@ -1298,10 +1404,8 @@ async def _send_listen_only_overlap_pair(
     return [first_response_id, second_response_id], ["speak", second_outcome], overlap_ok
 
 
-async def run_demo(args: argparse.Namespace) -> dict[str, object]:
-    demo_frame_b64: str | None = None
-    if getattr(args, "frame_image", None):
-        demo_frame_b64 = base64.b64encode(Path(args.frame_image).read_bytes()).decode("ascii")
+async def run_demo(args: DemoArgs) -> dict[str, object]:
+    demo_frames_b64, demo_stacked_b64 = _resolve_video_frames(args)
     turn_input_paths = _turn_input_paths(
         Path(args.input_wav),
         list(getattr(args, "turn_input_wav", []) or []),
@@ -1351,6 +1455,9 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         try:
             await ws.send(json.dumps(_session_update_event(args)))
             await _wait_for(state, lambda: state.count("session.created") > 0, timeout_s=20, label="session.created")
+            start_barrier = getattr(args, "start_barrier", None)
+            if start_barrier is not None:
+                await start_barrier.wait()
 
             turn_transcripts = _turn_transcripts(args.first_turn_transcript, turns=args.turns)
             turn_specs = list(zip(turn_transcripts, turn_durations, strict=True))
@@ -1369,7 +1476,8 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                     model_policy_settle_s=max(0.0, args.model_policy_settle_ms / 1000),
                     validation_mode=validation_mode,
                     silence_ms=max(0, args.silence_ms),
-                    frame_b64=demo_frame_b64,
+                    frames_b64=demo_frames_b64,
+                    stacked_frames_b64=demo_stacked_b64,
                 )
                 for turn_index in range(2, len(turn_specs)):
                     transcript, duration_ms = turn_specs[turn_index]
@@ -1387,7 +1495,8 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                         realtime_input=realtime_input,
                         model_policy_settle_s=max(0.0, args.model_policy_settle_ms / 1000),
                         commit_input=not continuous_input,
-                        frame_b64=demo_frame_b64,
+                        frames_b64=demo_frames_b64,
+                        stacked_frames_b64=demo_stacked_b64,
                     )
                     turn_response_ids.append(response_id)
                     turn_outcomes.append(outcome)
@@ -1407,7 +1516,8 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                         realtime_input=realtime_input,
                         model_policy_settle_s=max(0.0, args.model_policy_settle_ms / 1000),
                         commit_input=not continuous_input,
-                        frame_b64=demo_frame_b64,
+                        frames_b64=demo_frames_b64,
+                        stacked_frames_b64=demo_stacked_b64,
                     )
                     turn_response_ids.append(response_id)
                     turn_outcomes.append(outcome)
@@ -1582,6 +1692,8 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         "continuous_input": continuous_input,
         "continuous_input_ok": continuous_input_ok,
         "input_chunk_ms": args.chunk_ms,
+        "video_frame_count": len(demo_frames_b64),
+        "video_stacked_frame_count": sum(frame is not None for frame in demo_stacked_b64),
         "model_policy_settle_ms": args.model_policy_settle_ms,
         "turn_outcomes": turn_outcomes,
         "turn_outcomes_ok": turn_outcomes_ok,
@@ -1638,6 +1750,19 @@ def parse_args() -> argparse.Namespace:
         "--frame-image",
         default=None,
         help="Optional image file sent as an omni-duplex camera frame (one per 1 s of audio)",
+    )
+    parser.add_argument(
+        "--input-video",
+        default=None,
+        help="Optional video file streamed as omni-duplex camera frames (decoded at 1 fps, "
+        "overrides --frame-image; the last frame is held if the audio outlives the clip)",
+    )
+    parser.add_argument(
+        "--stack-frames",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="Frames per append: 2 also resends the previous frame for motion context.",
     )
     parser.add_argument(
         "--turn-input-wav",

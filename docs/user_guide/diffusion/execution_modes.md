@@ -101,8 +101,16 @@ set `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA` or configure
 `--max-num-seqs >1`. See the
 [HunyuanImage-3.0 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/HunyuanImage-3.0-Instruct.md)
 for its validated configuration. Helios supports single-request step execution only: use
-`--step-execution --max-num-seqs 1` for Helios. Consult the selected pipeline's
-documentation and source for the latest support status.
+`--step-execution --max-num-seqs 1` for Helios. MiniMax H3 supports step-wise
+continuous batching by packing co-batched requests into one sequence that keeps
+a separate attention document per request; that layout needs a backend which
+honors the packed `cu_seqlens` metadata, so run it with
+`--diffusion-attention-backend FLASH_ATTN` (other backends stay correct but
+fall back to one transformer forward per request). Batching H3 does not improve
+its throughput — see the measured numbers in the
+[MiniMax-H3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md)
+— so keep `--max-num-seqs 1` unless you need step-level scheduling. Consult the
+selected pipeline's documentation and source for the latest support status.
 
 ## Streaming Output
 
@@ -207,18 +215,16 @@ outputs = omni.generate(
 )
 ```
 
-## Stage Configuration
+## Deploy Configuration
 
 Use the equivalent engine arguments in a deployment YAML:
 
 ```yaml
-stage_args:
+stages:
   - stage_id: 0
-    stage_type: diffusion
-    engine_args:
-      step_execution: false
-      max_num_seqs: 4
-      request_batch_max_wait_ms: 20
+    step_execution: false
+    max_num_seqs: 4
+    request_batch_max_wait_ms: 20
 ```
 
 For step execution, set `step_execution: true` and remove

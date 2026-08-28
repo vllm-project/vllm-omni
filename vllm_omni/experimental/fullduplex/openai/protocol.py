@@ -9,7 +9,6 @@ from uuid import uuid4
 
 
 class DuplexOverlapPolicy(str, Enum):
-    AUTO = "auto"
     LISTEN_ONLY = "listen_only"
     BARGE_IN_ON_SPEECH = "barge_in_on_speech"
 
@@ -101,7 +100,7 @@ class DuplexCapabilities:
         supports_multi_session = max_sessions > 1
         return cls(
             supports_model_native_turn_policy=True,
-            supports_barge_in=False,
+            supports_barge_in=True,
             supports_input_append=True,
             supports_replace_latest_chunk=False,
             supports_reencode_context=False,
@@ -129,6 +128,8 @@ class DuplexCapabilities:
             signal_sources=["model_native", "client_event", "server_policy"],
             stage_handoff_transport="scheduler_data_plane",
             chunk_period_ms=1000,
+            # Barge-in latency depends on client chunking and lacks hardware E2E
+            # measurement, so do not advertise an invented target.
             target_barge_in_latency_ms=None,
         )
 

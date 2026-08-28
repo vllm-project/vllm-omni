@@ -37,6 +37,7 @@
           4
         ],
         "no_oversample": true,
+        "disable_shuffle": true,
         "trust_remote_code": true,
         "seed_tts_locale": "en",
         "extra_body": {
@@ -53,24 +54,24 @@
         "baseline": {
           "H100": {
             "request_throughput": [
-              0.7803,
-              1.1008
+              0.9731,
+              1.1986
             ],
             "mean_ttft_ms": [
-              166.9764,
-              307.7133
+              152.5665,
+              270.2559
             ],
             "mean_e2el_ms": [
-              1361.1682,
-              3800.6332
+              1027.2953,
+              3306.3735
             ],
             "mean_audio_ttfp_ms": [
-              635.8099,
-              1615.6591
+              458.1553,
+              2030.2335
             ],
             "mean_audio_rtf": [
-              0.3151,
-              0.8568
+              0.2357,
+              0.791
             ]
           }
         }

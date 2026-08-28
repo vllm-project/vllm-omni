@@ -3,13 +3,14 @@
 
 """
 Image-to-Video generation example using Wan2.2 I2V/TI2V models, LTX2/LTX-2.3,
-HunyuanVideo-1.5, Cosmos3, or Wan2.1 VACE.
+HunyuanVideo-1.5, SANA-Video, Cosmos3, or Wan2.1 VACE.
 
 Supports:
 - Wan2.2-I2V-A14B-Diffusers: MoE model with CLIP image encoder
 - Wan2.2-TI2V-5B-Diffusers: Unified T2V+I2V model (dense 5B)
 - LTX2 image-to-video pipeline
 - HunyuanVideo-1.5 I2V: SigLIP + VAE dual image conditioning
+- SANA-Video 2B: first-frame latent conditioning at 480p or 720p
 - Wan2.1 VACE: first/last-frame, inpainting, and reference conditioning
 
 Usage:
@@ -38,6 +39,13 @@ Usage:
         --image input.jpg --prompt "A cat playing with yarn" \
         --flow-shift 5.0 --guidance-scale 6.0
 
+    # SANA-Video 2B I2V (480p)
+    python image_to_video.py --model Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
+        --model-class-name SanaImageToVideoPipeline \
+        --image input.jpg --prompt "A cat turns toward the camera." \
+        --height 480 --width 832 --num-frames 81 --num-inference-steps 50 \
+        --guidance-scale 6.0
+
     # Cosmos3 I2V (image conditioning)
     python image_to_video.py --model nvidia/Cosmos3-Nano \
         --image input.jpg --prompt "The scene comes to life with smooth, natural motion." \
@@ -56,7 +64,6 @@ import numpy as np
 import PIL.Image
 import torch
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -108,13 +115,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Generate a video from one or more images "
-            "(Wan2.2, LTX2/LTX-2.3, HunyuanVideo-1.5, Cosmos3, or Wan2.1 VACE)."
+            "(Wan2.2, LTX2/LTX-2.3, HunyuanVideo-1.5, SANA-Video, Cosmos3, or Wan2.1 VACE)."
         )
     )
     parser.add_argument(
         "--model",
         default="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        help="Diffusers I2V model ID or local path (Wan2.2, LTX2/LTX-2.3, HunyuanVideo-1.5, Cosmos3, or Wan2.1 VACE).",
+        help=(
+            "Diffusers I2V model ID or local path "
+            "(Wan2.2, LTX2/LTX-2.3, HunyuanVideo-1.5, SANA-Video, Cosmos3, or Wan2.1 VACE)."
+        ),
     )
     parser.add_argument(
         "--model-class-name",
@@ -378,6 +388,7 @@ def main():
     is_ltx2_distilled = "distilled" in model_class_name_lower or "distilled" in model_name
     is_ltx23 = "ltx23" in model_class_name_lower or "ltx-2.3" in model_name
     is_ltx2 = is_ltx2_distilled or is_ltx23 or "ltx2" in model_class_name_lower or "ltx-2" in model_name
+    is_sana = model_class_name == "SanaImageToVideoPipeline" or "sana-video" in model_name
     is_cosmos = "cosmos" in model_name or (model_class_name is not None and "cosmos" in model_class_name.lower())
     is_cosmos_edge = is_cosmos and ("edge" in model_name or "edge" in model_class_name_lower)
 
@@ -434,6 +445,17 @@ def main():
             None,
             512 * 768,
             32,
+        )
+    elif is_sana:
+        is_720p = "720p" in model_name
+        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
+            16,
+            6.0,
+            81,
+            50,
+            5.0,
+            (704 * 1280) if is_720p else (480 * 832),
+            32 if is_720p else 16,
         )
     else:  # Wan2.2 / HunyuanVideo-1.5
         d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = 16, 5.0, 81, 50, 5.0, 480 * 832, 16
@@ -503,17 +525,6 @@ def main():
         }
 
     profiler_enabled = args.profiler_config is not None
-    parallel_config = DiffusionParallelConfig(
-        ulysses_degree=args.ulysses_degree,
-        ring_degree=args.ring_degree,
-        cfg_parallel_size=args.cfg_parallel_size,
-        tensor_parallel_size=args.tensor_parallel_size,
-        vae_patch_parallel_size=args.vae_patch_parallel_size,
-        use_hsdp=args.use_hsdp,
-        hsdp_shard_size=args.hsdp_shard_size,
-        hsdp_replicate_size=args.hsdp_replicate_size,
-        pipeline_parallel_size=args.pipeline_parallel_size,
-    )
     omni_kwargs = dict(
         model=args.model,
         enable_layerwise_offload=args.enable_layerwise_offload,
@@ -524,7 +535,15 @@ def main():
         diffusion_kv_cache_skip_steps=args.diffusion_kv_cache_skip_steps,
         diffusion_kv_cache_skip_layers=args.diffusion_kv_cache_skip_layers,
         enable_cpu_offload=args.enable_cpu_offload,
-        parallel_config=parallel_config,
+        ulysses_degree=args.ulysses_degree,
+        ring_degree=args.ring_degree,
+        cfg_parallel_size=args.cfg_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
+        vae_patch_parallel_size=args.vae_patch_parallel_size,
+        use_hsdp=args.use_hsdp,
+        hsdp_shard_size=args.hsdp_shard_size,
+        hsdp_replicate_size=args.hsdp_replicate_size,
+        pipeline_parallel_size=args.pipeline_parallel_size,
         enforce_eager=args.enforce_eager,
         model_class_name=model_class_name,
         cache_backend=args.cache_backend,

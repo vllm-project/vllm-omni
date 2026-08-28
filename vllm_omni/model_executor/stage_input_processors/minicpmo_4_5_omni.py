@@ -260,7 +260,15 @@ def tts2code2wav_async_chunk(
         return None
 
     if native_duplex and turn_end and record.get("last_terminal_turn") == duplex_turn_key:
-        return None
+        # Emit an empty replacement snapshot so Code2Wav cannot replay the
+        # prior terminal audio when this control-only boundary arrives.
+        return OmniPayloadStruct(
+            meta=_MiniCPMO45MetaStruct(
+                is_segment_finished=torch.tensor(True, dtype=torch.bool),
+                replace_runtime_additional_information=True,
+            ),
+            request_id=request_id,
+        )
 
     state = container.get(_MINICPMO45_ASYNC_STATE)
     if not isinstance(state, dict):
@@ -373,6 +381,7 @@ def tts2code2wav_async_chunk(
             llm_output_text_utf8=segment_text_utf8,
             tts_is_last_chunk=flush_pending,
             turn_end=turn_end and last_chunk,
+            replace_runtime_additional_information=True,
             ref_audio_sr=ref_audio_sr,
         ),
         request_id=request_id,
@@ -432,6 +441,7 @@ def tts2code2wav_full_payload(
             finished=finished,
             req_id=[request_id],
             ref_audio_sr=_coerce_int(meta_info.get("ref_audio_sr")),
+            replace_runtime_additional_information=True,
             native_duplex_segment_text=(
                 str(meta_info["native_duplex_segment_text"])
                 if isinstance(meta_info.get("native_duplex_segment_text"), str)
@@ -538,6 +548,29 @@ def _native_tts_boundary_token_ids(special_token_ids):
         )
         if token_id is not None
     }
+
+
+def _native_duplex_output_is_control_only(
+    output_ids: Sequence[int],
+    special_token_ids: Mapping[str, int],
+) -> bool:
+    if not output_ids:
+        return True
+    control_ids = {
+        token_id
+        for token_id in (
+            special_token_ids.get("tts_eos_token_id"),
+            special_token_ids.get("tts_pad_token_id"),
+            special_token_ids.get("listen_token_id"),
+            special_token_ids.get("chunk_eos_token_id"),
+            special_token_ids.get("chunk_tts_eos_token_id"),
+            special_token_ids.get("turn_eos_token_id"),
+            special_token_ids.get("unit_token_id"),
+            special_token_ids.get("unit_end_token_id"),
+        )
+        if token_id is not None
+    }
+    return bool(control_ids) and all(token_id in control_ids for token_id in output_ids)
 
 
 def _decode_native_duplex_token_ids(
@@ -747,10 +780,16 @@ def llm2tts(
             )
         prompt_token_ids_len = len(prompt_token_ids)
 
+        is_native_duplex_handoff = _has_native_duplex_prompt_metadata(mm_output)
+
         latent = mm_output.get("latent", None)
         if latent is None:
             latent = output.hidden_states if hasattr(output, "hidden_states") else None
             if latent is None:
+                if is_native_duplex_handoff and _native_duplex_output_is_control_only(
+                    llm_output_ids, special_token_ids
+                ):
+                    continue
                 raise ValueError("No latent or hidden_states found in thinker output")
 
         thinker_hidden_states = latent.detach()
@@ -761,7 +800,6 @@ def llm2tts(
         full_token_ids = prompt_token_ids + llm_output_ids
 
         tts_bos_id = special_token_ids.get("tts_bos_token_id")
-        is_native_duplex_handoff = _has_native_duplex_prompt_metadata(mm_output)
         if is_native_duplex_handoff:
             _require_native_tts_boundary_metadata(special_token_ids)
         tts_end_ids = _native_tts_boundary_token_ids(special_token_ids)
@@ -945,6 +983,9 @@ def llm2tts(
         if handoff_ids is not None and handoff_hidden is not None:
             condition_suffix_length = 1 if is_native_duplex_handoff else 2
             condition_length = max(len(handoff_ids), len(handoff_hidden)) + condition_suffix_length
+            # Dummy ids only reserve scheduler slots; prefill overwrites the
+            # embeddings. Talker.sample() blanks the whole prompt out of the
+            # repetition penalty, so codec id 0 is not taxed from step one.
             scheduler_prompt_token_ids = [0] * condition_length
             handoff_meta = model_intermediate_buffer.setdefault("meta", {})
             handoff_meta["next_stage_prompt_len"] = condition_length

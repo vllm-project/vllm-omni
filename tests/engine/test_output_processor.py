@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for OmniRequestState multimodal DELTA drain and consolidation guard."""
 
 from types import SimpleNamespace
@@ -581,18 +581,18 @@ def test_mm_only_terminal_finish_removes_request_state(monkeypatch):
 
 def test_no_detokenizer_make_request_output_with_routed_experts():
     """make_request_output accepts the routed_experts arg that the multimodal
-    output channel (_process_mm_only_outputs) passes positionally, and attaches
-    it to the completion output.
+    output channel (_process_mm_only_outputs) passes, and attaches it to the
+    completion output.
 
-    Regression: the call site passes 6 positional args
-    (..., kv_transfer_params, routed_experts) but the override previously took
-    only 5, raising TypeError on every generation-stage output.
+    routed_experts is omni-specific keyword-only: the 6th positional now
+    matches upstream's ec_transfer_params so that super().process_outputs()
+    calls do not misroute it.
     """
     s = _make_no_detok_state(RequestOutputKind.CUMULATIVE)
     s.add_multimodal_tensor(torch.randn(10), mm_type=AUDIO)
     routed_experts = np.zeros((2, 3), dtype=np.int32)
     # Mirror the exact call shape of _process_mm_only_outputs.
-    result = s.make_request_output([], None, FinishReason.STOP, None, None, routed_experts)
+    result = s.make_request_output([], None, FinishReason.STOP, None, None, routed_experts=routed_experts)
     assert result is not None
     assert not isinstance(result, PoolingRequestOutput)
     assert result.outputs[0].routed_experts is routed_experts
@@ -663,3 +663,40 @@ def test_mm_only_outputs_update_iteration_stats():
     assert finished.finish_reason == FinishReason.STOP
     assert finished.num_prompt_tokens == state.prompt_len
     assert finished.num_generation_tokens == 2
+
+
+def test_ec_transfer_params_survive_both_construction_paths():
+    """v0.28 contract: encoder-cache transfer metadata must reach
+    RequestOutput.ec_transfer_params through BOTH omni construction paths —
+    the upstream-delegating one (logprobs processor present) and the
+    no-detokenizer generation-stage one (direct RequestOutput build).
+    Regression: the override accepted the argument but dropped it."""
+    ec = {"remote_handle": "enc-cache-1"}
+
+    state = _make_state(RequestOutputKind.CUMULATIVE)
+    out = state.make_request_output([1], None, None, None, {"kv": 1}, ec)
+    assert out is not None and out.ec_transfer_params == ec
+
+    kwargs = dict(_DEFAULT_STATE_KWARGS)
+    kwargs.update(logprobs_processor=None, detokenizer=None)
+    gen_state = OmniRequestState(**kwargs, output_kind=RequestOutputKind.CUMULATIVE)
+    completion = gen_state._new_completion_output([1], None, None)
+    direct = gen_state._new_request_output("r", [completion], False, {"kv": 1}, ec)
+    assert direct.ec_transfer_params == ec
+
+
+def test_num_cache_creation_tokens_reaches_direct_request_output():
+    """v0.28 contract: prefix-cache creation usage must reach
+    RequestOutput.num_cache_creation_tokens through the no-detokenizer
+    direct build, which previously passed only num_cached_tokens."""
+    kwargs = dict(_DEFAULT_STATE_KWARGS)
+    kwargs.update(logprobs_processor=None, detokenizer=None)
+    gen_state = OmniRequestState(**kwargs, output_kind=RequestOutputKind.CUMULATIVE)
+    gen_state.num_cached_tokens = 3
+    gen_state.num_cache_creation_tokens = 2
+
+    completion = gen_state._new_completion_output([1], None, None)
+    direct = gen_state._new_request_output("r", [completion], False, None, None)
+
+    assert direct.num_cached_tokens == 3
+    assert direct.num_cache_creation_tokens == 2

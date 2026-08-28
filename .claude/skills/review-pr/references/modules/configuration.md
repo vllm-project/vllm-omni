@@ -3,7 +3,7 @@
 Primary design: [vLLM-Omni Configuration](https://docs.vllm.ai/projects/vllm-omni/en/latest/design/module/vllm_omni_config/).
 
 Use for config construction, deploy YAML, registries, schema, defaults,
-aliases, CLI projection, stage config, and topology. Inspect the reviewed
+aliases, CLI projection, pipeline config, and topology. Inspect the reviewed
 page's status: while its contract remains deferred or draft, current code and
 tests—not proposed precedence rules—are authoritative.
 

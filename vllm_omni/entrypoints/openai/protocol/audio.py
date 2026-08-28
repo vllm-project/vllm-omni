@@ -1,8 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import math
 from typing import Any, Literal
 
 import numpy as np
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
+
+# Bound int request fields to avoid overflow issues.
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
 
 _MAX_EMBEDDING_DIM = 8192
 
@@ -142,18 +148,21 @@ class OpenAICreateSpeechRequest(BaseModel):
     )
     max_new_tokens: int | None = Field(
         default=None,
+        ge=1,
+        le=_INT64_MAX,
         description="Maximum tokens to generate",
     )
     seed: int | None = Field(
         default=None,
-        ge=0,
-        le=2**63 - 1,
+        ge=_INT64_MIN,
+        le=_INT64_MAX,
         description="Random seed for reproducible generation. When set, ensures "
         "deterministic output for the same input text and seed value.",
     )
     initial_codec_chunk_frames: int | None = Field(
         default=None,
         ge=0,
+        le=_INT64_MAX,
         description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
     )
     non_streaming_mode: bool | None = Field(
@@ -365,10 +374,14 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
     )
     num_inference_steps: int | None = Field(
         default=None,
+        ge=1,
+        le=_INT64_MAX,
         description="Number of inference steps",
     )
     seed: int | None = Field(
         default=None,
+        ge=_INT64_MIN,
+        le=_INT64_MAX,
         description="Random seed for reproducibility",
     )
 
@@ -413,8 +426,8 @@ class SpeechBatchItem(BaseModel):
     ref_audio: str | None = None
     ref_text: str | None = None
     x_vector_only_mode: bool | None = None
-    max_new_tokens: int | None = None
-    initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+    max_new_tokens: int | None = Field(default=None, ge=1, le=_INT64_MAX)
+    initial_codec_chunk_frames: int | None = Field(default=None, ge=0, le=_INT64_MAX)
     non_streaming_mode: bool | None = None
 
 
@@ -433,8 +446,8 @@ class BatchSpeechRequest(BaseModel):
     ref_audio: str | None = None
     ref_text: str | None = None
     x_vector_only_mode: bool | None = None
-    max_new_tokens: int | None = None
-    initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+    max_new_tokens: int | None = Field(default=None, ge=1, le=_INT64_MAX)
+    initial_codec_chunk_frames: int | None = Field(default=None, ge=0, le=_INT64_MAX)
     non_streaming_mode: bool | None = None
 
 
@@ -517,11 +530,12 @@ class StreamingSpeechSessionConfig(BaseModel):
     instructions: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "opus"] = DEFAULT_AUDIO_FORMAT
     speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
-    max_new_tokens: int | None = Field(default=None, ge=1)
+    max_new_tokens: int | None = Field(default=None, ge=1, le=_INT64_MAX)
     initial_codec_chunk_frames: int | None = Field(
         default=None,
         ge=0,
-        description="Initial chunk size for reduced TTFA. Overrides stage config for this session.",
+        le=_INT64_MAX,
+        description="Initial chunk size for reduced TTFA. Overrides the deploy config for this session.",
     )
     non_streaming_mode: bool | None = Field(
         default=None,
