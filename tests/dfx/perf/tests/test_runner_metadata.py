@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for DFX runner metadata field exclusion."""
 
 import json
@@ -493,11 +496,66 @@ def test_omni_duplex_expected_audio_turns_accepts_complete_session():
     assert_result(
         {
             "completed": 1,
-            "duplex_session_metrics": [{"audio_turn_count": 4}],
+            "mean_tpot_ms": 12.0,
+            "duplex_session_metrics": [{"audio_turn_count": 4, "mean_tpot_ms": 12.0}],
         },
         {"expected_duplex_audio_turns_per_session": 4},
         1,
     )
+
+
+@pytest.mark.parametrize(
+    ("metric_name", "actual", "threshold", "message"),
+    [
+        ("request_throughput", 0.009, 0.01, "below baseline"),
+        ("mean_e2el_ms", 90_000.0, 85_000.0, "exceeds baseline"),
+    ],
+)
+def test_omni_duplex_enforces_current_hardware_baseline(metric_name, actual, threshold, message):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match=message):
+        assert_result(
+            {
+                "completed": 1,
+                "Hardware": "H100",
+                "baseline": {"H100": {metric_name: threshold}},
+                metric_name: actual,
+                "mean_tpot_ms": 12.0,
+                "duplex_session_metrics": [{"audio_turn_count": 4, "mean_tpot_ms": 12.0}],
+            },
+            {"expected_duplex_audio_turns_per_session": 4},
+            1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("metric_value", "message"),
+    [
+        (None, "is missing"),
+        (float("nan"), "is non-finite"),
+        (float("inf"), "is non-finite"),
+    ],
+)
+def test_omni_duplex_rejects_missing_or_non_finite_baseline_metric(metric_value, message):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result = {
+        "completed": 1,
+        "Hardware": "H100",
+        "baseline": {"H100": {"mean_e2el_ms": 85_000.0}},
+        "mean_tpot_ms": 12.0,
+        "duplex_session_metrics": [{"audio_turn_count": 4, "mean_tpot_ms": 12.0}],
+    }
+    if metric_value is not None:
+        result["mean_e2el_ms"] = metric_value
+
+    with pytest.raises(AssertionError, match=message):
+        assert_result(
+            result,
+            {"expected_duplex_audio_turns_per_session": 4},
+            1,
+        )
 
 
 def test_omni_duplex_expected_audio_turns_rejects_incomplete_session():
@@ -507,7 +565,33 @@ def test_omni_duplex_expected_audio_turns_rejects_incomplete_session():
         assert_result(
             {
                 "completed": 1,
-                "duplex_session_metrics": [{"audio_turn_count": 3}],
+                "mean_tpot_ms": 12.0,
+                "duplex_session_metrics": [{"audio_turn_count": 3, "mean_tpot_ms": 12.0}],
+            },
+            {"expected_duplex_audio_turns_per_session": 4},
+            1,
+        )
+
+
+def test_omni_duplex_always_requires_tpot_with_session_turns():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="Duplex TPOT metric is missing"):
+        assert_result(
+            {
+                "completed": 1,
+                "duplex_session_metrics": [{"audio_turn_count": 4, "mean_tpot_ms": 12.0}],
+            },
+            {"expected_duplex_audio_turns_per_session": 4},
+            1,
+        )
+
+    with pytest.raises(AssertionError, match="Duplex session TPOT metrics are missing"):
+        assert_result(
+            {
+                "completed": 1,
+                "mean_tpot_ms": 12.0,
+                "duplex_session_metrics": [{"audio_turn_count": 4}],
             },
             {"expected_duplex_audio_turns_per_session": 4},
             1,

@@ -244,6 +244,19 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
         help="Include per-utterance ASR rows in the saved JSON under key seed_tts_wer_eval_items. "
         "Or set SEED_TTS_WER_SAVE_ITEMS=1.",
     )
+    group.add_argument(
+        "--realtime-duplex-chunk-ms",
+        type=int,
+        default=1000,
+        help="PCM append chunk size for --backend openai-realtime-duplex. "
+        "Use 1000 for paper-style 1.0s units or 200 for the demo cadence.",
+    )
+    group.add_argument(
+        "--no-realtime-duplex-pacing",
+        action="store_true",
+        default=False,
+        help="Send native-duplex PCM chunks without wall-clock pacing.",
+    )
 
 
 _OMNI_BENCH_DATASET_CHOICES = (
@@ -354,4 +367,13 @@ def preprocess_serve_args(args: argparse.Namespace) -> None:
     bot_task = getattr(args, "bot_task", None)
     if getattr(args, "backend", None) == "openai-image-edits-omni" and bot_task is not None:
         extra_body.setdefault("bot_task", bot_task)
+    if getattr(args, "backend", None) == "openai-realtime-duplex":
+        chunk_ms = int(getattr(args, "realtime_duplex_chunk_ms", 1000))
+        if chunk_ms <= 0:
+            raise ValueError("--realtime-duplex-chunk-ms must be positive")
+        extra_body["realtime_duplex_chunk_ms"] = chunk_ms
+        extra_body["realtime_duplex_pacing"] = not getattr(args, "no_realtime_duplex_pacing", False)
+        temperature = getattr(args, "temperature", None)
+        if temperature is not None:
+            extra_body["temperature"] = temperature
     args.extra_body = extra_body

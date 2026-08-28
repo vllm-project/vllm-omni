@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Unit tests for patch.py
@@ -10,6 +10,7 @@ import base64
 import json
 import time
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from pytest_mock import MockerFixture
@@ -19,8 +20,9 @@ from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
     async_request_openai_chat_omni_completions,
     async_request_openai_realtime_duplex,
+    async_request_openai_realtime_tts,
 )
-from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
+from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector, write_pcm16_wav
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
 
@@ -49,7 +51,7 @@ class MockResponse:
 
 
 @pytest.mark.asyncio
-async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch):
+async def test_seed_tts_realtime_tts_exports_per_request_metrics(monkeypatch):
     class FakeRealtimeClient:
         last_instance = None
 
@@ -134,12 +136,14 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
         SimpleNamespace(utterance_id=f"utt-{index}", target_text=f"text {index}") for index in range(4)
     )
 
-    output = await async_request_openai_realtime_duplex(
+    output = await async_request_openai_realtime_tts(
         request_input,
         session=None,
     )
 
     client = FakeRealtimeClient.last_instance
+    assert client is not None
+    assert client.configure_kwargs is not None
     assert client.configure_kwargs["native_duplex"] is False
     assert client.configure_kwargs["extra_body"] == {
         "ref_audio": "data:audio/wav;base64,AAAA",
@@ -195,6 +199,180 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
         "mean_ttft_ms": pytest.approx(20.0, abs=2.0),
         "mean_ttfp_ms": pytest.approx(30.0, abs=2.0),
         "mean_rtf": pytest.approx(0.3, abs=0.03),
+    }
+
+
+@pytest.mark.asyncio
+async def test_seed_tts_native_duplex_streams_configured_pcm_chunks(monkeypatch, tmp_path):
+    wav_paths = []
+    for index in range(2):
+        wav_path = tmp_path / f"input-{index}.wav"
+        write_pcm16_wav(
+            wav_path,
+            bytes([index, 0]) * 3200,
+            sample_rate_hz=16_000,
+        )
+        wav_paths.append(wav_path)
+
+    class FakeRealtimeClient:
+        last_instance = None
+
+        def __init__(self, url):
+            parts = urlsplit(url)
+            assert parts.scheme == "ws"
+            query = parse_qs(parts.query)
+            assert query["minicpmo45_native_duplex"] == ["1"]
+            assert query["autostart"] == ["0"]
+            self.events = RealtimeEventCollector()
+            self.configure_kwargs = None
+            self.streams = []
+            self.response_count = 0
+            self.ack_count = 0
+            type(self).last_instance = self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def configure(self, model, **kwargs):
+            assert model == "openbmb/MiniCPM-o-4_5"
+            self.configure_kwargs = kwargs
+            self.events.add(
+                {
+                    "type": "session.created",
+                    "session": {"capabilities": {"chunk_period_ms": 1000}},
+                }
+            )
+
+        async def stream_pcm16(self, pcm16, **kwargs):
+            self.streams.append((pcm16, kwargs))
+
+        async def commit(self):
+            self.response_count += 1
+            response_id = f"native-{self.response_count}"
+            now = time.monotonic()
+            self.events.add(
+                {"type": "response.created", "response": {"id": response_id}},
+                received_at_s=now + 0.01,
+            )
+            self.events.add(
+                {
+                    "type": "response.audio_transcript.delta",
+                    "response_id": response_id,
+                    "delta": f"native turn {self.response_count}",
+                },
+                received_at_s=now + 0.02,
+            )
+            self.events.add(
+                {
+                    "type": "response.audio.delta",
+                    "response_id": response_id,
+                    "delta": base64.b64encode(b"\x00\x00" * 2400).decode(),
+                    "sample_rate_hz": 24_000,
+                    "metadata": {
+                        "audio_duration_ms": 100,
+                        "vllm_omni": {
+                            "stage_metrics": {
+                                "0": {
+                                    "num_tokens_out": 4,
+                                    "vllm_tpot_ms": 8.0 + self.response_count,
+                                }
+                            }
+                        },
+                    },
+                },
+                received_at_s=now + 0.03,
+            )
+            self.events.add(
+                {"type": "response.done", "response": {"id": response_id}},
+                received_at_s=now + 0.04,
+            )
+
+        async def acknowledge_playback(self, **_kwargs):
+            self.ack_count += 1
+
+        async def close_session(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(
+        "vllm_omni.benchmarks.patch.patch.RealtimeDuplexClient",
+        FakeRealtimeClient,
+    )
+    request_input = RequestFuncInput(
+        model="openbmb/MiniCPM-o-4_5",
+        model_name="openbmb/MiniCPM-o-4_5",
+        prompt="unused TTS target",
+        api_url="http://localhost:8000/v1/realtime",
+        prompt_len=1,
+        output_len=20,
+        logprobs=None,
+        multi_modal_content=None,
+        ignore_eos=False,
+        extra_body={
+            "save_duplex_request_metrics": True,
+            "realtime_duplex_chunk_ms": 200,
+            "realtime_duplex_pacing": False,
+            "realtime_duplex_max_input_ms": 100,
+            "temperature": 0.0,
+        },
+    )
+    request_input.seed_tts_turns = tuple(
+        SimpleNamespace(
+            utterance_id=f"utt-{index}",
+            target_text=f"tts target {index}",
+            prompt_wav_path=str(wav_paths[index]),
+        )
+        for index in range(2)
+    )
+    request_input.seed_tts_speech_extra = {
+        "ref_audio": "data:audio/wav;base64,AAAA",
+        "ref_text": "spoken input 0",
+    }
+    request_input.seed_tts_system_prompt = "Speak exactly."
+
+    output = await async_request_openai_realtime_duplex(
+        request_input,
+        session=None,
+    )
+
+    client = FakeRealtimeClient.last_instance
+    assert client is not None
+    assert client.configure_kwargs is not None
+    assert client.configure_kwargs["native_duplex"] is True
+    assert client.configure_kwargs["auto_response"] is True
+    assert client.configure_kwargs["ref_audio"] == "data:audio/wav;base64,AAAA"
+    assert client.configure_kwargs["instructions"] == "Speak exactly."
+    assert client.configure_kwargs["temperature"] == 0.0
+    assert client.configure_kwargs["extra_body"] == {"return_stage_metrics": True}
+    assert [kwargs for _, kwargs in client.streams] == [{"chunk_ms": 200, "realtime": False} for _ in range(2)]
+    # 100ms input is padded to one complete 1000ms native model unit.
+    assert all(len(pcm16) == 32000 for pcm16, _ in client.streams)
+    assert client.ack_count == 2
+    assert output.success is True
+    assert output.generated_text == "native turn 1 native turn 2"
+    assert output.output_tokens == 8
+    assert output.itl == []
+    assert output.text_latency == pytest.approx(output.ttft + 0.0095 * (output.output_tokens - 1))
+    assert output.duplex_session_metrics["audio_turn_count"] == 2
+    assert output.duplex_session_metrics["mean_tpot_ms"] == 9.5
+    assert output.duplex_session_metrics["input_chunk_ms"] == 200
+    assert output.duplex_session_metrics["global_ttft_ms"] >= 0
+    assert output.duplex_session_metrics["global_ttfp_ms"] >= 0
+    assert output.duplex_session_metrics["global_rtf"] >= 0
+    assert output.duplex_session_metrics["global_audio_duration_ms"] == 200.0
+    assert output.duplex_session_metrics["global_measurement_origin"] == {
+        "ttft": "first input_audio_buffer.commit client send to first non-empty text delta",
+        "ttfp": "first input_audio_buffer.commit client send to first audio packet",
+        "rtf": "first commit-to-last-audio receive time divided by total emitted audio duration",
+    }
+    assert [metric["input_chunk_ms"] for metric in output.duplex_request_metrics] == [200, 200]
+    assert output.duplex_request_metrics[0]["measurement_origin"] == {
+        "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+        "tpot": "Stage-0 engine mean time per output token",
+        "ttfp": "input_audio_buffer.commit client send to first audio packet",
+        "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
     }
 
 

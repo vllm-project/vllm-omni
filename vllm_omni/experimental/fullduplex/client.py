@@ -77,19 +77,22 @@ def summarize_session_request_metrics(
     *,
     session_id: str | None,
 ) -> dict[str, object]:
-    """Average client-observed metrics across turns that emitted audio."""
+    """Average client- and engine-observed metrics across audio turns."""
 
     def mean(metric: str, *, digits: int = 3) -> float | None:
         values = [value for request in request_metrics if (value := _finite_number(request.get(metric))) is not None]
         return round(sum(values) / len(values), digits) if values else None
 
-    return {
+    summary: dict[str, object] = {
         "session_id": session_id,
         "audio_turn_count": len(request_metrics),
         "mean_ttft_ms": mean("ttft_ms"),
         "mean_ttfp_ms": mean("ttfp_ms"),
         "mean_rtf": mean("rtf", digits=6),
     }
+    if (mean_tpot_ms := mean("tpot_ms")) is not None:
+        summary["mean_tpot_ms"] = mean_tpot_ms
+    return summary
 
 
 def _event_stage_metrics(event: dict[str, object]) -> dict[str, object] | None:
@@ -292,6 +295,96 @@ class RealtimeEventCollector:
                 return received_at_s
         return None
 
+    def global_timing_summary(
+        self,
+        *,
+        after_s: float,
+        input_committed_at_s: float,
+        response_ids: list[str],
+        measurement_origin: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        """Summarize one commit-anchored window across selected responses."""
+        selected_response_ids = set(response_ids)
+        first_text_received_at_s: float | None = None
+        audio_received_at_s: list[float] = []
+        response_audio_duration_ms: dict[str, float] = {}
+
+        for event, received_at_s in zip(self.events, self.event_received_at_s, strict=True):
+            if received_at_s < after_s:
+                continue
+            response_id = self.response_id(event)
+            if response_id not in selected_response_ids:
+                continue
+            if (
+                event.get("type")
+                in {
+                    "response.audio_transcript.delta",
+                    "response.output_text.delta",
+                    "response.text.delta",
+                }
+                and isinstance(event.get("delta"), str)
+                and bool(event["delta"])
+                and first_text_received_at_s is None
+            ):
+                first_text_received_at_s = received_at_s
+            if event.get("type") != "response.audio.delta":
+                continue
+            delta = event.get("delta") or event.get("audio")
+            if not isinstance(delta, str) or not delta:
+                continue
+            audio_received_at_s.append(received_at_s)
+            metadata = event.get("metadata")
+            duration_ms = metadata.get("audio_duration_ms") if isinstance(metadata, dict) else None
+            if isinstance(duration_ms, int | float) and math.isfinite(float(duration_ms)):
+                response_audio_duration_ms[response_id] = max(
+                    response_audio_duration_ms.get(response_id, 0.0),
+                    max(0.0, float(duration_ms)),
+                )
+
+        if not audio_received_at_s:
+            return {}
+
+        audio_duration_ms = sum(
+            response_audio_duration_ms.get(
+                response_id,
+                len(self.audio_bytes(response_id)) * 1000.0 / (self.output_sample_rate_hz * PCM16_BYTES_PER_SAMPLE),
+            )
+            for response_id in response_ids
+        )
+        audio_generation_ms = max(
+            0.0,
+            (audio_received_at_s[-1] - input_committed_at_s) * 1000.0,
+        )
+        return {
+            "source": "client_monotonic_receive",
+            "response_ids": response_ids,
+            "measurement_origin": measurement_origin
+            or {
+                "ttft": "first input_audio_buffer.commit client send to first non-empty text delta",
+                "ttfp": "first input_audio_buffer.commit client send to first audio packet",
+                "rtf": "first commit-to-last-audio receive time divided by total emitted audio duration",
+            },
+            "ttft_ms": (
+                _rounded_ms((first_text_received_at_s - input_committed_at_s) * 1000.0)
+                if first_text_received_at_s is not None
+                else None
+            ),
+            "ttfp_ms": _rounded_ms((audio_received_at_s[0] - input_committed_at_s) * 1000.0),
+            "rtf": (
+                round(
+                    compute_audio_rtf(
+                        audio_generation_ms / 1000.0,
+                        audio_duration_ms / 1000.0,
+                    ),
+                    6,
+                )
+                if audio_duration_ms > 0
+                else None
+            ),
+            "audio_generation_ms": _rounded_ms(audio_generation_ms),
+            "audio_duration_ms": _rounded_ms(audio_duration_ms),
+        }
+
     def timing_summary(
         self,
         *,
@@ -393,6 +486,13 @@ class RealtimeEventCollector:
             }
             request_started_at_s = input_committed_at_s if input_committed_at_s is not None else response_created_at_s
             if request_started_at_s is not None:
+                default_measurement_origin = {
+                    "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+                    "ttfp": "input_audio_buffer.commit client send to first audio packet",
+                    "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
+                }
+                if stage0_metrics is not None:
+                    default_measurement_origin["tpot"] = "Stage-0 engine mean time per output token"
                 audio_duration_ms = (
                     max(cumulative_audio_ms)
                     if cumulative_audio_ms
@@ -406,12 +506,7 @@ class RealtimeEventCollector:
                 )
                 result["request_metrics"] = {
                     "source": "client_monotonic_receive",
-                    "measurement_origin": measurement_origin
-                    or {
-                        "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
-                        "ttfp": "input_audio_buffer.commit client send to first audio packet",
-                        "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
-                    },
+                    "measurement_origin": measurement_origin or default_measurement_origin,
                     "ttft_ms": (
                         _rounded_ms((first_text_received_at_s - request_started_at_s) * 1000.0)
                         if first_text_received_at_s is not None
@@ -430,6 +525,12 @@ class RealtimeEventCollector:
                     "audio_generation_ms": _rounded_ms(audio_generation_ms),
                     "audio_duration_ms": _rounded_ms(audio_duration_ms),
                 }
+                if stage0_metrics is not None:
+                    request_metrics = result["request_metrics"]
+                    assert isinstance(request_metrics, dict)
+                    request_metrics["tpot_ms"] = (
+                        _finite_number(stage0_metrics.get("vllm_tpot_ms"), nonnegative=True) or 0.0
+                    )
         return result
 
 
@@ -670,13 +771,64 @@ class RealtimeDuplexClient:
     async def commit(self) -> None:
         await self.send({"type": "input_audio_buffer.commit", "final": True})
 
-    async def acknowledge_playback(self) -> None:
-        for response_id in self.events.response_ids:
-            pcm16 = self.events.audio_bytes(response_id)
+    def _playback_ack_event(
+        self,
+        response_id: str,
+        *,
+        after_count: int,
+    ) -> dict[str, object] | None:
+        item_id = f"item_{response_id}"
+        acknowledged = 0
+        for event in self.events.events:
+            if event.get("type") != "playback.acknowledged":
+                continue
+            acknowledged += 1
+            if acknowledged <= after_count:
+                continue
+            payload = event.get("event")
+            if not isinstance(payload, dict):
+                payload = event
+            if payload.get("item_id") == item_id or payload.get("response_id") == response_id:
+                return payload
+        return None
+
+    def _playback_history_committed(self, response_id: str, *, after_count: int) -> bool:
+        event = self._playback_ack_event(response_id, after_count=after_count)
+        return bool(event is not None and event.get("history_committed") is True)
+
+    async def acknowledge_playback(
+        self,
+        *,
+        response_id: str | None = None,
+        timeout_s: float = 0.0,
+        wait_for_history_committed: bool = False,
+    ) -> None:
+        """Ack one or all audio responses, optionally waiting for confirmation."""
+        targets = [response_id] if response_id is not None else list(self.events.response_ids)
+        for rid in targets:
+            if not isinstance(rid, str) or not rid:
+                continue
+            pcm16 = self.events.audio_bytes(rid)
             if not pcm16:
                 continue
+            if self._playback_history_committed(rid, after_count=0):
+                continue
             played_ms = len(pcm16) * 1000 // (self.events.output_sample_rate_hz * PCM16_BYTES_PER_SAMPLE)
-            await self.send_playback_ack(response_id, played_ms)
+            before_ack = self.events.count("playback.acknowledged")
+            await self.send_playback_ack(rid, played_ms)
+            if timeout_s <= 0:
+                continue
+
+            def playback_acknowledged() -> bool:
+                if wait_for_history_committed:
+                    return self._playback_history_committed(rid, after_count=before_ack)
+                return self._playback_ack_event(rid, after_count=before_ack) is not None
+
+            await wait_for(
+                playback_acknowledged,
+                timeout_s=timeout_s,
+                label=f"playback.acknowledged for {rid}",
+            )
 
     async def send_playback_ack(self, response_id: str, played_ms: int) -> None:
         await self.send(

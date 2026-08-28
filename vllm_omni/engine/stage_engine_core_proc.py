@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Stage Core Process for vLLM-Omni V1 architecture.
 
@@ -88,6 +91,7 @@ class StageEngineCoreProc(EngineCoreProc):
         """
         signal_callback: SignalCallback | None = None
         maybe_register_config_serialize_by_value()
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
 
         # Register vllm-omni reasoning parsers (e.g. step_audio) in this
         # subprocess so they are available when the engine core resolves

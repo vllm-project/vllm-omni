@@ -1,12 +1,12 @@
 [
   {
     "test_name": "test_minicpmo_4_5_duplex_seed_tts",
+    "description": "H100 demo-cadence native duplex gate: serial 200ms paced appends; each <=1400ms input is padded to the model's 1000ms unit before commit; global RTF is session wall time including inter-turn input and acknowledgements, not model-only RTF",
     "mark": [
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100",
-            "npu": "A3"
+            "cuda": "H100"
           },
           "num_cards": 1
         }
@@ -26,7 +26,7 @@
       {
         "dataset_name": "seed-tts",
         "dataset_path": "zhaochenyang20/seed-tts-eval",
-        "backend": "openai-realtime-tts",
+        "backend": "openai-realtime-duplex",
         "endpoint": "/v1/realtime",
         "num_prompts": [
           1
@@ -34,49 +34,48 @@
         "max_concurrency": [
           1
         ],
+        "num_warmups": 2,
         "no_oversample": true,
         "disable_shuffle": true,
         "trust_remote_code": true,
         "seed_tts_locale": "en",
         "seed_tts_turns_per_session": 4,
+        "realtime_duplex_chunk_ms": 200,
+        "temperature": 0.0,
         "expected_duplex_audio_turns_per_session": 4,
         "extra_body": {
-          "save_duplex_request_metrics": true
+          "save_duplex_request_metrics": true,
+          "realtime_duplex_max_input_ms": 1400
         },
-        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "percentile-metrics": "ttft,tpot,e2el,audio_ttfp,audio_rtf,audio_duration",
         "baseline": {
           "H100": {
             "request_throughput": [
-              0.3038
+              0.015
             ],
             "mean_ttft_ms": [
-              139.997
+              480.0
+            ],
+            "mean_tpot_ms": [
+              25.0
             ],
             "mean_e2el_ms": [
-              3269.8807
+              61000.0
             ],
             "mean_audio_ttfp_ms": [
-              456.073
+              485.0
             ],
             "mean_audio_rtf": [
-              0.2254
-            ]
-          },
-          "A3": {
-            "request_throughput": [
-              0.1594
+              1.75
             ],
-            "mean_ttft_ms": [
-              274.164
+            "mean_duplex_global_ttft_ms": [
+              465.0
             ],
-            "mean_e2el_ms": [
-              6250.7696
+            "mean_duplex_global_ttfp_ms": [
+              465.0
             ],
-            "mean_audio_ttfp_ms": [
-              994.422
-            ],
-            "mean_audio_rtf": [
-              0.46163
+            "mean_duplex_global_rtf": [
+              2.1
             ]
           }
         }

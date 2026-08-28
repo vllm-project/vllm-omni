@@ -172,6 +172,28 @@ def test_preprocess_serve_args_applies_safe_omniinteract_prompt_default(
             {"bot_task": "vanilla"},
             {"extra_body"},
         ),
+        (
+            [
+                "--backend",
+                "openai-realtime-duplex",
+                "--realtime-duplex-chunk-ms",
+                "200",
+                "--no-realtime-duplex-pacing",
+                "--temperature",
+                "0.0",
+            ],
+            {
+                "realtime_duplex_chunk_ms": 200,
+                "realtime_duplex_pacing": False,
+                "temperature": 0.0,
+            },
+            {
+                "backend",
+                "realtime_duplex_chunk_ms",
+                "no_realtime_duplex_pacing",
+                "temperature",
+            },
+        ),
     ],
 )
 def test_omni_args_parse_and_preprocess(
@@ -182,6 +204,7 @@ def test_omni_args_parse_and_preprocess(
     parser = TrackingArgumentParser()
     parser.add_argument("--extra-body", type=json.loads, default=None)
     parser.add_argument("--backend", default="openai-chat-omni")
+    parser.add_argument("--temperature", type=float, default=None)
     add_omni_args(parser)
 
     args = parser.parse_args(argv)

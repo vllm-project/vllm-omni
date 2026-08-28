@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Seed-TTS zero-shot evaluation-style prompts for ``vllm bench serve``.
 
 Loads rows from the `meta.lst` format used in `BytedanceSpeech/seed-tts-eval`_ (or any
@@ -22,7 +25,7 @@ import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from vllm.benchmarks.datasets import BenchmarkDataset, SampleRequest
 from vllm.tokenizers import TokenizerLike
@@ -61,10 +64,11 @@ class SeedTTSSampleRequest(SampleRequest):
 
 @dataclass(frozen=True)
 class SeedTTSTurn:
-    """One target utterance within a grouped Realtime Seed-TTS session."""
+    """One Seed-TTS row within a grouped Realtime session."""
 
     utterance_id: str
     target_text: str
+    prompt_wav_path: str = ""
 
 
 @dataclass
@@ -250,8 +254,9 @@ class SeedTTSDataset(BenchmarkDataset):
                 SeedTTSTurn(
                     utterance_id=row.utterance_id,
                     target_text=row.target_text,
+                    prompt_wav_path=str(wav_path),
                 )
-                for row, _ in group
+                for row, wav_path in group
             )
             prompt_len = sum(len(tok.encode(f"{self._system_prompt}\n{turn.target_text}")) for turn in turns)
             lang = "English" if self.locale == "en" else "Chinese"
@@ -349,6 +354,8 @@ class SeedTTSDesignDataset(SeedTTSDataset):
     ``ref_audio`` / ``ref_text``.  Speaker-similarity (SIM) is not computed.
     """
 
+    _design_rows: list[_SeedTTSDesignRow]
+
     def load_data(self) -> None:
         # Does NOT call super().load_data() — the format is different (5 fields,
         # no wav file).  self._rows is intentionally left empty; the parent
@@ -372,7 +379,7 @@ class SeedTTSDesignDataset(SeedTTSDataset):
         self._design_rows = design_rows
         # Keep self._rows empty — parent sample() is overridden.
         self._rows = []
-        self.data = self._design_rows
+        self.data = cast(Any, self._design_rows)
         logger.info(
             "Loaded Seed-TTS-Design: root=%s locale=%s rows=%d",
             self._root,

@@ -184,6 +184,44 @@ async def test_realtime_client_close_waits_for_a_new_session_closed_event():
 
 
 @pytest.mark.asyncio
+async def test_realtime_client_waits_for_wrapped_playback_acknowledgement():
+    class Client(RealtimeDuplexClient):
+        def __init__(self):
+            super().__init__("ws://unused")
+            self.sent = []
+            self.events.add({"type": "response.created", "response_id": "resp-1"})
+            self.events.add(
+                {
+                    "type": "response.audio.delta",
+                    "response_id": "resp-1",
+                    "delta": base64.b64encode(b"\x00\x00" * 2400).decode(),
+                    "sample_rate_hz": 24_000,
+                }
+            )
+
+        async def send(self, event):
+            self.sent.append(event)
+            self.events.add(
+                {
+                    "type": "playback.acknowledged",
+                    "event": {
+                        **event,
+                        "history_committed": True,
+                    },
+                }
+            )
+
+    client = Client()
+    await client.acknowledge_playback(
+        response_id="resp-1",
+        timeout_s=1,
+        wait_for_history_committed=True,
+    )
+
+    assert [event["type"] for event in client.sent] == ["playback.ack"]
+
+
+@pytest.mark.asyncio
 async def test_realtime_client_configure_sends_seed_tts_text_condition():
     class Client(RealtimeDuplexClient):
         def __init__(self):
@@ -253,6 +291,58 @@ def test_realtime_event_collector_partitions_audio_by_response():
     assert collector.output_sample_rate_hz == 16_000
     assert collector.first_received_at("response.created") is not None
     assert collector.last_received_at("response.audio.delta") is not None
+
+
+def test_realtime_event_collector_reports_global_metrics_across_responses():
+    collector = RealtimeEventCollector()
+    for response_id, created_at_s, text_at_s, audio_times, durations in (
+        ("resp-a", 10.1, 10.2, (10.3, 10.4), (100, 200)),
+        ("resp-b", 12.1, 12.2, (12.3, 12.5), (150, 300)),
+    ):
+        collector.add(
+            {"type": "response.created", "response": {"id": response_id}},
+            received_at_s=created_at_s,
+        )
+        collector.add(
+            {
+                "type": "response.audio_transcript.delta",
+                "response_id": response_id,
+                "delta": response_id,
+            },
+            received_at_s=text_at_s,
+        )
+        for received_at_s, duration_ms in zip(audio_times, durations, strict=True):
+            collector.add(
+                {
+                    "type": "response.audio.delta",
+                    "response_id": response_id,
+                    "delta": base64.b64encode(b"audio").decode("ascii"),
+                    "sample_rate_hz": 16_000,
+                    "metadata": {"audio_duration_ms": duration_ms},
+                },
+                received_at_s=received_at_s,
+            )
+
+    metrics = collector.global_timing_summary(
+        after_s=10.0,
+        input_committed_at_s=10.0,
+        response_ids=["resp-a", "resp-b"],
+    )
+
+    assert metrics == {
+        "source": "client_monotonic_receive",
+        "response_ids": ["resp-a", "resp-b"],
+        "measurement_origin": {
+            "ttft": "first input_audio_buffer.commit client send to first non-empty text delta",
+            "ttfp": "first input_audio_buffer.commit client send to first audio packet",
+            "rtf": "first commit-to-last-audio receive time divided by total emitted audio duration",
+        },
+        "ttft_ms": 200.0,
+        "ttfp_ms": 300.0,
+        "rtf": 5.0,
+        "audio_generation_ms": 2500.0,
+        "audio_duration_ms": 500.0,
+    }
 
 
 def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
@@ -350,10 +440,12 @@ def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
         "source": "client_monotonic_receive",
         "measurement_origin": {
             "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+            "tpot": "Stage-0 engine mean time per output token",
             "ttfp": "input_audio_buffer.commit client send to first audio packet",
             "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
         },
         "ttft_ms": 250.0,
+        "tpot_ms": 15.0,
         "ttfp_ms": 300.0,
         "rtf": pytest.approx(1.916667),
         "audio_generation_ms": 460.0,
