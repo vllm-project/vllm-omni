@@ -922,10 +922,14 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 self._sync_result_buffer.put(msg)
                 continue
 
-            # If shutdown started while we were dequeuing / unpacking, drop
-            # this delivery so it cannot repopulate _completed_outputs after
-            # shutdown() cleared it (issue #6413 / #6439 review).
-            if self._closed:
+            # If shutdown started while we were dequeuing, drop this delivery
+            # so it cannot repopulate _completed_outputs after shutdown()
+            # cleared it (issue #6413 / #6439 review). OUTPUT_READY must still
+            # flow through the dispatch below: unpack_diffusion_output_shm()
+            # is the only receive-side path that unlinks named SHM segments,
+            # and the closed-time re-checks under _futures_lock already
+            # prevent any cache write after unpack.
+            if self._closed and msg.kind != AsyncOutputKind.OUTPUT_READY:
                 continue
 
             if msg.kind in (AsyncOutputKind.RPC_RESULT, AsyncOutputKind.COMPUTE_DONE):
