@@ -1485,6 +1485,10 @@ def test_overlapping_weaker_lookup_cannot_return_after_artifact_is_denied(tmp_pa
         (errno.EIO, ResolutionStage.DOMAIN, FailureCode.DOMAIN_UNAVAILABLE),
     ],
 )
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="fault targeting requires Linux /proc/self/fd",
+)
 def test_deny_write_failure_surfaces_as_retryable_storage_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1785,6 +1789,10 @@ def test_operational_lookup_eio_is_retryable_without_denying_valid_artifact(
 
 
 @pytest.mark.parametrize("failure_point", ["entry_stat", "deny_stat"])
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="lock descriptor assertions require Linux /proc/self/fd",
+)
 def test_lookup_state_probe_eio_is_typed_and_releases_artifact_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
