@@ -2638,13 +2638,28 @@ class Orchestrator:
                 req_state.prompt,
                 streaming_context=req_state.streaming,
             )
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "[Orchestrator] req=%s process_engine_inputs FAILED for stage-%s",
                 req_id,
                 next_logical,
             )
-            raise
+            if not self._is_duplex_session_request(req_state):
+                raise
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    request_id=req_id,
+                    stage_id=next_logical,
+                    error=f"Stage-{next_logical} input processor failed: {type(exc).__name__}: {exc}",
+                    error_type=type(exc).__name__,
+                )
+            )
+            await self._cleanup_request_ids(
+                [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                abort=True,
+                close_duplex_sessions=True,
+            )
+            return
         finally:
             req_state.streaming.source_token_decoder = previous_decoder
 

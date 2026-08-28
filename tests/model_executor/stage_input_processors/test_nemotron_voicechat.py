@@ -414,8 +414,10 @@ def test_talker_drains_all_received_positions_per_wake() -> None:
     session = talker._sessions["req-0"]
     assert session["step"] == 1 and not session["sync_mode"]
 
-    # First decode wake: drains ALL prompt-region steps (t=1..P-1) at once.
-    _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info)
+    # First resumed wake: drains ALL prompt-region steps (t=1..P-1) at once.
+    # vLLM 0.28 reports each resumed one-token segment as prefill; the model
+    # session must still advance instead of restarting its EAR-TTS warmup.
+    _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=True, **info)
     assert session["step"] == prompt_len  # t advanced 1 -> P in one wake
     assert update["codes"]["audio"].shape == (prompt_len - 1, 31)
     assert float(embeds[0, 0]) == 0.0  # offline stream waits for upstream terminal

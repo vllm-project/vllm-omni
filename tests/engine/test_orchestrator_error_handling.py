@@ -936,6 +936,36 @@ async def test_diffusion_client_error_output_propagates_status_code(orchestrator
 
 
 @pytest.mark.asyncio
+async def test_duplex_input_processor_failure_is_request_scoped(orchestrator_factory, monkeypatch) -> None:
+    class FailingStage(FakeStageClient):
+        def process_engine_inputs(self, *_args, **_kwargs):
+            raise ValueError("No latent or hidden_states found in thinker output")
+
+    fixture = orchestrator_factory(
+        [FakeStageClient(stage_type="llm"), FailingStage(stage_type="llm", final_output=True)]
+    )
+    state = OrchestratorRequestState(
+        request_id="bad",
+        prompt=SimpleNamespace(request_id="bad", prompt_token_ids=[1]),
+        sampling_params_list=[_sampling_params(), _sampling_params()],
+        final_stage_id=1,
+        duplex_identity=SimpleNamespace(),
+    )
+
+    async def no_cleanup(*_args, **_kwargs):
+        pass
+
+    monkeypatch.setattr(fixture.orchestrator, "_cleanup_request_ids", no_cleanup)
+    try:
+        await fixture.orchestrator._forward_to_next_stage_unguarded("bad", 0, _build_request_output("raw"), state)
+        error = await _wait_for_error_message(fixture, request_id="bad")
+        assert error.fatal is False
+    finally:
+        fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
+        fixture.thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("status_code", "error_type"),
     [
