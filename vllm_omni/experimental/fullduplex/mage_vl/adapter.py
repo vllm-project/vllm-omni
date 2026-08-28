@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from vllm_omni.experimental.fullduplex.core.adapter import DuplexAdapter, DuplexCapability, OutputChunk
+from vllm_omni.experimental.fullduplex.core.runtime import DuplexRuntime, Emit
 from vllm_omni.experimental.fullduplex.core.session import DuplexSession
 
 
@@ -135,6 +137,8 @@ class MageVLDuplexAdapter(DuplexAdapter):
         state.pending_gate = None
         for task in tuple(state.gate_tasks):
             task.cancel()
+        while not state.gate_ready.empty():
+            state.gate_ready.get_nowait()
 
     async def on_close(self, session: DuplexSession) -> None:
         state = self._session_state.get(session.session_id)
@@ -147,9 +151,8 @@ class MageVLDuplexAdapter(DuplexAdapter):
         if state is not None and state.gate_tasks:
             await asyncio.gather(*tuple(state.gate_tasks), return_exceptions=True)
 
-    def close_session(self, session: DuplexSession) -> None:
-        """Release all mutable state owned by a disconnected session."""
-        self._session_state.pop(session.session_id, None)
+    async def wait_for_gate(self, session: DuplexSession) -> None:
+        await self._state_for(session).gate_ready.get()
 
     async def _evaluate_gate(self, session: DuplexSession) -> None:
         state = self._state_for(session)
@@ -165,6 +168,7 @@ class MageVLDuplexAdapter(DuplexAdapter):
         if decision.event_id:
             state.seen_events.add(decision.event_id)
         state.pending_gate = decision
+        state.gate_ready.put_nowait(None)
 
     def _schedule_gate(self, session: DuplexSession) -> None:
         state = self._state_for(session)
@@ -185,6 +189,44 @@ class _MageVLSessionState:
     pending_gate: MageVLGateDecision | None = None
     seen_events: set[str] = field(default_factory=set)
     gate_tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    gate_ready: asyncio.Queue[None] = field(default_factory=asyncio.Queue)
+
+
+class MageVLDuplexRuntime(DuplexRuntime):
+    """Shared turn runtime with a model-owned deferred-gate watcher."""
+
+    adapter: MageVLDuplexAdapter
+
+    def __init__(self, session: DuplexSession, adapter: MageVLDuplexAdapter) -> None:
+        super().__init__(session, adapter)
+        self._gate_watch_task: asyncio.Task[None] | None = None
+
+    async def _on_input_waiting(self, modality: str, emit: Emit) -> None:
+        if modality == "text" or self._gate_watch_task is not None:
+            return
+        self._gate_watch_task = asyncio.create_task(self._watch_gate(emit))
+
+    async def _watch_gate(self, emit: Emit) -> None:
+        while True:
+            await self.adapter.wait_for_gate(self.session)
+            if self.adapter.should_respond(self.session):
+                await self._start_response(emit)
+                # Let respond() consume the accepted gate before checking the
+                # next notification, so stacked decisions cannot supersede it.
+                await asyncio.sleep(0)
+
+    async def _stop_background(self) -> None:
+        task = self._gate_watch_task
+        self._gate_watch_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def _on_graceful_close(self, emit: Emit) -> None:
+        await self.adapter.flush(self.session)
+        if self.session.config.proactive and self.adapter.should_respond(self.session):
+            await self._start_response(emit)
 
 
 def _coerce_window(modality: str, data: Any) -> MageVLCodecWindow:

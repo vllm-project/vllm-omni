@@ -24,6 +24,12 @@ authentication, bounded concurrent sessions and message sizes, idle timeouts,
 disconnect cancellation, per-session state cleanup, and serialized access to the
 shared Transformers checkpoint. Native vLLM model execution remains follow-up work.
 
+The default `frames` backend uses decoded frames and has no codec preprocessing
+requirement. The optional `codec` backend requires `ffmpeg` and `ffprobe`, plus the
+`cv-preinfer` executable provided by `codec-video-prep>=0.2.5`, on `PATH`. Server
+startup fails with an actionable error when `cv-preinfer` is unavailable; use
+`--video-backend frames` when codec preprocessing is not installed.
+
 ## Serving
 
 ```bash
@@ -57,9 +63,8 @@ including:
 ## Adapter Shape
 
 ```python
-from vllm_omni.experimental.fullduplex.core.runtime import DuplexRuntime
 from vllm_omni.experimental.fullduplex.core.session import DuplexSession, DuplexSessionConfig
-from vllm_omni.experimental.fullduplex.mage_vl import MageVLDuplexAdapter
+from vllm_omni.experimental.fullduplex.mage_vl import MageVLDuplexAdapter, MageVLDuplexRuntime
 
 
 adapter = MageVLDuplexAdapter(gate=run_mage_gate, generate=run_mage_decoder)
@@ -71,7 +76,7 @@ session = DuplexSession(
         proactive=True,
     ),
 )
-runtime = DuplexRuntime(session, adapter)
+runtime = MageVLDuplexRuntime(session, adapter)
 await runtime.run(input_events, emit_event)
 ```
 

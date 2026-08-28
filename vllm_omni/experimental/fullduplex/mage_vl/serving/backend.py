@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import binascii
 import contextlib
+import shutil
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
@@ -43,6 +44,11 @@ class MageVLTransformersBackend:
     ) -> None:
         if video_backend not in {"frames", "codec"}:
             raise ValueError("video_backend must be frames or codec")
+        if video_backend == "codec" and shutil.which("cv-preinfer") is None:
+            raise RuntimeError(
+                "video_backend='codec' requires cv-preinfer from codec-video-prep>=0.2.5; "
+                "install it and ensure cv-preinfer is on PATH, or use video_backend='frames'"
+            )
         if num_frames <= 0 or target_fps <= 0 or max_new_tokens <= 0:
             raise ValueError("num_frames, target_fps, and max_new_tokens must be positive")
         self.checkpoint = checkpoint

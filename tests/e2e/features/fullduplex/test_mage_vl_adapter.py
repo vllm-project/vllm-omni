@@ -6,11 +6,11 @@ from __future__ import annotations
 import pytest
 
 from vllm_omni.experimental.fullduplex.core import protocol as ev
-from vllm_omni.experimental.fullduplex.core.runtime import DuplexRuntime
 from vllm_omni.experimental.fullduplex.core.session import DuplexSession, DuplexSessionConfig
 from vllm_omni.experimental.fullduplex.mage_vl import (
     MageVLCodecWindow,
     MageVLDuplexAdapter,
+    MageVLDuplexRuntime,
     MageVLGateDecision,
 )
 
@@ -56,7 +56,7 @@ async def test_mage_vl_proactive_gate_speaks_once_for_event():
             proactive=True,
         ),
     )
-    rt = DuplexRuntime(session, adapter)
+    rt = MageVLDuplexRuntime(session, adapter)
     out, emit = _collector()
 
     await rt.run(
@@ -98,7 +98,7 @@ async def test_mage_vl_query_bypasses_silent_gate_and_preserves_codec_metadata()
             proactive=True,
         ),
     )
-    rt = DuplexRuntime(session, adapter)
+    rt = MageVLDuplexRuntime(session, adapter)
     out, emit = _collector()
 
     await rt.run(

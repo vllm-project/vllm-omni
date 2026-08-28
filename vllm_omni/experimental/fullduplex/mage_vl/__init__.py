@@ -4,11 +4,13 @@
 from vllm_omni.experimental.fullduplex.mage_vl.adapter import (
     MageVLCodecWindow,
     MageVLDuplexAdapter,
+    MageVLDuplexRuntime,
     MageVLGateDecision,
 )
 
 __all__ = [
     "MageVLCodecWindow",
     "MageVLDuplexAdapter",
+    "MageVLDuplexRuntime",
     "MageVLGateDecision",
 ]

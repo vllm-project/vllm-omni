@@ -11,12 +11,30 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from vllm_omni.experimental.fullduplex.mage_vl import MageVLDuplexAdapter
+from vllm_omni.experimental.fullduplex.mage_vl.serving import backend as backend_module
 from vllm_omni.experimental.fullduplex.mage_vl.serving.server import (
     MageVLServingConfig,
     create_app,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_mage_vl_codec_backend_requires_preprocessor(monkeypatch):
+    monkeypatch.setattr(backend_module.shutil, "which", lambda _name: None)
+
+    with pytest.raises(RuntimeError, match="cv-preinfer"):
+        backend_module.MageVLTransformersBackend(video_backend="codec")
+
+
+def test_mage_vl_frames_backend_does_not_require_preprocessor(monkeypatch):
+    def unexpected_lookup(_name):
+        raise AssertionError("frames backend must not inspect codec dependencies")
+
+    monkeypatch.setattr(backend_module.shutil, "which", unexpected_lookup)
+    backend = backend_module.MageVLTransformersBackend(video_backend="frames")
+
+    assert backend.video_backend == "frames"
 
 
 def _factory():

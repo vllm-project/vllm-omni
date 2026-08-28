@@ -13,7 +13,7 @@ import json
 import secrets
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -24,135 +24,10 @@ from fastapi.responses import JSONResponse
 
 from vllm_omni.experimental.fullduplex.core import protocol as event_protocol
 from vllm_omni.experimental.fullduplex.core.adapter import DuplexAdapter
-from vllm_omni.experimental.fullduplex.core.session import (
-    DuplexSession,
-    DuplexSessionConfig,
-    DuplexState,
-)
-from vllm_omni.experimental.fullduplex.mage_vl import MageVLDuplexAdapter
+from vllm_omni.experimental.fullduplex.core.session import DuplexSession, DuplexSessionConfig
+from vllm_omni.experimental.fullduplex.mage_vl import MageVLDuplexAdapter, MageVLDuplexRuntime
 
 AdapterFactory = Callable[[], DuplexAdapter | Any]
-Emit = Callable[[dict[str, Any]], Awaitable[None]]
-
-
-class _MageVLServingRuntime:
-    """Connection-owned runtime with explicit disconnect cancellation."""
-
-    def __init__(self, session: DuplexSession, adapter: MageVLDuplexAdapter) -> None:
-        self.session = session
-        self.adapter = adapter
-        self.capabilities = adapter.capabilities()
-        self._response_task: asyncio.Task[None] | None = None
-        self._gate_watch_tasks: set[asyncio.Task[None]] = set()
-        self._response_lock = asyncio.Lock()
-        self._closed = False
-
-    async def run(self, inputs: AsyncIterator[dict[str, Any]], emit: Emit) -> None:
-        graceful_close = False
-        try:
-            async for event in inputs:
-                event_type = event.get("type")
-                if event_type == event_protocol.INPUT_APPEND:
-                    modality = event.get("modality", "")
-                    if modality not in self.capabilities.input_modalities:
-                        await emit(event_protocol.error(f"unsupported input modality: {modality}"))
-                        continue
-                    await self.adapter.on_input(self.session, modality, event.get("data"))
-                    self.session.state = DuplexState.LISTENING
-                    if self.session.config.proactive and self.adapter.should_respond(self.session):
-                        await self._start_response(emit)
-                    elif self.session.config.proactive and modality != "text":
-                        self._watch_gate(emit)
-                elif event_type in (event_protocol.INPUT_COMMIT, event_protocol.RESPONSE_CREATE):
-                    if self.adapter.should_respond(self.session):
-                        await self._start_response(emit)
-                elif event_type == event_protocol.RESPONSE_CANCEL:
-                    await self.cancel_response()
-                    await emit(event_protocol.cancelled(self.session.response_index))
-                elif event_type == event_protocol.PLAYBACK_ACK:
-                    await self.adapter.on_playback_ack(self.session, int(event.get("cursor", 0)))
-                elif event_type == event_protocol.CLOSE:
-                    await self.adapter.flush(self.session)
-                    if self.session.config.proactive and self.adapter.should_respond(self.session):
-                        await self._start_response(emit)
-                    graceful_close = True
-                    break
-        finally:
-            gate_tasks = tuple(self._gate_watch_tasks)
-            if graceful_close and gate_tasks:
-                await asyncio.gather(*gate_tasks, return_exceptions=True)
-            else:
-                for gate_task in gate_tasks:
-                    gate_task.cancel()
-                if gate_tasks:
-                    await asyncio.gather(*gate_tasks, return_exceptions=True)
-            task = self._response_task
-            if graceful_close and task is not None and not task.done():
-                await task
-            else:
-                await self.cancel_response()
-            await self.adapter.on_close(self.session)
-            self.session.state = DuplexState.CLOSED
-            self._closed = True
-
-    async def _start_response(self, emit: Emit) -> None:
-        async with self._response_lock:
-            if self._response_task is not None and not self._response_task.done():
-                await self.cancel_response()
-            self._response_task = asyncio.create_task(self._respond(emit))
-
-    def _watch_gate(self, emit: Emit) -> None:
-        task = asyncio.create_task(self._respond_when_gate_ready(emit))
-        self._gate_watch_tasks.add(task)
-        task.add_done_callback(self._gate_watch_tasks.discard)
-
-    async def _respond_when_gate_ready(self, emit: Emit) -> None:
-        await self.adapter.flush(self.session)
-        async with self._response_lock:
-            if self.adapter.should_respond(self.session):
-                if self._response_task is not None and not self._response_task.done():
-                    await self.cancel_response()
-                self._response_task = asyncio.create_task(self._respond(emit))
-
-    async def cancel_response(self) -> None:
-        task = self._response_task
-        if task is None or task.done():
-            self.session.barge_in()
-            await self.adapter.on_barge_in(self.session)
-            return
-        self.session.barge_in()
-        await self.adapter.on_barge_in(self.session)
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-        self._response_task = None
-
-    async def close(self) -> None:
-        if self._closed:
-            return
-        await self.cancel_response()
-        await self.adapter.on_close(self.session)
-        self.session.state = DuplexState.CLOSED
-        self._closed = True
-
-    async def _respond(self, emit: Emit) -> None:
-        response_index, epoch = self.session.begin_response()
-        await emit(event_protocol.created(response_index))
-        try:
-            async for chunk in self.adapter.respond(self.session):
-                if self.session.is_stale(epoch):
-                    return
-                await emit(event_protocol.delta(response_index, chunk.modality, chunk.data))
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            await emit(event_protocol.error(f"response failed: {error}"))
-        finally:
-            if not self.session.is_stale(epoch):
-                await emit(event_protocol.done(response_index))
-                self.session.end_response()
-            if self._response_task is asyncio.current_task():
-                self._response_task = None
 
 
 @dataclass(frozen=True)
@@ -169,7 +44,7 @@ class MageVLServingConfig:
 
 
 class _SessionLease:
-    def __init__(self, session_id: str, runtime: _MageVLServingRuntime) -> None:
+    def __init__(self, session_id: str, runtime: MageVLDuplexRuntime) -> None:
         self.session_id = session_id
         self.runtime = runtime
         self.last_activity = time.monotonic()
@@ -206,7 +81,7 @@ class _SessionRegistry:
                     proactive=capability.proactive,
                 ),
             )
-            lease = _SessionLease(session_id, _MageVLServingRuntime(session, adapter))
+            lease = _SessionLease(session_id, MageVLDuplexRuntime(session, adapter))
             self._leases[session_id] = lease
             return lease
 
