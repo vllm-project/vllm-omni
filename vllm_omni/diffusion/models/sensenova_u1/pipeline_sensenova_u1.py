@@ -1601,6 +1601,14 @@ class SenseNovaU1Pipeline(
         a parallel layer only holds this rank's slice of it, so the delta goes
         through the layer's own weight loader -- into a zeroed copy of the
         parameter, which is then added -- instead of being added directly.
+
+        Each parameter is fused in place as it is reached, so a failure part way
+        through leaves the earlier ones fused and the pipeline has to be
+        reloaded. Deferring the writes would mean holding every delta at once,
+        and the deltas are full rank: 15.09 GiB for the 8B checkpoint, against
+        the 192 MiB one parameter costs here. Fusion runs at load time, before
+        the pipeline serves anything, so a partially fused model is never
+        reachable from a request.
         """
         applied = 0
         for name, param in self.named_parameters():
