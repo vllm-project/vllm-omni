@@ -25,7 +25,7 @@ vllm serve /models/MiniCPM-o-4_5 --omni --served-model-name openbmb/MiniCPM-o-4_
 按 run_benchmarks.sh 顺序执行三项 Benchmark。
 
 ## 6. 预期结果
-精度四项全部通过，性能 RTF 0.46 / TTFT 372ms / TTFP 1105ms。
+精度四项全部通过，性能 RTF 0.36 / TTFT 372ms / TTFP 1105ms。
 
 ## 7. 依赖修补说明
 

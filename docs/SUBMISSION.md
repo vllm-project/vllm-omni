@@ -22,13 +22,13 @@
 ## 性能结果
 | 指标 | 实测值 | 官方基线 |
 |------|--------|----------|
-| RTF | 0.46 | 0.4423 |
+| RTF | 0.36 | 0.4423 |
 | TTFT | 372.10 ms | 333.27 ms |
 | TTFP | 1105.19 ms | 986.47 ms |
 
 ## Demo
 - Gradio Demo 已验证启动，端口 7862
-- 演示视频：https://www.bilibili.com/video/BV1Jw8i6kELe
+- 演示视频：https://www.bilibili.com/video/BV1ZLtT6pEvE/
 - 使用说明：demo/README.md
 
 ## 复现

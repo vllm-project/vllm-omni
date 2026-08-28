@@ -14,4 +14,4 @@ nohup python /vllm-workspace/vllm-omni/examples/online_serving/minicpmo/gradio_d
 4. 视频输入：上传视频
 
 ## 演示视频
-https://www.bilibili.com/video/BV1Jw8i6kELe
+https://www.bilibili.com/video/BV1ZLtT6pEvE/
