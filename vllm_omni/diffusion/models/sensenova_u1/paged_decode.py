@@ -195,27 +195,39 @@ class PagedDecodeCache:
         flat_v[:n].copy_(values_shd)
 
     def grow(self, length: int) -> bool:
-        """Move to the next bucket, keeping the tokens already stored."""
+        """Move to the next bucket, keeping the tokens already stored.
+
+        Everything is built into locals first and published in one step. A
+        resize that failed part way -- an allocation for a later layer, say --
+        would otherwise leave new K beside old V under the ``generation`` a
+        captured graph is keyed on, so the next request would keep selecting
+        that graph and replay it over storage that had just been freed.
+        """
         new_bucket = _bucket_for(length)
         if new_bucket == self.bucket:
             return False
-        old_k, old_v, old_len = self.k, self.v, self._length
         nblocks = new_bucket // BLOCK_SIZE
         shape = (nblocks, BLOCK_SIZE, self.kv_heads, self.head_dim)
-        self.k = [torch.zeros(shape, device=self.device, dtype=self.dtype) for _ in old_k]
-        self.v = [torch.zeros(shape, device=self.device, dtype=self.dtype) for _ in old_v]
-        for i in range(len(old_k)):
-            self.k[i].view(-1, self.kv_heads, self.head_dim)[:old_len].copy_(
-                old_k[i].view(-1, self.kv_heads, self.head_dim)[:old_len]
+        old_len = self._length
+        new_k, new_v = [], []
+        for old_k, old_v in zip(self.k, self.v):
+            k = torch.zeros(shape, device=self.device, dtype=self.dtype)
+            v = torch.zeros(shape, device=self.device, dtype=self.dtype)
+            k.view(-1, self.kv_heads, self.head_dim)[:old_len].copy_(
+                old_k.view(-1, self.kv_heads, self.head_dim)[:old_len]
             )
-            self.v[i].view(-1, self.kv_heads, self.head_dim)[:old_len].copy_(
-                old_v[i].view(-1, self.kv_heads, self.head_dim)[:old_len]
+            v.view(-1, self.kv_heads, self.head_dim)[:old_len].copy_(
+                old_v.view(-1, self.kv_heads, self.head_dim)[:old_len]
             )
-        self.bucket = new_bucket
-        self.block_table = torch.arange(nblocks, device=self.device, dtype=torch.int32).unsqueeze(0)
-        self.set_length(old_len)
-        # New buffers mean any graph captured against the old ones is stale.
+            new_k.append(k)
+            new_v.append(v)
+        block_table = torch.arange(nblocks, device=self.device, dtype=torch.int32).unsqueeze(0)
+
+        # Publish. New buffers mean any graph captured against the old ones is
+        # stale, so the generation moves in the same step that hands them over.
+        self.k, self.v, self.block_table, self.bucket = new_k, new_v, block_table, new_bucket
         self.generation += 1
+        self.set_length(old_len)
         logger.debug("Paged decode grew to bucket %d at length %d (generation %d)", new_bucket, length, self.generation)
         return True
 

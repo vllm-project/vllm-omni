@@ -116,6 +116,43 @@ def test_growing_keeps_the_tokens_already_stored():
         torch.testing.assert_close(new.view(-1, KV_HEADS, HEAD_DIM)[:500], old)
 
 
+def test_a_failed_grow_leaves_the_cache_on_its_old_buffers(monkeypatch):
+    """A half-applied resize would strand a capture on freed storage.
+
+    ``generation`` is half of the key a captured graph is stored under, so
+    publishing new K without publishing V, the block table, the bucket and the
+    generation leaves the old key selecting a graph whose recorded addresses
+    have just been freed. A later request replays it. Injecting a failure into
+    the last allocation is the cheapest way to reach that window.
+    """
+    dyn = _dyn_cache(500)
+    paged = PagedDecodeCache.from_dynamic_cache(dyn, LAYERS, torch.device("cpu"), torch.float32)
+    before_k, before_v = list(paged.k), list(paged.v)
+    before_table, before_bucket = paged.block_table, paged.bucket
+    before_generation, before_length = paged.generation, paged.length
+
+    real_zeros = torch.zeros
+    calls = []
+
+    def flaky(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2 * LAYERS:  # the last of the two allocations per layer
+            raise RuntimeError("injected allocation failure")
+        return real_zeros(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "zeros", flaky)
+    with pytest.raises(RuntimeError, match="injected"):
+        paged.grow(513)
+    monkeypatch.undo()
+
+    assert [id(t) for t in paged.k] == [id(t) for t in before_k], "K was published on its own"
+    assert [id(t) for t in paged.v] == [id(t) for t in before_v], "V was published on its own"
+    assert paged.block_table is before_table
+    assert paged.bucket == before_bucket
+    assert paged.generation == before_generation, "the graph key moved without new buffers"
+    assert paged.length == before_length
+
+
 def test_length_lives_in_device_tensors():
     """Both the attended length and the write slot must be tensors.
 
