@@ -14,10 +14,13 @@ from vllm_omni.data_entry_keys import (
     to_dict,
 )
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
+    commit_pending_frames,
     compute_dynamic_initial_chunk_size,
     compute_ramp_emit,
+    emit_threshold,
     max_ic_for_chunk_size,
     parse_chunk_ramp,
+    stack_frames,
 )
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_language_from_prompt,
@@ -57,12 +60,18 @@ def _qwen3_tts_degenerate_finished_payload():
 
 
 def _extract_last_frame(multimodal_output: OmniPayload | dict[str, Any]) -> torch.Tensor | None:
+    """Return the newest codec frame, still on its own device.
+
+    Deliberately does no content inspection. Deciding here whether the frame is
+    all-zero padding costs a ``.item()`` device sync on every talker decode
+    step; the emptiness test is batched into ``commit_pending_frames`` instead.
+    """
     audio_codes = multimodal_output.get("codes", {}).get("audio")
     if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
         return None
     if audio_codes.ndim == 2:
         frame = audio_codes[-1]
-        if frame.numel() == 0 or not bool(frame.any().item()):
+        if frame.numel() == 0:
             return None
         return frame.to(torch.long).reshape(-1)
     if audio_codes.ndim == 1:
@@ -83,11 +92,18 @@ def talker2code2wav_async_chunk(
         request_payload = {}
         transfer_manager.request_payload = request_payload
 
+    pending_frames = getattr(transfer_manager, "pending_frames", None)
+    if pending_frames is None:
+        pending_frames = {}
+        transfer_manager.pending_frames = pending_frames
+
     if isinstance(multimodal_output, Mapping):
         frame = _extract_last_frame(multimodal_output)
         if frame is not None:
-            codec_codes = frame.cpu().tolist()
-            transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
+            # Hold on-device and unclassified. Both the emptiness test and the
+            # host copy are deferred to the resolve below, so the per-step save
+            # path costs no device sync at all.
+            pending_frames.setdefault(request_id, []).append(frame)
         ref_code = multimodal_output.get("codes", {}).get("ref")
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
             request_payload[request_id] = ref_code.to(torch.long).cpu().contiguous()
@@ -132,7 +148,15 @@ def talker2code2wav_async_chunk(
             transfer_manager._cached_ic = _ic_cache
         if request_id not in _ic_cache:
             max_ic = max_ic_for_chunk_size(chunk_size)
-            active = sum(1 for v in transfer_manager.code_prompt_token_ids.values() if len(v) > 0)
+            # A request counts as active once it has produced any frame. Frames
+            # sit in `pending_frames` before their first resolve, so counting
+            # only the committed side would under-report load by one for every
+            # request still inside its first chunk -- including this one, which
+            # the pre-batching code always counted.
+            active = len(
+                {rid for rid, frames in transfer_manager.code_prompt_token_ids.items() if frames}
+                | {rid for rid, frames in pending_frames.items() if frames}
+            )
             capacity = getattr(transfer_manager, "scheduler_max_num_seqs", 1)
             _ic_cache[request_id] = compute_dynamic_initial_chunk_size(active, capacity, max_ic)
         initial_chunk_size = _ic_cache[request_id]
@@ -158,7 +182,27 @@ def talker2code2wav_async_chunk(
             chunk_size,
         )
         initial_chunk_size = chunk_size
-    length = len(transfer_manager.code_prompt_token_ids[request_id])
+
+    # Resolve the pending frames only when they could actually change the
+    # emission decision: when the request is finishing, or when committing all
+    # of them could reach the next threshold. Below that, no sync happens --
+    # this is what turns a per-step device sync into roughly one per chunk.
+    committed = transfer_manager.code_prompt_token_ids[request_id]
+    pending = pending_frames.get(request_id)
+    if pending and (
+        finished
+        or len(committed) + len(pending)
+        >= emit_threshold(
+            len(committed),
+            ramp=ramp,
+            chunk_index=int(transfer_manager.ramp_chunk_count.get(request_id, 0)) if ramp is not None else 0,
+            chunk_size=chunk_size,
+            initial_chunk_size=initial_chunk_size,
+        )
+    ):
+        commit_pending_frames(committed, pending)
+
+    length = len(committed)
 
     if length <= 0:
         if finished:
@@ -246,17 +290,19 @@ def talker2code2wav_async_chunk(
         if ref_context_size > 0:
             if emitted_chunks <= 0:
                 ref_context_request_id = request_id
-                ref_frames = ref_context.tolist()
-                window_frames = ref_frames + window_frames
                 ref_context_included = True
                 left_context_size = ref_context_size
 
-    num_quantizers = len(window_frames[0])
-    num_frames = len(window_frames)
-    code_predictor_codes = torch.tensor(
-        [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)],
-        dtype=torch.long,
-    )
+    # Committed frames are device tensors and already padding-free, so the
+    # codebook-major flatten is one transpose instead of a Python double loop
+    # over num_quantizers x num_frames. The ref context is a host tensor; it is
+    # moved onto the window's device before the concat. One `.cpu()` at the end
+    # keeps the payload host-resident, matching the full-payload path and the
+    # behavior every consumer of CodesStruct.audio already expects.
+    window = stack_frames(window_frames)
+    if ref_context_included:
+        window = torch.cat([ref_context.to(device=window.device, dtype=window.dtype), window], dim=0)
+    code_predictor_codes = window.transpose(0, 1).reshape(-1).to(device="cpu", dtype=torch.long)
 
     meta = MetaStruct(
         request_id=request_id,

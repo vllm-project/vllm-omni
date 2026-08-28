@@ -33,6 +33,9 @@ from vllm_omni.data_entry_keys import (
     OmniPayloadStruct,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
+    stack_frames,
+)
 
 __all__ = ["talker2code2wav", "talker2code2wav_async_chunk"]
 
@@ -257,7 +260,12 @@ def talker2code2wav_async_chunk(
     if isinstance(pooling_output, dict):
         row = _extract_last_step_row(pooling_output)
         if row is not None:
-            transfer_manager.code_prompt_token_ids[request_id].append(row.cpu().tolist())
+            # Keep the row on its own device. _extract_last_step_row decides on
+            # shape alone and keeps BOC rows verbatim, so nothing is ever
+            # dropped here and the row counts driving the window below are
+            # unchanged -- only the host copy moves to one transfer per emitted
+            # chunk instead of one per AR step.
+            transfer_manager.code_prompt_token_ids[request_id].append(row)
     elif not finished:
         return None
 
@@ -336,7 +344,7 @@ def talker2code2wav_async_chunk(
             )
         return None
 
-    codes_qt = torch.tensor(window_rows, dtype=torch.long).t().contiguous()
+    codes_qt = stack_frames(window_rows).to(torch.long).t().contiguous()
     try:
         de_delayed = _revert_delay_pattern(codes_qt)
     except ValueError:
@@ -368,7 +376,10 @@ def talker2code2wav_async_chunk(
         de_delayed = de_delayed[:, :-1]
         actual_chunk = max(actual_chunk - 1, 0)
 
-    codec_codes = de_delayed.reshape(-1)
+    # The de-delay, substitution and trim above all run wherever the rows live;
+    # this is the single host transfer per emitted chunk that replaces the
+    # per-step one.
+    codec_codes = de_delayed.reshape(-1).to(device="cpu")
     left_context_emitted = desired_left_context
     right_holdback_emitted = H
 

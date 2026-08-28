@@ -29,6 +29,10 @@ from vllm_omni.data_entry_keys import (
     OmniPayload,
     OmniPayloadStruct,
 )
+from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
+    emit_threshold,
+    stack_frames,
+)
 
 __all__ = ["talker2code2wav", "talker2code2wav_async_chunk"]
 
@@ -49,6 +53,17 @@ _AUDIO_STREAM_EOS_ID = 1025
 _NUM_REAL_CODES = _AUDIO_STREAM_BOS_ID  # codes in [0, 1023] are real
 
 
+def _real_code_frame_mask(frames: torch.Tensor) -> torch.Tensor:
+    """Per-frame keep mask: every code in ``[0, _NUM_REAL_CODES)``.
+
+    ``frames`` has shape ``[num_frames, num_codebooks]``. This is the single
+    definition of "carries no stream specials", shared by the sync filter below
+    and the batched async-chunk resolve; the async path used to spell it as a
+    scalar ``frame.min() < 0 or frame.max() >= _NUM_REAL_CODES`` per frame.
+    """
+    return (frames >= 0).all(dim=1) & (frames < _NUM_REAL_CODES).all(dim=1)
+
+
 def _filter_real_code_frames(audio_codes: torch.Tensor) -> torch.Tensor:
     """Keep only frames whose codes are entirely in [0, 1023].
 
@@ -60,8 +75,7 @@ def _filter_real_code_frames(audio_codes: torch.Tensor) -> torch.Tensor:
         return audio_codes
     if audio_codes.ndim != 2:
         raise ValueError(f"expected [num_frames, num_codebooks] audio_codes; got shape {tuple(audio_codes.shape)}")
-    valid = (audio_codes >= 0).all(dim=1) & (audio_codes < _NUM_REAL_CODES).all(dim=1)
-    return audio_codes[valid]
+    return audio_codes[_real_code_frame_mask(audio_codes)]
 
 
 def _revert_delay_pattern(audio_codes_qt: torch.Tensor) -> torch.Tensor:
@@ -167,11 +181,27 @@ def _extract_last_frame(pooling_output: OmniPayload) -> torch.Tensor | None:
         raise ValueError(f"unexpected audio_codes shape for higgs_audio_v2 async_chunk: {tuple(audio_codes.shape)}")
     if frame.numel() == 0:
         return None
-    frame = frame.to(torch.long).reshape(-1)
-    # Filter frames that still carry stream specials.
-    if int(frame.min().item()) < 0 or int(frame.max().item()) >= _NUM_REAL_CODES:
-        return None
-    return frame
+    # Deliberately no content inspection. The stream-special test that used to
+    # live here cost two `.item()` device syncs on every AR step; it is batched
+    # into `_commit_pending` below, which applies the same predicate to a whole
+    # pending batch at once.
+    return frame.to(torch.long).reshape(-1)
+
+
+def _commit_pending(committed: list, pending: list) -> None:
+    """Move real frames from ``pending`` into ``committed``, dropping specials.
+
+    One `.tolist()` for the whole pending batch, so the filter costs a single
+    device sync per resolve rather than two per AR step. Filtering happens here
+    rather than at emit so ``len(committed)`` keeps meaning "real frames so
+    far": it drives the ``length % chunk_size`` gate below, and counting
+    specials would move every chunk boundary.
+    """
+    if not pending:
+        return
+    keep = _real_code_frame_mask(stack_frames(pending)).tolist()
+    committed.extend(frame for frame, ok in zip(pending, keep) if ok)
+    pending.clear()
 
 
 def talker2code2wav_async_chunk(
@@ -190,10 +220,17 @@ def talker2code2wav_async_chunk(
     finished = bool(is_finished or request.is_finished())
     pooling_output = multimodal_output
 
+    pending_frames = getattr(transfer_manager, "pending_frames", None)
+    if pending_frames is None:
+        pending_frames = {}
+        transfer_manager.pending_frames = pending_frames
+
     if isinstance(pooling_output, dict):
         frame = _extract_last_frame(pooling_output)
         if frame is not None:
-            transfer_manager.code_prompt_token_ids[request_id].append(frame.cpu().tolist())
+            # On-device and unclassified; the stream-special test and the host
+            # copy both happen once per resolve below.
+            pending_frames.setdefault(request_id, []).append(frame)
     elif not finished:
         return None
 
@@ -209,7 +246,28 @@ def talker2code2wav_async_chunk(
             f"codec_left_context_frames={left_context_size_config}"
         )
 
-    length = len(transfer_manager.code_prompt_token_ids[request_id])
+    # Resolve pending frames only when they could change the emission decision:
+    # on finish, or when committing all of them could reach the next chunk
+    # boundary. Below that no sync happens, which is what turns a per-step
+    # device sync into roughly one per chunk. This gate has no ramp and no
+    # initial-chunk phase, so the shared threshold reduces to the next multiple
+    # of chunk_size -- the same rule as the `length % chunk_size` test below.
+    committed = transfer_manager.code_prompt_token_ids[request_id]
+    pending = pending_frames.get(request_id)
+    if pending and (
+        finished
+        or len(committed) + len(pending)
+        >= emit_threshold(
+            len(committed),
+            ramp=None,
+            chunk_index=0,
+            chunk_size=chunk_size,
+            initial_chunk_size=0,
+        )
+    ):
+        _commit_pending(committed, pending)
+
+    length = len(committed)
     if length <= 0:
         if finished:
             return OmniPayloadStruct(
@@ -238,11 +296,10 @@ def talker2code2wav_async_chunk(
     num_codebooks = len(window_frames[0])
     if num_codebooks != _NUM_CODEBOOKS:
         raise ValueError(f"expected {_NUM_CODEBOOKS} codebooks per frame; got {num_codebooks}")
-    num_frames = len(window_frames)
-    flat = torch.tensor(
-        [window_frames[f][q] for q in range(num_codebooks) for f in range(num_frames)],
-        dtype=torch.long,
-    )
+    # Committed frames are device tensors and already free of stream specials,
+    # so the codebook-major flatten is one transpose instead of a Python double
+    # loop over num_codebooks x num_frames, with a single host transfer.
+    flat = stack_frames(window_frames).t().reshape(-1).to(device="cpu", dtype=torch.long)
 
     return OmniPayloadStruct(
         codes=CodesStruct(audio=flat),

@@ -213,3 +213,46 @@ def test_none_multimodal_output_not_finished_returns_none():
     )
 
     assert payload is None
+
+
+def test_emitted_layout_matches_the_pre_device_accumulation_form():
+    """Deferring the host copy must not reorder the wire payload.
+
+    The old path built ``torch.tensor(list_of_lists).reshape(-1).tolist()`` and
+    prepended ``[ctx_frames, context_length]``. Frames are device tensors now
+    and the header is concatenated on-device, so pin the resulting order
+    against the literal old construction.
+    """
+    tm = _make_transfer_manager(codec_chunk_frames=2, codec_left_context_frames=0, codec_chunk_frames_at_begin=2)
+    rid = "rid-layout"
+    rows = ([1, 2, 3, 4], [5, 6, 7, 8])
+    payload = None
+    for row in rows:
+        payload = generator2tokenizer_async_chunk(
+            transfer_manager=tm,
+            multimodal_output={"codes": {"audio": torch.tensor(row, dtype=torch.long)}},
+            request=_req(rid, finished=False),
+        )
+
+    assert payload is not None
+    ctx_frames, context_length = 0, 2
+    expected = [ctx_frames, context_length] + torch.tensor(list(rows)).reshape(-1).tolist()
+    assert payload.codes.audio.tolist() == expected
+    assert payload.codes.audio.device.type == "cpu", "payload must stay host-resident"
+
+
+def test_frames_are_not_dropped_on_content():
+    """voxtral accepts on shape alone, so `length` counts every frame.
+
+    This is what makes it safe to defer the host copy without the batched
+    resolve machinery: nothing is ever filtered, so no count can shift.
+    """
+    tm = _make_transfer_manager(codec_chunk_frames=4, codec_left_context_frames=0, codec_chunk_frames_at_begin=4)
+    rid = "rid-nofilter"
+    for row in ([0, 0, 0, 0], [-1, -1, -1, -1], [9999, 9999, 9999, 9999]):
+        generator2tokenizer_async_chunk(
+            transfer_manager=tm,
+            multimodal_output={"codes": {"audio": torch.tensor(row, dtype=torch.long)}},
+            request=_req(rid, finished=False),
+        )
+    assert len(tm.code_prompt_token_ids[rid]) == 3, "zeros, negatives and out-of-range are all kept"

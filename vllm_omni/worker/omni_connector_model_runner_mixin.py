@@ -183,6 +183,10 @@ class OmniConnectorModelRunnerMixin:
         # ownership lives in ``_local_stage_payload_cache``.
         self._send_side_request_payload: dict[str, dict[str, Any]] = {}
         self._code_prompt_token_ids: dict[str, list[list[int]]] = defaultdict(list)
+        # Frames a stage-input processor is holding on-device until it batches
+        # its next resolve. Owned here rather than attached on first use so the
+        # cleanup below reclaims it; the entries are device tensors.
+        self._pending_frames: dict[str, list] = {}
         self._cached_ic: dict[str, int] = {}
         self._request_ids_mapping: dict[str, str] = {}
 
@@ -327,6 +331,7 @@ class OmniConnectorModelRunnerMixin:
                 self._put_req_chunk.pop(k, None)
                 self._send_side_request_payload.pop(k, None)
                 self._code_prompt_token_ids.pop(k, None)
+                self._pending_frames.pop(k, None)
                 self._cached_ic.pop(k, None)
                 self._ramp_chunk_count.pop(k, None)
             self._kv_pending_transfers.pop(req_id, None)
@@ -1655,6 +1660,10 @@ class OmniConnectorModelRunnerMixin:
     @property
     def code_prompt_token_ids(self) -> dict[str, list[list[int]]]:
         return self._code_prompt_token_ids
+
+    @property
+    def pending_frames(self) -> dict[str, list]:
+        return self._pending_frames
 
     @property
     def connector(self) -> Any | None:

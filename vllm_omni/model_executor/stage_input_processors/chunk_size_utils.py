@@ -3,6 +3,8 @@
 
 import logging
 
+import torch
+
 logger = logging.getLogger(__name__)
 
 
@@ -127,3 +129,62 @@ def compute_ramp_emit(
         return True, 0
 
     return True, length - prev_threshold
+
+
+def emit_threshold(
+    length: int,
+    *,
+    ramp: list[int] | None,
+    chunk_index: int,
+    chunk_size: int,
+    initial_chunk_size: int,
+) -> int:
+    """Smallest committed-frame count at which a chunk could be emitted.
+
+    Pure host arithmetic mirroring the emission gate below, used only to decide
+    whether the pending frames are worth resolving yet. Returning a value that
+    is too small costs an extra sync; returning one that is too large would
+    delay a chunk, so every branch here has to match the gate.
+    """
+    if ramp is not None:
+        return max(1, ramp_cumulative(chunk_index, ramp, chunk_size))
+    use_first_chunk = 0 < initial_chunk_size < chunk_size
+    if use_first_chunk and length < initial_chunk_size:
+        return initial_chunk_size
+    initial_coverage = initial_chunk_size if use_first_chunk else 0
+    remainder = max(0, length - initial_coverage) % chunk_size
+    return max(1, length + (chunk_size - remainder if remainder else 0))
+
+
+def stack_frames(frames: list) -> torch.Tensor:
+    """Stack frames into ``[num_frames, num_quantizers]`` on one device.
+
+    Frames arriving from the talker are device tensors, but callers may seed
+    ``code_prompt_token_ids`` with plain lists, so coerce rather than assume.
+    A seeded host prefix followed by device frames would otherwise reach
+    ``torch.stack`` as a mixed-device list and raise, and the adapter swallows
+    processor exceptions, so that surfaces as a silently dropped chunk. Pick the
+    first tensor's device and normalize everything onto it.
+    """
+    device = next((f.device for f in frames if isinstance(f, torch.Tensor)), None)
+    return torch.stack([torch.as_tensor(f, dtype=torch.long, device=device) for f in frames])
+
+
+def commit_pending_frames(committed: list, pending: list) -> None:
+    """Move real frames from ``pending`` into ``committed``, dropping padding.
+
+    One ``.tolist()`` for the whole pending batch, so the emptiness test costs a
+    single device sync per resolve instead of one per decode step. Frames stay
+    on-device; only the boolean mask crosses to the host.
+
+    Padding is dropped *here*, not at emit, so ``len(committed)`` keeps meaning
+    "real frames so far". The gate below is driven by that count, and roughly
+    2% of mid-stream frames are all-zero padding (the talker zeroes any frame
+    whose layer-0 id is out of codebook range, which covers EOS and the prefill
+    span), so counting padding would move every chunk boundary.
+    """
+    if not pending:
+        return
+    keep = stack_frames(pending).any(dim=1).tolist()
+    committed.extend(frame for frame, ok in zip(pending, keep) if ok)
+    pending.clear()

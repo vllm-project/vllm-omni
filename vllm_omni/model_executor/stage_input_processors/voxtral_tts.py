@@ -10,6 +10,7 @@ from vllm_omni.data_entry_keys import (
     OmniPayload,
     OmniPayloadStruct,
 )
+from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import stack_frames
 
 logger = init_logger(__name__)
 
@@ -51,8 +52,12 @@ def generator2tokenizer_async_chunk(
     if isinstance(multimodal_output, Mapping):
         frame = _extract_last_frame(multimodal_output)
         if frame is not None:
-            codec_codes = frame.cpu().tolist()
-            transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
+            # Keep the frame on its own device. _extract_last_frame accepts or
+            # rejects on shape alone, never on content, so no frame is ever
+            # dropped here and `length` below counts exactly what it counted
+            # before -- the host copy is simply deferred to one transfer per
+            # emitted chunk instead of one per decode step.
+            transfer_manager.code_prompt_token_ids[request_id].append(frame)
     elif not finished:
         # Some steps may not produce multimodal_output. Only flush on finish.
         return None
@@ -94,15 +99,16 @@ def generator2tokenizer_async_chunk(
     ctx_frames = max(0, int(end_index - context_length))
     window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
 
-    # Pack context + chunk into codebook-major flat codes for adapter.
-    code_predictor_codes = torch.tensor(window_frames).reshape(-1).tolist()
+    # Pack context + chunk into codebook-major flat codes for adapter. Frames
+    # are device tensors, so stack and flatten there and cross to the host once
+    # with the header prepended, rather than per frame on the way in.
+    window = stack_frames(window_frames).reshape(-1)
+    header = torch.tensor([int(ctx_frames), int(context_length)], dtype=torch.long, device=window.device)
+    code_predictor_codes = torch.cat([header, window.to(torch.long)]).to(device="cpu")
 
     return OmniPayloadStruct(
         codes=CodesStruct(
-            audio=torch.tensor(
-                [int(ctx_frames), int(context_length)] + code_predictor_codes,
-                dtype=torch.long,
-            ),
+            audio=code_predictor_codes,
         ),
         meta=MetaStruct(finished=torch.tensor(finished, dtype=torch.bool)),
     )
