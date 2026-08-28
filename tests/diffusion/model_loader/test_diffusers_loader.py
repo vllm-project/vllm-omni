@@ -249,6 +249,30 @@ def test_hwr_commit_failure_discards_model_and_reloads_without_hwr_or_mmap(tmp_p
     assert loader.take_host_weight_plan() is None
 
 
+def test_required_hwr_miss_fails_before_ordinary_loading_or_publication(
+    tmp_path: Path,
+    monkeypatch,
+):
+    canonical_root = tmp_path / "canonical"
+    canonical_root.mkdir()
+    save_file(
+        {"weight": torch.arange(4, dtype=torch.float32).to(torch.bfloat16).reshape(2, 2)},
+        str(canonical_root / "model.safetensors"),
+    )
+    loader = DiffusersPipelineLoader(
+        LoadConfig(),
+        _hwr_config(canonical_root, tmp_path / "empty-store", mode="required"),
+    )
+    pipeline = _HWRPipeline(canonical_root)
+    monkeypatch.setattr(loader, "_init_from_load_format", lambda *args, **kwargs: pipeline)
+
+    with pytest.raises(RuntimeError, match="Host Weight Runtime resolution failed"):
+        loader.load_model(load_device="cpu", device=torch.device("cpu"))
+
+    assert pipeline.load_count == 0
+    assert loader.take_host_weight_plan() is None
+
+
 def _make_dlo_online_quant_config() -> OmniDiffusionConfig:
     return OmniDiffusionConfig(
         model="",
@@ -261,10 +285,11 @@ def _make_dlo_online_quant_config() -> OmniDiffusionConfig:
 
 
 @pytest.mark.parametrize(
-    ("dist_offload", "use_allgather"),
+    ("dist_offload", "use_allgather", "mode"),
     [
-        (False, False),
-        (True, True),
+        (False, False, "preferred"),
+        (True, True, "preferred"),
+        (True, False, "disabled"),
     ],
 )
 def test_hwr_disabled_for_noneligible_dlo_paths_without_store_interaction(
@@ -272,12 +297,13 @@ def test_hwr_disabled_for_noneligible_dlo_paths_without_store_interaction(
     tmp_path,
     dist_offload,
     use_allgather,
+    mode,
 ):
     """Disabled and AllGather paths must never construct or probe HWR."""
     from vllm_omni.host_weight_runtime import HostWeightRuntime
 
     root = tmp_path / "must-not-be-touched"
-    loader = DiffusersPipelineLoader(LoadConfig(), _hwr_config("dummy-model", root))
+    loader = DiffusersPipelineLoader(LoadConfig(), _hwr_config("dummy-model", root, mode=mode))
     model = _DummyPipelineModel(source_prefix="transformer.")
     modules = SimpleNamespace(dit_names=("transformer",), dits=(model.transformer,))
 

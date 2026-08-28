@@ -205,6 +205,7 @@ steps:
           - tests/e2e/online_serving/test_minicpmo_realtime_duplex_drivers.py
           - tests/e2e/online_serving/helpers/minicpmo_realtime_duplex_scenarios.py
           - tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py
+          - tests/e2e/online_serving/run_minicpmo_realtime_duplex_server_vad.py
           - tests/e2e/online_serving/run_minicpmo_realtime_duplex_soft_interrupt.py
           - vllm_omni/deploy/minicpmo_4_5.yaml
           - tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py
@@ -335,5 +336,17 @@ steps:
             timeout 40m bash -c "
               export VLLM_IMAGE_FETCH_TIMEOUT=60
               pytest -s -v tests/e2e/online_serving/test_qwen_image.py -m 'core_model' --run-level 'core_model'
+            "
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · HunyuanVideo-1.5 Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_hunyuan_video_15_expansion.py
+          - vllm_omni/diffusion/models/hunyuan_video/
+        commands:
+          - |
+            timeout 40m bash -c "
+              export VLLM_IMAGE_FETCH_TIMEOUT=60
+              pytest -s -v tests/e2e/online_serving/test_hunyuan_video_15_expansion.py -m 'core_model and diffusion' --run-level 'core_model'
             "
         mirror_hardwares: h100_1

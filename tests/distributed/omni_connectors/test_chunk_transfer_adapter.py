@@ -1568,6 +1568,7 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
     scheduler.structured_output_manager.should_advance.return_value = False
     scheduler.finished_req_ids_dict = {}
     scheduler.kv_cache_manager.take_events.return_value = None
+    scheduler.kv_cache_manager.estimate_cached_tokens.return_value = 0
     scheduler.kv_event_publisher = mocker.MagicMock()
 
     request = _HashableRequest(
@@ -1648,6 +1649,7 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
     scheduler.finished_req_ids_dict = {}
     scheduler.kv_cache_manager = mocker.MagicMock()
     scheduler.kv_cache_manager.take_events.return_value = None
+    scheduler.kv_cache_manager.estimate_cached_tokens.return_value = 0
     scheduler.kv_event_publisher = mocker.MagicMock()
     scheduler.waiting_for_transfer_free = set()
     scheduler.transfer_triggered_requests = set()
@@ -1803,6 +1805,7 @@ def _build_deferred_finish_scheduler(mocker, *, running, pending_finish_reqs):
     scheduler.structured_output_manager.should_advance.return_value = False
     scheduler.finished_req_ids_dict = {}
     scheduler.kv_cache_manager.take_events.return_value = None
+    scheduler.kv_cache_manager.estimate_cached_tokens.return_value = 0
     scheduler.kv_event_publisher = mocker.MagicMock()
     scheduler._pending_finish_reqs = list(pending_finish_reqs)
 

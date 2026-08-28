@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from dataclasses import fields as dataclass_fields
 from typing import Any
 
@@ -148,6 +151,8 @@ class OmniRequestState(RequestState):
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
+        ec_transfer_params: dict[str, Any] | None = None,
+        *,
         routed_experts: Any = None,
     ) -> OmniRequestOutput | PoolingRequestOutput | None:
         """Create a request output from generation results.
@@ -162,8 +167,13 @@ class OmniRequestState(RequestState):
             finish_reason: Optional finish reason indicating why generation stopped
             stop_reason: Optional stop reason (token ID or stop string)
             kv_transfer_params: Optional KV cache transfer parameters
+            ec_transfer_params: Optional encoder-cache transfer parameters
+                (6th positional, matching upstream RequestState so that
+                super().process_outputs() calls do not misroute it).
             routed_experts: Optional MoE routed-expert ids for this step,
                 attached to the completion output for generation stages
+                (omni-specific keyword; upstream moved this accumulation
+                into RequestState.routed_experts_chunks).
 
         Returns:
             OmniRequestOutput or PoolingRequestOutput if output should be
@@ -177,6 +187,7 @@ class OmniRequestState(RequestState):
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,
+                ec_transfer_params,
             )
 
         is_delta = self.output_kind == RequestOutputKind.DELTA
@@ -230,6 +241,7 @@ class OmniRequestState(RequestState):
             outputs,
             finished,
             kv_transfer_params,
+            ec_transfer_params,
         )
 
     def _new_completion_output(
@@ -309,6 +321,7 @@ class OmniRequestState(RequestState):
         outputs: list,
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
+        ec_transfer_params: dict[str, Any] | None = None,
     ) -> RequestOutput | PoolingRequestOutput:
         """Create request output, handling no-detokenizer generation stages.
 
@@ -323,6 +336,7 @@ class OmniRequestState(RequestState):
                 outputs,
                 finished,
                 kv_transfer_params,
+                ec_transfer_params,
             )
 
         # No-detokenizer path: build RequestOutput directly.
@@ -341,7 +355,9 @@ class OmniRequestState(RequestState):
             outputs=outputs,
             finished=finished,
             kv_transfer_params=kv_transfer_params,
+            ec_transfer_params=ec_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
+            num_cache_creation_tokens=self.num_cache_creation_tokens,
             metrics=self.stats,
         )
 
@@ -560,6 +576,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             finish_reason = eco.finish_reason
             stop_reason = eco.stop_reason
             kv_transfer_params = eco.kv_transfer_params
+            ec_transfer_params = getattr(eco, "ec_transfer_params", None)
             routed_experts = eco.routed_experts
             self._update_stats_from_output(
                 req_state,
@@ -570,6 +587,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             prefill_stats = getattr(eco, "prefill_stats", None)
             if prefill_stats is not None:
                 req_state.num_cached_tokens = prefill_stats.num_cached_tokens
+                req_state.num_cache_creation_tokens = prefill_stats.num_cache_creation_tokens
             req_state.is_prefilling = False
 
             is_non_final_audio_chunk = (
@@ -583,7 +601,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,
-                routed_experts,
+                ec_transfer_params,
+                routed_experts=routed_experts,
             ):
                 if req_state.queue is not None:
                     req_state.queue.put(request_output)

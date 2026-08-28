@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Shared component construction helpers for the LTX model family."""
 
@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, FlowMatchEulerDiscreteScheduler
+from diffusers.models.autoencoders.ltx2_diffusion_decoder import LTX2VideoVaeNeighborhoodNattenProcessor
 from diffusers.pipelines.ltx2 import LTX2TextConnectors
 from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
@@ -35,6 +36,12 @@ from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
+from .ltx2_diffusion_decoder import (
+    LTX25_NATIVE_ARTIFACT_REVISION,
+    LTX25_NATIVE_DIFFUSION_DECODER_FILENAME,
+    LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID,
+)
+from .ltx2_diffusion_decoder_distributed import DistributedLTX2VideoDiffusionDecoderModel
 from .ltx2_request import LTXCheckpointKind, validate_ltx_checkpoint
 from .ltx2_transformer import (
     LTX2VideoTransformer3DModel,
@@ -69,6 +76,18 @@ _LTX_COMPONENT_SUBFOLDERS = (
 )
 logger = logging.getLogger(__name__)
 
+_LTX2_CONV_VAE_EXTRA = "ltx2_use_conv_vae"
+_LTX2_DIFFUSION_DECODER_SUBFOLDER = "diffusion_decoder"
+
+
+def _ltx2_use_diffusion_decoder(od_config: Any, model_version: str) -> bool:
+    """Select DiffVAE by default for LTX-2.5, with an explicit ConvVAE opt-in."""
+    extras = getattr(od_config, "extras", {}) or {}
+    use_conv_vae = extras.get(_LTX2_CONV_VAE_EXTRA, False)
+    if not isinstance(use_conv_vae, bool):
+        raise TypeError(f"{_LTX2_CONV_VAE_EXTRA} must be a bool, got {type(use_conv_vae)!r}")
+    return model_version == "2.5" and not use_conv_vae
+
 
 @dataclass(frozen=True)
 class LTXComponentProfile:
@@ -84,6 +103,7 @@ class LTXComponentProfile:
     text_encoder_cls: type | None = Gemma3ForConditionalGeneration
     vocoder_fallback_cls: type | None = None
     artifact_repo_id: str | None = None
+    artifact_revision: str | None = None
     latent_upsampler_filename: str | None = None
     distilled_lora_filename: str | None = None
     transformer_subfolder: str = "transformer"
@@ -202,6 +222,7 @@ LTX25_TWO_STAGE_COMPONENT_PROFILE = replace(
     name="ltx2_5_two_stage",
     resident_modules=(*LTX25_FULL_COMPONENT_PROFILE.resident_modules, "latent_upsampler"),
     artifact_repo_id="Lightricks/LTX-2.5",
+    artifact_revision=LTX25_NATIVE_ARTIFACT_REVISION,
     latent_upsampler_filename=("latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"),
     distilled_lora_filename="loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors",
 )
@@ -239,18 +260,46 @@ def resolve_ltx_artifact(
     model: str,
     repo_id: str,
     filename: str,
+    *,
+    model_revision: str | None,
+    artifact_revision: str | None,
 ) -> str:
-    """Resolve an official LTX sidecar from the model root or its Hub repository."""
+    """Resolve an official LTX sidecar without crossing repository revisions.
+
+    A local model path selects where the primary components are loaded from;
+    it does not imply that independently hosted sidecars must be offline. Hub
+    offline behavior remains controlled by huggingface_hub itself.
+    """
     candidate = Path(model) / filename
     if candidate.is_file():
         return str(candidate)
 
+    # Hub revisions are repository-scoped. Reuse the model revision only when
+    # the model and artifact are in the same repository; otherwise use the
+    # independently pinned artifact revision.
+    revision = model_revision if model == repo_id else artifact_revision
     try:
-        return hf_hub_download(repo_id=repo_id, filename=filename)
+        return hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            revision=revision,
+        )
     except Exception as exc:
         raise FileNotFoundError(
             f"Unable to resolve LTX artifact {filename!r}. Searched {candidate}; "
             f"place the file in the model root or make {repo_id} available."
+        ) from exc
+
+
+def _create_ltx25_natten_processor() -> LTX2VideoVaeNeighborhoodNattenProcessor:
+    """Create the required production attention backend with an actionable error."""
+    try:
+        return LTX2VideoVaeNeighborhoodNattenProcessor()
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(
+            "LTX-2.5 DiffVAE requires the shi-labs/natten Hub kernel. "
+            "Install kernels==0.14.1, use a supported GPU, leave "
+            "DIFFUSERS_DISABLE_REMOTE_CODE unset, and allow Hub access during kernel initialization."
         ) from exc
 
 
@@ -519,16 +568,47 @@ def _load_component(
     local_files_only: bool,
     dtype: torch.dtype,
     revision: str | None,
+    prefetch_list: tuple[str, ...] = _LTX_COMPONENT_SUBFOLDERS,
 ) -> Any:
     return from_pretrained_with_prefetch(
         component_cls.from_pretrained,
         model,
         subfolder=subfolder,
-        prefetch_list=_LTX_COMPONENT_SUBFOLDERS,
+        prefetch_list=prefetch_list,
         local_files_only=local_files_only,
         revision=revision,
         torch_dtype=dtype,
     )
+
+
+def _load_ltx25_native_diffusion_decoder(
+    model: str,
+    *,
+    local_files_only: bool,
+    dtype: torch.dtype,
+    revision: str | None,
+) -> DistributedLTX2VideoDiffusionDecoderModel:
+    """Load canonical Native weights into the local Diffusers-compatible class."""
+    config = DistributedLTX2VideoDiffusionDecoderModel.load_config(
+        model,
+        subfolder=_LTX2_DIFFUSION_DECODER_SUBFOLDER,
+        local_files_only=local_files_only,
+        revision=revision,
+    )
+    checkpoint_path = resolve_ltx_artifact(
+        model,
+        LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID,
+        LTX25_NATIVE_DIFFUSION_DECODER_FILENAME,
+        model_revision=revision,
+        artifact_revision=LTX25_NATIVE_ARTIFACT_REVISION,
+    )
+    decoder = DistributedLTX2VideoDiffusionDecoderModel.from_ltx25_native_checkpoint(
+        checkpoint_path,
+        config,
+        dtype,
+    )
+    decoder.init_distributed()
+    return decoder
 
 
 def _place_aux_components(pipeline: Any) -> None:
@@ -555,6 +635,7 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
     model = od_config.model
     revision = getattr(od_config, "revision", None)
     local_files_only = os.path.exists(model)
+    use_diffusion_decoder = pipeline.use_diffusion_decoder
 
     pipeline.weights_sources = [
         DiffusersPipelineLoader.ComponentSource(
@@ -604,6 +685,27 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
         dtype=dtype,
         revision=revision,
     )
+    if use_diffusion_decoder:
+        pipeline.diffusion_decoder = _load_ltx25_native_diffusion_decoder(
+            model,
+            local_files_only=local_files_only,
+            dtype=dtype,
+            revision=revision,
+        )
+        # The canonical decoder is trained and validated with NATTEN. Its
+        # portable FlexAttention fallback materializes an impractically large
+        # block mask at production video sizes, so fail early if the matching
+        # Hub kernel cannot be loaded instead of failing later during decode.
+        pipeline.diffusion_decoder.set_attn_processor(_create_ltx25_natten_processor())
+        vae_patch_parallel_size = int(
+            getattr(getattr(od_config, "parallel_config", None), "vae_patch_parallel_size", 1)
+        )
+        if vae_patch_parallel_size > 1 or getattr(od_config, "vae_use_tiling", False):
+            pipeline.diffusion_decoder.enable_tiling()
+        pipeline.diffusion_decoder.set_parallel_size(
+            vae_patch_parallel_size,
+            mode=getattr(getattr(od_config, "parallel_config", None), "vae_parallel_mode", "tile"),
+        )
     pipeline.audio_vae = _load_component(
         AutoencoderKLLTX2Audio,
         model,
@@ -656,6 +758,8 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
                     model,
                     profile.artifact_repo_id,
                     profile.latent_upsampler_filename,
+                    model_revision=revision,
+                    artifact_revision=profile.artifact_revision,
                 )
                 pipeline.latent_upsampler = _load_ltx_latent_upsampler_single_file(upsampler_path, dtype)
         else:
@@ -665,6 +769,8 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
                 model,
                 profile.artifact_repo_id,
                 profile.latent_upsampler_filename,
+                model_revision=revision,
+                artifact_revision=profile.artifact_revision,
             )
             pipeline.latent_upsampler = _load_ltx_latent_upsampler_single_file(upsampler_path, dtype)
 

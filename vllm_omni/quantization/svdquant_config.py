@@ -157,7 +157,10 @@ class DiffusionSVDQuantConfig(QuantizationConfig):
             prefix,
             self.modules_to_not_convert,
             self.packed_modules_mapping,
-            skip_with_substr=True,
+            # vLLM 0.28: skip_with_substr was replaced by match_mode
+            # ("substring" preserves the v0.27 skip_with_substr=True
+            # behavior verbatim).
+            match_mode="substring",
         ):
             return UnquantizedLinearMethod()
         return DiffusionSVDQuantLinearMethod(self)
