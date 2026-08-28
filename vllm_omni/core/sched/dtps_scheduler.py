@@ -5,9 +5,9 @@ both i2t and t2i). Rather than blindly prioritizing downstream tasks, it balance
 utilization by actively preventing DiT starvation, avoiding DiT queue overloads, and strictly
 guaranteeing that pure AR tasks never starve.
 
-[Dynamic 4-Tier Priority Logic]
+[Dynamic 3-Tier Priority Logic]
 The scheduler receives the DiT stage's real-time queue depth via a UTILITY
-ZMQ push from the Orchestrator. It then categorizes tasks into four dynamic
+ZMQ push from the Orchestrator. It then categorizes tasks into three dynamic
 priority tiers per batch:
 
   1. L0 (Highest: Starving AR): `ar_only` tasks that exceed the aging threshold. Anti-starvation
@@ -17,12 +17,13 @@ priority tiers per batch:
   3. L2 (Normal: Standard AR): Standard `ar_only` tasks. When DiT is busy or the budget is exhausted,
      these tasks are prioritized. This allows AR to crunch through its own workloads instead of
      piling tasks onto an already overloaded DiT queue.
-  4. L3 (Lowest: Excess DiT): Over-budget `ar_downstream` tasks are demoted here to prevent
-     downstream pile-ups.
 
-[Decoupling & Intra-Tier Sorting]
-- Intra-tier sorting uses an `ar_proxy` key (combining prefill length, CoT hints, and
-  max_tokens budgets), remaining entirely decoupled from specific models.
+Over-budget `ar_downstream` tasks are demoted below L2 to prevent downstream pile-ups.
+
+[Intra-Tier Sorting]
+- All tiers use FCFS (first-come-first-served) based on the ``waiting`` queue
+  order. No model-specific CoT weights or prompt-length proxies are used —
+  the scheduler is entirely decoupled from model internals.
 """
 
 from __future__ import annotations
@@ -38,9 +39,8 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 
 logger = init_logger(__name__)
 
-_DEFAULT_I2T_AGING_S = 500.0
-_DEFAULT_COT_TAG_KEY = "bot_task"
-_DEFAULT_DIT_LOAD_THRESHOLD = 0
+_DEFAULT_I2T_AGING_S = 100.0
+_DEFAULT_DIT_LOAD_THRESHOLD = 2
 _DIT_INFLIGHT_MAX_AGE_S = 1.0
 
 
@@ -64,24 +64,15 @@ class DTPSScheduler:
         self,
         *,
         i2t_aging_s: float = _DEFAULT_I2T_AGING_S,
-        cot_tag_key: str = _DEFAULT_COT_TAG_KEY,
-        cot_weight_table: dict[str, int] | None = None,
         dit_load_threshold: int = _DEFAULT_DIT_LOAD_THRESHOLD,
     ) -> None:
         self.i2t_aging_s: float = i2t_aging_s
-        self.cot_tag_key: str = cot_tag_key
         try:
             self.dit_load_threshold: int = int(dit_load_threshold)
         except (TypeError, ValueError):
             self.dit_load_threshold = _DEFAULT_DIT_LOAD_THRESHOLD
         # DiT-load snapshot pushed by the Orchestrator via UTILITY ZMQ.
         self._dit_load_snapshot: DitLoadSnapshot | None = None
-        if cot_weight_table is None:
-            self.cot_weight_table: dict[str, int] = {}
-        elif hasattr(cot_weight_table, "items"):
-            self.cot_weight_table = dict(cot_weight_table.items())
-        else:
-            self.cot_weight_table = dict(cot_weight_table)
 
         self._dit_inflight_ids: dict[str, _InflightEntry] = {}
         self._last_phase_stats: dict[str, int | bool] = {}
@@ -101,14 +92,6 @@ class DTPSScheduler:
                 "DTPS config block present but 'enabled' is not True; refusing to construct DTPSScheduler."
             )
 
-        raw_table = cfg_get("cot_weight_table", None)
-        if raw_table is None:
-            cot_weight_table: dict[str, int] | None = None
-        elif hasattr(raw_table, "items"):
-            cot_weight_table = {str(k): int(v) for k, v in raw_table.items()}
-        else:
-            raise ValueError(f"DTPS cot_weight_table must be a mapping; got {type(raw_table).__name__}.")
-
         raw_threshold = cfg_get("dit_load_threshold", _DEFAULT_DIT_LOAD_THRESHOLD)
         try:
             dit_load_threshold = int(raw_threshold)
@@ -121,9 +104,6 @@ class DTPSScheduler:
             dit_load_threshold = _DEFAULT_DIT_LOAD_THRESHOLD
 
         return cls(
-            i2t_aging_s=float(cfg_get("i2t_aging_s", _DEFAULT_I2T_AGING_S)),
-            cot_tag_key=str(cfg_get("cot_tag_key", _DEFAULT_COT_TAG_KEY)),
-            cot_weight_table=cot_weight_table,
             dit_load_threshold=dit_load_threshold,
         )
 
@@ -174,25 +154,6 @@ class DTPSScheduler:
         if task in _AR_DOWNSTREAM_TASKS:
             return "ar_downstream"
         return "ar_downstream"
-
-    def _ar_proxy(self, req: Request) -> int:
-        """Compute the ``ar_proxy`` sorting key for a downstream request.
-
-        ``ar_proxy`` combines the prompt length and a CoT-length weight from
-        the model-specific tag (e.g. ``bot_task``). Shorter proxy -> admitted
-        first within the DiT admission budget.
-        """
-        num_prompt = getattr(req, "num_prompt_tokens", 0) or 0
-        proxy = num_prompt
-
-        # CoT-length weight from the model-specific tag (e.g. bot_task).
-        info = self._deserialize_info(req)
-        if info is not None and self.cot_weight_table:
-            cot_tag = info.get(self.cot_tag_key)
-            if cot_tag is not None:
-                # Unknown tag value -> 0 extra weight (treated as no-CoT).
-                proxy += int(self.cot_weight_table.get(cot_tag, 0))
-        return proxy
 
     def update_dit_load(self, snapshot: DitLoadSnapshot) -> None:
         """Receive DiT load snapshot from the Orchestrator via UTILITY ZMQ.
@@ -325,11 +286,12 @@ class DTPSScheduler:
         Priority layers (smaller layer = admitted first):
           L0 — ``ar_only`` requests waiting longer than ``i2t_aging_s``
                (starving; aging boost to prevent starvation). ALWAYS highest.
-          L1 — ``ar_downstream`` within the DiT admission budget, by ar_proxy
-          L2 — remaining ``ar_only`` requests
-          L3 — ``ar_downstream`` beyond the budget, by ar_proxy
-        Within a layer, FCFS follows the ``waiting`` queue order (``arrival_time``
-        is only read for the L0 starving check).
+          L1 — ``ar_downstream`` within the DiT admission budget (FCFS)
+          L2 — remaining ``ar_only`` requests (FCFS)
+          L3 — ``ar_downstream`` beyond the budget (FCFS)
+
+        Within each layer, FCFS follows the ``waiting`` queue order
+        (``arrival_time`` is only read for the L0 starving check).
 
         ``ar_proxy`` and arrival are read-only; only queue order is mutated.
         FCFSRequestQueue (a deque subclass) is reordered via clear()+extend();
@@ -348,7 +310,7 @@ class DTPSScheduler:
             budget_raw = max(0, self.dit_load_threshold - eff_min) * n_reps
 
         ar_only_reqs: list = []
-        downstream_reqs: list[tuple[int, Any]] = []
+        downstream_reqs: list = []
         starving_ar_only: list = []
         aging_threshold = self.i2t_aging_s
         now = time.time()
@@ -365,17 +327,14 @@ class DTPSScheduler:
                 else:
                     ar_only_reqs.append(req)
             else:
-                proxy = self._ar_proxy(req)
-                downstream_reqs.append((proxy, req))
-
-        downstream_reqs.sort(key=lambda t: t[0])
+                downstream_reqs.append(req)
 
         if budget_raw is None:
-            downstream_head = [t[1] for t in downstream_reqs]
+            downstream_head = downstream_reqs
             downstream_tail: list = []
         else:
-            downstream_head = [t[1] for t in downstream_reqs[:budget_raw]]
-            downstream_tail = [t[1] for t in downstream_reqs[budget_raw:]]
+            downstream_head = downstream_reqs[:budget_raw]
+            downstream_tail = downstream_reqs[budget_raw:]
 
         ordered = starving_ar_only + downstream_head + ar_only_reqs + downstream_tail
         if hasattr(waiting, "clear") and hasattr(waiting, "extend"):

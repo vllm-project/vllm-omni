@@ -700,9 +700,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if negative_prompt is not None:
                     tprompt["negative_prompt"] = negative_prompt
 
-                _bot_task = extra_body.get("bot_task")
-                if _bot_task is not None:
-                    self._ensure_prompt_additional_information(tprompt)["bot_task"] = _bot_task
                 # Always attach mm_processor_kwargs (possibly empty) so
                 # OmniInputPreprocessor._process_text routes through the
                 # multimodal processor path. Without it, the preprocessor
@@ -3133,8 +3130,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         _dtps_info = self._ensure_prompt_additional_information(engine_prompt)
         _dtps_info["omni_task_type"] = "it2i" if reference_images else "t2i"
-        if bot_task is not None:
-            _dtps_info["bot_task"] = bot_task
 
         mm_processor_kwargs: dict[str, Any] = {}
         if height is not None:

@@ -226,13 +226,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._dtps = DTPSScheduler.from_config(dtps_cfg)
             logger.info(
                 "[OmniDTPS] AR stage %s: aging_threshold=%.1fs, "
-                "cot_tag_key=%r, cot_weight_entries=%d, dit_load_threshold=%d, "
+                "dit_load_threshold=%d, "
                 "idle when any replica waiting < threshold, "
                 "busy when all replicas waiting >= threshold)",
                 getattr(self.vllm_config.model_config, "stage_id", 0),
                 self._dtps.i2t_aging_s,
-                self._dtps.cot_tag_key,
-                len(self._dtps.cot_weight_table),
                 self._dtps.dit_load_threshold,
             )
         except Exception:
