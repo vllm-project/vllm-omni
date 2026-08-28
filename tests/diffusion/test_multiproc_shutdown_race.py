@@ -151,8 +151,7 @@ class TestResultPumpDelayedAfterShutdown:
         # The core assertion: the delayed pump must not have repopulated
         # `_completed_outputs` after shutdown cleared it.
         assert executor._completed_outputs == {}, (
-            f"delayed pump repopulated dict after shutdown: "
-            f"{list(executor._completed_outputs)}"
+            f"delayed pump repopulated dict after shutdown: {list(executor._completed_outputs)}"
         )
 
     def test_result_pump_delayed_after_shutdown_batch_split(self, mocker):
@@ -206,8 +205,7 @@ class TestResultPumpDelayedAfterShutdown:
         assert not pump_thread.is_alive(), "pump thread did not exit"
 
         assert executor._completed_outputs == {}, (
-            f"delayed batch-split pump repopulated dict after shutdown: "
-            f"{list(executor._completed_outputs)}"
+            f"delayed batch-split pump repopulated dict after shutdown: {list(executor._completed_outputs)}"
         )
 
 
@@ -226,7 +224,6 @@ class TestDropOutputAfterShutdown:
         executor.drop_output("abc-abort")
 
         assert executor._output_futures == {}, (
-            f"drop_output registered waiter after shutdown: "
-            f"{list(executor._output_futures)}"
+            f"drop_output registered waiter after shutdown: {list(executor._output_futures)}"
         )
         assert executor._completed_outputs == {}
