@@ -9,7 +9,10 @@ cleared and repopulate the dictionary, reintroducing the leak this PR was meant
 to close.
 
 Both single-output and batch-split code paths must discard deliveries once
-`_closed` is set; `drop_output()` must be a no-op after shutdown.
+`_closed` is set; `drop_output()` must be a no-op after shutdown. Discarding
+must NOT skip SHM unpack: `unpack_diffusion_output_shm()` is the only
+receive-side path that unlinks named SHM segments, so an OUTPUT_READY dequeued
+after shutdown still has to be unpacked (just never cached).
 """
 
 import queue
@@ -73,12 +76,14 @@ class _FakeBatchOutput:
         return MagicMock(result=result)
 
 
-def _run_pump_blocked_until_shutdown(executor, msg, unpack_gate):
+def _run_pump_with_one_msg(executor, msg):
     """Drive the pump thread with one *msg*.
 
-    The pump enters `unpack_diffusion_output_shm` and blocks on *unpack_gate*.
-    Caller is expected to close the executor, then release the gate. Returns
-    the pump thread so the test can join it.
+    After the single msg, dequeue blocks until ``_pump_stop`` is set so the
+    pump loops out cleanly. Returns the pump thread. The caller finishes the
+    pump with ``_finish_pump``; the message's delivery completes before the
+    second dequeue call, so joining the thread is a deterministic barrier for
+    "delivery handled".
     """
     call_count = [0]
 
@@ -86,8 +91,6 @@ def _run_pump_blocked_until_shutdown(executor, msg, unpack_gate):
         call_count[0] += 1
         if call_count[0] == 1:
             return msg
-        # After the single msg, block until pump_stop is set so the pump
-        # loops out cleanly (mirrors _feed_one_msg_to_pump behaviour).
         while not executor._pump_stop.is_set():
             time.sleep(0.02)
         raise TimeoutError
@@ -95,9 +98,13 @@ def _run_pump_blocked_until_shutdown(executor, msg, unpack_gate):
     executor._result_mq.dequeue = mock_dequeue
     t = threading.Thread(target=executor._result_pump, daemon=True)
     t.start()
-    # Give the pump time to dequeue and reach unpack_gate.wait().
-    time.sleep(0.1)
     return t
+
+
+def _finish_pump(executor, pump_thread):
+    executor._pump_stop.set()
+    pump_thread.join(timeout=5.0)
+    assert not pump_thread.is_alive(), "pump thread did not exit"
 
 
 class TestResultPumpDelayedAfterShutdown:
@@ -106,16 +113,20 @@ class TestResultPumpDelayedAfterShutdown:
 
     Without gating, the assertions here fail (leak reintroduced through the
     late-write path). With gating on `_closed`, deliveries after shutdown are
-    discarded.
+    discarded. `entered_unpack` proves the pump is inside the mocked unpack
+    BEFORE `_closed` is set, so the post-unpack race path is really exercised
+    (a fixed sleep could let the pump take the early closed gate instead).
     """
 
     def test_result_pump_delayed_after_shutdown_single(self, mocker):
         """Single-output pump path: late unpack must not repopulate the dict."""
         executor = _make_executor()
 
+        entered_unpack = threading.Event()
         unpack_gate = threading.Event()
 
         def _blocked_unpack(*_args, **_kwargs):
+            entered_unpack.set()
             unpack_gate.wait(timeout=10.0)
 
         mocker.patch(
@@ -130,7 +141,11 @@ class TestResultPumpDelayedAfterShutdown:
             output=DiffusionOutput(output="late"),
         )
 
-        pump_thread = _run_pump_blocked_until_shutdown(executor, msg, unpack_gate)
+        pump_thread = _run_pump_with_one_msg(executor, msg)
+
+        # The pump must be INSIDE unpack (past the early closed gate) before
+        # shutdown starts, otherwise the post-unpack race is not exercised.
+        assert entered_unpack.wait(timeout=5.0), "pump never reached SHM unpack"
 
         # Simulate shutdown() clearing state while the pump is still stuck
         # inside unpack. `_closed = True` mirrors shutdown()'s first line.
@@ -142,11 +157,9 @@ class TestResultPumpDelayedAfterShutdown:
         # _completed_outputs. Without the gate, this reintroduces the leak.
         unpack_gate.set()
 
-        # Give the pump time to finish delivering and hit the gate.
-        time.sleep(0.2)
-        executor._pump_stop.set()
-        pump_thread.join(timeout=2.0)
-        assert not pump_thread.is_alive(), "pump thread did not exit"
+        # Joining the pump is a deterministic barrier: the delivery is fully
+        # handled before the pump blocks on the second dequeue and exits.
+        _finish_pump(executor, pump_thread)
 
         # The core assertion: the delayed pump must not have repopulated
         # `_completed_outputs` after shutdown cleared it.
@@ -158,9 +171,11 @@ class TestResultPumpDelayedAfterShutdown:
         """Batch-split pump path: late unpack must not repopulate the dict."""
         executor = _make_executor()
 
+        entered_unpack = threading.Event()
         unpack_gate = threading.Event()
 
         def _blocked_unpack(*_args, **_kwargs):
+            entered_unpack.set()
             unpack_gate.wait(timeout=10.0)
 
         mocker.patch(
@@ -187,7 +202,9 @@ class TestResultPumpDelayedAfterShutdown:
             output=_FakeBatchOutput(outputs),
         )
 
-        pump_thread = _run_pump_blocked_until_shutdown(executor, msg, unpack_gate)
+        pump_thread = _run_pump_with_one_msg(executor, msg)
+
+        assert entered_unpack.wait(timeout=5.0), "pump never reached SHM unpack"
 
         # Simulate shutdown during unpack.
         executor._closed = True
@@ -199,14 +216,45 @@ class TestResultPumpDelayedAfterShutdown:
         # _completed_outputs.
         unpack_gate.set()
 
-        time.sleep(0.2)
-        executor._pump_stop.set()
-        pump_thread.join(timeout=2.0)
-        assert not pump_thread.is_alive(), "pump thread did not exit"
+        _finish_pump(executor, pump_thread)
 
         assert executor._completed_outputs == {}, (
             f"delayed batch-split pump repopulated dict after shutdown: {list(executor._completed_outputs)}"
         )
+
+    def test_output_ready_after_shutdown_still_unpacks_shm(self, mocker):
+        """An OUTPUT_READY dequeued after `_closed` is set must still go
+        through `unpack_diffusion_output_shm` (the only receive-side path that
+        unlinks named SHM segments) while writing nothing into the caches.
+        Discarding it before unpack would leak the segments in /dev/shm for
+        the lifetime of the parent process.
+        """
+        executor = _make_executor()
+
+        unpack_calls = []
+        mocker.patch(
+            "vllm_omni.diffusion.executor.multiproc_executor.unpack_diffusion_output_shm",
+            side_effect=lambda output: unpack_calls.append(output),
+        )
+
+        # Shutdown completed BEFORE the pump dequeues the message.
+        executor._closed = True
+        with executor._futures_lock:
+            executor._completed_outputs.clear()
+
+        output = DiffusionOutput(output="late-shm")
+        msg = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id="abc-shm",
+            output=output,
+        )
+
+        pump_thread = _run_pump_with_one_msg(executor, msg)
+        _finish_pump(executor, pump_thread)
+
+        assert unpack_calls == [output], "closed-time discard skipped SHM unpack/unlink"
+        assert executor._completed_outputs == {}
+        assert executor._output_futures == {}
 
 
 class TestDropOutputAfterShutdown:
