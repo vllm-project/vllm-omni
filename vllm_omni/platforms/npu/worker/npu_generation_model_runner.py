@@ -831,9 +831,9 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                 inputs_embeds = None
 
             # -------------------------------------- Omni-new -------------------------------------------------
-            # Some generation-stage models require model-specific runtime
-            # information (such as image size and conditioning embeddings)
-            # even during the dummy profiling run that vLLM uses to
+            # Some generation-stage models (e.g. MammothModa2DiTPipeline) require
+            # model-specific runtime information (such as image size and conditioning
+            # embeddings) even during the dummy profiling run that vLLM uses to
             # estimate KV-cache capacity.  get_dummy_runtime_additional_information
             # provides placeholder values of the correct shape so that the profiling
             # run does not raise an error due to missing inputs.

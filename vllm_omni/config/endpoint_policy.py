@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Endpoint restriction policy for omni pipelines."""
 
 from dataclasses import dataclass
@@ -8,7 +8,7 @@ from typing import NamedTuple
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from vllm.entrypoints.serve.utils.error_response import create_error_response
+from vllm.entrypoints.serve import create_error_response
 
 
 class RouteTarget(NamedTuple):

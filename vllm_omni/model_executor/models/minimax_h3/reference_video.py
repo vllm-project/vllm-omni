@@ -15,6 +15,53 @@ import torch
 
 from vllm_omni.errors import OmniClientError
 
+MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY = "minimax_h3_prepared_reference_videos"
+
+
+def serialize_prepared_reference_videos(items: list[dict[str, Any]], artifact_dir: str) -> str:
+    fields = (
+        "original_path",
+        "prepared_path",
+        "input_has_audio",
+        "width",
+        "height",
+        "start_time_seconds",
+        "duration_seconds",
+        "audio_duration_seconds",
+    )
+    return json.dumps(
+        {
+            "artifact_dir": artifact_dir,
+            "videos": [{field: item[field] for field in fields} for item in items],
+        },
+        separators=(",", ":"),
+    )
+
+
+def deserialize_prepared_reference_videos(value: str) -> tuple[str, list[dict[str, Any]]]:
+    try:
+        payload = json.loads(value)
+        artifact_dir = payload["artifact_dir"]
+        videos = payload["videos"]
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid MiniMax H3 prepared-reference-video descriptor") from exc
+    if not isinstance(artifact_dir, str) or not isinstance(videos, list):
+        raise ValueError("invalid MiniMax H3 prepared-reference-video descriptor")
+    required = {
+        "original_path",
+        "prepared_path",
+        "input_has_audio",
+        "width",
+        "height",
+        "start_time_seconds",
+        "duration_seconds",
+        "audio_duration_seconds",
+    }
+    if any(not isinstance(item, dict) or set(item) != required for item in videos):
+        raise ValueError("invalid MiniMax H3 prepared-reference-video descriptor")
+    return artifact_dir, videos
+
+
 MINIMAX_H3_FPS = 24.0
 MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS = 2.0
 MINIMAX_H3_QWEN_TEMPORAL_PATCH = 2
@@ -280,6 +327,7 @@ def _transcode_reference_video(
 ) -> str:
     output = str(Path(workdir) / "prepared.mp4")
     duration_args = ["-t", f"{float(duration_seconds):.6f}"] if duration_seconds is not None else []
+    frame_count_args = ["-frames:v", str(int(target_frame_count))] if target_frame_count > 0 else []
     subprocess.run(
         [
             "ffmpeg",
@@ -296,8 +344,7 @@ def _transcode_reference_video(
             "-vf",
             (f"fps={MINIMAX_H3_FPS:g},scale={target_width}:{target_height}:flags=lanczos,setsar=1"),
             *duration_args,
-            "-frames:v",
-            str(int(target_frame_count)),
+            *frame_count_args,
             "-metadata:s:v:0",
             "rotate=0",
             # Keep the transformed RGB pixels lossless. The same prepared
@@ -394,7 +441,7 @@ def prepare_reference_videos(
                 # bounded duration separately for audio extraction.
                 "audio_duration_seconds": min(
                     duration,
-                    float(target_frame_count) / MINIMAX_H3_FPS,
+                    float(target_frame_count) / MINIMAX_H3_FPS if target_frame_count > 0 else duration,
                 ),
             }
         )

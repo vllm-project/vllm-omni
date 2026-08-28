@@ -14,7 +14,7 @@ describe fixed model topology and are not accepted in deploy YAMLs.
 Common `PipelineConfig` fields include:
 
 | Field | Description |
-|-------|-------------|
+| ------- | ------------- |
 | `model_type` | Pipeline identifier used during model and config resolution. |
 | `default_deploy_config_name` | Bundled deploy YAML loaded when the user does not pass `deploy_config`. |
 | `model_arch` | Default Hugging Face architecture for the pipeline. |
@@ -26,7 +26,7 @@ Common `PipelineConfig` fields include:
 Common `StagePipelineConfig` fields include:
 
 | Field | Description |
-|-------|-------------|
+| ------- | ------------- |
 | `stage_id` | Stable stage identifier. |
 | `model_stage` | Logical stage name used by runtime and strategy resolution. |
 | `execution_type` | `LLM_AR`, `LLM_GENERATION`, or `DIFFUSION`. |
@@ -49,17 +49,17 @@ deployment overrides.
 The new deploy schema lives under `vllm_omni/deploy/` and is paired with a frozen `PipelineConfig` registered by the model's `pipeline.py`. Each deploy YAML has these top-level fields:
 
 | Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
+| ------- | ------ | ---------- | --------- | ------------- |
 | `base_config` | str (path) | optional | — | Overlay parent (relative or absolute). `stages:` / `platforms:` deep-merged by stage_id; other scalars overlay-wins. Intended for user-authored overlays; prod yamls stay flat. |
 | `async_chunk` | bool | optional | `true` | Enable chunked streaming between stages. Pin to `false` if the pipeline runs end-to-end. |
-| `session_mode` | str | optional | `"turn"` | Session behavior. Use `"duplex"` only with a pipeline that enables duplex control. |
+| `session_mode` | str | optional | `"turn"` | Session behavior. MiniCPM-o 4.5 deploy YAMLs set `"duplex"` so `/v1/realtime` and chat share the same profile. |
 | `active_stream_window` | int | optional | `0` | Number of active downstream stream slots; `0` preserves all-stream cycling. |
 | `duplex_session` | dict | optional | runtime defaults | Full-duplex session lifecycle, buffering, replay, and capacity limits. |
 | `connectors` | dict | optional | `null` | Named connector specs (`{name, extra}`). Referenced by each stage's `input_connectors` / `output_connectors`. See [Connector schema](#connector-schema). |
 | `edges` | list | optional | `null` | Explicit edge list for the KV transfer graph. Auto-derived from stage inputs if omitted. |
 | `stages` | list | optional | `[]` | Per-stage runtime overrides matched by `stage_id`. Pipeline stages are still created from `PipelineConfig` when this list is empty. |
 | `platforms` | dict | optional | `null` | Keyed by `npu` / `rocm` / `xpu`, each contains a `stages:` list with per-platform overrides applied on top of the CUDA defaults. |
-| `pipeline` | str | optional | `null` | Override the auto-detected pipeline registry key (used for structural variants like `qwen2_5_omni_thinker_only`). |
+| `pipeline` | str | optional | `null` | Override the auto-detected pipeline registry key (used for structural variants like `qwen2_5_omni_thinker_only` / `qwen3_omni_moe_thinker_only`). |
 | `trust_remote_code` | bool \| null | optional | `null` | **Pipeline-wide.** Trust HF remote code on model load; applies to every stage when specified. |
 | `distributed_executor_backend` | str \| null | optional | `null` | **Pipeline-wide.** Distributed executor backend forwarded to vLLM (`"mp"`, `"ray"`, `"external_launcher"`). If omitted, vLLM auto-selects backend from runtime topology. |
 | `dtype` | str \| null | optional | `null` | **Pipeline-wide.** Model dtype for every stage. |
@@ -84,7 +84,7 @@ subprocess on one GPU. `ray` / `external_launcher` are not fully supported yet.
 Each entry under `stages:` accepts any `StageDeployConfig` field directly (no nested `engine_args:`). Only fields whose value legitimately varies across stages live here; pipeline-wide settings (trust_remote_code, distributed_executor_backend, dtype, quantization, prefix/chunked prefill, DP/PP sizes) are declared at the top level and applied to every stage. Unknown keys fall through to `engine_extras:` and are forwarded to the engine. Frequently used fields are listed below; the source-of-truth schema is `StageDeployConfig` in `vllm_omni/config/stage_config.py`.
 
 | Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
+| ------- | ------ | ---------- | --------- | ------------- |
 | `stage_id` | int | required | — | Stage identity; matched against `PipelineConfig.stages[*].stage_id`. |
 | `max_num_seqs` | int \| null | optional | `null` | Max concurrent sequences per stage. |
 | `gpu_memory_utilization` | float \| null | optional | `null` | Per-stage total memory target; used for automatic KV-cache sizing. |
@@ -94,11 +94,13 @@ Each entry under `stages:` accepts any `StageDeployConfig` field directly (no ne
 | `max_num_batched_tokens` | int \| null | optional | `null` | Per-stage prefill/token budget; also contributes to the native maximum in-flight token limit. |
 | `max_model_len` | int \| null | optional | `null` | Per-sequence context or KV length; `-1` enables native cache-capacity auto-fitting, while values above the HF default auto-set `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`. |
 | `async_scheduling` | bool \| null | optional | `null` | Per-stage async scheduling toggle. |
-| `devices` | str \| null | optional | `null` | Device list assigned to this stage. |
+| `devices` | str \| null | optional | `null` | Device list assigned to this stage. The number of device ids must equal this stage's local world size (`tensor_parallel_size` × local data-parallel size × `pipeline_parallel_size`, or `num_replicas` × that product for a replica pool); a mismatch fails early — see the note below. |
 | `output_connectors` | dict \| null | optional | `null` | Keyed by `to_stage_<n>`; values are names registered under top-level `connectors:`. |
 | `input_connectors` | dict \| null | optional | `null` | Keyed by `from_stage_<n>`; values are names registered under top-level `connectors:`. |
 | `default_sampling_params` | dict \| null | optional | `null` | Baseline sampling params. Deep-merged with pipeline `sampling_constraints` (pipeline wins). |
 | `engine_extras` | dict | optional | `{}` | Catch-all for engine fields not listed above; deep-merged across overlays and forwarded to the stage engine. |
+
+**Note:** a stage's `devices` count must equal its local world size (`tensor_parallel_size` × `data_parallel_size_local` × `pipeline_parallel_size`, falling back to global `data_parallel_size` when the local size is unset), or `num_replicas` × that product for a replica pool. A mismatch fails early and names the offending stage. A top-level `--tensor-parallel-size` is broadcast to every stage, so it can make a single-GPU stage violate this contract ([issue #5003](gh-issue:5003)); fix that case with `--stage-overrides` (set `tensor_parallel_size` and `devices` together per stage) or set TP only on the multi-GPU stage.
 
 ### Connector schema
 
@@ -113,9 +115,9 @@ connectors:
       # Additional connector-specific options
 ```
 
-| Connector class | Use case | `extra` keys |
-|-----------------|----------|--------------|
-| `SharedMemoryConnector` | Same-host KV transfer between stages (default for bundled YAMLs). | None. All payloads use shared memory. |
+| Connector class          | Use case                                                              | `extra` keys                                                                                                      |
+|--------------------------|-----------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
+| `SharedMemoryConnector`  | Same-host KV transfer between stages (default for bundled YAMLs).     | None. All payloads use shared memory.                                                                             |
 | `MooncakeStoreConnector` | Cross-host KV transfer over TCP. Required for multi-node deployments. | `host`, `metadata_server`, `master`, `segment` (int bytes), `localbuf` (int bytes), `proto` (`"tcp"` / `"rdma"`). |
 
 A stage references a connector by name in its `input_connectors` / `output_connectors`:
@@ -135,7 +137,7 @@ stages:
 ### CLI flags
 
 | Flag | Description |
-|------|-------------|
+| ------ | ------------- |
 | `--deploy-config PATH` | Load a deploy YAML. **Optional** — when omitted, the bundled `vllm_omni/deploy/<model_type>.yaml` is auto-loaded by the model registry. |
 | `--stage-overrides JSON` | Per-stage JSON overrides, e.g. `'{"0":{"gpu_memory_utilization":0.5}}'`. Per-stage values always win over global flags. |
 | `--async-chunk` / `--no-async-chunk` | Flip the deploy YAML's `async_chunk:` bool. Unset (default) leaves the YAML value in force. |
@@ -249,7 +251,7 @@ CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
 Effective config per stage after the merge:
 
 | Stage | Field | Final value | Source |
-|-------|-------|-------------|--------|
+| ------- | ------- | ------------- | -------- |
 | 0 | `gpu_memory_utilization` | `0.9` | base YAML (overlay didn't touch stage 0) |
 | 0 | `max_num_seqs` | `8` | per-stage CLI (`--stage-overrides`) — wins over base `32` |
 | 0 | `max_model_len` | `16384` | global CLI |
@@ -273,12 +275,14 @@ when loading a deploy configuration.
 Examples:
 
 For offline inference (assuming the necessary dependencies have been imported):
+
 ```python
 model_name = "Qwen/Qwen2.5-Omni-7B"
 omni = Omni(model=model_name, deploy_config="/path/to/deploy_config.yaml")
 ```
 
 For online serving:
+
 ```bash
 vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/deploy_config.yaml
 ```

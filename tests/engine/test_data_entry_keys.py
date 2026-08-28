@@ -74,6 +74,25 @@ class TestOmniPayloadStruct:
         for top, sub in original.items():
             assert sorted(d[top].keys()) == sorted(sub.keys())
 
+    def test_text_conditioning_uses_shared_payload_fields(self):
+        hidden = torch.zeros(4, 5120)
+        token_role_ids = torch.tensor([[1], [1], [0], [0]])
+
+        payload = to_dict(
+            to_struct(
+                {
+                    "hidden_states": {"output": hidden},
+                    "meta": {"token_role_ids": token_role_ids},
+                }
+            )
+        )
+
+        assert torch.equal(payload["hidden_states"]["output"], hidden)
+        assert torch.equal(payload["meta"]["token_role_ids"], token_role_ids)
+        for legacy_key in ("encoder_hidden_states", "token_tags"):
+            with pytest.raises(msgspec.ValidationError, match="unknown field"):
+                to_struct({legacy_key: torch.zeros(1)})
+
     def test_to_dict_drops_unset_fields(self):
         s = OmniPayloadStruct(meta=MetaStruct(left_context_size=10))
         d = to_dict(s)
@@ -397,3 +416,12 @@ class TestSerializeDeserializePayload:
         original: OmniPayload = {"meta": {"finished": None}}
         wire = serialize_payload(original)
         assert wire is None
+
+    def test_minimax_h3_prepared_reference_video_descriptor_round_trip(self):
+        descriptor = '{"artifact_dir":"/tmp/h3","videos":[]}'
+
+        wire = serialize_payload({"meta": {"minimax_h3_prepared_reference_videos": descriptor}})
+        assert wire is not None
+        restored = deserialize_payload(wire)
+
+        assert restored["meta"]["minimax_h3_prepared_reference_videos"] == descriptor
