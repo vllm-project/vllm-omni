@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Unit tests for the shared LTX pipeline runtime and public contracts."""
 
@@ -8,6 +8,7 @@ import os
 import tempfile
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -165,7 +166,19 @@ def test_ltx_checkpoint_version_detection_uses_metadata(tmp_path):
     assert detect_ltx_model_version(str(tmp_path)) == "2"
 
 
-def test_ltx_artifact_falls_back_to_unpinned_hub_download(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("model", "repo_id", "expected_revision"),
+    [
+        ("Lightricks/test", "Lightricks/test", "model-revision"),
+        ("Lightricks/test-Diffusers", "Lightricks/test", "artifact-revision"),
+    ],
+)
+def test_ltx_artifact_uses_source_revision_and_hub_fallback(
+    monkeypatch,
+    model,
+    repo_id,
+    expected_revision,
+):
     filename = "ltx-sidecar.safetensors"
     calls = []
 
@@ -176,9 +189,22 @@ def test_ltx_artifact_falls_back_to_unpinned_hub_download(tmp_path, monkeypatch)
     monkeypatch.setattr(ltx2_components, "hf_hub_download", fake_download)
 
     assert (
-        resolve_ltx_artifact(str(tmp_path / "model"), "Lightricks/test", filename) == "/cache/ltx-sidecar.safetensors"
+        resolve_ltx_artifact(
+            model,
+            repo_id,
+            filename,
+            model_revision="model-revision",
+            artifact_revision="artifact-revision",
+        )
+        == "/cache/ltx-sidecar.safetensors"
     )
-    assert calls == [{"repo_id": "Lightricks/test", "filename": filename}]
+    assert calls == [
+        {
+            "repo_id": repo_id,
+            "filename": filename,
+            "revision": expected_revision,
+        }
+    ]
 
 
 def test_ltx_artifact_prefers_model_root(tmp_path, monkeypatch):
@@ -187,7 +213,41 @@ def test_ltx_artifact_prefers_model_root(tmp_path, monkeypatch):
     expected.write_bytes(b"sidecar")
     monkeypatch.setattr(ltx2_components, "hf_hub_download", lambda **_kwargs: pytest.fail("unexpected Hub lookup"))
 
-    assert resolve_ltx_artifact(str(tmp_path), "Lightricks/test", filename) == str(expected)
+    assert resolve_ltx_artifact(
+        str(tmp_path),
+        "Lightricks/test",
+        filename,
+        model_revision="unused-model-revision",
+        artifact_revision="unused-artifact-revision",
+    ) == str(expected)
+
+
+def test_ltx_artifact_local_model_missing_sidecar_falls_back_to_hub(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_download(**kwargs):
+        calls.append(kwargs)
+        return "/cache/ltx-sidecar.safetensors"
+
+    monkeypatch.setattr(ltx2_components, "hf_hub_download", fake_download)
+
+    assert (
+        resolve_ltx_artifact(
+            str(tmp_path),
+            "Lightricks/test",
+            "ltx-sidecar.safetensors",
+            model_revision="local-model-revision",
+            artifact_revision="artifact-revision",
+        )
+        == "/cache/ltx-sidecar.safetensors"
+    )
+    assert calls == [
+        {
+            "repo_id": "Lightricks/test",
+            "filename": "ltx-sidecar.safetensors",
+            "revision": "artifact-revision",
+        }
+    ]
 
 
 @pytest.mark.parametrize(
@@ -900,7 +960,7 @@ def test_ltx_two_stage_executes_declarative_i2v_phase_plan(pipeline_cls):
         max_sequence_length=16,
     )
     prompt_context = object()
-    phase_calls = []
+    phase_calls: list[Any] = []
 
     def resolve_request_inputs(req, **kwargs):
         return request_inputs
@@ -959,7 +1019,7 @@ def test_ltx_two_stage_executes_declarative_i2v_phase_plan(pipeline_cls):
     pipeline.vae_spatial_compression_ratio = 32
     pipeline.vae_temporal_compression_ratio = 8
     pipeline.latent_upsampler = FakeUpsampler()
-    activated_slots = []
+    activated_slots: list[Any] = []
     if pipeline_cls is LTX2TwoStagePipeline:
         pipeline._phase_adapter = SimpleNamespace(activate=activated_slots.append)
     object.__setattr__(pipeline, "_resolve_request_inputs", resolve_request_inputs)
@@ -1133,6 +1193,59 @@ def test_ltx_two_stage_recipe_rejects_sigmas():
         )
 
 
+def test_ltx_request_applies_diffvae_minimum_spatial_size_only_when_requested():
+    request = LTXRequestInputs(
+        prompt="prompt",
+        negative_prompt="",
+        height=128,
+        width=128,
+        num_frames=9,
+        frame_rate=24.0,
+        num_inference_steps=30,
+        guidance=LTX2_ONE_STAGE_RECIPE.request_guidance,
+        num_videos_per_prompt=1,
+        generator=None,
+        latents=None,
+        audio_latents=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        prompt_attention_mask=None,
+        negative_prompt_attention_mask=None,
+        decode_timestep=0.0,
+        decode_noise_scale=None,
+        output_type="np",
+        max_sequence_length=16,
+    )
+
+    with pytest.raises(ValueError, match="DiffVAE requires video latent spatial dimensions of at least 7x7"):
+        validate_pipeline_request(
+            request,
+            pipeline_recipe=LTX2_ONE_STAGE_RECIPE,
+            vae_spatial_compression_ratio=32,
+            vae_temporal_compression_ratio=8,
+            pipeline_name="LTX2Pipeline",
+            min_video_latent_spatial_size=(7, 7),
+        )
+
+    # ConvVAE does not use NATTEN, so its existing 128x128 boundary remains valid.
+    validate_pipeline_request(
+        request,
+        pipeline_recipe=LTX2_ONE_STAGE_RECIPE,
+        vae_spatial_compression_ratio=32,
+        vae_temporal_compression_ratio=8,
+        pipeline_name="LTX2Pipeline",
+    )
+
+    validate_pipeline_request(
+        replace(request, height=256, width=256),
+        pipeline_recipe=LTX2_ONE_STAGE_RECIPE,
+        vae_spatial_compression_ratio=32,
+        vae_temporal_compression_ratio=8,
+        pipeline_name="LTX2Pipeline",
+        min_video_latent_spatial_size=(7, 7),
+    )
+
+
 @pytest.mark.parametrize(
     ("direct_kwargs", "sampling_kwargs", "error"),
     [
@@ -1284,7 +1397,7 @@ def test_ltx_official_two_stage_recipes_only_vary_by_model_defaults(recipe, step
 
 
 def test_ltx_two_stage_entries_select_the_official_adapter_slots():
-    phase_switches = []
+    phase_switches: list[Any] = []
     ordinary_pipeline = object.__new__(LTX2TwoStagePipeline)
     ordinary_pipeline._phase_adapter = SimpleNamespace(activate=phase_switches.append)
     for phase in LTX2_TWO_STAGE_RECIPE.phases:

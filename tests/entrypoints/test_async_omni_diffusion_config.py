@@ -33,6 +33,64 @@ def test_default_stage_config_includes_cache_backend():
     assert engine_args["model_stage"] == "diffusion"
 
 
+def test_default_stage_config_preserves_model_extras():
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg({"extras": {"ltx2_use_conv_vae": True}})[0]
+
+    assert stage_cfg["engine_args"]["extras"]["ltx2_use_conv_vae"] is True
+
+
+def test_default_stage_config_preserves_and_overrides_promoted_extras():
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "extras": {
+                "auxiliary_text_encoder": "/models/extras-llama",
+                "default_llama_model_id": "extras/default-llama",
+            },
+            "auxiliary_text_encoder": None,
+        }
+    )[0]
+
+    extras = stage_cfg["engine_args"]["extras"]
+    assert extras["auxiliary_text_encoder"] == "/models/extras-llama"
+    assert extras["default_llama_model_id"] == "extras/default-llama"
+
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "extras": {
+                "auxiliary_text_encoder": "/models/extras-llama",
+                "default_llama_model_id": "extras/default-llama",
+            },
+            "auxiliary_text_encoder": "/models/top-level-llama",
+            "default_llama_model_id": "top-level/default-llama",
+        }
+    )[0]
+
+    extras = stage_cfg["engine_args"]["extras"]
+    assert extras["auxiliary_text_encoder"] == "/models/top-level-llama"
+    assert extras["default_llama_model_id"] == "top-level/default-llama"
+
+
+def test_stage_override_preserves_model_extras_for_default_diffusion_stage(mocker):
+    """Local/unregistered Diffusers checkpoints still honor stage-0 extras."""
+
+    def resolve_with_default(*_args, default_stage_cfg_factory, **_kwargs):
+        return None, default_stage_cfg_factory(), None
+
+    mocker.patch(
+        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
+        side_effect=resolve_with_default,
+    )
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+
+    _, stage_configs = engine._resolve_stage_configs(
+        "/models/LTX-2.5-Diffusers",
+        {"stage_overrides": '{"0":{"extras":{"ltx2_use_conv_vae":true}}}'},
+        trust_remote_code=False,
+    )
+
+    assert stage_configs[0]["engine_args"]["extras"]["ltx2_use_conv_vae"] is True
+
+
 def test_default_cache_config_used_when_missing():
     """Ensure default cache_config is synthesized when only backend is given."""
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(

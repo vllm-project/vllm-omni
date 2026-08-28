@@ -3148,7 +3148,7 @@ async def test_minicpmo_pre_response_continuation_drops_after_model_turn_ends():
 
 
 @pytest.mark.asyncio
-async def test_minicpmo_auto_response_continuation_has_no_semantic_unit_cap():
+async def test_minicpmo_auto_response_continuation_stops_at_large_safety_boundary():
     request_id = "duplex-sid-long-response-e0-stage0"
     engine = FakeEngineClient()
     handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
@@ -3164,7 +3164,7 @@ async def test_minicpmo_auto_response_continuation_has_no_semantic_unit_cap():
     _install_direct_silence_scheduler(handler, session)
     ws = TimedWebSocket()
 
-    for _ in range(9):
+    for _ in range(handler._NATIVE_AUTO_RESPONSE_MAX_CONTINUATION_UNITS):
         await handler._maybe_continue_native_response(
             ws.send_json,
             session=session,
@@ -3172,9 +3172,103 @@ async def test_minicpmo_auto_response_continuation_has_no_semantic_unit_cap():
         )
     await asyncio.sleep(0.02)
 
-    assert len(engine.appended) == 9
+    response_id = session.active_response_id
+    assert response_id is not None
+    assert len(engine.appended) == handler._NATIVE_AUTO_RESPONSE_MAX_CONTINUATION_UNITS
     assert all(payload["duplex_turn_id"] == 0 for _, _, payload, _ in engine.appended)
-    assert all("force_speak" not in payload for _, _, payload, _ in engine.appended)
+    assert all(not {"force_speak", "force_listen"} & payload.keys() for _, _, payload, _ in engine.appended[:-1])
+    assert engine.appended[-1][2]["force_listen"] is True
+    assert handler._native_response_continuations_remaining(session, response_id) is False
+
+    await handler._maybe_continue_native_response(
+        ws.send_json,
+        session=session,
+        expected_epoch=session.epoch,
+    )
+
+    assert len(engine.appended) == handler._NATIVE_AUTO_RESPONSE_MAX_CONTINUATION_UNITS
+    assert ws.sent_types()[-2:] == ["response.listen", "response.done"]
+    assert session.active_response_id is None
+    assert session.active_request_id == request_id
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_auto_response_boundary_listen_closes_response():
+    request_id = "duplex-sid-boundary-listen-e0-stage0"
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(engine))
+    session = DuplexSession(
+        session_id="sid-boundary-listen",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.capabilities = DuplexCapabilities.minicpmo45_native()
+    response_id = session.begin_response(turn_id=0)
+    session.bind_request(request_id)
+    native = handler._minicpmo_session_state(session)
+    native.continuation_owner_id = f"response:{response_id}"
+    native.continuation_units = handler._NATIVE_AUTO_RESPONSE_MAX_CONTINUATION_UNITS
+    _install_direct_silence_scheduler(handler, session)
+    ws = TimedWebSocket()
+
+    close_reason, emitted = await handler._send_one_native_duplex_event(
+        ws.send_json,
+        {
+            "supported": True,
+            "stage_role": "llm",
+            "is_listen": True,
+            "model_listen": True,
+            "data_plane_request_id": request_id,
+            "end_of_turn": False,
+            "uses_model_runner_scheduler": True,
+            "runner_kv_backed": True,
+            "runtime_impl": "scheduler_data_plane",
+        },
+        session=session,
+        expected_epoch=session.epoch,
+    )
+
+    assert close_reason is None
+    assert emitted is True
+    assert engine.appended == []
+    assert ws.sent_types() == ["response.listen", "response.done"]
+    assert session.active_response_id is None
+    assert session.active_request_id == request_id
+    assert native.continuation_owner_id is None
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_auto_response_boundary_does_not_close_new_epoch_response():
+    request_id = "duplex-sid-boundary-race-e0-stage0"
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(
+        session_id="sid-boundary-race",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.capabilities = DuplexCapabilities.minicpmo45_native()
+    old_response_id = session.begin_response(turn_id=0)
+    session.bind_request(request_id)
+    native = handler._minicpmo_session_state(session)
+    native.continuation_owner_id = f"response:{old_response_id}"
+    native.continuation_units = handler._NATIVE_AUTO_RESPONSE_MAX_CONTINUATION_UNITS
+    sent: list[dict[str, Any]] = []
+    new_response_ids: list[str] = []
+
+    async def _barge_in_on_listen(payload: dict[str, Any]) -> None:
+        sent.append(payload)
+        if payload["type"] == "response.listen":
+            session.barge_in()
+            session.bind_request("duplex-sid-boundary-race-e1-stage0")
+            new_response_ids.append(session.begin_response(turn_id=1))
+
+    await handler._maybe_continue_native_response(
+        _barge_in_on_listen,
+        session=session,
+        expected_epoch=session.epoch,
+    )
+
+    assert [payload["type"] for payload in sent] == ["response.listen"]
+    assert len(new_response_ids) == 1
+    assert session.active_response_id == new_response_ids[0]
 
 
 @pytest.mark.asyncio

@@ -114,6 +114,41 @@ _OMNI_MODELS = {
         "omnivoice",
         "OmniVoiceModel",
     ),
+    "MammothModa2Qwen2ForCausalLM": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2Qwen2ForCausalLM",
+    ),
+    "MammothModa2ARForConditionalGeneration": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2ARForConditionalGeneration",
+    ),
+    "MammothModa2Qwen3ARForConditionalGeneration": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2Qwen3ARForConditionalGeneration",
+    ),
+    "MammothModa2Qwen3ForCausalLM": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2Qwen3ForCausalLM",
+    ),
+    "MammothModa2DiTPipeline": (
+        "mammoth_moda2",
+        "pipeline_mammothmoda2_dit",
+        "MammothModa2DiTPipeline",
+    ),
+    "MammothModa2ForConditionalGeneration": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2ForConditionalGeneration",
+    ),
+    "Mammothmoda2Model": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2ForConditionalGeneration",
+    ),
     "Qwen3TTSForConditionalGeneration": (
         "qwen3_tts",
         "qwen3_tts_talker",
