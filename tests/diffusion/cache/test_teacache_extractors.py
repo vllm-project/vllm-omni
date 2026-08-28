@@ -857,7 +857,7 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
         token_tags = torch.full((seq_len,), -1, dtype=torch.long)
         token_tags[local_img_pos] = 0
         token_tags[local_audio_pos] = 2
-        inverse_indices = torch.arange(seq_len, dtype=torch.long) % 2
+        inverse_indices = torch.zeros(seq_len, dtype=torch.long)
         inputs = {
             **sample_inputs,
             "inverse_indices": inverse_indices,
