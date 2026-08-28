@@ -2005,7 +2005,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         # for precision, producing float32 embeddings.  Without autocast, these
         # float32 tensors flow into bf16 LayerNorm weights and NPU's aclnnLayerNorm
         # rejects the mixed dtype (CUDA auto-casts; NPU does not).
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type in ("cuda", "npu")):
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type != "cpu"):
             quantizer = cast(MossAudioTokenizerResidualVQ | MossAudioTokenizerResidualLFQ, self.quantizer)
             zq = quantizer.decode_codes(codes)
 
