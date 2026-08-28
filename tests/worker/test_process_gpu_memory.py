@@ -57,10 +57,18 @@ class TestGetProcessGpuMemory:
     def test_returns_memory_for_current_process(self):
         import torch
 
+        from vllm_omni.entrypoints.utils import detect_pid_host
         from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
+        if not detect_pid_host():
+            # NVML reports host PIDs. In an isolated PID namespace this
+            # process's PID cannot appear in the compute-process list, so a
+            # miss here is the environment rather than a regression -- and it
+            # is the same condition determine_available_memory() checks before
+            # it trusts a per-process reading at all.
+            pytest.skip("per-process NVML accounting needs the host PID namespace")
 
         device = torch.device("cuda:0")
         tensor = torch.zeros(1000, 1000, device=device)
