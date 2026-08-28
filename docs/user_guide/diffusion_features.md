@@ -23,12 +23,13 @@ vLLM-Omni supports various advanced features for diffusion models:
 
 #### Lossy Acceleration
 
-Cache methods trade minimal quality for significant speedup. Quality loss is typically imperceptible with proper tuning.
+Lossy methods trade minimal quality for significant speedup. Quality loss is typically imperceptible with proper tuning.
 
-| Method | Description | Best For |
-|--------|-------------|----------|
-| **[TeaCache](diffusion/cache_acceleration/teacache.md)** | Adaptive caching using modulated inputs | Quick setup, balanced quality/speed on single GPU |
-| **[Cache-DiT](diffusion/cache_acceleration/cache_dit.md)** | Multiple caching techniques: DBCache, TaylorSeer, SCM | Fine-grained control, tunable quality-speed tradeoff |
+| Method                                                     | Description                                                                                       | Best For                                                                                               |
+|------------------------------------------------------------|---------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|
+| **[TeaCache](diffusion/cache_acceleration/teacache.md)**   | Adaptive caching using modulated inputs                                                           | Quick setup, balanced quality/speed on single GPU                                                      |
+| **[Cache-DiT](diffusion/cache_acceleration/cache_dit.md)** | Multiple caching techniques: DBCache, TaylorSeer, SCM                                             | Fine-grained control, tunable quality-speed tradeoff                                                   |
+| **[PipeFusion](diffusion/parallelism/pipefusion.md)**      | Splits latents into patches and processes them asynchronously to reduce Pipeline Parallel bubbles | Images and shorter videos, where repeated KV-cache reads are less likely to become a memory bottleneck |
 
 
 #### Lossless Acceleration

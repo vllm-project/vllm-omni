@@ -17,7 +17,6 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.conv import Conv3dLayer
 from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -35,6 +34,12 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_pipeline_parallel_world_size,
     is_pipeline_first_stage,
     is_pipeline_last_stage,
+)
+from vllm_omni.diffusion.distributed.pipefusion.pipefusion_conv import Conv3dLayer
+from vllm_omni.diffusion.distributed.pipefusion.pipefusion_transformer import (
+    PipeFusionRotaryEmbeddingMixin,
+    PipeFusionSelfAttentionMixin,
+    PipeFusionTransformerMixin,
 )
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
@@ -158,7 +163,7 @@ class WanFeedForward(nn.Module):
         return hidden_states
 
 
-class WanRotaryPosEmbed(nn.Module):
+class WanRotaryPosEmbed(nn.Module, PipeFusionRotaryEmbeddingMixin):
     """
     Rotary position embeddings for 3D video data (temporal + spatial dimensions).
     """
@@ -175,6 +180,8 @@ class WanRotaryPosEmbed(nn.Module):
         self.attention_head_dim = attention_head_dim
         self.patch_size = patch_size
         self.max_seq_len = max_seq_len
+        self._cached_rope_emb = None
+        self._cached_rope_resolution = None
 
         # Split dimensions for temporal, height, width
         h_dim = w_dim = 2 * (attention_head_dim // 6)
@@ -208,8 +215,18 @@ class WanRotaryPosEmbed(nn.Module):
         freqs_sin = freqs.sin().float().repeat_interleave(2, dim=-1)
         return freqs_cos.float(), freqs_sin.float()
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size, num_channels, num_frames, height, width = hidden_states.shape
+    def forward(
+        self,
+        num_frames: int,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        current_rope_resolution = (num_frames, height, width)
+        if self._cached_rope_resolution == current_rope_resolution and self._cached_rope_emb is not None:
+            return self._cached_rope_emb
+
         p_t, p_h, p_w = self.patch_size
         ppf, pph, ppw = num_frames // p_t, height // p_h, width // p_w
 
@@ -233,7 +250,13 @@ class WanRotaryPosEmbed(nn.Module):
         freqs_cos = torch.cat([freqs_cos_f, freqs_cos_h, freqs_cos_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
         freqs_sin = torch.cat([freqs_sin_f, freqs_sin_h, freqs_sin_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
 
-        return freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
+        rotary_emb = (
+            freqs_cos[..., 0::2].to(device=device, dtype=dtype),
+            freqs_sin[..., 1::2].to(device=device, dtype=dtype),
+        )
+        self._cached_rope_resolution = current_rope_resolution
+        self._cached_rope_emb = rotary_emb
+        return rotary_emb
 
 
 class WanImageEmbedding(nn.Module):
@@ -351,7 +374,7 @@ class OutputScaleShiftPrepare(nn.Module):
         return shift, scale
 
 
-class WanSelfAttention(nn.Module):
+class WanSelfAttention(nn.Module, PipeFusionSelfAttentionMixin):
     """
     Optimized self-attention module using vLLM layers.
     """
@@ -418,6 +441,7 @@ class WanSelfAttention(nn.Module):
             role="self",
             prefix=prefix,
         )
+        self.rotary_embedding = RotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
 
         # FastVideo VSA checkpoints may add a learned projection that gates
         # the compressed global branch. Zero initialization makes checkpoints
@@ -780,7 +804,7 @@ class WanTransformerBlock(nn.Module):
         return hidden_states
 
 
-class WanTransformer3DModel(nn.Module):
+class WanTransformer3DModel(nn.Module, PipeFusionTransformerMixin):
     """
     Optimized Wan Transformer model for video generation using vLLM layers.
 
@@ -982,14 +1006,19 @@ class WanTransformer3DModel(nn.Module):
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(["hidden_states"], inner_dim)
 
-        # ROPE helper
-        self._cached_rope_emb = None
-        self._cached_rope_resolution = None
-
     @property
     def dtype(self) -> torch.dtype:
         """Return the dtype of the model parameters."""
         return next(self.parameters()).dtype
+
+    def _unpatchify(self, hidden_states: torch.Tensor, dims: tuple[int, int, int, int, int]) -> torch.Tensor:
+        batch_size, _, num_frames, height, width = dims
+        p_t, p_h, p_w = self.config.patch_size
+        hidden_states = hidden_states.reshape(
+            batch_size, num_frames // p_t, height // p_h, width // p_w, p_t, p_h, p_w, -1
+        )
+        hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
+        return hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
 
     def forward(
         self,
@@ -1000,33 +1029,28 @@ class WanTransformer3DModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
+        dims: tuple[int, int, int, int, int] | None = None,
     ) -> torch.Tensor | Transformer2DModelOutput | IntermediateTensors:
-        batch_size, num_channels, num_frames, height, width = hidden_states.shape
+        # hidden_states is 5D on the first PP stage, 3D on others; dims always carries the original shape.
+        batch_size, num_channels, num_frames, height, width = dims
         p_t, p_h, p_w = self.config.patch_size
         post_patch_num_frames = num_frames // p_t
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
-        # Compute RoPE embeddings (sharded by _sp_plan via split_output=True)
-        current_rope_resolution = (post_patch_num_frames, post_patch_height, post_patch_width)
-        if self._cached_rope_resolution == current_rope_resolution and self._cached_rope_emb is not None:
-            rotary_emb = self._cached_rope_emb
-        else:
-            freqs_cos, freqs_sin = self.rope(hidden_states)
-            rotary_emb = (freqs_cos[..., 0::2].to(hidden_states.dtype), freqs_sin[..., 1::2].to(hidden_states.dtype))
-            self._hidden_states_shape = hidden_states.shape
-            self._cached_rope_emb = rotary_emb
-
         if is_pipeline_first_stage():
             # Patch embedding and flatten to sequence. SP sharding happens at
             # _sp_shard_point so downstream block wrappers see local tensors.
-            hidden_states = self.patch_embedding(hidden_states)
+            hidden_states = self.patch_embedding(hidden_states, dims=dims)
             hidden_states = hidden_states.flatten(2).transpose(1, 2)
             hidden_states = self._sp_shard_point(hidden_states)
         else:
             if intermediate_tensors is None:
                 raise RuntimeError("intermediate_tensors must be provided for non-first PP stages")
             hidden_states = intermediate_tensors["hidden_states"]
+
+        # Compute RoPE embeddings (sharded by _sp_plan via split_output=True)
+        rotary_emb = self.rope(num_frames, height, width, device=hidden_states.device, dtype=hidden_states.dtype)
 
         # Handle timestep shape (2-D for TI2V, 1-D for T2V)
         if timestep.ndim == 2:
@@ -1110,12 +1134,7 @@ class WanTransformer3DModel(nn.Module):
 
         hidden_states = self.norm_out(hidden_states, scale, shift).type_as(hidden_states)
         hidden_states = self.proj_out(hidden_states)
-
-        hidden_states = hidden_states.reshape(
-            batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
-        )
-        hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
-        output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+        output = self._unpatchify(hidden_states, dims)
 
         if not return_dict:
             return (output,)

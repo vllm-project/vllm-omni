@@ -336,6 +336,7 @@ class DiffusionWorker:
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
                 enable_expert_parallel=parallel_config.enable_expert_parallel,
                 use_hsdp=parallel_config.use_hsdp,
+                enable_pipefusion=parallel_config.enable_pipefusion,
             )
             _setup_diffusion_worker_proc_title_and_log_prefix(enable_ep=parallel_config.enable_expert_parallel)
             if (

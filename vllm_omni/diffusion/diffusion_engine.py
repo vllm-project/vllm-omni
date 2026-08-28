@@ -1039,9 +1039,10 @@ class DiffusionEngine:
         height: int,
         width: int,
         guidance_scale: float,
+        num_inference_steps: int = 1,
         num_image_inputs: int = 1,
     ) -> OmniDiffusionRequest | None:
-        """Build a one-step model request for startup profiling or warmup."""
+        """Build a model request for startup profiling or warmup."""
 
         prompt: OmniTextPrompt = {"prompt": "dummy run"}
         supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
@@ -1063,7 +1064,7 @@ class DiffusionEngine:
             sampling_params=OmniDiffusionSamplingParams(
                 height=height,
                 width=width,
-                num_inference_steps=1,
+                num_inference_steps=num_inference_steps,
                 num_frames=num_frames,
                 guidance_scale=guidance_scale,
                 num_outputs_per_prompt=1,
@@ -1130,10 +1131,13 @@ class DiffusionEngine:
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""
+        # PipeFusion needs both sync and async branches warmed to avoid recompilation.
+        num_inference_steps = 2 if getattr(self.od_config.parallel_config, "enable_pipefusion", False) else 1
         req = self._make_dummy_request(
             height=512,
             width=512,
             guidance_scale=0.0,
+            num_inference_steps=num_inference_steps,
         )
         if req is None:
             logger.info("Skipping dummy warmup run (num_frames=0)")

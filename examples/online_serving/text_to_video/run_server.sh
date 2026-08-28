@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Wan2.2 online serving startup script
 
 MODEL="${MODEL:-Wan-AI/Wan2.2-T2V-A14B-Diffusers}"

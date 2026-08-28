@@ -21,9 +21,10 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.pipefusion.pipefusion import PipeFusionPipelineMixin
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
+from vllm_omni.diffusion.forward_context import DenoiseProgressMixin, set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
@@ -173,6 +174,7 @@ def get_wan22_i2v_pre_process_func(
 class Wan22I2VPipeline(
     nn.Module,
     SupportImageInput,
+    PipeFusionPipelineMixin,
     PipelineParallelMixin,
     CFGParallelMixin,
     ProgressBarMixin,
@@ -342,6 +344,7 @@ class Wan22I2VPipeline(
         self._guidance_scale_2 = None
         self._num_timesteps = None
         self._current_timestep = None
+
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
@@ -379,56 +382,38 @@ class Wan22I2VPipeline(
     ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
+
+        self._pipeline_kwargs = dict(
+            original_dims=latents.shape,
+            boundary_timestep=boundary_timestep,
+            condition=condition,
+            first_frame_mask=first_frame_mask,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            image_embeds=image_embeds,
+            attention_kwargs=attention_kwargs,
+            dtype=dtype,
+            guidance_low=guidance_low,
+            guidance_high=guidance_high,
+        )
+
+        # Standard denoising loop
         with self.progress_bar(total=len(timesteps)) as pbar:
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
 
                 # Select model and guidance scale based on timestep
-                current_model = self.transformer
+
                 current_guidance_scale = guidance_low
                 if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
-                    current_model = self.transformer_2
                     current_guidance_scale = guidance_high
 
                 self.record_denoise_step(step_idx, t)
+                set_forward_context_denoise_step_idx(step_idx)
 
-                # Prepare latent input
-                if self.expand_timesteps:
-                    # TI2V-5B style: blend condition with latents using mask
-                    latent_model_input = (1 - first_frame_mask) * condition + first_frame_mask * latents
-                    latent_model_input = latent_model_input.to(dtype)
-
-                    # Expand timesteps for each patch
-                    temp_ts = (first_frame_mask[0][0][:, ::2, ::2] * t).flatten()
-                    timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
-                else:
-                    # Wan2.1 style: concatenate condition with latents
-                    latent_model_input = torch.cat([latents, condition], dim=1).to(dtype)
-                    timestep = t.expand(latents.shape[0])
-
-                do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
-                # Prepare kwargs for positive and negative predictions
-                positive_kwargs = {
-                    "hidden_states": latent_model_input,
-                    "timestep": timestep,
-                    "encoder_hidden_states": prompt_embeds,
-                    "encoder_hidden_states_image": image_embeds,
-                    "attention_kwargs": attention_kwargs,
-                    "return_dict": False,
-                    "current_model": current_model,
-                }
-                if do_true_cfg:
-                    negative_kwargs = {
-                        "hidden_states": latent_model_input,
-                        "timestep": timestep,
-                        "encoder_hidden_states": negative_prompt_embeds,
-                        "encoder_hidden_states_image": image_embeds,
-                        "attention_kwargs": attention_kwargs,
-                        "return_dict": False,
-                        "current_model": current_model,
-                    }
-                else:
-                    negative_kwargs = None
+                positive_kwargs, negative_kwargs, do_true_cfg, current_guidance_scale = self.prepare_model_kwargs(
+                    latents, t, **self._pipeline_kwargs
+                )
 
                 # Predict noise with automatic CFG parallel handling
                 noise_pred = self.predict_noise_maybe_with_cfg(
@@ -797,6 +782,70 @@ class Wan22I2VPipeline(
             current_model = self.transformer
         result = current_model(**kwargs)
         return result if isinstance(result, IntermediateTensors) else result[0]
+
+    def prepare_model_kwargs(
+        self,
+        latents: torch.Tensor | None,
+        t: torch.Tensor,
+        *,
+        original_dims: torch.Size,
+        boundary_timestep: float | None,
+        condition: torch.Tensor,
+        first_frame_mask: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor | None,
+        image_embeds: torch.Tensor | None,
+        attention_kwargs: dict[str, Any],
+        dtype: torch.dtype,
+        guidance_low: float,
+        guidance_high: float,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, bool, float]:
+        """Prepare positive and negative kwargs for noise prediction."""
+
+        # Select model and guidance scale based on timestep
+        current_model = self.transformer
+        current_guidance_scale = guidance_low
+        if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
+            current_model = self.transformer_2
+            current_guidance_scale = guidance_high
+
+        if latents is not None:
+            if self.expand_timesteps:  # TI2V-5B style: only first stage blends condition with latents using mask
+                latents = ((1 - first_frame_mask) * condition + first_frame_mask * latents).to(dtype)
+            else:  # Wan2.1 style: concatenate condition with latents
+                latents = torch.cat([latents, condition], dim=1).to(dtype)
+
+        if self.expand_timesteps:
+            # Expand timesteps for each patch
+            temp_ts = (first_frame_mask[0][0][:, ::2, ::2] * t).flatten()
+            timestep = temp_ts.unsqueeze(0).expand(original_dims[0], -1)
+        else:
+            timestep = t.expand(original_dims[0])
+
+        do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
+        positive_kwargs = {
+            "hidden_states": latents,
+            "timestep": timestep,
+            "encoder_hidden_states": prompt_embeds,
+            "encoder_hidden_states_image": image_embeds,
+            "attention_kwargs": attention_kwargs,
+            "return_dict": False,
+            "current_model": current_model,
+            "dims": original_dims,
+        }
+        negative_kwargs = None
+        if do_true_cfg:
+            negative_kwargs = {
+                "hidden_states": latents,
+                "timestep": timestep,
+                "encoder_hidden_states": negative_prompt_embeds,
+                "encoder_hidden_states_image": image_embeds,
+                "attention_kwargs": attention_kwargs,
+                "return_dict": False,
+                "current_model": current_model,
+                "dims": original_dims,
+            }
+        return positive_kwargs, negative_kwargs, do_true_cfg, current_guidance_scale
 
     def encode_prompt(
         self,
