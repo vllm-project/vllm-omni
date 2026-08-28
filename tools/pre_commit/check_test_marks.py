@@ -11,31 +11,21 @@ at the right paths.
 SKU markers (``H100``, ``L4``, … tagged ``[hardware-resource]`` in
 ``pyproject.toml``) must be applied via ``hardware_test(`` / ``hardware_marks(``
 so ``cards_{n}`` is attached. Direct ``pytest.mark.H100`` is rejected.
+
+Platform names allowed as ``pytest.mark.cpu`` / ``cuda`` come from
+``get_supported_platforms()`` (``[hardware-platform]`` in ``pyproject.toml``).
+CI level names come from ``get_level_markers()`` (``[ci-level]``).
 """
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import sys
 from functools import lru_cache
 from pathlib import Path
-
-# CI level markers
-LEVEL_MARKERS = ("core_model", "advanced_model", "full_model", "local_model", "slow")
-
-# Platform markers that tests may apply directly (``pytest.mark.cpu``, …).
-# SKU names come from pyproject ``[hardware-resource]`` and must not be applied
-# as ``pytest.mark.H100`` — use ``hardware_test`` / ``hardware_marks`` instead.
-PLATFORM_MARKERS = (
-    "cpu",
-    "gpu",
-    "cuda",
-    "rocm",
-    "xpu",
-    "npu",
-    "musa",
-)
+from types import ModuleType
 
 # Helpers from tests/helpers/mark.py that auto-apply hardware + cards_* marks.
 HARDWARE_HELPERS = ("hardware_test", "hardware_marks")
@@ -43,24 +33,8 @@ HARDWARE_HELPERS = ("hardware_test", "hardware_marks")
 # The helper implementation is the only file allowed to write pytest.mark.<SKU>.
 _ALLOWED_DIRECT_SKU_FILES = frozenset({"tests/helpers/mark.py"})
 
-_HARDWARE_RESOURCE_MARKER_TAG = "[hardware-resource]"
-_FALLBACK_SKU_MARKERS = (
-    "H100",
-    "H800",
-    "H200",
-    "L4",
-    "B200",
-    "MI325",
-    "B60",
-    "S5000",
-    "A2",
-    "A3",
-)
-
 # Match mark.X since we could also do `from pytest import mark`.
 # \b prevents matching prefixes (e.g., mark.slow vs mark.slow_test).
-LEVEL_RE = re.compile(r"mark\.(?:" + "|".join(LEVEL_MARKERS) + r")\b")
-PLATFORM_RE = re.compile(r"mark\.(?:" + "|".join(PLATFORM_MARKERS) + r")\b")
 HELPER_RE = re.compile(r"(?:" + "|".join(HARDWARE_HELPERS) + r")\s*\(")
 
 MISSING_LEVEL_MARKER = "Level"
@@ -82,27 +56,54 @@ def _repo_root() -> Path:
 
 
 @lru_cache(maxsize=1)
+def _mark_module() -> ModuleType:
+    """Load ``mark.py`` by file path (no pytest/vllm; skip helpers ``__init__``)."""
+    path = _repo_root() / "tests" / "helpers" / "mark.py"
+    spec = importlib.util.spec_from_file_location("_vllm_omni_mark", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load mark helpers from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _mark_name_re(names: tuple[str, ...]) -> re.Pattern[str]:
+    if not names:
+        return re.compile(r"(?!)")
+    return re.compile(r"mark\.(?:" + "|".join(re.escape(n) for n in names) + r")\b")
+
+
+@lru_cache(maxsize=1)
+def level_markers() -> tuple[str, ...]:
+    """CI level names tagged ``[ci-level]`` (``core_model``, ``slow``, …)."""
+    return tuple(sorted(_mark_module().get_level_markers()))
+
+
+@lru_cache(maxsize=1)
+def platform_markers() -> tuple[str, ...]:
+    """Names tests may apply as ``pytest.mark.cpu`` / ``cuda`` (not SKUs)."""
+    return tuple(sorted(_mark_module().get_supported_platforms()))
+
+
+@lru_cache(maxsize=1)
 def sku_markers() -> tuple[str, ...]:
     """SKU marker names tagged ``[hardware-resource]`` in ``pyproject.toml``."""
-    path = _repo_root() / "pyproject.toml"
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return _FALLBACK_SKU_MARKERS
-    names = tuple(
-        re.findall(
-            rf'^\s*"([A-Za-z0-9_]+)\s*:\s*{re.escape(_HARDWARE_RESOURCE_MARKER_TAG)}',
-            text,
-            flags=re.M,
-        )
-    )
-    return names or _FALLBACK_SKU_MARKERS
+    return tuple(sorted(_mark_module().get_hardware_mark_list()))
+
+
+@lru_cache(maxsize=1)
+def _level_re() -> re.Pattern[str]:
+    return _mark_name_re(level_markers())
+
+
+@lru_cache(maxsize=1)
+def _platform_re() -> re.Pattern[str]:
+    return _mark_name_re(platform_markers())
 
 
 @lru_cache(maxsize=1)
 def _sku_mark_re() -> re.Pattern[str]:
-    names = sku_markers()
-    return re.compile(r"mark\.(?:" + "|".join(re.escape(n) for n in names) + r")\b")
+    return _mark_name_re(sku_markers())
 
 
 def is_test_file(path: str) -> bool:
@@ -120,12 +121,12 @@ def read_test_file(path: str) -> str | None:
 
 def has_level_marker(contents: str) -> bool:
     """Check if file contents contain at least one CI level marker."""
-    return bool(LEVEL_RE.search(contents))
+    return bool(_level_re().search(contents))
 
 
 def has_hardware_marker(contents: str) -> bool:
     """Check if file contents contain a platform marker or hardware helper."""
-    return bool(PLATFORM_RE.search(contents) or HELPER_RE.search(contents))
+    return bool(_platform_re().search(contents) or HELPER_RE.search(contents))
 
 
 def has_direct_sku_marker(path: str, contents: str) -> bool:
@@ -163,8 +164,8 @@ if __name__ == "__main__":
         print(
             "\033[91merror:\033[0m test files are missing pytest marks "
             "required for Buildkite CI collection, or apply SKU marks directly.\n\n"
-            f"Level marks, e.g.: {', '.join(LEVEL_MARKERS[:4])}\n"
-            f"Hardware marks, e.g.: {', '.join(PLATFORM_MARKERS[:4])}, ...\n"
+            f"Level marks, e.g.: {', '.join(level_markers()[:4])}\n"
+            f"Hardware marks, e.g.: {', '.join(platform_markers()[:4])}, ...\n"
             f"  or helpers: {', '.join(HARDWARE_HELPERS)}\n"
             f"Do not write pytest.mark.<SKU> ({sku}). "
             "Use hardware_test(...) / hardware_marks(...) so cards_* is attached.\n\n"

@@ -177,12 +177,13 @@ If you want to add support for a new platform (e.g., "tpu" for a new accelerator
    [tool.pytest.ini_options]
    markers = [
        # ... existing markers ...
-       "tpu: Tests that require TPU device",
-       "TPU_V3: Tests that require TPU v3 hardware",
-       "cards_1: Tests that require 1 accelerator card",
-       "cards_2: Tests that require 2 accelerator cards",
+       "tpu: [hardware-platform] Tests that require TPU device",
+       "TPU_V3: [hardware-resource] Tests that require TPU v3 hardware",
+       "cards_1: [hardware-cards] Tests that require 1 accelerator card",
+       "cards_2: [hardware-cards] Tests that require 2 accelerator cards",
    ]
    ```
+   `check-mark` treats `[hardware-platform]` names (including `cpu`/`gpu`) as allowed `pytest.mark.<name>` values. `hardware_test(res=...)` still rejects `cpu`/`gpu` as `res` keys.
 2. **Implement a marker construction function for your platform** in `vllm-omni/tests/helpers/mark.py`:
    ```python
    # In vllm-omni/tests/helpers/mark.py

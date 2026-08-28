@@ -22,9 +22,3 @@ def pytest_addoption(parser):
 def run_level(request) -> str:
     """Session test level from ``--run-level`` (see CI five-level docs)."""
     return request.config.getoption("--run-level")
-
-
-@pytest.fixture
-def _omni_hardware_platform(request):
-    """Platform id for a ``@hardware_test`` variant (``cuda`` / ``rocm`` / …)."""
-    return request.param

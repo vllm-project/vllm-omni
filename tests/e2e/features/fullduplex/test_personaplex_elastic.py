@@ -29,10 +29,8 @@ from tests.helpers.mark import hardware_marks
 torch = pytest.importorskip("torch")
 
 # slow + H100 + omni + cards_1 routes this module into weekly
-# "Omni · H100 · Single-GPU" (test-weekly.yml). Nightly Omni Function
-# Single-GPU also matches ``full_model and H100 and omni and cards_1``.
+# "Omni · H100 · Single-GPU" (test-weekly.yml).
 pytestmark = [
-    pytest.mark.full_model,
     pytest.mark.omni,
     pytest.mark.slow,
     *hardware_marks(res={"cuda": "H100"}),

@@ -3,7 +3,10 @@
 
 import pytest
 
-from tests.helpers.mark import hardware_marks, hardware_test
+from tests.helpers.mark import (
+    hardware_marks,
+    hardware_test,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -76,9 +79,9 @@ def _hardware_platform_params(func):
         if mark.name != "parametrize":
             continue
         argnames = mark.args[0]
-        if argnames == "_omni_hardware_platform":
+        if argnames == "_normalized_hardware_marks":
             return mark.args[1]
-    raise AssertionError("expected @hardware_test to parametrize _omni_hardware_platform")
+    raise AssertionError("expected @hardware_test to parametrize _normalized_hardware_marks")
 
 
 def test_mixed_card_counts_split_so_cuda_filter_does_not_see_rocm_count():
@@ -104,3 +107,9 @@ def test_mixed_card_counts_split_so_cuda_filter_does_not_see_rocm_count():
 def test_unsupported_card_count_raises():
     with pytest.raises(ValueError, match="num_cards=16"):
         hardware_marks(res={"cuda": "H100"}, num_cards=16)
+
+
+@pytest.mark.parametrize("platform", ["cpu", "gpu"])
+def test_res_rejects_cpu_and_gpu(platform):
+    with pytest.raises(ValueError, match="not a res dict key"):
+        hardware_marks(res={platform: "H100"})
