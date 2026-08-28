@@ -850,20 +850,20 @@ class LingBotWorldCausalDMDPipeline(
         return (_MAX_RAW_FRAMES - 1) // self.vae_scale_factor_temporal + 1
 
     def _condition_latent_frames(self) -> int:
-        """Latent frames a session needs to hold.
+        """Latent frames a session holds: the whole horizon.
 
-        The whole horizon until the onset has been measured, and afterwards only
-        as far as the settled block. Rounded up to whole blocks because ticks
-        slice at multiples of ``num_frames_per_block``; the rounding only ever
-        keeps more than the onset needs, so the block that gets reused still
-        sits inside the settled region.
+        An earlier version shrank this to the measured settling point, holding
+        twelve frames instead of thirty. That saving is withdrawn: the
+        measurement does not support it (see
+        :func:`condition_steady_state_onset`), and the ceiling this patch exists
+        to remove never needed it. Reuse past the horizon needs one settled
+        block; it does not need the buffer to stop at that block.
+
+        Holding the whole horizon also makes every tick up to the old ceiling
+        byte-identical to the unpatched pipeline, because each of them slices a
+        real encode rather than a reused tail.
         """
-        horizon = self._condition_horizon_latent_frames()
-        if self._measured_condition_onset is None:
-            return horizon
-        block_frames = int(self.transformer.config.num_frames_per_block)
-        blocks = -(-(self._measured_condition_onset + block_frames) // block_frames)
-        return min(horizon, blocks * block_frames)
+        return self._condition_horizon_latent_frames()
 
     def _encode_session_condition(self, inputs: _LingBotRequestInputs, *, dtype: torch.dtype) -> torch.Tensor:
         """Encode a session's image condition, and learn how much of it matters.
@@ -1262,22 +1262,6 @@ class LingBotWorldCausalDMDPipeline(
                     "fixed cache geometry "
                     f"{self._ar_height}x{self._ar_width}."
                 )
-            if self._measured_condition_onset is None:
-                # The ceiling is the horizon this pipeline preallocates, not
-                # anything the model knows: every tick sees a fixed-width slice
-                # and the transformer is never told how long the session is.
-                # Measuring where the condition settles removes it, so this only
-                # applies before the first session has been encoded, or on a
-                # checkpoint whose condition never settles.
-                max_realtime_ticks = self._condition_horizon_latent_frames() // block_frames
-                if tick.chunk_index >= max_realtime_ticks:
-                    raise ValueError(
-                        "LingBot realtime generation currently supports at most "
-                        f"{max_realtime_ticks} ticks per generation epoch "
-                        f"(chunk_index 0 through {max_realtime_ticks - 1}) because "
-                        f"the image-condition horizon is {_MAX_RAW_FRAMES} pixel "
-                        "frames; reset or create a session to start a new world."
-                    )
             session_state = self._ar_sessions.setdefault(
                 tick.session_id,
                 _LingBotARSessionState(),
@@ -1309,17 +1293,11 @@ class LingBotWorldCausalDMDPipeline(
             condition_stop = condition_start + block_frames
             held_frames = session_state.image_condition.shape[2]
             if condition_stop > held_frames:
-                # Gated on an onset being *known*, not on one having been
-                # configured. _encode_session_condition already shrinks the held
-                # tensor once it measures one, so gating on a configuration knob
-                # would make the measured path strictly worse than no
-                # measurement at all: the buffer drops and the fourth tick
-                # raises where the unmeasured path reaches the tenth.
-                if self._measured_condition_onset is None:
-                    raise ValueError("LingBot chunk_index exceeds the configured causal image condition horizon.")
-                # Past the transient the condition no longer moves, so every
-                # later tick gets the same settled block. This is what makes the
-                # horizon unbounded and the per-session cost constant.
+                # Past the horizon every tick reuses the encode's last block.
+                # That block is the one the condition has had the most frames to
+                # settle into, and it is a real slice of a real encode rather
+                # than an extrapolation. This is what makes the tick horizon
+                # unbounded and the per-session condition cost constant.
                 condition_start = held_frames - block_frames
                 condition_stop = held_frames
             condition = session_state.image_condition[
