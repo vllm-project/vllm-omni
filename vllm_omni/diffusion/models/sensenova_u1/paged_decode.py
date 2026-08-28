@@ -54,10 +54,19 @@ BUCKETS = (512, 1024, 2048, 4096, 8192)
 TAIL_STEP = 2048
 
 
-# The paged path exists only through these two kwargs. An older wheel can export
-# `flash_attn_varlen_func` without them, so probe the signature rather than a
-# version string and fall back to SDPA when either is missing.
-_REQUIRED_KWARGS = ("seqused_k", "block_table")
+# Every argument to the kernel is passed by keyword, so the probe covers all of
+# them. An older wheel can export `flash_attn_varlen_func` without the paged
+# ones, or under different names, and a version string would not say which;
+# probe the signature and fall back to SDPA when any is missing.
+_REQUIRED_KWARGS = (
+    "max_seqlen_q",
+    "cu_seqlens_q",
+    "max_seqlen_k",
+    "seqused_k",
+    "block_table",
+    "softmax_scale",
+    "causal",
+)
 
 
 def _flash_varlen():
@@ -270,9 +279,9 @@ class PagedDecodeCache:
             q,
             self.k[layer_idx],
             self.v[layer_idx],
-            1,
-            self.cu_seqlens_q,
-            self.bucket,
+            max_seqlen_q=1,
+            cu_seqlens_q=self.cu_seqlens_q,
+            max_seqlen_k=self.bucket,
             seqused_k=self.seqused,
             block_table=self.block_table,
             softmax_scale=softmax_scale,

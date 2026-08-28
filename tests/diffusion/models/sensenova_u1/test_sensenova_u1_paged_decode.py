@@ -508,22 +508,72 @@ def test_only_an_unmasked_single_token_step_takes_the_paged_path(seq, mask):
     assert len(host.sdpa_calls) == 1
 
 
-def test_a_kernel_without_the_paged_kwargs_is_not_supported(monkeypatch):
-    """An older wheel exports the same name without ``seqused_k``/``block_table``.
-    Probing the signature is what keeps that install on SDPA instead of raising
-    TypeError at the first decode step."""
+def test_a_kernel_missing_any_kwarg_we_pass_is_not_supported(monkeypatch):
+    """The call names every argument, so the probe has to cover every name.
 
-    def old_kernel(q, k, v, max_seqlen_q, cu_seqlens_q, max_seqlen_k, cu_seqlens_k, causal=False):
+    An older wheel exports ``flash_attn_varlen_func`` without the paged kwargs,
+    and a future one may rename the standard ones. Either way the probe is what
+    keeps that install on SDPA instead of raising TypeError at the first decode
+    step, with the feature on by default.
+    """
+
+    def no_paged_kwargs(q, k, v, max_seqlen_q, cu_seqlens_q, max_seqlen_k, cu_seqlens_k, causal=False):
         raise AssertionError("must not be called")  # pragma: no cover
 
-    monkeypatch.setattr(paged_decode, "_flash_varlen", lambda: old_kernel)
-    assert paged_decode.paged_decode_supported(torch.device("cuda"), HEAD_DIM) is False
+    def renamed_standard_args(q, k, v, max_q, cu_q, max_k, seqused_k=None, block_table=None, causal=False):
+        raise AssertionError("must not be called")  # pragma: no cover
 
-    def current_kernel(*args, seqused_k=None, block_table=None, **kwargs):
+    for kernel in (no_paged_kwargs, renamed_standard_args):
+        monkeypatch.setattr(paged_decode, "_flash_varlen", lambda kernel=kernel: kernel)
+        assert paged_decode.paged_decode_supported(torch.device("cuda"), HEAD_DIM) is False
+
+    def current_kernel(
+        q,
+        k,
+        v,
+        max_seqlen_q,
+        cu_seqlens_q,
+        max_seqlen_k,
+        seqused_k=None,
+        block_table=None,
+        softmax_scale=None,
+        causal=False,
+    ):
         raise AssertionError("must not be called")  # pragma: no cover
 
     monkeypatch.setattr(paged_decode, "_flash_varlen", lambda: current_kernel)
     assert paged_decode.paged_decode_supported(torch.device("cuda"), HEAD_DIM) is True
+
+
+def test_only_q_k_and_v_reach_the_kernel_positionally(monkeypatch):
+    """A positional standard argument binds to whatever a future wheel puts in
+    that slot, and the probe above only checks that the names exist."""
+    seen = {}
+
+    def recorder(*args, **kwargs):
+        seen["args"], seen["kwargs"] = args, kwargs
+        return torch.zeros(1, N_HEADS, HEAD_DIM)
+
+    monkeypatch.setattr(paged_decode, "_flash_varlen", lambda: recorder)
+    cache = PagedDecodeCache(1, KV_HEADS, HEAD_DIM, 8, torch.device("cpu"), torch.float32)
+    cache.set_length(4)
+    cache.attend(
+        0,
+        torch.zeros(1, N_HEADS, 1, HEAD_DIM),
+        torch.zeros(1, KV_HEADS, 1, HEAD_DIM),
+        torch.zeros(1, KV_HEADS, 1, HEAD_DIM),
+        1.0,
+    )
+    assert len(seen["args"]) == 3, "only q, k and v may be positional"
+    assert set(seen["kwargs"]) == {
+        "max_seqlen_q",
+        "cu_seqlens_q",
+        "max_seqlen_k",
+        "seqused_k",
+        "block_table",
+        "softmax_scale",
+        "causal",
+    }
 
 
 def test_the_kill_switch_returns_no_cache(monkeypatch):
