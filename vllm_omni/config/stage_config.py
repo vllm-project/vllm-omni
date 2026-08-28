@@ -28,6 +28,21 @@ _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
 
+_RUNTIME_ONLY_OVERRIDE_FIELDS = frozenset(
+    {
+        "devices",
+        "max_batch_size",
+        "num_replicas",
+    }
+)
+
+_TOPOLOGY_OWNED_ENGINE_FIELDS = frozenset(
+    {
+        "requires_full_payload_input",
+        "scheduling_metadata_adapter",
+    }
+)
+
 
 def pipeline_cfg_resolver(config_type: type[PretrainedConfig]):
     """Wraps a resolver such that we return None if a hf_config of the wrong type is provided."""
@@ -1244,7 +1259,11 @@ class StageConfig:
         # rationale as the platform-overlay deep-merge. Legacy atomic mappings
         # are handled explicitly below.
         for key, value in runtime_overrides.items():
-            if value is not None and key not in ("devices", "max_batch_size", "num_replicas"):
+            if (
+                value is not None
+                and key not in _RUNTIME_ONLY_OVERRIDE_FIELDS
+                and key not in _TOPOLOGY_OWNED_ENGINE_FIELDS
+            ):
                 existing = engine_args.get(key)
                 # ``omni_kv_config`` is an atomic legacy override: callers use
                 # a partial mapping to replace the topology-provided transfer
