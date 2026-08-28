@@ -157,7 +157,19 @@ def condition_steady_state_onset(condition: torch.Tensor, block_frames: int, *, 
     # An onset with no later block to compare against would come back settled
     # having compared nothing, which is how an encode too short to show the
     # settling reports a number instead of an answer. Two blocks minimum.
-    for onset in range(0, frames - 2 * block_frames + 1):
+    #
+    # The search steps by whole blocks rather than by frame. Frame precision is
+    # precision the caller cannot spend: _condition_latent_frames rounds the
+    # answer up to whole blocks anyway, so onsets 8 and 9 both mean "hold four
+    # blocks". What frame precision does buy is instability -- the encode is not
+    # bit-reproducible across processes, and an onset sitting on the tolerance
+    # boundary flips run to run. Observed directly: four runs on the same image
+    # printed byte-identical per-block residuals and returned 9, 8, 8, 9. Both
+    # values happened to round to the same twelve frames, so nothing downstream
+    # moved; a flip to 10 would have changed the held size with nothing to
+    # signal it. Stepping by blocks makes a flip require three frames of drift
+    # rather than one, which is the granularity the answer is used at.
+    for onset in range(0, frames - 2 * block_frames + 1, block_frames):
         settled_block = condition[:, :, onset : onset + block_frames]
         if all(
             torch.allclose(settled_block, condition[:, :, start : start + block_frames], atol=atol, rtol=0.0)
