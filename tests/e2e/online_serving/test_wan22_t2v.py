@@ -5,7 +5,8 @@
 Online serving smoke for ``Wan-AI/Wan2.2-T2V-A14B-Diffusers`` (text-to-video via ``/v1/videos``).
 
 Uses a single ``default`` ``OmniServerParams`` row via ``_get_diffusion_feature_cases`` (no extra
-``server_args``). Multi-variant / parallel coverage lives in ``test_wan22_expansion.py`` (L4).
+``server_args``). Multi-variant / parallel coverage lives in ``test_wan22_expansion.py``
+(H100 nightly).
 
 From ``tests/``::
 

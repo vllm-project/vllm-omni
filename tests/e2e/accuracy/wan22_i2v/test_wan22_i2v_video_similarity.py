@@ -75,7 +75,7 @@ from tests.e2e.accuracy.wan22_i2v.wan22_i2v_video_similarity_common import (
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion]
 
 
 def test_parse_video_metadata_extracts_dimensions_and_fps() -> None:
@@ -390,6 +390,7 @@ def _generate_offline_video(*, image_source: str) -> tuple[Path, Path]:
 
 
 @pytest.mark.benchmark
+@pytest.mark.full_model
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_wan22_i2v_diffusers_offline_generates_video(
     wan22_i2v_image_source: str | None,
@@ -411,6 +412,7 @@ def test_wan22_i2v_diffusers_offline_generates_video(
 
 
 @pytest.mark.benchmark
+@pytest.mark.full_model
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", SERVER_CASES, indirect=True)
 def test_wan22_i2v_online_serving_generates_video(
@@ -437,6 +439,7 @@ def test_wan22_i2v_online_serving_generates_video(
 
 
 @pytest.mark.benchmark
+@pytest.mark.full_model
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 def test_wan22_i2v_serving_matches_diffusers_video_similarity(
     wan22_i2v_image_source: str | None,
