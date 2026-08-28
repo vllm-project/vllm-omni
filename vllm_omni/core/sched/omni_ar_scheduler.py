@@ -231,7 +231,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 "idle when any replica waiting < threshold, "
                 "busy when all replicas waiting >= threshold)",
                 stage_id,
-                self._dtps.i2t_aging_s,
+                self._dtps.aging_s,
                 self._dtps.dit_load_threshold,
             )
         except Exception:

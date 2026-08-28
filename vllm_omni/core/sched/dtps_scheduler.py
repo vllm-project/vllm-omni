@@ -1,29 +1,16 @@
-"""DTPS (DiT-priority Type-based Scheduling) Unified Strategy.
+"""DTPS (DiT-priority Type-based Scheduling) for AR+DiT deployments.
 
-A dynamic, load-aware scheduling strategy tailored for mixed AR+DiT deployments (e.g., serving
-both i2t and t2i). Rather than blindly prioritizing downstream tasks, it balances AR/DiT
-utilization by actively preventing DiT starvation, avoiding DiT queue overloads, and strictly
-guaranteeing that pure AR tasks never starve.
+Reorders the AR waiting queue by task type + DiT load to prevent DiT
+starvation, avoid DiT overload, and guarantee no task starves.
 
-[Dynamic 3-Tier Priority Logic]
-The scheduler receives the DiT stage's real-time queue depth via a UTILITY
-ZMQ push from the Orchestrator. It then categorizes tasks into three dynamic
-priority tiers per batch:
+Priority tiers (admit top → bottom):
+  L0 — any request waiting > aging_s (starvation guard, FCFS)
+  L1 — ar_downstream within DiT budget (sorted by num_prompt_tokens ASC)
+  L2 — remaining ar_only (FCFS)
+  L3 — ar_downstream beyond budget (sorted by num_prompt_tokens ASC)
 
-  1. L0 (Highest: Starving AR): ``ar_only`` tasks that exceed the aging threshold. Anti-starvation
-     strictly overrides all load-awareness logic.
-  2. L1 (High: Budgeted DiT): When DiT is hungry (``min_waiting < threshold``), a dynamic admission
-     budget is granted. ``ar_downstream`` tasks within this budget are prioritized to feed the downstream.
-  3. L2 (Normal: Standard AR): Standard ``ar_only`` tasks. When DiT is busy or the budget is exhausted,
-     these tasks are prioritized. This allows AR to crunch through its own workloads instead of
-     piling tasks onto an already overloaded DiT queue.
-
-Over-budget ``ar_downstream`` tasks are demoted below L2 to prevent downstream pile-ups.
-
-[Intra-Tier Sorting]
-- All tiers use FCFS (first-come-first-served) based on the ``waiting`` queue
-  order. No model-specific CoT weights or prompt-length proxies are used —
-  the scheduler is entirely decoupled from model internals.
+Task classification uses the topology-resolved ``omni_final_stage_id``
+signal — no model-specific task-type strings.
 """
 
 from __future__ import annotations
@@ -39,43 +26,37 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 
 logger = init_logger(__name__)
 
-_DEFAULT_I2T_AGING_S = 100.0
+_DEFAULT_AGING_S = 100.0
 _DEFAULT_DIT_LOAD_THRESHOLD = 2
 _DIT_INFLIGHT_MAX_AGE_S = 1.0
 
 
 class _InflightEntry(NamedTuple):
-    """One finished-AR-but-not-yet-in-DiT downstream request."""
-
     added_mono: float
 
+
 class DTPSScheduler:
-    """A single instance is owned by ``OmniARScheduler`` (one per AR stage replica)
-    and invoked once per ``schedule()`` cycle via :meth:`maybe_reorder_waiting`.
-    """
+    """One per AR stage replica, invoked once per ``schedule()`` cycle."""
 
     def __init__(
         self,
         *,
         stage_id: int = 0,
-        i2t_aging_s: float = _DEFAULT_I2T_AGING_S,
+        aging_s: float = _DEFAULT_AGING_S,
         dit_load_threshold: int = _DEFAULT_DIT_LOAD_THRESHOLD,
     ) -> None:
         self._stage_id: int = stage_id
-        self.i2t_aging_s: float = i2t_aging_s
+        self.aging_s: float = aging_s
         try:
             self.dit_load_threshold: int = int(dit_load_threshold)
         except (TypeError, ValueError):
             self.dit_load_threshold = _DEFAULT_DIT_LOAD_THRESHOLD
-        # DiT-load snapshot pushed by the Orchestrator via UTILITY ZMQ.
         self._dit_load_snapshot: DitLoadSnapshot | None = None
-
         self._dit_inflight_ids: dict[str, _InflightEntry] = {}
         self._last_phase_stats: dict[str, int | bool] = {}
 
     @classmethod
     def from_config(cls, dtps_cfg: Any, *, stage_id: int = 0) -> DTPSScheduler:
-        # Build a DTPSScheduler from the ``omni_dtps_config`` block.
         if isinstance(dtps_cfg, dict):
             cfg_get = dtps_cfg.get
         else:
@@ -104,10 +85,6 @@ class DTPSScheduler:
             dit_load_threshold=dit_load_threshold,
         )
 
-    # ------------------------------------------------------------------ #
-    #  Task classification (model-agnostic, topology-resolved)
-    # ------------------------------------------------------------------ #
-
     @staticmethod
     def _deserialize_info(req: Request) -> dict[str, Any] | None:
         info = getattr(req, "additional_information", None)
@@ -118,16 +95,12 @@ class DTPSScheduler:
         try:
             info = deserialize_additional_information(info)
         except Exception:
-            logger.debug(
-                "[OmniDTPS] deserialize additional_information failed",
-                exc_info=True,
-            )
+            logger.debug("[OmniDTPS] deserialize additional_information failed", exc_info=True)
             return None
         return info if isinstance(info, dict) else None
 
     def _request_is_ar_only(self, req: Request) -> bool:
-        """Return True when the request terminates at this AR stage.
-        """
+        """True when the request terminates at this AR stage (no downstream)."""
         info = self._deserialize_info(req)
         if info is None:
             return False
@@ -136,25 +109,9 @@ class DTPSScheduler:
         return final_stage_id == self._stage_id and not force_kv
 
     def update_dit_load(self, snapshot: DitLoadSnapshot) -> None:
-        """Receive DiT load snapshot from the Orchestrator via UTILITY ZMQ.
-
-        Called by ``OmniARScheduler.update_dit_load``, which is invoked by
-        ``StageEngineCoreProc.omni_update_dit_load`` via vLLM's UTILITY
-        dispatch (``getattr(self, method_name)``). Runs on the same
-        EngineCore busy-loop thread as ``schedule()``, so no lock is needed.
-        """
         self._dit_load_snapshot = snapshot
 
     def register_finished_downstream(self, request_id: str) -> None:
-        """Record that a downstream request just finished AR.
-
-        Called from ``OmniARScheduler._free_request`` only when
-        ``_should_transfer_kv_for_request`` is True (i.e. the request
-        actually needs downstream KV transfer). The id lives in
-        ``_dit_inflight_ids`` until a DiT poll reports it (de-duped out)
-        or it times out (age cap). Idempotent: re-registering an id already
-        tracked does NOT reset its age.
-        """
         if self.dit_load_threshold <= 0:
             return
         if not request_id or request_id in self._dit_inflight_ids:
@@ -162,27 +119,7 @@ class DTPSScheduler:
         self._dit_inflight_ids[request_id] = _InflightEntry(added_mono=time.monotonic())
 
     def _dit_phase(self, inflight: int = 0) -> str:
-        """Return the DiT-load phase: ``"idle"`` or ``"busy"``.
-
-        ``inflight`` is the Fix-B feed-forward count of downstream
-        requests currently RUNNING on this AR stage — AR knows they will land
-        on DiT once they finish here but the polled DiT-load report hasn't
-        reflected them yet. ``_dit_inflight_ids`` is the blind-spot set: ids
-        that already LEFT AR's running set (t0) but haven't surfaced in a DiT
-        poll yet. The two terms are mutually exclusive (a request is in
-        AR-running XOR in the blind set), so they sum cleanly.
-
-        De-dup pass: any blind id that appears in DiT's reported waiting OR
-        running ids (union across all replicas) has reached DiT — drop it.
-        Anything older than ``_DIT_INFLIGHT_MAX_AGE_S`` is also dropped
-        (guards a dead DiT).
-
-        Multi-replica: both inflight terms (running + blind) spread uniformly
-        across ``n_reps`` DiT replicas, so only ~1/R of them land on the min
-        replica and actually raise ``min_waiting``. Fold them together and
-        floor-divide by R (R<=1 -> no fold, single-replica Fix-B behavior
-        exact). Floor biases toward idle (feed DiT) — safe per DTPS's goal.
-        """
+        """Return ``"idle"`` or ``"busy"`` based on DiT load + in-flight count."""
         inflight_running = max(int(inflight or 0), 0)
         if self.dit_load_threshold <= 0:
             self._last_phase_stats = {}
@@ -254,12 +191,10 @@ class DTPSScheduler:
     ) -> None:
         """Reorder the AR ``waiting`` queue by DTPS priority layers.
 
-        Priority layers (smaller layer = admitted first):
-          L0 — ``ar_only`` requests waiting longer than ``i2t_aging_s``
-               (starving; aging boost to prevent starvation). ALWAYS highest.
-          L1 — ``ar_downstream`` within the DiT admission budget (FCFS)
-          L2 — remaining ``ar_only`` requests (FCFS)
-          L3 — ``ar_downstream`` beyond the budget (FCFS)
+        L0: any request waiting > aging_s (FCFS)
+        L1: ar_downstream within budget (num_prompt_tokens ASC)
+        L2: remaining ar_only (FCFS)
+        L3: ar_downstream beyond budget (num_prompt_tokens ASC)
         """
         inflight_running = 0
         if running is not None:
@@ -275,22 +210,22 @@ class DTPSScheduler:
 
         ar_only_reqs: list = []
         downstream_reqs: list = []
-        starving_ar_only: list = []
-        aging_threshold = self.i2t_aging_s
+        starving_reqs: list = []
+        aging_threshold = self.aging_s
         now = time.time()
 
         for req in list(waiting):
             is_ar_only = self._request_is_ar_only(req)
             arrival = getattr(req, "arrival_time", None)
             wait = (now - arrival) if arrival is not None else 0.0
-            if is_ar_only:
-                starving = wait > aging_threshold
-                if starving:
-                    starving_ar_only.append(req)
-                else:
-                    ar_only_reqs.append(req)
+            if wait > aging_threshold:
+                starving_reqs.append(req)
+            elif is_ar_only:
+                ar_only_reqs.append(req)
             else:
                 downstream_reqs.append(req)
+
+        downstream_reqs.sort(key=lambda r: getattr(r, "num_prompt_tokens", 0) or 0)
 
         if budget_raw is None:
             downstream_head = downstream_reqs
@@ -299,7 +234,7 @@ class DTPSScheduler:
             downstream_head = downstream_reqs[:budget_raw]
             downstream_tail = downstream_reqs[budget_raw:]
 
-        ordered = starving_ar_only + downstream_head + ar_only_reqs + downstream_tail
+        ordered = starving_reqs + downstream_head + ar_only_reqs + downstream_tail
         if hasattr(waiting, "clear") and hasattr(waiting, "extend"):
             waiting.clear()
             waiting.extend(ordered)
