@@ -113,3 +113,8 @@ def test_unsupported_card_count_raises():
 def test_res_rejects_cpu_and_gpu(platform):
     with pytest.raises(ValueError, match="not a res dict key"):
         hardware_marks(res={platform: "H100"})
+
+
+def test_npu_rejects_unsupported_sku():
+    with pytest.raises(ValueError, match="Invalid NPU resource type"):
+        hardware_marks(res={"npu": "A100"})

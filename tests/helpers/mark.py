@@ -214,10 +214,8 @@ def npu_marks(*, res: str, num_cards: int):
     elif res == "A3":
         test_resource = pytest.mark.A3
     else:
-        test_resource = None
-    marks = [mark for mark in [test_platform, test_resource] if mark is not None]
-    marks.append(_cards_mark(num_cards))
-    return marks
+        raise ValueError(f"Invalid NPU resource type: {res}. Supported: A2, A3")
+    return [test_platform, test_resource, _cards_mark(num_cards)]
 
 
 def _res_platforms() -> frozenset[str]:
