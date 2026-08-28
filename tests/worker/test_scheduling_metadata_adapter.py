@@ -64,3 +64,20 @@ def test_resolve_accepts_an_adapter_instance() -> None:
     adapter = resolve_scheduling_metadata_adapter(CustomAdapter())
 
     assert adapter.extract({}, model_mode="generation") == SchedulingMetadataUpdate(resize_prompt_to=7)
+
+
+def test_resolve_rejects_an_incompatible_extract_signature() -> None:
+    class WrongSignatureAdapter:
+        def extract(self):
+            return None
+
+    with pytest.raises(TypeError, match=r"extract\(payload, \*, model_mode=\.\.\.\)"):
+        resolve_scheduling_metadata_adapter(WrongSignatureAdapter())
+
+
+def test_resolve_rejects_a_non_callable_extract() -> None:
+    class NonCallableExtractAdapter:
+        extract = None
+
+    with pytest.raises(TypeError, match="scheduling_metadata_adapter.extract must be callable"):
+        resolve_scheduling_metadata_adapter(NonCallableExtractAdapter())
