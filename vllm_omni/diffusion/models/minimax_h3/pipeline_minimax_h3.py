@@ -23,16 +23,12 @@ from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
-from vllm_omni.diffusion import envs
 from vllm_omni.diffusion.cache.cachedit import (
     CacheDiTBackend,
     RequestScopedCacheDiTRuntime,
 )
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.parallel_state import (
-    get_world_group,
-    init_world_group,
-)
+from vllm_omni.diffusion.distributed.parallel_state import get_world_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import (
@@ -652,21 +648,50 @@ def _resolve_output_canvas(aspect_ratio: float, short_edge: int) -> tuple[int, i
     )
 
 
-class _SingleRankEncoderGroup:
-    """Lightweight encoder group for ``text_encoder_tp_size == 1``.
+class _TextEncoderTensorParallelGroup:
+    """Minimal TP handle that is safe on ranks outside the encoder subset.
 
-    Avoids creating a distributed ``GroupCoordinator`` with a single-member
-    rank set, which would assert on every other DiT rank that is not part of
-    the group.  The pipeline and encoder only use the attributes below, and
-    all ``world_size == 1`` code paths short-circuit before any collective.
+    ``GroupCoordinator`` assumes that every process belongs to one of its rank
+    lists.  H3 intentionally loads its Qwen3-VL encoder on only the first
+    ``text_encoder_tp_size`` DiT ranks, so that assumption does not hold when
+    the encoder TP size is smaller than the DiT world size.
+
+    All ranks still construct ``device_group`` collectively.  Non-members keep
+    a handle with ``rank_in_group == -1`` for pipeline bookkeeping, but an
+    accidental encoder collective fails locally instead of entering a process
+    group they do not belong to.
     """
 
-    world_size: int = 1
-    ranks: list[int] = [0]
+    def __init__(
+        self,
+        *,
+        ranks: list[int],
+        rank: int,
+        device_group: Any | None,
+    ) -> None:
+        self.ranks = ranks
+        self.rank = rank
+        self.world_size = len(ranks)
+        self.rank_in_group = ranks.index(rank) if rank in ranks else -1
+        self.device_group = device_group
 
-    def __init__(self, rank: int) -> None:
-        self.rank_in_group = 0 if rank == 0 else -1
-        self.device_group = None
+    @property
+    def is_member(self) -> bool:
+        return self.rank_in_group >= 0
+
+    def _require_member(self) -> None:
+        if not self.is_member:
+            raise RuntimeError("this rank is not a member of the MiniMax H3 text-encoder TP group")
+
+    def all_reduce(
+        self,
+        input_: torch.Tensor,
+        op: dist.ReduceOp = dist.ReduceOp.SUM,
+    ) -> torch.Tensor:
+        self._require_member()
+        if self.world_size > 1:
+            dist.all_reduce(input_, op=op, group=self.device_group)
+        return input_
 
 
 class MiniMaxH3Pipeline(
@@ -920,7 +945,7 @@ class MiniMaxH3Pipeline(
         self.text_encoder = MiniMaxH3Qwen3VLEncoder(
             os.path.join(model_path, "text_encoder"),
             device=self.device,
-            load_model=load_text_encoder,
+            load_model=self.text_encoder_group.is_member,
             encoder_group=self.text_encoder_group,
             quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
         )
@@ -1230,7 +1255,7 @@ class MiniMaxH3Pipeline(
                 ),
             )
 
-        if rank < self.text_encoder_tp_size:
+        if self.text_encoder_group.is_member:
             # Distribute the encode inputs from the DiT main rank to the other
             # encoder TP ranks, then run the distributed encode on all of them.
             ids = self._distribute_encode_inputs(ids, vision_kwargs)
@@ -1253,19 +1278,20 @@ class MiniMaxH3Pipeline(
 
         The encoder group covers the first ``text_encoder_tp_size`` DiT ranks
         (the DiT group is always global ranks ``[0, dit_world)``).  Every rank
-        participates in ``new_group`` so the collective completes; ranks
-        outside the group never run encoder collectives.  For a single-rank
-        encoder we return a lightweight placeholder so non-encoder ranks do
-        not need to join a ``GroupCoordinator`` that would assert on ranks
-        outside the group.
+        participates in ``new_group`` so the collective completes, including
+        ranks outside the encoder subset.  Those ranks receive a non-member
+        handle and never load the encoder or run its collectives.
         """
-        if text_encoder_tp_size == 1:
-            return _SingleRankEncoderGroup(rank=self._dit_rank)
         ranks = list(range(text_encoder_tp_size))
-        return init_world_group(
+        device_group = None
+        if text_encoder_tp_size > 1:
+            # Inherit the default process group's backend. This is the device
+            # backend in production and lets CPU distributed tests use gloo.
+            device_group = dist.new_group(ranks=ranks)
+        return _TextEncoderTensorParallelGroup(
             ranks=ranks,
-            local_rank=envs.LOCAL_RANK,
-            backend=current_omni_platform.dist_backend,
+            rank=self._dit_rank,
+            device_group=device_group,
         )
 
     def _encoder_group_broadcast_tensor(
@@ -1277,6 +1303,7 @@ class MiniMaxH3Pipeline(
     ) -> torch.Tensor:
         """Broadcast a tensor from encoder rank 0 over the encoder TP group."""
         group = self.text_encoder_group
+        group._require_member()
         if group.world_size == 1:
             if tensor is None:
                 raise ValueError("source tensor is required for single-rank execution")

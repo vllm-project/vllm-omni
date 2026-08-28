@@ -1087,10 +1087,10 @@ def _get_rope_index(
 class MiniMaxH3Qwen3VLEncoder(nn.Module):
     """Frozen, TP-capable Qwen3-VL backbone returning layer-50 states.
 
-    ``encoder_group`` is a ``GroupCoordinator`` over the encoder tensor-parallel
-    ranks (by default the first ``text_encoder_tp_size`` DiT ranks).  Only
-    ranks inside the group load weights; other ranks construct a parameter-free
-    stub that never runs the forward.
+    ``encoder_group`` is the TP handle over the encoder ranks (by default the
+    first ``text_encoder_tp_size`` DiT ranks). Only ranks inside the group load
+    weights; other ranks construct a parameter-free stub that never runs the
+    forward.
     """
 
     def __init__(

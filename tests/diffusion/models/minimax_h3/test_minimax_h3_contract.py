@@ -2246,9 +2246,11 @@ def _one_layer_text_encoder():
         MiniMaxH3Qwen3VLQKVParallelLinear,
         MiniMaxH3Qwen3VLRMSNorm,
     )
-    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _SingleRankEncoderGroup
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _TextEncoderTensorParallelGroup,
+    )
 
-    group = _SingleRankEncoderGroup(0)
+    group = _TextEncoderTensorParallelGroup(ranks=[0], rank=0, device_group=None)
     layer = nn.Module()
     layer.self_attn = nn.Module()
     layer.mlp = nn.Module()
