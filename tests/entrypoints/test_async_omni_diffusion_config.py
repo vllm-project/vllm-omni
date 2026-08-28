@@ -315,6 +315,29 @@ def test_serve_cli_accepts_ulysses_mode():
     assert parallel_config.ulysses_mode == "advanced_uaa"
 
 
+def test_serve_cli_accepts_text_encoder_tp_size():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--text-encoder-tp-size",
+            "4",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+
+    assert args.text_encoder_tp_size == 4
+    assert parallel_config.text_encoder_tp_size == 4
+
+
 def test_serve_cli_forwards_model_defined_task_type_to_diffusion_stage():
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
@@ -572,6 +595,36 @@ def test_serve_cli_accepts_additional_config():
 
     assert args.additional_config == {"torchair_graph_config": {"enabled": True}}
     assert engine_args["additional_config"] == {"torchair_graph_config": {"enabled": True}}
+
+
+def test_default_stage_resolves_video_output_from_checkpoint(mocker):
+    captured = {}
+
+    def resolve_with_default(*args, default_stage_cfg_factory, **kwargs):
+        del args, kwargs
+        captured.update(default_stage_cfg_factory()[0])
+        stage = SimpleNamespace(stage_type="diffusion", engine_args=SimpleNamespace())
+        return ("", [stage], None)
+
+    resolver = mocker.patch(
+        "vllm_omni.engine.async_omni_engine.resolve_model_class_name",
+        return_value="MiniMaxH3Pipeline",
+    )
+    mocker.patch(
+        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
+        side_effect=resolve_with_default,
+    )
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+    engine._strip_single_engine_args = lambda kwargs: kwargs
+
+    engine._resolve_stage_configs(
+        "/models/MiniMax-H3/FL2VA",
+        {},
+        trust_remote_code=False,
+    )
+
+    resolver.assert_called_once_with("/models/MiniMax-H3/FL2VA", "default")
+    assert captured["final_output_type"] == "video"
 
 
 def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mocker):

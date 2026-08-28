@@ -27,7 +27,11 @@ from vllm_omni.engine.messages import (
     ShutdownRequestMessage,
     StageSubmissionMessage,
 )
-from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
+from vllm_omni.engine.orchestrator import (
+    Orchestrator,
+    OrchestratorRequestState,
+    cleanup_request_artifact_dirs,
+)
 from vllm_omni.engine.stage_pool import StageUnavailableError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -43,6 +47,18 @@ from .test_orchestrator import (
     _enqueue_add_request,
     _wait_for,
 )
+
+
+def test_request_artifact_cleanup_is_idempotent(tmp_path):
+    artifact_dir = tmp_path / "request-artifacts"
+    artifact_dir.mkdir()
+    (artifact_dir / "prepared.mp4").touch()
+
+    cleanup_request_artifact_dirs([str(artifact_dir)])
+    cleanup_request_artifact_dirs([str(artifact_dir)])
+
+    assert not artifact_dir.exists()
+
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
