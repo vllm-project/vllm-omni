@@ -1566,6 +1566,7 @@ class LingBotVideoPipeline(
                     LingBotRefinerConfig(),
                 ),
                 mode=request_config.mode,
+                vae_temporal_factor=self.vae_scale_factor_temporal,
             )
             self._validate_cache_dit_request(
                 request_config,

@@ -80,7 +80,7 @@ def test_hsdp_param_dtype_uses_configured_dtype_by_default():
     assert _resolve_hsdp_param_dtype(model, torch.bfloat16) == torch.bfloat16
 
 
-def test_hsdp_param_dtype_preserves_opt_in_model_dtypes():
+def test_hsdp_param_dtype_preserves_opt_in_model_dtypes(mocker):
     class _MixedDtypeModel(nn.Module):
         _hsdp_preserve_param_dtype = True
 
@@ -90,8 +90,10 @@ def test_hsdp_param_dtype_preserves_opt_in_model_dtypes():
             self.sensitive = nn.LayerNorm(2, dtype=torch.float32)
 
     model = _MixedDtypeModel()
+    parameters = mocker.spy(model, "parameters")
 
     assert _resolve_hsdp_param_dtype(model, torch.bfloat16) is None
+    parameters.assert_not_called()
 
 
 def test_hsdp_param_dtype_preserves_fp8_storage():

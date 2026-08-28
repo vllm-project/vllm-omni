@@ -97,6 +97,24 @@ def test_execution_options_validate_refiner_fields_even_when_bypassed(extra_args
         normalize_lingbot_execution_options(extra_args)
 
 
+def test_execution_options_use_configured_vae_temporal_factor():
+    from vllm_omni.diffusion.models.lingbot_video import (
+        normalize_lingbot_execution_options,
+    )
+
+    options = normalize_lingbot_execution_options(
+        {"refiner_max_video_frames": 7},
+        vae_temporal_factor=3,
+    )
+
+    assert options.refiner.max_video_frames == 7
+    with pytest.raises(ValueError, match=r"3n\+1"):
+        normalize_lingbot_execution_options(
+            {"refiner_max_video_frames": 5},
+            vae_temporal_factor=3,
+        )
+
+
 def test_postprocess_preserves_refined_video_metadata_envelope():
     from vllm_omni.diffusion.models.lingbot_video import (
         get_lingbot_video_post_process_func,

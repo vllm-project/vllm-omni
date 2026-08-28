@@ -25,6 +25,7 @@ def _make_pipeline():
     pipeline.default_negative_prompt = "default negative"
     pipeline.default_image_negative_prompt = "default image negative"
     pipeline.img_prompt_template = "<image>"
+    pipeline.vae_scale_factor_temporal = 4
     pipeline.od_config = SimpleNamespace(flow_shift=None)
     return pipeline
 
@@ -306,6 +307,31 @@ def test_forward_uses_lingbot_guidance_default_when_omitted():
 
     assert calls[0]["num_frames"] == 81
     assert calls[0]["guidance_scale"] == 6.0
+
+
+def test_forward_uses_pipeline_vae_temporal_factor_for_refiner_frame_validation():
+    pipeline = _make_pipeline()
+    pipeline.vae_scale_factor_temporal = 3
+    calls = []
+
+    def fake_generate(**kwargs):
+        calls.append(kwargs)
+        return torch.zeros(9, 192, 320, 3)
+
+    pipeline._generate = fake_generate
+    req = _make_request_batch(
+        "a robot arm",
+        height=192,
+        width=320,
+        num_frames=9,
+        num_inference_steps=2,
+        seed=42,
+        extra_args={"refiner_max_video_frames": 7},
+    )
+
+    pipeline.forward(req)
+
+    assert calls[0]["execution_options"].refiner.max_video_frames == 7
 
 
 def test_forward_prefers_shift_over_flow_shift_and_defaults_negative_prompt():

@@ -188,6 +188,7 @@ def normalize_lingbot_execution_options(
     default_base_sigma_tail_steps: int = 2,
     refiner_config: LingBotRefinerConfig | None = None,
     mode: LingBotGenerationMode | None = None,
+    vae_temporal_factor: int = 4,
 ) -> LingBotExecutionOptions:
     """Normalize Base and Refiner options before any model work is performed.
 
@@ -195,6 +196,7 @@ def normalize_lingbot_execution_options(
     Every ``refiner_*`` field exclusively configures the optional second stage.
     """
 
+    vae_temporal_factor = _positive_int_option(vae_temporal_factor, "vae_temporal_factor")
     extra_args = extra_args or {}
     refiner_config = refiner_config or LingBotRefinerConfig()
     new_threshold = _optional_float_option(
@@ -269,8 +271,14 @@ def normalize_lingbot_execution_options(
     refiner_max_frames = (
         None if raw_max_frames is None else _positive_int_option(raw_max_frames, "refiner_max_video_frames")
     )
-    if refiner_max_frames is not None and refiner_max_frames != 1 and (refiner_max_frames - 1) % 4 != 0:
-        raise ValueError(f"LingBot `refiner_max_video_frames` must be 1 or 4n+1, got {refiner_max_frames}.")
+    if (
+        refiner_max_frames is not None
+        and refiner_max_frames != 1
+        and (refiner_max_frames - 1) % vae_temporal_factor != 0
+    ):
+        raise ValueError(
+            f"LingBot `refiner_max_video_frames` must be 1 or {vae_temporal_factor}n+1, got {refiner_max_frames}."
+        )
 
     return LingBotExecutionOptions(
         batch_cfg=_boolean_option(extra_args, "batch_cfg"),
