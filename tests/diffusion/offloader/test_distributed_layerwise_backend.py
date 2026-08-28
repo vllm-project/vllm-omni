@@ -55,11 +55,8 @@ from vllm_omni.diffusion.offloader.tensor_utils import (
     set_tensor_storage,
 )
 from vllm_omni.diffusion.offloader.weight_transport_backend import (
-    ChunkEvents,
-    GroupPersistentBackend,
     ReferenceBackend,
     TransportCapability,
-    TransportStreams,
     select_transport,
 )
 from vllm_omni.host_weight_runtime import MappedHostRegion
@@ -2653,116 +2650,3 @@ class TestTransportBackendSelection:
         capability = TransportCapability(world_size=1, rank=0, global_ranks=(0,))
         selection = select_transport(TransportBackendKind.AUTO, capability)
         assert selection.effective_backend is TransportBackendKind.REFERENCE
-
-    def test_group_persistent_rejected_without_native_graph_support(self):
-        capability = TransportCapability(world_size=2, rank=0, global_ranks=(0, 1), native_persistent=False)
-        with pytest.raises(ValueError, match="group_persistent"):
-            select_transport(TransportBackendKind.GROUP_PERSISTENT, capability)
-
-    def test_group_persistent_accepted_with_native_graph_support(self):
-        capability = TransportCapability(world_size=2, rank=0, global_ranks=(0, 1), native_persistent=True)
-        selection = select_transport(TransportBackendKind.GROUP_PERSISTENT, capability)
-        assert selection.effective_backend is TransportBackendKind.GROUP_PERSISTENT
-
-
-class TestGroupPersistentBackend:
-    def test_stable_schedule_captured_once_then_replayed(self, monkeypatch):
-        """A stable chunk schedule builds one NPUGraph and replays it after."""
-
-        capability = TransportCapability(world_size=2, rank=0, global_ranks=(0, 1), native_persistent=True)
-        backend = GroupPersistentBackend(capability)
-
-        calls = []
-        graph_pool = object()
-
-        class FakeGraph:
-            def __init__(self):
-                self.replays = 0
-
-            def replay(self):
-                self.replays += 1
-                calls.append("replay")
-
-        @contextmanager
-        def fake_graph(graph, pool=None, stream=None):
-            calls.append(("capture", pool, stream))
-            yield graph
-
-        def fake_synchronize():
-            calls.append("synchronize")
-
-        monkeypatch.setattr(
-            torch,
-            "npu",
-            SimpleNamespace(
-                NPUGraph=FakeGraph,
-                graph=fake_graph,
-                graph_pool_handle=lambda: graph_pool,
-                synchronize=fake_synchronize,
-            ),
-            raising=False,
-        )
-        monkeypatch.setattr(current_omni_platform, "stream", dummy_stream)
-
-        gather_calls = []
-
-        def fake_all_gather(output, source, group=None):
-            gather_calls.append((output, source))
-            calls.append("all_gather")
-
-        monkeypatch.setattr(dist, "all_gather_into_tensor", fake_all_gather)
-        monkeypatch.setattr(dist, "barrier", lambda group=None: calls.append("barrier"))
-
-        capability = TransportCapability(world_size=2, rank=0, global_ranks=(0, 1), native_persistent=True)
-        backend = GroupPersistentBackend(capability)
-
-        specs = [("weight", torch.arange(8, dtype=torch.float32), False)]
-        manifest = build_part_manifest(
-            specs,
-            block_id=1,
-            part_id="block",
-            weight_shard_size=2,
-            weight_shard_rank=0,
-            chunk_size_bytes=1024,
-            alignment_bytes=1,
-        )
-        chunk = manifest.dtypes[0].chunks[0]
-        source = torch.arange(chunk.local_numel, dtype=torch.float32)
-        local_input = torch.zeros(chunk.local_numel)
-        full_output = torch.zeros(chunk.padded_numel)
-        streams = TransportStreams(copy=DummyStream(), communication=DummyStream())
-        events = ChunkEvents(h2d_done=DummyEvent(), transport_done=DummyEvent())
-
-        for _ in range(2):
-            backend.submit_chunk(
-                source=source,
-                local_input=local_input,
-                full_output=full_output,
-                chunk_meta=chunk,
-                streams=streams,
-                events=events,
-                group=object(),
-                generation=0,
-                non_blocking=False,
-                trace=lambda _kind: dummy_stream(None),
-            )
-
-        assert backend.counters.submitted_chunks == 2
-        assert backend.counters.schedule_builds == 1
-        assert backend.counters.schedule_replays == 1
-        # The first submission primes HCCL eagerly, drains both rendezvous
-        # barriers before capture, captures once, and then replays. The second
-        # submission only replays the cached graph.
-        assert len(gather_calls) == 2
-        assert calls == [
-            "barrier",
-            "all_gather",
-            "synchronize",
-            "barrier",
-            "synchronize",
-            ("capture", graph_pool, streams.communication),
-            "all_gather",
-            "synchronize",
-            "replay",
-            "replay",
-        ]

@@ -799,9 +799,6 @@ class OmniDiffusionConfig:
     dlo_chunk_size_mb: int = 64
     dlo_pin_budget_gb: float | None = None  # None = unlimited
     dlo_pin_failure_policy: str = "fail"  # "fail" | "whole_block_fallback"
-    # Chunked transport backend: "auto" keeps the reference schedule;
-    # "group_persistent" captures it into NPUGraphs and replays (NPU only).
-    dlo_transport_backend: str = "auto"
     # Final-layout Host Weight Runtime policy. The loader only activates this
     # for eligible no-AllGather DLO; all other configurations preserve their
     # existing loader/storage path.

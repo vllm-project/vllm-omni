@@ -190,13 +190,6 @@ Chunk packing applies only to the sharded AllGather path. With
 retains the checkpoint mmap views as node-shared host backing and stages one
 block at a time through two bounded pinned staging slots, as described below.
 
-The opt-in `group_persistent` transport backend is experimental and is not
-part of the supported contract introduced by this PR. Its inclusion will be
-decided after the current performance and correctness experiments. Until
-then, the supported chunked path is the non-persistent H2D + AllGather
-schedule; the documentation makes no promise that persistent replay captures
-the H2D operation.
-
 ### Rank-local path without DLO AllGather
 
 With `--dlo-no-use-allgather`, DLO forces its internal offload shard size to

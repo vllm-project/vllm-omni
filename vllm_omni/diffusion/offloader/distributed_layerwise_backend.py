@@ -1948,24 +1948,15 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
     def _probe_transport_capability(self) -> TransportCapability:
         """Probe only what the FS chunk-schedule backends rely on."""
-        native_persistent = bool(
-            self.device.type == "npu"
-            and hasattr(torch, "npu")
-            and hasattr(torch.npu, "NPUGraph")
-            and hasattr(torch.npu, "graph")
-        )
         return TransportCapability(
             world_size=self.weight_shard_size,
             rank=self.weight_shard_rank,
             global_ranks=self.weight_shard_ranks,
-            native_persistent=native_persistent,
         )
 
     def _configure_transport_backend(self) -> None:
         self.transport_capability = self._probe_transport_capability()
-        requested_backend = TransportBackendKind(
-            getattr(self.config, "dlo_transport_backend", TransportBackendKind.AUTO.value)
-        )
+        requested_backend = TransportBackendKind.AUTO
         self.transport_selection = select_transport(
             requested_backend,
             self.transport_capability,
@@ -2374,7 +2365,6 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         parts = len(self._prepared_host_parts)
         selection = self.transport_selection
-        capability = self.transport_capability
         backend_counters = self.data_transport_backend.counters if self.data_transport_backend is not None else None
         return {
             "weight_shard_size": self.weight_shard_size,
@@ -2393,13 +2383,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             "fallback_ratio": (fallback_parts / parts) if parts else 0.0,
             "transport_backend_requested": selection.requested_backend.value if selection is not None else None,
             "transport_backend_effective": selection.effective_backend.value if selection is not None else None,
-            "transport_native_persistent": capability.native_persistent if capability is not None else False,
             "backend_submitted_parts": backend_counters.submitted_parts if backend_counters is not None else 0,
             "backend_submitted_chunks": backend_counters.submitted_chunks if backend_counters is not None else 0,
             "backend_host_h2d_bytes": backend_counters.host_h2d_bytes if backend_counters is not None else 0,
             "backend_fabric_bytes": backend_counters.fabric_bytes if backend_counters is not None else 0,
-            "backend_schedule_builds": backend_counters.schedule_builds if backend_counters is not None else 0,
-            "backend_schedule_replays": backend_counters.schedule_replays if backend_counters is not None else 0,
             "backend_chunks": dict(backend_counters.backend_chunks) if backend_counters is not None else {},
             "request_generation": self._request_generation,
             "submissions": submissions,

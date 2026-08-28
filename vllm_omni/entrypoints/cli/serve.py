@@ -761,14 +761,6 @@ class OmniServeCommand(CLISubcommand):
             "whole-block transport.",
         )
         omni_config_group.add_argument(
-            "--dlo-transport-backend",
-            choices=("auto", "group_persistent"),
-            default="auto",
-            help="DLO chunked transport backend (default: auto). 'auto' keeps the "
-            "reference H2D + AllGather chunk schedule; 'group_persistent' captures "
-            "the stable schedule into NPUGraphs and replays it (NPU only).",
-        )
-        omni_config_group.add_argument(
             "--host-weight-runtime-mode",
             choices=("disabled", "preferred", "required"),
             default="disabled",

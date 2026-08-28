@@ -700,7 +700,6 @@ class _DiffusionConfigProjection:
     dlo_chunk_size_mb: int = 64
     dlo_pin_budget_gb: float | None = None
     dlo_pin_failure_policy: str = "fail"
-    dlo_transport_backend: str = "auto"
     host_weight_runtime_mode: Literal["disabled", "preferred", "required"] = "disabled"
     host_weight_runtime_root: str | None = None
     dlo_host_registration_limit_gib: float = Field(default=0.0, ge=0)

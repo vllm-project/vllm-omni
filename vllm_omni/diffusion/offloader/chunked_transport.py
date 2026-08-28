@@ -50,7 +50,6 @@ class WeightLayout(str, Enum):
 class TransportBackendKind(str, Enum):
     AUTO = "auto"
     REFERENCE = "reference"
-    GROUP_PERSISTENT = "group_persistent"
     GROUP_SCATTER_AG = "group_scatter_ag"
 
 

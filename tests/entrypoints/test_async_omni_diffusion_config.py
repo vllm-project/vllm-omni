@@ -333,7 +333,7 @@ def test_serve_cli_forwards_distilled_lora_to_diffusion_stage():
 
 
 def test_serve_cli_forwards_distributed_offload_residency():
-    """Ensure DLO placement and transport controls reach the diffusion stage."""
+    """Ensure DLO placement controls reach the diffusion stage."""
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
     OmniServeCommand().subparser_init(subparsers)
@@ -347,8 +347,6 @@ def test_serve_cli_forwards_distributed_offload_residency():
             "--dlo-no-use-allgather",
             "--dlo-resident-layers",
             "20",
-            "--dlo-transport-backend",
-            "group_persistent",
         ]
     )
 
@@ -359,11 +357,9 @@ def test_serve_cli_forwards_distributed_offload_residency():
     assert args.enable_distributed_layerwise_offload is True
     assert args.dlo_use_allgather is False
     assert args.dlo_resident_layers == 20
-    assert args.dlo_transport_backend == "group_persistent"
     assert engine_args["enable_distributed_layerwise_offload"] is True
     assert engine_args["dlo_use_allgather"] is False
     assert engine_args["dlo_resident_layers"] == 20
-    assert engine_args["dlo_transport_backend"] == "group_persistent"
 
 
 def test_serve_cli_forwards_dlo_transport_controls():
