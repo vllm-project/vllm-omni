@@ -472,14 +472,18 @@ class OmniConnectorModelRunnerMixin:
         """Remove and return a stage payload (consume after use)."""
         return self._local_stage_payload_cache.pop(req_id, None)
 
-    def put_local_request_metadata(self, req_id: str, update: SchedulingMetadataUpdate | None) -> None:
-        """Store a scheduler-visible update for a request when one is needed."""
-        if update is not None:
-            self._local_request_metadata[req_id] = update
-
     def get_local_request_metadata(self, req_id: str) -> SchedulingMetadataUpdate | None:
         """Retrieve the pending scheduler-visible update for a request."""
         return self._local_request_metadata.get(req_id)
+
+    def _extract_scheduling_metadata_update(self, payload: OmniPayload) -> SchedulingMetadataUpdate | None:
+        update = self._scheduling_metadata_adapter.extract(payload, model_mode=self._model_mode)
+        if update is not None and not isinstance(update, SchedulingMetadataUpdate):
+            raise TypeError(
+                "scheduling_metadata_adapter.extract must return None or "
+                f"SchedulingMetadataUpdate, got {type(update).__name__}"
+            )
+        return update
 
     # ------------------------------------------------------------------ #
     #  Scheduling metadata extraction
@@ -641,7 +645,7 @@ class OmniConnectorModelRunnerMixin:
         for req_id, payload in staged_payloads.items():
             self._local_stage_payload_cache[req_id] = self._snapshot_payload(payload)
 
-    def _collect_full_payload_results_locked(self) -> dict[str, Any] | None:
+    def _snapshot_full_payload_results_locked(self) -> dict[str, Any] | None:
         if not self._full_payload_pending_broadcast_req_ids:
             return None
         results: dict[str, Any] = {}
@@ -652,10 +656,11 @@ class OmniConnectorModelRunnerMixin:
                 missing_req_ids.append(req_id)
                 continue
             results[req_id] = self._snapshot_payload(payload)
-            self._full_payload_pending_broadcast_req_ids.discard(req_id)
+            # The caller clears this marker only after metadata extraction
+            # validates, so an adapter failure leaves the receive retryable.
         if missing_req_ids:
             logger.warning(
-                "[Stage-%s] _collect_full_payload_results_locked: "
+                "[Stage-%s] _snapshot_full_payload_results_locked: "
                 "pending full-payload reqs missing from local cache: %s",
                 self._stage_id,
                 missing_req_ids,
@@ -729,21 +734,28 @@ class OmniConnectorModelRunnerMixin:
             tp_group is None or getattr(tp_group, "world_size", 1) <= 1
         ) and not self._full_payload_pending_broadcast_req_ids:
             return None
+        is_data_transfer_rank = self.is_data_transfer_rank()
         with self._lock:
-            results = self._collect_full_payload_results_locked() if self.is_data_transfer_rank() else None
+            results = self._snapshot_full_payload_results_locked() if is_data_transfer_rank else None
         results = self._broadcast_tp_payload_packet(results)
         if not results:
             return None
+
+        # Validate every update before committing any one-shot readiness state.
+        request_metadata: dict[str, SchedulingMetadataUpdate] = {}
+        for req_id, payload in results.items():
+            update = self._extract_scheduling_metadata_update(payload)
+            if update is not None:
+                request_metadata[req_id] = update
+
         with self._lock:
-            self._stage_recv_req_ids.update(results.keys())
+            self._apply_staged_payloads_locked(results)
+            self._local_request_metadata.update(request_metadata)
+            self._stage_recv_req_ids.update(results)
+            if is_data_transfer_rank:
+                self._full_payload_pending_broadcast_req_ids.difference_update(results)
             for req_id in results:
                 self._pending_load_reqs.pop(req_id, None)
-            self._apply_staged_payloads_locked(results)
-            for req_id, payload in results.items():
-                self.put_local_request_metadata(
-                    req_id,
-                    self._scheduling_metadata_adapter.extract(payload, model_mode=self._model_mode),
-                )
         logger.debug(
             "[Stage-%s] recv_full_payload_inputs: consumed %s reqs: %s, stage_recv_req_ids now=%s",
             self._stage_id,
@@ -1811,8 +1823,8 @@ class OmniConnectorModelRunnerMixin:
                 payload_data = self._accumulate_payload(external_req_id, payload_data)
                 payload_consumable = incoming_payload_consumable
             else:
-                new_ids = self._payload_audio_codes(payload_data) or []
-                if not new_ids and not is_finished:
+                audio_codes = self._payload_audio_codes(payload_data)
+                if not self._payload_value_has_content(audio_codes) and not is_finished:
                     return False
                 payload_consumable = self._payload_is_consumable(payload_data)
 

@@ -5,7 +5,8 @@
 from __future__ import annotations
 
 import importlib
-from typing import Any, Protocol, runtime_checkable
+import inspect
+from typing import Any, Protocol, cast
 
 from vllm.logger import init_logger
 
@@ -15,7 +16,6 @@ from vllm_omni.outputs import SchedulingMetadataUpdate
 logger = init_logger(__name__)
 
 
-@runtime_checkable
 class SchedulingMetadataAdapter(Protocol):
     """Translate runner payloads into generic scheduler-visible effects.
 
@@ -95,6 +95,13 @@ def resolve_scheduling_metadata_adapter(
         adapter = getattr(importlib.import_module(module_name), attribute_name)
     if isinstance(adapter, type):
         adapter = adapter()
-    if not isinstance(adapter, SchedulingMetadataAdapter):
-        raise TypeError("scheduling_metadata_adapter must implement extract(payload, *, model_mode)")
-    return adapter
+    extract = getattr(adapter, "extract", None)
+    if not callable(extract):
+        raise TypeError("scheduling_metadata_adapter.extract must be callable")
+    try:
+        inspect.signature(extract).bind(object(), model_mode="generation")
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "scheduling_metadata_adapter.extract must be callable as extract(payload, *, model_mode=...)"
+        ) from exc
+    return cast(SchedulingMetadataAdapter, adapter)

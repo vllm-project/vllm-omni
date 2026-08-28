@@ -28,6 +28,21 @@ _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
 
+_RUNTIME_ONLY_OVERRIDE_FIELDS = frozenset(
+    {
+        "devices",
+        "max_batch_size",
+        "num_replicas",
+    }
+)
+
+_TOPOLOGY_OWNED_ENGINE_FIELDS = frozenset(
+    {
+        "requires_full_payload_input",
+        "scheduling_metadata_adapter",
+    }
+)
+
 
 def pipeline_cfg_resolver(config_type: type[PretrainedConfig]):
     """Wraps a resolver such that we return None if a hf_config of the wrong type is provided."""
@@ -1082,7 +1097,11 @@ class StageConfig:
 
         # CLI overrides take precedence over YAML defaults
         for key, value in runtime_overrides.items():
-            if value is not None and key not in ("devices", "max_batch_size", "num_replicas"):
+            if (
+                value is not None
+                and key not in _RUNTIME_ONLY_OVERRIDE_FIELDS
+                and key not in _TOPOLOGY_OWNED_ENGINE_FIELDS
+            ):
                 engine_args[key] = value
 
         # Build runtime config from YAML defaults + CLI overrides

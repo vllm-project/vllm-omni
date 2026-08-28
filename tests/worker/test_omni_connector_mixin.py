@@ -25,6 +25,7 @@ from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
 )
+from vllm_omni.worker.scheduling_metadata_adapter import resolve_scheduling_metadata_adapter
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -109,6 +110,18 @@ class _EchoSchedulingMetadataAdapter:
     def extract(self, payload: Any, *, model_mode: str) -> SchedulingMetadataUpdate:
         del payload, model_mode
         return SchedulingMetadataUpdate(resize_prompt_to=7)
+
+
+class _FailingSchedulingMetadataAdapter:
+    def extract(self, payload: Any, *, model_mode: str) -> SchedulingMetadataUpdate | None:
+        del payload, model_mode
+        raise ValueError("invalid scheduling metadata")
+
+
+class _WrongReturnSchedulingMetadataAdapter:
+    def extract(self, payload: Any, *, model_mode: str) -> dict[str, Any]:
+        del payload, model_mode
+        return {}
 
 
 # ------------------------------------------------------------------ #
@@ -961,32 +974,61 @@ class TestCustomSchedulingMetadataAdapterResolution(unittest.TestCase):
             )
         host._omni_connector = MagicMock()
         host._stage_id = 2
-        host._local_rank = 1
+        host._local_rank = 0
+        payload = {"meta": {"next_stage_prompt_len": 9}}
+        host._local_stage_payload_cache["r1"] = payload
         host._full_payload_pending_broadcast_req_ids.add("r1")
-        tp_group = _FakeTPGroup(
-            world_size=2,
-            rank_in_group=1,
-            follower_result={"r1": {"meta": {"next_stage_prompt_len": 9}}},
-        )
+        tp_group = _FakeTPGroup(world_size=2, rank_in_group=0)
 
         with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
             results = host.recv_full_payload_inputs(scheduler_output=None)
 
+        self.assertEqual(results, {"r1": payload})
+        self.assertEqual(
+            host.get_local_request_metadata("r1"),
+            SchedulingMetadataUpdate(resize_prompt_to=7),
+        )
+        self.assertNotIn("r1", host._full_payload_pending_broadcast_req_ids)
+        host.shutdown_omni_connectors()
+
+    def test_adapter_exception_preserves_full_payload_receive_transition(self):
+        host = MixinHost()
+        host.init_omni_connectors(model_config=_make_model_config(stage_id=2, worker_type="generation"))
+        host._scheduling_metadata_adapter = resolve_scheduling_metadata_adapter(_FailingSchedulingMetadataAdapter())
+        host._local_stage_payload_cache["r1"] = {"meta": {"next_stage_prompt_len": 9}}
+        host._full_payload_pending_broadcast_req_ids.add("r1")
+
+        with self.assertRaisesRegex(ValueError, "invalid scheduling metadata"):
+            host.recv_full_payload_inputs(scheduler_output=None)
+
+        self.assertIn("r1", host._full_payload_pending_broadcast_req_ids)
+        self.assertNotIn("r1", host._stage_recv_req_ids)
+        self.assertIsNone(host.get_local_request_metadata("r1"))
+
+        host._scheduling_metadata_adapter = resolve_scheduling_metadata_adapter(_EchoSchedulingMetadataAdapter())
+        results = host.recv_full_payload_inputs(scheduler_output=None)
         self.assertEqual(results, {"r1": {"meta": {"next_stage_prompt_len": 9}}})
+        self.assertNotIn("r1", host._full_payload_pending_broadcast_req_ids)
+        self.assertIn("r1", host._stage_recv_req_ids)
         self.assertEqual(
             host.get_local_request_metadata("r1"),
             SchedulingMetadataUpdate(resize_prompt_to=7),
         )
         host.shutdown_omni_connectors()
 
-    def test_default_adapter_none_effect_is_not_stored(self):
+    def test_wrong_adapter_return_preserves_full_payload_receive_transition(self):
         host = MixinHost()
-        host.init_omni_connectors(model_config=_make_model_config(worker_type="ar"))
+        host.init_omni_connectors(model_config=_make_model_config(stage_id=2, worker_type="generation"))
+        host._scheduling_metadata_adapter = resolve_scheduling_metadata_adapter(_WrongReturnSchedulingMetadataAdapter())
+        host._local_stage_payload_cache["r1"] = {"meta": {"next_stage_prompt_len": 9}}
+        host._full_payload_pending_broadcast_req_ids.add("r1")
 
-        update = host._scheduling_metadata_adapter.extract({"tok": [1]}, model_mode="ar")
-        self.assertIsNone(update)
-        host.put_local_request_metadata("r1", update)
-        self.assertNotIn("r1", host._local_request_metadata)
+        with self.assertRaisesRegex(TypeError, "must return None or SchedulingMetadataUpdate"):
+            host.recv_full_payload_inputs(scheduler_output=None)
+
+        self.assertIn("r1", host._full_payload_pending_broadcast_req_ids)
+        self.assertNotIn("r1", host._stage_recv_req_ids)
+        self.assertIsNone(host.get_local_request_metadata("r1"))
         host.shutdown_omni_connectors()
 
 
@@ -1023,6 +1065,27 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
         self.assertIn("r1", host._finished_load_reqs)
         self.assertIn("r1", host._async_chunk_updated_req_ids)
         self.assertEqual(tp_group.broadcast_inputs, [])
+        host.shutdown_omni_connectors()
+
+    def test_poll_single_request_accepts_tensor_audio_codes(self):
+        host = self._make_host(rank=0)
+        audio_codes = torch.tensor([[10, 11, 12]], dtype=torch.long)
+        payload = {
+            "codes": {"audio": audio_codes},
+            "meta": {"finished": torch.tensor(False)},
+        }
+        host._omni_connector.get.return_value = (payload, 123)
+
+        with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=None):
+            made_progress = host._poll_single_request("r1")
+
+        self.assertTrue(made_progress)
+        self.assertEqual(host._get_req_chunk["r1"], 1)
+        cached_payload = host.get_local_stage_payload("r1")
+        self.assertIsNotNone(cached_payload)
+        self.assertTrue(torch.equal(cached_payload["codes"]["audio"], audio_codes))
+        self.assertIn("r1", host._finished_load_reqs)
+        self.assertIn("r1", host._async_chunk_updated_req_ids)
         host.shutdown_omni_connectors()
 
     def test_tp_follower_skips_connector_poll_for_async_chunk(self):
