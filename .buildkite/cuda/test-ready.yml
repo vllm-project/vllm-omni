@@ -1,5 +1,5 @@
 # CUDA CI L2 (`core_model` e2e) plus L1 CPU Simple Test (`core_model and cpu`).
-# Uploaded by Upload Level2 Pipeline: PR label `ready`, or main+WEEKLY=1 with --e2e.
+# Uploaded by Upload Ready Pipeline: PR label `ready`, or main+WEEKLY=1 with --e2e.
 
 env:
   VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -9,7 +9,7 @@ env:
 
 steps:
   - group: ":card_index_dividers: Simple Test"
-    depends_on: upload-level2-pipeline
+    depends_on: upload-ready-pipeline
     steps:
       - label: "Simple · Model Executor Test"
         timeout_in_minutes: 20
@@ -36,7 +36,7 @@ steps:
         mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: Diffusion Test"
-    depends_on: upload-level2-pipeline
+    depends_on: upload-ready-pipeline
     steps:
 
       - label: "Diffusion · Offloader Test"
@@ -78,7 +78,7 @@ steps:
         mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: Tiny Model Tests [Single GPU]"
-    depends_on: upload-level2-pipeline
+    depends_on: upload-ready-pipeline
     steps:
 
       - label: "Tiny Model Tests · Diffusion (base)"
@@ -87,7 +87,7 @@ steps:
         mirror_hardwares: l4_1
 
   - label: "Engine&Model Executor Test"
-    depends_on: upload-level2-pipeline
+    depends_on: upload-ready-pipeline
     commands:
       - |
         timeout 15m bash -c "
@@ -96,7 +96,7 @@ steps:
     mirror_hardwares: l4_1
 
   - label: "Distributed Test"
-    depends_on: upload-level2-pipeline
+    depends_on: upload-ready-pipeline
     commands:
       - |
         timeout 20m bash -c "
@@ -105,7 +105,7 @@ steps:
     mirror_hardwares: l4_1
 
   - label: "Entrypoints Test"
-    depends_on: upload-level2-pipeline
+    depends_on: upload-ready-pipeline
     commands:
       - |
         timeout 30m bash -c "
@@ -115,7 +115,7 @@ steps:
     mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: E2E Test"
-    depends_on: upload-level2-pipeline
+    depends_on: upload-ready-pipeline
     steps:
       - label: "Custom Pipeline Test"
         source_file_dependencies:

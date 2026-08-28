@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Validate .buildkite YAML against the official Buildkite schema.
 
-Test pipelines (test-level2.yml, etc.) use Omni-only keys such as
+Test pipelines (test-ready.yml, etc.) use Omni-only keys such as
 ``mirror_hardwares`` and ``source_file_dependencies``. Those are expanded or
 stripped the same way ``upload_pipeline.py`` does before upload, then the
 rendered YAML is checked with check-jsonschema.

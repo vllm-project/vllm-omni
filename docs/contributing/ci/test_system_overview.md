@@ -177,7 +177,7 @@ Before entering specific testing levels, the project establishes two common spec
 
 ### L4 cadence (nightly and pre-release)
 
-CUDA **L4** (`full_model`) jobs are defined once in [`.buildkite/cuda/test-level4.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-level4.yml). That file is reused at two cadences:
+CUDA **L4** (`full_model`) jobs are defined once in [`.buildkite/cuda/test-nightly.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml). That file is reused at two cadences:
 
 - **Nightly:** scheduled `main` builds with `NIGHTLY=1` (and PR labels such as `nightly-test` / `omni-test`). Default fleet is typically H100.
 - **Pre-release:** the same L4 suite runs again on extra GPU SKUs before a release (for example B200 via `MIRROR_HW=b200`), so `full_model` coverage is not limited to the nightly machine type.

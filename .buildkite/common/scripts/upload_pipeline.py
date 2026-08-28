@@ -10,7 +10,7 @@ Bootstrap mode (``bootstrap-upload-steps.yml``):
   - Detect docs-only, pytest skip-mark-only, or combined skip-ci from git diff.
   - When only CI level YAML changes, enable **L2/L3** upload steps for affected levels only.
 
-Test pipeline mode (e.g. test-level3.yml):
+Test pipeline mode (e.g. test-merge.yml):
   - Drop steps whose ``source_file_dependencies`` do not match changed files.
   - Expand uploader-only ``mirror_hardwares`` into ``agents`` (+ optional ``image``
     for NPU) + ``plugins`` (see ci_mirror_hardwares.yml).
@@ -64,10 +64,10 @@ LOG = "upload_pipeline"
 BOOTSTRAP_STEPS_FILENAME = "bootstrap-upload-steps.yml"
 BOOTSTRAP_IMAGE_BUILD_KEYS = frozenset({"image-build", "image-build-a2", "image-build-a3"})
 BOOTSTRAP_UPLOAD_IF_KEYS = {
-    "upload-level2-pipeline": "level2",
-    "upload-level3-pipeline": "level3",
-    "upload-level4-pipeline": "level4",
-    "upload-level5-pipeline": "level5",
+    "upload-ready-pipeline": "level2",
+    "upload-merge-pipeline": "level3",
+    "upload-nightly-pipeline": "level4",
+    "upload-weekly-pipeline": "level5",
 }
 E2E_GROUP_MARKER = "E2E Test"
 CI_MIRROR_HARDWARES_PATH = ROOT / ".buildkite/common/ci_mirror_hardwares.yml"
@@ -230,7 +230,7 @@ def _render_bootstrap_pipeline(
     return yaml.safe_dump(doc, sort_keys=False)
 
 
-# --- Test pipeline (test-level2.yml, test-level3.yml) ---
+# --- Test pipeline (test-ready.yml, test-merge.yml) ---
 
 
 @lru_cache(maxsize=1)

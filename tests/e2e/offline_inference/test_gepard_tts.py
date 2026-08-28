@@ -30,7 +30,7 @@ from vllm_omni.model_executor.models.gepard.prompt import build_gepard_prompt_id
 
 # The codec decoder is an optional dependency; skip rather than fail the engine
 # inside the worker process when it is absent. The CI image does not carry it,
-# so the weekly step installs it first -- see .buildkite/cuda/test-level5.yml.
+# so the weekly step installs it first -- see .buildkite/cuda/test-weekly.yml.
 # Install recipe: examples/offline_inference/text_to_speech/README.md.
 pytest.importorskip("nemo.collections.tts.models")
 

@@ -24,10 +24,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 CUDA_BOOTSTRAP_STEPS = Path(".buildkite/cuda/bootstrap-upload-steps.yml")
 BOOTSTRAP_STEPS_TEMPLATE = """steps:
   - key: image-build
-  - key: upload-level2-pipeline
-  - key: upload-level3-pipeline
-  - key: upload-level4-pipeline
-  - key: upload-level5-pipeline
+  - key: upload-ready-pipeline
+  - key: upload-merge-pipeline
+  - key: upload-nightly-pipeline
+  - key: upload-weekly-pipeline
 """
 
 
@@ -51,14 +51,14 @@ def test_bootstrap_if_injected_by_step_key() -> None:
     assert "image-build" in by_key
     # Unconditional image has no ``if`` (Buildkite rejects YAML bool if: true).
     assert "if" not in by_key["image-build"]
-    assert isinstance(by_key["upload-level2-pipeline"]["if"], str)
-    assert isinstance(by_key["upload-level4-pipeline"]["if"], str)
+    assert isinstance(by_key["upload-ready-pipeline"]["if"], str)
+    assert isinstance(by_key["upload-nightly-pipeline"]["if"], str)
 
 
 def test_bootstrap_steps_loaded_from_file() -> None:
     steps = _load_bootstrap_steps(CUDA_BOOTSTRAP_STEPS)
     assert "key: image-build" in steps
-    assert "key: upload-level2-pipeline" in steps
+    assert "key: upload-ready-pipeline" in steps
     assert "placeholder:" not in steps
 
 
@@ -66,18 +66,18 @@ def test_docs_only_allows_main_scheduled_nightly_weekly_only() -> None:
     """skip_all: no PR labels; main + NIGHTLY=1 / WEEKLY=1 / NON_CRITICAL=1 still gates scheduled CI."""
     rendered = _render(["docs/foo.md"])
     assert "key: image-build" in rendered
-    assert "key: upload-level4-pipeline" in rendered
-    assert "key: upload-level5-pipeline" in rendered
+    assert "key: upload-nightly-pipeline" in rendered
+    assert "key: upload-weekly-pipeline" in rendered
     # Scheduled main+WEEKLY=1 uploads L2/L3 with --e2e; NIGHTLY still gates L4 only.
     doc = yaml.safe_load(rendered)
     by_key = {step["key"]: step for step in doc["steps"]}
-    assert "NIGHTLY" not in by_key["upload-level2-pipeline"]["if"]
-    assert 'build.branch == "main"' in by_key["upload-level2-pipeline"]["if"]
-    assert 'build.env("WEEKLY") == "1"' in by_key["upload-level2-pipeline"]["if"]
-    assert "NIGHTLY" not in by_key["upload-level3-pipeline"]["if"]
-    assert 'build.branch == "main"' in by_key["upload-level3-pipeline"]["if"]
-    assert 'build.env("WEEKLY") == "1"' in by_key["upload-level3-pipeline"]["if"]
-    assert 'build.env("NIGHTLY") == "1"' in by_key["upload-level4-pipeline"]["if"]
+    assert "NIGHTLY" not in by_key["upload-ready-pipeline"]["if"]
+    assert 'build.branch == "main"' in by_key["upload-ready-pipeline"]["if"]
+    assert 'build.env("WEEKLY") == "1"' in by_key["upload-ready-pipeline"]["if"]
+    assert "NIGHTLY" not in by_key["upload-merge-pipeline"]["if"]
+    assert 'build.branch == "main"' in by_key["upload-merge-pipeline"]["if"]
+    assert 'build.env("WEEKLY") == "1"' in by_key["upload-merge-pipeline"]["if"]
+    assert 'build.env("NIGHTLY") == "1"' in by_key["upload-nightly-pipeline"]["if"]
     assert 'build.env("WEEKLY") == "1"' in rendered
     assert 'build.env("NON_CRITICAL") == "1"' in rendered
     assert "nightly-test" not in rendered
@@ -96,23 +96,23 @@ def test_npu_docs_only_does_not_upload_ready_on_nightly() -> None:
     )
     doc = yaml.safe_load(rendered)
     by_key = {step["key"]: step for step in doc["steps"]}
-    assert "upload-level2-pipeline" not in by_key
-    assert 'build.env("NIGHTLY") == "1"' in by_key["upload-level4-pipeline"]["if"]
+    assert "upload-ready-pipeline" not in by_key
+    assert 'build.env("NIGHTLY") == "1"' in by_key["upload-nightly-pipeline"]["if"]
 
 
 def test_yaml_gated_l45_only_does_not_unconditionally_build_image() -> None:
-    rendered = _render([".buildkite/cuda/test-level4.yml"])
+    rendered = _render([".buildkite/cuda/test-nightly.yml"])
     assert "if: true" not in rendered
     assert 'build.pull_request.labels includes "nightly-test"' in rendered
     assert 'build.pull_request.labels includes "weekly-test"' in rendered
     # L2/L3 upload steps are unconditionally disabled → omitted from pipeline
-    assert "key: upload-level2-pipeline" not in rendered
-    assert "key: upload-level3-pipeline" not in rendered
-    assert "key: upload-level5-pipeline" in rendered
+    assert "key: upload-ready-pipeline" not in rendered
+    assert "key: upload-merge-pipeline" not in rendered
+    assert "key: upload-weekly-pipeline" in rendered
 
 
 def test_yaml_gated_l2_still_enables_image_via_ready_base() -> None:
-    rendered = _render([".buildkite/cuda/test-level2.yml"])
+    rendered = _render([".buildkite/cuda/test-ready.yml"])
     assert 'build.pull_request.labels includes "ready"' in rendered
     assert "if: true" not in rendered
 

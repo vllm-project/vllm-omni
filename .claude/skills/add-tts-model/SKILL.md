@@ -330,12 +330,12 @@ Classify the model's **CI priority** first (high / medium / low). High-priority 
 
 | Level | Location | Marker | CI pipeline | Notes |
 |-------|----------|--------|-------------|-------|
-| **L1** | `tests/model_executor/…`, `tests/entrypoints/openai_api/…`, stage-processor tests | `core_model` + `cpu` | `test-level2.yml` | Prompt assembly, async_chunk helpers, adapter validation — no GPU |
-| **L2** | `tests/e2e/online_serving/test_{slug}.py` | **`core_model` + `advanced_model`** (both on baseline smoke) + `tts` + `@hardware_test(...)` | `test-level2.yml` (`ready` label) | Default deploy smoke: single `/v1/audio/speech` or offline `OmniRunner` path |
-| **L3** | `tests/e2e/online_serving/test_{slug}.py` **and** `tests/e2e/offline_inference/test_{slug}.py` | Baseline smoke: **`core_model` + `advanced_model`**; heavier cases: `advanced_model` only (+ `tts`) | `test-level3.yml` **or** merged into nightly TTS function job | Streaming, voice clone, batch/queue, async_chunk |
-| **L4** | `tests/e2e/online_serving/test_{slug}_expansion.py`, optional offline expansion | `full_model` + `tts` | `test-level4.yml` (`:full_moon: TTS · Function Test with L4`) | Feature matrix; perf → `tests/dfx/perf/tests/test_tts.json` |
+| **L1** | `tests/model_executor/…`, `tests/entrypoints/openai_api/…`, stage-processor tests | `core_model` + `cpu` | `test-ready.yml` | Prompt assembly, async_chunk helpers, adapter validation — no GPU |
+| **L2** | `tests/e2e/online_serving/test_{slug}.py` | **`core_model` + `advanced_model`** (both on baseline smoke) + `tts` + `@hardware_test(...)` | `test-ready.yml` (`ready` label) | Default deploy smoke: single `/v1/audio/speech` or offline `OmniRunner` path |
+| **L3** | `tests/e2e/online_serving/test_{slug}.py` **and** `tests/e2e/offline_inference/test_{slug}.py` | Baseline smoke: **`core_model` + `advanced_model`**; heavier cases: `advanced_model` only (+ `tts`) | `test-merge.yml` **or** merged into nightly TTS function job | Streaming, voice clone, batch/queue, async_chunk |
+| **L4** | `tests/e2e/online_serving/test_{slug}_expansion.py`, optional offline expansion | `full_model` + `tts` | `test-nightly.yml` (`:full_moon: TTS · Function Test with L4`) | Feature matrix; perf → `tests/dfx/perf/tests/test_tts.json` |
 
-**L2 & L3 online — same file, dual marks on the baseline smoke:** The **first / simplest** case in `test_{slug}.py` (default deploy, single non-streaming `/v1/audio/speech` or equivalent offline path) should carry **both** `@pytest.mark.core_model` **and** `@pytest.mark.advanced_model` on the **same** function so it runs in L2 (`test-level2.yml`, `--run-level core_model`, basic validation) and L3 (`test-level3.yml`, `--run-level advanced_model`, deeper validation) without duplicating the test. In-tree examples: `test_voxcpm2_tts.py::test_text_to_audio_001`, `test_qwen3_tts_customvoice.py::test_text_to_audio_001`.
+**L2 & L3 online — same file, dual marks on the baseline smoke:** The **first / simplest** case in `test_{slug}.py` (default deploy, single non-streaming `/v1/audio/speech` or equivalent offline path) should carry **both** `@pytest.mark.core_model` **and** `@pytest.mark.advanced_model` on the **same** function so it runs in L2 (`test-ready.yml`, `--run-level core_model`, basic validation) and L3 (`test-merge.yml`, `--run-level advanced_model`, deeper validation) without duplicating the test. In-tree examples: `test_voxcpm2_tts.py::test_text_to_audio_001`, `test_qwen3_tts_customvoice.py::test_text_to_audio_001`.
 
 Heavier scenarios in the same file use **`advanced_model` only** (streaming, extra languages, concurrency, async_chunk, batch). Example: `test_voice_clone_en_streaming_001` → `advanced_model` only. When migrating L3 to nightly, move those heavier cases into `test_{slug}_expansion.py` with `full_model` and drop the dedicated merge job (see `test_ming_tts_expansion.py`, `test_glm_tts_expansion.py`).
 
@@ -351,7 +351,7 @@ def test_voice_clone_en_non_streaming_001(omni_server, online_client) -> None:
 
 **L4 consolidation:** Prefer parametrized `OmniServerParams` rows (`default`, `async_chunk`, feature flags) in one expansion module rather than many merge-only files ([#1832](https://github.com/vllm-project/vllm-omni/issues/1832)).
 
-**L4 performance (high-priority models):** Add latency / throughput / stress rows in `tests/dfx/perf/tests/test_tts.json`, or a dedicated `tests/dfx/perf/tests/test_{slug}.json` when the model must not join the shared nightly server matrix before integration lands (see VoxCPM2 / Coqui XTTS pattern). Register the model in `benchmarks/tts/model_configs.yaml` for local `bench_tts.py`. Wire a **separate** `test-level4.yml` Perf Test step when the JSON is not merged into `test_tts.json` yet.
+**L4 performance (high-priority models):** Add latency / throughput / stress rows in `tests/dfx/perf/tests/test_tts.json`, or a dedicated `tests/dfx/perf/tests/test_{slug}.json` when the model must not join the shared nightly server matrix before integration lands (see VoxCPM2 / Coqui XTTS pattern). Register the model in `benchmarks/tts/model_configs.yaml` for local `bench_tts.py`. Wire a **separate** `test-nightly.yml` Perf Test step when the JSON is not merged into `test_tts.json` yet.
 
 **Keep model-specific code inside test modules — not `tests/helpers/{slug}.py`:**
 
@@ -379,7 +379,7 @@ See [vllm-omni-test skill](../vllm-omni-test/SKILL.md) § **Runtime send helpers
 - Client scripts and server launcher under `examples/online_serving/text_to_speech/<model>/`
 - Gradio demo with streaming and voice cloning UI in the same dir
 - E2E tests per **Test Case Writing (CI Levels)** above (priority tier determines L1–L4 scope)
-- Buildkite wired per level: `test-level2.yml` (L1/L2), `test-level3.yml` or nightly function job (L3), `test-level4.yml` (L4) — see [vllm-omni-test skill](../vllm-omni-test/SKILL.md)
+- Buildkite wired per level: `test-ready.yml` (L1/L2), `test-merge.yml` or nightly function job (L3), `test-nightly.yml` (L4) — see [vllm-omni-test skill](../vllm-omni-test/SKILL.md)
 - New section in `examples/online_serving/text_to_speech/README.md` (table row + per-model section). Do **not** create a top-level `examples/online_serving/<model>/` dir or a per-model `README.md` inside `text_to_speech/<model>/`.
 
 ### E2E test pitfalls to avoid
@@ -540,7 +540,7 @@ Use this checklist when integrating a new TTS model:
 - [ ] All response formats work (wav, mp3, flac, pcm)
 - [ ] Client scripts and server launcher created
 - [ ] E2E tests added per model priority tier (see **Test Case Writing (CI Levels)**)
-- [ ] Buildkite entries match level: `test-level2.yml` / `test-level3.yml` or nightly TTS job / `test-level4.yml`
+- [ ] Buildkite entries match level: `test-ready.yml` / `test-merge.yml` or nightly TTS job / `test-nightly.yml`
 - [ ] Gradio demo working
 - [ ] Documentation added (offline + online docs, nav, supported models)
 

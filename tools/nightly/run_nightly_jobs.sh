@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
-# Extract steps from .buildkite/cuda/test-level4.yml that contain pytest, synthesize
+# Extract steps from .buildkite/cuda/test-nightly.yml that contain pytest, synthesize
 # small bash wrappers (exports + pytest), run them, and tee output to logs named
 # after each step's Buildkite "key" when present (otherwise a slug of the label).
 # YAML steps whose label contains "Perf Test" run first, then
@@ -25,7 +25,7 @@
 #   local    — pytest -sv -m "<MODEL_TYPE markers> and local_model" from repo root (no YAML step extract)
 #              When LABEL_SUBSTR is set, also runs matching tests/**/test_*.py and perf JSON configs under
 #              tests/dfx/perf/tests/*.json via run_benchmark.py / run_diffusion_benchmark.py.
-#   all      — no test-kind filter for YAML steps (any leaf step with pytest in test-level4.yml)
+#   all      — no test-kind filter for YAML steps (any leaf step with pytest in test-nightly.yml)
 #
 # Model area (--model-type / MODEL_TYPE), multiple allowed (OR semantics):
 #   e.g. --model-type omni,tts
@@ -53,22 +53,22 @@
 # Requirements: bash, python3, PyYAML (pip install pyyaml)
 #
 # Usage:
-#   bash path/to/run_level4_jobs.sh
-#   REPO_ROOT=/path/to/vllm-omni bash path/to/run_level4_jobs.sh --test-type perf,acc --dry-run
-#   YML=/path/to/vllm-omni/.buildkite/cuda/test-level4.yml bash path/to/run_level4_jobs.sh
+#   bash path/to/run_nightly_jobs.sh
+#   REPO_ROOT=/path/to/vllm-omni bash path/to/run_nightly_jobs.sh --test-type perf,acc --dry-run
+#   YML=/path/to/vllm-omni/.buildkite/cuda/test-nightly.yml bash path/to/run_nightly_jobs.sh
 #
 # Repository / YAML (no dependency on where this script lives):
-#   • Set REPO_ROOT (or pass --repo-root) — default YAML is $REPO_ROOT/.buildkite/cuda/test-level4.yml
+#   • Set REPO_ROOT (or pass --repo-root) — default YAML is $REPO_ROOT/.buildkite/cuda/test-nightly.yml
 #   • Or set YML (or --yaml) — repo root is inferred as parent of the .buildkite directory
 #   • Or run from inside the clone: git rev-parse --show-toplevel, else walk up from $PWD,
-#     then from the script's directory, until .buildkite/cuda/test-level4.yml exists
+#     then from the script's directory, until .buildkite/cuda/test-nightly.yml exists
 #
 # Optional environment:
 #   REPO_ROOT     - vllm-omni root (working directory for pytest); see above
-#   YML           - path to test-level4.yml (default: $REPO_ROOT/.buildkite/cuda/test-level4.yml)
+#   YML           - path to test-nightly.yml (default: $REPO_ROOT/.buildkite/cuda/test-nightly.yml)
 #   LOG_DIR       - logs + generated job scripts; when unset, a timestamped directory under
 #                   $REPO_ROOT/logs/ is created:
-#                     level4_jobs_YYYYMMDD-HHMMSS       (default / YAML nightly steps)
+#                     nightly_jobs_YYYYMMDD-HHMMSS       (default / YAML nightly steps)
 #                     level4_local_jobs_YYYYMMDD-HHMMSS (--test-type local only)
 #                     level4_stability_jobs_YYYYMMDD-HHMMSS (--test-type stability only)
 #                   per-job *.log plus timing_summary.log after the run;
@@ -253,11 +253,11 @@ _level4_log_dir_basename() {
   elif [[ "${has_stability}" -eq 1 && "${has_yaml}" -eq 0 && "${has_local}" -eq 0 ]]; then
     printf 'level4_stability_jobs_%s' "${ts}"
   else
-    printf 'level4_jobs_%s' "${ts}"
+    printf 'nightly_jobs_%s' "${ts}"
   fi
 }
 
-BUILDKITE_REL=".buildkite/cuda/test-level4.yml"
+BUILDKITE_REL=".buildkite/cuda/test-nightly.yml"
 
 _find_repo_containing_yml() {
   local dir="${1:-}"
@@ -294,7 +294,7 @@ if [[ -n "${YML:-}" && -n "${REPO_ROOT:-}" ]]; then
 elif [[ -n "${YML:-}" ]]; then
   YML="$(cd "$(dirname "${YML}")" && pwd)/$(basename "${YML}")"
   if ! REPO_ROOT="$(_derive_repo_root_from_yml "${YML}")"; then
-    echo "Could not derive REPO_ROOT from YML=${YML} (expected file at <repo>/.buildkite/cuda/test-level4.yml)." >&2
+    echo "Could not derive REPO_ROOT from YML=${YML} (expected file at <repo>/.buildkite/cuda/test-nightly.yml)." >&2
     echo "Set REPO_ROOT explicitly (or pass --repo-root) for pytest working directory." >&2
     exit 2
   fi
@@ -326,7 +326,7 @@ fi
 
 echo "Log directory: ${LOG_DIR}" >&2
 
-# Require test-level4.yml only when at least one non-stability test kind needs it (validated in Python too).
+# Require test-nightly.yml only when at least one non-stability test kind needs it (validated in Python too).
 _needs_level4_yml=0
 IFS=',' read -ra _TTOK <<< "${TEST_TYPE}"
 for _t in "${_TTOK[@]}"; do

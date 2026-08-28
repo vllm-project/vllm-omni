@@ -27,7 +27,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 # slow + H100 + omni routes this module into the weekly Buildkite E2E group
-# ("Omni · H100" in .buildkite/cuda/test-level5.yml: -m "slow and H100 and
+# ("Omni · H100" in .buildkite/cuda/test-weekly.yml: -m "slow and H100 and
 # omni" --run-level full_model); the ready/merge CPU sweeps exclude it by mark.
 pytestmark = [
     pytest.mark.full_model,

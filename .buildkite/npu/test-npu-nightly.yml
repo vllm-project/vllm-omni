@@ -1,7 +1,7 @@
 steps:
   - group: ":card_index_dividers: Omni Model Test"
     key: nightly-omni-test-group
-    depends_on: upload-level4-pipeline
+    depends_on: upload-nightly-pipeline
     if: >-
       build.env("NIGHTLY") == "1" ||
       build.pull_request.labels includes "nightly-test" ||
@@ -132,7 +132,7 @@ steps:
             exit $$EXIT
   - group: ":card_index_dividers: TTS Model Test"
     key: nightly-tts-test-group
-    depends_on: upload-level4-pipeline
+    depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "tts-test"
     steps:
       - label: ":full_moon: TTS · Perf Test"
@@ -153,7 +153,7 @@ steps:
             exit $$EXIT
   - group: ":card_index_dividers: Diffusion I2I Model Test"
     key: nightly-HunyuanImage3-x2i-test-group
-    depends_on: upload-level4-pipeline
+    depends_on: upload-nightly-pipeline
     if: >-
       build.env("NIGHTLY") == "1" ||
       build.pull_request.labels includes "nightly-test" ||
@@ -171,7 +171,7 @@ steps:
           - pytest -s -v tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py -m "full_model and A3" --run-level full_model
   - group: ":card_index_dividers: Diffusion Benchmark Perf Test"
     key: nightly-diffusion-benchmark-group
-    depends_on: upload-level4-pipeline
+    depends_on: upload-nightly-pipeline
     if: >-
       build.env("NIGHTLY") == "1" ||
       build.pull_request.labels includes "nightly-test" ||
@@ -227,7 +227,7 @@ steps:
             exit $$EXIT
   - group: ":card_index_dividers: Diffusion X2V Model Test"
     key: nightly-diffusion-x2v-group
-    depends_on: upload-level4-pipeline
+    depends_on: upload-nightly-pipeline
     if: >-
       build.env("NIGHTLY") == "1" ||
       build.pull_request.labels includes "nightly-test" ||

@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
-Parse pytest commands from Buildkite .buildkite/cuda/test-level{2,3,4,5}.yml;
+Parse pytest commands from Buildkite .buildkite/cuda/test-{ready,merge,nightly,weekly}.yml;
 collect test cases (including parametrized) via pytest --collect-only -q and produce an HTML report.
 
 Leaf steps may live under ``group:`` blocks (nested ``steps``); those are flattened with the
@@ -33,7 +33,7 @@ import yaml
 # Repo root (parent of the directory containing this script)
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 BUILDKITE_DIR = REPO_ROOT / ".buildkite" / "cuda"
-PIPELINE_FILES = ["test-level2.yml", "test-level3.yml", "test-level4.yml", "test-level5.yml"]
+PIPELINE_FILES = ["test-ready.yml", "test-merge.yml", "test-nightly.yml", "test-weekly.yml"]
 
 
 def load_yaml(path: Path) -> dict:
@@ -441,10 +441,10 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
     """Write stats to HTML with styling and responsive tables."""
     root = repo_root if repo_root is not None else REPO_ROOT
     pipeline_badges = {
-        "test-level2": "level2",
-        "test-level3": "level3",
-        "test-level4": "level4",
-        "test-level5": "level5",
+        "test-ready": "level2",
+        "test-merge": "level3",
+        "test-nightly": "level4",
+        "test-weekly": "level5",
     }
 
     def esc(s: str) -> str:
@@ -918,8 +918,8 @@ def _sample_preview_stats() -> list[tuple]:
     skipped_a = {"tests/e2e/demo/test_alpha.py::test_smoke"}
     return [
         (
-            "test-level2 / :card_index_dividers: Simple Test / Simple · Diffusion",
-            "test-level2",
+            "test-ready / :card_index_dividers: Simple Test / Simple · Diffusion",
+            "test-ready",
             ":card_index_dividers: Simple Test",
             "Simple · Diffusion & Model Executor Test",
             ["tests/diffusion/test_dummy.py", "tests/model_executor/test_dummy.py"],
@@ -931,8 +931,8 @@ def _sample_preview_stats() -> list[tuple]:
             skipped_a,
         ),
         (
-            "test-level2 / Custom Pipeline Test",
-            "test-level2",
+            "test-ready / Custom Pipeline Test",
+            "test-ready",
             None,
             "Custom Pipeline Test",
             ["tests/e2e/features/custom_pipeline/test_cp.py"],
@@ -944,8 +944,8 @@ def _sample_preview_stats() -> list[tuple]:
             set(),
         ),
         (
-            "test-level3 / :card_index_dividers: Diffusion Test / LoRA",
-            "test-level3",
+            "test-merge / :card_index_dividers: Diffusion Test / LoRA",
+            "test-merge",
             ":card_index_dividers: Diffusion Test",
             "Diffusion · LoRA Test",
             ["tests/diffusion/lora/test_lora.py"],
@@ -960,8 +960,8 @@ def _sample_preview_stats() -> list[tuple]:
             set(),
         ),
         (
-            "test-level4 / Omni marker-only (sample)",
-            "test-level4",
+            "test-nightly / Omni marker-only (sample)",
+            "test-nightly",
             ":card_index_dividers: Omni Model Test",
             "Omni · marker-only step (sample)",
             [],
@@ -973,8 +973,8 @@ def _sample_preview_stats() -> list[tuple]:
             set(),
         ),
         (
-            "test-level5 / Reliability (sample)",
-            "test-level5",
+            "test-weekly / Reliability (sample)",
+            "test-weekly",
             None,
             "Reliability Test - qwen3-omni",
             ["tests/dfx/reliability/test_reliability_qwen3_omni.py"],

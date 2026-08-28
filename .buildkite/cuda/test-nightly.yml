@@ -1,5 +1,5 @@
 # CUDA CI L4 (`full_model`): nightly and release share this file.
-# Uploaded by Upload Level4 Pipeline: NIGHTLY=1, or PR labels (nightly-test / omni-test / ...).
+# Uploaded by Upload Nightly Pipeline: NIGHTLY=1, or PR labels (nightly-test / omni-test / ...).
 # Hardware: omit mirror_hardwares to compose from -m SKU + cards_n; or set a preset string to force.
 
 env:
@@ -12,7 +12,7 @@ steps:
   # Group: collapses under one heading in the Buildkite UI; child steps still run in parallel.
   - group: ":card_index_dividers: Omni Model Test"
     key: nightly-omni-test-group
-    depends_on: upload-level4-pipeline
+    depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "omni-test"
     steps:
 
@@ -126,7 +126,7 @@ steps:
 
   - group: ":card_index_dividers: TTS Model Test"
     key: nightly-tts-test-group
-    depends_on: upload-level4-pipeline
+    depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "tts-test"
     steps:
 
@@ -155,7 +155,7 @@ steps:
 
   - group: ":card_index_dividers: Tiny Model Tests [Multi-GPU]"
     key: nightly-tiny-model-test-group
-    depends_on: upload-level4-pipeline
+    depends_on: upload-nightly-pipeline
     if: >-
       build.env("NIGHTLY") == "1" ||
       build.pull_request.labels includes "nightly-test"
@@ -176,7 +176,7 @@ steps:
 
   - group: ":card_index_dividers: Diffusion X2I(&A&T) Model Test"
     key: nightly-diffusion-x2iat-group
-    depends_on: upload-level4-pipeline
+    depends_on: upload-nightly-pipeline
     if: >-
       build.env("NIGHTLY") == "1" ||
       build.pull_request.labels includes "nightly-test" ||
@@ -257,7 +257,7 @@ steps:
 
   - group: ":card_index_dividers: Diffusion X2V Model Test"
     key: nightly-diffusion-x2v-group
-    depends_on: upload-level4-pipeline
+    depends_on: upload-nightly-pipeline
     if: >-
       build.env("NIGHTLY") == "1" ||
       build.pull_request.labels includes "nightly-test" ||
@@ -342,7 +342,7 @@ steps:
 
   - group: ":card_index_dividers: Diffusion Test"
     key: nightly-diffusion-test-group
-    depends_on: upload-level4-pipeline
+    depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     steps:
       - label: ":full_moon: Diffusion · Distributed Test with L4"

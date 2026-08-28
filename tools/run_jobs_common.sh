@@ -177,16 +177,16 @@ _run_jobs_print_timing_summary() {
 }
 
 # ---------------------------------------------------------------------------
-# Level2 / level3: CLI + YAML extract + run (tools/run_level2_jobs.sh,
-# tools/run_level3_jobs.sh). Level4 does not use this entrypoint.
+# Level2 / level3: CLI + YAML extract + run (tools/run_ready_jobs.sh,
+# tools/run_merge_jobs.sh). Level4 does not use this entrypoint.
 #
 # Entry scripts must set before calling run_yaml_ci_jobs_main:
-#   BUILDKITE_REL      - e.g. .buildkite/cuda/test-level2.yml
-#   DEFAULT_LOG_SUBDIR - e.g. level2_jobs
+#   BUILDKITE_REL      - e.g. .buildkite/cuda/test-ready.yml
+#   DEFAULT_LOG_SUBDIR - e.g. ready_jobs
 # ---------------------------------------------------------------------------
 
 _run_yaml_ci_jobs_usage() {
-  # Print the entry script header (caller is run_level2_jobs.sh / run_level3_jobs.sh).
+  # Print the entry script header (caller is run_ready_jobs.sh / run_merge_jobs.sh).
   sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
 }
 

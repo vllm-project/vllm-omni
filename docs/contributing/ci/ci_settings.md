@@ -19,10 +19,10 @@ Canonical layout (prefer these paths for new changes):
 ├── cuda/                            # Primary NVIDIA CUDA CI
 │   ├── pipeline.yml                 # Bootstrap entry (hook upload)
 │   ├── bootstrap-upload-steps.yml   # Bootstrap child steps (upload_pipeline --upload)
-│   ├── test-level2.yml              # L2
-│   ├── test-level3.yml              # L3
-│   ├── test-level4.yml              # L4
-│   ├── test-level5.yml              # L5
+│   ├── test-ready.yml               # L2
+│   ├── test-merge.yml               # L3
+│   ├── test-nightly.yml             # L4
+│   ├── test-weekly.yml              # L5
 │   └── rebase-pipeline.yml
 ├── npu/
 │   ├── pipeline-npu.yml             # Bootstrap entry (hook upload)
@@ -61,7 +61,7 @@ Canonical layout (prefer these paths for new changes):
 
 | Platform | Bootstrap entry | Test job files | Upload mechanism | Job hardware in YAML |
 | -------- | ---------------- | -------------- | ---------------- | -------------------- |
-| **CUDA** | `cuda/pipeline.yml` | `test-level2.yml`, `test-level3.yml`, `test-level4.yml`, `test-level5.yml` | `upload_pipeline.py --upload` (expands uploader-only keys) | omit `mirror_hardwares` (from `-m`) / preset string + `MIRROR_HW` |
+| **CUDA** | `cuda/pipeline.yml` | `test-ready.yml`, `test-merge.yml`, `test-nightly.yml`, `test-weekly.yml` | `upload_pipeline.py --upload` (expands uploader-only keys) | omit `mirror_hardwares` (from `-m`) / preset string + `MIRROR_HW` |
 | **NPU** | `npu/pipeline-npu.yml` | `test-npu-ready.yml`, `test-npu-nightly.yml` | `upload_pipeline.py --upload` | `mirror_hardwares: a2b3_npu_1` / `a2b3_npu_4` / `a3_npu_2` |
 | **AMD** | `amd/scripts/bootstrap-amd-omni.sh` | `test-amd-ready.yml`, `test-amd-merge.yml` | Jinja (`test-template-amd-omni.j2`) → `pipeline upload` | `agent_pool` + `mirror_hardwares: [amdproduction]` (array, template filter) |
 | **Intel** | `intel/scripts/bootstrap-intel-omni.sh` | `intel/pipeline-intel.yml` (steps inline) | Direct `pipeline upload` | Inline `agents.queue` on each step |
@@ -72,16 +72,16 @@ Canonical layout (prefer these paths for new changes):
 
     **Bootstrap:** [`cuda/pipeline.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/pipeline.yml) (hook upload) + [`cuda/bootstrap-upload-steps.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/bootstrap-upload-steps.yml) (child steps). Document 1 runs [`upload_pipeline.py --upload .buildkite/cuda/bootstrap-upload-steps.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/upload_pipeline.py), which injects `if` by step `key` from skip-ci and uploads image build plus L2–L5 child pipeline upload steps (see [Diff-aware CI — Bootstrap skip](#bootstrap-skip)).
 
-    **Test YAML:** `cuda/test-level2.yml` (L2), `test-level3.yml` (L3), `test-level4.yml` (L4), `test-level5.yml` (L5). Each file starts with shared `env:` then `steps:`.
+    **Test YAML:** `cuda/test-ready.yml` (L2), `test-merge.yml` (L3), `test-nightly.yml` (L4), `test-weekly.yml` (L5). Each file starts with shared `env:` then `steps:`.
 
     | CI level | File | Typical trigger |
     | -------- | ---- | ----------------- |
-    | L2 | `cuda/test-level2.yml` | `ready` label |
-    | L3 | `cuda/test-level3.yml` | `merge-test` label / main merge |
-    | L4 | `cuda/test-level4.yml` | `nightly-test` label or `NIGHTLY=1` |
-    | L5 | `cuda/test-level5.yml` | `weekly-test` label, `WEEKLY=1`, or `NON_CRITICAL=1` (see step `if`s below) |
+    | L2 | `cuda/test-ready.yml` | `ready` label |
+    | L3 | `cuda/test-merge.yml` | `merge-test` label / main merge |
+    | L4 | `cuda/test-nightly.yml` | `nightly-test` label or `NIGHTLY=1` |
+    | L5 | `cuda/test-weekly.yml` | `weekly-test` label, `WEEKLY=1`, or `NON_CRITICAL=1` (see step `if`s below) |
 
-    On scheduled `main` builds, `test-level5.yml` is uploaded when **`WEEKLY=1` or `NON_CRITICAL=1`**. Inside that file:
+    On scheduled `main` builds, `test-weekly.yml` is uploaded when **`WEEKLY=1` or `NON_CRITICAL=1`**. Inside that file:
 
     - **Reliability** / **Perf Test** / **Simple · CPU Coverage Test** → `WEEKLY=1` (or PR label `weekly-test` for Reliability/Perf). Pipeline upload for scheduled env vars still requires `main`.
     - **E2E Tests** group (slow Omni/TTS/Diffusion sweeps) → `NON_CRITICAL=1`
@@ -110,21 +110,21 @@ Canonical layout (prefer these paths for new changes):
 
     **Conventions**
 
-    - **`depends_on`:** leaf jobs depend on `upload-level2-pipeline`, `upload-level3-pipeline`, etc.
+    - **`depends_on`:** leaf jobs depend on `upload-ready-pipeline`, `upload-merge-pipeline`, etc.
     - **`group` / `label`:** `:card_index_dividers:` groups; labels like `Diffusion · Qwen Image Test`.
     - **`commands`:** `timeout … pytest …` with markers and `--run-level` for the pipeline level.
     - **`source_file_dependencies`:** required on **E2E Test** leaf jobs in L2/L3; see [Step filtering](#step-filtering).
 
     **Adding a job**
 
-    1. Pick the level file (`test-level2.yml` / `test-level3.yml` / `test-level4.yml` / `test-level5.yml`).
+    1. Pick the level file (`test-ready.yml` / `test-merge.yml` / `test-nightly.yml` / `test-weekly.yml`).
     2. Add a step under the right **group** (usually **E2E Test** for model pytest).
-    3. Set `label`, `commands`, `mirror_hardwares`, `depends_on: upload-level2-pipeline` (or `upload-level3-pipeline` / `upload-level4-pipeline` / `upload-level5-pipeline`).
+    3. Set `label`, `commands`, `mirror_hardwares`, `depends_on: upload-ready-pipeline` (or `upload-merge-pipeline` / `upload-nightly-pipeline` / `upload-weekly-pipeline`).
     4. For L2/L3 E2E, add `source_file_dependencies` (pytest + model + deploy YAML prefixes).
     5. Dry-run:
 
     ```bash
-    python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/cuda/test-level2.yml
+    python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/cuda/test-ready.yml
     ```
 
 === "NPU"
@@ -141,7 +141,7 @@ Canonical layout (prefer these paths for new changes):
 
     **Conventions**
 
-    - **`depends_on: upload-level2-pipeline`** (or `upload-level4-pipeline`) ties jobs to bootstrap upload keys.
+    - **`depends_on: upload-ready-pipeline`** (or `upload-nightly-pipeline`) ties jobs to bootstrap upload keys.
     - Do not duplicate `agents` / `image` / `plugins` when using `mirror_hardwares`.
 
     **Adding a job**
@@ -206,7 +206,7 @@ PR diffs drive **two independent skip layers**. Both read changed files from git
 | Layer | Script | When | What is skipped | Where you configure |
 | ----- | ------ | ---- | --------------- | ------------------- |
 | **Bootstrap** | [`skip_ci.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/skip_ci.py) + [`upload_pipeline.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/upload_pipeline.py) | Before child test pipelines upload (`cuda/pipeline.yml`, `npu/pipeline-npu.yml`, AMD/Intel bootstraps) | Entire default CI, or whole L2/L3 upload for a platform | Whitelists in `skip_ci.py`; bootstrap `if` injected by step `key` in `upload_pipeline.py` |
-| **Step filter** | [`upload_pipeline.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/upload_pipeline.py) | While uploading CUDA L2/L3 YAML | Individual Buildkite steps inside `test-level2.yml` / `test-level3.yml` | `source_file_dependencies` on each step or group |
+| **Step filter** | [`upload_pipeline.py`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/upload_pipeline.py) | While uploading CUDA L2/L3 YAML | Individual Buildkite steps inside `test-ready.yml` / `test-merge.yml` | `source_file_dependencies` on each step or group |
 
 **Changed files** (both layers):
 
@@ -243,13 +243,13 @@ Register new files in `L2_YAML_FILES`, `L3_YAML_FILES`, or `L45_YAML_FILES` in `
 
 | Level | File | Platform |
 | --- | --- | --- |
-| L2 | `.buildkite/cuda/test-level2.yml` | cuda |
+| L2 | `.buildkite/cuda/test-ready.yml` | cuda |
 | L2 | `.buildkite/npu/test-npu-ready.yml` | npu |
 | L2 | `.buildkite/amd/test-amd-ready.yml` | amd |
 | L2 | `.buildkite/intel/pipeline-intel.yml` | intel |
-| L3 | `.buildkite/cuda/test-level3.yml` | cuda |
+| L3 | `.buildkite/cuda/test-merge.yml` | cuda |
 | L3 | `.buildkite/amd/test-amd-merge.yml` | amd |
-| L4/L5 | `.buildkite/cuda/test-level4.yml`, `test-level5.yml` | cuda |
+| L4/L5 | `.buildkite/cuda/test-nightly.yml`, `test-weekly.yml` | cuda |
 | L4/L5 | `.buildkite/npu/test-npu-nightly.yml` | npu |
 
 ##### Yaml-gated category branches
@@ -272,11 +272,11 @@ Docs/skip-mark mixed with any row below follows the same matrix.
 
 | Diff (whitelist) | Branch | Enabled L2/L3 |
 | --- | --- | --- |
-| Only `cuda/test-level2.yml` | G2 | `cuda/l2` |
+| Only `cuda/test-ready.yml` | G2 | `cuda/l2` |
 | Only `amd/test-amd-ready.yml` | G2 | `amd/l2` |
 | Only `npu/test-npu-ready.yml` | G2 | `npu/l2` |
 | Only `intel/pipeline-intel.yml` | G2 | `intel/l2` |
-| Only `cuda/test-level3.yml` | G3 | `cuda/l3` |
+| Only `cuda/test-merge.yml` | G3 | `cuda/l3` |
 | Only `amd/test-amd-merge.yml` | G3 | `amd/l3` |
 | CUDA ready + CUDA merge | G4 | `cuda/l2` + `cuda/l3` |
 | CUDA ready + AMD merge | G4 | `cuda/l2` + `amd/l3` |
@@ -291,7 +291,7 @@ Docs/skip-mark mixed with any row below follows the same matrix.
 
 | Platform | Mechanism |
 | --- | --- |
-| **CUDA** | `upload_pipeline.py` injects `if` by step `key` (`image-build`, `upload-level2-pipeline`, `upload-level3-pipeline`, …) from `is_run(cuda, l2/l3)` |
+| **CUDA** | `upload_pipeline.py` injects `if` by step `key` (`image-build`, `upload-ready-pipeline`, `upload-merge-pipeline`, …) from `is_run(cuda, l2/l3)` |
 | **NPU** | Same injection; no merge upload step (L3 always off in bootstrap) |
 | **AMD / Intel** | `gate_bootstrap_ci <platform> <l2\|l3>` exits 0 when `skip_all` or that target is off |
 
@@ -299,7 +299,7 @@ Unit coverage: `tests/buildkite/test_skip_ci.py`.
 
 #### Step filtering {#step-filtering}
 
-CUDA **L2** (`.buildkite/cuda/test-level2.yml`) and **L3** (`.buildkite/cuda/test-level3.yml`) only. Bootstrap upload entry: `upload_pipeline.py --upload .buildkite/cuda/bootstrap-upload-steps.yml`.
+CUDA **L2** (`.buildkite/cuda/test-ready.yml`) and **L3** (`.buildkite/cuda/test-merge.yml`) only. Bootstrap upload entry: `upload_pipeline.py --upload .buildkite/cuda/bootstrap-upload-steps.yml`.
 
 **Uploader-only keys** — removed before Buildkite sees the YAML; never used at runtime on agents:
 
@@ -338,8 +338,8 @@ CUDA **L2** (`.buildkite/cuda/test-level2.yml`) and **L3** (`.buildkite/cuda/tes
 ### Local dry-run
 
 ```bash
-python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/cuda/test-level2.yml
-python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/cuda/test-level3.yml | grep source_file_dependencies
+python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/cuda/test-ready.yml
+python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/cuda/test-merge.yml | grep source_file_dependencies
 # (no output expected)
 ```
 
@@ -352,14 +352,14 @@ On PR builds, `upload_pipeline.py` logs `skip '…' (no changes under …)` for 
 
 ### Per-model coverage
 
-Pilot (v1): one Merge-tier (L3) job in `.buildkite/cuda/test-level3.yml` uploads
+Pilot (v1): one Merge-tier (L3) job in `.buildkite/cuda/test-merge.yml` uploads
 per-model, per-entry-mode coverage as Buildkite artifacts — "TTS · Qwen3-TTS Base
 Test". Coverage + artifact upload run only when bootstrap uploaded that job with
 `--e2e` (`WEEKLY=1` and `BUILDKITE_BRANCH=main`, via `run_cov_split.sh`); otherwise
 the same job runs plain pytest without `--cov`. It runs on a single GPU so the
 pilot is cheap to reproduce.
 
-**L1 package coverage (CPU):** ready/merge Simple Test jobs run without `--cov`. Scheduled weekly on `main` with `WEEKLY=1` runs **Simple · CPU Coverage Test** in `.buildkite/cuda/test-level5.yml` (`pytest -m 'core_model and cpu'` + Cobertura XML artifact).
+**L1 package coverage (CPU):** ready/merge Simple Test jobs run without `--cov`. Scheduled weekly on `main` with `WEEKLY=1` runs **Simple · CPU Coverage Test** in `.buildkite/cuda/test-weekly.yml` (`pytest -m 'core_model and cpu'` + Cobertura XML artifact).
 
 **Naming convention**: `coverage-<model_id>-<mode>-<step_id>.xml.gz`, where
 `<model_id>` is the model's directory name under
@@ -451,7 +451,7 @@ just confirming both files exist.
 | CUDA render | `python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/cuda/test-<level>.yml` |
 | No leaked uploader keys | Pipe the render into `grep -E 'mirror_hardwares\|source_file_dependencies'` — expect empty |
 | Skip-ci / upload unit tests | `pytest tests/buildkite/` |
-| Local job replay (CUDA L2+) | `tools/run_level2_jobs.sh`, `tools/run_level3_jobs.sh`, `tools/nightly/run_level4_jobs.sh` (read YAML from `cuda/`) |
+| Local job replay (CUDA L2+) | `tools/run_ready_jobs.sh`, `tools/run_merge_jobs.sh`, `tools/nightly/run_nightly_jobs.sh` (read YAML from `cuda/`) |
 
 ## Related documentation
 

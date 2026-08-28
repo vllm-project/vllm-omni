@@ -1,6 +1,6 @@
 ---
 name: vllm-omni-test
-description: Generate and run tests for vllm-project/vllm-omni with CI-aligned levels and markers; wire new tests into Buildkite (test-level2.yml for L1/L2, test-level3.yml for L3, test-level4.yml for L4). On completion, always provide copy-paste local and CI-like pytest commands plus prerequisites. Use when creating regression tests, adding L1-L4 coverage, selecting pytest markers, or validating fixes from issues/PRs.
+description: Generate and run tests for vllm-project/vllm-omni with CI-aligned levels and markers; wire new tests into Buildkite (test-ready.yml for L1/L2, test-merge.yml for L3, test-nightly.yml for L4). On completion, always provide copy-paste local and CI-like pytest commands plus prerequisites. Use when creating regression tests, adding L1-L4 coverage, selecting pytest markers, or validating fixes from issues/PRs.
 ---
 
 # vLLM-Omni Test Generator & Runner
@@ -9,7 +9,7 @@ description: Generate and run tests for vllm-project/vllm-omni with CI-aligned l
 
 Use this skill to generate minimal, stable test cases and run them with the correct marker/level strategy for [vllm-project/vllm-omni](https://github.com/vllm-project/vllm-omni).
 
-**Link convention:** Paths such as `.buildkite/` and `docs/contributing/` live at the **vllm-omni repo root**. Markdown links use repo-relative paths from this skill file (e.g. `../../../.buildkite/cuda/test-level2.yml`, `../../../docs/contributing/ci/test_system_overview.md`).
+**Link convention:** Paths such as `.buildkite/` and `docs/contributing/` live at the **vllm-omni repo root**. Markdown links use repo-relative paths from this skill file (e.g. `../../../.buildkite/cuda/test-ready.yml`, `../../../docs/contributing/ci/test_system_overview.md`).
 
 Default priorities:
 
@@ -55,18 +55,18 @@ Always attach markers deliberately:
 - **Hardware**: `cpu`, `gpu`, `cuda`, `rocm`, `npu`, `L4`, `H100`, `distributed_cuda`, …
 - Optional: `slow`, distributed markers when multi-card is required
 
-**Baseline smoke (L2 + L3):** The simplest e2e case per model — default deploy, minimal request — should usually carry **both** `@pytest.mark.core_model` and `@pytest.mark.advanced_model` on the **same** test function so `test-level2.yml` and `test-level3.yml` share one test. `send_*_request` picks validation depth from `--run-level`. References: `test_voxcpm2_tts.py::test_text_to_audio_001`, `test_qwen3_tts_customvoice.py::test_text_to_audio_001`. Heavier scenarios use **`advanced_model` only**; L4 expansion uses **`full_model`**.
+**Baseline smoke (L2 + L3):** The simplest e2e case per model — default deploy, minimal request — should usually carry **both** `@pytest.mark.core_model` and `@pytest.mark.advanced_model` on the **same** test function so `test-ready.yml` and `test-merge.yml` share one test. `send_*_request` picks validation depth from `--run-level`. References: `test_voxcpm2_tts.py::test_text_to_audio_001`, `test_qwen3_tts_customvoice.py::test_text_to_audio_001`. Heavier scenarios use **`advanced_model` only**; L4 expansion uses **`full_model`**.
 
 For hardware-aware tests, prefer `@hardware_test(...)` or `hardware_marks(...)` in `tests/helpers/mark.py`.
 
-**Diffusion nightly split** (`test-level4.yml`): all diffusion tests use `pytest.mark.diffusion`, but CI groups them by **output modality**, not by separate pytest markers:
+**Diffusion nightly split** (`test-nightly.yml`): all diffusion tests use `pytest.mark.diffusion`, but CI groups them by **output modality**, not by separate pytest markers:
 
 | Nightly group | Scope | Typical models / paths |
 |---------------|--------|-------------------------|
 | **Diffusion X2I(&A&T) Model Test** | x2**i** (image), x2**a** (audio), x2**t** (text) and other **non-video** diffusion | Qwen-Image*, BAGEL, FLUX, SD3, Z-Image, LongCat, DreamZero, … — `test_*_expansion.py` under X2I shards; L4 sweep uses `-k "not test_wan and not test_bagel_expansion and not hunyuan"` for L4 |
 | **Diffusion X2V Model Test** | x2**v** (video) only | Wan2.2, HunyuanVideo 1.5, Wan VACE, … — e.g. `test_wan22_expansion.py`, `test_hunyuan_video_15_expansion.py` |
 
-Wire new **video** diffusion expansion tests into the **X2V** group; wire **image/audio/text** diffusion expansion tests into **X2I(&A&T)**. Do not place x2v modules in X2I shards (see comment in `test-level4.yml` above the X2I group).
+Wire new **video** diffusion expansion tests into the **X2V** group; wire **image/audio/text** diffusion expansion tests into **X2I(&A&T)**. Do not place x2v modules in X2I shards (see comment in `test-nightly.yml` above the X2I group).
 
 ### Naming: generated test module files (L2–L4, model-centric e2e)
 
@@ -96,9 +96,9 @@ Existing references: `tests/e2e/offline_inference/test_qwen2_5_omni.py` (L2-styl
 |----------|------------------|---------------------------|---------------------------|
 | **Offline inference e2e** | `tests/e2e/offline_inference/` | **Module (default):** `omni_runner` + `offline_client`. **Function (isolation only):** `omni_runner_function` + `offline_client_function`. Diffusion/TTS may use `Omni(...).generate` directly | L2: `core_model` + **one of** `omni` / `tts` / `diffusion`; `@hardware_test(...)` when GPU/NPU is required |
 | **Online serving e2e** | `tests/e2e/online_serving/` | **Module (default):** `omni_server` + `online_client`. **Function (isolation only):** `omni_server_function` + `online_client_function`. Clients: `send_omni_request` (omni), `send_audio_speech_request` (tts), `send_diffusion_request` / `send_video_diffusion_request` / `send_images_generations_request` (diffusion) | Baseline smoke: **`core_model` + `advanced_model`**; heavier paths: `advanced_model` only; L4 expansion: `full_model` |
-| **Documentation / runnable examples** | `tests/examples/offline_inference/`, `tests/examples/online_serving/` | **Offline docs (preferred):** extract Python/Bash blocks from the doc README (e.g. `ReadmeSnippet.extract_readme_snippets`), `pytest.mark.parametrize` each snippet, run via `example_runner.run` with a stable `output_subfolder`. **Online docs:** copy client/request scripts into dedicated tests and keep them in sync with the doc page. | Usually **L4**: `advanced_model`, often `example` plus hardware marks matching the nightly docs-example job (see `.buildkite/cuda/test-level4.yml`). Full conventions: [docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md](../../../docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md) (introduced in [PR #1910](https://github.com/vllm-project/vllm-omni/pull/1910): naming, output directory layout, skip rules, avoid trimming `num_inference_steps` without a strong CI reason). |
-| **Performance / benchmark** | `tests/dfx/perf/tests/*.json` + `run_*_benchmark.py` | JSON or script-driven server + load config; assert explicit metrics / baselines | L4 Perf: JSON `mark` with `full_model` + `omni`/`tts`/`diffusion`; wire `test-level4.yml` Perf steps |
-| **Invalid parameter / negative HTTP validation** | `tests/dfx/reliability/invalid_param_test/` | Live `omni_server` + low-level `send_*_http_request` with `err_code` / `err_message` | `pytest.mark.slow` + `omni` / `tts` / `diffusion` + `@hardware_marks` (`H100` or `L4`); CI in **`test-level5.yml`** (not ready/merge/nightly) |
+| **Documentation / runnable examples** | `tests/examples/offline_inference/`, `tests/examples/online_serving/` | **Offline docs (preferred):** extract Python/Bash blocks from the doc README (e.g. `ReadmeSnippet.extract_readme_snippets`), `pytest.mark.parametrize` each snippet, run via `example_runner.run` with a stable `output_subfolder`. **Online docs:** copy client/request scripts into dedicated tests and keep them in sync with the doc page. | Usually **L4**: `advanced_model`, often `example` plus hardware marks matching the nightly docs-example job (see `.buildkite/cuda/test-nightly.yml`). Full conventions: [docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md](../../../docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md) (introduced in [PR #1910](https://github.com/vllm-project/vllm-omni/pull/1910): naming, output directory layout, skip rules, avoid trimming `num_inference_steps` without a strong CI reason). |
+| **Performance / benchmark** | `tests/dfx/perf/tests/*.json` + `run_*_benchmark.py` | JSON or script-driven server + load config; assert explicit metrics / baselines | L4 Perf: JSON `mark` with `full_model` + `omni`/`tts`/`diffusion`; wire `test-nightly.yml` Perf steps |
+| **Invalid parameter / negative HTTP validation** | `tests/dfx/reliability/invalid_param_test/` | Live `omni_server` + low-level `send_*_http_request` with `err_code` / `err_message` | `pytest.mark.slow` + `omni` / `tts` / `diffusion` + `@hardware_marks` (`H100` or `L4`); CI in **`test-weekly.yml`** (not ready/merge/nightly) |
 
 **If the user’s test plan includes invalid parameter validation / invalid params / negative HTTP / 400 validation:** do **not** add those `test_*` functions to `tests/e2e/online_serving/test_*.py` or `*_expansion.py`. **Move or author them** under `tests/dfx/reliability/invalid_param_test/` in the **endpoint-matching script** (see **Invalid parameter validation** below). Success-path e2e and invalid-param dfx tests must stay in separate modules.
 
@@ -114,7 +114,7 @@ After choosing offline/online/docs/perf, classify the **product under test** and
 | **Online client** | `online_client.send_omni_request` (chat completions, modalities) | `online_client.send_audio_speech_request` (`/v1/audio/speech`) | `send_diffusion_request` (chat/T2I), `send_video_diffusion_request` (`/v1/videos`, X2V), or `send_images_generations_http_request` / `send_images_edits_http_request` (DALL-E routes) |
 | **Typical assertions** | Stage outputs, text/audio keywords via `OfflineOmniClient` / response handler | WAV bytes, stream chunks, speech endpoint contract | Image/video dimensions, `final_output_type`, `assert_diffusion_response` |
 | **Deploy YAML** | Per-model deploy configs (`ci/qwen3_omni_moe.yaml`, …) | `qwen3_tts.yaml`, `voxcpm2.yaml`, … | Often default serve; parallel/offload YAML for heavy DiT |
-| **Nightly group** (`test-level4.yml`) | **Omni Model Test** — `-m "full_model and omni"` | **TTS Model Test** — `-m "full_model and tts"` | **Diffusion X2I(&A&T)** *or* **Diffusion X2V** (see Step 3 table; same `diffusion` marker, different YAML group / file shard) |
+| **Nightly group** (`test-nightly.yml`) | **Omni Model Test** — `-m "full_model and omni"` | **TTS Model Test** — `-m "full_model and tts"` | **Diffusion X2I(&A&T)** *or* **Diffusion X2V** (see Step 3 table; same `diffusion` marker, different YAML group / file shard) |
 | **L4 pressure** | Expansion per modality/model as needed | Expansion + accuracy/perf in TTS group | X2I: merge feature combos per [#1832](https://github.com/vllm-project/vllm-omni/issues/1832); X2V: separate nightly group |
 
 Do **not** mix fixtures across types (e.g. do not use `omni_runner` layout for a pure diffusion or TTS model without mirroring an in-tree test in that family).
@@ -124,7 +124,7 @@ Do **not** mix fixtures across types (e.g. do not use `omni_runner` layout for a
 - **X2I(&A&T)**: image / audio / text generation — Qwen-Image*, FLUX, SD3, Z-Image, BAGEL (expansion), LongCat, audio diffusion, etc.
 - **X2V**: video generation only — Wan2.2, HunyuanVideo 1.5, Wan VACE, LTX video similarity paths.
 
-When adding a new `test_*_expansion.py`, place it in the matching **nightly group** step (explicit file list in `test-level4.yml`), not only by marker expression.
+When adding a new `test_*_expansion.py`, place it in the matching **nightly group** step (explicit file list in `test-nightly.yml`), not only by marker expression.
 
 **2. Use the narrowest deterministic skeleton for the scenario**
 
@@ -461,7 +461,7 @@ When the user asks for **invalid parameter validation**, **invalid request bodie
 
 4. **Adding a new model** to invalid-param coverage: append a `pytest.param(OmniServerParams(model="...", stage_config_path=..., server_args=...), ...)` entry to the script’s `_PARAMS` list — do **not** create `test_invalid_<model>.py` unless the route is new.
 
-5. **CI — `.buildkite/cuda/test-level5.yml` only** (not `test-level2.yml` / `test-level3.yml` / `test-level4.yml`):
+5. **CI — `.buildkite/cuda/test-weekly.yml` only** (not `test-ready.yml` / `test-merge.yml` / `test-nightly.yml`):
 
 | Weekly step | Command | When your cases run |
 |-------------|---------|---------------------|
@@ -579,7 +579,7 @@ Implementation strategy:
 
 #### L4 nightly sub-pillars — Function vs Accuracy vs Perf
 
-**L4 is not only `test_*_expansion.py`.** In `test-level4.yml`, each model-type group typically runs **separate jobs**:
+**L4 is not only `test_*_expansion.py`.** In `test-nightly.yml`, each model-type group typically runs **separate jobs**:
 
 | Sub-pillar | Nightly step label pattern | What you add | Typical paths |
 |------------|----------------------------|--------------|---------------|
@@ -588,7 +588,7 @@ Implementation strategy:
 | **Perf** | `· Perf Test · <Model>` | Throughput / latency / memory benchmarks | `tests/dfx/perf/tests/test_<model>_vllm_omni.json` + runner script |
 | **Doc** (optional) | `· Doc Test` | Runnable doc examples | `tests/examples/*/test_text_to_image.py`, … |
 
-**Default when the user asks for “L4 functional cases”:** deliver **Function** pillar only (`*_expansion.py` + Function Test shard in `test-level4.yml`). **Do not** silently add Perf or Accuracy unless the user also asks for **performance** / **benchmark** / **accuracy** / **full L4** / **full L4 coverage**.
+**Default when the user asks for “L4 functional cases”:** deliver **Function** pillar only (`*_expansion.py` + Function Test shard in `test-nightly.yml`). **Do not** silently add Perf or Accuracy unless the user also asks for **performance** / **benchmark** / **accuracy** / **full L4** / **full L4 coverage**.
 
 **When the user explicitly asks for L4 perf (or full L4 including perf):**
 
@@ -603,7 +603,7 @@ Implementation strategy:
 | **TTS** | `tests/dfx/perf/scripts/run_benchmark.py` | `tests/dfx/perf/tests/test_tts.json` (shared) or `test_{slug}.json` (dedicated; use when the model must not join the shared nightly matrix before integration — e.g. `test_voxcpm2.json`, `test_coqui_tts.json`) |
 | **Omni** | `tests/dfx/perf/scripts/run_benchmark.py` | `test_qwen3_omni_no_async_chunk.json`, `test_qwen3_omni_async_chunk.json`, `test_qwen3_omni_vllm_text.json`, `test_qwen3_omni_multi_replicas.json` |
 
-5. Wire **`test-level4.yml` · Perf Test** step for that model (separate from Function Test): export `DIFFUSION_BENCHMARK_DIR` / `BENCHMARK_DIR`, run pytest on the script with **`--test-config-file`** (nightly perf steps do not use `-m`), **upload artifacts** (`buildkite-agent artifact upload`), often **multi-GPU H100** for diffusion perf.
+5. Wire **`test-nightly.yml` · Perf Test** step for that model (separate from Function Test): export `DIFFUSION_BENCHMARK_DIR` / `BENCHMARK_DIR`, run pytest on the script with **`--test-config-file`** (nightly perf steps do not use `-m`), **upload artifacts** (`buildkite-agent artifact upload`), often **multi-GPU H100** for diffusion perf.
 6. **One benchmark scenario → one `test_name` block** in JSON (same spirit as one `test_*` per function case). Combine server `serve_args` + workload in one entry; use multiple `benchmark_params` rows for size/step sweeps under the same server config.
 
 **Perf local commands:**
@@ -630,23 +630,23 @@ If the test is not already collected by an existing pipeline command (for exampl
 
 | Test level | Edit this file | Typical trigger / intent |
 |------------|----------------|---------------------------|
-| **L1** and **L2** | [`.buildkite/cuda/test-level2.yml`](../../../.buildkite/cuda/test-level2.yml) | PR **ready** label; L1 CPU + L2 GPU/basic e2e (steps labeled **Omni ·**, **TTS ·**, **Diffusion ·**) |
-| **L3** | [`.buildkite/cuda/test-level3.yml`](../../../.buildkite/cuda/test-level3.yml) | Post-merge; `advanced_model` integration per model type |
-| **L4** | [`.buildkite/cuda/test-level4.yml`](../../../.buildkite/cuda/test-level4.yml) | Nightly; grouped by model type (see below) |
-| **Invalid param / reliability (weekly)** | [`.buildkite/cuda/test-level5.yml`](../../../.buildkite/cuda/test-level5.yml) | Weekly; `tests/dfx/reliability/invalid_param_test/` — **not** L1–L4 e2e pipelines |
+| **L1** and **L2** | [`.buildkite/cuda/test-ready.yml`](../../../.buildkite/cuda/test-ready.yml) | PR **ready** label; L1 CPU + L2 GPU/basic e2e (steps labeled **Omni ·**, **TTS ·**, **Diffusion ·**) |
+| **L3** | [`.buildkite/cuda/test-merge.yml`](../../../.buildkite/cuda/test-merge.yml) | Post-merge; `advanced_model` integration per model type |
+| **L4** | [`.buildkite/cuda/test-nightly.yml`](../../../.buildkite/cuda/test-nightly.yml) | Nightly; grouped by model type (see below) |
+| **Invalid param / reliability (weekly)** | [`.buildkite/cuda/test-weekly.yml`](../../../.buildkite/cuda/test-weekly.yml) | Weekly; `tests/dfx/reliability/invalid_param_test/` — **not** L1–L4 e2e pipelines |
 
 **Level-specific Buildkite delivery (follow the user’s requested level):**
 
 | User asks for | Document / edit **only** | Do **not** add by default |
 |---------------|---------------------------|---------------------------|
-| **L4** (`*_expansion.py`, `full_model`) | `test-level4.yml` — append file to the matching nightly shard (X2I / X2V / Omni / TTS) **or** note it is already collected by an existing `-m` / `-k` sweep | `test-level3.yml` (L3 / `advanced_model`) or `test-level2.yml` (L2) |
-| **L3** | `test-level3.yml` with `advanced_model` + `source_file_dependencies` | `test-level4.yml` unless user also wants nightly |
-| **L2** | `test-level2.yml` with `core_model` + `source_file_dependencies` | merge / nightly pipelines |
-| **Invalid param** | `test-level5.yml` — **Invalid parameters Test** group (`-m "slow and H100"` / `-m "slow and L4"`). Usually **no YAML edit** when appending cases to existing `invalid_param_test` scripts | `test-level2.yml`, `test-level3.yml`, `test-level4.yml` |
+| **L4** (`*_expansion.py`, `full_model`) | `test-nightly.yml` — append file to the matching nightly shard (X2I / X2V / Omni / TTS) **or** note it is already collected by an existing `-m` / `-k` sweep | `test-merge.yml` (L3 / `advanced_model`) or `test-ready.yml` (L2) |
+| **L3** | `test-merge.yml` with `advanced_model` + `source_file_dependencies` | `test-nightly.yml` unless user also wants nightly |
+| **L2** | `test-ready.yml` with `core_model` + `source_file_dependencies` | merge / nightly pipelines |
+| **Invalid param** | `test-weekly.yml` — **Invalid parameters Test** group (`-m "slow and H100"` / `-m "slow and L4"`). Usually **no YAML edit** when appending cases to existing `invalid_param_test` scripts | `test-ready.yml`, `test-merge.yml`, `test-nightly.yml` |
 
-`test-level4.yml` shards use **explicit pytest file paths** in `commands` (and PR labels like `diffusion-x2iat-test`); they generally **do not** use `source_file_dependencies`. Only suggest merge/ready YAML when the requested level is L3/L2 (or the user explicitly asks for multi-level CI).
+`test-nightly.yml` shards use **explicit pytest file paths** in `commands` (and PR labels like `diffusion-x2iat-test`); they generally **do not** use `source_file_dependencies`. Only suggest merge/ready YAML when the requested level is L3/L2 (or the user explicitly asks for multi-level CI).
 
-**`test-level4.yml` top-level groups** (each uses `full_model` + type marker in pytest `-m`):
+**`test-nightly.yml` top-level groups** (each uses `full_model` + type marker in pytest `-m`):
 
 | Group | Type marker | Notes |
 |-------|-------------|--------|
@@ -657,15 +657,15 @@ If the test is not already collected by an existing pipeline command (for exampl
 
 Guidelines when editing YAML:
 
-- **Match markers and `--run-level`** to the test: L1/L2 in `test-level2.yml` use `core_model` + `omni` / `tts` / `diffusion` as appropriate; L3 merge uses `advanced_model`; L4 nightly uses `full_model` with the same type marker.
+- **Match markers and `--run-level`** to the test: L1/L2 in `test-ready.yml` use `core_model` + `omni` / `tts` / `diffusion` as appropriate; L3 merge uses `advanced_model`; L4 nightly uses `full_model` with the same type marker.
 - **Diffusion L4**: add x2i/x2a/x2t expansion files to an **X2I(&A&T)** step; add x2v expansion files to **X2V** — never rely on a broad `tests/e2e/` sweep alone (shards exist to save GPU and avoid wrong queue).
-- **`source_file_dependencies` (required for new E2E jobs in `test-level2.yml` and `test-level3.yml`)**: every step under the **`:card_index_dividers: E2E Test`** group **must** declare `source_file_dependencies` so Buildkite only schedules the job when relevant paths change. Omitting it breaks path-based CI skipping for GPU e2e jobs.
+- **`source_file_dependencies` (required for new E2E jobs in `test-ready.yml` and `test-merge.yml`)**: every step under the **`:card_index_dividers: E2E Test`** group **must** declare `source_file_dependencies` so Buildkite only schedules the job when relevant paths change. Omitting it breaks path-based CI skipping for GPU e2e jobs.
 - **Reuse or extend an existing step** when the new test shares the same marker expression, queue, and timeout; otherwise add a new `steps:` entry with the correct `agents.queue`, `timeout_in_minutes`, and docker/kubernetes plugin blocks consistent with neighboring jobs.
-- **Job timeout — use `timeout_in_minutes` on the step, not `timeout` before pytest**: when adding or documenting a new E2E job in `test-level2.yml` / `test-level3.yml`, set `timeout_in_minutes` on the step and run `pytest` directly in `commands`. **Do not** wrap pytest in `timeout 40m bash -c "..."` / `timeout 20m bash -c "..."`; Buildkite already enforces the step deadline via `timeout_in_minutes`.
+- **Job timeout — use `timeout_in_minutes` on the step, not `timeout` before pytest**: when adding or documenting a new E2E job in `test-ready.yml` / `test-merge.yml`, set `timeout_in_minutes` on the step and run `pytest` directly in `commands`. **Do not** wrap pytest in `timeout 40m bash -c "..."` / `timeout 20m bash -c "..."`; Buildkite already enforces the step deadline via `timeout_in_minutes`.
 - **Never omit `plugins` in skill examples or PR YAML snippets**: H100 E2E steps on `mithril-h100-pool` use the full `kubernetes` block (`resources`, `volumeMounts`, `env` with `HF_TOKEN` secret, `nodeSelector: gpu-h100-sxm`, `devshm` + `hf-cache` volumes). L4/docker steps on `gpu_1_queue` use the full `docker#v5.2.0` block (`shm-size`, `HF_HOME`, volumes). Do not write `# ... plugins unchanged` — paste the complete block from a sibling step.
 - **Platform forks** (e.g. AMD-ready / AMD-merge) live alongside these files; apply the same level → file mapping for those pipelines when the test is platform-specific.
 
-#### `source_file_dependencies` for E2E Test jobs (`test-level2.yml`, `test-level3.yml`)
+#### `source_file_dependencies` for E2E Test jobs (`test-ready.yml`, `test-merge.yml`)
 
 When adding or splitting a step inside the **E2E Test** group, **always** include `source_file_dependencies` on that step. List paths the job actually depends on — at minimum:
 
@@ -675,7 +675,7 @@ When adding or splitting a step inside the **E2E Test** group, **always** includ
 4. **Deploy / stage YAML** — `vllm_omni/deploy/<config>.yaml` or `vllm_omni/deploy/ci/<config>.yaml` referenced by the test’s `OmniServerParams` / `get_deploy_config_path(...)`.
 5. **Test helpers** (when changed in the same PR) — `tests/helpers/runtime.py` for new `send_*` client methods; `tests/helpers/assertions.py` for new shared `assert_*` helpers.
 
-Use **repo-relative paths** (no leading `./`). Prefer **directory** entries (`.../models/bagel/`) when the whole package matters; use **file** entries for single test modules and YAML configs. Mirror a neighboring step for the same model family (e.g. **Diffusion · Bagel Test** in `test-level2.yml`).
+Use **repo-relative paths** (no leading `./`). Prefer **directory** entries (`.../models/bagel/`) when the whole package matters; use **file** entries for single test modules and YAML configs. Mirror a neighboring step for the same model family (e.g. **Diffusion · Bagel Test** in `test-ready.yml`).
 
 **Example** (L2 ready — diffusion online smoke, H100 kubernetes):
 
@@ -812,19 +812,19 @@ When extending an **existing** E2E step to run an additional test file, **append
 
 #### L3 / L4: validating Buildkite from a feature branch (`cuda/pipeline.yml`)
 
-Production behavior is driven by [`.buildkite/cuda/pipeline.yml`](../../../.buildkite/cuda/pipeline.yml): it builds the CI image, then uploads **L2** (`test-level2.yml` on non-`main`), **L3** (`test-level3.yml` when `build.branch == "main"`), and **L4** (`test-level4.yml` when `build.env("NIGHTLY") == "1"`).
+Production behavior is driven by [`.buildkite/cuda/pipeline.yml`](../../../.buildkite/cuda/pipeline.yml): it builds the CI image, then uploads **L2** (`test-ready.yml` on non-`main`), **L3** (`test-merge.yml` when `build.branch == "main"`), and **L4** (`test-nightly.yml` when `build.env("NIGHTLY") == "1"`).
 
 When you add or debug **L3** or **L4** tests and need those child pipelines to run **off `main`** or **without** `NIGHTLY=1`, apply **temporary** edits (revert before merge):
 
 1. **Point the upload at the right file (optional shortcut)**  
-   In the **Upload Level2 Pipeline** step, the command is `buildkite-agent pipeline upload .buildkite/cuda/test-level2.yml`. For a one-off run you may change that path to `.buildkite/cuda/test-level3.yml` (L3) or `.buildkite/cuda/test-level4.yml` (L4), and adjust the step’s `if:` so it does not conflict with the other upload steps (avoid double-uploading unless intentional).
+   In the **Upload Ready Pipeline** step, the command is `buildkite-agent pipeline upload .buildkite/cuda/test-ready.yml`. For a one-off run you may change that path to `.buildkite/cuda/test-merge.yml` (L3) or `.buildkite/cuda/test-nightly.yml` (L4), and adjust the step’s `if:` so it does not conflict with the other upload steps (avoid double-uploading unless intentional).
 
 2. **L3 — merge pipeline**  
-   The gate `if: build.branch == "main"` lives on the **Upload Level3 Pipeline** step in `cuda/pipeline.yml` (not inside `test-level3.yml`). **Comment out that `if` line** so `test-level3.yml` is uploaded on your feature branch. Alternatively rely on step (1) instead of the dedicated merge upload step.
+   The gate `if: build.branch == "main"` lives on the **Upload Merge Pipeline** step in `cuda/pipeline.yml` (not inside `test-merge.yml`). **Comment out that `if` line** so `test-merge.yml` is uploaded on your feature branch. Alternatively rely on step (1) instead of the dedicated merge upload step.
 
 3. **L4 — nightly pipeline**  
-   **Comment out** `if: build.env("NIGHTLY") == "1"` on the **Upload Level4 Pipeline** step in `cuda/pipeline.yml` so the nightly definition is uploaded without setting the env var.  
-   Child steps in [`test-level4.yml`](../../../.buildkite/cuda/test-level4.yml) often repeat `if: build.env("NIGHTLY") == "1"`; **comment out those lines on the steps you need to run**, otherwise they will still be skipped after upload.
+   **Comment out** `if: build.env("NIGHTLY") == "1"` on the **Upload Nightly Pipeline** step in `cuda/pipeline.yml` so the nightly definition is uploaded without setting the env var.  
+   Child steps in [`test-nightly.yml`](../../../.buildkite/cuda/test-nightly.yml) often repeat `if: build.env("NIGHTLY") == "1"`; **comment out those lines on the steps you need to run**, otherwise they will still be skipped after upload.
 
 ### Step 6: Run Tests
 
@@ -851,7 +851,7 @@ Full templates live in [references/test-routing.md](references/test-routing.md).
 | **Invalid param (weekly L4)** | `pytest -s -v dfx/reliability/invalid_param_test/ -m "slow and L4"` |
 | **L1 CPU** | `pytest -s -v -m "core_model and cpu"` |
 
-**Prerequisites to mention when relevant**: GPU model (e.g. L4 vs H100), `HF_HOME` / token for hub weights, module-level `skipif` (NPU/XPU-only gaps), and whether CI already collects the path (e.g. `test_*_expansion.py` glob in `test-level4.yml`).
+**Prerequisites to mention when relevant**: GPU model (e.g. L4 vs H100), `HF_HOME` / token for hub weights, module-level `skipif` (NPU/XPU-only gaps), and whether CI already collects the path (e.g. `test_*_expansion.py` glob in `test-nightly.yml`).
 
 ### Step 7: Validate Result Quality
 
@@ -874,12 +874,12 @@ When completing a request, return:
 1. **Test plan** (level, markers, file target, **L4 pillar(s)** if applicable: Function / Accuracy / Perf / Doc; **or** **Invalid param** pillar with target `invalid_param_test/test_invalid_<area>.py`; module basename for e2e: `test_{slug}.py` / `test_{slug}_expansion.py`)
 2. **Generated/updated test file(s)** — model-specific constants and request payloads stay **inside** those test modules (**never** `tests/helpers/{slug}.py`). Extend **`tests/helpers/runtime.py`** / **`tests/helpers/assertions.py`** only when new **repo-wide** `send_*` or shared assert helpers are required (do not leave ad-hoc HTTP or `_assert_*` in test modules). **If L4 Perf was requested**, also list **`tests/dfx/perf/tests/*.json`**. **If invalid-param cases were requested**, list the **`invalid_param_test/` script** and parametrized `test_*` / new `id=` rows — **not** e2e paths.
 3. **Buildkite change** — **match the requested level and pillar**:
-   - **L4 Function**: `test-level4.yml` **Function Test** shard (file list / note existing sweep). **No** `test-level3.yml` unless user also asked for L3.
-   - **L4 Perf**: `test-level4.yml` **Perf Test · &lt;Model&gt;** step (new step or extend commands); include env exports + artifact upload pattern from a sibling perf job.
-   - **L4 Accuracy**: `test-level4.yml` **Accuracy Test** step under the same model-type group.
-   - **L3**: `test-level3.yml` + full `source_file_dependencies` + `agents` + `plugins`.
-   - **L2**: `test-level2.yml` + same E2E block requirements.
-   - **Invalid param**: `test-level5.yml` — note **Invalid parameters Test · H100/L4** group; usually **no YAML change** when only extending existing scripts.
+   - **L4 Function**: `test-nightly.yml` **Function Test** shard (file list / note existing sweep). **No** `test-merge.yml` unless user also asked for L3.
+   - **L4 Perf**: `test-nightly.yml` **Perf Test · &lt;Model&gt;** step (new step or extend commands); include env exports + artifact upload pattern from a sibling perf job.
+   - **L4 Accuracy**: `test-nightly.yml` **Accuracy Test** step under the same model-type group.
+   - **L3**: `test-merge.yml` + full `source_file_dependencies` + `agents` + `plugins`.
+   - **L2**: `test-ready.yml` + same E2E block requirements.
+   - **Invalid param**: `test-weekly.yml` — note **Invalid parameters Test · H100/L4** group; usually **no YAML change** when only extending existing scripts.
    If the user asked only for **L4 functional cases**, state explicitly that **Perf / Accuracy / Invalid param** were not included (offer to add if needed). If the plan mixes **success e2e** and **invalid param**, split deliverables across e2e vs `invalid_param_test/` and call out both CI files.
 4. **Run commands (required)** — always include, in fenced `bash` blocks:
    - **Local — whole file**: `cd tests` then `pytest -s -v <path> …`
@@ -891,5 +891,5 @@ When completing a request, return:
 ## Additional Resources
 
 - Marker and command routing: [references/test-routing.md](references/test-routing.md)
-- CI pipelines (vllm-omni): [test-level2.yml](../../../.buildkite/cuda/test-level2.yml) (L1/L2), [test-level3.yml](../../../.buildkite/cuda/test-level3.yml) (L3), [test-level4.yml](../../../.buildkite/cuda/test-level4.yml) (L4), [test-level5.yml](../../../.buildkite/cuda/test-level5.yml) (invalid param / reliability)
+- CI pipelines (vllm-omni): [test-ready.yml](../../../.buildkite/cuda/test-ready.yml) (L1/L2), [test-merge.yml](../../../.buildkite/cuda/test-merge.yml) (L3), [test-nightly.yml](../../../.buildkite/cuda/test-nightly.yml) (L4), [test-weekly.yml](../../../.buildkite/cuda/test-weekly.yml) (invalid param / reliability)
 - L4 documentation example tests (naming, extraction vs copied scripts, output dirs, skips): [docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md](../../../docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md) — see also [PR #1910](https://github.com/vllm-project/vllm-omni/pull/1910)
