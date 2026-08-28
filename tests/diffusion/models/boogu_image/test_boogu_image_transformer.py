@@ -172,6 +172,23 @@ def test_real_rotary_frequency_tables_use_float32_on_npu(monkeypatch):
     assert all(freqs.dtype == torch.float32 for pair in freqs_real for freqs in pair)
 
 
+def test_real_rotary_frequency_tables_use_float32_on_mps(monkeypatch):
+    from vllm_omni.diffusion.models.boogu_image import boogu_image_transformer
+
+    platform = SimpleNamespace(
+        is_npu=lambda: False,
+        supports_float64=lambda: True,
+    )
+    monkeypatch.setattr(boogu_image_transformer, "current_omni_platform", platform)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+
+    freqs_real = boogu_image_transformer.BooguImageDoubleStreamRotaryPosEmbed.get_freqs_real(
+        AXES_DIM_ROPE, AXES_LENS, theta=10000
+    )
+
+    assert all(freqs.dtype == torch.float32 for pair in freqs_real for freqs in pair)
+
+
 def test_single_stream_block_shape():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageTransformerBlock,

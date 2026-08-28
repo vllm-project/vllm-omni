@@ -213,10 +213,15 @@ class BooguImageDoubleStreamRotaryPosEmbed(nn.Module):
         freqs_real = []
         # Ascend supports real-valued gather but float32 avoids routing the
         # entire RoPE path through slower and less broadly supported float64
-        # kernels. Other platforms retain the previous precision where valid.
+        # kernels. MPS also requires float32 because it does not support
+        # float64. Other platforms retain the previous precision where valid.
         freqs_dtype = (
             torch.float32
-            if current_omni_platform.is_npu() or not current_omni_platform.supports_float64()
+            if (
+                current_omni_platform.is_npu()
+                or not current_omni_platform.supports_float64()
+                or torch.backends.mps.is_available()
+            )
             else torch.float64
         )
         for d, e in zip(axes_dim, axes_lens):
