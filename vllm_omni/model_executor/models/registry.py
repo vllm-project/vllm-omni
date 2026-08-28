@@ -425,11 +425,6 @@ _OMNI_MODELS = {
         "qwen3_vl",
         "AuraQwen3VLForConditionalGeneration",
     ),
-    "MageVLForConditionalGeneration": (
-        "mage_vl",
-        "mage_vl",
-        "MageVLForConditionalGeneration",
-    ),
     ## MiniMax-Music3 (text-to-music; AR talker -> flow-matching acoustic decoder)
     "MiniMaxMusic3TalkerForConditionalGeneration": (
         "minimax_music3",

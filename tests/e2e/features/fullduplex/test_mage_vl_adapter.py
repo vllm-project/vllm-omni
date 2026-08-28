@@ -31,10 +31,10 @@ def _collector():
     return out, emit
 
 
-def test_mage_vl_capabilities_include_codec_windows():
+def test_mage_vl_capabilities_match_backend_contract():
     capabilities = MageVLDuplexAdapter().capabilities()
 
-    assert {"codec_window", "image", "text", "video"} <= capabilities.input_modalities
+    assert capabilities.input_modalities == frozenset({"text", "video"})
     assert capabilities.output_modalities == frozenset({"text"})
     assert capabilities.proactive
 
@@ -51,7 +51,7 @@ async def test_mage_vl_proactive_gate_speaks_once_for_event():
     session = DuplexSession(
         "mage",
         DuplexSessionConfig(
-            input_modalities=("video", "codec_window", "text"),
+            input_modalities=("video", "text"),
             output_modalities=("text",),
             proactive=True,
         ),
@@ -107,7 +107,7 @@ async def test_mage_vl_query_bypasses_silent_gate_and_preserves_codec_metadata()
                 {"type": ev.INPUT_APPEND, "modality": "text", "data": "What changed?"},
                 {
                     "type": ev.INPUT_APPEND,
-                    "modality": "codec_window",
+                    "modality": "video",
                     "data": {
                         "kind": "h264",
                         "segment_id": "seg-7",

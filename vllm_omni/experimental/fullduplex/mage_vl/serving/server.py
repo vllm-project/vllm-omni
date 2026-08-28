@@ -68,6 +68,9 @@ class _MageVLServingRuntime:
                 elif event_type == event_protocol.PLAYBACK_ACK:
                     await self.adapter.on_playback_ack(self.session, int(event.get("cursor", 0)))
                 elif event_type == event_protocol.CLOSE:
+                    await self.adapter.flush(self.session)
+                    if self.session.config.proactive and self.adapter.should_respond(self.session):
+                        await self._start_response(emit)
                     graceful_close = True
                     break
         finally:
@@ -76,7 +79,7 @@ class _MageVLServingRuntime:
                 await task
             else:
                 await self.cancel_response()
-            self.adapter.close_session(self.session)
+            await self.adapter.on_close(self.session)
             self.session.state = DuplexState.CLOSED
             self._closed = True
 
@@ -99,7 +102,7 @@ class _MageVLServingRuntime:
         if self._closed:
             return
         await self.cancel_response()
-        self.adapter.close_session(self.session)
+        await self.adapter.on_close(self.session)
         self.session.state = DuplexState.CLOSED
         self._closed = True
 

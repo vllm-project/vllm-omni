@@ -120,15 +120,16 @@ class MageVLTransformersBackend:
                 # Cancelling an asyncio wrapper cannot stop a CUDA worker thread.
                 # Retain the lock until it really exits so a replacement request
                 # cannot race the same shared model.
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(Exception, asyncio.CancelledError):
                     await worker
                 raise
 
     def _gate_sync(self, windows: Sequence[MageVLCodecWindow]) -> float:
         import torch
 
-        prepared = [self._prepare(window, _STREAMING_PROMPT) for window in windows]
+        prepared: list[tuple[dict[str, Any], Path | None]] = []
         try:
+            prepared = [self._prepare(window, _STREAMING_PROMPT) for window in windows]
             visual = [self._gate_inputs(item[0]) for item in prepared]
             with torch.inference_mode():
                 logits = self.model.streammind_gate_forward_segments(visual)[0]

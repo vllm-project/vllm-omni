@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -71,6 +72,8 @@ class MageVLDuplexAdapter(DuplexAdapter):
             raise ValueError("window_size must be positive")
         if max_windows <= 0:
             raise ValueError("max_windows must be positive")
+        if window_size > max_windows:
+            raise ValueError("window_size cannot exceed max_windows")
         self._gate = gate
         self._generate = generate
         self._window_size = window_size
@@ -83,7 +86,9 @@ class MageVLDuplexAdapter(DuplexAdapter):
 
     def capabilities(self) -> DuplexCapability:
         return DuplexCapability(
-            input_modalities=frozenset({"codec_window", "image", "text", "video"}),
+            # The production Transformers backend currently consumes encoded
+            # video windows.  Do not advertise modalities it cannot materialize.
+            input_modalities=frozenset({"text", "video"}),
             output_modalities=frozenset({self._output_modality}),
             proactive=True,
         )
@@ -100,7 +105,7 @@ class MageVLDuplexAdapter(DuplexAdapter):
         state.windows.append(window)
         if len(state.windows) > self._max_windows:
             del state.windows[: len(state.windows) - self._max_windows]
-        await self._evaluate_gate(session)
+        self._schedule_gate(session)
 
     def should_respond(self, session: DuplexSession) -> bool:
         state = self._state_for(session)
@@ -128,6 +133,19 @@ class MageVLDuplexAdapter(DuplexAdapter):
         state = self._state_for(session)
         state.pending_query = None
         state.pending_gate = None
+        for task in tuple(state.gate_tasks):
+            task.cancel()
+
+    async def on_close(self, session: DuplexSession) -> None:
+        state = self._session_state.get(session.session_id)
+        if state is not None and state.gate_tasks:
+            await asyncio.gather(*tuple(state.gate_tasks), return_exceptions=True)
+        self._session_state.pop(session.session_id, None)
+
+    async def flush(self, session: DuplexSession) -> None:
+        state = self._session_state.get(session.session_id)
+        if state is not None and state.gate_tasks:
+            await asyncio.gather(*tuple(state.gate_tasks), return_exceptions=True)
 
     def close_session(self, session: DuplexSession) -> None:
         """Release all mutable state owned by a disconnected session."""
@@ -148,6 +166,14 @@ class MageVLDuplexAdapter(DuplexAdapter):
             state.seen_events.add(decision.event_id)
         state.pending_gate = decision
 
+    def _schedule_gate(self, session: DuplexSession) -> None:
+        state = self._state_for(session)
+        if self._gate is None or len(state.windows) < self._window_size:
+            return
+        task = asyncio.create_task(self._evaluate_gate(session))
+        state.gate_tasks.add(task)
+        task.add_done_callback(state.gate_tasks.discard)
+
     def _state_for(self, session: DuplexSession) -> _MageVLSessionState:
         return self._session_state.setdefault(session.session_id, _MageVLSessionState())
 
@@ -158,6 +184,7 @@ class _MageVLSessionState:
     pending_query: str | None = None
     pending_gate: MageVLGateDecision | None = None
     seen_events: set[str] = field(default_factory=set)
+    gate_tasks: set[asyncio.Task[None]] = field(default_factory=set)
 
 
 def _coerce_window(modality: str, data: Any) -> MageVLCodecWindow:

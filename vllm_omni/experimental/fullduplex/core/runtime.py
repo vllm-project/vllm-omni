@@ -44,9 +44,13 @@ class DuplexRuntime:
             elif etype == ev.PLAYBACK_ACK:
                 await self.adapter.on_playback_ack(self.session, int(event.get("cursor", 0)))
             elif etype == ev.CLOSE:
+                await self.adapter.flush(self.session)
+                if self.session.config.proactive and self.adapter.should_respond(self.session):
+                    task = await self._start_response(task, emit)
                 break
         if task is not None and not task.done():
             await task
+        await self.adapter.on_close(self.session)
         self.session.state = DuplexState.CLOSED
 
     async def _start_response(self, prev: asyncio.Task | None, emit: Emit) -> asyncio.Task:
