@@ -53,6 +53,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
+# Blocking-wait interval for the event-driven final-output drain
+# (VLLM_OMNI_EVENT_DRIVEN_ORCH=1): a message wakes the drain immediately via
+# the janus queue's condition variable; this timeout only bounds how often the
+# orchestrator liveness check runs while the pipeline is idle.
+_FINAL_OUTPUT_BLOCKING_WAIT_S = 1.0
 
 
 class AsyncEventResolver:
@@ -645,12 +650,12 @@ class AsyncOmni(EngineClient, OmniBase):
         except (asyncio.CancelledError, GeneratorExit):
             if input_stream_task is not None and not input_stream_task.done():
                 input_stream_task.cancel()
-            self._fire_failure_counter_if_alive(request_id)
+            self._record_request_failure_once(request_id, reason="client_disconnect")
             await self._abort_internal_requests(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
         except Exception as e:
-            self._fire_failure_counter_if_alive(request_id)
+            self._record_request_failure_once(request_id, reason="stage_error")
             await self._abort_internal_requests(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
@@ -880,14 +885,29 @@ class AsyncOmni(EngineClient, OmniBase):
 
         engine = self.engine
 
+        # Event-driven drain (VLLM_OMNI_EVENT_DRIVEN_ORCH=1): block on the
+        # queue's condition variable in a dedicated thread instead of the
+        # get_nowait + 1 ms sleep cadence. Same flag as the orchestrator-side
+        # event-driven loop (vllm_omni/engine/orchestrator.py).
+        from vllm_omni.engine.orchestrator import _event_driven_orch_enabled
+
+        event_driven_drain = _event_driven_orch_enabled() and hasattr(engine, "get_output_blocking_async")
+
         async def _final_output_loop():
             """Background coroutine that dispatches final outputs to request queues."""
             try:
                 while True:
-                    msg = await engine.try_get_output_async()
-                    if msg is None:
-                        await asyncio.sleep(_FINAL_OUTPUT_IDLE_SLEEP_S)
-                        continue
+                    if event_driven_drain:
+                        msg = await engine.get_output_blocking_async(timeout=_FINAL_OUTPUT_BLOCKING_WAIT_S)
+                        if msg is None:
+                            # Timed out with the orchestrator alive; loop for
+                            # the periodic liveness check.
+                            continue
+                    else:
+                        msg = await engine.try_get_output_async()
+                        if msg is None:
+                            await asyncio.sleep(_FINAL_OUTPUT_IDLE_SLEEP_S)
+                            continue
 
                     if isinstance(msg, dict) and msg.get("type") == "ack":
                         ack_data = msg.get("ack")
@@ -1115,6 +1135,7 @@ class AsyncOmni(EngineClient, OmniBase):
         """
         await self.engine.abort_async(request_ids)
         for rid in request_ids:
+            self._record_request_failure_once(rid, reason="client_abort")
             state = self.request_states.pop(rid, None)
             input_stream_task = getattr(state, "input_stream_task", None)
             if input_stream_task is not None and not input_stream_task.done():

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import contextlib
 import io
@@ -16,7 +19,6 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 import numpy as np
@@ -31,6 +33,7 @@ from vllm.benchmarks.lib.endpoint_request_func import (
     RequestFuncOutput,
     StreamedResponseHandler,
     _get_chat_content,
+    _get_headers,
     _update_headers_common,
     _update_payload_common,
     _validate_api_url,
@@ -46,6 +49,13 @@ from vllm_omni.benchmarks.data_modules.daily_omni_dataset import (
     daily_omni_local_videos_dir,
     resolve_daily_omni_local_root,
 )
+from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
+    DEFAULT_OMNIINTERACT_REPO,
+    OmniInteractDataset,
+    OmniInteractPreparedInput,
+    OmniInteractSampleRequest,
+    OmniInteractSessionOptions,
+)
 from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRandomMultiModalDataset
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
@@ -56,8 +66,27 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
 )
 from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDataset
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
+from vllm_omni.benchmarks.omniinteract import (
+    VIDEO_FPS,
+    OmniInteractBenchmarkConfig,
+    OmniInteractCaseResult,
+    clear_batch_artifacts,
+    clear_case_artifacts,
+    prepare_media,
+    publish_deferred_case_artifacts,
+    run_omniinteract_case,
+    write_failure_artifacts,
+)
+from vllm_omni.benchmarks.omniinteract import (
+    benchmark_summary as omniinteract_benchmark_summary,
+)
+from vllm_omni.benchmarks.omniinteract import (
+    write_batch_artifacts as write_omniinteract_batch_artifacts,
+)
 from vllm_omni.experimental.fullduplex.client import (
     RealtimeDuplexClient,
+    build_realtime_url,
+    reference_audio_data_url,
     summarize_session_request_metrics,
     wait_for,
 )
@@ -221,6 +250,91 @@ def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFu
     rfi.extra_body = base
 
 
+def _attach_omniinteract_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
+    if not isinstance(sample, OmniInteractSampleRequest):
+        return
+    setattr(rfi, "omniinteract_case", sample.omniinteract_case)
+    setattr(rfi, "omniinteract_options", sample.omniinteract_options)
+    setattr(rfi, "omniinteract_prepared_input", sample.omniinteract_prepared_input)
+
+
+def _append_error(existing: str, message: str) -> str:
+    return f"{existing}\n{message}" if existing else message
+
+
+def _finalize_omniinteract_batch(
+    input_requests: list[SampleRequest],
+    outputs: list[RequestFuncOutput],
+) -> dict[str, object] | None:
+    rows = [
+        (sample, output)
+        for sample, output in zip(input_requests, outputs, strict=True)
+        if isinstance(sample, OmniInteractSampleRequest)
+    ]
+    if not rows:
+        return None
+    options = rows[0][0].omniinteract_options
+    if not isinstance(options, OmniInteractSessionOptions):
+        raise RuntimeError("OmniInteract benchmark output lost its artifact options")
+    cases, results = [], []
+    artifact_errors: list[str] = []
+    for sample, output in rows:
+        case = sample.omniinteract_case
+        result = getattr(output, "omniinteract_case_result", None)
+        if case is None or not isinstance(result, OmniInteractCaseResult):
+            raise RuntimeError("OmniInteract benchmark output lost its dataset identity")
+        cases.append(case)
+        results.append(result)
+        try:
+            publish_deferred_case_artifacts(options.output_root, case, result)
+        except Exception as exc:  # noqa: BLE001 - artifact backends raise heterogeneous errors
+            result.success = result.eligible_for_official_eval = False
+            if "artifact_write_failed" not in result.official_eval_ineligible_reasons:
+                result.official_eval_ineligible_reasons.append("artifact_write_failed")
+            artifact_error = f"Artifact publication failed: {exc}"
+            result.error = _append_error(result.error, artifact_error)
+            output.error = _append_error(output.error, artifact_error)
+            message = f"{case.subset}/{case.video_rel}: {artifact_error}"
+            artifact_errors.append(message)
+            logger.exception(message)
+            try:
+                write_failure_artifacts(options.output_root, case, result)
+            except Exception as recovery_exc:  # noqa: BLE001 - preserve benchmark metrics after I/O failure
+                message = f"{case.subset}/{case.video_rel}: failure artifact publication failed: {recovery_exc}"
+                artifact_errors.append(message)
+                logger.exception(message)
+    try:
+        write_omniinteract_batch_artifacts(options.output_root, cases, results)
+    except Exception as exc:  # noqa: BLE001 - preserve benchmark metrics after I/O failure
+        message = f"Batch artifact publication failed: {exc}"
+        artifact_errors.append(message)
+        logger.exception(message)
+        try:
+            clear_batch_artifacts(options.output_root)
+        except Exception as cleanup_exc:  # noqa: BLE001 - best-effort removal of partial batch artifacts
+            message = f"Partial batch artifact cleanup failed: {cleanup_exc}"
+            artifact_errors.append(message)
+            logger.exception(message)
+    summary = omniinteract_benchmark_summary(results)
+    compact_summary = {key: value for key, value in summary.items() if key != "results"}
+    compact_summary["artifacts_complete"] = not artifact_errors
+    if artifact_errors:
+        compact_summary["artifact_errors"] = artifact_errors
+    return compact_summary
+
+
+def _prepare_omniinteract_batch(input_requests: list[SampleRequest]) -> None:
+    roots: set[Path] = set()
+    for sample in input_requests:
+        if not isinstance(sample, OmniInteractSampleRequest):
+            continue
+        root = sample.omniinteract_options.output_root.resolve()
+        roots.add(root)
+        clear_case_artifacts(sample.omniinteract_options.output_root, sample.omniinteract_case)
+    for root in roots:
+        clear_batch_artifacts(root)
+
+
 def _daily_omni_repo_from_args(args) -> str | None:
     """Resolve HuggingFace repo id for Daily-Omni from CLI args.
 
@@ -250,6 +364,7 @@ def get_samples(args, tokenizer):
         "ttsd",
         "sound-effect",
     )
+    is_omniinteract = args.dataset_name == "omniinteract"
 
     # Check if we need to handle omni-related backends/datasets
     is_omni_backend = args.backend in [
@@ -258,11 +373,67 @@ def get_samples(args, tokenizer):
         "openai-realtime-duplex",
         "daily-omni",
     ]
-    is_omni_dataset = is_daily_omni or is_seed_tts or args.dataset_name == "random-mm"
+    is_omni_dataset = is_daily_omni or is_seed_tts or is_omniinteract or args.dataset_name == "random-mm"
 
     if not is_omni_backend and not is_omni_dataset:
         # Not an omni-related request, delegate to original implementation
         return get_samples_old(args, tokenizer)
+
+    if is_omniinteract:
+        dataset_path = getattr(args, "dataset_path", None)
+        data_root = None
+        dataset_repo = DEFAULT_OMNIINTERACT_REPO
+        if dataset_path:
+            candidate = Path(dataset_path).expanduser()
+            if candidate.exists() or candidate.is_absolute():
+                data_root = str(candidate)
+            else:
+                dataset_repo = str(dataset_path)
+        dataset = OmniInteractDataset(
+            data_root=data_root,
+            dataset_repo=dataset_repo,
+            subsets=tuple(getattr(args, "omniinteract_subsets")),
+            random_seed=args.seed,
+            disable_shuffle=getattr(args, "disable_shuffle", False),
+        )
+        options = OmniInteractSessionOptions(
+            output_root=Path(getattr(args, "omniinteract_output_dir")),
+            timeout_s=float(getattr(args, "omniinteract_timeout_s")),
+            media_timeout_s=float(getattr(args, "omniinteract_media_timeout_s")),
+            ref_audio=str(getattr(args, "omniinteract_ref_audio")),
+            require_response=bool(getattr(args, "omniinteract_require_response")),
+            max_video_duration_s=float(getattr(args, "omniinteract_max_video_duration_s")),
+        )
+        requests = dataset.sample(
+            tokenizer,
+            args.num_prompts,
+            request_id_prefix=args.request_id_prefix,
+            options=options,
+        )
+        if not requests:
+            raise ValueError("No OmniInteract sessions were selected")
+        encoded_ref_audio = reference_audio_data_url(options.ref_audio)
+        assert encoded_ref_audio is not None
+        for request in requests:
+            case = request.omniinteract_case
+            assert isinstance(request, OmniInteractSampleRequest) and case is not None
+            duration, pcm, frames = prepare_media(
+                case.video_path,
+                VIDEO_FPS,
+                timeout_s=options.media_timeout_s,
+                max_duration_s=options.max_video_duration_s,
+            )
+            if not any(frames):
+                raise ValueError(f"No video frames were decoded from {case.video_path}")
+            request.omniinteract_prepared_input = OmniInteractPreparedInput(
+                duration_s=duration,
+                pcm16=pcm,
+                video_frames=tuple(frames),
+                ref_audio_data_url=encoded_ref_audio,
+            )
+        # Replace OmniInteract's ``0`` (all) with the measured request count.
+        args.num_prompts = len(requests)
+        return requests
 
     # Handle Daily-Omni dataset
     if is_daily_omni:
@@ -476,6 +647,7 @@ class MixRequestFuncOutput(RequestFuncOutput):
     image_pixels: int = 0
     denoise_step_latency_ms: float = 0.0
     text_latency: float = 0.0
+    tpot_measured: bool = True
     #: Worst-case streaming-audio underrun (wall-clock seconds the player
     #: would have been starved). Populated by the audio-speech backend; ``0.0``
     #: for backends that do not run continuity analysis.
@@ -1313,11 +1485,115 @@ async def async_request_openai_audio_speech(
 
 
 def _realtime_websocket_url(api_url: str) -> str:
-    parts = urlsplit(api_url)
-    scheme = "wss" if parts.scheme == "https" else "ws"
-    query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    query.setdefault("duplex", "1")
-    return urlunsplit((scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+    return build_realtime_url(api_url, None, native_duplex=None)
+
+
+def _nonnegative_number(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and np.isfinite(value) and value >= 0
+
+
+async def _async_request_omniinteract(
+    request_func_input: RequestFuncInput,
+    *,
+    pbar: tqdm | None,
+) -> MixRequestFuncOutput:
+    case = getattr(request_func_input, "omniinteract_case", None)
+    options = getattr(request_func_input, "omniinteract_options", None)
+    output = MixRequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+    output.start_time = time.perf_counter()
+    try:
+        if case is None or not isinstance(options, OmniInteractSessionOptions):
+            raise ValueError("OmniInteract RequestFuncInput is missing its dataset session layout")
+        prepared_input = getattr(request_func_input, "omniinteract_prepared_input", None)
+        if not isinstance(prepared_input, OmniInteractPreparedInput):
+            raise ValueError("OmniInteract media must be prepared before benchmark request timing")
+        headers = _get_headers()
+        _update_headers_common(headers, request_func_input)
+        config = OmniInteractBenchmarkConfig(
+            endpoint=request_func_input.api_url,
+            model=request_func_input.model_name or request_func_input.model,
+            output_root=options.output_root,
+            timeout_s=options.timeout_s,
+            media_timeout_s=options.media_timeout_s,
+            max_video_duration_s=options.max_video_duration_s,
+            ref_audio=options.ref_audio,
+            require_response=options.require_response,
+            extra_headers=headers or None,
+            extra_body=dict(request_func_input.extra_body or {}) or None,
+        )
+        case_result = await run_omniinteract_case(
+            case,
+            config,
+            request_index=request_func_input.request_id or uuid.uuid4().hex,
+            capture_artifacts=request_func_input.request_id is not None,
+            prepared_input=prepared_input,
+        )
+        output.latency = case_result.latency_s
+        output.generated_text = case_result.transcript
+        output.output_tokens = case_result.output_tokens
+        output.audio_duration = case_result.audio_bytes / (24_000 * 2)
+        output.audio_frames = case_result.audio_bytes // 2
+        session_metrics = case_result.duplex_session_metrics
+        output.ttft = float(session_metrics.get("mean_ttft_ms") or 0.0) / 1000.0
+        output.audio_ttfp = float(session_metrics.get("mean_ttfp_ms") or 0.0) / 1000.0
+        output.audio_rtf = float(session_metrics.get("mean_rtf") or 0.0)
+        stages: list[tuple[int, dict[str, object]]] = []
+        for request_metric in case_result.duplex_request_metrics:
+            stage0 = request_metric.get("stage0_tokens")
+            if not isinstance(stage0, dict):
+                continue
+            token_count = stage0.get("output_token_count")
+            if isinstance(token_count, int) and not isinstance(token_count, bool) and token_count >= 0:
+                stages.append((token_count, stage0))
+        timed = [(count - 1, stage) for count, stage in stages if count > 1]
+        complete = (
+            len(stages) == len(case_result.duplex_request_metrics)
+            and sum(count for count, _ in stages) == output.output_tokens
+        )
+        exact = complete and all(
+            isinstance(values := stage.get("itls_ms"), list)
+            and len(values) == intervals
+            and all(_nonnegative_number(value) for value in values)
+            for intervals, stage in timed
+        )
+        output.itl = [float(value) / 1000.0 for _, stage in timed for value in stage["itls_ms"]] if exact else []
+        if output.itl:
+            output.text_latency = output.ttft + sum(output.itl)
+        elif complete and timed and all(_nonnegative_number(stage.get("tpot_ms")) for _, stage in timed):
+            intervals = sum(count for count, _ in timed)
+            weighted_tpot = sum(float(stage["tpot_ms"]) * count for count, stage in timed) / intervals / 1000.0
+            output.text_latency = output.ttft + weighted_tpot * (output.output_tokens - 1)
+        else:
+            output.text_latency = output.ttft
+            output.tpot_measured = False
+            if output.output_tokens > 1 or (output.output_tokens == 0 and output.generated_text):
+                logger.warning(
+                    "OmniInteract session %s omitted complete engine token timing; standard TPOT/ITL are unavailable",
+                    case_result.session_id,
+                )
+        output.duplex_request_metrics = case_result.duplex_request_metrics
+        output.duplex_session_metrics = session_metrics
+        output.success = case_result.success
+        output.error = case_result.error
+        setattr(output, "omniinteract_case", case)
+        setattr(output, "omniinteract_case_result", case_result)
+    except Exception:
+        output.success = False
+        output.error = traceback.format_exc()
+        logger.error("OmniInteract Realtime request failed: %s", output.error)
+        if case is not None:
+            case_result = OmniInteractCaseResult(
+                subset=case.subset,
+                video=str(case.video_path),
+                output_dir="",
+                error=output.error,
+            )
+            setattr(output, "omniinteract_case", case)
+            setattr(output, "omniinteract_case_result", case_result)
+    if pbar:
+        pbar.update(1)
+    return output
 
 
 async def async_request_openai_realtime_duplex(
@@ -1325,8 +1601,9 @@ async def async_request_openai_realtime_duplex(
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
 ) -> MixRequestFuncOutput:
-    """Run one or more Seed-TTS turns through one explicit Realtime TTS session."""
     del session
+    if getattr(request_func_input, "omniinteract_case", None) is not None:
+        return await _async_request_omniinteract(request_func_input, pbar=pbar)
     output = MixRequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
     output.start_time = time.perf_counter()
@@ -1387,8 +1664,10 @@ async def async_request_openai_realtime_duplex(
                 )
                 await client.send({"type": "response.create"})
                 await wait_for(
-                    lambda: client.events.count("response.done") > done_before
-                    or len(client.events.errors()) > errors_before,
+                    lambda: (
+                        client.events.count("response.done") > done_before
+                        or len(client.events.errors()) > errors_before
+                    ),
                     timeout_s=180.0,
                     label=f"Seed-TTS Realtime TTS turn {request_index} response.done",
                 )
@@ -1433,19 +1712,7 @@ async def async_request_openai_realtime_duplex(
                         channels=1,
                     )
                 )
-                turn_transcripts.append(
-                    "".join(
-                        str(event.get("delta") or "")
-                        for event in client.events.events
-                        if client.events.response_id(event) == response_id
-                        and event.get("type")
-                        in {
-                            "response.audio_transcript.delta",
-                            "response.output_text.delta",
-                            "response.text.delta",
-                        }
-                    )
-                )
+                turn_transcripts.append(client.events.response_text(response_id))
                 await client.acknowledge_playback()
             request_finished_at = time.perf_counter()
             session_metrics = summarize_session_request_metrics(
@@ -1520,6 +1787,7 @@ from vllm.benchmarks.serve import TaskType, calculate_metrics_for_embeddings, ge
 from vllm_omni.benchmarks.metrics.metrics import (
     MultiModalsBenchmarkMetrics,
     calculate_metrics,
+    has_metric_samples,
 )
 
 # ruff: noqa: E402
@@ -1626,6 +1894,7 @@ async def benchmark(
     )
     _attach_daily_omni_to_request_func_input(input_requests[0], test_input)
     _attach_seed_tts_to_request_func_input(input_requests[0], test_input)
+    _attach_omniinteract_to_request_func_input(input_requests[0], test_input)
 
     if ready_check_timeout_sec > 0:
         test_output = await wait_for_endpoint(
@@ -1741,6 +2010,7 @@ async def benchmark(
         print(f"Probe request rate: {probe_request_rate} req/s")
         probe_task = asyncio.create_task(probe_loop())
 
+    _prepare_omniinteract_batch(input_requests)
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
 
@@ -1801,6 +2071,7 @@ async def benchmark(
         )
         _attach_daily_omni_to_request_func_input(request, request_func_input)
         _attach_seed_tts_to_request_func_input(request, request_func_input)
+        _attach_omniinteract_to_request_func_input(request, request_func_input)
         tasks.append(
             asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
         )
@@ -1814,6 +2085,8 @@ async def benchmark(
         pbar.close()
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
+
+    omniinteract_summary = _finalize_omniinteract_batch(input_requests, outputs)
 
     if task_type == TaskType.GENERATION:
         metrics, actual_output_lens = calculate_metrics(
@@ -1839,6 +2112,13 @@ async def benchmark(
         actual_output_lens = 0
 
     if isinstance(metrics, MultiModalsBenchmarkMetrics):
+
+        def measured_ttft(output: RequestFuncOutput) -> float | None:
+            session_metrics = getattr(output, "duplex_session_metrics", None)
+            if isinstance(session_metrics, dict) and session_metrics.get("mean_ttft_ms") is None:
+                return None
+            return output.ttft
+
         result = {
             "duration": benchmark_duration,
             "completed": metrics.completed,
@@ -1859,7 +2139,7 @@ async def benchmark(
             "input_lens": [output.prompt_len for output in outputs],
             "start_times": [output.start_time for output in outputs],
             "output_lens": actual_output_lens,
-            "ttfts": [output.ttft for output in outputs],
+            "ttfts": [measured_ttft(output) for output in outputs],
             "itls": [output.itl for output in outputs],
             "generated_texts": [output.generated_text for output in outputs],
             "errors": [output.error for output in outputs],
@@ -1893,6 +2173,8 @@ async def benchmark(
     ]
     if duplex_session_metrics:
         result["duplex_session_metrics"] = duplex_session_metrics
+    if omniinteract_summary is not None:
+        result["omniinteract"] = omniinteract_summary
 
     from vllm_omni.benchmarks.data_modules.daily_omni_eval import (
         compute_daily_omni_accuracy_metrics,
@@ -1948,6 +2230,8 @@ async def benchmark(
         # This function prints and adds statistics of the specified
         # metric.
         if metric_attribute_name not in result_percentile_metrics:
+            return
+        if not has_metric_samples(metrics, metric_attribute_name):
             return
         # No text tokens generated (e.g. pure TTS speech endpoint): per-token
         # latency metrics (ttft/tpot/itl) are undefined, so skip them.

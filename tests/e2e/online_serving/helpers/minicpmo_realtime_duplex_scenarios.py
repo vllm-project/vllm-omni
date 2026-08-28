@@ -58,16 +58,12 @@ from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
     read_pcm16_wav,
     summarize_session_request_metrics,
 )
+from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
+    reference_audio_data_url as _ref_audio_data_url,
+)
 
 _url_with_model = build_realtime_url
 _read_wav_pcm16 = read_pcm16_wav
-
-
-def _ref_audio_data_url(path: str | None) -> str | None:
-    if path is None:
-        return None
-    ref_path = Path(path).expanduser()
-    return "data:audio/wav;base64," + base64.b64encode(ref_path.read_bytes()).decode("ascii")
 
 
 @dataclass
