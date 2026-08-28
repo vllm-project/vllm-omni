@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import asyncio
@@ -1052,6 +1055,46 @@ class RealtimeInputTranslator:
         item_id = str(item["id"])
         item_type = item.get("type")
         role = item.get("role")
+        if item_type == "function_call_output":
+            call_id = item.get("call_id")
+            output = item.get("output")
+            matching_call = any(
+                known.get("type") == "function_call" and known.get("call_id") == call_id
+                for known in self._conversation_items.values()
+            )
+            duplicate_output = any(
+                known.get("type") == "function_call_output" and known.get("call_id") == call_id
+                for known in self._conversation_items.values()
+            )
+            if not isinstance(call_id, str) or not call_id or not matching_call:
+                await self._send_realtime_payload(
+                    self._realtime_error_payload(
+                        "invalid_function_call_output",
+                        "function_call_output requires the call_id of a completed function call",
+                        event_id=event.get("event_id"),
+                        param="item.call_id",
+                    )
+                )
+                return None
+            if not isinstance(output, str) or duplicate_output:
+                await self._send_realtime_payload(
+                    self._realtime_error_payload(
+                        "invalid_function_call_output",
+                        (
+                            "function_call_output requires a string output"
+                            if not isinstance(output, str)
+                            else f"function_call_output already exists for call_id {call_id}"
+                        ),
+                        event_id=event.get("event_id"),
+                        param="item.output",
+                    )
+                )
+                return None
+            # Do not retain the result until SessionRunner has delivered its
+            # runtime update. On success, the resulting
+            # ``conversation.item.created`` event records it in the shared
+            # input/output protocol state; on failure the client may retry the
+            # same call_id instead of being rejected by provisional history.
         if item_type != "message" or role in {"assistant", "system"}:
             return {
                 "type": "turn.signal",

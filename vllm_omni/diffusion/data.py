@@ -100,6 +100,35 @@ def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]
     return normalized
 
 
+def validate_host_weight_runtime_options(*, mode: object, root: object) -> None:
+    """Validate HWR policy without touching the configured storage domain.
+
+    Filesystem locality and store construction belong to the eligible loader
+    path. Keeping this check purely structural is what lets disabled and
+    AllGather DLO configurations retain zero HWR interaction.
+    """
+    if mode not in {"disabled", "preferred", "required"}:
+        raise ValueError("host_weight_runtime_mode must be disabled, preferred, or required")
+    if mode != "disabled" and (not isinstance(root, str) or not root.strip()):
+        raise ValueError("enabled Host Weight Runtime requires host_weight_runtime_root")
+
+
+def validate_dlo_host_registration_options(
+    *,
+    limit_gib: object,
+    enable_dlo: bool,
+    use_allgather: bool,
+    hwr_mode: object,
+) -> float:
+    """Validate the optional transport budget without probing CUDA or HWR."""
+    value = float(limit_gib)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("dlo_host_registration_limit_gib must be finite and >= 0")
+    if value and (not enable_dlo or use_allgather or hwr_mode == "disabled"):
+        raise ValueError("dlo_host_registration_limit_gib requires enabled no-AllGather DLO and Host Weight Runtime")
+    return value
+
+
 def parse_kv_cache_skip_selector(
     selector: str | list[int] | tuple[int, ...] | set[int] | None,
 ) -> set[int] | None:
@@ -766,6 +795,14 @@ class OmniDiffusionConfig:
     dlo_use_allgather: bool = True
     # Leading main-DiT blocks kept resident by distributed layerwise offload.
     dlo_resident_layers: int = 0
+    # Final-layout Host Weight Runtime policy. The loader only activates this
+    # for eligible no-AllGather DLO; all other configurations preserve their
+    # existing loader/storage path.
+    host_weight_runtime_mode: str = "disabled"
+    host_weight_runtime_root: str | None = None
+    # Optional per-worker ceiling for registering final-layout HWR mappings.
+    # Zero adds no ceiling; pin_cpu_memory controls whether registration is tried.
+    dlo_host_registration_limit_gib: float = 0.0
 
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 
@@ -1142,6 +1179,17 @@ class OmniDiffusionConfig:
         elif self.max_cpu_loras < 1:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
 
+        validate_host_weight_runtime_options(
+            mode=self.host_weight_runtime_mode,
+            root=self.host_weight_runtime_root,
+        )
+        self.dlo_host_registration_limit_gib = validate_dlo_host_registration_options(
+            limit_gib=self.dlo_host_registration_limit_gib,
+            enable_dlo=self.enable_distributed_layerwise_offload,
+            use_allgather=self.dlo_use_allgather,
+            hwr_mode=self.host_weight_runtime_mode,
+        )
+
         if self.diffusion_load_format != "diffusers" and (self.diffusers_load_kwargs or self.diffusers_call_kwargs):
             raise ValueError(
                 "diffusers_load_kwargs and diffusers_call_kwargs are only "
@@ -1479,6 +1527,9 @@ class DiffusionOutput:
 
     # memory usage info
     peak_memory_mb: float = 0.0
+
+    # KV-recv wall-clock (ms) from the runner; feeds vllm_omni:diffusion_kv_load_s.
+    kv_recv_ms: float = 0.0
 
     # When True, move tensor fields to CPU at construction time. Useful when
     # the output is shipped across process boundaries (e.g. step-execution

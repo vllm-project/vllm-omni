@@ -384,6 +384,7 @@ class OmniStageModelConfig:
     interleave_mm_strings: bool | None = None
     media_io_kwargs: dict[str, Any] | None = None
     active_stream_window: int = Field(default=0, ge=0)
+    session_mode: str = "turn"
     duplex_max_sessions: int = Field(default=1, ge=1)
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
@@ -404,6 +405,7 @@ class OmniStageModelConfig:
     # StagePipelineConfig.model_subdir/tokenizer_subdir on the legacy path.
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
+    requires_full_payload_input: bool = False
 
 
 @_enforce_keyword_only_init
@@ -696,6 +698,9 @@ class _DiffusionConfigProjection:
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = Field(default=0, ge=0)
+    host_weight_runtime_mode: Literal["disabled", "preferred", "required"] = "disabled"
+    host_weight_runtime_root: str | None = None
+    dlo_host_registration_limit_gib: float = Field(default=0.0, ge=0)
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
     diffusion_compile_dynamic: bool = Field(default=True, strict=True)
@@ -753,6 +758,8 @@ class _DiffusionConfigProjection:
             TransformerConfig,
             build_attention_config,
             parse_kv_cache_skip_selector,
+            validate_dlo_host_registration_options,
+            validate_host_weight_runtime_options,
         )
         from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
         from vllm_omni.quantization import build_quant_config
@@ -829,6 +836,17 @@ class _DiffusionConfigProjection:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+
+        validate_host_weight_runtime_options(
+            mode=self.host_weight_runtime_mode,
+            root=self.host_weight_runtime_root,
+        )
+        self.dlo_host_registration_limit_gib = validate_dlo_host_registration_options(
+            limit_gib=self.dlo_host_registration_limit_gib,
+            enable_dlo=self.enable_distributed_layerwise_offload,
+            use_allgather=self.dlo_use_allgather,
+            hwr_mode=self.host_weight_runtime_mode,
+        )
 
         if self.diffusion_load_format != "diffusers" and (self.diffusers_load_kwargs or self.diffusers_call_kwargs):
             raise ValueError(
@@ -1595,6 +1613,7 @@ def _build_model_config(
 ) -> OmniStageModelConfig:
     default_sampling_params = _stage_sampling_params(stage_deploy, topology)
     kwargs = _config_kwargs(engine)
+    kwargs["requires_full_payload_input"] = topology.requires_full_payload_input
     kwargs["model"] = _first_defined(kwargs.get("model"), model)
     if "model_arch" not in kwargs:
         kwargs["model_arch"] = topology.model_arch or pipeline.model_arch or None
@@ -1614,6 +1633,7 @@ def _build_model_config(
         kwargs["tokenizer_subdir"] = topology.tokenizer_subdir
     return cast(Any, OmniStageModelConfig)(
         default_sampling_params=default_sampling_params,
+        session_mode=deploy.session_mode,
         duplex_max_sessions=duplex_max_sessions,
         **kwargs,
     )

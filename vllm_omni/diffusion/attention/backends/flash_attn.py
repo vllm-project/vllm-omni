@@ -38,6 +38,20 @@ class FlashAttentionBackend(AttentionBackend):
         return current_omni_platform.is_cuda() or current_omni_platform.is_npu()
 
     @classmethod
+    def supports_multi_doc_packed_varlen(cls) -> bool:
+        # CUDA / ROCm / MUSA all route through ``forward_cuda``, which
+        # dispatches ``_forward_varlen_packed`` -> ``flash_attn_varlen_func``
+        # over the caller's cu_seqlens without a mask, so an arbitrary
+        # N-document packing keeps its boundaries. NPU's forward path
+        # (``_resolve_packed_seq_npu``) only accepts a ``[real, pad]``
+        # two-document layout (cu_seqlens shape <= 3) and otherwise falls
+        # back to a padding-mask rebuild that spans the whole packed row,
+        # so N>=2 real documents would silently attend across request
+        # boundaries. XPU never consumes cu_seqlens from ``extra``. Both
+        # therefore stay False here.
+        return current_omni_platform.is_cuda() or current_omni_platform.is_rocm() or current_omni_platform.is_musa()
+
+    @classmethod
     def supports_attention_mask(cls) -> bool:
         return True
 
@@ -79,12 +93,14 @@ class FlashAttentionImpl(AttentionImpl):
         prefix: str = "",
         qkv_layout: str | None = None,
         backend_kwargs: dict | None = None,
+        role: str = "self",
         **extra_impl_args,
     ) -> None:
         self.num_heads = num_heads
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.qkv_layout = qkv_layout
+        self.is_cross_attn = role == "cross"
         cfg = get_current_diffusion_config_or_none()
         self.fa_deterministic = bool(getattr(cfg, "fa_deterministic", False)) if cfg is not None else False
         if backend_kwargs:
@@ -138,6 +154,7 @@ class FlashAttentionImpl(AttentionImpl):
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
         from vllm_omni.diffusion.attention.backends.utils.fa import (
+            _index_first_axis,
             _pad_input,
             _unpad_input,
             _upad_input,
@@ -145,10 +162,21 @@ class FlashAttentionImpl(AttentionImpl):
         )
 
         assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
-        query_length = query.size(1)
-        q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
-            query, key, value, attention_mask, query_length, _unpad_input
-        )
+        batch_size, query_length = query.shape[:2]
+        if not self.is_cross_attn and query_length == key.size(1):
+            q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
+                query, key, value, attention_mask, query_length, _unpad_input
+            )
+        else:
+            # Cross-attention: the mask covers keys only, so keep every query row.
+            k, indices_k, cu_seq_lens_k, max_length_k, _ = _unpad_input(key, attention_mask)
+            v = _index_first_axis(value, indices_k)
+            q = query.flatten(0, 1)
+            cu_seq_lens_q = torch.arange(
+                0, (batch_size + 1) * query_length, query_length, dtype=torch.int32, device=query.device
+            )
+            max_length_q = query_length
+            indices_q = None
 
         out_unpad = flash_attn_varlen_func(
             q,
@@ -164,7 +192,9 @@ class FlashAttentionImpl(AttentionImpl):
             },
         )
         out_unpad = self._unwrap_flash_output(out_unpad)
-        return _pad_input(out_unpad, indices_q, query.size(0), query_length)
+        if indices_q is None:
+            return out_unpad.reshape(batch_size, query_length, *out_unpad.shape[1:])
+        return _pad_input(out_unpad, indices_q, batch_size, query_length)
 
     def _forward_varlen_packed(
         self,

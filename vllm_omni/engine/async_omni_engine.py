@@ -50,6 +50,7 @@ from vllm_omni.engine.async_engine_utils import (
 )
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
+    AbortResultMessage,
     AddCompanionRequestMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
@@ -106,7 +107,10 @@ class AsyncOmniEngine:
     _log_stats: bool = False
     _coordinator_runtime: Any = None
     _transfer_emitter: Any = None
+    _prom_metrics: Any = None
     _enable_orch_monitor: bool = False
+    # Lazily created by get_output_blocking_async().
+    _output_drain_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
     def __init__(
         self,
@@ -116,6 +120,7 @@ class AsyncOmniEngine:
         diffusion_batch_size: int = 1,
         single_stage_mode: bool = False,
         transfer_emitter: Any = None,
+        prom_metrics: Any = None,
         log_stats: bool = False,
         tokenizer: str | None = None,
         trust_remote_code: bool | None = None,
@@ -132,6 +137,7 @@ class AsyncOmniEngine:
         # Optional: when None, Orchestrator silently skips TX emit (existing
         # RX path still works via OrchestratorAggregator).
         self._transfer_emitter = transfer_emitter
+        self._prom_metrics = prom_metrics
         # Drives upstream EngineCore + scheduler stats production. When False
         # the engine skips SchedulerStats / IterationStats; the per-(stage,
         # replica) vllm:* wrap stays registered but reads zero. Respects the
@@ -397,6 +403,7 @@ class AsyncOmniEngine:
                 membership_controller=membership_controller,
                 running_counter=self._running_counter,
                 transfer_emitter=self._transfer_emitter,
+                prom_metrics=self._prom_metrics,
                 log_stats=self._log_stats,
                 enable_orch_monitor=self._enable_orch_monitor,
                 duplex_runtime_extension=duplex_runtime_extension,
@@ -1036,6 +1043,17 @@ class AsyncOmniEngine:
                 fastvideo_vsa_topk=kwargs.get("fastvideo_vsa_topk"),
             )
 
+        extras = dict(kwargs.get("extras") or {})
+        for key, default in (
+            ("auxiliary_text_encoder", None),
+            ("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
+        ):
+            top_level_value = kwargs.get(key)
+            if top_level_value is not None:
+                extras[key] = top_level_value
+            else:
+                extras.setdefault(key, default)
+
         stage_engine_args = {
             "max_num_seqs": kwargs.get("max_num_seqs") or 1,
             "parallel_config": parallel_config,
@@ -1058,6 +1076,9 @@ class AsyncOmniEngine:
             "enable_distributed_layerwise_offload": kwargs.get("enable_distributed_layerwise_offload", False),
             "dlo_use_allgather": kwargs.get("dlo_use_allgather", True),
             "dlo_resident_layers": kwargs.get("dlo_resident_layers", 0),
+            "host_weight_runtime_mode": kwargs.get("host_weight_runtime_mode", "disabled"),
+            "host_weight_runtime_root": kwargs.get("host_weight_runtime_root"),
+            "dlo_host_registration_limit_gib": kwargs.get("dlo_host_registration_limit_gib", 0.0),
             "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
             "diffusion_compile_granularity": (
                 "regional"
@@ -1093,10 +1114,7 @@ class AsyncOmniEngine:
             "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
             "streaming_output": kwargs.get("diffusion_streaming_output", False),
             "enable_ar_profiler": kwargs.get("enable_ar_profiler", False),
-            "extras": {
-                "auxiliary_text_encoder": kwargs.get("auxiliary_text_encoder", None),
-                "default_llama_model_id": kwargs.get("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
-            },
+            "extras": extras,
             **(
                 {
                     "profiler_config": asdict(kwargs["profiler_config"])
@@ -1186,11 +1204,29 @@ class AsyncOmniEngine:
         # Parse --stage-overrides JSON string if provided
         stage_overrides = parse_stage_overrides(stage_overrides_json)
 
+        # Unregistered diffusion checkpoints use the single-stage fallback
+        # below instead of StageConfigFactory, so fold stage-0 model extras
+        # into the fallback's input as well.  Registered pipelines still get
+        # the complete override mapping through load_and_resolve_stage_configs.
+        default_stage_kwargs = kwargs
+        stage_zero_overrides = (stage_overrides or {}).get("0", {})
+        if "extras" in stage_zero_overrides:
+            override_extras = stage_zero_overrides["extras"]
+            if not isinstance(override_extras, Mapping):
+                raise TypeError("stage 0 extras must be a mapping")
+            default_stage_kwargs = {
+                **kwargs,
+                "extras": {
+                    **(kwargs.get("extras") or {}),
+                    **override_extras,
+                },
+            }
+
         config_path, stage_configs, strategy_lb_policy = load_and_resolve_stage_configs(
             model,
             kwargs,
             trust_remote_code=trust_remote_code,
-            default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
+            default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(default_stage_kwargs),
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
             strategy_config_path=strategy_config_path,
@@ -1731,19 +1767,92 @@ class AsyncOmniEngine:
                 raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
             return None
 
+    async def get_output_blocking_async(self, timeout: float = 1.0) -> EngineQueueMessage | None:
+        """Blocking-wait read from the Orchestrator output queue.
+
+        Waits up to ``timeout`` seconds in a dedicated drain thread for the
+        next message (condition-variable wakeup instead of a poll cadence);
+        returns ``None`` on timeout so the caller keeps its liveness check,
+        mirroring ``try_get_output_async``'s contract. Used by the serving
+        final-output drain when ``VLLM_OMNI_EVENT_DRIVEN_ORCH`` is on.
+        """
+        executor = self._output_drain_executor
+        if executor is None:
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="omni-output-drain",
+            )
+            self._output_drain_executor = executor
+
+        sync_q = self.output_queue.sync_q
+
+        def _drain_get() -> EngineQueueMessage | None:
+            # Exceptions are swallowed to a None sentinel: the queue may be
+            # closed mid-shutdown, and an exception left on an executor future
+            # after task cancellation would warn as never-retrieved.
+            try:
+                return sync_q.get(timeout=timeout)
+            except queue.Empty:
+                return None
+            except Exception:
+                return None
+
+        loop = asyncio.get_running_loop()
+        msg = await loop.run_in_executor(executor, _drain_get)
+        if msg is None and not self.is_alive():
+            raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
+        return msg
+
     def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
         """Get cached metadata for a stage."""
         return self.stage_metadata[stage_id]
 
     def abort(self, request_ids: list[str]) -> None:
-        """Send abort message to the Orchestrator."""
+        """Fire-and-forget abort: enqueue and return without waiting.
+
+        Prefer :meth:`abort_async` when the caller needs acknowledgment that
+        stage aborts, binding release, and orchestrator request cleanup finished.
+        """
         if self.request_queue is None:
             raise RuntimeError("request_queue is not initialized")
         self.request_queue.sync_q.put(AbortRequestMessage(request_ids=request_ids))
 
-    async def abort_async(self, request_ids: list[str]) -> None:
-        """Async abort API."""
-        self.abort(request_ids)
+    async def abort_async(
+        self,
+        request_ids: list[str],
+        timeout: float | None = None,
+    ) -> None:
+        """Abort requests and wait for orchestrator acknowledgment.
+
+        Unlike :meth:`abort`, this generates an ``rpc_id``, correlates the
+        :class:`AbortResultMessage` via :class:`CorrelatedRpcClient`, and
+        raises if the orchestrator reports failure or times out.
+        """
+        if self.request_queue is None:
+            raise RuntimeError("request_queue is not initialized")
+        transport = self._correlated_rpc_client
+        if transport is None:
+            raise RuntimeError("correlated RPC client is not initialized")
+
+        rpc_id = uuid.uuid4().hex
+        msg = AbortRequestMessage(request_ids=request_ids, rpc_id=rpc_id)
+
+        def _wait() -> AbortResultMessage:
+            result_msg = transport.execute(
+                ("abort", rpc_id),
+                msg,
+                timeout=timeout,
+                timeout_message=f"abort timed out after {timeout} seconds",
+                block_on_submit=True,
+            )
+            if not isinstance(result_msg, AbortResultMessage):
+                raise RuntimeError(f"unexpected abort result type: {type(result_msg).__name__}")
+            return result_msg
+
+        loop = asyncio.get_running_loop()
+        result_msg = await loop.run_in_executor(None, _wait)
+        if not result_msg.success:
+            raise RuntimeError(result_msg.error or "abort failed")
 
     def submit_interaction(
         self,
@@ -1882,6 +1991,12 @@ class AsyncOmniEngine:
                     q.close()
             except Exception:
                 pass
+
+        if self._output_drain_executor is not None:
+            # Any in-flight blocking get bails out within its ≤1 s timeout
+            # (or immediately via the queue close above), so don't wait.
+            self._output_drain_executor.shutdown(wait=False)
+            self._output_drain_executor = None
 
         if hasattr(self, "_runtime") and self._runtime is not None and orchestrator_stopped:
             try:

@@ -308,6 +308,91 @@ def test_flash_attn_func_preferred_over_varlen():
     print("✓ flash_attn_func forward works correctly!")
 
 
+@pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU")
+@pytest.mark.parametrize("k_len", [40, 256])
+def test_cross_attn_key_padding_vs_sdpa(k_len):
+    """
+    Case 3: Cross-attention with a key-padding mask.
+
+    The mask covers only the key sequence; every query position must attend
+    to the valid keys. FA and SDPA outputs should be very close. k_len=256
+    covers equal Q/K lengths, which must not be mistaken for self-attention,
+    and valid key lengths differ per batch element.
+    """
+    device = torch.device(current_omni_platform.device_type)
+    dtype = torch.bfloat16
+
+    batch_size = 2
+    q_len = 256
+    valid_lens = (17, 29)
+    num_heads = 8
+    head_dim = 64
+
+    fa_impl = FlashAttentionImpl(
+        num_heads=num_heads, head_size=head_dim, softmax_scale=1.0 / (head_dim**0.5), causal=False, role="cross"
+    )
+    sdpa_impl = SDPAImpl(num_heads=num_heads, head_size=head_dim, softmax_scale=1.0 / (head_dim**0.5), causal=False)
+
+    torch.manual_seed(7)
+    query = torch.randn(batch_size, q_len, num_heads, head_dim, device=device, dtype=dtype)
+    key = torch.randn(batch_size, k_len, num_heads, head_dim, device=device, dtype=dtype)
+    value = torch.randn(batch_size, k_len, num_heads, head_dim, device=device, dtype=dtype)
+
+    attn_mask = torch.zeros(batch_size, k_len, dtype=torch.bool, device=device)
+    for i, valid_len in enumerate(valid_lens):
+        attn_mask[i, :valid_len] = True
+    attn_metadata = AttentionMetadata(attn_mask=attn_mask)
+
+    output_fa = fa_impl.forward(query=query, key=key, value=value, attn_metadata=attn_metadata)
+    output_sdpa = sdpa_impl.forward(query=query, key=key, value=value, attn_metadata=attn_metadata)
+
+    max_diff = torch.max(torch.abs(output_fa - output_sdpa)).item()
+    mean_diff = torch.mean(torch.abs(output_fa - output_sdpa)).item()
+
+    print("\n=== Case 3: Cross-Attention Key-Padding FA vs SDPA ===")
+    print(f"Max absolute difference: {max_diff:.6f}")
+    print(f"Mean absolute difference: {mean_diff:.6f}")
+
+    assert max_diff < 0.01, f"Max difference {max_diff} exceeds threshold 0.01"
+    assert mean_diff < 0.001, f"Mean difference {mean_diff} exceeds threshold 0.001"
+
+    print("✓ Case 3 PASSED: FA and SDPA cross-attention outputs are very close!")
+
+
+def test_varlen_masked_routing_by_role(monkeypatch):
+    """The unpad route is picked by role, not Q/K length equality; runs without a GPU."""
+    calls = []
+
+    def fake_varlen_func(q, k, v, **kwargs):
+        calls.append((q.shape[0], kwargs["cu_seqlens_q"], kwargs["cu_seqlens_k"]))
+        return q
+
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen_func)
+
+    batch_size, seq_len, num_heads, head_dim = 2, 4, 2, 8
+    query = torch.randn(batch_size, seq_len, num_heads, head_dim)
+    metadata = AttentionMetadata(attn_mask=torch.tensor([[True, True, False, False], [True, True, True, False]]))
+
+    cross_impl = FlashAttentionImpl(
+        num_heads=num_heads, head_size=head_dim, softmax_scale=0.5, causal=False, role="cross"
+    )
+    output = cross_impl.forward_cuda(query, query, query, metadata)
+    assert output.shape == query.shape
+    num_q_rows, cu_seqlens_q, cu_seqlens_k = calls[-1]
+    assert num_q_rows == batch_size * seq_len
+    assert cu_seqlens_q.tolist() == [0, 4, 8]
+    assert cu_seqlens_k.tolist() == [0, 2, 5]
+
+    self_impl = FlashAttentionImpl(num_heads=num_heads, head_size=head_dim, softmax_scale=0.5, causal=False)
+    output = self_impl.forward_cuda(query, query, query, metadata)
+    assert output.shape == query.shape
+    num_q_rows, cu_seqlens_q, cu_seqlens_k = calls[-1]
+    assert num_q_rows == 5
+    assert cu_seqlens_q.tolist() == [0, 2, 5]
+    assert cu_seqlens_k.tolist() == [0, 2, 5]
+
+
 def test_piecewise_flash_attn_uses_varlen_fallback(monkeypatch):
     calls = []
 

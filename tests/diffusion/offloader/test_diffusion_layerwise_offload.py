@@ -1,36 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from typing import Any
+
 import numpy as np
 import pytest
 import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
-from tests.helpers.env import DeviceMemoryMonitor
 from tests.helpers.mark import hardware_test
+from tests.helpers.monitor import DeviceMemoryMonitor
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
-AUDIO_MODEL = {
+AUDIO_MODEL: dict[str, dict[str, int | None]] = {
     "stabilityai/stable-audio-open-1.0": {"cuda": 1500, "rocm": 1500},
 }
 
-IMAGE_VIDEO_MODELS = {
+IMAGE_VIDEO_MODELS: dict[str, dict[str, int | None]] = {
     "riverclouds/qwen_image_random": {"cuda": 4500, "rocm": None},
     # "Wan-AI/Wan2.2-T2V-A14B-Diffusers": {"cuda": 45000, "rocm": None},
 }
 
-MODELS = {**AUDIO_MODEL, **IMAGE_VIDEO_MODELS}
+MODELS: dict[str, dict[str, int | None]] = {**AUDIO_MODEL, **IMAGE_VIDEO_MODELS}
 
 MODEL_MARKS = {
     "riverclouds/qwen_image_random": pytest.mark.core_model,
     "stabilityai/stable-audio-open-1.0": pytest.mark.full_model,
 }
 
-AUDIO_MODEL_PARAMS = {
+AUDIO_MODEL_PARAMS: dict[str, dict[str, Any]] = {
     "runner_params": {},
     "sampler_params": {},
 }
 
-IMAGE_VIDEO_MODELS_PARAMS = {
+IMAGE_VIDEO_MODELS_PARAMS: dict[str, dict[str, Any]] = {
     "runner_params": {"boundary_ratio": 0.875, "flow_shift": 5.0},
     "sampler_params": {"height": 480, "width": 640, "num_frames": 5},
 }
@@ -55,7 +60,7 @@ def run_inference(
     model_name: str,
     layerwise_offload: bool = False,
     num_inference_steps: int = 3,
-) -> float:
+) -> tuple[float, Any]:
     current_omni_platform.empty_cache()
     device_index = current_omni_platform.current_device()
     monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
@@ -140,6 +145,7 @@ def test_layerwise_offload_diffusion_model(model_name: str):
 
     if expected_saved_memory is None:
         pytest.skip(f"Threshold not defined for {platform} on {model_name}")
+    assert expected_saved_memory is not None
 
     # Verify that layerwise offloading significantly reduces memory usage
     # Passes only if the actual savings exceeds the expected savings

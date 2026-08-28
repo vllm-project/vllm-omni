@@ -534,6 +534,7 @@ class TestPipelineDiscovery:
         """Check that specific models are in OMNI_PIPELINES."""
         assert "qwen2_5_omni" in OMNI_PIPELINES
         assert "qwen3_omni_moe" in OMNI_PIPELINES
+        assert "qwen3_omni_moe_thinker_only" in OMNI_PIPELINES
         assert "qwen3_tts" in OMNI_PIPELINES
 
     def test_registry_resolver_qwen3_omni_all_stages(self):
@@ -557,6 +558,18 @@ class TestPipelineDiscovery:
         assert pipeline.model_type == "qwen3_omni_moe_thinker_only"
         assert pipeline.default_deploy_config_name is None
         assert len(pipeline.stages) == 1  # thinker only
+
+    def test_registry_qwen3_omni_thinker_only_key_is_static(self):
+        """Explicit registry key must not re-enter the HF-config resolver."""
+        pipeline = resolve_pipeline_config(
+            "qwen3_omni_moe_thinker_only",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert pipeline is OMNI_PIPELINES["qwen3_omni_moe_thinker_only"]
+        assert pipeline.model_type == "qwen3_omni_moe_thinker_only"
+        assert len(pipeline.stages) == 1
+        assert pipeline.stages[0].engine_output_type == "text"
+        assert pipeline.stages[0].final_output_type == "text"
 
     @pytest.mark.parametrize(
         "pipeline",
@@ -1109,8 +1122,35 @@ class TestDeployConfigLoading:
         with pytest.raises(ValueError, match=r"stage_args.*PipelineConfig.*stages"):
             load_deploy_config(deploy_path)
 
-    def test_load_minicpmo_duplex_deploy_config(self):
-        deploy_path = Path(get_deploy_config_path("minicpmo_4_5_duplex.yaml"))
+    @pytest.mark.parametrize(
+        ("filename", "max_sessions"),
+        [
+            ("minicpmo_4_5.yaml", 4),
+            ("minicpmo_4_5_2gpu.yaml", 4),
+            ("minicpmo_4_5_3gpu.yaml", 4),
+            ("minicpmo_4_5_8x4090.yaml", 1),
+            ("minicpmo_4_5_3gpu_stage1_replicas.yaml", 4),
+            ("minicpmo_4_5_4gpu_stage1_replicas.yaml", 4),
+            ("minicpmo_4_5_8x4090_stage1_replicas.yaml", 1),
+        ],
+    )
+    def test_minicpmo_deploy_configs_enable_duplex(self, filename: str, max_sessions: int):
+        """Every MiniCPM-o profile serves /v1/realtime, so the retired
+        minicpmo_4_5_duplex.yaml overlay has no replacement to fall back on.
+        """
+        deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert deploy.session_mode == "duplex"
+        assert deploy.active_stream_window == 1
+        assert deploy.duplex_session.max_sessions == max_sessions
+        assert [stage.session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
+        assert [stage.to_omegaconf().session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
+
+    def test_load_minicpmo_default_deploy_config(self):
+        deploy_path = Path(get_deploy_config_path("minicpmo_4_5.yaml"))
 
         deploy = load_deploy_config(deploy_path)
         pipeline = resolve_pipeline_config("minicpmo_4_5")
@@ -1118,17 +1158,15 @@ class TestDeployConfigLoading:
 
         stages = merge_pipeline_deploy(pipeline, deploy)
 
-        assert deploy.session_mode == "duplex"
         assert deploy.async_chunk is True
-        assert deploy.active_stream_window == 1
-        assert [stage.session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
-        assert [stage.to_omegaconf().session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
-        assert [stage.yaml_engine_args["async_scheduling"] for stage in stages] == [False, False, False]
-        assert all("Async" not in (stage.scheduler_cls or "") for stage in stages)
+        assert stages[0].yaml_engine_args["async_scheduling"] is True
+        assert stages[1].yaml_engine_args["async_scheduling"] is True
+        assert "Async" in (stages[0].scheduler_cls or "")
+        assert "Async" in (stages[1].scheduler_cls or "")
         assert [stage.devices for stage in deploy.stages] == ["0", "0", "0"]
         assert deploy.stages[1].enforce_eager is False
         assert stages[1].yaml_extras["default_sampling_params"]["max_tokens"] == 4096
-        assert stages[1].yaml_extras["default_sampling_params"]["min_tokens"] == 0
+        assert stages[1].yaml_extras["default_sampling_params"]["min_tokens"] == 50
         assert stages[1].yaml_extras["default_sampling_params"]["temperature"] == 0.8
         assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [6561]
         assert "codec_sampling_params" not in stages[1].yaml_engine_args
@@ -1200,14 +1238,22 @@ stages:
         assert deploy.connectors is not None
         assert deploy.platforms is not None
 
-    def test_qwen3_omni_thinker_only_deploy_config_uses_resolved_pipeline(self):
+    @pytest.mark.parametrize(
+        ("hf_config", "model"),
+        [
+            (Q3_OMNI_THINKER_HF_CONFIG, "Qwen/Qwen3-Omni-30B-A3B-Thinking"),
+            (Q3_OMNI_ALL_STAGES_HF_CONFIG, "Qwen/Qwen3-Omni-30B-A3B-Instruct"),
+        ],
+        ids=["thinker_checkpoint", "instruct_forced_thinker_only"],
+    )
+    def test_qwen3_omni_thinker_only_deploy_config_uses_resolved_pipeline(self, hf_config, model):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe_thinking.yaml"))
         with patch(
             "vllm_omni.config.config_factory.get_config",
-            return_value=Q3_OMNI_THINKER_HF_CONFIG,
+            return_value=hf_config,
         ):
             pipeline = StageConfigFactory.get_pipeline_config(
-                "Qwen/Qwen3-Omni-30B-A3B-Thinking",
+                model,
                 trust_remote_code=False,
                 deploy_config_path=str(deploy_path),
             )
@@ -1216,6 +1262,7 @@ stages:
         assert pipeline.model_type == "qwen3_omni_moe_thinker_only"
 
         deploy = load_deploy_config(deploy_path)
+        assert deploy.pipeline == "qwen3_omni_moe_thinker_only"
         stages = merge_pipeline_deploy(pipeline, deploy)
 
         assert len(stages) == 1
@@ -1267,6 +1314,8 @@ stages:
     @pytest.mark.parametrize(
         ("deploy_name", "pipeline_name", "stage_count", "final_output_type", "declared_pipeline"),
         [
+            ("mammoth_moda2.yaml", "mammoth_moda2", 2, "image", "mammoth_moda2"),
+            ("mammoth_moda2_ar.yaml", "mammoth_moda2_ar", 1, "text", "mammoth_moda2_ar"),
             ("omnivoice.yaml", "omnivoice", 1, "audio", "omnivoice"),
             ("mimo_audio.yaml", "mimo_audio", 2, "audio", None),
             ("step_audio_2.yaml", "step_audio_2", 2, "audio", None),
@@ -2116,7 +2165,8 @@ class TestBaseConfigInheritance:
     def test_minicpmo_overlays_inherit_talker_sampling_params(self):
         """Overlays must keep the base Talker codec Sampler knobs."""
         for filename in (
-            "minicpmo_4_5_duplex.yaml",
+            "minicpmo_4_5_2gpu.yaml",
+            "minicpmo_4_5_3gpu.yaml",
             "minicpmo_4_5_3gpu_stage1_replicas.yaml",
             "minicpmo_4_5_4gpu_stage1_replicas.yaml",
             "minicpmo_4_5_8x4090_stage1_replicas.yaml",
@@ -2128,9 +2178,6 @@ class TestBaseConfigInheritance:
             sampling = deploy.stages[1].default_sampling_params
             assert sampling is not None, f"{filename} stage 1 lost default_sampling_params"
             assert sampling["temperature"] == 0.8, filename
-            # Upstream utils.TTSSamplingParams. min_tokens is not checked here:
-            # the duplex overlay drops it to 0 because the model budgets each
-            # generate_chunk itself.
             assert sampling["top_k"] == 25, filename
             assert sampling["top_p"] == 0.85, filename
             assert sampling["repetition_penalty"] == 1.05, filename
@@ -2753,22 +2800,23 @@ class TestSentinelDefaultPrecedence:
         )
 
     def test_ming_flash_omni_topology(self):
-        """Guard ming_flash_omni's SIP cleanup: stage 0 has no full-payload
-        producer hook (arch is not in ``_FULL_PAYLOAD_INPUT_STAGES``), and
-        stage 1 uses only ``thinker2talker_token_only`` (sync_process_input_func).
+        """Guard ming_flash_omni's SIP cleanup: stage 0 has no
+        ``custom_process_next_stage_input_func``, and stage 1 does not set
+        ``requires_full_payload_input=True``. Stage 1 uses only
+        ``thinker2talker_token_only`` (sync_process_input_func).
         The dead ``thinker2talker`` (custom_process_input_func) was removed
         because ming_flash_omni has no async_chunk support and both functions
         called ``_build_talker_inputs`` identically.
-        Merge under either async_chunk mode must not re-introduce a
-        stage-0 full-payload hook."""
+        Merge under either async_chunk mode must not re-introduce either
+        full-payload transport gate."""
         pipeline = resolve_pipeline_config("ming_flash_omni")
         assert isinstance(pipeline, PipelineConfig)
 
         stage0, stage1 = pipeline.stages
         assert stage0.custom_process_next_stage_input_func is None, (
-            "ming_flash_omni stage 0 must not declare a full-payload producer "
-            "(connector path is not active for this arch)."
+            "ming_flash_omni stage 0 must not declare a full-payload producer hook."
         )
+        assert stage1.requires_full_payload_input is False
         assert stage1.custom_process_input_func is None
         assert stage1.sync_process_input_func is not None
         assert stage1.sync_process_input_func.endswith("thinker2talker_token_only")

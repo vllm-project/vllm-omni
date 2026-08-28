@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Stage initialization helpers for vLLM-Omni multi-stage runtime.
 
@@ -565,7 +568,7 @@ def _maybe_set_qwen3_omni_moe_env(engine_args_dict: dict[str, Any]) -> None:
 def split_devices_for_replicas(
     devices_str: str | None,
     num_replicas: int,
-    tp_size: int,
+    devices_per_replica: int,
     stage_id: int,
 ) -> list[str | None]:
     """Split a devices string into per-replica subsets.
@@ -578,19 +581,19 @@ def split_devices_for_replicas(
     When ``num_replicas`` is 1, returns ``[devices_str]`` unchanged.
     Otherwise, two YAML shapes are accepted:
 
-    1. **Legacy / pool mode** — ``len(devices) == num_replicas * tp_size``:
+    1. **Legacy / pool mode** — ``len(devices) == num_replicas * devices_per_replica``:
        the string enumerates the full per-stage pool. Each replica gets
-       ``tp_size`` consecutive entries. The values are logical indices
+       ``devices_per_replica`` consecutive entries. The values are logical indices
        into the launcher's ``CUDA_VISIBLE_DEVICES``.
 
        ``split_devices_for_replicas("1,2,3,4", 2, 2, 1) → ["1,2", "3,4"]``
 
-    2. **Template mode** — ``len(devices) == tp_size``: the YAML declares
+    2. **Template mode** — ``len(devices) == devices_per_replica``: the YAML declares
        a single per-replica template (the same shape one replica would
-       use), and is **dp-independent**. Each replica r gets the offsets
-       ``[r*tp_size + a for a in template]`` of the launcher's
+       use), and is **replica-count-independent**. Each replica r gets the offsets
+       ``[r*devices_per_replica + a for a in template]`` of the launcher's
        ``CUDA_VISIBLE_DEVICES``. The template's entries must lie in
-       ``[0, tp_size)``.
+       ``[0, devices_per_replica)``.
 
        ``split_devices_for_replicas("0,1", 2, 2, 1) → ["0,1", "2,3"]``
        ``split_devices_for_replicas("0,1", 4, 2, 1) → ["0,1", "2,3", "4,5", "6,7"]``
@@ -613,27 +616,29 @@ def split_devices_for_replicas(
 
     device_list = [d.strip() for d in devices_str.split(",") if d.strip()]
 
-    if len(device_list) == num_replicas * tp_size:
-        return [",".join(device_list[r * tp_size : (r + 1) * tp_size]) for r in range(num_replicas)]
+    if len(device_list) == num_replicas * devices_per_replica:
+        return [
+            ",".join(device_list[r * devices_per_replica : (r + 1) * devices_per_replica]) for r in range(num_replicas)
+        ]
 
-    if len(device_list) == tp_size:
+    if len(device_list) == devices_per_replica:
         try:
             offsets = [int(a) for a in device_list]
         except ValueError as e:
             raise ValueError(f"Stage {stage_id}: template-mode devices must be ints, got {devices_str!r}") from e
-        bad = [a for a in offsets if not (0 <= a < tp_size)]
+        bad = [a for a in offsets if not (0 <= a < devices_per_replica)]
         if bad:
             raise ValueError(
                 f"Stage {stage_id}: template-mode device offset(s) {bad} "
-                f"out of range [0, {tp_size}); devices={devices_str!r}"
+                f"out of range [0, {devices_per_replica}); devices={devices_str!r}"
             )
-        return [",".join(str(r * tp_size + a) for a in offsets) for r in range(num_replicas)]
+        return [",".join(str(r * devices_per_replica + a) for a in offsets) for r in range(num_replicas)]
 
     raise ValueError(
         f"Stage {stage_id}: devices={devices_str!r} has {len(device_list)} id(s); "
-        f"need either {tp_size} (template, dp-independent) or "
-        f"{num_replicas * tp_size} (pool / legacy). "
-        f"num_replicas={num_replicas}, tensor_parallel_size={tp_size}."
+        f"need either {devices_per_replica} (per-replica template) or "
+        f"{num_replicas * devices_per_replica} (pool / legacy). "
+        f"num_replicas={num_replicas}, devices_per_replica={devices_per_replica}."
     )
 
 
@@ -645,9 +650,32 @@ def get_stage_tp_size(stage_cfg: Any) -> int:
     return int(getattr(engine_args, "tensor_parallel_size", 1) or 1)
 
 
-def get_stage_devices_per_replica(stage_cfg: Any) -> int:
+def _get_local_llm_parallel_sizes(
+    stage_cfg: Any,
+    engine_args: Any | None = None,
+) -> tuple[int, int, int]:
+    """Return ``(tp, local_dp, pp)`` for one local LLM replica.
+
+    ``data_parallel_size`` is cluster-wide, whereas ``runtime.devices`` is
+    local to this process.  Prefer an explicitly resolved
+    ``data_parallel_size_local`` (including zero for a head process that owns
+    no local engines), and only fall back to the global DP width when it is
+    unset.
+    """
+    if engine_args is None:
+        engine_args = getattr(stage_cfg, "engine_args", {})
+    tp_size = int(_get_attr_or_item(engine_args, "tensor_parallel_size", 1) or 1)
+    pp_size = int(_get_attr_or_item(engine_args, "pipeline_parallel_size", 1) or 1)
+    local_dp_size = _get_attr_or_item(engine_args, "data_parallel_size_local", None)
+    if local_dp_size is None:
+        local_dp_size = _get_attr_or_item(engine_args, "data_parallel_size", 1)
+    return tp_size, int(local_dp_size if local_dp_size is not None else 1), pp_size
+
+
+def get_stage_devices_per_replica(stage_cfg: Any, engine_args: Any | None = None) -> int:
     """Return the number of devices consumed by one replica of *stage_cfg*."""
-    engine_args = getattr(stage_cfg, "engine_args", {})
+    if engine_args is None:
+        engine_args = getattr(stage_cfg, "engine_args", {})
     if getattr(stage_cfg, "stage_type", "llm") == "diffusion":
         parallel_config = _get_attr_or_item(engine_args, "parallel_config")
         if parallel_config is None:
@@ -664,14 +692,15 @@ def get_stage_devices_per_replica(stage_cfg: Any) -> int:
         except Exception:
             return 1
 
-    return get_stage_tp_size(stage_cfg)
+    tp_size, local_dp_size, pp_size = _get_local_llm_parallel_sizes(stage_cfg, engine_args)
+    return tp_size * max(1, local_dp_size) * pp_size
 
 
 def compute_replica_layout(
     stage_configs: Sequence[Any],
     *,
     allow_zero: bool = False,
-) -> tuple[list[int], dict[int, list[str]]]:
+) -> tuple[list[int], dict[int, list[str | None]]]:
     """Compute per-stage replica counts and device assignments.
 
     Args:
@@ -820,7 +849,7 @@ def _project_upstream_config_fields(
     field_map: Mapping[str, str],
 ) -> dict[str, Any]:
     """Project every explicit upstream input, including newly added fields."""
-    explicit_fields = getattr(config, "_omni_explicit_fields", frozenset())
+    explicit_fields: frozenset[str] = getattr(config, "_omni_explicit_fields", frozenset())
     unprojected_fields = explicit_fields - frozenset(field_map)
     if unprojected_fields:
         names = ", ".join(sorted(unprojected_fields))
@@ -838,9 +867,9 @@ def _project_omni_stage_engine_args(
     """Read backend inputs from one structured stage config."""
     engine_args: dict[str, Any] = {}
     is_diffusion = isinstance(stage_config, VllmOmniDiffusionStageConfig)
-
     if is_diffusion:
-        engine_args.update(_project_omni_config_fields(stage_config.diffusion_config))
+        diffusion_stage = cast(VllmOmniDiffusionStageConfig, stage_config)
+        engine_args.update(_project_omni_config_fields(diffusion_stage.diffusion_config))
 
     for config, excluded_fields in (
         (
@@ -1112,6 +1141,74 @@ def build_engine_args_dict_from_omni_stage_config(
     )
 
 
+def _count_stage_devices(devices: Any) -> int | None:
+    if devices is None:
+        return None
+    if isinstance(devices, (list, tuple)):
+        return len(devices)
+    values = [device for device in str(devices).split(",") if device.strip()]
+    return len(values) or None
+
+
+def _check_stage_device_layout(stage_config: Any, engine_args_dict: dict[str, Any]) -> None:
+    """Fail early when a stage's world size cannot fit its assigned ``devices``.
+
+    Re-runs :func:`check_device_layout` (normally only reached on the
+    ``--strategy-config`` path) against the fully resolved per-stage layout, so
+    an inconsistent ``tensor_parallel_size`` vs ``devices`` (issue #5003) is
+    reported here with a clear message instead of surfacing later as an opaque
+    worker-side ``local rank ... out of bounds`` assertion.
+    """
+    from vllm_omni.config.composable_parallel import StrategyApplyError, check_device_layout
+
+    runtime = getattr(stage_config, "runtime", None)
+    devices = _get_attr_or_item(runtime, "devices", None) if runtime is not None else None
+    if devices is None:
+        # No explicit placement -> vLLM assigns devices itself; nothing to check.
+        return
+
+    num_replicas = _get_attr_or_item(runtime, "num_replicas", 1) if runtime is not None else 1
+    stage_id = getattr(stage_config, "stage_id", "?")
+    tp_size, local_dp_size, pp_size = _get_local_llm_parallel_sizes(stage_config, engine_args_dict)
+    if local_dp_size == 0:
+        # This process hosts no local DP engines, so its local device list does
+        # not describe the cluster-wide DP layout and must not be validated.
+        return
+
+    try:
+        check_device_layout(
+            devices,
+            tensor_parallel_size=tp_size,
+            data_parallel_size=local_dp_size,
+            pipeline_parallel_size=pp_size,
+            num_replicas=int(num_replicas or 1),
+            role=f"stage-{stage_id}",
+        )
+    except StrategyApplyError as e:
+        message = (
+            f"Stage {stage_id}: device layout is inconsistent — {e} "
+            "Set devices and the per-stage TP, local DP, PP, and replica counts "
+            "so the declared device count matches the local world size."
+        )
+        device_count = _count_stage_devices(devices)
+        world_without_tp = local_dp_size * pp_size
+        valid_without_tp = {world_without_tp, int(num_replicas or 1) * world_without_tp}
+        if tp_size > 1 and device_count in valid_without_tp:
+            message += (
+                " This layout is consistent with issue #5003: a top-level "
+                "--tensor-parallel-size is applied to every stage, but each stage's "
+                "`devices` is not adjusted automatically. Pass --stage-overrides "
+                "to set tensor_parallel_size and devices together on every stage, "
+                "so single-GPU stages get tensor_parallel_size=1, e.g. "
+                '\'{"0": {"tensor_parallel_size": 4, "devices": "0,1,2,3"}, '
+                '"1": {"tensor_parallel_size": 1, "devices": "0"}, '
+                '"2": {"tensor_parallel_size": 1, "devices": "1"}}\'. '
+                "Or omit the top-level --tensor-parallel-size and set it only in "
+                "stage-0's override."
+            )
+        raise ValueError(message) from e
+
+
 def build_vllm_config(
     stage_config: Any,
     model: str,
@@ -1146,6 +1243,16 @@ def build_vllm_config(
         filtered_engine_args_dict["structured_outputs_config"] = StructuredOutputsConfig(**soc)
 
     omni_engine_args = OmniEngineArgs(**filtered_engine_args_dict)
+
+    # Guard against a per-stage world size that its assigned ``devices`` cannot
+    # satisfy (issue #5003). A top-level ``--tensor-parallel-size`` is broadcast
+    # to every stage, but ``devices`` is not, so a stage can end up with e.g.
+    # tensor_parallel_size=4 while still holding a single-GPU deploy default.
+    # Without --strategy-config the strategy-path device check never runs, so
+    # the mismatch used to surface only as an opaque worker-side assertion
+    # ("DP adjusted local rank N is out of bounds for M devices."). Re-run the
+    # same check here, before workers spawn, to fail early with a clear message.
+    _check_stage_device_layout(stage_config, filtered_engine_args_dict)
 
     # Multi-stage pipelines (qwen3_tts code2wav, etc.) set max_model_len
     # larger than HF max_position_embeddings by design. vLLM's validator
@@ -1473,6 +1580,7 @@ def build_diffusion_config(
     num_devices_per_stage = od_config.parallel_config.world_size
     device_control_env = current_omni_platform.device_control_env_var
     visible_devices_str = os.environ.get(device_control_env) if device_control_env else None
+    physical_devices: list[str | int]
     if visible_devices_str:
         physical_devices = [device.strip() for device in visible_devices_str.split(",") if device.strip()]
     else:
@@ -1506,15 +1614,14 @@ def initialize_diffusion_stage(
         stage_cfg: Stage configuration.
         metadata: Extracted stage metadata.
         stage_init_timeout: Timeout in seconds for stage initialization handshake
-        batch_size: Maximum number of requests to batch together in the
-            diffusion engine.  Passed through to ``StageDiffusionClient``
-            and ultimately to ``AsyncOmni``.
+        batch_size: Client-side request batch width. Does not set scheduler
+            ``max_num_seqs``; pass ``--max-num-seqs`` or stage YAML for that.
+            Forwarded to ``StageDiffusionClient``.
         use_inline: If True, uses the inline diffusion client instead of subprocess.
     """
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
-    od_config.max_num_seqs = batch_size
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
 
 

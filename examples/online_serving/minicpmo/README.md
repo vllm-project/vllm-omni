@@ -32,12 +32,14 @@ GPU 0 (90%) and colocates the Talker (55%) and Code2Wav (35%) on GPU 1. That
 profile admits at most four concurrent sequences per stage.
 
 | deploy config | GPUs | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `minicpmo_4_5.yaml` (default) | 1 | Memory-constrained compatibility layout. |
 | `minicpmo_4_5_2gpu.yaml` | 2 | Recommended continuous-batching layout; Talker and Code2Wav share GPU 1. |
 | `minicpmo_4_5_3gpu.yaml` | 3 | One GPU per stage. |
 | `minicpmo_4_5_8x4090.yaml` | 8 | Full 8x4090 layout. |
-| `minicpmo_4_5_duplex.yaml` | 1 | Experimental native full-duplex overlay. |
+
+Every profile sets `session_mode: duplex`, so native full-duplex is served
+from the same process as `/v1/chat/completions`.
 
 The split pipeline preserves native-duplex epoch/turn identity, segment text,
 turn completion, reference voice, and terminal-audio metadata through
@@ -55,8 +57,8 @@ vllm-omni serve openbmb/MiniCPM-o-4_5 \
 ```
 
 For local ModelScope checkpoints, replace `openbmb/MiniCPM-o-4_5` with the
-checkpoint path. To start the experimental native duplex backend, use
-`vllm_omni/deploy/minicpmo_4_5_duplex.yaml`.
+checkpoint path. For native full-duplex, connect `/v1/realtime?duplex=1` on
+this same server.
 
 ### Per-stage overrides
 
@@ -145,7 +147,7 @@ assistant template, so it is not an apples-to-apples accuracy run.
 
 ## Run the Realtime duplex CLI demo
 
-After the duplex backend is running, stream one WAV through the Realtime
+After the server is running, stream one WAV through the Realtime
 WebSocket endpoint:
 
 ```bash
@@ -189,6 +191,64 @@ which checks lifecycle and streaming invariants for arbitrary input audio. The
 stronger `response-required` mode is diagnostic: it requires a purpose-built
 two-response WAV, its `--input-sha256`, and an
 `--expect-second-response-substring` value.
+
+## Run Omni-DuplexEval
+
+Omni-DuplexEval generation uses the vLLM-Omni native MiniCPM-o duplex
+endpoint. Evaluation uses a separate OpenAI-compatible multimodal judge
+served from the same vLLM-Omni environment. This validates the vLLM-Omni
+duplex client and local judge integration; it does not reproduce the paper's
+original MiniCPM-o inference implementation.
+
+Start the duplex generation server:
+
+```bash
+vllm serve openbmb/MiniCPM-o-4_5 --omni --trust-remote-code \
+    --deploy-config vllm_omni/deploy/minicpmo_4_5_duplex.yaml \
+    --served-model-name openbmb/MiniCPM-o-4_5 \
+    --host 0.0.0.0 --port 8099
+```
+
+Start a separate multimodal judge. The allowed path must contain any local
+videos passed with `--judge-video-mode video_url`:
+
+```bash
+vllm serve Qwen/Qwen2.5-VL-7B-Instruct \
+    --served-model-name Qwen/Qwen2.5-VL-7B-Instruct \
+    --allowed-local-media-path /data/omni-duplex-eval \
+    --host 0.0.0.0 --port 8000
+```
+
+Generate, evaluate, and summarize:
+
+```bash
+vllm bench omni-duplex-eval --omni generate \
+    --url ws://127.0.0.1:8099/v1/realtime?duplex=1 \
+    --model openbmb/MiniCPM-o-4_5 \
+    --ref-audio /data/ref.wav \
+    --dataset Hothan/Omni-DuplexEval \
+    --concurrency 2 \
+    --response-root /data/omni-duplex-eval/responses
+
+vllm bench omni-duplex-eval --omni evaluate \
+    --dataset Hothan/Omni-DuplexEval \
+    --response-root /data/omni-duplex-eval/responses \
+    --score-root /data/omni-duplex-eval/scores \
+    --judge-base-url http://127.0.0.1:8000 \
+    --judge-model Qwen/Qwen2.5-VL-7B-Instruct \
+    --judge-video-mode video_url \
+    --eval-workers 4
+
+vllm bench omni-duplex-eval --omni summarize \
+    --score-root /data/omni-duplex-eval/scores
+```
+
+The dataset names such as `RTD_OCR` and `PR_correction` are Hugging Face
+splits, not dataset configurations. Pass one with `--split`, or omit it to
+run all nine splits. `--limit 1` is useful for a smoke test. Realtime
+generation records `clock=media`; artifacts generated with
+`--pace as-fast-as-possible` record `clock=invalid` and evaluation rejects
+them unless `--allow-invalid-clock` is explicit.
 
 ## Related examples
 
