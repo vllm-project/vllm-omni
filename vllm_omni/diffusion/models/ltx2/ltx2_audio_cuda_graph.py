@@ -60,6 +60,14 @@ class LTX2AudioGraphKey:
     has_perturbation_mask: bool
     stg_blocks: tuple[int, ...] | None
 
+    @property
+    def audio_token_count(self) -> int:
+        return self.hidden_shape[1]
+
+    @property
+    def context_token_count(self) -> int:
+        return self.context_shape[1]
+
 
 @dataclass
 class LTX2AudioGraphEntry:
@@ -147,6 +155,7 @@ class LTX2AudioCUDAGraphRunner:
         self._cache: OrderedDict[LTX2AudioGraphKey, LTX2AudioGraphEntry] = OrderedDict()
         self._failed_keys: OrderedDict[LTX2AudioGraphKey, None] = OrderedDict()
         self._pool: Any | None = None
+        # In-memory observability counters for CUDA Graph usage and eager fallbacks.
         self._stats = {
             "calls": 0,
             "hits": 0,
@@ -154,8 +163,13 @@ class LTX2AudioCUDAGraphRunner:
             "capture_failures": 0,
             "evictions": 0,
             "eager": 0,
+            "eager_incompatible_inputs": 0,
+            "eager_active_capture": 0,
+            "eager_previous_capture_failure": 0,
+            "eager_capture_failure": 0,
         }
         self.last_call_info: dict[str, Any] = {}
+        self.last_request_stats: dict[str, int] = {}
 
     def stats_snapshot(self) -> dict[str, int]:
         return {
@@ -164,6 +178,17 @@ class LTX2AudioCUDAGraphRunner:
             "failed_key_count": len(self._failed_keys),
             "max_graphs": self.max_graphs,
         }
+
+    def record_request_stats(self, before: Mapping[str, int]) -> dict[str, int]:
+        """Record counter deltas for one completed request without synchronizing."""
+        current = self.stats_snapshot()
+        self.last_request_stats = {
+            **{name: current[name] - before.get(name, 0) for name in self._stats},
+            "cache_size": current["cache_size"],
+            "failed_key_count": current["failed_key_count"],
+            "max_graphs": current["max_graphs"],
+        }
+        return dict(self.last_request_stats)
 
     @staticmethod
     def _canonical_blocks(stg_blocks: Sequence[int] | None) -> tuple[int, ...] | None:
@@ -280,11 +305,14 @@ class LTX2AudioCUDAGraphRunner:
             attention_kwargs=attention_kwargs,
         )
 
-    def _eager_forward(self, **kwargs: Any) -> torch.Tensor:
+    def _eager_forward(self, reason: str, **kwargs: Any) -> torch.Tensor:
         self._stats["eager"] += 1
+        reason_counter = f"eager_{reason}"
+        if reason_counter in self._stats:
+            self._stats[reason_counter] += 1
         return self._call_transformer(**kwargs)
 
-    def _capture(self, **inputs: Any) -> LTX2AudioGraphEntry:
+    def _capture(self, **inputs: Any) -> tuple[LTX2AudioGraphEntry, torch.Tensor]:
         static_inputs = {
             name: _static_copy(value) if isinstance(value, torch.Tensor) else value for name, value in inputs.items()
         }
@@ -293,7 +321,7 @@ class LTX2AudioCUDAGraphRunner:
         warmup_stream.wait_stream(current_stream)
         with torch.cuda.stream(warmup_stream), torch.no_grad():
             for _ in range(3):
-                self._call_transformer(**static_inputs)
+                initial_output = self._call_transformer(**static_inputs)
         current_stream.wait_stream(warmup_stream)
         torch.accelerator.synchronize(self.device)
 
@@ -311,16 +339,19 @@ class LTX2AudioCUDAGraphRunner:
             ),
         ):
             static_output = self._call_transformer(**static_inputs)
-        return LTX2AudioGraphEntry(
-            graph=graph,
-            static_hidden_states=static_inputs["hidden_states"],
-            static_context=static_inputs["context"],
-            static_timestep=static_inputs["timestep"],
-            static_sigma=static_inputs["sigma"],
-            static_coords=static_inputs["coords"],
-            static_attention_mask=static_inputs["attention_mask"],
-            static_perturbation_mask=static_inputs["perturbation_mask"],
-            static_output=static_output,
+        return (
+            LTX2AudioGraphEntry(
+                graph=graph,
+                static_hidden_states=static_inputs["hidden_states"],
+                static_context=static_inputs["context"],
+                static_timestep=static_inputs["timestep"],
+                static_sigma=static_inputs["sigma"],
+                static_coords=static_inputs["coords"],
+                static_attention_mask=static_inputs["attention_mask"],
+                static_perturbation_mask=static_inputs["perturbation_mask"],
+                static_output=static_output,
+            ),
+            initial_output,
         )
 
     @staticmethod
@@ -378,11 +409,12 @@ class LTX2AudioCUDAGraphRunner:
         if not self._inputs_are_compatible(**{k: v for k, v in inputs.items() if k != "stg_blocks"}):
             self.last_call_info = {"mode": "eager", "reason": "incompatible_inputs"}
             logger.debug("LTX2 audio CUDA Graph bypassed for incompatible request inputs")
-            return self._eager_forward(**inputs)
+            return self._eager_forward("incompatible_inputs", **inputs)
 
         if torch.cuda.is_current_stream_capturing():
             self.last_call_info = {"mode": "eager", "reason": "active_capture"}
-            return self._eager_forward(**inputs)
+            logger.debug("LTX2 audio CUDA Graph bypassed during an active outer capture")
+            return self._eager_forward("active_capture", **inputs)
 
         key = make_ltx2_audio_graph_key(
             audio_hidden_states,
@@ -395,7 +427,8 @@ class LTX2AudioCUDAGraphRunner:
         if entry is not None:
             if not self._entry_matches(entry, **{k: v for k, v in inputs.items() if k != "stg_blocks"}):
                 self.last_call_info = {"mode": "eager", "reason": "incompatible_inputs", "key": key}
-                return self._eager_forward(**inputs)
+                logger.debug("LTX2 audio CUDA Graph cache entry metadata no longer matches key=%s", key)
+                return self._eager_forward("incompatible_inputs", **inputs)
             self._cache.move_to_end(key)
             self._stats["hits"] += 1
             self.last_call_info = {"mode": "replay", "reason": "cache_hit", "key": key}
@@ -404,18 +437,29 @@ class LTX2AudioCUDAGraphRunner:
         if key in self._failed_keys:
             self._failed_keys.move_to_end(key)
             self.last_call_info = {"mode": "eager", "reason": "previous_capture_failure", "key": key}
-            return self._eager_forward(**inputs)
+            logger.debug("LTX2 audio CUDA Graph skipped a previously failed key=%s", key)
+            return self._eager_forward("previous_capture_failure", **inputs)
 
         try:
-            entry = self._capture(**inputs)
+            entry, initial_output = self._capture(**inputs)
             self._stats["captures"] += 1
             self._cache[key] = entry
             while len(self._cache) > self.max_graphs:
-                _, evicted = self._cache.popitem(last=False)
+                evicted_key, evicted = self._cache.popitem(last=False)
                 del evicted
                 self._stats["evictions"] += 1
+                logger.debug("LTX2 audio CUDA Graph evicted key=%s", evicted_key)
             self.last_call_info = {"mode": "capture", "reason": "cache_miss", "key": key}
-            return self._copy_and_replay(entry, **inputs)
+            logger.debug(
+                "LTX2 audio CUDA Graph captured audio_tokens=%d context_tokens=%d key=%s",
+                key.audio_token_count,
+                key.context_token_count,
+                key,
+            )
+            # The last warmup already produced the result for these inputs.
+            # Captured graph outputs are not populated until their first
+            # replay, so use the warmup result to avoid that redundant replay.
+            return initial_output.detach().clone()
         except Exception:
             self._stats["capture_failures"] += 1
             self._failed_keys[key] = None
@@ -427,7 +471,7 @@ class LTX2AudioCUDAGraphRunner:
                 "LTX2 audio CUDA Graph capture failed; using eager execution for this signature",
                 exc_info=True,
             )
-            return self._eager_forward(**inputs)
+            return self._eager_forward("capture_failure", **inputs)
 
     def clear(self) -> None:
         """Synchronously release captured graphs and reset the lifecycle."""
@@ -439,3 +483,4 @@ class LTX2AudioCUDAGraphRunner:
         for name in self._stats:
             self._stats[name] = 0
         self.last_call_info = {}
+        self.last_request_stats = {}

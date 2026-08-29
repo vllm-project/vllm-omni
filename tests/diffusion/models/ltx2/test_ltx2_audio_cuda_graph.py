@@ -77,6 +77,8 @@ def test_graph_key_uses_structure_not_values():
     first = _cpu_inputs(mask=True, perturb=True)
     second = _cpu_inputs(mask=True, perturb=True)
     assert _key(first) == _key(second)
+    assert _key(first).audio_token_count == 3
+    assert _key(first).context_token_count == 2
 
 
 @pytest.mark.parametrize(
@@ -116,6 +118,7 @@ def test_incompatible_inputs_fall_back_without_failed_key():
     assert output.shape == (2, 3, 4)
     assert runner.last_call_info["reason"] == "incompatible_inputs"
     assert runner.stats_snapshot()["eager"] == 1
+    assert runner.stats_snapshot()["eager_incompatible_inputs"] == 1
     assert runner.stats_snapshot()["failed_key_count"] == 0
 
 
@@ -128,16 +131,19 @@ def test_mock_cache_hit_lru_and_eviction(monkeypatch):
     def capture(**kwargs):
         captures.append(tuple(kwargs["hidden_states"].shape))
         tensor = kwargs["hidden_states"].clone()
-        return SimpleNamespace(
-            graph=SimpleNamespace(replay=lambda: None),
-            static_hidden_states=tensor,
-            static_context=kwargs["context"].clone(),
-            static_timestep=kwargs["timestep"].clone(),
-            static_sigma=kwargs["sigma"].clone(),
-            static_coords=kwargs["coords"].clone(),
-            static_attention_mask=None,
-            static_perturbation_mask=None,
-            static_output=tensor,
+        return (
+            SimpleNamespace(
+                graph=SimpleNamespace(replay=lambda: None),
+                static_hidden_states=tensor,
+                static_context=kwargs["context"].clone(),
+                static_timestep=kwargs["timestep"].clone(),
+                static_sigma=kwargs["sigma"].clone(),
+                static_coords=kwargs["coords"].clone(),
+                static_attention_mask=None,
+                static_perturbation_mask=None,
+                static_output=tensor,
+            ),
+            tensor,
         )
 
     monkeypatch.setattr(runner, "_capture", capture)
@@ -154,6 +160,52 @@ def test_mock_cache_hit_lru_and_eviction(monkeypatch):
     assert stats["captures"] == 3
     assert stats["evictions"] == 1
     assert list(runner._cache)[0] == _key(one)
+
+
+def test_cache_miss_returns_warmup_output_without_replay(monkeypatch):
+    runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cuda")
+    monkeypatch.setattr(runner, "_inputs_are_compatible", lambda **_kwargs: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    inputs = _cpu_inputs()
+    replay = Mock()
+    captured_output = inputs["audio_hidden_states"] + 1
+
+    def capture(**kwargs):
+        return (
+            SimpleNamespace(
+                graph=SimpleNamespace(replay=replay),
+                static_hidden_states=kwargs["hidden_states"].clone(),
+                static_context=kwargs["context"].clone(),
+                static_timestep=kwargs["timestep"].clone(),
+                static_sigma=kwargs["sigma"].clone(),
+                static_coords=kwargs["coords"].clone(),
+                static_attention_mask=None,
+                static_perturbation_mask=None,
+                static_output=torch.empty_like(captured_output),
+            ),
+            captured_output,
+        )
+
+    monkeypatch.setattr(runner, "_capture", capture)
+
+    before = runner.stats_snapshot()
+    output = runner(**inputs)
+
+    replay.assert_not_called()
+    torch.testing.assert_close(output, captured_output)
+    assert output.data_ptr() != captured_output.data_ptr()
+    assert runner.last_call_info["mode"] == "capture"
+
+    runner(**inputs)
+
+    replay.assert_called_once_with()
+    delta = runner.record_request_stats(before)
+    assert delta["calls"] == 2
+    assert delta["captures"] == 1
+    assert delta["hits"] == 1
+    assert delta["eager"] == 0
+    assert delta["cache_size"] == 1
+    assert runner.last_request_stats == delta
 
 
 def test_capture_failure_is_bounded_and_not_retried(monkeypatch):
@@ -176,6 +228,8 @@ def test_capture_failure_is_bounded_and_not_retried(monkeypatch):
     assert attempts == 2
     stats = runner.stats_snapshot()
     assert stats["capture_failures"] == 2
+    assert stats["eager_capture_failure"] == 2
+    assert stats["eager_previous_capture_failure"] == 1
     assert stats["failed_key_count"] == 1
 
 
@@ -188,6 +242,7 @@ def test_clear_resets_lifecycle(monkeypatch):
     assert runner._pool is None
     assert runner.stats_snapshot()["calls"] == 0
     assert runner.stats_snapshot()["failed_key_count"] == 0
+    assert runner.last_request_stats == {}
 
 
 def test_active_outer_capture_uses_eager_without_mutating_cache(monkeypatch):
@@ -204,6 +259,7 @@ def test_active_outer_capture_uses_eager_without_mutating_cache(monkeypatch):
     assert runner.last_call_info == {"mode": "eager", "reason": "active_capture"}
     assert runner.stats_snapshot()["captures"] == 0
     assert runner.stats_snapshot()["cache_size"] == 0
+    assert runner.stats_snapshot()["eager_active_capture"] == 1
     capture.assert_not_called()
 
 

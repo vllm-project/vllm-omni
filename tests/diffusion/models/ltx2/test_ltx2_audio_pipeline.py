@@ -419,10 +419,24 @@ def test_ltx25_t2a_overrides_shared_distilled_scheduler_before_validation(tmp_pa
     assert tokenizer_loaded
 
 
-def test_ltx_t2a_denoise_passes_audio_padding_mask_without_video_inputs(monkeypatch):
-    from vllm_omni.diffusion.models.ltx2 import ltx2_audio_runtime
+@pytest.mark.parametrize("request_sigmas", ([1.0, 0.5, 0.0], None))
+def test_ltx_t2a_denoise_passes_audio_padding_mask_without_video_inputs(monkeypatch, request_sigmas):
+    from vllm_omni.diffusion.models.ltx2 import ltx2_audio_runtime, ltx2_guidance
 
     calls = []
+    perturbation_builds = 0
+    sigma_scalars = []
+    original_build_perturbation_kwargs = ltx2_audio_runtime.build_perturbation_kwargs
+    original_velocity_from_x0 = ltx2_guidance.velocity_from_x0
+
+    def count_perturbation_builds(*args, **kwargs):
+        nonlocal perturbation_builds
+        perturbation_builds += 1
+        return original_build_perturbation_kwargs(*args, **kwargs)
+
+    def track_sigma_scalar(sample, x0, sigma, *, sigma_scalar=None):
+        sigma_scalars.append(sigma_scalar)
+        return original_velocity_from_x0(sample, x0, sigma, sigma_scalar=sigma_scalar)
 
     class Rope:
         @staticmethod
@@ -458,11 +472,13 @@ def test_ltx_t2a_denoise_passes_audio_padding_mask_without_video_inputs(monkeypa
     pipe._interrupt = False
     pipe.progress_bar = lambda **_kwargs: Progress()
     monkeypatch.setattr(ltx2_audio_runtime, "get_guidance_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(ltx2_audio_runtime, "build_perturbation_kwargs", count_perturbation_builds)
+    monkeypatch.setattr(ltx2_guidance, "velocity_from_x0", track_sigma_scalar)
     prompt_context = SimpleNamespace(
         positive_connector_audio_prompt_embeds=torch.zeros(1, 2, 4),
         negative_connector_audio_prompt_embeds=None,
     )
-    inputs = SimpleNamespace(num_inference_steps=1)
+    inputs = SimpleNamespace(num_inference_steps=2)
     latents = torch.ones(1, 3, 4)
 
     result = pipe._run_audio_denoise(
@@ -471,9 +487,18 @@ def test_ltx_t2a_denoise_passes_audio_padding_mask_without_video_inputs(monkeypa
         inputs,
         original_num_frames=2,
         padded_num_frames=3,
-        request_sigmas=[1.0, 0.0],
+        request_sigmas=request_sigmas,
     )
 
+    assert len(calls) == 2
+    assert perturbation_builds == 1
+    assert len(sigma_scalars) == 2
+    assert all(isinstance(value, float) for value in sigma_scalars)
+    if request_sigmas is not None:
+        assert sigma_scalars == [1.0, 0.5]
+    assert calls[0]["audio_encoder_hidden_states"] is calls[1]["audio_encoder_hidden_states"]
+    assert calls[0]["audio_coords"] is calls[1]["audio_coords"]
+    assert calls[0]["audio_attention_mask"] is calls[1]["audio_attention_mask"]
     assert not {"hidden_states", "encoder_hidden_states", "video_coords"} & calls[0].keys()
     torch.testing.assert_close(calls[0]["audio_attention_mask"], torch.tensor([[True, True, False]]))
     torch.testing.assert_close(result[:, :2], latents[:, :2])

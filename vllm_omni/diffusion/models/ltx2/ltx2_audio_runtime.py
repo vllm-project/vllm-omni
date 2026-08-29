@@ -517,12 +517,15 @@ class LTXAudioRuntime(
         audio_scheduler = copy.deepcopy(self.scheduler)
         if request_sigmas is None:
             sigmas = _official_ltx_sigmas(audio_scheduler, inputs.num_inference_steps, self.device)
+            sigma_scalars = tuple(sigmas.detach().to(device="cpu", dtype=torch.float32).tolist())
         else:
-            sigmas = torch.as_tensor(request_sigmas, dtype=torch.float32, device=self.device)
-            if sigmas.ndim != 1 or sigmas.numel() < 2:
+            host_sigmas = torch.as_tensor(request_sigmas, dtype=torch.float32)
+            if host_sigmas.ndim != 1 or host_sigmas.numel() < 2:
                 raise ValueError("An LTX custom sigma schedule must contain at least two boundary values.")
-            if sigmas[-1] != 0:
-                sigmas = torch.cat([sigmas, sigmas.new_zeros(1)])
+            if host_sigmas[-1] != 0:
+                host_sigmas = torch.cat([host_sigmas, host_sigmas.new_zeros(1)])
+            sigma_scalars = tuple(host_sigmas.tolist())
+            sigmas = host_sigmas.to(self.device)
         timesteps = self._set_audio_sigmas(audio_scheduler, sigmas)
         plan = self._guidance_plan
         audio_coords = self.transformer.audio_rope.prepare_audio_coords(
@@ -549,45 +552,52 @@ class LTXAudioRuntime(
         LTX_GUIDANCE_EXECUTOR.validate_guidance_world_size(plan, guidance_world_size)
         LTX_GUIDANCE_EXECUTOR.warn_if_imbalanced(plan, guidance_world_size, "generate_audio")
 
+        if guidance_parallel_ready:
+            assignments = LTX_GUIDANCE_EXECUTOR._parallel_assignments(len(plan.passes), guidance_world_size)
+            local_indices = assignments[get_guidance_parallel_rank()]
+            model_pass_count = max(len(indices) for indices in assignments)
+            padded_indices: list[int | None] = local_indices + [None] * (model_pass_count - len(local_indices))
+            local_passes = tuple(
+                plan.passes[0] if pass_index is None else plan.passes[pass_index] for pass_index in padded_indices
+            )
+            local_plan = LTXGuidancePlan(spec=plan.spec, passes=local_passes)
+        else:
+            local_passes = plan.passes
+            local_plan = plan
+            model_pass_count = len(plan.passes)
+
+        contexts = []
+        for denoise_pass in local_passes:
+            context = (
+                prompt_context.negative_connector_audio_prompt_embeds
+                if denoise_pass.negative_audio_context
+                else prompt_context.positive_connector_audio_prompt_embeds
+            )
+            if context is None:
+                raise ValueError("Negative audio prompt context is required when LTX T2A CFG is enabled.")
+            contexts.append(context)
+        model_dtype = prompt_context.positive_connector_audio_prompt_embeds.dtype
+        encoder_hidden_states = torch.cat(contexts)
+        model_audio_attention_mask = (
+            None if audio_attention_mask is None else _repeat_batch(audio_attention_mask, model_pass_count)
+        )
+        model_audio_coords = _repeat_batch(audio_coords, model_pass_count)
+        perturbations = build_perturbation_kwargs(
+            local_plan,
+            audio_latents.shape[0],
+            encoder_hidden_states,
+        )
+        perturbation_mask = perturbations.get("audio_self_attention_mask")
+        stg_blocks = perturbations.get("audio_self_attention_blocks")
+        audio_graph_runner = getattr(self, "audio_graph_runner", None)
+        graph_stats_before = audio_graph_runner.stats_snapshot() if audio_graph_runner is not None else None
+
         with self.progress_bar(total=len(timesteps)) as progress_bar:
             for index, timestep in enumerate(timesteps):
                 if self.interrupt:
                     continue
-                if guidance_parallel_ready:
-                    assignments = LTX_GUIDANCE_EXECUTOR._parallel_assignments(len(plan.passes), guidance_world_size)
-                    local_indices = assignments[get_guidance_parallel_rank()]
-                    model_pass_count = max(len(indices) for indices in assignments)
-                    padded_indices: list[int | None] = local_indices + [None] * (model_pass_count - len(local_indices))
-                    local_passes = tuple(
-                        plan.passes[0] if pass_index is None else plan.passes[pass_index]
-                        for pass_index in padded_indices
-                    )
-                    local_plan = LTXGuidancePlan(spec=plan.spec, passes=local_passes)
-                else:
-                    local_passes = plan.passes
-                    local_plan = plan
-                    model_pass_count = len(plan.passes)
-
-                contexts = []
-                for denoise_pass in local_passes:
-                    context = (
-                        prompt_context.negative_connector_audio_prompt_embeds
-                        if denoise_pass.negative_audio_context
-                        else prompt_context.positive_connector_audio_prompt_embeds
-                    )
-                    if context is None:
-                        raise ValueError("Negative audio prompt context is required when LTX T2A CFG is enabled.")
-                    contexts.append(context)
-                model_input = _repeat_batch(audio_latents, model_pass_count).to(
-                    prompt_context.positive_connector_audio_prompt_embeds.dtype
-                )
-                perturbations = build_perturbation_kwargs(local_plan, audio_latents.shape[0], model_input)
+                model_input = _repeat_batch(audio_latents, model_pass_count).to(model_dtype)
                 expanded_timestep = timestep.expand(model_input.shape[0])
-                encoder_hidden_states = torch.cat(contexts)
-                model_audio_attention_mask = (
-                    None if audio_attention_mask is None else _repeat_batch(audio_attention_mask, model_pass_count)
-                )
-                model_audio_coords = _repeat_batch(audio_coords, model_pass_count)
                 model_timestep = expanded_timestep[:, None].expand(-1, model_input.shape[1])
                 model_sigma = audio_scheduler.sigmas[index].expand(model_input.shape[0])
                 velocity = self._run_audio_transformer(
@@ -597,8 +607,8 @@ class LTXAudioRuntime(
                     audio_sigma=model_sigma,
                     audio_coords=model_audio_coords,
                     audio_attention_mask=model_audio_attention_mask,
-                    perturbation_mask=perturbations.get("audio_self_attention_mask"),
-                    stg_blocks=perturbations.get("audio_self_attention_blocks"),
+                    perturbation_mask=perturbation_mask,
+                    stg_blocks=stg_blocks,
                 )
                 if guidance_parallel_ready:
                     local_slots = velocity.chunk(model_pass_count)
@@ -617,6 +627,7 @@ class LTXAudioRuntime(
                     splits,
                     audio_scheduler.sigmas[index],
                     plan.spec.audio,
+                    sigma_scalar=sigma_scalars[index],
                     rescale_token_count=original_num_frames,
                 )
                 audio_latents = euler_step_from_velocity(
@@ -627,6 +638,8 @@ class LTXAudioRuntime(
                 )
                 audio_latents = latent_ops.clear_audio_padding(audio_latents, original_num_frames)
                 progress_bar.update()
+        if audio_graph_runner is not None and graph_stats_before is not None:
+            audio_graph_runner.record_request_stats(graph_stats_before)
         return audio_latents
 
     def _run_audio_transformer(
