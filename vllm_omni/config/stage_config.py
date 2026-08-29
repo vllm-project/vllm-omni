@@ -319,6 +319,13 @@ def resolve_diffusion_stage_role(
     return DiffusionStageRole.FULL
 
 
+class PDRole(str, Enum):
+    """Role of an autoregressive stage in a disaggregated PD pair."""
+
+    PREFILL = "prefill"
+    DECODE = "decode"
+
+
 def _resolve_scheduler(
     execution_type: StageExecutionType,
     async_scheduling: bool = True,
@@ -436,6 +443,7 @@ class StagePipelineConfig:
     # scheduling. The scheduler only receives its typed effects.
     scheduling_metadata_adapter: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
+    pd_role: PDRole | None = None
 
 
 @dataclass(frozen=True)
@@ -1577,6 +1585,7 @@ def merge_pipeline_deploy(
                 stage_id=ps.stage_id,
                 model_stage=ps.model_stage,
                 stage_role=ps.stage_role.value if ps.stage_role is not None else None,
+                pd_role=ps.pd_role,
                 session_mode=deploy.session_mode,
                 stage_type=stage_type,
                 input_sources=list(ps.input_sources),
@@ -1621,6 +1630,7 @@ class StageConfig:
     yaml_runtime: dict[str, Any] = field(default_factory=dict)
     yaml_extras: dict[str, Any] = field(default_factory=dict)
     runtime_overrides: dict[str, Any] = field(default_factory=dict)
+    pd_role: PDRole | None = None
 
     def to_omegaconf(self) -> Any:
         """TODO(@lishunyang12): remove once engine consumes ResolvedStageConfig directly."""
@@ -1701,6 +1711,7 @@ class StageConfig:
         config_dict: dict[str, Any] = {
             "stage_id": self.stage_id,
             "stage_type": StageType(self.stage_type).value,
+            "pd_role": self.pd_role.value if self.pd_role is not None else None,
             "session_mode": self.session_mode,
             "engine_args": create_config(engine_args),
             "runtime": create_config(runtime),
