@@ -6,6 +6,7 @@ Mixin for OmniBase — keeps omni.py focused on orchestration.
 """
 
 import logging
+import os
 import threading
 from dataclasses import asdict, is_dataclass
 from typing import TYPE_CHECKING, Any
@@ -61,17 +62,31 @@ class PDDisaggregationMixin:
         prefill_by_id: dict[int, int] = {}
         decode_indices: list[int] = []
         for i, stage in enumerate(stage_configs):
-            if getattr(stage, "is_prefill_only", False):
+            pd_role = getattr(stage, "pd_role", None)
+            pd_role_value = getattr(pd_role, "value", pd_role)
+            is_prefill = pd_role_value == "prefill"
+            is_decode = pd_role_value == "decode"
+
+            # Keep the community boolean markers as a compatibility fallback
+            # until their structured-config projection is implemented.
+            if pd_role_value is None:
+                is_prefill = bool(getattr(stage, "is_prefill_only", False))
+                is_decode = bool(getattr(stage, "is_decode_only", False))
+
+            if is_prefill:
                 prefill_by_id[i] = i
                 sid = getattr(stage, "stage_id", i)
                 if sid != i:
                     prefill_by_id[sid] = i
-            if getattr(stage, "is_decode_only", False):
+            if is_decode:
                 decode_indices.append(i)
 
         pd_pairs: list[tuple[int, int]] = []
         for j in decode_indices:
-            source_ids = getattr(stage_configs[j], "engine_input_source", [])
+            decode_stage = stage_configs[j]
+            source_ids = getattr(decode_stage, "engine_input_source", None)
+            if source_ids is None:
+                source_ids = getattr(decode_stage, "input_sources", [])
             for src in source_ids:
                 if src in prefill_by_id:
                     pd_pairs.append((prefill_by_id[src], j))
@@ -120,6 +135,53 @@ class PDDisaggregationMixin:
 
     def _normalize_kv_transfer_params(self, kv_params: Any) -> dict[str, Any] | None:
         return self._to_dict(kv_params)
+
+    @staticmethod
+    def get_mooncake_bootstrap_addr(stage: Any) -> str | None:
+        """Return the HTTP bootstrap address advertised by a Mooncake stage."""
+        engine_args = getattr(stage, "engine_args", None)
+        kv_cfg = getattr(engine_args, "kv_transfer_config", None)
+        if kv_cfg is None and hasattr(engine_args, "get"):
+            kv_cfg = engine_args.get("kv_transfer_config")
+
+        # Structured stage configs keep vLLM KV transfer settings under the
+        # connector config instead of the legacy engine_args projection.
+        if kv_cfg is None:
+            connector_config = getattr(stage, "connector_config", None)
+            kv_cfg = getattr(connector_config, "kv_transfer_config", None)
+
+        kv_cfg_dict = PDDisaggregationMixin._to_dict(kv_cfg, default={}) or {}
+        connector = str(kv_cfg_dict.get("kv_connector", "") or "")
+        if "mooncake" not in connector.lower():
+            return None
+
+        extra_cfg = (
+            PDDisaggregationMixin._to_dict(
+                kv_cfg_dict.get("kv_connector_extra_config"),
+                default={},
+            )
+            or {}
+        )
+
+        runtime = getattr(stage, "runtime", None)
+        if runtime is None:
+            runtime = getattr(stage, "runtime_config", None)
+        runtime_dict = PDDisaggregationMixin._to_dict(runtime, default={}) or {}
+        stage_env = PDDisaggregationMixin._to_dict(runtime_dict.get("env"), default={}) or {}
+
+        bootstrap_port = extra_cfg.get("mooncake_bootstrap_port")
+        if bootstrap_port is None:
+            bootstrap_port = stage_env.get("VLLM_MOONCAKE_BOOTSTRAP_PORT")
+        if bootstrap_port is None:
+            bootstrap_port = os.getenv(
+                "VLLM_MOONCAKE_BOOTSTRAP_PORT",
+                str(_DEFAULT_MOONCAKE_BOOTSTRAP_PORT),
+            )
+
+        kv_ip = kv_cfg_dict.get("kv_ip") or stage_env.get("VLLM_HOST_IP") or os.getenv("VLLM_HOST_IP")
+        if not kv_ip:
+            kv_ip = "127.0.0.1"
+        return f"http://{kv_ip}:{bootstrap_port}"
 
     def _validate_pd_separation_config(self) -> None:
         """Validate PD stage configurations are consistent."""
@@ -182,32 +244,13 @@ class PDDisaggregationMixin:
         p_id, _ = pair
         p_stage = self.stage_configs[p_id]
 
-        ea = p_stage.engine_args
-        kv_cfg = getattr(ea, "kv_transfer_config", None)
-        if kv_cfg is None and hasattr(ea, "get"):
-            kv_cfg = ea.get("kv_transfer_config")
-        if kv_cfg is None:
-            return None
+        bootstrap_addr = self.get_mooncake_bootstrap_addr(p_stage)
+        if bootstrap_addr is None:
+            return {}
+        return {"prefill_bootstrap_addr": bootstrap_addr}
 
-        kv_cfg_dict = self._kv_cfg_to_dict(kv_cfg)
-        if not kv_cfg_dict:
-            return None
-
-        kv_connector = str(kv_cfg_dict.get("kv_connector", "") or "")
-        extra_cfg = kv_cfg_dict.get("kv_connector_extra_config", {}) or {}
-        if not isinstance(extra_cfg, dict):
-            extra_cfg = self._kv_cfg_to_dict(extra_cfg)
-
-        info: dict[str, Any] = {}
-
-        if "mooncake" in kv_connector.lower():
-            bootstrap_port = extra_cfg.get("mooncake_bootstrap_port", _DEFAULT_MOONCAKE_BOOTSTRAP_PORT)
-            kv_ip = kv_cfg_dict.get("kv_ip") or "127.0.0.1"
-            info["prefill_bootstrap_addr"] = f"{kv_ip}:{bootstrap_port}"
-
-        return info
-
-    def _prepare_prefill_sampling_params(self, req_id: str, sp: "SamplingParams") -> "SamplingParams":
+    @staticmethod
+    def _prepare_prefill_sampling_params(req_id: str, sp: "SamplingParams") -> "SamplingParams":
         sp = sp.clone()
         sp.max_tokens = 1
         if hasattr(sp, "min_tokens"):
@@ -221,7 +264,7 @@ class PDDisaggregationMixin:
         sp.include_stop_str_in_output = False
         if sp.extra_args is None:
             sp.extra_args = {}
-        kv_params = self._normalize_kv_transfer_params(sp.extra_args.get("kv_transfer_params"))
+        kv_params = PDDisaggregationMixin._to_dict(sp.extra_args.get("kv_transfer_params"))
         merged: dict[str, Any] = {}
         if kv_params:
             merged.update(kv_params)
@@ -343,7 +386,7 @@ class PDDisaggregationMixin:
         )
         if "remote_request_id" not in decode_kv_params:
             logger.warning(
-                "[PD] remote_request_id NOT SET for req %s. Apply mooncake_connector.py patch to fix.",
+                "[PD] remote_request_id is not set for req %s; forwarding connector metadata without field validation",
                 req_id,
             )
 
