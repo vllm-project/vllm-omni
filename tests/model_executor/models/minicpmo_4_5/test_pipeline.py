@@ -229,6 +229,14 @@ class TestDeployTopology:
             "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni.tts2code2wav_token_only"
         )
 
+    def test_no_async_chunk_selects_full_payload_processor(self) -> None:
+        deploy = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5.yaml")
+        deploy.async_chunk = False
+        stages = merge_pipeline_deploy(OMNI_PIPELINES[_PIPELINE_KEY], deploy)
+
+        assert stages[1].yaml_engine_args["async_chunk"] is False
+        assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(".tts2code2wav_full_payload")
+
 
 def test_code2wav_model_is_lazily_registered() -> None:
     assert _OMNI_MODELS["MiniCPMO45Code2Wav"] == (

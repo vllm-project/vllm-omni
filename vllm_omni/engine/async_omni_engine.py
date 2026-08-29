@@ -67,6 +67,7 @@ from vllm_omni.engine.messages import (
     EngineQueueMessage,
     ErrorMessage,
     InteractionMessage,
+    OutputMessage,
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator
@@ -1920,12 +1921,16 @@ class AsyncOmniEngine:
         self,
         request_ids: list[str],
         timeout: float | None = None,
-    ) -> None:
+    ) -> list[OutputMessage]:
         """Abort requests and wait for orchestrator acknowledgment.
 
         Unlike :meth:`abort`, this generates an ``rpc_id``, correlates the
         :class:`AbortResultMessage` via :class:`CorrelatedRpcClient`, and
         raises if the orchestrator reports failure or times out.
+
+        Returns:
+            Final-stage AR abort ``OutputMessage`` list carrying partial
+            tokens generated before abort (empty for diffusion / no OP state).
         """
         if not request_ids or getattr(self, "_shutdown_called", False):
             return
@@ -1959,6 +1964,7 @@ class AsyncOmniEngine:
             raise
         if not result_msg.success:
             raise RuntimeError(result_msg.error or "abort failed")
+        return list(result_msg.abort_outputs or [])
 
     def submit_interaction(
         self,
