@@ -31,7 +31,8 @@ SAMPLE_RATE = 24_000
 REF_AUDIO_URL = "https://raw.githubusercontent.com/OpenMOSS/MOSS-TTS/main/assets/audio/reference_zh_1.wav"
 MODEL = "OpenMOSS-Team/MOSS-TTS-v1.5"
 
-_DEFAULT_SAMPLING = SamplingParams(
+# Stage 0 (talker) samples audio tokens; the upstream recipe is stochastic.
+_STAGE0_PARAMS = SamplingParams(
     temperature=1.7,
     top_p=0.8,
     top_k=25,
@@ -39,6 +40,23 @@ _DEFAULT_SAMPLING = SamplingParams(
     seed=42,
     detokenize=False,
 )
+# Stage 1 (codec) decodes those tokens to a waveform — a deterministic decode,
+# not a sampling step. Give it greedy params instead of replicating the talker's
+# (which would add sampling noise and cap the decode at 512 tokens); mirrors
+# ``test_moss_tts_realtime.py``.
+_STAGE1_PARAMS = SamplingParams(
+    temperature=0.0,
+    top_p=1.0,
+    top_k=-1,
+    max_tokens=65536,
+    seed=42,
+    detokenize=False,
+)
+
+
+def _per_stage_sampling(num_stages: int) -> list[SamplingParams]:
+    """Per-stage sampling list: talker params for stage 0, greedy for the rest."""
+    return [_STAGE0_PARAMS] + [_STAGE1_PARAMS] * max(0, num_stages - 1)
 
 
 def _get_test_config() -> str:
@@ -158,9 +176,10 @@ def _collect_audio(omni: Omni, request: dict) -> tuple[torch.Tensor, int]:
     """Run one request; return (waveform_cpu, sample_rate).
 
     Sampling params are PER STAGE — MOSS-TTS-v1.5 is a two-stage pipeline
-    (talker + codec), so replicate ``_DEFAULT_SAMPLING`` across stages.
+    (talker + codec), so pair the stochastic talker params with a greedy codec
+    decode via ``_per_stage_sampling``.
     """
-    sampling = [_DEFAULT_SAMPLING] * omni.num_stages
+    sampling = _per_stage_sampling(omni.num_stages)
     return collect_audio_from_outputs(omni.generate(request, sampling), SAMPLE_RATE)
 
 

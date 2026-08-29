@@ -901,6 +901,10 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         # something callable; a minimal pass-through suffices.
         self.logits_processor = LogitsProcessor(self.text_vocab_size)
         self._batch_state: list[dict[str, Any]] | None = None
+        # True once make_omni_output has populated per-request state at least
+        # once. Lets compute_logits tell the benign first-call empty state
+        # apart from a mid-stream one, which would be a row-tracking bug.
+        self._seen_batch_state = False
 
         # Stacked weight cache built after load_weights().
         # shape: (n_vq, audio_vocab_size, hidden_size)
@@ -957,10 +961,20 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         states = self._batch_state or []
         # ``logits`` starts all -inf and ``_iter_state_row_spans`` yields nothing
         # when there are no states, so without this the sampler would see an
-        # all -inf row. Reachable on the very first call (state is populated by
+        # all -inf row. Expected on the very first call (state is populated by
         # make_omni_output, which has not run yet), so default to text_pad
         # everywhere — "continue, emit nothing" — rather than returning garbage.
         if not states:
+            # Mid-stream this is not benign: it means per-request state was lost
+            # while decoding, and padding silently truncates audio instead of
+            # failing. Same class of row-tracking bug as #4415, so say so.
+            if self._seen_batch_state:
+                logger.warning_once(
+                    "MOSS-TTS-Realtime: compute_logits saw empty _batch_state after "
+                    "make_omni_output had already populated it (rows=%d); emitting "
+                    "text_pad. Audio for this step is padded, not generated.",
+                    B,
+                )
             logits[:, self.text_pad_id] = 0.0
             return logits
 
@@ -1088,8 +1102,10 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         **kwargs: Any,
     ) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
+            # Deliberate clear, so a following empty state is expected again.
             self._batch_state = None
             self._batch_state_spans = None
+            self._seen_batch_state = False
             return model_outputs
 
         hidden = model_outputs  # (S, H)
@@ -1104,6 +1120,8 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
 
         self._batch_state = [(info["audio_state"] if isinstance(info, dict) else {}) for info in info_dicts]
         self._batch_state_spans = kwargs.get("request_token_spans")
+        if self._batch_state:
+            self._seen_batch_state = True
 
         # See delay talker: real per-request row spans from the runner are
         # required because mixed prefill+decode steps have unequal row counts.

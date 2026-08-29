@@ -38,7 +38,8 @@ SAMPLE_RATE = 24_000  # All MOSS-TTS full variants output 24 kHz
 # a reference clip.
 _DELAY_INSTRUCTION = "A clear, natural speaking voice."
 
-_DEFAULT_SAMPLING = SamplingParams(
+# Stage 0 (talker) samples audio tokens; the upstream recipe is stochastic.
+_STAGE0_PARAMS = SamplingParams(
     temperature=1.7,
     top_p=0.8,
     top_k=25,
@@ -46,6 +47,24 @@ _DEFAULT_SAMPLING = SamplingParams(
     seed=42,
     detokenize=False,
 )
+# Stage 1 (codec) decodes those tokens to a waveform — a deterministic decode,
+# not a sampling step. Give it greedy params instead of replicating the talker's
+# (which would add sampling noise and cap the decode at 512 tokens); mirrors
+# ``test_moss_tts_realtime.py``.
+_STAGE1_PARAMS = SamplingParams(
+    temperature=0.0,
+    top_p=1.0,
+    top_k=-1,
+    max_tokens=65536,
+    seed=42,
+    detokenize=False,
+)
+
+
+def _per_stage_sampling(num_stages: int) -> list[SamplingParams]:
+    """Per-stage sampling list: talker params for stage 0, greedy for the rest."""
+    return [_STAGE0_PARAMS] + [_STAGE1_PARAMS] * max(0, num_stages - 1)
+
 
 # ---------------------------------------------------------------------------
 # Deploy config
@@ -103,10 +122,11 @@ def _collect_audio(omni: Omni, request: dict, sampling: list | None = None) -> t
     ``sampling`` is the PER-STAGE sampling-params list (its length must equal
     num_stages), not per request. MOSS-TTS is a two-stage pipeline (talker +
     codec), so a single SamplingParams is rejected — when omitted,
-    ``_DEFAULT_SAMPLING`` is replicated across stages.
+    ``_per_stage_sampling`` supplies stochastic talker params plus a greedy
+    codec decode.
     """
     if sampling is None:
-        sampling = [_DEFAULT_SAMPLING] * omni.num_stages
+        sampling = _per_stage_sampling(omni.num_stages)
     return collect_audio_from_outputs(omni.generate(request, sampling), SAMPLE_RATE)
 
 
@@ -240,7 +260,7 @@ def test_moss_tts_delay_batch(omni_runner: OmniRunner, delay_processor) -> None:
     # observable as identical waveforms across the two requests.
     # sampling_params_list is PER STAGE (length == num_stages), independent of
     # the number of requests; the two prompts above are the per-request batch.
-    sampling = [_DEFAULT_SAMPLING] * omni_runner.omni.num_stages
+    sampling = _per_stage_sampling(omni_runner.omni.num_stages)
     chunks_by_req: dict[int, list[torch.Tensor]] = {}
     for omni_out in omni_runner.omni.generate(requests, sampling):
         idx = int(omni_out.request_id.split("_", 1)[0])

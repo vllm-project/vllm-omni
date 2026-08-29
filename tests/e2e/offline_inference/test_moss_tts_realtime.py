@@ -77,8 +77,12 @@ def _get_test_config() -> str:
     """Derive a CI-friendly config from moss_tts_realtime.yaml.
 
     Reduces Stage 0 gpu_memory_utilization from 0.60 → 0.45 to leave headroom
-    for Stage 1 (0.12) on a shared L4/A10G.  max_num_seqs=1 keeps per-test
-    peak memory predictable.  Prefix caching is disabled so two identical-seed
+    for Stage 1 (0.12) on a shared L4/A10G.  ``max_num_seqs`` is capped at 2
+    rather than the YAML default of 8: it keeps per-test peak memory
+    predictable while still letting ``test_moss_tts_realtime_batch`` co-schedule
+    its two requests, which is the only way that test can observe the
+    cross-request row misalignment it guards (at 1 the scheduler serialises
+    them and the guard cannot fail).  Prefix caching is disabled so two identical-seed
     runs are bit-reproducible (the cached-prefill path can perturb logits enough
     to shift sampling/EOS) — required by ``test_moss_tts_realtime_deterministic``.
     """
@@ -87,7 +91,7 @@ def _get_test_config() -> str:
         updates={
             "stages": {
                 0: {
-                    "max_num_seqs": 1,
+                    "max_num_seqs": 2,
                     "gpu_memory_utilization": 0.45,
                     "enable_prefix_caching": False,
                 },
@@ -100,9 +104,13 @@ def _get_test_config() -> str:
 # pytestmark — one engine for the whole module
 # ---------------------------------------------------------------------------
 
+# Same marks as the sibling delay file test_moss_tts_expansion.py: selected by
+# the nightly "TTS · Function Test" (-m "full_model and L4 and tts"). The
+# module-wide skip stays until #4700 (moss_tts_realtime architecture is not
+# registered with Transformers in CI) is resolved; it is not fixed here.
 pytestmark = [
     pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4700"),
-    pytest.mark.slow,
+    pytest.mark.full_model,
     pytest.mark.tts,
     pytest.mark.parametrize(
         "omni_runner",
@@ -257,7 +265,7 @@ def _collect_audio(omni_runner: OmniRunner, request: dict) -> tuple[torch.Tensor
 # ---------------------------------------------------------------------------
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"})
 def test_moss_tts_realtime_english(omni_runner: OmniRunner, ref_audio_path: str) -> None:
     """MossTTSRealtime: English voice_clone produces non-empty 24 kHz audio."""
     req = _build_request(ref_audio_path, "This is a real-time TTS streaming test.")
@@ -268,7 +276,7 @@ def test_moss_tts_realtime_english(omni_runner: OmniRunner, ref_audio_path: str)
     assert not torch.all(audio == 0), "Audio is silence"
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"})
 def test_moss_tts_realtime_chinese(omni_runner: OmniRunner, ref_audio_path: str) -> None:
     """MossTTSRealtime: Chinese input produces non-empty audio."""
     req = _build_request(ref_audio_path, "你好，这是语音合成测试。")
@@ -279,8 +287,7 @@ def test_moss_tts_realtime_chinese(omni_runner: OmniRunner, ref_audio_path: str)
     assert not torch.all(audio == 0)
 
 
-@pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"})
 def test_moss_tts_realtime_deterministic(omni_runner: OmniRunner, ref_audio_path: str) -> None:
     """MossTTSRealtime: same seed yields identical waveforms.
 
@@ -300,8 +307,7 @@ def test_moss_tts_realtime_deterministic(omni_runner: OmniRunner, ref_audio_path
     assert torch.allclose(sp_audio1, sp_audio2, atol=1e-4), "Same seed produced different audio"
 
 
-@pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"})
 def test_moss_tts_realtime_batch(omni_runner: OmniRunner, ref_audio_path: str) -> None:
     """MossTTSRealtime: two concurrent requests with different text produce
     distinct audio.
@@ -310,6 +316,11 @@ def test_moss_tts_realtime_batch(omni_runner: OmniRunner, ref_audio_path: str) -
     (broadcast / row-misalignment): with that bug, request 1 would receive
     request 0's audio. Audio sampling is seeded (deterministic), so distinctness
     here reflects genuine per-request content, not RNG noise.
+
+    The guard only bites if the two requests actually share a batch — run
+    sequentially they each get their own correct audio and the assertion passes
+    whether or not the bug is present. ``_get_test_config`` therefore sets
+    ``max_num_seqs: 2`` on Stage 0; do not lower it back to 1.
 
     Coverage limitation: synchronous ``generate(requests, ...)`` prefills then
     decodes both requests in lockstep, so every step is all-prefill or
