@@ -45,6 +45,8 @@ stage_args:
         kv_parallel_size: 4
         kv_ip: "127.0.0.1"
         kv_connector_extra_config:
+          # Explicit PD data plane: Mooncake TCP; no RDMA/TCP auto-fallback.
+          pd_transport: tcp
           mooncake_bootstrap_port: 25201
     final_output: false
     # vLLM-Omni 0.26 reads stage_config.final_output_type directly
@@ -98,6 +100,8 @@ stage_args:
         kv_parallel_size: 4
         kv_ip: "127.0.0.1"
         kv_connector_extra_config:
+          # Explicit PD data plane: Mooncake TCP; no RDMA/TCP auto-fallback.
+          pd_transport: tcp
           mooncake_bootstrap_port: 25202
     final_output: false
     # vLLM-Omni 0.26 reads stage_config.final_output_type directly
@@ -151,6 +155,8 @@ stage_args:
         kv_parallel_size: 4
         kv_ip: "127.0.0.1"
         kv_connector_extra_config:
+          # Explicit PD data plane: Mooncake TCP; no RDMA/TCP auto-fallback.
+          pd_transport: tcp
           mooncake_bootstrap_port: 25203
     engine_input_source: [0, 1]
     final_output: false
@@ -218,6 +224,8 @@ stage_args:
         kv_parallel_size: 4
         kv_ip: "127.0.0.1"
         kv_connector_extra_config:
+          # Explicit PD data plane: Mooncake TCP; no RDMA/TCP auto-fallback.
+          pd_transport: tcp
           mooncake_bootstrap_port: 25204
     engine_input_source: [0, 1]
     final_output: false

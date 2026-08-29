@@ -28,6 +28,64 @@ _bootstrap_patched = False
 # fast / recompute instead of waiting minutes.
 _DEFAULT_KV_PULL_TIMEOUT_S = 60.0
 
+# PD data-plane selector. Keep this separate from Mooncake's protocol name:
+# operators choose a topology-oriented mode, while the connector receives the
+# concrete backend protocol it understands.
+_PD_TRANSPORT_TO_MOONCAKE_PROTOCOL = {
+    "tcp": "tcp",
+    "rdma": "rdma",
+    # Mooncake names its same-host NVLink backend ``nvlink_intra``.
+    "nvlink": "nvlink_intra",
+}
+
+
+def _configure_pd_transport(vllm_config: Any) -> str | None:
+    """Validate and materialize the explicit PD transport selection.
+
+    ``pd_transport`` is intentionally a PD-facing setting rather than a
+    Mooncake implementation detail. It is read before the upstream worker
+    initializes its TransferEngine, then translated to ``mooncake_protocol``.
+    Configurations that omit it retain upstream behavior for compatibility;
+    all shipped Qwen3-TTS PD configs set it explicitly.
+    """
+    kv_cfg = getattr(vllm_config, "kv_transfer_config", None)
+    if kv_cfg is None:
+        return None
+    extra = getattr(kv_cfg, "kv_connector_extra_config", None)
+    if not isinstance(extra, dict):
+        return None
+
+    configured = extra.get("pd_transport")
+    if configured is None:
+        return None
+    transport = str(configured).strip().lower()
+    if transport == "pcie":
+        raise NotImplementedError(
+            "PD transport 'pcie' was requested, but this build has no CUDA-IPC/"
+            "PCIe data-plane backend. It must not silently fall back to TCP. "
+            "Use pd_transport: tcp, rdma, or nvlink until a PCIe backend is added."
+        )
+    protocol = _PD_TRANSPORT_TO_MOONCAKE_PROTOCOL.get(transport)
+    if protocol is None:
+        valid = ", ".join((*_PD_TRANSPORT_TO_MOONCAKE_PROTOCOL, "pcie"))
+        raise ValueError(f"Unknown pd_transport={configured!r}; expected one of: {valid}")
+
+    existing = extra.get("mooncake_protocol")
+    if existing is not None and str(existing).strip().lower() != protocol:
+        raise ValueError(
+            "PD transport configuration conflict: "
+            f"pd_transport={transport!r} maps to mooncake_protocol={protocol!r}, "
+            f"but mooncake_protocol={existing!r} was also supplied."
+        )
+    extra["mooncake_protocol"] = protocol
+    logger.info(
+        "[PD_TRANSPORT] selected=%s mooncake_protocol=%s data_plane=Mooncake; "
+        "no automatic protocol fallback is permitted by this config.",
+        transport,
+        protocol,
+    )
+    return transport
+
 
 def _pd_trace_enabled() -> bool:
     return os.getenv("VLLM_OMNI_PD_TRACE", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -455,6 +513,19 @@ def _patch_mooncake_worker(mc_module: Any) -> None:
         return
 
     original_send_kv = getattr(worker_cls, "send_kv_to_decode", None)
+
+    # Upstream reads mooncake_protocol inside __init__ immediately before
+    # TransferEngine.initialize(). Resolve our PD-facing selector first so the
+    # chosen data plane is explicit and cannot be silently changed later.
+    original_init = getattr(worker_cls, "__init__", None)
+    if original_init is not None and not getattr(original_init, "_vllm_omni_transport_wrapped", False):
+
+        def worker_init(self_worker, vllm_config, *args, **kwargs):
+            _configure_pd_transport(vllm_config)
+            return original_init(self_worker, vllm_config, *args, **kwargs)
+
+        worker_init._vllm_omni_transport_wrapped = True  # type: ignore[attr-defined]
+        worker_cls.__init__ = worker_init  # type: ignore[assignment]
     if original_send_kv is not None and not getattr(original_send_kv, "_vllm_omni_wrapped", False):
 
         async def send_kv_to_decode(self_worker, identity, sock, meta):
