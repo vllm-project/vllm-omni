@@ -7,7 +7,7 @@ import json
 import os
 import re
 import time
-from collections.abc import Generator, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
 from pathlib import Path
 from typing import cast
 
@@ -34,7 +34,7 @@ from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig, apply_hsdp
 from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
     get_checkpoint_adapter,
 )
-from vllm_omni.diffusion.model_loader.host_weight_loader import HWRLoaderMixin, _HWRCommitError
+from vllm_omni.diffusion.model_loader.host_weight_loader import HWRLoaderMixin, _HWRCommitError, _HWRState
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
     build_checkpoint_mmap_plan,
@@ -160,7 +160,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         self.quant_config = od_config.quantization_config
         self.parallel_config = od_config.parallel_config
         self.host_weight_plan: HostWeightPlan | None = None
-        self._hwr_state: dict[str, object] | None = None
+        self._hwr_state: _HWRState | None = None
+        self._checkpoint_publication_waiter: Callable[[], None] | None = None
         self._last_load_request: dict[str, object] | None = None
         self._force_canonical_load = False
 
@@ -464,6 +465,51 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             return all_parameter_names
         return {name for name in all_parameter_names if name.startswith(source_prefixes)}
 
+    def _load_components_outside_plan(
+        self,
+        model: nn.Module,
+        sources: tuple["DiffusersPipelineLoader.ComponentSource", ...],
+        plan: HostWeightPlan,
+    ) -> nn.Module | None:
+        def load_components() -> None:
+            if not sources:
+                return
+            logger.info("Loading %d component weight source(s) outside the DLO host-weight plan", len(sources))
+            self.load_weights(model, sources=sources, planned_weights=plan.bindings)
+
+        state = self._hwr_state
+        if state is None:
+            load_components()
+            return None
+
+        error = self._run_hwr_warm_phase(state, "component_loading", load_components)
+        if error is None:
+            return None
+        self._prepare_hwr_warm_retry(state, error, "component loading")
+        return self.load_fresh_canonical_model()
+
+    def _finalize_loaded_model(self, model: nn.Module) -> nn.Module:
+        def finalize() -> None:
+            self._apply_skip_softmax_calibration(model)
+            model.eval()
+            state = self._hwr_state
+            if state is not None:
+                self._publish_hwr_after_load(model, ModuleDiscovery.discover(model), state)
+            self._attach_offload_startup_state(model)
+
+        state = self._hwr_state
+        if state is None:
+            finalize()
+            return model
+
+        error = self._run_hwr_warm_phase(state, "warm_finalization", finalize)
+        if error is None:
+            return model
+        if state.plan is None:
+            raise error
+        self._prepare_hwr_warm_retry(state, error, "warm finalization")
+        return self.load_fresh_canonical_model()
+
     def load_model(
         self,
         load_device: str,
@@ -474,6 +520,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         """Load a model with the given configurations."""
         self.host_weight_plan = None
         self._hwr_state = None
+        self._checkpoint_publication_waiter = None
         self._last_load_request = {
             "load_device": load_device,
             "load_format": load_format,
@@ -546,10 +593,9 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                         del model
                         return self.load_fresh_canonical_model()
                 self._hwr_state = hwr_state
-                hwr_active = hwr_state is not None
-                if hwr_active and hwr_state is not None:
-                    self.host_weight_plan = cast(HostWeightPlan | None, hwr_state.get("plan"))
-                if _dist_offload and not hwr_active and not self._force_canonical_load:
+                if hwr_state is not None:
+                    self.host_weight_plan = hwr_state.plan
+                if _dist_offload and self.host_weight_plan is None and not self._force_canonical_load:
                     modules = ModuleDiscovery.discover(model)
                     plan_result = build_checkpoint_mmap_plan(
                         model,
@@ -560,7 +606,14 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                         use_hsdp=_use_hsdp,
                         online_quantization=_has_online_quant,
                     )
-                    self.host_weight_plan = plan_result.plan
+                    hwr_state, self.host_weight_plan = self._select_checkpoint_plan(
+                        model,
+                        modules,
+                        hwr_state,
+                        plan_result.plan,
+                        plan_result.fallback_reason,
+                    )
+                    self._hwr_state = hwr_state
 
                 _skip_load = self.host_weight_plan is not None
 
@@ -576,16 +629,9 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                         for source in weight_sources
                         if source.prefix not in self.host_weight_plan.planned_source_prefixes
                     )
-                    if ordinary_sources:
-                        logger.info(
-                            "Loading %d component weight source(s) outside the DLO host-weight plan",
-                            len(ordinary_sources),
-                        )
-                        self.load_weights(
-                            model,
-                            sources=ordinary_sources,
-                            planned_weights=self.host_weight_plan.bindings,
-                        )
+                    replacement = self._load_components_outside_plan(model, ordinary_sources, self.host_weight_plan)
+                    if replacement is not None:
+                        return replacement
                 else:
                     if _dist_offload and _use_ag and _has_online_quant:
                         unsupported_methods = self._unsupported_dlo_allgather_online_quant_methods(model)
@@ -632,33 +678,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 model.to("cpu")
                 logger.info("Quantization complete, offloaded model back to CPU")
 
-        try:
-            self._apply_skip_softmax_calibration(model)
-            model = model.eval()
-            if self._hwr_state is not None:
-                warm_snapshot = self._hwr_state.get("warm_snapshot")
-                if warm_snapshot is not None:
-                    self._assert_final_layout_tensors_unchanged(model, cast(dict[str, tuple[int, str]], warm_snapshot))
-                self._publish_hwr_after_load(model, ModuleDiscovery.discover(model), self._hwr_state)
-        except Exception:
-            hwr_plan = self._hwr_state.get("plan") if self._hwr_state is not None else None
-            if isinstance(hwr_plan, HostWeightPlan):
-                carrier = hwr_plan.lease_carrier
-                if carrier is not None:
-                    carrier.close()
-                from vllm_omni.host_weight_runtime import RuntimeMode
-
-                mode = RuntimeMode(getattr(self.od_config, "host_weight_runtime_mode", "disabled"))
-                if mode is RuntimeMode.PREFERRED:
-                    logger.warning(
-                        "HWR warm finalization failed; discarding the model and retrying a fresh canonical load",
-                        exc_info=True,
-                    )
-                    del model
-                    return self.load_fresh_canonical_model()
-            raise
-        self._attach_offload_startup_state(model)
-        return model
+        return self._finalize_loaded_model(model)
 
     @staticmethod
     def _request_offload_after_quant(model: nn.Module) -> int:

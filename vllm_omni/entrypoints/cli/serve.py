@@ -743,7 +743,7 @@ class OmniServeCommand(CLISubcommand):
             choices=("disabled", "preferred", "required"),
             default="disabled",
             help=(
-                "Host Weight Runtime policy for eligible no-AllGather DLO: "
+                "Host Weight Runtime policy for eligible BF16 DLO: "
                 "disabled does not consult HWR; preferred restores an exact hit "
                 "or canonically loads and publishes on a miss; required restores "
                 "an exact hit or fails startup. Populate a required store with "

@@ -307,15 +307,19 @@ steps:
             "
         mirror_hardwares: h100_1
 
-      - label: "Diffusion · MiniMax-H3 DLO DP2 T2VA Test"
+      - label: "Diffusion · MiniMax-H3 BF16 HWR DLO DP2 T2VA Test"
         timeout_in_minutes: 90
         source_file_dependencies:
           - tests/e2e/online_serving/test_minimax_h3_dlo_dp2_t2va.py
           - tests/helpers/assertions.py
           - tests/helpers/runtime.py
+          - vllm_omni/diffusion/data.py
           - vllm_omni/diffusion/models/minimax_h3/
+          - vllm_omni/diffusion/model_loader/
           - vllm_omni/diffusion/offloader/
           - vllm_omni/diffusion/distributed/
+          - vllm_omni/host_weight_runtime/
+          - vllm_omni/entrypoints/cli/
           - vllm_omni/entrypoints/openai/
         commands:
           - |

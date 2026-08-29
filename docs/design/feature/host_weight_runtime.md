@@ -18,8 +18,12 @@ The implementation provides contracts and a CPU local-filesystem store. The
 diffusion consumer additionally defines typed,
 representation-independent final-layout identity/restoration mechanics plus a
 concrete BF16-with-preserved-FP32 policy for MiniMax H3 and
-`black-forest-labs/FLUX.2-klein-4B`. The opt-in no-AllGather DLO integration
-selects, publishes, restores, and transfers these artifacts.
+`black-forest-labs/FLUX.2-klein-4B`. The opt-in DLO integration selects,
+publishes, restores, and transfers these artifacts. Multi-rank AllGather copies
+one persistent rank-local shard from the validated artifact before releasing
+its mapping; no-AllGather retains the artifact mapping through service. The
+promoted AllGather consumer is currently MiniMax H3 BF16; FLUX.2-klein-4B does
+not claim AllGather end-to-end support without model-specific CUDA evidence.
 
 V1 includes:
 
@@ -33,9 +37,8 @@ V1 includes:
 
 V1 does not include:
 
-- default-on activation or consumers outside no-AllGather DLO;
+- default-on activation or consumers outside DLO;
 - online FP8, quantized, merged-adaptation, or additional model producers;
-- HWR interaction with DLO AllGather;
 - a remote artifact provider or cross-node coordination;
 - automatic eviction; or
 - a change to DLO collective or execution behavior.

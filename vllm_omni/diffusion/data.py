@@ -104,8 +104,8 @@ def validate_host_weight_runtime_options(*, mode: object, root: object) -> None:
     """Validate HWR policy without touching the configured storage domain.
 
     Filesystem locality and store construction belong to the eligible loader
-    path. Keeping this check purely structural is what lets disabled and
-    AllGather DLO configurations retain zero HWR interaction.
+    path. Keeping this check purely structural lets disabled configurations
+    retain zero HWR interaction.
     """
     if mode not in {"disabled", "preferred", "required"}:
         raise ValueError("host_weight_runtime_mode must be disabled, preferred, or required")
@@ -121,6 +121,8 @@ def validate_dlo_host_registration_options(
     hwr_mode: object,
 ) -> float:
     """Validate the optional transport budget without probing CUDA or HWR."""
+    if not isinstance(limit_gib, (int, float, str)):
+        raise ValueError("dlo_host_registration_limit_gib must be a number")
     value = float(limit_gib)
     if not math.isfinite(value) or value < 0:
         raise ValueError("dlo_host_registration_limit_gib must be finite and >= 0")
@@ -799,9 +801,8 @@ class OmniDiffusionConfig:
     dlo_use_allgather: bool = True
     # Leading main-DiT blocks kept resident by distributed layerwise offload.
     dlo_resident_layers: int = 0
-    # Final-layout Host Weight Runtime policy. The loader only activates this
-    # for eligible no-AllGather DLO; all other configurations preserve their
-    # existing loader/storage path.
+    # Final-layout Host Weight Runtime policy for eligible BF16 DLO. Both the
+    # rank-local and sharded-AllGather transports consume the same artifact.
     host_weight_runtime_mode: str = "disabled"
     host_weight_runtime_root: str | None = None
     # Optional per-worker ceiling for registering final-layout HWR mappings.

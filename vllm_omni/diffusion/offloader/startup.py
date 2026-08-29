@@ -21,6 +21,7 @@ class OffloadStartupState:
     host_weight_plan: HostWeightPlan | None = None
     fresh_model_loader: Callable[[], nn.Module] | None = None
     allow_fresh_retry: bool = False
+    after_backend_enable: Callable[[], None] | None = None
 
     def __post_init__(self) -> None:
         if self.allow_fresh_retry != (self.fresh_model_loader is not None):
@@ -33,6 +34,11 @@ class OffloadStartupState:
         carrier = self.host_weight_plan.lease_carrier
         if carrier is not None:
             carrier.close()
+
+    def finish_loader_work(self) -> None:
+        if self.after_backend_enable is not None:
+            self.after_backend_enable()
+            self.after_backend_enable = None
 
 
 def attach_offload_startup_state(model: nn.Module, state: OffloadStartupState) -> None:

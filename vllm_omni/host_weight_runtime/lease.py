@@ -144,9 +144,9 @@ class HostWeightLeaseCarrier:
     """Process-local, single-take ownership carrier for a host-weight lease.
 
     The loader creates the carrier after a restore transaction has committed.
-    The runner/backend takes the lease exactly once before starting any
-    asynchronous transport work.  If setup fails before that handoff, closing
-    the carrier releases the loader-owned lease.
+    The runner/backend takes the lease exactly once before starting transport
+    work. If setup fails before that handoff, closing the carrier releases the
+    loader-owned lease.
     """
 
     def __init__(self, lease: HostWeightLease) -> None:

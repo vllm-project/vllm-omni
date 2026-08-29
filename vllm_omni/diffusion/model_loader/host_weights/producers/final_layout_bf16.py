@@ -4,9 +4,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from contextlib import ExitStack
+from typing import TYPE_CHECKING
 
 import torch
+from safetensors import safe_open
 from torch import nn
 
 from vllm_omni.diffusion.models.host_weight_contract import (
@@ -44,6 +47,9 @@ from ..tensor_layout import (
     collect_final_layout_targets,
     validate_final_layout_model_contract,
 )
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.model_loader.host_weight_plan import HostWeightPlan
 
 FINAL_LAYOUT_BF16_PRODUCER_ID = "vllm-omni.diffusion.final-layout-bf16"
 FINAL_LAYOUT_BF16_VERSION = "1"
@@ -193,24 +199,69 @@ FINAL_LAYOUT_BF16_POLICY = FinalLayoutBF16Policy()
 
 
 def _split_shards(
-    records: Sequence[RuntimeTensorTarget],
+    specs: Sequence[TensorWriteSpec],
     max_shard_bytes: int,
-) -> tuple[tuple[RuntimeTensorTarget, ...], ...]:
+) -> tuple[tuple[TensorWriteSpec, ...], ...]:
     if max_shard_bytes <= 0:
         raise ValueError("final-layout BF16 shard size must be positive")
-    shards: list[tuple[RuntimeTensorTarget, ...]] = []
-    current: list[RuntimeTensorTarget] = []
+    shards: list[tuple[TensorWriteSpec, ...]] = []
+    current: list[TensorWriteSpec] = []
     current_bytes = 0
-    for record in records:
-        if current and current_bytes + record.nbytes > max_shard_bytes:
+    for spec in specs:
+        if current and current_bytes + spec.nbytes > max_shard_bytes:
             shards.append(tuple(current))
             current = []
             current_bytes = 0
-        current.append(record)
-        current_bytes += record.nbytes
+        current.append(spec)
+        current_bytes += spec.nbytes
     if current:
         shards.append(tuple(current))
     return tuple(shards)
+
+
+def _write_shards(
+    writer: ArtifactWriter,
+    specs: Sequence[TensorWriteSpec],
+    *,
+    max_shard_bytes: int,
+    tensor_for: Callable[[str], torch.Tensor],
+) -> None:
+    shards = _split_shards(specs, max_shard_bytes)
+    shard_count = len(shards)
+    for index, shard in enumerate(shards, start=1):
+        file_name = f"model-{index:05d}-of-{shard_count:05d}.safetensors"
+        with writer.open_tensor_file(file_name, shard, ordered=True) as output:
+            for spec in shard:
+                output.write_tensor(spec.name, tensor_for(spec.name))
+
+
+def _tensor_specs(records: Sequence[RuntimeTensorTarget]) -> tuple[TensorWriteSpec, ...]:
+    return tuple(
+        TensorWriteSpec(
+            name=record.name,
+            shape=tuple(record.tensor.shape),
+            dtype=record.tensor.dtype,
+            kind=record.kind,
+            role=record.role,
+        )
+        for record in records
+    )
+
+
+def _production_metadata(
+    context: FinalLayoutIdentityContext,
+    contract_digest: str,
+    tensor_count: int,
+) -> ProductionMetadata:
+    return ProductionMetadata(
+        producer_schema=FINAL_LAYOUT_BF16_MANIFEST_SCHEMA,
+        restorer_schema=FINAL_LAYOUT_TENSOR_RESTORER_SCHEMA,
+        format_metadata=FINAL_LAYOUT_BF16_POLICY.build_format_metadata(
+            component_names=context.dit_names,
+            tensor_contract_digest=contract_digest,
+            tensor_count=tensor_count,
+        ),
+    )
 
 
 class FinalLayoutBF16Producer:
@@ -272,34 +323,84 @@ class FinalLayoutBF16Producer:
         for binding in bindings:
             binding.validator()
 
-        shards = _split_shards(records, self._max_shard_bytes)
-        shard_count = len(shards)
-        for index, shard in enumerate(shards, start=1):
-            specs = tuple(
-                TensorWriteSpec(
-                    name=record.name,
-                    shape=tuple(record.tensor.shape),
-                    dtype=record.tensor.dtype,
-                    kind=record.kind,
-                    role=record.role,
-                )
-                for record in shard
-            )
-            file_name = f"model-{index:05d}-of-{shard_count:05d}.safetensors"
-            with writer.open_tensor_file(file_name, specs, ordered=True) as output:
-                for record in shard:
-                    output.write_tensor(record.name, record.tensor.detach())
+        tensors = {record.name: record.tensor.detach() for record in records}
+        _write_shards(
+            writer,
+            _tensor_specs(records),
+            max_shard_bytes=self._max_shard_bytes,
+            tensor_for=tensors.__getitem__,
+        )
 
         self._context.ensure_sources_unchanged()
-        return ProductionMetadata(
-            producer_schema=FINAL_LAYOUT_BF16_MANIFEST_SCHEMA,
-            restorer_schema=FINAL_LAYOUT_TENSOR_RESTORER_SCHEMA,
-            format_metadata=FINAL_LAYOUT_BF16_POLICY.build_format_metadata(
-                component_names=self._context.dit_names,
-                tensor_contract_digest=contract_digest,
-                tensor_count=len(records),
-            ),
+        return _production_metadata(self._context, contract_digest, len(records))
+
+
+class CheckpointPlanBF16Producer:
+    """Stream one validated checkpoint plan directly into an HWR artifact."""
+
+    def __init__(
+        self,
+        context: FinalLayoutIdentityContext,
+        pipeline: nn.Module,
+        dit_modules: Sequence[tuple[str, nn.Module]],
+        plan: HostWeightPlan,
+        *,
+        max_shard_bytes: int = DEFAULT_SHARD_SIZE_BYTES,
+    ) -> None:
+        self._context = context
+        self._plan = plan
+        self._max_shard_bytes = max_shard_bytes
+        records = collect_final_layout_targets(
+            pipeline,
+            dit_modules,
+            policy=FINAL_LAYOUT_BF16_POLICY,
+            require_materialized=False,
         )
+        self._contract_digest = validate_final_layout_identity(context, records)
+        self._tensor_specs = _tensor_specs(records)
+        self._spec = WeightProductionSpec(
+            producer_id=FINAL_LAYOUT_BF16_PRODUCER_ID,
+            outputs=(context.identity,),
+            source_mode=ProductionSourceMode.CHECKPOINT_STREAM,
+            coordination_scope=CoordinationScope.SINGLE_PROCESS,
+            lookup_phase=LookupPhase.PRE_LOAD_SAFE,
+        )
+
+    @property
+    def spec(self) -> WeightProductionSpec:
+        return self._spec
+
+    def produce(self, writer: ArtifactWriter) -> ProductionMetadata:
+        try:
+            return self._produce(writer)
+        except FinalLayoutContractError as exc:
+            raise final_layout_producer_error(exc) from exc
+
+    def _produce(self, writer: ArtifactWriter) -> ProductionMetadata:
+        self._context.ensure_sources_unchanged()
+
+        with ExitStack() as stack:
+            handles = {
+                file_path: stack.enter_context(safe_open(file_path, framework="pt", device="cpu"))
+                for file_path in sorted({binding.file_path for binding in self._plan.bindings.values()})
+            }
+
+            def checkpoint_tensor(name: str) -> torch.Tensor:
+                binding = self._plan.bindings[name]
+                tensor = handles[binding.file_path].get_tensor(binding.checkpoint_key)
+                if binding.transform is not None:
+                    tensor = binding.transform(tensor)
+                return tensor.detach()
+
+            _write_shards(
+                writer,
+                self._tensor_specs,
+                max_shard_bytes=self._max_shard_bytes,
+                tensor_for=checkpoint_tensor,
+            )
+
+        self._context.ensure_sources_unchanged()
+        return _production_metadata(self._context, self._contract_digest, len(self._tensor_specs))
 
 
 __all__ = [
@@ -310,6 +411,7 @@ __all__ = [
     "FINAL_LAYOUT_BF16_REPRESENTATION",
     "FINAL_LAYOUT_BF16_SPEC",
     "FINAL_LAYOUT_BF16_VERSION",
+    "CheckpointPlanBF16Producer",
     "FinalLayoutBF16Policy",
     "FinalLayoutBF16Producer",
 ]

@@ -16,6 +16,7 @@ from .identity_adapter import (
 from .producers import (
     FINAL_LAYOUT_BF16_POLICY,
     FINAL_LAYOUT_BF16_SPEC,
+    CheckpointPlanBF16Producer,
     FinalLayoutBF16Producer,
 )
 from .restorer import FinalLayoutTensorRestorer
@@ -24,6 +25,7 @@ from .source_identity import NodeSourceDigestCache, PreparedWeightSource, Weight
 __all__ = [
     "FINAL_LAYOUT_BF16_POLICY",
     "FINAL_LAYOUT_BF16_SPEC",
+    "CheckpointPlanBF16Producer",
     "FinalLayoutArtifactSpec",
     "FinalLayoutBF16Producer",
     "FinalLayoutIdentityContext",

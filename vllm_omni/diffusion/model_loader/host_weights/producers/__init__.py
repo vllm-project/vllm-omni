@@ -9,6 +9,7 @@ from .final_layout_bf16 import (
     FINAL_LAYOUT_BF16_REPRESENTATION,
     FINAL_LAYOUT_BF16_SPEC,
     FINAL_LAYOUT_BF16_VERSION,
+    CheckpointPlanBF16Producer,
     FinalLayoutBF16Policy,
     FinalLayoutBF16Producer,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "FINAL_LAYOUT_BF16_REPRESENTATION",
     "FINAL_LAYOUT_BF16_SPEC",
     "FINAL_LAYOUT_BF16_VERSION",
+    "CheckpointPlanBF16Producer",
     "FinalLayoutBF16Policy",
     "FinalLayoutBF16Producer",
 ]

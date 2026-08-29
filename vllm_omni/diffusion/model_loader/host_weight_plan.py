@@ -7,8 +7,9 @@ from __future__ import annotations
 import glob
 import json
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 import torch
@@ -42,9 +43,15 @@ class HostWeightPlan:
     """Complete, prevalidated host backing consumed by an offload backend."""
 
     backing_kind: str
-    bindings: dict[str, TensorBinding]
+    bindings: Mapping[str, TensorBinding]
     planned_source_prefixes: frozenset[str] = frozenset()
     lease_carrier: HostWeightLeaseCarrier | None = None
+
+    def __post_init__(self) -> None:
+        if self.backing_kind not in {"checkpoint_mmap", "host_weight_runtime"}:
+            raise ValueError(f"unsupported host-weight backing kind: {self.backing_kind}")
+        object.__setattr__(self, "bindings", MappingProxyType(dict(self.bindings)))
+        object.__setattr__(self, "planned_source_prefixes", frozenset(self.planned_source_prefixes))
 
 
 @dataclass(frozen=True)

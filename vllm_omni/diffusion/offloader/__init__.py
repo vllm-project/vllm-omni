@@ -169,6 +169,8 @@ def enable_offload_backend(
                 backend.enable(model)
             elif state is not None:
                 state.close_loader_ownership()
+            if state is not None:
+                state.finish_loader_work()
             return backend
         except Exception:
             if backend is not None:
@@ -177,6 +179,7 @@ def enable_offload_backend(
                 except Exception:
                     logger.exception("Failed to clean up the offload backend after startup failure")
             if state is not None:
+                state.finish_loader_work()
                 state.close_loader_ownership()
             raise
 

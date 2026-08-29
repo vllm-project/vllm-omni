@@ -194,212 +194,86 @@ topologies and platforms receive the same bounded policy but are not claimed
 performance targets; other DLO models remain unchanged unless they explicitly
 adopt it.
 
-### Final-layout Host Weight Runtime consumer
+### BF16 Host Weight Runtime consumers
 
-> **Status:** PR2 landed in
-> [PR #6486](https://github.com/vllm-project/vllm-omni/pull/6486). PR3 adds
-> registered direct H2D plus generic HWR publication/source-digest
-> optimizations without changing AllGather behavior.
+Both DLO transports consume the same immutable final-layout HWR artifact. The
+integration retains the final-layout contract from
+[PR #6486](https://github.com/vllm-project/vllm-omni/pull/6486) and registered
+mmap transport from
+[PR #6591](https://github.com/vllm-project/vllm-omni/pull/6591).
 
-Final-layout Host Weight Runtime (HWR) backing is opt-in and currently applies
-only to no-AllGather DLO. Enable it with
-`--host-weight-runtime-mode preferred` (or `required`) and
-`--host-weight-runtime-root <node-local-root>`.
+On an exact local hit, every rank resolves the same artifact identity and
+content digest, validates a restore plan without mutation, commits only after
+the complete cohort reports ready, and transfers its `HostWeightLease` to DLO.
+Warm finalization is also coordinated before any rank may enter backend setup.
+Any rank-local lookup, restore, commit, or finalization failure therefore causes
+the complete group to fall back or fail before a mismatched weight collective.
 
-The modes express operator fallback policy, not different artifact formats:
+On a miss, `preferred` uses a complete direct-checkpoint plan for the current
+DLO startup while publishing the final-layout artifact in parallel through the
+node-local HWR store. Backend setup waits for that publication only at its end,
+so artifact construction and rank-shard construction overlap. If no complete
+plan exists, preferred uses canonical loading and post-load publication.
+`required` remains consume-only and fails when the exact artifact is absent or
+unusable on any rank.
 
-- `preferred` consumes an exact hit, but on a miss it allows canonical loading
-  followed by post-load publication. It is the normal population path.
-- `required` consumes the same exact artifact but fails startup on a miss or
-  unusable artifact. It never invokes canonical DiT fallback or post-load
-  publication and therefore cannot populate an empty store.
+After handoff, multi-rank AllGather copies one persistent padded CPU shard per
+rank and closes the artifact lease after all shards are ready and before the
+first weight collective. No-AllGather keeps the artifact mapping as the host
+master through service and copies complete blocks through registered mmap or
+two bounded host staging slots.
 
-PR2 has no separate prewarm command. Operators populate one matching producer
-cohort per node-local storage domain in `preferred` mode, then restart the same
-model revision and parallel layout with `required`. TP coordinates have distinct
-identities, while equivalent DP replicas share them.
+The current AllGather promotion target is MiniMax H3 BF16 on DP2/TP1. The
+FLUX.2-klein-4B final-layout artifact contract is validated independently, but
+its AllGather transport is not claimed as an end-to-end promotion target until
+model-specific CUDA evidence is added. Neither model requires a direct
+checkpoint-mmap adapter on an HWR hit because restoration consumes finalized
+artifact tensor names rather than checkpoint loader callbacks.
 
-The current producer/consumer boundary is the model-declared final-layout BF16
-contract (MiniMax H3 and `black-forest-labs/FLUX.2-klein-4B`). The FLUX.2-klein
-contract covers both transformer block stacks, constructor-stable packed QKV
-mapping state, BF16 parameters, and any persistent loader-owned `beta`/`eps`
-buffers. The shared HWR machinery supports ordinary-loader final layouts for
-TP1 and TP2 rank identities plus SP layout identities. FLUX.2-klein evidence
-in this change is TP1-only; its TP2/SP layouts rely on the existing
-per-coordinate identity mechanics and remain unmeasured. Online quantization,
-HSDP, LoRA/adapted weights, and non-default load formats remain ineligible.
-HWR mode
-`disabled`, DLO-disabled, and DLO AllGather configurations stop before source
-identity or store construction and retain the existing checkpoint-mmap or
-ordinary-loader path.
-
-Eligibility is decided before constructing HWR, resolving canonical sources,
-hashing identity inputs, probing a filesystem, or emitting an HWR observer
-event:
+Lease ownership is:
 
 ```text
-DLO disabled / HWR disabled / DLO AllGather
-  -> zero final-layout HWR interaction
-  -> preserve current checkpoint-mmap or ordinary-loader behavior
+loader owns lease
+  -> restore plan validates and commits
+  -> carrier transfers ownership once
+  -> backend owns the mapping during setup or service
+  -> AllGather copies its persistent CPU shard and closes the lease
+     OR no-AllGather feeds requests from registered mmap/bounded staging
+  -> no-AllGather drains H2D and unregisters mapped ranges
+  -> close any retained lease
 ```
 
-When final-layout HWR is explicitly enabled for no-AllGather DLO, runtime
-outcomes are authoritative:
+A partial CUDA registration that cannot be rolled back aborts startup and keeps
+the mapping and lease alive for cleanup retry. A safely rolled-back registration
+error selects bounded staging. The optional
+`--dlo-host-registration-limit-gib` ceiling applies only to the registered
+no-AllGather HWR transport.
 
-- `LOCAL_HIT`: plan and commit an exact restoration, then transfer the lease
-  transactionally to DLO.
-- `CANONICAL_FALLBACK`: bypass checkpoint mmap, canonically materialize and
-  finalize the DiT, then call `publish_after_load()` for a future startup. The
-  current startup retains its canonical tensors.
-- `FAILED`: fail startup. Preferred mode does not reinterpret nonretryable
-  identity, configuration, or compatibility failures as misses.
-- Required mode cannot bootstrap an empty store through a `POST_LOAD_ONLY`
-  producer.
+#### Shared eligibility and fallback rules
 
-Checkpoint mmap remains an unchanged control path whenever final-layout HWR is
-not selected.
+Both BF16 paths require default loading, no quantization, no static/merged LoRA,
+non-HSDP ownership, and model-declared host-weight contracts. HWR-disabled or
+DLO-disabled configurations stop before source identity or store interaction.
 
-Local source identity and publication avoid repeated full-payload passes while
-preserving the same semantic contract:
+The loader continues to load VAE, text encoders, and other components outside
+the owned DiT source prefixes normally. An HWR hit must cover every required
+parameter and persistent buffer; otherwise restore planning fails without
+mutating the model and the complete cohort follows policy together.
 
-- Canonical files without a trusted immutable Hub blob identity are hashed in
-  parallel. Their content IDs are cached per storage domain under the HWR root
-  and reused only when the path, inode, size, timestamps, symlink target, and
-  cache-record checksum still match. Corrupt entries are rebuilt; cache-lock or
-  cache-I/O failure falls back to hashing the canonical file directly.
-- Producers that emit payload bytes in canonical storage-key order may declare
-  `ordered=True`. The filesystem writer then computes file and tensor SHA256
-  values during the write and overlaps payload `fsync` with later producer
-  work. Producers without that guarantee retain unordered writes and use a
-  parallel readback checksum fallback.
-- Manifest and `READY` publication still wait for every payload `fsync` and
-  checksum to complete. These optimizations do not weaken artifact validation
-  or change lease ownership.
+Promotion checks for artifact-backed AllGather are:
 
-#### Registered mmap transport
-
-After DLO takes an HWR lease, the no-AllGather backend may register the lease's
-complete immutable mapped ranges under the existing `pin_cpu_memory` policy.
-Registration is transport state: it does not change artifact identity, the
-store, tensor ownership, or H2D payload. On success, each tensor view copies
-directly into the existing rotating HBM block buffers and the two private host
-staging slots are not allocated.
-
-`--dlo-host-registration-limit-gib` is an optional per-worker preflight ceiling
-over page-aligned registered bytes. Zero adds no ceiling. A disabled pinned
-memory policy, unsupported platform/capability, over-budget mapping, or fully
-rolled-back registration error selects the existing two-slot staging path. A
-partial registration that cannot be rolled back aborts startup because closing
-the lease would unmap memory still owned by the platform.
-
-Direct checkpoint mmap remains unchanged and continues to use staging. It may
-require loader-owned per-block transforms, while the HWR artifact already
-contains final runtime bytes. DLO AllGather never receives an HWR final-layout
-lease and therefore never enters this registration path.
-
-#### Pre-service transaction boundary
-
-The startup transaction does not end at restore commit. A lease-backed model is
-disposable until backend setup and initial prefetch complete:
-
-```text
-UNRESOLVED
-  -> LEASE_OWNED_BY_LOADER
-  -> RESTORE_PLANNED
-  -> COMMIT_STARTED
-  -> CARRIER_OWNED
-  -> BACKEND_OWNED
-  -> BACKEND_READY
-  -> IN_SERVICE
-```
-
-Failure before `COMMIT_STARTED` closes the loader-owned lease. Preferred mode
-may canonically load using the untouched skeleton; required mode fails.
-
-Failure from `COMMIT_STARTED` through `BACKEND_READY` must:
-
-1. synchronize or otherwise quiesce partial backend and initial-prefetch work;
-2. release hook, staging, restore-plan, and model references;
-3. close the lease through its current owner;
-4. discard the restored model; and
-5. in preferred mode, construct a fresh canonical model while bypassing HWR
-   lookup, HWR publication, and checkpoint mmap for that recovery attempt.
-
-Required mode fails instead of constructing the fresh fallback. Once the model
-enters service, failures follow normal runtime handling rather than startup
-fallback.
-
-#### Finalization phases
-
-Cold canonical loading separates byte-changing work from shared runtime-state
-finalization:
-
-```text
-Cold-only byte-changing:
-  casting, reordering, packing, quantization, generated scales,
-  model-specific weight transforms, and calibration that mutates
-  parameters or persistent buffers
-
-Shared cold/warm non-byte:
-  validation, hook installation, eval state, bookkeeping,
-  and non-persistent runtime state
-```
-
-The warm path must snapshot restored tensor bytes and backing pointers before
-shared finalization and prove both are unchanged afterward.
-
-#### Lease ownership
-
-Lease transfer is single-owner and single-take:
-
-```text
-loader owns
-  -> restore plan borrows
-  -> commit succeeds
-  -> runner carrier takes once
-  -> backend takes once before asynchronous work
-  -> backend drains pending H2D work
-  -> backend releases hooks, staging, and model references
-  -> backend unregisters every mapped range
-  -> backend closes lease
-```
-
-The runner carrier is process-local, rejects serialization, and rejects a
-duplicate `take()`. If the carrier still owns the lease, runner cleanup closes
-it. Once the backend takes ownership, only backend abort or teardown may drain
-work and close it.
-
-The implementation keeps the final-layout lease through backend setup and
-initial prefetch. Successful registration copies directly from immutable HWR
-views; otherwise the backend uses the existing two bounded rank-local staging
-slots. Transactional cleanup drains device work, removes source references,
-unregisters mappings, and only then closes the lease. An unregistration failure
-retains both registration and lease for retry/process teardown. Preferred mode
-then uses the runner's fresh canonical retry; required mode propagates the
-failure.
-
-#### PR2 and PR3 promotion gates
-
-- Warm hit performs zero ordinary DiT materialization and zero producer calls.
-- Shared warm finalization changes neither restored bytes nor backing pointers.
-- Preferred `FAILED` outcomes do not silently fall back.
-- Planning failure leaves the skeleton untouched.
-- Any pre-service failure after commit begins discards the restored model;
-  preferred mode uses a fresh canonical model and required mode fails.
-- Mixed components load normally and no required tensor remains on `meta`.
-- Disabled mode and AllGather emit zero final-layout HWR interaction.
-- The lease carrier rejects duplicate take and serialization.
-- Backend setup or prefetch failure drains asynchronous work before lease close.
-- Registration is all-or-nothing; rollback/unregistration failure never closes
-  a mapping still owned by the platform.
-- Registered HWR transport bypasses host staging while preserving output and
-  H2D payload; unsupported registration retains the bounded staging path.
-- Compatible checkpoint mmap remains an unchanged benchmark and control path.
-- Prewarm uses one matching producer cohort per TP/SP topology and storage
-  domain.
-- Benchmarks compare ordinary loading, cold publication, and warm staging with
-  output parity, startup latency, aggregate PSS, page-cache state, HBM, and H2D
-  payload.
+- required mode rejects an empty or mismatched HWR store;
+- preferred cold startup uses a validated checkpoint plan while publishing the
+  artifact in parallel, and required warm startup restores it without ordinary
+  DiT loading;
+- all ranks agree on artifact identity, artifact content, restore status, and
+  the final transport plan;
+- each rank keeps only its persistent padded CPU shard and releases its artifact
+  mapping before the first weight collective;
+- disabled and ineligible configurations preserve the existing canonical path;
+- DP2/SP2 and DP4/SP1 produce output parity with HWR-disabled DLO; and
+- startup latency, aggregate PSS/RSS, HBM, and shutdown residue are measured
+  against that same-topology baseline.
 
 ## Parallelism compatibility
 
@@ -444,7 +318,7 @@ reconstructs those tensors with their recorded layouts. Other online methods
 must use `--dlo-no-use-allgather` or disable online quantization until their
 runtime layouts are validated.
 
-The Host Weight Runtime representation, publication, and no-AllGather consumer
+The Host Weight Runtime representation, publication, and both BF16 DLO consumer
 contracts are merged; see
 [RFC #6414](https://github.com/vllm-project/vllm-omni/issues/6414),
 [PR #6445](https://github.com/vllm-project/vllm-omni/pull/6445), and
