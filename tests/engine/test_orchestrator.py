@@ -2764,3 +2764,31 @@ async def test_request_cleanup_failure_is_deferred_to_control_plane():
 
     assert orchestrator.duplex_control_plane.deferred == ["sid-cleanup"]
     assert orchestrator.duplex_control_plane.finalized == []
+
+
+def test_pd_decode_params_forward_request_seed_to_talker_mtp():
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pd_kv_params = {
+        "req-seeded": {
+            "remote_request_id": "remote-1",
+            "pd_submit_ready": True,
+        }
+    }
+    orchestrator._pd_bootstrap_addr = None
+    orchestrator._pd_prefill_engine_id = None
+    source = SamplingParams(temperature=0.9, extra_args={"keep": "value"})
+
+    result = orchestrator._build_pd_decode_params("req-seeded", source, main_sampler_seed=42)
+
+    assert result is not source
+    assert source.seed is None
+    assert source.extra_args == {"keep": "value"}
+    assert result.seed == 42
+    assert result.extra_args["tts_local_seed"] == 42
+    assert result.extra_args["keep"] == "value"
+    assert result.extra_args["kv_transfer_params"] == {
+        "transfer_id": "xfer-req-seeded",
+        "remote_request_id": "remote-1",
+        "do_remote_prefill": True,
+        "do_remote_decode": False,
+    }

@@ -132,6 +132,101 @@ def test_generate_forwards_lora_request_to_engine():
 
 
 @pytest.mark.cpu
+def test_generate_routes_pd_request_to_selected_prefill_stage_and_slot_zero():
+    """Multi-PD routing must not fall back to the 1P1D-only pair helper."""
+
+    async def run():
+        submitted_params = []
+
+        async def capture_add_request(*, sampling_params_list, **kwargs):
+            del kwargs
+            submitted_params.append(list(sampling_params_list))
+
+        omni = get_async_omni_instance(fake_add_request=capture_add_request)
+        omni.engine.num_stages = 3
+        omni._maybe_expand_sampling_params = lambda params: params
+        omni._get_pd_decode_id = lambda: 2
+        omni._get_pd_prefill_ids = lambda: [0, 1]
+        picked_request_ids = []
+        omni._pick_prefill_stage = lambda request_id: (
+            picked_request_ids.append(request_id),
+            1,
+        )[1]
+        prepared = SimpleNamespace(max_tokens=1)
+        prepare_calls = []
+        omni._prepare_prefill_sampling_params = lambda request_id, params: (
+            prepare_calls.append((request_id, params)),
+            prepared,
+        )[1]
+        params = [
+            SimpleNamespace(name="slot0"),
+            SimpleNamespace(name="p1"),
+            SimpleNamespace(name="d"),
+        ]
+
+        async for _ in omni.generate(
+            prompt={"prompt": "test"},
+            request_id="multi-pd",
+            sampling_params_list=params,
+            output_modalities=["text"],
+        ):
+            pass
+
+        assert len(picked_request_ids) == 1
+        assert picked_request_ids[0].startswith("multi-pd-")
+        assert prepare_calls == [(picked_request_ids[0], params[1])]
+        assert submitted_params[0][0] is prepared
+        assert submitted_params[0][1] is prepared
+        assert submitted_params[0][2] is params[2]
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_terminal_output_releases_pd_prefill_binding(monkeypatch):
+    """A normally finished request must decrement the selected P inflight count."""
+
+    async def run():
+        import threading
+
+        import vllm_omni.entrypoints.async_omni as async_omni_module
+
+        class TerminalOutput:
+            stage_id = 2
+            finished = True
+
+        monkeypatch.setattr(async_omni_module, "OutputMessage", TerminalOutput)
+        request_id = "pd-finished"
+        queue = asyncio.Queue()
+        await queue.put(TerminalOutput())
+
+        omni = object.__new__(AsyncOmni)
+        omni.request_states = {request_id: SimpleNamespace(queue=queue, external_request_id=None)}
+        omni._pd_request_to_prefill = {request_id: 1}
+        omni._pd_prefill_inflight = {0: 0, 1: 1}
+        omni._pd_prefill_inflight_lock = threading.Lock()
+        omni._check_engine_output_error = lambda *args: None
+        omni._process_single_result = lambda *args: None
+
+        outputs = [
+            output
+            async for output in omni._process_orchestrator_results(
+                request_id,
+                metrics=None,
+                final_stage_id_for_e2e=2,
+                req_start_ts={},
+                wall_start_ts=0.0,
+            )
+        ]
+
+        assert outputs == []
+        assert request_id not in omni._pd_request_to_prefill
+        assert omni._pd_prefill_inflight[1] == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     "req_ids,cancel_prefix,expected_cancel_count",
     [

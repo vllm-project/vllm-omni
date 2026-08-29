@@ -823,13 +823,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                         )
                         if generator_state is not None:
                             if not isinstance(generator_state, torch.Tensor) or generator_state.dtype != torch.uint8:
-                                raise RuntimeError(
-                                    f"Qwen3-TTS PD sampler state is invalid for req={req_id}"
-                                )
+                                raise RuntimeError(f"Qwen3-TTS PD sampler state is invalid for req={req_id}")
                             if req_state.generator is None:
-                                raise RuntimeError(
-                                    f"Qwen3-TTS PD sampler generator is missing for req={req_id}"
-                                )
+                                raise RuntimeError(f"Qwen3-TTS PD sampler generator is missing for req={req_id}")
                             req_state.generator.set_state(generator_state.detach().to("cpu").contiguous())
                             logger.info(
                                 "[PD_TRACE] qwen3_tts_main_sampler_restored req=%s state_bytes=%d",
@@ -1996,13 +1992,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                     resume_meta = (
                         additional_information.get("meta") if isinstance(additional_information, dict) else None
                     )
-                resume_token_id = (
-                    resume_meta.get("pd_resume_token_id") if isinstance(resume_meta, dict) else None
-                )
+                resume_token_id = resume_meta.get("pd_resume_token_id") if isinstance(resume_meta, dict) else None
                 resume_consumed = (
-                    bool(resume_meta.get("pd_resume_token_consumed", False))
-                    if isinstance(resume_meta, dict)
-                    else False
+                    bool(resume_meta.get("pd_resume_token_consumed", False)) if isinstance(resume_meta, dict) else False
                 )
                 if isinstance(resume_token_id, torch.Tensor):
                     resume_token_id = resume_token_id.item() if resume_token_id.numel() == 1 else None
@@ -2121,7 +2113,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         # When talker_mtp is not wrapped by the platform's full-graph wrapper,
         # it manages its own device graphs internally (code_predictor has its
         # own bucket sizes).
-        if not isinstance(self.talker_mtp, current_omni_platform.get_graph_wrapper_cls()):
+        talker_mtp_graph_wrapped = isinstance(self.talker_mtp, current_omni_platform.get_graph_wrapper_cls())
+        if not talker_mtp_graph_wrapped:
             _cudagraph_mode = CUDAGraphMode.NONE
             num_tokens_padded = decode_batch_size
         else:
@@ -2158,6 +2151,18 @@ class OmniGPUModelRunner(GPUModelRunner):
             return generator
 
         row_generators = [_row_generator(req_id) for req_id in decode_req_ids]
+        # A full graph captures one RNG stream during warmup, so runtime
+        # torch.Generator kwargs are not consumed on replay. Seeded requests
+        # must bypass only this outer graph; the wrapped runnable and the code
+        # predictor inner graphs remain available, as do all main-model graphs.
+        if talker_mtp_graph_wrapped and any(generator is not None for generator in row_generators):
+            _cudagraph_mode = CUDAGraphMode.NONE
+            num_tokens_padded = decode_batch_size
+            req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
+            req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
+            last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
+            text_step = self.text_step.gpu[:num_tokens_padded]
+
         cache = getattr(self, "_talker_mtp_generators", None)
         if cache:
             # Generators live as long as their request; drop finished ones.

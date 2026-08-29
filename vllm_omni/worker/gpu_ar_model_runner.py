@@ -1836,17 +1836,22 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         for req_id in req_ids:
             state = export_state(self.model_intermediate_buffer.get(req_id, {}))
             req_state = self.requests.get(req_id)
+            output_token_ids = list(getattr(req_state, "output_token_ids", ()) or ())
+            if not output_token_ids:
+                raise RuntimeError(f"Qwen3-TTS PD prefill did not retain its sampled resume token for req={req_id}")
+            state["meta"]["pd_resume_token_id"] = int(output_token_ids[-1])
             generator = getattr(req_state, "generator", None)
             sampling_params = getattr(req_state, "sampling_params", None)
             seed = getattr(sampling_params, "seed", None)
-            if not isinstance(generator, torch.Generator) or seed is None:
-                raise RuntimeError(
-                    "Qwen3-TTS PD prefill requires a request-local main sampler generator "
-                    f"for req={req_id}"
-                )
-            # The P sampler has just consumed y0. Preserve its exact post-y0
-            # state; replaying a token sample on D is not equivalent because
-            # vLLM's sampler can consume a variable amount of RNG.
+            if seed is None:
+                raise RuntimeError(f"Qwen3-TTS PD prefill requires a request seed for req={req_id}")
+            # Greedy P never materializes vLLM's request-local generator. D
+            # still needs an initial RNG state for its first stochastic token.
+            if not isinstance(generator, torch.Generator):
+                generator = torch.Generator(device=self.device)
+                generator.manual_seed(int(seed))
+            # Preserve the post-y0 state when P sampled y0. For greedy P this
+            # is the seed-initial state, so D consumes randomness at y1.
             state["pd_sampler"] = {
                 "main_generator_state": generator.get_state().detach().to("cpu").clone(),
                 "seed": int(seed),
@@ -1869,9 +1874,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             # kv_connector_no_forward() returns the upstream base output type.
             # Promote it before crossing the worker/engine boundary; dynamically
             # adding multimodal_outputs to the base type is not wire-stable.
-            output = OmniModelRunnerOutput.with_kv_conn_output_only(
-                getattr(output, "kv_connector_output", None)
-            )
+            output = OmniModelRunnerOutput.with_kv_conn_output_only(getattr(output, "kv_connector_output", None))
         output.kv_extracted_req_ids = kv_ids
         if states is None:
             states = self._collect_pd_prefill_decode_states(kv_ids)
@@ -2318,9 +2321,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         use_async_omni_output = self._should_use_async_omni_output()
         kv_transfer_config = getattr(self.vllm_config, "kv_transfer_config", None)
-        has_pd_state_export = (
-            getattr(kv_transfer_config, "kv_role", None) == "kv_producer"
-            and callable(getattr(self.model, "export_pd_decode_state", None))
+        has_pd_state_export = getattr(kv_transfer_config, "kv_role", None) == "kv_producer" and callable(
+            getattr(self.model, "export_pd_decode_state", None)
         )
         omni_postprocess_already_applied = False
         if use_async_omni_output or has_pd_state_export:
@@ -2336,11 +2338,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             raise RuntimeError("Qwen3-TTS PD submit state export requires eager postprocess")
         # This snapshot rides the producer output that makes the decode worker
         # start its pull. ACK-side state remains a separate release signal.
-        pd_decode_states = (
-            self._export_pd_prefill_decode_states(req_ids_output_copy)
-            if has_pd_state_export
-            else None
-        )
+        pd_decode_states = self._export_pd_prefill_decode_states(req_ids_output_copy) if has_pd_state_export else None
         output_tensor_snapshot = self._snapshot_omni_output_tensors_for_async_output(
             use_async_omni_output=use_async_omni_output,
             hidden_states=hidden_states,

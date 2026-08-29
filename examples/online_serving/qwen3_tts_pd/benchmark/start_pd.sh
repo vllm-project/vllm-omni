@@ -179,7 +179,7 @@ cd "$VLLM_OMNI_DIR"
 if [[ -n "$YAML" ]]; then
     nohup vllm serve "$MODEL" \
         --omni --host "$HOST" --port "$PORT" \
-        --stage-configs-path "$YAML" \
+        --deploy-config "$YAML" \
         --trust-remote-code \
         > "$LOG" 2>&1 &
 else

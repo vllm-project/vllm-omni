@@ -608,10 +608,15 @@ class AsyncOmni(EngineClient, OmniBase):
 
             # PD disaggregation: modify prefill-stage sampling params per request
             req_sp_list = list(sampling_params_list)
-            pd_pair = self._get_pd_separation_pair()
-            if pd_pair is not None:
-                p_id = pd_pair[0]
-                req_sp_list[p_id] = self._prepare_prefill_sampling_params(request_id, req_sp_list[p_id])
+            # Multi-replica topologies need a per-request prefill pick; the
+            # compatibility single-pair helper is populated only for 1P1D.
+            if self._get_pd_decode_id() is not None and self._get_pd_prefill_ids():
+                p_id = self._pick_prefill_stage(request_id)
+                prefill_sp = self._prepare_prefill_sampling_params(request_id, req_sp_list[p_id])
+                req_sp_list[p_id] = prefill_sp
+                # Slot 0 drives the initial LLM submission. Reuse the same
+                # one-token params so it and the selected P stage stay aligned.
+                req_sp_list[0] = prefill_sp
 
             # Add request(s) to stage 0. For streaming inputs, submit
             # chunks incrementally through streaming_update. The helper
@@ -927,6 +932,7 @@ class AsyncOmni(EngineClient, OmniBase):
 
             # The Orchestrator sets "finished" when the final stage is done
             if result.finished:
+                self._release_pd_prefill_for_request(request_id)
                 break
 
     # ==================== Output Handler ====================

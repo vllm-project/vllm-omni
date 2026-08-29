@@ -28,8 +28,9 @@
 # token 都取一致（3p1d 里 P/D 本来不一样，1P1D 可以一样）。
 
 async_chunk: true
+pipeline: qwen3_tts_pd
 
-stage_args:
+stages:
   # ============================================================
   # Stage 0: Talker PREFILL-only (GPU 0, kv_producer, port 25201)
   # ============================================================
@@ -152,7 +153,6 @@ stage_args:
       top_p: 1.0
       top_k: 50
       max_tokens: 4096
-      # NOTE: no fixed default seed here -- see the stage-0 comment above.
       detokenize: true
       repetition_penalty: 1.05
       stop_token_ids: [2150]

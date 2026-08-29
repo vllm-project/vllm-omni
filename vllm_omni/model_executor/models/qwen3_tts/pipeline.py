@@ -56,3 +56,45 @@ QWEN3_TTS_PIPELINE = PipelineConfig(
         ),
     ),
 )
+
+# Qwen3-TTS PD topology: Talker prefill → Talker decode → Code2Wav.
+# Placement, KV transport, and sampling settings remain deployment concerns.
+QWEN3_TTS_PD_PIPELINE = PipelineConfig(
+    model_type="qwen3_tts_pd",
+    default_deploy_config_name="qwen3_tts_pd_1p1d.yaml",
+    model_arch="Qwen3TTSTalkerForConditionalGeneration",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="qwen3_tts",
+            execution_type=StageExecutionType.LLM_AR,
+            owns_tokenizer=True,
+            engine_output_type="latent",
+            sampling_constraints={"detokenize": False, "stop_token_ids": [2150]},
+        ),
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage="qwen3_tts",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(0,),
+            engine_output_type="latent",
+            async_chunk_process_next_stage_input_func=f"{_PROC}.talker2code2wav_async_chunk",
+            custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
+            sampling_constraints={"detokenize": False, "stop_token_ids": [2150]},
+        ),
+        StagePipelineConfig(
+            stage_id=2,
+            model_stage="code2wav",
+            execution_type=StageExecutionType.LLM_GENERATION,
+            input_sources=(1,),
+            final_output=True,
+            final_output_type="audio",
+            engine_output_type="audio",
+            model_arch="Qwen3TTSCode2Wav",
+            sync_process_input_func=f"{_PROC}.talker2code2wav_token_only",
+            sampling_constraints={"detokenize": True},
+            extras={"tts_args": {"max_instructions_length": 500}},
+            requires_full_payload_input=True,
+        ),
+    ),
+)

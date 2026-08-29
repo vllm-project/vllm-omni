@@ -19,6 +19,7 @@ PORT="${PORT:-8091}"
 MODEL="${MODEL:-/root/models/Qwen3-TTS-12Hz-0.6B-Base}"
 ROOT="${SEED_TTS_ROOT:-/root/datasets/seed-tts-eval}"
 INPUT_TEXT="${INPUT_TEXT:-}"   # 留空则用数据集该行的 target_text
+SEED="${SEED:-0}"
 
 META="$ROOT/$LOCALE/meta.lst"
 [[ -f "$META" ]] || { echo "!! meta.lst 不存在: $META"; exit 1; }
@@ -40,9 +41,9 @@ echo "==> ref_text=$REF_TEXT"
 echo "==> input(target)=$TARGET"
 
 # 用 python 组 JSON (安全转义 + inline base64 参考音)，再交给 curl
-python3 - "$MODEL" "$TARGET" "$REF_TEXT" "$LANG_NAME" "$WAV" > /tmp/_tts_req.json <<'PY'
+python3 - "$MODEL" "$TARGET" "$REF_TEXT" "$LANG_NAME" "$WAV" "$SEED" > /tmp/_tts_req.json <<'PY'
 import base64, json, sys
-model, target, ref_text, lang, wav = sys.argv[1:6]
+model, target, ref_text, lang, wav, seed = sys.argv[1:7]
 with open(wav, "rb") as f:
     b64 = base64.b64encode(f.read()).decode("ascii")
 print(json.dumps({
@@ -53,6 +54,7 @@ print(json.dumps({
     "language": lang,
     "ref_audio": f"data:audio/wav;base64,{b64}",
     "ref_text": ref_text,
+    "seed": int(seed),
 }))
 PY
 

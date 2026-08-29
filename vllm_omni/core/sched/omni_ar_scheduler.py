@@ -275,6 +275,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if self._uses_native_pd_kv_transfer():
                     self.transfer_triggered_requests.add(request.request_id)
                     self._pd_prefill_submit_ready_requests.add(request.request_id)
+                    if stop_decode_on_trigger:
+                        request.status = RequestStatus.FINISHED_STOPPED
                     return bool(stop_decode_on_trigger)
                 self._commit_kv_transfer_trigger(
                     request.request_id,
@@ -292,6 +294,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if self._uses_native_pd_kv_transfer():
                     self.transfer_triggered_requests.add(request.request_id)
                     self._pd_prefill_submit_ready_requests.add(request.request_id)
+                    if stop_decode_on_trigger:
+                        request.status = RequestStatus.FINISHED_STOPPED
                     return bool(stop_decode_on_trigger)
                 self._commit_kv_transfer_trigger(
                     request.request_id,
@@ -500,11 +504,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return
         try:
             running = len(self.running)
-            stuck = [
-                r
-                for r in self.waiting
-                if r.status in (RequestStatus.PREEMPTED, RequestStatus.WAITING)
-            ]
+            stuck = [r for r in self.waiting if r.status in (RequestStatus.PREEMPTED, RequestStatus.WAITING)]
             # Wedge signature: nothing running yet requests stranded in waiting.
             if running == 0 and stuck:
                 self._pd_wedge_ticks = getattr(self, "_pd_wedge_ticks", 0) + 1
@@ -532,7 +532,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self._pd_wedge_ticks = 0
         except Exception:
             init_logger(__name__).exception("[Omni][PD] wedge-recovery check failed")
-
 
     def update_from_output(
         self,
@@ -1185,8 +1184,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._free_blocks(req)
             else:
                 logger.warning(
-                    "[Omni][PD] finished_recving for req %s in unexpected "
-                    "status %s; skipping free.",
+                    "[Omni][PD] finished_recving for req %s in unexpected status %s; skipping free.",
                     req_id,
                     req.status,
                 )

@@ -35,6 +35,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.data_entry_keys import unflatten_payload
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
@@ -56,7 +57,6 @@ from vllm_omni.engine.messages import (
     UnregisterRemoteReplicaMessage,
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
-from vllm_omni.data_entry_keys import unflatten_payload
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE
@@ -2602,9 +2602,7 @@ class Orchestrator:
                 # earlier output recorded it, then add this submit-ready event.
                 previous_kv_params = self._pd_kv_params.get(req_id, {})
                 previous_kv_params = (
-                    dict(previous_kv_params)
-                    if isinstance(previous_kv_params, dict)
-                    else dict(previous_kv_params)
+                    dict(previous_kv_params) if isinstance(previous_kv_params, dict) else dict(previous_kv_params)
                 )
                 self._pd_kv_params[req_id] = {**previous_kv_params, **kv_params}
                 resume_token_ids = list(getattr(raw_output, "new_token_ids", None) or [])
@@ -2660,6 +2658,11 @@ class Orchestrator:
             sp.seed = int(main_sampler_seed)
         if sp.extra_args is None:
             sp.extra_args = {}
+        if main_sampler_seed is not None:
+            # P only samples layer-0 token y0; D performs the first residual
+            # codebook (Talker MTP) sample. Forward the request seed so D can
+            # create its request-local MTP generator from the initial state.
+            sp.extra_args["tts_local_seed"] = int(main_sampler_seed)
 
         # Get KV params captured from the prefill output (must include remote_request_id).
         kv_prefill_params = self._pd_kv_params.pop(req_id, None)
@@ -2681,11 +2684,7 @@ class Orchestrator:
         # Overlay transport metadata from prefill. Lifecycle events are
         # orchestrator-local and must not leak into the consumer connector.
         decode_kv_params.update(
-            {
-                key: value
-                for key, value in kv_prefill_params.items()
-                if key not in {"pd_submit_ready", "kv_ready"}
-            }
+            {key: value for key, value in kv_prefill_params.items() if key not in {"pd_submit_ready", "kv_ready"}}
         )
 
         # Ensure these flags are set correctly after any overlay.

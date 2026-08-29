@@ -344,6 +344,65 @@ def test_talker_mtp_forward_ignores_default_sampling_seed_without_request_marker
     assert runner.talker_mtp.calls[0]["generator"] is None
 
 
+@pytest.mark.parametrize(
+    ("seeded", "expected_mode"),
+    [
+        (True, CUDAGraphMode.NONE),
+        (False, CUDAGraphMode.FULL),
+    ],
+)
+def test_talker_mtp_full_graph_is_bypassed_only_for_seeded_requests(
+    monkeypatch, seeded: bool, expected_mode: CUDAGraphMode
+):
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    class PassthroughGraphWrapper:
+        def __init__(self, runnable):
+            self.runnable = runnable
+
+        def __call__(self, *args, **kwargs):
+            return self.runnable(*args, **kwargs)
+
+    modes = []
+
+    @contextmanager
+    def capture_forward_context(*args, **kwargs):
+        modes.append(kwargs["cudagraph_runtime_mode"])
+        yield
+
+    monkeypatch.setattr(mod.current_omni_platform, "get_graph_wrapper_cls", lambda: PassthroughGraphWrapper)
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", capture_forward_context)
+
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.requests["r1"].sampling_params = SimpleNamespace(
+        seed=42 if seeded else None,
+        extra_args={"tts_local_seed": 42} if seeded else None,
+    )
+    capture = CaptureTalkerMTP()
+    runner.talker_mtp = PassthroughGraphWrapper(capture)
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
+
+    def fake_determine(self, **kwargs):
+        return (
+            CUDAGraphMode.FULL,
+            SimpleNamespace(num_tokens=1),
+            None,
+            None,
+            None,
+        )
+
+    monkeypatch.setattr(
+        runner,
+        "_determine_batch_execution_and_padding",
+        fake_determine.__get__(runner, type(runner)),
+    )
+
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1"], torch.zeros((2, 4), dtype=torch.float32))
+
+    assert modes == [expected_mode]
+    assert (capture.calls[0]["generator"] is not None) is seeded
+
+
 def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker(monkeypatch):
     import vllm_omni.worker.gpu_model_runner as mod
 

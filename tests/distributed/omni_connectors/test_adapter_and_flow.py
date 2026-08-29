@@ -251,6 +251,39 @@ def test_full_payload_consumer_uses_receiver_connector_spec():
     assert spec["extra"] == {"codec_chunk_frames": 25, "role": "receiver"}
 
 
+@pytest.mark.parametrize(
+    ("async_chunk", "expected_name", "expected_frames", "expected_role"),
+    [
+        (True, "OutgoingConnector", 72, "sender"),
+        (False, "IncomingConnector", 25, "receiver"),
+    ],
+)
+def test_middle_stage_connector_direction_matches_payload_mode(
+    async_chunk: bool,
+    expected_name: str,
+    expected_frames: int,
+    expected_role: str,
+):
+    config = OmniTransferConfig(
+        connectors={
+            ("0", "1"): ConnectorSpec(
+                name="IncomingConnector",
+                extra={"codec_left_context_frames": 25},
+            ),
+            ("1", "2"): ConnectorSpec(
+                name="OutgoingConnector",
+                extra={"codec_left_context_frames": 72},
+            ),
+        }
+    )
+
+    spec = get_stage_connector_spec(config, stage_id=1, async_chunk=async_chunk)
+
+    assert spec["name"] == expected_name
+    assert spec["extra"]["codec_left_context_frames"] == expected_frames
+    assert spec["extra"]["role"] == expected_role
+
+
 def test_recv_with_missing_metadata(mocker: MockerFixture):
     """Test recv when queue payload is malformed (missing metadata)."""
     # Connector expects metadata but task doesn't have it
