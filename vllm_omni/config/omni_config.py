@@ -39,6 +39,7 @@ from vllm_omni.config.stage_config import (
     _STAGE_DEPLOY_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
+    PDRole,
     PipelineConfig,
     StageDeployConfig,
     StageExecutionType,
@@ -1656,6 +1657,10 @@ class BaseVllmOmniStageConfig:
     @property
     def model_stage(self) -> str:
         return self.stage_pipeline_config.model_stage
+
+    @property
+    def pd_role(self) -> PDRole | None:
+        return self.stage_pipeline_config.pd_role
 
     @property
     def input_sources(self) -> list[int]:

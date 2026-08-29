@@ -3,6 +3,7 @@
 """HunyuanImage3 pipeline topology."""
 
 from vllm_omni.config.stage_config import (
+    PDRole,
     PipelineConfig,
     StageExecutionType,
     StagePipelineConfig,
@@ -39,6 +40,52 @@ HUNYUAN_IMAGE3_PIPELINE = PipelineConfig(
             model_stage="dit",
             execution_type=StageExecutionType.DIFFUSION,
             input_sources=(0,),
+            final_output=True,
+            final_output_type="image",
+            requires_multimodal_data=True,
+            model_arch=_HUNYUAN_IMAGE3_MODEL_ARCH,
+            custom_process_input_func=f"{_HUNYUAN_IMAGE3_INPUT_PROCESSOR}.ar2diffusion",
+        ),
+    ),
+)
+
+
+HUNYUAN_IMAGE3_PD_PIPELINE = PipelineConfig(
+    model_type="hunyuan_image3_pd",
+    default_deploy_config_name="hunyuan_image_3_moe_pd.yaml",
+    model_arch=_HUNYUAN_IMAGE3_MODEL_ARCH,
+    hf_architectures=(),
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="AR",
+            execution_type=StageExecutionType.LLM_AR,
+            pd_role=PDRole.PREFILL,
+            input_sources=(),
+            final_output=False,
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            model_arch=_HUNYUAN_IMAGE3_MODEL_ARCH,
+            engine_output_type="latent",
+        ),
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage="AR",
+            execution_type=StageExecutionType.LLM_AR,
+            pd_role=PDRole.DECODE,
+            input_sources=(0,),
+            final_output=True,
+            final_output_type="text",
+            owns_tokenizer=False,
+            requires_multimodal_data=True,
+            model_arch=_HUNYUAN_IMAGE3_MODEL_ARCH,
+            engine_output_type="latent",
+        ),
+        StagePipelineConfig(
+            stage_id=2,
+            model_stage="dit",
+            execution_type=StageExecutionType.DIFFUSION,
+            input_sources=(1,),
             final_output=True,
             final_output_type="image",
             requires_multimodal_data=True,
