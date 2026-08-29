@@ -8,7 +8,7 @@ import torch
 
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
 import vllm_omni.diffusion.models.hunyuan_image3.request_layout as hy3_layout_module
-from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, DiffusionOutput
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer import TokenizerEncodeOutput
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import ImageInfo
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
@@ -440,3 +440,86 @@ def test_denoise_step_uses_input_batch_group_order_and_splits_back(monkeypatch):
     assert states[1].extra[_STEP_MODEL_KWARGS]["attention_mask"].shape == (2, 1, 2, 6)
     assert states[0].extra[_STEP_MODEL_KWARGS]["full_attn_spans"] == [[(2, 4)], [(2, 4)]]
     assert states[1].extra[_STEP_MODEL_KWARGS]["full_attn_spans"] == [[(4, 6)], [(4, 6)]]
+
+
+def test_forward_dispatches_single_request_to_legacy_path(monkeypatch):
+    """A one-request DiffusionRequestBatch must still go through
+    ``_forward_single_request`` (image-editing support, AR-KV-from-request
+    extraction), not the step-execution bridge - unchanged from before this
+    pipeline gained ``supports_request_batch``."""
+    pipeline = _pipeline()
+    called = {}
+
+    def fake_single(self, req, **kwargs):
+        del kwargs
+        called["req"] = req
+        return "single-request-result"
+
+    monkeypatch.setattr(HunyuanImage3Pipeline, "_forward_single_request", fake_single)
+    request = SimpleNamespace(
+        request_id="solo",
+        sampling_params=_sampling_params(),
+        prompt="a prompt",
+        kv_sender_info=None,
+        prepared_layout=None,
+    )
+    req = DiffusionRequestBatch(requests=[request])
+
+    result = pipeline.forward(req)
+
+    assert result == "single-request-result"
+    assert called["req"] is req
+
+
+def test_forward_batches_multiple_requests_through_step_execution_bridge(monkeypatch):
+    """A multi-request DiffusionRequestBatch must go through the generic
+    step-execution bridge, which ``DiffusionRequestBatch.sampling_params``
+    could not have served anyway (it asserts exactly one request)."""
+    pipeline = _pipeline()
+    prepare_calls = []
+    decode_calls = []
+
+    def fake_prepare_encode(self, state, **kwargs):
+        del kwargs
+        prepare_calls.append(state.request_id)
+        seed = state.sampling.seed
+        state.timesteps = [torch.tensor(float(seed))]
+        state.latents = torch.tensor([[float(seed)]])
+        return state
+
+    def fake_denoise_step(self, input_batch, *, states, **kwargs):
+        del kwargs
+        return torch.ones_like(input_batch.latents)
+
+    def fake_step_scheduler(self, state, noise_pred, **kwargs):
+        del kwargs
+        state.latents = state.latents + noise_pred
+        state.step_index += 1
+
+    def fake_post_decode(self, state, **kwargs):
+        del kwargs
+        decode_calls.append(state.request_id)
+        return DiffusionOutput(output=state.latents.clone())
+
+    monkeypatch.setattr(HunyuanImage3Pipeline, "prepare_encode", fake_prepare_encode)
+    monkeypatch.setattr(HunyuanImage3Pipeline, "denoise_step", fake_denoise_step)
+    monkeypatch.setattr(HunyuanImage3Pipeline, "step_scheduler", fake_step_scheduler)
+    monkeypatch.setattr(HunyuanImage3Pipeline, "post_decode", fake_post_decode)
+
+    requests = [
+        SimpleNamespace(
+            request_id=f"req-{i}",
+            sampling_params=SimpleNamespace(seed=seed, generator=None, generator_device=None),
+            prompt=f"prompt-{i}",
+            kv_sender_info=None,
+            prepared_layout=None,
+        )
+        for i, seed in enumerate([0, 1])
+    ]
+    req = DiffusionRequestBatch(requests=requests)
+
+    outputs = pipeline.forward(req)
+
+    assert prepare_calls == ["req-0", "req-1"]
+    assert decode_calls == ["req-0", "req-1"]
+    assert [out.output.item() for out in outputs] == [1.0, 2.0]
