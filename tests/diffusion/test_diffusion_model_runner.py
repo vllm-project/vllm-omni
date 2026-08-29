@@ -221,10 +221,6 @@ def test_ltx2_audio_graph_release_is_model_local_and_keeps_runner():
     [
         ({"dtype": torch.float16}, "dtype must be bfloat16"),
         (
-            {"parallel_config": SimpleNamespace(tensor_parallel_size=2, sequence_parallel_size=1)},
-            "tensor_parallel_size must be 1",
-        ),
-        (
             {"parallel_config": SimpleNamespace(tensor_parallel_size=1, sequence_parallel_size=2)},
             "sequence_parallel_size must be 1",
         ),
@@ -245,6 +241,14 @@ def test_ltx2_audio_graph_rejects_non_cuda_device():
     pipeline = _make_ltx2_graph_pipeline()
     with pytest.raises(ValueError, match="device must be CUDA"):
         LTXAudioRuntime._validate_audio_cuda_graph_support(pipeline.od_config, torch.device("cpu"))
+
+
+def test_ltx2_audio_graph_accepts_tensor_parallelism():
+    pipeline = _make_ltx2_graph_pipeline(
+        parallel_config=SimpleNamespace(tensor_parallel_size=2, sequence_parallel_size=1)
+    )
+
+    LTXAudioRuntime._validate_audio_cuda_graph_support(pipeline.od_config, pipeline.device)
 
 
 def _make_request():

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -155,6 +156,28 @@ def test_incompatible_inputs_fall_back_without_failed_key():
     assert runner.stats_snapshot()["eager"] == 1
     assert runner.stats_snapshot()["eager_incompatible_inputs"] == 1
     assert runner.stats_snapshot()["failed_key_count"] == 0
+
+
+def test_tp_capture_scope_registers_distributed_graph_buffers(monkeypatch):
+    runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cuda")
+    entered = []
+
+    @contextmanager
+    def fake_graph_capture(*, device):
+        entered.append(device)
+        yield
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.ltx2.ltx2_audio_cuda_graph.get_tensor_model_parallel_world_size",
+        lambda: 2,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.ltx2.ltx2_audio_cuda_graph.graph_capture",
+        fake_graph_capture,
+    )
+
+    with runner._tensor_parallel_capture_scope():
+        assert entered == [torch.device("cuda")]
 
 
 def test_mock_cache_hit_lru_and_eviction(monkeypatch):

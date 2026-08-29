@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed.parallel_state import graph_capture
 from vllm.logger import init_logger
 
 from .ltx2_audio_transformer import LTX2AudioStaticConditioning
@@ -386,32 +388,46 @@ class LTX2AudioCUDAGraphRunner:
             self._stats[reason_counter] += 1
         return self._call_transformer(**kwargs)
 
+    @contextmanager
+    def _tensor_parallel_capture_scope(self):
+        """Register TP communication buffers used by the captured graph."""
+        try:
+            tp_size = get_tensor_model_parallel_world_size()
+        except AssertionError:
+            tp_size = 1
+        if tp_size == 1:
+            yield
+            return
+        with graph_capture(device=self.device):
+            yield
+
     def _capture(self, **inputs: Any) -> tuple[LTX2AudioGraphEntry, torch.Tensor]:
         static_inputs = {
             name: _static_copy(value) if isinstance(value, torch.Tensor) else value for name, value in inputs.items()
         }
-        current_stream = torch.cuda.current_stream(self.device)
-        warmup_stream = torch.cuda.Stream(device=self.device)
-        warmup_stream.wait_stream(current_stream)
-        with torch.cuda.stream(warmup_stream), torch.no_grad():
-            initial_output = self._call_transformer(**static_inputs)
-        current_stream.wait_stream(warmup_stream)
-        torch.accelerator.synchronize(self.device)
+        with self._tensor_parallel_capture_scope():
+            current_stream = torch.cuda.current_stream(self.device)
+            warmup_stream = torch.cuda.Stream(device=self.device)
+            warmup_stream.wait_stream(current_stream)
+            with torch.cuda.stream(warmup_stream), torch.no_grad():
+                initial_output = self._call_transformer(**static_inputs)
+            current_stream.wait_stream(warmup_stream)
+            torch.accelerator.synchronize(self.device)
 
-        if self._pool is None:
-            self._pool = torch.cuda.graph_pool_handle()
-        graph = torch.cuda.CUDAGraph()
-        with (
-            torch.no_grad(),
-            torch.cuda.graph(
-                graph,
-                pool=self._pool,
-                # This controls capture-time error detection only; it does not
-                # bind the resulting graph to the capturing Python thread.
-                capture_error_mode="thread_local",
-            ),
-        ):
-            static_output = self._call_transformer(**static_inputs)
+            if self._pool is None:
+                self._pool = torch.cuda.graph_pool_handle()
+            graph = torch.cuda.CUDAGraph()
+            with (
+                torch.no_grad(),
+                torch.cuda.graph(
+                    graph,
+                    pool=self._pool,
+                    # This controls capture-time error detection only; it does not
+                    # bind the resulting graph to the capturing Python thread.
+                    capture_error_mode="thread_local",
+                ),
+            ):
+                static_output = self._call_transformer(**static_inputs)
         return (
             LTX2AudioGraphEntry(
                 graph=graph,

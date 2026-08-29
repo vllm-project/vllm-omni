@@ -300,8 +300,6 @@ class LTXAudioRuntime(
             errors.append("device must be CUDA")
         if od_config.dtype != torch.bfloat16:
             errors.append("dtype must be bfloat16")
-        if parallel.tensor_parallel_size != 1:
-            errors.append("tensor_parallel_size must be 1")
         if parallel.sequence_parallel_size != 1:
             errors.append("sequence_parallel_size must be 1")
         if od_config.enable_cpu_offload:
