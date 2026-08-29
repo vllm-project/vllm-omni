@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 
@@ -18,6 +18,7 @@ class CosyVoice3Config(PretrainedConfig):
         self.llm_output_size = 896
         self.hidden_size = self.llm_output_size
         self.num_attention_heads = 14
+        self.num_key_value_heads = 2
         self.num_hidden_layers = 24
         self.spk_embed_dim = 192
         self.token_frame_rate = 25

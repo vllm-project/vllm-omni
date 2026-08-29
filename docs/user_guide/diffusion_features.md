@@ -129,7 +129,6 @@ The following tables show which models support each feature:
 | **Krea 2**               |     ❌     |     ✅      |           ❌           |       ❌        |         ❌         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **LongCat-Image**        |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **LongCat-Image-Edit**   |     ✅     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
-| **MagiHuman**            |     ❌     |     ❌      |           ❌           |       ❓        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **MammothModa2(T2I)**    |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **Nextstep_1(T2I)**      |     ❓     |     ❓      |           ❌           |       ✅        |         ✅         |          ❌          |   ❌    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **OmniGen2**             |     ❌     |     ✅      |           ✅           |       ❌        |         ✅         |          ❌          |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
@@ -148,7 +147,7 @@ The following tables show which models support each feature:
 
 > Notes:
 > 1. Nextstep_1(T2I) does not support cache acceleration methods such as TeaCache or Cache-DiT.
-> 2. `Tongyi-MAI/Z-Image-Turbo` and `SII-GAIR/daVinci-MagiHuman-Base-1080p` are distilled models with minimal NFEs; CFG-Parallel is not necessary.
+> 2. `Tongyi-MAI/Z-Image-Turbo` is a distilled model with minimal NFEs; CFG-Parallel is not necessary.
 > 3. Cosmos3 T2I uses `Cosmos3OmniDiffusersPipeline` with `modalities=["image"]`. Model-level CPU offload swaps the nested UND reasoner and GEN generator pathways; layerwise offload remains available for blockwise GEN/UND offload.
 > 4. Krea 2 currently supports single-GPU inference plus LoRA, Cache-DiT, HSDP, CPU/layerwise offload, and VAE-patch-parallel (decode). TP/SP/CFG-Parallel are not yet wired. The few-step distilled (Turbo) checkpoint uses `is_distilled=true` (fixed timestep shift `mu=1.15`); generate at 2048x2048 by default with `num_inference_steps≈8` and `guidance_scale=0`. The Raw checkpoint uses 1024x1024, `num_inference_steps=28`, and `guidance_scale=4.5`.
 > 5. HunyuanImage3 supports step execution. Multi-request step execution requires `TORCH_SDPA`; see [Diffusion Execution Modes](diffusion/execution_modes.md#step-execution).
@@ -163,9 +162,9 @@ The following tables show which models support each feature:
 | **LTX-2**                    |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **LTX-2.3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **LTX-2.5**                  |     ❌     | ❓ (one-stage) | ❓ (Ulysses only) | ✅ (Full only) |         ❓         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |    ❓ (FP8)     |        ❌         |
+| **SANA-Video-2B T2V I2V**   |     ❓     |     ❓      |           ❓           |       ❓        |         ❓         |         ❓         |   ❓    |             ❓             |          ❓           |       ❓        |        ❌         |
 | **Helios**                   |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ✅*        |
 | **HunyuanVideo-1.5 T2V I2V** |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
-| **DreamID-Omni**             |     ❌     |     ❌      |           ❌           |       ✅        |         ❌         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ❌         |
 | **Cosmos3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **LongCat-Video-Avatar-1.5** |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **MiniMax-H3**               | ✅ (FL2VA) |     ✅      |           ✅           |       ❌        |       ✅ (DiT/TE)  |         ❌         |   ✅    |             ✅             |       ✅ (tile)       |      ✅ (DiT)      |        ❌         |
@@ -183,8 +182,8 @@ The following tables show which models support each feature:
 
 **Frame Interpolation Support**
 
-- **Supported**: Wan2.2 text-to-video, image-to-video, and TI2V pipelines
-- **Not supported**: Wan2.1-VACE, LTX-2, LTX-2.3, LTX-2.5, Helios, HunyuanVideo-1.5, DreamID-Omni, SANA-WM
+- **Supported**: Wan2.2 text-to-video, image-to-video, and TI2V pipelines; SANA-Video-2B native text-to-video and image-to-video pipelines
+- **Not supported**: Wan2.1-VACE, LTX-2, LTX-2.3, LTX-2.5, Helios, HunyuanVideo-1.5, DreamID-Omni, SANA-WM; SANA-Video-2B Diffusers-adapter text-to-video and image-to-video pipelines
 
 ### AudioGen
 

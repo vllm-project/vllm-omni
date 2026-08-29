@@ -225,3 +225,39 @@ def test_torchaudio_mel_filterbank_matches_librosa() -> None:
     reference = librosa.filters.mel(sr=16000, n_fft=512, n_mels=128, fmin=0.0, fmax=8000.0, norm="slaney")
     assert ta.shape == reference.shape
     assert abs(ta - reference).max() < 1e-6
+
+
+def test_code2wav_reuses_and_clears_per_request_streaming_cache() -> None:
+    import torch
+    from torch import nn
+
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_code2wav import (
+        NemotronVoiceChatCode2Wav,
+    )
+
+    class Codec(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = nn.Parameter(torch.zeros(()))
+            self.caches = []
+
+        def decode(self, codes, lengths, *, cache):
+            self.caches.append(cache)
+            wav = torch.zeros((1, int(codes.shape[1]) * 1764), device=codes.device)
+            return wav, lengths * 1764
+
+    model = NemotronVoiceChatCode2Wav.__new__(NemotronVoiceChatCode2Wav)
+    nn.Module.__init__(model)
+    model._sample_rate, model._num_quantizers, model._codebook_size, model._wav_per_frame = 22050, 31, 1024, 1764
+    model._duplex_codec_caches = {}
+    model.audio_codec = Codec()
+
+    def info(codes):
+        return [{"meta": {"codec_streaming": True, "request_id": "req"}, "codes": {"audio": codes}}]
+
+    model.forward(runtime_additional_information=info(torch.zeros((1, 31), dtype=torch.long)))
+    model.forward(runtime_additional_information=info(torch.zeros((2, 31), dtype=torch.long)))
+    assert model.audio_codec.caches[0] is model.audio_codec.caches[1]
+    assert "req" in model._duplex_codec_caches
+    model.on_requests_finished({"req"})
+    assert "req" not in model._duplex_codec_caches

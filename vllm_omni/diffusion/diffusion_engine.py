@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import asyncio
 import concurrent.futures
 import copy
 import inspect
+import os
 import queue
 import threading
 import time
@@ -29,7 +30,7 @@ from vllm_omni.diffusion.data import (
     DiffusionRequestAbortedError,
     OmniDiffusionConfig,
 )
-from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode, is_scheduler_paged_kv_mode
 from vllm_omni.diffusion.diffusion_kv.initialization import initialize_diffusion_kv_control_plane
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.io_support import (
@@ -55,13 +56,61 @@ from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.metrics.utils import (
+    diffusion_scheduler_waiting_metrics,
+    extract_diffusion_denoise_ms,
+    extract_diffusion_vae_decode_ms,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
-_ASYNC_OUTPUT_TIMEOUT = 30.0  # seconds
+_ASYNC_OUTPUT_TIMEOUT_ENV = "VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"
+_ASYNC_OUTPUT_TIMEOUT_DEFAULT = 600.0  # seconds
+
+
+def _async_output_timeout() -> float:
+    """Seconds to wait for one step's background D2H/SHM copy.
+
+    The copy itself finishes in milliseconds, but it is queued behind the GPU
+    work for that step, so the wall-clock wait tracks step time — a single-GPU
+    box legitimately runs tens of seconds per step on large shapes. A tight
+    bound therefore does not catch a hung engine (worker death and a dead
+    result pump are surfaced by the worker monitor and ``check_health``); it
+    only aborts renders that are still making progress, throwing away the
+    denoise that already completed. The default matches
+    ``_DLO_DP_WAVE_TIMEOUT_S`` in the same subsystem.
+
+    Resolved here rather than at import so a malformed value degrades to the
+    default instead of raising on the request path: this runs inside
+    ``step_streaming``/``add_req_and_wait_for_response``, where a typo in the
+    environment must not start failing generations.
+    """
+    raw = os.environ.get(_ASYNC_OUTPUT_TIMEOUT_ENV)
+    if raw is None:
+        return _ASYNC_OUTPUT_TIMEOUT_DEFAULT
+    try:
+        timeout = float(raw)
+    except ValueError:
+        logger.warning_once(
+            "Ignoring %s=%r: not a number. Using the default %.1fs.",
+            _ASYNC_OUTPUT_TIMEOUT_ENV,
+            raw,
+            _ASYNC_OUTPUT_TIMEOUT_DEFAULT,
+        )
+        return _ASYNC_OUTPUT_TIMEOUT_DEFAULT
+    if timeout <= 0:
+        logger.warning_once(
+            "Ignoring %s=%r: must be positive. Using the default %.1fs.",
+            _ASYNC_OUTPUT_TIMEOUT_ENV,
+            raw,
+            _ASYNC_OUTPUT_TIMEOUT_DEFAULT,
+        )
+        return _ASYNC_OUTPUT_TIMEOUT_DEFAULT
+    return timeout
+
 
 __all__ = [
     "DiffusionEngine",
@@ -331,6 +380,9 @@ class DiffusionEngine:
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
+        # Copied onto the existing output metrics payload so queue monitoring
+        # reuses the normal diffusion result path without additional IPC.
+        self._scheduler_num_waiting_reqs = 0
 
     def _init_execute_fn(self) -> None:
         if self.execution_mode == DiffusionExecutionMode.STEP_BATCH:
@@ -386,18 +438,28 @@ class DiffusionEngine:
             # Async mode: wait for background D2H/SHM to complete.
             if output.async_output_id:
                 fut = self.executor.wait_output_ready(output.async_output_id)
+                timeout = _async_output_timeout()
                 try:
-                    output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=_ASYNC_OUTPUT_TIMEOUT)
+                    output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
                 except (TimeoutError, asyncio.TimeoutError):
                     describe = getattr(self.executor, "describe_pending_state", None)
                     logger.error(
-                        "Timed out after %.0fs waiting for async output; executor state: %s",
-                        _ASYNC_OUTPUT_TIMEOUT,
+                        "Timed out after %.1fs waiting for async output; set %s to a larger value "
+                        "to allow slower steps. Executor state: %s",
+                        timeout,
+                        _ASYNC_OUTPUT_TIMEOUT_ENV,
                         describe(output.async_output_id) if describe else "unavailable",
                     )
                     raise
             postprocess_start_time = time.perf_counter()
-            formatted_outputs = self.postprocess_output(request, output)
+            scheduler_metrics = diffusion_scheduler_waiting_metrics(getattr(self, "_scheduler_num_waiting_reqs", 0))
+            try:
+                formatted_outputs = self.postprocess_output(request, output)
+            except Exception as exc:
+                # Preserve the latest scheduler snapshot across terminal
+                # abort/error paths, which do not produce formatted outputs.
+                setattr(exc, "diffusion_metrics", scheduler_metrics)
+                raise
             postprocess_time = time.perf_counter() - postprocess_start_time
             step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
             logger.debug(
@@ -409,14 +471,24 @@ class DiffusionEngine:
                 step_total_ms,
             )
             for request_output in formatted_outputs:
-                request_output.metrics.update(
-                    {
-                        "preprocess_time_ms": preprocess_time * 1000,
-                        "diffusion_engine_exec_time_ms": exec_total_time * 1000,
-                        "diffusion_engine_total_time_ms": step_total_ms,
-                        "postprocess_time_ms": postprocess_time * 1000,
-                    }
-                )
+                metrics_update = {
+                    "preprocess_time_ms": preprocess_time * 1000,
+                    "diffusion_engine_exec_time_ms": exec_total_time * 1000,
+                    "postprocess_time_ms": postprocess_time * 1000,
+                    **scheduler_metrics,
+                }
+                if request.scheduler_queue_wait_ms is not None:
+                    metrics_update["scheduler_queue_wait_ms"] = request.scheduler_queue_wait_ms
+                vae_decode_ms = extract_diffusion_vae_decode_ms(output)
+                if vae_decode_ms is not None:
+                    metrics_update["vae_decode_time_ms"] = vae_decode_ms
+                forward_ms = extract_diffusion_denoise_ms(output)
+                if forward_ms is not None:
+                    metrics_update["forward_time_ms"] = forward_ms
+                kv_recv_ms = getattr(output, "kv_recv_ms", 0.0)
+                if kv_recv_ms > 0:
+                    metrics_update["kv_recv_time_ms"] = kv_recv_ms
+                request_output.metrics.update(metrics_update)
             yield formatted_outputs
 
     async def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
@@ -507,6 +579,7 @@ class DiffusionEngine:
                 self._wait_for_admission_if_needed_locked()
 
                 sched_output = self.scheduler.schedule()
+                self._scheduler_num_waiting_reqs = max(int(sched_output.num_waiting_reqs), 0)
 
             if sched_output.is_empty:
                 self._emit_finished_outputs(sched_output.finished_req_ids, None)
@@ -634,12 +707,25 @@ class DiffusionEngine:
             if not task.future.done():
                 task.future.set_exception(exc)
 
+    def _remove_diffusion_kv_requests(self, request_ids: Iterable[str]) -> None:
+        """Clear terminal Worker rows while Scheduler owns the allocations."""
+
+        od_config = getattr(self, "od_config", None)
+        if od_config is None or not is_scheduler_paged_kv_mode(
+            getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+        ):
+            return
+        unique_request_ids = list(dict.fromkeys(request_ids))
+        if unique_request_ids:
+            self.executor.remove_diffusion_kv_requests(unique_request_ids)
+
     def _emit_finished_outputs(
         self,
         finished_ids: set[str],
         runner_output: BaseRunnerOutput | None = None,
         missing_result_error: str = "Diffusion execution finished without a final output",
     ) -> None:
+        self._remove_diffusion_kv_requests(finished_ids)
         for rid in finished_ids:
             if runner_output is not None:
                 _output = runner_output.get_request_output(rid)
@@ -658,6 +744,8 @@ class DiffusionEngine:
         if self.execution_mode != DiffusionExecutionMode.STEP_BATCH:
             self._emit_finished_outputs(finished_ids, runner_output)
             return
+
+        self._remove_diffusion_kv_requests(finished_ids)
 
         delivered_finished_req_ids: set[str] = set()
 
@@ -852,6 +940,7 @@ class DiffusionEngine:
                 sched_output = self.scheduler.schedule()
                 if sched_output.is_empty:
                     if target_request_id in sched_output.finished_req_ids:
+                        self._remove_diffusion_kv_requests([target_request_id])
                         return self._finalize_finished_request(target_request_id)
                     if not self.scheduler.has_requests():
                         raise RuntimeError("Diffusion scheduler has no runnable requests.")
@@ -881,6 +970,7 @@ class DiffusionEngine:
                 if not isinstance(runner_output, RunnerOutput) and not len(runner_output) == 1:
                     raise ValueError("Sync func should receive one result at one time")
                 if target_request_id in finished_req_ids:
+                    self._remove_diffusion_kv_requests([target_request_id])
                     req_output = runner_output.get_request_output(target_request_id)
                     output = self._finalize_finished_request(
                         target_request_id,
@@ -889,7 +979,7 @@ class DiffusionEngine:
                     )
                     if output.async_output_id:
                         fut = self.executor.wait_output_ready(output.async_output_id)
-                        output = fut.result(timeout=_ASYNC_OUTPUT_TIMEOUT)
+                        output = fut.result(timeout=_async_output_timeout())
                     return output
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
@@ -1232,8 +1322,11 @@ class DiffusionEngine:
 
     def _abort_requests(self, request_ids: str | Iterable[str]) -> None:
         request_ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
+        request_ids = list(dict.fromkeys(request_ids))
 
-        for request_id in dict.fromkeys(request_ids):
+        self._remove_diffusion_kv_requests(request_ids)
+
+        for request_id in request_ids:
             if self.scheduler.get_request_state(request_id) is not None:
                 self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
 

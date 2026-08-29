@@ -20,6 +20,27 @@ def get_stage_type(stage_cfg: Any) -> str:
     return getattr(stage_cfg, "stage_type", "llm")
 
 
+def is_video_generation_pipeline(stage_configs: list[Any] | None) -> bool:
+    """Return whether a pipeline declares a final video output stage."""
+    for stage in stage_configs or ():
+        if isinstance(stage, dict):
+            final_output = stage.get("final_output", False)
+            final_output_type = stage.get("final_output_type")
+        elif hasattr(stage, "get"):
+            try:
+                final_output = stage.get("final_output", False)
+                final_output_type = stage.get("final_output_type")
+            except Exception:
+                final_output = getattr(stage, "final_output", False)
+                final_output_type = getattr(stage, "final_output_type", None)
+        else:
+            final_output = getattr(stage, "final_output", False)
+            final_output_type = getattr(stage, "final_output_type", None)
+        if final_output and final_output_type in {"video", "videos"}:
+            return True
+    return False
+
+
 def parse_lora_request(lora_body: Any) -> tuple[LoRARequest | None, float | None]:
     """Parse a request-level LoRA object into a LoRARequest and optional scale.
 

@@ -723,11 +723,11 @@ def extract_flux2_klein_context(
 def extract_longcat_context(
     module: nn.Module,  # LongCatImageTransformer2DModel
     hidden_states,
-    timestep,
-    guidance,
-    encoder_hidden_states,
-    txt_ids,
-    img_ids,
+    encoder_hidden_states=None,
+    timestep=None,
+    img_ids=None,
+    txt_ids=None,
+    guidance=None,
     **kwargs,
 ) -> CacheContext:
     """Extract the cache context for LongCat Image.
@@ -1304,6 +1304,9 @@ def extract_minimax_h3_context(
     psp = _required_kwarg(kwargs, "packed_seq_params")
     cu_seqlens = module._psp_field(psp, "packed_seq_params", "cu_seqlens_q").to(torch.int32)
     max_seqlen = int(module._psp_field(psp, "packed_seq_params", "max_seqlen_q"))
+    # Mirror forward()'s host-side scalar so the refiner sees the number of
+    # packed requests without reading cu_seqlens off-device.
+    num_requests = int(module._psp_optional(psp, "num_requests", 1))
     refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
     refiner_cu = module._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
     refiner_max = int(module._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
@@ -1330,6 +1333,7 @@ def extract_minimax_h3_context(
         text_pos=text_pos.to(device),
         refiner_cu_seqlens=refiner_cu.to(device),
         refiner_max_seqlen=refiner_max,
+        num_requests=num_requests,
         seq_len=seq_len,
         device=device,
         local_span=(0, seq_len),

@@ -12,12 +12,13 @@ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.config.stage_config import StageConfig
 from vllm_omni.engine.async_omni_engine import StageRuntimeInfo
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni import Omni
-from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
+from vllm_omni.entrypoints.omni_base import OmniBase, OmniEngineDeadError
 from vllm_omni.errors import (
     OmniClientError,
     client_error_from_metadata,
@@ -188,12 +189,37 @@ def _patch_engine(monkeypatch: pytest.MonkeyPatch, engine: FakeAsyncOmniEngine) 
 
 
 def _make_base():
-    from vllm_omni.entrypoints.omni_base import OmniBase
-
     obj = object.__new__(OmniBase)
     obj.engine = MagicMock()
     obj.request_states = {}
     return obj
+
+
+def test_resolve_sampling_params_list_preserves_stage_constraints():
+    base = _make_base()
+    base.engine.num_stages = 1
+    base.default_sampling_params_list = [SamplingParams(max_tokens=1000, detokenize=False, stop_token_ids=[42])]
+    base.engine.stage_configs = [
+        StageConfig(
+            stage_id=0,
+            model_stage="dummy-model",
+            sampling_constraints={"detokenize": False, "stop_token_ids": [42]},
+        ).to_omegaconf()
+    ]
+    base.sampling_constraints_list = base._get_sampling_constraints_list(base.engine.stage_configs)
+    assert base.sampling_constraints_list == [{"detokenize": False, "stop_token_ids": [42]}]
+    caller_params = SamplingParams(seed=1234, max_tokens=7, detokenize=True, stop_token_ids=[7])
+
+    resolved = base.resolve_sampling_params_list(caller_params)
+
+    assert resolved[0] is not caller_params
+    assert resolved[0].seed == 1234
+    assert resolved[0].max_tokens == 7
+    assert resolved[0].detokenize is False
+    assert resolved[0].stop_token_ids == [42]
+    assert 42 in resolved[0]._all_stop_token_ids
+    assert caller_params.detokenize is True
+    assert caller_params.stop_token_ids == [7]
 
 
 def _stage_spec(
@@ -585,7 +611,13 @@ async def test_async_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPat
     # external ID to avoid collisions, so this also tests mapping
     external_req_id = "req-1"
     req_id = "req-1-12345678"
+    recorded_failures = []
     try:
+        monkeypatch.setattr(
+            app,
+            "_record_request_failure_once",
+            lambda request_id, reason: recorded_failures.append((request_id, reason)),
+        )
         app.request_states[req_id] = ClientRequestState(
             request_id=req_id,
             external_request_id=external_req_id,
@@ -596,6 +628,7 @@ async def test_async_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPat
 
     assert engine.aborted == [[req_id]]
     assert external_req_id not in app.request_states
+    assert recorded_failures == [(req_id, "client_abort")]
 
 
 @pytest.mark.asyncio
@@ -788,7 +821,13 @@ def test_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPatch):
     _patch_engine(monkeypatch, engine)
 
     app = Omni("dummy-model")
+    recorded_failures = []
     try:
+        monkeypatch.setattr(
+            app,
+            "_record_request_failure_once",
+            lambda request_id, reason: recorded_failures.append((request_id, reason)),
+        )
         app.request_states["req-1"] = object()
         app.abort("req-1")
     finally:
@@ -796,6 +835,7 @@ def test_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPatch):
 
     assert engine.aborted == [["req-1"]]
     assert "req-1" not in app.request_states
+    assert recorded_failures == [("req-1", "client_abort")]
 
 
 def test_omni_forces_final_only_on_llm_stages(monkeypatch: pytest.MonkeyPatch):

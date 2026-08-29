@@ -1,9 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import argparse
 import json
 import os
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field, fields
-from typing import Any
+from typing import Any, cast
 
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
@@ -12,6 +16,7 @@ from vllm_omni.config import OmniModelConfig
 from vllm_omni.outputs.output_modality import OutputModality
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.plugins import load_omni_general_plugins
+from vllm_omni.worker.omni_connector_validation import validate_worker_omni_connector
 
 logger = init_logger(__name__)
 
@@ -158,6 +163,7 @@ class OmniEngineArgs(EngineArgs):
             If None, default processing is used.
         stage_connector_spec: Extra configuration for stage connector
         async_chunk: If set to True, perform async chunk
+        session_mode: Request lifecycle mode, either turn-based or duplex
         worker_type: Model Type, e.g., "ar" or "generation"
         task_type: Model-defined startup task type. Consumers validate the
             supported values and decide whether it selects request behavior,
@@ -182,10 +188,12 @@ class OmniEngineArgs(EngineArgs):
     engine_output_type: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
+    requires_full_payload_input: bool = False
     stage_connector_spec: dict[str, Any] = field(default_factory=dict)
     subtalker_sampling_params: dict[str, Any] | None = None
     silence_ban_frames: int = 0
     async_chunk: bool = False
+    session_mode: str = "turn"
     retains_state_across_chunks: bool = False
     # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
     # Must be declared here so engine_args dict propagation does not silently
@@ -236,12 +244,19 @@ class OmniEngineArgs(EngineArgs):
     sampling_extra_args_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.worker_cls is None:
+        if self.worker_cls in (None, "auto"):
             if self.worker_type == "ar":
                 self.worker_cls = current_omni_platform.get_omni_ar_worker_cls()
             elif self.worker_type == "generation":
                 self.worker_cls = current_omni_platform.get_omni_generation_worker_cls()
         load_omni_general_plugins()
+
+        connector_extra = self.stage_connector_spec.get("extra")
+        connector_role = connector_extra.get("role") if isinstance(connector_extra, dict) else None
+        needs_connector = bool(
+            self.requires_full_payload_input or self.custom_process_next_stage_input_func or connector_role is not None
+        )
+        validate_worker_omni_connector(self.worker_cls, needs_connector)
         super().__post_init__()
 
     def _ensure_omni_models_registered(self):
@@ -298,24 +313,26 @@ class OmniEngineArgs(EngineArgs):
         }
         stage_connector_config["extra"]["stage_id"] = self.stage_id
 
+        hf_overrides = cast(dict[str, Any] | Callable[[Any], Any] | None, getattr(self, "hf_overrides", None))
         # If model_arch is specified, inject it into hf_overrides so vLLM can
         # resolve the architecture even when config.json lacks 'architectures'.
         # Also inject model_type so AutoConfig can resolve the correct config
         # class for models with empty or missing config.json (e.g. CosyVoice3).
         if self.model_arch:
-            if self.hf_overrides is None:
-                self.hf_overrides = {}
-            if isinstance(self.hf_overrides, dict):
-                self.hf_overrides.setdefault("architectures", [self.model_arch])
-                if "model_type" not in self.hf_overrides:
+            if hf_overrides is None:
+                hf_overrides = {}
+                self.hf_overrides = hf_overrides
+            if isinstance(hf_overrides, dict):
+                hf_overrides.setdefault("architectures", [self.model_arch])
+                if "model_type" not in hf_overrides:
                     model_type = _ARCH_TO_MODEL_TYPE.get(self.model_arch)
                     if model_type is not None:
-                        self.hf_overrides.setdefault("model_type", model_type)
+                        hf_overrides.setdefault("model_type", model_type)
 
                 # Stage wrappers (e.g. Code2Wav) may need max_model_len larger
                 # than the base checkpoint's text max_position_embeddings.
                 if self.model_arch == "Qwen3TTSCode2Wav" and self.max_model_len is not None:
-                    self.hf_overrides.setdefault("talker_config", {}).setdefault(
+                    hf_overrides.setdefault("talker_config", {}).setdefault(
                         "max_position_embeddings", int(self.max_model_len)
                     )
 
@@ -331,33 +348,37 @@ class OmniEngineArgs(EngineArgs):
                 if model_type is not None:
                     self._patch_empty_hf_config(model_type)
 
+        tokenizer = cast(str | None, getattr(self, "tokenizer", None))
+
         # NemotronVoiceChat: the checkpoint's only tokenizer subfolder is the
         # auxiliary rnnt_tokenizer/ (ASR loss vocab), which the generic
         # subfolder auto-detect below would wrongly pick up. The text tokenizer
         # is the Nemotron backbone's, resolved from a local override or its
         # HF id (cache-friendly).
-        if not self.tokenizer and self.model_arch in (
+        if not tokenizer and self.model_arch in (
             "NemotronVoiceChatThinkerForConditionalGeneration",
             "NemotronVoiceChatTalkerForConditionalGeneration",
             "NemotronVoiceChatCode2Wav",
         ):
             self.tokenizer = os.environ.get("NEMOTRON_VOICECHAT_LLM_PATH") or "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
-            logger.info("NemotronVoiceChat: using text tokenizer from %s", self.tokenizer)
+            tokenizer = self.tokenizer
+            logger.info("NemotronVoiceChat: using text tokenizer from %s", tokenizer)
 
         # Auto-detect tokenizer for models that store it in a subdirectory
         # rather than the root (e.g. CosyVoice3 uses CosyVoice-BlankEN/).
-        if not self.tokenizer and self.model:
+        if not tokenizer and self.model:
             model_path = self.model
             if os.path.isdir(model_path) and not os.path.isfile(os.path.join(model_path, "tokenizer_config.json")):
                 for subfolder in sorted(os.listdir(model_path)):
                     candidate = os.path.join(model_path, subfolder)
                     if os.path.isdir(candidate) and os.path.isfile(os.path.join(candidate, "tokenizer_config.json")):
                         self.tokenizer = candidate
+                        tokenizer = candidate
                         logger.info("Auto-detected tokenizer at %s", candidate)
                         break
             elif not os.path.isdir(model_path):
-                subfolder = _TOKENIZER_SUBFOLDER_MAP.get(self.model_arch)
-                if subfolder:
+                tokenizer_subfolder = _TOKENIZER_SUBFOLDER_MAP.get(self.model_arch or "")
+                if tokenizer_subfolder:
                     # Download just the tokenizer files from the subfolder
                     try:
                         from huggingface_hub import snapshot_download
@@ -365,15 +386,15 @@ class OmniEngineArgs(EngineArgs):
                         local_dir = snapshot_download(
                             model_path,
                             allow_patterns=[
-                                f"{subfolder}/tokenizer*",
-                                f"{subfolder}/tokenization_*",
-                                f"{subfolder}/special_tokens*",
-                                f"{subfolder}/vocab*",
-                                f"{subfolder}/merges*",
-                                f"{subfolder}/added_tokens*",
+                                f"{tokenizer_subfolder}/tokenizer*",
+                                f"{tokenizer_subfolder}/tokenization_*",
+                                f"{tokenizer_subfolder}/special_tokens*",
+                                f"{tokenizer_subfolder}/vocab*",
+                                f"{tokenizer_subfolder}/merges*",
+                                f"{tokenizer_subfolder}/added_tokens*",
                             ],
                         )
-                        candidate = os.path.join(local_dir, subfolder)
+                        candidate = os.path.join(local_dir, tokenizer_subfolder)
                         if os.path.isdir(candidate):
                             self.tokenizer = candidate
                             logger.info("Downloaded tokenizer from %s/%s", model_path, subfolder)
@@ -396,6 +417,7 @@ class OmniEngineArgs(EngineArgs):
             # All kwargs below are Omni specific
             stage_id=self.stage_id,
             async_chunk=self.async_chunk,
+            session_mode=self.session_mode,
             retains_state_across_chunks=self.retains_state_across_chunks,
             active_stream_window=self.active_stream_window,
             duplex_max_sessions=self.duplex_max_sessions,
@@ -406,6 +428,7 @@ class OmniEngineArgs(EngineArgs):
             engine_output_type=self.engine_output_type,
             hf_config_name=self.hf_config_name,
             custom_process_next_stage_input_func=self.custom_process_next_stage_input_func,
+            requires_full_payload_input=self.requires_full_payload_input,
             stage_connector_config=stage_connector_config,
             subtalker_sampling_params=self.subtalker_sampling_params,
             silence_ban_frames=self.silence_ban_frames,
@@ -532,6 +555,7 @@ class OrchestratorArgs:
     hsdp_shard_size: int = -1
     hsdp_replicate_size: int = 1
     diffusion_attention_backend: str | None = None
+    fastvideo_vsa_topk: int | None = None
     diffusion_attention_config: str | None = None
     diffusion_compile_granularity: str | None = None
     diffusion_compile_dynamic: bool | None = None
@@ -548,6 +572,9 @@ class OrchestratorArgs:
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = 0
+    host_weight_runtime_mode: str = "disabled"
+    host_weight_runtime_root: str | None = None
+    dlo_host_registration_limit_gib: float = 0.0
     boundary_ratio: float | None = None
     flow_shift: float | None = None
     diffusion_kv_cache_dtype: str | None = None
@@ -556,7 +583,6 @@ class OrchestratorArgs:
     cfg_parallel_size: int = 1
     vae_patch_parallel_size: int = 1
     vae_parallel_mode: str = "tile"
-    text_encoder_tp_size: int = 1
     default_sampling_params: str | None = None
     max_generated_image_size: int | None = None
     tts_max_instructions_length: int | None = None

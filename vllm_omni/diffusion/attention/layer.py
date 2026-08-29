@@ -24,7 +24,11 @@ from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
-from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    get_ulysses_mode,
+    is_forward_context_available,
+)
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -73,6 +77,11 @@ class Attention(nn.Module):
         self.role = role
         self.role_category = role_category
         self.qkv_layout = qkv_layout
+        # ``prefix`` is also the stable layer identity used by vLLM's native
+        # KV-cache metadata.  Keep it on the Omni layer so the active paged
+        # adapter can dispatch the already-resharded Q/K/V to the matching
+        # native cache tensor without replacing this Omni execution path.
+        self.prefix = prefix
         if paged_kv_cache_role == "":
             raise ValueError("paged_kv_cache_role must be non-empty when provided")
         self.paged_kv_cache_role = paged_kv_cache_role
@@ -311,25 +320,67 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         # Get the appropriate parallel strategy based on SP active state
         strategy = self._get_active_parallel_strategy()
+        paged_adapter = self._active_paged_kv_adapter()
+        use_paged_attention = paged_adapter is not None and self.paged_kv_cache_role is not None
+        if use_paged_attention and not getattr(self.attn_backend, "supports_paged_kv", False):
+            raise NotImplementedError(
+                f"Diffusion paged KV requires an Omni backend with paged support; "
+                f"selected {self.attn_backend.get_name()}"
+            )
+        if use_paged_attention and strategy is not self._no_parallel_strategy:
+            strategy_name = strategy.name
+            if self.use_ring or strategy_name == "ring":
+                raise NotImplementedError(
+                    "paged Scheduler KV is not supported with Ring attention; use strict Ulysses or no SP"
+                )
+            if strategy_name == "allgather_kv":
+                raise NotImplementedError("paged Scheduler KV is not supported with AllGather-KV sequence parallelism")
+            if strategy_name == "ulysses" and get_ulysses_mode(default="strict") != "strict":
+                raise NotImplementedError("paged Scheduler KV currently supports only strict Ulysses")
 
         # 1. Prepare inputs (Communication / Resharding)
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
         # For Ring: Concat joint_q
         query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
 
-        attn_metadata = self._with_kv_cache_dtype(attn_metadata)
-
-        # 2. Kernel Execution (Computation)
-        if self.use_ring and strategy is not self._no_parallel_strategy:
-            out = self._run_ring_attention(query, key, value, attn_metadata)
+        # 2. Kernel execution stays inside the selected Omni backend.  The
+        # Worker adapter only prepares the native page-table context after
+        # SP has produced rank-local Q/K/V tensors.
+        if use_paged_attention:
+            assert paged_adapter is not None
+            paged_kv_context = paged_adapter.prepare_layer_context(
+                self.prefix,
+                query,
+                key,
+                value,
+                omni_attn_metadata=attn_metadata,
+            )
+            out = self.attention.forward_paged(paged_kv_context)
         else:
-            out = self._run_local_attention(query, key, value, attn_metadata)
+            attn_metadata = self._with_kv_cache_dtype(attn_metadata)
+            if self.use_ring and strategy is not self._no_parallel_strategy:
+                out = self._run_ring_attention(query, key, value, attn_metadata)
+            else:
+                out = self._run_local_attention(query, key, value, attn_metadata)
 
         # 3. Post-processing (Reverse Communication)
         # For Ulysses: AllToAll Output, and AllGather Joint Output
         out = strategy.post_attention(out, ctx)
 
         return out
+
+    @staticmethod
+    def _active_paged_kv_adapter():
+        """Return the opaque Worker adapter installed for this forward."""
+
+        if not is_forward_context_available():
+            return None
+        return getattr(get_forward_context(), "paged_kv_adapter", None)
+
+    def is_paged_kv_active(self) -> bool:
+        """Return whether this layer will use Scheduler-managed paged KV."""
+
+        return self.paged_kv_cache_role is not None and self._active_paged_kv_adapter() is not None
 
     def _run_local_attention(self, query, key, value, attn_metadata):
         self._assert_piecewise_compatible(attn_metadata)

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Online serving benchmark subcommand for vLLM-Omni.
 
 ``OmniBenchmarkServingSubcommand`` starts from vLLM's serving benchmark
@@ -24,7 +27,7 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
     """The `serve` subcommand for vllm bench."""
 
     name = "serve"
-    help = "Benchmark the online serving throughput. Supports Daily-Omni and Seed-TTS datasets."
+    help = "Benchmark online serving. Supports Daily-Omni, OmniInteract, and Seed-TTS datasets."
 
     @classmethod
     def add_cli_args(cls, parser: argparse.ArgumentParser) -> None:

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import time
@@ -49,11 +52,13 @@ class StageRequestStats:
     audio_sample_rate: int = 0
     audio_duration_s: float = 0.0
     image_pixels: int = 0
+    num_inference_steps: int = 0
     denoise_step_latency_ms: float = 0.0
     pipeline_timings: dict[str, float] | None = None
     output_unit_type: str | None = None
     output_unit_count: int = 0
     serving_time_to_first_output_ms: float = 0.0
+    image_time_to_first_output_ms: float = 0.0
     time_per_output_unit_ms: float = 0.0
     inter_output_latency_ms: float = 0.0
     inter_output_latencies_ms: list[float] | None = None
@@ -480,6 +485,7 @@ class OrchestratorAggregator:
                 "output_unit_type": evt.output_unit_type,
                 defs.OUTPUT_UNIT_COUNT: int(evt.output_unit_count),
                 defs.SERVING_TIME_TO_FIRST_OUTPUT_MS: float(evt.serving_time_to_first_output_ms),
+                defs.IMAGE_TIME_TO_FIRST_OUTPUT_MS: float(evt.image_time_to_first_output_ms),
                 defs.TIME_PER_OUTPUT_UNIT_MS: float(evt.time_per_output_unit_ms),
                 defs.INTER_OUTPUT_LATENCY_MS: float(evt.inter_output_latency_ms),
                 defs.INTER_OUTPUT_LATENCIES_MS: list(evt.inter_output_latencies_ms or []),
@@ -512,6 +518,11 @@ class OrchestratorAggregator:
         current_first_output_ms = float(current.get(defs.SERVING_TIME_TO_FIRST_OUTPUT_MS, 0.0))
         if current_first_output_ms <= 0 < first_output_ms:
             current[defs.SERVING_TIME_TO_FIRST_OUTPUT_MS] = first_output_ms
+
+        image_first_output_ms = float(evt.image_time_to_first_output_ms)
+        current_image_first_output_ms = float(current.get(defs.IMAGE_TIME_TO_FIRST_OUTPUT_MS, 0.0))
+        if current_image_first_output_ms <= 0 < image_first_output_ms:
+            current[defs.IMAGE_TIME_TO_FIRST_OUTPUT_MS] = image_first_output_ms
 
         if evt.output_unit_type:
             current["output_unit_type"] = evt.output_unit_type
@@ -578,11 +589,20 @@ class OrchestratorAggregator:
         stats.request_id = req_id
         if final_output_type is not None:
             stats.final_output_type = final_output_type
+        diffusion_metrics_by_request = getattr(self, "diffusion_metrics", None)
         stats.diffusion_metrics = (
-            {k: float(v) for k, v in self.diffusion_metrics.pop(req_id, {}).items()}
-            if req_id in self.diffusion_metrics
+            {k: float(v) for k, v in diffusion_metrics_by_request.pop(req_id, {}).items()}
+            if diffusion_metrics_by_request is not None and req_id in diffusion_metrics_by_request
             else None
         )
+        forward_time_s = (stats.diffusion_metrics or {}).get("forward_time_s")
+        num_inference_steps = int(getattr(stats, "num_inference_steps", 0) or 0)
+        if num_inference_steps > 0 and getattr(stats, "output_unit_type", None) == "image":
+            if forward_time_s is not None:
+                denoise_time_ms = float(forward_time_s) * 1000.0
+            else:
+                denoise_time_ms = float(getattr(stats, "stage_gen_time_ms", 0.0) or 0.0)
+            stats.denoise_step_latency_ms = denoise_time_ms / num_inference_steps
         return stats
 
     def on_stage_metrics(
@@ -628,10 +648,24 @@ class OrchestratorAggregator:
             _postproc_ms = (time.perf_counter() - _t0) * 1000.0
             self.record_stage_postprocess_time(stage_id, req_id, _postproc_ms)
 
+    _MS_TO_S: dict[str, str] = {
+        "preprocess_time_ms": "preprocess_time_s",
+        "diffusion_engine_exec_time_ms": "diffusion_engine_exec_time_s",
+        "postprocess_time_ms": "postprocess_time_s",
+        "vae_decode_time_ms": "vae_decode_time_s",
+        "forward_time_ms": "forward_time_s",
+        "scheduler_queue_wait_ms": "scheduler_queue_wait_s",
+        "kv_recv_time_ms": "kv_recv_time_s",
+    }
+
     def accumulate_diffusion_metrics(self, stage_type: str, req_id: Any, engine_outputs: Any) -> None:
         """Accumulate diffusion metrics for a request.
 
-        Handles extraction and accumulation of diffusion stage metrics.
+        Engine emits ``*_ms`` timings; the accumulator converts them to ``_s``
+        keys via ``_MS_TO_S`` so downstream observers read a uniform
+        seconds-bearing dict. Per-chunk timing keys are summed; non-timing
+        keys (e.g. ``image_num`` / ``resolution`` from ``format_diffusion_outputs``)
+        preserve the existing ``+=`` semantics.
 
         Args:
             req_id: Request ID
@@ -643,20 +677,16 @@ class OrchestratorAggregator:
         diffusion_metrics: dict = getattr(engine_output, "metrics", {})
         if isinstance(diffusion_metrics, list):
             diffusion_metrics = diffusion_metrics[0]
-        if diffusion_metrics:
-            _MS_TO_S = {
-                "diffusion_engine_exec_time_ms": "diffusion_engine_exec_time_s",
-                "preprocess_time_ms": "preprocess_time_s",
-                "postprocess_time_ms": "postprocess_time_s",
-                "diffusion_engine_total_time_ms": "diffusion_engine_total_time_s",
-            }
-            for key, value in diffusion_metrics.items():
-                if value is None:
-                    continue
-                if key in _MS_TO_S:
-                    self.diffusion_metrics[req_id][_MS_TO_S[key]] = float(value) / 1000.0
-                else:
-                    self.diffusion_metrics[req_id][key] = value
+        if not diffusion_metrics:
+            return
+        bucket = self.diffusion_metrics[req_id]
+        for key, value in diffusion_metrics.items():
+            if value is None:
+                continue
+            if key in self._MS_TO_S:
+                bucket[self._MS_TO_S[key]] += float(value) / 1000.0
+            else:
+                bucket[key] += float(value)
 
     def on_forward(
         self,

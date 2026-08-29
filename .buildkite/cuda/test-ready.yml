@@ -9,23 +9,27 @@ steps:
     depends_on: upload-ready-pipeline
     steps:
       - label: "Simple · Model Executor Test"
+        timeout_in_minutes: 20
         commands:
-          - "timeout 20m pytest -sv tests/model_executor -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+          - "pytest -sv tests/model_executor -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
       - label: "Simple · Diffusion Test"
+        timeout_in_minutes: 20
         commands:
-          - "timeout 20m pytest -sv tests/diffusion -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+          - "pytest -sv tests/diffusion -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
       - label: "Simple · Engine&Entrypoints Test"
+        timeout_in_minutes: 20
         commands:
-          - "timeout 20m pytest -sv tests/entrypoints tests/engine -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+          - "pytest -sv tests/entrypoints tests/engine -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
       - label: "Simple · Other Test"
+        timeout_in_minutes: 20
         commands:
-          - "timeout 20m pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+          - "pytest -sv tests/ -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --ignore=tests/entrypoints --ignore=tests/engine"
         mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: Diffusion Test"
@@ -121,32 +125,8 @@ steps:
           - vllm_omni/outputs/
         commands:
           - timeout 20m pytest -s -v tests/e2e/features/custom_pipeline/ -m "core_model"
-        agents:
-          queue: "gpu_1_queue"
-        plugins:
-          - docker#v5.2.0:
-              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-              always-pull: true
-              propagate-environment: true
-              # vLLM 0.27 added a pre-flight capacity check in
-              # distributed/device_communicators/shm_broadcast.py. Without this
-              # the container gets Docker's 64 MiB default and every test in
-              # this step dies at engine start with
-              #   RuntimeError: Insufficient space in /dev/shm:
-              #                 240 MiB required, 64 MiB available
-              # (9 failed in 8.7s on build #2949). vLLM 0.26 had no such check
-              # and allocated regardless, so this step passed on main while
-              # being under-provisioned the whole time — 0.27 turned a silent
-              # risk into an explicit error.
-              #
-              # This is the only inline docker plugin block in .buildkite/cuda/;
-              # every other step inherits common/ci_mirror_hardwares.yml, which
-              # already sets 8gb. Matching that rather than inventing a value.
-              shm-size: "8gb"
-              environment:
-                - "HF_HOME=/fsx/hf_cache"
-              volumes:
-                - "/fsx/hf_cache:/fsx/hf_cache"
+        mirror_hardwares: l4_1
+
 
       - label: "RLHF · VeRL-Omni E2E Test"
         source_file_dependencies:
@@ -225,10 +205,10 @@ steps:
           - tests/e2e/online_serving/test_minicpmo_realtime_duplex_drivers.py
           - tests/e2e/online_serving/helpers/minicpmo_realtime_duplex_scenarios.py
           - tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py
+          - tests/e2e/online_serving/run_minicpmo_realtime_duplex_server_vad.py
           - tests/e2e/online_serving/run_minicpmo_realtime_duplex_soft_interrupt.py
           - vllm_omni/deploy/minicpmo_4_5.yaml
           - tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py
-          - vllm_omni/deploy/minicpmo_4_5_duplex.yaml
           - vllm_omni/experimental/fullduplex/
           - vllm_omni/model_executor/models/minicpmo_4_5/
           - vllm_omni/model_executor/models/step_audio2/
@@ -327,6 +307,24 @@ steps:
             "
         mirror_hardwares: h100_1
 
+      - label: "Diffusion · MiniMax-H3 DLO DP2 T2VA Test"
+        timeout_in_minutes: 90
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_minimax_h3_dlo_dp2_t2va.py
+          - tests/helpers/assertions.py
+          - tests/helpers/runtime.py
+          - vllm_omni/diffusion/models/minimax_h3/
+          - vllm_omni/diffusion/offloader/
+          - vllm_omni/diffusion/distributed/
+          - vllm_omni/entrypoints/openai/
+        commands:
+          - |
+            timeout 80m bash -c "
+              export VLLM_IMAGE_FETCH_TIMEOUT=60
+              pytest -s -v tests/e2e/online_serving/test_minimax_h3_dlo_dp2_t2va.py -m 'core_model and cuda and diffusion' --run-level 'core_model'
+            "
+        mirror_hardwares: h100_2
+
       - label: "Diffusion · Qwen Image Test"
         source_file_dependencies:
           - tests/e2e/online_serving/test_qwen_image.py
@@ -338,5 +336,17 @@ steps:
             timeout 40m bash -c "
               export VLLM_IMAGE_FETCH_TIMEOUT=60
               pytest -s -v tests/e2e/online_serving/test_qwen_image.py -m 'core_model' --run-level 'core_model'
+            "
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · HunyuanVideo-1.5 Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_hunyuan_video_15_expansion.py
+          - vllm_omni/diffusion/models/hunyuan_video/
+        commands:
+          - |
+            timeout 40m bash -c "
+              export VLLM_IMAGE_FETCH_TIMEOUT=60
+              pytest -s -v tests/e2e/online_serving/test_hunyuan_video_15_expansion.py -m 'core_model and diffusion' --run-level 'core_model'
             "
         mirror_hardwares: h100_1

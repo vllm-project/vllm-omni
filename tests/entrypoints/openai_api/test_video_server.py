@@ -64,7 +64,13 @@ class MockVideoResult:
 
 class FakeAsyncOmni:
     def __init__(self):
-        self.stage_configs = [SimpleNamespace(stage_type="diffusion")]
+        self.stage_configs = [
+            SimpleNamespace(
+                stage_type="diffusion",
+                final_output=True,
+                final_output_type="video",
+            )
+        ]
         self.default_sampling_params_list = [OmniDiffusionSamplingParams()]
         self.model_class_name = "WanPipeline"
         self.captured_prompt = None
@@ -87,6 +93,58 @@ class FakeAsyncOmni:
         num_outputs = sampling_params_list[0].num_outputs_per_prompt
         videos = [object() for _ in range(num_outputs)]
         yield MockVideoResult(videos)
+
+
+def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixture):
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        engine,
+        model_name="test-model",
+    )
+    assert handler._video_frame_converter.max_workers == 8
+    raw_encoder = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"encoded-video",
+    )
+    base64_encoder = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        return_value="encoded-video",
+    )
+
+    async def _generate_both_response_types():
+        request = VideoGenerationRequest(prompt="test prompt")
+        await handler.generate_video_bytes(request, "raw-request")
+        await handler.generate_videos(request, "base64-request")
+
+    asyncio.run(_generate_both_response_types())
+
+    assert raw_encoder.call_args.kwargs["frame_converter"] is handler._video_frame_converter
+    assert base64_encoder.call_args.kwargs["frame_converter"] is handler._video_frame_converter
+    handler.shutdown()
+
+
+def test_resolve_diffusion_od_config_falls_back_to_attribute():
+    od_config = SimpleNamespace(model_class_name="WanPipeline")
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        SimpleNamespace(od_config=od_config),
+        model_name="test-model",
+    )
+
+    assert handler._resolve_diffusion_od_config() is od_config
+
+
+def test_resolve_diffusion_od_config_prefers_getter_over_attribute():
+    attribute_config = SimpleNamespace(model_class_name="WanPipeline")
+    getter_config = SimpleNamespace(model_class_name="MiniMaxH3Pipeline")
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        SimpleNamespace(
+            od_config=attribute_config,
+            get_diffusion_od_config=lambda: getter_config,
+        ),
+        model_name="test-model",
+    )
+
+    assert handler._resolve_diffusion_od_config() is getter_config
 
 
 class BlockingVideoHandler:
@@ -778,6 +836,18 @@ def test_multi_video_generation_preserves_uploaded_files_until_generation(
     assert engine.captured_sampling_params_list[0].extra_args["duration"] == 15.0
 
 
+def test_mixed_reference_capability_uses_model_metadata_when_config_defaults_false(test_client):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = None
+    handler._engine_client.stage_configs = [
+        SimpleNamespace(engine_args={"model_class_name": "MiniMaxH3TextEncoder"}),
+        SimpleNamespace(engine_args={"model_class_name": "MiniMaxH3Pipeline"}),
+    ]
+    handler._stage_configs = handler._engine_client.stage_configs
+
+    assert handler.supports_mixed_reference_inputs
+
+
 def test_decode_video_bytes_can_keep_first_frames():
     from vllm_omni.entrypoints.openai.video_api_utils import _decode_video_bytes
 
@@ -1157,8 +1227,15 @@ def test_worker_fps_multiplier_is_applied_to_async_encoding(test_client, mocker:
 def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFixture):
     audio_sample_rates = []
 
-    def _fake_encode(video, fps, audio=None, audio_sample_rate=None, video_codec_options=None):
-        del video, fps, audio, video_codec_options
+    def _fake_encode(
+        video,
+        fps,
+        audio=None,
+        audio_sample_rate=None,
+        video_codec_options=None,
+        frame_converter=None,
+    ):
+        del video, fps, audio, video_codec_options, frame_converter
         audio_sample_rates.append(audio_sample_rate)
         return b"fake-video"
 

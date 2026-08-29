@@ -48,6 +48,7 @@ from vllm_omni.engine.stage_init_utils import (
     build_engine_args_dict_from_omni_stage_config,
     build_legacy_engine_args_dict,
 )
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -71,6 +72,7 @@ def _effective_backend_values(config_cls: type, engine_args: dict) -> dict[str, 
 
 _LLM_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniEngineArgs))
 _DIFFUSION_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniDiffusionConfig))
+_TOPOLOGY_ONLY_ENGINE_ARGS = frozenset({"inline_diffusion"})
 _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
     {
         "active_stream_window",
@@ -122,6 +124,17 @@ def _stable_engine_arg_environment(monkeypatch, tmp_path):
             engine_args["worker_cls"] = f"test.{worker_type}.Worker"
 
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", _resolve_test_worker)
+
+    class _TestConnectorRunner(OmniConnectorModelRunnerMixin):
+        pass
+
+    class _TestWorker:
+        model_runner_cls = _TestConnectorRunner
+
+    for worker_type in ("ar", "generation"):
+        worker_module = types.ModuleType(f"test.{worker_type}")
+        worker_module.Worker = _TestWorker
+        monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
 
 
 def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, str]:
@@ -356,7 +369,9 @@ def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
         )
         typed_args_by_stage[stage_id] = typed_args
 
-        assert {name: typed_args[name] for name in legacy_args} == legacy_args
+        expected_args = {name: value for name, value in legacy_args.items() if name not in _TOPOLOGY_ONLY_ENGINE_ARGS}
+        assert {name: typed_args[name] for name in expected_args} == expected_args
+        assert _TOPOLOGY_ONLY_ENGINE_ARGS.isdisjoint(typed_args)
 
     thinker_args = typed_args_by_stage[0]
     inherited_vllm_fields = {
@@ -646,6 +661,7 @@ def test_typed_engine_args_match_current_registry_backend_semantics(model_type):
             backend_fields = _LLM_BACKEND_FIELDS
             backend_config_cls = OmniEngineArgs
 
+        backend_fields -= _TOPOLOGY_ONLY_ENGINE_ARGS
         missing_fields = (legacy_args.keys() & backend_fields) - typed_args.keys()
         assert not missing_fields, f"{model_type} stage {stage_id} lost backend fields: {sorted(missing_fields)}"
 

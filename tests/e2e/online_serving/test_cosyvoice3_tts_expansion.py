@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E Online tests for CosyVoice3 TTS model with voice cloning.
 
@@ -14,22 +14,26 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import load_test_audio_data_url
+from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.platforms import current_omni_platform
 
-_SKIP_ISSUE_6416 = pytest.mark.skip(
-    reason="https://github.com/vllm-project/vllm-omni/issues/6416",
-)
+if current_omni_platform.is_rocm():
+    os.environ.setdefault("COSYVOICE3_TRT", "0")
 
-pytestmark = [pytest.mark.slow, pytest.mark.tts, _SKIP_ISSUE_6416]
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.tts,
+    pytest.mark.core_model,
+]
 
 MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 
 # Official CosyVoice zero-shot prompt audio and its transcript. Vendored under
 # tests/assets/ so the server does not depend on raw.githubusercontent.com being
 # reachable at request time (same rationale as issue #3263 for Qwen3-TTS).
-REF_AUDIO_URL = load_test_audio_data_url("cosyvoice3/zero_shot_prompt.wav")
+REF_AUDIO_URL = get_asset_path("cosyvoice3/zero_shot_prompt.wav", as_data_url=True)
 REF_TEXT = "希望你以后能够做的比我还好呦。"
 
 
@@ -44,6 +48,12 @@ def get_prompt(prompt_type="zh"):
         "en": "Hello, this is a voice cloning test with English text.",
     }
     return prompts.get(prompt_type, prompts["zh"])
+
+
+def _set_rocm_request_timeout(request_config: dict) -> None:
+    if current_omni_platform.is_rocm():
+        # Cold AITER MHA builds on loaded MI300 agents can exceed 20 minutes.
+        request_config["timeout"] = 1800.0
 
 
 tts_server_params = [
@@ -69,9 +79,9 @@ tts_async_chunk_server_params = [
 ]
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_voice_clone_zh_001(omni_server, openai_client) -> None:
+def test_voice_clone_zh_001(omni_server, online_client) -> None:
     """
     Test voice cloning TTS with Chinese text via OpenAI API.
     Deploy Setting: default yaml
@@ -88,12 +98,13 @@ def test_voice_clone_zh_001(omni_server, openai_client) -> None:
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
     }
-    openai_client.send_audio_speech_request(request_config)
+    _set_rocm_request_timeout(request_config)
+    online_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_async_chunk_server_params, indirect=True)
-def test_voice_clone_zh_002(omni_server, openai_client) -> None:
+def test_voice_clone_zh_002(omni_server, online_client) -> None:
     """
     Test voice cloning TTS with Chinese text via async_chunk streaming.
     Deploy Setting: cosyvoice3.yaml with default ``async_chunk: true``
@@ -111,12 +122,13 @@ def test_voice_clone_zh_002(omni_server, openai_client) -> None:
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
     }
-    openai_client.send_audio_speech_request(request_config)
+    _set_rocm_request_timeout(request_config)
+    online_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_voice_clone_en_001(omni_server, openai_client) -> None:
+def test_voice_clone_en_001(omni_server, online_client) -> None:
     """
     Test voice cloning TTS with English text via OpenAI API.
     Deploy Setting: default yaml
@@ -133,4 +145,5 @@ def test_voice_clone_en_001(omni_server, openai_client) -> None:
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
     }
-    openai_client.send_audio_speech_request(request_config)
+    _set_rocm_request_timeout(request_config)
+    online_client.send_audio_speech_request(request_config)
