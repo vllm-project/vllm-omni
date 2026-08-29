@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Literal
@@ -71,7 +72,7 @@ def resolve_ltx_audio_num_frames(
         if audio_length <= 0:
             raise ValueError("LTX text-to-audio `audio_length` must be positive.")
         target_num_frames = audio_length * frame_rate
-        interval_count = max(1, round((target_num_frames - 1) / temporal_compression_ratio))
+        interval_count = max(1, math.ceil((target_num_frames - 1) / temporal_compression_ratio))
         return interval_count * temporal_compression_ratio + 1
 
     resolved = default_num_frames if num_frames is None else int(num_frames)

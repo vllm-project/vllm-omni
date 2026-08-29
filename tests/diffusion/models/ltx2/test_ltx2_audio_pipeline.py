@@ -65,13 +65,13 @@ def test_ltx_t2a_public_contract_is_audio_only():
     [
         (5.0, 24.0, 121),
         (1.0, 24.0, 25),
-        (0.5, 24.0, 9),
+        (0.5, 24.0, 17),
         (1.0, 25.0, 25),
-        (5.1, 24.0, 121),
+        (5.1, 24.0, 129),
         (5.21, 24.0, 129),
     ],
 )
-def test_ltx_t2a_duration_quantizes_to_nearest_legal_video_clock(seconds, frame_rate, expected):
+def test_ltx_t2a_duration_quantizes_up_to_legal_video_clock(seconds, frame_rate, expected):
     assert (
         resolve_ltx_audio_num_frames(
             audio_length=seconds,
@@ -82,6 +82,18 @@ def test_ltx_t2a_duration_quantizes_to_nearest_legal_video_clock(seconds, frame_
         == expected
     )
     assert (expected - 1) % 8 == 0
+
+
+@pytest.mark.parametrize(("seconds", "frame_rate"), [(0.5, 24.0), (5.1, 24.0)])
+def test_ltx_t2a_audio_length_does_not_resolve_shorter_than_requested(seconds, frame_rate):
+    num_frames = resolve_ltx_audio_num_frames(
+        audio_length=seconds,
+        num_frames=None,
+        frame_rate=frame_rate,
+        default_num_frames=121,
+    )
+
+    assert num_frames / frame_rate >= seconds
 
 
 def test_ltx_t2a_exact_num_frames_overrides_default_duration():
