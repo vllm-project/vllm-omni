@@ -742,6 +742,8 @@ class TestStreamingSpeechWebSocket:
         config.speaker_embedding = None
         config.stream_audio = True
         config.word_timestamps = False
+        config.seed = None
+        config.non_streaming_mode = None
 
         with pytest.raises(WebSocketDisconnect):
             asyncio.run(
@@ -756,6 +758,116 @@ class TestStreamingSpeechWebSocket:
 
         speech_service.engine_client.abort.assert_awaited_once_with("req-abort")
         assert websocket.send_json.await_count == 2
+
+
+class TestWebSocketSentenceSplitting:
+    def test_sentence_granularity_emits_one_request_per_sentence(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "split_granularity": "sentence",
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "Hello world. How are you? "})
+                ws.send_json({"type": "input.done"})
+
+                first = ws.receive_json()
+                assert first["sentence_index"] == 0
+                assert first["sentence_text"] == "Hello world."
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+
+                second = ws.receive_json()
+                assert second["sentence_index"] == 1
+                assert second["sentence_text"] == "How are you?"
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+
+                assert ws.receive_json() == {
+                    "type": "session.done",
+                    "utterance_index": 0,
+                    "total_sentences": 2,
+                }
+
+        assert speech_service._generate_audio_bytes.await_count == 2
+        assert [call.args[0].input for call in speech_service._generate_audio_bytes.await_args_list] == [
+            "Hello world.",
+            "How are you?",
+        ]
+
+    def test_sentence_granularity_emits_before_input_done(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "split_granularity": "sentence",
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "First sentence. "})
+
+                start = ws.receive_json()
+                assert start["sentence_text"] == "First sentence."
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+                assert speech_service._generate_audio_bytes.await_count == 1
+
+                ws.send_json({"type": "input.done"})
+                assert ws.receive_json() == {
+                    "type": "session.done",
+                    "utterance_index": 0,
+                    "total_sentences": 1,
+                }
+
+    def test_indic_danda_splits_without_latin_period(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "language": "Auto",
+                        "split_granularity": "sentence",
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "नमस्ते। कैसे हो?"})
+                ws.send_json({"type": "input.done"})
+
+                first = ws.receive_json()
+                assert first["sentence_text"] == "नमस्ते।"
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+
+                second = ws.receive_json()
+                assert second["sentence_text"] == "कैसे हो?"
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+                assert ws.receive_json()["total_sentences"] == 2
+
+    def test_seed_is_forwarded_to_speech_request(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json({"type": "session.config", "voice": "Vivian", "seed": 42})
+                ws.send_json({"type": "input.text", "text": "Hello."})
+                ws.send_json({"type": "input.done"})
+                ws.receive_json()
+                ws.receive_bytes()
+                ws.receive_json()
+                ws.receive_json()
+
+        assert speech_service._generate_audio_bytes.await_args_list[0].args[0].seed == 42
 
 
 class TestGeneratePcmChunksContract:

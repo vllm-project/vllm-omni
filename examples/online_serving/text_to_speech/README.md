@@ -629,11 +629,19 @@ Raw PCM streaming requires `stream_format="audio"`, `response_format="pcm"`, and
 
 ### Streaming WebSocket
 
-The `/v1/audio/speech/stream` endpoint accepts text incrementally and synthesizes the buffered text as one continuous request on `input.done`:
+The `/v1/audio/speech/stream` endpoint accepts text incrementally and, by default, synthesizes the buffered text as one continuous request on `input.done`:
 
 ```bash
 python qwen3_tts/streaming_speech_client.py --text "Hello world. How are you? I am fine."
 python qwen3_tts/streaming_speech_client.py --text "..." --simulate-stt --stt-delay 0.1
+```
+
+For per-sentence audio (including Indic danda `।`) before `input.done`:
+
+```bash
+python qwen3_tts/streaming_speech_client.py \
+    --text "नमस्ते। कैसे हो?" \
+    --split-granularity sentence
 ```
 
 `input.done` flushes without closing, so repeating `--text` synthesizes several utterances over one connection:
