@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import importlib.util
 import shutil
@@ -31,6 +31,7 @@ _GROUP_GETTERS = (
     "get_cfg_group",
     "get_tp_group",
     "get_fs_group",
+    "get_hsdp_replicate_group",
     "get_ep_group",
 )
 
@@ -61,7 +62,7 @@ def test_setup_uses_default_name_before_model_parallel_init(
     set_process_title = mocker.patch.object(worker_module, "set_process_title")
     decorate_logs = mocker.patch.object(worker_module, "decorate_logs")
 
-    worker_module._setup_diffusion_worker_proc_title_and_log_prefix(enable_ep=True)
+    worker_module._setup_diffusion_worker_proc_title_and_log_prefix(enable_ep=True, use_hsdp=True)
 
     set_process_title.assert_called_once_with(
         name="DiffusionWorker",
@@ -73,18 +74,20 @@ def test_setup_uses_default_name_before_model_parallel_init(
 
 
 @pytest.mark.parametrize(
-    ("groups", "enable_ep", "expected_name"),
+    ("groups", "enable_ep", "use_hsdp", "hsdp_replicate_size", "expected_name"),
     [
-        ({}, False, "DiffusionWorker"),
-        ({"get_tp_group": _FakeGroup(2, 1)}, False, "DiffusionWorker_TP1"),
-        ({"get_dp_group": _FakeGroup(4, 2)}, False, "DiffusionWorker_DP2"),
-        ({"get_pp_group": _FakeGroup(2, 1)}, False, "DiffusionWorker_PP1"),
+        ({}, False, False, 1, "DiffusionWorker"),
+        ({"get_tp_group": _FakeGroup(2, 1)}, False, False, 1, "DiffusionWorker_TP1"),
+        ({"get_dp_group": _FakeGroup(4, 2)}, False, False, 1, "DiffusionWorker_DP2"),
+        ({"get_pp_group": _FakeGroup(2, 1)}, False, False, 1, "DiffusionWorker_PP1"),
         (
             {
                 "get_cfg_group": _FakeGroup(2, 1),
                 "get_tp_group": _FakeGroup(2, 1),
             },
             False,
+            False,
+            1,
             "DiffusionWorker_CFG1_TP1",
         ),
         (
@@ -94,22 +97,39 @@ def test_setup_uses_default_name_before_model_parallel_init(
                 "get_tp_group": _FakeGroup(2, 1),
             },
             False,
+            False,
+            1,
             "DiffusionWorker_DP1_SP2_TP1",
         ),
         (
-            {
-                "get_dp_group": _FakeGroup(4, 3),
-                "get_fs_group": _FakeGroup(2, 1),
-            },
+            {"get_fs_group": _FakeGroup(4, 3)},
             False,
-            "DiffusionWorker_DP3_FS1",
+            True,
+            1,
+            "DiffusionWorker_FS3",
         ),
         (
-            {"get_ep_group": _FakeGroup(4, 2)},
+            {
+                "get_sp_group": _FakeGroup(2, 1),
+                "get_fs_group": _FakeGroup(4, 3),
+            },
+            False,
             True,
-            "DiffusionWorker_EP2",
+            1,
+            "DiffusionWorker_SP1_FS3",
         ),
-        ({}, True, "DiffusionWorker"),
+        (
+            {
+                "get_fs_group": _FakeGroup(1, 0),
+                "get_hsdp_replicate_group": _FakeGroup(2, 1),
+            },
+            False,
+            True,
+            2,
+            "DiffusionWorker_RP1",
+        ),
+        ({"get_ep_group": _FakeGroup(4, 2)}, True, False, 1, "DiffusionWorker_EP2"),
+        ({}, True, False, 1, "DiffusionWorker"),
     ],
     ids=[
         "all-singleton",
@@ -118,7 +138,9 @@ def test_setup_uses_default_name_before_model_parallel_init(
         "pp-only",
         "tp-cfg",
         "dp-sp-tp",
-        "standalone-hsdp",
+        "hsdp-only",
+        "hsdp-sp",
+        "hsdp-replicated",
         "expert-parallel",
         "singleton-ep",
     ],
@@ -127,6 +149,8 @@ def test_setup_uses_initialized_parallel_groups(
     mocker: MockerFixture,
     groups: dict[str, _FakeGroup],
     enable_ep: bool,
+    use_hsdp: bool,
+    hsdp_replicate_size: int,
     expected_name: str,
 ) -> None:
     mocker.patch.object(
@@ -138,13 +162,26 @@ def test_setup_uses_initialized_parallel_groups(
     set_process_title = mocker.patch.object(worker_module, "set_process_title")
     decorate_logs = mocker.patch.object(worker_module, "decorate_logs")
 
-    worker_module._setup_diffusion_worker_proc_title_and_log_prefix(enable_ep=enable_ep)
+    worker_module._setup_diffusion_worker_proc_title_and_log_prefix(
+        enable_ep=enable_ep,
+        use_hsdp=use_hsdp,
+        hsdp_replicate_size=hsdp_replicate_size,
+    )
 
     set_process_title.assert_called_once_with(
         name=expected_name,
         prefix="vLLM-Omni",
     )
     decorate_logs.assert_called_once_with(expected_name)
+    if use_hsdp:
+        group_getters["get_fs_group"].assert_called_once_with()
+        if hsdp_replicate_size > 1:
+            group_getters["get_hsdp_replicate_group"].assert_called_once_with()
+        else:
+            group_getters["get_hsdp_replicate_group"].assert_not_called()
+    else:
+        group_getters["get_fs_group"].assert_not_called()
+        group_getters["get_hsdp_replicate_group"].assert_not_called()
     if enable_ep:
         group_getters["get_ep_group"].assert_called_once_with()
     else:
@@ -160,7 +197,7 @@ def test_missing_setproctitle_is_non_fatal(mocker: MockerFixture) -> None:
     mocker.patch.dict(sys.modules, {"setproctitle": None})
     decorate_logs = mocker.patch.object(worker_module, "decorate_logs")
 
-    worker_module._setup_diffusion_worker_proc_title_and_log_prefix(enable_ep=False)
+    worker_module._setup_diffusion_worker_proc_title_and_log_prefix(enable_ep=False, use_hsdp=False)
 
     decorate_logs.assert_called_once_with("DiffusionWorker")
 

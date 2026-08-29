@@ -1245,6 +1245,46 @@ class TestTTSMethods:
             cache_key
         ) == speech_server._make_ref_audio_artifact_cache_key(np.asarray(first[0], dtype=np.float32), 24000)
 
+    @pytest.mark.asyncio
+    async def test_diffusion_ref_audio_uses_media_access_config(
+        self,
+        mocker: MockerFixture,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
+        connector = mocker.MagicMock()
+        connector.fetch_audio_async = mocker.AsyncMock(return_value=(np.zeros(24000, dtype=np.float32), 24000))
+        connector_cls = mocker.patch.object(
+            serving_speech_module,
+            "MediaConnector",
+            return_value=connector,
+        )
+        media_dir = tmp_path / "media"
+        media_dir.mkdir()
+        ref_audio = media_dir / "reference.wav"
+        ref_audio.write_bytes(b"v1")
+
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mocker.MagicMock(),
+            model_name="test-model",
+            allowed_local_media_path=str(media_dir),
+            allowed_media_domains=["media.example.com"],
+        )
+        try:
+            first = await server._resolve_ref_audio(ref_audio.as_uri())
+            ref_audio.write_bytes(b"v2-with-different-size")
+            second = await server._resolve_ref_audio(ref_audio.as_uri())
+        finally:
+            server.shutdown()
+
+        connector_cls.assert_called_once_with(
+            allowed_local_media_path=str(media_dir),
+            allowed_media_domains=["media.example.com"],
+        )
+        assert first[2] != second[2]
+        assert connector.fetch_audio_async.await_count == 2
+
     # ── ref-audio cache key tests (static helper) ──
 
     def test_local_file_cache_key_invalidation(self):

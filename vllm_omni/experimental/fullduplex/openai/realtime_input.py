@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
@@ -17,6 +18,7 @@ from vllm_omni.experimental.fullduplex.openai.audio import (
 from vllm_omni.experimental.fullduplex.openai.realtime_state import (
     REALTIME_INPUT_AUDIO_FORMATS,
     REALTIME_OUTPUT_AUDIO_FORMATS,
+    RealtimeStateOwner,
 )
 from vllm_omni.experimental.fullduplex.openai.vad import (
     SILERO_VAD_MIN_THRESHOLD,
@@ -27,8 +29,41 @@ from vllm_omni.experimental.fullduplex.openai.vad import (
 )
 
 
-class RealtimeInputTranslator:
+class RealtimeInputTranslator(RealtimeStateOwner):
     """Translate and validate client Realtime events for the duplex core."""
+
+    _opened: bool
+    _initial_session_update: bool
+    _input_speech_started: bool
+    _input_audio_buffer_has_audio: bool
+    _input_audio_buffer_had_non_speech: bool
+    _input_audio_buffer_transcript_parts: list[str]
+    _active_input_item_id: str | None
+    _last_conversation_item_id: str | None
+    _active_response_id: str | None
+    _last_response_id: str | None
+    _input_audio_format: str
+    _output_audio_format: str
+    _input_sample_rate_hz: int
+    _conversation_items: dict[str, dict[str, object]]
+    _item_truncation_cursors: dict[str, tuple[int, int]]
+    _pending_outbound: asyncio.Queue[dict[str, object]]
+    _pending_commit_item_ids: asyncio.Queue[str]
+
+    async def _send_realtime_payload(self, payload: dict[str, object]) -> None:
+        raise NotImplementedError
+
+    def _realtime_error_payload(
+        self,
+        code: str,
+        message: str,
+        *,
+        event_id: object | None = None,
+        param: object | None = None,
+    ) -> dict[str, object]:
+        raise NotImplementedError
+
+    _response_is_done: Callable[[object], bool]
 
     async def discard_pending_input_audio(
         self,
@@ -77,7 +112,8 @@ class RealtimeInputTranslator:
     async def _to_duplex_event(self, event: dict[str, object]) -> dict[str, object] | None:
         event_type = event.get("type")
         if event_type == "session.update":
-            session_payload = event.get("session") if isinstance(event.get("session"), dict) else event
+            session = event.get("session")
+            session_payload: dict[str, object] = session if isinstance(session, dict) else event
             format_error = self._validate_realtime_session_audio_formats(session_payload)
             if format_error is not None:
                 await self._send_realtime_payload(
@@ -201,7 +237,7 @@ class RealtimeInputTranslator:
                 )
                 return None
             item = self._conversation_items.get(item_id)
-            if item is None:
+            if not isinstance(item, dict):
                 await self._send_realtime_payload(
                     self._realtime_error_payload(
                         "item_not_found",
@@ -357,7 +393,8 @@ class RealtimeInputTranslator:
                         )
                     )
                     return None
-                payload["video_frames"] = [frame for frame in video_frames if isinstance(frame, str) and frame]
+                if isinstance(video_frames, list):
+                    payload["video_frames"] = [frame for frame in video_frames if isinstance(frame, str) and frame]
             self._copy_realtime_input_hints(event, payload)
             payload["is_speech"] = looks_like_speech
             if vad_result is not None:
@@ -627,7 +664,8 @@ class RealtimeInputTranslator:
     def _remove_conversation_item(self, item_id: str) -> bool:
         removed = self._conversation_items.pop(item_id, None) is not None
         if self._last_conversation_item_id == item_id:
-            self._last_conversation_item_id = next(reversed(self._conversation_items), None)
+            remaining_ids = list(self._conversation_items)
+            self._last_conversation_item_id = remaining_ids[-1] if remaining_ids else None
         self._item_truncation_cursors.pop(item_id, None)
         return removed
 
@@ -713,29 +751,34 @@ class RealtimeInputTranslator:
         audio_config = session_payload.get("audio")
         audio_input = audio_config.get("input") if isinstance(audio_config, dict) else None
         audio_output = audio_config.get("output") if isinstance(audio_config, dict) else None
-        extra_body = (
-            dict(session_payload.get("extra_body")) if isinstance(session_payload.get("extra_body"), dict) else {}
-        )
+        extra_body_payload = session_payload.get("extra_body")
+        extra_body = dict(extra_body_payload) if isinstance(extra_body_payload, dict) else {}
         extra_body["realtime_session_payload"] = self._json_safe_realtime_payload(session_payload)
         if isinstance(session_payload.get("tools"), list):
             extra_body["realtime_tools"] = session_payload["tools"]
         if isinstance(session_payload.get("tool_choice"), str | dict):
             extra_body["realtime_tool_choice"] = session_payload["tool_choice"]
-        if isinstance(session_payload.get("metadata"), dict):
-            extra_body["realtime_metadata"] = dict(session_payload["metadata"])
-        if isinstance(session_payload.get("include"), list):
-            extra_body["realtime_include"] = list(session_payload["include"])
-        if isinstance(session_payload.get("prompt"), dict):
-            extra_body["realtime_prompt"] = dict(session_payload["prompt"])
+        metadata = session_payload.get("metadata")
+        if isinstance(metadata, dict):
+            extra_body["realtime_metadata"] = dict(metadata)
+        include = session_payload.get("include")
+        if isinstance(include, list):
+            extra_body["realtime_include"] = list(include)
+        prompt = session_payload.get("prompt")
+        if isinstance(prompt, dict):
+            extra_body["realtime_prompt"] = dict(prompt)
         input_audio_transcription = self._input_audio_transcription_config(session_payload)
         if isinstance(input_audio_transcription, dict):
             extra_body["realtime_input_audio_transcription"] = dict(input_audio_transcription)
-        if isinstance(session_payload.get("input_audio_noise_reduction"), dict):
-            extra_body["realtime_input_audio_noise_reduction"] = dict(session_payload["input_audio_noise_reduction"])
-        if isinstance(audio_input, dict) and isinstance(audio_input.get("noise_reduction"), dict):
-            extra_body["realtime_input_audio_noise_reduction"] = dict(audio_input["noise_reduction"])
-        if isinstance(session_payload.get("audio"), dict):
-            extra_body["realtime_audio"] = dict(session_payload["audio"])
+        noise_reduction = session_payload.get("input_audio_noise_reduction")
+        if isinstance(noise_reduction, dict):
+            extra_body["realtime_input_audio_noise_reduction"] = dict(noise_reduction)
+        audio_noise_reduction = audio_input.get("noise_reduction") if isinstance(audio_input, dict) else None
+        if isinstance(audio_noise_reduction, dict):
+            extra_body["realtime_input_audio_noise_reduction"] = dict(audio_noise_reduction)
+        audio = session_payload.get("audio")
+        if isinstance(audio, dict):
+            extra_body["realtime_audio"] = dict(audio)
         if isinstance(session_payload.get("tracing"), str | dict):
             extra_body["realtime_tracing"] = session_payload["tracing"]
         response_format = self._duplex_response_format(self._output_audio_format)
@@ -1032,10 +1075,14 @@ class RealtimeInputTranslator:
     def _validate_realtime_video_frames(video_frames: object, max_slice_nums: object) -> str | None:
         """Validate omni-duplex camera frames on input_audio_buffer.append.
 
-        Wire contract matches the official MiniCPM-o-Demo omni client: one
-        base64 JPEG per ~1 s audio chunk. HD slicing (max_slice_nums > 1) is
-        not implemented by the duplex adapter yet and is rejected explicitly
-        rather than silently ignored.
+        Wire contract matches the official MiniCPM-o duplex loop: one base
+        base64 JPEG per ~1 s audio chunk, optionally followed by that unit's
+        stacked composite tiling the sub-frames captured inside it (at most 2
+        images either way). HD slicing (max_slice_nums > 1) is not implemented
+        by the duplex adapter yet and is rejected explicitly rather than
+        silently ignored; note official suggests it for composites
+        (``max_slice_nums=[2, 1]``), so stacked detail is capped at
+        scale_resolution until that lands.
         """
         if max_slice_nums not in (None, 1):
             return "max_slice_nums > 1 (HD slicing) is not implemented by the duplex Realtime adapter"
@@ -1416,10 +1463,11 @@ class RealtimeInputTranslator:
         self._input_speech_started = True
         if self._active_input_item_id is None:
             self._active_input_item_id = f"item_{uuid4().hex}"
+        audio_start_ms = event.get("audio_start_ms", 0)
         await self._send_realtime_payload(
             {
                 "type": "input_audio_buffer.speech_started",
-                "audio_start_ms": int(event.get("audio_start_ms", 0) or 0),
+                "audio_start_ms": int(audio_start_ms) if isinstance(audio_start_ms, int | float) else 0,
                 "item_id": self._active_input_item_id,
             }
         )

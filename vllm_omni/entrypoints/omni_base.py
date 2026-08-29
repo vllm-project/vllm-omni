@@ -406,6 +406,26 @@ class OmniBase(PDDisaggregationMixin):
         prom.request_failed()
         prom.inc_requests_failed(normalize_failure_reason(reason))
 
+    def _publish_request_gauges(self, total: int) -> None:
+        """Publish num_requests_running / num_requests_waiting for ``total`` in-flight requests.
+
+        ``_running_counter`` counts requests from the moment the orchestrator
+        dispatches them to a stage engine, which includes requests still queued
+        inside a stage scheduler. The orchestrator reports those via
+        ``_engines_waiting_counter``.
+        """
+        prom = getattr(self, "prom_metrics", None)
+        if prom is None:
+            return
+        engine = getattr(self, "engine", None)
+        counter = getattr(engine, "_running_counter", None)
+        waiting_counter = getattr(engine, "_engines_waiting_counter", None)
+        dispatched = counter.value if counter is not None else total
+        in_engine_waiting = waiting_counter.value if waiting_counter is not None else 0
+        in_engine_waiting = min(max(0, in_engine_waiting), dispatched)
+        prom.set_running(max(0, dispatched - in_engine_waiting))
+        prom.set_waiting(max(0, total - dispatched) + in_engine_waiting)
+
     def _log_summary_and_cleanup(self, request_id: str, reason: str = "stage_error") -> None:
         req_state = self.request_states.get(request_id)
         try:
@@ -431,13 +451,7 @@ class OmniBase(PDDisaggregationMixin):
             # Republish gauges so any stale value left by the per-stage
             # publish in _process_single_result (which runs while the request
             # is still in self.request_states) is corrected after the pop.
-            prom = getattr(self, "prom_metrics", None)
-            counter = getattr(getattr(self, "engine", None), "_running_counter", None)
-            if prom is not None:
-                total = len(self.request_states)
-                running = counter.value if counter is not None else total
-                prom.set_running(running)
-                prom.set_waiting(max(0, total - running))
+            self._publish_request_gauges(len(self.request_states))
 
     def _compute_final_stage_id(self, output_modalities: list[str] | None) -> int:
         return get_final_stage_id_for_e2e(
@@ -708,12 +722,8 @@ class OmniBase(PDDisaggregationMixin):
         # hasn't popped self.request_states yet — exclude the finalizing
         # request from `total` so waiting doesn't read 1 and stay stuck
         # there until the next request arrives.
-        counter = getattr(self.engine, "_running_counter", None)
         is_finalizing = finished and stage_id == final_stage_id_for_e2e
-        total = max(0, len(self.request_states) - (1 if is_finalizing else 0))
-        running = counter.value if counter is not None else total
-        self.prom_metrics.set_running(running)
-        self.prom_metrics.set_waiting(max(0, total - running))
+        self._publish_request_gauges(max(0, len(self.request_states) - (1 if is_finalizing else 0)))
 
         response_metrics: dict[str, Any] = {}
         stage_metrics: dict[str, dict[str, Any]] = {}
