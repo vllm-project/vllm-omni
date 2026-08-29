@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for OpenAI-compatible video API encoding helpers."""
 
 import base64
 import threading
 from io import BytesIO
+from typing import Any
 
 import av
 import httpx
@@ -41,7 +42,7 @@ def _install_http_transport(monkeypatch, handler, client_kwargs):
 @pytest.mark.asyncio
 async def test_decode_image_url_follows_redirects_when_allowed(monkeypatch):
     requested_paths = []
-    client_kwargs = []
+    client_kwargs: list[dict[str, object]] = []
 
     def _handler(request):
         requested_paths.append(request.url.path)
@@ -63,7 +64,7 @@ async def test_decode_image_url_follows_redirects_when_allowed(monkeypatch):
 @pytest.mark.asyncio
 async def test_decode_image_url_rejects_redirects_when_disabled(monkeypatch):
     requested_paths = []
-    client_kwargs = []
+    client_kwargs: list[dict[str, object]] = []
 
     def _handler(request):
         requested_paths.append(request.url.path)
@@ -81,7 +82,7 @@ async def test_decode_image_url_rejects_redirects_when_disabled(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_decode_image_url_reports_http_status(monkeypatch):
-    client_kwargs = []
+    client_kwargs: list[dict[str, object]] = []
 
     def _handler(request):
         return httpx.Response(404)
@@ -95,7 +96,7 @@ async def test_decode_image_url_reports_http_status(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_decode_image_url_reports_connection_failure(monkeypatch):
-    client_kwargs = []
+    client_kwargs: list[dict[str, object]] = []
 
     def _handler(request):
         raise httpx.ConnectError("connection refused", request=request)
@@ -141,7 +142,7 @@ def _install_fake_video_mux(monkeypatch, mux_calls):
 
 
 def test_encode_video_bytes_exports_frames_without_interpolation(monkeypatch):
-    mux_calls = []
+    mux_calls: list[dict[str, Any]] = []
     _install_fake_video_mux(monkeypatch, mux_calls)
 
     frames = [np.full((2, 2, 3), fill_value=i / 5, dtype=np.float32) for i in range(5)]
@@ -550,6 +551,44 @@ def test_prepared_automatic_fallback_preserves_legacy_quantization(monkeypatch, 
 
 
 @pytest.mark.parametrize(
+    ("worker_count", "expected_path", "expected_reason"),
+    [
+        (None, "legacy_fallback", "non_contiguous_rgb_planes"),
+        (1, "legacy_fallback", "non_contiguous_rgb_planes"),
+        (8, "direct_planar", None),
+    ],
+)
+def test_interleaved_video_routing(monkeypatch, worker_count, expected_path, expected_reason):
+    routes = []
+
+    def fake_planar_mux(*args, **kwargs):
+        return b"planar-video"
+
+    def fake_compat_mux(frames, audio, **kwargs):
+        return b"legacy-video"
+
+    monkeypatch.setattr(media_utils, "mux_av_video_audio_bytes", fake_planar_mux)
+    monkeypatch.setattr(media_utils, "mux_video_audio_bytes", fake_compat_mux)
+    monkeypatch.setattr(video_api_utils, "_log_video_encoding_path", lambda **kwargs: routes.append(kwargs))
+
+    converter = None if worker_count is None else video_api_utils._PlanarFrameConverter(max_workers=worker_count)
+    try:
+        encoded = video_api_utils._encode_video_bytes(
+            np.zeros((2, 4, 6, 3), dtype=np.float32),
+            fps=12,
+            frame_converter=converter,
+        )
+    finally:
+        if converter is not None:
+            converter.shutdown()
+
+    assert encoded == (b"planar-video" if expected_path == "direct_planar" else b"legacy-video")
+    assert len(routes) == 1
+    assert routes[0]["selected_path"] == expected_path
+    assert routes[0].get("reason") == expected_reason
+
+
+@pytest.mark.parametrize(
     ("video", "reason"),
     [
         (np.zeros((2, 4, 6), dtype=np.float32), "unsupported_shape"),
@@ -690,7 +729,8 @@ def test_planar_bool_frames_match_bounded_compatible_output():
 )
 def test_planar_frame_rejects_undersized_plane(monkeypatch, plane_height, line_size):
     class FakePlane:
-        pass
+        height: int
+        line_size: int
 
     plane = FakePlane()
     plane.height = plane_height
@@ -756,6 +796,32 @@ def test_direct_and_compatible_paths_produce_equivalent_mp4(with_audio):
     assert direct_streams == compatible_streams
     assert ("audio" in direct_streams) is with_audio
     np.testing.assert_array_equal(direct_frames, compatible_frames)
+
+
+@pytest.mark.parametrize("with_audio", [False, True])
+def test_parallel_interleaved_and_legacy_paths_produce_equivalent_mp4(with_audio):
+    rng = np.random.default_rng(7)
+    video = rng.random((3, 32, 32, 3), dtype=np.float32)
+    audio = np.zeros((2, 2400), dtype=np.float32) if with_audio else None
+    kwargs = {
+        "fps": 12,
+        "audio": audio,
+        "audio_sample_rate": 24000,
+        "video_codec_options": {"preset": "ultrafast", "threads": "1"},
+    }
+
+    converter = video_api_utils._PlanarFrameConverter(max_workers=8)
+    try:
+        parallel_bytes = video_api_utils._encode_video_bytes(
+            video,
+            **kwargs,
+            frame_converter=converter,
+        )
+    finally:
+        converter.shutdown()
+    legacy_bytes = video_api_utils._encode_video_bytes_legacy(video, **kwargs)
+
+    assert parallel_bytes == legacy_bytes
 
 
 def test_mux_closes_container_and_preserves_generator_error(monkeypatch):

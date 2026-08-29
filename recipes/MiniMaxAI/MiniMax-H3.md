@@ -69,11 +69,12 @@ reference-video preparation and MP4 output.
 
 For CUDA and ROCm deployments, non-streaming MP4 responses are encoded on the
 host CPU through PyAV/libx264 after generation. The response encoder selects the
-path automatically at runtime: inputs with a supported frame shape, common dtype,
-and RGB per-channel contiguous layout use direct planar frames; other inputs
-fall back to the legacy path before the PyAV container is opened. No CLI flag,
-model declaration, or user configuration is required. Streaming fMP4 output is
-unchanged.
+path automatically at runtime. The server-owned parallel converter accepts
+supported frame shapes and dtypes with either per-channel-contiguous or strided
+RGB planes, including interleaved arrays materialized by output transport.
+Standalone callers without a parallel converter retain the legacy fallback for
+strided planes. No CLI flag, model declaration, or user configuration is
+required. Streaming fMP4 output is unchanged.
 
 A community benchmark on 2x Xeon 8480C reported the following comparison
 between the legacy and direct planar paths

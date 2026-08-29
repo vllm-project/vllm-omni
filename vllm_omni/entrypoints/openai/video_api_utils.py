@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Shared helper utilities for OpenAI-compatible video generation API.
 """
@@ -15,7 +15,7 @@ from collections import deque
 from collections.abc import Generator
 from concurrent.futures import Future, ThreadPoolExecutor
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import httpx
 import numpy as np
@@ -50,9 +50,9 @@ logger = init_logger(__name__)
 DEFAULT_AUDIO_SAMPLE_RATE = 24_000
 
 
-VideoInput = torch.Tensor | np.ndarray | list[torch.Tensor | np.ndarray | Image.Image]
+VideoInput: TypeAlias = torch.Tensor | np.ndarray | list[torch.Tensor | np.ndarray | Image.Image]
 AudioSample = int | float
-AudioInput = torch.Tensor | np.ndarray | list[AudioSample] | list[list[AudioSample]]
+AudioInput: TypeAlias = torch.Tensor | np.ndarray | list[AudioSample] | list[list[AudioSample]]
 
 
 class VideoFrames(list[Image.Image]):
@@ -561,6 +561,8 @@ def _direct_planar_fallback_reason(
     frames: list[np.ndarray],
     frame_shape: tuple[int, ...],
     common_dtype: np.dtype,
+    *,
+    allow_strided_rgb_planes: bool = False,
 ) -> str | None:
     """Return a stable reason when direct planar muxing cannot consume frames."""
     if len(frame_shape) != 3 or frame_shape[0] <= 0 or frame_shape[1] <= 0 or frame_shape[2] not in (3, 4):
@@ -573,7 +575,9 @@ def _direct_planar_fallback_reason(
     ):
         return "unsupported_dtype"
 
-    if not all(frame[..., channel].flags.c_contiguous for frame in frames for channel in range(3)):
+    if not allow_strided_rgb_planes and not all(
+        frame[..., channel].flags.c_contiguous for frame in frames for channel in range(3)
+    ):
         return "non_contiguous_rgb_planes"
 
     return None
@@ -627,6 +631,7 @@ class _PlanarFrameConverter:
             if frame.dtype == np.uint8:
                 plane_view[:height, :width] = frame[..., channel]
             else:
+                assert scratch is not None
                 np.copyto(scratch, frame[..., channel], casting="unsafe")
                 np.clip(scratch, 0.0, 1.0, out=scratch)
                 scratch *= 255.0
@@ -779,7 +784,12 @@ def _encode_video_bytes(
     # input is reported before any muxer is opened.
     frames, frame_shape, common_dtype = _prepare_video_frames(video)
     effective_audio_sample_rate = _resolve_audio_sample_rate(audio, audio_sample_rate) if audio is not None else None
-    fallback_reason = _direct_planar_fallback_reason(frames, frame_shape, common_dtype)
+    fallback_reason = _direct_planar_fallback_reason(
+        frames,
+        frame_shape,
+        common_dtype,
+        allow_strided_rgb_planes=frame_converter is not None and frame_converter.max_workers > 1,
+    )
     if fallback_reason is not None:
         _log_video_encoding_path(
             selected_path="legacy_fallback",
