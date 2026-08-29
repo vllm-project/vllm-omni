@@ -20,7 +20,7 @@ from vllm_omni.diffusion.worker.step_execution_batch import (
     run_step_execution_to_completion,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 # The bridge under test only reads a handful of attributes off its request and
@@ -173,8 +173,8 @@ def test_run_step_execution_to_completion_raises_on_row_mismatch():
             del kwargs
             self.denoise_calls += 1
             # Drop a row so the returned noise_pred under-counts requests.
-            return torch.ones_like(input_batch.latents)[:-1] if len(states) > 1 else torch.ones_like(
-                input_batch.latents
+            return (
+                torch.ones_like(input_batch.latents)[:-1] if len(states) > 1 else torch.ones_like(input_batch.latents)
             )
 
     pipeline = _BadRowCountPipeline()

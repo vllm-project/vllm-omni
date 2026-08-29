@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Bridge from step-execution pipelines to request-batch ``forward()``.
 
 Step-level and request-level batching are two different entry points into
@@ -26,7 +26,7 @@ this bridge.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
@@ -40,11 +40,20 @@ from vllm_omni.diffusion.worker.utils import (
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.models.interface import SupportsStepExecution
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    class _StepExecutionPipeline(SupportsStepExecution, Protocol):
+        """The bridge's actual requirement: the step-execution contract plus
+        the ``device`` every concrete pipeline already carries (not part of
+        ``SupportsStepExecution`` itself, since step mode never needs it)."""
+
+        device: torch.device
 
 
-def _initialize_generator(pipeline: Any, sampling_params: Any) -> None:
+def _initialize_generator(pipeline: _StepExecutionPipeline, sampling_params: OmniDiffusionSamplingParams) -> None:
     """Seed a request's generator from its seed, mirroring the runner's
     ``DiffusionModelRunner._initialize_generator`` so step-execution pipelines
     see the same generator semantics regardless of entry point."""
@@ -60,7 +69,7 @@ def _initialize_generator(pipeline: Any, sampling_params: Any) -> None:
 
 
 def run_step_execution_to_completion(
-    pipeline: Any,
+    pipeline: _StepExecutionPipeline,
     requests: list[OmniDiffusionRequest],
 ) -> list[DiffusionOutput]:
     """Run a step-execution pipeline's full denoise loop for a batch of
@@ -110,12 +119,12 @@ def run_step_execution_to_completion(
 
         if noise_pred is None:
             raise RuntimeError(
-                f"{type(pipeline).__name__}.denoise_step returned no prediction "
-                "while running a request-batch forward."
+                f"{type(pipeline).__name__}.denoise_step returned no prediction while running a request-batch forward."
             )
 
         offset = 0
         for state in pending:
+            assert state.latents is not None, f"Request {state.request_id} has no latents after denoise_step."
             row_num = state.latents.shape[0]
             pipeline.step_scheduler(state, noise_pred[offset : offset + row_num])
             offset += row_num
@@ -157,4 +166,8 @@ class StepExecutionRequestBatchMixin:
     supports_request_batch = True
 
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
-        return run_step_execution_to_completion(self, req.requests)
+        # A mixin's `self` only satisfies `_StepExecutionPipeline` once mixed
+        # into a concrete pipeline that provides `device` and the
+        # SupportsStepExecution methods; mypy can't see that from the mixin
+        # alone.
+        return run_step_execution_to_completion(self, req.requests)  # type: ignore[arg-type]

@@ -17,7 +17,7 @@ for real on the GPU.
 from __future__ import annotations
 
 import types
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import pytest
@@ -83,7 +83,9 @@ def _make_branch(*, device, text_len: int, latent_t: int, latent_h: int, latent_
         device=device,
     )
     video_rows = torch.randn(int(branch.img_pos.shape[0]), 96, generator=generator, device=device, dtype=torch.float32)
-    audio_rows = torch.randn(int(branch.audio_pos.shape[0]), 32, generator=generator, device=device, dtype=torch.float32)
+    audio_rows = torch.randn(
+        int(branch.audio_pos.shape[0]), 32, generator=generator, device=device, dtype=torch.float32
+    )
     return branch, video_rows, audio_rows
 
 
@@ -165,12 +167,24 @@ def test_step_execution_bridge_matches_solo_requests_on_gpu():
 
     model = _SegmentMeanModel()
     specs = [
-        dict(text_len=46, latent_t=7, latent_h=2, latent_w=4, audio_t=2, seed=7, shape=dict(
-            height=112, width=64, latent_t=7, latent_h=2, latent_w=4, audio_t=2
-        )),
-        dict(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=6, shape=dict(
-            height=64, width=96, latent_t=2, latent_h=4, latent_w=6, audio_t=3
-        )),
+        dict(
+            text_len=46,
+            latent_t=7,
+            latent_h=2,
+            latent_w=4,
+            audio_t=2,
+            seed=7,
+            shape=dict(height=112, width=64, latent_t=7, latent_h=2, latent_w=4, audio_t=2),
+        ),
+        dict(
+            text_len=9,
+            latent_t=2,
+            latent_h=4,
+            latent_w=6,
+            audio_t=3,
+            seed=6,
+            shape=dict(height=64, width=96, latent_t=2, latent_h=4, latent_w=6, audio_t=3),
+        ),
     ]
     schedules = [(_sigmas(6, 12.0), _sigmas(6, 3.0)), (_sigmas(4, 12.0), _sigmas(4, 3.0))]
 
