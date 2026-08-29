@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MiniMax H3 Qwen presentation building.
+"""Shared MiniMax H3 media normalization and Qwen presentation building.
 
 Builds the positive presentation token stream:
 - fl2va: '<Picture 1>: ' label + vision block (<|vision_start|> +
@@ -13,10 +13,16 @@ accumulator so ids and AdaLN token tags cannot drift apart.
 
 from __future__ import annotations
 
+import math
+import os
 from collections.abc import Sequence
 from typing import Any
 
+import numpy as np
 import torch
+from PIL import Image
+
+from vllm_omni.errors import OmniClientError
 
 VISION_START = "<|vision_start|>"
 VISION_END = "<|vision_end|>"
@@ -25,6 +31,142 @@ VIDEO_PAD = "<|video_pad|>"
 
 _TEXT_TAG = 1
 _VIDEO_TAG = 0
+
+MINIMAX_H3_OUTPUT_SHORT_EDGE = 768
+MINIMAX_H3_OUTPUT_MAX_PIXELS = 768 * 1344
+MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = 2048
+MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE = 32
+MINIMAX_H3_SUPPORTED_ASPECT_RATIOS = {
+    "21:9": 21.0 / 9.0,
+    "16:9": 16.0 / 9.0,
+    "4:3": 4.0 / 3.0,
+    "1:1": 1.0,
+    "3:4": 3.0 / 4.0,
+    "9:16": 9.0 / 16.0,
+}
+MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES = 30 * 1024 * 1024
+MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp", "heic", "heif"})
+
+
+def _align_multiple(value: float, multiple: int = 32) -> int:
+    return max(multiple, int(round(float(value) / multiple)) * multiple)
+
+
+def load_minimax_h3_images(value: Any) -> list[Image.Image]:
+    """Normalize one or more H3 image inputs to RGB PIL images."""
+    if isinstance(value, (list, tuple)):
+        if not value:
+            raise OmniClientError("MiniMax H3 image input must not be empty")
+        images: list[Image.Image] = []
+        for item in value:
+            loaded = load_minimax_h3_images(item)
+            if len(loaded) != 1:
+                raise OmniClientError(f"MiniMax H3 expected one image, got {len(loaded)}")
+            images.extend(loaded)
+        return images
+    if isinstance(value, (str, os.PathLike)):
+        if os.path.getsize(value) > MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES:
+            raise OmniClientError("MiniMax H3 reference image exceeds the 30 MiB size limit")
+        with Image.open(value) as image:
+            image_format = str(image.format or "").lower()
+            if image_format and image_format not in MINIMAX_H3_REFERENCE_IMAGE_FORMATS:
+                raise OmniClientError(
+                    f"MiniMax H3 reference image must use JPG, JPEG, PNG, WEBP, HEIC, or HEIF, got {image.format}"
+                )
+            return [image.convert("RGB")]
+    if isinstance(value, Image.Image):
+        return [value.convert("RGB")]
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().float().cpu()
+        if tensor.ndim == 4 and tensor.shape[0] == 1:
+            tensor = tensor[0]
+        if tensor.ndim != 3:
+            raise OmniClientError(f"image tensor must be [C,H,W], got {tuple(tensor.shape)}")
+        if tensor.shape[0] in (1, 3, 4):
+            tensor = tensor.permute(1, 2, 0)
+        array = tensor.numpy()
+        if array.max(initial=0) <= 1.0:
+            array = array * 255.0
+        return [Image.fromarray(array.clip(0, 255).astype(np.uint8)).convert("RGB")]
+    raise OmniClientError(f"unsupported MiniMax H3 image input {type(value)!r}")
+
+
+def resolve_minimax_h3_aspect_ratio(
+    task: str,
+    value: Any,
+    image: Image.Image | None,
+) -> float:
+    """Resolve H3's task-specific output aspect-ratio policy."""
+    if task == "fl2va":
+        if image is None:
+            raise OmniClientError("fl2va requires an input image to resolve its aspect ratio")
+        return float(image.width) / float(image.height)
+
+    if value is None:
+        if task == "t2va":
+            raise OmniClientError("t2va requires an explicit aspect_ratio")
+        return MINIMAX_H3_SUPPORTED_ASPECT_RATIOS["16:9"]
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"adaptive", "auto"}:
+            if task == "t2va":
+                raise OmniClientError("t2va requires an explicit named aspect_ratio, not adaptive")
+            return MINIMAX_H3_SUPPORTED_ASPECT_RATIOS["16:9"]
+        if normalized in MINIMAX_H3_SUPPORTED_ASPECT_RATIOS:
+            return MINIMAX_H3_SUPPORTED_ASPECT_RATIOS[normalized]
+        try:
+            numeric_value = float(normalized)
+        except (TypeError, ValueError) as exc:
+            supported = ", ".join(MINIMAX_H3_SUPPORTED_ASPECT_RATIOS)
+            raise OmniClientError(f"MiniMax H3 aspect_ratio must be one of {supported}, got {value!r}") from exc
+    elif isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
+        numeric_value = float(value)
+    else:
+        raise OmniClientError(f"MiniMax H3 aspect_ratio must be a string ratio, got {value!r}")
+
+    if not math.isfinite(numeric_value) or not any(
+        math.isclose(numeric_value, ratio, rel_tol=0.0, abs_tol=1e-6)
+        for ratio in MINIMAX_H3_SUPPORTED_ASPECT_RATIOS.values()
+    ):
+        supported = ", ".join(MINIMAX_H3_SUPPORTED_ASPECT_RATIOS)
+        raise OmniClientError(f"MiniMax H3 aspect_ratio must be one of {supported}, got {value!r}")
+    return numeric_value
+
+
+def resolve_minimax_h3_reference_image_shape(image: Image.Image) -> tuple[int, int]:
+    """Resize an H3 reference image to the official 2048-short-edge canvas."""
+    width, height = image.size
+    ratio = width / height
+    if not 0.4 <= ratio <= 2.5:
+        raise OmniClientError(f"reference image aspect ratio must be in [0.4, 2.5], got {width}x{height}")
+    if min(width, height) < 256 or max(width, height) > 5760:
+        raise OmniClientError(f"reference image dimensions must be in [256, 5760] pixels, got {width}x{height}")
+    scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / min(width, height)
+    return (
+        _align_multiple(width * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
+        _align_multiple(height * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
+    )
+
+
+def resolve_minimax_h3_output_canvas(aspect_ratio: float, short_edge: int) -> tuple[int, int]:
+    """Resolve the official H3 ratio/area policy to a 32-pixel canvas."""
+    if not math.isfinite(float(aspect_ratio)) or float(aspect_ratio) <= 0:
+        raise OmniClientError(f"MiniMax H3 canvas aspect ratio must be positive, got {aspect_ratio!r}")
+    if short_edge != MINIMAX_H3_OUTPUT_SHORT_EDGE:
+        raise OmniClientError(f"MiniMax H3 target.short_edge must be {MINIMAX_H3_OUTPUT_SHORT_EDGE}, got {short_edge}")
+    if aspect_ratio >= 1.0:
+        width = float(short_edge) * aspect_ratio
+        height = float(short_edge)
+    else:
+        width = float(short_edge)
+        height = float(short_edge) / aspect_ratio
+    area = width * height
+    if area > MINIMAX_H3_OUTPUT_MAX_PIXELS:
+        scale = (MINIMAX_H3_OUTPUT_MAX_PIXELS / area) ** 0.5
+        width *= scale
+        height *= scale
+    return _align_multiple(height, 32), _align_multiple(width, 32)
 
 
 def _text_ids(tokenizer: Any, text: str) -> list[int]:
@@ -107,26 +249,18 @@ def _multi_image_presentation(
     return presentation.build()
 
 
-def minimax_h3_multi_image_presentation_ids(
+def minimax_h3_multi_image_presentation(
     tokenizer: Any,
     *,
     prompt: str,
     image_token_counts: list[int],
-) -> torch.Tensor:
-    """Positive fl2va presentation with one or more labeled image slots."""
-    ids, _ = _multi_image_presentation(tokenizer, prompt=prompt, image_token_counts=image_token_counts)
-    return ids
-
-
-def minimax_h3_multi_image_presentation_token_tags(
-    tokenizer: Any,
-    *,
-    prompt: str,
-    image_token_counts: list[int],
-) -> torch.Tensor:
-    """AdaLN token tags aligned with minimax_h3_multi_image_presentation_ids."""
-    _, tags = _multi_image_presentation(tokenizer, prompt=prompt, image_token_counts=image_token_counts)
-    return tags
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return aligned FL2VA presentation token IDs and role IDs."""
+    return _multi_image_presentation(
+        tokenizer,
+        prompt=prompt,
+        image_token_counts=image_token_counts,
+    )
 
 
 def minimax_h3_ref2va_presentation(
@@ -288,10 +422,72 @@ def minimax_h3_ref2va_video_presentation(
     return presentation.build()
 
 
+def build_minimax_h3_presentation(
+    tokenizer: Any,
+    *,
+    prompt: str,
+    task: str,
+    condition_labels: list[tuple[str, int]],
+    image_grid_thw: torch.Tensor | None,
+    video_grid_thw: torch.Tensor | None,
+    video_timestamps: Sequence[Sequence[float]] | None,
+    merge_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the token IDs and role IDs shared by fused and split H3."""
+    if task == "t2va":
+        ids = minimax_h3_text_only_ids(tokenizer, prompt)
+        return ids, torch.ones_like(ids)
+
+    merge_length = int(merge_size) ** 2
+    image_counts = (
+        [int(grid.prod().item()) // merge_length for grid in image_grid_thw] if image_grid_thw is not None else []
+    )
+    if task == "fl2va":
+        return minimax_h3_multi_image_presentation(
+            tokenizer,
+            prompt=prompt,
+            image_token_counts=image_counts,
+        )
+
+    video_counts: list[list[int]] = []
+    if video_grid_thw is not None:
+        for grid in video_grid_thw:
+            block_count = int(grid[0].item())
+            tokens_per_block = int(grid[1:].prod().item()) // merge_length
+            video_counts.append([tokens_per_block] * block_count)
+    timestamps = (
+        [[float(value) for value in group] for group in video_timestamps] if video_timestamps is not None else []
+    )
+    if video_counts:
+        return minimax_h3_ref2va_video_presentation(
+            tokenizer,
+            prompt=prompt,
+            condition_labels=condition_labels,
+            image_token_count=image_counts or None,
+            video_block_token_counts=video_counts,
+            video_block_timestamps=timestamps,
+        )
+    return minimax_h3_ref2va_presentation(
+        tokenizer,
+        prompt=prompt,
+        condition_labels=condition_labels,
+        image_token_count=image_counts or None,
+    )
+
+
 __all__ = [
-    "minimax_h3_multi_image_presentation_ids",
-    "minimax_h3_multi_image_presentation_token_tags",
+    "IMAGE_PAD",
+    "MINIMAX_H3_OUTPUT_SHORT_EDGE",
+    "VIDEO_PAD",
+    "VISION_END",
+    "VISION_START",
+    "build_minimax_h3_presentation",
+    "load_minimax_h3_images",
+    "minimax_h3_multi_image_presentation",
     "minimax_h3_ref2va_presentation",
     "minimax_h3_ref2va_video_presentation",
     "minimax_h3_text_only_ids",
+    "resolve_minimax_h3_aspect_ratio",
+    "resolve_minimax_h3_output_canvas",
+    "resolve_minimax_h3_reference_image_shape",
 ]

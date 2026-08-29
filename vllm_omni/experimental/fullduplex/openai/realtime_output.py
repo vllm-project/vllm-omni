@@ -262,15 +262,8 @@ class RealtimeOutputProjector:
                         content_index=0,
                         audio_end_ms=committed_audio_ms,
                     )
-                payloads.append(
-                    {
-                        "type": "conversation.item.truncated",
-                        "item_id": item_id,
-                        "content_index": 0,
-                        "audio_end_ms": committed_audio_ms,
-                        "event": event,
-                    }
-                )
+                # Align server history with acknowledged playback; only explicit
+                # client truncation emits ``conversation.item.truncated``.
             payloads.extend(self._realtime_audio_done_events(event, response_id))
             payloads.extend(
                 self._realtime_response_terminal_events(
@@ -413,7 +406,7 @@ class RealtimeOutputProjector:
                 return [event]
             message = str(raw_error or event.get("message") or "Duplex runtime error")
             code = str(event.get("code") or "duplex_error")
-            return [self._realtime_error_payload(code, message)]
+            return [self._realtime_error_payload(code, message, event_id=event.get("realtime_event_id"))]
         if event_type == "session.closed":
             return [{"type": "session.closed", "event": event}]
         return [{"type": f"duplex.{event_type}", "event": event}]

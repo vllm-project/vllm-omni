@@ -27,6 +27,7 @@ from vllm_omni.diffusion.offloader.module_residency import (
     PinnedModuleStager,
 )
 
+from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
@@ -128,11 +129,18 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             component_path,
             self.config_dict,
         )
-        # Match the reference loader contract: video VAE weights stay FP32.
-        # Keyframe encoding is numerically sensitive to first casting the
-        # checkpoint through FP16; decode still runs under FP16 autocast.
+        # Match the reference loader contract before installing inference-only
+        # decoder fast paths. Keyframe encoding remains FP32; decoder Linear
+        # weights may be materialized in FP16 because reference decode casts
+        # those same tensors through CUDA autocast on every tile.
         initial_device = load_device or device
         self.remote.eval().to(device=initial_device, dtype=torch.float32)
+        decoder = getattr(self.remote.model, "decoder", None)
+        if decoder is not None:
+            install_h3_vae_optimizations(
+                decoder,
+                device=device,
+            )
         self._stager = None
         if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
             self._stager = PinnedModuleStager(

@@ -3,7 +3,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 import torch
 
@@ -126,8 +126,21 @@ class QueryRange:
 
 
 @dataclass(frozen=True, slots=True)
+class VideoTokenSpan:
+    """One physical video-grid slice in packed document 0."""
+
+    start: int
+    latent_grid: tuple[int, int, int]
+    role: Literal["reference", "target"]
+
+    @property
+    def length(self) -> int:
+        return self.latent_grid[0] * self.latent_grid[1] * self.latent_grid[2]
+
+
+@dataclass(frozen=True, slots=True)
 class VideoTokenLayout:
-    """Where the video segment sits inside a packed multimodal sequence.
+    """Video-grid slices in a packed multimodal sequence.
 
     A model that packs its sequence as ``[prefix | t*h*w video rows | padding]``
     publishes this so backends can recover spatiotemporal locality; the prefix
@@ -135,11 +148,17 @@ class VideoTokenLayout:
     Publishing it also asserts that any ``attn_mask`` masks only the trailing
     padding, so ``prefix_len + t*h*w`` is the used length of the sequence.
 
+    ``prefix_len``/``latent_grid`` retain the original one-tail contract. A
+    Ref2VA layout instead publishes ``used_len`` and every physical video
+    span, so audio and image rows between videos remain dense.
+
     Plain ints, so reading it never forces a device-to-host sync.
     """
 
-    prefix_len: int
-    latent_grid: tuple[int, int, int]
+    prefix_len: int | None = None
+    latent_grid: tuple[int, int, int] | None = None
+    used_len: int | None = None
+    video_spans: tuple[VideoTokenSpan, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

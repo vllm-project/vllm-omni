@@ -159,6 +159,33 @@ python examples/online_serving/minicpmo/realtime_duplex_demo.py \
     --output-dir /tmp/minicpmo_realtime_duplex_demo
 ```
 
+Video input uses the same session. PyAV demuxes JPEG frames at `--video-fps`
+(default 1.0) and vLLM `load_audio` extracts a 16 kHz mono WAV unless
+`--input-wav` overrides the soundtrack. Frames keep their capture size
+(`--frame-max-side 0`); the server `process_image` normalizes at 448.
+
+`--stack-frames N` raises the visual refresh rate the way official duplex does:
+each 1 s unit also samples the `N-1` sub-frames captured inside it and tiles
+them into a single composite image sent next to that unit's base frame. The
+audio cadence never changes — a unit is always one second — and the wire always
+carries 2 images per unit however large `N` is, because the sub-frames share one
+composite. Official uses 5 for high refresh rate mode:
+
+```bash
+python examples/online_serving/minicpmo/realtime_duplex_demo.py \
+    --url ws://localhost:8099/v1/realtime?duplex=1 \
+    --model openbmb/MiniCPM-o-4_5 \
+    --input-video /path/to/clip.mp4 \
+    --stack-frames 5 \
+    --ref-audio /path/to/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav \
+    --output-dir /tmp/minicpmo_realtime_duplex_video_demo
+```
+
+Detail inside a composite is capped by `scale_resolution=448` at
+`max_slice_nums=1`: official suggests HD slicing (`max_slice_nums=[2, 1]`) for
+stacked frames, which the duplex adapter does not implement yet. Reading small
+text or digits out of a wide scene is limited by that, not by frame timing.
+
 ## Open the experimental browser client
 
 The browser UI serves the page and proxies the same-origin Realtime WebSocket to

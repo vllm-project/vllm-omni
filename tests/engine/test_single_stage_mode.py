@@ -1207,6 +1207,48 @@ class TestSingleStageReplicaInitialization:
         )
         assert mock_from_addresses.call_args.kwargs["proc_manager"].proc is proc
 
+    def test_initialize_local_custom_diffusion_replica_uses_inline_client(self, mocker: MockerFixture):
+        import vllm_omni.engine.stage_runtime as runtime_mod
+        from vllm_omni.platforms import current_omni_platform
+
+        runtime = DistStageRuntime(
+            stage_configs=[],
+            model="fake-model",
+            config_path="/fake/stages.yaml",
+            stage_init_timeout=60,
+            diffusion_batch_size=4,
+            async_chunk=False,
+            single_stage_id_filter=None,
+            omni_master_address="127.0.0.1",
+            omni_master_port=26000,
+        )
+        runtime._omni_master_server = mocker.Mock(spec=OmniMasterServer)
+        runtime._coordinator_runtime = None
+        plan = _make_diffusion_plan(0, stage_id=0, launch_mode="local").replicas[0]
+        plan.stage_cfg.engine_args = {"custom_pipeline_args": {"pipeline_class": "test.CustomPipeline"}}
+        sentinel_client = SimpleNamespace()
+        mock_launch = mocker.patch.object(
+            runtime_mod,
+            "launch_diffusion_stage_replica",
+            return_value=(sentinel_client, StageReplicaResources()),
+        )
+        mocker.patch.object(runtime_mod, "inject_kv_stage_info")
+
+        device_env_var = current_omni_platform.device_control_env_var
+        prev_device_env = os.environ.get(device_env_var)
+        os.environ[device_env_var] = "0"
+        runtime._init_visible_devices_baseline = "0"
+        try:
+            result = runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=60)
+        finally:
+            if prev_device_env is None:
+                os.environ.pop(device_env_var, None)
+            else:
+                os.environ[device_env_var] = prev_device_env
+
+        assert result is sentinel_client
+        assert mock_launch.call_args.kwargs["use_inline"] is True
+
     def test_initialize_local_diffusion_replica_failure_terminates_proc(self, mocker: MockerFixture):
         import vllm_omni.engine.stage_runtime as runtime_mod
         from vllm_omni.platforms import current_omni_platform
