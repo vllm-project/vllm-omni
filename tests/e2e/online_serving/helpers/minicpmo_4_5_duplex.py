@@ -101,7 +101,8 @@ def duplex_camera_frames(*, seconds: int, cache_dir: Path) -> list[str]:
     from tests.helpers.media import generate_synthetic_video
 
     video = generate_synthetic_video(448, 448, 30 * seconds, cache_dir=cache_dir)
-    return _video_frames_from_file(Path(video["file_path"]))
+    frames, _ = _video_frames_from_file(Path(video["file_path"]))
+    return frames
 
 
 def realtime_url(omni_server) -> str:

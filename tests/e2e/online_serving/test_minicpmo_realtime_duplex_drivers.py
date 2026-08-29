@@ -1926,6 +1926,28 @@ def test_realtime_duplex_demo_sends_each_units_stacked_composite_next_to_its_bas
     assert _sent_video_frames(messages) == [["f0", "s0"], ["f1", "s1"], ["f2"]]
 
 
+def test_minicpmo_duplex_camera_fixture_returns_flat_base_frame_track(tmp_path, monkeypatch):
+    from tests.e2e.online_serving.helpers import minicpmo_4_5_duplex as fixtures
+    from tests.e2e.online_serving.helpers import minicpmo_realtime_duplex_scenarios as demo
+    from tests.helpers import media
+
+    video_path = tmp_path / "camera.mp4"
+    monkeypatch.setattr(
+        media,
+        "generate_synthetic_video",
+        lambda *args, **kwargs: {"file_path": str(video_path)},
+    )
+    monkeypatch.setattr(
+        demo,
+        "_video_frames_from_file",
+        lambda path: (["frame-0", "frame-1"], [None, None]),
+    )
+
+    frames = fixtures.duplex_camera_frames(seconds=2, cache_dir=tmp_path)
+
+    assert frames == ["frame-0", "frame-1"]
+
+
 def test_realtime_duplex_demo_decodes_a_video_file_into_one_frame_per_second(tmp_path):
     pytest.importorskip("cv2")
     pytest.importorskip("imageio")
