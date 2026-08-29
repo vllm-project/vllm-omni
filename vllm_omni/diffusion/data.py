@@ -630,6 +630,13 @@ def resolve_model_class_name(
 
     if not model:
         return None
+    # The diffusers backend always executes through the adapter, so resolve to
+    # its class before consulting the pipeline index — matching
+    # ``enrich_config``'s precedence. Returning the checkpoint's native
+    # ``_class_name`` here would route native (tensor-based) pre/post-process
+    # funcs onto the adapter's PIL/list outputs.
+    if diffusion_load_format == "diffusers":
+        return "DiffusersAdapterPipeline"
     is_lance_subfolder = os.path.basename(str(model).rstrip("/")) in {"Lance_3B", "Lance_3B_Video"}
 
     # Diffusers models: read _class_name from the pipeline index. Missing
@@ -640,8 +647,6 @@ def resolve_model_class_name(
         model_index = None
     if model_index is not None:
         return model_index.get("_class_name")
-    if diffusion_load_format == "diffusers":
-        return "DiffusersAdapterPipeline"
 
     # Other models: map model_type / architecture from config.json.
     try:
