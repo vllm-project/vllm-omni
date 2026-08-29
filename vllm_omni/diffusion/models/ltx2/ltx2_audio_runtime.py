@@ -213,11 +213,6 @@ def initialize_audio_pipeline_components(pipeline, od_config) -> None:
     pipeline.audio_vae_temporal_compression_ratio = pipeline.audio_vae.temporal_compression_ratio
     pipeline.audio_sampling_rate = pipeline.audio_vae.config.sample_rate
     pipeline.audio_hop_length = pipeline.audio_vae.config.mel_hop_length
-    vocoder_config = getattr(pipeline.vocoder, "config", None)
-    output_sample_rate = getattr(vocoder_config, "output_sampling_rate", None)
-    if output_sample_rate is None and hasattr(vocoder_config, "get"):
-        output_sample_rate = vocoder_config.get("output_sampling_rate")
-    pipeline.audio_sample_rate = int(output_sample_rate or pipeline.audio_sampling_rate)
     tokenizer_max_length = pipeline.tokenizer.model_max_length
     if tokenizer_max_length is None or tokenizer_max_length > 100000:
         encoder_config = getattr(pipeline.text_encoder, "config", None)
