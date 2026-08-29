@@ -398,12 +398,27 @@ def test_initialize_local_diffusion_replica_restores_device_visibility_after_loc
             os.environ[env_var] = old_env
 
 
-def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline_flag(monkeypatch):
+@pytest.mark.parametrize(
+    ("num_stages", "num_replicas", "engine_args", "expected_use_inline"),
+    [
+        pytest.param(1, 1, {}, True, id="single-stage-default-inline"),
+        pytest.param(2, 1, {"inline_diffusion": True}, True, id="multi-stage-explicit-inline"),
+        pytest.param(2, 1, {}, False, id="multi-stage-default-subprocess"),
+        pytest.param(1, 2, {"inline_diffusion": True}, False, id="multi-replica-subprocess"),
+    ],
+)
+def test_initialize_local_diffusion_replica_selects_inline_mode(
+    monkeypatch,
+    num_stages,
+    num_replicas,
+    engine_args,
+    expected_use_inline,
+):
     import vllm_omni.engine.stage_runtime as runtime_mod
     from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 
     runtime = StageRuntime(
-        stage_configs=[types.SimpleNamespace()],
+        stage_configs=[types.SimpleNamespace() for _ in range(num_stages)],
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
@@ -411,7 +426,8 @@ def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline
         async_chunk=False,
     )
 
-    plan = _make_diffusion_plan(0, stage_id=0).replicas[0]
+    plan = _make_diffusion_plan(0, stage_id=0, num_replicas=num_replicas).replicas[0]
+    plan.stage_cfg.engine_args.update(engine_args)
 
     captured: dict[str, object] = {}
 
@@ -433,33 +449,9 @@ def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline
         "stage_id": 0,
         "stage_init_timeout": 302,
         "batch_size": 4,
-        "use_inline": False,
+        "use_inline": expected_use_inline,
         "omni_master_server": None,
     }
-
-
-def test_initialize_local_diffusion_replica_uses_explicit_inline_opt_in(monkeypatch):
-    import vllm_omni.engine.stage_runtime as runtime_mod
-    from vllm_omni.engine.stage_engine_startup import StageReplicaResources
-
-    runtime = _make_stage_runtime()
-    plan = _make_diffusion_plan(0, stage_id=1).replicas[0]
-    plan.stage_cfg.engine_args["inline_diffusion"] = True
-    captured: dict[str, object] = {}
-
-    monkeypatch.setattr(runtime_mod, "inject_kv_stage_info", lambda *_: None)
-    monkeypatch.setattr(
-        runtime_mod,
-        "launch_diffusion_stage_replica",
-        lambda **kwargs: (
-            captured.update(use_inline=kwargs["use_inline"]),
-            (types.SimpleNamespace(), StageReplicaResources()),
-        )[1],
-    )
-
-    runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=1)
-
-    assert captured["use_inline"] is True
 
 
 def test_initialize_local_llm_replica_scopes_runtime_env(monkeypatch):
