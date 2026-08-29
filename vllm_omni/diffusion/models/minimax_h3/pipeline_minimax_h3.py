@@ -741,6 +741,10 @@ class MiniMaxH3Pipeline(
             self._turbo_lora_adapter_ids.add(lora_request.lora_int_id)
             return loaded
 
+        # Selection is by the artifact's safetensors ``key_format``, not by the
+        # running platform: the native loader is checkpoint-format parsing with
+        # no ``torch_npu`` dependency, so it needs no ``current_omni_platform``
+        # dispatch and binds the same adapter on NPU, CUDA and CPU.
         native_loaded = load_minimax_h3_native_lora(
             partition=self.partition,
             lora_request=lora_request,
@@ -801,18 +805,32 @@ class MiniMaxH3Pipeline(
         # message can never disagree with the schedule the denoise loop runs.
         schedule = self._lora_sigma_schedules.get(sampling.lora_request.lora_int_id)
         expected_steps = MINIMAX_H3_NATIVE_INFERENCE_STEPS if schedule is None else schedule.num_inference_steps
+        # Only request mode can take the count from the adapter schedule: step
+        # mode admits the request in ``StepScheduler``, which reads
+        # ``num_inference_steps`` off it before any pipeline hook runs. Reject
+        # omission there rather than advertise a contract that would either fail
+        # admission or disagree with the denoise loop.
+        od_config = getattr(self, "od_config", None)
+        omission_allowed = not getattr(od_config, "step_execution", False)
+        or_omitted = " or omitted" if omission_allowed else ""
         sigma_steps = sampling.num_inference_steps
         if sigma_steps is None:
-            return
+            if omission_allowed:
+                return
+            raise OmniClientError(
+                f"MiniMax-H3 native LoRA requires an explicit num_inference_steps={expected_steps} "
+                "under step execution, because the step scheduler derives the total step count from "
+                "the request before the adapter schedule is known"
+            )
         if int(sigma_steps) == expected_steps + 1:
             raise OmniClientError(
                 "MiniMax-H3 native LoRA uses the distilled interval-count contract; "
-                f"num_inference_steps must be {expected_steps} or omitted, not {expected_steps + 1}"
+                f"num_inference_steps must be {expected_steps}{or_omitted}, not {expected_steps + 1}"
             )
         if int(sigma_steps) != expected_steps:
             raise OmniClientError(
                 f"MiniMax-H3 native LoRA requires num_inference_steps={expected_steps} "
-                "(one denoiser evaluation per sigma interval) or omitted"
+                f"(one denoiser evaluation per sigma interval){or_omitted}"
             )
 
     def _sigma_schedule_for_request(self, sampling: Any, task: str) -> DMD2SigmaSchedule | None:

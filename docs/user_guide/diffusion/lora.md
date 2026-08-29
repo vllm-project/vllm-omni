@@ -254,19 +254,25 @@ MiniMax-H3 supports two few-step mechanisms that must not be conflated:
 - **Runtime native LoRA**: FlashGen-style artifacts declare
   `key_format=minimax-h3-native` and embed `base_schedule` in safetensors
   metadata. When active, the adapter schedule overrides the base checkpoint and
-  requests must use the interval-count contract (`num_inference_steps=4` or
-  omitted).
+  requests must use the interval-count contract (`num_inference_steps=4`).
+  Request-mode generation may omit the field and take the count from the adapter
+  schedule; step execution requires it explicitly, because the step scheduler
+  derives the total step count from the request before the adapter schedule is
+  known.
 
 Native artifacts also declare `qkv_layout=grouped`. The H3 loader reorders fused
 `qkv_proj` LoRA rows with the same `_reorder_grouped_qkv_to_qkv` helper used for
 base-weight loading, then binds the packed Q/K/V slices through the legacy PEFT
 manager without modifying `DiffusionLoRAManager`.
 
-Both runtime adapters run with distributed layerwise offload, where the manager
-keeps the LoRA A/B buffers resident on the compute device while DLO streams the
-base blocks. Model-level CPU offload and standard layerwise offload are still
-rejected, because the dynamic LoRA tensors are neither parameters nor registered
-buffers and therefore do not participate in those weight lifecycles.
+Both runtime adapters run with distributed layerwise offload in request-mode
+generation, where the manager keeps the LoRA A/B buffers resident on the compute
+device while DLO streams the base blocks. MiniMax-H3 step execution still
+rejects DLO, so `--step-execution` cannot be combined with
+`--enable-distributed-layerwise-offload`. Model-level CPU offload and standard
+layerwise offload are rejected in every mode, because the dynamic LoRA tensors
+are neither parameters nor registered buffers and therefore do not participate
+in those weight lifecycles.
 
 ## See Also
 

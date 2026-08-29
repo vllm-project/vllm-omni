@@ -362,6 +362,42 @@ def test_pipeline_native_step_count_follows_adapter_schedule():
         )
 
 
+@pytest.mark.parametrize("step_execution", [False, True])
+def test_pipeline_native_omitted_step_count_follows_execution_mode(step_execution):
+    """Only request mode can resolve an omitted count from the adapter schedule.
+
+    ``StepScheduler`` reads ``num_inference_steps`` off the request at admission,
+    before this pipeline sees it, so under step execution an omitted value can
+    only disagree with the denoise loop. The advertised contract has to match.
+    """
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.partition = "fl2va"
+    pipeline._native_lora_adapter_ids = {7}
+    pipeline._lora_sigma_schedules = {7: DMD2SigmaSchedule.from_positions([1.0, 0.7, 0.4, 0.15, 0.0])}
+    pipeline.od_config = SimpleNamespace(step_execution=step_execution)
+    sampling = SimpleNamespace(
+        lora_request=LoRARequest("flashgen", 7, "/tmp/native.safetensors"),
+        num_inference_steps=None,
+    )
+
+    if not step_execution:
+        # Request mode defaults to the adapter's own interval count.
+        pipeline._validate_native_sampling(sampling, task="t2va")
+        return
+
+    with pytest.raises(OmniClientError, match="explicit num_inference_steps=4 under step execution"):
+        pipeline._validate_native_sampling(sampling, task="t2va")
+    # The step-mode message must not offer omission it cannot accept.
+    with pytest.raises(OmniClientError, match=r"must be 4, not 5$"):
+        pipeline._validate_native_sampling(
+            SimpleNamespace(lora_request=sampling.lora_request, num_inference_steps=5),
+            task="t2va",
+        )
+
+
 def test_pipeline_replaces_native_classification_after_reload(monkeypatch, tmp_path):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
