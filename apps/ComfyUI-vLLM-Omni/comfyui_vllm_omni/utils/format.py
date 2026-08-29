@@ -152,12 +152,28 @@ def bytes_to_video(video_bytes: bytes) -> VideoInput:
             if video_stream is None:
                 raise ValueError("No video stream found in decoded payload.")
 
+            # Decode video and audio in a single demux pass: decoding the video
+            # stream first exhausts the container, so a second decode() call for
+            # the audio stream would yield zero frames (audio silently dropped).
+            audio_stream = container.streams.audio[-1] if len(container.streams.audio) else None
+            resampler = AudioResampler(format="fltp") if audio_stream is not None else None
+
             frames = []
-            for frame in container.decode(video_stream):
-                if not isinstance(frame, VideoFrame):
-                    continue
-                image = frame.to_ndarray(format="rgb24")
-                frames.append(torch.from_numpy(image).float() / 255.0)
+            audio_frames = []
+            # Decode only the selected streams (decoding all streams would mix in
+            # extra audio tracks / cover-art video tracks from unusual containers).
+            streams = [s for s in (video_stream, audio_stream) if s is not None]
+            for frame in container.decode(*streams):
+                if isinstance(frame, VideoFrame):
+                    image = frame.to_ndarray(format="rgb24")
+                    frames.append(torch.from_numpy(image).float() / 255.0)
+                elif isinstance(frame, AudioFrame):
+                    resampled = resampler.resample(frame)
+                    if not isinstance(resampled, list):
+                        resampled = [resampled]
+                    for audio_frame in resampled:
+                        if audio_frame is not None:
+                            audio_frames.append(audio_frame.to_ndarray())
 
             if len(frames) == 0:
                 raise ValueError("No video frames found in decoded payload.")
@@ -166,27 +182,13 @@ def bytes_to_video(video_bytes: bytes) -> VideoInput:
             frame_rate = Fraction(video_stream.average_rate) if video_stream.average_rate else Fraction(1)
 
             audio: AudioInput | None = None
-            if len(container.streams.audio):
-                audio_stream = container.streams.audio[-1]
-                audio_frames = []
-                resampler = AudioResampler(format="fltp")
-                for frame in container.decode(audio_stream):
-                    if not isinstance(frame, AudioFrame):
-                        continue
-                    resampled = resampler.resample(frame)
-                    if not isinstance(resampled, list):
-                        resampled = [resampled]
-                    for audio_frame in resampled:
-                        if audio_frame is not None:
-                            audio_frames.append(audio_frame.to_ndarray())
-
-                if len(audio_frames) > 0:
-                    audio_data = np.concatenate(audio_frames, axis=1)
-                    sample_rate = int(audio_stream.sample_rate) if audio_stream.sample_rate else 1
-                    audio = {
-                        "waveform": torch.from_numpy(audio_data).unsqueeze(0),
-                        "sample_rate": sample_rate,
-                    }
+            if audio_frames:
+                audio_data = np.concatenate(audio_frames, axis=1)
+                sample_rate = int(audio_stream.sample_rate) if audio_stream.sample_rate else 1
+                audio = {
+                    "waveform": torch.from_numpy(audio_data).unsqueeze(0),
+                    "sample_rate": sample_rate,
+                }
 
             components = Types.VideoComponents(
                 images=images,
