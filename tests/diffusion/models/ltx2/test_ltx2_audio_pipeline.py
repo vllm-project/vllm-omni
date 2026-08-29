@@ -108,6 +108,120 @@ def test_ltx_t2a_exact_num_frames_overrides_default_duration():
     )
 
 
+def test_ltx_t2a_audio_graph_bucket_pads_without_consuming_request_rng():
+    pipe = object.__new__(LTXAudioRuntime)
+    torch.nn.Module.__init__(pipe)
+    pipe.device = torch.device("cpu")
+    pipe.audio_sampling_rate = 100
+    pipe.audio_hop_length = 1
+    pipe.audio_vae_temporal_compression_ratio = 1
+    pipe.audio_vae_mel_compression_ratio = 2
+    pipe.audio_vae = SimpleNamespace(config=SimpleNamespace(mel_bins=8, latent_channels=2))
+    pipe.pipeline_recipe = SimpleNamespace(num_frames=121, phases=(SimpleNamespace(noise_scale=1.0),))
+    pipe._audio_cuda_graph_config = SimpleNamespace(audio_length_buckets=(1.0, 2.0))
+    logical = torch.arange(104 * 8, dtype=torch.float32).reshape(1, 104, 8)
+
+    def prepare_audio_latents(*_args, **_kwargs):
+        return logical.clone(), 104, 104
+
+    pipe.prepare_audio_latents = prepare_audio_latents
+    inputs = SimpleNamespace(
+        num_frames=25,
+        frame_rate=24.0,
+        num_videos_per_prompt=1,
+        generator=None,
+        audio_latents=None,
+    )
+    prompt_context = SimpleNamespace(
+        batch_size=1,
+        positive_connector_audio_prompt_embeds=torch.zeros(1, 1, 1),
+    )
+
+    audio_latents, original, padded, latent_mel_bins = pipe._prepare_audio_state(inputs, prompt_context)
+
+    assert original == 104
+    assert padded == 104
+    assert latent_mel_bins == 4
+    torch.testing.assert_close(audio_latents, logical)
+
+
+def test_ltx_t2a_audio_graph_warms_first_bucket_without_padding(monkeypatch):
+    from vllm_omni.diffusion.models.ltx2 import ltx2_audio_runtime
+    from vllm_omni.diffusion.models.ltx2.ltx2_request import LTXRequestInputs
+
+    pipe = object.__new__(LTXAudioRuntime)
+    torch.nn.Module.__init__(pipe)
+    pipe.pipeline_recipe = SimpleNamespace(frame_rate=24.0, num_frames=121, height=512, width=512)
+    pipe._audio_cuda_graph_config = SimpleNamespace(audio_length_buckets=(1.0, 5.0))
+    pipe._resolve_request_sigmas = lambda *_args: None
+
+    def resolve_inputs(_req, **kwargs):
+        return LTXRequestInputs(
+            prompt=None,
+            negative_prompt=None,
+            height=kwargs["height"],
+            width=kwargs["width"],
+            num_frames=kwargs["num_frames"],
+            frame_rate=kwargs["frame_rate"],
+            num_inference_steps=1,
+            guidance=LTXGuidanceSpec.positive_only(),
+            num_videos_per_prompt=1,
+            generator=None,
+            latents=None,
+            audio_latents=None,
+            prompt_embeds=None,
+            negative_prompt_embeds=None,
+            prompt_attention_mask=None,
+            negative_prompt_attention_mask=None,
+            decode_timestep=0.0,
+            decode_noise_scale=None,
+            output_type="np",
+            max_sequence_length=1024,
+        )
+
+    pipe._resolve_request_inputs = resolve_inputs
+    monkeypatch.setattr(ltx2_audio_runtime, "validate_pipeline_request", lambda *_args, **_kwargs: None)
+    sampling = SimpleNamespace(extra_args={}, num_frames=9, resolved_frame_rate=24.0, latents=None)
+    request = SimpleNamespace(sampling_params_list=[sampling], is_dummy_run=lambda: True)
+
+    inputs = pipe._resolve_audio_request_inputs(request)
+
+    assert inputs.num_frames == 25
+
+
+def test_ltx_t2a_audio_graph_bucket_appends_zero_padding():
+    pipe = object.__new__(LTXAudioRuntime)
+    torch.nn.Module.__init__(pipe)
+    pipe.device = torch.device("cpu")
+    pipe.audio_sampling_rate = 24
+    pipe.audio_hop_length = 1
+    pipe.audio_vae_temporal_compression_ratio = 1
+    pipe.audio_vae_mel_compression_ratio = 2
+    pipe.audio_vae = SimpleNamespace(config=SimpleNamespace(mel_bins=8, latent_channels=2))
+    pipe.pipeline_recipe = SimpleNamespace(num_frames=121, phases=(SimpleNamespace(noise_scale=1.0),))
+    pipe._audio_cuda_graph_config = SimpleNamespace(audio_length_buckets=(2.0,))
+    logical = torch.ones(1, 25, 8)
+    pipe.prepare_audio_latents = lambda *_args, **_kwargs: (logical.clone(), 25, 25)
+    inputs = SimpleNamespace(
+        num_frames=25,
+        frame_rate=24.0,
+        num_videos_per_prompt=1,
+        generator=None,
+        audio_latents=None,
+    )
+    prompt_context = SimpleNamespace(
+        batch_size=1,
+        positive_connector_audio_prompt_embeds=torch.zeros(1, 1, 1),
+    )
+
+    audio_latents, original, padded, _latent_mel_bins = pipe._prepare_audio_state(inputs, prompt_context)
+
+    assert original == 25
+    assert padded == 49
+    torch.testing.assert_close(audio_latents[:, :25], logical)
+    torch.testing.assert_close(audio_latents[:, 25:], torch.zeros(1, 24, 8))
+
+
 @pytest.mark.parametrize(
     ("audio_length", "num_frames", "frame_rate", "error"),
     [
@@ -422,8 +536,10 @@ def test_ltx25_t2a_overrides_shared_distilled_scheduler_before_validation(tmp_pa
 @pytest.mark.parametrize("request_sigmas", ([1.0, 0.5, 0.0], None))
 def test_ltx_t2a_denoise_passes_audio_padding_mask_without_video_inputs(monkeypatch, request_sigmas):
     from vllm_omni.diffusion.models.ltx2 import ltx2_audio_runtime, ltx2_guidance
+    from vllm_omni.diffusion.models.ltx2.ltx2_audio_transformer import LTX2AudioStaticConditioning
 
     calls = []
+    conditioning_preparations = []
     perturbation_builds = 0
     sigma_scalars = []
     original_build_perturbation_kwargs = ltx2_audio_runtime.build_perturbation_kwargs
@@ -451,6 +567,17 @@ def test_ltx_t2a_denoise_passes_audio_padding_mask_without_video_inputs(monkeypa
         def forward(self, **kwargs):
             calls.append(kwargs)
             return torch.zeros_like(kwargs["audio_hidden_states"])
+
+        def prepare_static_conditioning(self, context, coords, *, hidden_dtype):
+            conditioning = LTX2AudioStaticConditioning(
+                encoder_hidden_states=context,
+                rotary_emb=(
+                    coords.to(hidden_dtype),
+                    coords.to(hidden_dtype),
+                ),
+            )
+            conditioning_preparations.append(conditioning)
+            return conditioning
 
     class Progress:
         def __enter__(self):
@@ -491,6 +618,9 @@ def test_ltx_t2a_denoise_passes_audio_padding_mask_without_video_inputs(monkeypa
     )
 
     assert len(calls) == 2
+    assert len(conditioning_preparations) == 1
+    assert calls[0]["audio_static_conditioning"] is conditioning_preparations[0]
+    assert calls[1]["audio_static_conditioning"] is conditioning_preparations[0]
     assert perturbation_builds == 1
     assert len(sigma_scalars) == 2
     assert all(isinstance(value, float) for value in sigma_scalars)

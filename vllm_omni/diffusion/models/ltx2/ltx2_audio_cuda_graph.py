@@ -5,13 +5,17 @@
 
 from __future__ import annotations
 
+import math
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 from vllm.logger import init_logger
+
+from .ltx2_audio_transformer import LTX2AudioStaticConditioning
 
 logger = init_logger(__name__)
 
@@ -22,6 +26,7 @@ class LTX2AudioCUDAGraphConfig:
 
     enabled: bool = False
     max_entries: int = 4
+    audio_length_buckets: tuple[float, ...] = ()
 
     @classmethod
     def from_additional_config(cls, additional_config: Mapping[str, Any] | None) -> LTX2AudioCUDAGraphConfig:
@@ -36,18 +41,33 @@ class LTX2AudioCUDAGraphConfig:
         if not isinstance(raw, Mapping):
             raise TypeError("additional_config.ltx2_audio_cuda_graph must be a mapping")
 
-        unknown = set(raw) - {"enabled", "max_entries"}
+        unknown = set(raw) - {"enabled", "max_entries", "audio_length_buckets"}
         if unknown:
             names = ", ".join(sorted(str(name) for name in unknown))
             raise ValueError(f"Unknown LTX2 audio CUDA Graph option(s): {names}")
 
         enabled = raw.get("enabled", False)
         max_entries = raw.get("max_entries", 4)
+        raw_buckets = raw.get("audio_length_buckets", ())
         if type(enabled) is not bool:
             raise TypeError("additional_config.ltx2_audio_cuda_graph.enabled must be a bool")
         if type(max_entries) is not int or max_entries < 1:
             raise ValueError("additional_config.ltx2_audio_cuda_graph.max_entries must be a positive integer")
-        return cls(enabled=enabled, max_entries=max_entries)
+        if not isinstance(raw_buckets, (list, tuple)):
+            raise TypeError("additional_config.ltx2_audio_cuda_graph.audio_length_buckets must be a list or tuple")
+        buckets: list[float] = []
+        for value in raw_buckets:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError("LTX2 audio CUDA Graph length buckets must contain only numbers")
+            bucket = float(value)
+            if not math.isfinite(bucket) or bucket <= 0:
+                raise ValueError("LTX2 audio CUDA Graph length buckets must be finite and positive")
+            buckets.append(bucket)
+        if any(right <= left for left, right in zip(buckets, buckets[1:], strict=False)):
+            raise ValueError("LTX2 audio CUDA Graph length buckets must be strictly increasing")
+        if buckets and not enabled:
+            raise ValueError("LTX2 audio CUDA Graph length buckets require enabled=true")
+        return cls(enabled=enabled, max_entries=max_entries, audio_length_buckets=tuple(buckets))
 
 
 @dataclass(frozen=True)
@@ -56,6 +76,7 @@ class LTX2AudioGraphKey:
 
     hidden_shape: tuple[int, ...]
     context_shape: tuple[int, ...]
+    rotary_shapes: tuple[tuple[int, ...], tuple[int, ...]] | None
     has_audio_attention_mask: bool
     has_perturbation_mask: bool
     stg_blocks: tuple[int, ...] | None
@@ -76,10 +97,13 @@ class LTX2AudioGraphEntry:
     static_context: torch.Tensor
     static_timestep: torch.Tensor
     static_sigma: torch.Tensor
-    static_coords: torch.Tensor
+    static_coords: torch.Tensor | None
+    static_rotary_cos: torch.Tensor | None
+    static_rotary_sin: torch.Tensor | None
     static_attention_mask: torch.Tensor | None
     static_perturbation_mask: torch.Tensor | None
     static_output: torch.Tensor
+    request_generation: int | None = None
 
 
 def make_ltx2_audio_graph_key(
@@ -88,11 +112,18 @@ def make_ltx2_audio_graph_key(
     audio_attention_mask: torch.Tensor | None,
     perturbation_mask: torch.Tensor | None,
     stg_blocks: Sequence[int] | None,
+    static_conditioning: LTX2AudioStaticConditioning | None = None,
 ) -> LTX2AudioGraphKey:
     blocks = None if stg_blocks is None else tuple(sorted(set(int(block) for block in stg_blocks)))
+    rotary_shapes = (
+        None if static_conditioning is None else tuple(tuple(value.shape) for value in static_conditioning.rotary_emb)
+    )
     return LTX2AudioGraphKey(
         hidden_shape=tuple(hidden_states.shape),
-        context_shape=tuple(context.shape),
+        context_shape=tuple(
+            context.shape if static_conditioning is None else static_conditioning.encoder_hidden_states.shape
+        ),
+        rotary_shapes=rotary_shapes,
         has_audio_attention_mask=audio_attention_mask is not None,
         has_perturbation_mask=perturbation_mask is not None,
         stg_blocks=blocks,
@@ -170,6 +201,8 @@ class LTX2AudioCUDAGraphRunner:
         }
         self.last_call_info: dict[str, Any] = {}
         self.last_request_stats: dict[str, int] = {}
+        self._request_generation = 0
+        self._active_request_generation: int | None = None
 
     def stats_snapshot(self) -> dict[str, int]:
         return {
@@ -190,6 +223,20 @@ class LTX2AudioCUDAGraphRunner:
         }
         return dict(self.last_request_stats)
 
+    @contextmanager
+    def request_scope(self):
+        """Mark request-invariant graph inputs so replay can elide their copies."""
+        if self._active_request_generation is not None:
+            raise RuntimeError("LTX2 audio CUDA Graph request scopes cannot be nested")
+        before = self.stats_snapshot()
+        self._request_generation += 1
+        self._active_request_generation = self._request_generation
+        try:
+            yield
+        finally:
+            self.record_request_stats(before)
+            self._active_request_generation = None
+
     @staticmethod
     def _canonical_blocks(stg_blocks: Sequence[int] | None) -> tuple[int, ...] | None:
         return None if stg_blocks is None else tuple(sorted(set(int(block) for block in stg_blocks)))
@@ -201,7 +248,9 @@ class LTX2AudioCUDAGraphRunner:
         context: torch.Tensor,
         timestep: torch.Tensor,
         sigma: torch.Tensor,
-        coords: torch.Tensor,
+        coords: torch.Tensor | None,
+        rotary_cos: torch.Tensor | None,
+        rotary_sin: torch.Tensor | None,
         attention_mask: torch.Tensor | None,
         perturbation_mask: torch.Tensor | None,
     ) -> bool:
@@ -220,12 +269,24 @@ class LTX2AudioCUDAGraphRunner:
         if context.ndim != 3 or context.shape[0] != batch:
             return False
 
-        required_inputs = (
+        required_inputs = [
             (context, torch.bfloat16, None),
             (timestep, torch.float32, (batch, audio_tokens)),
             (sigma, torch.float32, (batch,)),
-            (coords, torch.float32, (batch, 1, audio_tokens, 2)),
-        )
+        ]
+        if coords is None:
+            if rotary_cos is None or rotary_sin is None:
+                return False
+            required_inputs.extend(
+                [
+                    (rotary_cos, torch.bfloat16, None),
+                    (rotary_sin, torch.bfloat16, None),
+                ]
+            )
+        else:
+            if rotary_cos is not None or rotary_sin is not None:
+                return False
+            required_inputs.append((coords, torch.float32, (batch, 1, audio_tokens, 2)))
         if not all(
             _has_tensor_metadata(value, device=expected_device, dtype=dtype, shape=shape)
             for value, dtype, shape in required_inputs
@@ -255,7 +316,9 @@ class LTX2AudioCUDAGraphRunner:
         context: torch.Tensor,
         timestep: torch.Tensor,
         sigma: torch.Tensor,
-        coords: torch.Tensor,
+        coords: torch.Tensor | None,
+        rotary_cos: torch.Tensor | None,
+        rotary_sin: torch.Tensor | None,
         attention_mask: torch.Tensor | None,
         perturbation_mask: torch.Tensor | None,
     ) -> bool:
@@ -265,6 +328,8 @@ class LTX2AudioCUDAGraphRunner:
             (entry.static_timestep, timestep),
             (entry.static_sigma, sigma),
             (entry.static_coords, coords),
+            (entry.static_rotary_cos, rotary_cos),
+            (entry.static_rotary_sin, rotary_sin),
             (entry.static_attention_mask, attention_mask),
             (entry.static_perturbation_mask, perturbation_mask),
         )
@@ -284,10 +349,12 @@ class LTX2AudioCUDAGraphRunner:
         context: torch.Tensor,
         timestep: torch.Tensor,
         sigma: torch.Tensor,
-        coords: torch.Tensor,
+        coords: torch.Tensor | None,
         attention_mask: torch.Tensor | None,
         perturbation_mask: torch.Tensor | None,
         stg_blocks: tuple[int, ...] | None,
+        rotary_cos: torch.Tensor | None = None,
+        rotary_sin: torch.Tensor | None = None,
     ) -> torch.Tensor:
         attention_kwargs: dict[str, Any] = {}
         if perturbation_mask is not None:
@@ -295,6 +362,12 @@ class LTX2AudioCUDAGraphRunner:
                 "audio_self_attention_mask": perturbation_mask,
                 "audio_self_attention_blocks": stg_blocks,
             }
+        transformer_kwargs: dict[str, Any] = {}
+        if rotary_cos is not None and rotary_sin is not None:
+            transformer_kwargs["audio_static_conditioning"] = LTX2AudioStaticConditioning(
+                encoder_hidden_states=context,
+                rotary_emb=(rotary_cos, rotary_sin),
+            )
         return self.transformer(
             audio_hidden_states=hidden_states,
             audio_encoder_hidden_states=context,
@@ -303,6 +376,7 @@ class LTX2AudioCUDAGraphRunner:
             audio_coords=coords,
             audio_attention_mask=attention_mask,
             attention_kwargs=attention_kwargs,
+            **transformer_kwargs,
         )
 
     def _eager_forward(self, reason: str, **kwargs: Any) -> torch.Tensor:
@@ -320,8 +394,7 @@ class LTX2AudioCUDAGraphRunner:
         warmup_stream = torch.cuda.Stream(device=self.device)
         warmup_stream.wait_stream(current_stream)
         with torch.cuda.stream(warmup_stream), torch.no_grad():
-            for _ in range(3):
-                initial_output = self._call_transformer(**static_inputs)
+            initial_output = self._call_transformer(**static_inputs)
         current_stream.wait_stream(warmup_stream)
         torch.accelerator.synchronize(self.device)
 
@@ -347,6 +420,8 @@ class LTX2AudioCUDAGraphRunner:
                 static_timestep=static_inputs["timestep"],
                 static_sigma=static_inputs["sigma"],
                 static_coords=static_inputs["coords"],
+                static_rotary_cos=static_inputs["rotary_cos"],
+                static_rotary_sin=static_inputs["rotary_sin"],
                 static_attention_mask=static_inputs["attention_mask"],
                 static_perturbation_mask=static_inputs["perturbation_mask"],
                 static_output=static_output,
@@ -354,31 +429,46 @@ class LTX2AudioCUDAGraphRunner:
             initial_output,
         )
 
-    @staticmethod
     def _copy_and_replay(
+        self,
         entry: LTX2AudioGraphEntry,
         *,
         hidden_states: torch.Tensor,
         context: torch.Tensor,
         timestep: torch.Tensor,
         sigma: torch.Tensor,
-        coords: torch.Tensor,
+        coords: torch.Tensor | None,
+        rotary_cos: torch.Tensor | None,
+        rotary_sin: torch.Tensor | None,
         attention_mask: torch.Tensor | None,
         perturbation_mask: torch.Tensor | None,
         stg_blocks: tuple[int, ...] | None,
     ) -> torch.Tensor:
         del stg_blocks
         entry.static_hidden_states.copy_(hidden_states)
-        entry.static_context.copy_(context)
         entry.static_timestep.copy_(timestep)
         entry.static_sigma.copy_(sigma)
-        entry.static_coords.copy_(coords)
-        if entry.static_attention_mask is not None:
-            assert attention_mask is not None
-            entry.static_attention_mask.copy_(attention_mask)
-        if entry.static_perturbation_mask is not None:
-            assert perturbation_mask is not None
-            entry.static_perturbation_mask.copy_(perturbation_mask)
+        copy_request_inputs = (
+            self._active_request_generation is None or entry.request_generation != self._active_request_generation
+        )
+        if copy_request_inputs:
+            entry.static_context.copy_(context)
+            if entry.static_coords is not None:
+                assert coords is not None
+                entry.static_coords.copy_(coords)
+            if entry.static_rotary_cos is not None:
+                assert rotary_cos is not None
+                entry.static_rotary_cos.copy_(rotary_cos)
+            if entry.static_rotary_sin is not None:
+                assert rotary_sin is not None
+                entry.static_rotary_sin.copy_(rotary_sin)
+            if entry.static_attention_mask is not None:
+                assert attention_mask is not None
+                entry.static_attention_mask.copy_(attention_mask)
+            if entry.static_perturbation_mask is not None:
+                assert perturbation_mask is not None
+                entry.static_perturbation_mask.copy_(perturbation_mask)
+            entry.request_generation = self._active_request_generation
         entry.graph.replay()
         return entry.static_output.detach().clone()
 
@@ -393,27 +483,36 @@ class LTX2AudioCUDAGraphRunner:
         audio_attention_mask: torch.Tensor | None = None,
         perturbation_mask: torch.Tensor | None = None,
         stg_blocks: Sequence[int] | None = None,
+        audio_static_conditioning: LTX2AudioStaticConditioning | None = None,
     ) -> torch.Tensor:
         self._stats["calls"] += 1
         blocks = self._canonical_blocks(stg_blocks)
+        context = (
+            audio_encoder_hidden_states
+            if audio_static_conditioning is None
+            else audio_static_conditioning.encoder_hidden_states
+        )
+        rotary_cos, rotary_sin = (
+            (None, None) if audio_static_conditioning is None else audio_static_conditioning.rotary_emb
+        )
         inputs = {
             "hidden_states": audio_hidden_states,
-            "context": audio_encoder_hidden_states,
+            "context": context,
             "timestep": audio_timestep,
             "sigma": audio_sigma,
-            "coords": audio_coords,
+            "coords": audio_coords if audio_static_conditioning is None else None,
+            "rotary_cos": rotary_cos,
+            "rotary_sin": rotary_sin,
             "attention_mask": audio_attention_mask,
             "perturbation_mask": perturbation_mask,
             "stg_blocks": blocks,
         }
         if not self._inputs_are_compatible(**{k: v for k, v in inputs.items() if k != "stg_blocks"}):
             self.last_call_info = {"mode": "eager", "reason": "incompatible_inputs"}
-            logger.debug("LTX2 audio CUDA Graph bypassed for incompatible request inputs")
             return self._eager_forward("incompatible_inputs", **inputs)
 
         if torch.cuda.is_current_stream_capturing():
             self.last_call_info = {"mode": "eager", "reason": "active_capture"}
-            logger.debug("LTX2 audio CUDA Graph bypassed during an active outer capture")
             return self._eager_forward("active_capture", **inputs)
 
         key = make_ltx2_audio_graph_key(
@@ -422,12 +521,12 @@ class LTX2AudioCUDAGraphRunner:
             audio_attention_mask,
             perturbation_mask,
             blocks,
+            audio_static_conditioning,
         )
         entry = self._cache.get(key)
         if entry is not None:
             if not self._entry_matches(entry, **{k: v for k, v in inputs.items() if k != "stg_blocks"}):
                 self.last_call_info = {"mode": "eager", "reason": "incompatible_inputs", "key": key}
-                logger.debug("LTX2 audio CUDA Graph cache entry metadata no longer matches key=%s", key)
                 return self._eager_forward("incompatible_inputs", **inputs)
             self._cache.move_to_end(key)
             self._stats["hits"] += 1
@@ -437,26 +536,19 @@ class LTX2AudioCUDAGraphRunner:
         if key in self._failed_keys:
             self._failed_keys.move_to_end(key)
             self.last_call_info = {"mode": "eager", "reason": "previous_capture_failure", "key": key}
-            logger.debug("LTX2 audio CUDA Graph skipped a previously failed key=%s", key)
             return self._eager_forward("previous_capture_failure", **inputs)
 
         try:
             entry, initial_output = self._capture(**inputs)
+            entry.request_generation = self._active_request_generation
             self._stats["captures"] += 1
             self._cache[key] = entry
             while len(self._cache) > self.max_graphs:
-                evicted_key, evicted = self._cache.popitem(last=False)
+                _, evicted = self._cache.popitem(last=False)
                 del evicted
                 self._stats["evictions"] += 1
-                logger.debug("LTX2 audio CUDA Graph evicted key=%s", evicted_key)
             self.last_call_info = {"mode": "capture", "reason": "cache_miss", "key": key}
-            logger.debug(
-                "LTX2 audio CUDA Graph captured audio_tokens=%d context_tokens=%d key=%s",
-                key.audio_token_count,
-                key.context_token_count,
-                key,
-            )
-            # The last warmup already produced the result for these inputs.
+            # The warmup already produced the result for these inputs.
             # Captured graph outputs are not populated until their first
             # replay, so use the warmup result to avoid that redundant replay.
             return initial_output.detach().clone()
@@ -484,3 +576,5 @@ class LTX2AudioCUDAGraphRunner:
             self._stats[name] = 0
         self.last_call_info = {}
         self.last_request_stats = {}
+        self._request_generation = 0
+        self._active_request_generation = None

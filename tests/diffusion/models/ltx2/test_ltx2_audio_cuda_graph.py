@@ -16,6 +16,7 @@ from vllm_omni.diffusion.models.ltx2.ltx2_audio_cuda_graph import (
     LTX2AudioCUDAGraphRunner,
     make_ltx2_audio_graph_key,
 )
+from vllm_omni.diffusion.models.ltx2.ltx2_audio_transformer import LTX2AudioStaticConditioning
 
 
 def test_config_defaults_and_preserves_unrelated_additional_config():
@@ -31,6 +32,20 @@ def test_config_defaults_and_preserves_unrelated_additional_config():
     ) == LTX2AudioCUDAGraphConfig(enabled=True, max_entries=8)
 
 
+def test_config_accepts_strictly_increasing_audio_length_buckets():
+    config = LTX2AudioCUDAGraphConfig.from_additional_config(
+        {
+            "ltx2_audio_cuda_graph": {
+                "enabled": True,
+                "max_entries": 4,
+                "audio_length_buckets": [1, 5.0, 10],
+            }
+        }
+    )
+
+    assert config.audio_length_buckets == (1.0, 5.0, 10.0)
+
+
 @pytest.mark.parametrize(
     ("additional_config", "error", "message"),
     [
@@ -42,6 +57,26 @@ def test_config_defaults_and_preserves_unrelated_additional_config():
         ({"ltx2_audio_cuda_graph": {"max_entries": True}}, ValueError, "positive integer"),
         ({"ltx2_audio_cuda_graph": {"max_entries": 0}}, ValueError, "positive integer"),
         ({"ltx2_audio_cuda_graph": {"max_entries": "4"}}, ValueError, "positive integer"),
+        (
+            {"ltx2_audio_cuda_graph": {"enabled": True, "audio_length_buckets": "1,5"}},
+            TypeError,
+            "list or tuple",
+        ),
+        (
+            {"ltx2_audio_cuda_graph": {"enabled": True, "audio_length_buckets": [1.0, 1.0]}},
+            ValueError,
+            "strictly increasing",
+        ),
+        (
+            {"ltx2_audio_cuda_graph": {"enabled": True, "audio_length_buckets": [0.0]}},
+            ValueError,
+            "finite and positive",
+        ),
+        (
+            {"ltx2_audio_cuda_graph": {"enabled": False, "audio_length_buckets": [1.0]}},
+            ValueError,
+            "enabled=true",
+        ),
     ],
 )
 def test_config_rejects_invalid_model_options(additional_config, error, message):
@@ -139,6 +174,8 @@ def test_mock_cache_hit_lru_and_eviction(monkeypatch):
                 static_timestep=kwargs["timestep"].clone(),
                 static_sigma=kwargs["sigma"].clone(),
                 static_coords=kwargs["coords"].clone(),
+                static_rotary_cos=None,
+                static_rotary_sin=None,
                 static_attention_mask=None,
                 static_perturbation_mask=None,
                 static_output=tensor,
@@ -179,6 +216,8 @@ def test_cache_miss_returns_warmup_output_without_replay(monkeypatch):
                 static_timestep=kwargs["timestep"].clone(),
                 static_sigma=kwargs["sigma"].clone(),
                 static_coords=kwargs["coords"].clone(),
+                static_rotary_cos=None,
+                static_rotary_sin=None,
                 static_attention_mask=None,
                 static_perturbation_mask=None,
                 static_output=torch.empty_like(captured_output),
@@ -206,6 +245,54 @@ def test_cache_miss_returns_warmup_output_without_replay(monkeypatch):
     assert delta["eager"] == 0
     assert delta["cache_size"] == 1
     assert runner.last_request_stats == delta
+
+
+def test_request_scope_copies_static_conditioning_once_per_request(monkeypatch):
+    runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cuda")
+    monkeypatch.setattr(runner, "_inputs_are_compatible", lambda **_kwargs: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    def capture(**kwargs):
+        tensor = kwargs["hidden_states"].clone()
+        return (
+            SimpleNamespace(
+                graph=SimpleNamespace(replay=lambda: None),
+                static_hidden_states=tensor,
+                static_context=kwargs["context"].clone(),
+                static_timestep=kwargs["timestep"].clone(),
+                static_sigma=kwargs["sigma"].clone(),
+                static_coords=kwargs["coords"].clone(),
+                static_rotary_cos=None,
+                static_rotary_sin=None,
+                static_attention_mask=None,
+                static_perturbation_mask=None,
+                static_output=tensor,
+                request_generation=None,
+            ),
+            tensor,
+        )
+
+    monkeypatch.setattr(runner, "_capture", capture)
+    first = _cpu_inputs()
+    changed = {**first, "audio_encoder_hidden_states": first["audio_encoder_hidden_states"] + 5}
+
+    with runner.request_scope():
+        runner(**first)
+        runner(**changed)
+        entry = runner._cache[_key(first)]
+        torch.testing.assert_close(entry.static_context, first["audio_encoder_hidden_states"])
+
+    assert runner.last_request_stats["calls"] == 2
+    assert runner.last_request_stats["captures"] == 1
+    assert runner.last_request_stats["hits"] == 1
+
+    with runner.request_scope():
+        runner(**changed)
+        torch.testing.assert_close(entry.static_context, changed["audio_encoder_hidden_states"])
+
+    assert runner.last_request_stats["calls"] == 1
+    assert runner.last_request_stats["captures"] == 0
+    assert runner.last_request_stats["hits"] == 1
 
 
 def test_capture_failure_is_bounded_and_not_retried(monkeypatch):
@@ -277,13 +364,20 @@ class _TinyAudioTransformer(nn.Module):
         audio_sigma,
         audio_coords,
         audio_attention_mask=None,
+        audio_static_conditioning=None,
         attention_kwargs=None,
     ):
+        if audio_static_conditioning is not None:
+            audio_encoder_hidden_states = audio_static_conditioning.encoder_hidden_states
         out = self.proj(audio_hidden_states)
         out = out + audio_encoder_hidden_states.mean(dim=1, keepdim=True)
         out = out + audio_timestep.unsqueeze(-1).to(out.dtype) * 0.01
         out = out + audio_sigma[:, None, None].to(out.dtype) * 0.02
-        out = out + audio_coords[:, 0, :, :1].to(out.dtype) * 0.03
+        if audio_static_conditioning is None:
+            position = audio_coords[:, 0, :, :1]
+        else:
+            position = audio_static_conditioning.rotary_emb[0][:, 0, :, :1]
+        out = out + position.to(out.dtype) * 0.03
         if audio_attention_mask is not None:
             out = out * audio_attention_mask.unsqueeze(-1)
         perturbation = (attention_kwargs or {}).get("ltx_perturbation_kwargs", {})
@@ -344,6 +438,58 @@ def test_cuda_graph_matches_eager_replays_values_and_owns_output():
     torch.testing.assert_close(second_graph, second_eager, rtol=0, atol=0)
     torch.testing.assert_close(first_graph, preserved, rtol=0, atol=0)
     assert first_graph.data_ptr() != runner._cache[_key(first_inputs)].static_output.data_ptr()
+    assert runner.stats_snapshot()["captures"] == 1
+    assert runner.stats_snapshot()["hits"] == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_graph_replays_request_scoped_static_conditioning():
+    transformer = _TinyAudioTransformer().eval()
+    runner = LTX2AudioCUDAGraphRunner(transformer, max_graphs=1)
+    first_inputs = _cuda_inputs(value=1)
+    second_inputs = _cuda_inputs(value=2)
+
+    def conditioning(inputs, value):
+        batch, tokens, _ = inputs["audio_hidden_states"].shape
+        rotary = torch.full((batch, 1, tokens, 2), value, dtype=torch.bfloat16, device="cuda")
+        return LTX2AudioStaticConditioning(
+            encoder_hidden_states=inputs["audio_encoder_hidden_states"],
+            rotary_emb=(rotary, rotary + 1),
+        )
+
+    first_conditioning = conditioning(first_inputs, 6)
+    second_conditioning = conditioning(second_inputs, 7)
+    with torch.inference_mode():
+        first_expected = runner._call_transformer(
+            hidden_states=first_inputs["audio_hidden_states"],
+            context=first_conditioning.encoder_hidden_states,
+            timestep=first_inputs["audio_timestep"],
+            sigma=first_inputs["audio_sigma"],
+            coords=None,
+            attention_mask=first_inputs["audio_attention_mask"],
+            perturbation_mask=first_inputs["perturbation_mask"],
+            stg_blocks=(28,),
+            rotary_cos=first_conditioning.rotary_emb[0],
+            rotary_sin=first_conditioning.rotary_emb[1],
+        ).clone()
+        first_actual = runner(**first_inputs, audio_static_conditioning=first_conditioning)
+        second_expected = runner._call_transformer(
+            hidden_states=second_inputs["audio_hidden_states"],
+            context=second_conditioning.encoder_hidden_states,
+            timestep=second_inputs["audio_timestep"],
+            sigma=second_inputs["audio_sigma"],
+            coords=None,
+            attention_mask=second_inputs["audio_attention_mask"],
+            perturbation_mask=second_inputs["perturbation_mask"],
+            stg_blocks=(28,),
+            rotary_cos=second_conditioning.rotary_emb[0],
+            rotary_sin=second_conditioning.rotary_emb[1],
+        ).clone()
+        second_actual = runner(**second_inputs, audio_static_conditioning=second_conditioning)
+    torch.accelerator.synchronize("cuda")
+
+    torch.testing.assert_close(first_actual, first_expected, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(second_actual, second_expected, rtol=0.0, atol=0.0)
     assert runner.stats_snapshot()["captures"] == 1
     assert runner.stats_snapshot()["hits"] == 1
 

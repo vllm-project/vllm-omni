@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import os
 from collections.abc import Iterable
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import ClassVar
 
@@ -44,6 +45,7 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from . import ltx2_latents as latent_ops
 from .ltx2_audio_cuda_graph import LTX2AudioCUDAGraphConfig, LTX2AudioCUDAGraphRunner
+from .ltx2_audio_transformer import LTX2AudioStaticConditioning
 from .ltx2_components import (
     LTXComponentProfile,
     _install_connector_attention,
@@ -400,6 +402,12 @@ class LTXAudioRuntime(
         if exact_num_frames is None and sampling.num_frames not in (None, 1):
             exact_num_frames = sampling.num_frames
         frame_rate = float(sampling.resolved_frame_rate or self.pipeline_recipe.frame_rate)
+        if req.is_dummy_run() and self._audio_cuda_graph_config.audio_length_buckets:
+            # Warm the first configured graph shape directly.  Padding the
+            # minimal dummy shape would capture the attention-mask branch,
+            # while an exact-length request normally uses the unmasked branch.
+            audio_length = self._audio_cuda_graph_config.audio_length_buckets[0]
+            exact_num_frames = None
         resolved_num_frames = resolve_ltx_audio_num_frames(
             audio_length=None if audio_length is None else float(audio_length),
             num_frames=exact_num_frames,
@@ -493,6 +501,26 @@ class LTXAudioRuntime(
             generator=inputs.generator,
             latents=inputs.audio_latents,
         )
+        for bucket_seconds in self._audio_cuda_graph_config.audio_length_buckets:
+            bucket_num_frames = resolve_ltx_audio_num_frames(
+                audio_length=bucket_seconds,
+                num_frames=None,
+                frame_rate=inputs.frame_rate,
+                default_num_frames=self.pipeline_recipe.num_frames,
+            )
+            bucket_duration_s = bucket_num_frames / inputs.frame_rate
+            bucket_audio_frames = round(bucket_duration_s * latent_rate)
+            if bucket_audio_frames < original_frames:
+                continue
+            if bucket_audio_frames > padded_frames:
+                padding = audio_latents.new_zeros(
+                    audio_latents.shape[0],
+                    bucket_audio_frames - padded_frames,
+                    audio_latents.shape[2],
+                )
+                audio_latents = torch.cat([audio_latents, padding], dim=1)
+                padded_frames = bucket_audio_frames
+            break
         return audio_latents, original_frames, padded_frames, latent_mel_bins
 
     @staticmethod
@@ -582,6 +610,14 @@ class LTXAudioRuntime(
             None if audio_attention_mask is None else _repeat_batch(audio_attention_mask, model_pass_count)
         )
         model_audio_coords = _repeat_batch(audio_coords, model_pass_count)
+        audio_static_conditioning = None
+        sequence_parallel_size = getattr(self.od_config.parallel_config, "sequence_parallel_size", 1) or 1
+        if sequence_parallel_size == 1 and hasattr(self.transformer, "prepare_static_conditioning"):
+            audio_static_conditioning = self.transformer.prepare_static_conditioning(
+                encoder_hidden_states,
+                model_audio_coords,
+                hidden_dtype=model_dtype,
+            )
         perturbations = build_perturbation_kwargs(
             local_plan,
             audio_latents.shape[0],
@@ -590,9 +626,9 @@ class LTXAudioRuntime(
         perturbation_mask = perturbations.get("audio_self_attention_mask")
         stg_blocks = perturbations.get("audio_self_attention_blocks")
         audio_graph_runner = getattr(self, "audio_graph_runner", None)
-        graph_stats_before = audio_graph_runner.stats_snapshot() if audio_graph_runner is not None else None
+        graph_request_scope = audio_graph_runner.request_scope() if audio_graph_runner is not None else nullcontext()
 
-        with self.progress_bar(total=len(timesteps)) as progress_bar:
+        with graph_request_scope, self.progress_bar(total=len(timesteps)) as progress_bar:
             for index, timestep in enumerate(timesteps):
                 if self.interrupt:
                     continue
@@ -609,6 +645,7 @@ class LTXAudioRuntime(
                     audio_attention_mask=model_audio_attention_mask,
                     perturbation_mask=perturbation_mask,
                     stg_blocks=stg_blocks,
+                    audio_static_conditioning=audio_static_conditioning,
                 )
                 if guidance_parallel_ready:
                     local_slots = velocity.chunk(model_pass_count)
@@ -638,8 +675,6 @@ class LTXAudioRuntime(
                 )
                 audio_latents = latent_ops.clear_audio_padding(audio_latents, original_num_frames)
                 progress_bar.update()
-        if audio_graph_runner is not None and graph_stats_before is not None:
-            audio_graph_runner.record_request_stats(graph_stats_before)
         return audio_latents
 
     def _run_audio_transformer(
@@ -653,6 +688,7 @@ class LTXAudioRuntime(
         audio_attention_mask: torch.Tensor | None,
         perturbation_mask: torch.Tensor | None,
         stg_blocks,
+        audio_static_conditioning: LTX2AudioStaticConditioning | None,
     ) -> torch.Tensor:
         """Run one normalized audio Transformer invocation eagerly or by graph."""
         audio_graph_runner = getattr(self, "audio_graph_runner", None)
@@ -666,6 +702,7 @@ class LTXAudioRuntime(
                 audio_attention_mask=audio_attention_mask,
                 perturbation_mask=perturbation_mask,
                 stg_blocks=stg_blocks,
+                audio_static_conditioning=audio_static_conditioning,
             )
 
         attention_kwargs = {}
@@ -674,6 +711,9 @@ class LTXAudioRuntime(
                 "audio_self_attention_mask": perturbation_mask,
                 "audio_self_attention_blocks": stg_blocks,
             }
+        transformer_kwargs = {}
+        if audio_static_conditioning is not None:
+            transformer_kwargs["audio_static_conditioning"] = audio_static_conditioning
         return self.transformer(
             audio_hidden_states=audio_hidden_states,
             audio_encoder_hidden_states=audio_encoder_hidden_states,
@@ -682,6 +722,7 @@ class LTXAudioRuntime(
             audio_coords=audio_coords,
             audio_attention_mask=audio_attention_mask,
             attention_kwargs=attention_kwargs,
+            **transformer_kwargs,
         )
 
     @torch.no_grad()

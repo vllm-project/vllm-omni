@@ -9,6 +9,7 @@ from torch import nn
 
 from vllm_omni.diffusion.models.ltx2 import ltx2_audio_transformer
 from vllm_omni.diffusion.models.ltx2.ltx2_audio_transformer import (
+    LTX2AudioStaticConditioning,
     LTX2AudioTransformerBlock,
     LTX2AudioTransformerModel,
 )
@@ -150,6 +151,64 @@ def test_ltx_audio_transformer_forward_has_audio_only_signature(monkeypatch):
     assert calls[0][1] == context.shape
     assert "audio_rotary_emb" in calls[0][2]
     assert torch.equal(prompt_timesteps[0], torch.full((2,), 500.0))
+
+
+def test_ltx_audio_static_conditioning_matches_raw_path_and_is_request_scoped(monkeypatch):
+    block_calls = []
+
+    class FakeBlock(nn.Module):
+        def __init__(self, **_kwargs):
+            super().__init__()
+
+        def forward(self, audio_hidden_states, audio_encoder_hidden_states, **kwargs):
+            block_calls.append(
+                (
+                    audio_encoder_hidden_states.detach().clone(),
+                    tuple(value.detach().clone() for value in kwargs["audio_rotary_emb"]),
+                )
+            )
+            return audio_hidden_states
+
+    monkeypatch.setattr(ltx2_audio_transformer, "LTX2AudioTransformerBlock", FakeBlock)
+    model = LTX2AudioTransformerModel(
+        audio_in_channels=4,
+        audio_out_channels=4,
+        audio_num_attention_heads=2,
+        audio_attention_head_dim=4,
+        audio_cross_attention_dim=8,
+        caption_channels=8,
+        num_layers=1,
+    )
+    projection_calls = []
+    rope_calls = []
+    model.audio_caption_projection.register_forward_hook(lambda *_args: projection_calls.append(True))
+    model.audio_rope.register_forward_hook(lambda *_args: rope_calls.append(True))
+    audio = torch.randn(2, 3, 4)
+    context = torch.randn(2, 5, 8)
+    coords = model.audio_rope.prepare_audio_coords(2, 3, audio.device)
+    timestep = torch.full((2, 3), 500.0)
+
+    raw_output = model(audio, context, timestep, audio_coords=coords)
+    prepared = model.prepare_static_conditioning(context, coords, hidden_dtype=audio.dtype)
+    calls_after_prepare = (len(projection_calls), len(rope_calls))
+    prepared_output = model(
+        audio,
+        context,
+        timestep,
+        audio_static_conditioning=prepared,
+    )
+
+    assert isinstance(prepared, LTX2AudioStaticConditioning)
+    assert (len(projection_calls), len(rope_calls)) == calls_after_prepare == (2, 2)
+    assert not hasattr(model, "_audio_static_conditioning")
+    torch.testing.assert_close(raw_output, prepared_output, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(block_calls[0][0], block_calls[1][0], rtol=0.0, atol=0.0)
+    for raw_rotary, prepared_rotary in zip(block_calls[0][1], block_calls[1][1], strict=True):
+        torch.testing.assert_close(raw_rotary, prepared_rotary, rtol=0.0, atol=0.0)
+
+    other = model.prepare_static_conditioning(context + 1, coords, hidden_dtype=audio.dtype)
+    assert other is not prepared
+    assert not torch.equal(other.encoder_hidden_states, prepared.encoder_hidden_states)
 
 
 def test_ltx_audio_weight_loader_ignores_video_weights_and_loads_audio_weights(monkeypatch):

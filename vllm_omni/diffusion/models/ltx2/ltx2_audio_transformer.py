@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -29,6 +30,14 @@ from .ltx2_transformer import (
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+
+@dataclass(frozen=True)
+class LTX2AudioStaticConditioning:
+    """Immutable Transformer inputs prepared once for one audio request."""
+
+    encoder_hidden_states: torch.Tensor
+    rotary_emb: tuple[torch.Tensor, torch.Tensor]
 
 
 class LTX2AudioTransformerBlock(nn.Module):
@@ -326,6 +335,32 @@ class LTX2AudioTransformerModel(nn.Module):
     def disable_gradient_checkpointing(self) -> None:
         self.gradient_checkpointing = False
 
+    def prepare_static_conditioning(
+        self,
+        audio_encoder_hidden_states: torch.Tensor,
+        audio_coords: torch.Tensor,
+        *,
+        hidden_dtype: torch.dtype,
+    ) -> LTX2AudioStaticConditioning:
+        """Project prompt context and build RoPE once for one request."""
+        batch_size = audio_encoder_hidden_states.shape[0]
+        if hasattr(self, "audio_caption_projection"):
+            audio_encoder_hidden_states = self.audio_caption_projection(audio_encoder_hidden_states)
+            audio_encoder_hidden_states = audio_encoder_hidden_states.view(
+                batch_size,
+                -1,
+                self.audio_proj_in.out_features,
+            )
+        audio_rotary_emb = self.audio_rope(
+            audio_coords,
+            device=audio_encoder_hidden_states.device,
+            out_dtype=hidden_dtype,
+        )
+        return LTX2AudioStaticConditioning(
+            encoder_hidden_states=audio_encoder_hidden_states,
+            rotary_emb=audio_rotary_emb,
+        )
+
     def forward(
         self,
         audio_hidden_states: torch.Tensor,
@@ -337,6 +372,7 @@ class LTX2AudioTransformerModel(nn.Module):
         audio_attention_mask: torch.Tensor | None = None,
         audio_num_frames: int | None = None,
         audio_coords: torch.Tensor | None = None,
+        audio_static_conditioning: LTX2AudioStaticConditioning | None = None,
         attention_kwargs: dict[str, Any] | None = None,
         return_dict: bool = False,
     ) -> torch.Tensor:
@@ -349,19 +385,22 @@ class LTX2AudioTransformerModel(nn.Module):
             audio_encoder_attention_mask = audio_encoder_attention_mask.unsqueeze(1)
 
         batch_size = audio_hidden_states.shape[0]
-        if audio_coords is None:
-            if audio_num_frames is None:
-                raise ValueError("`audio_num_frames` is required when `audio_coords` is not provided.")
-            audio_coords = self.audio_rope.prepare_audio_coords(
-                batch_size,
-                audio_num_frames,
-                audio_hidden_states.device,
+        if audio_static_conditioning is None:
+            if audio_coords is None:
+                if audio_num_frames is None:
+                    raise ValueError("`audio_num_frames` is required when `audio_coords` is not provided.")
+                audio_coords = self.audio_rope.prepare_audio_coords(
+                    batch_size,
+                    audio_num_frames,
+                    audio_hidden_states.device,
+                )
+            audio_static_conditioning = self.prepare_static_conditioning(
+                audio_encoder_hidden_states,
+                audio_coords,
+                hidden_dtype=audio_hidden_states.dtype,
             )
-        audio_rotary_emb = self.audio_rope(
-            audio_coords,
-            device=audio_hidden_states.device,
-            out_dtype=audio_hidden_states.dtype,
-        )
+        audio_encoder_hidden_states = audio_static_conditioning.encoder_hidden_states
+        audio_rotary_emb = audio_static_conditioning.rotary_emb
         audio_hidden_states = self.audio_proj_in(audio_hidden_states)
         temb_audio, embedded_timestep = self.audio_time_embed(
             audio_timestep.flatten(),
@@ -382,12 +421,6 @@ class LTX2AudioTransformerModel(nn.Module):
             temb_prompt_audio = temb_prompt_audio.view(batch_size, -1, temb_prompt_audio.shape[-1])
         else:
             temb_prompt_audio = None
-        if hasattr(self, "audio_caption_projection"):
-            audio_encoder_hidden_states = self.audio_caption_projection(audio_encoder_hidden_states)
-            audio_encoder_hidden_states = audio_encoder_hidden_states.view(
-                batch_size, -1, audio_hidden_states.shape[-1]
-            )
-
         perturbation_kwargs = (attention_kwargs or {}).get("ltx_perturbation_kwargs", {})
         for index, block in enumerate(self.transformer_blocks):
             perturbation_mask = perturbation_kwargs.get("audio_self_attention_mask")
