@@ -80,9 +80,6 @@
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "H100": {
-            "mean_e2el_ms": [
-              4556.4347
-            ],
             "mean_audio_rtf": [
               0.138
             ]
@@ -116,9 +113,6 @@
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "H100": {
-            "mean_e2el_ms": [
-              4768.0972
-            ],
             "mean_audio_rtf": [
               0.1609
             ]
@@ -154,9 +148,6 @@
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "H100": {
-            "mean_e2el_ms": [
-              6395.3517
-            ],
             "mean_audio_rtf": [
               0.2048
             ]
