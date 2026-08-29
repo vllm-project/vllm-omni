@@ -300,8 +300,19 @@ class LTXAudioRuntime(
             errors.append("device must be CUDA")
         if od_config.dtype != torch.bfloat16:
             errors.append("dtype must be bfloat16")
-        if parallel.sequence_parallel_size != 1:
-            errors.append("sequence_parallel_size must be 1")
+        if parallel.sequence_parallel_size > 1:
+            ulysses_degree = getattr(parallel, "ulysses_degree", 1)
+            ring_degree = getattr(parallel, "ring_degree", 1)
+            allgather_degree = getattr(parallel, "allgather_degree", 1)
+            ulysses_mode = getattr(parallel, "ulysses_mode", "strict")
+            if (
+                ulysses_degree != parallel.sequence_parallel_size
+                or ring_degree != 1
+                or allgather_degree != 1
+            ):
+                errors.append("sequence parallelism must use pure Ulysses")
+            if ulysses_mode != "strict":
+                errors.append("sequence parallelism requires ulysses_mode='strict'")
         if od_config.enable_cpu_offload:
             errors.append("CPU offload is unsupported")
         if od_config.enable_layerwise_offload:

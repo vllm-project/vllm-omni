@@ -221,8 +221,30 @@ def test_ltx2_audio_graph_release_is_model_local_and_keeps_runner():
     [
         ({"dtype": torch.float16}, "dtype must be bfloat16"),
         (
-            {"parallel_config": SimpleNamespace(tensor_parallel_size=1, sequence_parallel_size=2)},
-            "sequence_parallel_size must be 1",
+            {
+                "parallel_config": SimpleNamespace(
+                    tensor_parallel_size=1,
+                    sequence_parallel_size=2,
+                    ulysses_degree=1,
+                    ring_degree=2,
+                    allgather_degree=1,
+                    ulysses_mode="strict",
+                )
+            },
+            "pure Ulysses",
+        ),
+        (
+            {
+                "parallel_config": SimpleNamespace(
+                    tensor_parallel_size=1,
+                    sequence_parallel_size=2,
+                    ulysses_degree=2,
+                    ring_degree=1,
+                    allgather_degree=1,
+                    ulysses_mode="advanced_uaa",
+                )
+            },
+            "ulysses_mode='strict'",
         ),
         ({"enable_cpu_offload": True}, "CPU offload is unsupported"),
         ({"enable_layerwise_offload": True}, "layerwise offload is unsupported"),
@@ -246,6 +268,21 @@ def test_ltx2_audio_graph_rejects_non_cuda_device():
 def test_ltx2_audio_graph_accepts_tensor_parallelism():
     pipeline = _make_ltx2_graph_pipeline(
         parallel_config=SimpleNamespace(tensor_parallel_size=2, sequence_parallel_size=1)
+    )
+
+    LTXAudioRuntime._validate_audio_cuda_graph_support(pipeline.od_config, pipeline.device)
+
+
+def test_ltx2_audio_graph_accepts_strict_ulysses_sequence_parallelism():
+    pipeline = _make_ltx2_graph_pipeline(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            sequence_parallel_size=2,
+            ulysses_degree=2,
+            ring_degree=1,
+            allgather_degree=1,
+            ulysses_mode="strict",
+        )
     )
 
     LTXAudioRuntime._validate_audio_cuda_graph_support(pipeline.od_config, pipeline.device)
