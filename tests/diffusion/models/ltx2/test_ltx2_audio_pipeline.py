@@ -242,6 +242,39 @@ def test_ltx_t2a_decode_uses_only_audio_vae_and_vocoder():
     assert not hasattr(pipe, "video_processor")
 
 
+def test_ltx_t2a_decode_runs_bwe_vocoder_in_fp32_and_restores_dtype():
+    class AudioVAE:
+        dtype = torch.bfloat16
+        latents_mean = torch.tensor(0.0)
+        latents_std = torch.tensor(1.0)
+
+        def decode(self, latents, return_dict=False):
+            assert not return_dict
+            return (latents,)
+
+    class BWEVocoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bwe_generator = torch.nn.Identity()
+            self.weight = torch.nn.Parameter(torch.ones((), dtype=torch.bfloat16))
+            self.input_dtype = None
+
+        def forward(self, mel):
+            self.input_dtype = mel.dtype
+            return mel.float() * self.weight.float()
+
+    pipe = object.__new__(LTXAudioRuntime)
+    torch.nn.Module.__init__(pipe)
+    pipe.audio_vae = AudioVAE()
+    pipe.vocoder = BWEVocoder()
+    packed = torch.arange(16, dtype=torch.bfloat16).reshape(1, 2, 8)
+
+    waveform = pipe._decode_audio_latents(packed, original_num_frames=2, latent_mel_bins=4)
+
+    assert pipe.vocoder.input_dtype == torch.float32
+    assert waveform.dtype == torch.bfloat16
+
+
 def test_ltx_t2a_registry_and_postprocess_entries():
     from vllm_omni.diffusion.registry import (
         _DIFFUSION_MODELS,

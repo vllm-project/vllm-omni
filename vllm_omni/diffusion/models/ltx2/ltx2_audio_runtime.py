@@ -71,6 +71,7 @@ from .ltx2_request import (
     validate_ltx_checkpoint,
     validate_pipeline_request,
 )
+from .ltx2_runtime import _run_ltx_vocoder
 
 logger = init_logger(__name__)
 
@@ -728,7 +729,7 @@ class LTXAudioRuntime(
         )
         audio_latents = latent_ops.unpack_audio_latents(audio_latents, num_mel_bins=latent_mel_bins)
         generated_mel = self.audio_vae.decode(audio_latents.to(self.audio_vae.dtype), return_dict=False)[0]
-        return self.vocoder(generated_mel)
+        return _run_ltx_vocoder(self.vocoder, generated_mel)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return AutoWeightsLoader(self).load_weights(weights)
