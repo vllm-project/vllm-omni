@@ -195,3 +195,21 @@ steps:
             tests/e2e/ -m "slow and diffusion and H100 and distributed_cuda"
             --run-level "full_model"
         mirror_hardwares: h100_4
+
+  - group: "Stability Test"
+    depends_on: upload-weekly-pipeline
+    if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
+    steps:
+      - label: "Stability · MiniMax-H3 DLO USP4"
+        timeout_in_minutes: 1680
+        source_file_dependencies:
+          - tests/dfx/stability/scripts/test_stability_minimax_h3.py
+          - tests/dfx/stability/tests/test_minimax_h3.json
+          - tests/dfx/stability/helpers.py
+          - benchmarks/diffusion/diffusion_benchmark_serving.py
+          - benchmarks/diffusion/backends.py
+          - vllm_omni/diffusion/models/minimax_h3/
+          - vllm_omni/diffusion/offloader/
+        commands:
+          - pytest -s -v tests/dfx/stability/scripts/test_stability_minimax_h3.py -m "slow and diffusion and H100"
+        mirror_hardwares: h100_4

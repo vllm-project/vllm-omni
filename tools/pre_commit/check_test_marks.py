@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Run a pre-commit hook that fails if test files are modified or added
 that (probably) never run in the CI. For now, this means that every tests file
 needs to have a CI level marker (e.g., core_model, advanced_model, full_model,
@@ -36,8 +36,8 @@ HARDWARE_MARKERS = (
     "A3",
 )
 
-# Helpers from tests/helpers/mark.py that auto-apply hardware marks.
-HARDWARE_HELPERS = ("hardware_test", "hardware_marks")
+# Helpers that auto-apply hardware marks, including DFX JSON mark mapping.
+HARDWARE_HELPERS = ("hardware_test", "hardware_marks", "create_unique_server_pytest_params")
 
 # Match mark.X since we could also do `from pytest import mark`.
 # \b prevents matching prefixes (e.g., mark.slow vs mark.slow_test).
