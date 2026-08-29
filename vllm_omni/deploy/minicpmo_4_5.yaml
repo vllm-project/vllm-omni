@@ -4,7 +4,9 @@ async_chunk: true
 # Native full-duplex shares this profile with /v1/chat/completions. Every other
 # duplex_session knob keeps its runtime default.
 session_mode: duplex
-active_stream_window: 1
+# Keep the active window aligned with the session and stage capacities below.
+# A smaller window serializes first-packet generation for concurrent chat turns.
+active_stream_window: 4
 duplex_session:
   # Matches Stage 0/1 max_num_seqs below.
   max_sessions: 4

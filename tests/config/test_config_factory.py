@@ -1159,7 +1159,7 @@ class TestDeployConfigLoading:
         stages = merge_pipeline_deploy(pipeline, deploy)
 
         assert deploy.session_mode == "duplex"
-        assert deploy.active_stream_window == 1
+        assert deploy.active_stream_window == max_sessions
         assert deploy.duplex_session.max_sessions == max_sessions
         assert [stage.session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
         assert [stage.to_omegaconf().session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
