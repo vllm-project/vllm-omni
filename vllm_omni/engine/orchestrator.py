@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import time as _time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -65,6 +66,12 @@ from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+def cleanup_request_artifact_dirs(artifact_dirs: set[str] | list[str]) -> None:
+    for artifact_dir in artifact_dirs:
+        shutil.rmtree(artifact_dir, ignore_errors=True)
+
 
 # VLLM_OMNI_EVENT_DRIVEN_ORCH=1 switches the orchestration loop (and the
 # serving-side final-output drain in entrypoints/async_omni.py) from the legacy
@@ -220,6 +227,7 @@ class OrchestratorRequestState:
     duplex_stage_fences: dict[int, DuplexFence] = field(default_factory=dict)
     duplex_config_generation: int = -1
     running_counter_registered: bool = False
+    request_artifact_dirs: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -723,6 +731,7 @@ class Orchestrator:
             final_output_stage_ids=final_output_stage_ids,
             request_timestamp=float(msg.request_timestamp or _time.time()),
             mm_features=getattr(prompt, "mm_features", None),
+            request_artifact_dirs=set(msg.request_artifact_dirs or ()),
         )
         self.request_states[request_id] = req_state
         self._register_running_request(req_state)
@@ -1720,6 +1729,8 @@ class Orchestrator:
             for request_id in cleanup_ids:
                 self._pd_kv_params.pop(request_id, None)
                 req_state = self.request_states.pop(request_id, None)
+                if req_state is not None:
+                    cleanup_request_artifact_dirs(getattr(req_state, "request_artifact_dirs", ()))
                 if req_state is not None and req_state.running_counter_registered and self._running_counter is not None:
                     self._running_counter.decrement()
                     req_state.running_counter_registered = False
@@ -2627,13 +2638,28 @@ class Orchestrator:
                 req_state.prompt,
                 streaming_context=req_state.streaming,
             )
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "[Orchestrator] req=%s process_engine_inputs FAILED for stage-%s",
                 req_id,
                 next_logical,
             )
-            raise
+            if not self._is_duplex_session_request(req_state):
+                raise
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    request_id=req_id,
+                    stage_id=next_logical,
+                    error=f"Stage-{next_logical} input processor failed: {type(exc).__name__}: {exc}",
+                    error_type=type(exc).__name__,
+                )
+            )
+            await self._cleanup_request_ids(
+                [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                abort=True,
+                close_duplex_sessions=True,
+            )
+            return
         finally:
             req_state.streaming.source_token_decoder = previous_decoder
 

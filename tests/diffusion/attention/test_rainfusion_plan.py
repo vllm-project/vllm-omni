@@ -11,13 +11,16 @@ to the always-kept prefix segment before generating the block mask.
 """
 
 import dataclasses
+import sys
+import types
 
 import pytest
 import torch
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout, VideoTokenSpan
 from vllm_omni.diffusion.attention.backends.rainfusion_attn import (
     _BLOCK_SIZE,
+    RainFusionAttentionBackend,
     RainFusionAttentionImpl,
     RainFusionPlan,
 )
@@ -95,6 +98,62 @@ def test_video_segment_must_be_the_tail_of_packed_document_zero():
     metadata = make_metadata(ALIGNED_GRID, max_seqlen_q=PREFIX_ROWS + 59520 + 128)
 
     assert make_impl()._resolve_plan(metadata) is None
+
+
+def test_ref2va_multi_video_spans_resolve():
+    layout = VideoTokenLayout(
+        used_len=12000,
+        video_spans=(
+            VideoTokenSpan(start=128, latent_grid=(4, 16, 64), role="reference"),
+            VideoTokenSpan(start=5000, latent_grid=(4, 16, 64), role="target"),
+        ),
+    )
+    plan = make_impl()._resolve_plan(AttentionMetadata(extra={"max_seqlen_q": 12000}, video_layout=layout))
+
+    assert plan is not None
+    assert plan.used_len == 12000
+    assert plan.video_spans == [
+        {"start": 128, "latent_shape": [4, 16, 64]},
+        {"start": 5000, "latent_shape": [4, 16, 64]},
+    ]
+
+
+def test_invalid_ref2va_video_spans_fall_back_to_dense():
+    layout = VideoTokenLayout(
+        used_len=12000,
+        video_spans=(
+            VideoTokenSpan(start=128, latent_grid=(4, 16, 64), role="reference"),
+            VideoTokenSpan(start=4000, latent_grid=(4, 16, 64), role="target"),
+        ),
+    )
+    assert make_impl()._resolve_plan(AttentionMetadata(extra={"max_seqlen_q": 12000}, video_layout=layout)) is None
+
+
+def test_validate_available_rejects_legacy_mindiesd(monkeypatch):
+    mindiesd = types.ModuleType("mindiesd")
+
+    def sparse_attention(query, key, value, **kwargs):
+        return query
+
+    mindiesd.sparse_attention = sparse_attention
+    monkeypatch.setitem(sys.modules, "mindiesd", mindiesd)
+    monkeypatch.setattr("importlib.util.find_spec", lambda _: object())
+
+    with pytest.raises(ValueError, match="video_spans"):
+        RainFusionAttentionBackend.validate_available()
+
+
+def test_validate_available_accepts_new_mindiesd(monkeypatch):
+    mindiesd = types.ModuleType("mindiesd")
+
+    def sparse_attention(query, key, value, *, video_spans=None, **kwargs):
+        return query
+
+    mindiesd.sparse_attention = sparse_attention
+    monkeypatch.setitem(sys.modules, "mindiesd", mindiesd)
+    monkeypatch.setattr("importlib.util.find_spec", lambda _: object())
+
+    RainFusionAttentionBackend.validate_available()
 
 
 @pytest.mark.parametrize("grid", [(4, 24, 40), (1, 24, 40)])

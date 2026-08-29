@@ -540,6 +540,8 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
         if _should_enable_profiler_endpoints(stage_configs):
             logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
+            _remove_route_from_app(app, "/start_profile", frozenset({"POST"}))
+            _remove_route_from_app(app, "/stop_profile", frozenset({"POST"}))
             app.include_router(profiler_router)
 
         vllm_config = await _get_vllm_config(engine_client)
@@ -823,6 +825,8 @@ async def omni_init_app_state(
             diffusion_engine=engine_client,
             model_name=model_name,
             stage_configs=diffusion_stage_configs,
+            allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
+            allowed_media_domains=getattr(args, "allowed_media_domains", None),
         )
         state.openai_serving_duplex = None
         state.openai_streaming_speech = None

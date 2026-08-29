@@ -46,6 +46,7 @@ from vllm_omni.config.stage_config import (
     _select_processor_funcs,
     build_stage_runtime_overrides,
     load_deploy_config,
+    normalize_pipeline_cli_overrides,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 
@@ -730,6 +731,7 @@ class _DiffusionConfigProjection:
         default_factory=lambda: {
             "transformer": True,
             "vae": True,
+            "text_encoder": True,
         }
     )
     override_transformer_cls_name: str | None = None
@@ -1374,6 +1376,10 @@ class BaseVllmOmniStageConfig:
         return self.stage_pipeline_config.prompt_expand_func
 
     @property
+    def prompt_transform_func(self) -> str | None:
+        return self.stage_pipeline_config.prompt_transform_func
+
+    @property
     def cfg_kv_collect_func(self) -> str | None:
         return self.stage_pipeline_config.cfg_kv_collect_func
 
@@ -1836,6 +1842,7 @@ class VllmOmniConfig:
         """Create a structured config from a resolved pipeline and deploy YAML."""
         if cli_overrides is None:
             cli_overrides = {}
+        cli_overrides = normalize_pipeline_cli_overrides(pipeline_cfg, cli_overrides)
 
         deploy, loaded_deploy_config_path = _get_deploy_config(
             pipeline_cfg,

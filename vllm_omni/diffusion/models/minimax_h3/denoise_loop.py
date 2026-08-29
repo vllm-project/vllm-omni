@@ -14,7 +14,7 @@ from typing import Any
 
 import torch
 
-from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout
+from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout, VideoTokenSpan
 from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_step_idx,
     set_forward_context_denoise_timestep,
@@ -119,11 +119,23 @@ class MiniMaxH3DenoiseBranch:
         }
         # Where the video segment sits in the packed sequence. Resolved to plain
         # ints here so the attention layers never sync on it per step.
-        grid = packed["latent_grid"].tolist()
-        self.static_kwargs["video_token_layout"] = VideoTokenLayout(
-            prefix_len=int(packed["video_row_start"]),
-            latent_grid=(int(grid[0]), int(grid[1]), int(grid[2])),
-        )
+        raw_spans = packed.get("video_spans")
+        if raw_spans:
+            spans = tuple(
+                VideoTokenSpan(
+                    start=int(span["start"]),
+                    latent_grid=tuple(int(dim) for dim in span["latent_grid"]),
+                    role=str(span["role"]),
+                )
+                for span in raw_spans
+            )
+            self.static_kwargs["video_token_layout"] = VideoTokenLayout(used_len=int(cu[1]), video_spans=spans)
+        else:
+            grid = packed["latent_grid"].tolist()
+            self.static_kwargs["video_token_layout"] = VideoTokenLayout(
+                prefix_len=int(packed["video_row_start"]),
+                latent_grid=(int(grid[0]), int(grid[1]), int(grid[2])),
+            )
 
     def forward_kwargs(
         self,
