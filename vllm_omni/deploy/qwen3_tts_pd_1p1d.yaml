@@ -47,7 +47,7 @@ stages:
         VLLM_MOONCAKE_BOOTSTRAP_PORT: 25201
         VLLM_HOST_IP: "127.0.0.1"
     engine_args:
-      max_num_seqs: 256
+      max_num_seqs: 64
       model_stage: qwen3_tts
       model_arch: Qwen3TTSTalkerForConditionalGeneration
       hf_overrides:
@@ -61,8 +61,8 @@ stages:
       enable_prefix_caching: false   # PD 与 prefix caching 互斥
       engine_output_type: latent
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 4096
-      max_model_len: 4096
+      max_num_batched_tokens: 32768
+      max_model_len: 1024
       tensor_parallel_size: 1
       kv_transfer_config:
         kv_connector: "MooncakeConnector"
@@ -79,7 +79,7 @@ stages:
       temperature: 0.9
       top_p: 1.0
       top_k: 50
-      max_tokens: 4096
+      max_tokens: 1024
       min_tokens: 2
       detokenize: true
       repetition_penalty: 1.05
@@ -102,7 +102,7 @@ stages:
         VLLM_MOONCAKE_BOOTSTRAP_PORT: 25202
         VLLM_HOST_IP: "127.0.0.1"
     engine_args:
-      max_num_seqs: 256
+      max_num_seqs: 64
       model_stage: qwen3_tts
       model_arch: Qwen3TTSTalkerForConditionalGeneration
       hf_overrides:
@@ -118,8 +118,8 @@ stages:
       enable_prefix_caching: false
       engine_output_type: latent
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 4096
-      max_model_len: 4096
+      max_num_batched_tokens: 32768
+      max_model_len: 1024
       tensor_parallel_size: 1
       # Talker decode → Code2Wav async-chunk feeder：每生成一段 audio_codes
       # 就推到 SharedMemoryConnector，由 stage 2 的 code2wav 增量消费。
@@ -149,11 +149,12 @@ stages:
           codec_left_context_frames: 72
           initial_codec_chunk_frames: 1
           decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
+          decode_batch_max_size: 4
     default_sampling_params:
       temperature: 0.9
       top_p: 1.0
       top_k: 50
-      max_tokens: 4096
+      max_tokens: 1024
       min_tokens: 2
       detokenize: true
       repetition_penalty: 1.05
@@ -172,7 +173,7 @@ stages:
     runtime:
       devices: "0"
     engine_args:
-      max_num_seqs: 128
+      max_num_seqs: 64
       model_stage: code2wav
       model_arch: Qwen3TTSCode2Wav
       worker_type: generation
@@ -205,6 +206,7 @@ stages:
           codec_left_context_frames: 72
           initial_codec_chunk_frames: 1
           decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
+          decode_batch_max_size: 4
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
