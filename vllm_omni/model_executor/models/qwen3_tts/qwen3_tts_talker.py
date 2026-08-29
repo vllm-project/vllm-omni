@@ -1351,4 +1351,3 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         summed = (last_id_hidden.squeeze(1) + gathered.sum(dim=1)).unsqueeze(1)
         inputs_embeds_out = (summed + text_step).reshape(bsz, -1)
         return inputs_embeds_out, audio_codes.to(dtype=torch.long)
-

@@ -235,4 +235,3 @@ done
 echo "    !! /health timeout, last 80 log lines:"
 tail -80 "$LOG"
 exit 1
-

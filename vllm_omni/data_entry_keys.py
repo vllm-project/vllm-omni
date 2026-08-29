@@ -452,4 +452,3 @@ def deserialize_payload(
             flat[key] = entry.scalar_data
 
     return unflatten_payload(flat)  # type: ignore[return-value]
-

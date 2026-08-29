@@ -2425,4 +2425,3 @@ class OmniConnectorModelRunnerMixin:
     ) -> str:
         """Build connector key that includes rank info for KV transfers."""
         return f"{req_id}_{from_stage}_{chunk_id}_{from_rank}_{to_rank}"
-

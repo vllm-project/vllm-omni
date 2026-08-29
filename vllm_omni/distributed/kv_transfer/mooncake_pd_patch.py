@@ -800,5 +800,3 @@ def apply_mooncake_connector_patch() -> None:
     _patch_mooncake_scheduler(mc_module)
     _patch_mooncake_worker(mc_module)
     _patched = True
-
-
