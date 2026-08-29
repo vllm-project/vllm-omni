@@ -23,6 +23,8 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Literal, cast
 
 import janus
+import torch
+from omegaconf import OmegaConf
 from vllm import envs as vllm_envs
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
@@ -233,6 +235,7 @@ class AsyncOmniEngine:
 
         self.num_stages = len(self.stage_configs)
         stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
+        self._pd_pair = PDDisaggregationMixin.detect_pd_separation_from_stage_configs(self.stage_configs)
         self.async_chunk = bool(getattr(stage0_args, "async_chunk", False))
         self.stage_pools: list[StagePool] = []
         self.stage_clients: list[StageClient] = []  # logical-stage view for external readers
@@ -690,6 +693,10 @@ class AsyncOmniEngine:
                 f"Missing sampling params for stage 0. Got {len(effective_sampling_params_list)} stage params."
             )
         params = effective_sampling_params_list[0]
+        pd_pair = self._pd_pair
+        if pd_pair is not None and pd_pair[0] == 0:
+            params = PDDisaggregationMixin._prepare_prefill_sampling_params(request_id, params)
+            effective_sampling_params_list[0] = params
 
         # Keep the original prompt for downstream stages (they need the raw
         # dict, e.g. for multi_modal_data).
@@ -922,23 +929,13 @@ class AsyncOmniEngine:
         """Detect PD (Prefill-Decode) disaggregation config from stage_configs.
         Returns a dict with 'pd_pair' and 'bootstrap_addr', or None.
         """
-        pd_pair = PDDisaggregationMixin.detect_pd_separation_from_stage_configs(self.stage_configs)
+        pd_pair = self._pd_pair
         if pd_pair is None:
             return None
         prefill_idx, decode_idx = pd_pair
 
-        # Extract bootstrap address from prefill stage engine_args
-        bootstrap_addr: str | None = None
-        try:
-            prefill_cfg = self.stage_configs[prefill_idx]
-            ea = getattr(prefill_cfg, "engine_args", None)
-            kv_cfg = getattr(ea, "kv_transfer_config", None) if ea is not None else None
-            if kv_cfg is not None:
-                port = vllm_envs.VLLM_MOONCAKE_BOOTSTRAP_PORT
-                kv_ip = getattr(kv_cfg, "kv_ip", None) or "127.0.0.1"
-                bootstrap_addr = f"http://{kv_ip}:{port}"
-        except Exception as exc:
-            logger.warning("[AsyncOmniEngine] Could not extract PD bootstrap address: %s", exc)
+        prefill_cfg = self.stage_configs[prefill_idx]
+        bootstrap_addr = PDDisaggregationMixin.get_mooncake_bootstrap_addr(prefill_cfg)
 
         logger.info(
             "[AsyncOmniEngine] PD disaggregation detected: prefill=stage-%d, decode=stage-%d, bootstrap=%s",

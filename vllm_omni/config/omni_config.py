@@ -36,6 +36,7 @@ from vllm_omni.config.stage_config import (
     _STAGE_DEPLOY_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
+    PDRole,
     PipelineConfig,
     StageDeployConfig,
     StageExecutionType,
@@ -235,6 +236,7 @@ class _ParallelEngineOverrides(_ParallelConfigEngineOverrides, total=False):
 
 class _ConnectorEngineOverrides(TypedDict, total=False):
     omni_kv_config: dict[str, Any]
+    kv_transfer_config: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -512,6 +514,7 @@ class OmniStageConnectorConfig:
 
     async_chunk: bool = False
     omni_kv_config: dict[str, Any] | None = None
+    kv_transfer_config: dict[str, Any] | None = None
     stage_connector: dict[str, Any] = field(
         default_factory=lambda: {
             "name": "SharedMemoryConnector",
@@ -1375,6 +1378,10 @@ class BaseVllmOmniStageConfig:
         return self.stage_pipeline_config.model_stage
 
     @property
+    def pd_role(self) -> PDRole | None:
+        return self.stage_pipeline_config.pd_role
+
+    @property
     def input_sources(self) -> list[int]:
         return list(self.stage_pipeline_config.input_sources)
 
@@ -1797,6 +1804,7 @@ def _build_connector_config(
     return cast(Any, OmniStageConnectorConfig)(
         async_chunk=bool(deploy.async_chunk),
         omni_kv_config=_copy_value(engine.get("omni_kv_config")),
+        kv_transfer_config=_copy_value(engine.get("kv_transfer_config")),
         output_connectors=_copy_value(output_connectors) if output_connectors else None,
         input_connectors=_copy_value(input_connectors) if input_connectors else None,
     )

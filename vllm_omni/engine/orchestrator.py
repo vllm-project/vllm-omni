@@ -2381,11 +2381,16 @@ class Orchestrator:
         if sp.extra_args is None:
             sp.extra_args = {}
 
-        # Get KV params captured from the prefill output (must include remote_request_id).
+        # Get connector metadata captured from the prefill output.
         kv_prefill_params = self._pd_kv_params.pop(req_id, None)
-        if not kv_prefill_params or "remote_request_id" not in kv_prefill_params:
-            raise RuntimeError(
-                f"[Orchestrator][PD] Missing prefill kv_transfer_params.remote_request_id for req={req_id}"
+        if not kv_prefill_params:
+            raise RuntimeError(f"[Orchestrator][PD] Missing prefill kv_transfer_params for req={req_id}")
+        if "remote_request_id" not in kv_prefill_params:
+            logger.warning(
+                "[Orchestrator][PD] Prefill kv_transfer_params has no "
+                "remote_request_id for req=%s; forwarding connector metadata "
+                "without field validation",
+                req_id,
             )
 
         decode_kv_params: dict[str, Any] = {
@@ -2398,7 +2403,7 @@ class Orchestrator:
         if self._pd_prefill_engine_id:
             decode_kv_params["remote_engine_id"] = self._pd_prefill_engine_id
 
-        # Overlay params from prefill side (includes remote_request_id set by monkey patch).
+        # Preserve all metadata returned by the prefill-side connector.
         decode_kv_params.update(kv_prefill_params)
 
         # Ensure these flags are set correctly after any overlay.
