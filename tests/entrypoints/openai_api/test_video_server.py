@@ -95,12 +95,13 @@ class FakeAsyncOmni:
         yield MockVideoResult(videos)
 
 
-def test_raw_and_base64_encoders_receive_no_policy_config(mocker: MockerFixture):
+def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixture):
     engine = FakeAsyncOmni()
     handler = OmniOpenAIServingVideo.for_diffusion(
         engine,
         model_name="test-model",
     )
+    assert handler._video_frame_converter.max_workers == 8
     raw_encoder = mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
         return_value=b"encoded-video",
@@ -117,8 +118,9 @@ def test_raw_and_base64_encoders_receive_no_policy_config(mocker: MockerFixture)
 
     asyncio.run(_generate_both_response_types())
 
-    assert "encoding_config" not in raw_encoder.call_args.kwargs
-    assert "encoding_config" not in base64_encoder.call_args.kwargs
+    assert raw_encoder.call_args.kwargs["frame_converter"] is handler._video_frame_converter
+    assert base64_encoder.call_args.kwargs["frame_converter"] is handler._video_frame_converter
+    handler.shutdown()
 
 
 def test_resolve_diffusion_od_config_falls_back_to_attribute():
@@ -1231,8 +1233,9 @@ def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFi
         audio=None,
         audio_sample_rate=None,
         video_codec_options=None,
+        frame_converter=None,
     ):
-        del video, fps, audio, video_codec_options
+        del video, fps, audio, video_codec_options, frame_converter
         audio_sample_rates.append(audio_sample_rate)
         return b"fake-video"
 

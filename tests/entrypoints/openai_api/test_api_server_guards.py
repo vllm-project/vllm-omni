@@ -398,6 +398,12 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     async def fake_omni_init_app_state(engine_client, state, args):
         state.engine_client = engine_client
         state.initialized_by_omni = True
+        state.openai_serving_video = SimpleNamespace(
+            shutdown=lambda: captured.__setitem__("video_shutdown", True),
+        )
+        state.openai_serving_speech = SimpleNamespace(
+            shutdown=lambda: captured.__setitem__("speech_shutdown", True),
+        )
 
     async def fake_storage_start():
         captured["storage_started"] = True
@@ -433,6 +439,8 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     assert captured["supported_tasks"] == ("generate",)
     assert captured["storage_started"] is True
     assert captured["restrictions"] == {}
+    assert captured["video_shutdown"] is True
+    assert captured["speech_shutdown"] is True
     assert sock.closed is True
     assert served_app.state.initialized_by_omni is True
 
@@ -739,7 +747,11 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
     )
 
     state = State()
-    await api_server.omni_init_app_state(engine, state, _minimal_args())
+    await api_server.omni_init_app_state(
+        engine,
+        state,
+        _minimal_args(),
+    )
 
     _assert_app_state_snapshot(
         state,
@@ -748,6 +760,55 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
         must_be_none=_DIFFUSION_MUST_BE_NONE,
     )
     assert state.diffusion_engine is engine
+
+
+@pytest.mark.asyncio
+async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch) -> None:
+    stage = SimpleNamespace(engine_args={})
+    engine = _FakeEngineClient(stage_configs=[stage])
+    speech_kwargs = {}
+
+    def _for_diffusion_factory(label: str):
+        @classmethod
+        def _factory(cls, *args, **kwargs):
+            return _marker(label)
+
+        return _factory
+
+    @classmethod
+    def _speech_factory(cls, *args, **kwargs):
+        speech_kwargs.update(kwargs)
+        return _marker("speech")
+
+    monkeypatch.setattr(api_server, "get_stage_type", lambda _cfg: "diffusion")
+    monkeypatch.setattr(api_server.OmniOpenAIServingChat, "for_diffusion", _for_diffusion_factory("chat"))
+    monkeypatch.setattr(api_server.OmniOpenAIServingChatBatch, "for_diffusion", _for_diffusion_factory("chat_batch"))
+    monkeypatch.setattr(
+        api_server.OmniOpenAIServingAudioGenerate,
+        "for_diffusion",
+        _for_diffusion_factory("audio_generate"),
+    )
+    monkeypatch.setattr(api_server.OmniOpenAIServingVideo, "for_diffusion", _for_diffusion_factory("video"))
+    monkeypatch.setattr(api_server.OmniStreamingVideoOutputHandler, "__init__", lambda self, *a, **k: None)
+    monkeypatch.setattr(api_server.OmniOpenAIServingSpeech, "for_diffusion", _speech_factory)
+    monkeypatch.setattr(
+        api_server.ServingRealtimeRobotOpenPI,
+        "create_policy_server",
+        classmethod(lambda cls, *a, **k: _marker("openpi")),
+    )
+
+    state = State()
+    await api_server.omni_init_app_state(
+        engine,
+        state,
+        _minimal_args(
+            allowed_local_media_path="/allowed/media",
+            allowed_media_domains=["media.example.com"],
+        ),
+    )
+
+    assert speech_kwargs["allowed_local_media_path"] == "/allowed/media"
+    assert speech_kwargs["allowed_media_domains"] == ["media.example.com"]
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@
 """Unit tests for OpenAI-compatible video API encoding helpers."""
 
 import base64
+import threading
 from io import BytesIO
 
 import av
@@ -249,6 +250,95 @@ def test_channel_first_video_tensor_uses_direct_planar_mux(monkeypatch):
     assert options["fps"] == 12.0
 
 
+def test_planar_converter_serial_and_parallel_outputs_match():
+    frames = [np.full((2, 3, 3), fill_value=value / 10, dtype=np.float32) for value in (1, 4, 7)]
+
+    serial_converter = video_api_utils._PlanarFrameConverter(max_workers=1)
+    parallel_converter = video_api_utils._PlanarFrameConverter(max_workers=2)
+    try:
+        serial = [
+            frame.to_ndarray(format="rgb24") for frame in serial_converter.iter_frames(frames, np.dtype(np.float32))
+        ]
+        parallel = [
+            frame.to_ndarray(format="rgb24") for frame in parallel_converter.iter_frames(frames, np.dtype(np.float32))
+        ]
+    finally:
+        serial_converter.shutdown()
+        parallel_converter.shutdown()
+
+    np.testing.assert_array_equal(np.stack(serial), np.stack(parallel))
+
+
+def test_planar_converter_preserves_fifo_order_and_bounds_pending_futures(monkeypatch):
+    converter = video_api_utils._PlanarFrameConverter(max_workers=2)
+    started = threading.Event()
+    release = threading.Event()
+    four_submitted = threading.Event()
+    outstanding = 0
+    peak_outstanding = 0
+    lock = threading.Lock()
+    real_submit = converter._executor.submit
+
+    def fake_build(frame, _common_dtype):
+        started.set()
+        release.wait(timeout=2)
+        return int(frame[0, 0, 0])
+
+    def submit(*args, **kwargs):
+        nonlocal outstanding, peak_outstanding
+        with lock:
+            outstanding += 1
+            peak_outstanding = max(peak_outstanding, outstanding)
+            if peak_outstanding >= 4:
+                four_submitted.set()
+        future = real_submit(*args, **kwargs)
+
+        def done(_future):
+            nonlocal outstanding
+            with lock:
+                outstanding -= 1
+
+        future.add_done_callback(done)
+        return future
+
+    monkeypatch.setattr(converter, "_build_frame", fake_build)
+    monkeypatch.setattr(converter._executor, "submit", submit)
+    frames = [np.full((1, 1, 3), value, dtype=np.uint8) for value in range(8)]
+    result: list[int] = []
+    iterator = converter.iter_frames(frames, np.dtype(np.uint8))
+    consumer = threading.Thread(target=lambda: result.extend(iterator))
+    consumer.start()
+    try:
+        assert started.wait(timeout=2)
+        assert four_submitted.wait(timeout=2)
+        release.set()
+        consumer.join(timeout=2)
+        assert not consumer.is_alive()
+    finally:
+        release.set()
+        iterator.close()
+        converter.shutdown()
+
+    assert result == list(range(8))
+    assert peak_outstanding <= 4
+
+
+def test_planar_converter_reuses_executor_and_shutdowns_after_cancel():
+    converter = video_api_utils._PlanarFrameConverter(max_workers=2)
+    executor = converter._executor
+    frames = [np.zeros((2, 2, 3), dtype=np.uint8) for _ in range(4)]
+    try:
+        list(converter.iter_frames(frames, np.dtype(np.uint8)))
+        iterator = converter.iter_frames(frames, np.dtype(np.uint8))
+        next(iterator)
+        iterator.close()
+        assert converter._executor is executor
+    finally:
+        converter.shutdown()
+
+    assert executor._shutdown
+
+
 @pytest.mark.parametrize(
     ("video", "expected_path", "expected_reason", "expected_mux"),
     [
@@ -347,6 +437,35 @@ def test_video_only_does_not_log_default_audio_sample_rate(monkeypatch):
     assert log_messages == []
 
 
+def test_planar_mux_accepts_none_rate_and_defaults_audio_to_44100():
+    def make_frame():
+        return next(
+            video_api_utils._iter_planar_video_frames(
+                [np.zeros((2, 2, 3), dtype=np.uint8)],
+                np.dtype(np.uint8),
+            )
+        )
+
+    video_only = media_utils.mux_av_video_audio_bytes(
+        [make_frame()],
+        width=2,
+        height=2,
+        audio_sample_rate=None,
+    )
+    with av.open(BytesIO(video_only), mode="r", format="mp4") as container:
+        assert not container.streams.audio
+
+    with_audio = media_utils.mux_av_video_audio_bytes(
+        [make_frame()],
+        width=2,
+        height=2,
+        audio_waveform=np.zeros((1, 1024), dtype=np.float32),
+        audio_sample_rate=None,
+    )
+    with av.open(BytesIO(with_audio), mode="r", format="mp4") as container:
+        assert container.streams.audio[0].rate == 44100
+
+
 def test_interleaved_video_uses_legacy_fallback_automatically(monkeypatch):
     calls = []
     path_logs = []
@@ -383,6 +502,7 @@ def test_interleaved_video_uses_legacy_fallback_automatically(monkeypatch):
     assert "reason=non_contiguous_rgb_planes" in path_logs[0]
     assert "audio_present=False" in path_logs[0]
     assert "effective_audio_sample_rate=None" in path_logs[0]
+    assert "effective_frame_conversion_workers=0" in path_logs[0]
     assert len(coerce_calls) == 1
 
 

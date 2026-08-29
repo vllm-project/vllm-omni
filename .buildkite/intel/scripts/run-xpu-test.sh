@@ -5,7 +5,12 @@ set -ex
 
 omni_source_dir=$(git rev-parse --show-toplevel)
 
-base_image_name="xpu/vllm-omni-ci-base:${VLLM_VERSION:?VLLM_VERSION must be set}"
+: "${VLLM_VERSION:?VLLM_VERSION must be set}"
+# Official upstream XPU image. It is published from vllm's own
+# docker/Dockerfile.xpu, which is exactly what build_vllm_base() clones and
+# builds below, so pulling it is equivalent to building the fallback base.
+upstream_base_image="vllm/vllm-openai-xpu:${VLLM_VERSION}"
+local_base_image="xpu/vllm-omni-ci-base:${VLLM_VERSION}"
 image_name="xpu/vllm-omni-ci:${BUILDKITE_COMMIT:?BUILDKITE_COMMIT must be set}"
 container_name="xpu_${BUILDKITE_COMMIT}_$(
     tr -dc A-Za-z0-9 </dev/urandom | head -c 10
@@ -49,9 +54,36 @@ build_vllm_base() (
         "${vllm_source_dir}"
 )
 
-if [ -z "$(docker images -q "${base_image_name}")" ]; then
-    build_vllm_base
-fi
+# Resolve the vLLM base image, in priority order:
+#   1. the published upstream image for VLLM_VERSION, pulled fresh (so moving
+#      tags like nightly are refreshed rather than served stale from disk);
+#   2. a local copy of that same image, when the registry is unreachable;
+#   3. VLLM_BASE, if that image is already on disk;
+#   4. otherwise build VLLM_BASE from the matching vLLM source tag (~30min).
+# VLLM_BASE names the fallback base and defaults to ${local_base_image}; set it
+# to reuse or produce a base under a different tag.
+resolve_vllm_base() {
+    if docker pull "${upstream_base_image}"; then
+        base_image_name="${upstream_base_image}"
+        return
+    fi
+
+    # Registry unreachable, but a previous run may have left the image behind.
+    if [ -n "$(docker images -q "${upstream_base_image}")" ]; then
+        echo "WARNING: could not pull ${upstream_base_image}; using local copy" >&2
+        base_image_name="${upstream_base_image}"
+        return
+    fi
+
+    echo "WARNING: ${upstream_base_image} unavailable remotely and locally" >&2
+    base_image_name="${VLLM_BASE:-${local_base_image}}"
+    if [ -z "$(docker images -q "${base_image_name}")" ]; then
+        echo "WARNING: building ${base_image_name} from vLLM ${VLLM_VERSION} source" >&2
+        build_vllm_base
+    fi
+}
+
+resolve_vllm_base
 
 # Try building the docker image
 docker_build "${image_name}" --build-arg "VLLM_BASE=${base_image_name}" --build-arg "VLLM_VERSION=${VLLM_VERSION}"
