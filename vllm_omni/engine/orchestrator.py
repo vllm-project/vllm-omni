@@ -268,10 +268,11 @@ def _with_qwen3_tts_pd_decode_state(prompt: dict[str, Any], state: dict[str, Any
     prompt_token_ids = merged_prompt.get("prompt_token_ids")
     if not isinstance(prompt_token_ids, (list, tuple)):
         raise TypeError("Qwen3-TTS PD decode requires prompt_token_ids")
-    # Keep D's sequence length equal to P's transferred KV prefix. Mooncake
-    # requires matching block counts and the first local decode position is
-    # filled with `resume_token_id` by GPUModelRunner after the prefix loads.
-    merged_prompt["prompt_token_ids"] = list(prompt_token_ids)
+    # vLLM's remote-prefill contract leaves the final prompt token for D to
+    # compute locally. Append P's sampled y0 as that final token: Mooncake
+    # loads the original prompt KV, then D computes y0 and samples y1 without
+    # emitting a duplicate sample from the prompt's last token.
+    merged_prompt["prompt_token_ids"] = [*prompt_token_ids, resume_token_id]
 
     additional_information = merged_prompt.get("additional_information")
     if additional_information is None:
@@ -293,9 +294,8 @@ def _with_qwen3_tts_pd_decode_state(prompt: dict[str, Any], state: dict[str, Any
             raise TypeError(f"Qwen3-TTS PD decode additional_information.{category} must be a dictionary")
         target.update(values)
         additional_information[category] = target
-    # D receives P's KV only through the original prompt. Its runner injects
-    # this sampled codec token into the first local decode position after the
-    # remote prefix has loaded.
+    # Keep y0 in runtime metadata as well: model preprocessing uses it to
+    # recognize the appended final prompt row as a decode/MTP step.
     meta = additional_information.setdefault("meta", {})
     if not isinstance(meta, dict):
         raise TypeError("Qwen3-TTS PD decode additional_information.meta must be a dictionary")
@@ -2654,6 +2654,13 @@ class Orchestrator:
         decode engine where to pull the KV cache from (prefill engine's bootstrap addr).
         """
         sp = sp.clone()
+        if getattr(sp, "max_tokens", None) is not None:
+            remaining_max_tokens = int(sp.max_tokens) - 1
+            if remaining_max_tokens <= 0:
+                raise ValueError("PD decode requires at least one token after P-side y0")
+            sp.max_tokens = remaining_max_tokens
+        if hasattr(sp, "min_tokens"):
+            sp.min_tokens = max(0, int(getattr(sp, "min_tokens", 0) or 0) - 1)
         if main_sampler_seed is not None:
             sp.seed = int(main_sampler_seed)
         if sp.extra_args is None:
@@ -2662,7 +2669,7 @@ class Orchestrator:
             # P only samples layer-0 token y0; D performs the first residual
             # codebook (Talker MTP) sample. Forward the request seed so D can
             # create its request-local MTP generator from the initial state.
-            sp.extra_args["tts_local_seed"] = int(main_sampler_seed)
+            sp.extra_args.setdefault("tts_local_seed", int(main_sampler_seed))
 
         # Get KV params captured from the prefill output (must include remote_request_id).
         kv_prefill_params = self._pd_kv_params.pop(req_id, None)

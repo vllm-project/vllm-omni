@@ -275,7 +275,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if self._uses_native_pd_kv_transfer():
                     self.transfer_triggered_requests.add(request.request_id)
                     self._pd_prefill_submit_ready_requests.add(request.request_id)
-                    if stop_decode_on_trigger:
+                    if stop_decode_on_trigger and not request.is_finished():
                         request.status = RequestStatus.FINISHED_STOPPED
                     return bool(stop_decode_on_trigger)
                 self._commit_kv_transfer_trigger(
@@ -294,7 +294,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if self._uses_native_pd_kv_transfer():
                     self.transfer_triggered_requests.add(request.request_id)
                     self._pd_prefill_submit_ready_requests.add(request.request_id)
-                    if stop_decode_on_trigger:
+                    if stop_decode_on_trigger and not request.is_finished():
                         request.status = RequestStatus.FINISHED_STOPPED
                     return bool(stop_decode_on_trigger)
                 self._commit_kv_transfer_trigger(

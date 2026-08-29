@@ -1137,10 +1137,30 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # so the resume token never reached the worker and decode silently
         # regenerated the whole utterance instead of continuing from prefill.
         if requests is not None:
+            if self._is_pd_decode_consumer:
+                self.consume_new_request_additional_information(scheduler_output, requests)
             self.attach_cached_additional_information(scheduler_output, requests)
         if not self.receives_chunks:
             return
         self._clear_chunk_ready(scheduler_output)
+
+    def consume_new_request_additional_information(self, scheduler_output: Any, requests: dict[str, Request]) -> None:
+        """Drop a handoff payload after its scheduled-new copy is emitted."""
+        from vllm_omni.engine.serialization import deserialize_additional_information
+
+        for new_req in getattr(scheduler_output, "scheduled_new_reqs", ()):
+            payload = getattr(new_req, "additional_information", None)
+            info = deserialize_additional_information(payload)
+            meta = info.get("meta") if isinstance(info, dict) else None
+            if not isinstance(meta, dict) or "pd_resume_token_id" not in meta:
+                continue
+            request = requests.get(new_req.req_id)
+            if request is not None:
+                # The worker owns the mutable runtime copy after this request
+                # data is delivered. Retaining the frozen input on the core
+                # request would send it again on the first cached step and
+                # overwrite state advanced by the first model invocation.
+                request.additional_information = None
 
     def attach_cached_additional_information(self, scheduler_output: Any, requests: dict[str, Request]) -> None:
         cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)

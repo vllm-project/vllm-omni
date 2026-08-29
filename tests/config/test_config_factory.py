@@ -1586,6 +1586,23 @@ stages:
         assert s0.yaml_engine_args["engine_output_type"] == "latent"
         assert s0.yaml_extras["default_sampling_params"]["detokenize"] is True
 
+    def test_qwen3_tts_pd_registry_config_is_detected(self):
+        """PD flags carried through engine_args remain visible to routing."""
+        from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
+
+        deploy = load_deploy_config(_DEPLOY_DIR / "qwen3_tts_pd_1p1d.yaml")
+        pipeline = OMNI_PIPELINES[deploy.pipeline]
+        stage_configs = [stage.to_omegaconf() for stage in merge_pipeline_deploy(pipeline, deploy)]
+
+        topology = PDDisaggregationMixin.detect_pd_separation_topology(stage_configs)
+
+        assert topology == {
+            "prefill_ids": [0],
+            "decode_id": 1,
+            "decode_ids": [1],
+            "decode_to_prefill": {1: [0]},
+        }
+
     def test_merge_pipeline_deploy_preserves_num_replicas(self, tmp_path):
         pipeline = resolve_pipeline_config(
             "qwen3_omni_moe",

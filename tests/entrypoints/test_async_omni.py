@@ -22,6 +22,40 @@ OMNI_MODEL = "Qwen/Qwen2.5-Omni-7B"
 OMNI_STAGE_CONFIG = get_deploy_config_path("ci/qwen2_5_omni_thinker_only.yaml")
 
 
+@pytest.mark.cpu
+@pytest.mark.parametrize(("min_tokens", "expected_stop_ids"), [(0, []), (2, [7])])
+def test_prepare_pd_prefill_sampling_params_preserves_masked_y0_stops(min_tokens, expected_stop_ids):
+    omni = object.__new__(AsyncOmni)
+    source = SamplingParams(
+        max_tokens=8,
+        min_tokens=min_tokens,
+        stop=["STOP"],
+        stop_token_ids=[7],
+        extra_args={"keep": "value"},
+    )
+
+    result = omni._prepare_prefill_sampling_params("req-1", source)
+
+    assert result.max_tokens == 1
+    assert result.min_tokens == (1 if min_tokens else 0)
+    assert result.stop == []
+    assert result.stop_token_ids == expected_stop_ids
+    assert result.extra_args["keep"] == "value"
+    assert result.extra_args["kv_transfer_params"]["transfer_id"] == "xfer-req-1"
+    assert source.max_tokens == 8
+    assert source.min_tokens == min_tokens
+    assert source.stop == ["STOP"]
+    assert source.stop_token_ids == [7]
+
+
+@pytest.mark.cpu
+def test_prepare_pd_prefill_sampling_params_rejects_budget_without_decode_token():
+    omni = object.__new__(AsyncOmni)
+
+    with pytest.raises(ValueError, match="max_tokens >= 2"):
+        omni._prepare_prefill_sampling_params("req-1", SamplingParams(max_tokens=1))
+
+
 async def _noop(*args, **kw):
     pass
 

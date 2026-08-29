@@ -1310,11 +1310,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     )
 
                 sample_hidden_states = hidden_states[logits_indices.to(hidden_states.device)]
+                sampling_metadata = self._sampling_metadata_with_pd_resume_history(self.input_batch.sampling_metadata)
                 # Try with sampling_metadata first; fall back to without for models that don't support it
                 try:
-                    logits = self.model.compute_logits(
-                        sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
-                    )
+                    logits = self.model.compute_logits(sample_hidden_states, sampling_metadata=sampling_metadata)
                 except TypeError:
                     logits = self.model.compute_logits(sample_hidden_states)
             else:
@@ -1322,6 +1321,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 assert not self.is_pooling_model
 
                 sample_hidden_states = hidden_states[logits_indices.to(hidden_states.device)]
+                sampling_metadata = self._sampling_metadata_with_pd_resume_history(self.input_batch.sampling_metadata)
                 if not get_pp_group().is_last_rank:
                     all_gather_tensors = {
                         "residual": not is_residual_scattered_for_sp(self.vllm_config, num_tokens_padded)
@@ -1335,9 +1335,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 else:
                     # Try with sampling_metadata first; fall back to without for models that don't support it
                     try:
-                        logits = self.model.compute_logits(
-                            sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
-                        )
+                        logits = self.model.compute_logits(sample_hidden_states, sampling_metadata=sampling_metadata)
                     except TypeError:
                         logits = self.model.compute_logits(sample_hidden_states)
 
@@ -1390,10 +1388,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         fallthrough is load-bearing, not an error path; it is logged once per
         model for visibility.
         """
-        sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
             model_sample = getattr(self.model, "sample", None)
             self.input_batch.update_async_output_token_ids()
+            raw_sampling_metadata = self.input_batch.sampling_metadata
             if logits is not None and callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):
                 # Apply logit bias (min_tokens, allowed_token_ids) before
                 # the custom model sampler — the standard GPU sampler does
@@ -1405,7 +1403,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         self.input_batch.idx_mapping_np,
                         self.input_batch.positions[self.input_batch.logits_indices],
                     )
-                prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
+                prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(raw_sampling_metadata)
+                prepared_sampling_metadata = self._sampling_metadata_with_pd_resume_history(prepared_sampling_metadata)
                 self._apply_duplex_sampling(logits, prepared_sampling_metadata)
                 sampler_output = model_sample(logits, prepared_sampling_metadata)
                 if sampler_output is not None:
@@ -1418,6 +1417,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     "prefer_model_sampler model %s returned None from sample(); falling back to the default sampler.",
                     type(self.model).__name__,
                 )
+            sampling_metadata = self._sampling_metadata_with_pd_resume_history(raw_sampling_metadata)
             return self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,

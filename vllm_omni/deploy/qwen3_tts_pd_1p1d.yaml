@@ -80,6 +80,7 @@ stages:
       top_p: 1.0
       top_k: 50
       max_tokens: 4096
+      min_tokens: 2
       detokenize: true
       repetition_penalty: 1.05
       stop_token_ids: [2150]
@@ -153,6 +154,7 @@ stages:
       top_p: 1.0
       top_k: 50
       max_tokens: 4096
+      min_tokens: 2
       detokenize: true
       repetition_penalty: 1.05
       stop_token_ids: [2150]

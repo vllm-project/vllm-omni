@@ -1021,20 +1021,39 @@ def test_finished_releases_slot(build_adapter):
 
 def test_postprocess_scheduler_output(build_adapter):
     adapter, _ = build_adapter()
+    adapter._is_pd_decode_consumer = True
     adapter.requests_with_ready_chunks = {"new-ready", "cached-ready", "leftover"}
 
     scheduler_output = SimpleNamespace(
-        scheduled_new_reqs=[SimpleNamespace(req_id="new-ready")],
+        scheduled_new_reqs=[
+            SimpleNamespace(req_id="new-ready", additional_information={"meta": {"pd_resume_token_id": 7}}),
+            SimpleNamespace(req_id="generic-ready", additional_information={"new": "state"}),
+        ],
         scheduled_cached_reqs=SimpleNamespace(req_ids=["cached-ready", "missing"]),
     )
-    requests = {"cached-ready": SimpleNamespace(additional_information={"k": "v"})}
+    requests = {
+        "new-ready": SimpleNamespace(additional_information={"meta": {"pd_resume_token_id": 7}}),
+        "generic-ready": SimpleNamespace(additional_information={"new": "state"}),
+        "cached-ready": SimpleNamespace(additional_information={"k": "v"}),
+    }
 
     adapter.postprocess_scheduler_output(scheduler_output, requests)
 
     cached_info = scheduler_output.scheduled_cached_reqs.additional_information
     assert cached_info["cached-ready"] == {"k": "v"}
     assert cached_info["missing"] is None
+    assert scheduler_output.scheduled_new_reqs[0].additional_information == {"meta": {"pd_resume_token_id": 7}}
+    assert requests["new-ready"].additional_information is None
+    assert requests["generic-ready"].additional_information == {"new": "state"}
+    assert requests["cached-ready"].additional_information is None
     assert adapter.requests_with_ready_chunks == {"leftover"}
+
+    next_output = SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=["new-ready"]),
+    )
+    adapter.postprocess_scheduler_output(next_output, requests)
+    assert next_output.scheduled_cached_reqs.additional_information["new-ready"] is None
 
 
 @pytest.mark.parametrize("model_mode", ["ar", "generation"])

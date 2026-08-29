@@ -105,6 +105,27 @@ def test_early_return_when_sampled_absent_keeps_placeholders(cls):
 # --------------------------------------------------------------------------- #
 # Divergence — base KEEPS residual -1, AR CROPS at the first -1                #
 # --------------------------------------------------------------------------- #
+def test_pd_resume_token_is_prepended_without_mutating_request_history():
+    from dataclasses import dataclass
+
+    @dataclass
+    class Metadata:
+        output_token_ids: list[list[int]]
+
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.input_batch = SimpleNamespace(req_ids=["pd", "regular"])
+    runner.model_intermediate_buffer = {
+        "pd": {"meta": {"pd_resume_token_id": 7}},
+        "regular": {},
+    }
+    metadata = Metadata(output_token_ids=[[9], [4]])
+
+    decorated = runner._sampling_metadata_with_pd_resume_history(metadata)
+
+    assert decorated.output_token_ids == [[7, 9], [4]]
+    assert metadata.output_token_ids == [[9], [4]]
+
+
 _RESIDUAL_CASE = dict(
     req_ids=["r0"],
     req_output_token_ids=[[10, -1, -1]],  # two placeholders

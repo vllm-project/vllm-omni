@@ -507,6 +507,87 @@ class OmniGPUModelRunner(GPUModelRunner):
             return sampling_metadata
         return replace(sampling_metadata, output_token_ids=output_token_ids)
 
+    def _sampling_metadata_with_pd_resume_history(self, sampling_metadata):
+        """Include the P-side sampled token in D-side sampling history only.
+
+        The decode request appends P-side y0 to the prompt so remote prefill
+        leaves it as the first local D input. Because y0 is a prompt token on D,
+        it is absent from output history but must still be visible to repetition
+        penalties and model logits processors. Mutating request history would
+        double-count it in scheduler accounting, so this decorates
+        SamplingMetadata only.
+        """
+        req_ids = list(getattr(self.input_batch, "req_ids", ()))
+        histories = getattr(sampling_metadata, "output_token_ids", None)
+        if histories is None or len(histories) != len(req_ids):
+            return sampling_metadata
+
+        updated = None
+        for index, req_id in enumerate(req_ids):
+            info = self.model_intermediate_buffer.get(req_id, {})
+            meta = info.get("meta") if isinstance(info, dict) else None
+            resume_token_id = meta.get("pd_resume_token_id") if isinstance(meta, dict) else None
+            if isinstance(resume_token_id, torch.Tensor):
+                resume_token_id = resume_token_id.item() if resume_token_id.numel() == 1 else None
+            try:
+                resume_token_id = int(resume_token_id) if resume_token_id is not None else None
+            except (TypeError, ValueError):
+                resume_token_id = None
+            if resume_token_id is None:
+                continue
+
+            if updated is None:
+                updated = [list(history or ()) for history in histories]
+            updated[index].insert(0, resume_token_id)
+
+        if updated is None:
+            return sampling_metadata
+        return replace(sampling_metadata, output_token_ids=updated)
+
+    def _restore_qwen3_tts_pd_sampler_state(self, req_id: str, info: object) -> None:
+        """Restore the request-local main sampler once on a PD consumer."""
+        if not callable(getattr(self.model, "export_pd_decode_state", None)):
+            return
+        if not isinstance(info, dict) or "pd_sampler" not in info:
+            return
+
+        req_state = self.requests.get(req_id)
+        if req_state is None:
+            raise RuntimeError(f"Qwen3-TTS PD sampler request is missing for req={req_id}")
+        if getattr(req_state, "_qwen3_tts_pd_sampler_restored", False):
+            return
+
+        pd_sampler = info.get("pd_sampler")
+        if not isinstance(pd_sampler, dict):
+            raise RuntimeError(f"Qwen3-TTS PD sampler payload is invalid for req={req_id}")
+        generator_state = pd_sampler.get("main_generator_state")
+        if (
+            not isinstance(generator_state, torch.Tensor)
+            or generator_state.dtype != torch.uint8
+            or generator_state.numel() == 0
+        ):
+            raise RuntimeError(f"Qwen3-TTS PD sampler state is invalid for req={req_id}")
+        generator_state = generator_state.detach().to("cpu").contiguous()
+
+        generator = req_state.generator
+        sampling_params = req_state.sampling_params
+        if generator is None:
+            if sampling_params is not None and sampling_params.sampling_type == SamplingType.GREEDY:
+                setattr(req_state, "_qwen3_tts_pd_sampler_restored", True)
+                return
+            raise RuntimeError(f"Qwen3-TTS PD sampler generator is missing for req={req_id}")
+        try:
+            generator.set_state(generator_state)
+        except Exception as exc:
+            raise RuntimeError(f"Qwen3-TTS PD sampler state cannot be restored for req={req_id}") from exc
+
+        setattr(req_state, "_qwen3_tts_pd_sampler_restored", True)
+        logger.info(
+            "[PD_TRACE] qwen3_tts_main_sampler_restored req=%s state_bytes=%d",
+            req_id,
+            generator_state.numel(),
+        )
+
     def _init_mrope_positions(self, req_state: CachedRequestState):
         """Initialize M-RoPE positions for multimodal inputs.
 
@@ -802,13 +883,19 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Direct runner data-plane payloads populate
             # model_intermediate_buffer without going through the deprecated
             # additional_information request transport.
+            model_buffer_applied = None
             try:
                 model_buffer = getattr(new_req_data, "model_intermediate_buffer", None)
                 if isinstance(model_buffer, dict) and model_buffer:
                     self._update_intermediate_buffer(req_id, model_buffer)
+                    model_buffer_applied = model_buffer
             except Exception as e:
                 logger.error(f"Error updating model intermediate buffer: {e}")
-            # Decode additional_information payloads (dictionary)
+            if model_buffer_applied is not None:
+                self._restore_qwen3_tts_pd_sampler_state(req_id, model_buffer_applied)
+
+            # Decode additional_information payloads (dictionary).
+            info_dict = None
             try:
                 _ai_raw = getattr(new_req_data, "additional_information", None)
                 if _ai_raw is not None:
@@ -817,21 +904,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                     )
                     info_dict = deserialize_additional_information(_ai_raw)
                     if info_dict:
-                        pd_sampler = info_dict.get("pd_sampler")
-                        generator_state = (
-                            pd_sampler.get("main_generator_state") if isinstance(pd_sampler, dict) else None
-                        )
-                        if generator_state is not None:
-                            if not isinstance(generator_state, torch.Tensor) or generator_state.dtype != torch.uint8:
-                                raise RuntimeError(f"Qwen3-TTS PD sampler state is invalid for req={req_id}")
-                            if req_state.generator is None:
-                                raise RuntimeError(f"Qwen3-TTS PD sampler generator is missing for req={req_id}")
-                            req_state.generator.set_state(generator_state.detach().to("cpu").contiguous())
-                            logger.info(
-                                "[PD_TRACE] qwen3_tts_main_sampler_restored req=%s state_bytes=%d",
-                                req_id,
-                                generator_state.numel(),
-                            )
                         self.model_intermediate_buffer[req_id] = info_dict
                         setattr(
                             self.requests[req_id],
@@ -840,6 +912,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                         )
             except Exception as e:
                 logger.error(f"Error decoding additional information: {e}")
+            if info_dict:
+                self._restore_qwen3_tts_pd_sampler_state(req_id, info_dict)
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -1714,12 +1788,14 @@ class OmniGPUModelRunner(GPUModelRunner):
             model_buffer = getattr(new_req, "model_intermediate_buffer", None)
             if isinstance(model_buffer, dict) and model_buffer:
                 update_buffer(new_req.req_id, model_buffer)
+                self._restore_qwen3_tts_pd_sampler_state(new_req.req_id, model_buffer)
                 if replace:
                     continue
             payload_info = getattr(new_req, "additional_information", None)
             decoded_info = deserialize_additional_information(payload_info)
             if decoded_info:
                 update_buffer(new_req.req_id, decoded_info)
+                self._restore_qwen3_tts_pd_sampler_state(new_req.req_id, decoded_info)
 
         if hasattr(scheduler_output.scheduled_cached_reqs, "additional_information"):
             cached_infos = getattr(scheduler_output.scheduled_cached_reqs, "additional_information", {})
@@ -1728,6 +1804,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     decoded_info = deserialize_additional_information(req_infos)
                     if decoded_info:
                         update_buffer(req_id, decoded_info)
+                        self._restore_qwen3_tts_pd_sampler_state(req_id, decoded_info)
 
     def _maybe_attach_mimo_audio_req_infos(
         self,
@@ -2006,14 +2083,13 @@ class OmniGPUModelRunner(GPUModelRunner):
                     resume_token_id is not None
                     and not resume_consumed
                     and span_len == 1
-                    and num_computed_tokens == prompt_len
+                    and num_computed_tokens == prompt_len - 1
                 )
                 if is_pd_resume_token:
-                    # Keep the remote request at P's exact prompt length so
-                    # Mooncake pulls matching blocks. Once that prefix is
-                    # local, substitute P's sampled layer-0 token into D's
-                    # first decode position; this forward writes its local KV
-                    # and runs MTP exactly as a continuous decode would.
+                    # Mooncake leaves the appended final prompt token y0 for
+                    # D to compute locally. Force that row to P's sampled
+                    # layer-0 token; this forward writes y0's KV, runs its MTP,
+                    # and samples y1 exactly as continuous decoding does.
                     input_ids[s] = resume_token_id
                     resume_meta["pd_resume_token_consumed"] = True
                     logger.info(
@@ -2022,7 +2098,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                         resume_token_id,
                         prompt_len,
                     )
-                is_prefill = num_computed_tokens < prompt_len
+                is_prefill = num_computed_tokens < prompt_len and not is_pd_resume_token
                 req_infos["_omni_prompt_len"] = prompt_len
                 req_infos["_omni_num_computed_tokens"] = num_computed_tokens
                 req_infos["_omni_is_prefill"] = is_prefill

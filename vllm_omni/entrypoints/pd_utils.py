@@ -30,6 +30,19 @@ def _pd_trace_enabled() -> bool:
     return os.getenv("VLLM_OMNI_PD_TRACE", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _stage_pd_flag(stage: Any, name: str) -> bool:
+    """Read a PD topology flag from legacy or registry-backed configs."""
+    value = stage.get(name) if hasattr(stage, "get") else getattr(stage, name, None)
+    if value is not None:
+        return bool(value)
+
+    engine_args = stage.get("engine_args") if hasattr(stage, "get") else getattr(stage, "engine_args", None)
+    if engine_args is None:
+        return False
+    value = engine_args.get(name) if hasattr(engine_args, "get") else getattr(engine_args, name, None)
+    return bool(value)
+
+
 class PDDisaggregationMixin:
     def _get_pd_prefill_ids(self) -> list[int]:
         return list(getattr(self, "_pd_prefill_ids", []) or [])
@@ -89,12 +102,12 @@ class PDDisaggregationMixin:
         prefill_by_id: dict[int, int] = {}
         decode_indices: list[int] = []
         for i, stage in enumerate(stage_configs):
-            if getattr(stage, "is_prefill_only", False):
+            if _stage_pd_flag(stage, "is_prefill_only"):
                 prefill_by_id[i] = i
                 sid = getattr(stage, "stage_id", i)
                 if sid != i:
                     prefill_by_id[sid] = i
-            if getattr(stage, "is_decode_only", False):
+            if _stage_pd_flag(stage, "is_decode_only"):
                 decode_indices.append(i)
 
         if not decode_indices:
@@ -361,24 +374,25 @@ class PDDisaggregationMixin:
         return chosen
 
     def _prepare_prefill_sampling_params(self, req_id: str, sp: SamplingParams) -> SamplingParams:
+        max_tokens = getattr(sp, "max_tokens", None)
+        if max_tokens is not None and int(max_tokens) <= 1:
+            raise ValueError("PD disaggregation requires max_tokens >= 2 because P consumes the first token")
         sp = sp.clone()
         # P and D run in different processes. Give unseeded PD requests an
         # independent but stable stream so P's post-y0 generator state can be
         # restored on D instead of both sides consuming unrelated global RNG.
         if sp.seed is None:
             sp.seed = zlib.crc32(req_id.encode("utf-8"))
+        original_min_tokens = int(getattr(sp, "min_tokens", 0) or 0)
         sp.max_tokens = 1
         if hasattr(sp, "min_tokens"):
-            try:
-                # Keep min_tokens=1: Mooncake cancels the KV transfer unless the
-                # prefill finishes with finish_reason='length'. A 0 here would let
-                # an EOS on the first token end the step as 'stop' and drop the
-                # transfer, so the decode side never receives the prompt KV.
-                sp.min_tokens = 1
-            except Exception:
-                pass
+            # Preserve stop_token_ids when the unsplit request would mask them
+            # on y0. max_tokens=1 then still finishes as LENGTH_CAPPED, which
+            # is the status Mooncake uses to publish the transferred KV.
+            sp.min_tokens = 1 if original_min_tokens > 0 else 0
         sp.stop = []
-        sp.stop_token_ids = []
+        if original_min_tokens <= 0:
+            sp.stop_token_ids = []
         sp.include_stop_str_in_output = False
         if sp.extra_args is None:
             sp.extra_args = {}
@@ -579,12 +593,12 @@ class PDDisaggregationMixin:
         prefill_by_id: dict[int, int] = {}
         decode_indices: list[int] = []
         for i, stage in enumerate(stage_configs):
-            if getattr(stage, "is_prefill_only", False):
+            if _stage_pd_flag(stage, "is_prefill_only"):
                 prefill_by_id[i] = i
                 sid = getattr(stage, "stage_id", i)
                 if sid != i:
                     prefill_by_id[sid] = i
-            if getattr(stage, "is_decode_only", False):
+            if _stage_pd_flag(stage, "is_decode_only"):
                 decode_indices.append(i)
 
         pd_pairs: list[tuple[int, int]] = []

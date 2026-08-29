@@ -236,6 +236,7 @@ def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
     runner.talker_mtp = DummyTalkerMTP()
     runner.model = SimpleNamespace(talker_mtp_output_key=("codes", "audio"))
     runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace())
+    runner._mtp_ar_timing_enabled = False
 
     # Provide a minimal implementation that returns the expected 4-tuple.
     def _determine_batch_execution_and_padding(**kwargs):
@@ -573,6 +574,26 @@ def test_update_intermediate_buffer_accumulates():
     assert "a" in buf and "b" in buf
     assert torch.allclose(buf["a"], torch.tensor([1.0]))
     assert torch.allclose(buf["b"], torch.tensor([2.0]))
+
+
+def test_qwen3_tts_pd_sampler_state_is_restored_once():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.model.export_pd_decode_state = lambda _info: {}
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(1)
+    restored_generator = torch.Generator(device="cpu")
+    restored_generator.manual_seed(42)
+    runner.requests["r1"].generator = generator
+    runner.requests["r1"].sampling_params = SimpleNamespace()
+    payload = {"pd_sampler": {"main_generator_state": restored_generator.get_state()}}
+
+    runner._restore_qwen3_tts_pd_sampler_state("r1", payload)
+
+    assert torch.equal(generator.get_state(), restored_generator.get_state())
+    generator.manual_seed(99)
+    state_after_local_progress = generator.get_state().clone()
+    runner._restore_qwen3_tts_pd_sampler_state("r1", payload)
+    assert torch.equal(generator.get_state(), state_after_local_progress)
 
 
 def test_update_additional_information_deserializes_new_request_payload():

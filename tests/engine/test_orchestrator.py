@@ -36,6 +36,7 @@ from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
     _build_terminal_empty_output,
+    _with_qwen3_tts_pd_decode_state,
 )
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.experimental.fullduplex.engine.duplex_control_plane import DuplexControlPlane
@@ -2766,6 +2767,38 @@ async def test_request_cleanup_failure_is_deferred_to_control_plane():
     assert orchestrator.duplex_control_plane.finalized == []
 
 
+def test_qwen3_tts_pd_decode_state_appends_resume_token_without_mutating_source():
+    prompt = {
+        "prompt_token_ids": [10, 11],
+        "additional_information": {
+            "hidden_states": {"keep": "prompt"},
+            "meta": {"keep": "prompt"},
+        },
+    }
+    state = {
+        "_pd_resume_token_id": 7,
+        "hidden_states": {"last": "prefill-last"},
+        "meta": {"talker_text_offset": 0},
+        "pd_sampler": {"seed": 42},
+    }
+
+    result = _with_qwen3_tts_pd_decode_state(prompt, state)
+
+    assert result["prompt_token_ids"] == [10, 11, 7]
+    assert result["additional_information"] == {
+        "hidden_states": {"keep": "prompt", "last": "prefill-last"},
+        "meta": {"keep": "prompt", "talker_text_offset": 0, "pd_resume_token_id": 7},
+        "pd_sampler": {"seed": 42},
+    }
+    assert prompt == {
+        "prompt_token_ids": [10, 11],
+        "additional_information": {
+            "hidden_states": {"keep": "prompt"},
+            "meta": {"keep": "prompt"},
+        },
+    }
+
+
 def test_pd_decode_params_forward_request_seed_to_talker_mtp():
     orchestrator = object.__new__(Orchestrator)
     orchestrator._pd_kv_params = {
@@ -2776,13 +2809,17 @@ def test_pd_decode_params_forward_request_seed_to_talker_mtp():
     }
     orchestrator._pd_bootstrap_addr = None
     orchestrator._pd_prefill_engine_id = None
-    source = SamplingParams(temperature=0.9, extra_args={"keep": "value"})
+    source = SamplingParams(temperature=0.9, max_tokens=8, min_tokens=2, extra_args={"keep": "value"})
 
     result = orchestrator._build_pd_decode_params("req-seeded", source, main_sampler_seed=42)
 
     assert result is not source
     assert source.seed is None
     assert source.extra_args == {"keep": "value"}
+    assert source.max_tokens == 8
+    assert source.min_tokens == 2
+    assert result.max_tokens == 7
+    assert result.min_tokens == 1
     assert result.seed == 42
     assert result.extra_args["tts_local_seed"] == 42
     assert result.extra_args["keep"] == "value"
@@ -2792,3 +2829,17 @@ def test_pd_decode_params_forward_request_seed_to_talker_mtp():
         "do_remote_prefill": True,
         "do_remote_decode": False,
     }
+
+
+def test_pd_decode_params_preserve_explicit_talker_mtp_seed():
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._pd_kv_params = {"req-seeded": {"remote_request_id": "remote-1", "pd_submit_ready": True}}
+    orchestrator._pd_bootstrap_addr = None
+    orchestrator._pd_prefill_engine_id = None
+    source = SamplingParams(max_tokens=8, extra_args={"tts_local_seed": 99})
+
+    result = orchestrator._build_pd_decode_params("req-seeded", source, main_sampler_seed=42)
+
+    assert result.seed == 42
+    assert result.extra_args["tts_local_seed"] == 99
+    assert source.extra_args["tts_local_seed"] == 99
