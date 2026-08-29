@@ -1414,15 +1414,64 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # talker reads for short prompts; full Realtime support needs a
         # separate processor.from_module path which we don't wire here.
         if v == "realtime":
-            params: dict[str, Any] = {
-                "text": [request.input or ""],
-                "mode": ["voice_clone"],
-            }
-            if request.max_new_tokens is not None:
-                params["max_new_frames"] = [request.max_new_tokens]
-            wav_list, sr, cache_key = await self._resolve_ref_audio(request.ref_audio)
-            params["prompt_audio_array"] = [[wav_list, sr]]
-            params["ref_audio_cache_key"] = cache_key
+            # MossTTSRealtime's talker prefills a pre-built (L, 1+channels) grid:
+            # column 0 is the text/special stream, columns 1: are the reference
+            # audio-code grid (``codes.ref``), and text past the prefill window
+            # streams one token/step via ``ids.all``. Build that grid here (the
+            # ``MossTTSRealtimeProcessor`` isn't AutoProcessor-discoverable, so it
+            # is loaded from the snapshot inside the builder). Previously this
+            # path forwarded the raw ``text``/``prompt_audio_array``, which the
+            # talker ignores — it then prefilled a bare ``[1]`` placeholder with
+            # no text and produced unconditioned (flaky) audio.
+            from vllm_omni.model_executor.models.moss_tts.reference_encoder import (
+                build_realtime_prompt,
+                encode_realtime_reference,
+            )
+
+            model_id = self.engine_client.model_config.model
+            # Encode the reference clip for voice-timbre cloning. Best-effort:
+            # if the audio tokenizer can't load/encode, fall back to the default
+            # voice — the requested text is still synthesised correctly and
+            # deterministically (the talker's audio sampling is seeded).
+            ref_tokens = None
+            ref_cache_key: str | None = None
+            if request.ref_audio:
+                try:
+                    # Resolve first so the speaker-cache key is content-addressed
+                    # (mtime/size for local files), matching the anonymous branch
+                    # of ``encode_reference_codes`` on the delay path. Caching
+                    # skips the CPU codec encode, which otherwise costs a fixed
+                    # amount per request.
+                    wav_list, sr, ref_cache_key = await self._resolve_ref_audio(request.ref_audio)
+                    speaker_key = self._speaker_cache.make_cache_key(
+                        "ref:" + ref_cache_key,
+                        model_type="moss_tts_realtime_nq16",
+                        created_at=0,
+                    )
+                    cached = self._speaker_cache.get(speaker_key)
+                    if cached is not None:
+                        ref_tokens = cached["codes"]
+                    else:
+                        codec_path = os.environ.get("MOSS_TTS_CODEC_PATH", "OpenMOSS-Team/MOSS-Audio-Tokenizer")
+                        ref_tokens = await asyncio.to_thread(
+                            encode_realtime_reference, wav_list, sr, codec_path=codec_path
+                        )
+                        self._speaker_cache.put(speaker_key, {"codes": ref_tokens.detach().cpu()})
+                except Exception:
+                    logger.warning("MOSS-TTS-Realtime: reference encoding failed; using default voice", exc_info=True)
+                    ref_tokens = None
+            prompt_token_ids, info = await asyncio.to_thread(
+                build_realtime_prompt,
+                model_id,
+                request.input or "",
+                reference_audio_tokens=ref_tokens,
+                seed=request.seed,
+                max_new_frames=request.max_new_tokens,
+            )
+            params = dict(info)
+            params["prompt_token_ids"] = prompt_token_ids
+            if ref_cache_key is not None:
+                params["ref_audio_cache_key"] = ref_cache_key
             return params
 
         # ---- MossTTSDelay family (tts/ttsd/sound_effect/voice_generator)

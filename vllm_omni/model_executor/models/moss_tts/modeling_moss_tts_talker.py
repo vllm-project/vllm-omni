@@ -74,6 +74,41 @@ def _iter_state_row_spans(
     )
 
 
+def _audio_seed_from_info(info_dict: dict[str, Any]) -> int | None:
+    """Extract the per-request audio sampling seed from request info, or None.
+
+    The request carries it under ``additional_information["seed"]`` (a 1-element
+    list, mirroring ``max_new_frames``). Returns None when absent so the
+    sampler falls back to the global RNG (the prior, non-reproducible path).
+    """
+    seed = info_dict.get("seed")
+    if isinstance(seed, (list, tuple)):
+        seed = seed[0] if seed else None
+    if seed is None:
+        return None
+    try:
+        return int(seed)
+    except (TypeError, ValueError):
+        return None
+
+
+def _seeded_generator(seed: int | None, step: int, device: torch.device) -> torch.Generator | None:
+    """Per-``(seed, frame step)`` RNG so identical seeds reproduce audio.
+
+    The talker samples audio codes with ``torch.multinomial`` *outside* vLLM's
+    seeded sampler, so without this the global RNG advances between calls and
+    two same-seed generations diverge (different EOS timing → different audio).
+    Re-seeding from ``(seed, step)`` keeps each frame distinct yet reproducible
+    without persisting a (non-serialisable) ``Generator`` across decode steps.
+    Returns None when ``seed`` is None, preserving the prior global-RNG path.
+    """
+    if seed is None:
+        return None
+    gen = torch.Generator(device=device)
+    gen.manual_seed(((int(seed) & 0x7FFFFFFF) * 1_000_003 + int(step)) & 0x7FFFFFFFFFFFFFFF)
+    return gen
+
+
 # ---------------------------------------------------------------------------
 # MossTTSDelayTalkerForGeneration
 # ---------------------------------------------------------------------------
@@ -475,6 +510,9 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
                 audio_state["max_new_frames"] = int(max_new_frames_req) if max_new_frames_req is not None else -1
             except (TypeError, ValueError):
                 audio_state["max_new_frames"] = -1
+            # Lift the per-request seed so audio-code sampling is reproducible
+            # across runs (the multinomial path bypasses vLLM's seeded sampler).
+            audio_state["audio_seed"] = _audio_seed_from_info(info_dict)
             info_update: dict[str, Any] = {
                 "audio_state": audio_state,
                 "audio_codes": {"current": current_codes},
@@ -518,6 +556,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         logits: torch.Tensor,
         top_k: int,
         temperature: float,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """Top-k sampling on a (..., V) logits tensor returning (...,) ids."""
         if temperature > 0:
@@ -530,7 +569,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
             return logits.argmax(dim=-1)
         probs = torch.softmax(logits, dim=-1)
         flat = probs.reshape(-1, probs.shape[-1])
-        sampled = torch.multinomial(flat, num_samples=1).reshape(probs.shape[:-1])
+        sampled = torch.multinomial(flat, num_samples=1, generator=generator).reshape(probs.shape[:-1])
         return sampled
 
     def _sample_audio_codes(
@@ -566,6 +605,11 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         audio_top_k = 25
         audio_temp = 1.7
 
+        # Per-request seeded RNG (when the request set a seed) so identical
+        # seeds reproduce the same codes; one generator per frame, shared
+        # across the n_vq heads so the stream advances deterministically.
+        generator = _seeded_generator(state.get("audio_seed"), int(state.get("step", 0)), device)
+
         if self._stacked_audio_head_w is not None:
             # Single batched matmul: (n_vq, V+1, H) @ (H,) → (n_vq, V+1).
             # Replaces n_vq serial nn.Linear calls.
@@ -585,7 +629,8 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
                     active_logits,
                 )
             probs = torch.softmax(active_logits, dim=-1)
-            codes[active_idx] = torch.multinomial(probs, num_samples=1).squeeze(-1).long()
+            # Per-request seeded draw so identical seeds reproduce codes.
+            codes[active_idx] = torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1).long()
             return codes
 
         # Fallback: per-head loop (used before load_weights() completes).
@@ -596,7 +641,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
             logits = head(last_h).reshape(-1)  # (V,)
             logits[..., -1] = float("-inf")
             logits[..., self.audio_pad_code] = float("-inf")
-            sampled = self._sample_with_top_k(logits, audio_top_k, audio_temp)
+            sampled = self._sample_with_top_k(logits, audio_top_k, audio_temp, generator)
             codes[i] = sampled.long()
         return codes
 
@@ -856,6 +901,10 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         # something callable; a minimal pass-through suffices.
         self.logits_processor = LogitsProcessor(self.text_vocab_size)
         self._batch_state: list[dict[str, Any]] | None = None
+        # True once make_omni_output has populated per-request state at least
+        # once. Lets compute_logits tell the benign first-call empty state
+        # apart from a mid-stream one, which would be a row-tracking bug.
+        self._seen_batch_state = False
 
         # Stacked weight cache built after load_weights().
         # shape: (n_vq, audio_vocab_size, hidden_size)
@@ -910,6 +959,25 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         logits = hidden_states.new_full((B, V), float("-inf"))
 
         states = self._batch_state or []
+        # ``logits`` starts all -inf and ``_iter_state_row_spans`` yields nothing
+        # when there are no states, so without this the sampler would see an
+        # all -inf row. Expected on the very first call (state is populated by
+        # make_omni_output, which has not run yet), so default to text_pad
+        # everywhere — "continue, emit nothing" — rather than returning garbage.
+        if not states:
+            # Mid-stream this is not benign: it means per-request state was lost
+            # while decoding, and padding silently truncates audio instead of
+            # failing. Same class of row-tracking bug as #4415, so say so.
+            if self._seen_batch_state:
+                logger.warning_once(
+                    "MOSS-TTS-Realtime: compute_logits saw empty _batch_state after "
+                    "make_omni_output had already populated it (rows=%d); emitting "
+                    "text_pad. Audio for this step is padded, not generated.",
+                    B,
+                )
+            logits[:, self.text_pad_id] = 0.0
+            return logits
+
         for state, r0, r1 in _iter_state_row_spans(
             states,
             getattr(self, "_batch_state_spans", None),
@@ -931,10 +999,6 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
             else:
                 tok = self.text_pad_id
             logits[r0:r1, tok] = 0.0
-        # Defensive: if no states recorded yet (very first call before
-        # make_omni_output ran), default to text_pad everywhere.
-        if not states:
-            logits[:, self.text_pad_id] = 0.0
         return logits
 
     # ------------------------------------------------------------------
@@ -1003,6 +1067,9 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                     "step": 0,
                     "text_cursor": 0,
                     "remaining_text": list(remaining),
+                    # Per-request seed so the local-transformer audio sampling is
+                    # reproducible across runs (it bypasses vLLM's seeded sampler).
+                    "audio_seed": _audio_seed_from_info(info_dict),
                 },
                 "audio_codes": {"current": current_codes},
                 "ref_offset": ref_offset + span_len,
@@ -1035,8 +1102,10 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         **kwargs: Any,
     ) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
+            # Deliberate clear, so a following empty state is expected again.
             self._batch_state = None
             self._batch_state_spans = None
+            self._seen_batch_state = False
             return model_outputs
 
         hidden = model_outputs  # (S, H)
@@ -1051,6 +1120,8 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
 
         self._batch_state = [(info["audio_state"] if isinstance(info, dict) else {}) for info in info_dicts]
         self._batch_state_spans = kwargs.get("request_token_spans")
+        if self._batch_state:
+            self._seen_batch_state = True
 
         # See delay talker: real per-request row spans from the runner are
         # required because mixed prefill+decode steps have unequal row counts.
@@ -1101,6 +1172,9 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                     do_sample=True,
                     repetition_penalty=1.1,
                     history_per_codebook=hist_per_cb,
+                    # Per-(seed, frame) RNG so identical seeds reproduce; one
+                    # generator per frame, shared across the rvq codebook loop.
+                    generator=_seeded_generator(state.get("audio_seed"), int(state.get("step", 0)), last_h.device),
                 ).squeeze(0)  # (n_vq,)
                 if int(state.get("step", 0)) < 5 or int(state.get("step", 0)) % 50 == 0:
                     logger.debug(

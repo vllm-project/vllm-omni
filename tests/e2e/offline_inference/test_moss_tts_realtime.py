@@ -14,9 +14,11 @@ The request format mirrors end2end.py:_build_realtime_prompt exactly:
 
 Set MOSS_TTS_SKIP_ON_NET_FAIL=1 to skip in air-gapped environments.
 
-No determinism test: MossTTSRealtime uses a local depth transformer that is
-sensitive to async scheduling timing; waveform reproducibility is not
-guaranteed across back-to-back calls.
+A determinism test is included: the talker's local depth transformer samples
+audio codes with ``torch.multinomial`` outside vLLM's seeded sampler, so the
+per-request seed re-seeds a generator (``_seeded_generator`` in the talker) and
+two same-seed runs reproduce.  Prefix caching is disabled in ``_get_test_config``
+so the cached-prefill path can't perturb the logits.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ import soundfile as sf
 import torch
 from vllm import SamplingParams
 
+from tests.helpers.audio_output import audio_from_mm, collect_audio_from_outputs
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
@@ -74,16 +77,23 @@ def _get_test_config() -> str:
     """Derive a CI-friendly config from moss_tts_realtime.yaml.
 
     Reduces Stage 0 gpu_memory_utilization from 0.60 → 0.45 to leave headroom
-    for Stage 1 (0.12) on a shared L4/A10G.  max_num_seqs=1 keeps per-test
-    peak memory predictable.
+    for Stage 1 (0.12) on a shared L4/A10G.  ``max_num_seqs`` is capped at 2
+    rather than the YAML default of 8: it keeps per-test peak memory
+    predictable while still letting ``test_moss_tts_realtime_batch`` co-schedule
+    its two requests, which is the only way that test can observe the
+    cross-request row misalignment it guards (at 1 the scheduler serialises
+    them and the guard cannot fail).  Prefix caching is disabled so two identical-seed
+    runs are bit-reproducible (the cached-prefill path can perturb logits enough
+    to shift sampling/EOS) — required by ``test_moss_tts_realtime_deterministic``.
     """
     return modify_stage_config(
         get_deploy_config_path("moss_tts_realtime.yaml"),
         updates={
             "stages": {
                 0: {
-                    "max_num_seqs": 1,
+                    "max_num_seqs": 2,
                     "gpu_memory_utilization": 0.45,
+                    "enable_prefix_caching": False,
                 },
             },
         },
@@ -94,9 +104,13 @@ def _get_test_config() -> str:
 # pytestmark — one engine for the whole module
 # ---------------------------------------------------------------------------
 
+# Same marks as the sibling delay file test_moss_tts_expansion.py: selected by
+# the nightly "TTS · Function Test" (-m "full_model and L4 and tts"). The
+# module-wide skip stays until #4700 (moss_tts_realtime architecture is not
+# registered with Transformers in CI) is resolved; it is not fixed here.
 pytestmark = [
     pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4700"),
-    pytest.mark.slow,
+    pytest.mark.full_model,
     pytest.mark.tts,
     pytest.mark.parametrize(
         "omni_runner",
@@ -148,14 +162,17 @@ def _load_ref_audio(path: str, target_sr: int = 24000) -> torch.Tensor:
     return wav  # (1, T)
 
 
-def _build_request(ref_audio_path: str, text: str) -> dict:
+def _build_request(ref_audio_path: str, text: str, seed: int = 42) -> dict:
     """Build a MOSS-TTS-Realtime request.
 
     Mirrors end2end.py:_build_realtime_prompt exactly:
       1. Locate MossTTSRealtimeProcessor in the HF snapshot.
       2. Encode ref audio via MOSS-Audio-Tokenizer (separate repo).
       3. Build the (L, 17) int grid and return prompt_token_ids +
-         additional_information: {codes.ref, ids.all}.
+         additional_information: {codes.ref, seed, ids.all}.
+
+    ``seed`` is forwarded under ``additional_information["seed"]`` so the talker's
+    audio sampler re-seeds its generator per request (reproducible audio).
 
     Frees the codec model before returning to avoid competing with the
     running vllm engine for GPU/CPU memory.
@@ -228,7 +245,7 @@ def _build_request(ref_audio_path: str, text: str) -> dict:
     audio_codes_tensor = torch.from_numpy(grid[:, 1:].astype(np.int64).copy())  # (L, 16)
     remaining_text_ids = list(text_ids_only[cur_len:])
 
-    additional_info: dict = {"codes": {"ref": audio_codes_tensor}}
+    additional_info: dict = {"codes": {"ref": audio_codes_tensor}, "seed": [seed]}
     if remaining_text_ids:
         additional_info["ids"] = {"all": remaining_text_ids}
 
@@ -240,30 +257,7 @@ def _build_request(ref_audio_path: str, text: str) -> dict:
 
 def _collect_audio(omni_runner: OmniRunner, request: dict) -> tuple[torch.Tensor, int]:
     """Run one request and return (waveform_cpu, sample_rate)."""
-    chunks: list[torch.Tensor] = []
-    sr_final = SAMPLE_RATE
-    for out in omni_runner.omni.generate(request, _SAMPLING):
-        mm = out.multimodal_output
-        if not mm:
-            continue
-        audio = mm.get("audio")
-        if audio is None:
-            audio = mm.get("model_outputs")
-        if audio is None:
-            continue
-        sr = mm.get("sr")
-        if sr is not None:
-            sr_final = int(sr.item() if hasattr(sr, "item") else sr)
-        if isinstance(audio, list):
-            audio = torch.cat(
-                [t.reshape(-1) for t in audio if isinstance(t, torch.Tensor) and t.numel() > 0],
-                dim=0,
-            )
-        if isinstance(audio, torch.Tensor) and audio.numel() > 0:
-            chunks.append(audio.reshape(-1).cpu())
-    if not chunks:
-        raise AssertionError("No audio output received from generate()")
-    return torch.cat(chunks, dim=0), sr_final
+    return collect_audio_from_outputs(omni_runner.omni.generate(request, _SAMPLING), SAMPLE_RATE)
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +265,7 @@ def _collect_audio(omni_runner: OmniRunner, request: dict) -> tuple[torch.Tensor
 # ---------------------------------------------------------------------------
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"})
 def test_moss_tts_realtime_english(omni_runner: OmniRunner, ref_audio_path: str) -> None:
     """MossTTSRealtime: English voice_clone produces non-empty 24 kHz audio."""
     req = _build_request(ref_audio_path, "This is a real-time TTS streaming test.")
@@ -282,7 +276,7 @@ def test_moss_tts_realtime_english(omni_runner: OmniRunner, ref_audio_path: str)
     assert not torch.all(audio == 0), "Audio is silence"
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"})
 def test_moss_tts_realtime_chinese(omni_runner: OmniRunner, ref_audio_path: str) -> None:
     """MossTTSRealtime: Chinese input produces non-empty audio."""
     req = _build_request(ref_audio_path, "你好，这是语音合成测试。")
@@ -291,3 +285,65 @@ def test_moss_tts_realtime_chinese(omni_runner: OmniRunner, ref_audio_path: str)
     assert sr == SAMPLE_RATE
     assert audio.numel() > 0
     assert not torch.all(audio == 0)
+
+
+@hardware_test(res={"cuda": "L4"})
+def test_moss_tts_realtime_deterministic(omni_runner: OmniRunner, ref_audio_path: str) -> None:
+    """MossTTSRealtime: same seed yields identical waveforms.
+
+    The local-transformer samples audio codes with ``torch.multinomial`` outside
+    vLLM's seeded sampler; the per-request seed re-seeds a generator so two
+    same-seed runs reproduce exactly (prefix caching is disabled in
+    ``_get_test_config`` so the cached-prefill path can't perturb the logits).
+    """
+    sp_audio1, _ = _collect_audio(
+        omni_runner, _build_request(ref_audio_path, "Determinism check for realtime.", seed=7)
+    )
+    sp_audio2, _ = _collect_audio(
+        omni_runner, _build_request(ref_audio_path, "Determinism check for realtime.", seed=7)
+    )
+
+    assert sp_audio1.shape == sp_audio2.shape, f"Shapes differ: {sp_audio1.shape} vs {sp_audio2.shape}"
+    assert torch.allclose(sp_audio1, sp_audio2, atol=1e-4), "Same seed produced different audio"
+
+
+@hardware_test(res={"cuda": "L4"})
+def test_moss_tts_realtime_batch(omni_runner: OmniRunner, ref_audio_path: str) -> None:
+    """MossTTSRealtime: two concurrent requests with different text produce
+    distinct audio.
+
+    Regression guard for the cross-request audio corruption fixed in #4415
+    (broadcast / row-misalignment): with that bug, request 1 would receive
+    request 0's audio. Audio sampling is seeded (deterministic), so distinctness
+    here reflects genuine per-request content, not RNG noise.
+
+    The guard only bites if the two requests actually share a batch — run
+    sequentially they each get their own correct audio and the assertion passes
+    whether or not the bug is present. ``_get_test_config`` therefore sets
+    ``max_num_seqs: 2`` on Stage 0; do not lower it back to 1.
+
+    Coverage limitation: synchronous ``generate(requests, ...)`` prefills then
+    decodes both requests in lockstep, so every step is all-prefill or
+    all-decode — it does not exercise the mixed prefill+decode row-misalignment
+    path (which needs staggered submission the batch API can't express).
+    """
+    requests = [
+        _build_request(ref_audio_path, "Hello, how are you today?", seed=42),
+        _build_request(ref_audio_path, "The weather is sunny and warm.", seed=42),
+    ]
+    # generate() returns a flat list of OmniRequestOutput; each carries
+    # .request_id ("<idx>_<uuid>"). Group audio chunks per request index so a
+    # per-request mix-up shows up as identical waveforms across the two requests.
+    chunks_by_req: dict[int, list[torch.Tensor]] = {}
+    for out in omni_runner.omni.generate(requests, _SAMPLING):
+        idx = int(out.request_id.split("_", 1)[0])
+        chunk = audio_from_mm(out.multimodal_output)
+        if chunk is not None and chunk.numel() > 0:
+            chunks_by_req.setdefault(idx, []).append(chunk)
+
+    assert set(chunks_by_req) == {0, 1}, f"Expected audio for requests 0 and 1, got {sorted(chunks_by_req)}"
+    a = torch.cat(chunks_by_req[0], dim=0)
+    b = torch.cat(chunks_by_req[1], dim=0)
+    assert a.numel() > 0 and b.numel() > 0, "An output is empty"
+    if a.numel() == b.numel():
+        assert not torch.equal(a, b), "Both requests returned identical audio (batch concurrency bug)"

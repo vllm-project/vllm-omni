@@ -91,6 +91,7 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
         do_sample: bool = True,
         repetition_penalty: float = 1.0,
         history_per_codebook: list[list[int]] | None = None,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """Generate one audio frame (rvq codebook tokens) for batch B.
 
@@ -130,7 +131,7 @@ class MossTTSRealtimeLocalTransformer(nn.Module):
                     sel = torch.where(pos, sel / repetition_penalty, sel * repetition_penalty)
                     logits.index_copy_(-1, hist_t, sel)
 
-            codes[:, step] = _sample_token(logits, temperature, top_k, top_p, do_sample)
+            codes[:, step] = _sample_token(logits, temperature, top_k, top_p, do_sample, generator)
 
             if step + 1 < rvq:
                 embeds[:, step + 1, :] = codec_embeds[step](codes[:, step].view(B, 1)).view(B, hidden_size)

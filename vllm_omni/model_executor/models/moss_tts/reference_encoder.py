@@ -123,3 +123,177 @@ async def encode_reference_codes(
     speaker_cache.put(cache_key, {"codes": codes.detach().cpu()})
     logger.debug("Speaker cache STORE for MOSS-TTS reference '%s'", speaker_name)
     return codes
+
+
+# ---------------------------------------------------------------------------
+# MOSS-TTS-Realtime prompt building (serving path)
+#
+# The realtime talker's ``preprocess`` reads a pre-built ``(L, 1+channels)``
+# grid: column 0 is the text/special token stream, columns ``1:`` are the
+# reference audio-code grid (``codes.ref``); text past the prefill window streams
+# one token/step via ``additional_information["ids"]["all"]``. The online serving
+# path previously forwarded the raw ``text``/``prompt_audio_array``, which the
+# talker ignores — it then prefilled a bare ``[1]`` placeholder with no text and
+# produced unconditioned (flaky, mostly-garbled) audio. The builders below
+# produce the same grid the offline path (``test_moss_tts._build_realtime_request``)
+# and upstream ``end2end.py``/``streaming_mossttsrealtime.py`` produce.
+# ---------------------------------------------------------------------------
+
+# Prefill this many text tokens into the grid; the rest stream one/step during
+# decode (mirrors the processor's ``delay_tokens_len`` and upstream
+# ``MossTTSRealtimeInference._build_prefill_batch``).
+_REALTIME_PREFILL_MAX_TEXT = 12
+
+_RT_PROC_CACHE: dict[str, Any] = {}
+_RT_CODEC_CACHE: dict[str, Any] = {}
+
+
+def _load_realtime_processor(model_id_or_path: str) -> Any:
+    """Load (and cache) the snapshot's ``MossTTSRealtimeProcessor``.
+
+    It is not auto-discovered by ``AutoProcessor`` (no ``processor_config.json``
+    in the snapshot), so load it from ``processing_mossttsrealtime.py`` directly.
+    """
+    cached = _RT_PROC_CACHE.get(model_id_or_path)
+    if cached is not None:
+        return cached
+
+    import importlib.util
+    import os
+    import sys
+
+    if os.path.isdir(model_id_or_path):
+        snap_dir = model_id_or_path
+    else:
+        from huggingface_hub import snapshot_download
+
+        snap_dir = snapshot_download(repo_id=model_id_or_path)
+
+    proc_path = os.path.join(snap_dir, "processing_mossttsrealtime.py")
+    spec = importlib.util.spec_from_file_location("_moss_rt_proc", proc_path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id_or_path, trust_remote_code=True)
+    proc = mod.MossTTSRealtimeProcessor(tokenizer=tokenizer)
+    _RT_PROC_CACHE[model_id_or_path] = proc
+    return proc
+
+
+def _load_realtime_codec(codec_path: str) -> Any:
+    """Lazily load (and cache) the MOSS audio tokenizer on CPU for reference
+    encoding. The repo carries an ``auto_map`` so it loads via ``AutoModel``.
+    """
+    cached = _RT_CODEC_CACHE.get(codec_path)
+    if cached is not None:
+        return cached
+    from transformers import AutoModel
+
+    codec = AutoModel.from_pretrained(codec_path, trust_remote_code=True).to("cpu").eval()
+    _RT_CODEC_CACHE[codec_path] = codec
+    return codec
+
+
+def encode_realtime_reference(
+    wav_list: list,
+    sr: int,
+    *,
+    codec_path: str,
+    sr_target: int = 24000,
+    n_vq: int = 16,
+) -> torch.Tensor:
+    """Blocking: encode a reference waveform into ``(T, n_vq)`` RVQ codes.
+
+    Mirrors upstream ``StreamingTextToAudio.set_voice_prompt`` (resample →
+    ``codec.batch_encode``). Returns ``(T, n_vq)`` int tensor on CPU.
+    """
+    wav = torch.tensor(wav_list, dtype=torch.float32)
+    if wav.dim() > 1:
+        wav = wav.reshape(-1)
+    if sr != sr_target:
+        import torchaudio
+
+        wav = torchaudio.functional.resample(wav, sr, sr_target)
+    codec = _load_realtime_codec(codec_path)
+    with torch.no_grad():
+        out = codec.batch_encode([wav], num_quantizers=n_vq)
+    codes = out.audio_codes  # (n_vq, B=1, T)
+    if out.audio_codes_lengths is not None:
+        t = int(out.audio_codes_lengths[0].item())
+        codes = codes[:, :, :t]
+    codes = codes[:, 0, :].to(torch.int64).cpu()  # (n_vq, T)
+    return codes.transpose(0, 1).contiguous()  # (T, n_vq)
+
+
+def build_realtime_prompt(
+    model_id_or_path: str,
+    text: str,
+    *,
+    reference_audio_tokens: Any | None = None,
+    seed: int | None = None,
+    max_new_frames: int | None = None,
+    prefill_max_text: int = _REALTIME_PREFILL_MAX_TEXT,
+) -> tuple[list[int], dict[str, Any]]:
+    """Return ``(prompt_token_ids, additional_information)`` for one realtime
+    request, building the talker's ``(L, 1+channels)`` grid.
+
+    ``reference_audio_tokens`` is the encoded reference clip ``(T, channels)``
+    for voice cloning; ``None`` falls back to the default-voice system prompt
+    (text content is still synthesised correctly — only timbre differs).
+    """
+    import numpy as np
+
+    proc = _load_realtime_processor(model_id_or_path)
+    tokenizer = proc.tokenizer
+    n_cols = proc.channels + 1  # text/special column + per-codebook columns
+    pad = int(proc.audio_channel_pad)
+    bos = int(proc.audio_bos_token)
+
+    ref_tokens = None
+    if reference_audio_tokens is not None:
+        if isinstance(reference_audio_tokens, torch.Tensor):
+            ref_tokens = reference_audio_tokens.detach().cpu().numpy()
+        else:
+            ref_tokens = np.asarray(reference_audio_tokens)
+
+    system_grid = proc.make_ensemble(prompt_audio_tokens=ref_tokens)  # (L_sys, n_cols)
+
+    header_ids = tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
+    header_grid = np.full((len(header_ids), n_cols), pad, dtype=np.int64)
+    header_grid[:, 0] = header_ids
+
+    text_ids = tokenizer.encode(text, add_special_tokens=False)
+    if not text_ids:
+        raise ValueError("MOSS-TTS-Realtime: empty text after tokenisation")
+    cur = min(len(text_ids), max(1, int(prefill_max_text)))
+    text_grid = np.full((cur, n_cols), pad, dtype=np.int64)
+    text_grid[:, 0] = text_ids[:cur]
+    text_grid[-1, 1] = bos  # audio_bos on the last prefilled text token
+
+    grid = np.concatenate([system_grid, header_grid, text_grid], axis=0)
+
+    prompt_token_ids: list[int] = grid[:, 0].astype(np.int64).tolist()
+    info: dict[str, Any] = {
+        "codes": {"ref": torch.from_numpy(grid[:, 1:].astype(np.int64).copy())},  # (L, channels)
+    }
+    if seed is not None:
+        info["seed"] = [int(seed)]
+    if max_new_frames is not None:
+        info["max_new_frames"] = [int(max_new_frames)]
+    remaining = list(text_ids[cur:])
+    if remaining:
+        info["ids"] = {"all": remaining}
+
+    logger.debug(
+        "MOSS-TTS-Realtime prompt: %d grid rows (%d sys + %d header + %d text), %d streamed, ref=%s",
+        grid.shape[0],
+        system_grid.shape[0],
+        header_grid.shape[0],
+        text_grid.shape[0],
+        len(remaining),
+        ref_tokens is not None,
+    )
+    return prompt_token_ids, info

@@ -136,6 +136,13 @@ steps:
           - pytest -s -v tests/e2e/ -m "full_model and L4 and tts" --run-level "full_model" --ignore=tests/e2e/accuracy
         mirror_hardwares: l4_1
 
+      - label: ":full_moon: TTS · Function Test with H100"
+        timeout_in_minutes: 90
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - pytest -s -v tests/e2e/ -m "full_model and H100 and tts" --run-level "full_model" --ignore=tests/e2e/accuracy
+        mirror_hardwares: h100_1
+
       - label: ":full_moon: TTS · Perf Test"
         key: nightly-tts-performance
         timeout_in_minutes: 180
