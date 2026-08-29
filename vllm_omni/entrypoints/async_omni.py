@@ -622,6 +622,8 @@ class AsyncOmni(EngineClient, OmniBase):
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
             req_start_ts[request_id] = submit_ts
+            # Refresh gauges on arrival.
+            self._publish_request_gauges(len(self.request_states))
 
             # Process results based on mode
             # Both sequential and async_chunk modes read the same message stream
