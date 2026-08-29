@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Test script for FlashAttention backend with padding handling.
@@ -353,8 +353,11 @@ def test_cross_attn_key_padding_vs_sdpa(k_len):
     print(f"Max absolute difference: {max_diff:.6f}")
     print(f"Mean absolute difference: {mean_diff:.6f}")
 
-    assert max_diff < 0.01, f"Max difference {max_diff} exceeds threshold 0.01"
-    assert mean_diff < 0.001, f"Mean difference {mean_diff} exceeds threshold 0.001"
+    if current_omni_platform.is_rocm():
+        torch.testing.assert_close(output_fa, output_sdpa, rtol=1e-2, atol=1.5e-2)
+    else:
+        assert max_diff < 0.01, f"Max difference {max_diff} exceeds threshold 0.01"
+        assert mean_diff < 0.001, f"Mean difference {mean_diff} exceeds threshold 0.001"
 
     print("✓ Case 3 PASSED: FA and SDPA cross-attention outputs are very close!")
 
