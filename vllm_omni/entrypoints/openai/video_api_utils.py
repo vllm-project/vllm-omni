@@ -10,13 +10,19 @@ import base64
 import binascii
 import os
 import tempfile
+import threading
+from collections import deque
+from collections.abc import Generator
+from concurrent.futures import Future, ThreadPoolExecutor
 from io import BytesIO
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 import numpy as np
 import torch
 from PIL import Image, UnidentifiedImageError
+from vllm import envs
+from vllm.logger import init_logger
 from vllm.multimodal.video import (
     VIDEO_LOADER_REGISTRY,
     VideoBackend,
@@ -33,6 +39,20 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     UrlVideoReference,
     VideoReference,
 )
+
+if TYPE_CHECKING:
+    import av
+
+
+logger = init_logger(__name__)
+
+
+DEFAULT_AUDIO_SAMPLE_RATE = 24_000
+
+
+VideoInput = torch.Tensor | np.ndarray | list[torch.Tensor | np.ndarray | Image.Image]
+AudioSample = int | float
+AudioInput = torch.Tensor | np.ndarray | list[AudioSample] | list[list[AudioSample]]
 
 
 class VideoFrames(list[Image.Image]):
@@ -172,11 +192,21 @@ async def decode_image_url(image_url: str) -> Image.Image:
         return _decode_base64_image(image_url, source="image_reference.image_url")
 
     if image_url.startswith(("http://", "https://")):
-        async with httpx.AsyncClient(timeout=60) as client:
+        allow_redirects = envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS
+        async with httpx.AsyncClient(timeout=60, follow_redirects=allow_redirects) as client:
             try:
                 response = await client.get(image_url)
                 response.raise_for_status()
-            except httpx.HTTPError as exc:
+            except httpx.HTTPStatusError as exc:
+                if exc.response.has_redirect_location and not allow_redirects:
+                    raise InvalidInputReferenceError(
+                        "Invalid image_reference.image_url: redirect response was rejected because "
+                        "VLLM_MEDIA_URL_ALLOW_REDIRECTS is disabled."
+                    ) from exc
+                raise InvalidInputReferenceError(
+                    f"Invalid image_reference.image_url: server returned HTTP {exc.response.status_code}."
+                ) from exc
+            except httpx.RequestError as exc:
                 raise InvalidInputReferenceError(
                     "Invalid image_reference.image_url: failed to download image."
                 ) from exc
@@ -387,7 +417,7 @@ def _normalize_single_video_array(video_array: np.ndarray) -> np.ndarray:
             video_array = np.transpose(video_array, (0, 2, 3, 1))
 
     if np.issubdtype(video_array.dtype, np.floating):
-        if video_array.min() < 0.0 or video_array.max() > 1.0:
+        if video_array.size and (video_array.min() < 0.0 or video_array.max() > 1.0):
             video_array = np.clip(video_array, -1.0, 1.0) * 0.5 + 0.5
     elif np.issubdtype(video_array.dtype, np.integer):
         video_array = video_array.astype(np.float32) / 255.0
@@ -421,7 +451,7 @@ def _normalize_frames(frames: list[Any]) -> list[np.ndarray]:
             frame_array = np.transpose(frame_array, (1, 2, 0))
 
         if np.issubdtype(frame_array.dtype, np.floating):
-            if frame_array.min() < 0.0 or frame_array.max() > 1.0:
+            if frame_array.size and (frame_array.min() < 0.0 or frame_array.max() > 1.0):
                 frame_array = np.clip(frame_array, -1.0, 1.0) * 0.5 + 0.5
         elif np.issubdtype(frame_array.dtype, np.integer):
             frame_array = frame_array.astype(np.float32) / 255.0
@@ -475,17 +505,29 @@ def _coerce_audio_to_numpy(audio: Any) -> np.ndarray:
     return arr.astype(np.float32)
 
 
-def _coerce_video_to_uint8_frames(video: Any) -> np.ndarray:
-    """Convert a video payload into contiguous uint8 frames shaped (F, H, W, 3)."""
+def _prepare_video_frames(video: Any) -> tuple[list[np.ndarray], tuple[int, ...], np.dtype]:
+    """Normalize and validate frames for the common video encoding dispatcher."""
     frames = _coerce_video_to_frames(video)
     if not frames:
         raise ValueError("No frames found to encode.")
 
     frame_shape = frames[0].shape
+    if any(frame.shape != frame_shape for frame in frames[1:]):
+        raise ValueError("All video frames must have the same shape.")
+
+    common_dtype = np.result_type(*(frame.dtype for frame in frames))
+    return frames, frame_shape, common_dtype
+
+
+def _coerce_prepared_video_to_uint8_frames(
+    frames: list[np.ndarray],
+    frame_shape: tuple[int, ...],
+    common_dtype: np.dtype,
+) -> np.ndarray:
+    """Convert prepared frames into contiguous uint8 frames for the legacy muxer."""
     has_alpha = len(frame_shape) == 3 and frame_shape[-1] == 4
     output_shape = (*frame_shape[:-1], 3) if has_alpha else frame_shape
     frames_u8 = np.empty((len(frames), *output_shape), dtype=np.uint8)
-    common_dtype = np.result_type(*(frame.dtype for frame in frames))
 
     # Convert one frame at a time instead of stacking the normalized float
     # payload first. Long videos can otherwise require another full-size
@@ -509,25 +551,285 @@ def _coerce_video_to_uint8_frames(video: Any) -> np.ndarray:
     return frames_u8
 
 
-def _encode_video_bytes(
+def _coerce_video_to_uint8_frames(video: Any) -> np.ndarray:
+    """Convert a video payload into contiguous uint8 frames shaped (F, H, W, 3)."""
+    frames, frame_shape, common_dtype = _prepare_video_frames(video)
+    return _coerce_prepared_video_to_uint8_frames(frames, frame_shape, common_dtype)
+
+
+def _direct_planar_fallback_reason(
+    frames: list[np.ndarray],
+    frame_shape: tuple[int, ...],
+    common_dtype: np.dtype,
+) -> str | None:
+    """Return a stable reason when direct planar muxing cannot consume frames."""
+    if len(frame_shape) != 3 or frame_shape[0] <= 0 or frame_shape[1] <= 0 or frame_shape[2] not in (3, 4):
+        return "unsupported_shape"
+
+    if not (
+        common_dtype == np.dtype(np.uint8)
+        or np.issubdtype(common_dtype, np.bool_)
+        or np.issubdtype(common_dtype, np.floating)
+    ):
+        return "unsupported_dtype"
+
+    if not all(frame[..., channel].flags.c_contiguous for frame in frames for channel in range(3)):
+        return "non_contiguous_rgb_planes"
+
+    return None
+
+
+class _PlanarFrameConverter:
+    """Convert response frames with one reusable, bounded executor."""
+
+    def __init__(self, max_workers: int) -> None:
+        self._max_workers = max_workers
+        if self._max_workers < 1:
+            raise ValueError("max_workers must be positive")
+        self._executor = (
+            ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="video-planar")
+            if self._max_workers > 1
+            else None
+        )
+        self._scratch_local = threading.local()
+        self._shutdown = False
+
+    @property
+    def max_workers(self) -> int:
+        return self._max_workers
+
+    def _channel_scratch(self, height: int, width: int, common_dtype: np.dtype) -> np.ndarray:
+        scratch_dtype = np.dtype(common_dtype)
+        if not np.issubdtype(scratch_dtype, np.floating):
+            scratch_dtype = np.dtype(np.float64)
+        scratch = getattr(self._scratch_local, "channel", None)
+        if scratch is None or scratch.shape != (height, width) or scratch.dtype != scratch_dtype:
+            scratch = np.empty((height, width), dtype=scratch_dtype)
+            self._scratch_local.channel = scratch
+        return scratch
+
+    def _build_frame(self, frame: np.ndarray, common_dtype: np.dtype) -> av.VideoFrame:
+        """Build one quantized GBR PyAV frame."""
+        import av
+
+        height, width = frame.shape[:2]
+        scratch = None if frame.dtype == np.uint8 else self._channel_scratch(height, width, common_dtype)
+        av_frame = av.VideoFrame(width, height, format="gbrp")
+        for plane, channel in zip(av_frame.planes, (1, 2, 0)):
+            if plane.height < height or plane.line_size < width:
+                raise ValueError("PyAV video plane is smaller than the requested frame dimensions.")
+            plane_view = np.frombuffer(
+                memoryview(plane),
+                dtype=np.uint8,
+                count=plane.height * plane.line_size,
+            ).reshape(plane.height, plane.line_size)
+            plane_view.fill(0)
+            if frame.dtype == np.uint8:
+                plane_view[:height, :width] = frame[..., channel]
+            else:
+                np.copyto(scratch, frame[..., channel], casting="unsafe")
+                np.clip(scratch, 0.0, 1.0, out=scratch)
+                scratch *= 255.0
+                np.rint(scratch, out=scratch)
+                plane_view[:height, :width] = scratch
+        return av_frame
+
+    def iter_frames(
+        self,
+        frames: list[np.ndarray],
+        common_dtype: np.dtype,
+    ) -> Generator[av.VideoFrame, None, None]:
+        """Yield converted frames in order with at most two batches in flight."""
+        effective_workers = min(len(frames), self._max_workers)
+        if effective_workers <= 1:
+            for frame in frames:
+                yield self._build_frame(frame, common_dtype)
+            return
+
+        executor = self._executor
+        assert executor is not None
+        pending: deque[Future[av.VideoFrame]] = deque()
+        next_index = 0
+        max_pending = 2 * effective_workers
+        try:
+            while next_index < len(frames) and len(pending) < max_pending:
+                pending.append(executor.submit(self._build_frame, frames[next_index], common_dtype))
+                next_index += 1
+
+            while pending:
+                converted_frame = pending.popleft().result()
+                if next_index < len(frames):
+                    pending.append(executor.submit(self._build_frame, frames[next_index], common_dtype))
+                    next_index += 1
+                yield converted_frame
+        finally:
+            for future in pending:
+                future.cancel()
+
+    def shutdown(self) -> None:
+        if not self._shutdown:
+            self._shutdown = True
+            if self._executor is not None:
+                self._executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _iter_planar_video_frames(
+    frames: list[np.ndarray],
+    common_dtype: np.dtype,
+) -> Generator[av.VideoFrame, None, None]:
+    """Yield serial planar frames for direct utility callers."""
+    converter = _PlanarFrameConverter(max_workers=1)
+    try:
+        yield from converter.iter_frames(frames, common_dtype)
+    finally:
+        converter.shutdown()
+
+
+def _log_video_encoding_path(
+    *,
+    selected_path: str,
+    frames: list[np.ndarray],
+    frame_shape: tuple[int, ...],
+    common_dtype: np.dtype,
+    fps: int,
+    audio: AudioInput | None,
+    audio_sample_rate: int | None,
+    effective_frame_conversion_workers: int,
+    reason: str | None = None,
+) -> None:
+    reason_field = "" if reason is None else f" reason={reason}"
+    logger.info(
+        "Video response encoding route selected: selected_path=%s%s frames=%d frame_shape=%s dtype=%s fps=%s "
+        "audio_present=%s effective_audio_sample_rate=%s effective_frame_conversion_workers=%s",
+        selected_path,
+        reason_field,
+        len(frames),
+        frame_shape,
+        np.dtype(common_dtype).name,
+        fps,
+        audio is not None,
+        audio_sample_rate,
+        effective_frame_conversion_workers,
+    )
+
+
+def _resolve_audio_sample_rate(audio: AudioInput | None, audio_sample_rate: int | None) -> int:
+    if audio is not None and audio_sample_rate is None:
+        logger.info_once(
+            "Audio sample rate was not provided; using default sample rate of %s Hz.",
+            DEFAULT_AUDIO_SAMPLE_RATE,
+        )
+    return audio_sample_rate or DEFAULT_AUDIO_SAMPLE_RATE
+
+
+def _encode_prepared_video_bytes_legacy(
+    frames: list[np.ndarray],
+    frame_shape: tuple[int, ...],
+    common_dtype: np.dtype,
+    fps: int,
+    audio: Any | None = None,
+    audio_sample_rate: int | None = None,
+    video_codec_options: dict[str, str] | None = None,
+) -> bytes:
+    """Encode validated frames through the compatibility path used before planar encoding."""
+    from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
+
+    audio_np = _coerce_audio_to_numpy(audio) if audio is not None else None
+    return mux_video_audio_bytes(
+        _coerce_prepared_video_to_uint8_frames(frames, frame_shape, common_dtype),
+        audio_np,
+        fps=float(fps),
+        audio_sample_rate=audio_sample_rate or DEFAULT_AUDIO_SAMPLE_RATE,
+        video_codec_options=video_codec_options,
+    )
+
+
+def _encode_video_bytes_legacy(
     video: Any,
     fps: int,
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
 ) -> bytes:
-    """Encode a video payload into MP4 bytes, optionally muxing audio."""
-    from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
-
-    audio_np = _coerce_audio_to_numpy(audio) if audio is not None else None
-
-    return mux_video_audio_bytes(
-        _coerce_video_to_uint8_frames(video),
-        audio_np,
-        fps=float(fps),
-        audio_sample_rate=audio_sample_rate or 24000,
+    """Encode through the compatibility path used before planar encoding."""
+    frames, frame_shape, common_dtype = _prepare_video_frames(video)
+    return _encode_prepared_video_bytes_legacy(
+        frames,
+        frame_shape,
+        common_dtype,
+        fps,
+        audio=audio,
+        audio_sample_rate=_resolve_audio_sample_rate(audio, audio_sample_rate),
         video_codec_options=video_codec_options,
     )
+
+
+def _encode_video_bytes(
+    video: Any,
+    fps: int,
+    audio: Any | None = None,
+    audio_sample_rate: int | None = None,
+    video_codec_options: dict[str, str] | None = None,
+    frame_converter: _PlanarFrameConverter | None = None,
+) -> bytes:
+    """Encode a video payload through the direct planar or legacy path."""
+    from vllm_omni.diffusion.utils.media_utils import mux_av_video_audio_bytes
+
+    # Prepare once so validation is shared by both paths and malformed common
+    # input is reported before any muxer is opened.
+    frames, frame_shape, common_dtype = _prepare_video_frames(video)
+    effective_audio_sample_rate = _resolve_audio_sample_rate(audio, audio_sample_rate) if audio is not None else None
+    fallback_reason = _direct_planar_fallback_reason(frames, frame_shape, common_dtype)
+    if fallback_reason is not None:
+        _log_video_encoding_path(
+            selected_path="legacy_fallback",
+            reason=fallback_reason,
+            frames=frames,
+            frame_shape=frame_shape,
+            common_dtype=common_dtype,
+            fps=fps,
+            audio=audio,
+            audio_sample_rate=effective_audio_sample_rate,
+            effective_frame_conversion_workers=0,
+        )
+        return _encode_prepared_video_bytes_legacy(
+            frames,
+            frame_shape,
+            common_dtype,
+            fps,
+            audio=audio,
+            audio_sample_rate=effective_audio_sample_rate,
+            video_codec_options=video_codec_options,
+        )
+
+    owns_frame_converter = frame_converter is None
+    converter = frame_converter or _PlanarFrameConverter(max_workers=1)
+    _log_video_encoding_path(
+        selected_path="direct_planar",
+        frames=frames,
+        frame_shape=frame_shape,
+        common_dtype=common_dtype,
+        fps=fps,
+        audio=audio,
+        audio_sample_rate=effective_audio_sample_rate,
+        effective_frame_conversion_workers=min(len(frames), converter.max_workers),
+    )
+    audio_np = _coerce_audio_to_numpy(audio) if audio is not None else None
+    video_frames = converter.iter_frames(frames, common_dtype)
+    try:
+        return mux_av_video_audio_bytes(
+            video_frames,
+            width=frame_shape[1],
+            height=frame_shape[0],
+            audio_waveform=audio_np,
+            fps=float(fps),
+            audio_sample_rate=effective_audio_sample_rate,
+            video_codec_options=video_codec_options,
+        )
+    finally:
+        video_frames.close()
+        if owns_frame_converter:
+            converter.shutdown()
 
 
 class FragmentedMP4VideoEncoder:
@@ -585,9 +887,15 @@ def encode_video_base64(
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
+    frame_converter: _PlanarFrameConverter | None = None,
 ) -> str:
     """Encode a video (frames/array/tensor) to base64 MP4."""
     video_bytes = _encode_video_bytes(
-        video, fps=fps, audio=audio, audio_sample_rate=audio_sample_rate, video_codec_options=video_codec_options
+        video,
+        fps=fps,
+        audio=audio,
+        audio_sample_rate=audio_sample_rate,
+        video_codec_options=video_codec_options,
+        frame_converter=frame_converter,
     )
     return base64.b64encode(video_bytes).decode("utf-8")

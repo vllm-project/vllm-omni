@@ -3,38 +3,13 @@
 
 from __future__ import annotations
 
-from typing import Any
-
-
-def build_text_to_image_prompt(
-    prompt: str,
-    negative_prompt: str | None,
-    height: int | None = None,
-    width: int | None = None,
-) -> dict[str, Any]:
-    """Build a Cosmos3 T2I prompt by selecting image output modality.
-
-    Cosmos3 uses the same pipeline class for T2I and video modes. The OpenAI
-    image endpoint selects T2I by adding ``modalities=["image"]``. ``height``
-    and ``width`` are accepted for registry compatibility; sizing travels
-    through sampling params instead of the prompt payload.
-    """
-    del height, width
-    text_prompt: dict[str, Any] = {
-        "prompt": prompt,
-        "modalities": ["image"],
-    }
-    if negative_prompt is not None:
-        text_prompt["negative_prompt"] = negative_prompt
-    return text_prompt
-
-
 COSMOS3_EXTRA_BODY_PARAMS = frozenset(
     {
         "flow_shift",
         "max_sequence_length",
         "use_resolution_template",
         "use_duration_template",
+        "negative_metadata_mode",
         "use_system_prompt",
         "system_prompt",
         "negative_prompt",

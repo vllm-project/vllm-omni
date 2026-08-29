@@ -1,9 +1,9 @@
-# Claude Skills for vLLM-Omni
+# Repository Skills for vLLM-Omni
 
-This directory contains Claude Code skills maintained for the `vllm-omni`
-repository. These skills capture repeatable workflows for common contributor
-tasks such as model integration, pull request review, and release note
-generation.
+This directory contains repository-scale skills maintained for `vllm-omni`.
+They capture repeatable workflows for common contributor and maintainer tasks
+such as model integration, CI-aligned testing, performance optimization, and
+pull request review.
 
 ## Directory Structure
 
@@ -14,31 +14,44 @@ include:
 - `references/`: focused reference material used by the skill
 - `scripts/`: small helper scripts used by the skill
 
+## Using the Skills
+
+Coding agents that discover repository skills can invoke the relevant skill by
+name. For other agents, point them to the skill's `SKILL.md` and ask them to
+read it before changing code. Combine a domain skill with `vllm-omni-test` when
+tests or CI coverage change, then use `precheck-pr` for the contributor's final
+self-check.
+
 ## Available Skills
 
-- `add-diffusion-model`: guides integration of a new diffusion model into
-  `vllm-omni`
-- `diffusion-perf-opt`: guides diffusion model performance optimization,
-  including profiling traces, parallel strategies, stage timing analysis, and
-  benchmark-driven tuning
-- `quantization`: guides quantization method selection, model integration,
-  checkpoint loading, and quality/performance validation for vLLM-Omni
-- `add-omni-model`: covers addition of new omni-modality model support
-- `add-tts-model`: covers integration of new TTS models and related serving
-  workflows
-- `generate-release-note`: helps prepare release notes for repository changes
-- `precheck-pr`: self-check a branch before creating a PR — validates PR title
-  format, catches dead code, verifies accuracy/perf claims, and confirms merge
-  readiness
-- `vllm-omni-test`: guides generation and execution of CI-aligned tests (L1–L4),
-  pytest marker selection (`core_model` / `advanced_model` / `full_model`,
-  `omni` / `tts` / `diffusion`), Buildkite wiring (`test-ready.yml`,
-  `test-merge.yml`, `test-nightly.yml`, `test-weekly.yml`), and copy-paste
-  local plus CI-like `pytest` commands; see `references/test-routing.md` for
-  level-to-command mapping
-- `review-pr`: provides a structured workflow for reviewing pull requests
-- `vllm-omni-npu-model-runner-upgrade`: upgrades NPU model runners to align with the
-  latest vllm-ascend NPUModelRunner
+- [`add-diffusion-model`](add-diffusion-model/SKILL.md): guides integration of
+  a new diffusion model into `vllm-omni`
+- [`add-tts-model`](add-tts-model/SKILL.md): covers integration of new TTS
+  models and related serving workflows
+- [`diffusion-perf-opt`](diffusion-perf-opt/SKILL.md): guides diffusion model
+  performance optimization, including profiling traces, parallel strategies,
+  stage timing analysis, and benchmark-driven tuning
+- [`find-simplifications`](find-simplifications/SKILL.md): finds evidence-backed
+  opportunities to remove or merge dead, duplicated, speculative,
+  over-generalized, or unnecessarily defensive vLLM-Omni code
+- [`precheck-pr`](precheck-pr/SKILL.md): self-checks a branch before creating a
+  PR by validating title format, dead code, simplification opportunities,
+  accuracy and performance claims, and merge readiness
+- [`quantization`](quantization/SKILL.md): guides quantization method selection,
+  model integration, checkpoint loading, and quality/performance validation
+  for vLLM-Omni
+- [`review-pr`](review-pr/SKILL.md): provides a frozen-snapshot, contract-aware
+  workflow for maintainers and reviewers; contributors should use
+  `precheck-pr` for self-review
+- [`vllm-omni-npu-model-runner-upgrade`](vllm-omni-npu-upgrade/SKILL.md):
+  upgrades NPU model runners to align with the latest vllm-ascend
+  `NPUModelRunner`
+- [`vllm-omni-test`](vllm-omni-test/SKILL.md): guides generation and execution
+  of CI-aligned tests (L1–L4), pytest marker selection (`core_model` /
+  `advanced_model` / `full_model`, `omni` / `tts` / `diffusion`), Buildkite
+  wiring (`test-ready.yml`, `test-merge.yml`, `test-nightly.yml`,
+  `test-weekly.yml`), and copy-paste local plus CI-like `pytest` commands; see
+  `references/test-routing.md` for level-to-command mapping
 
 ## Maintenance Guidelines
 

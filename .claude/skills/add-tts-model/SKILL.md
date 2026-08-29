@@ -138,9 +138,12 @@ A shared buffer silently corrupts audio across concurrent requests — the sympt
    - Load codec weights (may need lazy loading from separate checkpoint)
    - Implement `forward()`: codec codes -> audio waveform
    - Return `OmniOutput` with `multimodal_outputs`
-5. **Create stage config YAML** defining both stages, memory allocation, and model paths
-6. **Create stage input processor** for prompt building
-7. **Write end2end.py** test script
+5. **Define and register the pipeline topology** in
+   `vllm_omni/model_executor/models/<model>/pipeline.py`
+6. **Create the deploy YAML** under `vllm_omni/deploy/` for placement,
+   memory sizing, connectors, and runtime overrides
+7. **Create stage input processor** for prompt building and inter-stage handoff
+8. **Write end2end.py** test script
 
 ### Critical Parameters to Get Right
 
@@ -174,7 +177,7 @@ These bugs appear in almost every new TTS PR. Check all before the first push. S
 - **All return paths must emit `model_outputs`** — if any early-return branch skips setting `model_outputs`, the serving layer silently drops that step's audio (fish speech: `fix: ensure ALL return paths emit model_outputs`)
 - **Per-request state isolation** — for batched concurrent requests, key all state by request ID; a shared buffer corrupts audio across requests (fish speech: `fix: per-request vocode + delta emission`)
 - **Codec tensor device** — move codec codes to the codec decoder's device before calling decode; mismatches cause silent CPU fallback or crashes (fish speech: `fix: use model device for CUDA stream`)
-- **AR stage `max_num_seqs`** — set to at least 4 in production configs; for single-stage models this is the only stage. For two-stage models, Stage 0 (AR) needs `max_num_seqs ≥ 4` to pipeline concurrent requests; Stage 1 (codec decoder) typically uses `max_num_seqs: 1` intentionally. Default of 1 everywhere causes audio gaps under concurrency because the codec window round-robins across requests (RFC #2568)
+- **AR stage `max_num_seqs`** — set to at least 4 in production deploy configs; for single-stage models this is the only stage. For two-stage models, Stage 0 (AR) needs `max_num_seqs ≥ 4` to pipeline concurrent requests; Stage 1 (codec decoder) is model-specific and may intentionally use `max_num_seqs: 1`. Defaulting the AR stage to 1 causes audio gaps under concurrency because the codec window round-robins across requests (RFC #2568)
 
 ### Optional Dependency Handling
 
@@ -190,18 +193,18 @@ pattern, signature constraints, and MOSS-TTS-Nano reference.
 When the upstream model cannot be cleanly split into an AR stage and a
 separate decoder, run the full pipeline inside a single AR worker and
 stream audio through a per-request `inference_stream()` generator keyed by
-`_omni_req_id`. Stage config must set `worker_type: ar`,
-`engine_output_type: audio`, `final_output: true`, `is_comprehension: true`,
-and `async_chunk: false` at the top level. Only extract params from
+`_omni_req_id`. Define one `StagePipelineConfig` with
+`execution_type=StageExecutionType.LLM_AR`, `engine_output_type="audio"`,
+`final_output=True`, and `owns_tokenizer=True`. Set `async_chunk: false` in
+the deploy YAML. Only extract params from
 `additional_information` that you actually forward, or pre-commit fails
 `ruff F841`.
 
 Full walkthrough with the complete `forward()` / `_create_stream_gen()`
-skeleton and stage-config fields:
+skeleton plus pipeline/deploy definitions:
 [references/single-stage-ar.md](references/single-stage-ar.md). For an
 in-tree reference, look for any single-stage AR model under
-`vllm_omni/model_executor/models/` — e.g. the MOSS-TTS-Nano integration when
-it lands.
+`vllm_omni/model_executor/models/`, such as MOSS-TTS-Nano.
 
 **VoxCPM2 is a different pattern** and should not reuse this skeleton — it
 runs the base LM under vLLM PagedAttention with external side-computation.
@@ -210,7 +213,8 @@ See `plan/voxcpm2_native_ar_design.md`.
 ### Deliverables
 
 - Model files in `vllm_omni/model_executor/models/<model_name>/`
-- Stage config YAML
+- Registered `pipeline.py` topology
+- Deploy YAML under `vllm_omni/deploy/`
 - Working `end2end.py` at `examples/offline_inference/text_to_speech/<model>/end2end.py`
 - New section in `examples/offline_inference/text_to_speech/README.md` (table row + per-model section). Do **not** create a top-level `examples/offline_inference/<model>/` dir or a per-model `README.md` inside `text_to_speech/<model>/` — the hub README is the documented surface and the mkdocs `generate_examples` hook only descends one level into `examples/<category>/`.
 
@@ -220,65 +224,70 @@ See `plan/voxcpm2_native_ar_design.md`.
 
 ### Steps
 
-1. **Register in `serving_speech.py`** — add all 5 points in a **single commit**;
-   partial integration causes hard-to-debug failures. This file is modified by every
-   model PR and is the most common source of rebase conflicts — see conflict note below.
+1. **Write one adapter** under `vllm_omni/entrypoints/openai/tts_adapters/`.
+   `serving_speech.py` should not need an edit — detection, stage discovery and
+   dispatch are all derived from what the adapter declares.
 
-   **Point 1** — stage constant (near the top, alongside the other `_*_TTS_MODEL_STAGES` sets):
+   Create `vllm_omni/entrypoints/openai/tts_adapters/your_model.py`:
    ```python
-   _YOUR_MODEL_TTS_MODEL_STAGES = {"your_stage_key"}
+   @register_tts_adapter
+   class YourModelAdapter(ARTTSAdapter):
+       name = "your_model"                              # registry key + log label
+       stage_keys = frozenset({"your_stage_key"})       # the deploy yaml's model_stage
+
+       def validate(self, request) -> str | None:
+           if not request.input or not request.input.strip():
+               return "Input text cannot be empty"
+           return None
+
+       async def build(self, request, sampling_params_list, has_inline_ref_audio):
+           params = {"text": [request.input]}
+           if request.voice is not None:
+               params["voice"] = [request.voice]
+           return PreparedRequest(
+               prompt={"prompt": request.input},
+               tts_params=params,
+               model_type=self.name,
+           )
    ```
 
-   **Point 2** — union into `_TTS_MODEL_STAGES`:
-   ```python
-   _TTS_MODEL_STAGES: set[str] = (
-       ...
-       | _YOUR_MODEL_TTS_MODEL_STAGES
-   )
-   ```
+   Then add the module to the import block at the bottom of
+   `tts_adapters/__init__.py` so it registers. That import line is the only shared
+   file a new model touches — which is also why the old rebase-conflict hotspot is
+   gone.
 
-   **Point 3** — model type detection in `_detect_tts_model_type()`:
-   ```python
-   if model_stage in _YOUR_MODEL_TTS_MODEL_STAGES:
-       return "your_model"
-   ```
+   > **Pure-diffusion TTS does not go through adapters yet.** Under
+   > `for_diffusion()`, `create_speech()` routes straight to
+   > `_create_diffusion_speech()` and never calls `validate()`/`build()`.
+   > `DiffusionTTSAdapter` is scaffolding with no production subclass, so logic
+   > placed in one would silently never run. Diffusion-engine models follow the
+   > existing diffusion path; wiring it through adapters is open work (#4855).
 
-   **Point 4** — validation dispatch in `_validate_tts_request()`:
-   ```python
-   if self._tts_model_type == "your_model":
-       return self._validate_your_model_request(request)
-   ```
+   **If a stage key alone cannot identify the model**, declare
+   `model_archs = frozenset({"YourModelForConditionalGeneration"})`; add
+   `arch_identifies_entry_stage = True` when the model owns no stage key at all
+   (Ming dense). For a rule that is not set membership, override `matches()` (see
+   `covo_audio.py`). For a genuine overlap with another adapter, give one an
+   explicit `detect_priority` — `test_tts_detection.py` fails on an unordered
+   overlap. Models that only serve speech in some topologies override
+   `stage_serves_speech()` (see `audex.py`).
 
-   **Point 5** — validation + parameter-builder methods:
-   ```python
-   def _validate_your_model_request(self, request) -> str | None:
-       if not request.input or not request.input.strip():
-           return "Input text cannot be empty"
-       return None
+   **Reuse shared helpers via `self.ctx.server`** rather than reimplementing them:
+   `_resolve_ref_audio`, `_apply_uploaded_speaker`, `_validate_ref_audio_format`,
+   `_max_instructions_length`. Read a comparable adapter first — `fish_speech.py`
+   (voice cloning), `higgs_audio_v3.py` (parameter-heavy), `moss_tts.py` (family
+   sharing a base class).
 
-   def _build_your_model_params(self, request) -> dict:
-       params = {"text": [request.input]}
-       if request.voice is not None:
-           params["voice"] = [request.voice]
-       return params
-   ```
-   Wire `_build_your_model_params` into `_create_tts_request()` alongside the other
-   model-specific param builders.
+   > **Do not add `self._tts_model_type == ...` branches to `serving_speech.py`.**
+   > Older models predate the adapter framework and still have them; they are being
+   > migrated out (RFC #4327, #4855). `tools/pre_commit/check_tts_adapter.py` is a
+   > ratchet on the remaining count and fails the commit if it grows. Behaviour that
+   > no adapter hook can express is a missing hook — propose it on the RFC.
 
-   > **Two dispatch patterns coexist**: Fish Speech uses a `self._is_fish_speech` boolean
-   > instance attribute checked before `elif self._is_tts`, while all newer models
-   > (CosyVoice3, MOSS-TTS-Nano) use the `_tts_model_type` string returned by
-   > `_detect_tts_model_type()`. For new models, always use the `_tts_model_type` string
-   > pattern — do not add new `_is_*` flags.
-
-   > **Unused variable rule**: only extract fields in `_build_your_model_params` that
-   > are actually forwarded to the model. Unused extractions fail `ruff F841`.
-   > For voice-cloning fields (`ref_audio` → `prompt_audio_path`, `ref_text` →
-   > `prompt_text`), add them to the param builder and verify they reach the model call.
-
-   **Rebase conflict note**: when rebasing onto `main` after another model was merged,
-   `serving_speech.py` will conflict. Resolution: always keep *both* the upstream
-   model's additions and your own — never discard either side.
+   > **Unused variable rule**: only extract fields in `build()` that are actually
+   > forwarded to the model. Unused extractions fail `ruff F841`. For voice-cloning
+   > fields (`ref_audio` -> `prompt_audio_path`, `ref_text` -> `prompt_text`), add
+   > them to the params and verify they reach the model call.
 
 2. **Handle model-specific parameters**:
    - Voice cloning: `ref_audio` encoding and prompt injection
@@ -295,7 +304,7 @@ import base64
 from pathlib import Path
 
 def build_voice_clone_prompt(ref_audio_path: str, text: str, codec) -> list:
-    """Build prompt with reference audio for voice cloning in serving_speech.py."""
+    """Build prompt with reference audio for voice cloning, called from the adapter."""
     audio_bytes = Path(ref_audio_path).read_bytes()
     codes = codec.encode(audio_bytes)  # Encode on CPU using model's codec (e.g., DAC)
     token_ids = [code + codec.vocab_offset for code in codes.flatten().tolist()]
@@ -321,7 +330,7 @@ Classify the model's **CI priority** first (high / medium / low). High-priority 
 
 | Level | Location | Marker | CI pipeline | Notes |
 |-------|----------|--------|-------------|-------|
-| **L1** | `tests/model_executor/…`, `tests/entrypoints/openai_api/…`, stage-processor tests | `core_model` + `cpu` | `test-ready.yml` | Prompt assembly, async_chunk helpers, `serving_speech` validation — no GPU |
+| **L1** | `tests/model_executor/…`, `tests/entrypoints/openai_api/…`, stage-processor tests | `core_model` + `cpu` | `test-ready.yml` | Prompt assembly, async_chunk helpers, adapter validation — no GPU |
 | **L2** | `tests/e2e/online_serving/test_{slug}.py` | **`core_model` + `advanced_model`** (both on baseline smoke) + `tts` + `@hardware_test(...)` | `test-ready.yml` (`ready` label) | Default deploy smoke: single `/v1/audio/speech` or offline `OmniRunner` path |
 | **L3** | `tests/e2e/online_serving/test_{slug}.py` **and** `tests/e2e/offline_inference/test_{slug}.py` | Baseline smoke: **`core_model` + `advanced_model`**; heavier cases: `advanced_model` only (+ `tts`) | `test-merge.yml` **or** merged into nightly TTS function job | Streaming, voice clone, batch/queue, async_chunk |
 | **L4** | `tests/e2e/online_serving/test_{slug}_expansion.py`, optional offline expansion | `full_model` + `tts` | `test-nightly.yml` (`:full_moon: TTS · Function Test with L4`) | Feature matrix; perf → `tests/dfx/perf/tests/test_tts.json` |
@@ -336,8 +345,8 @@ Heavier scenarios in the same file use **`advanced_model` only** (streaming, ext
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_voice_clone_en_non_streaming_001(omni_server, openai_client) -> None:
-    openai_client.send_audio_speech_request({...})
+def test_voice_clone_en_non_streaming_001(omni_server, online_client) -> None:
+    online_client.send_audio_speech_request({...})
 ```
 
 **L4 consolidation:** Prefer parametrized `OmniServerParams` rows (`default`, `async_chunk`, feature flags) in one expansion module rather than many merge-only files ([#1832](https://github.com/vllm-project/vllm-omni/issues/1832)).
@@ -354,8 +363,8 @@ def test_voice_clone_en_non_streaming_001(omni_server, openai_client) -> None:
 
 | Path | Fixture | Call |
 |------|---------|------|
-| Online `/v1/*` | `openai_client` | `openai_client.send_*_request(request_config)` |
-| Offline inference | `omni_runner_handler` | `omni_runner_handler.send_*_request(request_config)` |
+| Online `/v1/*` | `online_client` | `online_client.send_*_request(request_config)` |
+| Offline inference | `offline_client` | `offline_client.send_*_request(request_config)` |
 
 1. **Grep `runtime.py` first** — reuse `send_omni_request`, `send_diffusion_request`, `send_audio_speech_request` (online + offline Qwen-style TTS), `send_single_stage_tts_request` (Coqui XTTS / MOSS-TTS-Nano offline), etc.
 2. **No matching helper** → add `send_<feature>_request` (or `send_<route>_http_request` for negative/dfx) in **`runtime.py`** with general `assert_*` bundled inside, **then** call it from the test.
@@ -366,7 +375,7 @@ See [vllm-omni-test skill](../vllm-omni-test/SKILL.md) § **Runtime send helpers
 
 ### Deliverables
 
-- Updated `serving_speech.py` with all 5 integration points (single commit)
+- One adapter file under `tts_adapters/` plus its line in the package import block
 - Client scripts and server launcher under `examples/online_serving/text_to_speech/<model>/`
 - Gradio demo with streaming and voice cloning UI in the same dir
 - E2E tests per **Test Case Writing (CI Levels)** above (priority tier determines L1–L4 scope)
@@ -387,7 +396,7 @@ See [vllm-omni-test skill](../vllm-omni-test/SKILL.md) § **Runtime send helpers
   `/health` return non-200 until you're actually ready.
 - **Mark tests per the CI Levels table** — baseline smoke: `core_model` + `advanced_model`; heavier cases: `advanced_model` only; L4 expansion: `full_model`
 - **No per-model helper modules** — do not create `tests/helpers/{slug}.py`; keep constants and `request_config` payloads in the test file
-- **Online and offline e2e go through `runtime.py`** — `openai_client.send_audio_speech_request` (online); `omni_runner_handler.send_audio_speech_request` (Qwen-style offline) or `send_single_stage_tts_request` (single-stage offline). Add a new `send_*_request` in `runtime.py` when none fits; do not embed `omni.generate` or HTTP in tests
+- **Online and offline e2e go through `runtime.py`** — `online_client.send_audio_speech_request` (online); `offline_client.send_audio_speech_request` (Qwen-style offline) or `send_single_stage_tts_request` (single-stage offline). Add a new `send_*_request` in `runtime.py` when none fits; do not embed `omni.generate` or HTTP in tests
 
 ## Phase 4: Async Chunk (Streaming)
 
@@ -395,21 +404,29 @@ See [vllm-omni-test skill](../vllm-omni-test/SKILL.md) § **Runtime send helpers
 
 ### Steps
 
-1. **Update stage config YAML**:
+1. **Update the pipeline topology** so the producing stage declares its async
+   handoff processor with `async_chunk_process_next_stage_input_func`.
+2. **Update the deploy YAML** to enable async chunk and configure the connector:
    ```yaml
    async_chunk: true
-   codec_chunk_frames: 25      # frames per chunk
-   codec_left_context_frames: 25  # overlap for smooth boundaries
+
+   connectors:
+     connector_of_shared_memory:
+       name: SharedMemoryConnector
+       extra:
+         codec_streaming: true
+         codec_chunk_frames: 25
+         codec_left_context_frames: 25
    ```
-2. **Implement chunk handling in Stage 1**:
+3. **Implement chunk handling in Stage 1**:
    - Accept partial input (chunk of codec codes)
    - Handle left context for smooth audio boundaries
    - Return partial audio in `OmniOutput`
-3. **Test streaming**:
+4. **Test streaming**:
    - Verify audio quality matches non-streaming output
    - Check for artifacts at chunk boundaries
    - Measure TTFA (time to first audio)
-4. **Update online serving** to support `stream=true` with PCM output
+5. **Update online serving** to support `stream=true` with PCM output
 
 ### Streaming Architecture
 
@@ -430,7 +447,8 @@ Stage 0 (AR)                    Stage 1 (Decoder)
 
 ### Deliverables
 
-- Updated stage config with async_chunk enabled
+- Updated pipeline async handoff processor and deploy config with
+  `async_chunk: true`
 - Smooth streaming audio without boundary artifacts
 - TTFA metrics
 
@@ -502,20 +520,21 @@ Use this checklist when integrating a new TTS model:
 - [ ] Config classes created with `model_type` registration
 - [ ] Stage 0 (AR) implemented and generates correct tokens
 - [ ] Stage 1 (Decoder) produces correct audio from tokens — dtype float32 for codec decoder
-- [ ] Stage 1 `max_num_seqs` ≥ 4 in production config (default 1 causes gaps under concurrency)
+- [ ] AR stage `max_num_seqs` ≥ 4 in the production deploy config unless the model has a tested lower limit
 - [ ] Optional dependency fallbacks handled at `load_weights()` time (torchaudio/soundfile/etc.)
 - [ ] Streaming: codec codes accumulated across AR steps (not reset per step)
 - [ ] Streaming: delta audio emitted per chunk, not full re-decoded waveform
 - [ ] Streaming: all `forward()` return paths emit `model_outputs`
 - [ ] Streaming: per-request state keyed by request ID (not shared across requests)
 - [ ] Streaming: codec tensors moved to codec decoder device before decode
-- [ ] Stage config YAML created
+- [ ] Pipeline topology defined in `pipeline.py` and registered in `OMNI_PIPELINES`
+- [ ] Deploy YAML created under `vllm_omni/deploy/`
 - [ ] `end2end.py` produces audio matching reference quality
 - [ ] README.md written
 
 ### Phase 3: Online Serving
-- [ ] All 5 `serving_speech.py` integration points added in one commit
-- [ ] Only extract params in `_build_*_params` that are forwarded to the model call (ruff F841)
+- [ ] Adapter written under `tts_adapters/` and registered in the import block
+- [ ] Only extract params in `build()` that are forwarded to the model call (ruff F841)
 - [ ] Prompt builder handles text input correctly
 - [ ] Voice cloning works (if supported)
 - [ ] All response formats work (wav, mp3, flac, pcm)
@@ -526,7 +545,8 @@ Use this checklist when integrating a new TTS model:
 - [ ] Documentation added (offline + online docs, nav, supported models)
 
 ### Phase 4: Async Chunk
-- [ ] Stage config updated with `async_chunk: true`
+- [ ] Pipeline declares the async handoff processor
+- [ ] Deploy config sets `async_chunk: true` and connector chunk parameters
 - [ ] Stage 1 handles partial chunks correctly
 - [ ] No audio artifacts at chunk boundaries
 - [ ] Streaming via API (`stream=true`) works
@@ -543,7 +563,7 @@ Use this checklist when integrating a new TTS model:
 - [ ] `pre-commit run --files <changed>` passes before every push
 - [ ] Every commit has `Signed-off-by` matching the author email (`git commit -s`)
 - [ ] `git config user.email` matches the email registered on your GitHub account
-- [ ] Details and failure-recovery commands: [references/precommit-dco.md](references/precommit-dco.md)
+- [ ] Hook list, failure table, and DCO recovery: [references/precommit-dco.md](references/precommit-dco.md)
 
 ## References
 

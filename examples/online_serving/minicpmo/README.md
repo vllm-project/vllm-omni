@@ -23,21 +23,23 @@ including `librosa`.
 
 The deploy config auto-loads via `--omni`.
 The default `vllm_omni/deploy/minicpmo_4_5.yaml` keeps all three stages on
-logical device 0 with memory budgets of 55%, 15%, and 15%, leaving headroom
+logical device 0 with memory budgets of 55%, 15%, and 18%, leaving headroom
 for runtime kernels such as the HiFi-GAN vocoder's cuDNN workspace. The
-profile admits at most four sequences per stage and bounds startup video
-profiling to 32 frames per video. For throughput,
+profile admits at most four sequences per stage and bounds Talker context
+to 4096 tokens. For throughput,
 `minicpmo_4_5_2gpu.yaml` gives the Thinker
 GPU 0 (90%) and colocates the Talker (55%) and Code2Wav (35%) on GPU 1. That
 profile admits at most four concurrent sequences per stage.
 
 | deploy config | GPUs | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `minicpmo_4_5.yaml` (default) | 1 | Memory-constrained compatibility layout. |
 | `minicpmo_4_5_2gpu.yaml` | 2 | Recommended continuous-batching layout; Talker and Code2Wav share GPU 1. |
 | `minicpmo_4_5_3gpu.yaml` | 3 | One GPU per stage. |
 | `minicpmo_4_5_8x4090.yaml` | 8 | Full 8x4090 layout. |
-| `minicpmo_4_5_duplex.yaml` | 1 | Experimental native full-duplex overlay. |
+
+Every profile sets `session_mode: duplex`, so native full-duplex is served
+from the same process as `/v1/chat/completions`.
 
 The split pipeline preserves native-duplex epoch/turn identity, segment text,
 turn completion, reference voice, and terminal-audio metadata through
@@ -55,8 +57,8 @@ vllm-omni serve openbmb/MiniCPM-o-4_5 \
 ```
 
 For local ModelScope checkpoints, replace `openbmb/MiniCPM-o-4_5` with the
-checkpoint path. To start the experimental native duplex backend, use
-`vllm_omni/deploy/minicpmo_4_5_duplex.yaml`.
+checkpoint path. For native full-duplex, connect `/v1/realtime?duplex=1` on
+this same server.
 
 ### Per-stage overrides
 
@@ -145,7 +147,7 @@ assistant template, so it is not an apples-to-apples accuracy run.
 
 ## Run the Realtime duplex CLI demo
 
-After the duplex backend is running, stream one WAV through the Realtime
+After the server is running, stream one WAV through the Realtime
 WebSocket endpoint:
 
 ```bash
@@ -156,6 +158,33 @@ python examples/online_serving/minicpmo/realtime_duplex_demo.py \
     --ref-audio /path/to/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav \
     --output-dir /tmp/minicpmo_realtime_duplex_demo
 ```
+
+Video input uses the same session. PyAV demuxes JPEG frames at `--video-fps`
+(default 1.0) and vLLM `load_audio` extracts a 16 kHz mono WAV unless
+`--input-wav` overrides the soundtrack. Frames keep their capture size
+(`--frame-max-side 0`); the server `process_image` normalizes at 448.
+
+`--stack-frames N` raises the visual refresh rate the way official duplex does:
+each 1 s unit also samples the `N-1` sub-frames captured inside it and tiles
+them into a single composite image sent next to that unit's base frame. The
+audio cadence never changes — a unit is always one second — and the wire always
+carries 2 images per unit however large `N` is, because the sub-frames share one
+composite. Official uses 5 for high refresh rate mode:
+
+```bash
+python examples/online_serving/minicpmo/realtime_duplex_demo.py \
+    --url ws://localhost:8099/v1/realtime?duplex=1 \
+    --model openbmb/MiniCPM-o-4_5 \
+    --input-video /path/to/clip.mp4 \
+    --stack-frames 5 \
+    --ref-audio /path/to/MiniCPM-o-Demo/assets/ref_audio/ref_minicpm_signature.wav \
+    --output-dir /tmp/minicpmo_realtime_duplex_video_demo
+```
+
+Detail inside a composite is capped by `scale_resolution=448` at
+`max_slice_nums=1`: official suggests HD slicing (`max_slice_nums=[2, 1]`) for
+stacked frames, which the duplex adapter does not implement yet. Reading small
+text or digits out of a wide scene is limited by that, not by frame timing.
 
 ## Open the experimental browser client
 
@@ -189,6 +218,64 @@ which checks lifecycle and streaming invariants for arbitrary input audio. The
 stronger `response-required` mode is diagnostic: it requires a purpose-built
 two-response WAV, its `--input-sha256`, and an
 `--expect-second-response-substring` value.
+
+## Run Omni-DuplexEval
+
+Omni-DuplexEval generation uses the vLLM-Omni native MiniCPM-o duplex
+endpoint. Evaluation uses a separate OpenAI-compatible multimodal judge
+served from the same vLLM-Omni environment. This validates the vLLM-Omni
+duplex client and local judge integration; it does not reproduce the paper's
+original MiniCPM-o inference implementation.
+
+Start the duplex generation server:
+
+```bash
+vllm serve openbmb/MiniCPM-o-4_5 --omni --trust-remote-code \
+    --deploy-config vllm_omni/deploy/minicpmo_4_5_duplex.yaml \
+    --served-model-name openbmb/MiniCPM-o-4_5 \
+    --host 0.0.0.0 --port 8099
+```
+
+Start a separate multimodal judge. The allowed path must contain any local
+videos passed with `--judge-video-mode video_url`:
+
+```bash
+vllm serve Qwen/Qwen2.5-VL-7B-Instruct \
+    --served-model-name Qwen/Qwen2.5-VL-7B-Instruct \
+    --allowed-local-media-path /data/omni-duplex-eval \
+    --host 0.0.0.0 --port 8000
+```
+
+Generate, evaluate, and summarize:
+
+```bash
+vllm bench omni-duplex-eval --omni generate \
+    --url ws://127.0.0.1:8099/v1/realtime?duplex=1 \
+    --model openbmb/MiniCPM-o-4_5 \
+    --ref-audio /data/ref.wav \
+    --dataset Hothan/Omni-DuplexEval \
+    --concurrency 2 \
+    --response-root /data/omni-duplex-eval/responses
+
+vllm bench omni-duplex-eval --omni evaluate \
+    --dataset Hothan/Omni-DuplexEval \
+    --response-root /data/omni-duplex-eval/responses \
+    --score-root /data/omni-duplex-eval/scores \
+    --judge-base-url http://127.0.0.1:8000 \
+    --judge-model Qwen/Qwen2.5-VL-7B-Instruct \
+    --judge-video-mode video_url \
+    --eval-workers 4
+
+vllm bench omni-duplex-eval --omni summarize \
+    --score-root /data/omni-duplex-eval/scores
+```
+
+The dataset names such as `RTD_OCR` and `PR_correction` are Hugging Face
+splits, not dataset configurations. Pass one with `--split`, or omit it to
+run all nine splits. `--limit 1` is useful for a smoke test. Realtime
+generation records `clock=media`; artifacts generated with
+`--pace as-fast-as-possible` record `clock=invalid` and evaluation rejects
+them unless `--allow-invalid-clock` is explicit.
 
 ## Related examples
 

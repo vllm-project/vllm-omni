@@ -8,7 +8,7 @@ For CI levels (L1–L5) and triggers, see [Test System Overview](./test_system_o
 
 Canonical layout (prefer these paths for new changes):
 
-```
+```text
 .buildkite/
 ├── common/                          # Shared across platforms
 │   ├── scripts/
@@ -48,7 +48,7 @@ Canonical layout (prefer these paths for new changes):
     └── scripts/
 ```
 
-**Placement rules**
+### Placement rules
 
 | Rule | Detail |
 | ---- | ------ |
@@ -81,7 +81,14 @@ There are still **legacy copies** at `.buildkite/*.yaml` (without the `cuda/` pr
     | L2 | `cuda/test-ready.yml` | `ready` label |
     | L3 | `cuda/test-merge.yml` | `merge-test` label / main merge |
     | L4 | `cuda/test-nightly.yml` | `nightly-test` label or `NIGHTLY=1` |
-    | L5 | `cuda/test-weekly.yml` | `weekly-test` label or `WEEKLY=1` |
+    | L5 | `cuda/test-weekly.yml` | `weekly-test` label, `WEEKLY=1`, or `NON_CRITICAL=1` (see step `if`s below) |
+
+    On scheduled `main` builds, `test-weekly.yml` is uploaded when **`WEEKLY=1` or `NON_CRITICAL=1`**. Inside that file:
+
+    - **Reliability** / **Perf Test** / **Simple · CPU Coverage Test** → `WEEKLY=1` (or PR label `weekly-test` for Reliability/Perf). Pipeline upload for scheduled env vars still requires `main`.
+    - **E2E Tests** group (slow Omni/TTS/Diffusion sweeps) → `NON_CRITICAL=1`
+
+    **`--e2e`:** when uploading ready/merge on `main` with **`WEEKLY=1`**, bootstrap passes `--e2e` so only the **E2E Test** group is kept (same flag `run_cov_split.sh` uses to enable per-model coverage).
 
     **Upload:** `upload_pipeline.py --upload` expands uploader-only keys before Buildkite upload.
 
@@ -111,6 +118,8 @@ There are still **legacy copies** at `.buildkite/*.yaml` (without the `cuda/` pr
     **Bootstrap:** [`npu/pipeline-npu.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/pipeline-npu.yml) + [`npu/bootstrap-upload-steps.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/bootstrap-upload-steps.yml)—same split as CUDA; builds A2/B3 and A3 CI images, then uploads child test pipelines.
 
     **Test YAML:** `npu/test-npu-ready.yml` (L2), `test-npu-nightly.yml` (L4).
+
+    **L2 trigger:** PR label `ready` (CUDA/AMD L2). PR labels `ready` + `npu-test` trigger NPU CI only.
 
     **Upload:** same as CUDA—`upload_pipeline.py --upload`.
 
@@ -204,15 +213,15 @@ Label triggers (`ready`, `merge-test`) are unchanged—diff-aware logic only red
 | Diff shape | Path | Default L2/L3 |
 | --- | --- | --- |
 | Product code / non-whitelisted paths | normal CI | all on |
-| Docs and/or qualifying skip-mark only | `skip_all` | all off (scheduled `main` NIGHTLY/WEEKLY exceptions below) |
+| Docs and/or qualifying skip-mark only | `skip_all` | all off (scheduled `main` NIGHTLY/WEEKLY/`NON_CRITICAL` exceptions below) |
 | Whitelisted CI YAML only | yaml-gated (`skip_l2_l3`) | per platform/level matrix |
 | Docs/skip-mark **+** whitelisted CI YAML | yaml-gated (`skip_l2_l3`) | same as CI-YAML-only (does **not** widen to normal CI) |
 | Non-qualifying skip-mark and no CI YAML | normal CI | all on |
 | Diff unavailable | normal CI | all on |
 
-**`skip_all` exceptions (CUDA/NPU bootstrap only):** PR labels (`nightly-test`, `merge-test`, `npu-test`, `weekly-test`, …) do **not** revive jobs. On `main`, scheduled `NIGHTLY=1` still builds the image and uploads L4 plus L2/L3 (with `--e2e`); `WEEKLY=1` still builds the image and uploads L5 (CUDA).
+**`skip_all` exceptions (CUDA/NPU bootstrap only):** PR labels (`nightly-test`, `merge-test`, `weekly-test`, `ready`, …) do **not** revive jobs under `skip_all`. On `main`, scheduled `NIGHTLY=1` still builds the image and uploads L4; `WEEKLY=1` or `NON_CRITICAL=1` still builds the image and uploads L5 (CUDA). `WEEKLY=1` on `main` also uploads L2/L3 with `--e2e`.
 
-**Yaml-gated nightly/weekly:** L4/L5 upload steps keep their normal label / `NIGHTLY` / `WEEKLY` conditions (for example PR `nightly-test` still uploads nightly). Only L2/L3 upload steps are matrix-gated.
+**Yaml-gated nightly/weekly:** L4/L5 upload steps keep their normal label / `NIGHTLY` / `WEEKLY` / `NON_CRITICAL` conditions (for example PR `nightly-test` still uploads nightly). Only L2/L3 upload steps are matrix-gated.
 
 ##### Whitelisted CI YAML → platform
 
@@ -285,12 +294,12 @@ CUDA **L2** (`.buildkite/cuda/test-ready.yml`) and **L3** (`.buildkite/cuda/test
 | `source_file_dependencies` | List of path **prefixes**. If any changed file equals a prefix or starts with `prefix/`, keep the step (or group); otherwise omit it. |
 | `mirror_hardwares` | Expand to `agents` + `plugins` (+ optional `image`) from `ci_mirror_hardwares.yml`. |
 
-**Policy**
+### Policy
 
 - **Always uploaded** (no key): groups outside **E2E Test**—Simple Test, Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints (L2), LoRA / Entrypoints (L3).
 - **Diff-gated**: every **E2E Test** leaf job. List the smallest prefix set per step—pytest file(s), model code under `vllm_omni/model_executor/models/` or `vllm_omni/diffusion/models/`, plus `stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable. A **group** may define the key instead; the whole group drops if no prefix matches.
 
-**YAML examples**
+### YAML examples
 
 ```yaml
       - label: "Diffusion · Qwen Image Test"
@@ -312,7 +321,7 @@ CUDA **L2** (`.buildkite/cuda/test-ready.yml`) and **L3** (`.buildkite/cuda/test
         mirror_hardwares: l4_4
 ```
 
-**Local dry-run**
+### Local dry-run
 
 ```bash
 python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/cuda/test-ready.yml
@@ -324,15 +333,109 @@ On PR builds, `upload_pipeline.py` logs `skip '…' (no changes under …)` for 
 
 ### Labels and grouping
 
-- Use **groups** for dashboard readability; keep **E2E Test** as the group name CUDA diff filtering expects for `--e2e` nightly runs on main.
+- Use **groups** for dashboard readability; keep **E2E Test** as the group name CUDA diff filtering expects for `--e2e` weekly runs on main (`WEEKLY=1`).
 - Prefix labels by model domain: **Omni ·**, **TTS ·**, **Diffusion ·**, **Simple ·**, etc., matching existing steps.
+
+### Per-model coverage
+
+Pilot (v1): one Merge-tier (L3) job in `.buildkite/cuda/test-merge.yml` uploads
+per-model, per-entry-mode coverage as Buildkite artifacts — "TTS · Qwen3-TTS Base
+Test". Coverage + artifact upload run only when bootstrap uploaded that job with
+`--e2e` (`WEEKLY=1` and `BUILDKITE_BRANCH=main`, via `run_cov_split.sh`); otherwise
+the same job runs plain pytest without `--cov`. It runs on a single GPU so the
+pilot is cheap to reproduce.
+
+**L1 package coverage (CPU):** ready/merge Simple Test jobs run without `--cov`. Scheduled weekly on `main` with `WEEKLY=1` runs **Simple · CPU Coverage Test** in `.buildkite/cuda/test-weekly.yml` (`pytest -m 'core_model and cpu'` + Cobertura XML artifact).
+
+**Naming convention**: `coverage-<model_id>-<mode>-<step_id>.xml.gz`, where
+`<model_id>` is the model's directory name under
+`vllm_omni/diffusion/models/<model_id>/` or
+`vllm_omni/model_executor/models/<model_id>/` (e.g. `z_image`, `qwen3_omni`),
+`<mode>` is `online` or `offline`, and `<step_id>` is `BUILDKITE_STEP_ID`
+(`local` outside Buildkite). `gunzip` before feeding a report to a Cobertura
+consumer.
+
+Reports are gzipped because `--cov=vllm_omni` sets coverage's `source`, which
+makes it walk the package and emit one `<line>` element per statement for every
+file — including the ones a single model's tests never import. That inventory,
+not the coverage, is the size: a Bagel report is 7.1 MB, of which 96.5% is
+`<line>` elements and 77% belongs to the 840 of 1169 files that run never
+imported. A run covering zero lines produces the same 7 MB. gzip takes it to
+roughly 410 KB and changes nothing about the data.
+
+`<step_id>` is what keeps two steps that cover the same model apart. Artifacts are
+scoped to the build, and a weekly build can carry ready/merge (with `--e2e`) and
+weekly tiers at once, so several same-model steps land in one namespace — `qwen3_tts` already has
+both a Base and a CustomVoice job, and `minicpmo_4_5` a base and a duplex one. Two
+uploads on one path do not fail loudly: an exact-name download can report the path
+as ambiguous, and a glob download fetches every match concurrently and renames each
+onto the same destination, so whichever finishes last wins. The step id remains the
+logical step identifier across retries, while Buildkite's default artifact lookup
+selects only the latest attempt — `BUILDKITE_JOB_ID` would instead give every
+attempt its own filename, leaving a failed attempt's partial report to be picked up
+alongside the real one. A step using `parallelism`/matrix would need
+`BUILDKITE_PARALLEL_JOB` added, since its jobs share a step id; neither pilot is
+one.
+
+**Opting in a new model**: replace the job's combined `pytest` command with
+[`run_cov_split.sh`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/scripts/run_cov_split.sh),
+which runs each mode, names the reports, uploads them, and fails the step if
+either half or the upload failed:
+
+```yaml
+commands:
+  - |
+    .buildkite/common/scripts/run_cov_split.sh \
+      --model-id <model_id> \
+      --offline <offline test path> \
+      --online <online test path> \
+      -- <the job's existing pytest flags, e.g. -m '...' --run-level '...'>
+```
+
+Everything after `--` is forwarded verbatim to both runs with quoting preserved,
+so an expression like `-m 'advanced_model and cuda'` survives intact and a job can
+pass anything else it needs. `--offline`/`--online` are repeatable and only one is
+required, so a job with tests in a single mode runs just that half. Runtime is
+bounded solely by the step's `timeout_in_minutes` — raise it, since the split
+loads the model once per mode.
+
+Before splitting, confirm each half actually collects at least one test under the job's forwarded filters — pytest exits with code 5 ("no tests collected") if a half is empty, which the script reports as a failure, red-ing a job that used to pass as one combined invocation.
+
+Also check the tests' `num_cards` against the job's `mirror_hardwares` preset.
+`cuda_marks` turns `num_cards > 1` into `skipif(device_count() < num_cards)`, so a
+test asking for more GPUs than the preset provides is silently skipped and its
+coverage artifact comes back empty. Splitting such a job produces a file that
+looks fine and measures nothing — "Diffusion · Z Image Test" is the current
+example (online tests want 4 cards, the job runs on `l4_1`), which is why it is
+not a coverage pilot.
+
+Online-mode coverage depends on the `[tool.coverage.run]` `patch`/`sigterm`
+settings in `pyproject.toml`: online tests launch the server with
+`subprocess.Popen` and stop it with SIGTERM, and without those settings the XML
+reflects only the pytest parent process, not the server's code paths.
+
+The upload depends on `buildkite-agent` being callable inside the container. The
+`kubernetes` presets (`h100_*`, `*_npu_*`) provide it; the `docker` ones (`l4_*`)
+only do because they set `mount-buildkite-agent: true`. A new docker preset that
+runs a coverage job needs the same.
+
+List both `run_cov_split.sh` and `pyproject.toml` in every opted-in job's
+`source_file_dependencies` — both change what the job measures, so without them a
+change there is filtered out of normal PR builds and only surfaces in a later
+nightly. `tests/buildkite/test_upload_pipeline.py` covers the filter behavior with
+a synthetic job (it does not pin real merge labels).
+Editing only the surrounding CI YAML still does not schedule them, so a PR that
+touches just the wiring needs a full E2E run (or the commands run on a GPU host)
+to produce artifacts. When checking a new model's
+artifacts, compare `lines-covered` between the online and offline XML rather than
+just confirming both files exist.
 
 ### Validation checklist
 
 | Check | Command / location |
 | ----- | ------------------ |
 | CUDA render | `python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/cuda/test-<level>.yml` |
-| No leaked uploader keys | `… \| grep -E 'mirror_hardwares|source_file_dependencies'` → empty |
+| No leaked uploader keys | Pipe the render into `grep -E 'mirror_hardwares\|source_file_dependencies'` — expect empty |
 | Skip-ci / upload unit tests | `pytest tests/buildkite/` |
 | Local job replay (CUDA L2+) | `tools/run_ready_jobs.sh`, `tools/run_merge_jobs.sh`, `tools/nightly/run_nightly_jobs.sh` (read YAML from `cuda/`) |
 

@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".buildkite" / "common" / "scripts"))
 
@@ -38,8 +40,6 @@ def _render(changed_files: list[str]) -> str:
 
 
 def test_bootstrap_if_injected_by_step_key() -> None:
-    import yaml
-
     rendered = _render_bootstrap_pipeline(
         BOOTSTRAP_STEPS_TEMPLATE,
         decision=resolve_ci_decision([]),
@@ -62,21 +62,41 @@ def test_bootstrap_steps_loaded_from_file() -> None:
 
 
 def test_docs_only_allows_main_scheduled_nightly_weekly_only() -> None:
-    """skip_all: no PR labels; main + NIGHTLY=1 / WEEKLY=1 still gates scheduled CI."""
+    """skip_all: no PR labels; main + NIGHTLY=1 / WEEKLY=1 / NON_CRITICAL=1 still gates scheduled CI."""
     rendered = _render(["docs/foo.md"])
     assert "key: image-build" in rendered
     assert "key: upload-nightly-pipeline" in rendered
     assert "key: upload-weekly-pipeline" in rendered
-    # Scheduled nightly also uploads L2/L3 with --e2e
-    assert "key: upload-ready-pipeline" in rendered
-    assert "key: upload-merge-pipeline" in rendered
-    assert 'build.env("NIGHTLY") == "1"' in rendered
+    # Scheduled main+WEEKLY=1 uploads L2/L3 with --e2e; NIGHTLY still gates L4 only.
+    doc = yaml.safe_load(rendered)
+    by_key = {step["key"]: step for step in doc["steps"]}
+    assert "NIGHTLY" not in by_key["upload-ready-pipeline"]["if"]
+    assert 'build.branch == "main"' in by_key["upload-ready-pipeline"]["if"]
+    assert 'build.env("WEEKLY") == "1"' in by_key["upload-ready-pipeline"]["if"]
+    assert "NIGHTLY" not in by_key["upload-merge-pipeline"]["if"]
+    assert 'build.branch == "main"' in by_key["upload-merge-pipeline"]["if"]
+    assert 'build.env("WEEKLY") == "1"' in by_key["upload-merge-pipeline"]["if"]
+    assert 'build.env("NIGHTLY") == "1"' in by_key["upload-nightly-pipeline"]["if"]
     assert 'build.env("WEEKLY") == "1"' in rendered
+    assert 'build.env("NON_CRITICAL") == "1"' in rendered
     assert "nightly-test" not in rendered
     assert "weekly-test" not in rendered
     assert "merge-test" not in rendered
     assert 'labels includes "ready"' not in rendered
     assert "if: false" not in rendered
+
+
+def test_npu_docs_only_does_not_upload_ready_on_nightly() -> None:
+    """NPU skip_all: scheduled NIGHTLY still uploads L4, not L2 ready."""
+    rendered = _render_bootstrap_pipeline(
+        BOOTSTRAP_STEPS_TEMPLATE,
+        decision=resolve_ci_decision(["docs/foo.md"]),
+        path=Path(".buildkite/npu/bootstrap-upload-steps.yml"),
+    )
+    doc = yaml.safe_load(rendered)
+    by_key = {step["key"]: step for step in doc["steps"]}
+    assert "upload-ready-pipeline" not in by_key
+    assert 'build.env("NIGHTLY") == "1"' in by_key["upload-nightly-pipeline"]["if"]
 
 
 def test_yaml_gated_l45_only_does_not_unconditionally_build_image() -> None:
@@ -139,3 +159,65 @@ def test_mirror_hardwares_a2b3_npu_4_expands_agents_image_and_plugins() -> None:
     assert step["plugins"][0]["kubernetes"]["podSpecPatch"]["imagePullSecrets"] == [
         {"name": "swr-secret"},
     ]
+
+
+def _surviving_labels(doc: dict, changed_files: list[str]) -> set[str]:
+    rendered = _render_test_pipeline(doc, changed_files=changed_files)
+    labels: set[str] = set()
+
+    def walk(steps: list | None) -> None:
+        for step in steps or []:
+            if not isinstance(step, dict):
+                continue
+            if "label" in step:
+                labels.add(step["label"])
+            walk(step.get("steps"))
+
+    walk(rendered.get("steps"))
+    return labels
+
+
+# Synthetic coverage-style job: shared inputs that change what the split measures.
+_COVERAGE_SHARED_INPUTS_DOC = {
+    "steps": [
+        {
+            "label": "Coverage Pilot",
+            "source_file_dependencies": [
+                "tests/e2e/online_serving/test_example.py",
+                ".buildkite/common/scripts/run_cov_split.sh",
+                "pyproject.toml",
+            ],
+            "commands": [".buildkite/common/scripts/run_cov_split.sh --model-id example"],
+        },
+        {
+            "label": "Unrelated Model Test",
+            "source_file_dependencies": [
+                "tests/e2e/online_serving/test_other.py",
+            ],
+            "commands": ["pytest -sv tests/e2e/online_serving/test_other.py"],
+        },
+    ],
+}
+
+
+@pytest.mark.parametrize(
+    "changed_file",
+    [
+        ".buildkite/common/scripts/run_cov_split.sh",
+        "pyproject.toml",
+    ],
+)
+def test_coverage_shared_inputs_select_dependent_job(changed_file: str) -> None:
+    """Jobs that list coverage shared inputs must stay selected when those files change."""
+    labels = _surviving_labels(_COVERAGE_SHARED_INPUTS_DOC, [changed_file])
+    assert "Coverage Pilot" in labels
+    assert "Unrelated Model Test" not in labels
+
+
+def test_coverage_shared_inputs_ignored_for_unrelated_change() -> None:
+    labels = _surviving_labels(
+        _COVERAGE_SHARED_INPUTS_DOC,
+        ["vllm_omni/entrypoints/openai/serving_chat.py"],
+    )
+    assert "Coverage Pilot" not in labels
+    assert "Unrelated Model Test" not in labels

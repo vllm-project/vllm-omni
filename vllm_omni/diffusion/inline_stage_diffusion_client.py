@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Inline Stage Diffusion Client for vLLM-Omni multi-stage runtime.
 
 Runs DiffusionEngine in a ThreadPoolExecutor inside the Orchestrator process
@@ -8,6 +11,7 @@ IPC overhead. Used when there is only a single diffusion stage.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
@@ -22,6 +26,7 @@ from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt
+from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID, diffusion_exception_metrics
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
@@ -55,6 +60,8 @@ class InlineStageDiffusionClient(StageClientBase):
         self.default_sampling_params = metadata.default_sampling_params
         self.requires_multimodal_data = metadata.requires_multimodal_data
         self.custom_process_input_func = metadata.custom_process_input_func
+        self.prompt_transform_func = None
+        self.prompt_expand_func = None
         self.engine_input_source = metadata.engine_input_source
         self.batch_size = batch_size
 
@@ -66,6 +73,8 @@ class InlineStageDiffusionClient(StageClientBase):
         self._tasks: dict[str, asyncio.Task] = {}
         self._engine_dead = False
         self._shutting_down = False
+        self._shutdown_complete = False
+        self._shutdown_lock = threading.Lock()
 
         self._engine.executor.register_failure_callback(self._mark_engine_dead)
 
@@ -101,6 +110,10 @@ class InlineStageDiffusionClient(StageClientBase):
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
     ) -> None:
+        # Each request mutates its sampling state while it is normalized and
+        # executed. Callers commonly reuse one params object for concurrent
+        # requests, so take the copy synchronously before either task starts.
+        sampling_params = sampling_params.clone()
         logger.debug(
             "[InlineStageDiffusionClient] stage-%s [rep-%s] add request: %s",
             self.stage_id,
@@ -151,6 +164,15 @@ class InlineStageDiffusionClient(StageClientBase):
                 self._output_queue.put_nowait(result)
         except DiffusionRequestAbortedError as e:
             logger.info("request_id: %s aborted: %s", request_id, str(e))
+            metrics = diffusion_exception_metrics(e)
+            if metrics:
+                self._output_queue.put_nowait(
+                    OmniRequestOutput(
+                        request_id=DIFFUSION_METRICS_ONLY_REQUEST_ID,
+                        finished=True,
+                        metrics=metrics,
+                    )
+                )
         except Exception as e:
             logger.exception("Diffusion request %s failed: %s", request_id, e)
             status_code, error_type = client_error_metadata(e)
@@ -160,6 +182,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 status_code=status_code,
                 error_type=error_type,
             )
+            error_output.metrics.update(diffusion_exception_metrics(e))
             self._output_queue.put_nowait(error_output)
         finally:
             self._tasks.pop(request_id, None)
@@ -174,9 +197,8 @@ class InlineStageDiffusionClient(StageClientBase):
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         for rid in request_ids:
-            task = self._tasks.pop(rid, None)
-            if task:
-                task.cancel()
+            # Keep the consumer alive until the engine emits its terminal
+            # abort output. That path carries the refreshed scheduler gauge.
             self._engine.abort(rid)
 
     async def submit_interaction_async(
@@ -298,19 +320,25 @@ class InlineStageDiffusionClient(StageClientBase):
             raise
 
     def shutdown(self) -> None:
-        self._shutting_down = True
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            self._shutting_down = True
 
-        # Cancel all pending tasks
-        for task in self._tasks.values():
-            task.cancel()
+            # Cancel all pending tasks
+            for task in self._tasks.values():
+                task.cancel()
 
-        try:
-            # Cancel queued futures and wait for the running one to complete deterministically
-            self._executor.shutdown(wait=True, cancel_futures=True)
-        except Exception:
-            pass
+            try:
+                # Stop the engine first so any control RPC running in the thread
+                # pool can observe shutdown instead of keeping stage teardown
+                # blocked while the executor waits for that RPC.
+                self._engine.close()
+            except Exception:
+                pass
 
-        try:
-            self._engine.close()
-        except Exception:
-            pass
+            try:
+                self._executor.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                pass
+            self._shutdown_complete = True

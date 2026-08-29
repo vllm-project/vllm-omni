@@ -15,7 +15,11 @@ from vllm_omni.diffusion.data import (
     DiffusionParallelConfig,
     OmniDiffusionConfig,
 )
-from vllm_omni.diffusion.model_metadata import QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.model_metadata import (
+    HUNYUAN_IMAGE3_MAX_INPUT_IMAGES,
+    QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -88,6 +92,30 @@ class TestParallelConfigPropagation:
         od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
         assert od.num_gpus == 2
 
+    def test_dp_is_inferred_from_num_gpus(self):
+        pc = DiffusionParallelConfig(tensor_parallel_size=2, ulysses_degree=2)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=8)
+        assert od.parallel_config.data_parallel_size == 2
+        assert od.parallel_config.world_size == 8
+
+    def test_explicit_dp_is_validated_against_num_gpus(self):
+        pc = DiffusionParallelConfig(tensor_parallel_size=2, data_parallel_size=2)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4)
+        assert od.parallel_config.data_parallel_size == 2
+
+        with pytest.raises(ValueError, match="does not match WORLD-derived value"):
+            OmniDiffusionConfig.from_kwargs(
+                model="x",
+                parallel_config=DiffusionParallelConfig(tensor_parallel_size=2, data_parallel_size=2),
+                num_gpus=8,
+            )
+
+    def test_hsdp_does_not_infer_ordinary_dp(self):
+        pc = DiffusionParallelConfig(use_hsdp=True, hsdp_shard_size=4)
+        od = OmniDiffusionConfig.from_kwargs(model="x", parallel_config=pc, num_gpus=4)
+        assert od.parallel_config.data_parallel_size == 1
+        assert od.parallel_config.world_size == 4
+
 
 class TestCreateDefaultDiffusion:
     """Verify engine_args structure from create_default_diffusion."""
@@ -121,6 +149,34 @@ class TestCreateDefaultDiffusion:
         assert ea["enforce_eager"] is True
         assert ea["lora_path"] == "/tmp/lora"
 
+    def test_diffusion_kv_mode_roundtrip(self, monkeypatch):
+        from vllm_omni.platforms import current_omni_platform
+
+        monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+        od = _roundtrip_diffusion_config(
+            model="x",
+            diffusion_kv_mode="paged_scheduler",
+            diffusion_kv_max_rows_per_request=2,
+        )
+
+        assert od.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+        assert od.diffusion_kv_max_rows_per_request == 2
+
+    def test_diffusion_kv_sizing_fields_roundtrip(self, monkeypatch):
+        monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda self: 29500)
+        od = _roundtrip_diffusion_config(
+            model="x",
+            kv_cache_memory_bytes=4096,
+            gpu_memory_utilization=0.75,
+            max_num_batched_tokens=2048,
+            max_model_len=4096,
+        )
+
+        assert od.kv_cache_memory_bytes == 4096
+        assert od.gpu_memory_utilization == 0.75
+        assert od.max_num_batched_tokens == 2048
+        assert od.max_model_len == 4096
+
 
 def test_qwen_image_edit_plus_sets_generic_multimodal_limit():
     od_config = OmniDiffusionConfig(model="Qwen/Qwen-Image-Edit-2511", model_class_name="QwenImageEditPlusPipeline")
@@ -129,6 +185,35 @@ def test_qwen_image_edit_plus_sets_generic_multimodal_limit():
 
     assert od_config.supports_multimodal_inputs is True
     assert od_config.max_multimodal_image_inputs == QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES
+
+
+def test_task_type_roundtrip():
+    od = _roundtrip_diffusion_config(model="x", task_type="model-defined-task")
+    assert od.task_type == "model-defined-task"
+
+
+def test_architecture_name_resolves_via_pipeline_class_fallback():
+    # Direct hit: the architecture name itself is the metadata table key.
+    qwen_od_config = OmniDiffusionConfig(
+        model="Qwen/Qwen-Image-Edit-2511",
+        model_class_name="QwenImageEditPlusPipeline",
+    )
+    qwen_od_config.update_multimodal_support()
+
+    assert qwen_od_config.supports_multimodal_inputs is True
+    assert qwen_od_config.max_multimodal_image_inputs == QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES
+
+    # Fallback: the HF architecture name differs from the internal pipeline class
+    # name, so ``get_diffusion_model_metadata`` must consult ``_DIFFUSION_MODELS``
+    # and resolve the metadata via the pipeline class name.
+    hunyuan_od_config = OmniDiffusionConfig(
+        model="tencent/HunyuanImage-3.0-Instruct",
+        model_class_name="HunyuanImage3ForCausalMM",
+    )
+    hunyuan_od_config.update_multimodal_support()
+
+    assert hunyuan_od_config.supports_multimodal_inputs is True
+    assert hunyuan_od_config.max_multimodal_image_inputs == HUNYUAN_IMAGE3_MAX_INPUT_IMAGES
 
 
 def test_additional_config_roundtrip():

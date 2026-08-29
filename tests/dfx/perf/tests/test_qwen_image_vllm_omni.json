@@ -36,7 +36,7 @@
           "H100": {
             "throughput_qps": 0.4153,
             "latency_mean": 2.4065,
-            "peak_memory_mb_mean": 55121.4286
+            "peak_memory_mb_mean": 55062.0
           }
         }
       },
@@ -54,7 +54,7 @@
           "H100": {
             "throughput_qps": 0.0423,
             "latency_mean": 23.5991,
-            "peak_memory_mb_mean": 65118.0
+            "peak_memory_mb_mean": 64546.0
           }
         }
       }
@@ -74,13 +74,14 @@
       "full_model",
       "diffusion"
     ],
-    "description": "Single-device baseline (no parallelism) with step execution",
+    "description": "Single-device step execution: sequential 512/1536 plus 512 concurrency sweep. One server (max-num-seqs 8).",
     "server_type": "vllm-omni",
     "server_params": {
       "model": "Qwen/Qwen-Image",
       "serve_args": {
         "enable-diffusion-pipeline-profiler": true,
-        "step-execution": true
+        "step-execution": true,
+        "max-num-seqs": 8
       }
     },
     "benchmark_params": [
@@ -98,7 +99,7 @@
           "H100": {
             "throughput_qps": 0.4175,
             "latency_mean": 2.3953,
-            "peak_memory_mb_mean": 55088.5714
+            "peak_memory_mb_mean": 54952.0
           }
         }
       },
@@ -116,7 +117,28 @@
           "H100": {
             "throughput_qps": 0.0423,
             "latency_mean": 23.5768,
-            "peak_memory_mb_mean": 66012.2857
+            "peak_memory_mb_mean": 64500.0
+          }
+        }
+      },
+      {
+        "name": "512x512_steps20_high_concurrency",
+        "dataset": "random",
+        "task": "t2i",
+        "width": 512,
+        "height": 512,
+        "num-inference-steps": 20,
+        "num-prompts": [20, 40, 80, 160],
+        "max-concurrency": [1, 2, 4, 8],
+        "warmup-requests": 8,
+        "warmup-concurrency": 8,
+        "warmup-num-inference-steps": 20,
+        "enable-negative-prompt": true,
+        "baseline": {
+          "H100": {
+            "throughput_qps": [0.3937, 0.6606, 0.6188, 0.7752],
+            "latency_mean": [2.5466, 3.0235, 6.3948, 10.1944],
+            "peak_memory_mb_mean": [55149.0, 55150.0, 55153.1458, 55156.325]
           }
         }
       }
@@ -163,7 +185,7 @@
           "H100": {
             "throughput_qps": 0.1214,
             "latency_mean": 8.2211,
-            "peak_memory_mb_mean": 54501.1429
+            "peak_memory_mb_mean": 54474.0
           }
         }
       }
@@ -220,7 +242,7 @@
           "H100": {
             "throughput_qps": 0.559,
             "latency_mean": 1.794,
-            "peak_memory_mb_mean": 55290.5714
+            "peak_memory_mb_mean": 55174.0
           }
         }
       },
@@ -238,56 +260,8 @@
           "H100": {
             "throughput_qps": 0.1918,
             "latency_mean": 5.2022,
-            "peak_memory_mb_mean": 64838.8571
+            "peak_memory_mb_mean": 64750.0
           }
-        }
-      }
-    ]
-  },
-  {
-    "test_name": "test_qwen_image_single_device_step_execution_high_concurrency",
-    "mark": [
-      {
-        "hardware_marks": {
-          "res": {
-            "cuda": "H100"
-          },
-          "num_cards": 1
-        }
-      },
-      "full_model",
-      "diffusion"
-    ],
-    "description": "Single-device Qwen-Image step-level execution benchmark at 512x512, 20 steps, concurrency sweep",
-    "server_type": "vllm-omni",
-    "server_params": {
-      "model": "Qwen/Qwen-Image",
-      "serve_args": {
-        "enable-diffusion-pipeline-profiler": true,
-        "step-execution": true,
-        "max-num-seqs": 8
-      }
-    },
-    "benchmark_params": [
-      {
-        "name": "512x512_steps20_high_concurrency",
-        "dataset": "random",
-        "task": "t2i",
-        "width": 512,
-        "height": 512,
-        "num-inference-steps": 20,
-        "num-prompts": [20, 40, 80, 160],
-        "max-concurrency": [1, 2, 4, 8],
-        "warmup-requests": 8,
-        "warmup-concurrency": 8,
-        "warmup-num-inference-steps": 20,
-        "enable-negative-prompt": true,
-        "baseline": {
-            "H100": {
-                "throughput_qps": [0.4125, 0.6714, 0.6674, 0.8159],
-                "latency_mean": [2.4215, 2.992, 5.9293, 9.656],
-                "peak_memory_mb_mean": [55147.4286, 55148.0, 55150.4643, 55152.3821]
-            }
         }
       }
     ]

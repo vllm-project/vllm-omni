@@ -26,12 +26,12 @@ environments. Differences from the GPU path:
 
 ### Checkpoint
 
-Same as the GPU recipe — Hugging Face access approval is required:
+Same as the GPU recipe — Hugging Face access approval is required. Authenticate
+once; `vllm serve` downloads the required nested components automatically:
 
 ```bash
 hf auth login
-export MODEL_ROOT=/path/to/MiniMax-H3
-hf download MiniMaxAI/MiniMax-H3 --local-dir "${MODEL_ROOT}"
+export MODEL=MiniMaxAI/MiniMax-H3
 ```
 
 ### Environment
@@ -73,24 +73,22 @@ pip install mindiesd-*.whl
 
 ## Start a server
 
-One server loads one checkpoint partition. Set `MODEL` to `FL2VA` for T2VA
-and FL2VA requests, or to `Ref2VA` for Ref2VA requests.
+Pass the repository ID directly. The pipeline loads the two nested DiTs while
+sharing the tokenizer, processor, text encoder, and VAEs from `FL2VA`.
 
-### Multi-NPU: 768P validated configuration
+### Multi-NPU: 768P combined-service configuration
 
-Validated on eight NPUs of an Atlas 800I A3 server with Ulysses sequence
-parallelism degree 8, text-encoder tensor parallelism degree 8, native tiled
-VAE patch parallelism degree 8, and layerwise offload:
+Use Ulysses sequence parallelism degree 8, text-encoder tensor parallelism
+degree 8, native tiled VAE patch parallelism degree 8, and distributed
+layerwise offload:
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export PORT=9098
-export MODEL="${MODEL_ROOT}/FL2VA"
+export MODEL=MiniMaxAI/MiniMax-H3
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800
 export PYTHONDONTWRITEBYTECODE=1
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
 
 vllm serve "${MODEL}" \
   --omni \
@@ -101,7 +99,7 @@ vllm serve "${MODEL}" \
   --usp 8 \
   --ring 1 \
   --text-encoder-tp-size 8 \
-  --enable-layerwise-offload \
+  --enable-distributed-layerwise-offload \
   --vae-parallel-mode tile \
   --vae-use-tiling \
   --vae-patch-parallel-size 8 \
@@ -111,6 +109,29 @@ vllm serve "${MODEL}" \
 Do not add `--enforce-eager`. The first request includes regional
 compilation; warm the server once before measuring steady-state latency.
 H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1.
+
+The same endpoint accepts `task=t2va`, `task=fl2va`, and `task=ref2va`; no
+partition restart is required. Layerwise offload applies to both DiTs.
+
+On Atlas 800I A3 (64 GB HBM per device) the combined service does not fit at
+768P without offloading or sharding: use distributed layerwise offload (as
+above) or HSDP — see
+[§ Memory and attention optimizations](#memory-and-attention-optimizations-a3).
+
+### CPU MP4 response encoding (Atlas A2)
+
+Non-streaming MP4 responses use one public automatic encoder. It checks the
+runtime frame shape, common dtype, and RGB channel-plane contiguity for every
+request; compatible inputs use direct planar PyAV frames, while unsupported
+inputs fall back to the legacy muxer before opening the PyAV container. No CLI
+flag, model declaration, or user configuration is required. Streaming fMP4
+output remains on its existing incremental path.
+
+Current performance and correctness validation is limited to one Atlas A2 host
+with 8x Ascend 910B4-1 NPUs, the `FL2VA`/`t2va` partition, one request at a
+time, 1344x768 at 24 fps, and 5, 8.7, and 15 second requests. This optimization
+only changes CPU MP4 response encoding; it does not change DiT execution or
+stage 0.
 
 ### Optional optimizations
 
@@ -124,7 +145,7 @@ every other flag unchanged:
   --diffusion-attention-backend RAINFUSION_ATTN
 ```
 
-**INT8 online quantization** — add one flag to either command above:
+**INT8 online quantization** — add one flag to the server command above:
 
 ```bash
   --quantization int8
@@ -134,11 +155,62 @@ Keep `--ring 1` when using RainFusion: the `rf_v2` kernel ranks key blocks
 over the whole sequence, so ring parallelism would split away the keys it
 needs. Scale with `--usp` instead.
 
-To serve Ref2VA, stop the FL2VA server and restart with:
+## Memory and attention optimizations (A3)
+
+### Fitting 768P into 64 GB HBM: distributed layerwise offload or HSDP
+
+Each Atlas 800I A3 NPU has 64 GB of HBM, which is not enough for the
+combined MiniMax-H3 service at 768P. Enable **one** of the following at
+server startup:
+
+**Distributed layerwise offload** — DiT layers are offloaded with parameters
+gathered across the parallel group instead of replicated per rank:
 
 ```bash
-export MODEL="${MODEL_ROOT}/Ref2VA"
+  --enable-distributed-layerwise-offload
 ```
+
+Measured peak NPU memory is about 45 GB per device for Ref2VA with a 13.88 s
+input video generating a 15 s 768P (1344x768) output video. Host (CPU) memory
+usage is high with this option.
+
+**HSDP** — hybrid sharded data parallelism for the DiT parameters. The
+multi-stream memory-reuse knob is mandatory with this flag:
+
+```bash
+export MULTI_STREAM_MEMORY_REUSE=2
+```
+
+```bash
+  --use-hsdp
+```
+
+Host memory usage is small, but large shapes may still OOM; HBM usage
+optimizations for this path are ongoing.
+
+### FLASH_ATTN backend with MindIE-SD
+
+Keep `--diffusion-attention-backend FLASH_ATTN` and install MindIE-SD (see
+[§ Environment](#environment)). On NPU this backend carries most of the
+memory-reduction and performance work: a mask-free packed varlen path that
+never materializes the quadratic `full_qk` padding mask, and K/V prefix
+slicing, both driven by the packed `cu_seqlens` metadata emitted by the H3
+transformer.
+
+### Optional: LaserAttention fused kernel
+
+For an additional attention speedup, select the Ascend LaserAttention fused
+kernel before starting the server:
+
+```bash
+export MINDIE_SD_FA_TYPE="ascend_laser_attention"
+```
+
+This requires the FLASH_ATTN backend and MindIE-SD. H3 automatically applies
+exact power-of-two input pre-scaling (`laser_input_scale=256`) so the
+kernel's fp16 workspace cannot overflow on outlier activations. Measured
+speedup numbers will be added here.
+
 
 ## HTTP API examples
 
@@ -160,15 +232,16 @@ configuration above:
 
 | Workload | Configuration |
 |----------|---------------|
-| T2VA, 209 frames, 1344x768 | TE TP8, layerwise offload, Ulysses 8, VPP8 tile, regional compile |
-| Ref2VA (prompt + video), 124 frames, 1344x768 | TE TP8, layerwise offload, Ulysses 8, VPP8 tile, regional compile |
+| T2VA, 209 frames, 1344x768 | TE TP8, distributed layerwise offload, Ulysses 8, VPP8 tile, regional compile |
+| Ref2VA (prompt + video), 124 frames, 1344x768 | TE TP8, distributed layerwise offload, Ulysses 8, VPP8 tile, regional compile |
 
 These measurements describe the validated shapes rather than a general
 throughput guarantee.
 
 ## Known limitations
 
-- Each server process loads only one checkpoint partition.
+- Combined serving requires sibling `FL2VA` and `Ref2VA` directories, loads
+  both task-specific DiTs, and loads one copy of every shared component.
 - H3 currently executes one generation request per diffusion batch.
 - The first regional-compile request is a warmup and should not be included
   in steady-state performance measurements.

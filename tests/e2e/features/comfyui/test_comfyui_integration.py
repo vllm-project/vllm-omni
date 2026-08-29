@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Integration tests for ComfyUI nodes that use the Omni API client, with a mocked AsyncOmni and a real API server running in a background process.
 These tests cover the integration between ComfyUI node and the API server, without actual model inference logic.
@@ -39,6 +42,7 @@ from pytest_mock import MockerFixture
 from vllm import SamplingParams
 from vllm.outputs import CompletionOutput, RequestOutput
 
+from tests.helpers.runtime import get_open_port
 from vllm_omni.entrypoints.async_omni import AsyncOmni as RealAsyncOmni
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
@@ -171,11 +175,11 @@ def _build_text_output(text: str = "This is a test response.") -> OmniRequestOut
         metrics=None,
         lora_request=None,
     )
-    return OmniRequestOutput(
+    return OmniRequestOutput.from_stage_output(
+        request_output,
         request_id="test_req_text",
         finished=True,
         final_output_type="text",
-        request_output=request_output,
     )
 
 
@@ -200,11 +204,11 @@ def _build_audio_chat_output(num_samples: int = 24000) -> OmniRequestOutput:
         metrics=None,
         lora_request=None,
     )
-    return OmniRequestOutput(
+    return OmniRequestOutput.from_stage_output(
+        request_output,
         request_id="test_req_audio_chat",
         finished=True,
         final_output_type="audio",
-        request_output=request_output,
     )
 
 
@@ -240,11 +244,11 @@ def _build_diffusion_image_output_for_chat_endpoint() -> OmniRequestOutput:
         images=[_build_image_output(color="blue")],
         finished=True,
     )
-    return OmniRequestOutput(
+    return OmniRequestOutput.from_stage_output(
+        request_output,
         request_id="test_req_img_chat",
-        finished=True,
+        images=[_build_image_output(color="blue")],
         final_output_type="image",
-        request_output=request_output,
     )
 
 
@@ -515,14 +519,25 @@ def mock_async_omni(
 
 
 @pytest.fixture
-def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni):
+def api_server(server_case: ServerCase, mock_async_omni, tmp_path):
     """Set up a API server in background process from command line with parametrized model name and mocked AsyncOmni."""
+    # Override the STORAGE_MANAGER path to a writable temp directory before
+    # forking the server subprocess.  The default /tmp/storage may be owned
+    # by a different user (e.g. from a previous CI run) and cause
+    # PermissionError when the server tries to save generated video files.
+    from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
+
+    old_storage_path = STORAGE_MANAGER.storage_path
+    new_storage_path = tmp_path / "omni_storage"
+    new_storage_path.mkdir(exist_ok=True)
+    STORAGE_MANAGER.storage_path = str(new_storage_path)
+
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
     cmd = OmniServeCommand()
     cmd.subparser_init(subparsers)
 
-    port = unused_tcp_port_factory()
+    port = get_open_port(host="0.0.0.0")
     args = parser.parse_args(["serve", server_case.served_model, "--omni", "--port", str(port)])
 
     def run_server():
@@ -539,11 +554,12 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
     wait_poll_interval = 1
     for _ in range(wait_time // wait_poll_interval):
         try:
-            response = requests.get(f"http://127.0.0.1:{port}/health")
+            response = requests.get(f"http://127.0.0.1:{port}/health", timeout=wait_poll_interval)
             if response.status_code == 200:
                 break
-        except requests.ConnectionError:
-            time.sleep(wait_poll_interval)
+        except requests.RequestException:
+            pass
+        time.sleep(wait_poll_interval)
     else:
         if server_process.is_alive():
             server_process.terminate()
@@ -554,6 +570,9 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
         pytest.fail(f"API server failed to start within {wait_time} seconds")
 
     yield f"http://127.0.0.1:{port}/v1"
+
+    # Restore the original storage path after the test.
+    STORAGE_MANAGER.storage_path = old_storage_path
 
     if server_process.is_alive():
         server_process.terminate()
@@ -795,7 +814,7 @@ async def test_tts_nodes(api_server: str, node_cls, call_kwargs: dict, sampling_
             ServerCase(
                 served_model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
                 stage_list=["diffusion"],
-                stage_configs=[{"stage_type": "diffusion"}],
+                stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
                 outputs=[_build_diffusion_video_output()],
             ),
             "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
@@ -806,7 +825,7 @@ async def test_tts_nodes(api_server: str, node_cls, call_kwargs: dict, sampling_
             ServerCase(
                 served_model="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
                 stage_list=["diffusion"],
-                stage_configs=[{"stage_type": "diffusion"}],
+                stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
                 outputs=[_build_diffusion_video_output()],
             ),
             "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
@@ -867,7 +886,7 @@ async def test_video_generation_node(api_server: str, model: str, image_input: b
             ServerCase(
                 served_model="MiniMaxAI/MiniMax-H3",
                 stage_list=["diffusion"],
-                stage_configs=[{"stage_type": "diffusion"}],
+                stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
                 outputs=[_build_diffusion_video_output()],
             ),
             SamplingCase(kind=SamplingKind.VIDEO_REF2VA_IMAGE_AUDIO, sampling_params=None),
@@ -878,7 +897,7 @@ async def test_video_generation_node(api_server: str, model: str, image_input: b
             ServerCase(
                 served_model="MiniMaxAI/MiniMax-H3",
                 stage_list=["diffusion"],
-                stage_configs=[{"stage_type": "diffusion"}],
+                stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
                 outputs=[_build_diffusion_video_output()],
             ),
             SamplingCase(kind=SamplingKind.VIDEO_REF2VA_MULTI_VIDEO, sampling_params=None),

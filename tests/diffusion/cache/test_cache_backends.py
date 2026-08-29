@@ -11,6 +11,7 @@ This module tests the cache backend implementations:
 - DiffusionCacheConfig: configuration dataclass
 """
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import cache_dit
@@ -21,6 +22,7 @@ from vllm_omni.diffusion.cache.cachedit import (
     CacheDiTAdapterConfig,
     CacheDiTBackend,
     CacheDiTConfig,
+    cache_summary,
 )
 from vllm_omni.diffusion.cache.magcache import MagCacheBackend
 from vllm_omni.diffusion.cache.selector import get_cache_backend
@@ -86,8 +88,83 @@ class TestCacheDiTBackend:
 
         # Verify cache-dit was enabled
         assert backend.enabled is True
-        assert backend._refresh_func is not None
+        assert backend._refresh_funcs
         mock_cache_dit.enable_cache.assert_called_once()
+
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
+    def test_lifecycle_applies_to_every_declared_dit(self, mock_cache_dit, mock_block_adapter):
+        """Combined pipelines manage every exact Cache-DiT target."""
+        pipeline = Mock()
+        pipeline.__class__.__name__ = "MiniMaxH3Pipeline"
+        pipeline._dit_modules = ["transformer", "transformers_ref"]
+        pipeline.transformer = Mock()
+        pipeline.transformers_ref = Mock()
+        for transformer in (pipeline.transformer, pipeline.transformers_ref):
+            transformer._cache_dit_adapter_config = CacheDiTAdapterConfig(
+                block_forward_patterns={"blocks": ForwardPattern.Pattern_3}
+            )
+        installed_adapters = [Mock(), Mock()]
+        mock_block_adapter.side_effect = installed_adapters
+
+        backend = CacheDiTBackend({"Fn_compute_blocks": 2})
+        backend.enable(pipeline)
+        backend.refresh(pipeline, num_inference_steps=20)
+        backend.disable(pipeline)
+
+        assert mock_cache_dit.enable_cache.call_count == 2
+        assert mock_cache_dit.refresh_context.call_count == 2
+        assert {call.args[0] for call in mock_cache_dit.refresh_context.call_args_list} == {
+            pipeline.transformer,
+            pipeline.transformers_ref,
+        }
+        assert [call.args[0] for call in mock_cache_dit.disable_cache.call_args_list] == installed_adapters
+        assert backend._refresh_funcs == []
+        assert backend._cache_targets == []
+        assert not backend.is_enabled()
+
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
+    def test_summary_skips_uncached_nested_dit(self, mock_cache_dit):
+        """Only DiT modules with an active Cache-DiT context are summarized."""
+        language_model = Mock()
+        language_model._is_cached = False
+        transformer = Mock()
+        transformer._is_cached = True
+        transformer.language_model = language_model
+        pipeline = SimpleNamespace(
+            _dit_modules=["transformer.language_model", "transformer"],
+            transformer=transformer,
+        )
+
+        cache_summary(pipeline)
+
+        mock_cache_dit.summary.assert_called_once_with(transformer, details=True)
+
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
+    def test_enable_and_refresh_nested_declared_dit(self, mock_cache_dit, mock_block_adapter):
+        """Dotted component paths resolve to their nested DiT module."""
+        transformer = Mock()
+        transformer._cache_dit_adapter_config = CacheDiTAdapterConfig(
+            block_forward_patterns={"blocks": ForwardPattern.Pattern_3}
+        )
+        pipeline = SimpleNamespace(
+            _dit_modules=["language_model.model"],
+            language_model=SimpleNamespace(model=transformer),
+        )
+
+        backend = CacheDiTBackend({"Fn_compute_blocks": 2})
+        backend.enable(pipeline)
+        backend.refresh(pipeline, num_inference_steps=20)
+
+        cache_summary(pipeline)
+        mock_cache_dit.enable_cache.assert_called_once()
+        mock_cache_dit.refresh_context.assert_called_once_with(
+            transformer,
+            num_inference_steps=20,
+            verbose=True,
+        )
+        mock_cache_dit.summary.assert_called_once_with(transformer, details=True)
 
     @patch("vllm_omni.diffusion.cache.cachedit.backend.logger")
     @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
@@ -106,7 +183,7 @@ class TestCacheDiTBackend:
         backend.enable(pipeline)
 
         assert backend.enabled is True
-        assert backend._refresh_func is not None
+        assert backend._refresh_funcs
         assert mock_cache_dit.enable_cache.call_args.args[0] is pipeline.transformer
         mock_logger.info.assert_any_call(
             "Transformer %s does not declare _cache_dit_adapter_config; "
@@ -138,7 +215,7 @@ class TestCacheDiTBackend:
 
         assert isinstance(exc_info.value.__cause__, ValueError)
         assert backend.enabled is False
-        assert backend._refresh_func is None
+        assert backend._refresh_funcs == []
 
     @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
     @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
@@ -222,6 +299,32 @@ class TestCacheDiTBackend:
 
     @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
     @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
+    def test_refresh_rearms_force_refresh_hint(self, mock_cache_dit, mock_block_adapter):
+        """A once hint must be restored for every repeated request."""
+        pipeline = Mock()
+        pipeline.__class__.__name__ = "DiTPipeline"
+        pipeline.transformer = Mock()
+        pipeline.transformer._cache_dit_adapter_config = CacheDiTAdapterConfig(
+            block_forward_patterns={"layers": ForwardPattern.Pattern_0}
+        )
+
+        config = DiffusionCacheConfig(
+            force_refresh_step_hint=7,
+            force_refresh_step_policy="once",
+        )
+        backend = CacheDiTBackend(config)
+        backend.enable(pipeline)
+        backend.refresh(pipeline, num_inference_steps=20)
+        backend.refresh(pipeline, num_inference_steps=20)
+
+        assert mock_cache_dit.refresh_context.call_count == 2
+        for call in mock_cache_dit.refresh_context.call_args_list:
+            refresh_config = call.kwargs["cache_config"]
+            assert refresh_config.force_refresh_step_hint == 7
+            assert refresh_config.force_refresh_step_policy == "once"
+
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
+    @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
     def test_enable_hunyuan_pipeline_uses_model_transformer(self, mock_cache_dit, mock_block_adapter):
         """Test HunyuanImage3 uses pipeline.transformer for cache enable/refresh.
 
@@ -245,7 +348,7 @@ class TestCacheDiTBackend:
         backend.enable(mock_pipeline)
 
         assert backend.enabled is True
-        assert backend._refresh_func is not None
+        assert backend._refresh_funcs
         mock_block_adapter.assert_called_once()
         adapter_kwargs = mock_block_adapter.call_args.kwargs
         assert adapter_kwargs["transformer"] is mock_pipeline.model
@@ -262,13 +365,10 @@ class TestCacheDiTBackend:
 
     @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
     @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
-    def test_enable_dreamid_pipeline_uses_fused_blocks(self, mock_cache_dit, mock_block_adapter):
-        """Test DreamID uses pipeline.transformer for cache enable/refresh.
-
-        NOTE: DreamID no longer has a custom enabler, so this tests against the generic path.
-        """
+    def test_enable_pipeline_uses_fused_blocks(self, mock_cache_dit, mock_block_adapter):
+        """Generic cache path should pick up ``transformer.fused_blocks``."""
         mock_pipeline = Mock()
-        mock_pipeline.__class__.__name__ = "DreamIDOmniPipeline"
+        mock_pipeline.__class__.__name__ = "FakeFusedBlocksPipeline"
         mock_pipeline.transformer = Mock()
         mock_pipeline.transformer.fused_blocks = Mock()
         mock_pipeline.transformer._cache_dit_adapter_config = CacheDiTAdapterConfig(
@@ -285,7 +385,7 @@ class TestCacheDiTBackend:
         backend.enable(mock_pipeline)
 
         assert backend.enabled is True
-        assert backend._refresh_func is not None
+        assert backend._refresh_funcs
         mock_block_adapter.assert_called_once()
         adapter_kwargs = mock_block_adapter.call_args.kwargs
         assert adapter_kwargs["transformer"] is mock_pipeline.transformer
@@ -367,6 +467,66 @@ class TestTeaCacheBackend:
         # Verify hook was applied
         assert backend.enabled is True
         mock_apply_hook.assert_called_once()
+
+    @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
+    def test_enable_uses_generic_default_threshold(self, mock_apply_hook):
+        pipeline = Mock()
+        pipeline.__class__.__name__ = "QwenImagePipeline"
+        pipeline.transformer = Mock()
+        pipeline.transformer.__class__.__name__ = "QwenImageTransformer2DModel"
+
+        TeaCacheBackend(DiffusionCacheConfig()).enable(pipeline)
+        assert mock_apply_hook.call_args.args[1].rel_l1_thresh == 0.2
+
+    @pytest.mark.parametrize("partition", ["fl2va", "combined"])
+    @pytest.mark.parametrize(
+        ("configured_threshold", "expected_threshold"),
+        [(None, 0.17), (0.2, 0.2)],
+    )
+    @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
+    def test_minimax_h3_only_enables_fl2va_teacache(
+        self,
+        mock_apply_hook,
+        partition,
+        configured_threshold,
+        expected_threshold,
+    ):
+        pipeline = Mock()
+        pipeline.__class__.__name__ = "MiniMaxH3Pipeline"
+        pipeline.partition = partition
+        pipeline.transformer = Mock()
+        pipeline.transformer.__class__.__name__ = "MiniMaxH3DiTModel"
+        pipeline.transformers_ref = Mock()
+
+        config = (
+            DiffusionCacheConfig()
+            if configured_threshold is None
+            else DiffusionCacheConfig(rel_l1_thresh=configured_threshold)
+        )
+        backend = TeaCacheBackend(config)
+        backend.enable(pipeline)
+
+        mock_apply_hook.assert_called_once()
+        transformer, teacache_config = mock_apply_hook.call_args.args
+        assert transformer is pipeline.transformer
+        assert transformer is not pipeline.transformers_ref
+        assert teacache_config.rel_l1_thresh == expected_threshold
+
+    @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
+    def test_minimax_h3_rejects_ref2va_teacache(self, mock_apply_hook):
+        pipeline = Mock()
+        pipeline.__class__.__name__ = "MiniMaxH3Pipeline"
+        pipeline.partition = "ref2va"
+        pipeline.transformer = Mock()
+        pipeline.transformer.__class__.__name__ = "MiniMaxH3DiTModel"
+
+        backend = TeaCacheBackend(DiffusionCacheConfig())
+
+        with pytest.raises(ValueError, match="only supports the MiniMax-H3 FL2VA partition"):
+            backend.enable(pipeline)
+
+        assert backend.enabled is False
+        mock_apply_hook.assert_not_called()
 
     @patch("vllm_omni.diffusion.cache.teacache.backend.apply_teacache_hook")
     def test_enable_with_coefficients(self, mock_apply_hook):

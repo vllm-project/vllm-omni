@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Shared latent layout and normalization primitives for LTX pipelines."""
 
@@ -18,6 +18,11 @@ class LTXAVState:
 
     video: torch.Tensor
     audio: torch.Tensor
+
+
+def official_video_token_layout(latents: torch.Tensor) -> torch.Tensor:
+    """Match the token-major view produced by the official LTX patchifier."""
+    return latents.transpose(1, 2).contiguous().transpose(1, 2)
 
 
 def pack_latents(
@@ -62,6 +67,13 @@ def unpack_latents(
         patch_size,
     )
     return latents.permute(0, 4, 1, 5, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(2, 3)
+
+
+def resolve_video_latent_statistics(pipeline: Any) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """Return statistics owned by the active video decoder."""
+    decoder = pipeline.diffusion_decoder if getattr(pipeline, "use_diffusion_decoder", False) else pipeline.vae
+    scaling_factor = getattr(getattr(decoder, "config", None), "scaling_factor", 1.0)
+    return decoder.latents_mean, decoder.latents_std, scaling_factor
 
 
 def normalize_latents(
@@ -117,7 +129,23 @@ def create_noised_state(
         device=latents.device,
         dtype=latents.dtype,
     )
-    return noise_scale * noise + (1 - noise_scale) * latents
+    # Official GaussianNoisier blends in fp32, then materializes the next
+    # latent state in the model dtype. Batched request weights may arrive in
+    # the model dtype, so promote tensor weights alongside both endpoints.
+    lerp_weight = noise_scale.float() if isinstance(noise_scale, torch.Tensor) else noise_scale
+    return torch.lerp(latents.float(), noise.float(), lerp_weight).to(latents.dtype)
+
+
+def create_conditioned_noised_state(
+    latents: torch.Tensor,
+    clean_latents: torch.Tensor,
+    denoise_mask: torch.Tensor,
+    noise_scale: float | torch.Tensor,
+    generator: torch.Generator | list[torch.Generator] | None = None,
+) -> torch.Tensor:
+    """Match the official conditioned Gaussian noisier operation order."""
+    noised_latents = create_noised_state(latents, noise_scale, generator)
+    return torch.lerp(clean_latents.float(), noised_latents.float(), denoise_mask.float()).to(latents.dtype)
 
 
 def pack_audio_latents(latents: torch.Tensor) -> torch.Tensor:
@@ -133,6 +161,16 @@ def unpack_audio_latents(
 
 def unpad_audio_latents(latents: torch.Tensor, num_frames: int) -> torch.Tensor:
     return latents[:, :num_frames]
+
+
+def clear_audio_padding(latents: torch.Tensor, num_frames: int) -> torch.Tensor:
+    """Keep SP-only audio padding outside the logical sampler state."""
+    if not 0 < num_frames <= latents.shape[1]:
+        raise ValueError(f"Audio frame count must be in [1, {latents.shape[1]}], got {num_frames}.")
+    if num_frames == latents.shape[1]:
+        return latents
+    padding = latents.new_zeros(latents.shape[0], latents.shape[1] - num_frames, latents.shape[2])
+    return torch.cat([latents[:, :num_frames], padding], dim=1)
 
 
 def get_sp_padded_audio_latent_length(audio_latent_length: int, sp_size: int) -> int:
@@ -171,11 +209,12 @@ def prepare_video_latents(
 ) -> torch.Tensor:
     if latents is not None:
         if latents.ndim == 5:
+            latents_mean, latents_std, scaling_factor = resolve_video_latent_statistics(pipeline)
             latents = normalize_latents(
                 latents,
-                pipeline.vae.latents_mean,
-                pipeline.vae.latents_std,
-                pipeline.vae.config.scaling_factor,
+                latents_mean,
+                latents_std,
+                scaling_factor,
             )
             latents = pack_latents(
                 latents,
@@ -184,7 +223,8 @@ def prepare_video_latents(
             )
         if latents.ndim != 3:
             raise ValueError(f"Provided `latents` has shape {latents.shape}, expected [batch, seq, features].")
-        return create_noised_state(latents, noise_scale, generator).to(device=device, dtype=dtype)
+        latents = create_noised_state(latents, noise_scale, generator).to(device=device, dtype=dtype)
+        return official_video_token_layout(latents)
 
     num_frames, height, width = resolve_video_latent_shape(
         height,
@@ -205,7 +245,8 @@ def prepare_video_latents(
             f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
             f" size of {batch_size}. Make sure the batch size matches the length of the generators."
         )
-    return randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+    latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+    return official_video_token_layout(latents)
 
 
 def prepare_audio_latents(
@@ -226,6 +267,16 @@ def prepare_audio_latents(
     sp_size = getattr(pipeline.od_config.parallel_config, "sequence_parallel_size", 1) or 1
     padded_latent_length = get_sp_padded_audio_latent_length(original_latent_length, int(sp_size))
 
+    def pad_logical_latents(logical_latents: torch.Tensor) -> torch.Tensor:
+        if padded_latent_length == original_latent_length:
+            return logical_latents
+        padding = logical_latents.new_zeros(
+            logical_latents.shape[0],
+            padded_latent_length - original_latent_length,
+            logical_latents.shape[2],
+        )
+        return torch.cat([logical_latents, padding], dim=1)
+
     if latents is not None:
         if latents.ndim == 4:
             latents = pack_audio_latents(latents)
@@ -237,29 +288,24 @@ def prepare_audio_latents(
                 pipeline.audio_vae.latents_mean,
                 pipeline.audio_vae.latents_std,
             )
-        latents = create_noised_state(latents, noise_scale, generator)
 
         if latents.shape[1] not in {original_latent_length, padded_latent_length}:
             raise ValueError(
                 "Provided `audio_latents` has incompatible audio frame count "
                 f"{latents.shape[1]}; expected {original_latent_length} or {padded_latent_length}."
             )
-        if latents.shape[1] == original_latent_length and padded_latent_length > original_latent_length:
-            padding = torch.zeros(
-                latents.shape[0],
-                padded_latent_length - original_latent_length,
-                latents.shape[2],
-                dtype=latents.dtype,
-                device=latents.device,
-            )
-            latents = torch.cat([latents, padding], dim=1)
+        # Padding is an Omni implementation detail, not part of the official
+        # audio state. Draw request RNG only for logical tokens so later phases
+        # remain seed-invariant across SP degrees, then append deterministic 0s.
+        latents = create_noised_state(latents[:, :original_latent_length], noise_scale, generator)
+        latents = pad_logical_latents(latents)
         return latents.to(device=device, dtype=dtype), original_latent_length, padded_latent_length
 
-    shape = (batch_size, padded_latent_length, num_channels_latents * latent_mel_bins)
+    shape = (batch_size, original_latent_length, num_channels_latents * latent_mel_bins)
     if isinstance(generator, list) and len(generator) != batch_size:
         raise ValueError(
             f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
             f" size of {batch_size}. Make sure the batch size matches the length of the generators."
         )
-    latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+    latents = pad_logical_latents(randn_tensor(shape, generator=generator, device=device, dtype=dtype))
     return latents, original_latent_length, padded_latent_length

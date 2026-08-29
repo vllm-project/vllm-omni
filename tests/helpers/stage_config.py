@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Config/message construction helpers used by tests."""
 
 import atexit
@@ -8,11 +11,13 @@ from typing import Any
 
 import yaml
 
+from vllm_omni.config.stage_config import load_deploy_config
+
 
 def modify_stage_config(
     yaml_path: str,
-    updates: dict[str, Any] = None,
-    deletes: dict[str, Any] = None,
+    updates: dict[str, Any] | None = None,
+    deletes: dict[str, Any] | None = None,
 ) -> str:
     """
     Modify configurations in a YAML file, supporting both top-level and stage-specific modifications,
@@ -23,17 +28,17 @@ def modify_stage_config(
         updates: Dictionary containing both top-level and stage-specific modifications to add or update.
                 Format: {
                     'async_chunk': True,
-                    'stage_args': {
-                        0: {'engine_args.max_model_len': 5800},
-                        1: {'engine_args.max_num_seqs': 2}
+                    'stages': {
+                        0: {'max_model_len': 5800},
+                        1: {'max_num_seqs': 2}
                     }
                 }
         deletes: Dictionary containing configurations to delete.
                 Format: {
                     'old_config': None,  # Delete entire key
-                    'stage_args': {
-                        0: ['engine_args.old_param'],
-                        1: ['runtime.unused_setting']
+                    'stages': {
+                        0: ['old_param'],
+                        1: ['unused_setting']
                     }
                 }
 
@@ -164,24 +169,20 @@ def modify_stage_config(
         else:
             print(f"Path {path} does not exist")
 
-    _stage_key = "stages" if "stages" in config else "stage_args"
+    stages = get_stage_entries(config)
 
     # Apply deletions first
     if deletes:
         for key, value in deletes.items():
-            if key in ("stage_args", "stages"):
+            if key == "stages":
                 if value and isinstance(value, dict):
-                    stage_args = config.get(_stage_key, [])
-                    if not stage_args:
-                        raise ValueError("stage_args does not exist in config")
-
                     for stage_id, delete_paths in value.items():
                         if not delete_paths:
                             continue
 
                         # Find stage by ID
                         target_stage = None
-                        for stage in stage_args:
+                        for stage in stages:
                             if stage.get("stage_id") == int(stage_id):
                                 target_stage = stage
                                 break
@@ -204,28 +205,24 @@ def modify_stage_config(
     # Apply updates
     if updates:
         for key, value in updates.items():
-            if key in ("stage_args", "stages"):
+            if key == "stages":
                 if value and isinstance(value, dict):
-                    stage_args = config.get(_stage_key, [])
-                    if not stage_args:
-                        raise ValueError("stage_args does not exist in config")
-
                     for stage_id, stage_updates in value.items():
                         # Find stage by ID
                         target_stage = None
-                        for stage in stage_args:
+                        for stage in stages:
                             if stage.get("stage_id") == int(stage_id):
                                 target_stage = stage
                                 break
 
                         if target_stage is None:
-                            available_ids = [s.get("stage_id") for s in stage_args if "stage_id" in s]
+                            available_ids = [s.get("stage_id") for s in stages if "stage_id" in s]
                             raise KeyError(f"Stage ID {stage_id} not found, available: {available_ids}")
 
                         # Apply updates to this stage
                         for update_path, val in stage_updates.items():
                             # Check if this is a simple key (not dot-separated)
-                            # Example: 'engine_input_source' vs 'engine_args.max_model_len'
+                            # Example: 'engine_input_source' vs nested 'default_sampling_params.max_tokens'
                             if "." not in update_path:
                                 # Direct key assignment (e.g., updating a list value)
                                 target_stage[update_path] = val
@@ -624,6 +621,36 @@ def _materialize_ci_overlay(model_type: str) -> Path:
     return out
 
 
+def get_stage_entries(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the ``stages`` list from a new-schema deploy config dict.
+
+    Raises ``ValueError`` when the top-level ``stages`` key is missing.
+    """
+    stages = cfg.get("stages")
+    if stages is None:
+        raise ValueError("Deploy config missing top-level 'stages'")
+    return list(stages)
+
+
+def load_stage_ids(resolved_config: dict[str, Any]) -> list[int]:
+    """Return ``stage_id`` values from a resolved deploy config dict."""
+    stage_ids = [stage["stage_id"] for stage in get_stage_entries(resolved_config) if "stage_id" in stage]
+    if not stage_ids:
+        raise ValueError("No stage IDs found in resolved config")
+    return stage_ids
+
+
+def load_stage_replica_counts(resolved_config: dict[str, Any]) -> dict[int, int]:
+    """Return ``{stage_id: num_replicas}`` from flat stage entries (default 1)."""
+    replica_counts: dict[int, int] = {}
+    for stage in get_stage_entries(resolved_config):
+        stage_id = stage.get("stage_id")
+        if stage_id is None:
+            continue
+        replica_counts[int(stage_id)] = max(1, int(stage.get("num_replicas", 1)))
+    return replica_counts
+
+
 def get_deploy_config_path(rel_path: str) -> str:
     """Resolve a deploy yaml; ``ci/<model>.yaml`` materializes from ``_CI_OVERLAYS``."""
     if rel_path.startswith("ci/") and rel_path.endswith(".yaml"):
@@ -638,33 +665,30 @@ def get_deploy_config_stage(rel_path: str, stage_id: int) -> dict[str, Any]:
     with open(get_deploy_config_path(rel_path), encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
 
-    stage_key = "stages" if "stages" in cfg else "stage_args"
-    for stage in cfg.get(stage_key, []):
+    for stage in get_stage_entries(cfg):
         if stage.get("stage_id") == stage_id:
             return stage
     raise KeyError(f"No stage_id={stage_id} in deploy config {rel_path!r}")
 
 
-def _get_config_value_by_path(config_dict: dict, path: str) -> Any:
-    """Read a dot-separated path from a nested dict (e.g. ``engine_args.load_format``)."""
-    current: Any = config_dict
-    for key in path.split("."):
-        if not isinstance(current, dict) or key not in current:
-            return None
-        current = current[key]
-    return current
+def get_deploy_duplex_max_sessions(rel_path: str) -> int:
+    """Return the duplex session capacity a deploy yaml admits.
+
+    Loads through ``load_deploy_config`` so ``base_config`` merging and
+    ``DuplexSessionRuntimeConfig`` defaults stay in lockstep with the server
+    instead of being re-implemented here.
+    """
+    return load_deploy_config(get_deploy_config_path(rel_path)).duplex_session.max_sessions
 
 
-def _stage_load_format_paths(stage_config_path: str) -> tuple[str, str, list[int]]:
-    """Return ``(stage_key, load_format_field_path, stage_ids)`` for a deploy YAML."""
+def _stage_ids_from_deploy_yaml(stage_config_path: str) -> list[int]:
+    """Return ``stage_id`` values from a new-schema deploy YAML (``stages``)."""
     with open(stage_config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
-    new_schema_stages = cfg.get("stages")
-    stage_key = "stages" if new_schema_stages is not None else "stage_args"
-    load_format_path = "load_format" if new_schema_stages is not None else "engine_args.load_format"
-    stage_entries = cfg.get(stage_key, [])
-    stage_ids = [stage["stage_id"] for stage in stage_entries if "stage_id" in stage]
-    return stage_key, load_format_path, stage_ids
+    try:
+        return load_stage_ids(cfg)
+    except ValueError as exc:
+        raise ValueError(f"Deploy YAML missing top-level 'stages': {stage_config_path}") from exc
 
 
 def _add_dummy_load_format(
@@ -674,10 +698,10 @@ def _add_dummy_load_format(
     """For ``core_model`` runs, patch every stage in the deploy YAML to ``load_format: dummy``."""
     if run_level != "core_model" or stage_config_path is None:
         return stage_config_path
-    stage_key, load_format_path, stage_ids = _stage_load_format_paths(stage_config_path)
+    stage_ids = _stage_ids_from_deploy_yaml(stage_config_path)
     return modify_stage_config(
         stage_config_path,
-        updates={stage_key: {stage_id: {load_format_path: "dummy"} for stage_id in stage_ids}},
+        updates={"stages": {stage_id: {"load_format": "dummy"} for stage_id in stage_ids}},
     )
 
 
@@ -688,25 +712,27 @@ def _delete_dummy_load_format(
     """For ``advanced_model`` / ``full_model``, strip ``load_format: dummy`` so real weights load."""
     if run_level not in {"advanced_model", "full_model"} or stage_config_path is None:
         return stage_config_path
-    stage_key, load_format_path, _stage_ids = _stage_load_format_paths(stage_config_path)
     with open(stage_config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
-    stage_entries = cfg.get(stage_key, [])
+    try:
+        stages = get_stage_entries(cfg)
+    except ValueError as exc:
+        raise ValueError(f"Deploy YAML missing top-level 'stages': {stage_config_path}") from exc
 
     deletes: dict[int, list[str]] = {}
-    for stage in stage_entries:
+    for stage in stages:
         stage_id = stage.get("stage_id")
         if stage_id is None:
             continue
-        if _get_config_value_by_path(stage, load_format_path) == "dummy":
-            deletes[stage_id] = [load_format_path]
+        if stage.get("load_format") == "dummy":
+            deletes[stage_id] = ["load_format"]
 
     if not deletes:
         return stage_config_path
 
     return modify_stage_config(
         stage_config_path,
-        deletes={stage_key: deletes},
+        deletes={"stages": deletes},
     )
 
 
@@ -720,6 +746,10 @@ def stage_config_path_for_run_level(stage_config_path: str | None, run_level: st
 __all__ = [
     "get_deploy_config_path",
     "get_deploy_config_stage",
+    "get_deploy_duplex_max_sessions",
+    "get_stage_entries",
+    "load_stage_ids",
+    "load_stage_replica_counts",
     "modify_stage_config",
     "stage_config_path_for_run_level",
 ]

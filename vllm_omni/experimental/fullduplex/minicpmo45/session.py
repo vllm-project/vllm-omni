@@ -16,6 +16,7 @@ class MiniCPMO45ServingSessionState:
     audio_buffer: MiniCPMO45PcmAppendBuffer = field(default_factory=MiniCPMO45PcmAppendBuffer)
     input_since_commit: bool = False
     speech_since_commit: bool = False
+    native_context_locked: bool = False
     committed_audio_payload: dict[str, object] | None = None
     committed_audio_operation_id: str | None = None
     committed_audio_reserved_bytes: int = 0

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """vLLM-Omni extensions for the ``vllm bench serve`` CLI.
 
 Core functions:
@@ -16,6 +19,63 @@ by ``add_omni_args``.
 """
 
 import argparse
+import math
+from pathlib import Path
+
+_DEFAULT_OMNIINTERACT_NUM_PROMPTS = 3
+
+
+def _positive_finite_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError(f"must be a finite positive number, got {value!r}")
+    return parsed
+
+
+def _existing_file(value: str) -> str:
+    path = Path(value).expanduser()
+    if not path.is_file():
+        raise argparse.ArgumentTypeError(f"file does not exist: {value!r}")
+    return str(path)
+
+
+def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
+    from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
+        DEFAULT_MAX_VIDEO_DURATION_S,
+        OMNIINTERACT_SUBSETS,
+    )
+
+    group = parser.add_argument_group("OmniInteract Benchmark Options")
+    group.add_argument(
+        "--omniinteract-subsets", nargs="+", choices=OMNIINTERACT_SUBSETS, default=list(OMNIINTERACT_SUBSETS)
+    )
+    group.add_argument(
+        "--omniinteract-timeout-s", type=_positive_finite_float, default=900.0, help="Complete session timeout."
+    )
+    group.add_argument(
+        "--omniinteract-media-timeout-s",
+        type=_positive_finite_float,
+        default=600.0,
+        help="Per-command media timeout.",
+    )
+    group.add_argument(
+        "--omniinteract-max-video-duration-s",
+        type=_positive_finite_float,
+        default=DEFAULT_MAX_VIDEO_DURATION_S,
+        help="Reject media longer than this safety limit before decoding.",
+    )
+    group.add_argument(
+        "--omniinteract-ref-audio", type=_existing_file, help="Reference WAV for native-duplex audio output."
+    )
+    group.add_argument(
+        "--omniinteract-require-response", action="store_true", help="Fail LISTEN-only functional E2E cases."
+    )
+    group.add_argument(
+        "--omniinteract-output-dir",
+        type=Path,
+        default=Path("omniinteract-output"),
+        help="Directory for case and evaluator artifacts.",
+    )
 
 
 def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -133,6 +193,13 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
         help="Which Seed-TTS split to load: en/meta.lst or zh/meta.lst under the dataset root.",
     )
     group.add_argument(
+        "--seed-tts-turns-per-session",
+        type=int,
+        default=1,
+        help="Group this many Seed-TTS target texts into one Realtime session. "
+        "The first row's reference audio and transcript are reused for every turn.",
+    )
+    group.add_argument(
         "--seed-tts-root",
         type=str,
         default=None,
@@ -181,6 +248,7 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
 
 _OMNI_BENCH_DATASET_CHOICES = (
     "daily-omni",
+    "omniinteract",
     "seed-tts",
     "seed-tts-text",
     "seed-tts-design",
@@ -211,6 +279,11 @@ def extend_omni_choices(parser: argparse.ArgumentParser) -> None:
 def update_omni_help(parser: argparse.ArgumentParser) -> None:
     """Update upstream argument help text to describe Omni-specific behavior."""
     for action in parser._actions:
+        if action.dest == "num_prompts":
+            action.help = (
+                f"{action.help} OmniInteract uses {_DEFAULT_OMNIINTERACT_NUM_PROMPTS} when this option is omitted; "
+                "0 selects all available cases."
+            )
         if action.dest == "percentile_metrics":
             action.help = (
                 "Comma-separated list of selected metrics to report percentiles. "
@@ -247,6 +320,7 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
 def add_omni_args(parser: argparse.ArgumentParser) -> None:
     """Register all vLLM-Omni serving benchmark arguments."""
     add_daily_omni_cli_args(parser)
+    add_omniinteract_cli_args(parser)
     add_seed_tts_cli_args(parser)
     add_multi_stage_cli_args(parser)
     add_diffusion_cli_args(parser)
@@ -254,6 +328,28 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
 
 def preprocess_serve_args(args: argparse.Namespace) -> None:
     """Apply serving benchmark CLI transformations after parsing."""
+    if getattr(args, "dataset_name", None) == "omniinteract":
+        if getattr(args, "backend", None) != "openai-realtime-duplex":
+            raise ValueError("OmniInteract requires --backend openai-realtime-duplex")
+        if getattr(args, "endpoint", None) != "/v1/realtime":
+            raise ValueError("OmniInteract requires --endpoint /v1/realtime")
+        if not getattr(args, "omniinteract_ref_audio", None):
+            raise ValueError("OmniInteract requires --omniinteract-ref-audio")
+        if getattr(args, "ignore_eos", False):
+            raise ValueError("OmniInteract does not support --ignore-eos")
+        if getattr(args, "profile", False):
+            raise ValueError("OmniInteract does not support --profile")
+        if getattr(args, "skip_tokenizer_init", False):
+            raise ValueError("OmniInteract does not support --skip-tokenizer-init")
+        if float(getattr(args, "probe_request_rate", 0.0) or 0.0) > 0:
+            raise ValueError("OmniInteract does not support --probe-request-rate")
+        if "num_prompts" not in getattr(args, "explicit_keys", ()):
+            args.num_prompts = _DEFAULT_OMNIINTERACT_NUM_PROMPTS
+        max_concurrency = getattr(args, "max_concurrency", None)
+        if max_concurrency is None:
+            args.max_concurrency = 1
+        elif max_concurrency <= 0:
+            raise ValueError("OmniInteract requires --max-concurrency to be positive")
     extra_body = dict(getattr(args, "extra_body", None) or {})
     bot_task = getattr(args, "bot_task", None)
     if getattr(args, "backend", None) == "openai-image-edits-omni" and bot_task is not None:

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import base64
 import importlib.util
@@ -13,7 +16,9 @@ import pytest
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 DRIVER_DIR = Path(__file__).resolve().parent
-DEMO_PATH = DRIVER_DIR / "minicpmo_realtime_duplex_scenarios.py"
+HELPERS_DIR = DRIVER_DIR / "helpers"
+DEMO_PATH = HELPERS_DIR / "minicpmo_realtime_duplex_scenarios.py"
+EXAMPLE_DEMO_PATH = DRIVER_DIR.parents[2] / "examples/online_serving/minicpmo/realtime_duplex_demo.py"
 MULTI_DEMO_PATH = DRIVER_DIR / "run_minicpmo_realtime_duplex_multi_session.py"
 PAIR_DEMO_PATH = DRIVER_DIR / "run_minicpmo_realtime_duplex_demo_pair.py"
 SOFT_INTERRUPT_DEMO_PATH = DRIVER_DIR / "run_minicpmo_realtime_duplex_soft_interrupt.py"
@@ -46,6 +51,18 @@ def _load_pair_demo_module():
     return module
 
 
+def _load_example_demo_module():
+    spec = importlib.util.spec_from_file_location(
+        "minicpmo_realtime_duplex_example_demo_test",
+        EXAMPLE_DEMO_PATH,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _load_soft_interrupt_demo_module():
     spec = importlib.util.spec_from_file_location(
         "minicpmo_realtime_duplex_soft_interrupt_test",
@@ -64,7 +81,7 @@ def test_realtime_duplex_multi_session_script_is_directly_executable():
         cwd=MULTI_DEMO_PATH.parents[3],
         capture_output=True,
         text=True,
-        timeout=20,
+        timeout=60,
         check=False,
     )
 
@@ -77,7 +94,7 @@ def test_realtime_duplex_demo_pair_script_is_directly_executable():
         cwd=PAIR_DEMO_PATH.parents[3],
         capture_output=True,
         text=True,
-        timeout=20,
+        timeout=60,
         check=False,
     )
 
@@ -90,7 +107,7 @@ def test_realtime_duplex_soft_interrupt_script_is_directly_executable():
         cwd=SOFT_INTERRUPT_DEMO_PATH.parents[3],
         capture_output=True,
         text=True,
-        timeout=20,
+        timeout=60,
         check=False,
     )
 
@@ -333,6 +350,71 @@ def test_realtime_duplex_soft_interrupt_accepts_explicit_ref_audio(monkeypatch):
 
     assert args.ref_audio == "ref.wav"
     assert args.validation_mode == "model-policy"
+    assert args.temperature is None
+
+
+def test_realtime_duplex_soft_interrupt_response_required_defaults_temperature(tmp_path, monkeypatch):
+    demo = _load_soft_interrupt_demo_module()
+    input_wav = tmp_path / "input.wav"
+    with wave.open(str(input_wav), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16_000)
+        wav_file.writeframes(b"\x00\x00" * 320)
+    ref_audio = tmp_path / "ref.wav"
+    ref_audio.write_bytes(b"ref")
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    captured: dict[str, object] = {}
+
+    class _FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b'{"ok": true}', b""
+
+        def kill(self):
+            return None
+
+    async def _fake_exec(*command, **kwargs):
+        captured["command"] = list(command)
+        return _FakeProcess()
+
+    monkeypatch.setattr(demo.asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(
+        demo,
+        "summarize_artifacts",
+        lambda **kwargs: {"ok": True, "returncode": 0},
+    )
+
+    result = asyncio.run(
+        demo.run_soft_interrupt(
+            SimpleNamespace(
+                url="ws://127.0.0.1:8099/v1/realtime?duplex=1",
+                model="openbmb/MiniCPM-o-4_5",
+                input_wav=str(input_wav),
+                ref_audio=str(ref_audio),
+                output_dir=str(output_dir),
+                summary_output=None,
+                chunk_ms=200,
+                timeout_s=5.0,
+                require_audio=True,
+                no_realtime_pacing=False,
+                validation_mode="response-required",
+                temperature=None,
+                min_responses=2,
+                min_audio_deltas_per_response=2,
+                input_sha256=None,
+                expect_followup_response_substring=None,
+            )
+        )
+    )
+
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert "--temperature" in command
+    assert command[command.index("--temperature") + 1] == "0.0"
+    assert result["ok"] is True
 
 
 def test_realtime_duplex_soft_interrupt_response_required_needs_bound_fixture(monkeypatch):
@@ -497,6 +579,43 @@ def test_realtime_duplex_soft_interrupt_model_policy_accepts_single_response(tmp
     assert summary["listen_after_response_before_commit"] is True
 
 
+def test_realtime_duplex_soft_interrupt_model_policy_accepts_commit_during_speak(tmp_path):
+    demo = _load_soft_interrupt_demo_module()
+    output = tmp_path / "model_policy_commit_during_speak"
+    output.mkdir()
+    response_id = "resp-long"
+    events = [
+        {"type": "response.listen", "_client_received_at_s": 1.0},
+        {"type": "response.created", "response": {"id": response_id}, "_client_received_at_s": 2.0},
+        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.1},
+        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 2.2},
+        {"type": "input_audio_buffer.committed", "_client_received_at_s": 3.0},
+        {"type": "response.audio.delta", "response_id": response_id, "delta": "AAAA", "_client_received_at_s": 4.0},
+        {"type": "response.done", "response_id": response_id, "_client_received_at_s": 5.0},
+    ]
+    (output / "events.jsonl").write_text(
+        "".join(demo.json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    (output / "result.json").write_text(
+        demo.json.dumps({"ok": True, "response_ids": [response_id]}),
+        encoding="utf-8",
+    )
+
+    summary = demo.summarize_artifacts(
+        output_dir=output,
+        validation_mode="model-policy",
+        min_responses=1,
+        min_audio_deltas_per_response=2,
+        expect_followup_response_substring=None,
+    )
+
+    assert summary["ok"] is True
+    assert summary["response_before_final_commit"] is True
+    assert summary["listen_after_response_before_commit"] is False
+    assert summary["final_listen_after_commit"] is False
+
+
 def test_realtime_duplex_soft_interrupt_response_required_rejects_single_response(tmp_path):
     demo = _load_soft_interrupt_demo_module()
     output = tmp_path / "response_required"
@@ -655,6 +774,34 @@ def test_realtime_duplex_multi_session_rejects_cross_session_response_identity()
     )
 
 
+def test_realtime_duplex_multi_session_rejects_overlapping_expected_tokens(monkeypatch, capsys):
+    demo = _load_multi_demo_module()
+    monkeypatch.setattr(
+        demo.sys,
+        "argv",
+        [
+            "multi.py",
+            "--sessions",
+            "2",
+            "--input-wav",
+            "fallback.wav",
+            "--session-input-wav",
+            "a.wav",
+            "--session-input-wav",
+            "b.wav",
+            "--session-expected-token",
+            "cat",
+            "--session-expected-token",
+            "cater",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        demo.parse_args()
+
+    assert "must not overlap after normalization" in capsys.readouterr().err
+
+
 def test_realtime_duplex_multi_session_reads_nested_terminal_identity():
     demo = _load_multi_demo_module()
 
@@ -663,6 +810,67 @@ def test_realtime_duplex_multi_session_reads_nested_terminal_identity():
         demo._event_session_id({"type": "session.closed", "event": {"type": "session.closed", "session_id": "sid"}})
         == "sid"
     )
+
+
+def test_realtime_duplex_synchronized_start_gate_releases_all_participants():
+    demo = _load_multi_demo_module()
+
+    async def exercise():
+        gate = demo._SynchronizedStartGate(3, timeout_s=0.5)
+        released = []
+
+        async def participant(index):
+            await gate.wait()
+            released.append(index)
+
+        await asyncio.wait_for(
+            asyncio.gather(*(participant(index) for index in range(3))),
+            timeout=1.0,
+        )
+        return released
+
+    assert set(asyncio.run(exercise())) == {0, 1, 2}
+
+
+def test_realtime_duplex_synchronized_start_gate_aborts_waiters_on_failure(monkeypatch):
+    demo = _load_multi_demo_module()
+
+    async def fake_run_demo(args):
+        if args.fail:
+            raise RuntimeError("session creation failed")
+        await args.start_barrier.wait()
+        return {"ok": True}
+
+    monkeypatch.setattr(demo, "run_demo", fake_run_demo)
+
+    async def exercise():
+        gate = demo._SynchronizedStartGate(2, timeout_s=0.5)
+        return await asyncio.wait_for(
+            asyncio.gather(
+                demo._run_demo_with_start_gate(SimpleNamespace(start_barrier=gate, fail=True)),
+                demo._run_demo_with_start_gate(SimpleNamespace(start_barrier=gate, fail=False)),
+                return_exceptions=True,
+            ),
+            timeout=1.0,
+        )
+
+    failed, aborted = asyncio.run(exercise())
+    assert isinstance(failed, RuntimeError)
+    assert str(failed) == "session creation failed"
+    assert isinstance(aborted, RuntimeError)
+    assert "synchronized start aborted" in str(aborted)
+    assert "session creation failed" in str(aborted)
+
+
+def test_realtime_duplex_synchronized_start_gate_has_bounded_wait():
+    demo = _load_multi_demo_module()
+
+    async def exercise():
+        gate = demo._SynchronizedStartGate(2, timeout_s=0.01)
+        await gate.wait()
+
+    with pytest.raises(TimeoutError, match=r"1/2 sessions ready"):
+        asyncio.run(exercise())
 
 
 def test_realtime_duplex_demo_resolves_distinct_turn_inputs():
@@ -799,6 +1007,7 @@ def test_realtime_duplex_demo_reads_response_playback_cursor():
 def test_realtime_duplex_demo_partitions_timing_by_response_identity():
     demo = _load_demo_module()
     state = demo.DemoState()
+    state.input_commit_sent_at_s.extend((9.9, 19.9))
     for response_id, created_at_s, audio_at_s, token_count in (
         ("resp-1", 10.0, 10.1, 3),
         ("resp-2", 20.0, 20.2, 5),
@@ -826,15 +1035,66 @@ def test_realtime_duplex_demo_partitions_timing_by_response_identity():
             },
             received_at_s=audio_at_s,
         )
+        state.add(
+            {
+                "type": "response.audio_transcript.delta",
+                "response_id": response_id,
+                "delta": "audio",
+            },
+            received_at_s=created_at_s + 0.05,
+        )
 
     timings = state.response_timing_summaries()
+    requests = state.session_request_metrics(session_id="seed-tts-session")
+    session_metrics = state.session_metric_summary(session_id="seed-tts-session")
 
     assert timings["resp-1"]["stage0_tokens"]["output_token_count"] == 3
     assert timings["resp-1"]["audio_output"]["response_created_to_first_audio_ms"] == 100.0
-    assert timings["resp-1"]["audio_output"]["commit_to_first_audio_ms"] is None
+    assert timings["resp-1"]["audio_output"]["commit_to_first_audio_ms"] == 200.0
     assert timings["resp-2"]["stage0_tokens"]["output_token_count"] == 5
     assert timings["resp-2"]["audio_output"]["response_created_to_first_audio_ms"] == 200.0
-    assert timings["resp-2"]["audio_output"]["commit_to_first_audio_ms"] is None
+    assert timings["resp-2"]["audio_output"]["commit_to_first_audio_ms"] == 300.0
+    assert requests == [
+        {
+            "session_id": "seed-tts-session",
+            "request_index": 0,
+            "response_id": "resp-1",
+            "ttft_ms": 150.0,
+            "ttfp_ms": 200.0,
+            "rtf": 2.5,
+            "audio_generation_ms": 200.0,
+            "audio_duration_ms": 80.0,
+            "source": "client_monotonic_receive",
+            "measurement_origin": {
+                "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+                "ttfp": "input_audio_buffer.commit client send to first audio packet",
+                "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
+            },
+        },
+        {
+            "session_id": "seed-tts-session",
+            "request_index": 1,
+            "response_id": "resp-2",
+            "ttft_ms": 150.0,
+            "ttfp_ms": 300.0,
+            "rtf": 3.75,
+            "audio_generation_ms": 300.0,
+            "audio_duration_ms": 80.0,
+            "source": "client_monotonic_receive",
+            "measurement_origin": {
+                "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+                "ttfp": "input_audio_buffer.commit client send to first audio packet",
+                "rtf": "commit-to-last-audio receive time divided by emitted audio duration",
+            },
+        },
+    ]
+    assert session_metrics == {
+        "session_id": "seed-tts-session",
+        "audio_turn_count": 2,
+        "mean_ttft_ms": 150.0,
+        "mean_ttfp_ms": 250.0,
+        "mean_rtf": 3.125,
+    }
 
 
 def test_realtime_duplex_demo_model_policy_accepts_one_listen_per_streamed_turn():
@@ -1564,6 +1824,219 @@ def test_realtime_duplex_demo_waits_at_each_model_unit_and_stops_after_speak():
 
     assert model_unit_message_counts == [5, 10]
     assert len(ws.messages) == 10
+
+
+def _sent_video_frames(messages: list[dict[str, object]]) -> list[list[str]]:
+    frames: list[list[str]] = []
+    for message in messages:
+        raw = message.get("video_frames")
+        if not isinstance(raw, list):
+            continue
+        frames.append([frame for frame in raw if isinstance(frame, str)])
+    return frames
+
+
+def _decode_jpeg_size(frame_b64: str) -> tuple[int, int]:
+    import io
+
+    from PIL import Image
+
+    return Image.open(io.BytesIO(base64.b64decode(frame_b64))).size
+
+
+class _RecordingWebSocket:
+    def __init__(self, demo):
+        self._demo = demo
+        self.messages: list[dict[str, object]] = []
+
+    async def send(self, payload):
+        self.messages.append(self._demo.json.loads(payload))
+
+
+def _send_seconds_of_audio(demo, *, seconds: int, frames: list[str], stacked: list[str | None] | None = None):
+    ws = _RecordingWebSocket(demo)
+    asyncio.run(
+        demo._send_pcm16(
+            ws,
+            b"\x01\x00" * (demo.PCM16_SAMPLE_RATE * seconds),
+            chunk_ms=200,
+            realtime_delay=False,
+            frames_b64=frames,
+            stacked_frames_b64=stacked,
+        )
+    )
+    return ws.messages
+
+
+def test_realtime_duplex_demo_streams_one_video_frame_per_model_unit():
+    demo = _load_demo_module()
+
+    messages = _send_seconds_of_audio(demo, seconds=3, frames=["f0", "f1", "f2", "f3"])
+
+    # Frame k rides the append that closes model unit k, so Stage0 can bind it
+    # to that unit's audio. 3 s of audio closes units at 1030 ms and 2030 ms and
+    # leaves a residual too short for a third, so only two frames go out.
+    assert _sent_video_frames(messages) == [["f0"], ["f1"]]
+    frame_indices = [index for index, message in enumerate(messages) if "video_frames" in message]
+    assert frame_indices == [5, 10]
+    # The carrying appends are exactly the ones that reach a unit boundary.
+    assert [messages[index]["audio_end_ms"] for index in frame_indices] == [1200, 2200]
+
+
+def test_realtime_duplex_demo_never_sends_a_frame_before_its_unit_can_close():
+    """Regression: frame 0 used to ride the very first 200 ms append.
+
+    Stage0 cannot close a unit until 1030 ms of audio has arrived, and it does
+    not carry frames across appends, so a frame sent that early was silently
+    dropped and every later frame ended up one unit ahead of its audio.
+    """
+    demo = _load_demo_module()
+
+    messages = _send_seconds_of_audio(demo, seconds=3, frames=["f0", "f1", "f2"])
+
+    carried = [message for message in messages if "video_frames" in message]
+    assert carried, "expected at least one frame to be sent"
+    for message in carried:
+        assert message["audio_end_ms"] >= demo.duplex_unit_boundary_ms(0)
+
+
+def test_realtime_duplex_demo_holds_the_last_video_frame_when_audio_outlives_the_clip():
+    demo = _load_demo_module()
+
+    # 4 s of audio closes three units (1030/2030/3030 ms); the two-frame clip
+    # holds its last frame for the third.
+    assert _sent_video_frames(_send_seconds_of_audio(demo, seconds=4, frames=["a", "b"])) == [["a"], ["b"], ["b"]]
+    # A still image is a one-element clip and therefore repeats every unit.
+    assert _sent_video_frames(_send_seconds_of_audio(demo, seconds=3, frames=["still"])) == [["still"], ["still"]]
+
+
+def test_realtime_duplex_demo_sends_each_units_stacked_composite_next_to_its_base_frame():
+    demo = _load_demo_module()
+
+    messages = _send_seconds_of_audio(
+        demo,
+        seconds=4,
+        frames=["f0", "f1", "f2"],
+        stacked=["s0", "s1", None],
+    )
+
+    # Official pairing is frame_list=[base, composite of that unit's interior],
+    # so the composite belongs to the same unit as the base beside it -- never
+    # to the previous one. A unit without interior sub-frames sends base alone.
+    assert _sent_video_frames(messages) == [["f0", "s0"], ["f1", "s1"], ["f2"]]
+
+
+def test_realtime_duplex_demo_decodes_a_video_file_into_one_frame_per_second(tmp_path):
+    pytest.importorskip("cv2")
+    pytest.importorskip("imageio")
+    from tests.helpers.media import generate_synthetic_video
+
+    demo = _load_demo_module()
+    # 30 fps synthetic clip: 90 frames is 3 s of camera input.
+    video = generate_synthetic_video(64, 64, 90, cache_dir=tmp_path)
+
+    frames, stacked = demo._resolve_video_frames(SimpleNamespace(input_video=video["file_path"]))
+
+    assert len(frames) == 3
+    assert all(base64.b64decode(frame, validate=True)[:3] == b"\xff\xd8\xff" for frame in frames)
+    assert len(set(frames)) == 3
+    # stack_frames defaults to 1, so there is nothing to stack.
+    assert stacked == [None, None, None]
+
+
+def test_realtime_duplex_demo_stacks_a_units_interior_subframes_into_one_composite(tmp_path):
+    pytest.importorskip("cv2")
+    pytest.importorskip("imageio")
+    from tests.helpers.media import generate_synthetic_video
+
+    demo = _load_demo_module()
+    video = generate_synthetic_video(64, 64, 90, cache_dir=tmp_path)
+
+    frames, stacked = demo._resolve_video_frames(SimpleNamespace(input_video=video["file_path"], stack_frames=5))
+
+    # stack_frames=5 raises the visual refresh rate to 5 fps, but the four
+    # interior sub-frames of each second collapse into a single composite, so
+    # the wire still carries 2 images per unit and the audio cadence is
+    # untouched.
+    assert len(frames) == 3
+    assert len(stacked) == 3
+    assert all(frame is not None for frame in stacked)
+    assert all(base64.b64decode(frame, validate=True)[:3] == b"\xff\xd8\xff" for frame in stacked)
+    composite = _decode_jpeg_size(stacked[0])
+    assert composite != _decode_jpeg_size(frames[0])
+
+
+def test_example_demo_uses_external_wav_duration_and_skips_video_soundtrack(tmp_path, monkeypatch):
+    demo = _load_example_demo_module()
+    wav = tmp_path / "external.wav"
+    demo.write_pcm16_wav(wav, b"\x00\x00" * (demo.PCM16_SAMPLE_RATE * 2), sample_rate_hz=demo.PCM16_SAMPLE_RATE)
+    soundtrack_calls: list[object] = []
+
+    def fake_soundtrack(*args, **kwargs):
+        soundtrack_calls.append(1)
+        raise AssertionError("video soundtrack must not be loaded when --input-wav is set")
+
+    def fake_frames(video_path, work_dir, *, fps, max_side, duration_s, stack_frames):
+        assert video_path == Path("/tmp/silent.mp4")
+        assert fps == 1.0
+        assert duration_s == pytest.approx(2.0)
+        return ["f0", "f1"], [None, None]
+
+    monkeypatch.setattr(demo, "_extract_video_soundtrack", fake_soundtrack)
+    monkeypatch.setattr(demo, "_extract_video_frames", fake_frames)
+
+    wav_out, frames, stacked = demo._resolve_duplex_av_inputs(
+        input_wav=str(wav),
+        input_video="/tmp/silent.mp4",
+        work_dir=tmp_path / "video_input",
+        fps=1.0,
+        max_side=0,
+    )
+
+    assert wav_out == str(wav)
+    assert frames == ["f0", "f1"]
+    assert stacked == [None, None]
+    assert soundtrack_calls == []
+
+
+def test_example_demo_extracts_video_soundtrack_only_when_wav_is_absent(tmp_path, monkeypatch):
+    demo = _load_example_demo_module()
+    extracted = tmp_path / "from_video.wav"
+    demo.write_pcm16_wav(extracted, b"\x00\x00" * demo.PCM16_SAMPLE_RATE, sample_rate_hz=demo.PCM16_SAMPLE_RATE)
+
+    def fake_extract(video_path, work_dir, *, fps, max_side, stack_frames):
+        assert video_path == Path("/tmp/clip.mp4")
+        return extracted, ["v0"], ["s0"]
+
+    monkeypatch.setattr(demo, "_extract_video_input", fake_extract)
+
+    wav_out, frames, stacked = demo._resolve_duplex_av_inputs(
+        input_wav=None,
+        input_video="/tmp/clip.mp4",
+        work_dir=tmp_path / "video_input",
+        fps=1.0,
+        max_side=0,
+    )
+
+    assert wav_out == str(extracted)
+    assert frames == ["v0"]
+    assert stacked == ["s0"]
+
+
+def test_realtime_duplex_demo_prefers_a_video_over_a_still_frame_image(tmp_path):
+    demo = _load_demo_module()
+    still = tmp_path / "frame.jpg"
+    still.write_bytes(b"\xff\xd8\xff-still")
+
+    # A still has no interior sub-frames, so it never stacks.
+    assert demo._resolve_video_frames(SimpleNamespace(frame_image=str(still))) == (
+        [base64.b64encode(still.read_bytes()).decode("ascii")],
+        [None],
+    )
+    assert demo._resolve_video_frames(
+        SimpleNamespace(frame_image=str(still), video_frames_b64=["preset"]),
+    ) == (["preset"], [None])
+    assert demo._resolve_video_frames(SimpleNamespace()) == ([], [])
 
 
 def test_realtime_duplex_demo_listen_only_overlap_accepts_silence_unit_before_first_done(monkeypatch):

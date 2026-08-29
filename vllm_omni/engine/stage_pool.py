@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unified stage-local runtime abstraction for vLLM-Omni."""
 
 from __future__ import annotations
@@ -44,6 +47,19 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class StageUnavailableError(RuntimeError):
+    """Raised when dispatch cannot reach a live replica of a stage.
+
+    Deliberately a ``RuntimeError`` subclass (not ``EngineDeadError``): no
+    engine died at the raise site — the stage's replica set is empty or the
+    chosen slot was evicted, which is a routing/capacity condition and, in
+    distributed mode, recoverable. Dispatch guards catch exactly this type so
+    unrelated ``RuntimeError``s keep failing fast, and existing
+    ``EngineDeadError`` handlers (teardown-on-dead, poll-path eviction) are
+    not silently enrolled.
+    """
+
+
 @dataclass
 class _ReplicaMetrics:
     """Per-replica metrics accumulators owned by a stage pool."""
@@ -81,6 +97,16 @@ class StagePool:
 
     DISPATCH_WAIT_TIMEOUT_S: float = 10.0
     DISPATCH_RETRY_INTERVAL_S: float = 0.1
+    # Only these EngineCore helpers may skip collective_rpc_async. A generic
+    # ``{method}_async`` on AsyncMPClient must not silently drop timeout.
+    _ENGINE_CORE_CONTROL_ASYNC_METHODS = frozenset(
+        {
+            "pause_scheduler",
+            "resume_scheduler",
+            "sleep",
+            "wake_up",
+        }
+    )
 
     def __init__(
         self,
@@ -329,7 +355,9 @@ class StagePool:
 
             now = _time.monotonic()
             if now >= deadline:
-                raise RuntimeError(f"no UP replica for stage {self.stage_id} after {self.DISPATCH_WAIT_TIMEOUT_S:.1f}s")
+                raise StageUnavailableError(
+                    f"no UP replica for stage {self.stage_id} after {self.DISPATCH_WAIT_TIMEOUT_S:.1f}s"
+                )
             await asyncio.sleep(min(self.DISPATCH_RETRY_INTERVAL_S, deadline - now))
 
     def preselect_replica_id(
@@ -555,7 +583,7 @@ class StagePool:
             # Prefer replicas that are both live (client up) and available.
             live = [r for r in self.live_replica_ids() if self.is_replica_available(r)]
             if not live:
-                raise RuntimeError(f"stage {self.stage_id} has no live replicas")
+                raise StageUnavailableError(f"stage {self.stage_id} has no live replicas")
             if len(live) == 1:
                 chosen = live[0]
             else:
@@ -570,13 +598,13 @@ class StagePool:
     def _llm_client(self, replica_id: int) -> StagePoolLLMClient:
         client = self.clients[replica_id]
         if client is None:
-            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
         return cast(StagePoolLLMClient, client)
 
     def _diffusion_client(self, replica_id: int) -> StagePoolDiffusionClient:
         client = self.clients[replica_id]
         if client is None:
-            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
         return cast(StagePoolDiffusionClient, client)
 
     # ---- Metrics ----
@@ -628,16 +656,16 @@ class StagePool:
         )
         image_pixels = self._count_image_pixels(request_outputs) if output_unit_type == "image" else 0
         num_inference_steps = coerce_positive_int_scalar(getattr(sampling_params, "num_inference_steps", None)) or 0
-        denoise_step_latency_ms = (
-            defs.compute_denoise_step_latency(stage_gen_time_ms, num_inference_steps)
-            if output_unit_type == "image"
-            else 0.0
-        )
         has_output_timestamps = bool(output_timestamps)
         first_ts = output_timestamps[0] if has_output_timestamps else now
         serving_time_to_first_output_ms = (
             max((non_empty_first_output_ts - request_timestamp) * 1000.0, 0.0)
             if non_empty_first_output_ts is not None
+            else 0.0
+        )
+        image_time_to_first_output_ms = (
+            max((non_empty_first_output_ts - submit_ts) * 1000.0, 0.0)
+            if non_empty_first_output_ts is not None and output_unit_type == "image"
             else 0.0
         )
         remaining_ms = max((now - first_ts) * 1000.0, 0.0)
@@ -684,10 +712,11 @@ class StagePool:
             audio_sample_rate=audio_sample_rate,
             audio_duration_s=audio_duration_s,
             image_pixels=image_pixels,
-            denoise_step_latency_ms=denoise_step_latency_ms,
+            num_inference_steps=num_inference_steps,
             output_unit_type=output_unit_type,
             output_unit_count=output_unit_count,
             serving_time_to_first_output_ms=serving_time_to_first_output_ms,
+            image_time_to_first_output_ms=image_time_to_first_output_ms,
             time_per_output_unit_ms=time_per_output_unit_ms,
             inter_output_latency_ms=inter_output_latency_ms,
             inter_output_latencies_ms=inter_output_latencies_ms,
@@ -961,7 +990,7 @@ class StagePool:
         )
         client = self.clients[replica_id]
         if client is None:
-            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
         try:
             self.output_processor.add_request(
                 request=request,
@@ -1010,7 +1039,7 @@ class StagePool:
 
         client = self.clients[replica_id]
         if client is None:
-            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
 
         if self.stage_type == "diffusion":
             if isinstance(request, list):
@@ -1199,6 +1228,7 @@ class StagePool:
         kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any] | Any:
         """Dispatch a stage-scoped control-plane RPC to one physical route."""
+        args = tuple(args or ())
         kwargs = dict(kwargs or {})
         client = self.clients[replica_id]
         if client is None:
@@ -1207,6 +1237,14 @@ class StagePool:
                 "error": f"stage {self.stage_id} replica {replica_id} is not attached",
             }
         try:
+            if self.stage_type != "diffusion" and method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS:
+                client_method = getattr(client, f"{method}_async", None)
+                if callable(client_method):
+                    result = client_method(*args, **kwargs)
+                    if timeout is not None:
+                        return await asyncio.wait_for(result, timeout=timeout)
+                    return await result
+
             return await client.collective_rpc_async(
                 method=method,
                 timeout=timeout,
@@ -1246,3 +1284,21 @@ class StagePool:
                 replica_id,
                 e,
             )
+
+    def evict_replica(self, replica_id: int) -> None:
+        """Shut down a replica and remove it from the live set.
+
+        After eviction ``live_replica_ids`` / ``live_num_replicas`` no longer
+        include this slot, so the orchestrator stops polling and dispatching to
+        it (per-replica fault isolation). The slot is left as a ``None`` hole,
+        consistent with ``num_replicas``.
+        """
+        # replica_id should always come from live_replica_ids() (a valid, live
+        # index). Fail loud on an out-of-range id rather than letting a negative
+        # index wrap or IndexError on the next line; an ``assert`` would be
+        # stripped under ``python -O``, silently leaving a dead replica in the
+        # live set and breaking isolation.
+        if not 0 <= replica_id < len(self.clients):
+            raise ValueError(f"evict_replica: replica_id {replica_id} out of range (num_replicas={len(self.clients)})")
+        self.shutdown_replica(replica_id)
+        self.clients[replica_id] = None

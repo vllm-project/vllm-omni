@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -87,6 +87,29 @@ def test_diffusion_base_linear_apply_multi_slice():
     delta1 = torch.tensor([[6.0]])
     expected = torch.cat([base_out[:, :2] + delta0, base_out[:, 2:3] + delta1], dim=-1)
     assert torch.allclose(out, expected)
+
+
+def test_diffusion_lora_buffer_device_persists_across_reallocation(monkeypatch):
+    from vllm.lora.layers.base_linear import BaseLinearLayerWithLoRA
+
+    layer = DiffusionBaseLinearLayerWithLoRA.__new__(DiffusionBaseLinearLayerWithLoRA)
+    torch.nn.Module.__init__(layer)
+    layer.base_layer = torch.nn.Module()
+    layer.n_slices = 1
+    layer.lora_a_stacked = (torch.zeros(2),)
+    layer.lora_b_stacked = (torch.zeros(3),)
+
+    layer._set_diffusion_lora_buffer_device(torch.device("meta"))
+    assert all(tensor.is_meta for tensor in (*layer.lora_a_stacked, *layer.lora_b_stacked))
+
+    def recreate_on_cpu(self, max_loras, lora_config, model_config):
+        self.lora_a_stacked = (torch.zeros(4),)
+        self.lora_b_stacked = (torch.zeros(5),)
+
+    monkeypatch.setattr(BaseLinearLayerWithLoRA, "create_lora_weights", recreate_on_cpu)
+    layer.create_lora_weights(max_loras=1, lora_config=object())
+
+    assert all(tensor.is_meta for tensor in (*layer.lora_a_stacked, *layer.lora_b_stacked))
 
 
 def test_diffusion_base_linear_reset_lora_disables_fast_path(monkeypatch):

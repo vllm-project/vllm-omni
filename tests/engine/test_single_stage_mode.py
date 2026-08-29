@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for AsyncOmniEngine single-stage mode and OmniMasterServer."""
 
 from __future__ import annotations
@@ -428,7 +431,7 @@ class TestSingleStageModeDetection:
         assert engine.single_stage_mode is False
         assert engine._single_stage_id_filter is None
 
-    def test_stage_configs_path_loads_duplex_runtime_config(self, mocker: MockerFixture):
+    def test_deploy_config_loads_duplex_runtime_config(self, mocker: MockerFixture):
         duplex_session = DuplexSessionRuntimeConfig(max_sessions=2)
         get_pipeline_config = mocker.patch(
             "vllm_omni.engine.async_omni_engine.StageConfigFactory.get_pipeline_config",
@@ -441,7 +444,7 @@ class TestSingleStageModeDetection:
 
         engine = self._make_engine_no_thread(
             mocker,
-            stage_configs_path="/fake/duplex.yaml",
+            deploy_config="/fake/duplex.yaml",
         )
 
         get_pipeline_config.assert_called_once_with(
@@ -1138,7 +1141,8 @@ class TestSingleStageReplicaInitialization:
         runtime._init_visible_devices_baseline = "0"
 
         mocker.patch.object(runtime_mod, "inject_kv_stage_info")
-        mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value="diffusion-config")
+        od_config = SimpleNamespace(max_num_seqs=None, parallel_config=SimpleNamespace(world_size=1))
+        mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value=od_config)
         mock_register = mocker.patch(
             "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
             return_value=StageRegistrationResponse(
@@ -1174,6 +1178,7 @@ class TestSingleStageReplicaInitialization:
                 os.environ[device_env_var] = prev_device_env
 
         assert result is sentinel_client
+        assert od_config.max_num_seqs is None
         mock_register.assert_called_once_with(
             omni_master_address="127.0.0.1",
             omni_master_port=25000,
@@ -1183,7 +1188,7 @@ class TestSingleStageReplicaInitialization:
         )
         mock_manager.assert_called_once_with(
             model="fake-model",
-            od_config="diffusion-config",
+            od_config=od_config,
             stage_init_timeout=60,
             handshake_address="tcp://127.0.0.1:26001",
             addresses=mocker.ANY,
@@ -1201,6 +1206,48 @@ class TestSingleStageReplicaInitialization:
             batch_size=4,
         )
         assert mock_from_addresses.call_args.kwargs["proc_manager"].proc is proc
+
+    def test_initialize_local_custom_diffusion_replica_uses_inline_client(self, mocker: MockerFixture):
+        import vllm_omni.engine.stage_runtime as runtime_mod
+        from vllm_omni.platforms import current_omni_platform
+
+        runtime = DistStageRuntime(
+            stage_configs=[],
+            model="fake-model",
+            config_path="/fake/stages.yaml",
+            stage_init_timeout=60,
+            diffusion_batch_size=4,
+            async_chunk=False,
+            single_stage_id_filter=None,
+            omni_master_address="127.0.0.1",
+            omni_master_port=26000,
+        )
+        runtime._omni_master_server = mocker.Mock(spec=OmniMasterServer)
+        runtime._coordinator_runtime = None
+        plan = _make_diffusion_plan(0, stage_id=0, launch_mode="local").replicas[0]
+        plan.stage_cfg.engine_args = {"custom_pipeline_args": {"pipeline_class": "test.CustomPipeline"}}
+        sentinel_client = SimpleNamespace()
+        mock_launch = mocker.patch.object(
+            runtime_mod,
+            "launch_diffusion_stage_replica",
+            return_value=(sentinel_client, StageReplicaResources()),
+        )
+        mocker.patch.object(runtime_mod, "inject_kv_stage_info")
+
+        device_env_var = current_omni_platform.device_control_env_var
+        prev_device_env = os.environ.get(device_env_var)
+        os.environ[device_env_var] = "0"
+        runtime._init_visible_devices_baseline = "0"
+        try:
+            result = runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=60)
+        finally:
+            if prev_device_env is None:
+                os.environ.pop(device_env_var, None)
+            else:
+                os.environ[device_env_var] = prev_device_env
+
+        assert result is sentinel_client
+        assert mock_launch.call_args.kwargs["use_inline"] is True
 
     def test_initialize_local_diffusion_replica_failure_terminates_proc(self, mocker: MockerFixture):
         import vllm_omni.engine.stage_runtime as runtime_mod
@@ -1230,7 +1277,8 @@ class TestSingleStageReplicaInitialization:
         runtime._init_visible_devices_baseline = "0"
 
         mocker.patch.object(runtime_mod, "inject_kv_stage_info")
-        mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value="diffusion-config")
+        od_config = SimpleNamespace(max_num_seqs=None, parallel_config=SimpleNamespace(world_size=1))
+        mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value=od_config)
         mocker.patch(
             "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
             return_value=StageRegistrationResponse(
@@ -1371,7 +1419,7 @@ class TestConnectRemoteEngineCoresCoordinator:
         omni_master_server.get_zmq_addresses.assert_called_once_with(7, replica_id=2)
         omni_master_server.get_allocation.assert_called_once_with(7, replica_id=2)
         mock_wait.assert_called_once()
-        _, _, core_engines, parallel_config, *_ = mock_wait.call_args.args
+        _, core_engines, parallel_config, *_ = mock_wait.call_args.args
         assert core_engines[0].local is False
         assert parallel_config.data_parallel_size_local == 0
 

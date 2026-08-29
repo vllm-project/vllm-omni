@@ -72,6 +72,16 @@ def _codes(payload) -> list[int]:
     return payload.codes.audio.tolist()
 
 
+def test_empty_full_payload_releases_consumer_wait_gate() -> None:
+    payload = tts2code2wav_full_payload(_manager(), None, _request("req"))
+
+    assert _codes(payload) == []
+    assert payload.meta.code_flat_numel == 0
+    assert payload.meta.left_context_size == 0
+    assert payload.meta.last_chunk is True
+    assert payload.meta.finished.item() is True
+
+
 @pytest.mark.parametrize(("count", "emitted"), [(24, False), (25, True), (26, True)])
 def test_first_chunk_threshold_is_25_generated_codes(count: int, emitted: bool) -> None:
     manager = _manager()
@@ -423,6 +433,12 @@ def test_duplex_turn_end_closes_epoch_and_next_turn_restarts_sequence() -> None:
         request,
         True,
     )
+    duplicate_boundary = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(turn_id=7, turn_end=True),
+        request,
+        True,
+    )
     next_turn = tts2code2wav_async_chunk(
         manager,
         _duplex_delta(20, turn_id=8),
@@ -435,6 +451,10 @@ def test_duplex_turn_end_closes_epoch_and_next_turn_restarts_sequence() -> None:
     assert turn_end.meta.last_chunk is True
     assert turn_end.meta.turn_end is True
     assert turn_end.meta.is_segment_finished.item() is True
+    assert turn_end.meta.replace_runtime_additional_information is True
+    assert duplicate_boundary is not None
+    assert duplicate_boundary.meta.is_segment_finished.item() is True
+    assert duplicate_boundary.meta.replace_runtime_additional_information is True
     assert next_turn.meta.cache_epoch == turn_end.meta.cache_epoch + 1
     assert next_turn.meta.chunk_seq == 0
     assert next_turn.meta.last_chunk is False
