@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import re
 from types import SimpleNamespace
@@ -8,6 +11,7 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -77,7 +81,7 @@ def test_generate_submits_randomized_id_to_engine():
     """Ensure the engine receives a UUID-suffixed ID, not the raw request ID"""
 
     async def run():
-        submitted_ids = []
+        submitted_ids: list[str] = []
         omni = get_async_omni_instance(fake_add_request=get_fake_add_request(submitted_ids))
 
         req_id = "my-req-1"
@@ -106,8 +110,8 @@ def test_generate_forwards_lora_request_to_engine():
     """
 
     async def run():
-        submitted_ids = []
-        submitted_loras = []
+        submitted_ids: list[str] = []
+        submitted_loras: list[LoRARequest | None] = []
         omni = get_async_omni_instance(fake_add_request=get_fake_add_request(submitted_ids, submitted_loras))
 
         lora = LoRARequest(lora_name="test", lora_int_id=1, lora_path="/tmp/fake")
@@ -143,7 +147,7 @@ def test_abort_handles_internal_request_mapping(req_ids: list[str], cancel_prefi
     user provided request ID will be aborted."""
 
     async def run():
-        aborted_batches = []
+        aborted_batches: list[list[str]] = []
         omni = get_async_omni_instance(
             fake_abort_request=get_fake_abort(aborted_batches),
         )
@@ -186,10 +190,62 @@ def test_abort_handles_internal_request_mapping(req_ids: list[str], cancel_prefi
 
 
 @pytest.mark.cpu
+def test_abort_pops_request_states_only_after_ack():
+    async def run():
+        release = asyncio.Event()
+        seen_during_wait: list[int] = []
+
+        async def slow_abort_async(request_ids):
+            del request_ids
+            seen_during_wait.append(len(omni.request_states))
+            await release.wait()
+
+        omni = get_async_omni_instance(fake_abort_request=slow_abort_async)
+        omni.request_states["req-1-aaaa"] = SimpleNamespace(
+            request_id="req-1-aaaa",
+            external_request_id="req-1",
+            input_stream_task=None,
+        )
+
+        task = asyncio.create_task(omni.abort("req-1"))
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert "req-1-aaaa" in omni.request_states
+        assert seen_during_wait == [1]
+
+        release.set()
+        await task
+        assert "req-1-aaaa" not in omni.request_states
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_abort_propagates_engine_errors_without_popping_state():
+    async def run():
+        async def failing_abort_async(request_ids):
+            del request_ids
+            raise RuntimeError("orchestrator abort failed")
+
+        omni = get_async_omni_instance(fake_abort_request=failing_abort_async)
+        omni.request_states["req-1-bbbb"] = SimpleNamespace(
+            request_id="req-1-bbbb",
+            external_request_id="req-1",
+            input_stream_task=None,
+        )
+
+        with pytest.raises(RuntimeError, match="orchestrator abort failed"):
+            await omni.abort("req-1")
+        assert "req-1-bbbb" in omni.request_states
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_generate_accepts_request_after_repeated_cancellations():
     async def run_test():
-        submitted_request_ids = []
-        aborted_request_batches = []
+        submitted_request_ids: list[str] = []
+        aborted_request_batches: list[list[str]] = []
 
         async def collect_outputs(request_id):
             outputs = []
@@ -230,6 +286,43 @@ def test_generate_accepts_request_after_repeated_cancellations():
         for batch, prefix in zip(aborted_request_batches, ["cancel-0-", "cancel-1-", "cancel-2-"]):
             assert len(batch) == 1
             assert batch[0].startswith(prefix)
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.cpu
+def test_generate_cancellation_converges_after_engine_shutdown_starts(mocker):
+    async def run_test():
+        submitted_request_ids: list[str] = []
+        engine = object.__new__(AsyncOmniEngine)
+        engine._shutdown_called = True
+        engine.request_queue = mocker.Mock()
+        engine.num_stages = 1
+        engine.add_request_async = get_fake_add_request(submitted_request_ids)
+
+        omni = get_async_omni_instance()
+        omni.engine = engine
+
+        async def collect_outputs():
+            async for _ in omni.generate(
+                prompt={"prompt": "prompt"},
+                request_id="cancel-shutdown",
+                sampling_params_list=[SimpleNamespace()],
+                output_modalities=["image"],
+            ):
+                pass
+
+        task = asyncio.create_task(collect_outputs())
+        await asyncio.sleep(0)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert len(submitted_request_ids) == 1
+        assert submitted_request_ids[0].startswith("cancel-shutdown-")
+        assert omni.request_states == {}
+        engine.request_queue.sync_q.put.assert_not_called()
 
     asyncio.run(run_test())
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Wan2.2 Speech-to-Video (S2V) Pipeline for vLLM-Omni.
@@ -22,7 +22,6 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from torchvision import transforms
 from transformers import AutoTokenizer, UMT5Config, UMT5EncoderModel, Wav2Vec2ForCTC, Wav2Vec2Processor
-from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.multimodal.media.audio import load_audio
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -36,6 +35,7 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     load_transformer_config,
+    load_wan_weights_with_optional_gate,
     retrieve_latents,
 )
 from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
@@ -1475,6 +1475,4 @@ class Wan22S2VPipeline(
         return outputs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights using AutoWeightsLoader for vLLM integration."""
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return load_wan_weights_with_optional_gate(self, weights)

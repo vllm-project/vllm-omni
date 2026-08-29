@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from types import SimpleNamespace
 
 import pytest
@@ -45,6 +48,39 @@ def test_prepare_video_latents_matches_official_values_and_token_major_layout():
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert actual.stride()[1:] == (1, actual.shape[1])
+
+
+def test_prepare_video_latents_uses_diffusion_decoder_statistics():
+    pipeline = _make_pipeline(LTX2Pipeline)
+    pipeline.use_diffusion_decoder = True
+    pipeline.vae_spatial_compression_ratio = 1
+    pipeline.vae_temporal_compression_ratio = 1
+    pipeline.transformer_spatial_patch_size = 1
+    pipeline.transformer_temporal_patch_size = 1
+    pipeline.vae = SimpleNamespace(
+        latents_mean=torch.full((2,), 100.0),
+        latents_std=torch.full((2,), 10.0),
+        config=SimpleNamespace(scaling_factor=1.0),
+    )
+    pipeline.diffusion_decoder = SimpleNamespace(
+        latents_mean=torch.tensor([1.0, 3.0]),
+        latents_std=torch.tensor([2.0, 4.0]),
+        config=SimpleNamespace(scaling_factor=2.0),
+    )
+
+    actual = pipeline.prepare_latents(
+        batch_size=1,
+        num_channels_latents=2,
+        height=1,
+        width=1,
+        num_frames=1,
+        noise_scale=0.0,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        latents=torch.tensor([[[[[3.0]]], [[[7.0]]]]]),
+    )
+
+    torch.testing.assert_close(actual, torch.full((1, 1, 2), 2.0))
 
 
 def test_prepare_audio_latents_samples_directly_in_packed_token_space():

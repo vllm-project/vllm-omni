@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import ast
@@ -847,6 +850,161 @@ def test_minicpmo_stage0_data_plane_prefill_matches_official_unit_format():
     assert result["success"] is True
     assert result["input_token_ids"] == [2, 1, 11]
     assert result["prompt_suffix_len"] == 0
+
+
+def _stage0_vision_runtime():
+    import torch
+
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+    )
+
+    class _StageModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(256, 2)
+
+        def get_input_embeddings(self):
+            return self.embed
+
+        def get_audio_hidden_states(self, _data):
+            return [torch.tensor([[0.5, 0.5]], dtype=torch.float32)]
+
+    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+    runtime.stage_model = _StageModel()
+    runtime.thinker = runtime.stage_model
+    runtime.tokenizer = SimpleNamespace(
+        unk_token_id=0,
+        convert_tokens_to_ids=lambda token: {
+            "<unit>": 1,
+            "</unit>": 2,
+            "<|listen|>": 3,
+            "<|speak|>": 4,
+            "<|tts_bos|>": 5,
+            "<|tts_eos|>": 6,
+            "<|tts_pad|>": 7,
+            "<|chunk_eos|>": 8,
+            "<|chunk_tts_eos|>": 9,
+            "<|turn_eos|>": 10,
+            "<|audio|>": 11,
+            "<image>": 12,
+            "</image>": 13,
+            "<slice>": 14,
+            "</slice>": 15,
+        }.get(token, 0),
+        encode=lambda text, add_special_tokens=False: [201, 5],
+    )
+    runtime.processor = SimpleNamespace(get_streaming_chunk_size=lambda: 4)
+    runtime.device = "cpu"
+    runtime._init_token_ids()
+    # One 2-row block per frame keeps the expected token_ids readable; the real
+    # resampler emits VISION_EMBEDS_PER_FRAME rows per slice.
+    runtime._stage_vision_embeddings = lambda frames: [
+        [torch.full((2, 2), float(index), dtype=torch.float32)] for index in range(len(frames))
+    ]
+    return runtime
+
+
+def test_minicpmo_stage0_puts_every_frame_of_an_append_in_one_unit():
+    """Official streaming_prefill feeds the whole frame_list into one unit.
+
+    Stacked pairs used to be spread one frame per unit, so a two-frame append
+    that closed a single unit left a frame over, failed the prefill, and still
+    advanced the session state.
+    """
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-stage0-stacked-frames")
+
+    result = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        video_frames=["frame-prev", "frame-cur"],
+        seq=1,
+    )
+
+    assert result["success"] is True
+    # <unit>, then each frame as <image> + embeds + </image>, then the audio.
+    assert result["input_token_ids"] == [1, 12, 0, 0, 13, 12, 0, 0, 13, 11]
+    assert state.audio_chunk_idx == 1
+
+
+def test_minicpmo_stage0_wraps_hd_slices_after_the_source_image():
+    """Official stacked pair is max_slice_nums=[2, 1]: source + slices, then audio."""
+    import torch
+
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-stage0-hd-slices")
+    runtime._stage_vision_embeddings = lambda frames: [
+        [torch.ones((2, 2)), torch.full((2, 2), 2.0), torch.full((2, 2), 3.0)],
+        [torch.full((2, 2), 4.0)],
+    ]
+
+    result = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(4, dtype=np.float32),
+        video_frames=["base", "stack"],
+        seq=1,
+    )
+
+    assert result["success"] is True
+    # <unit> <image> src </image> <slice> p0 </slice> <slice> p1 </slice>
+    # <image> stack </image> audio
+    assert result["input_token_ids"] == [
+        1,
+        12,
+        0,
+        0,
+        13,
+        14,
+        0,
+        0,
+        15,
+        14,
+        0,
+        0,
+        15,
+        12,
+        0,
+        0,
+        13,
+        11,
+    ]
+
+
+def test_minicpmo_stage0_reports_frames_that_close_no_unit_instead_of_dropping_them():
+    """A frame only binds to the unit its append closes.
+
+    Frames are not carried across appends, so one arriving early used to vanish
+    under a generic "audio not enough" buffering result.
+    """
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-stage0-early-frame")
+
+    assert runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=1)["success"] is True
+
+    early = runtime._stage_prefill_embeddings_only(
+        state,
+        np.zeros(2, dtype=np.float32),
+        video_frames=["frame-cur"],
+        seq=2,
+    )
+
+    assert early["success"] is False
+    assert "closes no model unit" in early["reason"]
+    # The half-filled append must not advance the unit counter.
+    assert state.audio_chunk_idx == 1
 
 
 def test_minicpmo_stage0_speech_append_sets_pending_context_once():
@@ -2514,7 +2672,7 @@ def _ar_runner_classdefs():
 
 
 def _method_calls(method):
-    calls = {}
+    calls: dict[str, int] = {}
     for node in ast.walk(method):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             calls.setdefault(node.func.attr, node.lineno)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for the additive structured Omni config."""
 
 from __future__ import annotations
@@ -92,10 +92,23 @@ def _from_pipeline_key(
     )
 
 
+def test_minimax_h3_text_encoder_tp_targets_only_structured_stage_zero() -> None:
+    config = _from_pipeline_key(
+        "minimax_h3_disaggregated",
+        cli_overrides={"text_encoder_tp_size": 4},
+    )
+
+    assert config.stage_by_id(0).parallel_config.tensor_parallel_size == 4
+    diffusion = config.stage_by_id(1)
+    assert diffusion.parallel_config.tensor_parallel_size == 1
+    assert diffusion.parallel_config.text_encoder_tp_size == 1
+
+
 def test_duplex_session_capacity_propagates_to_every_structured_stage() -> None:
     omni_config = _from_pipeline_key("personaplex")
 
     assert [stage.model_config.duplex_max_sessions for stage in omni_config.stage_configs] == [2, 2]
+    assert [stage.model_config.session_mode for stage in omni_config.stage_configs] == ["duplex", "duplex"]
 
 
 def test_non_duplex_deploy_keeps_model_session_capacity_at_one(tmp_path: Path) -> None:
@@ -105,6 +118,7 @@ def test_non_duplex_deploy_keeps_model_session_capacity_at_one(tmp_path: Path) -
     omni_config = _from_pipeline_key("personaplex", deploy_config_path=str(deploy_path))
 
     assert [stage.model_config.duplex_max_sessions for stage in omni_config.stage_configs] == [1, 1]
+    assert [stage.model_config.session_mode for stage in omni_config.stage_configs] == ["turn", "turn"]
 
 
 @pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
@@ -132,6 +146,7 @@ def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(mod
 
         engine_args = legacy_stage.yaml_engine_args
         assert omni_stage.model_config.duplex_max_sessions == engine_args.get("duplex_max_sessions", 1)
+        assert omni_stage.model_config.session_mode == engine_args.get("session_mode", "turn")
         assert omni_stage.model_config.enforce_eager == engine_args.get("enforce_eager", False)
         assert omni_stage.load_config.load_format == engine_args.get("load_format", "auto")
         assert omni_stage.load_config.tokenizer_mode == engine_args.get("tokenizer_mode", "auto")
@@ -242,6 +257,36 @@ def test_from_pipeline_config_rejects_unowned_deploy_engine_extras(engine_extras
 
     with pytest.raises(ValueError, match=rf"no structured config owner: {unowned_field}"):
         VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+
+
+@pytest.mark.parametrize(
+    ("engine_extras", "cli_overrides"),
+    [
+        ({"requires_full_payload_input": False}, {}),
+        ({}, {"stage_1_requires_full_payload_input": False}),
+    ],
+    ids=["deploy", "stage-cli"],
+)
+def test_from_pipeline_config_rejects_full_payload_input_capability_overrides(
+    engine_extras,
+    cli_overrides,
+):
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    deploy = DeployConfig(
+        stages=[
+            StageDeployConfig(
+                stage_id=1,
+                engine_extras=engine_extras,
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match=r"no structured config owner: requires_full_payload_input"):
+        VllmOmniConfig.from_pipeline_config(
+            pipeline,
+            user_deploy_config=deploy,
+            cli_overrides=cli_overrides,
+        )
 
 
 @pytest.mark.parametrize(
@@ -443,10 +488,12 @@ def test_from_pipeline_config_dispatches_async_chunk_processors_without_mutating
     async_config = _from_pipeline_key("qwen3_tts")
     assert async_config.stage_by_id(0).custom_process_next_stage_input_func.endswith("talker2code2wav_async_chunk")
     assert async_config.stage_by_id(1).custom_process_input_func is None
+    assert async_config.stage_by_id(1).model_config.requires_full_payload_input is True
 
     sync_config = _from_pipeline_key("qwen3_tts", cli_overrides={"async_chunk": False})
     assert sync_config.stage_by_id(0).custom_process_next_stage_input_func.endswith("talker2code2wav_full_payload")
     assert sync_config.stage_by_id(1).custom_process_input_func.endswith("talker2code2wav_token_only")
+    assert sync_config.stage_by_id(1).model_config.requires_full_payload_input is True
 
     assert pipeline.get_stage(0).custom_process_next_stage_input_func.endswith("talker2code2wav_full_payload")
     assert pipeline.get_stage(1).custom_process_input_func is None
@@ -547,6 +594,7 @@ def test_sub_config_fields_match_structured_scopes():
         "interleave_mm_strings",
         "media_io_kwargs",
         "active_stream_window",
+        "session_mode",
         "duplex_max_sessions",
         "enable_sleep_mode",
         "default_sampling_params",
@@ -567,6 +615,7 @@ def test_sub_config_fields_match_structured_scopes():
         # legacy engine-args path.
         "model_subdir",
         "tokenizer_subdir",
+        "requires_full_payload_input",
     }
     vllm_load_fields = {f.name for f in fields(VllmLoadConfig)}
     assert issubclass(OmniStageLoadConfig, VllmLoadConfig)
@@ -606,8 +655,8 @@ def test_sub_config_fields_match_structured_scopes():
         "ulysses_mode",
         "cfg_parallel_size",
         "vae_patch_parallel_size",
-        "text_encoder_tp_size",
         "vae_parallel_mode",
+        "text_encoder_tp_size",
         "use_hsdp",
         "mask_sp_padding",
         "hsdp_shard_size",
@@ -903,6 +952,35 @@ def test_structured_diffusion_config_rejects_non_boolean_compile_dynamic():
         omni_config_module._DiffusionConfigProjection(diffusion_compile_dynamic="false")
 
 
+def test_from_pipeline_config_routes_ltx2_conv_vae_extra(tmp_path):
+    deploy_path = tmp_path / "dreamzero_ltx2_extras.yaml"
+    deploy_path.write_text(
+        "\n".join(
+            [
+                "pipeline: dreamzero",
+                "async_chunk: false",
+                "stages:",
+                "  - stage_id: 0",
+                "    extras:",
+                "      ltx2_use_conv_vae: true",
+            ]
+        )
+    )
+
+    stage = _from_pipeline_key("dreamzero", deploy_config_path=str(deploy_path)).stage_by_id(0)
+
+    assert stage.diffusion_config.extras["ltx2_use_conv_vae"] is True
+
+
+def test_stage_override_routes_ltx2_conv_vae_extra():
+    stage = _from_pipeline_key(
+        "dreamzero",
+        cli_overrides={"stage_0_extras": {"ltx2_use_conv_vae": True}},
+    ).stage_by_id(0)
+
+    assert stage.diffusion_config.extras["ltx2_use_conv_vae"] is True
+
+
 def test_structured_diffusion_config_rejects_invalid_compile_granularity():
     with pytest.raises(ValidationError, match="diffusion_compile_granularity"):
         omni_config_module._DiffusionConfigProjection(diffusion_compile_granularity="block")
@@ -1150,6 +1228,35 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
     assert stage.diffusion_config.fa_deterministic is True
     assert stage.diffusion_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
     assert stage.diffusion_config.diffusion_kv_max_rows_per_request == 2
+
+
+def test_from_pipeline_config_forwards_fastvideo_vsa_topk(tmp_path, monkeypatch):
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    deploy_path = tmp_path / "dreamzero_fastvideo_vsa.yaml"
+    deploy_path.write_text(
+        "\n".join(
+            [
+                "pipeline: dreamzero",
+                "async_chunk: false",
+                "stages:",
+                "  - stage_id: 0",
+                "    diffusion_attention_backend: FASTVIDEO_VSA",
+                "    fastvideo_vsa_topk: 96",
+            ]
+        )
+    )
+
+    stage = _from_pipeline_key(
+        "dreamzero",
+        deploy_config_path=str(deploy_path),
+    ).stage_by_id(0)
+
+    attention_config = stage.diffusion_config.diffusion_attention_config
+    assert attention_config.default is not None
+    assert attention_config.default.backend == "FASTVIDEO_VSA"
+    assert attention_config.default.fastvideo_vsa_topk == 96
 
 
 def test_from_pipeline_config_rejects_reserved_diffusion_kv_mode(tmp_path):

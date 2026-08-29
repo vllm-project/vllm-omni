@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage configuration system for vLLM-Omni."""
 
 from __future__ import annotations
@@ -87,6 +87,43 @@ def build_stage_runtime_overrides(
         result[key] = value
 
     return result
+
+
+def normalize_pipeline_cli_overrides(
+    pipeline: PipelineConfig,
+    cli_overrides: dict[str, Any],
+) -> dict[str, Any]:
+    """Translate pipeline-owned global CLI aliases into stage-scoped overrides."""
+    normalized = dict(cli_overrides)
+    for source, (stage_id, target) in pipeline.stage_cli_aliases.items():
+        invalid_stage_keys = [
+            key
+            for key, value in normalized.items()
+            if value is not None
+            and (match := _STAGE_OVERRIDE_PATTERN.match(key)) is not None
+            and match.group(2) == source
+            and int(match.group(1)) != stage_id
+        ]
+        if invalid_stage_keys:
+            invalid = ", ".join(sorted(invalid_stage_keys))
+            raise ValueError(
+                f"{invalid} cannot be set for pipeline {pipeline.model_type!r}; "
+                f"{source} belongs to stage {stage_id} as {target}."
+            )
+        value = normalized.pop(source, None)
+        if value is None:
+            continue
+        stage_key = f"stage_{stage_id}_{target}"
+        stage_value = normalized.get(stage_key)
+        if stage_value is not None and stage_value != value:
+            warnings.warn(
+                f"Ignoring {source}={value!r} because {stage_key}={stage_value!r} takes precedence.",
+                UserWarning,
+                stacklevel=2,
+            )
+            continue
+        normalized[stage_key] = value
+    return normalized
 
 
 def _apply_diffusion_parallel_runtime_overrides(
@@ -191,6 +228,10 @@ class StagePipelineConfig:
     # Alternates picked by ``merge_pipeline_deploy`` based on ``deploy.async_chunk``.
     async_chunk_process_next_stage_input_func: str | None = None
     sync_process_input_func: str | None = None
+    # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
+    # The callable receives ``(prompt, sampling_params_list)``; downstream
+    # stages continue to receive the original prompt.
+    prompt_transform_func: str | None = None
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
     omni_kv_config: dict[str, Any] | None = None
@@ -201,6 +242,16 @@ class StagePipelineConfig:
     # by ``stage_init_utils._resolve_model_tokenizer_paths``.
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
+    # Model-owned hook that resolves a pipeline root to this stage's checkpoint.
+    # Consumed and removed before backend engine args are constructed.
+    model_path_resolver: str | None = None
+    # Keep a single-replica diffusion stage in the orchestrator process.
+    # Disabled by default so existing multi-stage pipelines retain subprocess
+    # isolation unless their topology explicitly opts in.
+    inline_diffusion: bool = False
+    # Whether the non-async path waits for a complete upstream payload from
+    # the model-runner connector before scheduling this stage.
+    requires_full_payload_input: bool = False
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -234,6 +285,7 @@ class PipelineConfig:
     # this value to auto-detect the pipeline.  Only needed for diffusers-style
     # multi-component repos (e.g. GLM-Image).  ``None`` = not a diffusers model.
     diffusers_class_name: str | None = None
+    diffusers_class_aliases: tuple[str, ...] = ()
     endpoint_restrictions: tuple[EndpointRestriction, ...] = ()
     # Optional model-owned duplex planner loaded by the stable engine runtime.
     duplex_runtime_extension: str | None = None
@@ -247,6 +299,8 @@ class PipelineConfig:
     # Bundled deploy defaults for this concrete pipeline topology. The file is
     # loaded from vllm_omni/deploy; None uses DeployConfig defaults.
     default_deploy_config_name: str | None = None
+    # Global CLI spelling -> (stage id, stage-local spelling).
+    stage_cli_aliases: dict[str, tuple[int, str]] = field(default_factory=dict)
 
     def get_stage(self, stage_id: int) -> StagePipelineConfig | None:
         """Look up a stage by its ID."""
@@ -356,6 +410,7 @@ class StageDeployConfig:
     diffusers_call_kwargs: dict[str, Any] | None = None
     diffusion_quantization_config: str | None = None
     diffusion_attention_backend: str | None = None
+    fastvideo_vsa_topk: int | None = None
     diffusion_attention_config: dict[str, Any] | None = None
 
     # Diffusion execution, cache, and VAE behavior.
@@ -384,6 +439,9 @@ class StageDeployConfig:
     enable_distributed_layerwise_offload: bool | None = None
     dlo_use_allgather: bool | None = None
     dlo_resident_layers: int | None = None
+    host_weight_runtime_mode: str | None = None
+    host_weight_runtime_root: str | None = None
+    dlo_host_registration_limit_gib: float | None = None
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
 
@@ -826,6 +884,9 @@ def _build_engine_args(
         engine_args["model_subdir"] = ps.model_subdir
     if ps.tokenizer_subdir:
         engine_args["tokenizer_subdir"] = ps.tokenizer_subdir
+    if ps.model_path_resolver:
+        engine_args["model_path_resolver"] = ps.model_path_resolver
+    engine_args["inline_diffusion"] = ps.inline_diffusion
 
     # Pipeline-wide top-level DeployConfig settings, applied to every stage.
     for name in _PIPELINE_WIDE_ENGINE_FIELDS:
@@ -843,6 +904,7 @@ def _build_engine_args(
     # Materialize the resolved pipeline-wide async_chunk value into every
     # stage so explicit False overrides do not get lost downstream.
     engine_args["async_chunk"] = bool(deploy.async_chunk)
+    engine_args["session_mode"] = deploy.session_mode
     if deploy.session_mode == "duplex":
         # The engine admission limit is also the authoritative capacity for
         # model-owned streaming state. Propagate it to every stage instead of
@@ -850,6 +912,7 @@ def _build_engine_args(
         engine_args["duplex_max_sessions"] = deploy.duplex_session.max_sessions
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
+    engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
     return engine_args
 
 
@@ -871,6 +934,8 @@ def _build_extras(
         extras["output_connectors"] = dict(ds.output_connectors)
     if ds is not None and ds.input_connectors:
         extras["input_connectors"] = dict(ds.input_connectors)
+    if ps.prompt_transform_func:
+        extras["prompt_transform_func"] = ps.prompt_transform_func
     if ps.prompt_expand_func:
         extras["prompt_expand_func"] = ps.prompt_expand_func
     if ps.cfg_kv_collect_func:

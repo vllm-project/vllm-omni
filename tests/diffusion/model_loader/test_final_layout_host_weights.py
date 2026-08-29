@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import dataclasses
 import gc
+import json
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,10 +26,12 @@ from vllm_omni.diffusion.model_loader.host_weights import (
     FinalLayoutRequest,
     FinalLayoutTensorRestorer,
     ImplementationIdentity,
+    NodeSourceDigestCache,
     PreparedWeightSource,
     WeightSourceKind,
     build_final_layout_identity,
 )
+from vllm_omni.diffusion.model_loader.host_weights import source_identity as source_identity_module
 from vllm_omni.diffusion.model_loader.host_weights.contracts import (
     FINAL_LAYOUT_TENSOR_RESTORER_SCHEMA,
     FinalLayoutArtifactSpec,
@@ -299,6 +303,83 @@ class _FakeH3Attention(nn.Module):
         super().__init__()
 
 
+class _FakeFluxLinear(_FakeH3Linear):
+    def __init__(
+        self,
+        *args: object,
+        bias: bool = False,
+        params_dtype: torch.dtype | None = None,
+        total_num_heads: int | None = None,
+        total_num_kv_heads: int | None = None,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(
+            *args,
+            bias=bias,
+            params_dtype=params_dtype,
+            total_num_heads=total_num_heads,
+            total_num_kv_heads=total_num_kv_heads,
+            **kwargs,
+        )
+        self.weight.weight_loader = self._load_weight
+
+    @staticmethod
+    def _load_weight(
+        parameter: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        shard_id: str | None = None,
+    ) -> None:
+        del shard_id
+        parameter.data.copy_(loaded_weight.to(parameter).reshape_as(parameter))
+
+
+class _FakeFluxAttention(nn.Module):
+    def __init__(self, **kwargs: object) -> None:
+        del kwargs
+        super().__init__()
+        self.register_buffer("beta", torch.tensor([0.5]))
+        self.register_buffer("eps", torch.tensor([-1e-6]))
+
+
+class _Flux2KleinPipeline(nn.Module):
+    def __init__(self, transformer: nn.Module) -> None:
+        super().__init__()
+        self.transformer = transformer
+        self.text_encoder = nn.Linear(2, 2, dtype=torch.bfloat16)
+        self.vae = nn.Module()
+        self.vae.register_buffer("gain", torch.tensor([9.0], dtype=torch.float32))
+
+
+def _reduced_flux2_klein(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    device: torch.device | str = "cpu",
+) -> nn.Module:
+    from vllm_omni.diffusion.models.flux2_klein import flux2_klein_transformer as flux2
+
+    monkeypatch.setattr(flux2, "ColumnParallelLinear", _FakeFluxLinear)
+    monkeypatch.setattr(flux2, "MergedColumnParallelLinear", _FakeFluxLinear)
+    monkeypatch.setattr(flux2, "QKVParallelLinear", _FakeFluxLinear)
+    monkeypatch.setattr(flux2, "RowParallelLinear", _FakeFluxLinear)
+    monkeypatch.setattr(flux2, "Attention", _FakeFluxAttention)
+
+    transformer = flux2.Flux2Transformer2DModel(
+        patch_size=1,
+        in_channels=8,
+        out_channels=8,
+        num_layers=1,
+        num_single_layers=1,
+        attention_head_dim=8,
+        num_attention_heads=1,
+        joint_attention_dim=8,
+        timestep_guidance_channels=8,
+        mlp_ratio=1.0,
+        axes_dims_rope=(2, 2, 2, 2),
+        guidance_embeds=False,
+    )
+    return transformer.to(device=device, dtype=torch.bfloat16)
+
+
 class _H3Pipeline(nn.Module):
     def __init__(self, transformer: nn.Module) -> None:
         super().__init__()
@@ -380,6 +461,7 @@ def _identity(
     *,
     request: FinalLayoutRequest | None = None,
     policy: FinalLayoutTensorPolicy = FINAL_LAYOUT_BF16_POLICY,
+    source_digest_cache: NodeSourceDigestCache | None = None,
 ) -> FinalLayoutIdentityContext:
     transformer = model.get_submodule("transformer")
     return build_final_layout_identity(
@@ -388,6 +470,7 @@ def _identity(
         prepared_sources=(source,),
         request=request or _request(),
         policy=policy,
+        source_digest_cache=source_digest_cache,
     )
 
 
@@ -564,6 +647,131 @@ def test_source_identity_resolves_longest_prefix_and_rejects_ties(tmp_path: Path
     assert exc_info.value.code is FinalLayoutContractCode.SOURCE_COVERAGE_INVALID
 
 
+def test_node_source_digest_cache_reuses_recovers_and_invalidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _TinyPipeline()
+    source = _prepared_source(tmp_path)
+    cache_root = tmp_path / "store"
+    calls = 0
+    original_sha256 = source_identity_module._sha256_file
+
+    def counted_sha256(path: Path, state: object) -> str:
+        nonlocal calls
+        calls += 1
+        return original_sha256(path, state)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(source_identity_module, "_sha256_file", counted_sha256)
+    first = _identity(
+        model,
+        source,
+        source_digest_cache=NodeSourceDigestCache(cache_root, timeout_seconds=1.0),
+    )
+    second = _identity(
+        model,
+        source,
+        source_digest_cache=NodeSourceDigestCache(cache_root, timeout_seconds=1.0),
+    )
+
+    assert second.identity == first.identity
+    assert calls == 1
+
+    cache_entry = next((cache_root / "source-digests-v1" / "entries").glob("*.json"))
+    cache_entry.write_text("not-json", encoding="utf-8")
+    recovered = _identity(
+        model,
+        source,
+        source_digest_cache=NodeSourceDigestCache(cache_root, timeout_seconds=1.0),
+    )
+    assert recovered.identity == first.identity
+    assert calls == 2
+
+    cache_document = json.loads(cache_entry.read_text(encoding="utf-8"))
+    cache_document["content_id"] = f"sha256:{'0' * 64}"
+    cache_entry.write_text(json.dumps(cache_document), encoding="utf-8")
+    checksum_recovered = _identity(
+        model,
+        source,
+        source_digest_cache=NodeSourceDigestCache(cache_root, timeout_seconds=1.0),
+    )
+    assert checksum_recovered.identity == first.identity
+    assert calls == 3
+
+    source.weight_files[0].write_bytes(b"changed-canonical-source-with-a-new-size")
+    changed = _identity(
+        model,
+        source,
+        source_digest_cache=NodeSourceDigestCache(cache_root, timeout_seconds=1.0),
+    )
+    assert changed.identity != first.identity
+    assert calls == 4
+
+
+def test_source_identity_hashes_checkpoint_shards_in_parallel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _TinyPipeline()
+    source = _prepared_source(tmp_path)
+    second_file = source.resolved_root / "model-00002.safetensors"
+    second_file.write_bytes(b"second-checkpoint-shard")
+    source = dataclasses.replace(source, weight_files=(*source.weight_files, second_file))
+    barrier = threading.Barrier(2)
+    thread_ids: set[int] = set()
+    thread_ids_lock = threading.Lock()
+    original_sha256 = source_identity_module._sha256_file
+
+    def synchronized_sha256(path: Path, state: object) -> str:
+        with thread_ids_lock:
+            thread_ids.add(threading.get_ident())
+        barrier.wait(timeout=5)
+        return original_sha256(path, state)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(source_identity_module, "_sha256_file", synchronized_sha256)
+    _identity(model, source)
+
+    assert len(thread_ids) == 2
+
+
+def test_source_digest_cache_lock_timeout_falls_back_to_direct_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _TinyPipeline()
+    source = _prepared_source(tmp_path)
+    cache = NodeSourceDigestCache(tmp_path / "store", timeout_seconds=0.01)
+
+    def unavailable_lock(*_args: object, **_kwargs: object) -> object:
+        raise source_identity_module.FileLockTimeoutError("busy")
+
+    monkeypatch.setattr(source_identity_module, "FileLock", unavailable_lock)
+    context = _identity(model, source, source_digest_cache=cache)
+
+    assert context.identity.source.revision.startswith("content-")
+    assert not tuple(cache.entries.glob("*.json"))
+
+
+def test_source_digest_cache_directory_failure_falls_back_to_direct_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _TinyPipeline()
+    source = _prepared_source(tmp_path)
+    original_mkdir = Path.mkdir
+
+    def failing_cache_mkdir(path: Path, *args: object, **kwargs: object) -> None:
+        if "source-digests-v1" in path.parts:
+            raise OSError("injected cache directory failure")
+        original_mkdir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "mkdir", failing_cache_mkdir)
+    cache = NodeSourceDigestCache(tmp_path / "store", timeout_seconds=0.01)
+    context = _identity(model, source, source_digest_cache=cache)
+
+    assert context.identity.source.revision.startswith("content-")
+
+
 def test_local_hex_named_symlink_target_is_content_hashed_across_startups(tmp_path: Path) -> None:
     model = _TinyPipeline()
     source_root = tmp_path / "local-symlink-source"
@@ -724,6 +932,36 @@ def test_identity_uses_resolved_revision_and_exact_semantics(tmp_path: Path) -> 
     ).identity
     assert identity_v2.representation == base_identity.representation
     assert identity_v2.key != base_identity.key
+
+
+@pytest.mark.parametrize(
+    "parallel",
+    [
+        FinalLayoutParallelIdentity(),
+        FinalLayoutParallelIdentity(tensor_parallel_size=2, tensor_parallel_rank=0),
+        FinalLayoutParallelIdentity(tensor_parallel_size=2, tensor_parallel_rank=1),
+        FinalLayoutParallelIdentity(sequence_parallel_size=2, ulysses_degree=2),
+        FinalLayoutParallelIdentity(sequence_parallel_size=2, ring_degree=2),
+        FinalLayoutParallelIdentity(
+            tensor_parallel_size=2,
+            tensor_parallel_rank=1,
+            sequence_parallel_size=2,
+            ulysses_degree=2,
+        ),
+    ],
+)
+def test_parallel_identity_matrix_is_exact_for_tp_and_sp(tmp_path: Path, parallel: FinalLayoutParallelIdentity) -> None:
+    """TP rank/size and SP backend are identity coordinates for HWR artifacts."""
+    model = _TinyPipeline()
+    source = _prepared_source(tmp_path)
+    context = _identity(model, source, request=_request(parallel=parallel))
+    layout = context.identity.layout
+
+    assert layout.tensor_parallel_size == parallel.tensor_parallel_size
+    assert layout.tensor_parallel_rank == parallel.tensor_parallel_rank
+    assert layout.sequence_parallel_size == parallel.sequence_parallel_size
+    assert layout.sequence_parallel_backend == parallel.sequence_parallel_backend
+    assert "data_parallel" not in context.identity.layout.metadata.to_value().get("parallel", {})
 
 
 @pytest.mark.parametrize(
@@ -1039,3 +1277,152 @@ def test_minimax_h3_declares_the_final_layout_restore_contract() -> None:
     assert contract.implementation_id == "minimax-h3-dit"
     assert callable(MiniMaxH3DiTModel.validate_restored_host_weights)
     assert "data_parallel" not in FinalLayoutRequest.__dataclass_fields__
+
+
+def test_reduced_flux2_klein_declares_complete_final_layout_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
+        Flux2Transformer2DModel,
+    )
+
+    transformer = _reduced_flux2_klein(monkeypatch)
+    pipeline = _Flux2KleinPipeline(transformer)
+    source = _prepared_source(tmp_path, directory="flux2-klein-source")
+    context = _identity(pipeline, source)
+    targets = collect_final_layout_targets(
+        pipeline,
+        (("transformer", transformer),),
+        policy=FINAL_LAYOUT_BF16_POLICY,
+        require_materialized=True,
+    )
+    target_names = {target.name for target in targets}
+
+    contract = Flux2Transformer2DModel.host_weight_restore_contract
+    assert isinstance(contract, FinalLayoutModelContract)
+    assert contract.schema == FINAL_LAYOUT_TENSOR_MODEL_CONTRACT_SCHEMA
+    assert contract.implementation_id == "flux2-klein-dit"
+    assert contract.version == "1"
+    assert context.model_contracts == (contract,)
+    assert transformer.stacked_params_mapping == [
+        (".to_qkv.", ".to_q.", "q"),
+        (".to_qkv.", ".to_k.", "k"),
+        (".to_qkv.", ".to_v.", "v"),
+        (".add_kv_proj", ".add_q_proj", "q"),
+        (".add_kv_proj", ".add_k_proj", "k"),
+        (".add_kv_proj", ".add_v_proj", "v"),
+    ]
+    loaded = transformer.load_weights(
+        [
+            ("transformer_blocks.0.attn.to_q.weight", torch.tensor([1.0], dtype=torch.bfloat16)),
+            ("transformer_blocks.0.attn.add_q_proj.weight", torch.tensor([2.0], dtype=torch.bfloat16)),
+            (
+                "single_transformer_blocks.0.attn.to_qkv_mlp_proj.weight",
+                torch.tensor([3.0], dtype=torch.bfloat16),
+            ),
+        ]
+    )
+    assert loaded == {
+        "transformer_blocks.0.attn.to_qkv.weight",
+        "transformer_blocks.0.attn.add_kv_proj.weight",
+        "single_transformer_blocks.0.attn.to_qkv_mlp_proj.weight",
+    }
+    assert any(name.startswith("transformer.transformer_blocks.0.") for name in target_names)
+    assert any(name.startswith("transformer.single_transformer_blocks.0.") for name in target_names)
+    assert "transformer.transformer_blocks.0.attn.to_qkv.weight" in target_names
+    assert "transformer.transformer_blocks.0.attn.add_kv_proj.weight" in target_names
+    assert "transformer.single_transformer_blocks.0.attn.to_qkv_mlp_proj.weight" in target_names
+    assert "transformer.transformer_blocks.0.attn.attn.beta" in target_names
+    assert "transformer.transformer_blocks.0.attn.attn.eps" in target_names
+    assert all("text_encoder" not in name and "vae" not in name for name in target_names)
+    transformer.validate_restored_host_weights()
+
+
+def test_flux2_klein_restore_validator_rejects_non_ready_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transformer = _reduced_flux2_klein(monkeypatch)
+
+    mapping = transformer.stacked_params_mapping
+    transformer.stacked_params_mapping = None
+    with pytest.raises(ValueError, match="packed QKV mapping"):
+        transformer.validate_restored_host_weights()
+    transformer.stacked_params_mapping = mapping
+
+    weight = transformer.x_embedder.weight
+    weight.data = weight.data.float()
+    with pytest.raises(ValueError, match="must stay bf16"):
+        transformer.validate_restored_host_weights()
+    weight.data = weight.data.to(torch.bfloat16)
+
+    weight.data = weight.data.T
+    with pytest.raises(ValueError, match="contiguous strided layout"):
+        transformer.validate_restored_host_weights()
+    weight.data = weight.data.contiguous()
+
+    attention = transformer.transformer_blocks[0].attn.attn
+    attention._non_persistent_buffers_set.add("beta")
+    with pytest.raises(ValueError, match="must be persistent"):
+        transformer.validate_restored_host_weights()
+    attention._non_persistent_buffers_set.remove("beta")
+
+    attention.beta.data = attention.beta.data.float()
+    with pytest.raises(ValueError, match="scalar bf16"):
+        transformer.validate_restored_host_weights()
+
+
+def test_flux2_klein_publication_restore_fallback_and_teardown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _prepared_source(tmp_path, directory="flux2-klein-source")
+    cold_transformer = _reduced_flux2_klein(monkeypatch)
+    cold_model = _Flux2KleinPipeline(cold_transformer)
+    with torch.no_grad():
+        for index, parameter in enumerate(cold_transformer.parameters(), start=1):
+            parameter.fill_(index)
+        for name, buffer in cold_transformer.named_buffers():
+            if name.endswith((".beta", ".eps")):
+                buffer.fill_(0.5 if name.endswith(".beta") else -1e-6)
+
+    context = _identity(cold_model, source)
+    runtime = _runtime(tmp_path / "flux2-klein-store")
+    miss = runtime.resolve(context.identity)
+    assert miss.report.outcome is ResolutionOutcome.CANONICAL_FALLBACK
+
+    producer = FinalLayoutBF16Producer(
+        context,
+        cold_model,
+        (("transformer", cold_transformer),),
+        max_shard_bytes=64,
+    )
+    publication = runtime.publish_after_load(context.identity, producer=producer)
+    assert publication.outcome is PostLoadPublicationOutcome.PUBLISHED
+
+    warm_transformer = _reduced_flux2_klein(monkeypatch, device="meta")
+    warm_model = _Flux2KleinPipeline(warm_transformer)
+    warm_context = _identity(warm_model, source)
+    assert warm_context.identity == context.identity
+    hit = runtime.resolve(warm_context.identity)
+    assert hit.report.outcome is ResolutionOutcome.LOCAL_HIT
+    assert hit.lease is not None
+
+    plan = FinalLayoutTensorRestorer(warm_context).plan_restore(warm_model, hit.lease)
+    assert all(tensor.is_meta for name, tensor in warm_model.named_parameters() if name.startswith("transformer."))
+    plan.commit()
+    warm_transformer.validate_restored_host_weights()
+
+    cold_tensors = dict(cold_model.named_parameters()) | dict(cold_model.named_buffers())
+    warm_tensors = dict(warm_model.named_parameters()) | dict(warm_model.named_buffers())
+    for name in warm_context.tensor_names:
+        assert torch.equal(warm_tensors[name], cold_tensors[name])
+        assert warm_tensors[name].untyped_storage().data_ptr() == hit.lease.tensors[name].untyped_storage().data_ptr()
+    assert warm_transformer.stacked_params_mapping == cold_transformer.stacked_params_mapping
+
+    del warm_tensors, warm_model, warm_transformer, plan
+    gc.collect()
+    hit.lease.close()
+    assert hit.lease.closed
+    assert isinstance(runtime.store, FilesystemHostWeightStore)
+    assert runtime.store.cleanup(context.identity) is None
