@@ -62,7 +62,7 @@ stages:
       engine_output_type: latent
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 32768
-      max_model_len: 1024
+      max_model_len: 4096
       tensor_parallel_size: 1
       kv_transfer_config:
         kv_connector: "MooncakeConnector"
@@ -79,7 +79,7 @@ stages:
       temperature: 0.9
       top_p: 1.0
       top_k: 50
-      max_tokens: 1024
+      max_tokens: 4096
       min_tokens: 2
       detokenize: true
       repetition_penalty: 1.05
@@ -119,7 +119,7 @@ stages:
       engine_output_type: latent
       distributed_executor_backend: "mp"
       max_num_batched_tokens: 32768
-      max_model_len: 1024
+      max_model_len: 4096
       tensor_parallel_size: 1
       # Talker decode → Code2Wav async-chunk feeder：每生成一段 audio_codes
       # 就推到 SharedMemoryConnector，由 stage 2 的 code2wav 增量消费。
@@ -154,7 +154,7 @@ stages:
       temperature: 0.9
       top_p: 1.0
       top_k: 50
-      max_tokens: 1024
+      max_tokens: 4096
       min_tokens: 2
       detokenize: true
       repetition_penalty: 1.05
