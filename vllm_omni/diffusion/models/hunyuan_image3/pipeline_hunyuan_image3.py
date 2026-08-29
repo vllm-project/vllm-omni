@@ -76,6 +76,12 @@ _STEP_PROMPT_KV = "hunyuan_prompt_kv"
 _HUNYUAN_DEFAULT_OUTPUT_TYPE = "pil"
 
 
+def _config_flag(config: Any, name: str) -> bool:
+    """Read an optional Hunyuan config flag with legacy-safe defaults."""
+
+    return bool(getattr(config, name, False))
+
+
 class HunyuanImage3FlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
     def get_timestep_r(self, timestep: float | torch.FloatTensor):
         if self.step_index is None:
@@ -274,8 +280,8 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
                 image_processor=image_processor,
                 generation_config=generation_config,
                 image_base_size=hf_config.image_base_size,
-                cfg_distilled=hf_config.cfg_distilled,
-                use_meanflow=hf_config.use_meanflow,
+                cfg_distilled=_config_flag(hf_config, "cfg_distilled"),
+                use_meanflow=_config_flag(hf_config, "use_meanflow"),
             )
             request.prepared_layout = prepared_layout
             request.diffusion_kv_requests = request_layout_utils.build_hunyuan_diffusion_kv_requests(
@@ -411,9 +417,9 @@ class HunyuanImage3Pipeline(
         )
         self.time_embed_2 = TimestepEmbedder(hidden_size=self.hf_config.hidden_size)
         # Distillation-specific embedding modules
-        if self.hf_config.cfg_distilled:
+        if _config_flag(self.hf_config, "cfg_distilled"):
             self.guidance_emb = TimestepEmbedder(hidden_size=self.hf_config.hidden_size)
-        if self.hf_config.use_meanflow:
+        if _config_flag(self.hf_config, "use_meanflow"):
             self.timestep_r_emb = TimestepEmbedder(hidden_size=self.hf_config.hidden_size)
         self.lm_head = nn.Linear(self.hf_config.hidden_size, self.hf_config.vocab_size, bias=False)
         self.vllm_config = get_current_vllm_config()
@@ -1200,8 +1206,8 @@ class HunyuanImage3Pipeline(
                     batch_gen_image_info = [
                         self.image_processor.build_image_info(
                             image_size,
-                            add_guidance_token=self.hf_config.cfg_distilled,
-                            add_timestep_r_token=self.hf_config.use_meanflow,
+                            add_guidance_token=_config_flag(getattr(self, "hf_config", None), "cfg_distilled"),
+                            add_timestep_r_token=_config_flag(getattr(self, "hf_config", None), "use_meanflow"),
                         )
                         for _ in range(batch_size)
                     ]
@@ -1222,7 +1228,7 @@ class HunyuanImage3Pipeline(
         # For CFG distilled models, cfg_factor is always 1 (CFG is embedded in the model)
         # For non-distilled models, cfg_factor depends on guidance_scale
         cfg_factor = {"gen_text": 1, "gen_image": 1 + int(guidance_scale > 1.0)}
-        if self.hf_config.cfg_distilled:
+        if _config_flag(getattr(self, "hf_config", None), "cfg_distilled"):
             cfg_factor["gen_image"] = 1
         bot_task = kwargs.pop("bot_task", "auto")
         if prepared_layout is None:
@@ -2119,13 +2125,13 @@ class HunyuanImage3Pipeline(
             row_branches,
             first_step,
         )
-        if self.hf_config.cfg_distilled:
+        if _config_flag(self.hf_config, "cfg_distilled"):
             model_kwargs["guidance"] = torch.tensor(
                 [1000.0 * state.extra[_STEP_GUIDANCE_SCALE] for state in states] * cfg_factor,
                 device=latents.device,
                 dtype=torch.bfloat16,
             )
-        if self.hf_config.use_meanflow:
+        if _config_flag(self.hf_config, "use_meanflow"):
             model_kwargs["timesteps_r"] = torch.cat(
                 [
                     state.scheduler.get_timestep_r(state.current_timestep).reshape(1).to(device=latents.device)

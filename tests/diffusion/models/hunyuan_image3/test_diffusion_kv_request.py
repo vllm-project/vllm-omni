@@ -410,9 +410,13 @@ def test_prepared_model_inputs_match_local_tokenization(
     torch.testing.assert_close(prepared_mask, local_mask)
     assert prepared_inputs["full_attn_spans"] == local_inputs["full_attn_spans"]
 
-    num_image_tokens = hunyuan_num_image_tokens(prepared_layout.generated_image_info)
-    local_inputs.update(attention_mask=local_mask, num_image_tokens=num_image_tokens)
-    prepared_inputs.update(attention_mask=prepared_mask, num_image_tokens=num_image_tokens)
+    image_info = prepared_layout.generated_image_info
+    generation_token_counts = {
+        "num_image_tokens": hunyuan_num_image_tokens(image_info),
+        "num_special_tokens": hunyuan_num_special_tokens(image_info),
+    }
+    local_inputs.update(attention_mask=local_mask, **generation_token_counts)
+    prepared_inputs.update(attention_mask=prepared_mask, **generation_token_counts)
     local_step_inputs = pipeline._update_model_kwargs_for_generation(ModelOutput(), local_inputs)
     prepared_step_inputs = pipeline._update_model_kwargs_for_generation(ModelOutput(), prepared_inputs)
 
