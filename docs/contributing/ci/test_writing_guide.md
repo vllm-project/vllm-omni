@@ -49,9 +49,6 @@ Defined in `pyproject.toml`:
 | `A2`               | Tests that require A2 NPU *                                                                             |
 | `A3`               | Tests that require A3 NPU *                                                                             |
 | `cards_{n}`        | Tests that require *n* accelerator cards (`cards_1` … `cards_8`); auto-added from `num_cards` *         |
-| `skipif_cuda`      | Skip if the num of CUDA cards is less than the required *                                               |
-| `skipif_rocm`      | Skip if the num of ROCm cards is less than the required *                                               |
-| `skipif_npu`       | Skip if the num of NPU cards is less than the required *                                                |
 | `slow`             | Slow tests (may skip in quick CI)                                                                       |
 | `benchmark`        | Benchmark tests (decorator on runner test functions; perf JSON uses `full_model` + type marker instead) |
 | `local_model`      | Tests requiring local / non-HF-hub model weights                                                        |
@@ -79,7 +76,7 @@ def test_video_to_audio()
 This decorator is intended to make hardware-aware, cross-platform test authoring easier and more robust for CI/CD environments. The `hardware_test` decorator in `vllm-omni/tests/helpers/mark.py` performs the following actions:
 
 1. **Applies platform and resource markers**  
-   Adds the appropriate pytest markers for each specified hardware platform (e.g., `cuda`, `rocm`, `xpu`, `npu`) and resource type (e.g., `L4`, `H100`, `MI325`, `B60`, `A2`, `A3`).
+   Adds the appropriate pytest markers for each specified hardware platform (e.g., `cuda`, `rocm`, `xpu`, `npu`) and resource type (e.g., `L4`, `H100`, `H200`, `B200`, `MI325`, `B60`, `A2`, `A3`).
    ```python
    @pytest.mark.cuda
    @pytest.mark.L4
@@ -92,8 +89,7 @@ This decorator is intended to make hardware-aware, cross-platform test authoring
    Accepts `num_cards` as either a single integer for all platforms or as a dictionary with per-platform values. If not specified, defaults to 1 card per platform.
 
 4. **Integrates resource validation**  
-   On CUDA, adds a skip marker (`skipif_cuda`) if the system does not have the required number of devices.
-   Support for `skipif_rocm` and `skipif_npu` will be implemented later.
+   On CUDA and XPU, when `num_cards > 1`, attaches pytest's built-in `skipif` if the machine has fewer devices than requested. This is not a named `skipif_*` marker and is not used for `-m` filtering.
 
 5. **Works with pytest filtering**  
    Allows tests to be filtered and selected at runtime using standard pytest marker expressions (e.g., `-m "H100 and cards_2"`, `-m "L4 and not cards_1"`).
@@ -114,7 +110,7 @@ This decorator is intended to make hardware-aware, cross-platform test authoring
         num_cards=2,
     )
     ```
-- `res` must be a dict; supported resources: CUDA (L4/H100), ROCm (MI325), XPU (B60), MUSA (S5000), NPU (A2/A3)
+- `res` must be a dict. SKU values come from `pyproject.toml` markers tagged `[hardware-resource]` plus the platform key (`[cuda]`, `[rocm]`, `[xpu]`, `[npu]`, `[musa]`).
 - `num_cards` can be int (all platforms) or dict (per platform); defaults to 1 when missing
 - Filtering examples:
     - CUDA H100 4-card: `pytest -m "H100 and cards_4 and cuda"`
@@ -178,7 +174,8 @@ If you want to add support for a new platform (e.g., "tpu" for a new accelerator
    markers = [
        # ... existing markers ...
        "tpu: [hardware-platform] Tests that require TPU device",
-       "TPU_V3: [hardware-resource] Tests that require TPU v3 hardware",
+       # Add [gpu] next to [hardware-platform] if this platform should also get pytest.mark.gpu.
+       "TPU_V3: [hardware-resource] [tpu] Tests that require TPU v3 hardware",
        "cards_1: [hardware-cards] Tests that require 1 accelerator card",
        "cards_2: [hardware-cards] Tests that require 2 accelerator cards",
    ]
@@ -188,23 +185,18 @@ If you want to add support for a new platform (e.g., "tpu" for a new accelerator
    ```python
    # In vllm-omni/tests/helpers/mark.py
 
-   def tpu_marks(*, res: str, num_cards: int):
-       test_platform = pytest.mark.tpu
-       if res == "TPU_V3":
-           test_resource = pytest.mark.TPU_V3
-       else:
-           raise ValueError(
-               f"Invalid TPU resource type: {res}. Supported: TPU_V3")
-
-       return [test_platform, test_resource, _cards_mark(num_cards)]
+   def _tpu_marks(*, res: str, num_cards: int):
+       _require_sku("tpu", res)
+       return [pytest.mark.tpu, getattr(pytest.mark, res), _cards_mark(num_cards)]
    ```
-3. **Update `hardware_marks` to recognize your new platform**:
-    In the relevant place (see the `hardware_marks` implementation), add:
+3. **Register the builder** in `_marks_for_platform`:
     ```python
-    if platform == "tpu":
-        marks = tpu_marks(res=resource, num_cards=cards)
+    builders = {
+        # ... existing platforms ...
+        "tpu": _tpu_marks,
+    }
     ```
-    (`hardware_test` calls `hardware_marks` internally, so both will pick up the change.)
+    (`hardware_test` / `hardware_marks` both go through `_marks_for_platform`.)
 4. **(Recommended) Add a test using your new markers**:
    ```python
    @hardware_test(
@@ -218,11 +210,11 @@ If you want to add support for a new platform (e.g., "tpu" for a new accelerator
 **Summary**:  
 
 - Add pytest markers for your new platform/resources  
-- Implement a marker function (`xxx_marks`)  
-- Plug into `hardware_marks`  
+- Implement a private marker function (`_xxx_marks`)
+- Register it in `_marks_for_platform`
 - You're done: tests using `@hardware_test` or `hardware_marks` with your platform now automatically get the correct markers and `cards_{n}` filtering.
 
-See code in `vllm-omni/tests/helpers/mark.py` for existing examples (`cuda_marks`, `rocm_marks`, `npu_marks`).
+See code in `vllm-omni/tests/helpers/mark.py` for existing examples (`_cuda_marks`, `_rocm_marks`, `_npu_marks`).
 
 ## Test case style
 

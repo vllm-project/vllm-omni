@@ -17,17 +17,17 @@ if TYPE_CHECKING:
     import pytest
 
 # Marker description tags in ``pyproject.toml`` ``tool.pytest.ini_options.markers``.
-# Example: ``"H100: [hardware-resource] Tests that require H100 GPU"``.
+# Example: ``"H100: [hardware-resource] [cuda] Tests that require H100 GPU"``.
 _HARDWARE_RESOURCE_MARKER_TAG = "[hardware-resource]"
 _HARDWARE_CARDS_MARKER_TAG = "[hardware-cards]"
 _HARDWARE_PLATFORM_MARKER_TAG = "[hardware-platform]"
 _CI_LEVEL_MARKER_TAG = "[ci-level]"
+# On ``[hardware-platform]`` lines (not SKUs): also attach ``pytest.mark.gpu``.
+_GPU_DEVICE_CLASS_TAG = "[gpu]"
 _CARDS_MARK_NAME_RE = re.compile(r"^cards_(\d+)$")
 # Indirect fixture in ``tests.helpers.fixtures.runtime``: mixed-count ``@hardware_test``
 # parametrizes it so each collected item carries one platform's SKU and ``cards_{n}``.
 HARDWARE_MARK_NORMALIZATION_FIXTURE = "_normalized_hardware_marks"
-# Device-class marks from ``get_supported_platforms()``; not ``res`` dict keys.
-_NON_RES_PLATFORMS = frozenset({"cpu", "gpu"})
 
 
 def _repo_root() -> Path:
@@ -48,7 +48,7 @@ def _load_pyproject() -> dict:
         return {}
 
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=16)
 def _marker_names_with_tag(tag: str) -> frozenset[str]:
     """Return pytest marker names whose description contains ``tag``."""
     data = _load_pyproject()
@@ -57,7 +57,7 @@ def _marker_names_with_tag(tag: str) -> frozenset[str]:
         text = (_repo_root() / "pyproject.toml").read_text(encoding="utf-8")
         return frozenset(
             re.findall(
-                rf'^\s*"([A-Za-z0-9_]+)\s*:\s*{re.escape(tag)}',
+                rf'^\s*"([A-Za-z0-9_]+)\s*:.*{re.escape(tag)}',
                 text,
                 flags=re.M,
             )
@@ -107,6 +107,19 @@ def get_level_markers() -> frozenset[str]:
     return _marker_names_with_tag(_CI_LEVEL_MARKER_TAG)
 
 
+@lru_cache(maxsize=8)
+def _skus_for_platform(platform: str) -> frozenset[str]:
+    """SKU names tagged ``[hardware-resource]`` and ``[platform]`` (e.g. ``[cuda]``)."""
+    return get_hardware_mark_list() & _marker_names_with_tag(f"[{platform}]")
+
+
+def _require_sku(platform: str, res: str) -> None:
+    allowed = _skus_for_platform(platform)
+    if res not in allowed:
+        supported = ", ".join(sorted(allowed)) or f"(none tagged [hardware-resource] [{platform}])"
+        raise ValueError(f"Invalid {platform} resource type: {res}. Supported: {supported}")
+
+
 def _cards_mark(num_cards: int) -> pytest.MarkDecorator:
     """Return ``cards_{n}`` so collection can filter with ``-m cards_2`` (etc.).
 
@@ -124,19 +137,13 @@ def _cards_mark(num_cards: int) -> pytest.MarkDecorator:
     return getattr(pytest.mark, f"cards_{num_cards}")
 
 
-def cuda_marks(*, res: str, num_cards: int):
+def _cuda_marks(*, res: str, num_cards: int):
     import pytest
     from vllm.platforms import current_platform
 
+    _require_sku("cuda", res)
+    test_resource = getattr(pytest.mark, res)
     test_platform_detail = pytest.mark.cuda
-    if res == "L4":
-        test_resource = pytest.mark.L4
-    elif res == "H100":
-        test_resource = pytest.mark.H100
-    elif res == "H800":
-        test_resource = pytest.mark.H800
-    else:
-        raise ValueError(f"Invalid CUDA resource type: {res}. Supported: L4, H100, H800")
     marks = [test_resource, test_platform_detail, _cards_mark(num_cards)]
     if num_cards == 1 or not current_platform.is_cuda():
         return marks
@@ -148,27 +155,19 @@ def cuda_marks(*, res: str, num_cards: int):
     ]
 
 
-def rocm_marks(*, res: str, num_cards: int):
+def _rocm_marks(*, res: str, num_cards: int):
     import pytest
 
-    test_platform_detail = pytest.mark.rocm
-    if res == "MI325":
-        test_resource = pytest.mark.MI325
-    else:
-        raise ValueError(f"Invalid ROCm resource type: {res}. Supported: MI325")
-    return [test_resource, test_platform_detail, _cards_mark(num_cards)]
+    _require_sku("rocm", res)
+    return [getattr(pytest.mark, res), pytest.mark.rocm, _cards_mark(num_cards)]
 
 
-def xpu_marks(*, res: str, num_cards: int):
+def _xpu_marks(*, res: str, num_cards: int):
     import pytest
     from vllm.platforms import current_platform
 
-    test_platform_detail = pytest.mark.xpu
-    if res == "B60":
-        test_resource = pytest.mark.B60
-    else:
-        raise ValueError(f"Invalid XPU resource type: {res}. Supported: B60")
-    marks = [test_resource, test_platform_detail, _cards_mark(num_cards)]
+    _require_sku("xpu", res)
+    marks = [getattr(pytest.mark, res), pytest.mark.xpu, _cards_mark(num_cards)]
     if num_cards == 1 or not current_platform.is_xpu():
         return marks
     return marks + [
@@ -179,54 +178,40 @@ def xpu_marks(*, res: str, num_cards: int):
     ]
 
 
-def musa_marks(*, res: str, num_cards: int):
+def _musa_marks(*, res: str, num_cards: int):
     import pytest
 
-    test_platform_detail = pytest.mark.musa
-    if res == "S5000":
-        test_resource = pytest.mark.S5000
-    else:
-        raise ValueError(f"Invalid MUSA resource type: {res}. Supported: S5000")
-    return [test_resource, test_platform_detail, _cards_mark(num_cards)]
+    _require_sku("musa", res)
+    return [getattr(pytest.mark, res), pytest.mark.musa, _cards_mark(num_cards)]
 
 
-def gpu_marks(*, res: str, num_cards: int):
+@lru_cache(maxsize=1)
+def _gpu_res_platforms() -> frozenset[str]:
+    """Accelerator platforms tagged ``[hardware-platform] [gpu]`` (not the ``gpu`` mark)."""
+    return (get_supported_platforms() & _marker_names_with_tag(_GPU_DEVICE_CLASS_TAG)) - {"gpu"}
+
+
+def _npu_marks(*, res: str, num_cards: int):
     import pytest
 
-    test_platform = pytest.mark.gpu
-    if res in ("L4", "H100", "H800"):
-        return [test_platform] + cuda_marks(res=res, num_cards=num_cards)
-    if res == "MI325":
-        return [test_platform] + rocm_marks(res=res, num_cards=num_cards)
-    if res == "B60":
-        return [test_platform] + xpu_marks(res=res, num_cards=num_cards)
-    if res == "S5000":
-        return [test_platform] + musa_marks(res=res, num_cards=num_cards)
-    raise ValueError(f"Invalid resource type: {res}. Supported: L4, H100, H800, MI325, B60, S5000")
-
-
-def npu_marks(*, res: str, num_cards: int):
-    import pytest
-
-    test_platform = pytest.mark.npu
-    if res == "A2":
-        test_resource = pytest.mark.A2
-    elif res == "A3":
-        test_resource = pytest.mark.A3
-    else:
-        raise ValueError(f"Invalid NPU resource type: {res}. Supported: A2, A3")
-    return [test_platform, test_resource, _cards_mark(num_cards)]
+    _require_sku("npu", res)
+    return [pytest.mark.npu, getattr(pytest.mark, res), _cards_mark(num_cards)]
 
 
 def _res_platforms() -> frozenset[str]:
-    """Accelerator keys allowed in ``hardware_test(res=...)`` / ``hardware_marks(res=...)``."""
-    return get_supported_platforms() - _NON_RES_PLATFORMS
+    """Accelerator keys allowed in ``hardware_test(res=...)`` / ``hardware_marks(res=...)``.
+
+    A ``[hardware-platform]`` name is a ``res`` key only if some SKU is tagged
+    with that platform (``[cuda]``, ``[npu]``, …). ``cpu`` / ``gpu`` have no SKUs.
+    """
+    return frozenset(p for p in get_supported_platforms() if _skus_for_platform(p))
 
 
 def _normalize_num_cards(res: dict[str, str], num_cards: int | dict[str, int]) -> dict[str, int]:
     allowed = _res_platforms()
+    device_class = get_supported_platforms() - allowed
     for platform in res:
-        if platform in _NON_RES_PLATFORMS:
+        if platform in device_class:
             raise ValueError(
                 f"{platform!r} is not a res dict key; use pytest.mark.{platform} "
                 f"or an accelerator key ({', '.join(sorted(allowed))})."
@@ -248,11 +233,22 @@ def _normalize_num_cards(res: dict[str, str], num_cards: int | dict[str, int]) -
 
 
 def _marks_for_platform(platform: str, resource: str, num_cards: int) -> list[pytest.MarkDecorator]:
-    if platform in ("cuda", "rocm", "xpu", "musa"):
-        return gpu_marks(res=resource, num_cards=num_cards)
-    if platform == "npu":
-        return npu_marks(res=resource, num_cards=num_cards)
-    raise ValueError(f"Unsupported platform: {platform}")
+    import pytest
+
+    builders = {
+        "cuda": _cuda_marks,
+        "rocm": _rocm_marks,
+        "xpu": _xpu_marks,
+        "musa": _musa_marks,
+        "npu": _npu_marks,
+    }
+    builder = builders.get(platform)
+    if builder is None:
+        raise ValueError(f"Unsupported platform: {platform}")
+    marks = builder(res=resource, num_cards=num_cards)
+    if platform in _gpu_res_platforms():
+        return [pytest.mark.gpu] + marks
+    return marks
 
 
 def _skipif_not_platform(platform: str) -> pytest.MarkDecorator:

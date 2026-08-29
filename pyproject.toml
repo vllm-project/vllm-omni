@@ -263,26 +263,28 @@ markers = [
     "example: Doc example code tests",
     # platform markers
     # Tag with [hardware-platform] for tests.helpers.mark.get_supported_platforms().
+    # Add [gpu] on accelerator platforms that should also get pytest.mark.gpu.
     # cpu/gpu are pytest marks; hardware_test(res=...) rejects them as keys.
     "cpu: [hardware-platform] Tests that run on CPU",
     "gpu: [hardware-platform] Tests that run on GPU (auto-added)",
-    "cuda: [hardware-platform] Tests that run on CUDA (auto-added)",
-    "rocm: [hardware-platform] Tests that run on AMD/ROCm (auto-added)",
-    "xpu: [hardware-platform] Tests that run on XPU (auto-added)",
+    "cuda: [hardware-platform] [gpu] Tests that run on CUDA (auto-added)",
+    "rocm: [hardware-platform] [gpu] Tests that run on AMD/ROCm (auto-added)",
+    "xpu: [hardware-platform] [gpu] Tests that run on XPU (auto-added)",
     "npu: [hardware-platform] Tests that run on NPU/Ascend (auto-added)",
-    "musa: [hardware-platform] Tests that run on MUSA/Moore Threads (auto-added)",
+    "musa: [hardware-platform] [gpu] Tests that run on MUSA/Moore Threads (auto-added)",
     # specified computation resources marks (auto-added)
-    # Tag with [hardware-resource] for tests.helpers.mark.get_hardware_mark_list().
-    "H100: [hardware-resource] Tests that require H100 GPU",
-    "H800: [hardware-resource] Tests that require H800 GPU",
-    "H200: [hardware-resource] Tests that require H200 GPU",
-    "L4: [hardware-resource] Tests that require L4 GPU",
-    "B200: [hardware-resource] Tests that require B200 GPU",
-    "MI325: [hardware-resource] Tests that require MI325 GPU (AMD/ROCm)",
-    "B60: [hardware-resource] Tests that require Intel Arc Pro B60 XPU",
-    "S5000: [hardware-resource] Tests that require S5000 GPU (Moore Threads/MUSA)",
-    "A2: [hardware-resource] Tests that require A2 NPU",
-    "A3: [hardware-resource] Tests that require A3 NPU",
+    # [hardware-resource] + [cuda]/[rocm]/[xpu]/[npu]/[musa] for hardware_test(res=...).
+    # Do not put [gpu] on SKU lines: that would make gpu a res key.
+    "H100: [hardware-resource] [cuda] Tests that require H100 GPU",
+    "H800: [hardware-resource] [cuda] Tests that require H800 GPU",
+    "H200: [hardware-resource] [cuda] Tests that require H200 GPU",
+    "L4: [hardware-resource] [cuda] Tests that require L4 GPU",
+    "B200: [hardware-resource] [cuda] Tests that require B200 GPU",
+    "MI325: [hardware-resource] [rocm] Tests that require MI325 GPU (AMD/ROCm)",
+    "B60: [hardware-resource] [xpu] Tests that require Intel Arc Pro B60 XPU",
+    "S5000: [hardware-resource] [musa] Tests that require S5000 GPU (Moore Threads/MUSA)",
+    "A2: [hardware-resource] [npu] Tests that require A2 NPU",
+    "A3: [hardware-resource] [npu] Tests that require A3 NPU",
     # Tag with [hardware-cards] for tests.helpers.mark.get_supported_card_counts().
     "cards_1: [hardware-cards] Tests that require 1 accelerator card",
     "cards_2: [hardware-cards] Tests that require 2 accelerator cards",
@@ -292,11 +294,6 @@ markers = [
     "cards_6: [hardware-cards] Tests that require 6 accelerator cards",
     "cards_7: [hardware-cards] Tests that require 7 accelerator cards",
     "cards_8: [hardware-cards] Tests that require 8 accelerator cards",
-    "skipif_cuda: Skip if the num of CUDA cards is less than the required",
-    "skipif_rocm: Skip if the num of ROCm cards is less than the required",
-    "skipif_xpu: Skip if the num of XPU cards is less than the required",
-    "skipif_npu: Skip if the num of NPU cards is less than the required",
-    "skipif_musa: Skip if the num of MUSA cards is less than the required",
     # more detailed markers
     "sp: Sequence parallelism tests (multi-GPU)",
     "slow: [ci-level] Slow tests (may skip in quick CI)",

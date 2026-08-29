@@ -4,6 +4,7 @@
 import pytest
 
 from tests.helpers.mark import (
+    _gpu_res_platforms,
     hardware_marks,
     hardware_test,
 )
@@ -13,6 +14,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def _mark_names(marks) -> set[str]:
     return {mark.name for mark in marks}
+
+
+def test_gpu_platforms_come_from_pyproject_gpu_tag():
+    assert "npu" not in _gpu_res_platforms()
+    assert "gpu" not in _gpu_res_platforms()
 
 
 def test_default_num_cards_adds_cards_1():
@@ -38,6 +44,8 @@ def test_h100_four_cards_is_selectable_with_cards_4():
 def test_npu_card_count_mark_is_independent_of_sku():
     names = _mark_names(hardware_marks(res={"npu": "A2"}, num_cards=4))
     assert "cards_4" in names
+    assert "npu" in names
+    assert "gpu" not in names
 
 
 def test_hardware_marks_rejects_mixed_counts_on_one_item():
@@ -116,5 +124,16 @@ def test_res_rejects_cpu_and_gpu(platform):
 
 
 def test_npu_rejects_unsupported_sku():
-    with pytest.raises(ValueError, match="Invalid NPU resource type"):
+    with pytest.raises(ValueError, match="Invalid npu resource type"):
         hardware_marks(res={"npu": "A100"})
+
+
+@pytest.mark.parametrize("sku", ["H200", "B200", "H800"])
+def test_cuda_registered_skus_attach_sku_and_cards(sku):
+    names = _mark_names(hardware_marks(res={"cuda": sku}, num_cards=2))
+    assert names >= {sku, "cuda", "gpu", "cards_2"}
+
+
+def test_cuda_rejects_sku_from_another_platform():
+    with pytest.raises(ValueError, match="Invalid cuda resource type"):
+        hardware_marks(res={"cuda": "MI325"})
