@@ -387,6 +387,7 @@ class Orchestrator:
     # Class-level defaults so tests that bypass __init__ via object.__new__
     # don't AttributeError when transfer / counter emit paths access them.
     _running_counter: OmniRequestCounter | None = None
+    _engines_waiting_counter: OmniRequestCounter | None = None
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
@@ -403,6 +404,7 @@ class Orchestrator:
         pd_config: dict[str, Any] | None = None,
         membership_controller: MembershipController | None = None,
         running_counter: OmniRequestCounter | None = None,
+        engines_waiting_counter: OmniRequestCounter | None = None,
         transfer_emitter: Any = None,
         prom_metrics: Any = None,
         log_stats: bool = False,
@@ -439,7 +441,13 @@ class Orchestrator:
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
-        self._init_metrics_state(stage_pools, running_counter, transfer_emitter, log_stats=log_stats)
+        self._init_metrics_state(
+            stage_pools,
+            running_counter,
+            transfer_emitter,
+            engines_waiting_counter=engines_waiting_counter,
+            log_stats=log_stats,
+        )
 
         self._cfg_tracker = CfgCompanionTracker()
         self._stage_input_processors: dict[int, Any] = {}
@@ -485,6 +493,7 @@ class Orchestrator:
         stage_pools: list[StagePool],
         running_counter: OmniRequestCounter | None,
         transfer_emitter: Any,
+        engines_waiting_counter: OmniRequestCounter | None = None,
         log_stats: bool = False,
     ) -> None:
         """Wire up all metric-related orchestrator state.
@@ -510,6 +519,7 @@ class Orchestrator:
         from iteration_stats independently of scheduler gauges.
         """
         self._running_counter = running_counter
+        self._engines_waiting_counter = engines_waiting_counter
         self._transfer_emitter = transfer_emitter
 
         # Flat engine_idx ↔ (stage, replica) maps. The reverse map is
@@ -1458,11 +1468,20 @@ class Orchestrator:
         """Update one replica snapshot and expose the stage-wide total."""
         self._stage_replica_waiting[(stage_id, replica_id)] = max(int(n_waiting), 0)
         self._set_stage_waiting_total(stage_id)
+        self._sync_engines_waiting_counter()
 
     def _remove_stage_replica_waiting(self, stage_id: int, replica_id: int) -> None:
         """Drop a dead replica's snapshot and refresh the stage total."""
         self._stage_replica_waiting.pop((stage_id, replica_id), None)
         self._set_stage_waiting_total(stage_id)
+        self._sync_engines_waiting_counter()
+
+    def _sync_engines_waiting_counter(self) -> None:
+        """Aggregate per-replica waiting into the counter shared with the
+        frontend so engine-queued requests show as waiting, not running."""
+        counter = self._engines_waiting_counter
+        if counter is not None:
+            counter.value = sum(self._stage_replica_waiting.values())
 
     def _set_stage_waiting_total(self, stage_id: int) -> None:
         if self._prom_metrics is None:

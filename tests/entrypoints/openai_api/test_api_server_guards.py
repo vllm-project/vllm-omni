@@ -398,6 +398,12 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     async def fake_omni_init_app_state(engine_client, state, args):
         state.engine_client = engine_client
         state.initialized_by_omni = True
+        state.openai_serving_video = SimpleNamespace(
+            shutdown=lambda: captured.__setitem__("video_shutdown", True),
+        )
+        state.openai_serving_speech = SimpleNamespace(
+            shutdown=lambda: captured.__setitem__("speech_shutdown", True),
+        )
 
     async def fake_storage_start():
         captured["storage_started"] = True
@@ -433,6 +439,8 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     assert captured["supported_tasks"] == ("generate",)
     assert captured["storage_started"] is True
     assert captured["restrictions"] == {}
+    assert captured["video_shutdown"] is True
+    assert captured["speech_shutdown"] is True
     assert sock.closed is True
     assert served_app.state.initialized_by_omni is True
 

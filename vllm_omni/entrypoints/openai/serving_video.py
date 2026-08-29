@@ -32,6 +32,7 @@ from vllm_omni.entrypoints.openai.stage_params import (
 from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import (
     _encode_video_bytes,
+    _PlanarFrameConverter,
     encode_video_base64,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -43,6 +44,8 @@ from vllm_omni.outputs.output_metadata import (
 )
 
 logger = init_logger(__name__)
+
+_VIDEO_RESPONSE_FRAME_CONVERSION_WORKERS = 8
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -96,6 +99,11 @@ class OmniOpenAIServingVideo:
         self._engine_client = engine_client
         self._model_name = model_name
         self._stage_configs = stage_configs
+        self._video_frame_converter = _PlanarFrameConverter(max_workers=_VIDEO_RESPONSE_FRAME_CONVERSION_WORKERS)
+        logger.info(
+            "Video response frame conversion pool configured: workers=%d",
+            self._video_frame_converter.max_workers,
+        )
 
     def _resolve_diffusion_od_config(self) -> OmniDiffusionConfig | SimpleNamespace | None:
         get_od_config = getattr(self._engine_client, "get_diffusion_od_config", None)
@@ -169,6 +177,9 @@ class OmniOpenAIServingVideo:
             model_name=model_name,
             stage_configs=stage_configs,
         )
+
+    def shutdown(self) -> None:
+        self._video_frame_converter.shutdown()
 
     async def _run_and_extract(
         self,
@@ -361,6 +372,7 @@ class OmniOpenAIServingVideo:
                         video,
                         fps=artifacts.output_fps,
                         video_codec_options=video_codec_options,
+                        frame_converter=self._video_frame_converter,
                     )
                     if artifacts.audios[idx] is None
                     else encode_video_base64(
@@ -369,6 +381,7 @@ class OmniOpenAIServingVideo:
                         audio=artifacts.audios[idx],
                         audio_sample_rate=artifacts.audio_sample_rate,
                         video_codec_options=video_codec_options,
+                        frame_converter=self._video_frame_converter,
                     )
                 ),
                 action=artifacts.actions[idx],
@@ -425,6 +438,7 @@ class OmniOpenAIServingVideo:
             fps=artifacts.output_fps,
             **({"audio": audio, "audio_sample_rate": artifacts.audio_sample_rate} if audio is not None else {}),
             video_codec_options=video_codec_options,
+            frame_converter=self._video_frame_converter,
         )
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)

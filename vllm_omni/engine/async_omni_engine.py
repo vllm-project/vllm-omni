@@ -52,6 +52,8 @@ from vllm_omni.engine.async_engine_utils import (
     apply_omni_final_stage_metadata,
     enqueue_orchestrator_shutdown,
     inject_global_id,
+    is_abort_transport_shutdown,
+    is_janus_sync_queue_shutdown,
     shutdown_runtime_after_orchestrator,
     upgrade_to_omni_request,
     weak_shutdown_async_omni_engine,
@@ -251,6 +253,7 @@ class AsyncOmniEngine:
         self._correlated_rpc_client: CorrelatedRpcClient | None = None
         self._duplex_control_client: DuplexControlClient | None = None
         self._running_counter = OmniRequestCounter()
+        self._engines_waiting_counter = OmniRequestCounter()
 
         logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
 
@@ -415,6 +418,7 @@ class AsyncOmniEngine:
                 pd_config=pd_config,
                 membership_controller=membership_controller,
                 running_counter=self._running_counter,
+                engines_waiting_counter=self._engines_waiting_counter,
                 transfer_emitter=self._transfer_emitter,
                 prom_metrics=self._prom_metrics,
                 log_stats=self._log_stats,
@@ -1901,9 +1905,16 @@ class AsyncOmniEngine:
         Prefer :meth:`abort_async` when the caller needs acknowledgment that
         stage aborts, binding release, and orchestrator request cleanup finished.
         """
+        if not request_ids or getattr(self, "_shutdown_called", False):
+            return
         if self.request_queue is None:
             raise RuntimeError("request_queue is not initialized")
-        self.request_queue.sync_q.put(AbortRequestMessage(request_ids=request_ids))
+        try:
+            self.request_queue.sync_q.put(AbortRequestMessage(request_ids=request_ids))
+        except Exception as exc:
+            if getattr(self, "_shutdown_called", False) and is_janus_sync_queue_shutdown(exc):
+                return
+            raise
 
     async def abort_async(
         self,
@@ -1916,6 +1927,8 @@ class AsyncOmniEngine:
         :class:`AbortResultMessage` via :class:`CorrelatedRpcClient`, and
         raises if the orchestrator reports failure or times out.
         """
+        if not request_ids or getattr(self, "_shutdown_called", False):
+            return
         if self.request_queue is None:
             raise RuntimeError("request_queue is not initialized")
         transport = self._correlated_rpc_client
@@ -1938,7 +1951,12 @@ class AsyncOmniEngine:
             return result_msg
 
         loop = asyncio.get_running_loop()
-        result_msg = await loop.run_in_executor(None, _wait)
+        try:
+            result_msg = await loop.run_in_executor(None, _wait)
+        except Exception as exc:
+            if getattr(self, "_shutdown_called", False) and is_abort_transport_shutdown(exc):
+                return
+            raise
         if not result_msg.success:
             raise RuntimeError(result_msg.error or "abort failed")
 
