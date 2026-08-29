@@ -203,7 +203,8 @@ class OmniEngineArgs(EngineArgs):
     # model-owned streaming state (codec, decoder, and similar resources).
     duplex_max_sessions: int = 1
     omni_kv_config: dict | None = None
-    omni_dtps_config: dict[str, Any] | None = None
+    dit_load_aware: bool | None = None
+    dit_load_threshold: int | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
     worker_type: str | None = None
@@ -434,7 +435,8 @@ class OmniEngineArgs(EngineArgs):
             subtalker_sampling_params=self.subtalker_sampling_params,
             silence_ban_frames=self.silence_ban_frames,
             omni_kv_config=self.omni_kv_config,
-            omni_dtps_config=self.omni_dtps_config,
+            dit_load_aware=self.dit_load_aware,
+            dit_load_threshold=self.dit_load_threshold,
             task_type=self.task_type,
             has_sampling_extra_args=self.has_sampling_extra_args,
             sampling_extra_args_keys=tuple(self.sampling_extra_args_keys or ()),

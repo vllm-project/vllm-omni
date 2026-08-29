@@ -5,11 +5,6 @@ pipeline: hunyuan_image_3_moe
 async_chunk: false
 trust_remote_code: true
 
-# DTPS (DiT-load-aware Type-Priority Scheduling) config
-dtps:
-  enabled: false
-  dit_load_threshold: 2    # DiT phase boundary + per-batch admission cap
-
 connectors:
   rdma_connector:
     name: MooncakeTransferEngineConnector
@@ -50,6 +45,8 @@ stages:
     max_num_batched_tokens: 32768
     devices: "0,1"
     tensor_parallel_size: 2
+    dit_load_aware: false
+    dit_load_threshold: 2
     hf_overrides:
       rope_parameters:
         mrope_section: [0, 32, 32]

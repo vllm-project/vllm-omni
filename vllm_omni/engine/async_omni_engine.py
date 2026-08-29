@@ -422,6 +422,7 @@ class AsyncOmniEngine:
                 prom_metrics=self._prom_metrics,
                 log_stats=self._log_stats,
                 enable_orch_monitor=self._enable_orch_monitor,
+                dit_load_aware=self._detect_dit_load_aware(),
                 duplex_runtime_extension=duplex_runtime_extension,
                 enable_duplex_control=self._duplex_control_enabled,
                 duplex_session_config=self.duplex_session_config,
@@ -965,6 +966,13 @@ class AsyncOmniEngine:
         if cache_config is None and cache_backend not in (None, "", "none"):
             cache_config = AsyncOmniEngine._get_default_cache_config(cache_backend)
         return cache_config
+
+    def _detect_dit_load_aware(self) -> bool:
+        for cfg in self.stage_configs:
+            ea = getattr(cfg, "engine_args", None)
+            if getattr(ea, "dit_load_aware", False):
+                return True
+        return False
 
     def _detect_pd_config(self) -> dict[str, Any] | None:
         """Detect PD (Prefill-Decode) disaggregation config from stage_configs.

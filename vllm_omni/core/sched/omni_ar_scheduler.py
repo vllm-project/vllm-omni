@@ -89,8 +89,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
 
         # [OmniDTPS] Optional DTPS component. Constructed only for AR+DiT
-        # deployments with an omni_dtps_config block (enabled: true); None
-        # otherwise, so schedule() stays pure FCFS.
+        # deployments with dit_load_aware=true; None otherwise, so
+        # schedule() stays pure FCFS.
         self._dtps: DTPSScheduler | None = None
         self._init_dtps_scheduler()
 
@@ -205,38 +205,25 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return getattr(config, key, default) if config is not None else default
 
     def _init_dtps_scheduler(self) -> None:
-        """Construct the optional DTPS component for AR+DiT deployments.
-
-        Only built when ``merge_pipeline_deploy`` injected an
-        ``omni_dtps_config`` block with ``enabled: true``
-        """
         if not hasattr(self, "vllm_config"):
             return
-        dtps_cfg = getattr(self.vllm_config.model_config, "omni_dtps_config", None)
-        if not dtps_cfg:
+        if not getattr(self.vllm_config.model_config, "dit_load_aware", None):
             return
-
-        if isinstance(dtps_cfg, dict):
-            pass
-        elif hasattr(dtps_cfg, "items"):
-            dtps_cfg = dict(dtps_cfg.items())
-        else:
-            return
-        stage_id: int = getattr(self.vllm_config.model_config, "stage_id", 0) if hasattr(self, "vllm_config") else 0
+        stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
+        threshold = getattr(self.vllm_config.model_config, "dit_load_threshold", None)
         try:
-            self._dtps = DTPSScheduler.from_config(dtps_cfg, stage_id=stage_id)
+            self._dtps = DTPSScheduler(
+                stage_id=stage_id,
+                **({"dit_load_threshold": threshold} if threshold is not None else {}),
+            )
             logger.info(
                 "[OmniDTPS] AR stage %s: aging_threshold=%.1fs, "
-                "dit_load_threshold=%d, "
-                "idle when any replica waiting < threshold, "
-                "busy when all replicas waiting >= threshold)",
+                "dit_load_threshold=%d",
                 stage_id,
                 self._dtps.aging_s,
                 self._dtps.dit_load_threshold,
             )
         except Exception:
-            # DTPS is a throughput optimization; never let its construction
-            # failure break the AR scheduler. Fall back to pure FCFS.
             logger.exception(
                 "[OmniDTPS] Failed to construct DTPSScheduler; falling back to FCFS on AR stage %s",
                 stage_id,

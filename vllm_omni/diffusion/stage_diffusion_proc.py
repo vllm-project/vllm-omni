@@ -56,9 +56,6 @@ logger = init_logger(__name__)
 
 _SIGNAL_EXIT_BASE = 128
 
-# DTPS: per-queue cap on the request-id sets returned by ``get_load``.
-_DIT_LOAD_ID_CAP = 256
-
 
 def _signal_exit_code(signum: int) -> int:
     """Return the conventional process exit code for signal-driven exits."""
@@ -501,8 +498,8 @@ class StageDiffusionProc:
                         else:
                             waiting = len(getattr(sched, "_waiting", ()) or ())
                             running = len(getattr(sched, "_running", ()) or ())
-                            waiting_ids = list(getattr(sched, "_waiting", ()) or [])[:_DIT_LOAD_ID_CAP]
-                            running_ids = list(getattr(sched, "_running", ()) or [])[:_DIT_LOAD_ID_CAP]
+                            waiting_ids = list(getattr(sched, "_waiting", ()) or [])
+                            running_ids = list(getattr(sched, "_running", ()) or [])
                     except Exception:
                         logger.debug("get_load: failed to read scheduler state", exc_info=True)
                         waiting, running = 0, 0

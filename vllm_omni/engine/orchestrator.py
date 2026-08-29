@@ -430,6 +430,7 @@ class Orchestrator:
     _stat_logger: OmniPrometheusStatLogger | None = None
     duplex_control_plane: DuplexControlPlanePort | None = None
     _dit_load_state: DitLoadState | None = None
+    _dit_load_aware: bool = False
 
     def __init__(
         self,
@@ -447,6 +448,7 @@ class Orchestrator:
         prom_metrics: Any = None,
         log_stats: bool = False,
         enable_orch_monitor: bool = False,
+        dit_load_aware: bool = False,
         duplex_runtime_extension: DuplexRuntimeExtension | None = None,
         enable_duplex_control: bool = False,
         duplex_session_config: DuplexSessionRuntimeConfig | None = None,
@@ -525,11 +527,10 @@ class Orchestrator:
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
-        # Aggregate DiT replica loads and push snapshots to the AR scheduler
-        # via UTILITY ZMQ. Internally maintained — no external injection.
-        self._dit_load_state: DitLoadState = DitLoadState()
-        # Per-(stage_id, replica_id) last-poll timestamp, to throttle RPCs.
-        self._dit_load_last_poll: dict[tuple[int, int], float] = {}
+        self._dit_load_aware = bool(dit_load_aware)
+        if self._dit_load_aware:
+            self._dit_load_state: DitLoadState = DitLoadState()
+            self._dit_load_last_poll: dict[tuple[int, int], float] = {}
 
     # [OmniDTPS] Min interval between DiT-load polls per replica.
     _DIT_LOAD_POLL_INTERVAL_S: float = 0.1
@@ -717,7 +718,7 @@ class Orchestrator:
             elif isinstance(msg, UnregisterRemoteReplicaMessage):
                 if self._membership is not None:
                     await self._membership.handle_unregister(msg.stage_id, msg.input_addr)
-                if self._dit_load_state is not None and msg.stage_id < len(self.stage_pools):
+                if self._dit_load_aware and self._dit_load_state is not None and msg.stage_id < len(self.stage_pools):
                     pool = self.stage_pools[msg.stage_id]
                     if pool.stage_type == "diffusion":
                         replica_id = pool.get_replica_id_by_addr(msg.input_addr)
@@ -1220,6 +1221,8 @@ class Orchestrator:
         state = self._dit_load_state
         if state is None:
             return
+        if not self._dit_load_aware:
+            return
         now = _time.monotonic()
         key = (stage_id, replica_id)
         if not force:
@@ -1284,15 +1287,8 @@ class Orchestrator:
 >>>>>>> cb711f05 ([Core] DTPS DiT-load-aware Type-Priority Scheduling)
 =======
     async def _push_dit_load_to_ar(self, state: DitLoadState) -> None:
-        """Push the aggregate DiT-load snapshot to all AR stage replicas.
-
-        Called after each :meth:`DitLoadState.update` (when data changed)
-        and after :meth:`DitLoadState.remove`. The snapshot is sent over the
-        existing UTILITY ZMQ channel (``call_utility_async``) that the AR
-        stage replica already listens on, so no new socket is needed.
-        Colocated deployments use ``ipc://`` transport; distributed
-        deployments use ``tcp://`` — both handled transparently.
-        """
+        if not self._dit_load_aware:
+            return
         snapshot = state.snapshot()
         for stage_id in range(self.num_stages):
             pool = self.stage_pools[stage_id]
@@ -1317,7 +1313,8 @@ class Orchestrator:
                     try:
                         if pool.stage_type == "diffusion":
                             diffusion_output = pool.poll_diffusion_output(replica_id)
-                            await self._poll_dit_load_throttled(stage_id, pool, replica_id)
+                            if self._dit_load_aware:
+                                await self._poll_dit_load_throttled(stage_id, pool, replica_id)
                             if diffusion_output is None:
                                 continue
 

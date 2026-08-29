@@ -76,7 +76,7 @@ class StageEngineCoreProc(EngineCoreProc):
         de-duplication.
 
         Defensive ``getattr(scheduler, "update_dit_load", None)`` so non-DTPS
-        deployments (no ``omni_dtps_config``) are unaffected.
+        deployments (dit_load_aware=false) are unaffected.
         """
         if isinstance(dit_load, dict):
             for key in ("waiting_ids", "running_ids"):

@@ -22,7 +22,6 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.diffusion.data import DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.stage_diffusion_proc import _DIT_LOAD_ID_CAP
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.errors import client_error_metadata
@@ -214,8 +213,8 @@ class InlineStageDiffusionClient(StageClientBase):
                 return (0, 0, [], [])
             waiting = len(getattr(scheduler, "_waiting", ()) or ())
             running = len(getattr(scheduler, "_running", ()) or ())
-            waiting_ids = list(getattr(scheduler, "_waiting", ()) or [])[:_DIT_LOAD_ID_CAP]
-            running_ids = list(getattr(scheduler, "_running", ()) or [])[:_DIT_LOAD_ID_CAP]
+            waiting_ids = list(getattr(scheduler, "_waiting", ()) or [])
+            running_ids = list(getattr(scheduler, "_running", ()) or [])
             return (int(waiting), int(running), waiting_ids, running_ids)
         except Exception:
             logger.debug(

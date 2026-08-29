@@ -55,36 +55,6 @@ class DTPSScheduler:
         self._dit_inflight_ids: dict[str, _InflightEntry] = {}
         self._last_phase_stats: dict[str, int | bool] = {}
 
-    @classmethod
-    def from_config(cls, dtps_cfg: Any, *, stage_id: int = 0) -> DTPSScheduler:
-        if isinstance(dtps_cfg, dict):
-            cfg_get = dtps_cfg.get
-        else:
-
-            def cfg_get(key: str, default: Any = None) -> Any:
-                return getattr(dtps_cfg, key, default)
-
-        if not cfg_get("enabled", False):
-            raise ValueError(
-                "DTPS config block present but 'enabled' is not True; refusing to construct DTPSScheduler."
-            )
-
-        raw_threshold = cfg_get("dit_load_threshold", _DEFAULT_DIT_LOAD_THRESHOLD)
-        try:
-            dit_load_threshold = int(raw_threshold)
-        except (TypeError, ValueError):
-            logger.warning(
-                "[OmniDTPS] Invalid dit_load_threshold=%r; using default %d.",
-                raw_threshold,
-                _DEFAULT_DIT_LOAD_THRESHOLD,
-            )
-            dit_load_threshold = _DEFAULT_DIT_LOAD_THRESHOLD
-
-        return cls(
-            stage_id=stage_id,
-            dit_load_threshold=dit_load_threshold,
-        )
-
     @staticmethod
     def _deserialize_info(req: Request) -> dict[str, Any] | None:
         info = getattr(req, "additional_information", None)

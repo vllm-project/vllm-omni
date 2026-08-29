@@ -409,6 +409,10 @@ class StageDeployConfig:
     async_scheduling: bool | None = None
     disable_hybrid_kv_cache_manager: bool | None = None
     mm_processor_cache_gb: float | None = None
+    # AR-stage DiT-load-aware scheduling (DTPS): when True, the AR scheduler
+    # reorders its waiting queue by task type + downstream DiT load.
+    dit_load_aware: bool | None = None
+    dit_load_threshold: int | None = None
     # Hybrid-mamba stages (e.g. the NemotronVoiceChat thinker's NemotronH
     # backbone) pin the SSM state dtype; projected onto vLLM CacheConfig.
     mamba_ssm_cache_dtype: str | None = None
@@ -548,7 +552,6 @@ class DeployConfig:
     platforms: dict[str, Any] | None = None
     # Overrides the auto-detected pipeline registry key for structural variants.
     pipeline: str | None = None
-    dtps: dict[str, Any] | None = None
 
     # === Pipeline-wide engine settings (applied uniformly to every stage) ===
     trust_remote_code: bool | None = None
@@ -755,7 +758,6 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         "stages": stages,
         "platforms": raw_dict.get("platforms", None),
         "pipeline": raw_dict.get("pipeline", None),
-        "dtps": raw_dict.get("dtps", None),
     }
     # Pipeline-wide engine settings: only set if explicitly present in YAML
     # so the DeployConfig dataclass defaults take effect otherwise.
@@ -986,30 +988,6 @@ def _build_extras(
     return extras
 
 
-def _build_dtps_config_block(dtps_raw: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Build the validated ``omni_dtps_config`` block from the raw YAML ``dtps`` dict.
-
-    Returns ``None`` (DTPS disabled) unless ``enabled: true``.
-    """
-    if not dtps_raw:
-        return None
-    if not bool(dtps_raw.get("enabled", False)):
-        return None
-
-    block: dict[str, Any] = {"enabled": True}
-
-    if "dit_load_threshold" in dtps_raw:
-        try:
-            block["dit_load_threshold"] = int(dtps_raw["dit_load_threshold"])
-        except (TypeError, ValueError):
-            logger.warning(
-                "[OmniDTPS] Invalid dit_load_threshold=%r; ignoring (DTPSScheduler will fall back to its default).",
-                dtps_raw["dit_load_threshold"],
-            )
-
-    return block
-
-
 def merge_pipeline_deploy(
     pipeline: PipelineConfig,
     deploy: DeployConfig,
@@ -1065,23 +1043,21 @@ def merge_pipeline_deploy(
         )
         if ps.execution_type == StageExecutionType.LLM_AR:
             engine_args["async_scheduling"] = sched_cls is OmniARAsyncScheduler
-            # DTPS requires this AR stage to have a downstream DIFFUSION stage
-            _has_downstream_dit = any(
-                s.execution_type == StageExecutionType.DIFFUSION and ps.stage_id in (s.input_sources or ())
-                for s in pipeline.stages
-            )
-            if _has_downstream_dit:
-                dtps_block = _build_dtps_config_block(deploy.dtps)
-                if dtps_block is not None:
-                    engine_args["omni_dtps_config"] = dtps_block
-            elif deploy.dtps and bool(deploy.dtps.get("enabled", False)):
-                logger.warning(
-                    "[OmniDTPS] dtps: enabled is set in the deploy YAML but "
-                    "AR stage %d in pipeline %r has no downstream DIFFUSION "
-                    "stage; ignoring dtps config.",
-                    ps.stage_id,
-                    pipeline.model_type,
+            _dit_load_aware = bool(ds.dit_load_aware) if ds is not None else False
+            if _dit_load_aware:
+                _has_downstream_dit = any(
+                    s.execution_type == StageExecutionType.DIFFUSION and ps.stage_id in (s.input_sources or ())
+                    for s in pipeline.stages
                 )
+                if not _has_downstream_dit:
+                    logger.warning(
+                        "[OmniDTPS] dit_load_aware is set on AR stage %d in "
+                        "pipeline %r but it has no downstream DIFFUSION stage; "
+                        "ignoring.",
+                        ps.stage_id,
+                        pipeline.model_type,
+                    )
+                    engine_args["dit_load_aware"] = False
         extras = _build_extras(ps, ds)
         runtime: dict[str, Any] = {"process": True}
         if ds is not None:
