@@ -29,6 +29,7 @@ from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
     find_vllm_cli,
 )
 from tests.helpers.mark import hardware_test
+from tests.helpers.minicpmo_4_5_duplex import SERVER_PARAMS as DUPLEX_TEST_PARAMS
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
