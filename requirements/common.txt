@@ -1,22 +1,24 @@
 # Common dependencies for all platforms
-# transformers: kept exactly aligned with the upstream vLLM constraint.
-# vLLM pins ">= 4.56.0, != 5.0.*, != 5.1.*, != 5.2.*, != 5.3.*, != 5.4.*, != 5.5.0".
-# The previous extra "< 5.9.0" exclusion was removed when re-aligning with
-# upstream: transformers 5.9 changed _adjust_missing_and_unexpected_keys from
+# transformers: required unified multimodal model classes are unavailable
+# before 5.10.1; 5.10.0 is yanked, and 5.15 has a known construction
+# regression. transformers 5.9 also changed
+# _adjust_missing_and_unexpected_keys from
 # list+list to set|set, breaking models that declare
 # _keys_to_ignore_on_load_unexpected as a list (e.g. OpenMOSS-Team/MOSS-TTS-Nano)
 # with "TypeError: unsupported operand type(s) for |: 'list' and 'set'".
 # That breakage is now handled in code instead of by pinning:
 # MossTTSNanoForGeneration wraps weight loading in
 # transformers_keys_to_ignore_compat (vllm_omni/model_executor/models/utils.py).
-transformers >= 5.5.3
+transformers >= 5.10.1, < 5.15
 av>=14.0.0
 omegaconf>=2.3.0
-diffusers==0.38.0
+diffusers==0.40.0
+# Hub kernels, including LTX-2.5 NATTEN
+kernels==0.14.1
 safetensors>=0.8.0
 accelerate==1.12.0
 soundfile>=0.13.1
-cache-dit==1.3.0
+cache-dit==1.5.0
 tqdm>=4.66.0
 torchsde>=0.2.6
 openai-whisper>=20250625
@@ -34,3 +36,5 @@ pydantic-settings>=2.0.0
 # base image does not ship it, so declare it explicitly. The loader also guards
 # this import so a missing gguf no longer breaks all diffusion model loading.
 gguf>=0.10.0
+# Required for running the Cosmos3 model with guardrails enabled (default behavior).
+cosmos-guardrail>=0.3.1

@@ -4,7 +4,7 @@ from vllm_omni.metrics import OrchestratorAggregator
 
 
 class ClientRequestState:
-    """Tracks the state of an individual request in the orchestrator."""
+    """Tracks one entrypoint request and its output queue."""
 
     def __init__(
         self,
@@ -17,6 +17,8 @@ class ClientRequestState:
         self.stage_id: int | None = None
         self.queue = queue if queue is not None else asyncio.Queue()
         self.metrics: OrchestratorAggregator | None = None
+        # Request-scoped idempotency guard for Prometheus failure counters.
+        self.failure_recorded = False
         # Wall-clock time at which the user's request arrived in the engine
         # entrypoint. Set in async_omni.generate() before the orchestrator
         # accepts the request. Used as the t0 anchor for audio_ttfp.

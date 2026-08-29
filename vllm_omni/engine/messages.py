@@ -6,7 +6,7 @@ import msgspec
 from vllm.inputs import PromptType
 from vllm.v1.engine import EngineCoreRequest
 
-from vllm_omni.inputs.data import OmniSamplingParams
+from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -27,6 +27,7 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     request_timestamp: float
     enqueue_ts: float
     final_output_stage_ids: list[int] | None = None
+    request_artifact_dirs: list[str] | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
@@ -42,6 +43,26 @@ class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):
 class AbortRequestMessage(EngineQueueMessage, kw_only=True):
     type: Literal["abort"] = "abort"
     request_ids: list[str]
+    # When set, Orchestrator emits AbortResultMessage on rpc_async_queue so
+    # callers can await acknowledgment. Omit for fire-and-forget abort().
+    rpc_id: str | None = None
+
+
+class AbortResultMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["abort_result"] = "abort_result"
+    rpc_id: str
+    success: bool
+    error: str | None = None
+
+    @property
+    def rpc_correlation_key(self) -> tuple[str, str]:
+        return ("abort", self.rpc_id)
+
+
+class InteractionMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["interaction"] = "interaction"
+    request_id: str
+    interaction: OmniInteractionPrompt
 
 
 class CollectiveRPCRequestMessage(EngineQueueMessage, kw_only=True):
@@ -78,6 +99,7 @@ class ErrorMessage(EngineQueueMessage, kw_only=True):
     fatal: bool = False
     request_id: str | None = None
     stage_id: int | None = None
+    event_id: str | None = None  # for interactions on diffusion generation requests
 
 
 class OutputMessage(EngineQueueMessage, kw_only=True):
@@ -106,3 +128,7 @@ class CollectiveRPCResultMessage(EngineQueueMessage, kw_only=True):
     method: str
     stage_ids: list[int]
     results: list[object]
+
+    @property
+    def rpc_correlation_key(self) -> tuple[str, str]:
+        return ("collective", self.rpc_id)

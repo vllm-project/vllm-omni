@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Shared helpers for Qwen3-Omni Daily-Omni / Seed-TTS ``vllm bench serve --omni`` accuracy runs.
 
 Local dataset paths are **optional**. When ``VLLM_DAILY_OMNI_QA_JSON`` + ``VLLM_DAILY_OMNI_VIDEO_DIR``
@@ -19,6 +20,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -27,7 +29,7 @@ DEFAULT_SEED_TTS_HF_REPO = "zhaochenyang20/seed-tts-eval"
 
 
 class OmniBenchServerEndpoint(Protocol):
-    """Anything with ``host`` / ``port`` / ``model`` (e.g. :class:`tests.conftest.OmniServer`)."""
+    """Anything with ``host`` / ``port`` / ``model`` (e.g. :class:`tests.helpers.runtime.OmniServer`)."""
 
     host: str
     port: int
@@ -121,9 +123,13 @@ def seed_tts_bench_argv(*, locale: str = "en") -> list[str]:
 
 def find_vllm_cli() -> str:
     exe = shutil.which("vllm")
-    if not exe:
-        raise FileNotFoundError("Could not find `vllm` on PATH (install vLLM-Omni with CLI entrypoints).")
-    return exe
+    if exe:
+        return exe
+    # Fallback when pytest is invoked via absolute venv path without activating PATH.
+    sibling = Path(sys.executable).resolve().parent / "vllm"
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        return str(sibling)
+    raise FileNotFoundError("Could not find `vllm` on PATH (install vLLM-Omni with CLI entrypoints).")
 
 
 def run_vllm_bench_subprocess(vllm: str, argv: list[str], *, extra_env: dict[str, str] | None = None) -> None:
@@ -150,6 +156,11 @@ def build_serve_common_argv(
     result_dir: Path,
     result_filename: str,
     ready_check_timeout_sec: int | None = None,
+    trust_remote_code: bool = False,
+    backend: str = "openai-chat-omni",
+    endpoint: str = "/v1/chat/completions",
+    temperature: float | None = None,
+    output_len: int | None = None,
 ) -> list[str]:
     out = [
         "bench",
@@ -162,9 +173,9 @@ def build_serve_common_argv(
         "--model",
         model,
         "--endpoint",
-        "/v1/chat/completions",
+        endpoint,
         "--backend",
-        "openai-chat-omni",
+        backend,
         "--request-rate",
         "inf",
         "--num-prompts",
@@ -184,6 +195,12 @@ def build_serve_common_argv(
     ]
     if ready_check_timeout_sec is not None:
         out.extend(["--ready-check-timeout-sec", str(int(ready_check_timeout_sec))])
+    if trust_remote_code:
+        out.append("--trust-remote-code")
+    if temperature is not None:
+        out.extend(["--temperature", str(temperature)])
+    if output_len is not None:
+        out.extend(["--output-len", str(int(output_len))])
     return out
 
 

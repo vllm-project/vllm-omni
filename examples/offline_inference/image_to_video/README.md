@@ -1,7 +1,7 @@
 # Image-To-Video
 
-This shared example generates videos from images with VACE, Wan2.2,
-LTX-2/LTX-2.3, HunyuanVideo-1.5, Cosmos3, and other compatible pipelines.
+This shared example generates videos from images with VACE, Wan2.2, LTX-2,
+HunyuanVideo-1.5, SANA-Video, Cosmos3, and other compatible pipelines.
 
 - `image_to_video.py`: command-line script for single video generation with advanced options.
 
@@ -26,12 +26,33 @@ This folder provides a unified CLI script for image-to-video generation using vL
 | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | 480 x 832 | 81 | 50 | 5.0 | Around 60 GiB BF16 for basic single-card usage |
 | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | 480 x 832 | 81 | 50 | 4.0 | Around 20–25 GiB BF16, smallest I2V model |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v` | 480 x 832 | 121 | 50 | 6.0 | Around 100 GiB at default settings; the example enables `--enable-cpu-offload` + VAE tiling/slicing to fit an 80 GiB card |
-| LTX2 (local path + `--model-class-name LTX2ImageToVideoPipeline`) | 512 x 768 | 121 | 40 | 4.0 | Memory use depends on frame count and tensor parallelism |
+| `Lightricks/LTX-2` | 512 x 768 | 121 | 40 | video 3.0 / audio 7.0 | Memory use depends on frame count and tensor parallelism |
+| `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | 480 x 832 | 81 | 50 | 6.0 | Native `SanaImageToVideoPipeline`; Wan VAE |
+| `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` | 704 x 1280 | 81 | 50 | 6.0 | Native `SanaImageToVideoPipeline`; LTX-2 Video VAE |
 
 !!! info
     Peak VRAM: based on basic single-card usage, batch size = 1, without any acceleration/optimization features. Some model weights cannot fit into one card with 80 GiB VRAM, which may need to use CPU offloading.
 
 Default model: `Wan-AI/Wan2.2-I2V-A14B-Diffusers`.
+
+### LingBot-Video TI2V
+
+LingBot-Video accepts exactly one first-frame image and uses the same dense or
+MoE checkpoint as its T2I and T2V modes:
+
+```bash
+python examples/offline_inference/image_to_video/image_to_video.py \
+  --model robbyant/lingbot-video-dense-1.3b \
+  --model-class-name LingBotVideoPipeline \
+  --image /path/to/input.png \
+  --prompt "the fox looks toward the camera" \
+  --height 192 --width 320 --num-frames 9 --num-inference-steps 2 \
+  --guidance-scale 3.0 --flow-shift 3.0 --fps 24 \
+  --output lingbot_ti2v.mp4
+```
+
+The input image keeps its original geometry until the LingBot pipeline applies
+its model-specific resize and center crop.
 
 ## Prerequisites
 
@@ -77,7 +98,7 @@ if __name__ == "__main__":
         ),
     )
     from diffusers.utils import export_to_video
-    frames = outputs[0].request_output.images
+    frames = outputs[0].images
     export_to_video(frames, "quick_test_i2v.mp4", fps=16)
 ```
 
@@ -105,7 +126,7 @@ python image_to_video.py \
 | Argument | Type | Default | Description |
 | -------- | ---- | ------- | ----------- |
 | `--model` | str | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Diffusers I2V model ID or local path |
-| `--model-class-name` | str | `None` | Override model class name (e.g., `LTX2ImageToVideoPipeline`) |
+| `--model-class-name` | str | `None` | Optional pipeline override |
 | `--image` | str | (required) | Path to input image |
 | `--prompt` | str | `""` | Text description of desired motion/animation |
 | `--negative-prompt` | str | `""` | Optional list of artifacts to suppress |
@@ -195,23 +216,60 @@ python image_to_video.py \
   --output hunyuan_i2v.mp4
 ```
 
-### LTX2 Image-to-Video
+### LTX-2
 
 ```bash
 python image_to_video.py \
-  --model /path/to/LTX-2 \
-  --model-class-name LTX2ImageToVideoPipeline \
+  --model Lightricks/LTX-2 \
   --image cherry_blossom.jpg \
   --prompt "A cinematic dolly shot of cherry blossoms" \
-  --height 512 \
-  --width 768 \
-  --num-frames 121 \
-  --num-inference-steps 40 \
-  --guidance-scale 4.0 \
-  --frame-rate 24 \
-  --fps 24 \
   --output ltx2_i2v.mp4
 ```
+
+See the [LTX-2 recipe](../../../recipes/LTX/LTX-2.md) for all checkpoints,
+pipeline selection, T2V, defaults, and advanced options.
+
+### SANA-Video-2B
+
+The checkpoint metadata selects the upstream T2V pipeline, so pass
+`SanaImageToVideoPipeline` explicitly for I2V:
+
+```bash
+python image_to_video.py \
+  --model Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
+  --model-class-name SanaImageToVideoPipeline \
+  --image cherry_blossom.jpg \
+  --prompt "Cherry blossoms sway in the breeze as petals drift past the camera." \
+  --negative-prompt "blurry, low quality, temporal artifacts" \
+  --height 480 \
+  --width 832 \
+  --num-frames 81 \
+  --num-inference-steps 50 \
+  --guidance-scale 6.0 \
+  --extra-body '{"motion_score": 30}' \
+  --fps 16 \
+  --seed 42 \
+  --output sana_video_i2v_480p.mp4
+```
+
+Use the 720p checkpoint with `--height 704 --width 1280`. In this example,
+81 frames at 16 FPS means the standard approximately five-second SANA-Video
+checkpoint request. It does not enable the separate LongSANA/LongLive
+minute-scale autoregressive workflow.
+
+The native `SanaImageToVideoPipeline` supports both checkpoint variants. The
+480p path uses vLLM-Omni's `DistributedAutoencoderKLWan` wrapper and the 720p
+path uses `DistributedAutoencoderKLLTX2Video`; both wrap their corresponding
+Diffusers VAE implementations. The native denoising loop intentionally keeps
+Diffusers' checkpoint-compatible `DPMSolverMultistepScheduler`.
+
+The Diffusers adapter has completed end-to-end I2V serving validation at both
+480p and 720p. For online adapter serving, select the matching checkpoint and
+use `WIDTH=1280 HEIGHT=704` for the 720p request. Adapter T2V is also validated
+at both resolutions; see the recipe for the exact backend matrix.
+
+See the [SANA-Video recipe](../../../recipes/NVIDIA/SANA-Video-2B.md) for
+online serving, native/adapter validation boundaries, and hardware notes.
 
 ## Advanced Features
 
@@ -233,30 +291,6 @@ python image_to_video.py \
   --output i2v_cached.mp4
 ```
 
-### LTX-2.3
-
-```bash
-python image_to_video.py \
-  --model dg845/LTX-2.3-Diffusers \
-  --model-class-name LTX23ImageToVideoPipeline \
-  --image cherry_blossom.jpg \
-  --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
-  --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
-  --height 384 \
-  --width 512 \
-  --num-frames 25 \
-  --guidance-scale 4.0 \
-  --num-inference-steps 20 \
-  --frame-rate 24 \
-  --fps 24 \
-  --output ltx23_i2v_output.mp4
-```
-
-Use a Diffusers-format checkpoint such as `dg845/LTX-2.3-Diffusers`; the
-upstream `Lightricks/LTX-2.3` raw safetensors repo is not directly loadable by
-this pipeline. Pass `--model-class-name LTX23ImageToVideoPipeline` to select
-the LTX-2.3 image-to-video pipeline.
-
 ### Cosmos3
 
 ```bash
@@ -274,8 +308,8 @@ python image_to_video.py \
 
 Key arguments:
 
-- `--model`: Model ID (I2V-A14B for MoE, TI2V-5B for unified T2V+I2V,
-  LTX-2/LTX-2.3, Cosmos3, or VACE).
+- `--model`: Model ID (I2V-A14B for MoE, TI2V-5B for unified T2V+I2V, LTX-2,
+  Cosmos3, or VACE).
 - `--image`: Path to the first-frame or source image.
 - `--last-image`: Optional last-frame condition for models such as VACE.
 - `--mask-image`: Optional inpainting mask. White pixels are regenerated and black pixels are preserved.
@@ -290,7 +324,7 @@ Key arguments:
 - `--guidance-scale` and `--guidance-scale-high`: CFG scale (applied to low/high-noise stages for MoE).
 - `--negative-prompt`: Optional list of artifacts to suppress.
 - `--boundary-ratio`: Boundary split ratio for two-stage MoE models.
-- `--flow-shift`: Scheduler flow shift (default: model-specific — Wan/LTX2 5.0, Cosmos3 10.0).
+- `--flow-shift`: Scheduler flow shift (default: Wan 5.0, Cosmos3 10.0). LTX does not consume this option.
 - `--sample-solver`: Wan2.2 sampling solver. Use `unipc` for the default multistep solver, or `euler` for Lightning/Distill checkpoints.
 - `--num-inference-steps`: Number of denoising steps (default: model-specific — Wan 50, LTX2 40, Cosmos3 35).
 - `--fps`: Frames per second for the saved MP4 (requires `diffusers` export_to_video).

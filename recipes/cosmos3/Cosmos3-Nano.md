@@ -195,11 +195,13 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
 
 # Transfer V2V with a precomputed depth control video. `control_path` can point
 # to a local image/video; edge and blur can also be computed from `input_reference`
-# by passing `"edge":true` or `"blur":true`.
+# by passing `"edge":true` or `"blur":true`. The reference negative prompt is
+# optional; omit the `negative_prompt` form field to use an empty negative branch.
 curl -sS -X POST http://localhost:8000/v1/videos/sync \
   -H "Accept: video/mp4" \
   -F "model=nvidia/Cosmos3-Nano" \
   -F "prompt=Generate a realistic scene following the provided control video." \
+  --form-string "negative_prompt=$(jq -c . recipes/cosmos3/negative_prompt.json)" \
   -F "size=1280x720" -F "num_frames=121" \
   -F "num_inference_steps=50" -F "seed=125" \
   -F 'extra_params={"depth":{"control_path":"/path/to/depth_control.mp4"},"max_frames":121,"resolution":"720","num_video_frames_per_chunk":121}' \
@@ -322,15 +324,34 @@ vllm serve nvidia/Cosmos3-Nano-Policy-DROID \
   `extra_params={"guardrails":false}` (per request) toggles safety. The
   per-request flag only takes effect when the server was launched **with**
   guardrails enabled (it cannot re-enable them on a `--no-guardrails` server).
-  `use_resolution_template` / `use_duration_template` are off by default and only
-  needed when not using upsampled prompts that already encode resolution/duration.
+  Outside transfer mode, `use_resolution_template` / `use_duration_template`
+  are off by default and only needed when not using upsampled prompts that
+  already encode resolution/duration.
   For V2V, `condition_frame_indexes_vision` selects the clean conditioned latent
   frame indexes (default `[0, 1]`), and `condition_video_keep` selects whether the
   API decodes the first or last needed reference frames (`"first"` by default).
 - **Transfer controls:** `extra_params` may include `edge`, `blur`, `depth`,
   `seg`, or `wsm`. Each hint accepts `true`, a path string, or an object such as
   `{"control_path": "/path/to/control.mp4"}`; `edge` also accepts
-  `preset_edge_threshold` and `blur` accepts `preset_blur_strength`.
+  `preset_edge_threshold` and `blur` accepts `preset_blur_strength`. Every hint
+  accepts a non-negative `control_weight`; weights are normalized across active
+  controls and therefore only set their relative influence. A single positive
+  weight always normalizes to `1.0`; use `control_guidance` to change the
+  absolute strength of a single control. With two or more active controls, the
+  per-control attention passes run replicated on every sequence-parallel
+  (Ulysses) rank, so Ulysses does not reduce per-rank memory or latency for
+  multi-control transfer requests.
+  Transfer always uses Cosmos3's transfer-specific system prompt. By default it
+  also appends a directive naming every active hint and asking the model to
+  follow its shape, position, and motion precisely; set the request-level
+  `emphasize_control_in_prompt` option to `false` for prompt ablations. Transfer
+  does not add a negative prompt automatically. An optional reference prompt is
+  provided in [`negative_prompt.json`](negative_prompt.json); compact the JSON
+  with `jq -c` and pass it through `negative_prompt` as shown in the transfer
+  example. Transfer enables duration/FPS and resolution metadata on both CFG
+  branches. Set `use_duration_template` or `use_resolution_template` to
+  `false` to disable either template. `negative_metadata_mode` accepts `same`
+  (the transfer default), `inverse`, or `none`.
   Transfer-level options include `control_guidance`,
   `control_guidance_interval`, `num_video_frames_per_chunk` (default `93`,
   `101` for WSM), `num_conditional_frames` (default `1`),
@@ -422,6 +443,156 @@ ffprobe -v error -show_entries stream=codec_type,nb_frames,width,height cosmos3_
   `generate_sound`/`sound_duration`, `guardrails`, `action_*`, ...) are declared
   once in `vllm_omni/model_extras/cosmos3.py` and forwarded through `--extra-body`;
   unknown keys for the model are dropped.
+
+## ROCm
+
+### 1x MI350X (Online serving)
+
+#### Environment
+
+- OS: Ubuntu 22.04+
+- Python: 3.12+
+- Driver / runtime: ROCm, HIP 7.2, **gfx942 or gfx950** (validated on gfx950 / MI350X,
+  which exposes 252 GiB of HBM to PyTorch)
+- PyTorch: 2.11.0 (ROCm build)
+- vLLM version: match the repository requirements from your current checkout
+- vLLM-Omni version or commit: use the commit you are deploying from
+
+No ROCm-specific patch or flag is needed: Cosmos3 runs on the stock code path.
+
+#### Command
+
+The NVIDIA command works unchanged. Guardrails need the gated
+`nvidia/Cosmos-1.0-Guardrail` repo, so the quick path is to disable them (you are
+then responsible for license compliance):
+
+```bash
+vllm serve nvidia/Cosmos3-Nano \
+  --omni \
+  --no-guardrails \
+  --host 0.0.0.0 --port 8000 \
+  --init-timeout 1800
+```
+
+For 720p video, add `--vae-use-tiling`: it cuts peak VRAM by ~68% for ~13%
+latency, which is the difference between needing a 120 GiB card and a 40 GiB one.
+`--quantization fp8` and `--enable-layerwise-offload` are also supported; see the
+Notes for the measured cost of each. For extra GPUs use `--ulysses-degree N` or
+`--tensor-parallel-size N` (not validated on ROCm yet).
+
+#### Verification
+
+Use the same `curl` requests as the CUDA section above. The ROCm images do not
+ship `ffprobe`, so the CUDA section's `ffprobe` line does not work here. `imageio`
+and `pyav` are already installed and report the same thing:
+
+```bash
+python -c "from PIL import Image; im=Image.open('cosmos3_t2i.png'); print(im.size, im.mode)"
+python -c "import imageio.v3 as iio; print(iio.improps('cosmos3_t2v.mp4', plugin='pyav').shape)"
+```
+
+Expect `(1024, 1024) RGB` and `(189, 720, 1280, 3)` for the requests above.
+Re-running the same request with the same seed reproduces a byte-identical mp4,
+so an md5 comparison across two runs also works as a smoke check.
+
+#### Notes
+
+- **Warm up once per output shape before timing anything.** The first generation
+  of a shape pays a one-time cost that is cached on disk and reused by later
+  processes in the same container: a ~250 s aiter attention-kernel JIT build plus
+  a ~390 s build of the VAE decode path *for that shape*, so warming 1024² images
+  does nothing for 189-frame video. At 720p / 189 frames / 35 steps this is
+  **540 s cold vs 161 s warm, with byte-identical output**.
+- **Measured on 1x MI350X (bf16, guardrails off, warm):** T2I 1024² @ 50 steps
+  **~2.7 s**; T2V 1280×720 / 189 frames @ 35 steps **~161 s**, of which ~92% is
+  the DiT denoise loop and ~4% VAE decode, so optimization effort belongs in the
+  denoise loop. The optional flags act on different terms of the memory bill and
+  are therefore complementary rather than redundant:
+
+  | Flag | Latency | Peak reserved | Peak allocated | Acts on |
+  |---|---|---|---|---|
+  | *(none)* | 161 s | 120 GiB | 95 GiB | — |
+  | `--vae-use-tiling` | 183 s (+13.5%) | **38 GiB** (−68%) | **36 GiB** (−62%) | decode activations |
+  | `--enable-layerwise-offload` | 162 s (+0.8%) | 84 GiB (−30%) | 69 GiB (−27%) | weights |
+  | `--quantization fp8` | 150 s (−6.6%) | 107 GiB (−11%) | 82 GiB (−14%) | weights (online, no calibration) |
+
+  Reserved is the caching-allocator high water mark and runs ~2–25 GiB above
+  allocated; allocated is the figure to compare against another platform.
+- **`--vae-use-tiling` is by far the biggest lever for video.** Of the 95 GiB
+  allocated by default only ~35 GiB is weights and fixed overhead; the remaining
+  **60 GiB is activations from decoding all 189 frames in one piece**, which is
+  why fp8 and offload cannot touch it and why tiling, which leaves under 5 GiB of
+  them, wins so much. `--vae-use-slicing` is a no-op for a single video request:
+  peak memory is bit-identical to the default.
+- **`--enable-layerwise-offload` is close to free on this part:** per-block DiT
+  compute is long enough to hide the weight transfer, so on a card this size it
+  buys headroom for concurrency or higher resolution rather than the
+  speed-for-memory trade it is on small cards.
+- **Attention backend:** the numbers above are aiter FlashAttention, not SDPA.
+  ROCm picks aiter when it is installed and the encoded device capability
+  satisfies `90 < major * 10 + minor < 100` (gfx942 and gfx950); otherwise it
+  falls back to `TORCH_SDPA` and says so only at debug level, which is easy to
+  miss. If you are reporting numbers, assert the choice instead of trusting the
+  default: `RocmOmniPlatform.get_diffusion_attn_backend_cls(None, 128)` returns
+  the resolved path.
+- **Determinism is per-configuration:** same seed and same flags reproduce a
+  byte-identical mp4 across processes, but different configurations do not match
+  each other — including offload, which nominally only relocates weights, so do
+  not use it as a bit-exact regression baseline. Quality was not evaluated for
+  any configuration.
+
+### 1x MI350X (Offline generation)
+
+#### Environment
+
+Same as the online serving section above.
+
+#### Command
+
+The standard task examples run unchanged:
+
+```bash
+# Text-to-image
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model nvidia/Cosmos3-Nano \
+  --prompt "A photorealistic red sports car at golden hour, cinematic lighting." \
+  --negative-prompt "blurry, distorted, low quality" \
+  --height 1024 --width 1024 --num-inference-steps 50 --guidance-scale 7.0 \
+  --extra-body '{"flow_shift": 3.0, "guardrails": false}' \
+  --output cosmos3_t2i.png
+
+# Text-to-video
+python examples/offline_inference/text_to_video/text_to_video.py \
+  --model nvidia/Cosmos3-Nano \
+  --prompt "A robot arm is cleaning a plate in the kitchen." \
+  --negative-prompt "blurry, distorted, low quality" \
+  --height 720 --width 1280 --num-frames 189 --fps 24 \
+  --num-inference-steps 35 --guidance-scale 6.0 --flow-shift 10.0 \
+  --extra-body '{"max_sequence_length": 4096, "guardrails": false,
+                 "use_resolution_template": false, "use_duration_template": false}' \
+  --output cosmos3_t2v.mp4
+```
+
+Both scripts print `Total generation time` and `Worker peak GPU memory
+(reserved)`, which is where the latency and reserved figures in the Notes above
+come from. Add `--vae-use-tiling`, `--quantization fp8` or
+`--enable-layerwise-offload` to reproduce the other rows. The allocated column
+needs `VLLM_LOGGING_LEVEL=DEBUG`, which enables a per-request line reporting
+reserved, allocated and pool overhead together.
+
+#### Verification
+
+Same as the online serving section above.
+
+#### Notes
+
+- Run each command twice and read the second run; the first pays the one-time
+  compilation described above. If you run in a container, keep the container
+  alive between runs (`docker run --rm` throws the JIT cache away and you pay
+  the ~250 s kernel build every time).
+- Latency and memory figures are identical to the online serving section — they
+  were taken from this path, because a single process has no client/server
+  timing ambiguity.
 
 ## NPU
 

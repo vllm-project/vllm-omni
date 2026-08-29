@@ -23,8 +23,9 @@ class StepAudio2Adapter(ARTTSAdapter):
     name = "step_audio2"
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
-        # Dispatcher routes to the step_audio2 case (non-empty input check).
-        return self.ctx.server._validate_tts_request(request)
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+        return None
 
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool

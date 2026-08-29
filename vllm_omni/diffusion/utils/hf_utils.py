@@ -7,6 +7,24 @@ from vllm.transformers_utils.config import get_hf_file_to_dict
 
 logger = init_logger(__name__)
 
+DIFFUSION_MODEL_INDEX_FILES = (
+    "model_index.json",
+    "modular_model_index.json",
+)
+
+
+def get_diffusion_model_index(
+    model_name: str,
+    *,
+    revision: str | None = None,
+) -> dict | None:
+    """Read the first standard Diffusers pipeline index available."""
+    for filename in DIFFUSION_MODEL_INDEX_FILES:
+        config = get_hf_file_to_dict(filename, model_name, revision=revision)
+        if isinstance(config, Mapping):
+            return dict(config)
+    return None
+
 
 def load_diffusers_config(model_name) -> dict:
     from diffusers.pipelines.pipeline_utils import DiffusionPipeline
@@ -53,38 +71,61 @@ def _looks_like_dreamzero(model_name: str) -> bool:
         return False
 
 
+HIDREAM_O1_SIGNATURE_WEIGHTS = (
+    "model.final_layer2.linear.weight",
+    "final_layer2.linear.weight",
+)
+
+
+def _looks_like_hidream_o1(model_name: str, config: Mapping | None = None) -> bool:
+    """Detect HiDream-O1 without matching regular Qwen3-VL checkpoints."""
+    try:
+        cfg = config if config is not None else get_hf_file_to_dict("config.json", model_name)
+        if not isinstance(cfg, Mapping) or cfg.get("model_type") != "qwen3_vl":
+            return False
+
+        index = get_hf_file_to_dict("model.safetensors.index.json", model_name)
+        if not isinstance(index, Mapping):
+            return False
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, Mapping):
+            return False
+        return any(key in weight_map for key in HIDREAM_O1_SIGNATURE_WEIGHTS)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
 @lru_cache
 def is_diffusion_model(model_name: str) -> bool:
     """Check if a model is a diffusion model.
 
     Uses multiple fallback strategies to detect diffusion models:
-    1. Check local file system for model_index.json (fastest, no imports)
+    1. Check the local file system for a standard Diffusers index
     2. Check using vllm's get_hf_file_to_dict utility
     3. Try the standard diffusers approach (may fail due to import issues)
     """
     # Strategy 1: Check local file system first (fastest, avoids import issues)
     if os.path.isdir(model_name):
-        model_index_path = os.path.join(model_name, "model_index.json")
-        if os.path.exists(model_index_path):
+        for filename in DIFFUSION_MODEL_INDEX_FILES:
+            model_index_path = os.path.join(model_name, filename)
+            if not os.path.exists(model_index_path):
+                continue
             try:
                 import json
 
                 with open(model_index_path) as f:
                     config_dict = json.load(f)
                 if config_dict.get("_class_name") and config_dict.get("_diffusers_version"):
-                    logger.debug("Detected diffusion model via local model_index.json")
+                    logger.debug("Detected diffusion model via local %s", filename)
                     return True
             except Exception as e:
-                logger.debug("Failed to read local model_index.json: %s", e)
+                logger.debug("Failed to read local %s: %s", filename, e)
 
     # Strategy 2: Check using vllm's utility (works for both local and remote models)
-    try:
-        config_dict = get_hf_file_to_dict("model_index.json", model_name)
-        if config_dict is not None and config_dict.get("_class_name") and config_dict.get("_diffusers_version"):
-            logger.debug("Detected diffusion model via model_index.json")
-            return True
-    except Exception as e:
-        logger.debug("Failed to check model_index.json via get_hf_file_to_dict: %s", e)
+    config_dict = get_diffusion_model_index(model_name)
+    if config_dict is not None and config_dict.get("_class_name") and config_dict.get("_diffusers_version"):
+        logger.debug("Detected diffusion model via a standard Diffusers index")
+        return True
 
     # Strategy 3: Try the standard diffusers approach (may fail due to import issues)
     # This is last because it requires importing diffusers/xformers/flash_attn
@@ -98,7 +139,4 @@ def is_diffusion_model(model_name: str) -> bool:
     except Exception as e:
         logger.debug("Failed to load diffusers config via DiffusionPipeline: %s", e)
 
-        # Bagel and DreamZero are not diffusers pipelines (no model_index.json),
-        # but are still diffusion-style models in vllm-omni. Detect them via
-        # config.json.
-    return _looks_like_bagel(model_name) or _looks_like_dreamzero(model_name)
+    return _looks_like_bagel(model_name) or _looks_like_dreamzero(model_name) or _looks_like_hidream_o1(model_name)

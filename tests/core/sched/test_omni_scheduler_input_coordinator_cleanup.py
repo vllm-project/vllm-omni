@@ -53,7 +53,11 @@ def test_finish_requests_cleans_input_coordinator_for_finished_ids(
     def fake_finish_requests(self, request_ids, finished_status):
         assert request_ids == ["req-a", "req-b"]
         assert finished_status == RequestStatus.FINISHED_STOPPED
-        return [("req-a", 0), ("req-b", 1)]
+        # vLLM 0.26 returns the finished Request objects, not (req_id, client_index) tuples.
+        return [
+            SimpleNamespace(request_id="req-a", client_index=0),
+            SimpleNamespace(request_id="req-b", client_index=1),
+        ]
 
     monkeypatch.setattr(scheduler_mod.VLLMScheduler, "finish_requests", fake_finish_requests)
 
@@ -63,7 +67,7 @@ def test_finish_requests_cleans_input_coordinator_for_finished_ids(
         RequestStatus.FINISHED_STOPPED,
     )
 
-    assert result == [("req-a", 0), ("req-b", 1)]
+    assert [(r.request_id, r.client_index) for r in result] == [("req-a", 0), ("req-b", 1)]
     assert coordinator.freed == ["req-a", "req-b"]
 
 
@@ -71,6 +75,7 @@ def test_ar_free_request_cleans_input_coordinator_on_normal_free() -> None:
     coordinator = FakeInputCoordinator()
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
     scheduler.input_coordinator = coordinator
+    scheduler.chunk_transfer_adapter = None
     scheduler._omits_kv_transfer_cache = {"req-free": True}
     scheduler.encoder_cache_manager = SimpleNamespace(free=lambda request: None)
     scheduler.finished_req_ids = set()
@@ -82,7 +87,7 @@ def test_ar_free_request_cleans_input_coordinator_on_normal_free() -> None:
 
     result = OmniARScheduler._free_request(scheduler, DummyRequest())
 
-    assert result is None
+    assert result == (None, None)
     assert coordinator.freed == ["req-free"]
     assert scheduler._omits_kv_transfer_cache == {}
     assert scheduler._new_prompt_len_snapshot == {}

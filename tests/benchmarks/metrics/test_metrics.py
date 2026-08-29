@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Unit tests for metrics.py
 """
+
+import math
 
 import pytest
 from vllm.benchmarks.serve import TaskType
@@ -66,6 +68,22 @@ def _make_output(prompt_len: int, output_tokens: int = 10) -> MixRequestFuncOutp
     return output
 
 
+def _calculate_test_metrics(outputs, goodput=None):
+    return calculate_metrics(
+        input_requests=[],
+        outputs=outputs,
+        dur_s=1.0,
+        tokenizer=None,
+        selected_percentiles=[50.0],
+        goodput_config_dict=goodput or {},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=[],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=1.0,
+    )[0]
+
+
 # ============================================================================
 # total_input Tests
 # ============================================================================
@@ -124,6 +142,166 @@ def test_audio_continuity_aggregation():
     # p99 of [0.5, 0.02, 0.0] is dominated by the 0.5 outlier.
     p99 = dict(metrics.percentiles_audio_underrun_s).get(99.0)
     assert p99 is not None and p99 > 0.4
+
+
+def test_unmeasured_duplex_latency_does_not_add_zero_samples():
+    measured = _make_output(100, output_tokens=2)
+    measured.ttft = 0.1
+    measured.audio_ttfp = 0.2
+    measured.audio_rtf = 0.5
+    measured.duplex_session_metrics = {
+        "mean_ttft_ms": 100.0,
+        "mean_ttfp_ms": 200.0,
+        "mean_rtf": 0.5,
+    }
+    listen_only = _make_output(100, output_tokens=0)
+    listen_only.ttft = listen_only.audio_ttfp = listen_only.audio_rtf = 0.0
+    listen_only.duplex_session_metrics = {
+        "mean_ttft_ms": None,
+        "mean_ttfp_ms": None,
+        "mean_rtf": None,
+    }
+
+    metrics = _calculate_test_metrics([measured, listen_only], {"ttft": 150.0})
+
+    assert metrics.mean_ttft_ms == 100.0
+    assert metrics.mean_audio_ttfp_ms == 200.0
+    assert metrics.mean_audio_rtf == 0.5
+    assert (metrics.num_ttft_samples, metrics.num_audio_ttfp_samples, metrics.num_audio_rtf_samples) == (1, 1, 1)
+    assert metrics.request_goodput == 1.0
+
+
+def test_all_unmeasured_duplex_latency_is_not_reported_as_zero():
+    listen_only = _make_output(100, output_tokens=0)
+    listen_only.duplex_session_metrics = {
+        "mean_ttft_ms": None,
+        "mean_ttfp_ms": None,
+        "mean_rtf": None,
+    }
+
+    metrics = _calculate_test_metrics(
+        [listen_only],
+        {"ttft": float("inf"), "audio_ttft": float("inf")},
+    )
+
+    assert (metrics.num_ttft_samples, metrics.num_audio_ttfp_samples, metrics.num_audio_rtf_samples) == (0, 0, 0)
+    assert math.isnan(metrics.mean_ttft_ms)
+    assert math.isnan(metrics.mean_audio_ttfp_ms)
+    assert math.isnan(metrics.mean_audio_rtf)
+    assert metrics.request_goodput == 0.0
+
+
+def test_unmeasured_duplex_tpot_does_not_add_zero_or_misalign_goodput():
+    missing_tpot = _make_output(100, output_tokens=5)
+    missing_tpot.itl = []
+    missing_tpot.text_latency = missing_tpot.ttft = 0.1
+    missing_tpot.tpot_measured = False
+    missing_tpot.duplex_session_metrics = {"mean_ttft_ms": 100.0}
+
+    slow_ttft = _make_output(100, output_tokens=5)
+    slow_ttft.ttft = 1.0
+    slow_ttft.text_latency = 1.4
+    slow_ttft.itl = [0.1] * 4
+    slow_ttft.duplex_session_metrics = {"mean_ttft_ms": 1000.0}
+
+    metrics = _calculate_test_metrics(
+        [missing_tpot, slow_ttft],
+        {"ttft": 500.0, "tpot": 200.0},
+    )
+
+    assert metrics.num_tpot_samples == 1
+    assert metrics.mean_tpot_ms == pytest.approx(100.0)
+    assert metrics.request_goodput == 0.0
+
+
+def test_all_unmeasured_duplex_token_timing_is_not_reported_as_zero():
+    output = _make_output(100, output_tokens=5)
+    output.itl = []
+    output.text_latency = output.ttft
+    output.tpot_measured = False
+    output.duplex_session_metrics = {"mean_ttft_ms": 100.0}
+
+    metrics = _calculate_test_metrics([output], {"tpot": float("inf")})
+
+    assert (metrics.num_tpot_samples, metrics.num_itl_samples) == (0, 0)
+    assert math.isnan(metrics.mean_tpot_ms)
+    assert math.isnan(metrics.mean_itl_ms)
+    assert metrics.request_goodput == 0.0
+
+
+def test_duplex_response_timings_do_not_build_a_session_token_timeline():
+    output = _make_output(100, output_tokens=5)
+    output.latency = 101.0
+    output.duplex_request_metrics = [
+        {"response_id": "r1", "stage0_tokens": {"itls_ms": [100.0, 100.0]}},
+        {"response_id": "r2", "stage0_tokens": {"itls_ms": [100.0, 100.0]}},
+    ]
+    output.duplex_session_metrics = {"mean_ttft_ms": 100.0}
+
+    metrics = _calculate_test_metrics([output])
+
+    assert math.isnan(metrics.max_output_tokens_per_s)
+    assert metrics.max_concurrent_requests == 1
+    assert metrics.mean_tpot_ms == pytest.approx(100.0)
+    assert metrics.mean_itl_ms == pytest.approx(100.0)
+
+
+def test_unmeasured_tpot_stays_missing_after_tokenizer_fallback():
+    output = _make_output(100, output_tokens=0)
+    output.generated_text = "timing metadata missing"
+    output.itl = []
+    output.text_latency = output.ttft
+    output.tpot_measured = False
+    output.duplex_session_metrics = {"mean_ttft_ms": 100.0}
+
+    def tokenizer(text, *, add_special_tokens):
+        assert text == output.generated_text
+        assert add_special_tokens is False
+        return type("Tokenized", (), {"input_ids": [1, 2, 3]})()
+
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[output],
+        dur_s=1.0,
+        tokenizer=tokenizer,
+        selected_percentiles=[50.0],
+        goodput_config_dict={"tpot": float("inf")},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=[],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=1.0,
+    )
+
+    assert metrics.total_output == 3
+    assert metrics.num_tpot_samples == 0
+    assert math.isnan(metrics.mean_tpot_ms)
+    assert metrics.request_goodput == 0.0
+
+
+def test_measured_zero_itl_is_not_treated_as_missing():
+    output = _make_output(100, output_tokens=3)
+    output.itl = [0.0, 0.0]
+    output.duplex_session_metrics = {"mean_ttft_ms": 100.0}
+
+    metrics = _calculate_test_metrics([output], {"tpot": 1.0})
+
+    assert (metrics.num_tpot_samples, metrics.num_itl_samples) == (1, 2)
+    assert metrics.mean_tpot_ms == 0.0
+    assert metrics.mean_itl_ms == 0.0
+    assert metrics.request_goodput == 1.0
+
+
+def test_duplex_goodput_does_not_pair_measurements_from_different_requests():
+    text_only, audio_only = _make_output(100), _make_output(100)
+    text_only.ttft, text_only.audio_ttfp = 0.1, 0.0
+    text_only.duplex_session_metrics = {"mean_ttft_ms": 100.0, "mean_ttfp_ms": None, "mean_rtf": None}
+    audio_only.ttft, audio_only.audio_ttfp = 0.0, 0.2
+    audio_only.duplex_session_metrics = {"mean_ttft_ms": None, "mean_ttfp_ms": 200.0, "mean_rtf": None}
+
+    metrics = _calculate_test_metrics([text_only, audio_only], {"ttft": 500.0, "audio_ttft": 500.0})
+
+    assert metrics.request_goodput == 0.0
 
 
 # ============================================================================

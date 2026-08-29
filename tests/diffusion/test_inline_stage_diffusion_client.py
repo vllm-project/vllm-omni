@@ -52,11 +52,19 @@ def client(mock_engine):
         c.shutdown()
 
 
+def test_inline_client_implements_shared_prompt_hook_protocol(client):
+    assert client.prompt_transform_func is None
+    assert client.prompt_expand_func is None
+
+
 @pytest.mark.asyncio
 async def test_inline_dispatch_request_success(client, mock_engine):
-    # Setup mock engine step to return a successful result
     mock_result = OmniRequestOutput.from_diffusion(request_id="req-1", images=[MagicMock()])
-    mock_engine.step.return_value = [mock_result]
+
+    async def _step_streaming(_request):
+        yield [mock_result]
+
+    mock_engine.step_streaming = _step_streaming
 
     sampling_params = OmniDiffusionSamplingParams()
     await client.add_request_async("req-1", "A test prompt", sampling_params)
@@ -70,7 +78,32 @@ async def test_inline_dispatch_request_success(client, mock_engine):
 
     assert output is not None
     assert output.request_id == "req-1"
-    mock_engine.step.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_inline_requests_clone_shared_sampling_params(client, mock_engine):
+    requests = []
+
+    async def _step_streaming(request):
+        requests.append(request)
+        yield [OmniRequestOutput.from_diffusion(request_id=request.request_id, images=[MagicMock()])]
+
+    mock_engine.step_streaming = _step_streaming
+
+    shared = OmniDiffusionSamplingParams()
+    await client.add_request_async("req-1", "First prompt", shared)
+    await client.add_request_async("req-2", "Second prompt", shared)
+
+    for _ in range(10):
+        if len(requests) == 2:
+            break
+        await asyncio.sleep(0.01)
+
+    assert len(requests) == 2
+    assert requests[0].sampling_params is not requests[1].sampling_params
+    assert requests[0].sampling_params.guidance_scale_provided is False
+    assert requests[1].sampling_params.guidance_scale_provided is False
+    assert shared.guidance_scale is None
 
 
 @pytest.mark.asyncio
@@ -104,8 +137,11 @@ async def test_inline_dispatch_request_streaming_success(client, mock_engine):
 
 @pytest.mark.asyncio
 async def test_inline_dispatch_request_error(client, mock_engine):
-    # Setup mock engine step to raise an exception
-    mock_engine.step.side_effect = RuntimeError("Engine failure")
+    async def _step_streaming(_request):
+        raise RuntimeError("Engine failure")
+        yield  # pragma: no cover
+
+    mock_engine.step_streaming = _step_streaming
 
     sampling_params = OmniDiffusionSamplingParams()
     await client.add_request_async("req-err", "A test prompt", sampling_params)
@@ -129,6 +165,20 @@ def test_inline_shutdown(client, mock_engine):
     client.shutdown()
 
     assert client._shutting_down
+    mock_engine.close.assert_called_once()
+
+
+def test_inline_shutdown_runs_after_orchestrator_premark(client, mock_engine):
+    # The orchestrator pre-marks clients to suppress false worker-death errors
+    # before StagePool invokes the actual teardown.
+    client._shutting_down = True
+
+    client.shutdown()
+
+    mock_engine.close.assert_called_once()
+    assert client._shutdown_complete
+
+    client.shutdown()
     mock_engine.close.assert_called_once()
 
 

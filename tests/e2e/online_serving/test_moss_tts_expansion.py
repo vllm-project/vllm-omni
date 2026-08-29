@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E online tests for the full MOSS-TTS family via /v1/audio/speech.
 
@@ -88,7 +88,7 @@ tts_server_params = [
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_text_to_audio_001(omni_server, openai_client, ref_audio_data_url) -> None:
+def test_text_to_audio_001(omni_server, online_client, ref_audio_data_url) -> None:
     """
     Realtime voice_clone via /v1/audio/speech, non-streaming.
     Deploy Setting: moss_tts_realtime.yaml
@@ -110,12 +110,12 @@ def test_text_to_audio_001(omni_server, openai_client, ref_audio_data_url) -> No
         "min_audio_bytes": _MIN_AUDIO_BYTES,
     }
 
-    openai_client.send_audio_speech_request(request_config)
+    online_client.send_audio_speech_request(request_config)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_text_to_audio_002_streaming(omni_server, openai_client, ref_audio_data_url) -> None:
+def test_text_to_audio_002_streaming(omni_server, online_client, ref_audio_data_url) -> None:
     """
     Realtime voice_clone via /v1/audio/speech, streaming PCM.
     Deploy Setting: moss_tts_realtime.yaml
@@ -139,12 +139,12 @@ def test_text_to_audio_002_streaming(omni_server, openai_client, ref_audio_data_
         "min_hnr_db": -5.0,
     }
 
-    openai_client.send_audio_speech_request(request_config)
+    online_client.send_audio_speech_request(request_config)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_text_to_audio_003_chinese(omni_server, openai_client, ref_audio_data_url) -> None:
+def test_text_to_audio_003_chinese(omni_server, online_client, ref_audio_data_url) -> None:
     """
     Realtime voice_clone via /v1/audio/speech, Chinese input.
     Deploy Setting: moss_tts_realtime.yaml
@@ -164,4 +164,4 @@ def test_text_to_audio_003_chinese(omni_server, openai_client, ref_audio_data_ur
         "min_audio_bytes": _MIN_AUDIO_BYTES,
     }
 
-    openai_client.send_audio_speech_request(request_config)
+    online_client.send_audio_speech_request(request_config)

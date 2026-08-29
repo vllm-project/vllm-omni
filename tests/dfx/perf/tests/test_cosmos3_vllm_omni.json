@@ -48,9 +48,11 @@
           "guardrails": false
         },
         "baseline": {
-          "throughput_qps": 1.107,
-          "latency_mean": 0.8929,
-          "peak_memory_mb_mean": 80000.0
+          "H100": {
+            "throughput_qps": 1.1958,
+            "latency_mean": 0.843,
+            "peak_memory_mb_mean": 80000.0
+          }
         }
       }
     ]
@@ -115,9 +117,11 @@
           "use_duration_template": false
         },
         "baseline": {
-          "throughput_qps": 0.027,
-          "latency_mean": 36.6824,
-          "peak_memory_mb_mean": 30155.4
+          "H100": {
+            "throughput_qps": 0.0307,
+            "latency_mean": 32.7665,
+            "peak_memory_mb_mean": 28762.4762
+          }
         }
       }
     ]
@@ -181,9 +185,11 @@
           "guardrails": false
         },
         "baseline": {
-          "throughput_qps": 0.027,
-          "latency_mean": 36.968,
-          "peak_memory_mb_mean": 30443.6
+          "H100": {
+            "throughput_qps": 0.0305,
+            "latency_mean": 33.1009,
+            "peak_memory_mb_mean": 29441.1429
+          }
         }
       }
     ]
@@ -251,9 +257,11 @@
           "condition_video_keep": "first"
         },
         "baseline": {
-          "throughput_qps": 0.027,
-          "latency_mean": 37.2117,
-          "peak_memory_mb_mean": 30135.6
+          "H100": {
+            "throughput_qps": 0.0299,
+            "latency_mean": 33.925,
+            "peak_memory_mb_mean": 29443.1429
+          }
         }
       }
     ]

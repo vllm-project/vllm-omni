@@ -354,16 +354,10 @@ class _ProjectedTransformer(nn.Module):
     ) -> None:
         super().__init__()
         self.downsample_ratio: int = 1
-        # This is the LEGACY (v1) architecture — the v2 tokenizer lives in
-        # ``audio_tokenizer_v2.py``. v1 checkpoints carry no projection weights
-        # where the dimensions already match (encoder stages 3/5/7 in_proj,
-        # decoder stages 0/2/4 out_proj), so an unconditional Linear here adds
-        # 6 parameters the checkpoint cannot fill and load_weights() aborts
-        # with ``loaded=1600/1606 missing=6``. Keep Identity for equal dims.
         self.in_proj = nn.Linear(input_dimension, d_model, bias=False) if input_dimension != d_model else nn.Identity()
         self.transformer = _Transformer(d_model=d_model, **kwargs)
         self.out_proj = (
-            nn.Linear(d_model, output_dimension, bias=False) if d_model != output_dimension else nn.Identity()
+            nn.Linear(d_model, output_dimension, bias=False) if output_dimension != d_model else nn.Identity()
         )
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

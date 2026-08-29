@@ -1,47 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import gc
+from typing import Any
 
 import numpy as np
 import pytest
 import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
-from tests.helpers import skip_if_gated_repo_inaccessible
-from tests.helpers.env import DeviceMemoryMonitor
 from tests.helpers.mark import hardware_test
+from tests.helpers.monitor import DeviceMemoryMonitor
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
-AUDIO_MODEL = {
+AUDIO_MODEL: dict[str, dict[str, int | None]] = {
     "stabilityai/stable-audio-open-1.0": {"cuda": 100, "rocm": None},
 }
 
-IMAGE_VIDEO_MODELS = {
+IMAGE_MODELS: dict[str, dict[str, int | None]] = {
     "riverclouds/qwen_image_random": {"cuda": 2200, "rocm": 2100},
-    "Tongyi-MAI/Z-Image-Turbo": {"cuda": 2500, "rocm": 2100},
-    "OmniGen2/OmniGen2": {"cuda": 2500, "rocm": 2100},
 }
 
-MODELS = {**AUDIO_MODEL, **IMAGE_VIDEO_MODELS}
+MODELS: dict[str, dict[str, int | None]] = {**AUDIO_MODEL, **IMAGE_MODELS}
 
 MODEL_MARKS = {
     "riverclouds/qwen_image_random": pytest.mark.core_model,
-    "Tongyi-MAI/Z-Image-Turbo": pytest.mark.advanced_model,
     "stabilityai/stable-audio-open-1.0": pytest.mark.full_model,
-    "OmniGen2/OmniGen2": pytest.mark.full_model,
 }
 
 _GATED_MODELS = {"stabilityai/stable-audio-open-1.0"}
 
-# Aliased for backward compatibility (imported by test_diffusion_layerwise_offload.py).
-_skip_if_gated_repo_inaccessible = skip_if_gated_repo_inaccessible
 
-AUDIO_MODEL_PARAMS = {
+AUDIO_MODEL_PARAMS: dict[str, dict[str, Any]] = {
     "runner_params": {},
     "sampler_params": {},
 }
 
-IMAGE_VIDEO_MODELS_PARAMS = {
+IMAGE_MODEL_PARAMS: dict[str, dict[str, Any]] = {
     "runner_params": {},
     "sampler_params": {
         "height": 256,
@@ -50,7 +47,7 @@ IMAGE_VIDEO_MODELS_PARAMS = {
 }
 
 
-def inference(model_name: str, offload: bool = True):
+def inference(model_name: str, offload: bool = True) -> tuple[float, Any]:
     gc.collect()
     current_omni_platform.empty_cache()
     device_index = current_omni_platform.current_device()
@@ -60,7 +57,7 @@ def inference(model_name: str, offload: bool = True):
     if model_name in AUDIO_MODEL:
         params = AUDIO_MODEL_PARAMS
     else:
-        params = IMAGE_VIDEO_MODELS_PARAMS
+        params = IMAGE_MODEL_PARAMS
 
     with OmniRunner(
         model_name,
@@ -111,19 +108,12 @@ def check_audio_determinism(audio1, audio2, atol=1e-2):
     [pytest.param(name, marks=MODEL_MARKS[name]) for name in MODELS],
 )
 def test_cpu_offload_diffusion_model(model_name: str):
-    if model_name == "OmniGen2/OmniGen2":
-        pytest.skip("issue #4537")
-    if model_name in _GATED_MODELS:
-        _skip_if_gated_repo_inaccessible(model_name)
     try:
         offload_peak_memory, output_offload = inference(model_name, offload=True)
         cleanup_dist_env_and_memory()
         no_offload_peak_memory, output_no_offload = inference(model_name, offload=False)
     except ValueError as exc:
-        # omni_snapshot_download wraps GatedRepoError in a ValueError.
-        # If the pre-flight guard above did not catch it (e.g. partial
-        # HF_TOKEN where config.json is accessible but weight shards are
-        # blocked), skip instead of failing.
+        # omni_snapshot_download wraps GatedRepoError in a ValueError; skip instead of failing.
         if "Access to model" in str(exc) and "is restricted" in str(exc):
             pytest.skip(
                 f"Skipping: gated HF repo {model_name!r} inaccessible "
@@ -136,8 +126,8 @@ def test_cpu_offload_diffusion_model(model_name: str):
     print(f"No offload peak memory: {no_offload_peak_memory} MB")
 
     if model_name == "stabilityai/stable-audio-open-1.0":
-        audio_offload = output_offload[0].request_output.multimodal_output.get("audio")
-        audio_no_offload = output_no_offload[0].request_output.multimodal_output.get("audio")
+        audio_offload = output_offload[0].multimodal_output.get("audio")
+        audio_no_offload = output_no_offload[0].multimodal_output.get("audio")
         check_audio_determinism(audio_offload, audio_no_offload, atol=1e-2)
 
     # Set platform-specific VRAM saving thresholds to account
@@ -147,6 +137,7 @@ def test_cpu_offload_diffusion_model(model_name: str):
     threshold = MODELS[model_name][platform]
     if threshold is None:
         pytest.skip(f"Threshold not defined for {platform} on {model_name}")
+    assert threshold is not None
 
     assert offload_peak_memory + threshold < no_offload_peak_memory, (
         f"Offload peak memory {offload_peak_memory} MB should be less than "

@@ -28,6 +28,18 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
     --deploy-config /path/to/deploy_config_file
 ```
 
+To serve **thinker-only** (text output, no talker / code2wav loaded) with Instruct
+weights, pass the bundled thinker-only deploy YAML. The `pipeline:` key
+`qwen3_omni_moe_thinker_only` overrides the HF `enable_audio_output` resolver:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --deploy-config vllm_omni/deploy/qwen3_omni_moe_thinking.yaml
+```
+
+Captioner / Thinking checkpoints (`enable_audio_output=false`) still auto-select
+the same single-stage pipeline without `--deploy-config`.
+
 ### Launch individual stages (stage-based CLI)
 
 Adopt the stage-based CLI architecture to independently instantiate execution processes per functional stage.
@@ -271,7 +283,7 @@ The script supports the following arguments:
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
-If you have custom stage configs file:
+If you have a custom deploy config file:
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --deploy-config /path/to/deploy_config_file
 ```
@@ -306,7 +318,7 @@ The gradio script supports the following arguments:
     ``````
 ??? abstract "qwen3_omni_moe_thinking.yaml"
     ``````yaml
-    --8<-- "examples/online_serving/qwen3_omni/qwen3_omni_moe_thinking.yaml"
+    --8<-- "vllm_omni/deploy/qwen3_omni_moe_thinking.yaml"
     ``````
 ??? abstract "run_curl_multimodal_generation.sh"
     ``````sh

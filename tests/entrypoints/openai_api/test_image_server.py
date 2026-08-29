@@ -117,11 +117,23 @@ def test_encode_image_base64():
 class MockGenerationResult:
     """Mock result object compatible with current diffusion output shape."""
 
-    def __init__(self, images):
+    def __init__(self, images, stage_durations=None, peak_memory_mb=0.0):
         self.images = images
-        self.request_output = SimpleNamespace(images=images)
-        self.stage_durations = {}
-        self.peak_memory_mb = 0.0
+        self.stage_durations = {} if stage_durations is None else stage_durations
+        self.peak_memory_mb = peak_memory_mb
+
+
+def _stub_engine_generate_with_metrics(engine, *, stage_durations, peak_memory_mb):
+    """Stub engine.generate to return profiler metrics."""
+
+    async def generate(*args, **kwargs):
+        yield MockGenerationResult(
+            [Image.new("RGB", (16, 16), color="blue")],
+            stage_durations=stage_durations,
+            peak_memory_mb=peak_memory_mb,
+        )
+
+    engine.generate = generate
 
 
 class MockStageResult:
@@ -137,10 +149,7 @@ class MockStageResult:
             outputs = [SimpleNamespace(text=text, index=0)]
         else:
             outputs = []
-        self.request_output = SimpleNamespace(
-            outputs=outputs,
-            images=self.images,
-        )
+        self.outputs = outputs
         self.stage_durations = {}
         self.peak_memory_mb = 0.0
 
@@ -221,6 +230,17 @@ def test_client(mock_async_diffusion):
     )
 
     return TestClient(app)
+
+
+@pytest.fixture
+def lingbot_test_client(test_client):
+    test_client.app.state.stage_configs = [
+        SimpleNamespace(
+            stage_type="diffusion",
+            engine_args={"model_class_name": "LingBotVideoPipeline"},
+        )
+    ]
+    return test_client
 
 
 @pytest.fixture
@@ -965,6 +985,53 @@ def test_image_edits_streaming_rejects_single_stage_before_loading_url(test_clie
     assert "multi-stage" in response.json()["detail"]
 
 
+def test_generate_images_returns_metrics_single_stage(test_client):
+    """Single-stage /v1/images/generations copies getattr metrics onto the response."""
+    stage_durations = {"queue_wait_ms": 1.0, "stage_0_gen_ms": 2.0}
+    peak_memory_mb = 1024.0
+    _stub_engine_generate_with_metrics(
+        test_client.app.state.engine_client,
+        stage_durations=stage_durations,
+        peak_memory_mb=peak_memory_mb,
+    )
+
+    response = test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a cat", "n": 1, "size": "256x256"},
+    )
+    assert response.status_code == 200
+    assert response.json()["metrics"] == {
+        "stage_durations": stage_durations,
+        "peak_memory_mb": peak_memory_mb,
+    }
+
+
+def test_generate_images_returns_metrics_multistage(async_omni_test_client):
+    """Multi-stage /v1/images/generations unpacks generate_diffusion_images metrics."""
+    stage_durations = {
+        "queue_wait_ms": 1.0,
+        "preprocess_ms": 2.0,
+        "stage_0_gen_ms": 3.0,
+        "stage_1_gen_ms": 4.0,
+    }
+    peak_memory_mb = 2048.0
+    _stub_engine_generate_with_metrics(
+        async_omni_test_client.app.state.engine_client,
+        stage_durations=stage_durations,
+        peak_memory_mb=peak_memory_mb,
+    )
+
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a cat", "n": 1, "size": "256x256"},
+    )
+    assert response.status_code == 200
+    assert response.json()["metrics"] == {
+        "stage_durations": stage_durations,
+        "peak_memory_mb": peak_memory_mb,
+    }
+
+
 def test_generate_images_max_size_rejected(async_omni_test_client):
     """Test that a size exceeding max_generated_image_size returns 400."""
     response = async_omni_test_client.post(
@@ -1301,7 +1368,11 @@ def test_generate_images_rejects_model_mismatch(test_client):
     assert "model mismatch" in response.json()["detail"].lower()
 
 
-def test_image_file_response_format_multiple(test_client):
+@pytest.mark.parametrize(
+    ("output_format", "expected_pil_format"),
+    [("png", "PNG"), ("jpeg", "JPEG"), ("webp", "WEBP")],
+)
+def test_image_file_response_format_multiple(test_client, output_format, expected_pil_format):
     """Test response_format=file with n>1 returns ZIP archive"""
     response = test_client.post(
         "/v1/images/generations",
@@ -1309,6 +1380,7 @@ def test_image_file_response_format_multiple(test_client):
             "prompt": "a dog",
             "n": 3,
             "response_format": "file",
+            "output_format": output_format,
         },
     )
 
@@ -1317,23 +1389,32 @@ def test_image_file_response_format_multiple(test_client):
     assert "attachment" in response.headers.get("content-disposition", "")
     assert ".zip" in response.headers.get("content-disposition", "")
 
-    # Verify it's a valid ZIP with 3 PNG files
+    # Verify it's a valid ZIP with 3 correctly labelled image files
     import zipfile
 
     zip_buffer = io.BytesIO(response.content)
     with zipfile.ZipFile(zip_buffer, "r") as zf:
         files = zf.namelist()
         assert len(files) == 3
-        assert all(f.endswith(".png") for f in files)
+        assert all(f.endswith(f".{output_format}") for f in files)
 
-        # Verify each file is a valid PNG
+        # Verify each file's bytes match its advertised format
         for filename in files:
             img_bytes = zf.read(filename)
             img = Image.open(io.BytesIO(img_bytes))
-            assert img.format == "PNG"
+            assert img.format == expected_pil_format
 
 
-def test_image_file_response_format_single(test_client):
+@pytest.mark.parametrize(
+    ("output_format", "expected_media_type", "expected_pil_format"),
+    [
+        ("png", "image/png", "PNG"),
+        ("jpg", "image/jpeg", "JPEG"),
+        ("jpeg", "image/jpeg", "JPEG"),
+        ("webp", "image/webp", "WEBP"),
+    ],
+)
+def test_image_file_response_format_single(test_client, output_format, expected_media_type, expected_pil_format):
     """Test response_format=file with n=1 returns a single image file."""
     response = test_client.post(
         "/v1/images/generations",
@@ -1341,16 +1422,61 @@ def test_image_file_response_format_single(test_client):
             "prompt": "a dog",
             "n": 1,
             "response_format": "file",
+            "output_format": output_format,
         },
     )
 
     assert response.status_code == 200
-    assert response.headers["content-type"] == "image/png"
+    assert response.headers["content-type"] == expected_media_type
     assert "attachment" in response.headers.get("content-disposition", "")
-    assert ".png" in response.headers.get("content-disposition", "")
+    assert f".{output_format}" in response.headers.get("content-disposition", "")
 
     img = Image.open(io.BytesIO(response.content))
-    assert img.format == "PNG"
+    assert img.format == expected_pil_format
+
+
+@pytest.mark.parametrize(
+    ("output_format", "image_count", "expected_media_type", "expected_pil_format"),
+    [
+        ("jpeg", 1, "image/jpeg", "JPEG"),
+        ("webp", 2, "application/zip", "WEBP"),
+    ],
+)
+def test_multistage_image_file_response_uses_requested_format(
+    async_omni_test_client,
+    output_format,
+    image_count,
+    expected_media_type,
+    expected_pil_format,
+):
+    engine = async_omni_test_client.app.state.engine_client
+    engine._images = [Image.new("RGB", (16, 16), color="green") for _ in range(image_count)]
+
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a dog",
+            "n": image_count,
+            "response_format": "file",
+            "output_format": output_format,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == expected_media_type
+    if image_count == 1:
+        assert f".{output_format}" in response.headers["content-disposition"]
+        assert Image.open(io.BytesIO(response.content)).format == expected_pil_format
+        return
+
+    import zipfile
+
+    with zipfile.ZipFile(io.BytesIO(response.content), "r") as archive:
+        filenames = archive.namelist()
+        assert len(filenames) == image_count
+        assert all(filename.endswith(f".{output_format}") for filename in filenames)
+        for filename in filenames:
+            assert Image.open(io.BytesIO(archive.read(filename))).format == expected_pil_format
 
 
 def make_test_image_bytes(size=(64, 64)) -> bytes:
@@ -1562,6 +1688,7 @@ def test_image_edit_parameter_pass(async_omni_test_client):
             "output_format": "jpeg",
             "num_inference_steps": 20,
             "guidance_scale": 8.0,
+            "guidance_scale_2": 2.0,
             "seed": 1234,
             "negative_prompt": "negative",
             "n": 2,
@@ -1576,6 +1703,7 @@ def test_image_edit_parameter_pass(async_omni_test_client):
     assert captured_prompt["negative_prompt"] == "negative"
     assert captured_sampling_params.num_inference_steps == 20
     assert captured_sampling_params.guidance_scale == 8.0
+    assert captured_sampling_params.guidance_scale_2 == 2.0
     assert captured_sampling_params.seed == 1234
     assert captured_sampling_params.num_outputs_per_prompt == 2
     assert captured_sampling_params.width == 16
@@ -1919,6 +2047,56 @@ def test_image_edit_with_seed_zero(async_omni_test_client):
     )
 
 
+def test_image_edits_returns_metrics_single_stage(test_client):
+    """Single-stage /v1/images/edits copies getattr metrics onto the response."""
+    stage_durations = {"queue_wait_ms": 1.0, "stage_0_gen_ms": 2.0}
+    peak_memory_mb = 1024.0
+    _stub_engine_generate_with_metrics(
+        test_client.app.state.engine_client,
+        stage_durations=stage_durations,
+        peak_memory_mb=peak_memory_mb,
+    )
+
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes((16, 16)))],
+        data={"prompt": "edit me"},
+    )
+    assert response.status_code == 200
+    assert response.json()["metrics"] == {
+        "stage_durations": stage_durations,
+        "peak_memory_mb": peak_memory_mb,
+    }
+
+
+def test_image_edits_returns_metrics_multistage(async_omni_test_client):
+    """Multi-stage /v1/images/edits unpacks generate_diffusion_images metrics."""
+    stage_durations = {
+        "queue_wait_ms": 1.0,
+        "preprocess_ms": 2.0,
+        "ar2diffusion_ms": 3.0,
+        "stage_0_gen_ms": 4.0,
+        "stage_1_gen_ms": 5.0,
+    }
+    peak_memory_mb = 2048.0
+    _stub_engine_generate_with_metrics(
+        async_omni_test_client.app.state.engine_client,
+        stage_durations=stage_durations,
+        peak_memory_mb=peak_memory_mb,
+    )
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes((16, 16)))],
+        data={"prompt": "edit me"},
+    )
+    assert response.status_code == 200
+    assert response.json()["metrics"] == {
+        "stage_durations": stage_durations,
+        "peak_memory_mb": peak_memory_mb,
+    }
+
+
 def test_image_edit_with_seed_zero_single_stage(test_client):
     """Test that seed=0 is correctly handled in image editing (single stage).
 
@@ -2008,22 +2186,20 @@ def test_extract_images_from_result():
     assert all(isinstance(img, Image.Image) for img in images)
     assert all(img.size == (64, 64) for img in images)
 
-    # Test dict path: result.request_output["images"]
+    # Test result with "images" attribute set in __init__
     class DictRequestOutput:
         def __init__(self):
-            self.request_output = {"images": [np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)]}
+            self.images = [np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)]
 
     result = DictRequestOutput()
     images = _extract_images_from_result(result)
     assert len(images) == 1
     assert isinstance(images[0], Image.Image)
 
-    # Test attribute path: result.request_output.images
+    # Test result with "images" attribute from an inner object
     class AttrRequestOutput:
         def __init__(self):
-            self.request_output = type(
-                "obj", (), {"images": [np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)]}
-            )()
+            self.images = [np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)]
 
     result = AttrRequestOutput()
     images = _extract_images_from_result(result)

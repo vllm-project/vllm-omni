@@ -7,14 +7,17 @@ import copy
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import cached_property
 from http import HTTPStatus
-from typing import Any, cast
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import HTTPException
 from PIL import Image
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoAction,
@@ -26,9 +29,13 @@ from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
 )
-from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
-from vllm_omni.entrypoints.openai.video_api_utils import _encode_video_bytes, encode_video_base64
+from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline, parse_lora_request
+from vllm_omni.entrypoints.openai.video_api_utils import (
+    _encode_video_bytes,
+    encode_video_base64,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.model_extras import should_preserve_reference_image_size
 from vllm_omni.outputs.output_metadata import (
     DiffusionMetadataMapping,
     DiffusionMultimodalOutput,
@@ -37,26 +44,31 @@ from vllm_omni.outputs.output_metadata import (
 
 logger = init_logger(__name__)
 
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
 
 @dataclass
 class ReferenceImage:
     """Reference class for tracking additional metadata if needed"""
 
-    data: Image.Image
+    data: Image.Image | list[Image.Image]
 
 
 @dataclass
 class ReferenceVideo:
     """Reference video frames for video-conditioned generation."""
 
-    data: list[Image.Image]
+    data: list[Image.Image] | list[str]
+    cleanup_paths: tuple[str, ...] = ()
 
 
 @dataclass
 class ReferenceAudio:
     """Reference audio file path for speech-to-video generation."""
 
-    path: str
+    path: str | list[str]
+    cleanup_paths: tuple[str, ...] = ()
 
 
 @dataclass
@@ -85,6 +97,12 @@ class OmniOpenAIServingVideo:
         self._model_name = model_name
         self._stage_configs = stage_configs
 
+    def _resolve_diffusion_od_config(self) -> OmniDiffusionConfig | SimpleNamespace | None:
+        get_od_config = getattr(self._engine_client, "get_diffusion_od_config", None)
+        if callable(get_od_config):
+            return get_od_config()
+        return getattr(self._engine_client, "od_config", None)
+
     @property
     def model_name(self) -> str | None:
         return self._model_name
@@ -96,6 +114,48 @@ class OmniOpenAIServingVideo:
     def set_stage_configs_if_missing(self, stage_configs: list[Any] | None) -> None:
         if self._stage_configs is None and stage_configs is not None:
             self._stage_configs = stage_configs
+
+    @cached_property
+    def preserves_reference_image_size(self) -> bool:
+        """Return whether the active pipeline owns reference-image resizing."""
+        od_config = self._resolve_diffusion_od_config()
+        model_class_name = None if od_config is None else getattr(od_config, "model_class_name", None)
+        model = getattr(od_config, "model", None) if od_config is not None else None
+        model = model or self.model_name
+        revision = getattr(od_config, "revision", None) if od_config is not None else None
+        return should_preserve_reference_image_size(
+            model_class_name,
+            model=None if model is None else str(model),
+            revision=revision,
+        )
+
+    @property
+    def supports_mixed_reference_inputs(self) -> bool:
+        """Return whether the configured diffusion model accepts mixed refs."""
+        od_config = self._resolve_diffusion_od_config()
+        if od_config is None:
+            return False
+
+        capability = getattr(od_config, "supports_mixed_reference_inputs", None)
+        model_class_name = getattr(od_config, "model_class_name", None)
+        model_archs = [model_class_name]
+        for stage_config in self.stage_configs or ():
+            stage_get = (
+                stage_config.get if isinstance(stage_config, Mapping) else lambda key: getattr(stage_config, key, None)
+            )
+            engine_args = stage_get("engine_args") or {}
+            model_archs.extend(
+                (
+                    stage_get("model_arch"),
+                    engine_args.get("model_class_name")
+                    if isinstance(engine_args, Mapping)
+                    else getattr(engine_args, "model_class_name", None),
+                )
+            )
+        metadata_capability = any(
+            get_diffusion_model_metadata(model_arch).supports_mixed_reference_inputs for model_arch in model_archs
+        )
+        return capability is True or metadata_capability
 
     @classmethod
     def for_diffusion(
@@ -128,22 +188,31 @@ class OmniOpenAIServingVideo:
 
         input_image = None if reference_image is None else reference_image.data
         input_video = None if reference_video is None else reference_video.data
-        if input_image is not None and input_video is not None:
+        if input_image is not None and input_video is not None and not self.supports_mixed_reference_inputs:
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
-                detail="Provide either an image reference or a video reference, not both.",
+                detail="This diffusion model does not support mixed image and video references.",
             )
         provided_fields = request.model_fields_set
         fps_provided = self._request_fps_provided(request)
         vp = request.resolve_video_params()
-        if input_image is not None and vp.width is not None and vp.height is not None:
+        if (
+            input_image is not None
+            and vp.width is not None
+            and vp.height is not None
+            and not self.preserves_reference_image_size
+        ):
             target_size = (vp.width, vp.height)
-            if input_image.size != target_size:
-                input_image = input_image.resize(target_size, Image.Resampling.LANCZOS)
+            image_items = input_image if isinstance(input_image, list) else [input_image]
+            resized_images = [
+                image.resize(target_size, Image.Resampling.LANCZOS) if image.size != target_size else image
+                for image in image_items
+            ]
+            input_image = resized_images if isinstance(input_image, list) else resized_images[0]
         multi_modal_data: dict[str, Any] = {}
         if input_image is not None:
             multi_modal_data["image"] = input_image
-        elif input_video is not None:
+        if input_video is not None:
             multi_modal_data["video"] = input_video
         if reference_audio is not None:
             multi_modal_data["audio"] = reference_audio.path
@@ -154,6 +223,15 @@ class OmniOpenAIServingVideo:
             gen_params.height = vp.height
         if vp.num_frames is not None:
             gen_params.num_frames = vp.num_frames
+        gen_params.num_outputs_per_prompt = request.num_outputs_per_prompt
+        if request.seconds is not None:
+            gen_params.extra_args.setdefault("duration", float(request.seconds))
+        if request.aspect_ratio is not None:
+            gen_params.extra_args["aspect_ratio"] = request.aspect_ratio
+        if request.short_edge is not None:
+            gen_params.extra_args["short_edge"] = request.short_edge
+        if request.start_time_seconds is not None:
+            gen_params.extra_args["start_time_seconds"] = request.start_time_seconds
         # Leave fps/frame_rate as None when the user did not provide fps.
         if fps_provided and vp.fps is not None:
             gen_params.fps = vp.fps
@@ -169,6 +247,8 @@ class OmniOpenAIServingVideo:
 
         if "num_inference_steps" in provided_fields and request.num_inference_steps is not None:
             gen_params.num_inference_steps = request.num_inference_steps
+        if "quality" in provided_fields:
+            gen_params.quality = request.quality
         if "guidance_scale" in provided_fields and request.guidance_scale is not None:
             gen_params.guidance_scale = request.guidance_scale
         if "guidance_scale_2" in provided_fields and request.guidance_scale_2 is not None:
@@ -277,7 +357,11 @@ class OmniOpenAIServingVideo:
         video_data = [
             VideoData(
                 b64_json=(
-                    encode_video_base64(video, fps=artifacts.output_fps, video_codec_options=video_codec_options)
+                    encode_video_base64(
+                        video,
+                        fps=artifacts.output_fps,
+                        video_codec_options=video_codec_options,
+                    )
                     if artifacts.audios[idx] is None
                     else encode_video_base64(
                         video,
@@ -408,14 +492,13 @@ class OmniOpenAIServingVideo:
                 detail="Stage configs not found. Start server with an omni diffusion model.",
             )
 
-        # Video generation endpoint only supports diffusion stages.
-        for stage in stage_configs:
-            stage_type = get_stage_type(stage)
-            if stage_type != "diffusion":
-                raise HTTPException(
-                    status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-                    detail=f"Video generation only supports diffusion stages, found '{stage_type}' stage.",
-                )
+        # Video pipelines may use preparatory AR stages (for example, a
+        # vLLM-hosted text encoder) before the diffusion stage.
+        if not is_video_generation_pipeline(stage_configs):
+            raise HTTPException(
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                detail="No final video output stage found in video generation pipeline.",
+            )
 
         # Common generation logic for both paths
         engine_client = cast(AsyncOmni, self._engine_client)
@@ -472,16 +555,6 @@ class OmniOpenAIServingVideo:
         videos = None
         if hasattr(result, "images") and result.images:
             videos = result.images
-        elif hasattr(result, "request_output"):
-            request_output = result.request_output
-            if isinstance(request_output, dict) and request_output.get("images"):
-                videos = request_output["images"]
-            elif hasattr(request_output, "images") and request_output.images:
-                videos = request_output.images
-            else:
-                request_multimodal_output = getattr(request_output, "multimodal_output", None)
-                if isinstance(request_multimodal_output, Mapping):
-                    videos = request_multimodal_output.get("video")
         if videos is None:
             multimodal_output = getattr(result, "multimodal_output", None)
             if isinstance(multimodal_output, Mapping):
@@ -501,16 +574,6 @@ class OmniOpenAIServingVideo:
         multimodal_output = getattr(result, "multimodal_output", None)
         if isinstance(multimodal_output, Mapping):
             audio = multimodal_output.get("audio")
-        elif hasattr(result, "request_output"):
-            request_output = result.request_output
-            if isinstance(request_output, dict) and request_output.get("multimodal_output"):
-                mm_output = request_output.get("multimodal_output") or {}
-                if isinstance(mm_output, Mapping):
-                    audio = mm_output.get("audio")
-            else:
-                request_multimodal_output = getattr(request_output, "multimodal_output", None)
-                if isinstance(request_multimodal_output, Mapping):
-                    audio = request_multimodal_output.get("audio")
 
         if audio is None:
             return [None] * expected_count
@@ -566,7 +629,7 @@ class OmniOpenAIServingVideo:
         if isinstance(multimodal_output, Mapping):
             return dict(multimodal_output)
 
-        request_output = getattr(result, "request_output", None)
+        request_output = result
         if isinstance(request_output, dict):
             multimodal_output = request_output.get("multimodal_output")
             if multimodal_output is None:
@@ -683,7 +746,7 @@ class OmniOpenAIServingVideo:
                 except (TypeError, ValueError):
                     pass
 
-        request_output = getattr(result, "request_output", None)
+        request_output = result
         if isinstance(request_output, dict):
             mm = request_output.get("multimodal_output") or {}
             if isinstance(mm, Mapping):
@@ -722,7 +785,7 @@ class OmniOpenAIServingVideo:
             if sample_rate is not None:
                 return sample_rate
 
-        request_output = getattr(result, "request_output", None)
+        request_output = result
         if isinstance(request_output, dict):
             multimodal_output = request_output.get("multimodal_output") or {}
             if isinstance(multimodal_output, Mapping):

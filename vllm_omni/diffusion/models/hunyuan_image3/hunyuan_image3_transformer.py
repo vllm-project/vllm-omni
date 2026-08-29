@@ -60,8 +60,9 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
+    get_allgather_parallel_world_size,
     get_cfg_group,
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
@@ -75,10 +76,19 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
-from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe import HunyuanFusedMoE
+
+# ResBlock is platform-dispatched in the layers package __init__: CUDA gets
+# fused GroupNorm+SiLU and AdaGN kernels, every other backend gets the plain
+# PyTorch block. UNetDown and UNetUp below instantiate whichever one this
+# resolves to.
+from vllm_omni.diffusion.models.hunyuan_image3.layers import ResBlock
+from vllm_omni.diffusion.models.hunyuan_image3.layers.common import conv_nd, normalization
+from vllm_omni.diffusion.utils.kv_utils import repeat_kv
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
+from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 
@@ -166,44 +176,6 @@ def real_batched_index_select(t, dim, idx):
     assert t.ndim >= 2 and idx.ndim >= 2, f"{t.ndim=} {idx.ndim=}"
     assert len(t) == len(idx), f"{len(t)=} != {len(idx)=}"
     return torch.stack([torch.index_select(t[i], dim - 1, idx[i]) for i in range(len(t))])
-
-
-def conv_nd(dims, *args, **kwargs):  # noqa: N802
-    """
-    Create a 1D, 2D, or 3D convolution module.
-    """
-    if dims == 1:
-        return nn.Conv1d(*args, **kwargs)
-    elif dims == 2:
-        return nn.Conv2d(*args, **kwargs)
-    elif dims == 3:
-        return nn.Conv3d(*args, **kwargs)
-    raise ValueError(f"unsupported dimensions: {dims}")
-
-
-def normalization(channels, **kwargs):
-    """
-    Make a standard normalization layer.
-    :param channels: number of input channels.
-    :return: a nn.Module for normalization.
-    """
-    return nn.GroupNorm(32, channels, **kwargs)
-
-
-def linear(*args, **kwargs):
-    """
-    Create a linear module.
-    """
-    return nn.Linear(*args, **kwargs)
-
-
-def zero_module(module):
-    """
-    Zero out the parameters of a module and return it.
-    """
-    for p in module.parameters():
-        p.detach().zero_()
-    return module
 
 
 def _to_tuple(x, dim=2):
@@ -424,22 +396,6 @@ def apply_rotary_pos_emb(
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    Equivalent to torch.repeat_interleave(x, dim=2, repeats=n_rep).
-    Input:  (batch, seqlen, num_key_value_heads, head_dim)
-    Output: (batch, seqlen, num_attention_heads, head_dim)
-    """
-    batch, slen, num_key_value_heads, head_dim = hidden_states.shape
-
-    if n_rep == 1:
-        return hidden_states
-
-    hidden_states = hidden_states[:, :, :, None, :].expand(batch, slen, num_key_value_heads, n_rep, head_dim)
-
-    return hidden_states.reshape(batch, slen, num_key_value_heads * n_rep, head_dim)
 
 
 def default(value, default_value):
@@ -926,7 +882,7 @@ class HunYuanRotary2DEmbedder:
         return q, k
 
 
-class ImageKVCacheManager:
+class ImageKVCacheManager(nn.Module):
     """
     Manages specialized caching and updating of KV-Cache for image tokens in multimodal models.
     """
@@ -945,6 +901,7 @@ class ImageKVCacheManager:
             image_token_len: Number of tokens per image (including special placeholders),
             default 4097 (timestamp + 4096 image tokens).
         """
+        super().__init__()
         # attention related
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -957,6 +914,7 @@ class ImageKVCacheManager:
         self._injected_ar_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
 
         self.sp_size = get_sequence_parallel_world_size()
+        self.allgather_size = get_allgather_parallel_world_size()
         self.sp_rank = get_sequence_parallel_rank()
         self.attn = Attention(
             num_heads=self.num_heads,
@@ -965,6 +923,10 @@ class ImageKVCacheManager:
             softmax_scale=self.scaling,
             num_kv_heads=self.num_kv_heads,
             prefix=f"{prefix}.attn" if prefix else "",
+            paged_kv_cache_role="primary",
+            # Hunyuan image RoPE produces bfloat16 K and denoising runs under
+            # bfloat16 autocast, independent of the weight-loading dtype.
+            paged_kv_cache_dtype=torch.bfloat16,
         )
 
     @staticmethod
@@ -1107,7 +1069,7 @@ class ImageKVCacheManager:
         )
         return key, value
 
-    def __call__(
+    def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -1130,6 +1092,7 @@ class ImageKVCacheManager:
         head_num_per_rank = query.shape[1]
         kv_head_num_per_rank = key.shape[1]
         repeat_num = head_num_per_rank // kv_head_num_per_rank
+        keep_kv_compressed = self.allgather_size > 1
         head_dim = query.shape[2]
 
         query = query.reshape(bs, q_len, head_num_per_rank, head_dim)
@@ -1171,11 +1134,12 @@ class ImageKVCacheManager:
                 joint_text_query = query[:, :0, :, :]
                 joint_text_key, joint_text_value = self._reuse_prompt_kv(key, value, seq_len, bs, shard_image_size)
 
-        key = repeat_kv(key, repeat_num)
-        value = repeat_kv(value, repeat_num)
-        if self.sp_size > 1:
-            joint_text_key = repeat_kv(joint_text_key, repeat_num)
-            joint_text_value = repeat_kv(joint_text_value, repeat_num)
+        if not keep_kv_compressed and not self.attn.is_paged_kv_active():
+            key = repeat_kv(key, repeat_num)
+            value = repeat_kv(value, repeat_num)
+            if self.sp_size > 1:
+                joint_text_key = repeat_kv(joint_text_key, repeat_num)
+                joint_text_value = repeat_kv(joint_text_value, repeat_num)
 
         attention_mask = attention_mask.contiguous()
 
@@ -1631,7 +1595,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             self.shared_mlp = None
 
         enable_expert_parallel = get_current_vllm_config().parallel_config.enable_expert_parallel
-        self.experts = HunyuanFusedMoE(
+        self.experts = FusedMoE(
             shared_experts=self.shared_mlp,
             num_experts=self.n_routed_experts,
             top_k=top_k,
@@ -2111,7 +2075,7 @@ class HunyuanImage3Model(nn.Module):
         if _is_moe(self.config):
             # Params for weights, fp8 weight scales, fp8 activation scales
             # (param_name, weight_name, expert_id, shard_id)
-            fused_moe_expert_mapping = HunyuanFusedMoE.make_expert_params_mapping(
+            fused_moe_expert_mapping = FusedMoE.make_expert_params_mapping(
                 self,
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
@@ -2392,6 +2356,8 @@ class HunyuanImage3Model(nn.Module):
         ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
     ) -> tuple | BaseModelOutputWithPast:
+        current_omni_platform.reset_diffusion_fused_moe_forward_context()
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -3241,8 +3207,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             assert image.shape[2] == 1, "image should have shape [B, C, T, H, W] and T should be 1"
             image = image.squeeze(2)
 
-        do_denormalize = [True] * image.shape[0]
-        image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
+        # Denormalize + PIL moved to engine post_process_func for overlap with next request.
 
         if not return_dict:
             return (image,)
@@ -3284,99 +3249,6 @@ class TimestepEmbedder(nn.Module):
         t_freq = timestep_embedding(t, self.frequency_embedding_size, self.max_period).type(self.mlp[0].weight.dtype)
         t_emb = self.mlp(t_freq)
         return t_emb
-
-
-class ResBlock(nn.Module):
-    r"""
-    A residual block that can optionally change the number of channels.
-
-    Args:
-        in_channels (`int`):
-            The number of input channels.
-        emb_channels (`int`):
-            The number of timestep embedding channels.
-        dropout (`float`):
-            The rate of dropout.
-        out_channels (`int`, *optional*):
-            If specified, the number of output channels.
-        use_conv (`bool`, *optional*):
-            If True and out_channels is specified, use a spatial convolution instead of a
-            smaller 1x1 convolution to change the channels in the skip connection.
-        dims (`int`, *optional*):
-            Determines if the signal is 1D, 2D, or 3D.
-        up (`bool`, *optional*):
-            If True, use this block for upsampling.
-        down (`bool`, *optional*):
-            If True, use this block for downsampling.
-
-    """
-
-    def __init__(
-        self,
-        in_channels,
-        emb_channels,
-        out_channels=None,
-        dropout=0.0,
-        use_conv=False,
-        dims=2,
-        up=False,
-        down=False,
-        device=None,
-        dtype=None,
-    ) -> None:
-        factory_kwargs = {"dtype": dtype, "device": device}
-        super().__init__()
-        self.in_channels = in_channels
-        self.dropout = dropout
-        self.out_channels = out_channels or self.in_channels
-        self.use_conv = use_conv
-
-        self.in_layers = nn.Sequential(
-            normalization(self.in_channels, **factory_kwargs),
-            nn.SiLU(),
-            conv_nd(dims, self.in_channels, self.out_channels, 3, padding=1, **factory_kwargs),  # noqa: N802
-        )
-
-        self.updown = up or down
-        self.h_upd = self.x_upd = nn.Identity()
-
-        self.emb_layers = nn.Sequential(nn.SiLU(), linear(emb_channels, 2 * self.out_channels, **factory_kwargs))
-
-        self.out_layers = nn.Sequential(
-            normalization(self.out_channels, **factory_kwargs),
-            nn.SiLU(),
-            nn.Dropout(p=dropout),
-            zero_module(conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1, **factory_kwargs)),  # noqa: N802
-        )
-
-        if self.out_channels == self.in_channels:
-            self.skip_connection = nn.Identity()
-        elif use_conv:
-            self.skip_connection = conv_nd(dims, self.in_channels, self.out_channels, 3, padding=1, **factory_kwargs)  # noqa: N802
-        else:
-            self.skip_connection = conv_nd(dims, self.in_channels, self.out_channels, 1, **factory_kwargs)  # noqa: N802
-
-    def forward(self, x, emb) -> torch.Tensor:
-        if self.updown:
-            in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
-            h = in_rest(x)
-            h = self.h_upd(h)
-            x = self.x_upd(x)
-            h = in_conv(h)
-        else:
-            h = self.in_layers(x)
-
-        emb_out = self.emb_layers(emb)
-        while len(emb_out.shape) < len(h.shape):
-            emb_out = emb_out[..., None]
-
-        # Adaptive Group Normalization
-        out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
-        scale, shift = torch.chunk(emb_out, 2, dim=1)
-        h = out_norm(h) * (1.0 + scale) + shift
-        h = out_rest(h)
-
-        return self.skip_connection(x) + h
 
 
 class UNetDown(nn.Module):
