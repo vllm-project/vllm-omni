@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import base64
 import hashlib
@@ -275,6 +278,8 @@ def _conditioning_cache_salt(request, tts_params: dict | None = None) -> str:
 
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     _diffusion_mode: bool = False
+    _media_connector: MediaConnector | None = None
+    _allowed_local_media_path: str = ""
     _tts_executor: ThreadPoolExecutor | None = None
 
     def _init_speaker_storage(self) -> None:
@@ -391,6 +396,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         diffusion_engine: "Any",
         model_name: str,
         stage_configs: "list[Any] | None" = None,
+        allowed_local_media_path: str = "",
+        allowed_media_domains: list[str] | None = None,
     ) -> "OmniOpenAIServingSpeech":
         """Create a speech serving instance for pure diffusion TTS models.
 
@@ -402,6 +409,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         instance._diffusion_engine = diffusion_engine
         instance._diffusion_model_name = model_name
         instance._diffusion_stage_configs = stage_configs
+        instance._allowed_local_media_path = allowed_local_media_path
+        instance._media_connector = MediaConnector(
+            allowed_local_media_path=allowed_local_media_path,
+            allowed_media_domains=allowed_media_domains,
+        )
         instance._tts_model_type = "omnivoice"
         instance._is_tts = False
         # Diffusion-only instances don't have a TTS stage; set None so any
@@ -412,6 +424,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return instance
 
     def __init__(self, *args, **kwargs):
+        self._media_connector = None
+        self._allowed_local_media_path = ""
         self.model_name = kwargs.pop("model_name", None)
         # True when the server was launched with --forced-aligner (a pooling
         # aligner stage is appended to the pipeline). Gates word_timestamps.
@@ -1860,15 +1874,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """
         # Pass the allowed-local-media-path so the stat is restricted to
         # paths the server operator has explicitly permitted.
-        allowed_path = None
-        if not self._diffusion_mode:
+        allowed_path: str | None
+        if self._diffusion_mode:
+            allowed_path = self._allowed_local_media_path
+        else:
             allowed_path = getattr(self.model_config, "allowed_local_media_path", None)
 
         wav_list: list[float] | None = None
         sr = 0
         artifact_key = ""
         post_key = ""
-        connector: MediaConnector | None = None
         for attempt in range(_REF_AUDIO_METADATA_FETCH_ATTEMPTS):
             cache_key = await self._ref_audio_cache_key(ref_audio_str, allowed_path)
             cached = self._ref_audio_resolve_cache.get(cache_key)
@@ -1883,19 +1898,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
                 return wav_list, sr, cache_key
 
-            if connector is None:
-                # In diffusion mode, model_config may not be available
-                if self._diffusion_mode:
-                    connector = MediaConnector()
-                else:
-                    model_config = self.model_config
-                    connector = MediaConnector(
-                        allowed_local_media_path=model_config.allowed_local_media_path,
-                        allowed_media_domains=model_config.allowed_media_domains,
-                    )
+            if self._media_connector is None:
+                model_config = self.model_config
+                self._media_connector = MediaConnector(
+                    allowed_local_media_path=model_config.allowed_local_media_path,
+                    allowed_media_domains=model_config.allowed_media_domains,
+                )
 
             fetch_start_s = time.perf_counter()
-            wav_np, fetched_sr = await connector.fetch_audio_async(ref_audio_str)
+            wav_np, fetched_sr = await self._media_connector.fetch_audio_async(ref_audio_str)
             fetch_decode_ms = (time.perf_counter() - fetch_start_s) * 1000.0
             tolist_start_s = time.perf_counter()
             wav_list, sr, artifact_key, duration = self._finalize_fetched_ref_audio(wav_np, fetched_sr)

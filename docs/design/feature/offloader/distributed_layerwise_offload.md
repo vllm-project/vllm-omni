@@ -220,9 +220,15 @@ model revision and parallel layout with `required`. TP coordinates have distinct
 identities, while equivalent DP replicas share them.
 
 The current producer/consumer boundary is the model-declared final-layout BF16
-contract (MiniMax H3 today). It supports ordinary-loader final layouts for TP1
-and TP2 rank identities plus SP layout identities; online quantization, HSDP,
-LoRA/adapted weights, and non-default load formats remain ineligible. HWR mode
+contract (MiniMax H3 and `black-forest-labs/FLUX.2-klein-4B`). The FLUX.2-klein
+contract covers both transformer block stacks, constructor-stable packed QKV
+mapping state, BF16 parameters, and any persistent loader-owned `beta`/`eps`
+buffers. The shared HWR machinery supports ordinary-loader final layouts for
+TP1 and TP2 rank identities plus SP layout identities. FLUX.2-klein evidence
+in this change is TP1-only; its TP2/SP layouts rely on the existing
+per-coordinate identity mechanics and remain unmeasured. Online quantization,
+HSDP, LoRA/adapted weights, and non-default load formats remain ineligible.
+HWR mode
 `disabled`, DLO-disabled, and DLO AllGather configurations stop before source
 identity or store construction and retain the existing checkpoint-mmap or
 ordinary-loader path.

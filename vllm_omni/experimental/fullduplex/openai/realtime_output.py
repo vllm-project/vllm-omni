@@ -262,15 +262,8 @@ class RealtimeOutputProjector:
                         content_index=0,
                         audio_end_ms=committed_audio_ms,
                     )
-                payloads.append(
-                    {
-                        "type": "conversation.item.truncated",
-                        "item_id": item_id,
-                        "content_index": 0,
-                        "audio_end_ms": committed_audio_ms,
-                        "event": event,
-                    }
-                )
+                # Align server history with acknowledged playback; only explicit
+                # client truncation emits ``conversation.item.truncated``.
             payloads.extend(self._realtime_audio_done_events(event, response_id))
             payloads.extend(
                 self._realtime_response_terminal_events(
@@ -346,13 +339,74 @@ class RealtimeOutputProjector:
                     "reason": event.get("finish_reason") or "stop",
                 },
             )
+        if event_type == "function_call.done":
+            call_id = event.get("call_id")
+            name = event.get("name")
+            arguments = event.get("arguments", "")
+            if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+                return [{"type": "duplex.function_call.done", "event": event}]
+            if not isinstance(arguments, str):
+                arguments = str(arguments)
+            response_id = f"resp_{uuid4().hex}"
+            item = {
+                "id": f"item_{uuid4().hex}",
+                "object": "realtime.item",
+                "type": "function_call",
+                "status": "completed",
+                "name": name,
+                "call_id": call_id,
+                "arguments": arguments,
+            }
+            self._conversation_items[str(item["id"])] = item
+            response = {
+                "id": response_id,
+                "object": "realtime.response",
+                "status": "completed",
+                "status_details": {"type": "completed", "reason": "completed"},
+                "output": [dict(item)],
+                "metadata": {},
+            }
+            return [
+                {"type": "response.created", "response": {**response, "status": "in_progress", "output": []}},
+                *self._conversation_item_added_events(item),
+                {
+                    "type": "response.output_item.added",
+                    "response_id": response_id,
+                    "output_index": 0,
+                    "item": dict(item),
+                },
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "response_id": response_id,
+                    "item_id": item["id"],
+                    "output_index": 0,
+                    "call_id": call_id,
+                    "delta": arguments,
+                },
+                {
+                    "type": "response.function_call_arguments.done",
+                    "response_id": response_id,
+                    "item_id": item["id"],
+                    "output_index": 0,
+                    "call_id": call_id,
+                    "arguments": arguments,
+                },
+                {
+                    "type": "response.output_item.done",
+                    "response_id": response_id,
+                    "output_index": 0,
+                    "item": dict(item),
+                },
+                self._conversation_item_done_event(item),
+                {"type": "response.done", "response": response},
+            ]
         if event_type == "error":
             raw_error = event.get("error")
             if isinstance(raw_error, dict):
                 return [event]
             message = str(raw_error or event.get("message") or "Duplex runtime error")
             code = str(event.get("code") or "duplex_error")
-            return [self._realtime_error_payload(code, message)]
+            return [self._realtime_error_payload(code, message, event_id=event.get("realtime_event_id"))]
         if event_type == "session.closed":
             return [{"type": "session.closed", "event": event}]
         return [{"type": f"duplex.{event_type}", "event": event}]

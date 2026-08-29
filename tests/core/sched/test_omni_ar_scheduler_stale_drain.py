@@ -100,6 +100,7 @@ def _make_drain_sched(session: Request) -> MagicMock:
     sched.pending_stop_after_extraction = set()
     sched.connector = None
     sched.kv_cache_manager.take_events.return_value = None
+    sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
     return sched

@@ -67,6 +67,11 @@ class OmniDiffusionRequest:
     # This is populated by a pipeline preprocessor before the request reaches
     # the scheduler; ``None`` keeps the default behavior for other pipelines.
     batch_compatibility_key: tuple[Any, ...] | None = None
+    # KV-recv wall-clock (ms), set by the runner's _prepare_request_for_forward
+    # and carried to DiffusionOutput for the vllm_omni:diffusion_kv_load_s metric.
+    kv_recv_ms: float = 0.0
+    # Time spent waiting for initial admission by the diffusion scheduler.
+    scheduler_queue_wait_ms: float | None = None
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""

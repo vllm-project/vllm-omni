@@ -52,9 +52,8 @@ def get_prompt(prompt_type="zh"):
 
 def _set_rocm_request_timeout(request_config: dict) -> None:
     if current_omni_platform.is_rocm():
-        # A cold AITER MHA kernel build took 301 seconds on MI300X.
-        # Allow 600 seconds for the first request; later requests reuse the cache.
-        request_config["timeout"] = 600.0
+        # Cold AITER MHA builds on loaded MI300 agents can exceed 20 minutes.
+        request_config["timeout"] = 1800.0
 
 
 tts_server_params = [

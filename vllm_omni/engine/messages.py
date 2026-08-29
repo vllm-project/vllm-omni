@@ -27,6 +27,7 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     request_timestamp: float
     enqueue_ts: float
     final_output_stage_ids: list[int] | None = None
+    request_artifact_dirs: list[str] | None = None
 
 
 class AddCompanionRequestMessage(EngineQueueMessage, kw_only=True):

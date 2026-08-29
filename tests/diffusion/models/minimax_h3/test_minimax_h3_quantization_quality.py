@@ -187,7 +187,6 @@ def test_minimax_h3_quantization_quality(config: QualityTestConfig):
         "model": model_ref,
         "enforce_eager": True,
         "tensor_parallel_size": 2,
-        "text_encoder_tp_size": 2,
         "vae_use_tiling": True,
     }
 

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unified stage-local runtime abstraction for vLLM-Omni."""
 
 from __future__ import annotations
@@ -653,16 +656,16 @@ class StagePool:
         )
         image_pixels = self._count_image_pixels(request_outputs) if output_unit_type == "image" else 0
         num_inference_steps = coerce_positive_int_scalar(getattr(sampling_params, "num_inference_steps", None)) or 0
-        denoise_step_latency_ms = (
-            defs.compute_denoise_step_latency(stage_gen_time_ms, num_inference_steps)
-            if output_unit_type == "image"
-            else 0.0
-        )
         has_output_timestamps = bool(output_timestamps)
         first_ts = output_timestamps[0] if has_output_timestamps else now
         serving_time_to_first_output_ms = (
             max((non_empty_first_output_ts - request_timestamp) * 1000.0, 0.0)
             if non_empty_first_output_ts is not None
+            else 0.0
+        )
+        image_time_to_first_output_ms = (
+            max((non_empty_first_output_ts - submit_ts) * 1000.0, 0.0)
+            if non_empty_first_output_ts is not None and output_unit_type == "image"
             else 0.0
         )
         remaining_ms = max((now - first_ts) * 1000.0, 0.0)
@@ -709,10 +712,11 @@ class StagePool:
             audio_sample_rate=audio_sample_rate,
             audio_duration_s=audio_duration_s,
             image_pixels=image_pixels,
-            denoise_step_latency_ms=denoise_step_latency_ms,
+            num_inference_steps=num_inference_steps,
             output_unit_type=output_unit_type,
             output_unit_count=output_unit_count,
             serving_time_to_first_output_ms=serving_time_to_first_output_ms,
+            image_time_to_first_output_ms=image_time_to_first_output_ms,
             time_per_output_unit_ms=time_per_output_unit_ms,
             inter_output_latency_ms=inter_output_latency_ms,
             inter_output_latencies_ms=inter_output_latencies_ms,

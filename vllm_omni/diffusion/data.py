@@ -632,8 +632,12 @@ def resolve_model_class_name(
         return None
     is_lance_subfolder = os.path.basename(str(model).rstrip("/")) in {"Lance_3B", "Lance_3B_Video"}
 
-    # Diffusers models: read _class_name from the pipeline index.
-    model_index = get_diffusion_model_index(model, revision=revision)
+    # Diffusers models: read _class_name from the pipeline index. Missing
+    # local paths can otherwise be interpreted as invalid Hub repo IDs.
+    try:
+        model_index = get_diffusion_model_index(model, revision=revision)
+    except Exception:
+        model_index = None
     if model_index is not None:
         return model_index.get("_class_name")
     if diffusion_load_format == "diffusers":
@@ -881,6 +885,7 @@ class OmniDiffusionConfig:
         default_factory=lambda: {
             "transformer": True,
             "vae": True,
+            "text_encoder": True,
         }
     )
     override_transformer_cls_name: str | None = None
@@ -1527,6 +1532,9 @@ class DiffusionOutput:
 
     # memory usage info
     peak_memory_mb: float = 0.0
+
+    # KV-recv wall-clock (ms) from the runner; feeds vllm_omni:diffusion_kv_load_s.
+    kv_recv_ms: float = 0.0
 
     # When True, move tensor fields to CPU at construction time. Useful when
     # the output is shipped across process boundaries (e.g. step-execution

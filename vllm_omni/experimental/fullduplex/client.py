@@ -11,7 +11,7 @@ import json
 import math
 import time
 import wave
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -27,6 +27,20 @@ except ImportError as exc:  # pragma: no cover - example dependency
 
 PCM16_SAMPLE_RATE = 16_000
 PCM16_BYTES_PER_SAMPLE = 2
+
+# Server-side model unit boundaries, in cumulative appended audio.
+# Stage0 configures the streaming mel processor with first_chunk_ms=1035 and
+# chunk_ms=1000; the processor aligns the first chunk down to a hop_length (160
+# samples) multiple, so unit 0 closes at 16480 samples and every later unit
+# closes 16000 samples after it. Camera frames must ride the append that closes
+# a unit, otherwise Stage0 cannot bind them to that unit's audio.
+DUPLEX_FIRST_UNIT_MS = 1030
+DUPLEX_UNIT_MS = 1000
+
+
+def duplex_unit_boundary_ms(unit_index: int) -> int:
+    """Cumulative appended audio, in ms, that closes model unit ``unit_index``."""
+    return DUPLEX_FIRST_UNIT_MS + max(0, int(unit_index)) * DUPLEX_UNIT_MS
 
 
 def _rounded_ms(value: float) -> float:
@@ -435,6 +449,7 @@ class RealtimeDuplexClient:
         self.events = RealtimeEventCollector()
         self._ws: Any = None
         self._reader_task: asyncio.Task[None] | None = None
+        self._media_clock_ms = 0
 
     async def __aenter__(self) -> RealtimeDuplexClient:
         self._ws = await websockets.connect(
@@ -463,6 +478,7 @@ class RealtimeDuplexClient:
                     continue
                 event = json.loads(raw)
                 if isinstance(event, dict):
+                    event.setdefault("_media_clock_ms", self._media_clock_ms)
                     self.events.add(event)
         except ConnectionClosed:
             return
@@ -495,6 +511,7 @@ class RealtimeDuplexClient:
         auto_response: bool = True,
         temperature: float | None = None,
         extra_body: dict[str, object] | None = None,
+        turn_detection: dict[str, object] | None = None,
         session_id: str | None = None,
         idle_timeout_s: float | None = None,
         timeout_s: float = 20.0,
@@ -515,8 +532,12 @@ class RealtimeDuplexClient:
             "modalities": ["audio", "text"],
             "input_audio_format": "pcm16",
             "output_audio_format": output_audio_format,
-            "turn_detection": None,
-            "overlap_policy": "listen_only",
+            "turn_detection": dict(turn_detection) if turn_detection is not None else None,
+            "overlap_policy": (
+                "barge_in_on_speech"
+                if turn_detection is not None and turn_detection.get("interrupt_response", True) is True
+                else "listen_only"
+            ),
             "playback_commit_policy": "ack_only",
             "extra_body": session_extra_body,
         }
@@ -554,28 +575,97 @@ class RealtimeDuplexClient:
         *,
         chunk_ms: int = 200,
         realtime: bool = True,
-    ) -> None:
+        video_frames: Sequence[str] | None = None,
+        stacked_video_frames: Sequence[str | None] | None = None,
+    ) -> int:
+        """Append PCM16 audio, optionally interleaving omni camera frames.
+
+        ``video_frames`` holds base64 JPEG/PNG frames in capture order, one per
+        second of the clip. Frame ``k`` rides the append that closes model unit
+        ``k`` (see ``duplex_unit_boundary_ms``), which reproduces the official
+        ``streaming_prefill(audio_waveform=<1 s>, frame_list=[frame])`` pairing:
+        a second of audio and the picture captured during it enter the same
+        unit. Sending on whole-second boundaries instead would strand frame 0 on
+        an append that cannot close a unit yet, and shift every later frame one
+        unit ahead of its audio.
+
+        ``stacked_video_frames`` is the optional parallel track of composites
+        built by ``video_stacking.concat_frames``: entry ``k`` tiles the
+        sub-frames captured *inside* unit ``k``, and rides the same append right
+        after the base frame, giving the official ``frame_list=[base,
+        composite]``. The audio is untouched — a unit stays one second however
+        many sub-frames the composite carries. ``None`` entries send the base
+        frame alone.
+
+        Returns the number of base frames actually sent (a clip shorter than the
+        frame list leaves the tail unsent).
+        """
         chunk_bytes = max(
             PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_ms // 1000,
             PCM16_BYTES_PER_SAMPLE,
         )
+        frames = list(video_frames or [])
+        stacked = list(stacked_video_frames or [])
+
+        def units() -> Iterator[tuple[bytes, list[str] | None]]:
+            audio_end_ms = 0
+            frames_sent = 0
+            for offset in range(0, len(pcm16), chunk_bytes):
+                chunk = pcm16[offset : offset + chunk_bytes]
+                audio_end_ms += len(chunk) * 1000 // (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
+                if not frames or audio_end_ms < duplex_unit_boundary_ms(frames_sent):
+                    yield chunk, None
+                    continue
+                # A video advances one frame per unit and holds its last frame
+                # when the audio outlives the clip; a still image is a
+                # one-element list and therefore repeats.
+                index = min(frames_sent, len(frames) - 1)
+                composite = stacked[index] if index < len(stacked) else None
+                frames_sent += 1
+                yield chunk, [frames[index]] if composite is None else [frames[index], composite]
+
+        return await self.stream_av_units(units(), realtime=realtime)
+
+    async def stream_av_units(
+        self,
+        units: Any,
+        *,
+        realtime: bool = True,
+    ) -> int:
+        """Stream PCM16 units, optionally attaching camera frames to each unit.
+
+        A unit's frame slot takes a single JPEG/PNG (raw bytes or base64) or a
+        sequence of them, which the Realtime wire caps at two per append.
+        Returns the number of appends that carried at least one frame.
+        """
         audio_end_ms = 0
-        for offset in range(0, len(pcm16), chunk_bytes):
-            chunk = pcm16[offset : offset + chunk_bytes]
+        frames_sent = 0
+        for chunk, frame in units:
+            if not chunk:
+                continue
             duration_ms = len(chunk) * 1000 // (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
             audio_end_ms += duration_ms
-            await self.send(
-                {
-                    "type": "input_audio_buffer.append",
-                    "audio": base64.b64encode(chunk).decode("ascii"),
-                    "input_audio_format": "pcm16",
-                    "sample_rate_hz": PCM16_SAMPLE_RATE,
-                    "duration_ms": duration_ms,
-                    "audio_end_ms": audio_end_ms,
-                }
-            )
+            self._media_clock_ms = audio_end_ms
+            event: dict[str, object] = {
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(chunk).decode("ascii"),
+                "input_audio_format": "pcm16",
+                "sample_rate_hz": PCM16_SAMPLE_RATE,
+                "duration_ms": duration_ms,
+                "audio_end_ms": audio_end_ms,
+            }
+            encoded_frames = [
+                base64.b64encode(item).decode("ascii") if isinstance(item, bytes | bytearray) else item
+                for item in (frame if isinstance(frame, list | tuple) else [frame])
+                if item is not None
+            ]
+            if encoded_frames:
+                event["video_frames"] = encoded_frames
+                frames_sent += 1
+            await self.send(event)
             if realtime:
                 await asyncio.sleep(duration_ms / 1000)
+        return frames_sent
 
     async def commit(self) -> None:
         await self.send({"type": "input_audio_buffer.commit", "final": True})
