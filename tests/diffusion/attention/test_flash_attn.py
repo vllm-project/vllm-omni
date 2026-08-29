@@ -353,6 +353,9 @@ def test_cross_attn_key_padding_vs_sdpa(k_len):
     print(f"Max absolute difference: {max_diff:.6f}")
     print(f"Mean absolute difference: {mean_diff:.6f}")
 
+    # Reuse Case 2's ROCm BF16 tolerance; AMD CI measured a 0.015625
+    # maximum difference for both key lengths:
+    # https://buildkite.com/vllm/vllm-omni-amd-ci/builds/11110
     if current_omni_platform.is_rocm():
         torch.testing.assert_close(output_fa, output_sdpa, rtol=1e-2, atol=1.5e-2)
     else:
