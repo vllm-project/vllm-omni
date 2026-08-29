@@ -54,26 +54,41 @@ class DTPSScheduler:
         self._dit_load_snapshot: DitLoadSnapshot | None = None
         self._dit_inflight_ids: dict[str, _InflightEntry] = {}
         self._last_phase_stats: dict[str, int | bool] = {}
-
-    @staticmethod
-    def _deserialize_info(req: Request) -> dict[str, Any] | None:
-        info = getattr(req, "additional_information", None)
-        if info is None:
-            return None
-        if isinstance(info, dict):
-            return info
-        try:
-            info = deserialize_additional_information(info)
-        except Exception:
-            logger.debug("[OmniDTPS] deserialize additional_information failed", exc_info=True)
-            return None
-        return info if isinstance(info, dict) else None
+        self._ar_only_cache: dict[str, bool] = {}
 
     def _request_is_ar_only(self, req: Request) -> bool:
-        """True when the request terminates at this AR stage (no downstream)."""
-        info = self._deserialize_info(req)
+        """True when the request terminates at this AR stage (no downstream).
+
+        Result is cached per request_id — deserialization happens at most
+        once per request lifetime. Cache is evicted via
+        :meth:`evict_request` when the request is freed.
+        """
+        rid = req.request_id
+        cached = self._ar_only_cache.get(rid)
+        if cached is not None:
+            return cached
+        result = self._compute_ar_only(req)
+        self._ar_only_cache[rid] = result
+        return result
+
+    def evict_request(self, request_id: str) -> None:
+        """Remove a finished request's cached classification."""
+        self._ar_only_cache.pop(request_id, None)
+
+    def _compute_ar_only(self, req: Request) -> bool:
+        info = getattr(req, "additional_information", None)
         if info is None:
             return False
+        if isinstance(info, dict):
+            pass
+        else:
+            try:
+                info = deserialize_additional_information(info)
+            except Exception:
+                logger.debug("[OmniDTPS] deserialize additional_information failed", exc_info=True)
+                return False
+            if not isinstance(info, dict):
+                return False
         final_stage_id = info.get("omni_final_stage_id")
         force_kv = bool(info.get("omni_force_kv_transfer", False))
         return final_stage_id == self._stage_id and not force_kv
@@ -205,10 +220,38 @@ class DTPSScheduler:
             downstream_tail = downstream_reqs[budget_raw:]
 
         ordered = starving_reqs + downstream_head + ar_only_reqs + downstream_tail
+        before_list = list(waiting)
+
+        if [r.request_id for r in ordered] == [r.request_id for r in before_list]:
+            return
+
+        def _fmt(reqs: list) -> str:
+            parts = []
+            for r in reqs:
+                w = (now - r.arrival_time) if r.arrival_time else 0.0
+                npt = getattr(r, "num_prompt_tokens", 0) or 0
+                tag = "AR+DiT" if not self._request_is_ar_only(r) else "AR"
+                parts.append(f"{r.request_id}({tag},{w:.1f}s,{npt}t)")
+            return "[" + ",".join(parts) + "]"
+
+        logger.debug(
+            "[OmniDTPS] reorder: before=%s | L0_starving=%s L1_budget=%s "
+            "L2_ar_only=%s L3_overflow=%s | budget=%s eff_min=%s | "
+            "after=%s",
+            _fmt(before_list),
+            _fmt(starving_reqs),
+            _fmt(downstream_head),
+            _fmt(ar_only_reqs),
+            _fmt(downstream_tail),
+            budget_raw,
+            self._last_phase_stats.get("effective_min"),
+            _fmt(ordered),
+        )
+
         if hasattr(waiting, "clear") and hasattr(waiting, "extend"):
             waiting.clear()
             waiting.extend(ordered)
         else:
-            waiting.remove_requests(list(waiting))
+            waiting.remove_requests(before_list)
             for req in ordered:
                 waiting.add_request(req)
