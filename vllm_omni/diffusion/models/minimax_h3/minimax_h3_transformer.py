@@ -534,12 +534,18 @@ class MiniMaxH3Attention(nn.Module):
             # supports_packed_mask_free: backend consumes the packed metadata
             # without ever reading attn_mask (CUDA packed varlen, NPU
             # npu_attn_varlen opt-in with its own fallback rebuild).
-            use_ring = getattr(self.attention, "use_ring", False)
+            use_ring = getattr(self.attention, "use_ring", False) and not getattr(
+                self.attention, "skip_sequence_parallel", False
+            )
             mask_free_packed_padding = not use_ring and self.attention.attn_backend.supports_packed_mask_free()
             no_mask = not use_ring and (
                 self.attention.attn_backend.supports_prefix_kv_slicing or mask_free_packed_padding
             )
-            if used < packed_total and not no_mask:
+            # Hybrid Ulysses reshards Q to one ring partition before the ring
+            # kernel runs, so a global [packed_total] mask cannot pass its
+            # query-length check. Ring consumes valid_kv_length directly and
+            # trims the circulated K/V blocks instead.
+            if used < packed_total and not no_mask and not use_ring:
                 attn_mask = torch.arange(packed_total, device=q.device)[None] < used
         metadata = AttentionMetadata(
             attn_mask=attn_mask,

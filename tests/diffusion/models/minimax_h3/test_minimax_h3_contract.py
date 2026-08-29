@@ -1122,6 +1122,25 @@ def test_packed_attention_keeps_padding_mask_for_other_backends():
     )
 
 
+def test_ring_packed_attention_publishes_prefix_length_without_global_mask():
+    attention = _fake_packed_attention("CUDNN_ATTN")
+    attention.attention.use_ring = True
+    q = torch.randn(4, 2, 4)
+
+    attention._run_packed_attention(
+        q,
+        q,
+        q,
+        cu_seqlens=torch.tensor([0, 5, 8], dtype=torch.int32),
+        max_seqlen=5,
+        packed_total=8,
+    )
+
+    metadata = attention.attention.metadata
+    assert metadata.attn_mask is None
+    assert metadata.extra["valid_kv_length"] == 5
+
+
 def _fake_packed_attention(
     backend_name: str,
     *,
