@@ -257,7 +257,7 @@ def test_ltx_t2a_checkpoint_metadata_selects_profile(tmp_path, monkeypatch):
         model=str(tmp_path),
         revision=None,
         parallel_config=SimpleNamespace(ulysses_mode="strict"),
-        cache_backend="none",
+        cache_backend="cache_dit",
         enable_diffusion_pipeline_profiler=False,
     )
     pipe = LTX2TextToAudioPipeline(od_config=od_config)
@@ -266,6 +266,28 @@ def test_ltx_t2a_checkpoint_metadata_selects_profile(tmp_path, monkeypatch):
     assert pipe.component_profile is LTX25_T2A_COMPONENT_PROFILE
     assert pipe.pipeline_recipe is LTX25_T2A_RECIPE
     assert pipe.audio_graph_runner is None
+
+
+def test_ltx_t2a_rejects_cache_dit_with_manual_cuda_graph():
+    od_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(ulysses_mode="strict"),
+        cache_backend="cache_dit",
+        additional_config={"ltx2_audio_cuda_graph": {"enabled": True}},
+    )
+
+    with pytest.raises(ValueError, match="cannot be enabled together"):
+        LTX2TextToAudioPipeline(od_config=od_config)
+
+
+def test_ltx_t2a_rejects_other_cache_backends():
+    od_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(ulysses_mode="strict"),
+        cache_backend="tea_cache",
+        additional_config=None,
+    )
+
+    with pytest.raises(ValueError, match="does not support cache_backend='tea_cache'"):
+        LTX2TextToAudioPipeline(od_config=od_config)
 
 
 def test_ltx_t2a_runtime_owns_configured_audio_graph_runner(tmp_path, monkeypatch):
@@ -414,7 +436,7 @@ def test_ltx_t2a_registry_and_postprocess_entries():
         "LTX2TextToAudioPipeline",
     )
     assert _DIFFUSION_POST_PROCESS_FUNCS["LTX2TextToAudioPipeline"] == "get_ltx2_audio_post_process_func"
-    assert "LTX2TextToAudioPipeline" in _NO_CACHE_ACCELERATION
+    assert "LTX2TextToAudioPipeline" not in _NO_CACHE_ACCELERATION
 
 
 def test_ltx_t2a_weight_source_filters_video_tensors_before_materialization(tmp_path, monkeypatch):

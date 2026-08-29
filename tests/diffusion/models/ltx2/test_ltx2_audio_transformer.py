@@ -5,6 +5,7 @@
 
 import pytest
 import torch
+from cache_dit import ForwardPattern
 from torch import nn
 
 from vllm_omni.diffusion.models.ltx2 import ltx2_audio_transformer
@@ -81,6 +82,14 @@ def test_ltx_audio_transformer_sp_plan_only_shards_audio_inputs_and_output():
         "audio_timestep",
     }
     assert set(plan) == {"", "audio_rope", "audio_proj_out"}
+
+
+def test_ltx_audio_transformer_declares_single_stream_cache_dit_pattern():
+    config = LTX2AudioTransformerModel._cache_dit_adapter_config
+
+    assert config.block_forward_patterns == {"transformer_blocks": ForwardPattern.Pattern_2}
+    assert config.has_separate_cfg is False
+    assert config.check_forward_pattern is False
 
 
 def test_ltx_audio_transformer_exposes_hsdp_blocks(monkeypatch):

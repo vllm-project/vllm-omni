@@ -11,12 +11,14 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import torch
+from cache_dit import ForwardPattern
 from diffusers.models.embeddings import PixArtAlphaTextProjection
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 
@@ -181,6 +183,16 @@ class LTX2AudioTransformerBlock(nn.Module):
 
 class LTX2AudioTransformerModel(nn.Module):
     """LTX full-checkpoint Transformer with every video path removed."""
+
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "transformer_blocks": ForwardPattern.Pattern_2,
+        },
+        # Guidance passes are fused into one batch and produce one Transformer
+        # forward per denoising step.
+        has_separate_cfg=False,
+        check_forward_pattern=False,
+    )
 
     _supports_gradient_checkpointing = True
     _skip_layerwise_casting_patterns = ["norm"]

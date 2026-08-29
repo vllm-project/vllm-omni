@@ -260,6 +260,11 @@ class LTXAudioRuntime(
         self._audio_cuda_graph_config = LTX2AudioCUDAGraphConfig.from_additional_config(
             getattr(od_config, "additional_config", None)
         )
+        cache_backend = getattr(od_config, "cache_backend", "none")
+        if cache_backend not in (None, "", "none", "cache_dit"):
+            raise ValueError(f"{type(self).__name__} does not support cache_backend={cache_backend!r}.")
+        if self._audio_cuda_graph_config.enabled and cache_backend == "cache_dit":
+            raise ValueError("LTX2 audio CUDA Graph and cache_backend='cache_dit' cannot be enabled together.")
         if self._audio_cuda_graph_config.enabled:
             self._validate_audio_cuda_graph_support(od_config, get_local_device())
 
@@ -270,8 +275,6 @@ class LTXAudioRuntime(
 
         self.component_profile = resolve_ltx_component_profile(self.pipeline_kind, self.model_version)
         self.pipeline_recipe = resolve_ltx_pipeline_recipe(self.pipeline_kind, self.model_version)
-        if getattr(od_config, "cache_backend", "none") == "cache_dit":
-            raise ValueError(f"{type(self).__name__} does not support cache_backend='cache_dit'.")
         self._dit_modules = list(self.component_profile.dit_modules)
         self._encoder_modules = list(self.component_profile.encoder_modules)
         self._vae_modules = list(self.component_profile.vae_modules)
