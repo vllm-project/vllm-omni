@@ -67,6 +67,39 @@ def test_build_add_request_message_preserves_additional_information(mocker: Mock
     output_processor.add_request.assert_not_called()
 
 
+def test_build_add_request_message_injects_global_id_before_prompt_transform(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("speech",)
+
+    input_processor = mocker.Mock()
+    input_processor.process_inputs.return_value = _make_engine_core_request()
+    engine.input_processor = input_processor
+    engine.output_processors = [mocker.Mock()]
+
+    seen_global_ids: list[list[str]] = []
+
+    def transform(prompt, _sampling_params):
+        seen_global_ids.append(prompt["additional_information"]["global_request_id"])
+        return prompt
+
+    engine.prompt_transform_func = transform
+    prompt = {"prompt_token_ids": [1, 1, 1]}
+
+    message = engine._build_add_request_message(
+        request_id="req-1",
+        prompt=prompt,
+        sampling_params_list=[params],
+        final_stage_id=0,
+        arrival_time=0.0,
+    )
+
+    assert seen_global_ids == [["req-1"]]
+    assert message.original_prompt["additional_information"]["global_request_id"] == ["req-1"]
+
+
 def test_build_add_request_message_preserves_model_intermediate_buffer(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)

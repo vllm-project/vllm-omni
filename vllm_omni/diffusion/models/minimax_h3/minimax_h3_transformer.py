@@ -27,7 +27,11 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
+from vllm_omni.diffusion.attention.backends.abstract import (
+    AttentionMetadata,
+    PackedPaddingMetadata,
+    VideoTokenLayout,
+)
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.ops.minimax_h3_modulation import (
     indexed_gate,
@@ -472,6 +476,7 @@ class MiniMaxH3Attention(nn.Module):
                 f"max_seqlen must be within the packed sequence, got {max_seqlen} for length {packed_total}"
             )
         attn_mask = None
+        mask_free_packed_padding = False
         if num_requests > 1:
             # A step-mode batch packs one document per request, so its valid
             # rows are block-diagonal rather than a prefix: neither a KV prefix
@@ -498,14 +503,25 @@ class MiniMaxH3Attention(nn.Module):
             # supports_packed_mask_free: backend consumes the packed metadata
             # without ever reading attn_mask (CUDA packed varlen, NPU
             # npu_attn_varlen opt-in with its own fallback rebuild).
-            no_mask = not getattr(self.attention, "use_ring", False) and (
-                self.attention.attn_backend.supports_prefix_kv_slicing
-                or self.attention.attn_backend.supports_packed_mask_free()
+            use_ring = getattr(self.attention, "use_ring", False)
+            mask_free_packed_padding = not use_ring and self.attention.attn_backend.supports_packed_mask_free()
+            no_mask = not use_ring and (
+                self.attention.attn_backend.supports_prefix_kv_slicing or mask_free_packed_padding
             )
             if used < packed_total and not no_mask:
                 attn_mask = torch.arange(packed_total, device=q.device)[None] < used
         metadata = AttentionMetadata(
             attn_mask=attn_mask,
+            packed_padding=(
+                PackedPaddingMetadata(
+                    q_length=used,
+                    kv_length=used,
+                    cu_seqlens_q=cu_seqlens[:2],
+                    cu_seqlens_k=cu_seqlens[:2],
+                )
+                if mask_free_packed_padding
+                else None
+            ),
             extra={
                 "cu_seqlens_q": cu_seqlens,
                 "cu_seqlens_k": cu_seqlens,
@@ -575,9 +591,9 @@ class MiniMaxH3Attention(nn.Module):
                 self.q_norm.variance_epsilon,
             )
 
-        # Each request contributes a document for its rows plus one for its
-        # alignment padding. Local/Ulysses backends unpad it, while Ring keeps
-        # aligned rows for fixed-size P2P buffers.
+        # Each request contributes a document for its rows plus one for any
+        # nonempty alignment padding. Local/Ulysses backends unpad it, while
+        # Ring keeps aligned rows for fixed-size P2P buffers.
         out = self._run_packed_attention(
             q,
             k,

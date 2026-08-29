@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """HTTP + WebSocket validation for Qwen3-TTS Base, Higgs Audio V3 and Audex TTA ``/v1/audio/speech`` (and related routes)."""
 
 from __future__ import annotations
@@ -13,8 +13,8 @@ from typing import Any
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.media import load_test_audio_data_url
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
+from tests.helpers.media import get_asset_path
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 from tests.helpers.stage_config import get_deploy_config_path
 
 # Speech / voice-upload numeric caps for these tests only (not exported from vllm_omni).
@@ -26,7 +26,7 @@ _SPEECH_API_MAX_NEW_TOKENS = 4096
 _VOICE_UPLOAD_MAX_CONSENT_LEN = 1024
 _VOICE_UPLOAD_MAX_REF_TEXT_CHARS = 8192
 _VOICE_UPLOAD_MAX_SPEAKER_DESCRIPTION_CHARS = 2048
-REF_AUDIO_URL = load_test_audio_data_url("qwen3_tts/clone_2.wav")
+REF_AUDIO_URL = get_asset_path("qwen3_tts/clone_2.wav", as_data_url=True)
 REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 # Qwen3-TTS 0.6B expects 1024-dim speaker embeddings (see serving_speech / talker hidden_size).
 _QWEN3_TTS_06B_SPEAKER_EMBEDDING_DIM = 1024
@@ -57,6 +57,7 @@ _QWEN3_TTS_SPEECH = [
     ),
 ]
 
+
 _HIGGS_AUDIO_V3_SPEECH = [
     pytest.param(
         OmniServerParams(
@@ -84,7 +85,7 @@ _AUDEX_TTA_SPEECH = [
 ]
 
 
-def _apply_batch_overrides(body: dict[str, object], *, loc: str, overrides: dict[str, object]) -> None:
+def _apply_batch_overrides(body: dict[str, Any], *, loc: str, overrides: dict[str, object]) -> None:
     if loc == "batch":
         body.update(overrides)
         return
@@ -112,8 +113,8 @@ def _pcm_wav_mono_bytes(*, duration_s: float = 1.1, sample_rate: int = 44100) ->
 
 
 @pytest.mark.parametrize("omni_server", _QWEN3_TTS_SPEECH, indirect=True)
-def test_speech_malformed_json(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
-    openai_client.send_audio_speech_http_request(
+def test_speech_malformed_json(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:
+    online_client.send_audio_speech_http_request(
         {
             "raw_body": "{",
             "timeout": 120,
@@ -124,8 +125,8 @@ def test_speech_malformed_json(omni_server: OmniServer, openai_client: OpenAICli
 
 
 @pytest.mark.parametrize("omni_server", _QWEN3_TTS_SPEECH, indirect=True)
-def test_speech_missing_required_fields(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
-    openai_client.send_audio_speech_http_request(
+def test_speech_missing_required_fields(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:
+    online_client.send_audio_speech_http_request(
         {
             "json": {"model": omni_server.model},
             "timeout": 120,
@@ -156,8 +157,8 @@ def test_speech_missing_required_fields(omni_server: OmniServer, openai_client: 
                 "ref_audio": None,
                 "ref_text": None,
             },
-            ("CustomVoice", "does not support"),
-            id="customvoice_task_not_supported",
+            ("Invalid voice", "vivian"),
+            id="customvoice_invalid_voice",
         ),
         pytest.param(
             {"task_type": "InvalidEnum"}, ("task_type", "literal_error", "CustomVoice"), id="task_type_invalid"
@@ -180,13 +181,17 @@ def test_speech_missing_required_fields(omni_server: OmniServer, openai_client: 
             ("mutually exclusive", "speaker_embedding", "ref_audio"),
             id="speaker_embedding_with_ref_audio_mutually_exclusive",
         ),
-        pytest.param({"max_new_tokens": 0}, ("max_new_tokens", "least 1"), id="max_new_tokens_below_min"),
+        pytest.param({"max_new_tokens": 0}, ("max_new_tokens", "greater_than_equal"), id="max_new_tokens_below_min"),
         pytest.param(
             {"max_new_tokens": _SPEECH_API_MAX_NEW_TOKENS + 1},
             ("max_new_tokens", "exceed 4096"),
             id="max_new_tokens_above_max",
         ),
-        pytest.param({"seed": -1}, ("seed", "greater_than_equal", "0"), id="seed_negative"),
+        pytest.param(
+            {"seed": -(2**63) - 1},
+            ("seed", "greater_than_equal", "-9223372036854775808"),
+            id="seed_below_min",
+        ),
         pytest.param({"seed": 2**63}, ("seed", "less_than_equal", "9223372036854775807"), id="seed_above_max"),
         pytest.param(
             {"initial_codec_chunk_frames": -1},
@@ -242,13 +247,13 @@ def test_speech_missing_required_fields(omni_server: OmniServer, openai_client: 
 @pytest.mark.parametrize("omni_server", _QWEN3_TTS_SPEECH, indirect=True)
 def test_speech_invalid_field_values(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
     overrides: dict[str, object],
     err_message: str | tuple[str, ...],
 ) -> None:
     ov = dict(overrides)
     embedding_only = bool(ov.pop(_SPEECH_INVALID_EMBEDDING_ONLY_BODY, False))
-    body = {
+    body: dict[str, Any] = {
         "model": omni_server.model,
         "input": "Hello.",
         "voice": "clone",
@@ -261,7 +266,7 @@ def test_speech_invalid_field_values(
         body.pop("ref_audio", None)
         body.pop("ref_text", None)
     body.update(ov)
-    openai_client.send_audio_speech_http_request(
+    online_client.send_audio_speech_http_request(
         {"json": body, "timeout": 120, "err_code": 400, "err_message": err_message}
     )
 
@@ -274,7 +279,9 @@ def test_speech_invalid_field_values(
         pytest.param({"input": "", "response_format": "wav"}, ("input", "empty"), id="input_empty"),
         pytest.param({"input": "   ", "response_format": "wav"}, ("input", "empty"), id="input_whitespace_only"),
         pytest.param(
-            {"input": "Hello world.", "max_new_tokens": 0}, ("max_new_tokens", "least 1"), id="max_new_tokens_below_min"
+            {"input": "Hello world.", "max_new_tokens": 0},
+            ("max_new_tokens", "greater_than_equal"),
+            id="max_new_tokens_below_min",
         ),
         pytest.param(
             {
@@ -328,12 +335,12 @@ def test_speech_invalid_field_values(
 @pytest.mark.parametrize("omni_server", _HIGGS_AUDIO_V3_SPEECH, indirect=True)
 def test_speech_higgs_invalid_field_values(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
     extra_json: dict[str, object],
     err_message: str | tuple[str, ...],
 ) -> None:
     body = {"model": omni_server.model, **extra_json}
-    openai_client.send_audio_speech_http_request(
+    online_client.send_audio_speech_http_request(
         {"json": body, "timeout": 120, "err_code": 400, "err_message": err_message}
     )
 
@@ -359,12 +366,12 @@ def test_speech_higgs_invalid_field_values(
 @pytest.mark.parametrize("omni_server", _AUDEX_TTA_SPEECH, indirect=True)
 def test_speech_audex_tta_invalid_field_values(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
     overrides: dict[str, object],
     err_message: str | tuple[str, ...],
 ) -> None:
     body = {"model": omni_server.model, "input": _AUDEX_TTA_CAPTION, **overrides}
-    openai_client.send_audio_speech_http_request(
+    online_client.send_audio_speech_http_request(
         {"json": body, "timeout": 120, "err_code": 400, "err_message": err_message}
     )
 
@@ -375,15 +382,15 @@ def test_speech_audex_tta_invalid_field_values(
 
 
 @pytest.mark.parametrize("omni_server", _QWEN3_TTS_SPEECH, indirect=True)
-def test_speech_batch_empty_items(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
-    openai_client.send_audio_speech_batch_http_request(
+def test_speech_batch_empty_items(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:
+    online_client.send_audio_speech_batch_http_request(
         {"json": {"items": []}, "timeout": 120, "err_code": (400, 422), "err_message": ("items", "least 1 item")}
     )
 
 
 @pytest.mark.parametrize("omni_server", _QWEN3_TTS_SPEECH, indirect=True)
-def test_speech_batch_missing_items(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
-    openai_client.send_audio_speech_batch_http_request(
+def test_speech_batch_missing_items(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:
+    online_client.send_audio_speech_batch_http_request(
         {
             "json": {"model": omni_server.model},
             "timeout": 120,
@@ -553,14 +560,14 @@ def test_speech_batch_missing_items(omni_server: OmniServer, openai_client: Open
         pytest.param(
             "batch",
             {"max_new_tokens": 0},
-            ("max_new_tokens", "least 1"),
+            ("max_new_tokens", "greater_than_equal"),
             id="batch_max_new_tokens_below_min",
             marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "item",
             {"max_new_tokens": 0},
-            ("max_new_tokens", "least 1"),
+            ("max_new_tokens", "greater_than_equal"),
             id="item_max_new_tokens_below_min",
             marks=_SKIP_ISSUE_3649,
         ),
@@ -618,14 +625,14 @@ def test_speech_batch_missing_items(omni_server: OmniServer, openai_client: Open
 @pytest.mark.parametrize("omni_server", _QWEN3_TTS_SPEECH, indirect=True)
 def test_speech_batch_invalid_field_values(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
     loc: str,
     overrides: dict[str, object],
     err_message: str | tuple[str, ...],
 ) -> None:
     ov = dict(overrides)
     strip_clone = bool(ov.pop(_SPEECH_BATCH_NO_CLONE_FIELDS, False))
-    body = {
+    body: dict[str, Any] = {
         "model": omni_server.model,
         "voice": "clone",
         "ref_audio": REF_AUDIO_URL,
@@ -638,7 +645,7 @@ def test_speech_batch_invalid_field_values(
         body.pop("ref_audio", None)
         body.pop("ref_text", None)
     _apply_batch_overrides(body, loc=loc, overrides=ov)
-    openai_client.send_audio_speech_batch_http_request(
+    online_client.send_audio_speech_batch_http_request(
         {"json": body, "timeout": 120, "err_code": 400, "err_message": err_message}
     )
 
@@ -670,7 +677,7 @@ _SPEECH_STREAM_WS_SESSION_STREAM_AUDIO_WAV_FRAMES = object()
 @pytest.mark.parametrize("omni_server", _QWEN3_TTS_SPEECH, indirect=True)
 def test_speech_stream_invalid_requests(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
     send_frames_spec: Any,
     err_message: str | tuple[str, ...],
 ) -> None:
@@ -687,7 +694,7 @@ def test_speech_stream_invalid_requests(
     else:
         send_frames = send_frames_spec
     assert isinstance(send_frames, str)
-    openai_client.send_audio_speech_stream_ws_request(
+    online_client.send_audio_speech_stream_ws_request(
         {
             "send_frames": send_frames,
             "timeout": 120,
@@ -893,7 +900,7 @@ def _voices_upload_multipart_files(kind: str | None) -> dict[str, Any] | None:
 @pytest.mark.parametrize("omni_server", _QWEN3_TTS_SPEECH, indirect=True)
 def test_voices_create_invalid_requests(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
     multipart_kind: str | None,
     form_template: dict[str, Any],
     err_message: str | tuple[str, ...],
@@ -909,7 +916,7 @@ def test_voices_create_invalid_requests(
     files = _voices_upload_multipart_files(multipart_kind)
     if files is not None:
         cfg["files"] = files
-    openai_client.send_audio_voices_create_http_request(cfg)
+    online_client.send_audio_voices_create_http_request(cfg)
 
 
 @pytest.mark.parametrize(
@@ -962,13 +969,13 @@ def test_voices_create_invalid_requests(
 @pytest.mark.parametrize("omni_server", _QWEN3_TTS_SPEECH, indirect=True)
 def test_voices_delete_invalid_requests(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
     voice_name: str,
     err_code: int | tuple[int, ...],
     err_message: str | tuple[str, ...],
 ) -> None:
     """DELETE ``/v1/audio/voices/{name}``: missing voice (404), odd segments (often 404), ``.``paths (405)."""
-    openai_client.send_audio_voices_delete_http_request(
+    online_client.send_audio_voices_delete_http_request(
         {
             "name": voice_name,
             "timeout": 120,
@@ -1021,7 +1028,7 @@ _MINIMAX_MUSIC3_MAX_FRAMES = 9000
 @pytest.mark.parametrize("omni_server", _MINIMAX_MUSIC3_SPEECH, indirect=True)
 def test_minimax_music3_speech_invalid_field_values(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
     overrides: dict[str, object],
     err_message: str | tuple[str, ...],
 ) -> None:
@@ -1038,6 +1045,6 @@ def test_minimax_music3_speech_invalid_field_values(
             body.pop(key, None)
         else:
             body[key] = value
-    openai_client.send_audio_speech_http_request(
+    online_client.send_audio_speech_http_request(
         {"json": body, "timeout": 120, "err_code": 400, "err_message": err_message}
     )

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import contextlib
 import dataclasses
 import glob
@@ -34,6 +34,7 @@ from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig, apply_hsdp
 from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
     get_checkpoint_adapter,
 )
+from vllm_omni.diffusion.model_loader.host_weight_loader import HWRLoaderMixin, _HWRCommitError
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
     build_checkpoint_mmap_plan,
@@ -125,7 +126,7 @@ def _resolve_custom_pipeline_cls(custom_pipeline_name: str | type | None) -> typ
     )
 
 
-class DiffusersPipelineLoader:
+class DiffusersPipelineLoader(HWRLoaderMixin):
     """Model loader that can load diffusers pipeline components from disk."""
 
     @dataclasses.dataclass
@@ -159,6 +160,9 @@ class DiffusersPipelineLoader:
         self.quant_config = od_config.quantization_config
         self.parallel_config = od_config.parallel_config
         self.host_weight_plan: HostWeightPlan | None = None
+        self._hwr_state: dict[str, object] | None = None
+        self._last_load_request: dict[str, object] | None = None
+        self._force_canonical_load = False
 
     def take_host_weight_plan(self) -> HostWeightPlan | None:
         """Transfer the loader-produced plan to the offload backend."""
@@ -469,6 +473,13 @@ class DiffusersPipelineLoader:
     ) -> nn.Module:
         """Load a model with the given configurations."""
         self.host_weight_plan = None
+        self._hwr_state = None
+        self._last_load_request = {
+            "load_device": load_device,
+            "load_format": load_format,
+            "custom_pipeline_name": custom_pipeline_name,
+            "device": device,
+        }
         if load_format is None:
             load_format = "default"
         # CPU offload + quantization: for offline-quantized models (e.g., AutoRound MXFP8),
@@ -511,7 +522,34 @@ class DiffusersPipelineLoader:
 
                 plan_result = None
                 weight_sources = self._get_weight_sources(model)
-                if _dist_offload:
+                hwr_state = None
+                if not self._force_canonical_load:
+                    try:
+                        hwr_state = self._resolve_hwr(
+                            model,
+                            ModuleDiscovery.discover(model),
+                            dist_offload=_dist_offload,
+                            use_allgather=_use_ag,
+                            load_format=load_format,
+                            sources=weight_sources,
+                        )
+                    except _HWRCommitError:
+                        from vllm_omni.host_weight_runtime import RuntimeMode
+
+                        mode = RuntimeMode(getattr(self.od_config, "host_weight_runtime_mode", "disabled"))
+                        if mode is not RuntimeMode.PREFERRED:
+                            raise
+                        logger.warning(
+                            "HWR restore commit failed; discarding the model and retrying a fresh canonical load",
+                            exc_info=True,
+                        )
+                        del model
+                        return self.load_fresh_canonical_model()
+                self._hwr_state = hwr_state
+                hwr_active = hwr_state is not None
+                if hwr_active and hwr_state is not None:
+                    self.host_weight_plan = cast(HostWeightPlan | None, hwr_state.get("plan"))
+                if _dist_offload and not hwr_active and not self._force_canonical_load:
                     modules = ModuleDiscovery.discover(model)
                     plan_result = build_checkpoint_mmap_plan(
                         model,
@@ -584,12 +622,43 @@ class DiffusersPipelineLoader:
                             self.load_weights(model)
                     self._process_weights_after_loading(model, target_device)
 
+                # A warm final-layout hit has already completed all
+                # byte-changing work through the restorer.  Shared runtime
+                # finalization happens once at the end for both cold and warm
+                # paths; the warm path never re-enters the ordinary
+                # materialization/finalization pipeline.
+
             if offload_after_quant:
                 model.to("cpu")
                 logger.info("Quantization complete, offloaded model back to CPU")
 
-        self._apply_skip_softmax_calibration(model)
-        return model.eval()
+        try:
+            self._apply_skip_softmax_calibration(model)
+            model = model.eval()
+            if self._hwr_state is not None:
+                warm_snapshot = self._hwr_state.get("warm_snapshot")
+                if warm_snapshot is not None:
+                    self._assert_final_layout_tensors_unchanged(model, cast(dict[str, tuple[int, str]], warm_snapshot))
+                self._publish_hwr_after_load(model, ModuleDiscovery.discover(model), self._hwr_state)
+        except Exception:
+            hwr_plan = self._hwr_state.get("plan") if self._hwr_state is not None else None
+            if isinstance(hwr_plan, HostWeightPlan):
+                carrier = hwr_plan.lease_carrier
+                if carrier is not None:
+                    carrier.close()
+                from vllm_omni.host_weight_runtime import RuntimeMode
+
+                mode = RuntimeMode(getattr(self.od_config, "host_weight_runtime_mode", "disabled"))
+                if mode is RuntimeMode.PREFERRED:
+                    logger.warning(
+                        "HWR warm finalization failed; discarding the model and retrying a fresh canonical load",
+                        exc_info=True,
+                    )
+                    del model
+                    return self.load_fresh_canonical_model()
+            raise
+        self._attach_offload_startup_state(model)
+        return model
 
     @staticmethod
     def _request_offload_after_quant(model: nn.Module) -> int:

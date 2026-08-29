@@ -1296,9 +1296,13 @@ class OmniGPUModelRunner(GPUModelRunner):
         per_req_runtime_info = []
         for req_id in self.input_batch.req_ids:
             req_state = self.requests.get(req_id)
-            # Per-request runtime metadata is stamped with the number of tokens
-            # already generated so models can apply step-dependent constraints
-            # (for example end-of-row tokens during image-grid decoding).
+            # MammothModa2 AR grid constraint: the model must emit a special
+            # end-of-line (EOL) token at the end of each image row.  To determine
+            # whether the current decoding step falls on a row boundary, the
+            # constraint logic (see MammothModa2ARForConditionalGeneration.
+            # _apply_t2i_token_constraints) computes:
+            #   column_id = generated_len % (ar_width + 1)
+            # and forces the EOL token when column_id == ar_width.
             generated_len = len(req_state.output_token_ids) if req_state is not None else 0
             info = self.model_intermediate_buffer.get(req_id, {})
             if info:

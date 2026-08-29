@@ -49,13 +49,14 @@ class FishSpeechAdapter(ARTTSAdapter):
     ) -> PreparedRequest:
         server = self.ctx.server
         ref_audio_data = None
+        tts_params: dict = {}
         if request.ref_audio is not None:
-            wav_list, sr = await server._resolve_ref_audio(request.ref_audio)
+            wav_list, sr, cache_key = await server._resolve_ref_audio(request.ref_audio)
             ref_audio_data = (wav_list, sr)
+            tts_params["ref_audio_cache_key"] = cache_key
         prompt = await server._build_fish_speech_prompt_async(
             request, ref_audio_data=ref_audio_data, has_inline_ref_audio=has_inline_ref_audio
         )
-        tts_params = {}
         prompt["cache_salt"] = conditioning_cache_salt(request, tts_params)
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type="fish_speech")
 
