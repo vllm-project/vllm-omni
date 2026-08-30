@@ -1,9 +1,5 @@
 # Uploaded by upload_pipeline.py --upload (not the Buildkite hook).
 # ``if`` is injected by step ``key`` from skip-ci at upload time.
-#
-# TEMP: pin B200 scheduling for this PR. Delete the env block after debug.
-env:
-  MIRROR_HW: b200
 steps:
   - label: ":docker: Build image"
     key: image-build
