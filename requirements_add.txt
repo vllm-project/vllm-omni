@@ -1,0 +1,12 @@
+datasets==3.6.0
+pyarrow
+fastparquet
+pytest==8.3.2
+pytest-asyncio==0.21.1
+jiwer
+zhon
+gradio==6.24.0
+funasr==1.4.2
+kaldiio
+torch-complex
+zhconv
