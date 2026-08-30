@@ -11,14 +11,15 @@ from __future__ import annotations
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import pytest
 
-# CUDA (and only CUDA) may list several SKUs so one item matches H100 nightly
-# and B200 mirror collection: ``res={"cuda": ["H100", "B200"]}``.
-SkuSpec: TypeAlias = str | list[str] | tuple[str, ...]
+    # CUDA (and only CUDA) may list several SKUs so one item matches H100 nightly
+    # and B200 mirror collection: ``res={"cuda": ["H100", "B200"]}``.
+    # Kept under TYPE_CHECKING so Python 3.9 agents do not evaluate ``str | list``.
+    SkuSpec = str | list[str] | tuple[str, ...]
 
 # Marker description tags in ``pyproject.toml`` ``tool.pytest.ini_options.markers``.
 # Example: ``"H100: [hardware-resource] [cuda] Tests that require H100 GPU"``.

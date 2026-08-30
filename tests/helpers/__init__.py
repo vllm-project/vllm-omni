@@ -11,6 +11,8 @@ affect in-process Omni (``OmniRunner`` / offline e2e) vs subprocess-based
 ``OmniServer`` tests.
 """
 
+from __future__ import annotations
+
 
 def skip_if_gated_repo_inaccessible(
     repo_id: str,
