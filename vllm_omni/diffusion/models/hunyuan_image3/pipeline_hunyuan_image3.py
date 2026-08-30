@@ -70,6 +70,7 @@ _STEP_GUIDANCE_SCALE = "hunyuan_guidance_scale"
 _STEP_CFG_FACTOR = "hunyuan_cfg_factor"
 _STEP_OUTPUT_SIZE = "hunyuan_output_size"
 _STEP_COT_TEXT_LIST = "hunyuan_cot_text_list"
+_STEP_ROLLOUT_METADATA = "hunyuan_rollout_metadata_list"
 _STEP_AR_KV = "hunyuan_ar_kv"
 _STEP_PROMPT_KV = "hunyuan_prompt_kv"
 
@@ -1716,6 +1717,7 @@ class HunyuanImage3Pipeline(
             system_prompt,
             batch_cond_image_info,
             tokenizer_bot_task,
+            rollout_metadata_list,
         ) = request_layout_utils.extract_hunyuan_prompt_inputs(
             [state.prompt] if state.prompt is not None else [],
             getattr(sampling, "extra_args", {}) or {},
@@ -1817,6 +1819,7 @@ class HunyuanImage3Pipeline(
             _STEP_CFG_FACTOR: 1 + int(guidance_scale > 1.0),
             _STEP_OUTPUT_SIZE: (target_height, target_width),
             _STEP_COT_TEXT_LIST: cot_text_list,
+            _STEP_ROLLOUT_METADATA: rollout_metadata_list,
             _STEP_AR_KV: self._snapshot_injected_ar_kv(),
         }
         return state
@@ -2093,9 +2096,14 @@ class HunyuanImage3Pipeline(
         # Postprocess deferred to engine post_process_func for overlap with next request.
 
         cot_text_list = state.extra.get(_STEP_COT_TEXT_LIST) or []
+        rollout_metadata_list = state.extra.get(_STEP_ROLLOUT_METADATA) or []
         metadata = {}
         if any(text is not None for text in cot_text_list):
-            metadata["text"] = {"ar_generated_text": cot_text_list[0]}
+            text_metadata: dict[str, Any] = {"ar_generated_text": cot_text_list[0]}
+            rollout_metadata = rollout_metadata_list[0] if rollout_metadata_list else None
+            if isinstance(rollout_metadata, dict):
+                text_metadata.update(rollout_metadata)
+            metadata["text"] = text_metadata
         return DiffusionOutput(
             output={
                 "payload": {"image": image[0]},
@@ -2123,6 +2131,7 @@ class HunyuanImage3Pipeline(
             system_prompt,
             batch_cond_image_info,
             tokenizer_bot_task,
+            rollout_metadata_list,
         ) = request_layout_utils.extract_hunyuan_prompt_inputs(
             req.prompts,
             extra_args,
@@ -2169,7 +2178,13 @@ class HunyuanImage3Pipeline(
         image = outputs[0]
         metadata = {}
         if any(t is not None for t in cot_text_list):
-            metadata["text"] = {"ar_generated_text": cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list}
+            text_metadata: dict[str, Any] = {
+                "ar_generated_text": cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list
+            }
+            rollout_metadata = rollout_metadata_list[0] if rollout_metadata_list else None
+            if isinstance(rollout_metadata, dict):
+                text_metadata.update(rollout_metadata)
+            metadata["text"] = text_metadata
         stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
         return DiffusionOutput(
             output={

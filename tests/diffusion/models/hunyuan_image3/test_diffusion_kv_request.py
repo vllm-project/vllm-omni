@@ -278,12 +278,15 @@ def test_prepared_model_inputs_match_local_tokenization(
     request = _request(guidance_scale=guidance_scale, prompt=prompt)
     prepared_layout = _prepare(request, tokenizer, image_processor)
 
-    prompts, cot_texts, system_prompt, batch_cond_image_info, bot_task = extract_hunyuan_prompt_inputs(
-        [request.prompt],
-        request.sampling_params.extra_args or {},
-        request_id=request.request_id,
-        allow_cond_image=True,
+    prompts, cot_texts, system_prompt, batch_cond_image_info, bot_task, rollout_metadata_list = (
+        extract_hunyuan_prompt_inputs(
+            [request.prompt],
+            request.sampling_params.extra_args or {},
+            request_id=request.request_id,
+            allow_cond_image=True,
+        )
     )
+    assert rollout_metadata_list == [None]
     cot_text = (
         [normalize_hunyuan_cot_text(text) for text in cot_texts]
         if any(text is not None for text in cot_texts)

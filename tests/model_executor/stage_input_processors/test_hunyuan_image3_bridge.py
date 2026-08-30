@@ -19,16 +19,24 @@ from vllm_omni.model_executor.stage_input_processors.hunyuan_image3 import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _source_output(token_ids: list[int], text: str = ""):
+def _source_output(
+    token_ids: list[int],
+    text: str = "",
+    *,
+    logprobs: list | None = None,
+    prompt_token_ids: list[int] | None = None,
+):
     return SimpleNamespace(
         outputs=[
             SimpleNamespace(
                 token_ids=token_ids,
                 cumulative_token_ids=token_ids,
                 text=text,
+                logprobs=logprobs,
             )
         ],
         multimodal_output=None,
+        prompt_token_ids=prompt_token_ids,
     )
 
 
@@ -66,6 +74,38 @@ def test_ar2diffusion_uses_parent_output_when_companions_are_present():
 
     assert result is not None
     assert result["extra"]["ar_generated_text"] == "parent thought"
+
+
+def test_ar2diffusion_exposes_ar_rollout_metadata():
+    """#6768: sampled token ids / per-token log-probs / prompt ids must be
+    carried alongside ar_generated_text instead of being dropped."""
+    logprobs = [
+        {101: SimpleNamespace(logprob=-0.5), 999: SimpleNamespace(logprob=-8.0)},
+        {102: SimpleNamespace(logprob=-1.25)},
+    ]
+    result = ar2diffusion(
+        [_source_output([101, 102], text="thought", logprobs=logprobs, prompt_token_ids=[7, 8, 9])],
+        prompt={"prompt": "edit"},
+    )
+
+    assert result is not None
+    extra = result["extra"]
+    assert extra["ar_generated_text"] == "thought"
+    assert extra["ar_generated_token_ids"] == [101, 102]
+    assert extra["ar_generated_logprobs"] == [-0.5, -1.25]
+    assert extra["ar_prompt_token_ids"] == [7, 8, 9]
+
+
+def test_ar2diffusion_omits_logprobs_when_not_requested():
+    result = ar2diffusion(
+        [_source_output([100], text="thought", prompt_token_ids=[7])],
+        prompt={"prompt": "edit"},
+    )
+
+    assert result is not None
+    assert "ar_generated_logprobs" not in result["extra"]
+    assert result["extra"]["ar_generated_token_ids"] == [100]
+    assert result["extra"]["ar_prompt_token_ids"] == [7]
 
 
 def test_ar2diffusion_returns_none_without_parent_output():

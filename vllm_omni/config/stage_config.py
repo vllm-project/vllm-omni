@@ -256,6 +256,23 @@ class StagePipelineConfig:
 
 
 @dataclass(frozen=True)
+class PipelineTopology:
+    """Read-only summary of a pipeline's stage graph (cycle-agnostic).
+
+    Inspects only the declared ``input_sources`` / ``final_output`` fields and
+    never assumes the graph is acyclic: cyclic pipelines (e.g. MiMo Audio,
+    DiTAR) must be introspectable too (see #4560).
+    """
+
+    entry_stages: tuple[int, ...]
+    terminal_stages: tuple[int, ...]
+    # stage_id -> declared input source stage ids
+    inputs: dict[int, tuple[int, ...]]
+    # stage_id -> consuming (downstream) stage ids, derived from inputs
+    consumers: dict[int, tuple[int, ...]]
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
     """Complete pipeline topology for a model (frozen)."""
 
@@ -308,6 +325,27 @@ class PipelineConfig:
             if stage.stage_id == stage_id:
                 return stage
         return None
+
+    def topology(self) -> PipelineTopology:
+        """Return a read-only topology summary: entry/terminal stages and adjacency.
+
+        Cycle-agnostic: this only inspects declared ``input_sources`` and
+        ``final_output`` flags; it performs no DAG/cycle analysis (see #4560).
+        """
+        entry_stages = tuple(stage.stage_id for stage in self.stages if not stage.input_sources)
+        terminal_stages = tuple(stage.stage_id for stage in self.stages if stage.final_output)
+        inputs = {stage.stage_id: tuple(stage.input_sources) for stage in self.stages}
+        consumers: dict[int, list[int]] = {stage.stage_id: [] for stage in self.stages}
+        for stage in self.stages:
+            for src in stage.input_sources:
+                if src in consumers:
+                    consumers[src].append(stage.stage_id)
+        return PipelineTopology(
+            entry_stages=entry_stages,
+            terminal_stages=terminal_stages,
+            inputs=inputs,
+            consumers={stage_id: tuple(downstream) for stage_id, downstream in consumers.items()},
+        )
 
     def validate(self) -> list[str]:
         """Return list of topology errors (empty if valid)."""
