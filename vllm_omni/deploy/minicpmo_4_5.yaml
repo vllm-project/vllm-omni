@@ -12,6 +12,7 @@ connectors:
       codec_chunk_frames: 512
       codec_left_context_frames: 3
       initial_codec_chunk_frames: 4
+      token2wav_n_timesteps: 3
 stages:
 - stage_id: 0
   max_num_seqs: 4
