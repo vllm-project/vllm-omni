@@ -158,26 +158,46 @@ def test_incompatible_inputs_fall_back_without_failed_key():
     assert runner.stats_snapshot()["failed_key_count"] == 0
 
 
-def test_tp_capture_scope_registers_distributed_graph_buffers(monkeypatch):
+def test_tp_capture_scope_uses_dedicated_stream(monkeypatch):
     runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cuda")
-    entered = []
+    current_stream = object()
+    capture_stream = SimpleNamespace(wait_stream_calls=[])
+    capture_stream.wait_stream = capture_stream.wait_stream_calls.append
+    entered_streams = []
 
     @contextmanager
-    def fake_graph_capture(*, device):
-        entered.append(device)
+    def use_stream(stream):
+        entered_streams.append(stream)
         yield
 
     monkeypatch.setattr(
         "vllm_omni.diffusion.models.ltx2.ltx2_audio_cuda_graph.get_tensor_model_parallel_world_size",
         lambda: 2,
     )
+    monkeypatch.setattr(torch.cuda, "Stream", lambda *, device: capture_stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: current_stream)
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
+
+    with runner._tensor_parallel_capture_scope():
+        assert entered_streams == [capture_stream]
+
+    assert capture_stream.wait_stream_calls == [current_stream]
+
+
+def test_tp1_capture_scope_does_not_create_stream(monkeypatch):
+    runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cuda")
     monkeypatch.setattr(
-        "vllm_omni.diffusion.models.ltx2.ltx2_audio_cuda_graph.graph_capture",
-        fake_graph_capture,
+        "vllm_omni.diffusion.models.ltx2.ltx2_audio_cuda_graph.get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "Stream",
+        lambda **_kwargs: pytest.fail("TP1 must not create a dedicated capture stream"),
     )
 
     with runner._tensor_parallel_capture_scope():
-        assert entered == [torch.device("cuda")]
+        pass
 
 
 def test_mock_cache_hit_lru_and_eviction(monkeypatch):

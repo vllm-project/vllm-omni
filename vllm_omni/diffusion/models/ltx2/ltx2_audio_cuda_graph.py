@@ -14,7 +14,6 @@ from typing import Any
 
 import torch
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.distributed.parallel_state import graph_capture
 from vllm.logger import init_logger
 
 from .ltx2_audio_transformer import LTX2AudioStaticConditioning
@@ -390,7 +389,13 @@ class LTX2AudioCUDAGraphRunner:
 
     @contextmanager
     def _tensor_parallel_capture_scope(self):
-        """Register TP communication buffers used by the captured graph."""
+        """Run TP graph capture on a dedicated CUDA stream.
+
+        Diffusion uses a lightweight TP coordinator without vLLM's custom
+        all-reduce communicator. NCCL collectives only require every rank to
+        enter graph capture on a non-default stream after its current work has
+        completed, so keep that setup local to the LTX2 audio graph path.
+        """
         try:
             tp_size = get_tensor_model_parallel_world_size()
         except AssertionError:
@@ -398,7 +403,11 @@ class LTX2AudioCUDAGraphRunner:
         if tp_size == 1:
             yield
             return
-        with graph_capture(device=self.device):
+
+        capture_stream = torch.cuda.Stream(device=self.device)
+        current_stream = torch.cuda.current_stream(self.device)
+        capture_stream.wait_stream(current_stream)
+        with torch.cuda.stream(capture_stream):
             yield
 
     def _capture(self, **inputs: Any) -> tuple[LTX2AudioGraphEntry, torch.Tensor]:
