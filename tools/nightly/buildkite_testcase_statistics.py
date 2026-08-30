@@ -441,10 +441,10 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
     """Write stats to HTML with styling and responsive tables."""
     root = repo_root if repo_root is not None else REPO_ROOT
     pipeline_badges = {
-        "test-ready": "level2",
-        "test-merge": "level3",
-        "test-nightly": "level4",
-        "test-weekly": "level5",
+        "test-ready": "ready",
+        "test-merge": "merge",
+        "test-nightly": "nightly",
+        "test-weekly": "weekly",
     }
 
     def esc(s: str) -> str:
@@ -601,10 +601,10 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
       --text: #e6edf3;
       --muted: #8b949e;
       --accent: #58a6ff;
-      --level2: #3fb950;
-      --level3: #a371f7;
-      --level4: #f0883e;
-      --level5: #79c0ff;
+      --ready: #3fb950;
+      --merge: #a371f7;
+      --nightly: #f0883e;
+      --weekly: #79c0ff;
     }}
     * {{ box-sizing: border-box; }}
     body {{
@@ -716,10 +716,10 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
       font-size: 0.8rem;
       font-weight: 500;
     }}
-    .badge.level2 {{ background: rgba(63, 185, 80, 0.2); color: var(--level2); }}
-    .badge.level3 {{ background: rgba(163, 113, 247, 0.2); color: var(--level3); }}
-    .badge.level4 {{ background: rgba(240, 136, 62, 0.2); color: var(--level4); }}
-    .badge.level5 {{ background: rgba(121, 192, 255, 0.2); color: var(--level5); }}
+    .badge.ready {{ background: rgba(63, 185, 80, 0.2); color: var(--ready); }}
+    .badge.merge {{ background: rgba(163, 113, 247, 0.2); color: var(--merge); }}
+    .badge.nightly {{ background: rgba(240, 136, 62, 0.2); color: var(--nightly); }}
+    .badge.weekly {{ background: rgba(121, 192, 255, 0.2); color: var(--weekly); }}
     .badge.skip {{ background: rgba(139, 148, 158, 0.25); color: var(--muted); }}
     td.status {{ color: var(--muted); font-size: 0.85rem; }}
     .case-details details {{

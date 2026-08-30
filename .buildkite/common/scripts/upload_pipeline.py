@@ -64,10 +64,10 @@ LOG = "upload_pipeline"
 BOOTSTRAP_STEPS_FILENAME = "bootstrap-upload-steps.yml"
 BOOTSTRAP_IMAGE_BUILD_KEYS = frozenset({"image-build", "image-build-a2", "image-build-a3"})
 BOOTSTRAP_UPLOAD_IF_KEYS = {
-    "upload-ready-pipeline": "level2",
-    "upload-merge-pipeline": "level3",
-    "upload-nightly-pipeline": "level4",
-    "upload-weekly-pipeline": "level5",
+    "upload-ready-pipeline": "ready",
+    "upload-merge-pipeline": "merge",
+    "upload-nightly-pipeline": "nightly",
+    "upload-weekly-pipeline": "weekly",
 }
 E2E_GROUP_MARKER = "E2E Test"
 CI_MIRROR_HARDWARES_PATH = ROOT / ".buildkite/common/ci_mirror_hardwares.yml"
@@ -89,14 +89,14 @@ NIGHTLY_LABEL_IF = (
 WEEKLY_E2E_IF = 'build.branch == "main" && build.env("WEEKLY") == "1"'
 WEEKLY_MAIN_IF = 'build.branch == "main" && (build.env("WEEKLY") == "1" || build.env("NON_CRITICAL") == "1")'
 WEEKLY_LABEL_IF = f'({WEEKLY_MAIN_IF}) || (build.branch != "main" && build.pull_request.labels includes "weekly-test")'
-LEVEL2_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "ready"'
-LEVEL3_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "merge-test"'
-LEVEL3_MAIN_IF = (
+READY_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "ready"'
+MERGE_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "merge-test"'
+MERGE_MAIN_IF = (
     'build.branch == "main" && build.env("NIGHTLY") != "1" && '
     'build.env("WEEKLY") != "1" && build.env("NON_CRITICAL") != "1"'
 )
-LEVEL2_UPLOAD_IF = f"({WEEKLY_E2E_IF}) || ({LEVEL2_LABEL_IF})"
-LEVEL3_UPLOAD_IF = f"({WEEKLY_E2E_IF}) || (({LEVEL3_MAIN_IF}) || ({LEVEL3_LABEL_IF}))"
+READY_UPLOAD_IF = f"({WEEKLY_E2E_IF}) || ({READY_LABEL_IF})"
+MERGE_UPLOAD_IF = f"({WEEKLY_E2E_IF}) || (({MERGE_MAIN_IF}) || ({MERGE_LABEL_IF}))"
 BOOTSTRAP_DISABLED_IF = "false"
 BOOTSTRAP_ENABLED_IF = "true"
 
@@ -131,53 +131,53 @@ def _format_bootstrap_if(expr: str) -> str:
 
 def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
     if platform == "npu":
-        level2_upload = LEVEL2_LABEL_IF
-        level3_upload = BOOTSTRAP_DISABLED_IF
-        level5_label_if = BOOTSTRAP_DISABLED_IF
+        ready_upload = READY_LABEL_IF
+        merge_upload = BOOTSTRAP_DISABLED_IF
+        weekly_label_if = BOOTSTRAP_DISABLED_IF
     else:
-        level2_upload = LEVEL2_UPLOAD_IF
-        level3_upload = LEVEL3_UPLOAD_IF
-        level5_label_if = WEEKLY_LABEL_IF
+        ready_upload = READY_UPLOAD_IF
+        merge_upload = MERGE_UPLOAD_IF
+        weekly_label_if = WEEKLY_LABEL_IF
 
     if decision.skip_all:
         # Docs / skip-mark only: no PR-label escape hatch. Main scheduled
         # NIGHTLY=1 still runs L4; WEEKLY=1 / NON_CRITICAL=1 still run L5.
         # main+WEEKLY=1 also uploads L2/L3 (those steps then pass --e2e).
         image_expr = f"({NIGHTLY_MAIN_IF}) || ({WEEKLY_MAIN_IF})" if platform == "cuda" else NIGHTLY_MAIN_IF
-        level2_expr = WEEKLY_E2E_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
-        level3_expr = WEEKLY_E2E_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
-        level4_expr = NIGHTLY_MAIN_IF
-        level5_expr = WEEKLY_MAIN_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
+        ready_expr = WEEKLY_E2E_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
+        merge_expr = WEEKLY_E2E_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
+        nightly_expr = NIGHTLY_MAIN_IF
+        weekly_expr = WEEKLY_MAIN_IF if platform == "cuda" else BOOTSTRAP_DISABLED_IF
     elif decision.skip_l2_l3:
         l2_enabled = decision.is_run("npu", "l2") if platform == "npu" else decision.is_run("cuda", "l2")
         l3_enabled = platform == "cuda" and decision.is_run("cuda", "l3")
 
-        level2_expr = level2_upload if l2_enabled else BOOTSTRAP_DISABLED_IF
-        level3_expr = level3_upload if l3_enabled else BOOTSTRAP_DISABLED_IF
-        level4_expr = NIGHTLY_LABEL_IF
-        level5_expr = level5_label_if if platform == "cuda" else BOOTSTRAP_DISABLED_IF
+        ready_expr = ready_upload if l2_enabled else BOOTSTRAP_DISABLED_IF
+        merge_expr = merge_upload if l3_enabled else BOOTSTRAP_DISABLED_IF
+        nightly_expr = NIGHTLY_LABEL_IF
+        weekly_expr = weekly_label_if if platform == "cuda" else BOOTSTRAP_DISABLED_IF
 
         image_parts = [f"({NIGHTLY_LABEL_IF})"]
         if platform == "cuda":
-            image_parts.append(f"({level5_label_if})")
+            image_parts.append(f"({weekly_label_if})")
         if l2_enabled:
-            image_parts.insert(0, f"({level2_upload})")
+            image_parts.insert(0, f"({ready_upload})")
         if l3_enabled:
-            image_parts.insert(1 if l2_enabled else 0, f"({level3_upload})")
+            image_parts.insert(1 if l2_enabled else 0, f"({merge_upload})")
         image_expr = " || ".join(image_parts)
     else:
         image_expr = BOOTSTRAP_ENABLED_IF
-        level2_expr = level2_upload
-        level3_expr = level3_upload if platform == "cuda" else BOOTSTRAP_DISABLED_IF
-        level4_expr = NIGHTLY_LABEL_IF
-        level5_expr = level5_label_if if platform == "cuda" else BOOTSTRAP_DISABLED_IF
+        ready_expr = ready_upload
+        merge_expr = merge_upload if platform == "cuda" else BOOTSTRAP_DISABLED_IF
+        nightly_expr = NIGHTLY_LABEL_IF
+        weekly_expr = weekly_label_if if platform == "cuda" else BOOTSTRAP_DISABLED_IF
 
     return {
         "image": _format_bootstrap_if(image_expr),
-        "level2": _format_bootstrap_if(level2_expr),
-        "level3": _format_bootstrap_if(level3_expr),
-        "level4": _format_bootstrap_if(level4_expr),
-        "level5": _format_bootstrap_if(level5_expr),
+        "ready": _format_bootstrap_if(ready_expr),
+        "merge": _format_bootstrap_if(merge_expr),
+        "nightly": _format_bootstrap_if(nightly_expr),
+        "weekly": _format_bootstrap_if(weekly_expr),
     }
 
 

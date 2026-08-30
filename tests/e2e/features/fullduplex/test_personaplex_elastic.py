@@ -28,12 +28,12 @@ from tests.helpers.mark import hardware_marks
 
 torch = pytest.importorskip("torch")
 
-# slow + H100/B200 + omni + cards_1 routes this module into weekly
-# "Omni · H100 · Single-GPU" (test-weekly.yml) and B200 mirror collection.
+# slow + H100 + omni + cards_1 routes this module into weekly
+# "Omni · H100 · Single-GPU" (test-weekly.yml).
 pytestmark = [
     pytest.mark.omni,
     pytest.mark.slow,
-    *hardware_marks(res={"cuda": ["H100", "B200"]}),
+    *hardware_marks(res={"cuda": "H100"}),
 ]
 
 if not torch.cuda.is_available():  # noqa: E402

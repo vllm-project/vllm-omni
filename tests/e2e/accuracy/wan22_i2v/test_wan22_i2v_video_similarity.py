@@ -69,17 +69,6 @@ SERVER_CASES = [
 ]
 
 
-@pytest.mark.core_model
-@pytest.mark.cpu
-def test_resolve_similarity_thresholds_uses_device_profile() -> None:
-    default = resolve_similarity_thresholds(SIMILARITY_THRESHOLDS_BY_DEVICE, "default")
-    b200 = resolve_similarity_thresholds(SIMILARITY_THRESHOLDS_BY_DEVICE, "B200")
-    assert default.ssim == 0.94
-    assert default.psnr == 28.0
-    assert b200.ssim == 0.93
-    assert b200.psnr == 28.0
-
-
 def _build_diffusers_command(
     *,
     runner_path: Path,

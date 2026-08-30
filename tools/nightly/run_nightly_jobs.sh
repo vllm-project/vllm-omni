@@ -69,8 +69,8 @@
 #   LOG_DIR       - logs + generated job scripts; when unset, a timestamped directory under
 #                   $REPO_ROOT/logs/ is created:
 #                     nightly_jobs_YYYYMMDD-HHMMSS       (default / YAML nightly steps)
-#                     level4_local_jobs_YYYYMMDD-HHMMSS (--test-type local only)
-#                     level4_stability_jobs_YYYYMMDD-HHMMSS (--test-type stability only)
+#                     nightly_local_jobs_YYYYMMDD-HHMMSS (--test-type local only)
+#                     nightly_stability_jobs_YYYYMMDD-HHMMSS (--test-type stability only)
 #                   per-job *.log plus timing_summary.log after the run;
 #                   perf JSON from tests/dfx/perf/results/ (produced this run) -> $LOG_DIR/perf_results/
 #   TEST_TYPE     - comma-separated and/or repeated flags (default: all); see above
@@ -236,7 +236,7 @@ TEST_TYPE="$(_finalize_test_type_csv)"
 MODEL_TYPE="$(_finalize_model_type_csv)"
 
 # Default log directory basename: date + local timestamp; prefix depends on TEST_TYPE.
-_level4_log_dir_basename() {
+_nightly_log_dir_basename() {
   local ts has_local=0 has_stability=0 has_yaml=0 _t
   ts="$(date +%Y%m%d-%H%M%S)"
   IFS=',' read -ra _TTOK <<< "${TEST_TYPE}"
@@ -249,9 +249,9 @@ _level4_log_dir_basename() {
     esac
   done
   if [[ "${has_local}" -eq 1 && "${has_yaml}" -eq 0 && "${has_stability}" -eq 0 ]]; then
-    printf 'level4_local_jobs_%s' "${ts}"
+    printf 'nightly_local_jobs_%s' "${ts}"
   elif [[ "${has_stability}" -eq 1 && "${has_yaml}" -eq 0 && "${has_local}" -eq 0 ]]; then
-    printf 'level4_stability_jobs_%s' "${ts}"
+    printf 'nightly_stability_jobs_%s' "${ts}"
   else
     printf 'nightly_jobs_%s' "${ts}"
   fi
@@ -321,23 +321,23 @@ else
 fi
 
 if [[ -z "${LOG_DIR:-}" ]]; then
-  LOG_DIR="${REPO_ROOT}/logs/$(_level4_log_dir_basename)"
+  LOG_DIR="${REPO_ROOT}/logs/$(_nightly_log_dir_basename)"
 fi
 
 echo "Log directory: ${LOG_DIR}" >&2
 
 # Require test-nightly.yml only when at least one non-stability test kind needs it (validated in Python too).
-_needs_level4_yml=0
+_needs_nightly_yml=0
 IFS=',' read -ra _TTOK <<< "${TEST_TYPE}"
 for _t in "${_TTOK[@]}"; do
   _t="$(printf '%s' "${_t}" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
   case "${_t}" in
     perf | acc | function | all)
-      _needs_level4_yml=1
+      _needs_nightly_yml=1
       ;;
   esac
 done
-if [[ "${_needs_level4_yml}" -eq 1 ]] && [[ ! -f "${YML}" ]]; then
+if [[ "${_needs_nightly_yml}" -eq 1 ]] && [[ ! -f "${YML}" ]]; then
   echo "YAML not found: ${YML}" >&2
   exit 2
 fi

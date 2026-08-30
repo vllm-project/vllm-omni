@@ -5,8 +5,8 @@
 # Shared helpers for tools/run_*_jobs.sh (source this file; do not execute).
 #
 # Contents:
-#   1) Timing / tee runners used by level2, level3, and level4.
-#   2) Level2/level3 CLI + YAML extract entrypoint: run_yaml_ci_jobs_main
+#   1) Timing / tee runners used by ready, merge, and nightly.
+#   2) Ready/merge CLI + YAML extract entrypoint: run_yaml_ci_jobs_main
 #      (set BUILDKITE_REL and DEFAULT_LOG_SUBDIR in the entry script, then call it).
 #
 # Job timeouts: generated job scripts embed GNU timeout on the pytest line itself
@@ -24,7 +24,7 @@ if [[ -z "${SCRIPT_DIR:-}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Timing / tee helpers (level2, level3, level4)
+# Timing / tee helpers (ready, merge, nightly)
 # ---------------------------------------------------------------------------
 
 RUN_JOB_NAMES=()
@@ -177,8 +177,8 @@ _run_jobs_print_timing_summary() {
 }
 
 # ---------------------------------------------------------------------------
-# Level2 / level3: CLI + YAML extract + run (tools/run_ready_jobs.sh,
-# tools/run_merge_jobs.sh). Level4 does not use this entrypoint.
+# Ready / merge: CLI + YAML extract + run (tools/run_ready_jobs.sh,
+# tools/run_merge_jobs.sh). Nightly does not use this entrypoint.
 #
 # Entry scripts must set before calling run_yaml_ci_jobs_main:
 #   BUILDKITE_REL      - e.g. .buildkite/cuda/test-ready.yml
