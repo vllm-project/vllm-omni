@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """NPU patches for the MiniMax H3 Qwen3-VL text encoder."""
 
@@ -112,5 +112,5 @@ def apply_minimax_h3_qwen3vl_swiglu_patch() -> None:
 
     from vllm_omni.diffusion.models.minimax_h3 import encoder
 
-    encoder.MiniMaxH3Qwen3VLTextMLP.forward = _forward_minimax_h3_qwen3vl_text_mlp_npu
+    encoder.MiniMaxH3Qwen3VLTextMLP.forward = _forward_minimax_h3_qwen3vl_text_mlp_npu  # type: ignore[method-assign]
     _SWIGLU_PATCHED = True

@@ -494,6 +494,22 @@ class OmniDuplexSessionHandler(
             # playback only controls history ACKs, not model admission.
             if is_speech:
                 session.accumulate_overlap_speech(duration_ms)
+            vad_speech_started = self._vad_speech_started(event, payload)
+            if (
+                self._uses_native_input_append(session)
+                and session.capabilities.supports_barge_in
+                and is_speech
+                and session.config.overlap_policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+                and vad_speech_started is not False
+            ):
+                return {
+                    "action": "barge_in",
+                    "reason": ("server_vad_speech_started" if vad_speech_started is True else "barge_in_on_speech"),
+                    "cancel_reason": "turn_detected" if vad_speech_started is True else "barge_in",
+                    "duration_ms": duration_ms,
+                    "overlap_speech_ms": session.overlap_speech_ms,
+                    "buffer_audio": True,
+                }
             return {
                 "action": "listen",
                 "reason": "auto_response_continuous",
@@ -501,7 +517,7 @@ class OmniDuplexSessionHandler(
                 "overlap_speech_ms": session.overlap_speech_ms,
                 "buffer_audio": True,
                 "defer_runtime_append": False,
-                "force_listen": False,
+                "force_listen": event.get("force_listen") is True or payload.get("force_listen") is True,
                 "preserve_realtime_input": True,
             }
         if bool(event.get("force_listen", False)):
@@ -553,9 +569,22 @@ class OmniDuplexSessionHandler(
 
         session.accumulate_overlap_speech(duration_ms)
         if policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value:
+            vad_speech_started = self._vad_speech_started(event, payload)
+            if vad_speech_started is False:
+                return {
+                    "action": "listen",
+                    "reason": "server_vad_utterance_active",
+                    "duration_ms": duration_ms,
+                    "overlap_speech_ms": session.overlap_speech_ms,
+                    "buffer_audio": True,
+                    "defer_runtime_append": False,
+                    "force_listen": True,
+                    "preserve_realtime_input": True,
+                }
             return {
                 "action": "barge_in",
-                "reason": "policy_barge_in_on_speech",
+                "reason": ("server_vad_speech_started" if vad_speech_started is True else "policy_barge_in_on_speech"),
+                "cancel_reason": "turn_detected" if vad_speech_started is True else "barge_in",
                 "duration_ms": duration_ms,
                 "overlap_speech_ms": session.overlap_speech_ms,
                 "buffer_audio": True,
@@ -598,6 +627,17 @@ class OmniDuplexSessionHandler(
             "buffer_audio": True,
             "defer_runtime_append": True,
         }
+
+    @staticmethod
+    def _vad_speech_started(
+        event: Mapping[str, object],
+        payload: Mapping[str, object],
+    ) -> bool | None:
+        for source in (event, payload):
+            vad = source.get("vad")
+            if isinstance(vad, Mapping) and isinstance(vad.get("speech_started"), bool):
+                return bool(vad["speech_started"])
+        return None
 
     @staticmethod
     def _event_requests_barge_in(event: Mapping[str, object]) -> bool:
@@ -1155,7 +1195,13 @@ class OmniDuplexSessionHandler(
         candidate_config: DuplexSessionConfig,
     ) -> dict[str, object] | None:
         if not self._uses_native_input_append(session):
-            return None
+            if candidate_config.overlap_policy != DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value:
+                return None
+            return {
+                "type": "error",
+                "code": "server_vad_requires_native_duplex",
+                "error": "Realtime server_vad requires a model-native duplex runtime",
+            }
         if (
             candidate_config.instructions != session.config.instructions
             and self._runtime_session_state(session).native_context_locked
@@ -1626,6 +1672,54 @@ class OmniDuplexSessionHandler(
         if response_id is None and item_id is None and session.active_response_id is not None:
             response_id = session.active_response_id
             item_id = f"item_{response_id}"
+        if response_id is not None:
+            expected_item_id = f"item_{response_id}"
+            if item_id is None:
+                item_id = expected_item_id
+            elif item_id != expected_item_id:
+                await send_json(
+                    {
+                        "type": "error",
+                        "session_id": session.session_id,
+                        "epoch": session.epoch,
+                        "code": "playback_item_mismatch",
+                        "error": "playback.ack item_id must match item_<response_id>.",
+                    }
+                )
+                return
+            if not session.has_assistant_response_item(response_id, item_id):
+                await send_json(
+                    {
+                        "type": "error",
+                        "session_id": session.session_id,
+                        "epoch": session.epoch,
+                        "code": "playback_item_not_found",
+                        "error": f"No assistant response item is registered for {response_id}.",
+                    }
+                )
+                return
+            if session.playback_ack_is_too_late(response_id, item_id):
+                await send_json(
+                    {
+                        "type": "error",
+                        "session_id": session.session_id,
+                        "epoch": session.epoch,
+                        "code": "playback_ack_too_late",
+                        "error": "playback.ack arrived after a later user input was committed.",
+                    }
+                )
+                return
+        elif item_id is not None:
+            await send_json(
+                {
+                    "type": "error",
+                    "session_id": session.session_id,
+                    "epoch": session.epoch,
+                    "code": "playback_item_not_found",
+                    "error": "playback.ack requires a response-owned assistant item.",
+                }
+            )
+            return
         if event.get("truncate") is True:
             playback = session.acknowledge_playback(
                 int(played_ms),
@@ -1644,6 +1738,16 @@ class OmniDuplexSessionHandler(
             )
         committed_history = False
         if isinstance(item_id, str) and item_id:
+            expected_item_id = f"item_{response_id}" if response_id is not None else None
+            if (
+                expected_item_id == item_id
+                and item_id not in session.history_item_ids
+                and item_id not in session.pending_history_item_ids
+            ):
+                # ACK_ONLY responses are normally registered as pending when
+                # the response ends. Recover the response-local item if that
+                # registration was lost across the response/ack boundary.
+                session.register_history_item(item_id, None)
             committed_history = session.truncate_history_item(
                 item_id,
                 audio_end_ms=committed_cursor,
@@ -1724,7 +1828,7 @@ class OmniDuplexSessionHandler(
             item_id = f"item_{old_response_id}"
             if committed_message is not None:
                 session.register_history_item(item_id, committed_message)
-            elif committed_ms > 0:
+            elif committed_ms > 0 and not session.playback_ack_is_too_late(old_response_id, item_id):
                 session.truncate_history_item(item_id, audio_end_ms=committed_ms)
         new_epoch, old_playback = self._advance_barge_in_epoch(session)
         if old_request_id is not None:

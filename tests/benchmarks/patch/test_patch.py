@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Unit tests for patch.py
@@ -17,6 +17,7 @@ from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
+    _apply_stage0_token_timings,
     async_request_openai_chat_omni_completions,
     async_request_openai_realtime_duplex,
 )
@@ -102,7 +103,24 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
                 received_at_s=now + 0.03,
             )
             self.events.add(
-                {"type": "response.done", "response": {"id": response_id}},
+                {
+                    "type": "response.done",
+                    "response": {
+                        "id": response_id,
+                        "metadata": {
+                            "vllm_omni": {
+                                "stage_metrics": {
+                                    "0": {
+                                        "num_tokens_out": 3,
+                                        "vllm_ttft_ms": 20.0,
+                                        "vllm_tpot_ms": 10.0,
+                                        "vllm_itls_ms": [10.0, 10.0],
+                                    }
+                                }
+                            }
+                        },
+                    },
+                },
                 received_at_s=now + 0.04,
             )
 
@@ -143,6 +161,7 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
     assert client.configure_kwargs["native_duplex"] is False
     assert client.configure_kwargs["extra_body"] == {
         "ref_audio": "data:audio/wav;base64,AAAA",
+        "return_stage_metrics": True,
     }
     assert client.sent == [
         event
@@ -167,6 +186,10 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
     assert output.audio_ttfp > output.ttft
     assert output.audio_rtf > 0
     assert output.latency > 0
+    assert output.output_tokens == 12
+    assert output.itl == [0.01, 0.01] * 4
+    assert output.text_latency == pytest.approx(output.ttft + 0.08)
+    assert output.tpot_measured is True
     assert output.tts_turn_pcm_bytes == [b"\x00\x00" * 2400] * 4
     assert output.tts_output_pcm_bytes == b"\x00\x00" * 9600
     session_id = output.duplex_request_metrics[0]["session_id"]
@@ -196,6 +219,54 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
         "mean_ttfp_ms": pytest.approx(30.0, abs=2.0),
         "mean_rtf": pytest.approx(0.3, abs=0.03),
     }
+
+
+def test_stage0_token_timings_use_weighted_tpot_when_itls_are_incomplete():
+    output = MixRequestFuncOutput(ttft=0.1)
+
+    measured = _apply_stage0_token_timings(
+        output,
+        [
+            {"output_token_count": 3, "itls_ms": [], "tpot_ms": 10.0},
+            {"output_token_count": 2, "itls_ms": [], "tpot_ms": 40.0},
+        ],
+        expected_output_tokens=5,
+    )
+
+    assert measured is True
+    assert output.itl == []
+    assert output.tpot_measured is True
+    assert (output.text_latency - output.ttft) / 4 == pytest.approx(0.02)
+
+
+def test_stage0_zero_itls_fall_back_to_positive_tpot():
+    output = MixRequestFuncOutput(ttft=0.1)
+
+    measured = _apply_stage0_token_timings(
+        output,
+        [{"output_token_count": 3, "itls_ms": [0.0, 0.0], "tpot_ms": 25.0}],
+        expected_output_tokens=3,
+    )
+
+    assert measured is True
+    assert output.itl == []
+    assert output.tpot_measured is True
+    assert (output.text_latency - output.ttft) / 2 == pytest.approx(0.025)
+
+
+def test_stage0_token_count_without_timing_is_not_measured():
+    output = MixRequestFuncOutput(ttft=0.1)
+
+    measured = _apply_stage0_token_timings(
+        output,
+        [{"output_token_count": 3, "itls_ms": [], "tpot_ms": None}],
+        expected_output_tokens=3,
+    )
+
+    assert measured is False
+    assert output.itl == []
+    assert output.text_latency == output.ttft
+    assert output.tpot_measured is False
 
 
 def create_sse_chunk(data_dict):

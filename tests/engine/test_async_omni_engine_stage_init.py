@@ -433,9 +433,33 @@ def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline
         "stage_id": 0,
         "stage_init_timeout": 302,
         "batch_size": 4,
-        "use_inline": True,
+        "use_inline": False,
         "omni_master_server": None,
     }
+
+
+def test_initialize_local_diffusion_replica_uses_explicit_inline_opt_in(monkeypatch):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+    from vllm_omni.engine.stage_engine_startup import StageReplicaResources
+
+    runtime = _make_stage_runtime()
+    plan = _make_diffusion_plan(0, stage_id=1).replicas[0]
+    plan.stage_cfg.engine_args["inline_diffusion"] = True
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(runtime_mod, "inject_kv_stage_info", lambda *_: None)
+    monkeypatch.setattr(
+        runtime_mod,
+        "launch_diffusion_stage_replica",
+        lambda **kwargs: (
+            captured.update(use_inline=kwargs["use_inline"]),
+            (types.SimpleNamespace(), StageReplicaResources()),
+        )[1],
+    )
+
+    runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=1)
+
+    assert captured["use_inline"] is True
 
 
 def test_initialize_local_llm_replica_scopes_runtime_env(monkeypatch):
@@ -1138,6 +1162,21 @@ def test_build_engine_args_keeps_stage_owned_tokenizer_subdir(tmp_path):
 
     assert engine_args["model"] == os.path.join(str(tmp_path), "llm")
     assert engine_args["tokenizer"] == os.path.join(str(tmp_path), "tokenizer")
+
+
+def test_model_path_resolver_is_generic_and_model_owned(tmp_path):
+    from vllm_omni.engine.stage_init_utils import _resolve_model_path
+
+    engine_args = {
+        "model_path_resolver": ("vllm_omni.model_executor.models.minimax_h3.checkpoint.resolve_minimax_h3_model_root"),
+        "revision": None,
+        "task_type": "ref2va",
+    }
+
+    resolved = _resolve_model_path(str(tmp_path), engine_args)
+
+    assert resolved == str(tmp_path / "Ref2VA" / "text_encoder")
+    assert "model_path_resolver" not in engine_args
 
 
 def test_build_stage0_input_processor_uses_omni_input_preprocessor(monkeypatch):

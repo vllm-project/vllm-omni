@@ -101,7 +101,12 @@ class TestAttentionSpec:
     def test_block_sparse_defaults_applied_when_backend_selected(self):
         spec = AttentionSpec(backend="RAINFUSION_ATTN")
         assert spec.block_sparse.sparsity == 0.8
-        assert spec.backend_kwargs() == {"sparsity": 0.8, "start_step": 0}
+        assert spec.backend_kwargs() == {
+            "sparsity": 0.8,
+            "start_step": 0,
+            "end_step": 0,
+            "precision": "bf16",
+        }
 
     def test_block_sparse_skip_layers_selector_expanded(self):
         spec = AttentionSpec(
@@ -112,6 +117,8 @@ class TestAttentionSpec:
         assert spec.backend_kwargs() == {
             "sparsity": 0.9,
             "start_step": 12,
+            "end_step": 0,
+            "precision": "bf16",
             "skip_layers": [0, 1, 2, 38],
         }
 
@@ -121,11 +128,43 @@ class TestAttentionSpec:
 
     @pytest.mark.parametrize(
         "block_sparse",
-        [{"sparsity": 1.5}, {"start_step": -1}],
+        [{"sparsity": 1.5}, {"start_step": -1}, {"end_step": -1}, {"precision": "bogus"}],
     )
     def test_block_sparse_invalid_values(self, block_sparse):
         with pytest.raises(ValueError):
             AttentionSpec(backend="RAINFUSION_ATTN", block_sparse=block_sparse)
+
+    def test_block_sparse_end_step_precision_forwarded(self):
+        spec = AttentionSpec(
+            backend="RAINFUSION_ATTN",
+            block_sparse={"sparsity": 0.9, "start_step": 5, "end_step": 3, "precision": "fp8"},
+        )
+        assert spec.backend_kwargs() == {
+            "sparsity": 0.9,
+            "start_step": 5,
+            "end_step": 3,
+            "precision": "fp8",
+        }
+
+    def test_block_sparse_precision_enum_input_normalized(self):
+        """RainFusionPrecision enum members must normalize to their string value.
+
+        Regression: the str,Enum members passed the value check but str() later
+        produced "RainFusionPrecision.MIX" instead of "mix" (StrEnum fixes it).
+        """
+        from vllm_omni.diffusion.attention.backends.rainfusion_attn import RainFusionConfig
+        from vllm_omni.diffusion.data import RainFusionPrecision
+
+        spec = AttentionSpec(
+            backend="RAINFUSION_ATTN",
+            block_sparse={"sparsity": 0.8, "precision": RainFusionPrecision.MIX},
+        )
+        kwargs = spec.backend_kwargs()
+        assert kwargs["precision"] == "mix"
+        # The config path is where str(value) used to mangle enum members.
+        cfg = RainFusionConfig.from_backend_kwargs(kwargs)
+        assert cfg.precision == "mix"
+        assert type(cfg.precision) is str
 
 
 class TestAttentionConfig:

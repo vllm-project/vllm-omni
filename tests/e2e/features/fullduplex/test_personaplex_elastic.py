@@ -24,17 +24,16 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from tests.helpers.mark import hardware_marks
+
 torch = pytest.importorskip("torch")
 
-# slow + H100 + omni routes this module into the weekly Buildkite E2E group
-# ("Omni · H100" in .buildkite/cuda/test-weekly.yml: -m "slow and H100 and
-# omni" --run-level full_model); the ready/merge CPU sweeps exclude it by mark.
+# slow + H100/B200 + omni + cards_1 routes this module into weekly
+# "Omni · H100 · Single-GPU" (test-weekly.yml) and B200 mirror collection.
 pytestmark = [
-    pytest.mark.full_model,
     pytest.mark.omni,
     pytest.mark.slow,
-    pytest.mark.H100,
-    pytest.mark.B200,
+    *hardware_marks(res={"cuda": ["H100", "B200"]}),
 ]
 
 if not torch.cuda.is_available():  # noqa: E402

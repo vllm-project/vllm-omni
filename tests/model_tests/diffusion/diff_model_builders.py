@@ -242,19 +242,18 @@ def tiny_flux_kontext_builder() -> str:
 
 def tiny_flux2_builder() -> str:
     def shrink_text_encoder(config: dict) -> dict:
-        # The real checkpoint ships language_model.lm_head.weight as its own
-        # tensor even though tie_word_embeddings defaults to True; keep it
-        # untied here too so transformers doesn't drop it on save.
         config["tie_word_embeddings"] = False
-        config["text_config"]["num_hidden_layers"] = 31
+        config["text_config"]["num_hidden_layers"] = 3
+        config["text_config"]["hidden_size"] = 32
         config["text_config"]["intermediate_size"] = 64
-        config["text_config"]["num_attention_heads"] = 4
-        config["text_config"]["head_dim"] = 32
+        config["text_config"]["num_attention_heads"] = 2
+        config["text_config"]["head_dim"] = 16
         config["text_config"]["num_key_value_heads"] = 2
+        config["text_config"]["text_encoder_out_layers"] = [0, 1, 2]
         config["vision_config"]["num_hidden_layers"] = 2
         config["vision_config"]["intermediate_size"] = 64
-        config["vision_config"]["num_attention_heads"] = 4
-        config["vision_config"]["head_dim"] = 32
+        config["vision_config"]["num_attention_heads"] = 2
+        config["vision_config"]["head_dim"] = 16
         return config
 
     return build_tiny_from_configs(
@@ -262,6 +261,6 @@ def tiny_flux2_builder() -> str:
         "black-forest-labs/FLUX.2-dev",
         transform={
             "text_encoder": shrink_text_encoder,
-            "transformer": partial(_shrink_dit_rope_config, num_single_layers=2),
+            "transformer": partial(_shrink_dit_rope_config, num_single_layers=2, joint_attention_dim=96),
         },
     )
