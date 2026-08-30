@@ -135,7 +135,14 @@ def extract_hunyuan_prompt_inputs(
     *,
     request_id: str,
     allow_cond_image: bool,
-) -> tuple[list[str], list[str | None], str | None, list[list[JointImageInfo]] | None, str]:
+) -> tuple[
+    list[str],
+    list[str | None],
+    str | None,
+    list[list[JointImageInfo]] | None,
+    str,
+    list[dict[str, Any] | None],
+]:
     """Normalize request prompt fields shared by planning and execution."""
 
     is_dummy_warmup = OmniDiffusionRequest.is_dummy_run_request_id(request_id)
@@ -162,6 +169,22 @@ def extract_hunyuan_prompt_inputs(
         (p.get("extra", {}).get("ar_generated_text") if isinstance(p, dict) else None) or None for p in prompts
     ]
 
+    # Per-prompt AR rollout metadata (#6768), surfaced through the same
+    # ``extra`` channel as ``ar_generated_text`` so RL consumers can
+    # teacher-force against the exact sampled tokens and log-probs.
+    rollout_metadata_list: list[dict[str, Any] | None] = []
+    for p in prompts:
+        if not isinstance(p, dict):
+            rollout_metadata_list.append(None)
+            continue
+        extra = p.get("extra", {}) or {}
+        fields = {
+            "ar_generated_token_ids": extra.get("ar_generated_token_ids"),
+            "ar_generated_logprobs": extra.get("ar_generated_logprobs"),
+            "ar_prompt_token_ids": extra.get("ar_prompt_token_ids"),
+        }
+        rollout_metadata_list.append(fields if any(v is not None for v in fields.values()) else None)
+
     batch_cond_image_info: list[list[JointImageInfo]] | None = None
     if any(not isinstance(p, str) for p in prompts):
         batch_cond_image_info = []
@@ -185,7 +208,7 @@ def extract_hunyuan_prompt_inputs(
         if not allow_cond_image or not any(has_cond_image):
             batch_cond_image_info = None
 
-    return prompt, cot_text_list, system_prompt, batch_cond_image_info, tokenizer_bot_task
+    return prompt, cot_text_list, system_prompt, batch_cond_image_info, tokenizer_bot_task, rollout_metadata_list
 
 
 def resolve_hunyuan_guidance_scale(sampling: Any, default_scale: float = 5.0) -> float:

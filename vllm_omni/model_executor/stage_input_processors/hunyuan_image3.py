@@ -91,6 +91,29 @@ def _extract_ratio_index(generated_token_ids) -> int | None:
     return None
 
 
+def _extract_generated_logprobs(output: Any) -> list[float | None] | None:
+    """Return the sampled token's logprob for each generated position.
+
+    ``output.logprobs`` is a list with one entry per generated token position,
+    each mapping token id -> Logprob (top-k). ``output.token_ids`` lists the
+    sampled token per position. Returns ``None`` when logprobs are unavailable
+    (e.g. not requested), so callers can omit the field instead of emitting a
+    misleading ``None``-filled list.
+    """
+    logprobs = getattr(output, "logprobs", None)
+    token_ids = getattr(output, "token_ids", None)
+    if not logprobs or not token_ids:
+        return None
+    per_position: list[float | None] = []
+    for position_logprobs, sampled_token_id in zip(logprobs, token_ids):
+        if not isinstance(position_logprobs, dict):
+            per_position.append(None)
+            continue
+        entry = position_logprobs.get(int(sampled_token_id))
+        per_position.append(float(entry.logprob) if entry is not None else None)
+    return per_position
+
+
 def ar2diffusion(
     source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | list | None = None,
@@ -189,6 +212,20 @@ def ar2diffusion(
             "ar_generated_text": cot_text_for_dit,
         },
     }
+
+    # Expose AR rollout metadata for RL teacher-forcing (#6768). These values
+    # are already computed by the AR stage but dropped; re-tokenizing
+    # ar_generated_text client-side is lossy (structure tokens) and cannot
+    # recover per-token log-probs.
+    extra = diffusion_input["extra"]
+    if generated_token_ids is not None:
+        extra["ar_generated_token_ids"] = list(generated_token_ids)
+    prompt_token_ids = getattr(ar_output, "prompt_token_ids", None)
+    if prompt_token_ids is not None:
+        extra["ar_prompt_token_ids"] = list(prompt_token_ids)
+    generated_logprobs = _extract_generated_logprobs(output)
+    if generated_logprobs is not None:
+        extra["ar_generated_logprobs"] = generated_logprobs
 
     # Forward use_system_prompt so the DiT can build the same system prefix.
     # Also forward the custom system prompt body when sys_type=custom so

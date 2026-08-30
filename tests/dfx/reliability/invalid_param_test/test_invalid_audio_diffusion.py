@@ -70,10 +70,19 @@ _PARAMS = [
         pytest.param({"guidance_scale": -1.0}, "guidance_scale", id="guidance_scale_negative", marks=_SKIP_ISSUE_3649),
         pytest.param({"guidance_scale": 0}, "guidance_scale", id="guidance_scale_zero", marks=_SKIP_ISSUE_3649),
         pytest.param(
-            {"num_inference_steps": 0}, "num_inference_steps", id="num_inference_steps_zero", marks=_SKIP_ISSUE_3649
+            # #6598 added ge=1 to the request schema; 0 is now rejected at the
+            # route with the same pydantic contract as -1.
+            {"num_inference_steps": 0},
+            ("num_inference_steps", "greater_than_equal", "1"),
+            id="num_inference_steps_zero",
         ),
         pytest.param(
-            {"num_inference_steps": -1}, ("number of steps", "non-negative"), id="num_inference_steps_negative"
+            # #6598 moved num_inference_steps bounds into the request schema
+            # (ge=1), so the route now rejects -1 with a pydantic error instead
+            # of the engine-side "number of steps must be non-negative" message.
+            {"num_inference_steps": -1},
+            ("num_inference_steps", "greater_than_equal", "1"),
+            id="num_inference_steps_negative",
         ),
         pytest.param(
             {"num_inference_steps": 6000},
