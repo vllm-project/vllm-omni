@@ -13,21 +13,10 @@
 
 The checkpoint is Apache-2.0 licensed. The vLLM-Omni integration code is also Apache-2.0.
 
-## Realtime architecture
-
-PR #5491 established a model-neutral tick/session orchestration layer for
-autoregressive diffusion world models on top of the existing AR-Diffusion
-engine and paged-KV session capabilities. ABot-World reuses its typed tick
-protocol, session manager, tick consumer, worker lifecycle, request
-orchestration, output metadata, and session-owned paged-KV cache.
-
-Only the model-specific pieces live in the ABot integration: the causal
-transformer and pipeline, official checkpoint loader, UMT5 and Wan2.2 VAE
-conversion, action reducer, and ABot tensor/KV geometry. It does not reuse
-LingBot weights or LingBot-specific conditioning logic.
-
-The official ABot checkpoint uses its native single-directory layout and does
-not need a Diffusers `model_index.json`.
+> [!IMPORTANT]
+> ABot-World currently requires `enforce_eager=True`. Current experiments show
+> that disabling eager execution can reduce accuracy or generation quality; the
+> root cause is still under investigation.
 
 ## Offline generation
 
@@ -35,7 +24,8 @@ Create `AsyncOmni` with the checkpoint path and
 `model_class_name="ABotWorldCausalPipeline"`. Submit an image-conditioned
 diffusion request with `height=512`, `width=832`, `num_frames=9`,
 `num_inference_steps=4`, `max_sequence_length=512`, and
-`extra_args={"flow_shift": 5.0}`.
+`extra_args={"flow_shift": 5.0}`. The official ABot checkpoint uses its native
+single-directory layout and does not need a Diffusers `model_index.json`.
 
 The bundled Wan2.2 VAE compresses space by 16 and the DiT applies a 2x2
 spatial patch, so 512x832 produces 16x26 = 416 tokens per latent frame. The
