@@ -12,9 +12,6 @@ connectors:
       codec_chunk_frames: 512
       codec_left_context_frames: 3
       initial_codec_chunk_frames: 4
-    enable_hift_graph: true
-    enable_cfm_graph: true
-    cfm_max_graphs: 32
 stages:
 - stage_id: 0
   max_num_seqs: 4
@@ -65,9 +62,6 @@ stages:
   gpu_memory_utilization: 0.18
   enforce_eager: true
   enable_chunked_prefill: false
-  additional_config:
-    code2wav_enable_npu_graph: true
-    code2wav_max_npu_graphs: 32
   max_num_batched_tokens: 65536
   max_model_len: 65536
   devices: '0'
