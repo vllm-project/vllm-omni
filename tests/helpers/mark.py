@@ -112,13 +112,13 @@ def get_level_markers() -> frozenset[str]:
 
 
 @lru_cache(maxsize=8)
-def _skus_for_platform(platform: str) -> frozenset[str]:
+def get_skus_for_platform(platform: str) -> frozenset[str]:
     """SKU names tagged ``[hardware-resource]`` and ``[platform]`` (e.g. ``[cuda]``)."""
     return get_hardware_mark_list() & _marker_names_with_tag(f"[{platform}]")
 
 
 def _require_sku(platform: str, res: str) -> None:
-    allowed = _skus_for_platform(platform)
+    allowed = get_skus_for_platform(platform)
     if res not in allowed:
         supported = ", ".join(sorted(allowed)) or f"(none tagged [hardware-resource] [{platform}])"
         raise ValueError(f"Invalid {platform} resource type: {res}. Supported: {supported}")
@@ -216,7 +216,7 @@ def _res_platforms() -> frozenset[str]:
     A ``[hardware-platform]`` name is a ``res`` key only if some SKU is tagged
     with that platform (``[cuda]``, ``[npu]``, …). ``cpu`` / ``gpu`` have no SKUs.
     """
-    return frozenset(p for p in get_supported_platforms() if _skus_for_platform(p))
+    return frozenset(p for p in get_supported_platforms() if get_skus_for_platform(p))
 
 
 def _normalize_num_cards(res: dict[str, SkuSpec], num_cards: int | dict[str, int]) -> dict[str, int]:
@@ -247,19 +247,21 @@ def _normalize_num_cards(res: dict[str, SkuSpec], num_cards: int | dict[str, int
 def _marks_for_platform(platform: str, resource: SkuSpec, num_cards: int) -> list[pytest.MarkDecorator]:
     import pytest
 
-    builders = {
-        "cuda": _cuda_marks,
-        "rocm": _rocm_marks,
-        "xpu": _xpu_marks,
-        "musa": _musa_marks,
-        "npu": _npu_marks,
-    }
-    builder = builders.get(platform)
-    if builder is None:
-        raise ValueError(f"Unsupported platform: {platform}")
-    if platform != "cuda" and not isinstance(resource, str):
-        raise ValueError(f"{platform} resource must be a string, got {resource!r}")
-    marks = builder(res=resource, num_cards=num_cards)
+    if platform == "cuda":
+        marks = _cuda_marks(res=resource, num_cards=num_cards)
+    else:
+        if not isinstance(resource, str):
+            raise ValueError(f"{platform} resource must be a string, got {resource!r}")
+        builders = {
+            "rocm": _rocm_marks,
+            "xpu": _xpu_marks,
+            "musa": _musa_marks,
+            "npu": _npu_marks,
+        }
+        builder = builders.get(platform)
+        if builder is None:
+            raise ValueError(f"Unsupported platform: {platform}")
+        marks = builder(res=resource, num_cards=num_cards)
     if platform in _gpu_res_platforms():
         return [pytest.mark.gpu] + marks
     return marks

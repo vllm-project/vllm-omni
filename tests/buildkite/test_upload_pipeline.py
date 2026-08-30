@@ -296,6 +296,34 @@ def test_mirror_hardwares_inferred_skips_when_unset_and_only_b200(
     )
 
 
+def test_mirror_hardwares_inferred_skips_cuda_sku_without_preset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    assert (
+        _expand_mirror_hardwares(
+            {
+                "label": "H200 only",
+                "commands": ['pytest -sv tests/e2e -m "H200 and cards_2"'],
+            },
+        )
+        is None
+    )
+
+
+def test_mirror_hardwares_inferred_cards_8_rejected_without_preset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    with pytest.raises(ValueError, match="has no preset 'h100_8'"):
+        _expand_mirror_hardwares(
+            {
+                "label": "H100 8-gpu",
+                "commands": ['pytest -sv tests/e2e -m "H100 and cards_8"'],
+            },
+        )
+
+
 def test_mirror_hardwares_inferred_skips_when_cards_without_h100_or_l4(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

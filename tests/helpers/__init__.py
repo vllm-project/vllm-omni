@@ -11,8 +11,6 @@ affect in-process Omni (``OmniRunner`` / offline e2e) vs subprocess-based
 ``OmniServer`` tests.
 """
 
-import pytest
-
 
 def skip_if_gated_repo_inaccessible(
     repo_id: str,
@@ -36,11 +34,15 @@ def skip_if_gated_repo_inaccessible(
     try:
         hf_hub_download(repo_id=repo_id, filename=filename, revision=revision)
     except GatedRepoError as exc:
+        import pytest
+
         pytest.skip(
             f"Skipping: gated HF repo {repo_id!r} inaccessible to the current "
             f"HF_TOKEN ({exc}). See docs/contributing/ci/hf_credentials.md."
         )
     except RepositoryNotFoundError as exc:
+        import pytest
+
         pytest.skip(f"Skipping: HF repo {repo_id!r} not found ({exc}).")
     except Exception:
         return

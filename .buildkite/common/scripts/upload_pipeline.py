@@ -58,6 +58,14 @@ from skip_ci import (
     resolve_ci_context_from_git,
 )
 
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tests.helpers.mark import (  # noqa: E402
+    get_skus_for_platform,
+    get_supported_card_counts,
+)
+
 # --- Constants ---
 
 LOG = "upload_pipeline"
@@ -246,26 +254,63 @@ def _load_mirror_hardwares() -> dict[str, dict[str, Any]]:
     return presets
 
 
-# Longer tokens first so ``h100`` is not matched as a prefix of ``h200``.
-_CUDA_MIRROR_CHIPS = ("b200", "h200", "h100", "l4")
+@lru_cache(maxsize=1)
+def _cuda_mirror_chips() -> tuple[str, ...]:
+    """Lowercase CUDA SKUs that have at least one ``{chip}_{n}`` preset.
+
+    Longer tokens first so ``h100`` is not matched as a prefix of ``h200``.
+    """
+    skus = get_skus_for_platform("cuda")
+    known = _load_mirror_hardwares()
+    chips = {
+        sku.lower() for sku in skus if any(name == sku.lower() or name.startswith(f"{sku.lower()}_") for name in known)
+    }
+    return tuple(sorted(chips, key=lambda chip: (-len(chip), chip)))
+
+
+def _read_cards_marks(expr: str) -> tuple[set[int], bool]:
+    """Parse registered ``cards_n`` / ``not cards_n`` from a pytest ``-m`` expr.
+
+    Returns positive card counts and whether any ``not cards_*`` is present.
+    """
+    counts = get_supported_card_counts()
+    alt = "|".join(str(n) for n in sorted(counts, key=lambda n: (-len(str(n)), -n))) if counts else "(?!)"
+    positives: set[int] = set()
+    has_not_cards = False
+    for match in re.finditer(rf"\b(?:(not)\s+)?cards_({alt})\b", expr):
+        if match.group(1):
+            has_not_cards = True
+        else:
+            positives.add(int(match.group(2)))
+    return positives, has_not_cards
+
+
+def _read_hardware_marks(expr: str) -> set[str]:
+    """Return lowercase positive CUDA SKUs that have a mirror preset.
+
+    ``not H100`` is ignored. SKUs with no ``{chip}_*`` preset (e.g. H200) are dropped.
+    """
+    skus = sorted(get_skus_for_platform("cuda"), key=lambda s: (-len(s), s))
+    if not skus:
+        return set()
+    alt = "|".join(re.escape(sku) for sku in skus)
+    mirror = set(_cuda_mirror_chips())
+    chips: set[str] = set()
+    for match in re.finditer(rf"\b(?:(not)\s+)?({alt})\b", expr):
+        if match.group(1):
+            continue
+        chip = match.group(2).lower()
+        if chip in mirror:
+            chips.add(chip)
+    return chips
+
+
+# CI policy: not pytest-mark registry.
 _SUPPORTED_MIRROR_HW_SELECTORS = frozenset({"b200"})
 # Unset MIRROR_HW: match H100 then L4 in -m (skip if neither).
 _DEFAULT_INFER_CHIPS = ("h100", "l4")
 _PYTEST_MARKER_ARG = re.compile(r"-m\s+(?:\"([^\"]*)\"|'([^']*)'|(\S+))")
-_CARDS_MARK = re.compile(r"\bcards_([1-4])\b")
-_NOT_CARDS_MARK = re.compile(r"\bnot\s+cards_([1-4])\b")
-_NOT_SKU_MARK = re.compile(
-    r"\bnot\s+(" + "|".join(re.escape(chip.upper()) for chip in _CUDA_MIRROR_CHIPS) + r")\b",
-)
-_COUNT_PRESET_RANGE = range(1, 5)
 _CARDS_CHIP_MAX: Literal["max"] = "max"
-
-
-def _english_or(names: Any) -> str:
-    items = [str(name) for name in names]
-    if len(items) <= 2:
-        return " or ".join(items)
-    return f"{', '.join(items[:-1])}, or {items[-1]}"
 
 
 def _get_mirror_hw_selector() -> str:
@@ -278,10 +323,8 @@ def _get_mirror_hw_selector() -> str:
     if not selector:
         return ""
     if selector not in _SUPPORTED_MIRROR_HW_SELECTORS:
-        raise ValueError(
-            f"unsupported MIRROR_HW={selector!r}; expected empty or "
-            f"{_english_or(f'{s!r}' for s in sorted(_SUPPORTED_MIRROR_HW_SELECTORS))}"
-        )
+        allowed = " or ".join(repr(s) for s in sorted(_SUPPORTED_MIRROR_HW_SELECTORS))
+        raise ValueError(f"unsupported MIRROR_HW={selector!r}; expected empty or {allowed}")
     return selector
 
 
@@ -313,15 +356,10 @@ def _read_pytest_marks(commands: Any) -> tuple[set[str], int | Literal["max"] | 
     has_not_cards = False
     for match in _PYTEST_MARKER_ARG.finditer(text):
         expr = match.group(1) or match.group(2) or match.group(3) or ""
-        stripped_sku = _NOT_SKU_MARK.sub(" ", expr)
-        for chip in _CUDA_MIRROR_CHIPS:
-            if re.search(rf"\b{re.escape(chip.upper())}\b", stripped_sku):
-                chips.add(chip)
-        if _NOT_CARDS_MARK.search(expr):
-            has_not_cards = True
-        stripped_cards = _NOT_CARDS_MARK.sub(" ", expr)
-        for cards_match in _CARDS_MARK.finditer(stripped_cards):
-            positives.add(int(cards_match.group(1)))
+        chips |= _read_hardware_marks(expr)
+        card_counts, not_cards = _read_cards_marks(expr)
+        positives.update(card_counts)
+        has_not_cards = has_not_cards or not_cards
 
     if positives:
         cards: int | Literal["max"] | None = max(positives)
@@ -342,8 +380,8 @@ def _compose_mirror_hardware_name(
 
     Unset ``MIRROR_HW``: ``H100`` if in ``-m``, else ``L4``, else skip.
     Set ``MIRROR_HW``: that chip if in ``-m``, else skip.
-    ``cards`` is 1–4, ``"max"`` for that chip's highest existing preset, or
-    None (error after a chip matched — the step has no ``cards_*``).
+    ``cards`` is a registered ``cards_n``, ``"max"`` for that chip's highest
+    existing preset, or None (error after a chip matched — no ``cards_*``).
     """
     selector = _get_mirror_hw_selector()
     if selector:
@@ -357,19 +395,21 @@ def _compose_mirror_hardware_name(
         return None
     if cards is None:
         raise ValueError(
-            f"step {step_label!r} has a pytest -m SKU marker but no cards_1..4 "
+            f"step {step_label!r} has a pytest -m SKU marker but no cards_* "
             f"(or not cards_*); add cards_n or set mirror_hardwares to force a preset",
         )
 
     count_source = "not cards_*" if cards == _CARDS_CHIP_MAX else f"cards_{cards}"
     count = None if cards == _CARDS_CHIP_MAX else cards
-    if count is not None and count not in _COUNT_PRESET_RANGE:
+    registered = get_supported_card_counts()
+    if count is not None and count not in registered:
+        supported = ", ".join(f"cards_{n}" for n in sorted(registered)) or "(none)"
         raise ValueError(
-            f"{count_source} in step {step_label!r} must be 1–4, got {count}",
+            f"{count_source} in step {step_label!r} is not a registered cards_* mark; supported: {supported}",
         )
     known = _load_mirror_hardwares()
     if count is None:
-        available = [n for n in _COUNT_PRESET_RANGE if f"{chip}_{n}" in known]
+        available = [n for n in sorted(registered) if f"{chip}_{n}" in known]
         if not available:
             raise ValueError(
                 f"{count_source} in step {step_label!r} has no CUDA count presets for {chip}",
@@ -407,7 +447,7 @@ def _resolve_mirror_hardware_name(hardware: Any, *, step_label: str) -> str | No
     selector = _get_mirror_hw_selector()
     token = name.lower()
     chip = next(
-        (c for c in _CUDA_MIRROR_CHIPS if token == c or token.startswith(f"{c}_")),
+        (c for c in _cuda_mirror_chips() if token == c or token.startswith(f"{c}_")),
         None,
     )
     if selector and chip is not None and chip != selector:
