@@ -122,3 +122,24 @@ class TestBuildEngineArgsDictNoMutate:
         assert stage_cfg.engine_args["omni_kv_config"] == original_kv, (
             "Mutating the returned dict's nested value propagated back to stage_config.engine_args"
         )
+
+    def test_inject_omni_kv_does_not_leak_back(self):
+        """inject_omni_kv_connector_config on the result must not pollute stage_config."""
+        engine_args = {
+            "omni_kv_config": {"need_send_cache": True},
+        }
+        original = copy.deepcopy(engine_args)
+        stage_cfg = _make_stage_config(engine_args)
+
+        from vllm_omni.engine.stage_init_utils import (
+            build_engine_args_dict,
+            inject_omni_kv_connector_config,
+        )
+
+        result = build_engine_args_dict(stage_cfg, model="dummy-model")
+        connector = ({"host": "localhost", "port": 1234}, "stage-0", "stage-1")
+        inject_omni_kv_connector_config(result, connector, stage_id=0)
+
+        assert stage_cfg.engine_args == original, (
+            "inject_omni_kv_connector_config on the returned dict mutated stage_config.engine_args"
+        )
