@@ -103,6 +103,13 @@ curl -s http://localhost:8091/v1/chat/completions \
   (`--enable-cpu-offload` / `--enable-layerwise-offload`), Cache-DiT
   (`--cache-backend cache_dit`), and multi-GPU parallelism (TP / SP / CFG /
   HSDP) are planned follow-ups and are not validated for this model yet.
+- **TeaCache:** pass `--cache-backend tea_cache` to skip recomputing the
+  single-stream stage (the bulk of the network) on similar consecutive
+  timesteps. Example: `--cache-backend tea_cache --cache-config '{"rel_l1_thresh":0.15}'`.
+  The default coefficients/threshold are an unfitted placeholder borrowed from
+  FLUX.1 (architecturally the closest dual→single-stream model); treat any
+  speed/quality numbers as provisional until Boogu-specific coefficients are
+  calibrated from branch-separated adjacent-step samples.
 
 ## Image editing (Boogu-Image-0.1-Edit)
 
