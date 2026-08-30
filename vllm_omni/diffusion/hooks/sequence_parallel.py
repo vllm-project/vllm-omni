@@ -431,7 +431,10 @@ class SequenceParallelSplitHook(ModelHook):
             role="self",
             attention_config=attention_config,
         )
-        if not attn_backend.supports_attention_mask():
+        attention_spec = None
+        if attention_config is not None:
+            attention_spec, _ = attention_config.resolve_with_source(role="self")
+        if not attn_backend.supports_attention_mask(attention_spec):
             raise ValueError(
                 f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "
                 f"Cannot use {attn_backend.get_name()} which does not support attention_mask. "

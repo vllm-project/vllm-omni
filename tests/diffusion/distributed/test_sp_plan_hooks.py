@@ -997,7 +997,8 @@ class TestDimensionValidation:
 
         class NoMaskBackend:
             @classmethod
-            def supports_attention_mask(cls):
+            def supports_attention_mask(cls, attention_spec=None):
+                del attention_spec
                 return False
 
             @staticmethod
@@ -1043,6 +1044,33 @@ class TestDimensionValidation:
 
         # seq_len=3 padded to 4, then sharded by world_size=2 → rank 0 gets 2.
         assert result.shape == (1, 2, 8)
+
+    def test_auto_pad_rejects_explicit_flashinfer_cute_on_blackwell(self, monkeypatch):
+        from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, OmniDiffusionConfig
+        from vllm_omni.diffusion.distributed import parallel_state
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+        from vllm_omni.diffusion.forward_context import set_forward_context
+        from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelSplitHook
+
+        monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(parallel_state, "get_sequence_parallel_rank", lambda: 0)
+        monkeypatch.setattr(parallel_state, "get_ring_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 0))
+
+        hook = SequenceParallelSplitHook(
+            metadata={},
+            config=SequenceParallelConfig(ulysses_degree=2, ring_degree=1),
+        )
+        tensor = torch.randn(1, 3, 8)
+        od_config = OmniDiffusionConfig(
+            model="test",
+            dtype=torch.float32,
+            diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="FLASHINFER_ATTN")),
+        )
+
+        with set_forward_context(omni_diffusion_config=od_config):
+            with pytest.raises(ValueError, match="does not support attention_mask"):
+                hook._shard_with_auto_pad(tensor, dim=1)
 
 
 @pytest.mark.cpu

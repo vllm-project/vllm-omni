@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 from functools import partial
@@ -52,7 +52,8 @@ class FlashAttentionBackend(AttentionBackend):
         return current_omni_platform.is_cuda() or current_omni_platform.is_rocm() or current_omni_platform.is_musa()
 
     @classmethod
-    def supports_attention_mask(cls) -> bool:
+    def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
+        del attention_spec
         return True
 
     @staticmethod
@@ -68,7 +69,7 @@ class FlashAttentionBackend(AttentionBackend):
         return FlashAttentionImpl
 
 
-class FlashAttentionImpl(AttentionImpl):
+class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
     # Per-platform FP8 KV quantization support.
     # To enable FP8 on a new platform, add its OmniPlatformEnum value here
     # and handle kv_cache_dtype in the corresponding forward_{platform}().
@@ -161,6 +162,8 @@ class FlashAttentionImpl(AttentionImpl):
             flash_attn_varlen_func,
         )
 
+        if flash_attn_varlen_func is None:
+            raise ImportError("Masked variable-length attention requires flash_attn_varlen_func")
         assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
         batch_size, query_length = query.shape[:2]
         if not self.is_cross_attn and query_length == key.size(1):
@@ -254,6 +257,8 @@ class FlashAttentionImpl(AttentionImpl):
             flash_attn_varlen_func,
         )
 
+        if flash_attn_varlen_func is None:
+            raise ImportError("Dense variable-length attention requires flash_attn_varlen_func")
         batch_size, q_len = query.size()[:2]
         k_len = key.size(1)
         cu_seqlens_q = torch.arange(0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=query.device)
@@ -350,7 +355,7 @@ class FlashAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_metadata: AttentionMetadata = None,
+        attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """CUDA/ROCm/MUSA flash attention implementation."""
         from vllm_omni.diffusion.attention.backends.utils.fa import (
@@ -394,7 +399,7 @@ class FlashAttentionImpl(AttentionImpl):
                 full_attn_spans,
                 self.softmax_scale,
                 attn_func,
-                query_ranges=attn_metadata.query_ranges,
+                query_ranges=None if attn_metadata is None else attn_metadata.query_ranges,
             )
 
         packed_keys = ("cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k")
@@ -445,7 +450,7 @@ class FlashAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_metadata: AttentionMetadata = None,
+        attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """XPU flash attention implementation."""
         from vllm_omni.diffusion.attention.backends.utils.fa import (
@@ -480,7 +485,7 @@ class FlashAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_metadata: AttentionMetadata = None,
+        attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """NPU attention implementation using mindiesd."""
 
@@ -494,7 +499,7 @@ class FlashAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_metadata: AttentionMetadata = None,
+        attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         from vllm_omni.platforms.npu.quant.kv_quant_npu import fp8_rotate_quant_fa
 
@@ -514,7 +519,7 @@ class FlashAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attn_metadata: AttentionMetadata = None,
+        attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         try:
             from mindiesd import attention_forward
@@ -705,8 +710,12 @@ class FlashAttentionImpl(AttentionImpl):
         key = key[:, :used_k]
         value = value[:, :used_k]
 
-        input_scale = extra.get("laser_input_scale")
-        preserve_input_range = isinstance(input_scale, (int, float)) and input_scale > 1
+        input_scale_raw = extra.get("laser_input_scale")
+        if isinstance(input_scale_raw, (int, float)) and input_scale_raw > 1:
+            input_scale = float(input_scale_raw)
+        else:
+            input_scale = 1.0
+        preserve_input_range = input_scale > 1
         if preserve_input_range:
             query = query / input_scale
             key = key / input_scale

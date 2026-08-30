@@ -6,7 +6,11 @@ import torch
 
 from vllm_omni.diffusion.attention.backends import flashinfer_attn
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
-from vllm_omni.diffusion.attention.backends.flashinfer_attn import FlashInferAttentionImpl
+from vllm_omni.diffusion.attention.backends.flashinfer_attn import (
+    FlashInferAttentionBackend,
+    FlashInferAttentionImpl,
+)
+from vllm_omni.diffusion.data import AttentionSpec, AttnQuantSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -62,3 +66,25 @@ def test_auto_cute_dsl_falls_back_to_sdpa_for_custom_mask(monkeypatch):
     output = impl.forward_cuda(query, query, query, metadata)
 
     assert output.shape == query.shape
+
+
+def test_explicit_cute_dsl_is_not_mask_capable(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 0))
+    spec = AttentionSpec(backend="FLASHINFER_ATTN")
+
+    assert FlashInferAttentionBackend.supports_attention_mask() is True
+    assert FlashInferAttentionBackend.supports_attention_mask(spec) is False
+
+
+def test_explicit_fa2_flashinfer_is_mask_capable(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 0))
+    spec = AttentionSpec(backend="FLASHINFER_ATTN", quant=AttnQuantSpec(flashinfer_backend="fa2"))
+
+    assert FlashInferAttentionBackend.supports_attention_mask(spec) is True
+
+
+def test_hopper_explicit_flashinfer_is_mask_capable(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (9, 0))
+    spec = AttentionSpec(backend="FLASHINFER_ATTN")
+
+    assert FlashInferAttentionBackend.supports_attention_mask(spec) is True

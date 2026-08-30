@@ -53,6 +53,13 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         return True
 
     @classmethod
+    def has_flash_attn_4(cls) -> bool:
+        """Return whether CuTe FA4 is importable (Blackwell-capable FLASH_ATTN)."""
+        from vllm_omni.diffusion.attention.backends.utils.fa import is_flash_attn_4_available
+
+        return is_flash_attn_4_available()
+
+    @classmethod
     def get_diffusion_attn_backend_cls(
         cls,
         selected_backend: str | None,
@@ -92,10 +99,14 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         packages_info = PACKAGES_CHECKER.get_packages_info()
         packages_available = packages_info.get("has_flash_attn", False)
 
-        # The currently discovered FA2/FA3 implementations only ship kernels
-        # for Ampere/Ada/Hopper. Importing them on Blackwell succeeds, but the
-        # first forward aborts the process with "no kernel image".
-        flash_attn_supported = compute_supported and packages_available and not is_blackwell
+        # FA2/FA3 wheels are often importable on Blackwell but only ship
+        # Ampere/Ada/Hopper kernels; the first forward then dies with
+        # "no kernel image". FA4 (flash_attn.cute / vllm-omni[fa4]) is the
+        # FLASH_ATTN implementation that actually runs on Blackwell.
+        if is_blackwell:
+            flash_attn_supported = compute_supported and cls.has_flash_attn_4()
+        else:
+            flash_attn_supported = compute_supported and packages_available
 
         # cuDNN 9.5+ ships Blackwell FMHA kernels. If the runtime is older,
         # skip the CUDNN_ATTN default rather than selecting a backend whose
@@ -214,7 +225,10 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
 
             if backend_upper == "FLASH_ATTN" and not flash_attn_supported:
                 if is_blackwell:
-                    reason = "the discovered FA2/FA3 kernels do not support Blackwell"
+                    reason = (
+                        "Blackwell requires CuTe FlashAttention-4 "
+                        "(flash_attn.cute / vllm-omni[fa4]); FA2/FA3 kernels are Hopper-only"
+                    )
                 elif not compute_supported:
                     reason = "compute capability < 8.0"
                 else:

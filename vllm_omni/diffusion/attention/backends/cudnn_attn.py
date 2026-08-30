@@ -23,7 +23,8 @@ class CuDNNAttentionBackend(AttentionBackend):
     _HEAD_SIZE_MULTIPLE = 8
 
     @classmethod
-    def supports_attention_mask(cls) -> bool:
+    def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
+        del attention_spec
         return True
 
     @staticmethod

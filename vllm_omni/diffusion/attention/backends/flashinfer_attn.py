@@ -38,9 +38,18 @@ class FlashInferAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
 
     @classmethod
-    def supports_attention_mask(cls) -> bool:
-        # Non-CuTe batch-prefill backends accept boolean custom masks. CuTe-DSL
-        # falls back to SDPA for nontrivial masks.
+    def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
+        # fa2/fa3 batch-prefill accept boolean custom masks. cute-dsl does not:
+        # automatic platform selection may fall back to SDPA, but an explicit
+        # FLASHINFER_ATTN config must not be advertised as mask-capable.
+        requested = "auto"
+        quant = getattr(attention_spec, "quant", None) if attention_spec is not None else None
+        requested_backend = getattr(quant, "flashinfer_backend", None)
+        if requested_backend:
+            requested = requested_backend
+        backend = FlashInferAttentionImpl._select_backend(requested)
+        if backend == "cute-dsl":
+            return attention_spec is None
         return True
 
     @staticmethod
@@ -110,7 +119,7 @@ class FlashInferAttentionImpl(AttentionImpl):
 
         self._check_flashinfer_version()
 
-        self.flashinfer_backend = self._select_backend(requested_backend, self.device)
+        self.flashinfer_backend = self._select_backend(requested_backend, device=self.device)
         workspace_size = 0 if self.flashinfer_backend == "cute-dsl" else 128 * 1024 * 1024
         self._workspace = torch.empty(
             workspace_size,
@@ -154,10 +163,15 @@ class FlashInferAttentionImpl(AttentionImpl):
             )
 
     @staticmethod
-    def _select_backend(requested_backend: str, device: torch.device) -> str:
+    def _select_backend(requested_backend: str, device: torch.device | None = None) -> str:
         if requested_backend != "auto":
             return requested_backend
-        major, _minor = torch.cuda.get_device_capability(device)
+        try:
+            major, _minor = (
+                torch.cuda.get_device_capability(device) if device is not None else torch.cuda.get_device_capability()
+            )
+        except Exception:
+            return "fa2"
         if major >= 10:
             return "cute-dsl"
         if major >= 9:

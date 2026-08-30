@@ -611,7 +611,7 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
     def test_unsupported_attention_mask_is_rejected_before_backend_call(self):
         fake_backend = SimpleNamespace(
             get_name=lambda: "NO_MASK_BACKEND",
-            supports_attention_mask=lambda: False,
+            supports_attention_mask=lambda *args, **kwargs: False,
         )
         fake_attention = SimpleNamespace(attn_backend=fake_backend)
         metadata = AttentionMetadata(attn_mask=torch.ones(1, 2, dtype=torch.bool))

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import sys
 import types
@@ -78,7 +78,8 @@ def test_explicit_flash_attention_unavailable_does_not_fallback(monkeypatch: pyt
         classmethod(lambda cls, device_id=0: DeviceCapability(10, 3)),
     )
     monkeypatch.setattr(PACKAGES_CHECKER, "get_packages_info", lambda: {"has_flash_attn": True})
-    with pytest.raises(ValueError, match="do not support Blackwell"):
+    monkeypatch.setattr(CudaOmniPlatform, "has_flash_attn_4", classmethod(lambda cls: False))
+    with pytest.raises(ValueError, match="requires CuTe FlashAttention-4"):
         CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN", head_size=64)
 
 
