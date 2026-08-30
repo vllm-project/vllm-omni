@@ -68,6 +68,19 @@ def test_cache_miss_propagates(paths):
     paths.download.assert_not_called()
 
 
+@pytest.mark.parametrize("allow_download", [False, True])
+def test_non_strict_falls_back_to_input(paths, allow_download):
+    """With strict=False a failed resolution degrades into the raw reference.
+
+    This is the best-effort contract stage init relies on for
+    model_subdir/tokenizer_subdir indirection.
+    """
+    paths.cache_only.side_effect = LocalEntryNotFoundError("cold cache")
+    paths.download.side_effect = OSError("offline")
+
+    assert resolve_model_to_local_path(REPO_ID, allow_download=allow_download, strict=False) == REPO_ID
+
+
 @pytest.mark.parametrize(
     ("kwargs", "allow_patterns"),
     [

@@ -94,9 +94,9 @@ def resolve_model_to_local_path(
     allow_download: bool = False,
     allow_patterns: list[str] | None = None,
     cache_dir: str | None = None,
+    strict: bool = True,
 ) -> str:
     """Resolve a model reference to a local directory.
-    Failure is always raised: whether a failure is fatal is the caller's decision.
 
     Args:
         model: A local directory or an HF Hub repo ID.
@@ -105,27 +105,38 @@ def resolve_model_to_local_path(
         allow_patterns: Restrict the fetch to these glob patterns.
             Defaults to the whole repository. Ignored when model is already a directory.
         cache_dir: Download cache location; None uses the HF default.
+        strict: When True (default), resolution failures propagate to the
+            caller, which decides whether they are fatal. When False, a
+            failure is logged and *model* is returned unchanged, for
+            best-effort callers (e.g. stage init path indirection).
 
     Returns:
-        Path to a local directory containing the model files.
+        Path to a local directory containing the model files,
+        or **model** itself when strict=False and resolution fails.
     """
     if os.path.isdir(model):
         return model
 
-    if allow_download:
-        return download_weights_from_hf_specific(
-            model_name_or_path=model,
-            cache_dir=cache_dir,
-            allow_patterns=allow_patterns or ["*"],
-            require_all=True,
-        )
+    try:
+        if allow_download:
+            return download_weights_from_hf_specific(
+                model_name_or_path=model,
+                cache_dir=cache_dir,
+                allow_patterns=allow_patterns or ["*"],
+                require_all=True,
+            )
 
-    # Cache-only lookups stay on huggingface_hub even under VLLM_USE_MODELSCOPE:
-    # ModelScope's snapshot_download has no local_files_only equivalent,
-    # so a ModelScope deployment that needs resolution here must pass allow_download.
-    return huggingface_hub.snapshot_download(
-        model,
-        cache_dir=cache_dir,
-        allow_patterns=allow_patterns,
-        local_files_only=True,
-    )
+        # Cache-only lookups stay on huggingface_hub even under VLLM_USE_MODELSCOPE:
+        # ModelScope's snapshot_download has no local_files_only equivalent,
+        # so a ModelScope deployment that needs resolution here must pass allow_download.
+        return huggingface_hub.snapshot_download(
+            model,
+            cache_dir=cache_dir,
+            allow_patterns=allow_patterns,
+            local_files_only=True,
+        )
+    except Exception:
+        if strict:
+            raise
+        logger.warning("Could not resolve %s to a local snapshot; using it as-is", model)
+        return model

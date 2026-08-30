@@ -50,6 +50,7 @@ from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
+from vllm_omni.model_executor.model_loader.weight_utils import resolve_model_to_local_path
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.inc_config import OmniINCConfig
@@ -82,24 +83,6 @@ class LogicalStageInitPlan:
     replicas: list[ReplicaInitPlan]
 
 
-def _resolve_model_to_local_path(model: str) -> str:
-    """Resolve an HF Hub model ID to a local cache path."""
-    if os.path.isdir(model):
-        return model
-
-    try:
-        from huggingface_hub import snapshot_download
-
-        # Keep init path resolution offline-friendly.
-        return snapshot_download(model, local_files_only=True)
-    except Exception:
-        logger.warning(
-            "[stage_init] Could not resolve %s to local snapshot; using as-is",
-            model,
-        )
-        return model
-
-
 def _resolve_model_tokenizer_paths(model: str, engine_args: dict[str, Any]) -> str:
     """Apply model_subdir/tokenizer_subdir indirections from stage engine args."""
     model_subdir = engine_args.pop("model_subdir", None)
@@ -107,7 +90,7 @@ def _resolve_model_tokenizer_paths(model: str, engine_args: dict[str, Any]) -> s
     if model_subdir is None and tokenizer_subdir is None:
         return model
 
-    resolved_base = _resolve_model_to_local_path(model)
+    resolved_base = resolve_model_to_local_path(model, strict=False)
 
     if model_subdir:
         model = os.path.join(resolved_base, model_subdir)
