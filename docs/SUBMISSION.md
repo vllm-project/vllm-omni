@@ -35,7 +35,7 @@
 
 - Gradio Demo 已验证启动，端口 7862
 - 使用说明见 demo/README.md
-- 演示视频链接待最终提交前更新
+- 演示视频：https://www.bilibili.com/video/BV1rLtp6BECv/
 
 ## 复现
 
