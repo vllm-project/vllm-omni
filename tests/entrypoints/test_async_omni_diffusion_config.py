@@ -627,6 +627,36 @@ def test_default_stage_resolves_video_output_from_checkpoint(mocker):
     assert captured["final_output_type"] == "video"
 
 
+def test_default_diffusers_stage_preserves_video_model_identity(mocker):
+    captured = {}
+
+    def resolve_with_default(*args, default_stage_cfg_factory, **kwargs):
+        del args, kwargs
+        captured.update(default_stage_cfg_factory()[0])
+        stage = SimpleNamespace(stage_type="diffusion", engine_args=SimpleNamespace())
+        return ("", [stage], None)
+
+    mocker.patch(
+        "vllm_omni.diffusion.utils.hf_utils.get_diffusion_model_index",
+        return_value={"_class_name": "WanImageToVideoPipeline"},
+    )
+    mocker.patch(
+        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
+        side_effect=resolve_with_default,
+    )
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+    engine._strip_single_engine_args = lambda kwargs: kwargs
+
+    engine._resolve_stage_configs(
+        "/models/Wan2.2-I2V",
+        {"diffusion_load_format": "diffusers"},
+        trust_remote_code=False,
+    )
+
+    assert captured["engine_args"]["model_class_name"] == "WanImageToVideoPipeline"
+    assert captured["final_output_type"] == "video"
+
+
 def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mocker):
     """Ensure YAML/deploy stage resolution forwards top-level additional_config."""
     fake_diffusion_stage = SimpleNamespace(

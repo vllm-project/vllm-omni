@@ -35,6 +35,7 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
+    StreamingSegmentState,
     _build_terminal_empty_output,
 )
 from vllm_omni.engine.stage_pool import StagePool
@@ -2259,7 +2260,7 @@ async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
         final_stage_id=0,
     )
     req_state.streaming.enabled = True
-    req_state.streaming.segment_finished = True
+    req_state.streaming.segments[0] = StreamingSegmentState(finished=True)
     req_state.stage_submit_ts[0] = time.time()
     orchestrator.request_states = {"req-stream": req_state}
     orchestrator.stage_pools = [pool]
@@ -2292,7 +2293,12 @@ def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:
     )
     output = SimpleNamespace(
         request_id="req-stream",
-        outputs=[SimpleNamespace(cumulative_token_ids=list(range(11)))],
+        outputs=[
+            SimpleNamespace(
+                cumulative_token_ids=list(range(11)),
+                finish_reason=FinishReason.LENGTH,
+            )
+        ],
     )
 
     metrics = pool.build_stage_metrics(
@@ -2304,6 +2310,7 @@ def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:
 
     assert metrics.num_tokens_out == 3
     assert metrics.output_unit_count == 3
+    assert metrics.finish_reason == "length"
 
 
 def test_image_ttfo_preserves_request_time_and_tracks_stage_time() -> None:

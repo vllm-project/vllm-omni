@@ -633,6 +633,15 @@ class StagePool:
             if callable(pop_native_text_metrics):
                 native_text_metrics = pop_native_text_metrics(request_id)
         native_generation_tokens = native_text_metrics.get("num_generation_tokens")
+        finish_reason = next(
+            (
+                str(reason)
+                for request_output in reversed(request_outputs)
+                for completion in reversed(getattr(request_output, "outputs", []) or [])
+                if (reason := getattr(completion, "finish_reason", None)) is not None
+            ),
+            None,
+        )
         num_tokens_out = (
             max(int(native_generation_tokens), 0)
             if isinstance(native_generation_tokens, int) and not isinstance(native_generation_tokens, bool)
@@ -701,6 +710,7 @@ class StagePool:
             # happens inside the model runner and is not observable here.
             batch_size=1,
             replica_id=replica_id,
+            finish_reason=finish_reason,
             rx_decode_time_ms=0.0,
             rx_transfer_bytes=0,
             rx_in_flight_time_ms=0.0,

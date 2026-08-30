@@ -231,23 +231,51 @@ class OrchestratorRequestState:
 
 
 @dataclass
-class StreamingInputState:
-    # Flag of streaming input request
-    enabled: bool = False
+class StreamingSegmentState:
+    """Streaming segment-boundary state for one stage of a request.
+
+    Every stage of a multi-stage pipeline reaches its own segment boundaries
+    independently, so this is tracked per stage rather than per request.
+    """
+
     # Flag of segment of streaming input finished
-    segment_finished: bool = False
+    finished: bool = False
     # Tokens from the current raw segment boundary. The vLLM output processor
     # does not guarantee that EngineCoreOutput.new_token_ids survives on the
     # processed RequestOutput used by the routing layer.
-    segment_token_ids: list[int] = field(default_factory=list)
-    segment_output_metadata: dict[str, Any] = field(default_factory=dict)
-    # Streaming update prompt length
+    token_ids: list[int] = field(default_factory=list)
+    output_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class StreamingInputState:
+    # Flag of streaming input request
+    enabled: bool = False
+    # Keyed by stage. ``_orchestration_loop`` records a boundary per stage poll
+    # into this one ``req_state``, while every consumer reads it for a specific
+    # ``stage_id``, so a flat slot is only correct as long as each read happens in
+    # the same iteration as its own stage's write. It is not for a stage that
+    # never records one (the ``poll_diffusion_output`` branch reaches
+    # ``_handle_processed_outputs`` without the raw-output loop) or for any
+    # consumer reading outside the writing iteration.
+    segments: dict[int, StreamingSegmentState] = field(default_factory=dict)
+    # Streaming update prompt length. NOT stage-keyed: its only consumer reads it
+    # through the streaming context on the stage-input-bridge path, not by stage
+    # id. Do not assume the rest of this struct is stage-safe.
     new_prompt_len_snapshot: int | None = None
     # Model/bridge-specific runtime states (e.g., thinker->talker)
     bridge_states: dict[str, Any] = field(default_factory=dict)
     # Synchronous stage-transition capability installed by the orchestrator
     # while the downstream input processor consumes upstream token output.
     source_token_decoder: Callable[..., str] | None = None
+
+    def segment(self, stage_id: int | None) -> StreamingSegmentState:
+        """Return ``stage_id``'s segment state, or a fresh empty one if unreported.
+
+        Fresh rather than shared: ``output_metadata`` is handed out by reference.
+        """
+        segment = self.segments.get(stage_id)
+        return segment if segment is not None else StreamingSegmentState()
 
 
 class _OrchestratorDuplexStagePort:
@@ -290,7 +318,15 @@ class _OrchestratorDuplexStagePort:
             duplex_state = {}
             request_state.streaming.bridge_states["duplex"] = duplex_state
         previous_epoch = duplex_state.get("epoch")
-        if not isinstance(duplex_state.get("model_turn_id"), int) or previous_epoch != context.fence.epoch:
+        current_model_turn_id = duplex_state.get("model_turn_id")
+        if (
+            not isinstance(current_model_turn_id, int)
+            or previous_epoch != context.fence.epoch
+            or current_model_turn_id < context.fence.turn_id
+        ):
+            # A serving-side safety boundary can close a Realtime response
+            # before the model emits its normal turn_eos. Catch up the
+            # engine-owned identity when the next fenced append starts.
             duplex_state["model_turn_id"] = context.fence.turn_id
         duplex_state.update(
             {
@@ -1093,15 +1129,12 @@ class Orchestrator:
             req_state = self.request_states.get(getattr(eco, "request_id", None))
             if req_state is None or not req_state.streaming.enabled:
                 continue
-            req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
-            req_state.streaming.segment_token_ids = (
-                self._coerce_int_list(getattr(eco, "new_token_ids", None))
-                if req_state.streaming.segment_finished
-                else []
-            )
+            segment_finished = bool(getattr(eco, "is_segment_finished", False))
             raw_mm = self._completion_multimodal_output(eco, None)
-            req_state.streaming.segment_output_metadata = (
-                dict(raw_mm) if req_state.streaming.segment_finished and isinstance(raw_mm, dict) else {}
+            req_state.streaming.segments[stage_id] = StreamingSegmentState(
+                finished=segment_finished,
+                token_ids=(self._coerce_int_list(getattr(eco, "new_token_ids", None)) if segment_finished else []),
+                output_metadata=(dict(raw_mm) if segment_finished and isinstance(raw_mm, dict) else {}),
             )
             req_state.streaming.new_prompt_len_snapshot = getattr(
                 eco,
@@ -1479,7 +1512,7 @@ class Orchestrator:
                 continue
 
             stage_metrics = None
-            segment_finished = req_state.streaming.enabled and req_state.streaming.segment_finished
+            segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
             if output.finished or segment_finished:
                 stage_metrics = pool.build_stage_metrics(
                     [output],
@@ -1946,6 +1979,7 @@ class Orchestrator:
         req_id = output.request_id
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
+        segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
         # CFG companion: stash output so parent can bundle [parent, *companions]
         # into source_outputs for the bridge (e.g. thinker2imagegen).
         if finished and self._cfg_tracker.is_companion(req_id):
@@ -1955,11 +1989,7 @@ class Orchestrator:
             return
 
         request_finished = False
-        if (
-            finished
-            and self.stage_pools[stage_id].final_output
-            and not (req_state.streaming.enabled and req_state.streaming.segment_finished)
-        ):
+        if finished and self.stage_pools[stage_id].final_output and not segment_finished:
             req_state.finished_final_output_stage_ids.add(stage_id)
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
             request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
@@ -1971,7 +2001,7 @@ class Orchestrator:
         # filter out again (the official implementation returns exactly one
         # result per audio chunk).
         is_duplex_stage0_segment = (
-            stage_id == 0 and self._is_duplex_session_request(req_state) and req_state.streaming.segment_finished
+            stage_id == 0 and self._is_duplex_session_request(req_state) and req_state.streaming.segment(0).finished
         )
         if self.stage_pools[stage_id].final_output and not is_duplex_stage0_segment:
             await self.output_async_queue.put(
@@ -1983,7 +2013,10 @@ class Orchestrator:
                     metrics=stage_metrics,
                     finished=(
                         request_finished
-                        or (self._is_duplex_session_request(req_state) and req_state.streaming.segment_finished)
+                        or (
+                            self._is_duplex_session_request(req_state)
+                            and req_state.streaming.segment(stage_id).finished
+                        )
                     ),
                     stage_submit_ts=submit_ts,
                 )
@@ -2018,7 +2051,7 @@ class Orchestrator:
             return
 
         if (
-            (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
+            (finished or segment_finished)
             and stage_id < req_state.final_stage_id
             and (not self.async_chunk or not self._stage_receives_async_chunks(stage_id + 1))
             and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
@@ -2157,7 +2190,9 @@ class Orchestrator:
     def _duplex_output_context(
         req_state: OrchestratorRequestState,
         *,
-        stage_id: int | None = None,
+        # Required: segment state is stage-keyed, so a caller that omitted this
+        # would silently read "no boundary" rather than the intended stage's.
+        stage_id: int | None,
     ) -> DuplexOutputContext | None:
         identity = req_state.duplex_identity
         if identity is None:
@@ -2168,15 +2203,16 @@ class Orchestrator:
         )
 
         fence = req_state.duplex_stage_fences.get(stage_id, identity.fence) if stage_id is not None else identity.fence
+        segment = req_state.streaming.segment(stage_id)
         return DuplexOutputContext(
             identity=DuplexRequestIdentity(
                 session_id=identity.session_id,
                 fence=fence,
             ),
             final_stage_id=req_state.final_stage_id,
-            segment_finished=req_state.streaming.enabled and req_state.streaming.segment_finished,
-            segment_token_ids=tuple(req_state.streaming.segment_token_ids),
-            segment_output_metadata=req_state.streaming.segment_output_metadata,
+            segment_finished=req_state.streaming.enabled and segment.finished,
+            segment_token_ids=tuple(segment.token_ids),
+            segment_output_metadata=segment.output_metadata,
         )
 
     @staticmethod

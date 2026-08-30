@@ -32,7 +32,11 @@ from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import (
     MossTTSAdapter,
     MossTTSNanoAdapter,
 )
-from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSAdapter
+from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import (
+    QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY,
+    Qwen3TTSAdapter,
+    Qwen3TTSCodecLimitError,
+)
 from vllm_omni.model_executor.models.indextts2 import prompt_utils
 from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
     INDEXTTS25_TOKENIZER_FILE,
@@ -160,6 +164,56 @@ def test_moss_tts_seed_falls_back_to_stage_default(adapter_cls, mocker):
 def test_qwen3_tts_metadata():
     assert Qwen3TTSAdapter.backend == "ar"
     assert issubclass(Qwen3TTSAdapter, ARTTSAdapter)
+
+
+@pytest.mark.parametrize(
+    ("task_type", "text_tokens", "request_cap", "expected_cap"),
+    [
+        ("Base", 0, None, 4096),
+        ("Base", 10, None, 192),
+        ("Base", 23, None, 276),
+        ("Base", 23, 128, 128),
+        ("Base", 23, 512, 512),
+        ("Base", 400, None, 4096),
+        ("CustomVoice", 10, None, 4096),
+        ("CustomVoice", 10, 256, 256),
+    ],
+)
+def test_qwen3_tts_applies_text_scaled_codec_safety_limit(task_type, text_tokens, request_cap, expected_cap, mocker):
+    server = mocker.Mock()
+    server._count_usage_text_tokens.return_value = text_tokens
+    adapter = Qwen3TTSAdapter(SpeechServingContext(server=server))
+    stage_defaults = [SamplingParams(max_tokens=4096, min_tokens=2)]
+    request = OpenAICreateSpeechRequest(
+        input="test text",
+        task_type=task_type,
+        max_new_tokens=request_cap,
+    )
+    prompt: dict[str, Any] = {"additional_information": {}}
+
+    overridden = adapter.apply_sampling_overrides(stage_defaults, request, prompt)
+
+    assert overridden[0].max_tokens == expected_cap
+    assert prompt["additional_information"][QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY] == [expected_cap]
+    assert stage_defaults[0].max_tokens == 4096
+
+
+def test_qwen3_tts_rejects_only_length_finished_base_audio(mocker):
+    adapter = Qwen3TTSAdapter(SpeechServingContext(server=mocker.Mock()))
+    params = {
+        "task_type": ["Base"],
+        QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY: [192],
+    }
+
+    # EOS at the exact budget is valid; the token count alone is not a
+    # sufficient failure signal.
+    adapter.validate_generation(params, stage0_finish_reason="stop", output_tokens=192)
+    adapter.validate_generation(params, stage0_finish_reason=None, output_tokens=192)
+
+    # Some frontends expose 191 decoded frames for max_new_tokens=192. The
+    # engine terminal reason still makes this an unambiguous limit failure.
+    with pytest.raises(Qwen3TTSCodecLimitError, match="191/192"):
+        adapter.validate_generation(params, stage0_finish_reason="length", output_tokens=191)
 
 
 def test_indextts_adapters_are_versioned():

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the MiniCPM-o 4.5 pipeline registration.
 
 Covers:
@@ -19,6 +19,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from transformers import PretrainedConfig
+from vllm.config import ModelConfig
 
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
@@ -167,8 +169,11 @@ class TestDeployTopology:
         assert connector["extra"]["connector_get_max_wait"] == 300
         expected_processor = "tts2code2wav_async_chunk" if deploy.async_chunk else "tts2code2wav_full_payload"
         assert stages[1].yaml_engine_args["custom_process_next_stage_input_func"].endswith(expected_processor)
+        if filename != "minicpmo_4_5.yaml":
+            assert "hf_overrides" not in stages[1].yaml_engine_args
         if filename == "minicpmo_4_5.yaml":
             assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [4, 4, 4]
+            assert stages[1].yaml_engine_args["hf_overrides"] == {"tts_config": {"attention_type": "sliding_recompute"}}
             memory_utilizations = [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages]
             assert memory_utilizations == [
                 0.55,
@@ -188,6 +193,18 @@ class TestDeployTopology:
                 0.55,
                 0.35,
             ]
+
+    def test_duplex_talker_hf_override_resolves_nested_attention_policy(self) -> None:
+        deploy = load_deploy_config(_DEPLOY_DIR / "minicpmo_4_5.yaml")
+        stages = merge_pipeline_deploy(OMNI_PIPELINES[deploy.pipeline], deploy)
+        overrides = stages[1].yaml_engine_args["hf_overrides"]
+        hf_config = PretrainedConfig()
+        hf_config.tts_config = PretrainedConfig(attention_type="full_attention")
+
+        model_config = object.__new__(ModelConfig)
+        model_config._apply_dict_overrides(hf_config, overrides)
+
+        assert hf_config.tts_config.attention_type == "sliding_recompute"
 
     @pytest.mark.parametrize(
         "filename",
