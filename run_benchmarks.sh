@@ -17,7 +17,7 @@ SEED_TTS_SIM_EVAL=1 SEED_TTS_WER_EVAL=1 vllm bench serve \
   --endpoint /v1/chat/completions --backend openai-chat-omni \
   --percentile-metrics ttft,tpot,itl,e2el,audio_ttfp,audio_rtf \
   --extra_body '{"modalities": ["text", "audio"], "chat_template_kwargs": {"enable_thinking": false, "use_tts_template": true}}' \
-  --tokenizer /models/MiniCPM-o-4_5
+  --tokenizer /workspace/local_models/OpenBMB/MiniCPM-o-4_5
 
 # 2. Daily-Omni 全量精度
 vllm bench serve \
@@ -31,7 +31,7 @@ vllm bench serve \
   --endpoint /v1/chat/completions --backend openai-chat-omni \
   --percentile-metrics ttft,tpot,itl,e2el \
   --extra_body '{"modalities": ["text"], "chat_template_kwargs": {"enable_thinking": false}}' \
-  --tokenizer /models/MiniCPM-o-4_5
+  --tokenizer /workspace/local_models/OpenBMB/MiniCPM-o-4_5
 
 # 3. Video-MME 全量精度
 vllm bench serve \
@@ -44,4 +44,4 @@ vllm bench serve \
   --endpoint /v1/chat/completions --backend openai-chat-omni \
   --percentile-metrics ttft,tpot,itl,e2el \
   --extra_body '{"modalities": ["text"], "chat_template_kwargs": {"enable_thinking": false}}' \
-  --tokenizer /models/MiniCPM-o-4_5
+  --tokenizer /workspace/local_models/OpenBMB/MiniCPM-o-4_5
