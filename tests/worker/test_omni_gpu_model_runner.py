@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
@@ -94,17 +95,31 @@ class DummyBuffer:
 
 
 class DummyInputBatch:
-    """A minimal input batch that only provides `req_ids`."""
+    """Minimal persistent batch."""
 
-    def __init__(self, req_ids):
+    def __init__(self, req_ids, max_model_len=64):
         self.req_ids = req_ids
         self.req_id_to_index = {r: i for i, r in enumerate(req_ids)}
+        self.num_prompt_tokens = np.zeros(len(req_ids), dtype=np.int64)
+        self.num_computed_tokens_cpu = np.zeros(len(req_ids), dtype=np.int64)
+        self.num_tokens_no_spec = np.zeros(len(req_ids), dtype=np.int64)
+        self.token_ids_cpu = np.zeros((len(req_ids), max_model_len), dtype=np.int32)
+        self.is_token_ids = np.zeros((len(req_ids), max_model_len), dtype=bool)
+        self.req_prompt_embeds = {}
 
 
 class DummyReqState:
     """A minimal request state container."""
 
     pass
+
+
+class DummyMropeBuffer:
+    """Minimal mrope_positions buffer exposing the .cpu / .np attrs upstream uses."""
+
+    def __init__(self, width: int):
+        self.cpu = torch.zeros((3, width), dtype=torch.int64)
+        self.np = self.cpu.numpy()
 
 
 class MiMoAudioForConditionalGeneration(torch.nn.Module):
@@ -857,3 +872,55 @@ def test_maybe_attach_mimo_audio_req_infos_no_req_state_returns_input():
 
     # When no req_state, helper should be a no-op.
     assert result is req_infos
+
+
+def _make_grown_prompt_runner(old_prompt_len: int, grow_by: int):
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.input_batch = DummyInputBatch(["request1"])
+    runner.input_batch.num_prompt_tokens[0] = old_prompt_len
+    runner.input_batch.num_computed_tokens_cpu[0] = old_prompt_len
+    runner.input_batch.num_tokens_no_spec[0] = old_prompt_len
+    runner.model = SimpleNamespace(precomputed_mrope_decode=False)
+    runner.mrope_positions = DummyMropeBuffer(width=old_prompt_len + grow_by)
+    req = DummyReqState()
+    req.prompt_token_ids = list(range(old_prompt_len))
+    req.prompt_embeds = None
+    req.prompt_is_token_ids = None
+    req.mrope_positions = torch.zeros((3, old_prompt_len), dtype=torch.int64)
+    runner.requests = {"request1": req}
+    runner.input_batch.token_ids_cpu[0, :old_prompt_len] = list(range(old_prompt_len))
+    runner.input_batch.is_token_ids[0, :old_prompt_len] = True
+    # The async-chunk re-feed grows the RUNNING request's prompt in place.
+    req.prompt_token_ids.extend(list(range(old_prompt_len, old_prompt_len + grow_by)))
+    return runner, req
+
+
+def test_calc_mrope_positions_ok_after_grown_prompt(monkeypatch):
+    runner, req = _make_grown_prompt_runner(8, 5)  # prompt 8 -> 13
+
+    def fake_init_mrope(r):
+        r.mrope_positions = (
+            torch.arange(len(r.prompt_token_ids), dtype=torch.int64).view(1, -1).expand(3, -1).contiguous()
+        )
+
+    monkeypatch.setattr(runner, "_init_mrope_positions", fake_init_mrope)
+
+    # Round 1: digest the 5 newly-gained prompt tokens (8 -> 13).
+    OmniGPUModelRunner._calc_mrope_positions(runner, SimpleNamespace(num_scheduled_tokens={"request1": 5}))
+
+    # The scheduler records the fully-computed prompt length.
+    runner.input_batch.num_computed_tokens_cpu[0] = len(req.prompt_token_ids)  # 13
+
+    # Round 2: the prompt grows again in place (13 -> 15).
+    req.prompt_token_ids.extend(list(range(13, 15)))
+    OmniGPUModelRunner._calc_mrope_positions(runner, SimpleNamespace(num_scheduled_tokens={"request1": 2}))
+
+    # After round 2 the batch must cover all 15 staged prompt tokens.
+    assert int(runner.input_batch.num_tokens_no_spec[0]) == 15
+    assert int(runner.input_batch.num_prompt_tokens[0]) == 15
+    assert req.num_prompt_tokens == 15
+    assert runner.input_batch.token_ids_cpu[0, :15].tolist() == list(range(15))
+    assert runner.input_batch.is_token_ids[0, :15].all()
+
+    # The newly-gained prompt positions were copied into the output buffer.
+    assert torch.equal(runner.mrope_positions.cpu[:, :2], req.mrope_positions[:, 13:15])

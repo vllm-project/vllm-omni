@@ -399,6 +399,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         class attribute.  When set, ``get_mrope_input_positions`` is expected
         to return positions covering **both** prefill and decode tokens.
         """
+        # NOTE: This is a temporary fix, not the final solution, see #5234 for more info.
+        # Refresh any request whose mrope_positions lags behind its live prompt.
+        self._refresh_stale_mrope_positions()
+
         # Run upstream logic (handles prompt positions + linear decode fallback)
         super()._calc_mrope_positions(scheduler_output)
 
@@ -407,6 +411,48 @@ class OmniGPUModelRunner(GPUModelRunner):
             return
 
         self._fixup_precomputed_mrope_decode_positions(scheduler_output)
+
+    def _refresh_stale_mrope_positions(self) -> None:
+        """Recompute M-RoPE positions for requests with in-place grown prompts.
+
+        Streaming chunk re-feeds (async-chunk mode) grow ``prompt_token_ids``
+        in place, then restore the request to its origin queue:
+
+        * WAITING — re-scheduled as a new request, so
+          ``_update_streaming_request`` re-inits ``mrope_positions``. Fine.
+        * RUNNING — re-scheduled via ``scheduled_cached_reqs``, which skips
+          that re-init, leaving ``mrope_positions`` at the pre-extend width.
+          Upstream ``_calc_mrope_positions`` then slices past the stale
+          tensor: "[3, N] vs [3, 0]" RuntimeError.
+
+        Only the RUNNING case is stale here; WAITING fails the check below.
+        """
+        from vllm.utils import length_from_prompt_token_ids_or_embeds
+
+        for req_index, req_id in enumerate(self.input_batch.req_ids):
+            req = self.requests[req_id]
+            if req.mrope_positions is None:
+                continue
+            cur_prompt_len = length_from_prompt_token_ids_or_embeds(req.prompt_token_ids, req.prompt_embeds)
+            if req.mrope_positions.shape[1] < cur_prompt_len:
+                self._init_mrope_positions(req)
+                # Keep req.num_prompt_tokens and the persistent batch in step
+                # with refreshed M-RoPE width.
+                req.num_prompt_tokens = cur_prompt_len
+                self.input_batch.num_prompt_tokens[req_index] = cur_prompt_len
+                self.input_batch.num_tokens_no_spec[req_index] = max(
+                    int(self.input_batch.num_tokens_no_spec[req_index]), cur_prompt_len
+                )
+                if req.prompt_token_ids is not None:
+                    prompt_is_token_ids = getattr(req, "prompt_is_token_ids", None)
+                    self.input_batch.token_ids_cpu[req_index, :cur_prompt_len] = req.prompt_token_ids
+                    self.input_batch.is_token_ids[req_index, :cur_prompt_len] = (
+                        prompt_is_token_ids if prompt_is_token_ids is not None else True
+                    )
+                else:
+                    self.input_batch.is_token_ids[req_index, :cur_prompt_len] = False
+                if req.prompt_embeds is not None:
+                    self.input_batch.req_prompt_embeds[req_index] = req.prompt_embeds
 
     def _fixup_precomputed_mrope_decode_positions(self, scheduler_output: "SchedulerOutput") -> None:
         """Overwrite linear decode M-RoPE positions with pre-computed ones.
