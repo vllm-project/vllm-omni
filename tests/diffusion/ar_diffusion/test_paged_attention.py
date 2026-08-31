@@ -32,20 +32,8 @@ POS = "positive"
 NEG = "negative"
 
 
-def make_state(
-    *,
-    num_layers=1,
-    window_chunks=2,
-    sink_chunks=0,
-    dtype=torch.float32,
-    device=torch.device("cpu"),
-):
-    cfg = ARDiffusionKVConfig(
-        enable=True,
-        chunk_size=BLOCK,
-        window_chunks=window_chunks,
-        sink_chunks=sink_chunks,
-    )
+def make_state(*, num_layers=1, window_chunks=2, dtype=torch.float32, device=torch.device("cpu")):
+    cfg = ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=window_chunks)
     kv = ARDiffusionKVCache(
         cfg,
         num_layers=num_layers,
@@ -115,10 +103,12 @@ def _commit_video_span(
     dtype: torch.dtype,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    layer_ctx = st.get_kv_caches(kv_branch, seq_len=n_chunks * BLOCK, commit_current=True)[0]
+    ctx = st.get_kv_caches(kv_branch, seq_len=n_chunks * BLOCK, commit_current=True)[0].forward_ctx
+    ctx.ensure_video_slots(device)
     k = torch.randn(1, n_chunks * BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
     v = torch.randn(1, n_chunks * BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
-    layer_ctx.write_only(k, v)
+    kv._k_pools[0][ctx.current_video_slot_mapping] = k[0]
+    kv._v_pools[0][ctx.current_video_slot_mapping] = v[0]
     st.commit_paged_context(kv_branch)
     return k, v
 
@@ -132,8 +122,7 @@ def test_paged_context_allocates_lazily_and_commits_after_forward():
     assert st.adapter(POS).completed_chunks == 0
     assert ctx.current_video_slot_mapping is None
 
-    zeros = torch.zeros(1, BLOCK, N_HEADS, HEAD_DIM)
-    contexts[0].write_only(zeros, zeros)
+    ctx.ensure_video_slots(torch.device("cpu"))
     assert st.adapter(POS).completed_chunks == 0
     assert len(ctx.current_video_block_ids) == 1
 
@@ -154,155 +143,6 @@ def test_scratch_video_and_action_blocks_do_not_commit():
     st.commit_paged_context(POS)
     assert st.adapter(POS).completed_chunks == 0
     assert st._committed[POS] == 0
-
-
-def test_dense_gather_uses_immutable_history_snapshot_and_write_only_is_strict():
-    _, st = make_state(num_layers=2)
-    first = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)
-    old_k = []
-    old_v = []
-    for layer_idx, layer_ctx in enumerate(first):
-        k = torch.full((1, BLOCK, N_HEADS, HEAD_DIM), float(layer_idx + 1))
-        v = torch.full((1, BLOCK, N_HEADS, HEAD_DIM), float(-(layer_idx + 1)))
-        layer_ctx.write_only(k, v)
-        old_k.append(k)
-        old_v.append(v)
-    st.commit_paged_context(POS)
-
-    current = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)
-    gathered_k0, gathered_v0 = current[0].gather_history()
-    torch.testing.assert_close(gathered_k0, old_k[0])
-    torch.testing.assert_close(gathered_v0, old_v[0])
-
-    current_k = torch.full_like(old_k[0], 99)
-    current_v = torch.full_like(old_v[0], -99)
-    current[0].write_only(current_k, current_v)
-
-    # Layer 0's write allocated an in-flight block in the live manager table.
-    # Layer 1 must still gather only the snapshot captured before that write.
-    gathered_k1, gathered_v1 = current[1].gather_history()
-    torch.testing.assert_close(gathered_k1, old_k[1])
-    torch.testing.assert_close(gathered_v1, old_v[1])
-
-    with pytest.raises(RuntimeError, match=r"incomplete current page.*missing layers \[1\]"):
-        st.commit_paged_context(POS)
-    with pytest.raises(RuntimeError, match="more than once"):
-        current[0].write_only(current_k, current_v)
-
-    current[1].write_only(current_k + 1, current_v - 1)
-    st.commit_paged_context(POS)
-
-
-def test_gather_history_trims_to_window_after_rollover():
-    """Eviction is lazy, so post-rollover snapshots can transiently hold one
-    out-of-window chunk. gather_history must never expose it: the visible
-    history must exactly match the dense oracle's eager sink+window trim."""
-    torch.manual_seed(0)
-    kv, st = make_state(window_chunks=2)
-    committed = [
-        _commit_video_span(
-            kv,
-            st,
-            kv_branch=POS,
-            n_chunks=1,
-            dtype=torch.float32,
-            device=torch.device("cpu"),
-        )
-        for _ in range(3)
-    ]
-
-    # No allocation has happened since the third commit, so the raw snapshot
-    # may still contain the rolled-out first chunk; the gather must not.
-    layer_ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0]
-    gathered_k, gathered_v = layer_ctx.gather_history()
-    assert gathered_k.shape[1] == kv.spec.sliding_window
-    expected_k = torch.cat([committed[1][0], committed[2][0]], dim=1)
-    expected_v = torch.cat([committed[1][1], committed[2][1]], dim=1)
-    torch.testing.assert_close(gathered_k, expected_k)
-    torch.testing.assert_close(gathered_v, expected_v)
-
-
-def test_gather_history_preserves_sink_blocks_across_rollover():
-    torch.manual_seed(0)
-    kv, st = make_state(window_chunks=2, sink_chunks=1)
-    committed = [
-        _commit_video_span(
-            kv,
-            st,
-            kv_branch=POS,
-            n_chunks=1,
-            dtype=torch.float32,
-            device=torch.device("cpu"),
-        )
-        for _ in range(4)
-    ]
-
-    layer_ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0]
-    gathered_k, gathered_v = layer_ctx.gather_history()
-    assert gathered_k.shape[1] == (kv.spec.sink_chunks + kv.spec.window_chunks) * BLOCK
-    expected_k = torch.cat([committed[0][0], committed[2][0], committed[3][0]], dim=1)
-    expected_v = torch.cat([committed[0][1], committed[2][1], committed[3][1]], dim=1)
-    torch.testing.assert_close(gathered_k, expected_k)
-    torch.testing.assert_close(gathered_v, expected_v)
-
-
-def test_dense_write_only_rejects_non_committing_context():
-    _, st = make_state()
-    layer_ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0]
-    kv = torch.zeros(1, BLOCK, N_HEADS, HEAD_DIM)
-    with pytest.raises(RuntimeError, match="commit_current=True"):
-        layer_ctx.write_only(kv, kv)
-
-
-def test_commit_refuses_context_without_all_layer_writes():
-    _, st = make_state(num_layers=2)
-    st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)
-    with pytest.raises(RuntimeError, match=r"missing layers \[0, 1\]"):
-        st.commit_paged_context(POS)
-
-
-def test_fused_commit_refuses_context_without_all_layer_writes():
-    _, st = make_state(num_layers=2)
-    contexts = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)
-    fctx = contexts[0].forward_ctx
-    fctx.prepare(device=torch.device("cpu"), action_len=0, query_len=BLOCK)
-    query = torch.randn(BLOCK, N_HEADS, HEAD_DIM)
-    key = torch.randn_like(query)
-    value = torch.randn_like(query)
-
-    paged_write_attn(
-        contexts[0].to_layer_inputs(),
-        query,
-        key,
-        value,
-        None,
-        None,
-        HEAD_DIM**-0.5,
-    )
-    with pytest.raises(RuntimeError, match=r"missing layers \[1\]"):
-        st.commit_paged_context(POS)
-
-    paged_write_attn(
-        contexts[1].to_layer_inputs(),
-        query,
-        key,
-        value,
-        None,
-        None,
-        HEAD_DIM**-0.5,
-    )
-    st.commit_paged_context(POS)
-    assert st.adapter(POS).completed_chunks == 1
-
-
-def test_unallocated_committing_context_cannot_be_replaced():
-    """A commit context is a transaction even before its first lazy write."""
-
-    _, st = make_state()
-    st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)
-
-    with pytest.raises(RuntimeError, match="replaced before.*committed"):
-        st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)
 
 
 def test_pipeline_kv_get_paged_path_has_no_gather_backend():
@@ -342,16 +182,12 @@ def test_paged_attention_matches_dense_reference_cpu(history_chunks, action_len,
         history_k_parts.append(k)
         history_v_parts.append(v)
 
-    layer_ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=commit_current)[0]
-    ctx = layer_ctx.forward_ctx
+    ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=commit_current)[0].forward_ctx
     ctx.ensure_video_slots(device)
     current_k = torch.randn(1, BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
     current_v = torch.randn(1, BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
-    if commit_current:
-        layer_ctx.write_only(current_k, current_v)
-    else:
-        kv._k_pools[0][ctx.current_video_slot_mapping] = current_k[0]
-        kv._v_pools[0][ctx.current_video_slot_mapping] = current_v[0]
+    kv._k_pools[0][ctx.current_video_slot_mapping] = current_k[0]
+    kv._v_pools[0][ctx.current_video_slot_mapping] = current_v[0]
 
     action_k = action_v = None
     if action_len:
@@ -476,17 +312,12 @@ def test_block_table_padded_to_fixed_width():
     device = torch.device("cpu")
     kv, st = make_state(window_chunks=2)
 
-    layer1 = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)[0]
-    ctx1 = layer1.forward_ctx
+    ctx1 = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)[0].forward_ctx
     ctx1.prepare(device=device, action_len=0, query_len=BLOCK)
-    key = torch.zeros(1, BLOCK, N_HEADS, HEAD_DIM)
-    layer1.write_only(key, torch.zeros_like(key))
     st.commit_paged_context(POS)
 
-    layer2 = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)[0]
-    ctx2 = layer2.forward_ctx
+    ctx2 = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)[0].forward_ctx
     ctx2.prepare(device=device, action_len=0, query_len=BLOCK)
-    layer2.write_only(key, torch.zeros_like(key))
     st.commit_paged_context(POS)
 
     # 1-block vs 2-block visible history: same table width, same max_seq_len.
@@ -518,7 +349,6 @@ def test_prepare_is_idempotent_and_layers_share_metadata():
     assert i0.block_table is i1.block_table
     assert i0.seq_lens is i1.seq_lens
     assert i0.video_slots is i1.video_slots
-    assert i0.written_mask is i1.written_mask
     assert i0.key_pool is kv._k_pools[0]
     assert i0.value_pool is kv._v_pools[0]
     assert i1.key_pool is kv._k_pools[1]

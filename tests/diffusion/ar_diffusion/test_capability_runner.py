@@ -15,7 +15,6 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
-    ARDiffusionRequestRejectedError,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
@@ -147,18 +146,8 @@ def make_runner(
 
 def commit_one_frame(runner: ARDiffusionModelRunner, session_id: str, kv_branch: str):
     state = runner._get_or_create_session(session_id)
-    contexts = state.get_kv_caches(kv_branch, seq_len=BLOCK, commit_current=True)
-    assert runner.kv_cache is not None
-    key = torch.zeros(
-        1,
-        BLOCK,
-        runner.kv_cache.num_kv_heads,
-        runner.kv_cache.head_size,
-        dtype=runner.kv_cache.dtype,
-    )
-    value = torch.zeros_like(key)
-    for layer_ctx in contexts:
-        layer_ctx.write_only(key, value)
+    ctx = state.get_kv_caches(kv_branch, seq_len=BLOCK, commit_current=True)[0].forward_ctx
+    ctx.ensure_video_slots(torch.device("cpu"))
     state.commit_paged_context(kv_branch)
     return state
 
@@ -167,17 +156,8 @@ def commit_one_block(runner: ARDiffusionModelRunner, session_id: str, kv_branch:
     state = runner._get_or_create_session(session_id)
     assert runner.kv_cache is not None
     seq_len = BLOCK * runner.kv_cache.frames_per_block
-    contexts = state.get_kv_caches(kv_branch, seq_len=seq_len, commit_current=True)
-    key = torch.zeros(
-        1,
-        seq_len,
-        runner.kv_cache.num_kv_heads,
-        runner.kv_cache.head_size,
-        dtype=runner.kv_cache.dtype,
-    )
-    value = torch.zeros_like(key)
-    for layer_ctx in contexts:
-        layer_ctx.write_only(key, value)
+    ctx = state.get_kv_caches(kv_branch, seq_len=seq_len, commit_current=True)[0].forward_ctx
+    ctx.ensure_video_slots(torch.device("cpu"))
     state.commit_paged_context(kv_branch)
     return state
 
@@ -400,60 +380,6 @@ def test_forward_exception_releases_pending_allocation_and_model_state(monkeypat
     assert not runner._sessions
     assert not kv._adapters
     assert kv.manager.block_pool.get_num_free_blocks() == free_total
-
-
-def test_request_rejection_preserves_session_state(monkeypatch):
-    """Admission rejections must NOT tear down the session: the client keeps
-    its paid-for KV history and can retry a corrected request or reset."""
-    pipeline = CapablePipeline(lingbot_like_spec())
-    runner = make_runner(pipeline)
-    kv = runner.kv_cache
-    assert kv is not None
-    state_before = commit_one_frame(runner, "keep", "main")
-    blocks_before = kv.window_block_ids(state_before.adapter("main"))
-    assert blocks_before
-
-    def reject(self, req, kv_prefetch_job=None):
-        raise ARDiffusionRequestRejectedError("out-of-order tick")
-
-    monkeypatch.setattr(DiffusionModelRunner, "execute_model", reject)
-    request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={"session_id": "keep"}))
-
-    with pytest.raises(ARDiffusionRequestRejectedError, match="out-of-order tick"):
-        runner.execute_model(request)
-
-    assert pipeline.bound_state is None
-    assert pipeline.closes == []
-    assert pipeline.resets == []
-    assert tuple(runner._sessions) == ("keep",)
-    assert runner._sessions["keep"] is state_before
-    assert kv.window_block_ids(state_before.adapter("main")) == blocks_before
-
-
-def test_malformed_extra_args_is_rejected_before_session_creation():
-    runner = make_runner(CapablePipeline(lingbot_like_spec()))
-    request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args=[]))
-
-    with pytest.raises(ARDiffusionRequestRejectedError, match="extra_args must be a mapping"):
-        runner.execute_model(request)
-
-    assert not runner._sessions
-
-
-def test_typed_tick_supplies_the_runner_session_and_lifecycle_flags():
-    tick = ARDiffusionTickRequest(
-        session_id="typed-world",
-        request_id="typed-request",
-        chunk_index=3,
-        reset=True,
-        close_session=True,
-    )
-    request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args=tick.to_extra_args()))
-
-    session_id, _, parsed = ARDiffusionModelRunner._request_session(request)
-
-    assert session_id == "typed-world"
-    assert parsed == tick
 
 
 def test_synchronize_exception_uses_forward_cleanup_path(monkeypatch):

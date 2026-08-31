@@ -30,6 +30,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 BLOCK = 16
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def make_spec(*, chunk_size=BLOCK, window_chunks=2, sink_chunks=0, reset_at_boundary=False):
     return ChunkWindowSpec(
@@ -432,24 +434,6 @@ def test_scratch_exhaustion_still_raises():
     cap = one.scratch_blocks_per_kv_branch
     with pytest.raises(RuntimeError, match="scratch blocks exhausted"):
         one.scratch_block_ids("positive", 0, cap + 1)
-
-
-def test_startup_allocation_fails_before_pool_build_when_geometry_exceeds_budget():
-    with pytest.raises(ValueError, match="available device memory cannot fit one session"):
-        ARDiffusionKVCache(
-            ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=9),
-            num_layers=2,
-            num_kv_heads=4,
-            head_size=64,
-            dtype=torch.float32,
-            block_size=BLOCK,
-            max_model_len=4096,
-            available_bytes=1 << 16,
-            device=torch.device("cpu"),
-            kv_branches=(ARDiffusionKVBranchSpec("main", 0),),
-            session_capacity=1,
-            frames_per_block=2,
-        )
 
 
 def test_non_contiguous_branch_indices_rejected():

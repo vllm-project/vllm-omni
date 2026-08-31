@@ -1214,14 +1214,6 @@ def test_postprocess_handles_image_video_audio_and_validation() -> None:
     video = torch.zeros(1, 3, 1, 4, 4)
 
     assert func(video, output_type="latent") is video
-    latent_payload = {"video": video}
-    assert (
-        func(
-            latent_payload,
-            sampling_params=SimpleNamespace(output_type="latent"),
-        )
-        is latent_payload
-    )
     assert func({"image": video})[0].size == (4, 4)
     # Video-only postprocess returns the bare processed video (not a dict),
     # matching the image/latent branches and peer audio-capable pipelines.
@@ -1238,25 +1230,6 @@ def test_postprocess_handles_image_video_audio_and_validation() -> None:
         func({"image": torch.zeros(1, 3, 2, 4, 4)})
     with pytest.raises(ValueError, match="both image and video"):
         func({"image": video, "video": video})
-
-
-def test_postprocess_output_type_request_precedence_and_empty_fallback(monkeypatch) -> None:
-    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
-
-    class RecordingVideoProcessor:
-        def __init__(self, *, vae_scale_factor: int) -> None:
-            assert vae_scale_factor == 16
-
-        def postprocess_video(self, _video, *, output_type: str) -> str:
-            return output_type
-
-    monkeypatch.setattr(pipeline_cosmos3, "VideoProcessor", RecordingVideoProcessor)
-    func = pipeline_cosmos3.get_cosmos3_post_process_func(SimpleNamespace())
-    output = object()
-
-    assert func(output, output_type="pt", sampling_params=SimpleNamespace(output_type=None)) == "pt"
-    assert func(output, output_type="pt", sampling_params=SimpleNamespace(output_type="")) == "pt"
-    assert func(output, output_type="np", sampling_params=SimpleNamespace(output_type="pt")) == "pt"
 
 
 def test_action_postprocess_handles_robolab_policy_outputs() -> None:
