@@ -34,6 +34,7 @@ from vllm_omni.config.stage_config import (
     build_stage_runtime_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
+    normalize_pipeline_cli_overrides,
     pipeline_cfg_resolver,
 )
 from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
@@ -429,6 +430,20 @@ class TestStageConfigFactory:
         assert cfg["final_output"] is True
         assert cfg["final_output_type"] == "image"
 
+    @pytest.mark.parametrize(
+        "model_class_name",
+        [
+            "MiniMaxH3Pipeline",
+            "WanPipeline",
+            "LTX2Pipeline",
+            "Cosmos3OmniDiffusersPipeline",
+        ],
+    )
+    def test_default_video_diffusion_output_type(self, model_class_name):
+        configs = StageConfigFactory.create_default_diffusion({"model_class_name": model_class_name})
+
+        assert configs[0]["final_output_type"] == "video"
+
     def test_default_diffusion_with_parallel_config(self):
         """Test diffusion config calculates devices from parallel_config."""
 
@@ -534,6 +549,7 @@ class TestPipelineDiscovery:
         """Check that specific models are in OMNI_PIPELINES."""
         assert "qwen2_5_omni" in OMNI_PIPELINES
         assert "qwen3_omni_moe" in OMNI_PIPELINES
+        assert "qwen3_omni_moe_thinker_only" in OMNI_PIPELINES
         assert "qwen3_tts" in OMNI_PIPELINES
 
     def test_registry_resolver_qwen3_omni_all_stages(self):
@@ -557,6 +573,18 @@ class TestPipelineDiscovery:
         assert pipeline.model_type == "qwen3_omni_moe_thinker_only"
         assert pipeline.default_deploy_config_name is None
         assert len(pipeline.stages) == 1  # thinker only
+
+    def test_registry_qwen3_omni_thinker_only_key_is_static(self):
+        """Explicit registry key must not re-enter the HF-config resolver."""
+        pipeline = resolve_pipeline_config(
+            "qwen3_omni_moe_thinker_only",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert pipeline is OMNI_PIPELINES["qwen3_omni_moe_thinker_only"]
+        assert pipeline.model_type == "qwen3_omni_moe_thinker_only"
+        assert len(pipeline.stages) == 1
+        assert pipeline.stages[0].engine_output_type == "text"
+        assert pipeline.stages[0].final_output_type == "text"
 
     @pytest.mark.parametrize(
         "pipeline",
@@ -622,7 +650,7 @@ class TestPipelineConfigNew:
             model_arch="A",
             stages=(
                 StagePipelineConfig(stage_id=0, model_stage="a"),
-                StagePipelineConfig(stage_id=1, model_stage="b", input_sources=(0,)),
+                StagePipelineConfig(stage_id=1, model_stage="b", input_sources=(0,), final_output=True),
             ),
         )
         assert p.validate() == []
@@ -630,6 +658,30 @@ class TestPipelineConfigNew:
     def test_validate_no_stages(self):
         p = PipelineConfig(model_type="t", model_arch="A")
         assert any("no stages" in e.lower() for e in p.validate())
+
+    def test_validate_no_terminal_stage(self):
+        """A pipeline with no ``final_output`` stage can never emit a result."""
+        p = PipelineConfig(
+            model_type="t",
+            model_arch="A",
+            stages=(
+                StagePipelineConfig(stage_id=0, model_stage="a"),
+                StagePipelineConfig(stage_id=1, model_stage="b", input_sources=(0,)),
+            ),
+        )
+        assert any("no terminal stage" in e.lower() for e in p.validate())
+
+    def test_validate_terminal_stage_need_not_be_last(self):
+        """The check is cycle-agnostic: any stage may carry ``final_output``."""
+        p = PipelineConfig(
+            model_type="t",
+            model_arch="A",
+            stages=(
+                StagePipelineConfig(stage_id=0, model_stage="a", final_output=True),
+                StagePipelineConfig(stage_id=1, model_stage="b", input_sources=(0,)),
+            ),
+        )
+        assert p.validate() == []
 
 
 class TestPipelineRegistration:
@@ -1131,7 +1183,7 @@ class TestDeployConfigLoading:
         stages = merge_pipeline_deploy(pipeline, deploy)
 
         assert deploy.session_mode == "duplex"
-        assert deploy.active_stream_window == 1
+        assert deploy.active_stream_window == max_sessions
         assert deploy.duplex_session.max_sessions == max_sessions
         assert [stage.session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
         assert [stage.to_omegaconf().session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
@@ -1225,14 +1277,22 @@ stages:
         assert deploy.connectors is not None
         assert deploy.platforms is not None
 
-    def test_qwen3_omni_thinker_only_deploy_config_uses_resolved_pipeline(self):
+    @pytest.mark.parametrize(
+        ("hf_config", "model"),
+        [
+            (Q3_OMNI_THINKER_HF_CONFIG, "Qwen/Qwen3-Omni-30B-A3B-Thinking"),
+            (Q3_OMNI_ALL_STAGES_HF_CONFIG, "Qwen/Qwen3-Omni-30B-A3B-Instruct"),
+        ],
+        ids=["thinker_checkpoint", "instruct_forced_thinker_only"],
+    )
+    def test_qwen3_omni_thinker_only_deploy_config_uses_resolved_pipeline(self, hf_config, model):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe_thinking.yaml"))
         with patch(
             "vllm_omni.config.config_factory.get_config",
-            return_value=Q3_OMNI_THINKER_HF_CONFIG,
+            return_value=hf_config,
         ):
             pipeline = StageConfigFactory.get_pipeline_config(
-                "Qwen/Qwen3-Omni-30B-A3B-Thinking",
+                model,
                 trust_remote_code=False,
                 deploy_config_path=str(deploy_path),
             )
@@ -1241,6 +1301,7 @@ stages:
         assert pipeline.model_type == "qwen3_omni_moe_thinker_only"
 
         deploy = load_deploy_config(deploy_path)
+        assert deploy.pipeline == "qwen3_omni_moe_thinker_only"
         stages = merge_pipeline_deploy(pipeline, deploy)
 
         assert len(stages) == 1
@@ -1292,6 +1353,8 @@ stages:
     @pytest.mark.parametrize(
         ("deploy_name", "pipeline_name", "stage_count", "final_output_type", "declared_pipeline"),
         [
+            ("mammoth_moda2.yaml", "mammoth_moda2", 2, "image", "mammoth_moda2"),
+            ("mammoth_moda2_ar.yaml", "mammoth_moda2_ar", 1, "text", "mammoth_moda2_ar"),
             ("omnivoice.yaml", "omnivoice", 1, "audio", "omnivoice"),
             ("mimo_audio.yaml", "mimo_audio", 2, "audio", None),
             ("step_audio_2.yaml", "step_audio_2", 2, "audio", None),
@@ -1300,6 +1363,13 @@ stages:
             ("step_audio2_ci.yaml", "step_audio_2_asr", 1, "text", "step_audio_2_asr"),
             ("hunyuan_video_15.yaml", "hunyuan_video_15", 1, "video", None),
             ("wan2_2_ti2v.yaml", "wan2_2_ti2v", 1, "video", None),
+            (
+                "minimax_h3_disaggregated.yaml",
+                "minimax_h3_disaggregated",
+                2,
+                "video",
+                "minimax_h3_disaggregated",
+            ),
         ],
     )
     def test_load_new_registry_backed_deploy_configs(
@@ -1320,8 +1390,90 @@ stages:
         assert len(stages) == stage_count
         assert stages[-1].final_output is True
         assert stages[-1].final_output_type == final_output_type
+        if pipeline_name == "minimax_h3_disaggregated":
+            assert stages[0].yaml_engine_args["model_path_resolver"].endswith(".resolve_minimax_h3_model_root")
+            assert (
+                stages[1].yaml_engine_args["model_path_resolver"].endswith(".resolve_minimax_h3_diffusion_model_path")
+            )
+            assert "model_path_resolver" not in stages[0].yaml_extras
+            assert "model_path_resolver" not in stages[1].yaml_extras
         if deploy.trust_remote_code is not None:
             assert {s.yaml_engine_args.get("trust_remote_code") for s in stages} == {deploy.trust_remote_code}
+
+    def test_minimax_h3_resolvers_reach_production_engine_args(self, tmp_path: Path, monkeypatch):
+        from vllm_omni.engine import stage_init_utils
+
+        model_root = tmp_path / "MiniMax-H3"
+        (model_root / "FL2VA" / "text_encoder").mkdir(parents=True)
+        (model_root / "Ref2VA" / "text_encoder").mkdir(parents=True)
+        monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda _engine_args: None)
+
+        deploy = load_deploy_config(get_deploy_config_path("minimax_h3_disaggregated.yaml"))
+        assert deploy.stages[1].engine_extras["model_loaded"] == {"text_encoder": False}
+        stages = merge_pipeline_deploy(OMNI_PIPELINES["minimax_h3_disaggregated"], deploy)
+        resolved = [stage_init_utils.build_engine_args_dict(stage.to_omegaconf(), str(model_root)) for stage in stages]
+
+        assert resolved[0]["model"] == str(model_root / "FL2VA" / "text_encoder")
+        assert resolved[1]["model"] == str(model_root / "FL2VA")
+        assert all("model_path_resolver" not in engine_args for engine_args in resolved)
+
+    def test_minimax_h3_text_encoder_tp_reaches_only_stage_zero(self):
+        pipeline = OMNI_PIPELINES["minimax_h3_disaggregated"]
+        stages, _ = StageConfigFactory._create_legacy_from_registry(
+            pipeline,
+            {"text_encoder_tp_size": 4},
+        )
+
+        assert stages[0].runtime_overrides["tensor_parallel_size"] == 4
+        assert "text_encoder_tp_size" not in stages[0].runtime_overrides
+        assert "text_encoder_tp_size" not in stages[1].runtime_overrides
+        assert stages[1].yaml_engine_args["parallel_config"]["tensor_parallel_size"] == 1
+
+    def test_minimax_h3_disaggregated_defaults_match_validated_topology(self):
+        pipeline = OMNI_PIPELINES["minimax_h3_disaggregated"]
+        deploy = load_deploy_config(Path(get_deploy_config_path("minimax_h3_disaggregated.yaml")))
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert stages[0].yaml_engine_args["max_num_seqs"] == 1
+        assert stages[0].yaml_engine_args["model_path_resolver"].endswith(".resolve_minimax_h3_model_root")
+        assert stages[1].yaml_engine_args["model_path_resolver"].endswith(".resolve_minimax_h3_diffusion_model_path")
+        parallel = stages[1].yaml_engine_args["parallel_config"]
+        assert parallel["tensor_parallel_size"] == 1
+        assert parallel["ulysses_degree"] == 4
+        assert parallel["vae_patch_parallel_size"] == 4
+        assert stages[1].yaml_engine_args["inline_diffusion"] is True
+        assert stages[1].yaml_extras["default_sampling_params"]["num_inference_steps"] == 50
+
+        turbo = load_deploy_config(Path(get_deploy_config_path("minimax_h3_disaggregated_turbo.yaml")))
+        turbo_stages = merge_pipeline_deploy(pipeline, turbo)
+        turbo_sampling = turbo_stages[1].yaml_extras["default_sampling_params"]
+        assert turbo_sampling["num_inference_steps"] == 5
+        assert turbo_sampling["extra_args"] == {"flow_shift": 6.0, "audio_flow_shift": 3.0}
+
+    def test_minimax_h3_text_encoder_tp_alias_targets_stage_zero(self):
+        pipeline = OMNI_PIPELINES["minimax_h3_disaggregated"]
+
+        assert normalize_pipeline_cli_overrides(pipeline, {}) == {}
+        assert normalize_pipeline_cli_overrides(pipeline, {"text_encoder_tp_size": 4}) == {
+            "stage_0_tensor_parallel_size": 4
+        }
+
+    def test_minimax_h3_stage_zero_tp_override_wins_alias_conflict(self):
+        pipeline = OMNI_PIPELINES["minimax_h3_disaggregated"]
+
+        with pytest.warns(UserWarning, match="stage_0_tensor_parallel_size=2 takes precedence"):
+            normalized = normalize_pipeline_cli_overrides(
+                pipeline,
+                {"text_encoder_tp_size": 4, "stage_0_tensor_parallel_size": 2},
+            )
+
+        assert normalized == {"stage_0_tensor_parallel_size": 2}
+
+    def test_minimax_h3_rejects_text_encoder_tp_on_diffusion_stage(self):
+        pipeline = OMNI_PIPELINES["minimax_h3_disaggregated"]
+
+        with pytest.raises(ValueError, match="stage_1_text_encoder_tp_size cannot be set"):
+            normalize_pipeline_cli_overrides(pipeline, {"stage_1_text_encoder_tp_size": 4})
 
     @pytest.mark.parametrize(
         ("config_json", "model_index", "expected_pipeline"),
@@ -1357,6 +1509,29 @@ stages:
 
         assert pipeline is not None
         assert pipeline.model_type == expected_pipeline
+
+    def test_minimax_h3_disaggregation_is_not_auto_discovered(self):
+        def get_model_file(filename, _model, revision=None):
+            del revision
+            if filename == "config.json":
+                return None
+            if filename == "model_index.json":
+                return {"_class_name": "MiniMaxH3Pipeline"}
+            return None
+
+        with (
+            patch.object(StageConfigFactory, "get_hf_config", return_value=None),
+            patch(
+                "vllm_omni.config.config_factory.get_hf_file_to_dict",
+                side_effect=get_model_file,
+            ),
+        ):
+            pipeline = StageConfigFactory.get_pipeline_config(
+                model="/models/unrelated-checkpoint-name",
+                trust_remote_code=False,
+            )
+
+        assert pipeline is None
 
     @pytest.mark.parametrize("deploy_name", ["step_audio_2.yaml", "step_audio_2_async_chunk.yaml"])
     def test_step_audio2_deploy_configs_fit_two_gpus(self, deploy_name):
@@ -2247,6 +2422,20 @@ class TestPlatformOverrides:
         rocm = _apply_platform_overrides(base, platform="rocm")
         assert rocm.stages[0].enforce_eager is None
         assert rocm.stages[1].enforce_eager is True
+
+    def test_higgs_audio_v3_rocm_uses_triton_attention(self):
+        deploy_path = Path(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
+
+        base = load_deploy_config(deploy_path)
+        assert base.stages[0].engine_extras["attention_backend"] == "FLASHINFER"
+
+        rocm = _apply_platform_overrides(base, platform="rocm")
+        assert rocm.stages[0].engine_extras["attention_backend"] == "TRITON_ATTN"
+
+        pipeline = resolve_pipeline_config("higgs_multimodal_qwen3")
+        assert isinstance(pipeline, PipelineConfig)
+        stages = merge_pipeline_deploy(pipeline, rocm)
+        assert stages[0].yaml_engine_args["attention_backend"] == "TRITON_ATTN"
 
     def test_qwen3_omni_cuda_uses_thinker_rotary_custom_op(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))

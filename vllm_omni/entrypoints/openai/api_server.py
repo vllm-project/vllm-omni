@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import asyncio
 import base64
 import dataclasses
@@ -65,6 +65,14 @@ from vllm.entrypoints.pooling.pooling.serving import ServingPooling
 from vllm.entrypoints.pooling.scoring.serving import ServingScores
 from vllm.entrypoints.scale_out.token_in_token_out.serving import ServingTokens
 
+# vLLM < 0.28 keeps create_error_response under serve.utils (it is not
+# re-exported from vllm.entrypoints.serve); 0.28+ moved it under
+# serve.exception_handling and re-exports it from the package root.
+try:
+    from vllm.entrypoints.serve import create_error_response
+except ImportError:
+    from vllm.entrypoints.serve.utils.error_response import create_error_response
+
 # vLLM moved `base` from openai.basic.api_router to serve.instrumentator.basic.
 # Keep a fallback for older/newer upstream layouts during rebase windows.
 from vllm.entrypoints.serve.instrumentator.basic import base
@@ -75,7 +83,6 @@ from vllm.entrypoints.serve.utils.api_utils import (
     validate_json_request,
     with_cancellation,
 )
-from vllm.entrypoints.serve.utils.error_response import create_error_response
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.serve.utils.server_utils import get_uvicorn_log_config
@@ -540,6 +547,8 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
         if _should_enable_profiler_endpoints(stage_configs):
             logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
+            _remove_route_from_app(app, "/start_profile", frozenset({"POST"}))
+            _remove_route_from_app(app, "/stop_profile", frozenset({"POST"}))
             app.include_router(profiler_router)
 
         vllm_config = await _get_vllm_config(engine_client)
@@ -613,6 +622,9 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             await shutdown_task
         finally:
             state = getattr(app, "state", None)
+            serving_video = getattr(state, "openai_serving_video", None) if state is not None else None
+            if serving_video is not None:
+                serving_video.shutdown()
             serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
             if serving_speech is not None:
                 serving_speech.shutdown()
@@ -823,6 +835,8 @@ async def omni_init_app_state(
             diffusion_engine=engine_client,
             model_name=model_name,
             stage_configs=diffusion_stage_configs,
+            allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
+            allowed_media_domains=getattr(args, "allowed_media_domains", None),
         )
         state.openai_serving_duplex = None
         state.openai_streaming_speech = None
@@ -997,11 +1011,9 @@ async def omni_init_app_state(
     )
 
     # Warm up chat template processing to avoid first-request latency
-    # Upstream f5ffc59b6a moved warmup onto OnlineRenderer. Accelerator
-    # images can temporarily lag that renderer API, where warmup is optional.
-    renderer_warmup = getattr(state.online_renderer, "warmup", None)
-    if renderer_warmup is not None:
-        renderer_warmup()
+    # Upstream f5ffc59b6a removed OpenAIServingChat.warmup() and moved the
+    # warmup onto the renderer (OnlineRenderer.warmup()); mirror upstream.
+    state.online_renderer.warmup()
 
     state.openai_serving_completion = (
         OpenAIServingCompletion(

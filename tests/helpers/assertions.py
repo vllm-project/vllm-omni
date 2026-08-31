@@ -665,7 +665,7 @@ def _speech_assertion_needs_audio_transcript(request_config: dict[str, Any], run
         return False
     if request_config.get("response_format") == "pcm":
         return False
-    return bool(request_config.get("input"))
+    return bool(request_config.get("transcript_expected_text", request_config.get("input")))
 
 
 def _resolve_audio_transcript(
@@ -880,7 +880,7 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
 
         transcript = _resolve_audio_transcript(response, request_config, run_level, speech_api=True)
         if transcript is not None:
-            expected_text = request_config.get("input")
+            expected_text = request_config.get("transcript_expected_text", request_config.get("input"))
             if expected_text:
                 print(f"audio content is: {transcript}")
                 print(f"input text is: {expected_text}")

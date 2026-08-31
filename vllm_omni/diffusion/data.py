@@ -7,7 +7,7 @@ import os
 import random
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import TYPE_CHECKING, Any
 
 import diffusers
@@ -222,6 +222,9 @@ class DiffusionParallelConfig:
     - When used in hybrid Ulysses+Ring, Ring requires consistent per-rank
       sequence shapes across the ring group.
     """
+
+    ulysses_a2a_permute: bool = False
+    """Use fused permute-free all-to-all for eligible strict Ulysses exchanges."""
 
     cfg_parallel_size: int = 1
     """Number of ranks used to execute guidance passes in parallel."""
@@ -632,8 +635,12 @@ def resolve_model_class_name(
         return None
     is_lance_subfolder = os.path.basename(str(model).rstrip("/")) in {"Lance_3B", "Lance_3B_Video"}
 
-    # Diffusers models: read _class_name from the pipeline index.
-    model_index = get_diffusion_model_index(model, revision=revision)
+    # Diffusers models: read _class_name from the pipeline index. Missing
+    # local paths can otherwise be interpreted as invalid Hub repo IDs.
+    try:
+        model_index = get_diffusion_model_index(model, revision=revision)
+    except Exception:
+        model_index = None
     if model_index is not None:
         return model_index.get("_class_name")
     if diffusion_load_format == "diffusers":
@@ -679,6 +686,19 @@ def resolve_model_class_name(
     if len(architectures) == 1:
         return architectures[0]
     return None
+
+
+def uses_diffusers_adapter(od_config: object) -> bool:
+    """Return whether execution uses the Diffusers adapter backend.
+
+    A custom pipeline takes precedence over ``diffusion_load_format`` in the
+    worker, so adapter-specific behavior must only apply when no custom
+    pipeline override is configured.
+    """
+    return (
+        getattr(od_config, "custom_pipeline_args", None) is None
+        and getattr(od_config, "diffusion_load_format", "default") == "diffusers"
+    )
 
 
 @dataclass
@@ -881,6 +901,7 @@ class OmniDiffusionConfig:
         default_factory=lambda: {
             "transformer": True,
             "vae": True,
+            "text_encoder": True,
         }
     )
     override_transformer_cls_name: str | None = None
@@ -1312,10 +1333,6 @@ class OmniDiffusionConfig:
 
         from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
 
-        # Default model_class_name for diffusers adapter
-        if self.model_class_name is None and self.diffusion_load_format == "diffusers":
-            self.model_class_name = "DiffusersAdapterPipeline"
-
         assert self.model is not None
         try:
             config_dict = get_diffusion_model_index(
@@ -1325,6 +1342,8 @@ class OmniDiffusionConfig:
             if config_dict is not None:
                 if self.model_class_name is None:
                     self.model_class_name = config_dict.get("_class_name", None)
+                    if self.model_class_name is None and self.diffusion_load_format == "diffusers":
+                        self.model_class_name = "DiffusersAdapterPipeline"
                 self.update_multimodal_support()
 
                 # Skip transformer config loading for diffusers adapter
@@ -1365,6 +1384,8 @@ class OmniDiffusionConfig:
             # Skip transformer config loading for diffusers adapter
             # (non-DiT models don't have a separate transformer folder/config)
             if self.diffusion_load_format == "diffusers":
+                if self.model_class_name is None:
+                    self.model_class_name = "DiffusersAdapterPipeline"
                 self.set_tf_model_config(TransformerConfig())
                 logger.warning(
                     "Could not find a valid pipeline index per Diffusers format. "
@@ -1670,6 +1691,20 @@ class AttnQuantSpec:
 BLOCK_SPARSE_BACKENDS = frozenset({"RAINFUSION_ATTN"})
 
 
+class RainFusionPrecision(StrEnum):
+    """Execution precision for block-sparse RainFusion (rf_v3) attention.
+
+    ``bf16``: no quantization, pure BF16 sparse attention (official baseline).
+    ``fp8``: BSA FP8 path - Hadamard rotation then full FP8 block quantization
+        of Q/K/V before the BSA kernel.
+    ``mix``: EagleQBSA mixed precision - Q/K per-block INT8 + V per-channel FP8.
+    """
+
+    BF16 = "bf16"
+    FP8 = "fp8"
+    MIX = "mix"
+
+
 @dataclass
 class BlockSparseSpec:
     """User-facing controls shared by block-sparse attention backends.
@@ -1678,10 +1713,13 @@ class BlockSparseSpec:
     ``start_step`` keeps the first N denoise steps dense and ``skip_layers`` (an
     index selector such as "0-3,38") exempts individual DiT blocks. Those two are
     the accuracy knobs to trade back quality at a fixed ``sparsity``.
+    ``precision`` selects the kernel precision mode (see ``RainFusionPrecision``).
     """
 
     sparsity: float = 0.8
     start_step: int = 0
+    end_step: int = 0
+    precision: str = RainFusionPrecision.BF16.value
     skip_layers: str | list[int] | None = None
     skip_layer_indices: set[int] | None = field(default=None, repr=False)
 
@@ -1689,6 +1727,13 @@ class BlockSparseSpec:
         self.sparsity = _in_range(self.sparsity, "block_sparse.sparsity", 0.0, 1.0) or 0.0
         if self.start_step < 0:
             raise ValueError(f"block_sparse.start_step must be >= 0; got {self.start_step!r}.")
+        if self.end_step < 0:
+            raise ValueError(f"block_sparse.end_step must be >= 0; got {self.end_step!r}.")
+        if self.precision not in {p.value for p in RainFusionPrecision}:
+            raise ValueError(
+                f"block_sparse.precision must be one of {sorted(p.value for p in RainFusionPrecision)}; "
+                f"got {self.precision!r}."
+            )
         self.skip_layer_indices = parse_kv_cache_skip_selector(self.skip_layers)
 
 
@@ -1771,6 +1816,8 @@ class AttentionSpec:
             bs = self.block_sparse
             kw["sparsity"] = bs.sparsity
             kw["start_step"] = bs.start_step
+            kw["end_step"] = bs.end_step
+            kw["precision"] = bs.precision
             if bs.skip_layer_indices:
                 kw["skip_layers"] = sorted(bs.skip_layer_indices)
 

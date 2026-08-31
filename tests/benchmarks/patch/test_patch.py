@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Unit tests for patch.py
@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 import time
+from argparse import Namespace
 from types import SimpleNamespace
 
 import pytest
@@ -17,8 +18,10 @@ from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
+    _apply_stage0_token_timings,
     async_request_openai_chat_omni_completions,
     async_request_openai_realtime_duplex,
+    should_request_stage_metrics,
 )
 from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
 
@@ -102,7 +105,24 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
                 received_at_s=now + 0.03,
             )
             self.events.add(
-                {"type": "response.done", "response": {"id": response_id}},
+                {
+                    "type": "response.done",
+                    "response": {
+                        "id": response_id,
+                        "metadata": {
+                            "vllm_omni": {
+                                "stage_metrics": {
+                                    "0": {
+                                        "num_tokens_out": 3,
+                                        "vllm_ttft_ms": 20.0,
+                                        "vllm_tpot_ms": 10.0,
+                                        "vllm_itls_ms": [10.0, 10.0],
+                                    }
+                                }
+                            }
+                        },
+                    },
+                },
                 received_at_s=now + 0.04,
             )
 
@@ -143,6 +163,7 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
     assert client.configure_kwargs["native_duplex"] is False
     assert client.configure_kwargs["extra_body"] == {
         "ref_audio": "data:audio/wav;base64,AAAA",
+        "return_stage_metrics": True,
     }
     assert client.sent == [
         event
@@ -167,6 +188,10 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
     assert output.audio_ttfp > output.ttft
     assert output.audio_rtf > 0
     assert output.latency > 0
+    assert output.output_tokens == 12
+    assert output.itl == [0.01, 0.01] * 4
+    assert output.text_latency == pytest.approx(output.ttft + 0.08)
+    assert output.tpot_measured is True
     assert output.tts_turn_pcm_bytes == [b"\x00\x00" * 2400] * 4
     assert output.tts_output_pcm_bytes == b"\x00\x00" * 9600
     session_id = output.duplex_request_metrics[0]["session_id"]
@@ -198,9 +223,158 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
     }
 
 
+def test_stage0_token_timings_use_weighted_tpot_when_itls_are_incomplete():
+    output = MixRequestFuncOutput(ttft=0.1)
+
+    measured = _apply_stage0_token_timings(
+        output,
+        [
+            {"output_token_count": 3, "itls_ms": [], "tpot_ms": 10.0},
+            {"output_token_count": 2, "itls_ms": [], "tpot_ms": 40.0},
+        ],
+        expected_output_tokens=5,
+    )
+
+    assert measured is True
+    assert output.itl == []
+    assert output.tpot_measured is True
+    assert (output.text_latency - output.ttft) / 4 == pytest.approx(0.02)
+
+
+def test_stage0_zero_itls_fall_back_to_positive_tpot():
+    output = MixRequestFuncOutput(ttft=0.1)
+
+    measured = _apply_stage0_token_timings(
+        output,
+        [{"output_token_count": 3, "itls_ms": [0.0, 0.0], "tpot_ms": 25.0}],
+        expected_output_tokens=3,
+    )
+
+    assert measured is True
+    assert output.itl == []
+    assert output.tpot_measured is True
+    assert (output.text_latency - output.ttft) / 2 == pytest.approx(0.025)
+
+
+def test_stage0_token_count_without_timing_is_not_measured():
+    output = MixRequestFuncOutput(ttft=0.1)
+
+    measured = _apply_stage0_token_timings(
+        output,
+        [{"output_token_count": 3, "itls_ms": [], "tpot_ms": None}],
+        expected_output_tokens=3,
+    )
+
+    assert measured is False
+    assert output.itl == []
+    assert output.text_latency == output.ttft
+    assert output.tpot_measured is False
+
+
 def create_sse_chunk(data_dict):
     """Helper to create SSE formatted chunk"""
     return f"data: {json.dumps(data_dict)}\n\n".encode()
+
+
+def test_chat_text_timing_metrics_request_stage_metrics():
+    args = Namespace(
+        backend="openai-chat-omni",
+        percentile_metrics="ttft,tpot,itl,e2el",
+        print_stage=False,
+        extra_body={},
+    )
+
+    assert should_request_stage_metrics(args) is True
+
+
+@pytest.mark.asyncio
+async def test_bundled_first_text_chunk_uses_stage0_token_timings(mocker: MockerFixture):
+    """Engine timings recover TPOT when every text token arrives together."""
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=10,
+        output_len=20,
+    )
+    chunks = [
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": "ABCD"}}],
+                "modality": "text",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+                "metrics": {
+                    "stage_metrics": {
+                        "0": {
+                            "num_tokens_out": 4,
+                            "vllm_itls_ms": [10.0, 11.0, 12.0],
+                            "vllm_tpot_ms": 11.0,
+                        }
+                    }
+                },
+            }
+        ),
+        b"data: [DONE]\n\n",
+    ]
+    mock_response = MockResponse(200, chunks)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert output.success is True
+    assert output.output_tokens == 4
+    assert output.itl == pytest.approx([0.010, 0.011, 0.012])
+    assert output.text_latency - output.ttft == pytest.approx(0.033)
+    assert output.tpot_measured is True
+
+
+@pytest.mark.asyncio
+async def test_positive_client_text_timings_take_precedence_over_stage0(mocker: MockerFixture):
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=10,
+        output_len=20,
+    )
+    chunks = [
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": "A"}}],
+                "modality": "text",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+            }
+        ),
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {"content": "B"}}],
+                "modality": "text",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+                "metrics": {
+                    "stage_metrics": {
+                        "0": {
+                            "num_tokens_out": 2,
+                            "vllm_itls_ms": [1000.0],
+                            "vllm_tpot_ms": 1000.0,
+                        }
+                    }
+                },
+            }
+        ),
+        b"data: [DONE]\n\n",
+    ]
+    mock_response = MockResponse(200, chunks, delay_between_chunks=0.01)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    assert output.success is True
+    assert len(output.itl) == 1
+    assert 0.0 < output.itl[0] < 0.1
 
 
 # ============================================================================

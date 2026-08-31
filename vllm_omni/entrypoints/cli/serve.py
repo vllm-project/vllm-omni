@@ -541,6 +541,15 @@ class OmniServeCommand(CLISubcommand):
             "'advanced_uaa' enables the experimental UAA path for uneven sequence/head shapes.",
         )
         omni_config_group.add_argument(
+            "--ulysses-a2a-permute",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Enable fused permute-free Ulysses all-to-all over NCCL symmetric memory. "
+                "Only strict Ulysses layouts are eligible. Defaults to disabled."
+            ),
+        )
+        omni_config_group.add_argument(
             "--ring",
             "--ring-degree",
             dest="ring_degree",
@@ -821,10 +830,9 @@ class OmniServeCommand(CLISubcommand):
         omni_config_group.add_argument(
             "--text-encoder-tp-size",
             type=int,
-            default=1,
+            default=None,
             help="Tensor-parallel degree for the diffusion text encoder. "
-            "Shards the Qwen3-VL encoder across the first N DiT ranks, "
-            "removing the rank-0 encoder memory hotspot in no-offload runs. "
+            "Shards the encoder across the first N DiT ranks. "
             "Equivalent to setting DiffusionParallelConfig.text_encoder_tp_size.",
         )
         omni_config_group.add_argument(

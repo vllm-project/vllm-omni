@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
 from base64 import b64decode
 from binascii import Error as BinasciiError
-from typing import Any
+from typing import Any, cast
 
 from vllm.sampling_params import SamplingParams
 
@@ -22,6 +22,9 @@ _DUPLEX_SAMPLES_PER_AUDIO_TOKEN = 1600
 # <image> + 64 resampler embeddings + </image> per frame (max_slice_nums=1),
 # matching MiniCPMO45DuplexPolicy.VISION_TOKENS_PER_FRAME.
 _DUPLEX_VISION_TOKENS_PER_FRAME = 66
+# Official stacked pair uses max_slice_nums=[2, 1]: the current frame is HD
+# sliced (1 source + 2 patches on 960x540) and the composite is not.
+_DUPLEX_HD_SLICES_PER_BASE_FRAME = 3
 
 
 def _duplex_frame_count(payload: object) -> int:
@@ -31,6 +34,22 @@ def _duplex_frame_count(payload: object) -> int:
     if not isinstance(frames, list):
         return 0
     return sum(1 for frame in frames if isinstance(frame, str) and frame)
+
+
+def _duplex_vision_tokens(payload: object) -> int:
+    """Scheduler slots for this append's camera track.
+
+    Audio is never stacked: a unit still carries one second of soundtrack.
+    ``stack_frames`` only adds a second *image*. Official HD on that pair is
+    ``[2, 1]``, so the base frame reserves three 66-token blocks and every
+    extra frame reserves one.
+    """
+    count = _duplex_frame_count(payload)
+    if count <= 0:
+        return 0
+    if count >= 2:
+        return (_DUPLEX_HD_SLICES_PER_BASE_FRAME + (count - 1)) * _DUPLEX_VISION_TOKENS_PER_FRAME
+    return count * _DUPLEX_VISION_TOKENS_PER_FRAME
 
 
 def _duplex_pcm_sample_count(payload: object) -> int | None:
@@ -48,7 +67,7 @@ def _duplex_pcm_sample_count(payload: object) -> int | None:
 
 def duplex_payload_is_exact_chunks(payload: object) -> bool:
     sample_count = _duplex_pcm_sample_count(payload)
-    return bool(sample_count) and sample_count % _DUPLEX_CHUNK_SAMPLES == 0
+    return sample_count is not None and sample_count != 0 and sample_count % _DUPLEX_CHUNK_SAMPLES == 0
 
 
 def duplex_first_append_unit_count(payload: object) -> int | None:
@@ -59,7 +78,7 @@ def duplex_first_append_unit_count(payload: object) -> int | None:
 
 
 def duplex_scheduler_token_budget(payload: object, *, default: int = 64) -> int:
-    vision_tokens = _duplex_frame_count(payload) * _DUPLEX_VISION_TOKENS_PER_FRAME
+    vision_tokens = _duplex_vision_tokens(payload)
     sample_count = _duplex_pcm_sample_count(payload)
     if sample_count is None:
         return max(1, int(default)) + vision_tokens
@@ -114,9 +133,7 @@ def build_duplex_data_plane_prompt(
         token_budget += context_reserve
         first_units = duplex_first_append_unit_count(payload)
         if first_units is not None:
-            token_budget = (
-                context_reserve + first_units * 12 - 1 + _duplex_frame_count(payload) * _DUPLEX_VISION_TOKENS_PER_FRAME
-            )
+            token_budget = context_reserve + first_units * 12 - 1 + _duplex_vision_tokens(payload)
     if seq > 1 and duplex_payload_is_exact_chunks(payload):
         token_budget += 1
     if final and duplex_payload_is_exact_chunks(payload):
@@ -124,7 +141,7 @@ def build_duplex_data_plane_prompt(
     extra_body = session_config.get("extra_body")
     raw_token_id = runtime_config.get("duplex_scheduler_token_id")
     try:
-        token_id = max(0, int(raw_token_id))
+        token_id = 0 if raw_token_id is None else max(0, int(raw_token_id))
     except (TypeError, ValueError):
         token_id = 0
     force_listen_count = _duplex_force_listen_count(extra_body)
@@ -163,16 +180,17 @@ def build_duplex_data_plane_prompt(
 
 
 def _coerce_int(value: object) -> int | None:
-    if hasattr(value, "detach"):
+    detach = getattr(value, "detach", None)
+    if callable(detach):
         try:
-            value = value.detach().cpu().reshape(-1)
-            if value.numel() == 0:
+            flat: Any = detach().cpu().reshape(-1)
+            if flat.numel() == 0:
                 return None
-            value = value[0].item()
+            value = flat[0].item()
         except Exception:
             return None
     try:
-        return int(value)
+        return int(cast(Any, value))
     except (TypeError, ValueError):
         return None
 

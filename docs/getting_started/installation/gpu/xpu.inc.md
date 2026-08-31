@@ -23,6 +23,19 @@ vLLM-Omni currently recommends using the Docker image setup steps below.
 DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.xpu -t vllm-omni-xpu --shm-size=4g .
 ```
 
+This layers vLLM-Omni on top of the published `vllm/vllm-openai-xpu:<VLLM_VERSION>`
+base image, which Docker pulls automatically. To target a different vLLM release,
+pass `--build-arg VLLM_VERSION=<tag>`. If that tag has not been published yet, build
+the base from upstream's own Dockerfile first and point the build at it:
+
+```bash
+git clone --depth 1 --branch "$VLLM_VERSION" https://github.com/vllm-project/vllm /tmp/vllm
+DOCKER_BUILDKIT=1 docker build -t vllm-openai-xpu:local --target vllm-openai \
+  -f /tmp/vllm/docker/Dockerfile.xpu /tmp/vllm
+DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.xpu -t vllm-omni-xpu --shm-size=4g \
+  --build-arg VLLM_BASE=vllm-openai-xpu:local .
+```
+
 #### Launch the docker image
 
 ##### Launch with OpenAI API Server
