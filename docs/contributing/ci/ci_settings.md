@@ -129,7 +129,7 @@ Canonical layout (prefer these paths for new changes):
 
 === "NPU"
 
-    **Bootstrap:** [`npu/pipeline-npu.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/pipeline-npu.yml) + [`npu/bootstrap-upload-steps.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/bootstrap-upload-steps.yml)—same split as CUDA; builds A2/B3 and A3 CI images, then uploads child test pipelines.
+    **Bootstrap:** [`npu/pipeline-npu.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/pipeline-npu.yml) + [`npu/bootstrap-upload-steps.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/bootstrap-upload-steps.yml)—same split as CUDA; builds A2/B3, A3, A5, and 310P CI images, then uploads child test pipelines.
 
     **Test YAML:** `npu/test-npu-ready.yml` (L2), `test-npu-nightly.yml` (L4).
 
@@ -137,7 +137,12 @@ Canonical layout (prefer these paths for new changes):
 
     **Upload:** same as CUDA—`upload_pipeline.py --upload`.
 
-    **Hardware in YAML:** `mirror_hardwares` preset (string), expanded to `agents`, top-level `image`, and `plugins`. Presets: `a2b3_npu_1`, `a2b3_npu_4`, `a3_npu_2` in `common/ci_mirror_hardwares.yml`.
+    **Hardware in YAML:** `mirror_hardwares` preset (string), expanded to `agents`, top-level `image`, and `plugins`. NPU presets in `common/ci_mirror_hardwares.yml` are:
+
+    - A2: `a2b3_npu_1`, `a2b3_npu_4`, `a2b3_npu_8`
+    - A3: `a3_npu_2`, `a3_npu_4`, `a3_npu_8`, `a3_npu_16`
+    - A5: `a5_npu_2`, `a5_npu_4`, `a5_npu_8`, `a5_npu_16`
+    - 310P: `310p_npu_1`, `310p_npu_2`, `310p_npu_4`
 
     **Conventions**
 

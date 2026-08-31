@@ -7,13 +7,34 @@ For detailed hardware and software requirements, please refer to the [vLLM-Ascen
 
 The recommended way to use vLLM-Omni on NPU is through the vLLM-Ascend pre-built Docker images:
 
+=== "A2"
+
+    ```bash
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.28.0
+    ```
+
+=== "A3"
+
+    ```bash
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.28.0-a3
+    ```
+
+=== "A5"
+
+    ```bash
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.28.0-a5
+    ```
+
+=== "310P (Experimental)"
+
+    ```bash
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.28.0-310p
+    ```
+
 ```bash
-# vLLM-Ascend image
-# Atlas A2: quay.io/atlas-ci/vllm-ascend:v0.28.0
-# Atlas A3: quay.io/atlas-ci/vllm-ascend:v0.28.0-a3
 docker run --rm \
     --name vllm-omni-npu \
-    --shm-size=1g \
+    --shm-size=64g \
     --device /dev/davinci0 \
     --device /dev/davinci1 \
     --device /dev/davinci2 \
@@ -27,8 +48,8 @@ docker run --rm \
     -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
     -v /etc/ascend_install.info:/etc/ascend_install.info \
     -v /root/.cache:/root/.cache \
-    -p 8000:8000 \
-    -it quay.io/atlas-ci/vllm-ascend:v0.28.0-a3 bash
+    -p 8091:8091 \
+    -it "$IMAGE" bash
 
 # Inside the container, install vLLM-Omni from source
 cd /vllm-workspace
@@ -72,53 +93,110 @@ Supported images as following.
 
 | image name | Hardware | OS |
 |-|-|-|
-| image-tag | Atlas A2 | Ubuntu |
-| image-tag-a3 | Atlas A3 | Ubuntu |
+| image-tag | A2 | Ubuntu |
+| image-tag-a3 | A3 | Ubuntu |
+| image-tag-a5 | A5 | Ubuntu |
+| image-tag-310p | 310P (experimental) | Ubuntu |
 
 Here's an example deployment command that has been verified on 4 x NPUs:
 
-```bash
-# Atlas A2: quay.io/ascend/vllm-omni:v0.28.0
-# Atlas A3: quay.io/ascend/vllm-omni:v0.28.0-a3
-docker run --rm \
-    --name vllm-omni-a3 \
-    --shm-size=4g \
-    --device /dev/davinci0 \
-    --device /dev/davinci1 \
-    --device /dev/davinci2 \
-    --device /dev/davinci3 \
-    --device /dev/davinci_manager \
-    --device /dev/devmm_svm \
-    --device /dev/hisi_hdc \
-    -v /usr/local/dcmi:/usr/local/dcmi \
-    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
-    -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
-    -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
-    --device /dev/davinci_manager \
-    --device /dev/devmm_svm \
-    --device /dev/hisi_hdc \
-    -v /usr/local/dcmi:/usr/local/dcmi \
-    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
-    -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
-    -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
-    -v /etc/ascend_install.info:/etc/ascend_install.info \
-    -v ~/.cache:/root/.cache \
-    -p 8091:8091 \
-    -it quay.io/ascend/vllm-omni:v0.28.0-a3 bash
-```
+=== "A2"
+
+    ```bash
+    export IMAGE=quay.io/ascend/vllm-omni:v0.28.0
+    docker run --rm \
+        --name vllm-omni-a2 \
+        --shm-size=64g \
+        --device /dev/davinci0 \
+        --device /dev/davinci1 \
+        --device /dev/davinci2 \
+        --device /dev/davinci3 \
+        --device /dev/davinci_manager \
+        --device /dev/devmm_svm \
+        --device /dev/hisi_hdc \
+        -v /usr/local/dcmi:/usr/local/dcmi \
+        -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+        -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+        -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+        -v /etc/ascend_install.info:/etc/ascend_install.info \
+        -v ~/.cache:/root/.cache \
+        -p 8091:8091 \
+        -it "$IMAGE" bash
+    ```
+
+=== "A3"
+
+    ```bash
+    export IMAGE=quay.io/ascend/vllm-omni:v0.28.0-a3
+    docker run --rm \
+        --name vllm-omni-a3 \
+        --shm-size=64g \
+        --device /dev/davinci0 \
+        --device /dev/davinci1 \
+        --device /dev/davinci2 \
+        --device /dev/davinci3 \
+        --device /dev/davinci_manager \
+        --device /dev/devmm_svm \
+        --device /dev/hisi_hdc \
+        -v /usr/local/dcmi:/usr/local/dcmi \
+        -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+        -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+        -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+        -v /etc/ascend_install.info:/etc/ascend_install.info \
+        -v ~/.cache:/root/.cache \
+        -p 8091:8091 \
+        -it "$IMAGE" bash
+    ```
+
+=== "A5"
+
+    ```bash
+    export IMAGE=quay.io/ascend/vllm-omni:v0.28.0-a5
+    docker run --rm \
+        --name vllm-omni-a5 \
+        --shm-size=64g \
+        --device /dev/davinci0 \
+        --device /dev/davinci1 \
+        --device /dev/davinci2 \
+        --device /dev/davinci3 \
+        --device /dev/davinci_manager \
+        --device /dev/devmm_svm \
+        --device /dev/hisi_hdc \
+        -v /usr/local/dcmi:/usr/local/dcmi \
+        -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+        -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+        -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+        -v /etc/ascend_install.info:/etc/ascend_install.info \
+        -v ~/.cache:/root/.cache \
+        -p 8091:8091 \
+        -it "$IMAGE" bash
+    ```
+
+=== "310P (Experimental)"
+
+    ```bash
+    export IMAGE=quay.io/ascend/vllm-omni:v0.28.0-310p
+    docker run --rm \
+        --name vllm-omni-310p \
+        --shm-size=64g \
+        --device /dev/davinci0 \
+        --device /dev/davinci1 \
+        --device /dev/davinci2 \
+        --device /dev/davinci3 \
+        --device /dev/davinci_manager \
+        --device /dev/devmm_svm \
+        --device /dev/hisi_hdc \
+        -v /usr/local/dcmi:/usr/local/dcmi \
+        -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+        -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+        -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+        -v /etc/ascend_install.info:/etc/ascend_install.info \
+        -v ~/.cache:/root/.cache \
+        -p 8091:8091 \
+        -it "$IMAGE" bash
+    ```
 
 !!! tip
     You can use this docker image to serve models the same way you would with in vLLM! To do so, make sure you overwrite the default entrypoint (`vllm serve --omni`) which works only for models supported in the vLLM-Omni project.
-
-Or build IMAGE from **source code**:
-
-```bash
-git clone https://github.com/vllm-project/vllm-omni.git
-cd vllm-omni
-# A2
-# docker build -t vllm-omni-dev-image:latest -f ./docker/Dockerfile.npu .
-# A3
-docker build -t vllm-omni-dev-image:latest -f ./docker/Dockerfile.npu.a3 .
-```
 
 # --8<-- [end:pre-built-images]
