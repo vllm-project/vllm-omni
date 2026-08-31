@@ -626,7 +626,18 @@ def _merge_platforms(
 
 
 def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
-    """Load a deploy YAML with optional ``base_config`` inheritance."""
+    """Load a deploy YAML with optional ``base_config`` inheritance.
+
+    NPU perf defaults are applied here (not just in :func:`load_deploy_config`)
+    so every consumer of the raw dict — including the connector/transfer
+    config path in ``stage_init_utils.load_omni_transfer_config_for_model`` —
+    sees the tuned values.
+    """
+    return _apply_npu_perf_defaults(_resolve_deploy_yaml_raw(path))
+
+
+def _resolve_deploy_yaml_raw(path: str | Path) -> dict[str, Any]:
+    """Resolve ``base_config`` inheritance without perf-default injection."""
     raw_dict = to_dict(load_yaml_config(path))
 
     base_path = raw_dict.pop("base_config", None)
@@ -651,9 +662,50 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
     return merged
 
 
+def _apply_npu_perf_defaults(raw_dict: dict[str, Any]) -> dict[str, Any]:
+    """Apply NPU perf defaults for the MiniCPM-o 4.5 omni pipeline.
+
+    The official benchmark serves the stock ``minicpmo_4_5.yaml``; these
+    overrides make the tuned codec-chunking / token2wav / cudagraph settings
+    take effect on NPU runtimes without requiring a deploy-config change.
+    Operator-tuned YAML values win: only the stock untuned defaults
+    (``codec_chunk_frames: 25`` / ``cudagraph_mode: PIECEWISE``) are upgraded.
+    """
+    if raw_dict.get("pipeline") != "minicpmo_4_5":
+        return raw_dict
+    try:
+        import torch
+
+        if getattr(torch, "npu", None) is None or not torch.npu.is_available():
+            return raw_dict
+    except Exception:
+        return raw_dict
+
+    extra = (
+        raw_dict.setdefault("connectors", {})
+        .setdefault("connector_of_shared_memory", {})
+        .setdefault("extra", {})
+    )
+    # 25 is the stock untuned default; treat it as absent and upgrade to the
+    # tuned streaming chunk. Any other explicit value wins.
+    if extra.get("codec_chunk_frames", 25) == 25:
+        extra["codec_chunk_frames"] = 512
+    extra.setdefault("initial_codec_chunk_frames", 4)
+    extra.setdefault("token2wav_n_timesteps", 1)
+
+    npu_stages = raw_dict.setdefault("platforms", {}).setdefault("npu", {}).setdefault("stages", [])
+    for platform_stage in npu_stages:
+        if platform_stage.get("stage_id") in (0, 1):
+            compile_cfg = platform_stage.setdefault("compilation_config", {})
+            if compile_cfg.get("cudagraph_mode", "FULL") == "PIECEWISE":
+                compile_cfg["cudagraph_mode"] = "FULL"
+
+    return raw_dict
+
+
 def load_deploy_config(path: str | Path) -> DeployConfig:
     """Load a deploy YAML (with optional base_config inheritance)."""
-    raw_dict = resolve_deploy_yaml(path)
+    raw_dict = _apply_npu_perf_defaults(resolve_deploy_yaml(path))
 
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
 

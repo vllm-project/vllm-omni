@@ -68,6 +68,12 @@ class StageEngineCoreProc(EngineCoreProc):
         omni_replica_id: int = 0,
         **kwargs: Any,
     ) -> None:
+        from vllm_omni.utils.cpu_isolation import isolate_host_thread
+
+        # Pin this stage-core process to its own core group so shared-machine
+        # load does not stall the per-frame host dispatch loop (group 0 is the
+        # orchestrator; stages take 1/2/3).
+        isolate_host_thread(group=int(omni_stage_id) + 1 if omni_stage_id is not None else 1)
         """Launch StageEngineCoreProc busy loop in background process.
 
         Omni-specific kwargs:

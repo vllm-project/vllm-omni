@@ -462,6 +462,11 @@
         };
         const session = {
           modalities: ['audio', 'text'],
+          // Session-level formats are required: without input_audio_format the
+          // server misconfigures the model's audio input path and the model
+          // never speaks (matches the reference duplex client's session).
+          input_audio_format: 'pcm16',
+          output_audio_format: 'pcm16',
           voice: 'default',
           extra_body: extraBody,
         };

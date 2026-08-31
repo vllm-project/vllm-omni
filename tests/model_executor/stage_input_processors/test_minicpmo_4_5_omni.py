@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.experimental.fullduplex.engine.intermediate import unpack_tts_hidden
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
     _extract_first_audio_ref,
     llm2tts,
@@ -61,7 +62,7 @@ def test_plain_chat_handoff_owns_talker_prompt_contract() -> None:
 
     info = converted["model_intermediate_buffer"]
     assert info["ids"]["tts"] == output_ids
-    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[2:4])
+    assert torch.equal(unpack_tts_hidden(info["hidden_states"]["tts"]), latent[2:4])
     assert converted["prompt_token_ids"] == [0, 0, 0, 0]
     assert info["meta"]["replace_streaming_prompt"] is True
     assert info["meta"]["next_stage_prompt_len"] == 4

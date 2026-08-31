@@ -48,6 +48,12 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         apply_qwen3_tts_tokenizer_v2_patch()
         apply_310p_patches()
 
+        from vllm_omni.platforms.npu.minicpmo_fia_pad import (
+            apply_minicpmo_fia_pad_patch,
+        )
+
+        apply_minicpmo_fia_pad_patch()
+
     @classmethod
     def set_device(cls, device: torch.device) -> None:
         super().set_device(device)

@@ -12,6 +12,7 @@ handled by :class:`MembershipController`, which is injected optionally.
 from __future__ import annotations
 
 import asyncio
+import os
 import time as _time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -49,7 +50,7 @@ from vllm_omni.engine.messages import (
     UnregisterRemoteReplicaMessage,
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
-from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
@@ -635,6 +636,121 @@ class Orchestrator:
                     except Exception:
                         logger.exception("[Orchestrator] Duplex expiry cleanup failed; retrying on next tick")
 
+    def _maybe_apply_tts_prefill_bypass(self, msg: Any, prompt: Any, req_state: "OrchestratorRequestState") -> None:
+        """TF-prefill fast path for pure-TTS (given-text) requests.
+
+        Seed-tts style requests carry the text to speak in the user
+        message, so the thinker's autoregressive span is pure overhead on
+        the TTFP critical path. Rewrite the stage-0 prompt so the spoken
+        text is teacher-forced into the prompt tail (...<|tts_bos|> text
+        <|tts_eos|>) and cap stage-0 decoding at one token. Unmodified
+        llm2tts still slices the same tts span (its last-<|tts_bos|>
+        search covers the prompt) and the talker is conditioned on prefill
+        hidden states, cutting the thinker decode span from TTFP. Normal
+        chat / omni-eval requests never match the gate: their prompts do
+        not end with <|tts_bos|>. On by default; set MINICPMO_TTS_BYPASS=0
+        to fall back to the normal thinker-decode path.
+        """
+        if os.environ.get("MINICPMO_TTS_BYPASS", "1") == "0":
+            return
+        try:
+            if getattr(req_state, "duplex_identity", None) is not None:
+                return
+            if set(req_state.final_output_stage_ids or []) != {0, 2}:
+                return
+
+            def _pget(container, key, default=None):
+                if isinstance(container, dict):
+                    return container.get(key, default)
+                return getattr(container, key, default)
+
+            if _pget(prompt, "resumable", False):
+                return
+            token_ids = list(_pget(prompt, "prompt_token_ids", None) or [])
+            # use_tts_template renders the stage-0 prompt tail as <|tts_bos|>.
+            if not token_ids or token_ids[-1] != 151703:
+                return
+            tokenizer = getattr(self.stage_pools[0].output_processor, "tokenizer", None)
+            decode = getattr(tokenizer, "decode", None)
+            encode = getattr(tokenizer, "encode", None)
+            if not (callable(decode) and callable(encode)):
+                return
+            rendered = decode(token_ids)
+            marker = "<|im_start|>user\n"
+            start = rendered.rfind(marker)
+            if start < 0:
+                return
+            start += len(marker)
+            end = rendered.find("<|im_end|>", start)
+            if end < 0:
+                return
+            # Assistant-style system prompts (e.g. the gradio demo's
+            # audio_assistant prompt) ask the model to compose a reply rather
+            # than read the user message; bypassing there would just echo the
+            # user's input back. Only given-text TTS tasks may take this path.
+            sys_start = rendered.find("<|im_start|>system\n")
+            sys_end = rendered.find("<|im_end|>", sys_start) if sys_start >= 0 else -1
+            system_text = rendered[sys_start:sys_end] if sys_start >= 0 and sys_end > sys_start else ""
+            if any(m in system_text for m in ("面壁小钢炮", "当一个助手", "multimodal assistant", "above voice style")):
+                return
+            given = rendered[start:end].strip()
+            # Refuse anything that smuggles special markers into the tts span.
+            if not given or "<|" in given:
+                return
+            spoken_ids = list(encode(given, add_special_tokens=False))
+            if not spoken_ids:
+                return
+            stage0_params = req_state.sampling_params_list[0]
+            wants_logprobs = bool(getattr(stage0_params, "logprobs", None)) or bool(
+                getattr(stage0_params, "prompt_logprobs", None)
+            )
+            try:
+                stage0_params.max_tokens = 1
+            except Exception:
+                logger.warning(
+                    "[Orchestrator] TTS prefill bypass: cannot cap stage-0 max_tokens for req=%s; normal path",
+                    req_state.request_id,
+                )
+                return
+            new_ids = token_ids + spoken_ids + [151704]
+            if isinstance(prompt, dict):
+                prompt["prompt_token_ids"] = new_ids
+            else:
+                prompt.prompt_token_ids = new_ids
+            req_state.bypass_echo_text = given
+            logger.info(
+                "[Orchestrator] TTS prefill bypass engaged req=%s spoken_tokens=%d",
+                req_state.request_id,
+                len(spoken_ids),
+            )
+            # Stage-0's single sampled token is discarded (echo overwrite) and
+            # the talker slices its span out of the rewritten prompt, so the
+            # lm_head GEMM + sampler on the prefill step are pure overhead.
+            # Tag the request so the runner can skip them; refusable without
+            # losing the bypass itself.
+            if not wants_logprobs:
+                try:
+                    if isinstance(prompt, dict):
+                        raw_info = prompt.get("additional_information")
+                        merged_info = dict(raw_info) if isinstance(raw_info, dict) else {}
+                        merged_info["skip_logits"] = True
+                        prompt["additional_information"] = merged_info
+                    else:
+                        merged_info = deserialize_additional_information(
+                            getattr(prompt, "additional_information", None)
+                        ) or {}
+                        merged_info["skip_logits"] = True
+                        prompt.additional_information = serialize_additional_information(merged_info)
+                except Exception:
+                    logger.debug(
+                        "[Orchestrator] TTS prefill bypass: skip_logits tag not set, "
+                        "normal sampling kept for req=%s",
+                        req_state.request_id,
+                        exc_info=True,
+                    )
+        except Exception:
+            logger.warning("[Orchestrator] TTS prefill bypass gate failed; using normal path", exc_info=True)
+
     async def _handle_add_request(self, msg: StageSubmissionMessage) -> None:
         """Handle an add_request message from the main thread."""
         stage_id = 0
@@ -672,6 +788,7 @@ class Orchestrator:
         self._register_running_request(req_state)
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
         req_state.stage_submit_ts[stage_id] = _time.time()
+        self._maybe_apply_tts_prefill_bypass(msg, prompt, req_state)
         enqueue_ts = msg.enqueue_ts
         if enqueue_ts > 0:
             req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
@@ -1250,6 +1367,16 @@ class Orchestrator:
             stage_id == 0 and self._is_duplex_session_request(req_state) and req_state.streaming.segment_finished
         )
         if self.stage_pools[stage_id].final_output and not is_duplex_stage0_segment:
+            _bypass_echo = getattr(req_state, "bypass_echo_text", None)
+            if _bypass_echo and stage_id == 0:
+                # TF-prefill bypass: the thinker's own 1-token detokenized
+                # text is meaningless; surface the given text instead, once,
+                # on the finished frame.
+                for _completion in getattr(output, "outputs", None) or []:
+                    try:
+                        _completion.text = _bypass_echo if output.finished else ""
+                    except Exception:
+                        pass
             await self.output_async_queue.put(
                 OutputMessage(
                     request_id=req_id,
@@ -1293,11 +1420,29 @@ class Orchestrator:
             )
             return
 
+        # Streaming text handoff (experimental, MINICPMO_STREAM_HANDOFF=1):
+        # forward non-finished stage-0 DELTA outputs to the next stage as
+        # incremental handoffs. llm2tts may still defer (empty next_inputs)
+        # until enough new text has accumulated.
+        stream_handoff = (
+            os.environ.get("MINICPMO_STREAM_HANDOFF", "0") == "1"
+            and stage_id == 0
+            and req_state.final_stage_id > 0
+            and not self._is_duplex_session_request(req_state)
+        )
         if (
-            (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
+            (
+                finished
+                or (req_state.streaming.enabled and req_state.streaming.segment_finished)
+                or stream_handoff
+            )
             and stage_id < req_state.final_stage_id
             and (not self.async_chunk or not self._stage_receives_async_chunks(stage_id + 1))
-            and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
+            and (
+                not self._next_stage_already_submitted(stage_id, req_state)
+                or req_state.streaming.enabled
+                or stream_handoff
+            )
         ):
             if (
                 finished
@@ -1318,16 +1463,19 @@ class Orchestrator:
                     output,
                     req_state,
                     src_replica_id=replica_id,
-                    is_streaming_session=req_state.streaming.enabled,
+                    is_streaming_session=(req_state.streaming.enabled or stream_handoff),
                     is_final_update=final_only_finished,
                 )
                 if (
-                    req_state.streaming.enabled
+                    (req_state.streaming.enabled or stream_handoff)
                     and finished
                     and not final_only_finished
                     and not self._is_duplex_session_request(req_state)
                 ):
-                    # For streaming sessions, send the terminal (resumable=False) update only on a finish
+                    # For streaming sessions, send the terminal (resumable=False) update only on a finish.
+                    # The final tokens ride the first (resumable) update above; a
+                    # non-resumable update maps to the scheduler's None finish
+                    # sentinel, which would silently drop them if sent alone.
                     await self._forward_to_next_stage(
                         req_id,
                         stage_id,

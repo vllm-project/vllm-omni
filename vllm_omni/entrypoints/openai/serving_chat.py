@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import os
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
@@ -239,7 +240,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             model_stage = self._stage_get(engine_args, "model_stage")
             if model_stage == "llm":
-                sp.output_kind = RequestOutputKind.FINAL_ONLY
+                if os.environ.get("MINICPMO_STREAM_HANDOFF", "0") == "1":
+                    # Streaming handoff (experimental): stream thinker deltas so
+                    # llm2tts can extend the talker mid-flight instead of waiting
+                    # for the completed reply.
+                    sp.output_kind = RequestOutputKind.DELTA
+                else:
+                    sp.output_kind = RequestOutputKind.FINAL_ONLY
             elif model_stage == "tts":
                 sp.output_kind = RequestOutputKind.DELTA
         return sampling_params_list
@@ -389,6 +396,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # Handle diffusion mode
         if self._diffusion_mode:
             return await self._create_diffusion_chat_completion(request, raw_request)
+
+        # MiniCPM-o: audio-output (TTS) requests default to thinking-off. The
+        # Thinker's think block is dead weight for speech synthesis and its
+        # occasional runaway (~1600 tok) blows TTFT p99; text-output requests
+        # (Daily/VideoMME, modalities=["text"]) keep default reasoning.
+        # setdefault: an explicit user value always wins.
+        _req_modalities = getattr(request, "modalities", None)
+        if _req_modalities is None or any(m == "audio" for m in _req_modalities):
+            _ctk = dict(request.chat_template_kwargs or {})
+            _ctk.setdefault("enable_thinking", False)
+            request.chat_template_kwargs = _ctk
 
         request_timestamp = time.time()
         if raw_request is not None:

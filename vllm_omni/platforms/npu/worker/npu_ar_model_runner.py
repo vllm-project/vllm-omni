@@ -23,6 +23,7 @@ from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     ECConnectorOutput,
+    SamplerOutput,
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -32,8 +33,9 @@ from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, PerLayerA
 from vllm.v1.worker.mamba_utils import preprocess_mamba
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
-from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, get_graph_params
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -46,6 +48,8 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 from vllm_omni.distributed.omni_connectors.utils.config import get_stage_connector_role, stage_sends_async_output
 from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.platforms.npu.minicpmo_fia_pad import STATE as FIA_PAD_STATE
+from vllm_omni.platforms.npu.minicpmo_fia_pad import fia_pad_mode, talker_gate
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -85,6 +89,16 @@ def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]
     return result
 
 
+# TTS prefill bypass placeholder: the stage-0 token is echo-overwritten by
+# the orchestrator and sits OUTSIDE the llm2tts [tts_bos, tts_eos) slice, so
+# any id that is not 151703 (<|tts_bos|>) keeps stage-1 conditioning identical.
+# 0 is far from the 1516xx special range.
+_BYPASS_SKIP_LOGITS_EOS_ID = 151645  # <|im_end|>: the greedy token the bypassed
+# prefill step would sample; check_stop() stops the stage-0 request on it
+# (Request.max_tokens is copied before the orchestrator caps it, so the
+# EOS hit — not the cap — is what terminates the bypass request).
+
+
 class ExecuteModelState(NamedTuple):
     """Ephemeral cached state transferred between execute_model() and
     sample_tokens(), after execute_model() returns None."""
@@ -105,6 +119,7 @@ class ExecuteModelState(NamedTuple):
 
 class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, DuplexSamplingRunnerMixin):
     """Autoregressive NPU model runner that returns hidden states per request."""
+    _skip_logits_step = False  # TTS prefill bypass: skip lm_head+sampler for the step
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -142,10 +157,286 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             )
         self._downstream_payload_cache: dict[str, bool] = {}
         self._init_duplex_sampling_state()
+        # [Omni] Single-request decode cache for _build_attention_metadata.
+        # Entry: (key, attn_metadata); spec_decode_common is always None in
+        # the eligible regime (speculative_config is None).
+        self._cached_attn_meta: tuple[tuple, PerLayerAttnMetadata] | None = None
+        # [minicpm-challenge: A-tier FIA pad] per-engine gate + persistent
+        # buffers (see vllm_omni/platforms/npu/minicpmo_fia_pad.py). The
+        # talker-only gate keeps stage0 (which shares this runner class) and
+        # stage2 fully stock.
+        FIA_PAD_STATE.mode = fia_pad_mode()
+        if FIA_PAD_STATE.mode != 0 and talker_gate(self.model_config):
+            FIA_PAD_STATE.enabled = True
+            FIA_PAD_STATE.degraded = FIA_PAD_STATE.mode == 2
+            dev = self.device
+            FIA_PAD_STATE.klen_dev = torch.zeros(1, dtype=torch.int32, device=dev)
+            FIA_PAD_STATE.klen_host = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+            FIA_PAD_STATE.klen_host[0] = FIA_PAD_STATE.KV_PAD
+            FIA_PAD_STATE.klen_dev.copy_(FIA_PAD_STATE.klen_host)
+            FIA_PAD_STATE.arange_buf = (
+                torch.arange(FIA_PAD_STATE.KV_MAX, dtype=torch.int32, device=dev)
+                .view(1, 1, 1, -1)
+                .contiguous()
+            )
+            FIA_PAD_STATE.cmp_buf = torch.zeros(
+                1, 1, 1, FIA_PAD_STATE.KV_MAX, dtype=torch.bool, device=dev
+            )
+            FIA_PAD_STATE.mask_buf = torch.ones(
+                1, 1, 1, FIA_PAD_STATE.KV_MAX, dtype=torch.int8, device=dev
+            )
+            logger.info(
+                "[fia_pad] stage1 talker gate OPEN (mode=%d degraded=%s)",
+                FIA_PAD_STATE.mode,
+                FIA_PAD_STATE.degraded,
+            )
 
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
+
+    # minicpm-challenge: prep-fast (Slice B2b). Steady-state decode fast
+    # path for _prepare_inputs; see the docstring below. Falls back to the
+    # parent implementation for any frame that is not exactly one running
+    # request with one scheduled token (prefill, chunked, spec, PCP, ...).
+    def _prepare_inputs(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_scheduled_tokens: np.ndarray,
+    ) -> tuple[torch.Tensor, "SpecDecodeMetadata | None", int]:
+        import os
+
+        if os.environ.get("MINICPMO_PREP_FAST", "1") != "0":
+            try:
+                r = self._prep_fast(scheduler_output, num_scheduled_tokens)
+                if r is not None:
+                    return r
+            except Exception:
+                # Leave no stale optimization state behind; the parent
+                # implementation rewrites every buffer from scratch.
+                self._pf_state = None
+                if not getattr(self, "_pf_err_logged", False):
+                    self._pf_err_logged = True
+                    try:
+                        import logging
+
+                        logging.getLogger(
+                            "vllm.omni.prep_fast"
+                        ).exception("prep-fast: falling back to parent")
+                    except Exception:
+                        pass
+        return super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
+
+    def _prep_fast(
+        self, scheduler_output: "SchedulerOutput", num_scheduled_tokens: np.ndarray
+    ) -> tuple[torch.Tensor, None, int] | None:
+        """1-req / 1-token decode fast path. None => use parent path."""
+        import os
+
+        ib = self.input_batch
+        dbg = os.environ.get("MINICPMO_PREP_FAST_DEBUG") == "1"
+
+        def bail(reason: str):
+            if dbg:
+                seen = getattr(self, "_pf_dbg", None)
+                if seen is None:
+                    seen = self._pf_dbg = {"n": 0, "reasons": {}}
+                if reason not in seen["reasons"]:
+                    seen["reasons"][reason] = True
+                    seen["n"] += 1
+                    if seen["n"] <= 5:
+                        try:
+                            import logging
+
+                            logging.getLogger(
+                                "vllm.omni.prep_fast"
+                            ).info("prep-fast guard: %s", reason)
+                        except Exception:
+                            pass
+            return None
+
+        if ib.num_reqs != 1:
+            return bail(f"num_reqs={ib.num_reqs}")
+        if num_scheduled_tokens[0] != 1:
+            return bail(f"nsched={num_scheduled_tokens[0]}")
+        if scheduler_output.total_num_scheduled_tokens != 1:
+            return bail("total!=1")
+        if scheduler_output.scheduled_spec_decode_tokens:
+            return bail("spec_tokens")
+        if getattr(self, "speculative_config", None):
+            return bail("spec_config")
+        if getattr(self, "pcp_size", 1) > 1 or getattr(self, "use_cp", False):
+            return bail("pcp/cp")
+        if getattr(self, "uses_mrope", False) or getattr(
+            self, "uses_xdrope_dim", 0
+        ) > 0:
+            return bail("mrope/xdrope")
+        if getattr(self, "_has_gdn", False):
+            return bail("gdn")
+        if getattr(self, "enable_prompt_embeds", False) or ib.req_prompt_embeds:
+            return bail("prompt_embeds")
+        if getattr(self, "use_async_spec_decode", False):
+            return bail("async_spec")
+        pos0 = int(ib.num_computed_tokens_cpu[0])
+        if pos0 == 0:
+            return bail("pos0=0")
+
+        st = getattr(self, "_pf_state", None)
+        if st is None:
+            st = self._pf_state = {
+                "bt_rows": None,       # last committed row snapshot per group
+                "slot": "unverified",  # unverified | ok | bad
+                "ids_np": hasattr(self.input_ids, "np"),
+            }
+
+        # Side effects the rest of the frame depends on.
+        self._build_attn_state(1, num_scheduled_tokens, num_scheduled_tokens)
+        self.with_prefill = False  # DecodeOnly branch
+        self.query_lens = torch.from_numpy(num_scheduled_tokens)
+
+        bt = ib.block_table
+        groups = getattr(bt, "block_tables", None)
+        if groups is None:
+            groups = [bt]
+        if st["bt_rows"] is None or len(st["bt_rows"]) != len(groups):
+            st["bt_rows"] = [None] * len(groups)
+
+        # Block table: upstream commits the full-width row of every KV-cache
+        # group each frame; for decode a row only changes when a new block is
+        # appended. Skip a group's copy when its row 0 content is unchanged
+        # (content compare, not a flag).
+        for gi, g in enumerate(groups):
+            nb = int(g.num_blocks_per_row[0])
+            row = g.block_table.np[0, :nb]
+            cached = st["bt_rows"][gi]
+            if (
+                cached is None
+                or row.shape != cached.shape
+                or not np.array_equal(row, cached)
+            ):
+                g.block_table.copy_to_gpu(1)
+                st["bt_rows"][gi] = row.copy()
+
+        # input_ids: under async scheduling the scheduler has not committed
+        # the previous step's sampled token to token_ids_cpu, so for a
+        # continuing request (prev row >= 0) the token is copied on device
+        # from prev_sampled_token_ids — the same slice the upstream
+        # common-case optimization uses. Otherwise it is a single scalar
+        # read from the host token table.
+        self._compute_prev_positions(1)
+        pv = int(self.prev_positions.np[0])
+        if pv >= 0 and ib.prev_sampled_token_ids is not None:
+            self.input_ids.gpu[:1].copy_(
+                ib.prev_sampled_token_ids[pv : pv + 1, 0], non_blocking=True
+            )
+        else:
+            tid = ib.token_ids_cpu[0, pos0]
+            if st["ids_np"]:
+                self.input_ids.np[0] = tid
+            else:
+                self.input_ids.cpu[0] = tid
+            self.input_ids.copy_to_gpu(1)
+
+        # Constant-for-decode buffers: upstream re-writes and re-copies these
+        # every frame; the copies are n=1/2 slices (never the full buffer).
+        self.query_pos.np[0] = 0
+        self.query_pos.copy_to_gpu(1)
+        qsl = self.query_start_loc
+        qsl.np[0] = 0
+        qsl.np[1] = 1
+        qsl.copy_to_gpu(2)
+        self.req_indices.np[0] = 0
+        self.req_indices.copy_to_gpu(1)
+        self.num_scheduled_tokens.np[0] = 1
+        self.num_scheduled_tokens.copy_to_gpu(1)
+
+        # seq_lens[:1] == optimistic value (computed + 1); write the pinned
+        # host buffer once and do a single non_blocking H2D slice copy
+        # instead of the upstream device-side add chain. The gpu tails
+        # (qsl -1 fill / seq_lens 0 / num_accepted all-ones) are maintained
+        # by every parent-path frame and are not written by anything else.
+        opt = self.optimistic_seq_lens_cpu
+        opt[0] = pos0 + 1
+        self.seq_lens[:1].copy_(opt[:1], non_blocking=True)
+        if FIA_PAD_STATE.enabled:
+            # [minicpm-challenge: A-tier FIA pad] publish the current klen to
+            # the device scalar the captured in-graph mask rebuild reads
+            # (enqueued on the compute stream, ordered before the replay).
+            FIA_PAD_STATE.klen_host[0] = pos0 + 1
+            FIA_PAD_STATE.klen_dev.copy_(
+                FIA_PAD_STATE.klen_host, non_blocking=True
+            )
+        self.num_computed_tokens[:1].copy_(
+            ib.num_computed_tokens_cpu_tensor[:1], non_blocking=True
+        )
+        self._positions_np_buf[0] = pos0
+        self.positions[:1].copy_(
+            self._positions_cpu_buf[:1], non_blocking=True
+        )
+
+        # num_accepted_tokens: under async scheduling upstream synchronizes
+        # the recorded event and mirrors the per-request accepted count (1
+        # for non-spec decode) into the pinned buffer, then copies it up.
+        # The gpu tail stays all-ones from the surrounding parent frames.
+        evt = getattr(self, "num_accepted_tokens_event", None)
+        if evt is not None:
+            evt.synchronize()
+            na = self.num_accepted_tokens
+            if pv >= 0:
+                na.np[0] = ib.num_accepted_tokens_cpu[pv]
+                ib.num_accepted_tokens_cpu[0] = na.np[0]
+            else:
+                na.np[0] = 1
+                ib.num_accepted_tokens_cpu[0] = 1
+            na.copy_to_gpu(1)
+
+        # Discard bookkeeping: scalar equivalent of the upstream mask math.
+        nt = self.requests[ib.req_ids[0]].num_tokens
+        mask0 = (pos0 + 1) < nt
+        if mask0:
+            self.discard_request_indices.np[0] = 0
+            self.discard_request_indices.copy_to_gpu(1)
+            self.num_discarded_requests = 1
+        else:
+            self.num_discarded_requests = 0
+        self.discard_request_mask.np[0] = mask0
+        self.discard_request_mask.copy_to_gpu(1)
+
+        # Slot mapping: the general path launches the jit kernel once per
+        # KV-cache group per frame (vllm_ascend.worker.block_table wraps
+        # vllm core's _compute_slot_mapping_kernel). For one token each
+        # group's slot is a host scalar following the kernel's math:
+        #   vbi, voff = divmod(pos, physical_block_size)
+        #   bt_idx = vbi * blocks_per_phys_block + voff // block_size
+        #   slot = bt[row, bt_idx] * block_size + voff % block_size
+        # Verified against the real kernel on the first fast frame per boot
+        # (torch.equal, per group); any mismatch keeps the kernel running.
+        for g in groups:
+            pbs = g.physical_block_size
+            lbs = g.block_size
+            bpp = g.blocks_per_phys_block
+            vbi, voff = divmod(pos0, pbs)
+            bi = vbi * bpp + voff // lbs
+            slot = int(g.block_table.np[0, bi]) * lbs + (voff % lbs)
+            sm = g.slot_mapping
+            if st["slot"] == "ok":
+                sm.np[0] = slot
+                sm.copy_to_gpu(1)
+            else:
+                g.compute_slot_mapping(
+                    1, self.query_start_loc.gpu[:2], self.positions[:1]
+                )
+                if st["slot"] == "unverified":
+                    exp = torch.tensor(
+                        [slot], dtype=sm.gpu.dtype, device=sm.gpu.device
+                    )
+                    if not bool(torch.equal(sm.gpu[:1], exp)):
+                        st["slot"] = "bad"
+        if st["slot"] == "unverified":
+            st["slot"] = "ok"
+
+        logits_indices = self.query_start_loc.gpu[1:2] - 1
+        return logits_indices, None, 1
 
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
@@ -308,6 +599,23 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             return None
         return wire_payloads
 
+
+    def _skip_logits_for_batch(self) -> bool:
+        """True when EVERY request in the persistent batch carries the
+        orchestrator's skip_logits tag (TTS prefill bypass; the sampled
+        token is discarded downstream). Any miss -> normal lm_head path."""
+        num_reqs = self.input_batch.num_reqs
+        if num_reqs == 0:
+            return False
+        req_ids = self.input_batch.req_ids
+        for i in range(num_reqs):
+            info = self.model_intermediate_buffer.get(req_ids[i])
+            if not isinstance(info, dict):
+                req_state = self.requests.get(req_ids[i])
+                info = getattr(req_state, "additional_information_cpu", None)
+            if not isinstance(info, dict) or info.get("skip_logits") is not True:
+                return False
+        return True
 
     def _request_final_stage_id(self, req_id: str) -> int | None:
         info = self.model_intermediate_buffer.get(req_id)
@@ -801,13 +1109,25 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
                 sample_hidden_states = hidden_states[logits_indices]
                 #  -------------------------------------- Omni-new -------------------------------------------------
-                # Try with sampling_metadata first; fall back to without for models that don't support it
-                try:
-                    logits = self.model.compute_logits(
-                        sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
+                self._skip_logits_step = spec_decode_metadata is None and self._skip_logits_for_batch()
+                if self._skip_logits_step:
+                    # TTS prefill bypass: every request in this batch discards
+                    # its sampled token (orchestrator echo overwrite), so skip
+                    # the lm_head GEMM; a zero-logits tensor keeps every
+                    # downstream shape/None consumer intact.
+                    logits = torch.zeros(
+                        (sample_hidden_states.shape[0], self.model_config.get_vocab_size()),
+                        dtype=torch.float32,
+                        device=sample_hidden_states.device,
                     )
-                except TypeError:
-                    logits = self.model.compute_logits(sample_hidden_states)
+                else:
+                    # Try with sampling_metadata first; fall back to without for models that don't support it
+                    try:
+                        logits = self.model.compute_logits(
+                            sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
+                        )
+                    except TypeError:
+                        logits = self.model.compute_logits(sample_hidden_states)
                 #  -------------------------------------- Omni-new -------------------------------------------------
             else:
                 # Rare case.
@@ -865,6 +1185,268 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             self._omni_routed_experts_d2h(scheduler_output)
 
         return None
+
+    #  -------------------------------------- Omni-new -------------------------------------------------
+    def _attn_meta_cache_eligible(self) -> bool:
+        # One-time config guards: any feature that changes what the upstream
+        # builder produces or adds per-frame side effects disables the cache.
+        return (
+            self.speculative_config is None
+            and not self.use_async_spec_decode
+            and self.pcp_size == 1
+            and not self.use_cp
+            and not self._has_gdn
+            and not self.enable_hamming_sparse
+            and not self.is_mm_prefix_lm
+            and not self.model_config.enable_return_routed_experts
+            and not self.cache_config.kv_sharing_fast_prefill
+            and len(self.kv_cache_config.kv_cache_groups) == 1
+        )
+
+    def _build_attention_metadata(
+        self,
+        num_tokens: int,
+        num_reqs: int,
+        max_query_len: int,
+        num_tokens_padded: int | None = None,
+        num_reqs_padded: int | None = None,
+        ubatch_slices=None,
+        logits_indices: torch.Tensor | None = None,
+        use_spec_decode: bool = False,
+        for_cudagraph_capture: bool = False,
+        num_scheduled_tokens=None,
+        num_scheduled_tokens_np: "np.ndarray | None" = None,
+        cascade_attn_prefix_lens=None,
+    ):
+        # [Omni] Fast path: in the steady single-request decode regime every
+        # tensor field of the built metadata is a live view of a persistent
+        # in-place buffer, so the dict can be reused; only the serialized
+        # python lists (seq_lens_list / actual_seq_lengths_q) plus the padding
+        # side effects must be refreshed each frame.
+        cacheable = (
+            self._attn_meta_cache_eligible()
+            and not for_cudagraph_capture
+            and not use_spec_decode
+            and ubatch_slices is None
+            and cascade_attn_prefix_lens is None
+            and num_reqs == 1
+            and num_tokens == 1
+            and max_query_len == 1
+            and num_tokens_padded is not None
+            and num_reqs_padded is not None
+            and self.attn_state == AscendAttentionState.DecodeOnly
+        )
+        key = None
+        if cacheable:
+            req_id = self.input_batch.req_ids[0]
+            key = (req_id, num_tokens, num_tokens_padded, num_reqs, num_reqs_padded, max_query_len)
+            cached = self._cached_attn_meta
+            if cached is not None and cached[0] == key:
+                self._refresh_cached_attention_metadata(
+                    cached[1], num_reqs, num_reqs_padded, num_tokens, num_tokens_padded
+                )
+                return cached[1], None
+
+        result = super()._build_attention_metadata(
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            max_query_len=max_query_len,
+            num_tokens_padded=num_tokens_padded,
+            num_reqs_padded=num_reqs_padded,
+            ubatch_slices=ubatch_slices,
+            logits_indices=logits_indices,
+            use_spec_decode=use_spec_decode,
+            for_cudagraph_capture=for_cudagraph_capture,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_scheduled_tokens_np=num_scheduled_tokens_np,
+            cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+        )
+        if (
+            FIA_PAD_STATE.enabled
+            and FIA_PAD_STATE.capturing_pad
+            and for_cudagraph_capture
+            and num_tokens == 1
+        ):
+            # [minicpm-challenge: A-tier FIA pad] forge the bucket-1 FULL
+            # capture metadata: kv=512 descriptor (seq_lens_list),
+            # sparse_mode=0 (causal=False) + persistent wide mask, narrow
+            # block_table view. Only this fresh capture-time object is
+            # touched; the steady B4 cache is bypassed for captures and
+            # keeps stock fields for every eager fallback frame.
+            attn_metadata_cap, spec_common_cap = result
+            if spec_common_cap is None:
+                bucket = FIA_PAD_STATE.KV_PAD
+                for meta in attn_metadata_cap.values():
+                    if (
+                        getattr(meta, "attn_state", None)
+                        != AscendAttentionState.DecodeOnly
+                    ):
+                        continue
+                    meta.causal = False
+                    meta.attn_mask = FIA_PAD_STATE.mask_buf
+                    if meta.block_tables is not None:
+                        meta.block_tables = meta.block_tables[:, : bucket // 128]
+                    meta.seq_lens_list = [bucket]
+                FIA_PAD_STATE.pad_captured = True
+                FIA_PAD_STATE.baked_kv = bucket
+                logger.info(
+                    "[fia_pad] bucket-1 capture forged (kv=%d, sparse0 + wide mask)",
+                    bucket,
+                )
+        if key is not None:
+            attn_metadata, spec_common = result
+            if spec_common is None:
+                self._cached_attn_meta = (key, attn_metadata)
+        return result
+
+    def _refresh_cached_attention_metadata(
+        self,
+        attn_metadata: PerLayerAttnMetadata,
+        num_reqs: int,
+        num_reqs_padded: int,
+        num_tokens: int,
+        num_tokens_padded: int,
+    ) -> None:
+        # Live buffers are refreshed in place by _prepare_inputs (and by
+        # _pad_query_start_loc_for_fia) before this runs each frame.
+        qsl_cpu = self.query_start_loc.cpu
+        if callable(qsl_cpu):
+            qsl_cpu = qsl_cpu()
+        qsl_cpu = qsl_cpu[: num_reqs_padded + 1]
+        seq_lens_live = self.optimistic_seq_lens_cpu[:num_reqs_padded]
+        # Replicate the builder's padding side effects on the live buffers
+        # exactly (empty slices are aten no-ops in the unpadded regime).
+        slot_mapping = self.input_batch.block_table[0].slot_mapping.gpu[:num_tokens_padded]
+        slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
+        blk_table_tensor = self.input_batch.block_table[0].get_device_tensor()[:num_reqs_padded]
+        blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
+        seen: set[int] = set()
+        for meta in attn_metadata.values():
+            if id(meta) in seen:
+                continue
+            seen.add(id(meta))
+            # Serialized host copies: the only values the FULL-graph replay
+            # update loop re-reads every frame. Must be rebuilt per frame.
+            meta.actual_seq_lengths_q = qsl_cpu[1:].tolist()
+            meta.seq_lens_list = seq_lens_live.tolist()
+            # Live views: rebind so the object always tracks the persistent
+            # buffers (identical to what a fresh build would install).
+            meta.seq_lens = seq_lens_live
+            meta.seq_lens_cpu = seq_lens_live
+            if meta.query_start_loc is not None:
+                # Keep the device copy byte-identical for any eager fallback
+                # frame, without the per-frame pin_memory() allocation.
+                meta.query_start_loc.copy_(qsl_cpu, non_blocking=True)
+
+    def _update_full_graph_params_if_needed(
+        self,
+        forward_context,
+        num_tokens_padded: int,
+        positions: torch.Tensor | None,
+    ) -> None:
+        # [minicpm-challenge: A-tier FIA pad] replace the per-frame 20-layer
+        # FIA graph_task_update loop (~2.3ms host) with an ExternalEvent
+        # re-arm: the forged capture already bakes kv=bucket + sparse0 +
+        # wide mask + narrow block_table view, and the in-graph mask rebuild
+        # tracks klen, so steady frames need no re-issue at all. Promotion
+        # (klen crossed the bucket) and demotion (new short request while a
+        # high bucket is baked) run ONE forged stock update pass.
+        st = FIA_PAD_STATE
+        in_full = (
+            forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and not forward_context.capturing
+            and not self.use_sparse
+            and not self.use_compress
+        )
+        if (
+            st.enabled
+            and not st.degraded
+            and in_full
+            and num_tokens_padded == 1
+            and st.pad_captured
+            and positions is not None
+        ):
+            events = get_graph_params().events.get(1)
+            klen = int(self.optimistic_seq_lens_cpu[0])
+            if events:
+                if klen > st.baked_kv:
+                    nb = next((b for b in st.BUCKETS if b >= klen), st.KV_MAX)
+                    try:
+                        self._fia_pad_forge_update(forward_context, nb, positions)
+                        st.baked_kv = nb
+                        logger.info("[fia_pad] promoted baked kv -> %d (klen=%d)", nb, klen)
+                        return
+                    except Exception:
+                        logger.exception("[fia_pad] promote forge failed; stock update")
+                elif st.baked_kv > st.KV_PAD and klen <= st.KV_PAD:
+                    try:
+                        self._fia_pad_forge_update(forward_context, st.KV_PAD, positions)
+                        st.baked_kv = st.KV_PAD
+                        logger.info("[fia_pad] demoted baked kv -> 512 (request switch)")
+                        return
+                    except Exception:
+                        logger.exception("[fia_pad] demote forge failed; stock update")
+                else:
+                    for ev in events:
+                        ev.record(self.update_stream)
+                    if not st.skip_logged:
+                        st.skip_logged = True
+                        logger.info("[fia_pad] steady skip engaged (baked_kv=%d)", st.baked_kv)
+                    return
+        super()._update_full_graph_params_if_needed(forward_context, num_tokens_padded, positions)
+        if st.enabled and not st.degraded and in_full and num_tokens_padded == 1:
+            # A stock pass re-baked kv from the live metadata (fall-through or
+            # failed forge); track it so the skip gate stays truthful until
+            # the next forge heals the descriptor.
+            st.baked_kv = int(self.optimistic_seq_lens_cpu[0])
+
+    def _fia_pad_forge_update(self, forward_context, new_bucket: int, positions) -> None:
+        # Temporarily swap the live per-layer metadata's kv descriptor and
+        # block_table to the forged bucket values, run ONE stock update pass
+        # (re-bakes the graph's kv + block_table descriptors), then restore
+        # the python attributes -- the enqueued update ops keep the forged
+        # device views (single request -> single bt row, so the narrow view
+        # shares the persistent buffer's base pointer).
+        attn_metadata = forward_context.attn_metadata
+        ncols = new_bucket // 128
+        # Validate every layer group BEFORE mutating anything: layers in the
+        # same KV group share one metadata object (dedupe by id, or the
+        # restore would write the forged view back over the original and the
+        # block_table could never widen again), and a view too narrow for the
+        # target bucket must bail out before any device call -- torch slicing
+        # silently clamps it, the FIA update fails inside the graph task
+        # group, poisons it (107033 on every later update) and kills the
+        # engine.
+        metas = []
+        seen: set[int] = set()
+        for meta in attn_metadata.values():
+            if (
+                getattr(meta, "attn_state", None)
+                != AscendAttentionState.DecodeOnly
+            ):
+                continue
+            if id(meta) in seen:
+                continue
+            seen.add(id(meta))
+            bt = meta.block_tables
+            if bt is not None and bt.shape[1] < ncols:
+                raise ValueError(
+                    f"block_table view too narrow for bucket {new_bucket} "
+                    f"({bt.shape[1]} < {ncols} cols)"
+                )
+            metas.append(meta)
+        saved = [(m, m.seq_lens_list, m.block_tables) for m in metas]
+        for m in metas:
+            m.seq_lens_list = [new_bucket]
+            if m.block_tables is not None:
+                m.block_tables = m.block_tables[:, :ncols]
+        try:
+            super()._update_full_graph_params_if_needed(forward_context, 1, positions)
+        finally:
+            for meta, seq_lens_saved, bt_saved in saved:
+                meta.seq_lens_list = seq_lens_saved
+                meta.block_tables = bt_saved
+    #  -------------------------------------- Omni-new -------------------------------------------------
 
     def _sample(
         self,
@@ -983,7 +1565,21 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
 
         with record_function_or_nullcontext("sample_token"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            if self._skip_logits_step:
+                # Bypass: the real token is echo-overwritten by the orchestrator;
+                # emit a fixed placeholder outside the tts_bos/tts_end id set so
+                # the llm2tts span slice (prompt + this token) is unchanged.
+                sampler_output = SamplerOutput(
+                    sampled_token_ids=torch.full(
+                        (sample_hidden_states.shape[0], 1),
+                        _BYPASS_SKIP_LOGITS_EOS_ID,
+                        dtype=torch.int32,
+                        device=sample_hidden_states.device,
+                    ),
+                    logprobs_tensors=None,
+                )
+            else:
+                sampler_output = self._sample(logits, spec_decode_metadata)
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -1307,3 +1903,12 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             return str(global_id)
         return req_id
     #  -------------------------------------- Omni-new -------------------------------------------------
+
+
+# minicpm-challenge: profile-skip hook (Slice B2); see profile_skip.py.
+try:
+    from vllm_omni.platforms.npu.profile_skip import install_profile_skip
+
+    install_profile_skip()
+except Exception:
+    pass

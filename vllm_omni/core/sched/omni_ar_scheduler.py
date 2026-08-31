@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from collections import defaultdict
 from time import time
 from typing import Any
@@ -202,6 +204,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # async abort (e.g. client disconnect during TTS streaming) to leave
         # requests in the waiting/running queues temporarily.
         for queue in (self.waiting, self.running):
+            # Fast path: nothing to evict — skip the snapshot copy. Empty
+            # queues return True from all() without iterating.
+            if all(getattr(req, "status", None) != RequestStatus.FINISHED_ABORTED for req in queue):
+                continue
             for req in list(queue):
                 if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
                     queue.remove(req)
@@ -500,10 +506,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if self.chunk_transfer_adapter is not None and (
                 inter_stage_output is not None or is_segment_finished or finished
             ):
+                send_segment_finished = is_segment_finished
+                if (
+                    is_segment_finished
+                    and not finished
+                    and os.environ.get("MINICPMO_STREAM_HANDOFF", "0") == "1"
+                    and self.vllm_config.model_config.stage_id == 1
+                ):
+                    # Plain-stream text handoff: a Talker stop that resumes via
+                    # a queued streaming update is not a duplex segment
+                    # boundary. Forwarding the marker would make the chunk-fed
+                    # Code2Wav stage treat it as end-of-stream and finish the
+                    # whole request while the Talker is still speaking.
+                    send_segment_finished = False
                 self.chunk_transfer_adapter.save_async(
                     inter_stage_output,
                     request,
-                    is_segment_finished,
+                    send_segment_finished,
                 )
 
         # Remove the stopped requests from the running and waiting queues.

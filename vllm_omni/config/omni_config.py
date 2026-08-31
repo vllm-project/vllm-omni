@@ -819,8 +819,8 @@ def _orchestrator_cli_overrides(cli_overrides: Mapping[str, Any]) -> dict[str, A
 class VllmOmniOrchestratorConfig:
     """Configuration consumed by the orchestrator process only."""
 
-    stage_init_timeout: int = Field(default=300, ge=1)
-    init_timeout: int = Field(default=600, ge=1)
+    stage_init_timeout: int = Field(default=600, ge=1)
+    init_timeout: int = Field(default=1200, ge=1)
     worker_backend: str = "multi_process"
     ray_address: str | None = None
     deploy_config_path: str | None = None

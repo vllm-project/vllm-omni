@@ -996,3 +996,12 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
         del hidden_states
         self.encoder_cache.clear()
         gc.collect()
+
+
+# minicpm-challenge: profile-skip hook (Slice B2); see profile_skip.py.
+try:
+    from vllm_omni.platforms.npu.profile_skip import install_profile_skip
+
+    install_profile_skip()
+except Exception:
+    pass

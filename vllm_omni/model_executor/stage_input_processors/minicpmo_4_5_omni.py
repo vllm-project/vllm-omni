@@ -3,6 +3,7 @@
 """MiniCPM-o 4.5 Thinker-to-Talker and Talker-to-Code2Wav bridges."""
 
 import logging
+import os
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -22,6 +23,25 @@ _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
 _MINICPMO45_STREAM_RECORD = "_minicpmo45_async_stream_record"
 _MINICPMO45_SILENCE_CODE = 4218
 _MINICPMO45_MIN_STREAM_BODY_FRAMES = 5
+
+
+def _plain_stream_handoff_enabled() -> bool:
+    """Experimental plain-chat streaming thinker-to-talker handoff."""
+    return os.environ.get("MINICPMO_STREAM_HANDOFF", "0") == "1"
+
+
+def _plain_stream_first_tokens() -> int:
+    try:
+        return max(1, int(os.environ.get("MINICPMO_STREAM_HANDOFF_FIRST", "4")))
+    except ValueError:
+        return 4
+
+
+def _plain_stream_next_tokens() -> int:
+    try:
+        return max(1, int(os.environ.get("MINICPMO_STREAM_HANDOFF_NEXT", "2")))
+    except ValueError:
+        return 2
 
 
 class _MiniCPMO45MetaStruct(MetaStruct):
@@ -125,20 +145,22 @@ def _coerce_int(value):
         return None
 
 
-def _codec_config(transfer_manager: Any) -> tuple[int, int]:
+def _codec_config(transfer_manager: Any) -> tuple[int, int, int]:
     connector = getattr(transfer_manager, "connector", None)
     raw_config = getattr(connector, "config", {}) or {}
     config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
     config = config if isinstance(config, dict) else {}
     chunk_frames = int(config.get("codec_chunk_frames", 25))
     left_context_frames = int(config.get("codec_left_context_frames", 3))
-    if chunk_frames <= 0 or left_context_frames < 0:
+    initial_frames = int(config.get("initial_codec_chunk_frames", 0))
+    if chunk_frames <= 0 or left_context_frames < 0 or initial_frames < 0:
         raise ValueError(
             "Invalid MiniCPM-o codec chunk config: "
             f"codec_chunk_frames={chunk_frames}, "
-            f"codec_left_context_frames={left_context_frames}"
+            f"codec_left_context_frames={left_context_frames}, "
+            f"initial_codec_chunk_frames={initial_frames}"
         )
-    return chunk_frames, left_context_frames
+    return chunk_frames, left_context_frames, initial_frames
 
 
 def _codec_scalars(value: Any) -> list[int]:
@@ -289,7 +311,12 @@ def tts2code2wav_async_chunk(
         state["segment_text_recorded"] = True
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
-    chunk_frames, left_context_frames = _codec_config(transfer_manager)
+    chunk_frames, left_context_frames, initial_frames = _codec_config(transfer_manager)
+    if int(record["chunk_seq"]) == 0 and 0 < initial_frames < chunk_frames:
+        # First chunk flushes early to cut TTFP; subsequent chunks fall back to
+        # the full codec_chunk_frames cadence. Must stay above the Code2Wav
+        # pre-lookahead width (codec_left_context_frames).
+        chunk_frames = initial_frames
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
     if not flush_pending and len(pending) < chunk_frames:
@@ -395,7 +422,7 @@ def tts2code2wav_full_payload(
     internal_id = getattr(request, "request_id", None)
     request_id = str(external_id if external_id is not None else internal_id)
     codes = _extract_codec_delta(pooling_output, request_id)
-    _, left_context_frames = _codec_config(transfer_manager)
+    _, left_context_frames, _ = _codec_config(transfer_manager)
     context = [_MINICPMO45_SILENCE_CODE] * left_context_frames if codes else []
     output_codes = [*context, *codes]
 
@@ -753,6 +780,21 @@ def llm2tts(
             if latent is None:
                 raise ValueError("No latent or hidden_states found in thinker output")
 
+        if isinstance(latent, list):
+            # DELTA snapshots keep latent as un-consolidated per-step
+            # tensors (latent is non-drainable, so each snapshot is the
+            # cumulative prompt+output span rather than per-step deltas).
+            # Rebuild one [seq, hidden] tensor from them.
+            parts = []
+            for item in latent:
+                part = item.detach() if hasattr(item, "detach") else torch.tensor(item)
+                if part.ndim == 1:
+                    part = part.unsqueeze(0)
+                elif part.ndim == 3 and part.shape[0] == 1:
+                    part = part.squeeze(0)
+                parts.append(part)
+            latent = torch.cat(parts, dim=0)
+
         thinker_hidden_states = latent.detach()
         if thinker_hidden_states.ndim == 3 and thinker_hidden_states.shape[0] == 1:
             thinker_hidden_states = thinker_hidden_states.squeeze(0)
@@ -882,7 +924,97 @@ def llm2tts(
                         .to(torch.float32)
                         .contiguous()
                     )
-        handoff_ids = _coerce_token_id_list(tts_token_ids_slice) if tts_token_ids_slice is not None else None
+        # Streaming text handoff (experimental): for plain chat, cut the
+        # cumulative TTS span into incremental handoffs so the Talker starts
+        # decoding codec frames while the thinker is still generating text.
+        # Mid handoffs carry only the newly generated slice and end with a
+        # bare <audio_bos> (official duplex chunk shape); the final handoff
+        # (thinker finished) flushes the remainder plus the full
+        # <text_eos><audio_bos> boundary, matching the non-streaming
+        # condition exactly.
+        plain_stream_mid = False
+        plain_stream_final = False
+        handoff_ids = None
+        if (
+            not is_native_duplex_handoff
+            and _plain_stream_handoff_enabled()
+            and _streaming_context is not None
+        ):
+            bridge_states = getattr(_streaming_context, "bridge_states", None)
+            if isinstance(bridge_states, dict):
+                store = bridge_states.setdefault("_minicpmo45_plain_stream", {})
+                sh_key = str(llm_output.request_id)
+                if not isinstance(store.get(sh_key), dict):
+                    store[sh_key] = {"handed": 0}
+                sh_state = store[sh_key]
+                handed = int(sh_state.get("handed", 0))
+                span_ids_all = _coerce_token_id_list(tts_token_ids_slice) or []
+                n_span = len(span_ids_all)
+                new_tokens = n_span - handed
+                plain_stream_final = bool(getattr(llm_output, "finished", False))
+                logger.info(
+                    "[StreamHandoff] req=%s entry: fin=%d span=%d new=%d hidden=%d full=%d",
+                    sh_key,
+                    plain_stream_final,
+                    n_span,
+                    new_tokens,
+                    thinker_hidden_states.shape[0],
+                    len(full_token_ids),
+                )
+                if (
+                    not plain_stream_final
+                    and thinker_hidden_states.shape[0] + 1 < len(full_token_ids)
+                ):
+                    # The hidden tensor lags the token stream by exactly one
+                    # causal position (forward(t_i) yields hidden_i and token
+                    # t_{i+1}), and the slice below aligns by tail, so one
+                    # missing row is expected and fine. Anything more means
+                    # the DELTA snapshot is not yet alignable; keep
+                    # accumulating.
+                    logger.info(
+                        "[StreamHandoff] req=%s skip: hidden=%d +1 < full=%d",
+                        sh_key,
+                        thinker_hidden_states.shape[0],
+                        len(full_token_ids),
+                    )
+                    continue
+                if not plain_stream_final:
+                    threshold = _plain_stream_first_tokens() if handed == 0 else _plain_stream_next_tokens()
+                    if new_tokens < threshold:
+                        # Keep accumulating; the orchestrator treats empty
+                        # next_inputs as "waiting for more outputs".
+                        logger.info(
+                            "[StreamHandoff] req=%s skip: new=%d < thr=%d",
+                            sh_key,
+                            new_tokens,
+                            threshold,
+                        )
+                        continue
+                    plain_stream_mid = True
+                if plain_stream_final and new_tokens == 0:
+                    # Terminal-sentinel forward after the final tokens were
+                    # already handed off: the scheduler discards the payload of
+                    # non-resumable updates (StreamingUpdate.from_request -> None),
+                    # so this only needs to be non-empty for the orchestrator to
+                    # submit it rather than route an empty terminal output.
+                    tts_hidden_slice = None
+                if new_tokens > 0:
+                    handoff_ids = list(span_ids_all[handed:])
+                    if tts_hidden_slice is not None:
+                        tts_hidden_slice = tts_hidden_slice[handed:].contiguous()
+                    sh_state["handed"] = n_span
+                else:
+                    handoff_ids = []
+                logger.info(
+                    "[StreamHandoff] req=%s %s new_tokens=%d span=%d suffix=%s",
+                    sh_key,
+                    "final" if plain_stream_final else "mid",
+                    new_tokens,
+                    n_span,
+                    "boundary" if plain_stream_final else "audio_bos",
+                )
+        if not (plain_stream_mid or plain_stream_final):
+            handoff_ids = _coerce_token_id_list(tts_token_ids_slice) if tts_token_ids_slice is not None else None
         if is_native_duplex_handoff and handoff_ids:
             handoff_text = _decode_native_duplex_token_ids(
                 handoff_ids,
@@ -931,7 +1063,10 @@ def llm2tts(
         if ref_audio is not None:
             ref_waveform, ref_sr = ref_audio
             set_ref_audio(model_intermediate_buffer, _to_transport_list(ref_waveform), ref_sr)
-        handoff_hidden = _to_transport_list(tts_hidden_slice) if tts_hidden_slice is not None else None
+        # Pass the tensor through: set_tts_handoff packs it as raw bytes
+        # (bit-exact msgspec bin transport). len() below keeps its meaning
+        # because len(torch.Tensor) == shape[0] == row count == len(old list).
+        handoff_hidden = tts_hidden_slice
         native_turn_end_handoff = False
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
@@ -943,14 +1078,28 @@ def llm2tts(
             model_intermediate_buffer.setdefault("meta", {})["turn_end"] = True
 
         if handoff_ids is not None and handoff_hidden is not None:
-            condition_suffix_length = 1 if is_native_duplex_handoff else 2
+            plain_stream_mode = plain_stream_mid or plain_stream_final
+            # Native duplex and plain-stream mid handoffs append a bare
+            # <audio_bos> (1 token); the final handoff ends with the 2-token
+            # boundary (text_eos + audio_bos). After a mid handoff folds into
+            # the running session, the decoded audio codes sit directly before
+            # the next text span — the official duplex unit shape the Talker
+            # was trained on. A mid text_eos instead produces a mid-reply
+            # text_eos the model has never seen (garbled segment joins).
+            condition_suffix_length = 1 if (is_native_duplex_handoff or plain_stream_mid) else 2
             condition_length = max(len(handoff_ids), len(handoff_hidden)) + condition_suffix_length
             scheduler_prompt_token_ids = [0] * condition_length
             handoff_meta = model_intermediate_buffer.setdefault("meta", {})
             handoff_meta["next_stage_prompt_len"] = condition_length
+            if plain_stream_mode:
+                # Incremental handoffs extend the running Talker session
+                # (already-generated frames fold into the prompt upstream);
+                # never replace mid-reply.
+                if plain_stream_mid:
+                    handoff_meta["condition_suffix"] = "audio_bos"
             # Native duplex resumes one Talker request within a turn, but a new
             # assistant turn must discard the previous turn's prompt and KV.
-            if not is_native_duplex_handoff or native_turn_start:
+            elif not is_native_duplex_handoff or native_turn_start:
                 handoff_meta["replace_streaming_prompt"] = True
         else:
             scheduler_prompt_token_ids = _build_tts_scheduler_prompt_token_ids(

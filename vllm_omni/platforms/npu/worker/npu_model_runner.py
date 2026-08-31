@@ -22,6 +22,7 @@ from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms.npu._310p import is_310p
+from vllm_omni.platforms.npu.minicpmo_fia_pad import STATE as _fia_pad_st
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 logger = init_logger(__name__)
@@ -180,6 +181,18 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                     if is_graph_capturing and using_paged_attention(num_tokens, self.vllm_config)
                     else max_query_len
                 )  # type: ignore[assignment]
+            if (
+                _fia_pad_st.enabled
+                and is_graph_capturing
+                and num_tokens == 1
+                and profile_seq_lens is None
+            ):
+                # [minicpm-challenge: A-tier FIA pad] forge the bucket-1
+                # FULL capture: bake kv=512 instead of the stock dummy
+                # value so replay frames never need a descriptor update.
+                _fia_pad_st.capturing_pad = True
+                _fia_pad_st.rebuild_emitted = False
+                seq_lens = _fia_pad_st.KV_PAD
             self.optimistic_seq_lens_cpu[:num_reqs] = seq_lens
             self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
             self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
@@ -337,6 +350,10 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                 target.clear_all_moe_loads()
             if self.dynamic_eplb:
                 self.eplb_updator.forward_end()
+            if _fia_pad_st.capturing_pad:
+                # [minicpm-challenge: A-tier FIA pad] the forged bucket-1
+                # capture pass is done; later captures keep stock fields.
+                _fia_pad_st.capturing_pad = False
             return hidden_states, hidden_states
 
     def _model_forward(
