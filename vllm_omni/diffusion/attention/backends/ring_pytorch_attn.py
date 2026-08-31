@@ -108,14 +108,43 @@ class RingAttentionFunc(torch.autograd.Function):
                         step_k = torch.cat([step_k, joint_tensor_key], dim=1)
                         step_v = torch.cat([step_v, joint_tensor_value], dim=1)
 
-                block_out, block_lse = pytorch_attn_forward(
-                    q,
-                    step_k,
-                    step_v,
-                    softmax_scale=sm_scale,
-                    causal=is_causal and step == 0,
-                    op_type=op_type,
-                )
+                if is_causal and step == 0 and joint_tensor_key is not None and joint_strategy == "front":
+                    # For joint front tokens: attend to joint tokens without causal mask,
+                    # then attend to local tokens with causal mask.
+                    joint_len = joint_tensor_key.shape[1]
+                    local_k = step_k[:, joint_len:, :]
+                    local_v = step_v[:, joint_len:, :]
+                    joint_k = step_k[:, :joint_len, :]
+                    joint_v = step_v[:, :joint_len, :]
+
+                    # Joint attention (no causal)
+                    block_out_joint, block_lse_joint = pytorch_attn_forward(
+                        q, joint_k, joint_v,
+                        softmax_scale=sm_scale,
+                        causal=False,
+                        op_type=op_type,
+                    )
+                    # Local attention (causal)
+                    block_out_local, block_lse_local = pytorch_attn_forward(
+                        q, local_k, local_v,
+                        softmax_scale=sm_scale,
+                        causal=True,
+                        op_type=op_type,
+                    )
+                    # Combine using online softmax
+                    block_out, block_lse = update_out_and_lse(
+                        block_out_joint, block_lse_joint,
+                        block_out_local, block_lse_local,
+                    )
+                else:
+                    block_out, block_lse = pytorch_attn_forward(
+                        q,
+                        step_k,
+                        step_v,
+                        softmax_scale=sm_scale,
+                        causal=is_causal and step == 0,
+                        op_type=op_type,
+                    )
                 out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
             if step + 1 != comm.world_size:
