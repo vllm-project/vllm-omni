@@ -132,14 +132,17 @@ def test_cache_manager_registers_attention_without_adding_dense_state() -> None:
     assert mgr.state_dict() == {}
 
 
-@pytest.mark.parametrize(
-    ("paged_kv_active", "expected_kv_heads"),
-    [(False, NUM_HEADS), (True, NUM_KV_HEADS)],
-)
-def test_gqa_kv_stays_compressed_for_paged_attention(
+@pytest.mark.parametrize("paged_kv_active", [False, True])
+def test_gqa_kv_stays_compressed(
     paged_kv_active: bool,
-    expected_kv_heads: int,
 ) -> None:
+    """K/V reach the Attention layer compact (num_kv_heads), never pre-expanded.
+
+    The manager no longer repeat_kv's K/V up to num_heads: the SP path keeps
+    them compact through the head-dim all-to-all (that is the comm saving),
+    and the attention backend does the GQA broadcast. This holds whether or
+    not the paged-KV backend is active.
+    """
     mgr = _make_cache_mgr()
     mgr.attn.paged_kv_active = paged_kv_active
     q_len = 3
@@ -158,7 +161,7 @@ def test_gqa_kv_stays_compressed_for_paged_attention(
     )
 
     _, key_input, value_input = mgr.attn.calls[-1]
-    expected_shape = (1, q_len, expected_kv_heads, HEAD_DIM)
+    expected_shape = (1, q_len, NUM_KV_HEADS, HEAD_DIM)
     assert key_input.shape == expected_shape
     assert value_input.shape == expected_shape
 
