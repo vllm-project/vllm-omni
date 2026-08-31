@@ -58,9 +58,14 @@ class _ExecutorShutdownCleaner:
     broadcast_mq: MessageQueue | None = None
     num_workers: int = 0
     processes: list[mp.Process] | None = None
+    wake_events: list[Any] | None = None
 
     def __call__(self) -> None:
         """Clean up background resources."""
+        if self.wake_events:
+            for ev in self.wake_events:
+                ev.set()
+
         if self.broadcast_mq is not None:
             try:
                 for _ in range(self.num_workers):
@@ -99,12 +104,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._closed = False
         self._is_failed = False
         self._failure_callbacks: list[Callable[[], None]] = []
+        self._mp_context = mp.get_context("spawn")
         self._result_mq: MessageQueue | None = None
         self._result_mqs: list[MessageQueue] = []
         self._rpc_wave_id: int = 0
 
         num_workers = cast(int, self.od_config.num_gpus)
-        self.wake_events = [mp.Event() for _ in range(num_workers)]
+        self.wake_events = [self._mp_context.Event() for _ in range(num_workers)]
 
         self._broadcast_mq = self._init_broadcast_queue(num_workers)
         broadcast_handle = self._broadcast_mq.export_handle()
@@ -117,6 +123,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             broadcast_mq=self._broadcast_mq,
             num_workers=num_workers,
             processes=self._processes,
+            wake_events=self.wake_events,
         )
         self._shutdown_cleaner: _ExecutorShutdownCleaner | None = shutdown_cleaner
         self._finalizer = weakref.finalize(self, shutdown_cleaner)
@@ -301,6 +308,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # user-provided OMP_NUM_THREADS.
         set_multiprocessing_worker_envs()
         mp.set_start_method("spawn", force=True)
+        mp_context = getattr(self, "_mp_context", mp.get_context("spawn"))
         processes = []
 
         # Extract worker_extension_cls and custom_pipeline_args from od_config
@@ -312,9 +320,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         scheduler_pipe_writers = []
 
         for i in range(num_gpus):
-            reader, writer = mp.Pipe(duplex=False)
+            reader, writer = mp_context.Pipe(duplex=False)
             scheduler_pipe_writers.append(writer)
-            process = mp.Process(
+            process = mp_context.Process(
                 target=WorkerProc.worker_main,
                 args=(
                     i,  # rank

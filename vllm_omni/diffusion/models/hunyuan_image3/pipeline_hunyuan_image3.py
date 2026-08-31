@@ -43,6 +43,7 @@ from .hunyuan_image3_transformer import (
     HunyuanImage3PreTrainedModel,
     HunyuanImage3Text2ImagePipeline,
     ImageInfo,
+    ImageKVCacheManager,
     JointImageInfo,
     LightProjector,
     TimestepEmbedder,
@@ -53,6 +54,14 @@ from .hunyuan_image3_transformer import (
     retrieve_timesteps,
 )
 from .request_layout import HunyuanPreparedLayout
+from .mixfusion import (
+    MixFusionSequencePlan,
+    build_mixfusion_sequence_plan,
+    merge_mixfusion_chunks_to_sequences,
+    split_sequences_to_mixfusion_chunks,
+    validate_mixfusion_sequence_plan,
+)
+from .system_prompt import get_system_prompt
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -925,15 +934,192 @@ class HunyuanImage3Pipeline(
 
         return x
 
-    def ragged_final_layer(self, x, image_mask, timestep, token_h, token_w, first_step):
+    def _mixfusion_patch_embed(
+        self,
+        images: list[torch.Tensor],
+        timestep: torch.Tensor,
+        plan: MixFusionSequencePlan,
+    ) -> tuple[torch.Tensor, int, int]:
+        image_sequences: list[torch.Tensor] = []
+        for layout in plan.layouts:
+            image = images[layout.index]
+            if image.dim() == 3:
+                image = image.unsqueeze(0)
+            image_timestep = timestep[layout.chunk_start : layout.chunk_start + 1]
+            image_emb, token_h, token_w = self.patch_embed(image, self.time_embed(image_timestep))
+            assert (token_h, token_w) == (layout.token_height, layout.token_width), (
+                f"MixFusion token shape mismatch: got {(token_h, token_w)}, "
+                f"expected {(layout.token_height, layout.token_width)}"
+            )
+            image_sequences.append(image_emb)
+        return split_sequences_to_mixfusion_chunks(image_sequences, plan), 1, plan.chunk_size
+
+    def _scatter_mixfusion_image_tokens(
+        self,
+        x: torch.Tensor,
+        images: list[torch.Tensor],
+        timestep: torch.Tensor,
+        image_mask: torch.Tensor,
+        plan: MixFusionSequencePlan,
+    ):
+        batch_size, seq_len, n_embd = x.shape
+        image_seq, token_h, token_w = self._mixfusion_patch_embed(images, timestep, plan)
+        cfg_factor = batch_size // plan.chunk_count
+        if cfg_factor > 1:
+            image_seq = torch.cat([image_seq] * cfg_factor, dim=0)
+        index = torch.arange(seq_len, device=x.device).unsqueeze(0).repeat(batch_size, 1)
+        image_scatter_index = index.masked_select(image_mask.bool()).reshape(batch_size, -1)
+        x.scatter_(
+            dim=1,
+            index=image_scatter_index.unsqueeze(-1).repeat(1, 1, n_embd),
+            src=image_seq,
+        )
+        return x, token_h, token_w
+
+    def ragged_final_layer(
+        self,
+        x,
+        image_mask,
+        timestep,
+        token_h,
+        token_w,
+        first_step,
+        mixfusion_sequence_plan: MixFusionSequencePlan | None = None,
+    ):
         bsz, seq_len, n_embd = x.shape
         if first_step:
             image_output = x.masked_select(image_mask.unsqueeze(-1).bool()).reshape(bsz, -1, n_embd)
         else:
             image_output = x[:, 1:, :]
+        if mixfusion_sequence_plan is not None:
+            plan = mixfusion_sequence_plan
+            cfg_factor = bsz // plan.chunk_count
+            preds: list[torch.Tensor] = []
+            for branch in range(cfg_factor):
+                start = branch * plan.chunk_count
+                end = start + plan.chunk_count
+                sequences = merge_mixfusion_chunks_to_sequences(image_output[start:end], plan)
+                for layout, sequence in zip(plan.layouts, sequences, strict=True):
+                    timestep_index = start + layout.chunk_start
+                    timestep_emb = self.time_embed_2(timestep[timestep_index : timestep_index + 1])
+                    preds.append(self.final_layer(sequence, timestep_emb, layout.token_height, layout.token_width))
+            return preds
         timestep_emb = self.time_embed_2(timestep)
         pred = self.final_layer(image_output, timestep_emb, token_h, token_w)
         return pred
+
+    @staticmethod
+    def build_batch_rope_image_info(output, sections):
+        if output.all_image_slices is None:
+            return []
+        if len(sections) == 1 and len(output.all_image_slices) > 1:
+            sections = sections * len(output.all_image_slices)
+        if len(output.all_image_slices) != len(sections):
+            raise ValueError(
+                "RoPE metadata batch size mismatch: "
+                f"{len(output.all_image_slices)} image-slice entries but {len(sections)} section entries."
+            )
+
+        rope_image_info = []
+        for image_slices, sections_i in zip(output.all_image_slices, sections):
+            image_shapes = []
+            for section in sections_i:
+                if "image" in section["type"]:
+                    if isinstance(section["token_height"], list):
+                        assert len(section["token_height"]) == len(section["token_width"]), (
+                            f"token_height and token_width should have the same length, "
+                            f"but got {len(section['token_height'])} and {len(section['token_width'])}"
+                        )
+                        image_shapes.extend(list(zip(section["token_height"], section["token_width"])))
+                    else:
+                        image_shapes.append((section["token_height"], section["token_width"]))
+            assert len(image_slices) == len(image_shapes), (
+                f"Size miss matching: Image slices({len(image_slices)}) != image shapes({len(image_shapes)})"
+            )
+            rope_image_info.append(list(zip(image_slices, image_shapes)))
+        return rope_image_info
+
+    @staticmethod
+    def _expand_rope_batch(
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        target_batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if cos.shape[0] == target_batch_size:
+            return cos, sin
+        if cos.shape[0] != 1:
+            raise ValueError(
+                f"RoPE batch size mismatch: got {cos.shape[0]} RoPE rows for {target_batch_size} token rows."
+            )
+        repeat_shape = [target_batch_size] + [1] * (cos.ndim - 1)
+        return cos.repeat(*repeat_shape), sin.repeat(*repeat_shape)
+
+    def _apply_mixfusion_rope_positions(
+        self,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        gen_image_slices: list[list[slice]],
+        plan: MixFusionSequencePlan,
+        original_image_infos: list[ImageInfo],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if len(original_image_infos) != len(plan.layouts):
+            raise ValueError(f"Expected {len(plan.layouts)} original image infos, got {len(original_image_infos)}.")
+        if len(gen_image_slices) != cos.shape[0]:
+            raise ValueError(
+                "MixFusion RoPE metadata batch size mismatch: "
+                f"{len(gen_image_slices)} image-slice rows but {cos.shape[0]} RoPE rows."
+            )
+
+        cfg_factor = cos.shape[0] // plan.chunk_count
+        if cos.shape[0] % plan.chunk_count != 0:
+            raise ValueError(f"MixFusion RoPE batch size {cos.shape[0]} is not divisible by {plan.chunk_count}.")
+
+        cos = cos.clone()
+        sin = sin.clone()
+        for cfg_idx in range(cfg_factor):
+            cfg_base = cfg_idx * plan.chunk_count
+            for layout in plan.layouts:
+                first_sample = cfg_base + layout.chunk_start
+                if not gen_image_slices[first_sample]:
+                    raise ValueError("MixFusion requires generated image slices for RoPE recovery.")
+
+                image_slice = gen_image_slices[first_sample][-1]
+                image_start = 0 if image_slice.start is None else image_slice.start
+                fake_image_stop = cos.shape[1] if image_slice.stop is None else image_slice.stop
+                original_seq_len = cos.shape[1] - plan.chunk_size + layout.seq_len
+                full_cos, full_sin = build_batch_2d_rope(
+                    image_infos=[
+                        [
+                            (
+                                slice(image_start, image_start + layout.seq_len),
+                                (layout.token_height, layout.token_width),
+                            )
+                        ]
+                    ],
+                    seq_len=original_seq_len,
+                    n_elem=self.config.attention_head_dim,
+                    device=device,
+                    base=self.config.rope_theta,
+                )
+                full_cos = full_cos[0]
+                full_sin = full_sin[0]
+
+                for chunk_idx in range(layout.chunk_count):
+                    sample_idx = first_sample + chunk_idx
+                    chunk_start = image_start + chunk_idx * plan.chunk_size
+                    chunk_stop = chunk_start + plan.chunk_size
+                    cos[sample_idx, image_start:fake_image_stop] = full_cos[chunk_start:chunk_stop]
+                    sin[sample_idx, image_start:fake_image_stop] = full_sin[chunk_start:chunk_stop]
+
+                    suffix_len = cos.shape[1] - fake_image_stop
+                    if suffix_len > 0:
+                        full_suffix_start = image_start + layout.seq_len
+                        full_suffix_stop = full_suffix_start + suffix_len
+                        cos[sample_idx, fake_image_stop:] = full_cos[full_suffix_start:full_suffix_stop]
+                        sin[sample_idx, fake_image_stop:] = full_sin[full_suffix_start:full_suffix_stop]
+
+        return cos, sin
 
     def vae_encode(self, image, cfg_factor=1, generator=None):
         config = self.vae.config
@@ -1067,7 +1253,7 @@ class HunyuanImage3Pipeline(
         batch_prompt = prompt
         batch_cot_text = cot_text
         batch_system_prompt = system_prompt
-        batch_gen_image_info = None
+        batch_gen_image_info = kwargs.pop("batch_gen_image_info", None)
         batch_cond_image_info = kwargs.pop("batch_cond_image_info", None)
 
         #   -- 2.1 message_list
@@ -1117,10 +1303,21 @@ class HunyuanImage3Pipeline(
                     if batch_size != 1:
                         raise ValueError("Hunyuan prepared layout currently supports one public request at a time.")
                     batch_gen_image_info = [prepared_layout.generated_image_info]
-                else:
-                    batch_gen_image_info = [
-                        self.image_processor.build_image_info(image_size) for _ in range(batch_size)
-                    ]
+                elif batch_gen_image_info is None:
+                    if (
+                        isinstance(image_size, list)
+                        and len(image_size) == batch_size
+                        and all(isinstance(size, (list, tuple)) for size in image_size)
+                    ):
+                        batch_gen_image_info = [self.image_processor.build_image_info(size) for size in image_size]
+                    else:
+                        batch_gen_image_info = [
+                            self.image_processor.build_image_info(image_size) for _ in range(batch_size)
+                        ]
+            elif batch_gen_image_info is not None:
+                assert len(batch_gen_image_info) == batch_size, (
+                    "`batch_gen_image_info` should have the same batch size as `prompt`."
+                )
 
             if batch_cond_image_info is not None:
                 assert isinstance(batch_cond_image_info, list) and len(batch_cond_image_info) == batch_size, (
@@ -1207,6 +1404,20 @@ class HunyuanImage3Pipeline(
             device=device,
             base=self.config.rope_theta,
         )
+        cos, sin = self._expand_rope_batch(cos, sin, output.tokens.shape[0])
+        mixfusion_sequence_plan = kwargs.pop("mixfusion_sequence_plan", None)
+        mixfusion_original_image_infos = kwargs.pop("mixfusion_original_image_infos", None)
+        if mixfusion_sequence_plan is not None:
+            if mixfusion_original_image_infos is None:
+                raise ValueError("`mixfusion_original_image_infos` is required for MixFusion RoPE recovery.")
+            cos, sin = self._apply_mixfusion_rope_positions(
+                cos,
+                sin,
+                output.gen_image_slices,
+                mixfusion_sequence_plan,
+                mixfusion_original_image_infos,
+                device,
+            )
 
         # 6. Build kv cache
         if bot_task == "img_ratio":
@@ -1301,6 +1512,59 @@ class HunyuanImage3Pipeline(
         model_kwargs["full_attn_spans"] = full_attn_spans
         return attention_mask
 
+    @staticmethod
+    def _build_mixfusion_attention_mask_buckets(
+        attention_mask: torch.Tensor,
+        full_attn_spans: list[list[tuple[int, int]]],
+        plan: MixFusionSequencePlan,
+    ) -> dict[tuple[int, int, tuple[tuple[int, int], ...]], torch.Tensor]:
+        bs, _, q_len, seq_len = attention_mask.shape
+        if bs % plan.chunk_count != 0:
+            raise ValueError(f"MixFusion mask batch size {bs} is not divisible by {plan.chunk_count}.")
+
+        cfg_factor = bs // plan.chunk_count
+        buckets: dict[tuple[int, int, tuple[tuple[int, int], ...]], list[torch.Tensor]] = {}
+        for cfg_idx in range(cfg_factor):
+            cfg_base = cfg_idx * plan.chunk_count
+            for layout in plan.layouts:
+                sample_indices = [cfg_base + layout.chunk_start + i for i in range(layout.chunk_count)]
+                first_sample = sample_indices[0]
+                if not full_attn_spans[first_sample]:
+                    raise ValueError("MixFusion requires image full-attention spans for each chunk.")
+
+                key_image_start, key_image_stop = ImageKVCacheManager._select_mixfusion_image_span(
+                    full_attn_spans[first_sample],
+                    plan.chunk_size,
+                )
+                query_image_start, query_image_stop = ImageKVCacheManager._mixfusion_query_span(
+                    (key_image_start, key_image_stop),
+                    seq_len,
+                    q_len,
+                    plan.chunk_size,
+                )
+
+                row_map = [(first_sample, idx) for idx in range(query_image_start)]
+                col_map = [(first_sample, idx) for idx in range(key_image_start)]
+                for sample_idx in sample_indices:
+                    row_map.extend((sample_idx, idx) for idx in range(query_image_start, query_image_stop))
+                    col_map.extend((sample_idx, idx) for idx in range(key_image_start, key_image_stop))
+                row_map.extend((first_sample, idx) for idx in range(query_image_stop, q_len))
+                col_map.extend((first_sample, idx) for idx in range(key_image_stop, seq_len))
+
+                recovered_spans = ImageKVCacheManager._recover_mixfusion_spans(
+                    full_attn_spans[first_sample],
+                    (key_image_start, key_image_stop),
+                    layout.seq_len,
+                )
+                recovered_q_len = query_image_start + layout.seq_len + q_len - query_image_stop
+                recovered_k_len = key_image_start + layout.seq_len + seq_len - key_image_stop
+                bucket_key = (recovered_q_len, recovered_k_len, tuple(recovered_spans))
+                buckets.setdefault(bucket_key, []).append(
+                    ImageKVCacheManager._recover_mixfusion_attention_mask(attention_mask, row_map, col_map)
+                )
+
+        return {bucket_key: torch.cat(masks, dim=0) for bucket_key, masks in buckets.items()}
+
     def prepare_inputs_for_generation(
         self,
         input_ids,
@@ -1344,6 +1608,8 @@ class HunyuanImage3Pipeline(
                 "num_image_tokens": kwargs.get("num_image_tokens"),
                 "ar_kv_reuse_len": kwargs.get("ar_kv_reuse_len", 0),
                 "full_attn_spans": kwargs.get("full_attn_spans"),
+                "mixfusion_sequence_plan": kwargs.get("mixfusion_sequence_plan"),
+                "mixfusion_attention_masks": kwargs.get("mixfusion_attention_masks"),
             }
         )
         return model_inputs
@@ -1364,6 +1630,10 @@ class HunyuanImage3Pipeline(
         }
         if "full_attn_spans" in model_kwargs:
             updated_model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"]
+        if "mixfusion_sequence_plan" in model_kwargs:
+            updated_model_kwargs["mixfusion_sequence_plan"] = model_kwargs["mixfusion_sequence_plan"]
+        if "mixfusion_attention_masks" in model_kwargs:
+            updated_model_kwargs["mixfusion_attention_masks"] = model_kwargs["mixfusion_attention_masks"]
 
         # update past_key_values keeping its naming used in model code
         for possible_cache_name in ALL_CACHE_NAMES:
@@ -1461,6 +1731,8 @@ class HunyuanImage3Pipeline(
                 guidance_scale=kwargs.get("guidance_scale", 5.0),
                 generator=generator,
                 model_kwargs=kwargs,
+                mixfusion_image_sizes=kwargs.get("mixfusion_image_sizes"),
+                mixfusion_generator=kwargs.get("mixfusion_generator"),
             )
             samples = results[0]
             return samples
@@ -1506,6 +1778,9 @@ class HunyuanImage3Pipeline(
         uncond_cfg_prefill: bool = False,
         ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
+        mixfusion_sequence_plan: Any | None = None,
+        mixfusion_attention_masks: dict[str, dict[tuple[int, int, tuple[tuple[int, int], ...]], torch.Tensor]]
+        | None = None,
     ) -> tuple | CausalMMOutputWithPast:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         # Sanity Check of Inputs
@@ -1561,7 +1836,28 @@ class HunyuanImage3Pipeline(
         elif uncond_cfg_prefill:
             token_h, token_w = None, None
         else:
-            if first_step:
+            if mixfusion_sequence_plan is not None:
+                if not isinstance(images, list):
+                    raise TypeError("MixFusion expects `images` to be a list of per-request latent tensors.")
+                if first_step:
+                    inputs_embeds, token_h, token_w = self._scatter_mixfusion_image_tokens(
+                        inputs_embeds, images, timestep, image_mask, mixfusion_sequence_plan
+                    )
+                    inputs_embeds = self.instantiate_timestep_tokens(
+                        inputs_embeds, timestep, gen_timestep_scatter_index
+                    )
+                else:
+                    image_emb, token_h, token_w = self._mixfusion_patch_embed(
+                        images,
+                        timestep,
+                        mixfusion_sequence_plan,
+                    )
+                    cfg_factor = bsz // mixfusion_sequence_plan.chunk_count
+                    if cfg_factor > 1:
+                        image_emb = torch.cat([image_emb] * cfg_factor, dim=0)
+                    timestep_emb = self.timestep_emb(timestep).reshape(bsz, -1, n_embd)
+                    inputs_embeds = torch.cat([timestep_emb, image_emb], dim=1)
+            elif first_step:
                 assert inputs_embeds is not None
                 inputs_embeds, token_h, token_w = self.instantiate_vae_image_tokens(
                     inputs_embeds, images, timestep, image_mask
@@ -1611,6 +1907,8 @@ class HunyuanImage3Pipeline(
                 uncond_cfg_prefill=uncond_cfg_prefill,
                 ar_kv_reuse_len=ar_kv_reuse_len,
                 full_attn_spans=full_attn_spans,
+                mixfusion_sequence_plan=mixfusion_sequence_plan,
+                mixfusion_attention_masks=mixfusion_attention_masks,
             )
         hidden_states = outputs[0]
 
@@ -1630,7 +1928,13 @@ class HunyuanImage3Pipeline(
             )
             hidden_states = hidden_states.reshape(bsz, seq_len, n_embd)
             diffusion_prediction = self.ragged_final_layer(
-                hidden_states, image_mask, timestep, token_h, token_w, first_step
+                hidden_states,
+                image_mask,
+                timestep,
+                token_h,
+                token_w,
+                first_step,
+                mixfusion_sequence_plan=mixfusion_sequence_plan,
             )
 
         if not return_dict:
@@ -1685,6 +1989,66 @@ class HunyuanImage3Pipeline(
             f"each with length: {next(iter(ar_kv_data.values()))['key'].shape}"
         )
         return {"ar_kv_data": ar_kv_data}
+
+    @staticmethod
+    def _resolve_per_prompt_image_sizes(req: OmniDiffusionRequest, default_height: int, default_width: int):
+        sizes: list[tuple[int, int]] = []
+        for prompt_item in req.prompts:
+            prompt_height = None
+            prompt_width = None
+            if isinstance(prompt_item, dict):
+                prompt_height = prompt_item.get("height")
+                prompt_width = prompt_item.get("width")
+                extra = prompt_item.get("extra") or {}
+                prompt_height = prompt_height or extra.get("height")
+                prompt_width = prompt_width or extra.get("width")
+            sizes.append((int(prompt_height or default_height), int(prompt_width or default_width)))
+        return sizes
+
+    @staticmethod
+    def _repeat_by_mixfusion_layout(items, layouts):
+        if items is None:
+            return None
+        repeated = []
+        for layout in layouts:
+            repeated.extend([items[layout.index]] * layout.chunk_count)
+        return repeated
+
+    def _build_mixfusion_chunk_image_infos(
+        self,
+        plan: MixFusionSequencePlan,
+        original_image_infos: list[ImageInfo],
+    ) -> list[ImageInfo]:
+        if len(original_image_infos) != len(plan.layouts):
+            raise ValueError(f"Expected {len(plan.layouts)} original image infos, got {len(original_image_infos)}.")
+
+        infos: list[ImageInfo] = []
+        for layout in plan.layouts:
+            original_info = original_image_infos[layout.index]
+            if (original_info.token_height, original_info.token_width) != (layout.token_height, layout.token_width):
+                raise ValueError(
+                    f"MixFusion layout {layout.index} has token shape "
+                    f"{(layout.token_height, layout.token_width)}, but original image info has "
+                    f"{(original_info.token_height, original_info.token_width)}."
+                )
+            for _ in range(layout.chunk_count):
+                infos.append(
+                    ImageInfo(
+                        image_type="gen_image",
+                        image_width=original_info.image_width,
+                        image_height=original_info.image_height,
+                        token_width=plan.chunk_size,
+                        token_height=1,
+                        image_token_length=plan.chunk_size,
+                        base_size=original_info.base_size,
+                        ratio_index=original_info.ratio_index,
+                        add_timestep_token=original_info.add_timestep_token,
+                        add_guidance_token=original_info.add_guidance_token,
+                        use_front_boi_token=original_info.use_front_boi_token,
+                        add_image_shape_token=original_info.add_image_shape_token,
+                    )
+                )
+        return infos
 
     def _extract_ar_kv_from_sampling(self, sampling: Any) -> dict[str, Any]:
         kv = getattr(sampling, "past_key_values", None)
@@ -2144,29 +2508,82 @@ class HunyuanImage3Pipeline(
         if guidance_scale <= 1.0:
             logger.info("HunyuanImage3.0 runs without classifier-free guidance when guidance_scale <= 1.0.")
         image_size = (height, width)
+        enable_mixfusion = bool(extra_args.get("enable_mixfusion", False))
+        batch_image_sizes = self._resolve_per_prompt_image_sizes(req, height, width)
+        mixfusion_plan = None
+        mixfusion_generator = None
+        model_prompt = prompt
+        model_cot_text = cot_text
+        model_system_prompt = system_prompt
+        model_batch_cond_image_info = batch_cond_image_info
+        model_batch_gen_image_info = None
+        original_image_infos = [self.image_processor.build_image_info(size) for size in batch_image_sizes]
+        token_shapes = [(info.token_height, info.token_width) for info in original_image_infos]
+        if enable_mixfusion and len(batch_image_sizes) > 1 and len(set(token_shapes)) > 1:
+            candidate_plan = build_mixfusion_sequence_plan(token_shapes)
+            min_chunk_tokens = int(extra_args.get("mixfusion_min_chunk_tokens", 256))
+            max_chunks = int(extra_args.get("mixfusion_max_chunks", 128))
+            use_mixfusion, reject_reason = validate_mixfusion_sequence_plan(
+                candidate_plan,
+                min_chunk_tokens=min_chunk_tokens,
+                max_chunks=max_chunks,
+            )
+            if not use_mixfusion:
+                logger.warning(
+                    "Disable HunyuanImage3 MixFusion for this batch: %s. token_shapes=%s",
+                    reject_reason,
+                    token_shapes,
+                )
+            else:
+                mixfusion_plan = candidate_plan
+        if mixfusion_plan is not None:
+            model_prompt = self._repeat_by_mixfusion_layout(prompt, mixfusion_plan.layouts)
+            if isinstance(cot_text, list):
+                model_cot_text = self._repeat_by_mixfusion_layout(cot_text, mixfusion_plan.layouts)
+            if isinstance(system_prompt, list):
+                model_system_prompt = self._repeat_by_mixfusion_layout(system_prompt, mixfusion_plan.layouts)
+            if batch_cond_image_info is not None:
+                model_batch_cond_image_info = self._repeat_by_mixfusion_layout(
+                    batch_cond_image_info, mixfusion_plan.layouts
+                )
+            mixfusion_generator = generator
+            if isinstance(generator, list):
+                generator = self._repeat_by_mixfusion_layout(generator, mixfusion_plan.layouts)
+            model_batch_gen_image_info = self._build_mixfusion_chunk_image_infos(
+                mixfusion_plan,
+                original_image_infos,
+            )
+        elif len(batch_image_sizes) > 1:
+            model_batch_gen_image_info = original_image_infos
 
         # ---- AR KV Reuse: extract injected KV from request ----
         ar_kv_kwargs = self._extract_ar_kv_from_request(req)
 
         model_inputs = self.prepare_model_inputs(
-            prompt=prompt,
-            cot_text=cot_text,
-            system_prompt=system_prompt,
+            prompt=model_prompt,
+            cot_text=model_cot_text,
+            system_prompt=model_system_prompt,
             mode="gen_image",
             generator=generator,
             image_size=image_size,
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
-            batch_cond_image_info=batch_cond_image_info,
-            bot_task=tokenizer_bot_task,
+            batch_gen_image_info=model_batch_gen_image_info,
+            batch_cond_image_info=model_batch_cond_image_info,
+            mixfusion_sequence_plan=mixfusion_plan,
+            mixfusion_original_image_infos=original_image_infos,
+            bot_task=tokenizer_bot_task or "auto",
             prepared_layout=request_layout_utils.get_hunyuan_prepared_layout(req.requests[0]),
             **ar_kv_kwargs,
         )
-
-        model_inputs.update(ar_kv_kwargs)
-
+        if mixfusion_plan is not None:
+            model_inputs["mixfusion_image_sizes"] = [
+                (info.image_height, info.image_width) for info in original_image_infos
+            ]
+            model_inputs["mixfusion_generator"] = mixfusion_generator
+            model_inputs["mixfusion_sequence_plan"] = mixfusion_plan
         outputs = self._generate(**model_inputs, **kwargs)
-        image = outputs[0]
+        image = outputs.samples if hasattr(outputs, "samples") else outputs[0]
         metadata = {}
         if any(t is not None for t in cot_text_list):
             metadata["text"] = {"ar_generated_text": cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list}
