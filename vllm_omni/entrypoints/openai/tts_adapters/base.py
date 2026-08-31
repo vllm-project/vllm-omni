@@ -166,6 +166,10 @@ class TTSModelAdapter(ABC):
     validates_generation: ClassVar[bool] = False
     #: Whether the model consumes ``request.speed`` in its native parameters.
     native_speed_control: ClassVar[bool] = False
+    #: Text-input modes accepted by this model. ``buffered`` preserves the
+    #: existing whole-utterance request contract; adapters must opt into
+    #: incremental commitment explicitly.
+    supported_text_input_modes: ClassVar[frozenset[str]] = frozenset({"buffered"})
 
     max_new_tokens_min = 1
 

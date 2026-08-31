@@ -42,6 +42,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
     validates_generation = True
     stage_keys = frozenset({"qwen3_tts"})
     name = "qwen3_tts"
+    supported_text_input_modes = frozenset({"buffered", "commitment"})
 
     def normalize(self, request: "OpenAICreateSpeechRequest") -> None:
         """Qwen3-TTS normalization (Base-task inference, voice lowercasing) is
@@ -194,7 +195,13 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         talker codec embeddings, so the real compatibility requirement is the
         talker hidden size.
         """
-        hf_config = self.ctx.engine_client.model_config.hf_config
+        engine_client = self.ctx.engine_client
+        if engine_client is None:
+            raise RuntimeError("Qwen3-TTS engine client is unavailable")
+        model_config = engine_client.model_config
+        if model_config is None:
+            raise RuntimeError("Qwen3-TTS model configuration is unavailable")
+        hf_config = model_config.hf_config
         talker_config = hf_config.talker_config
         return int(talker_config.hidden_size)
 
@@ -211,7 +218,13 @@ class Qwen3TTSAdapter(ARTTSAdapter):
 
     def _load_supported_languages(self) -> frozenset[str]:
         try:
-            config = self.ctx.engine_client.model_config.hf_config.talker_config
+            engine_client = self.ctx.engine_client
+            if engine_client is None:
+                raise RuntimeError("Qwen3-TTS engine client is unavailable")
+            model_config = engine_client.model_config
+            if model_config is None:
+                raise RuntimeError("Qwen3-TTS model configuration is unavailable")
+            config = model_config.hf_config.talker_config
 
             if isinstance(config, dict):
                 codec_language_id = config.get("codec_language_id")
