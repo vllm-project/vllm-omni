@@ -611,7 +611,13 @@ async def test_async_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPat
     # external ID to avoid collisions, so this also tests mapping
     external_req_id = "req-1"
     req_id = "req-1-12345678"
+    recorded_failures = []
     try:
+        monkeypatch.setattr(
+            app,
+            "_record_request_failure_once",
+            lambda request_id, reason: recorded_failures.append((request_id, reason)),
+        )
         app.request_states[req_id] = ClientRequestState(
             request_id=req_id,
             external_request_id=external_req_id,
@@ -622,6 +628,7 @@ async def test_async_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPat
 
     assert engine.aborted == [[req_id]]
     assert external_req_id not in app.request_states
+    assert recorded_failures == [(req_id, "client_abort")]
 
 
 @pytest.mark.asyncio
@@ -814,7 +821,13 @@ def test_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPatch):
     _patch_engine(monkeypatch, engine)
 
     app = Omni("dummy-model")
+    recorded_failures = []
     try:
+        monkeypatch.setattr(
+            app,
+            "_record_request_failure_once",
+            lambda request_id, reason: recorded_failures.append((request_id, reason)),
+        )
         app.request_states["req-1"] = object()
         app.abort("req-1")
     finally:
@@ -822,6 +835,7 @@ def test_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPatch):
 
     assert engine.aborted == [["req-1"]]
     assert "req-1" not in app.request_states
+    assert recorded_failures == [("req-1", "client_abort")]
 
 
 def test_omni_forces_final_only_on_llm_stages(monkeypatch: pytest.MonkeyPatch):

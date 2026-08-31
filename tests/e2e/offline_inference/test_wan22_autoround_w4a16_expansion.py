@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E tests for Wan2.2 AutoRound W4A16 quantized inference.
 
 These tests cover I2V (image-to-video) and T2V (text-to-video) generation
@@ -19,8 +19,8 @@ import pytest
 import torch
 from PIL import Image
 
-from tests.helpers.env import DeviceMemoryMonitor
 from tests.helpers.mark import hardware_test
+from tests.helpers.monitor import DeviceMemoryMonitor
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
@@ -91,7 +91,7 @@ def _create_test_image(width: int = WIDTH, height: int = HEIGHT) -> Image.Image:
     return Image.fromarray(arr)
 
 
-def _generate_i2v_video(omni_runner_handler, prompt: str = "A cat sitting on a table, smooth motion") -> tuple:
+def _generate_i2v_video(offline_client, prompt: str = "A cat sitting on a table, smooth motion") -> tuple:
     """Generate one I2V video, return (frames, peak_memory_mb)."""
     gc.collect()
     current_omni_platform.empty_cache()
@@ -101,7 +101,7 @@ def _generate_i2v_video(omni_runner_handler, prompt: str = "A cat sitting on a t
     monitor.start()
 
     image = _create_test_image()
-    response = omni_runner_handler.send_diffusion_request(
+    response = offline_client.send_diffusion_request(
         {
             "prompt": prompt,
             "images": image,
@@ -112,7 +112,7 @@ def _generate_i2v_video(omni_runner_handler, prompt: str = "A cat sitting on a t
     peak = monitor.peak_used_mb
     monitor.stop()
 
-    assert response.success, f"Request failed: {response.error_message}"
+    assert response.success, "Request failed"
     assert response.images is not None and len(response.images) > 0, "Expected image output"
     frames = response.images[0]
 
@@ -122,7 +122,7 @@ def _generate_i2v_video(omni_runner_handler, prompt: str = "A cat sitting on a t
     return frames, peak
 
 
-def _generate_t2v_video(omni_runner_handler, prompt: str = "A cat sitting on a table") -> tuple:
+def _generate_t2v_video(offline_client, prompt: str = "A cat sitting on a table") -> tuple:
     """Generate one T2V video, return (frames, peak_memory_mb)."""
     gc.collect()
     current_omni_platform.empty_cache()
@@ -131,7 +131,7 @@ def _generate_t2v_video(omni_runner_handler, prompt: str = "A cat sitting on a t
     monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
     monitor.start()
 
-    response = omni_runner_handler.send_diffusion_request(
+    response = offline_client.send_diffusion_request(
         {
             "prompt": prompt,
             "sampling_params": _sampling_params_t2v(),
@@ -141,7 +141,7 @@ def _generate_t2v_video(omni_runner_handler, prompt: str = "A cat sitting on a t
     peak = monitor.peak_used_mb
     monitor.stop()
 
-    assert response.success, f"Request failed: {response.error_message}"
+    assert response.success, "Request failed"
     assert response.images is not None and len(response.images) > 0, "Expected image output"
     frames = response.images[0]
 
@@ -158,9 +158,9 @@ def _generate_t2v_video(omni_runner_handler, prompt: str = "A cat sitting on a t
 
 @hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize("omni_runner", quant_i2v_params, indirect=True)
-def test_wan22_i2v_autoround_w4a16_generates_video(omni_runner, omni_runner_handler):
+def test_wan22_i2v_autoround_w4a16_generates_video(omni_runner, offline_client):
     """Load the W4A16 quantized Wan2.2 I2V model and verify it produces a valid video."""
-    frames, _ = _generate_i2v_video(omni_runner_handler)
+    frames, _ = _generate_i2v_video(offline_client)
 
     assert frames is not None, "Expected video frames output"
     assert hasattr(frames, "shape"), "Expected frames to have a shape attribute"
@@ -182,9 +182,9 @@ def test_wan22_i2v_autoround_w4a16_generates_video(omni_runner, omni_runner_hand
 
 @hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize("omni_runner", quant_t2v_params, indirect=True)
-def test_wan22_t2v_autoround_w4a16_generates_video(omni_runner, omni_runner_handler):
+def test_wan22_t2v_autoround_w4a16_generates_video(omni_runner, offline_client):
     """Load the W4A16 quantized Wan2.2 T2V model and verify it produces a valid video."""
-    frames, _ = _generate_t2v_video(omni_runner_handler)
+    frames, _ = _generate_t2v_video(offline_client)
 
     assert frames is not None, "Expected video frames output"
     assert hasattr(frames, "shape"), "Expected frames to have a shape attribute"
@@ -204,9 +204,9 @@ def test_wan22_t2v_autoround_w4a16_generates_video(omni_runner, omni_runner_hand
 
 @hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize("omni_runner", quant_i2v_params, indirect=True)
-def test_wan22_i2v_autoround_w4a16_quant_peak(omni_runner, omni_runner_handler):
+def test_wan22_i2v_autoround_w4a16_quant_peak(omni_runner, offline_client):
     """Measure peak GPU memory of W4A16 quantized I2V model."""
-    frames, peak = _generate_i2v_video(omni_runner_handler)
+    frames, peak = _generate_i2v_video(offline_client)
 
     assert frames is not None, "Expected video frames output"
     _memory_results["quant_i2v"] = peak
@@ -220,9 +220,9 @@ def test_wan22_i2v_autoround_w4a16_quant_peak(omni_runner, omni_runner_handler):
 
 @hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize("omni_runner", baseline_i2v_params, indirect=True)
-def test_wan22_i2v_autoround_w4a16_baseline_peak(omni_runner, omni_runner_handler):
+def test_wan22_i2v_autoround_w4a16_baseline_peak(omni_runner, offline_client):
     """Measure peak GPU memory of BF16 baseline I2V model."""
-    frames, peak = _generate_i2v_video(omni_runner_handler)
+    frames, peak = _generate_i2v_video(offline_client)
 
     assert frames is not None, "Expected video frames output"
     _memory_results["baseline_i2v"] = peak
@@ -261,9 +261,9 @@ def test_wan22_i2v_autoround_w4a16_memory_savings():
 
 @hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize("omni_runner", quant_t2v_params, indirect=True)
-def test_wan22_t2v_autoround_w4a16_quant_peak(omni_runner, omni_runner_handler):
+def test_wan22_t2v_autoround_w4a16_quant_peak(omni_runner, offline_client):
     """Measure peak GPU memory of W4A16 quantized T2V model."""
-    frames, peak = _generate_t2v_video(omni_runner_handler)
+    frames, peak = _generate_t2v_video(offline_client)
 
     assert frames is not None, "Expected video frames output"
     _memory_results["quant_t2v"] = peak
@@ -277,9 +277,9 @@ def test_wan22_t2v_autoround_w4a16_quant_peak(omni_runner, omni_runner_handler):
 
 @hardware_test(res={"cuda": "H100"})
 @pytest.mark.parametrize("omni_runner", baseline_t2v_params, indirect=True)
-def test_wan22_t2v_autoround_w4a16_baseline_peak(omni_runner, omni_runner_handler):
+def test_wan22_t2v_autoround_w4a16_baseline_peak(omni_runner, offline_client):
     """Measure peak GPU memory of BF16 baseline T2V model."""
-    frames, peak = _generate_t2v_video(omni_runner_handler)
+    frames, peak = _generate_t2v_video(offline_client)
 
     assert frames is not None, "Expected video frames output"
     _memory_results["baseline_t2v"] = peak

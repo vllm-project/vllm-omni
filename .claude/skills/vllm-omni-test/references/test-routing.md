@@ -79,7 +79,7 @@ E2E (L2+) should not rely on mocks unless documenting a rare exception; prefer r
    - `full_model` — L4 nightly (`test-nightly.yml`); some expansion tests still carry both `advanced_model` and `full_model` during migration
 2. **Model type** (pick one): `omni`, `tts`, or `diffusion`
 3. **Cross-cutting** when relevant: `parallel`, `cache`, `example`, `benchmark`
-4. **Hardware**: `cpu`, `cuda`, `rocm`, `npu`, `L4`, `H100`, `distributed_cuda`, …
+4. **Hardware**: `cpu`, `cuda`, `rocm`, `npu`, `L4`, `H100`, `cards_1`, …
 5. Multi-card: `@hardware_test(...)` in `tests/helpers/mark.py`
 
 ## Command Templates
@@ -244,7 +244,7 @@ pytest -s -v dfx/reliability/invalid_param_test/test_invalid_image_generation.py
 
 ```bash
 cd tests
-pytest -s -v -m "core_model and distributed_cuda and L4" --run-level=core_model
+pytest -s -v -m "core_model and L4 and not cards_1" --run-level=core_model
 ```
 
 ### Concrete e2e paths (common in-tree)
@@ -279,7 +279,7 @@ When adding or modifying tests, do not stop at “where the file lives” — al
 4. **API client + assert placement**: **General** validation → implement in `assertions.py`, call **inside** `send_*_request` in `runtime.py`; tests call **`send_*_request` only**. **Special** case validation → `assert_*` in `assertions.py`, called **in the test** after `send_*_request`. Low-level `send_*_http_request` is for negative/dfx tests (`err_code`), not ordinary L2+ success e2e.
 5. **Shared assertions**: logic in **`tests/helpers/assertions.py`**; general checks inside `send_*_request`; special checks only in the test. No `_assert_*` in `test_*.py`.
 6. **One case → one `test_*`**: function name reflects what is validated; no `if case_id == ...` mega-test merging multiple scenarios.
-7. **Fixture scope**: default **`omni_server` + `openai_client`** / **`omni_runner` + `omni_runner_handler`** (module). Use **`omni_server_function` + `openai_client_function`** / **`omni_runner_function` + `omni_runner_handler_function`** only when each `test_*` must spawn a fresh instance. Parametrize name must match fixture (`omni_server` vs `omni_server_function`).
+7. **Fixture scope**: default **`omni_server` + `online_client`** / **`omni_runner` + `offline_client`** (module). Use **`omni_server_function` + `online_client_function`** / **`omni_runner_function` + `offline_client_function`** only when each `test_*` must spawn a fresh instance. Parametrize name must match fixture (`omni_server` vs `omni_server_function`).
 8. **Type marker**: `omni`, `tts`, or `diffusion` on every model e2e module.
 9. **Diffusion L4 Function**: wire `*_expansion.py` into **X2I(&A&T)** or **X2V** **Function Test** in **`test-nightly.yml` only** — do not add `test-merge.yml` unless the user also requested L3.
 10. **Diffusion L4 Perf** (only when requested): add `tests/dfx/perf/tests/test_<slug>_vllm_omni.json` + **Perf Test · &lt;Model&gt;** step (artifact upload); not part of “L4 functional cases” by default.

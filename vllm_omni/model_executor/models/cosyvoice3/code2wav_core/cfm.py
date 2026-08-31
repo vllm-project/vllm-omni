@@ -148,9 +148,9 @@ class ConditionalCFM(BASECFM):
             # ``.contiguous().data_ptr()`` could free the temp -> dangling ptr).
             io_dtype = getattr(self.estimator, "io_dtype", x.dtype)
             [estimator, stream], trt_engine = self.estimator.acquire_estimator()
-            # NOTE need to synchronize when switching stream
-            torch.cuda.current_stream().synchronize()
-            with stream:
+            caller_stream = torch.cuda.current_stream(x.device)
+            stream.wait_stream(caller_stream)
+            with torch.cuda.stream(stream):
                 x_e = x.to(io_dtype).contiguous()
                 mask_e = mask.to(io_dtype).contiguous()
                 mu_e = mu.to(io_dtype).contiguous()
@@ -176,8 +176,13 @@ class ConditionalCFM(BASECFM):
                 for i, j in enumerate(data_ptrs):
                     estimator.set_tensor_address(trt_engine.get_tensor_name(i), j)
                 # run trt engine
-                assert estimator.execute_async_v3(torch.cuda.current_stream().cuda_stream) is True
-                torch.cuda.current_stream().synchronize()
+                assert estimator.execute_async_v3(stream.cuda_stream) is True
+                for tensor in (x_e, mask_e, mu_e, t_e, spks_e, cond_e, out_e):
+                    if tensor.is_cuda:
+                        tensor.record_stream(stream)
+            caller_stream.wait_stream(stream)
+            if out_e.is_cuda:
+                out_e.record_stream(caller_stream)
             self.estimator.release_estimator(estimator, stream)
             return out_e.to(x.dtype)
 

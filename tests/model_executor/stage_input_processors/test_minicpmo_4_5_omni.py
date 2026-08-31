@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from types import SimpleNamespace
 
 import pytest
@@ -131,6 +134,7 @@ def test_native_duplex_speak_segment_reaches_split_talker() -> None:
     assert converted["prompt_token_ids"] == [0, 0, 0]
     assert info["meta"]["replace_streaming_prompt"] is True
     assert info["meta"]["next_stage_prompt_len"] == 3
+    assert info["meta"]["next_stage_generation_tokens"] == 26
     assert info["meta"]["turn_start"] is True
     assert info["meta"]["segment_end"] is True
     assert info["duplex"]["epoch"] == 3
@@ -203,6 +207,7 @@ def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:
     assert "replace_streaming_prompt" not in second_input["model_intermediate_buffer"]["meta"]
     assert third_input["model_intermediate_buffer"]["meta"]["replace_streaming_prompt"] is True
     assert second_input["model_intermediate_buffer"]["meta"]["next_stage_prompt_len"] == 3
+    assert second_input["model_intermediate_buffer"]["meta"]["next_stage_generation_tokens"] == 26
     assert second_input["prompt_token_ids"] == [0, 0, 0]
 
 

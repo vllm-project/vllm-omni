@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for DFX runner metadata field exclusion."""
 
 import json
@@ -105,7 +108,7 @@ def test_resolve_pytest_marks_hardware_dict_with_extra():
     assert "H100" in names
     assert "cuda" in names
     assert "gpu" in names
-    assert "distributed_cuda" in names
+    assert "cards_2" in names
     assert "full_model" in names
     assert "diffusion" in names
     assert "local_model" in names
@@ -510,5 +513,43 @@ def test_omni_duplex_expected_audio_turns_rejects_incomplete_session():
                 "duplex_session_metrics": [{"audio_turn_count": 3}],
             },
             {"expected_duplex_audio_turns_per_session": 4},
+            1,
+        )
+
+
+def test_omni_tpot_baseline_accepts_measured_finite_sample():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result(
+        {
+            "completed": 1,
+            "Hardware": "H100",
+            "num_tpot_samples": 1,
+            "mean_tpot_ms": 10.0,
+        },
+        {"baseline": {"H100": {"mean_tpot_ms": 20.0}}},
+        1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_tpot_samples", "mean_tpot_ms", "match"),
+    [
+        (0, float("nan"), "no measurable TPOT samples"),
+        (1, float("nan"), "mean_tpot_ms is not finite"),
+    ],
+)
+def test_omni_tpot_baseline_rejects_missing_or_nonfinite_sample(num_tpot_samples, mean_tpot_ms, match):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match=match):
+        assert_result(
+            {
+                "completed": 1,
+                "Hardware": "H100",
+                "num_tpot_samples": num_tpot_samples,
+                "mean_tpot_ms": mean_tpot_ms,
+            },
+            {"baseline": {"H100": {"mean_tpot_ms": 20.0}}},
             1,
         )

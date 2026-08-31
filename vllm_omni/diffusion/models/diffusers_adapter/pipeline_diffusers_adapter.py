@@ -23,7 +23,11 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from torch import nn
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import BasePipelineUtils, get_pipeline_utils
+from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import (
+    BasePipelineUtils,
+    get_pipeline_utils_for_config,
+    resolve_diffusers_pipeline_class,
+)
 from vllm_omni.diffusion.models.diffusers_adapter.quantization_utils import (
     apply_diffusers_quantization_config,
     convert_diffusers_quantization_config,
@@ -117,9 +121,7 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         }
         convert_diffusers_quantization_config(load_kwargs)
 
-        pipeline_class = self.od_config.diffusers_pipeline_cls
-        pipeline_class_name = pipeline_class.__name__ if pipeline_class is not None else None
-        self._pipeline_utils = get_pipeline_utils(pipeline_class_name)
+        self._pipeline_utils = get_pipeline_utils_for_config(self.od_config)
         self._pipeline_utils.update_load_kwargs(self.od_config, load_kwargs)
         component_names = (
             self._load_diffusers_component_names(model_id, load_kwargs)
@@ -129,7 +131,7 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         apply_diffusers_quantization_config(self.od_config, load_kwargs, component_names)
         logger.debug(f"Loading diffusers pipeline with kwargs: {load_kwargs}")
 
-        self._pipeline = DiffusionPipeline.from_pretrained(model_id, **load_kwargs)
+        self._pipeline = self._load_pipeline_from_pretrained(model_id, load_kwargs)
         self._pipeline_utils.apply_post_load_updates(self._pipeline, self.od_config)
 
         self._pipeline.to(self.device)
@@ -161,6 +163,23 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         # Attention backend
         self._set_attention_backend()
+
+    def _load_pipeline_from_pretrained(
+        self,
+        model_id: str,
+        load_kwargs: dict[str, Any],
+    ) -> DiffusionPipeline:
+        pipeline_class = resolve_diffusers_pipeline_class(self.od_config)
+        configured_pipeline_class = self.od_config.diffusers_pipeline_cls
+        # Preserve DiffusionPipeline's normal dynamic class resolution unless
+        # a model-specific adapter hook explicitly selected another class.
+        loader_class = (
+            pipeline_class
+            if pipeline_class is not None and pipeline_class is not configured_pipeline_class
+            else DiffusionPipeline
+        )
+        logger.info("Loading Diffusers pipeline class %s", loader_class.__name__)
+        return loader_class.from_pretrained(model_id, **load_kwargs)
 
     # ------------------------------------------------------------------
     # Step-wise execution — explicitly rejected
@@ -375,6 +394,13 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 continue
             if self._accept_call_kwargs is None or key in self._accept_call_kwargs:
                 kwargs[key] = value
+
+        self._pipeline_utils.update_call_kwargs(
+            req,
+            sampling,
+            self._accept_call_kwargs,
+            kwargs,
+        )
 
         # Special format fields in sampling params
         if output_type := sampling.output_type or self.od_config.output_type:

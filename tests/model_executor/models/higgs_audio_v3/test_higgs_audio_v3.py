@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Deterministic unit tests for higgs-audio v3.
 
 These tests verify AC-1 (config), AC-3 (prompt), AC-4 (fused modules),
@@ -343,7 +344,22 @@ class TestSamplerMethods:
         return t
 
     @staticmethod
-    def _sampling_metadata(temperature=1.0, top_k=50, top_p=0.95):
+    def _make_state_tracking_talker(num_rows):
+        from vllm_omni.model_executor.models.higgs_audio_v3 import higgs_audio_v3_talker as mod
+
+        talker_cls = mod.HiggsAudioV3TalkerForConditionalGeneration
+        talker = talker_cls.__new__(talker_cls)
+        torch.nn.Module.__init__(talker)
+        talker.num_codebooks = 8
+        talker._decode_last_codes = torch.zeros(num_rows, 8, dtype=torch.long)
+        talker._decode_has_codes = torch.zeros(num_rows, dtype=torch.bool)
+        talker._decode_delay_count = torch.zeros(num_rows, dtype=torch.long)
+        talker._decode_eoc_countdown = torch.full((num_rows,), -1, dtype=torch.long)
+        talker._decode_generation_done = torch.zeros(num_rows, dtype=torch.bool)
+        return talker
+
+    @staticmethod
+    def _sampling_metadata(temperature=1.0, top_k=50, top_p=0.95, generators=None):
         return type(
             "SamplingMetadata",
             (),
@@ -352,8 +368,15 @@ class TestSamplerMethods:
                 "top_k": top_k,
                 "top_p": top_p,
                 "all_greedy": temperature is None,
+                "generators": generators or {},
             },
         )()
+
+    @staticmethod
+    def _seeded_generator(seed):
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(seed)
+        return generator
 
     def test_sample_respects_mask(self):
         """Tokens masked to -inf must never be sampled."""
@@ -441,6 +464,51 @@ class TestSamplerMethods:
         torch.testing.assert_close(seen[0][2], seen[0][3])
         assert torch.count_nonzero(seen[0][0]).item() == 1
         assert torch.count_nonzero(seen[0][2]).item() > 1
+
+    def test_seeded_sampling_is_batch_independent(self):
+        t = self._make_minimal_talker()
+        num_codebooks = 8
+        torch.manual_seed(123)
+        first_logits = torch.randn(num_codebooks, 64)
+        second_logits = torch.randn(num_codebooks, 64)
+        filler_logits = torch.randn(num_codebooks, 64)
+        reference_generator = self._seeded_generator(42)
+        batched_generators = {
+            1: self._seeded_generator(42),
+            2: self._seeded_generator(42),
+        }
+
+        reference_first = t._sample_audio_codes(
+            first_logits,
+            self._sampling_metadata(generators={0: reference_generator}),
+            num_codebooks=num_codebooks,
+        )
+        batched_first = t._sample_audio_codes(
+            torch.cat([filler_logits, first_logits, first_logits]),
+            self._sampling_metadata(generators=batched_generators),
+            num_codebooks=num_codebooks,
+        )
+        assert torch.equal(reference_first, batched_first[num_codebooks : 2 * num_codebooks])
+        assert torch.equal(reference_first, batched_first[2 * num_codebooks :])
+
+        reference_second = t._sample_audio_codes(
+            second_logits,
+            self._sampling_metadata(generators={0: reference_generator}),
+            num_codebooks=num_codebooks,
+        )
+        condensed_second = t._sample_audio_codes(
+            torch.cat([second_logits, second_logits]),
+            self._sampling_metadata(
+                generators={
+                    0: batched_generators[1],
+                    1: batched_generators[2],
+                }
+            ),
+            num_codebooks=num_codebooks,
+        )
+
+        assert torch.equal(reference_second, condensed_second[:num_codebooks])
+        assert torch.equal(reference_second, condensed_second[num_codebooks:])
 
     def test_delay_masking_forces_boc_during_delay(self):
         """During delay phase, codebooks beyond delay_count must have only BOC allowed."""
@@ -677,6 +745,58 @@ class TestSamplerMethods:
         assert not t._decode_has_codes[2:5].any()
         assert not t._decode_generation_done[2:5].any()
         assert t._decode_eoc_countdown[2:5].eq(-1).all()
+
+    def test_decode_state_follows_request_after_batch_condensation(self):
+        talker = self._make_state_tracking_talker(3)
+
+        talker._sync_decode_state_with_batch(["A", "B", "C"])
+        c_codes = torch.arange(300, 308)
+        talker._decode_last_codes[:] = torch.stack((torch.arange(100, 108), torch.zeros(8, dtype=torch.long), c_codes))
+        talker._decode_has_codes[:] = torch.tensor([True, False, True])
+        talker._decode_delay_count[:] = torch.tensor([3, 0, 8])
+
+        talker.on_requests_finished({"B"})
+        talker._sync_decode_state_with_batch(["A", "C"])
+
+        assert talker._decode_has_codes[1].item() is True
+        assert talker._decode_delay_count[1].item() == 8
+        assert torch.equal(talker._decode_last_codes[1], c_codes)
+
+    def test_finished_request_state_is_cleared_before_pool_slot_reuse(self):
+        talker = self._make_state_tracking_talker(1)
+
+        talker._sync_decode_state_with_batch(["finished"])
+        talker._decode_has_codes[0] = True
+        talker._decode_last_codes[0] = 7
+        talker._decode_delay_count[0] = 5
+        talker._decode_eoc_countdown[0] = 0
+        talker._decode_generation_done[0] = True
+        talker.on_requests_finished({"finished"})
+        talker._sync_decode_state_with_batch(["new"])
+
+        assert talker._decode_has_codes[0].item() is False
+        assert talker._decode_last_codes[0].eq(0).all()
+        assert talker._decode_delay_count[0].item() == 0
+        assert talker._decode_eoc_countdown[0].item() == -1
+        assert talker._decode_generation_done[0].item() is False
+
+    def test_finished_request_state_is_cleared_when_request_id_is_reused(self):
+        talker = self._make_state_tracking_talker(1)
+
+        talker._sync_decode_state_with_batch(["request"])
+        talker._decode_has_codes[0] = True
+        talker._decode_last_codes[0] = 7
+        talker._decode_delay_count[0] = 5
+        talker._decode_eoc_countdown[0] = 0
+        talker._decode_generation_done[0] = True
+        talker.on_requests_finished({"request"})
+        talker._sync_decode_state_with_batch(["request"])
+
+        assert talker._decode_has_codes[0].item() is False
+        assert talker._decode_last_codes[0].eq(0).all()
+        assert talker._decode_delay_count[0].item() == 0
+        assert talker._decode_eoc_countdown[0].item() == -1
+        assert talker._decode_generation_done[0].item() is False
 
     def test_mixed_batch_prefill_mask_targets_request_rows(self):
         """Mixed prefill/decode must reset only prefill request rows."""

@@ -2000,8 +2000,12 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         if codes_lengths is None:
             codes_lengths = torch.full((B,), T, device=device, dtype=torch.long)
 
-        # Keep eager execution and CUDA Graph capture on the same BF16 path.
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+        # Keep eager execution and CUDA/NPU Graph capture on the same BF16 path.
+        # Autocast is required on NPU because #5235's decode-LUT uses .float()
+        # for precision, producing float32 embeddings.  Without autocast, these
+        # float32 tensors flow into bf16 LayerNorm weights and NPU's aclnnLayerNorm
+        # rejects the mixed dtype (CUDA auto-casts; NPU does not).
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type != "cpu"):
             quantizer = cast(MossAudioTokenizerResidualVQ | MossAudioTokenizerResidualLFQ, self.quantizer)
             zq = quantizer.decode_codes(codes)
 

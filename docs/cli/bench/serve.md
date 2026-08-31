@@ -2,7 +2,7 @@
 The vllm bench command launches the vLLM-Omni benchmark to evaluate the performance of multimodal models.
 
 ## Notes
-vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, and `daily-omni` serving benchmark backends.
+vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, and `openai-realtime-duplex` serving benchmark backends. It also adds the `omniinteract` dataset.
 
 ## Basic Parameter Description
 You can use `vllm bench serve --omni --help=all` to get descriptions of all parameters. The commonly used parameters are described below:
@@ -10,7 +10,7 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
   Enable Omni (multimodal) mode, supporting multimodal inputs and outputs such as images, videos, and audio.
 
 - `--backend`
-  Specify the backend adapter. vLLM-Omni adds `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, and `daily-omni` to the upstream vLLM backend choices.
+  Specify the backend adapter. vLLM-Omni adds `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, and `openai-realtime-duplex` to the upstream vLLM backend choices.
 
 - `--model`
   The model identifier to load, filled according to the models supported by vLLM-Omni.
@@ -19,7 +19,7 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
   The API endpoint exposed externally, to which clients send their requests.
 
 - `--dataset-name`
-  The name of the dataset used; random-mm indicates generating random multimodal inputs (images, videos, audio).
+  The name of the dataset used; random-mm indicates generating random multimodal inputs (images, videos, audio), while `omniinteract` replays official OmniInteract videos.
 
 - `--num-prompts`
   The total number of requests to send, an integer.
@@ -268,6 +268,44 @@ Notes:
 We use audio generation time / audio duration to calculate RTF.
 
 </details>
+
+### OmniInteract Realtime Benchmark
+
+OmniInteract runs each video as one native-duplex WebSocket sample in the standard serving-benchmark lifecycle:
+
+```bash
+vllm bench serve --omni \
+  --backend openai-realtime-duplex \
+  --dataset-name omniinteract \
+  --dataset-path /path/to/OmniInteract \
+  --model openbmb/MiniCPM-o-4_5 \
+  --base-url http://127.0.0.1:8000 \
+  --endpoint /v1/realtime \
+  --omniinteract-ref-audio /path/to/reference.wav \
+  --omniinteract-output-dir ./omniinteract-artifacts \
+  --num-prompts 3 \
+  --num-warmups 0
+```
+
+`--dataset-path` accepts an extracted directory, `data.tar[.gz]`, or a Hugging Face dataset ID; omitting it uses
+`lucky-lance/OmniInteract`. `--num-prompts` is the total across subsets and defaults to 3 for OmniInteract; explicit `0`
+selects all and oversize values use all available cases. Reference audio is required, and OmniInteract uses the
+`/v1/realtime` endpoint.
+
+Audio is replayed as 16 kHz PCM16 in 200 ms chunks and video at 1 FPS with real-time pacing. All selected media is decoded
+before timing and remains in client memory for the run, so `--max-concurrency` does not limit media preparation memory; use
+explicit `--num-prompts 0` only when the client has enough RAM for the full dataset. Media commands are bounded by
+`--omniinteract-media-timeout-s`, and concurrency defaults to 1. Standard request-rate, warmup, result-saving, and summary
+options apply. Use `--omniinteract-require-response` only for functional E2E cases; LISTEN is a valid benchmark result.
+
+Each completed case writes `output.wav`, `wav_transcript.json`, `events.json`, `result.json`, and a final `.done` marker under
+`--omniinteract-output-dir`. The root also contains `batch_summary.json` and `official_eval_manifest.jsonl`; failed cases write
+`.failed.json`. Runs sharing one output root are serialized. Completion validates transport, response lifecycle, and artifacts,
+not answer accuracy. Transcript timestamps are serialized playback-queue times. Clipped or cancelled outputs are ineligible and
+omitted from the official manifest; `audio_clipped_bytes` records output beyond the rounded video horizon.
+
+TTFT, TTFP, and RTF start at client receipt of `response.created`. TPOT/ITL use engine stage-0 timing; ITL is emitted only when
+every token interval is present.
 
 ### Multi-Modal Benchmark
 

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import gc
@@ -12,7 +15,7 @@ from PIL import Image
 
 from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
 from tests.e2e.accuracy.helpers import assert_images_pixel_close, assert_similarity, model_output_dir
-from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
+from tests.helpers.clean import cleanup_test_environment
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServer
@@ -109,7 +112,7 @@ def _run_diffusers_image_edit(
     input_images: list[Image.Image],
     output_path: Path,
 ) -> Image.Image:
-    run_pre_test_cleanup()
+    cleanup_test_environment()
     pipe: QwenImageEditPipeline | QwenImageEditPlusPipeline | None = None
     try:
         images = input_images[0] if len(input_images) == 1 else input_images
@@ -140,7 +143,7 @@ def _run_diffusers_image_edit(
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup()
+        cleanup_test_environment()
 
 
 def _load_edit_2511_input_images() -> list[Image.Image]:
@@ -189,7 +192,7 @@ def _run_diffusers_image_edit_2511(
     input_images: list[Image.Image],
     output_path: Path,
 ) -> Image.Image:
-    run_pre_test_cleanup()
+    cleanup_test_environment()
     pipe: QwenImageEditPlusPipeline | None = None
     try:
         pipe = QwenImageEditPlusPipeline.from_pretrained(
@@ -222,7 +225,7 @@ def _run_diffusers_image_edit_2511(
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup()
+        cleanup_test_environment()
 
 
 def _vllm_omni_output_single_image(

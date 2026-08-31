@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E tests for Qwen3-Omni ModelOpt NVFP4 W4A4 — Marlin fallback path.
 
 Loads the published full-thinker NVFP4 W4A4 checkpoint on H100 (sm_90),
@@ -74,7 +74,7 @@ quant_params = [(QUANTIZED_MODEL, _stage_config())]
 
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
-def test_marlin_fallback_no_nan_collapse(omni_runner, omni_runner_handler):
+def test_marlin_fallback_no_nan_collapse(omni_runner, offline_client):
     """H100 Marlin FP4 fallback: text in -> coherent text out.
 
     On H100 the upstream NVFP4 PWAL routes through
@@ -89,7 +89,7 @@ def test_marlin_fallback_no_nan_collapse(omni_runner, omni_runner_handler):
     degenerate-output signature that indicates NaN propagation through
     the FP4 GEMM.
     """
-    response = omni_runner_handler.send_omni_request({"prompts": "Why is the sky blue?", "modalities": ["text"]})
+    response = offline_client.send_omni_request({"prompts": "Why is the sky blue?", "modalities": ["text"]})
     assert response.success, "request failed"
     text = (response.text_content or "").strip()
     assert text, "empty response — likely server returned only EOS"

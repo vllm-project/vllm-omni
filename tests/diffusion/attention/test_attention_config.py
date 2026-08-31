@@ -11,6 +11,7 @@ Tests cover:
 """
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -101,7 +102,12 @@ class TestAttentionSpec:
     def test_block_sparse_defaults_applied_when_backend_selected(self):
         spec = AttentionSpec(backend="RAINFUSION_ATTN")
         assert spec.block_sparse.sparsity == 0.8
-        assert spec.backend_kwargs() == {"sparsity": 0.8, "start_step": 0}
+        assert spec.backend_kwargs() == {
+            "sparsity": 0.8,
+            "start_step": 0,
+            "end_step": 0,
+            "precision": "bf16",
+        }
 
     def test_block_sparse_skip_layers_selector_expanded(self):
         spec = AttentionSpec(
@@ -112,6 +118,8 @@ class TestAttentionSpec:
         assert spec.backend_kwargs() == {
             "sparsity": 0.9,
             "start_step": 12,
+            "end_step": 0,
+            "precision": "bf16",
             "skip_layers": [0, 1, 2, 38],
         }
 
@@ -121,11 +129,43 @@ class TestAttentionSpec:
 
     @pytest.mark.parametrize(
         "block_sparse",
-        [{"sparsity": 1.5}, {"start_step": -1}],
+        [{"sparsity": 1.5}, {"start_step": -1}, {"end_step": -1}, {"precision": "bogus"}],
     )
     def test_block_sparse_invalid_values(self, block_sparse):
         with pytest.raises(ValueError):
             AttentionSpec(backend="RAINFUSION_ATTN", block_sparse=block_sparse)
+
+    def test_block_sparse_end_step_precision_forwarded(self):
+        spec = AttentionSpec(
+            backend="RAINFUSION_ATTN",
+            block_sparse={"sparsity": 0.9, "start_step": 5, "end_step": 3, "precision": "fp8"},
+        )
+        assert spec.backend_kwargs() == {
+            "sparsity": 0.9,
+            "start_step": 5,
+            "end_step": 3,
+            "precision": "fp8",
+        }
+
+    def test_block_sparse_precision_enum_input_normalized(self):
+        """RainFusionPrecision enum members must normalize to their string value.
+
+        Regression: the str,Enum members passed the value check but str() later
+        produced "RainFusionPrecision.MIX" instead of "mix" (StrEnum fixes it).
+        """
+        from vllm_omni.diffusion.attention.backends.rainfusion_attn import RainFusionConfig
+        from vllm_omni.diffusion.data import RainFusionPrecision
+
+        spec = AttentionSpec(
+            backend="RAINFUSION_ATTN",
+            block_sparse={"sparsity": 0.8, "precision": RainFusionPrecision.MIX},
+        )
+        kwargs = spec.backend_kwargs()
+        assert kwargs["precision"] == "mix"
+        # The config path is where str(value) used to mangle enum members.
+        cfg = RainFusionConfig.from_backend_kwargs(kwargs)
+        assert cfg.precision == "mix"
+        assert type(cfg.precision) is str
 
 
 class TestAttentionConfig:
@@ -427,6 +467,120 @@ class TestCurrentDiffusionConfig:
 
 
 class TestAttentionInitUsesCurrentDiffusionConfig:
+    @pytest.mark.parametrize("mindiesd_available", [False, True])
+    def test_paged_npu_memory_profile_uses_sdpa_only_without_mindiesd(self, monkeypatch, mindiesd_available):
+        attention = Attention.__new__(Attention)
+        attention._scheduler_paged_kv = True
+        attention.paged_kv_cache_role = "primary"
+        attention.backend_pref = "FLASH_ATTN"
+        attention.attn_backend = SimpleNamespace(supports_piecewise_spans=True, get_name=lambda: "FLASH_ATTN")
+        flash_output = torch.ones(1)
+        sdpa_output = torch.zeros(1)
+        dense_flash = Mock(return_value=flash_output)
+        sdpa = Mock(return_value=sdpa_output)
+        attention.attention = SimpleNamespace(forward=dense_flash)
+        attention.sdpa_fallback = SimpleNamespace(forward=sdpa)
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: True)
+        monkeypatch.setattr(
+            layer_mod,
+            "get_forward_context",
+            lambda: SimpleNamespace(in_diffusion_kv_memory_profile=True),
+        )
+        monkeypatch.setattr(layer_mod.current_omni_platform, "is_npu", lambda: True)
+        monkeypatch.setattr(
+            layer_mod.current_omni_platform,
+            "supports_diffusion_dense_flash_attention",
+            lambda: mindiesd_available,
+        )
+
+        result = attention._run_local_attention(
+            torch.zeros(1, dtype=torch.bfloat16),
+            torch.zeros(1, dtype=torch.bfloat16),
+            torch.zeros(1, dtype=torch.bfloat16),
+            AttentionMetadata(),
+        )
+
+        if mindiesd_available:
+            assert result is flash_output
+            dense_flash.assert_called_once()
+            sdpa.assert_not_called()
+        else:
+            assert result is sdpa_output
+            dense_flash.assert_not_called()
+            sdpa.assert_called_once()
+
+    def test_dense_flash_import_error_is_not_reclassified(self, monkeypatch):
+        attention = Attention.__new__(Attention)
+        attention._scheduler_paged_kv = False
+        attention.paged_kv_cache_role = "primary"
+        attention.backend_pref = "FLASH_ATTN"
+        attention.attn_backend = SimpleNamespace(supports_piecewise_spans=True, get_name=lambda: "FLASH_ATTN")
+        attention.attention = SimpleNamespace(
+            forward=Mock(side_effect=ModuleNotFoundError("No module named 'mindiesd'", name="mindiesd"))
+        )
+        attention.sdpa_fallback = SimpleNamespace(forward=Mock(side_effect=AssertionError("must not fall back")))
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: False)
+
+        with pytest.raises(ModuleNotFoundError, match="mindiesd"):
+            attention._run_local_attention(
+                torch.zeros(1, dtype=torch.bfloat16),
+                torch.zeros(1, dtype=torch.bfloat16),
+                torch.zeros(1, dtype=torch.bfloat16),
+                AttentionMetadata(),
+            )
+
+    def test_paged_marker_does_not_change_dense_backend(self, monkeypatch):
+        class _FakeAttentionImpl:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def forward(self, query, key, value, attn_metadata=None):
+                return query
+
+        class _DenseBackend:
+            supports_paged_kv = False
+
+            @staticmethod
+            def get_name() -> str:
+                return "TORCH_SDPA"
+
+            @staticmethod
+            def get_impl_cls():
+                return _FakeAttentionImpl
+
+        calls = []
+
+        def _fake_get_attn_backend_for_role(*args, **kwargs):
+            calls.append((args, kwargs))
+            return _DenseBackend, None
+
+        monkeypatch.setattr(layer_mod, "get_attn_backend_for_role", _fake_get_attn_backend_for_role)
+        monkeypatch.setattr(layer_mod.SDPABackend, "get_impl_cls", staticmethod(lambda: _FakeAttentionImpl))
+        monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: object())
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: False)
+
+        od_config = SimpleNamespace(
+            diffusion_attention_config=AttentionConfig(),
+            diffusion_kv_mode=layer_mod.DiffusionKVCacheMode.DENSE_LEGACY,
+            parallel_config=SimpleNamespace(ring_degree=1),
+            diffusion_kv_cache_dtype=None,
+            diffusion_kv_cache_skip_step_indices=None,
+            diffusion_kv_cache_skip_layer_indices=None,
+        )
+
+        with set_current_diffusion_config(od_config):
+            attention = Attention(
+                num_heads=4,
+                head_size=64,
+                causal=False,
+                softmax_scale=1.0,
+                paged_kv_cache_role="primary",
+            )
+
+        assert len(calls) == 1
+        assert attention.attn_backend is _DenseBackend
+        assert attention.backend_pref is None
+
     def test_attention_init_uses_current_diffusion_config_without_forward_context(self, monkeypatch):
         class _FakeAttentionImpl:
             def __init__(self, **kwargs):

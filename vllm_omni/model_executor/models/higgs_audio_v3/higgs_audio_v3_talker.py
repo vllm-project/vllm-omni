@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage-0 talker for higgs-audio v3 (Qwen3 backbone, fused multi-codebook).
 
 Architecture:
@@ -344,6 +344,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         positions: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         omni_query_start_loc: torch.Tensor | None = None,
+        req_ids: list[str] | None = None,
         **_: Any,
     ) -> None:
         """Update per-step metadata before runner forward or CUDA graph replay."""
@@ -354,6 +355,91 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 self._ensure_decode_state_capacity(int(input_ids.shape[0]), input_ids.device)
         self._set_last_step_query_start_loc(omni_query_start_loc)
         self._decode_step_metadata_from_runner = True
+
+        if req_ids is not None:
+            self._sync_decode_state_with_batch(req_ids)
+
+    def _ensure_state_pool_capacity(self, num_rows: int, device: torch.device) -> None:
+        if not hasattr(self, "_state_pool_indices"):
+            self._state_pool_indices: dict[str, int] = {}
+            self._free_state_pool_indices: set[int] = set()
+            self._state_pool_has_codes = torch.empty(0, dtype=torch.bool, device=device)
+            self._state_pool_last_codes = torch.empty((0, self.num_codebooks), dtype=torch.long, device=device)
+            self._state_pool_delay_count = torch.empty(0, dtype=torch.long, device=device)
+            self._state_pool_eoc_countdown = torch.empty(0, dtype=torch.long, device=device)
+            self._state_pool_generation_done = torch.empty(0, dtype=torch.bool, device=device)
+
+        current_rows = self._state_pool_has_codes.shape[0]
+        if current_rows >= num_rows:
+            return
+
+        new_rows = max(current_rows * 2, num_rows, 64)
+
+        def resize(tensor: torch.Tensor, fill_value: int | bool) -> torch.Tensor:
+            result = torch.empty((new_rows, *tensor.shape[1:]), dtype=tensor.dtype, device=device)
+            result[:current_rows] = tensor
+            result[current_rows:] = fill_value
+            return result
+
+        self._state_pool_has_codes = resize(self._state_pool_has_codes, False)
+        self._state_pool_last_codes = resize(self._state_pool_last_codes, 0)
+        self._state_pool_delay_count = resize(self._state_pool_delay_count, 0)
+        self._state_pool_eoc_countdown = resize(self._state_pool_eoc_countdown, -1)
+        self._state_pool_generation_done = resize(self._state_pool_generation_done, False)
+
+    def _sync_decode_state_with_batch(self, req_ids: list[str]) -> None:
+        device = self._decode_has_codes.device
+        self._ensure_state_pool_capacity(len(req_ids), device)
+        previous_req_ids = getattr(self, "_last_batch_req_ids", [])
+
+        if previous_req_ids != req_ids or any(req_id not in self._state_pool_indices for req_id in req_ids):
+            previous_rows = [row for row, req_id in enumerate(previous_req_ids) if req_id in self._state_pool_indices]
+            if previous_rows:
+                pool_rows = [self._state_pool_indices[previous_req_ids[row]] for row in previous_rows]
+                src = torch.tensor(previous_rows, dtype=torch.long, device=device)
+                dst = torch.tensor(pool_rows, dtype=torch.long, device=device)
+                self._state_pool_has_codes[dst] = self._decode_has_codes[src]
+                self._state_pool_last_codes[dst] = self._decode_last_codes[src]
+                self._state_pool_delay_count[dst] = self._decode_delay_count[src]
+                self._state_pool_eoc_countdown[dst] = self._decode_eoc_countdown[src]
+                self._state_pool_generation_done[dst] = self._decode_generation_done[src]
+
+            for req_id in req_ids:
+                if req_id in self._state_pool_indices:
+                    continue
+                if self._free_state_pool_indices:
+                    pool_row = self._free_state_pool_indices.pop()
+                else:
+                    pool_row = len(self._state_pool_indices)
+                    self._ensure_state_pool_capacity(pool_row + 1, device)
+                self._state_pool_indices[req_id] = pool_row
+                self._state_pool_has_codes[pool_row] = False
+                self._state_pool_last_codes[pool_row] = 0
+                self._state_pool_delay_count[pool_row] = 0
+                self._state_pool_eoc_countdown[pool_row] = -1
+                self._state_pool_generation_done[pool_row] = False
+
+            self._ensure_decode_state_capacity(len(req_ids), device)
+            pool_rows = torch.tensor(
+                [self._state_pool_indices[req_id] for req_id in req_ids],
+                dtype=torch.long,
+                device=device,
+            )
+            self._decode_has_codes[: len(req_ids)] = self._state_pool_has_codes[pool_rows]
+            self._decode_last_codes[: len(req_ids)] = self._state_pool_last_codes[pool_rows]
+            self._decode_delay_count[: len(req_ids)] = self._state_pool_delay_count[pool_rows]
+            self._decode_eoc_countdown[: len(req_ids)] = self._state_pool_eoc_countdown[pool_rows]
+            self._decode_generation_done[: len(req_ids)] = self._state_pool_generation_done[pool_rows]
+
+        self._last_batch_req_ids = list(req_ids)
+
+    def on_requests_finished(self, finished_req_ids: set[str]) -> None:
+        if not hasattr(self, "_state_pool_indices"):
+            return
+        for req_id in finished_req_ids:
+            pool_row = self._state_pool_indices.pop(req_id, None)
+            if pool_row is not None:
+                self._free_state_pool_indices.add(pool_row)
 
     # ------------------------------------------------------------------ forward
     def forward(
@@ -1386,7 +1472,19 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         fallback = x.argmax(dim=-1)
         safe_x = torch.where(all_masked.unsqueeze(-1), torch.zeros_like(x), x)
         probs = safe_x.softmax(dim=-1)
-        sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        if sampling_metadata.generators:
+            sampled = torch.cat(
+                [
+                    torch.multinomial(
+                        probs[req_idx * num_codebooks : (req_idx + 1) * num_codebooks],
+                        num_samples=1,
+                        generator=sampling_metadata.generators.get(req_idx),
+                    )
+                    for req_idx in range(int(probs.shape[0]) // num_codebooks)
+                ]
+            ).squeeze(-1)
+        else:
+            sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)
         sampled = torch.where(all_masked, fallback, sampled)
         return torch.where(greedy, logits_2d.argmax(dim=-1), sampled)
 

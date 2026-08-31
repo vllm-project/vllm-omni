@@ -1,0 +1,70 @@
+# MiMo-Audio deploy for 1x RTX 5090 / 5090D 32GB (Blackwell, SM 12.x).
+#
+# Verified offline TTS (`tts_sft`) with async-chunk streaming on a single GPU.
+# Stage 0 uses TRITON_ATTN to avoid FlashAttention-2 PTX/toolchain issues on
+# Blackwell. Stage 1 keeps a small VRAM budget; pair with
+# MIMO_AUDIO_TOKENIZER_DEVICE=cpu in the recipe when tokenizer VRAM is tight.
+#
+# Default async-chunk layout matches vllm_omni/deploy/mimo_audio.yaml (both
+# stages on device 0). For the legacy 2-GPU sync pipeline, see the header
+# comment in mimo_audio.yaml.
+async_chunk: true
+dtype: bfloat16
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      connector_get_sleep_s: 0.001
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 30
+      codec_left_context_frames: 40
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.78
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    attention_backend: TRITON_ATTN
+    enable_flashinfer_autotune: false
+    skip_mm_profiling: true
+    mm_processor_cache_gb: 0
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.6
+      top_p: 0.95
+      top_k: 50
+      max_tokens: 18192
+      seed: 42
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.12
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    attention_backend: TRITON_ATTN
+    enable_flashinfer_autotune: false
+    skip_mm_profiling: true
+    mm_processor_cache_gb: 0
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 18192
+      seed: 42

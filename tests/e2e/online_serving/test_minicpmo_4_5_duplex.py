@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """CI coverage for the MiniCPM-o 4.5 native-duplex Realtime API."""
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ import websockets
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     SERVER_PARAMS,
     demo_args,
+    duplex_camera_frames,
     multi_session_args,
     realtime_url,
     resolve_ref_audio,
@@ -27,8 +31,14 @@ from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import 
 )
 from tests.helpers.mark import hardware_test
 from vllm_omni.experimental.fullduplex.client import build_realtime_url
+from vllm_omni.experimental.fullduplex.video_stacking import concat_frames_b64
 
 pytestmark = pytest.mark.omni
+
+
+def _assert_positive_int(value: object) -> None:
+    assert isinstance(value, int)
+    assert value > 0
 
 
 def _assert_request_metrics(metrics: object, *, expected_count: int) -> None:
@@ -107,8 +117,8 @@ async def _run_protocol_smoke(*, url: str, model: str, ref_audio: Path) -> list[
 @pytest.mark.core_model
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
-def test_duplex_websocket_protocol_smoke(omni_server, model_prefix: str) -> None:
-    ref_audio = resolve_ref_audio(model_prefix)
+def test_duplex_websocket_protocol_smoke(omni_server) -> None:
+    ref_audio = resolve_ref_audio()
     events = asyncio.run(
         _run_protocol_smoke(
             url=realtime_url(omni_server),
@@ -125,11 +135,11 @@ def test_duplex_websocket_protocol_smoke(omni_server, model_prefix: str) -> None
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
-def test_duplex_single_session_response_required(omni_server, model_prefix: str, tmp_path: Path) -> None:
+def test_duplex_single_session_response_required(omni_server, tmp_path: Path) -> None:
     args = demo_args(
         omni_server=omni_server,
         input_wav=validated_input_wav(),
-        ref_audio=resolve_ref_audio(model_prefix),
+        ref_audio=resolve_ref_audio(),
         output_dir=tmp_path / "single_session",
     )
     args.turns = 2
@@ -139,7 +149,7 @@ def test_duplex_single_session_response_required(omni_server, model_prefix: str,
     args.turn_duration_ms = [args.first_turn_ms] * args.turns
     result = asyncio.run(run_demo(args))
     assert result["ok"] is True
-    assert result["audio_delta_count"] > 0
+    _assert_positive_int(result["audio_delta_count"])
     assert result["done_count"] == 2
     assert result["error_count"] == 0
     assert result["all_audio_responses_have_transcript"] is True
@@ -151,13 +161,51 @@ def test_duplex_single_session_response_required(omni_server, model_prefix: str,
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
-def test_duplex_two_sessions_resume_and_takeover(omni_server, model_prefix: str, tmp_path: Path) -> None:
+def test_duplex_single_session_video_input(omni_server, tmp_path: Path) -> None:
+    """Audio plus a 1 fps camera track, the omni-duplex video contract.
+
+    Frames ride the audio appends, so the response contract is unchanged: what
+    this covers is that interleaved vision input keeps the turn intact instead
+    of stalling or erroring out mid-segment.
+    """
+    args = demo_args(
+        omni_server=omni_server,
+        input_wav=validated_input_wav(),
+        ref_audio=resolve_ref_audio(),
+        output_dir=tmp_path / "video_input",
+    )
+    args.turns = 2
+    args.turn_duration_ms = [args.first_turn_ms] * args.turns
+    frames = duplex_camera_frames(seconds=4, cache_dir=tmp_path / "camera")
+    args.video_frames_b64 = frames
+    # Each unit also carries a composite of its interior sub-frames, so the
+    # append exercises the official two-image frame_list that carries motion.
+    args.video_stacked_frames_b64 = [concat_frames_b64([frames[index]] * 2) for index in range(len(frames))]
+
+    result = asyncio.run(run_demo(args))
+
+    assert result["ok"] is True
+    assert result["video_frame_count"] == 4
+    assert result["video_stacked_frame_count"] == 4
+    _assert_positive_int(result["audio_delta_count"])
+    assert result["done_count"] == 2
+    assert result["error_count"] == 0
+    assert result["all_audio_responses_have_transcript"] is True
+    assert result["transcript_delta_done_ok"] is True
+    _assert_request_metrics(result["request_metrics"], expected_count=2)
+    _assert_session_metrics(result["session_metrics"], expected_count=2)
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+def test_duplex_two_sessions_resume_and_takeover(omni_server, tmp_path: Path) -> None:
     result = asyncio.run(
         run_multi_session(
             multi_session_args(
                 omni_server=omni_server,
                 input_wav=validated_input_wav(),
-                ref_audio=resolve_ref_audio(model_prefix),
+                ref_audio=resolve_ref_audio(),
                 output_dir=tmp_path / "multi_session",
                 response_required=True,
             )

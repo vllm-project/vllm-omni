@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -485,8 +485,16 @@ def test_valid_sequence_and_context_install_into_native_rows(monkeypatch: pytest
     assert runner.get_diffusion_kv_row("req-0", 0, "text") == 1
     sequence_binding = runner._resolve_paged_attention_row("req-0", 0, None)
     context_binding = runner._resolve_paged_attention_row("req-0", None, "text")
-    assert (sequence_binding.row_index, sequence_binding.max_seq_len) == (0, 9)
-    assert (context_binding.row_index, context_binding.max_seq_len) == (1, 5)
+    assert (sequence_binding.row_index, sequence_binding.max_seq_len, sequence_binding.block_ids) == (
+        0,
+        9,
+        ((1, 2, 3), (4, 5)),
+    )
+    assert (context_binding.row_index, context_binding.max_seq_len, context_binding.block_ids) == (
+        1,
+        5,
+        ((6, 7), (8,)),
+    )
 
 
 def test_block_table_mutations_invalidate_prepared_attention_batches(

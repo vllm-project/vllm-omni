@@ -31,6 +31,13 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.nemotron_voicechat"
 NEMOTRON_VOICECHAT_PIPELINE = PipelineConfig(
     model_type="nemotron_voicechat",
     model_arch="NemotronVoiceChatThinkerForConditionalGeneration",
+    duplex_runtime_extension=(
+        "vllm_omni.experimental.fullduplex.nemotron_voicechat.runtime.NemotronVoiceChatDuplexRuntimeExtension"
+    ),
+    duplex_serving_adapter=(
+        "vllm_omni.experimental.fullduplex.nemotron_voicechat.serving_adapter.NemotronVoiceChatServingRuntimeAdapter"
+    ),
+    duplex_control_enabled=True,
     # Named after the alias key so the deploy-yaml stem substring-matches the
     # checkpoint directory name (NVIDIA-NemotronLabs-VoiceChat-11B) during
     # bare-path auto-detection.
@@ -80,6 +87,7 @@ NEMOTRON_VOICECHAT_PIPELINE = PipelineConfig(
             engine_output_type="audio",
             sync_process_input_func=f"{_PROC}.talker2code2wav_token_only",
             sampling_constraints={"detokenize": False},
+            requires_full_payload_input=True,
         ),
     ),
 )

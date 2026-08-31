@@ -18,7 +18,7 @@ validation_paths:
   - tests/diffusion/offloader/**
 upstream_refs:
   - torch.nn.Module.to
-last_reviewed: 2026-07-16
+last_reviewed: 2026-08-25
 ---
 
 # Diffusion offloader
@@ -47,6 +47,11 @@ and correctness required by the selected execution mode.
 
 **Rule:** Retained host and device copies MUST respect configured limits and
 provide deterministic teardown.
+
+Allocator-cache retention MUST remain local to an explicit component owner,
+declare both cache and physical-free-memory bounds, release conservatively
+when telemetry is unavailable, and force release on failure or memory
+pressure. It MUST NOT replace unconditional executor shutdown cleanup.
 
 ## Safe-change guide
 

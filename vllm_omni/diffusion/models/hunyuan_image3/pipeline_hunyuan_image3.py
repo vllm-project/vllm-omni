@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import copy
 import logging
@@ -72,7 +72,6 @@ _STEP_OUTPUT_SIZE = "hunyuan_output_size"
 _STEP_COT_TEXT_LIST = "hunyuan_cot_text_list"
 _STEP_AR_KV = "hunyuan_ar_kv"
 _STEP_PROMPT_KV = "hunyuan_prompt_kv"
-
 _HUNYUAN_DEFAULT_OUTPUT_TYPE = "pil"
 
 
@@ -466,6 +465,11 @@ class HunyuanImage3Pipeline(
         return self._pipeline
 
     def _validate_step_request(self, state: "StepRequestState") -> None:
+        if self._uses_scheduler_paged_kv():
+            raise ValueError(
+                "HunyuanImage3 paged_scheduler currently supports request-level execution only; "
+                "disable step execution or use dense_legacy."
+            )
         prompt = state.prompt
         sampling = state.sampling
         if prompt is None:
@@ -663,6 +667,12 @@ class HunyuanImage3Pipeline(
             prefix_lens.append(int(prompt_kv[0]["lens"][branch].item()))
         return prefix_lens
 
+    def _uses_scheduler_paged_kv(self) -> bool:
+        return (
+            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+        )
+
     def _merge_step_model_inputs(
         self,
         states: list["StepRequestState"],
@@ -693,6 +703,7 @@ class HunyuanImage3Pipeline(
                         values,
                         row_branches,
                         prefix_lens or [None] * len(row_branches),
+                        strict=True,
                     )
                 ]
                 continue
@@ -1871,8 +1882,7 @@ class HunyuanImage3Pipeline(
         row_branches = [branch for branch in range(cfg_factor) for _ in states]
         return row_state_indexes, row_branches
 
-    @staticmethod
-    def _validate_step_group_states(states: list["StepRequestState"]) -> tuple[bool, int]:
+    def _validate_step_group_states(self, states: list["StepRequestState"]) -> tuple[bool, int]:
         if not states:
             raise ValueError("HunyuanImage3 denoise_step received an empty group.")
 
@@ -2035,6 +2045,11 @@ class HunyuanImage3Pipeline(
         states = list(input_batch.states)
         if not states:
             raise ValueError("HunyuanImage3 denoise_step received an empty batch.")
+        if self._uses_scheduler_paged_kv():
+            raise ValueError(
+                "HunyuanImage3 paged_scheduler currently supports request-level execution only; "
+                "disable step execution or use dense_legacy."
+            )
         self._ensure_grouped_attention_backend_supported(len(states))
         outputs: dict[str, torch.Tensor] = {}
         for group in self._split_step_groups(states):

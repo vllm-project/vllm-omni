@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import asyncio
@@ -43,20 +46,22 @@ class ChatFallbackProjectorMixin:
             else:
                 await self._emit_full_response(session, result, epoch, response_id, send_json)
             if session.epoch == epoch:
+                final_stage_metrics = session.accumulate_response_stage_metrics(None)
                 should_commit = self._should_commit_response_to_history(session, response_id)
                 committed_message = session.end_response(commit_text=should_commit)
                 if should_commit:
                     session.register_history_item(f"item_{response_id}", committed_message)
-                await send_json(
-                    {
-                        "type": "response.done",
-                        "session_id": session.session_id,
-                        "response_id": response_id,
-                        "epoch": epoch,
-                        "committed": committed_message is not None,
-                        "playback": session.playback.as_dict(),
-                    }
-                )
+                done_payload: dict[str, object] = {
+                    "type": "response.done",
+                    "session_id": session.session_id,
+                    "response_id": response_id,
+                    "epoch": epoch,
+                    "committed": committed_message is not None,
+                    "playback": session.playback.as_dict(),
+                }
+                if final_stage_metrics:
+                    done_payload["vllm_omni"] = {"stage_metrics": final_stage_metrics}
+                await send_json(done_payload)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -177,6 +182,11 @@ class ChatFallbackProjectorMixin:
         response_id: str,
         send_json,
     ) -> None:
+        metrics = payload.get("metrics")
+        stage_metrics = metrics.get("stage_metrics") if isinstance(metrics, dict) else None
+        if isinstance(stage_metrics, dict):
+            session.replace_response_stage_metric_snapshots(stage_metrics)
+
         modality = payload.get("modality")
         if modality not in {None, "text", "audio"}:
             await send_json(

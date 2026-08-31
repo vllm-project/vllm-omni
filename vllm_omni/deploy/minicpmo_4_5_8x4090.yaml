@@ -15,6 +15,10 @@
 # so 4096 is the empirically-verified safe ceiling.
 pipeline: minicpmo_4_5
 async_chunk: true
+# Native full-duplex shares this profile with /v1/chat/completions. The default
+# duplex_session caps sessions at 1, matching Stage 0/1 max_num_seqs below.
+session_mode: duplex
+active_stream_window: 1
 
 trust_remote_code: true
 enable_prefix_caching: false

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -192,6 +192,47 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
     assert vllm_group_names == ["vllm_pcp", "vllm_tp", "vllm_dp", "vllm_ep"]
     ep_groups = [group.local_group for group in created_groups if group.parallel_mode == "vllm_ep"]
     assert ep_groups == [parallel_state.vllm_parallel_state._EP.local_group]
+
+
+@pytest.mark.cpu
+@pytest.mark.core_model
+@pytest.mark.parametrize(
+    ("fully_shard_degree", "error_message"),
+    [(0, "fully_shard_degree must be positive"), (3, "must be divisible by fully_shard_degree")],
+)
+def test_invalid_hsdp_shard_size_fails_before_group_creation(monkeypatch, fully_shard_degree: int, error_message: str):
+    """Reject invalid HSDP shard sizes before allocating any process groups."""
+    world_size = 4
+    created_groups: list[object] = []
+
+    def fail_if_group_created(*args, **kwargs):
+        del args, kwargs
+        created_groups.append(object())
+        raise AssertionError("a process group was created before HSDP validation")
+
+    fake_world_group = SimpleNamespace(
+        rank_in_group=0,
+        local_rank=0,
+        device_group=object(),
+    )
+    monkeypatch.setattr(parallel_state.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(parallel_state.torch.distributed, "get_world_size", lambda: world_size)
+    monkeypatch.setattr(parallel_state, "get_world_group", lambda: fake_world_group)
+    monkeypatch.setattr(parallel_state, "init_model_parallel_group", fail_if_group_created)
+
+    for name in ("_DP", "_CFG", "_SP", "_PP", "_FS", "_HSDP_REPLICATE", "_EXPERT_PARALLEL_GROUP_RANKS"):
+        monkeypatch.setattr(parallel_state, name, None)
+    for name in ("_TP", "_PCP", "_DP", "_EP", "_PP"):
+        monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)
+
+    with pytest.raises(ValueError, match=error_message):
+        parallel_state.initialize_model_parallel(
+            fully_shard_degree=fully_shard_degree,
+            use_hsdp=True,
+            backend="gloo",
+        )
+
+    assert created_groups == []
 
 
 @pytest.mark.cpu

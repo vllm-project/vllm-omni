@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from typing import Any
@@ -24,7 +27,9 @@ class MiniCPMO45DuplexPolicy:
     # Vision framing contract (omni duplex). Official streaming_prefill feeds
     # each frame as <image> + 64 resampler embeddings + </image> inside the
     # unit, ahead of the unit's audio embeddings (max_slice_nums=1 in
-    # streaming, so exactly one 64-token block per frame).
+    # streaming, so exactly one 64-token block per frame). A unit may carry
+    # its base frame plus an optional stacked composite of the sub-frames
+    # captured inside that unit (2 blocks).
     VISION_EMBEDS_PER_FRAME = 64
     VISION_TOKENS_PER_FRAME = VISION_EMBEDS_PER_FRAME + 2  # <image> + embeds + </image>
     DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK = 20
@@ -77,6 +82,8 @@ class MiniCPMO45DuplexPolicy:
         "audio_placeholder_token_id": "<|audio|>",
         "image_start_token_id": "<image>",
         "image_end_token_id": "</image>",
+        "slice_start_token_id": "<slice>",
+        "slice_end_token_id": "</slice>",
     }
 
     @classmethod
@@ -92,7 +99,7 @@ class MiniCPMO45DuplexPolicy:
                     value = value[0] if len(value) == 1 else None
             unk_token_id = getattr(tokenizer, "unk_token_id", None)
             try:
-                candidate = int(value)
+                candidate = int(value) if value is not None else -1
             except (TypeError, ValueError):
                 candidate = -1
             if candidate >= 0 and candidate != unk_token_id:
@@ -118,7 +125,8 @@ class MiniCPMO45DuplexPolicy:
         if resolved.get("listen_token_id", -1) < 0:
             eos_id = getattr(tokenizer, "eos_token_id", None)
             try:
-                resolved["listen_token_id"] = int(eos_id)
+                if eos_id is not None:
+                    resolved["listen_token_id"] = int(eos_id)
             except (TypeError, ValueError):
                 pass
         return resolved

@@ -58,13 +58,13 @@ The checkpoint keeps these verified contracts:
 - scheduler data-plane append over a resumable request;
 - stale epoch/turn/response fencing;
 - `/v1/duplex` and OpenAI Realtime projection;
+- optional OpenAI `server_vad` turn detection backed by per-session Silero VAD;
 - existing JoyVL behavior.
 
 The checkpoint does not claim:
 
 - scheduler-native KV append;
-- deterministic VAD-triggered interruption (the browser intentionally does not
-  run VAD; MiniCPM owns listen/speak decisions at model-unit boundaries);
+- an acoustic-onset-to-cancel latency target across arbitrary client chunk sizes;
 - production multi-session admission, fairness, capacity, or failure recovery;
 - bounded long-session KV;
 - video input or audio/video synchronization.
@@ -640,9 +640,8 @@ multi-turn runtime evidence.
 
 During auto-response overlap, `preserve_realtime_input` distinguishes "do not
 append this silent chunk to the native buffer" from "clear the open Realtime
-item". Silent overlap no longer discards earlier user PCM. This is an input
-ownership correction. It does not add a VAD policy: overlap is admitted to
-Stage0 and the model decides whether to listen or speak.
+item". Silent overlap no longer discards earlier user PCM. A separate explicit
+`server_vad` policy is documented in the Realtime contract above.
 
 The first chunk of one overlapping input item also reserves its target model
 turn. A later Realtime commit uses that reserved identity even if response EOS
@@ -1024,6 +1023,6 @@ Passing this checkpoint supports the statement:
 > Single-session, model-owned MiniCPM-o 4.5 native duplex is reviewable on the
 > validated H20 configuration.
 
-It does not support claims for deterministic VAD-triggered interruption,
-multi-session production concurrency, bounded long-session KV,
-scheduler-native append, or video input.
+It does not support claims for an acoustic-onset barge-in latency target across
+arbitrary client chunk sizes, multi-session production concurrency, bounded
+long-session KV, scheduler-native append, or video input.

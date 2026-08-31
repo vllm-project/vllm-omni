@@ -1,7 +1,7 @@
 # NemotronLabs VoiceChat 11B
 
-> Offline speech-to-speech: a 16 kHz user utterance in, the agent's spoken reply
-> (text + 22.05 kHz WAV) out, on a 3-stage vLLM-Omni pipeline.
+> Speech-to-speech on a 3-stage vLLM-Omni pipeline: offline single-turn
+> inference and experimental model-native, frame-locked Realtime serving.
 
 ## Summary
 
@@ -11,8 +11,8 @@
   timeline: a Conformer + NemotronH hybrid-Mamba thinker emits one text token
   per acoustic frame, a Gemma3-1B EAR-TTS talker turns the text timeline into
   31-quantizer RVQ code stacks, and an RVQ-VAE codec decodes them to audio.
-- Mode: Offline single-turn inference (batch=1). Online/duplex serving,
-  function calling, and batch>1 are documented follow-ups.
+- Mode: Offline single-turn inference (batch=1), plus experimental native
+  duplex Realtime serving at one 80 ms microphone frame per scheduler wake.
 - Maintainer: [`@yuekaizhang`](https://github.com/yuekaizhang)
 
 ## When to use this recipe
@@ -33,6 +33,11 @@ NeMo modules (`nemo_vendored/`), so no `nemo_toolkit` install is needed.
   [`vllm_omni/model_executor/models/nemotron_voicechat/`](../../vllm_omni/model_executor/models/nemotron_voicechat/)
 - Staged pipeline config:
   [`vllm_omni/deploy/nemotron_labs_voicechat.yaml`](../../vllm_omni/deploy/nemotron_labs_voicechat.yaml)
+- Native duplex config and E2E probe:
+  [`vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml`](../../vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml),
+  [`tests/e2e/online_serving/nemotron_voicechat_realtime_duplex.py`](../../tests/e2e/online_serving/nemotron_voicechat_realtime_duplex.py)
+- Nightly model-level gate:
+  [`tests/e2e/online_serving/test_nemotron_voicechat_duplex.py`](../../tests/e2e/online_serving/test_nemotron_voicechat_duplex.py)
 - Upstream model card:
   [`nvidia/NVIDIA-NemotronLabs-VoiceChat-11B`](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B)
 - Reference implementation: NVIDIA-NeMo/Speech, branch `nemotron-labs-voicechat`
@@ -60,7 +65,7 @@ output stayed within one word of the reference in testing.
 
 - OS: Linux
 - Python: 3.12
-- vLLM version: 0.26.0
+- vLLM version: 0.27.0
 - vLLM-Omni version or commit: this PR / current `main`
 
 #### Command
@@ -88,6 +93,55 @@ The reply text should read as a coherent spoken-style answer to the question in
 the input WAV, and the WAV should transcribe to (approximately) the same text
 with any ASR model.
 
+#### Native duplex serving
+
+The checkpoint does not contain the underlying Nemotron text tokenizer. Set
+`NEMOTRON_VOICECHAT_LLM_PATH` to a local snapshot of
+`nvidia/NVIDIA-Nemotron-Nano-9B-v2` before starting an offline deployment.
+
+```bash
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export NEMOTRON_VOICECHAT_LLM_PATH=/path/to/NVIDIA-Nemotron-Nano-9B-v2
+
+vllm-omni serve /path/to/NVIDIA-NemotronLabs-VoiceChat-11B \
+  --omni \
+  --served-model-name nemotron-voicechat \
+  --deploy-config vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml
+```
+
+The single-GPU profile runs three eager fp32 engine processes on one device.
+
+In another shell, stream only the user channel of one of NVIDIA's bundled
+stereo conversation fixtures:
+
+```bash
+python tests/e2e/online_serving/nemotron_voicechat_realtime_duplex.py \
+  --model nemotron-voicechat \
+  --input-wav /path/to/NVIDIA-NemotronLabs-VoiceChat-11B/turn_taking.wav \
+  --input-channel 0 \
+  --output-dir results/nemotron_voicechat_duplex \
+  --timeout-s 600
+```
+
+The probe requires a completed response, non-silent 22.05 kHz output, and the
+advertised native 80 ms append capabilities. Add `--expect-function-call` and
+use `tool_call.wav` to validate the function-call channel. To validate the
+Realtime tool round trip, also provide the expected arguments and return a
+tool result:
+
+```bash
+python tests/e2e/online_serving/nemotron_voicechat_realtime_duplex.py \
+  --model nemotron-voicechat \
+  --input-wav /path/to/NVIDIA-NemotronLabs-VoiceChat-11B/tool_call.wav \
+  --output-dir results/nemotron_voicechat_tool_call \
+  --expect-function-call \
+  --expected-function-name generate_random_number \
+  --expected-function-arguments '{"min":1,"max":50}' \
+  --function-output 20 \
+  --expected-post-tool-text "random number"
+```
+
 #### Notes
 
 - Memory usage: the shipped yaml runs all three stages on one GPU
@@ -109,5 +163,14 @@ with any ASR model.
   instead of pausing.
 - The talker's `max_tokens` is 16383 (its stage prompt is one placeholder
   token, and the stage context is 16384).
-- Known limitations: batch=1 only; offline single turn (no online/duplex
-  serving yet); the function-call channel is decoded but not yet acted on.
+- The 80 ms frame period is a model/protocol contract, not a throughput
+  guarantee. In an eager fp32 H200 profile, Stage 2 emitted 80 ms packets at
+  roughly 0.87--0.88 s intervals (RTF about 10.8--10.9); placing the three
+  stages on separate GPUs did not remove the serial 8-step EAR-TTS bottleneck.
+  The current native duplex path is functionally streaming but not wall-clock
+  realtime.
+- Known limitations: batch=1 only. The native duplex deployment allows one
+  active session and does not support barge-in. Tool execution remains
+  client-owned: the server emits function-call events, accepts a validated
+  `function_call_output`, and resumes the live model with the returned result;
+  it does not execute arbitrary tools itself.

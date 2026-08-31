@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Model-specific extractors for TeaCache.
@@ -13,6 +13,7 @@ all model-specific information needed for generic caching, including preprocessi
 transformer execution, and postprocessing logic.
 """
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -1263,7 +1264,6 @@ def extract_minimax_h3_context(
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         _FORWARD_SUPPORTED_KWARGS,
         MINIMAX_H3_ADALN_MODALITY_NUM,
-        _build_rope_table,
         _required_kwarg,
     )
 
@@ -1304,6 +1304,9 @@ def extract_minimax_h3_context(
     psp = _required_kwarg(kwargs, "packed_seq_params")
     cu_seqlens = module._psp_field(psp, "packed_seq_params", "cu_seqlens_q").to(torch.int32)
     max_seqlen = int(module._psp_field(psp, "packed_seq_params", "max_seqlen_q"))
+    # Mirror forward()'s host-side scalar so the refiner sees the number of
+    # packed requests without reading cu_seqlens off-device.
+    num_requests = int(module._psp_optional(psp, "num_requests", 1))
     refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
     refiner_cu = module._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
     refiner_max = int(module._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
@@ -1317,8 +1320,20 @@ def extract_minimax_h3_context(
     if inverse_indices.shape[0] != seq_len:
         raise ValueError(f"inverse_indices must be [{seq_len}], got {list(inverse_indices.shape)}")
     device = x.device
-
-    rope_table = _build_rope_table(module.rope(img_position_ids).to(device))
+    local_span = module._rope_local_span(seq_len)
+    local_start, local_len = local_span
+    rope_table = kwargs.get("rope_table")
+    if rope_table is None:
+        rope_table = module.prepare_rope_table(
+            img_position_ids,
+            seq_len=seq_len,
+        )
+    else:
+        module._validate_prepared_rope_table(
+            rope_table,
+            local_len=local_len,
+            device=device,
+        )
 
     decoder_input, t_emb = module._embed(
         x=x,
@@ -1330,14 +1345,25 @@ def extract_minimax_h3_context(
         text_pos=text_pos.to(device),
         refiner_cu_seqlens=refiner_cu.to(device),
         refiner_max_seqlen=refiner_max,
+        num_requests=num_requests,
         seq_len=seq_len,
         device=device,
-        local_span=(0, seq_len),
+        local_span=local_span,
     )
 
     combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
     inverse_indices = inverse_indices.to(device)
     cu_seqlens = cu_seqlens.to(device)
+
+    # In strict SP, _embed already returns this rank's packed rows while
+    # combined_indices still describes the full packed sequence. TeaCache uses
+    # the first block's modulation as part of its rank-local cache state, so
+    # the modulation indices must be sliced to the same local layout. Keep the
+    # full indices below: local_sp_prepare owns the global-to-local conversion
+    # for transformer-block inputs.
+    state_combined_indices = combined_indices.narrow(0, local_start, local_len)
+    if local_len == seq_len:
+        state_combined_indices = combined_indices
 
     shift_msa, scale_msa, *_ = module.blocks[0].adaln_proj(t_emb)
     modulated_input = module.blocks[0].norm1(decoder_input)
@@ -1345,15 +1371,36 @@ def extract_minimax_h3_context(
         modulated_input,
         shift_msa,
         scale_msa,
-        combined_indices,
+        state_combined_indices,
     )
 
-    def run_transformer_blocks() -> tuple[torch.Tensor, ...]:
-        hidden, block_rope, block_combined = module.sp_prepare(
-            decoder_input,
-            rope_table,
-            combined_indices,
+    def synchronize_cache_decision(local_should_compute: bool) -> bool:
+        if local_len == seq_len:
+            return local_should_compute
+
+        from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+
+        decision = torch.tensor(
+            int(local_should_compute),
+            dtype=torch.int32,
+            device=device,
         )
+        get_sp_group().all_reduce(decision, op=torch.distributed.ReduceOp.MAX)
+        return bool(decision.item())
+
+    def run_transformer_blocks() -> tuple[torch.Tensor, ...]:
+        if local_len == seq_len:
+            hidden, block_rope, block_combined = module.sp_prepare(
+                decoder_input,
+                rope_table,
+                combined_indices,
+            )
+        else:
+            hidden, block_rope, block_combined = module.local_sp_prepare(
+                decoder_input,
+                rope_table,
+                combined_indices,
+            )
         for block in module.blocks:
             hidden = block(
                 hidden,
@@ -1365,15 +1412,36 @@ def extract_minimax_h3_context(
                 packed_total=seq_len,
                 video_layout=video_layout,
             )
-        hidden = module.sp_gather(hidden)
+        # TeaCache stores residuals as block_output - decoder_input. Strict SP
+        # must keep both tensors rank-local until postprocess projects local
+        # rows to compact logits and gathers them exactly once.
+        if local_len == seq_len:
+            hidden = module.sp_gather(hidden)
         return (hidden,)
 
     def postprocess(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        video_logits, audio_logits = module.final_layer(
-            hidden,
-            t_emb=t_emb,
-            inverse_indices=inverse_indices,
-        )
+        if local_len == seq_len:
+            video_logits, audio_logits = module.final_layer(
+                hidden,
+                t_emb=t_emb,
+                inverse_indices=inverse_indices,
+            )
+        else:
+            local_inverse_indices = inverse_indices.narrow(
+                0,
+                local_start,
+                local_len,
+            )
+            video_logits, audio_logits = module.final_layer(
+                hidden,
+                t_emb=t_emb,
+                inverse_indices=local_inverse_indices,
+            )
+            compact_logits = torch.cat((video_logits, audio_logits), dim=-1)
+            compact_logits = module.sp_gather(compact_logits)
+            video_width = module.arch.latents_dim * math.prod(module.arch.patch_size)
+            video_logits = compact_logits[..., :video_width]
+            audio_logits = compact_logits[..., video_width:]
         video_logits = video_logits.index_select(0, infer_out_pos.to(device))
         audio_logits = audio_logits.index_select(0, audio_pos.to(device))
         if not skip_mask_out_condition:
@@ -1392,6 +1460,9 @@ def extract_minimax_h3_context(
         temb=t_emb,
         run_transformer_blocks=run_transformer_blocks,
         postprocess=postprocess,
+        extra_states={
+            "synchronize_cache_decision": synchronize_cache_decision,
+        },
     )
 
 

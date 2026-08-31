@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 E2E Online tests for Qwen3-Omni model with video input and audio output.
 """
@@ -82,7 +85,7 @@ def get_max_batch_size(size_type="few"):
 @pytest.mark.skipif(_USE_PD, reason="Temporarily skip PD mode in this test module.")
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3 if _USE_PD else 2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
+def test_mix_to_text_audio_001(omni_server, online_client) -> None:
     """
     Test multi-modal input processing and text/audio output generation via OpenAI API.
     Deploy Setting: default yaml
@@ -113,7 +116,7 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     }
 
     # Test single completion
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    online_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
 @pytest.mark.advanced_model
@@ -122,7 +125,7 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.skipif(_USE_PD, reason="Temporarily skip PD mode in this test module.")
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3 if _USE_PD else 2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_text_to_text_001(omni_server, openai_client) -> None:
+def test_text_to_text_001(omni_server, online_client) -> None:
     """
     Test text input processing and text/audio output generation via OpenAI API.
     Deploy Setting: default yaml
@@ -140,10 +143,10 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
         "key_words": {"text": ["beijing"]},
     }
 
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    online_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-def _run_prefix_cache_check(openai_client, request_config: dict):
+def _run_prefix_cache_check(online_client, request_config: dict):
     """Make two requests given a request config, and validate that:
     1. The second request actually had cached tokens
     2. The number of cached tokens is divisible by the block size used in
@@ -157,8 +160,8 @@ def _run_prefix_cache_check(openai_client, request_config: dict):
 
     Returns the (first, second) responses for additional per-test assertions.
     """
-    first_response = openai_client.send_omni_request(request_config, request_num=1)[0]
-    cached_response = openai_client.send_omni_request(request_config, request_num=1)[0]
+    first_response = online_client.send_omni_request(request_config, request_num=1)[0]
+    cached_response = online_client.send_omni_request(request_config, request_num=1)[0]
 
     assert first_response.cached_tokens is not None
 
@@ -180,7 +183,7 @@ def _run_prefix_cache_check(openai_client, request_config: dict):
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_thinker_prefix_caching_text_output(omni_server, openai_client) -> None:
+def test_thinker_prefix_caching_text_output(omni_server, online_client) -> None:
     """
     Test thinker prefix caching by sending identical requests with an image (i.e.,
     a large shared prefix) and verifying that the second request uses cached tokens
@@ -206,7 +209,7 @@ def test_thinker_prefix_caching_text_output(omni_server, openai_client) -> None:
         "stream": False,
         "modalities": ["text"],
     }
-    first_response, _ = _run_prefix_cache_check(openai_client, request_config)
+    first_response, _ = _run_prefix_cache_check(online_client, request_config)
 
     assert first_response.multimodal_tokens is not None
     assert first_response.multimodal_tokens.get("image", 0) > 0
@@ -217,7 +220,7 @@ def test_thinker_prefix_caching_text_output(omni_server, openai_client) -> None:
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_thinker_prefix_caching_audio_output(omni_server, openai_client) -> None:
+def test_thinker_prefix_caching_audio_output(omni_server, online_client) -> None:
     """
     Verify that thinker prefix caching does not hang when the request
     produces audio output (text + audio modalities).  Sends two identical
@@ -239,7 +242,7 @@ def test_thinker_prefix_caching_audio_output(omni_server, openai_client) -> None
         },
     }
 
-    _run_prefix_cache_check(openai_client, request_config)
+    _run_prefix_cache_check(online_client, request_config)
 
 
 @pytest.mark.advanced_model
@@ -247,13 +250,13 @@ def test_thinker_prefix_caching_audio_output(omni_server, openai_client) -> None
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_completions_rejected_for_thinker_talker(omni_server, openai_client) -> None:
+def test_completions_rejected_for_thinker_talker(omni_server, online_client) -> None:
     """Ensure Thinker-talker models reject /v1/completions; we do this because the
     thinker-talker handoff implementations currently use ChatML <|im_start|> and
     <|im_end|> markers to segment the input sequence; when we don't have them,
     the talker does not get any embeddings, which breaks the server.
     """
-    responses = openai_client.send_completions_http_request(
+    responses = online_client.send_completions_http_request(
         {
             "json": {
                 "model": omni_server.model,

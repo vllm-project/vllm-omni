@@ -1,6 +1,19 @@
 [
     {
-        "test_name": "test_wan22_i2v_stability_v1_videos",
+        "test_name": "test_wan22_i2v_stability_ulysses2_vae_patch2_hsdp_slicing_tiling",
+        "description": "Ulysses=2 + VAE patch parallel=2 + HSDP + VAE slicing + tiling",
+        "mark": [
+            {
+                "hardware_marks": {
+                    "res": {
+                        "cuda": "H800"
+                    },
+                    "num_cards": 2
+                }
+            },
+            "local_model",
+            "diffusion"
+        ],
         "server_params": {
             "model": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
             "serve_args": {
@@ -10,6 +23,46 @@
                 "use-hsdp": true,
                 "vae-use-slicing": true,
                 "vae-use-tiling": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "dataset": "random",
+                "task": "i2v",
+                "backend": "v1/videos",
+                "duration_sec": 86400,
+                "max_concurrency": 1,
+                "num_prompts_per_batch": 50,
+                "enable_negative_prompt": true,
+                "random_request_config": [
+                    {"width": 832, "height": 480, "num_inference_steps": 4, "num_frames": 81, "fps": 16, "weight": 0.5},
+                    {"width": 1280, "height": 720, "num_inference_steps": 4, "num_frames": 121, "fps": 16, "weight": 0.5}
+                ]
+            }
+        ]
+    },
+    {
+        "test_name": "test_wan22_i2v_stability_usp2_vae_patch2_hsdp_slicing",
+        "description": "USP=2 + VAE patch parallel=2 + HSDP + VAE slicing",
+        "mark": [
+            {
+                "hardware_marks": {
+                    "res": {
+                        "npu": "A3"
+                    },
+                    "num_cards": 2
+                }
+            },
+            "local_model",
+            "diffusion"
+        ],
+        "server_params": {
+            "model": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+            "serve_args": {
+                "usp": 2,
+                "vae-patch-parallel-size": 2,
+                "use-hsdp": true,
+                "vae-use-slicing": true
             }
         },
         "benchmark_params": [

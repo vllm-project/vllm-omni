@@ -1,18 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Model specific tests for CacheDiT enablement.
 """
 
 import ast
-import sys
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
 from cache_dit.caching.cache_blocks.pattern_0_1_2 import CachedBlocks_Pattern_0_1_2
+from vllm.distributed import parallel_state
 
 import vllm_omni.diffusion.cache.cachedit as cd_backend
 import vllm_omni.diffusion.cache.cachedit.model_specific as cd_model_specific
@@ -24,18 +24,9 @@ from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import L
 from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformer3DModel
 from vllm_omni.platforms import current_omni_platform
 
-# NOTE: We patch DreamID Omni's modules here with mocks so that we can import and inspect
-# the class even though the dependency may not be set up correctly; this is ok for these
-# tests because we just inspect it and never initialize the model.
-for mod in ("dreamid_omni", "dreamid_omni.modules", "dreamid_omni.modules.model"):
-    sys.modules.setdefault(mod, Mock())
-# isort: split
-from vllm_omni.diffusion.models.dreamid_omni.fusion import FusionModel as DreamIdOmniModel  # noqa: E402
-
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 SEPARATE_CFG_TRANSFORMERS = [
-    DreamIdOmniModel,
     HeliosTransformer3DModel,
     LongCatImageTransformer2DModel,
     Cosmos3VFMTransformer,
@@ -59,6 +50,18 @@ def test_custom_cache_dit_enablers_are_registered_explicitly():
     with patch.dict(cd_backend.CUSTOM_DIT_ENABLERS, {}, clear=True):
         cd_model_specific.register_custom_dit_enablers()
         assert cd_backend.CUSTOM_DIT_ENABLERS == expected_enablers
+
+
+@pytest.fixture()
+def init_fake_tp_group(mocker):
+    """Provide a fake TP group so vLLM linear layers can be instantiated."""
+    mock_tp = mocker.MagicMock()
+    mock_tp.world_size = 1
+    mock_tp.rank_in_group = 0
+    old = parallel_state._TP
+    parallel_state._TP = mock_tp
+    yield
+    parallel_state._TP = old
 
 
 def test_wan22_vace_uses_wan22_custom_cache_dit_enabler():
@@ -110,7 +113,9 @@ def test_cachedit_consumers_use_package_api():
 
             for module in modules:
                 if module == legacy_module or module.startswith(internal_prefix):
-                    invalid_imports.append(f"{source_path.relative_to(package_root)}:{node.lineno}: {module}")
+                    invalid_imports.append(
+                        f"{source_path.relative_to(package_root)}:{getattr(node, 'lineno', '?')}: {module}"
+                    )
 
     assert not invalid_imports, "Cache-DiT consumers must use the package API:\n" + "\n".join(invalid_imports)
 

@@ -1,0 +1,104 @@
+[
+  {
+    "test_name": "test_hunyuanvideo15_t2v_single_device",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 1
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "Single-device baseline",
+    "server_type": "vllm-omni",
+    "server_params": {
+      "model": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v",
+      "serve_args": {
+        "flow-shift": 5.0,
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "832x480_frames33_steps4",
+        "dataset": "random",
+        "task": "t2v",
+        "num-prompts": 10,
+        "max-concurrency": 1,
+        "seed": 42,
+        "enable-negative-prompt": true,
+        "random-request-config": [
+          {
+            "width": 832,
+            "height": 480,
+            "num_inference_steps": 4,
+            "num_frames": 33,
+            "fps": 24,
+            "weight": 1
+          }
+        ],
+        "extra-body": {
+          "guidance_scale": 6.0,
+          "flow_shift": 5.0
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_hunyuanvideo15_t2v_cachedit_tp2_vae_patch2",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 2
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "CacheDiT + TP=2 + VAE patch parallel=2 + VAE tiling",
+    "server_type": "vllm-omni",
+    "server_params": {
+      "model": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v",
+      "serve_args": {
+        "flow-shift": 5.0,
+        "cache-backend": "cache_dit",
+        "tensor-parallel-size": 2,
+        "vae-patch-parallel-size": 2,
+        "vae-use-tiling": true,
+        "enable-diffusion-pipeline-profiler": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "832x480_frames33_steps4",
+        "dataset": "random",
+        "task": "t2v",
+        "num-prompts": 10,
+        "max-concurrency": 1,
+        "seed": 42,
+        "enable-negative-prompt": true,
+        "random-request-config": [
+          {
+            "width": 832,
+            "height": 480,
+            "num_inference_steps": 4,
+            "num_frames": 33,
+            "fps": 24,
+            "weight": 1
+          }
+        ],
+        "extra-body": {
+          "guidance_scale": 6.0,
+          "flow_shift": 5.0
+        }
+      }
+    ]
+  }
+]

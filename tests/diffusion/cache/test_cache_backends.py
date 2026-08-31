@@ -365,13 +365,10 @@ class TestCacheDiTBackend:
 
     @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
     @patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
-    def test_enable_dreamid_pipeline_uses_fused_blocks(self, mock_cache_dit, mock_block_adapter):
-        """Test DreamID uses pipeline.transformer for cache enable/refresh.
-
-        NOTE: DreamID no longer has a custom enabler, so this tests against the generic path.
-        """
+    def test_enable_pipeline_uses_fused_blocks(self, mock_cache_dit, mock_block_adapter):
+        """Generic cache path should pick up ``transformer.fused_blocks``."""
         mock_pipeline = Mock()
-        mock_pipeline.__class__.__name__ = "DreamIDOmniPipeline"
+        mock_pipeline.__class__.__name__ = "FakeFusedBlocksPipeline"
         mock_pipeline.transformer = Mock()
         mock_pipeline.transformer.fused_blocks = Mock()
         mock_pipeline.transformer._cache_dit_adapter_config = CacheDiTAdapterConfig(

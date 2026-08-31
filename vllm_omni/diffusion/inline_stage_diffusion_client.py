@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Inline Stage Diffusion Client for vLLM-Omni multi-stage runtime.
 
 Runs DiffusionEngine in a ThreadPoolExecutor inside the Orchestrator process
@@ -23,6 +26,7 @@ from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt
+from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID, diffusion_exception_metrics
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
@@ -56,6 +60,8 @@ class InlineStageDiffusionClient(StageClientBase):
         self.default_sampling_params = metadata.default_sampling_params
         self.requires_multimodal_data = metadata.requires_multimodal_data
         self.custom_process_input_func = metadata.custom_process_input_func
+        self.prompt_transform_func = None
+        self.prompt_expand_func = None
         self.engine_input_source = metadata.engine_input_source
         self.batch_size = batch_size
 
@@ -158,6 +164,15 @@ class InlineStageDiffusionClient(StageClientBase):
                 self._output_queue.put_nowait(result)
         except DiffusionRequestAbortedError as e:
             logger.info("request_id: %s aborted: %s", request_id, str(e))
+            metrics = diffusion_exception_metrics(e)
+            if metrics:
+                self._output_queue.put_nowait(
+                    OmniRequestOutput(
+                        request_id=DIFFUSION_METRICS_ONLY_REQUEST_ID,
+                        finished=True,
+                        metrics=metrics,
+                    )
+                )
         except Exception as e:
             logger.exception("Diffusion request %s failed: %s", request_id, e)
             status_code, error_type = client_error_metadata(e)
@@ -167,6 +182,7 @@ class InlineStageDiffusionClient(StageClientBase):
                 status_code=status_code,
                 error_type=error_type,
             )
+            error_output.metrics.update(diffusion_exception_metrics(e))
             self._output_queue.put_nowait(error_output)
         finally:
             self._tasks.pop(request_id, None)
@@ -181,9 +197,8 @@ class InlineStageDiffusionClient(StageClientBase):
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         for rid in request_ids:
-            task = self._tasks.pop(rid, None)
-            if task:
-                task.cancel()
+            # Keep the consumer alive until the engine emits its terminal
+            # abort output. That path carries the refreshed scheduler gauge.
             self._engine.abort(rid)
 
     async def submit_interaction_async(

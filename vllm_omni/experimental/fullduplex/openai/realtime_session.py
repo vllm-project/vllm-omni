@@ -58,6 +58,7 @@ class NativeRealtimeSessionProtocol(
         while True:
             if not self._pending_outbound.empty():
                 return json.dumps(await self._pending_outbound.get())
+            await self.wait_for_realtime_turn_detection_update()
             raw = await websocket.receive_text()
             try:
                 event = json.loads(raw)

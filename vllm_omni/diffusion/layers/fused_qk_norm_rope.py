@@ -11,10 +11,13 @@ The public contract is shared by diffusion attention implementations:
   ``[cos(theta), sin(theta)]`` with ``theta`` of width ``rotary_dim // 2``.
 
 The CUDA fast path fuses RMSNorm and RoPE without materializing normalized Q/K
-or rotary-product intermediates. Unsupported inputs use the eager reference.
+or rotary-product intermediates. Ascend composes its RMSNorm and rotary fused
+primitives; unsupported inputs use the eager reference.
 """
 
 from __future__ import annotations
+
+from importlib.util import find_spec
 
 import torch
 import torch.nn.functional as F
@@ -22,6 +25,8 @@ from torch.library import Library
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
+
+from vllm_omni.platforms import current_omni_platform
 
 _FUSED_HEAD_DIM = 128
 _FUSED_ROTARY_DIM = 96
@@ -130,6 +135,72 @@ def _eager_qk_norm_rope(
     )
 
 
+def _npu_apply_rope_table(
+    x: torch.Tensor,
+    rope_table: torch.Tensor,
+    rotary_dim: int,
+) -> torch.Tensor:
+    """Apply H3's rotary dimensions through Ascend's fused rotary kernel.
+
+    ``mindiesd.rotary_position_embedding`` takes a 4-D BSND tensor, whereas
+    MiniMax-H3 keeps packed activations as ``[tokens, heads, head_dim]``.
+    The shared MindIE-SD wrapper normalizes this 3-D layout to BSND and
+    restores it afterwards. It receives the half-width cos/sin values from
+    the packed table; the wrapper expands them to H3's non-interleaved 96-D
+    rotary layout. The 32 non-rotary head dimensions bypass the kernel.
+
+    Some CANN environments package ``torch_npu`` without MindIE-SD. Keep
+    those deployments on the same Ascend fused rotary primitive rather than
+    silently falling back to eager elementwise RoPE.
+    """
+    import torch_npu
+
+    half = rotary_dim // 2
+    x_rot, x_pass = x[..., :rotary_dim], x[..., rotary_dim:]
+    cos = rope_table[..., :half]
+    sin = rope_table[..., half:]
+
+    if find_spec("mindiesd") is not None:
+        from vllm_omni.diffusion.layers.rope import apply_rotary_emb_mindiesd
+
+        x_rot = apply_rotary_emb_mindiesd(
+            x_rot,
+            cos,
+            sin,
+            interleaved=False,
+            half_head_dim=True,
+        )
+    else:
+        # npu_rotary_mul uses BSND and full rotary-width cos/sin. H3 uses
+        # NeoX/rotated-half ordering, so duplicate rather than interleave the
+        # half-width table along the final dimension.
+        cos = cos.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
+        sin = sin.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
+        x_rot = torch_npu.npu_rotary_mul(x_rot.unsqueeze(0), cos, sin).squeeze(0)
+
+    return torch.cat((x_rot, x_pass), dim=-1)
+
+
+def _npu_qk_norm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    rope_table: torch.Tensor,
+    eps: float,
+    rotary_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use Ascend RMSNorm and RoPE fused primitives for MiniMax-H3 DiT."""
+    import torch_npu
+
+    q_norm = torch_npu.npu_rms_norm(q, q_weight, epsilon=eps)[0]
+    k_norm = torch_npu.npu_rms_norm(k, k_weight, epsilon=eps)[0]
+    return (
+        _npu_apply_rope_table(q_norm, rope_table, rotary_dim),
+        _npu_apply_rope_table(k_norm, rope_table, rotary_dim),
+    )
+
+
 def _fused_cuda_supported(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -141,6 +212,24 @@ def _fused_cuda_supported(
         and current_platform.is_cuda()
         and q.is_cuda
         and k.is_cuda
+        and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and head_dim == _FUSED_HEAD_DIM
+        and rotary_dim == _FUSED_ROTARY_DIM
+    )
+
+
+def _fused_npu_supported(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    head_dim: int,
+    rotary_dim: int,
+) -> bool:
+    """Return whether the MiniMax-H3 Ascend fused-op contract is satisfied."""
+    return (
+        current_omni_platform.is_npu()
+        and q.device.type == "npu"
+        and k.device.type == "npu"
         and q.dtype == torch.bfloat16
         and k.dtype == torch.bfloat16
         and head_dim == _FUSED_HEAD_DIM
@@ -192,6 +281,16 @@ def _fused_qk_norm_rope_impl(
     head_dim: int,
     rotary_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if _fused_npu_supported(q, k, head_dim, rotary_dim):
+        return _npu_qk_norm_rope(
+            q,
+            k,
+            q_weight,
+            k_weight,
+            rope_table,
+            eps,
+            rotary_dim,
+        )
     if not _fused_cuda_supported(q, k, head_dim, rotary_dim):
         return _eager_qk_norm_rope(
             q,
@@ -273,6 +372,16 @@ def fused_qk_norm_rope(
     q_weight = q_weight.contiguous()
     k_weight = k_weight.contiguous()
     rope_table = rope_table.contiguous()
+    if _fused_npu_supported(q, k, head_dim, rotary_dim):
+        return _npu_qk_norm_rope(
+            q,
+            k,
+            q_weight,
+            k_weight,
+            rope_table,
+            eps,
+            rotary_dim,
+        )
     if not _fused_cuda_supported(q, k, head_dim, rotary_dim):
         return _fused_qk_norm_rope_impl(
             q,

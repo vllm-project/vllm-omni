@@ -259,6 +259,51 @@ class StreamingEncoder(ABC):
         """
         pass
 
+    @abstractmethod
+    def get_initial_cache_state(self, batch_size, dtype, device, max_dim):
+        pass
+
+    def cache_aware_stream_step(
+        self,
+        processed_signal,
+        processed_signal_length=None,
+        cache_last_channel=None,
+        cache_last_time=None,
+        cache_last_channel_len=None,
+        keep_all_outputs=True,
+        drop_extra_pre_encoded=None,
+    ):
+        """Run one incremental encoder step using NeMo's cache contract."""
+        if self.streaming_cfg is None:
+            self.setup_streaming_params()
+        if drop_extra_pre_encoded is not None:
+            prev_drop_extra_pre_encoded = self.streaming_cfg.drop_extra_pre_encoded
+            self.streaming_cfg.drop_extra_pre_encoded = drop_extra_pre_encoded
+        else:
+            prev_drop_extra_pre_encoded = None
+
+        if processed_signal_length is None:
+            processed_signal_length = processed_signal.new_full(
+                (processed_signal.size(0),),
+                processed_signal.size(-1),
+            )
+
+        try:
+            encoder_output = self(
+                audio_signal=processed_signal,
+                length=processed_signal_length,
+                cache_last_channel=cache_last_channel,
+                cache_last_time=cache_last_time,
+                cache_last_channel_len=cache_last_channel_len,
+            )
+            return self.streaming_post_process(
+                encoder_output,
+                keep_all_outputs=keep_all_outputs,
+            )
+        finally:
+            if prev_drop_extra_pre_encoded is not None:
+                self.streaming_cfg.drop_extra_pre_encoded = prev_drop_extra_pre_encoded
+
 
 # ==============================================================================
 # CacheAwareStreamingConfig — exact copy of the dataclass from

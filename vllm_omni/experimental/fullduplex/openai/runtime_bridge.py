@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import asyncio
@@ -135,7 +138,9 @@ class NativeRuntimeBridgeMixin:
                     incarnation=session.incarnation,
                 )
             if self._callable_accepts_keyword(append_input, "collect_outputs"):
-                append_kwargs["collect_outputs"] = False
+                append_kwargs["collect_outputs"] = bool(
+                    getattr(self._serving_runtime_adapter, "collect_outputs_on_append", False)
+                )
             result = await append_input(session.session_id, **append_kwargs)
         except Exception as exc:
             logger.exception("Failed to append duplex runtime input: %s", exc)
@@ -315,27 +320,86 @@ class NativeRuntimeBridgeMixin:
         native.data_plane_task = task
         return True
 
-    # One model unit (1 s at 16 kHz) of pcm_f32le silence, matching the
-    # official full-duplex behavior where the microphone keeps streaming
-    # silence while the assistant speaks; replies span multiple units.
+    # One MiniCPM model unit (1 s at 16 kHz) is the compatibility default.
+    # Other native-duplex adapters may use a different frame-locked unit.
     _NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO = base64.b64encode(bytes(16000 * 4)).decode("ascii")
     _NATIVE_RESPONSE_MAX_CONTINUATION_UNITS = 8
+    # Each unit is one second of silence. Auto-response needs substantially
+    # more room than the eight decision beats above, but must still terminate
+    # well before the 300-second benchmark playback horizon. The final unit
+    # asks the model to LISTEN; a protocol fallback closes the response if that
+    # logit hint is ignored.
+    _NATIVE_AUTO_RESPONSE_MAX_CONTINUATION_UNITS = 64
 
     def _native_silence_unit_payload(self) -> dict[str, object]:
+        samples = int(getattr(self._serving_runtime_adapter, "silence_continuation_samples", 16000))
+        audio = (
+            self._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO
+            if samples == 16000
+            else base64.b64encode(bytes(samples * 4)).decode("ascii")
+        )
         return {
             "type": "audio",
-            "audio": self._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO,
+            "audio": audio,
             "format": "pcm_f32le",
             "sample_rate_hz": 16000,
         }
 
     def _native_response_continuations_remaining(self, session: DuplexSession, response_id: str) -> bool:
-        if self._session_auto_responds(session):
-            return True
         native = self._runtime_session_state(session)
         owner_id = f"response:{response_id}"
         count = native.continuation_units if native.continuation_owner_id == owner_id else 0
-        return count < self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS
+        limit = (
+            self._NATIVE_AUTO_RESPONSE_MAX_CONTINUATION_UNITS
+            if self._session_auto_responds(session)
+            else self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS
+        )
+        return count < limit
+
+    async def _finish_bounded_native_auto_response(
+        self,
+        send_json,
+        *,
+        session: DuplexSession,
+        expected_epoch: int | None,
+        model_turn_id: int | None = None,
+    ) -> None:
+        """Close an auto-response whose final silence unit did not end it."""
+        native = self._runtime_session_state(session)
+        response_id = session.active_response_id
+        response_epoch = session.epoch
+        response_turn_id = model_turn_id if model_turn_id is not None else session.active_response_turn_id
+        if expected_epoch is not None and response_epoch != expected_epoch:
+            return
+        native.clear_continuation()
+        await send_json(
+            {
+                "type": "response.listen",
+                "session_id": session.session_id,
+                "epoch": response_epoch,
+                "reason": "continuation_limit",
+                "model_listen": False,
+            }
+        )
+        if response_id is None:
+            if session.epoch == response_epoch and response_turn_id is not None:
+                session.complete_model_turn(response_turn_id)
+            return
+        if session.epoch != response_epoch or session.active_response_id != response_id:
+            return
+        if response_turn_id is not None:
+            session.complete_model_turn(response_turn_id)
+        session.end_response(commit_text=False, preserve_request=True)
+        await send_json(
+            {
+                "type": "response.done",
+                "session_id": session.session_id,
+                "response_id": response_id,
+                "epoch": response_epoch,
+                "committed": False,
+                "playback": session.playback.as_dict(),
+            }
+        )
 
     def _native_silence_continuation_is_stale(
         self,
@@ -400,9 +464,23 @@ class NativeRuntimeBridgeMixin:
             owner_id = f"model-turn:{expected_model_turn_id}"
             payload_turn_id = expected_model_turn_id
         count = native.continuation_units if native.continuation_owner_id == owner_id else 0
-        if not auto_response and count >= self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS:
+        continuation_limit = (
+            self._NATIVE_AUTO_RESPONSE_MAX_CONTINUATION_UNITS
+            if auto_response
+            else self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS
+        )
+        if count >= continuation_limit:
+            if auto_response:
+                await self._finish_bounded_native_auto_response(
+                    send_json,
+                    session=session,
+                    expected_epoch=expected_epoch,
+                    model_turn_id=payload_turn_id,
+                )
             return
         payload = self._native_silence_unit_payload()
+        if auto_response and count + 1 == continuation_limit:
+            payload["force_listen"] = True
         payload["duplex_turn_id"] = payload_turn_id
 
         scheduler = native.silence_continuation_scheduler
@@ -826,6 +904,18 @@ class NativeRuntimeBridgeMixin:
                     }
                 )
             return close_reason, True
+        if native_result.get("function_call") is True:
+            await send_json(
+                {
+                    "type": "function_call.done",
+                    "session_id": session.session_id,
+                    "epoch": session.epoch,
+                    "call_id": native_result.get("call_id"),
+                    "name": native_result.get("name"),
+                    "arguments": native_result.get("arguments", ""),
+                }
+            )
+            return close_reason, True
         if native_result.get("requires_stage_handoff") is True or native_result.get("requires_tts_stage") is True:
             # Stage0 announces a talker handoff before Stage1 has produced
             # client-visible audio. A single client input stream may contain
@@ -861,11 +951,17 @@ class NativeRuntimeBridgeMixin:
                 and not session.active_response_accepts_model_turn(model_turn_id)
             ):
                 return close_reason, emitted_response
+            auto_response = self._session_auto_responds(session)
+            active_response_id = session.active_response_id
+            auto_continuations_remaining = active_response_id is None or self._native_response_continuations_remaining(
+                session, active_response_id
+            )
             non_terminal_auto_listen = (
-                self._session_auto_responds(session)
-                and session.active_response_id is not None
+                auto_response
+                and active_response_id is not None
                 and session.active_request_id is not None
                 and native_result.get("end_of_turn") is not True
+                and auto_continuations_remaining
             )
             if non_terminal_auto_listen:
                 await self._maybe_continue_native_response(
@@ -874,7 +970,6 @@ class NativeRuntimeBridgeMixin:
                     expected_epoch=expected_epoch,
                 )
                 return close_reason, emitted_response
-            auto_response = self._session_auto_responds(session)
             if not auto_response and data_plane_request_id == session.active_request_id:
                 session.clear_request()
             model_listen = native_result.get("model_listen")
@@ -913,6 +1008,14 @@ class NativeRuntimeBridgeMixin:
                         expected_epoch=expected_epoch,
                     )
                     return close_reason, emitted_response
+                if auto_response:
+                    self._runtime_session_state(session).clear_continuation()
+                    if not auto_continuations_remaining:
+                        completed_turn_id = model_turn_id
+                        if completed_turn_id is None:
+                            completed_turn_id = session.active_response_turn_id
+                        if completed_turn_id is not None:
+                            session.complete_model_turn(completed_turn_id)
                 session.end_response(commit_text=False, preserve_request=auto_response)
                 await send_json(
                     {

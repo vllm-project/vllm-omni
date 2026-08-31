@@ -452,7 +452,7 @@ def test_minicpmo_native_capabilities_separate_model_state_from_core_kv_lease():
     assert caps["supports_core_resumable_request"] is True
     assert caps["supports_stage_connector_handoff"] is True
     assert caps["supports_audio_truncate"] is True
-    assert caps["supports_barge_in"] is False
+    assert caps["supports_barge_in"] is True
     assert caps["target_barge_in_latency_ms"] is None
     assert caps["supports_multi_session"] is True
     assert caps["supports_multi_session_same_replica"] is True
@@ -460,6 +460,15 @@ def test_minicpmo_native_capabilities_separate_model_state_from_core_kv_lease():
     assert caps["supports_session_resume"] is True
     assert caps["session_admission_mode"] == "engine_managed"
     assert caps["stage_handoff_transport"] == "scheduler_data_plane"
+
+
+def test_duplex_overlap_policy_auto_falls_back_to_listen_only():
+    from vllm_omni.experimental.fullduplex.openai.protocol import (
+        DuplexOverlapPolicy,
+        DuplexSessionConfig,
+    )
+
+    assert DuplexSessionConfig._normalize_overlap_policy("auto") == DuplexOverlapPolicy.LISTEN_ONLY.value
 
 
 def test_minicpmo_native_capabilities_do_not_overclaim_single_session_deployment():

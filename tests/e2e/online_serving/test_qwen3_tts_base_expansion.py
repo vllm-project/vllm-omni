@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E Online tests for Qwen3-TTS model with text input and audio output.
 
@@ -12,7 +12,7 @@ import os
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import load_test_audio_data_url
+from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
@@ -23,7 +23,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 
 # See tests/e2e/online_serving/test_qwen3_tts_base.py for the vendored-asset rationale.
-REF_AUDIO_URL = load_test_audio_data_url("qwen3_tts/clone_2.wav")
+REF_AUDIO_URL = get_asset_path("qwen3_tts/clone_2.wav", as_data_url=True)
 REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 
 
@@ -41,7 +41,7 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
-tts_server_params = [
+tts_async_chunk_server_params = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
@@ -50,9 +50,12 @@ tts_server_params = [
         ),
         id="async_chunk",
     ),
-    # Synchronous (no async-chunk) variant — ``--no-async-chunk`` alone
-    # flips the deploy yaml's bool and the pipeline dispatches to the
-    # end-to-end codec processor. No variant yaml / pipeline needed.
+]
+
+# Synchronous (no async-chunk) variant — ``--no-async-chunk`` alone
+# flips the deploy yaml's bool and the pipeline dispatches to the
+# end-to-end codec processor. No variant yaml / pipeline needed.
+tts_no_async_chunk_server_params = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
@@ -63,10 +66,16 @@ tts_server_params = [
     ),
 ]
 
+DEFAULT_AUDIO_SPEECH_TIMEOUT_S = 180.0
+
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_voice_clone_streaming_001(omni_server, openai_client) -> None:
+@pytest.mark.parametrize(
+    "omni_server",
+    tts_async_chunk_server_params + tts_no_async_chunk_server_params,
+    indirect=True,
+)
+def test_voice_clone_streaming_001(omni_server, online_client) -> None:
     """
     Test text input processing and audio output via OpenAI API.
     Deploy Setting: default yaml
@@ -87,12 +96,16 @@ def test_voice_clone_streaming_001(omni_server, openai_client) -> None:
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
     }
-    openai_client.send_audio_speech_request(request_config, request_num=get_max_batch_size("few"))
+    online_client.send_audio_speech_request(request_config, request_num=get_max_batch_size("few"))
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_response_format_001(omni_server, openai_client) -> None:
+@pytest.mark.parametrize(
+    "omni_server",
+    tts_async_chunk_server_params + tts_no_async_chunk_server_params,
+    indirect=True,
+)
+def test_response_format_001(omni_server, online_client) -> None:
     """
     Test text input processing and audio output via OpenAI API.
     Deploy Setting: default yaml
@@ -111,4 +124,31 @@ def test_response_format_001(omni_server, openai_client) -> None:
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
     }
-    openai_client.send_audio_speech_request(request_config)
+    online_client.send_audio_speech_request(request_config)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", tts_async_chunk_server_params, indirect=True)
+def test_xvector_then_icl_same_ref_audio_keeps_engine_alive(omni_server, online_client) -> None:
+    """Regression for #5049: x-vector-only then ICL on the same ``ref_audio``.
+
+    Pre-fix, readiness was mode-agnostic: an x-vector request marked the
+    artifact ready (embedding only, no ``ref_code``), so the following ICL
+    request took the artifact-only path and killed EngineCore. After the fix
+    (readiness keyed by ``(artifact_key, x_vector_only)``), both modes succeed
+    and the server stays up. Only runs on the ``async_chunk`` server param.
+    """
+    base_request = {
+        "model": omni_server.model,
+        "input": get_prompt(),
+        "stream": False,
+        "timeout": DEFAULT_AUDIO_SPEECH_TIMEOUT_S,
+        "response_format": "wav",
+        "task_type": "Base",
+        "ref_audio": REF_AUDIO_URL,
+        "min_audio_bytes": 1,
+    }
+
+    online_client.send_audio_speech_request({**base_request, "x_vector_only_mode": True})
+    online_client.send_audio_speech_request({**base_request, "x_vector_only_mode": False, "ref_text": REF_TEXT})
+    online_client.send_audio_speech_request({**base_request, "x_vector_only_mode": True})

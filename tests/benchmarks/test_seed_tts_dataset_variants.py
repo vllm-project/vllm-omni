@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for SeedTTSTextDataset, SeedTTSTextSampleRequest, SeedTTSDesignDataset,
 and SeedTTSDesignSampleRequest.
 
@@ -232,34 +235,6 @@ def test_seed_tts_design_dataset_rejects_missing_description(seed_tts_design_roo
     for req in requests:
         assert isinstance(req, SeedTTSDesignSampleRequest)
         assert req.seed_tts_utterance_id == "ok"
-
-
-def test_attach_sets_seed_tts_row_even_without_extra_body():
-    """seed_tts_row=True must be set for SeedTTSTextSampleRequest (no extra body)."""
-    from vllm_omni.benchmarks.data_modules.seed_tts_dataset import SeedTTSTextSampleRequest
-
-    req = SeedTTSTextSampleRequest(
-        prompt="hello world",
-        prompt_len=2,
-        expected_output_len=100,
-        multi_modal_data=None,
-        request_id="test-0",
-        seed_tts_speech_extra=None,
-        seed_tts_ref_wav_path="",
-    )
-    assert req.seed_tts_speech_extra is None
-    assert req.seed_tts_ref_wav_path == ""
-    # The fix ensures that even with speech_extra=None, the function
-    # sets seed_tts_row=True. We verify the source code has the fix.
-    import inspect
-
-    import vllm_omni.benchmarks.patch.patch as patch_mod
-
-    src = inspect.getsource(patch_mod._attach_seed_tts_to_request_func_input)
-    # seed_tts_row must be set BEFORE the 'if not ex: return' check
-    row_pos = src.index("seed_tts_row")
-    not_ex_pos = src.index("if not ex:")
-    assert row_pos < not_ex_pos, "seed_tts_row must be set before 'if not ex: return'"
 
 
 def test_seed_tts_whisper_transcribe_passes_attention_mask(monkeypatch):

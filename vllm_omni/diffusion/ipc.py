@@ -158,7 +158,7 @@ def _pack_value_if_large(
 
     Walks the container shapes pipelines return as ``DiffusionOutput.output``:
     bare tensors, dicts (e.g. Cosmos3 ``{"image"/"video": ...}``), and
-    tuples/lists (e.g. LTX2 and DreamID ``(video, audio)``). Other values pass
+    tuples/lists (e.g. LTX2 ``(video, audio)``). Other values pass
     through unchanged. ``_unpack_if_shm_handle`` must mirror these shapes — keep
     the two in sync.
     """

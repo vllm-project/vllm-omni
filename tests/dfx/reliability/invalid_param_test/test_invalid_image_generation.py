@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """``POST /v1/images/generations`` validation (live ``Qwen/Qwen-Image``)."""
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 
 pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
 
@@ -126,7 +126,7 @@ def _minimal_images_gen_json(omni_server: OmniServer) -> dict[str, object]:
 @pytest.mark.parametrize("omni_server", _PARAMS, indirect=True)
 def test_images_generations_invalid_requests(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
     body_spec: Any,
     err_message: str | tuple[str, ...],
 ) -> None:
@@ -137,6 +137,6 @@ def test_images_generations_invalid_requests(
         assert isinstance(body_spec, dict)
         body = _minimal_images_gen_json(omni_server)
         body.update(body_spec)
-    openai_client.send_images_generations_http_request(
+    online_client.send_images_generations_http_request(
         {"json": body, "timeout": 300, "err_code": 400, "err_message": err_message}
     )

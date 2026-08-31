@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Loader-owned host-weight plans shared with diffusion offload backends."""
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ import json
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from safetensors import safe_open
@@ -20,6 +21,9 @@ from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
 )
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm_omni.host_weight_runtime import HostWeightLeaseCarrier
 
 TensorTransform = Callable[[torch.Tensor], torch.Tensor]
 
@@ -40,6 +44,7 @@ class HostWeightPlan:
     backing_kind: str
     bindings: dict[str, TensorBinding]
     planned_source_prefixes: frozenset[str] = frozenset()
+    lease_carrier: HostWeightLeaseCarrier | None = None
 
 
 @dataclass(frozen=True)

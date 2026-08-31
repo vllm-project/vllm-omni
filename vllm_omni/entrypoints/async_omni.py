@@ -17,7 +17,7 @@ from vllm import TokensPrompt
 from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.outputs import PoolingRequestOutput
+from vllm.outputs import CompletionOutput, PoolingRequestOutput
 from vllm.plugins.io_processors import get_io_processor
 from vllm.pooling_params import PoolingParams
 from vllm.renderers.inputs.preprocess import extract_prompt_components
@@ -37,7 +37,6 @@ from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm.inputs.preprocess import InputPreprocessor
@@ -54,6 +53,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
+# Blocking-wait interval for the event-driven final-output drain
+# (VLLM_OMNI_EVENT_DRIVEN_ORCH=1): a message wakes the drain immediately via
+# the janus queue's condition variable; this timeout only bounds how often the
+# orchestrator liveness check runs while the pipeline is idle.
+_FINAL_OUTPUT_BLOCKING_WAIT_S = 1.0
 
 
 class AsyncEventResolver:
@@ -146,12 +150,19 @@ class AsyncOmni(EngineClient, OmniBase):
         OmniBase.__init__(self, model=model, **kwargs)
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
+        # In-flight EngineCore submits (non-streaming add_request, or each
+        # streaming ADD/update/final marker). sleep() waits for this to hit
+        # zero so a pipelined request cannot race into EngineCore during
+        # drain/offload. Streaming generate does not hold a slot while
+        # waiting for the next client chunk.
+        self._admitting: int = 0
         # True after pause_generation() or AR EngineCore sleep; wake_up must
         # not reopen generate() until resume_generation(). Diffusion-only
         # sleep uses _paused as a temporary admission gate and clears it
         # on wake so sleep → wake → generate keeps working.
         self._hold_admission_until_resume: bool = False
         self._sleeping_tags: set[str] = set()
+        self._stage_sleeping_tags: dict[int, set[str]] = {}
         self._level2_sleeping: bool = False
         self._duplex_request_client: DuplexRequestClient | None = None
         self.duplex_lifecycle_events: asyncio.Queue[DuplexSessionLifecycleMessage] = asyncio.Queue()
@@ -509,31 +520,40 @@ class AsyncOmni(EngineClient, OmniBase):
         external_request_id = request_id
         request_id = self._get_unique_request_id(external_request_id)
 
-        # Wait until generation is resumed if the engine is paused
+        # Wait until generation is resumed if the engine is paused. Non-streaming
+        # generate holds an admission slot until add_request completes so sleep()
+        # cannot race a just-unblocked generate into EngineCore during offload.
+        # Streaming generate does **not** hold the slot while waiting for the
+        # first client chunk; the input pump acquires it immediately before each
+        # EngineCore ADD/update.
+        streaming_input = isinstance(prompt, AsyncGenerator)
         async with self._pause_cond:
             await self._pause_cond.wait_for(lambda: not self._paused)
+            if not streaming_input:
+                self._admitting = getattr(self, "_admitting", 0) + 1
+        admitting = not streaming_input
 
         logger.debug(f"[AsyncOmni] generate() called for request {external_request_id}")
 
-        _sleeping_tags = getattr(self, "_sleeping_tags", None)
-        if _sleeping_tags:
-            raise RuntimeError(
-                f"Generation rejected: Engine is partially or fully asleep. "
-                f"Currently sleeping tags: {list(_sleeping_tags)}. "
-                f"Please perform a full wake_up before generating."
-            )
-
-        # Reject diffusion list-prompt early with a clear API error.
-        if isinstance(prompt, list) and any(
-            getattr(client, "stage_type", "") == "diffusion" for client in getattr(self.engine, "stage_clients", [])
-        ):
-            raise ValueError(
-                "Diffusion stages accept only a single prompt per request. "
-                "Submit multiple independent requests to use scheduler batching."
-            )
-
         input_stream_task: asyncio.Task | None = None
         try:
+            _sleeping_tags = getattr(self, "_sleeping_tags", None)
+            if _sleeping_tags:
+                raise RuntimeError(
+                    f"Generation rejected: Engine is partially or fully asleep. "
+                    f"Currently sleeping tags: {list(_sleeping_tags)}. "
+                    f"Please perform a full wake_up before generating."
+                )
+
+            # Reject diffusion list-prompt early with a clear API error.
+            if isinstance(prompt, list) and any(
+                getattr(client, "stage_type", "") == "diffusion" for client in getattr(self.engine, "stage_clients", [])
+            ):
+                raise ValueError(
+                    "Diffusion stages accept only a single prompt per request. "
+                    "Submit multiple independent requests to use scheduler batching."
+                )
+
             # Start final output dispatcher on the first call to generate()
             self._final_output_handler()
 
@@ -594,8 +614,11 @@ class AsyncOmni(EngineClient, OmniBase):
                 req_sp_list[p_id] = self._prepare_prefill_sampling_params(request_id, req_sp_list[p_id])
 
             # Add request(s) to stage 0. For streaming inputs, submit
-            # chunks incrementally through streaming_update.
-            if isinstance(prompt, AsyncGenerator):
+            # chunks incrementally through streaming_update. The helper
+            # returns as soon as the pump task is created; each ADD/update
+            # takes its own admission slot inside the pump.
+            if streaming_input:
+                first_chunk_submitted = asyncio.get_running_loop().create_future()
                 input_stream_task = await self._add_streaming_input_request(
                     request_id=request_id,
                     input_stream=prompt,
@@ -604,7 +627,9 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
+                    first_chunk_submitted=first_chunk_submitted,
                 )
+                await first_chunk_submitted
             else:
                 await self.engine.add_request_async(
                     request_id=request_id,
@@ -618,6 +643,11 @@ class AsyncOmni(EngineClient, OmniBase):
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
             req_start_ts[request_id] = submit_ts
+            if admitting:
+                await self._release_generate_admission()
+                admitting = False
+            # Refresh gauges on arrival.
+            self._publish_request_gauges(len(self.request_states))
 
             # Process results based on mode
             # Both sequential and async_chunk modes read the same message stream
@@ -634,27 +664,38 @@ class AsyncOmni(EngineClient, OmniBase):
 
             logger.debug(f"[AsyncOmni] Request {request_id} completed")
 
-            # The input pump can outlive a normally-completed generation
-            # (e.g. a realtime client that keeps streaming after the final
-            # output); a live pump keeps issuing streaming updates for a
-            # request the orchestrator no longer tracks.
-            if input_stream_task is not None and not input_stream_task.done():
-                input_stream_task.cancel()
-
-            self._log_summary_and_cleanup(request_id)
-
         except (asyncio.CancelledError, GeneratorExit):
-            if input_stream_task is not None and not input_stream_task.done():
-                input_stream_task.cancel()
-            self._fire_failure_counter_if_alive(request_id)
+            self._record_request_failure_once(request_id, reason="client_disconnect")
             await self._abort_internal_requests(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
         except Exception as e:
-            self._fire_failure_counter_if_alive(request_id)
+            self._record_request_failure_once(request_id, reason="stage_error")
             await self._abort_internal_requests(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
+        finally:
+            if input_stream_task is not None and not input_stream_task.done():
+                input_stream_task.cancel()
+            if admitting:
+                await self._release_generate_admission()
+            self._log_summary_and_cleanup(request_id)
+
+    async def _release_generate_admission(self) -> None:
+        """Drop one in-flight generate admission slot held across add_request."""
+        async with self._pause_cond:
+            self._admitting = max(getattr(self, "_admitting", 1) - 1, 0)
+            self._pause_cond.notify_all()
+
+    async def _submit_with_admission(self, awaitable):
+        """Wait for resume, hold one admission slot for a single EngineCore submit."""
+        async with self._pause_cond:
+            await self._pause_cond.wait_for(lambda: not self._paused)
+            self._admitting = getattr(self, "_admitting", 0) + 1
+        try:
+            return await awaitable
+        finally:
+            await self._release_generate_admission()
 
     async def _add_streaming_input_request(
         self,
@@ -666,6 +707,7 @@ class AsyncOmni(EngineClient, OmniBase):
         final_output_stage_ids: Sequence[int],
         arrival_time: float,
         lora_request: Any = None,
+        first_chunk_submitted: asyncio.Future[None] | None = None,
     ) -> asyncio.Task:
         """Submit a streaming input generator as incremental stage-0 updates."""
         if not sampling_params_list:
@@ -682,6 +724,10 @@ class AsyncOmni(EngineClient, OmniBase):
             stage0_params = stage0_params.clone()
             stage0_params.skip_clone = True
 
+        def _mark_first_chunk_submitted() -> None:
+            if first_chunk_submitted is not None and not first_chunk_submitted.done():
+                first_chunk_submitted.set_result(None)
+
         async def handle_inputs() -> None:
             nonlocal has_submitted_first_chunk
             cancelled = False
@@ -695,29 +741,34 @@ class AsyncOmni(EngineClient, OmniBase):
                     prompt_text, _, _ = extract_prompt_components(self.model_config, chunk_prompt)
 
                     if not has_submitted_first_chunk:
-                        await self.engine.add_request_async(
-                            request_id=request_id,
-                            prompt=chunk_prompt,
-                            prompt_text=prompt_text,
-                            sampling_params_list=chunk_sampling_params_list,
-                            final_stage_id=final_stage_id,
-                            final_output_stage_ids=final_output_stage_ids,
-                            arrival_time=arrival_time,
-                            lora_request=lora_request,
-                            resumable=True,
+                        await self._submit_with_admission(
+                            self.engine.add_request_async(
+                                request_id=request_id,
+                                prompt=chunk_prompt,
+                                prompt_text=prompt_text,
+                                sampling_params_list=chunk_sampling_params_list,
+                                final_stage_id=final_stage_id,
+                                final_output_stage_ids=final_output_stage_ids,
+                                arrival_time=arrival_time,
+                                lora_request=lora_request,
+                                resumable=True,
+                            )
                         )
                         has_submitted_first_chunk = True
+                        _mark_first_chunk_submitted()
                     else:
-                        await self.engine.add_streaming_update_async(
-                            request_id=request_id,
-                            prompt=chunk_prompt,
-                            prompt_text=prompt_text,
-                            sampling_params_list=chunk_sampling_params_list,
-                            final_stage_id=final_stage_id,
-                            final_output_stage_ids=final_output_stage_ids,
-                            arrival_time=arrival_time,
-                            lora_request=lora_request,
-                            resumable=True,
+                        await self._submit_with_admission(
+                            self.engine.add_streaming_update_async(
+                                request_id=request_id,
+                                prompt=chunk_prompt,
+                                prompt_text=prompt_text,
+                                sampling_params_list=chunk_sampling_params_list,
+                                final_stage_id=final_stage_id,
+                                final_output_stage_ids=final_output_stage_ids,
+                                arrival_time=arrival_time,
+                                lora_request=lora_request,
+                                resumable=True,
+                            )
                         )
             except (asyncio.CancelledError, GeneratorExit):
                 cancelled = True
@@ -732,37 +783,47 @@ class AsyncOmni(EngineClient, OmniBase):
                     )
                 )
             finally:
-                if not cancelled:
-                    # Send empty final request to indicate that inputs have
-                    # finished. Don't send if canceled (session was aborted).
-                    final_sampling_params_list = list(sampling_params_list)
-                    final_sampling_params_list[0] = stage0_params
-                    final_prompt = TokensPrompt(prompt_token_ids=[0])
+                try:
+                    if not cancelled:
+                        # Send empty final request to indicate that inputs have
+                        # finished. Don't send if canceled (session was aborted).
+                        final_sampling_params_list = list(sampling_params_list)
+                        final_sampling_params_list[0] = stage0_params
+                        final_prompt = TokensPrompt(prompt_token_ids=[0])
 
-                    if has_submitted_first_chunk:
-                        await self.engine.add_streaming_update_async(
-                            request_id=request_id,
-                            prompt=final_prompt,
-                            prompt_text=None,
-                            sampling_params_list=final_sampling_params_list,
-                            final_stage_id=final_stage_id,
-                            final_output_stage_ids=final_output_stage_ids,
-                            arrival_time=arrival_time,
-                            lora_request=lora_request,
-                            resumable=False,
-                        )
-                    else:
-                        await self.engine.add_request_async(
-                            request_id=request_id,
-                            prompt=final_prompt,
-                            prompt_text=None,
-                            sampling_params_list=final_sampling_params_list,
-                            final_stage_id=final_stage_id,
-                            final_output_stage_ids=final_output_stage_ids,
-                            arrival_time=arrival_time,
-                            lora_request=lora_request,
-                            resumable=False,
-                        )
+                        if has_submitted_first_chunk:
+                            await self._submit_with_admission(
+                                self.engine.add_streaming_update_async(
+                                    request_id=request_id,
+                                    prompt=final_prompt,
+                                    prompt_text=None,
+                                    sampling_params_list=final_sampling_params_list,
+                                    final_stage_id=final_stage_id,
+                                    final_output_stage_ids=final_output_stage_ids,
+                                    arrival_time=arrival_time,
+                                    lora_request=lora_request,
+                                    resumable=False,
+                                )
+                            )
+                        else:
+                            await self._submit_with_admission(
+                                self.engine.add_request_async(
+                                    request_id=request_id,
+                                    prompt=final_prompt,
+                                    prompt_text=None,
+                                    sampling_params_list=final_sampling_params_list,
+                                    final_stage_id=final_stage_id,
+                                    final_output_stage_ids=final_output_stage_ids,
+                                    arrival_time=arrival_time,
+                                    lora_request=lora_request,
+                                    resumable=False,
+                                )
+                            )
+                            has_submitted_first_chunk = True
+                finally:
+                    # Unblock generate() even on cancel / empty stream / submit
+                    # failure so it can observe a terminal abort or empty result.
+                    _mark_first_chunk_submitted()
 
         input_stream_task = asyncio.create_task(handle_inputs())
         req_state.input_stream_task = input_stream_task
@@ -881,14 +942,29 @@ class AsyncOmni(EngineClient, OmniBase):
 
         engine = self.engine
 
+        # Event-driven drain (VLLM_OMNI_EVENT_DRIVEN_ORCH=1): block on the
+        # queue's condition variable in a dedicated thread instead of the
+        # get_nowait + 1 ms sleep cadence. Same flag as the orchestrator-side
+        # event-driven loop (vllm_omni/engine/orchestrator.py).
+        from vllm_omni.engine.orchestrator import _event_driven_orch_enabled
+
+        event_driven_drain = _event_driven_orch_enabled() and hasattr(engine, "get_output_blocking_async")
+
         async def _final_output_loop():
             """Background coroutine that dispatches final outputs to request queues."""
             try:
                 while True:
-                    msg = await engine.try_get_output_async()
-                    if msg is None:
-                        await asyncio.sleep(_FINAL_OUTPUT_IDLE_SLEEP_S)
-                        continue
+                    if event_driven_drain:
+                        msg = await engine.get_output_blocking_async(timeout=_FINAL_OUTPUT_BLOCKING_WAIT_S)
+                        if msg is None:
+                            # Timed out with the orchestrator alive; loop for
+                            # the periodic liveness check.
+                            continue
+                    else:
+                        msg = await engine.try_get_output_async()
+                        if msg is None:
+                            await asyncio.sleep(_FINAL_OUTPUT_IDLE_SLEEP_S)
+                            continue
 
                     if isinstance(msg, dict) and msg.get("type") == "ack":
                         ack_data = msg.get("ack")
@@ -1108,20 +1184,75 @@ class AsyncOmni(EngineClient, OmniBase):
         await self._abort(internal_req_ids)
 
     async def _abort(self, request_ids: list[str]) -> None:
-        """Abort request IDs via the engine and clean frontend state after ack.
+        """Abort request IDs via the engine and enqueue terminal abort outputs.
 
-        Waits for orchestrator abort acknowledgment before popping
-        ``request_states`` so generate() cleanup stays consistent with
-        backend binding/request teardown. Orchestrator abort errors propagate.
+        Waits for orchestrator abort acknowledgment, enqueues any AR terminal
+        abort outputs (partial tokens) into each request's asyncio queue, then
+        cancels the input pump. Frontend ``request_states`` stay registered so
+        ``generate()`` can consume the terminal message in
+        ``_process_orchestrator_results`` and run normal cleanup.
+
+        When ``abort_async`` returns no output for an active request (OP not
+        registered yet, unbound replica, or orchestrator id drop), enqueue a
+        synthetic finished abort so ``generate()`` cannot hang on ``queue.get``.
         """
-        await self.engine.abort_async(request_ids)
+        abort_outputs = await self.engine.abort_async(request_ids) or []
+        delivered: set[str] = set()
+        for output_msg in abort_outputs:
+            req_id = getattr(output_msg, "request_id", None)
+            if req_id is None:
+                continue
+            state = self.request_states.get(req_id)
+            if state is None:
+                logger.debug("[AsyncOmni] Dropping abort output for unknown req %s", req_id)
+                continue
+            await state.queue.put(output_msg)
+            delivered.add(req_id)
         for rid in request_ids:
-            state = self.request_states.pop(rid, None)
+            state = self.request_states.get(rid)
+            if state is not None and rid not in delivered:
+                queue = getattr(state, "queue", None)
+                if queue is not None:
+                    await state.queue.put(self._synthetic_abort_output_message(rid))
+                    delivered.add(rid)
+        for rid in request_ids:
+            self._record_request_failure_once(rid, reason="client_abort")
+            state = self.request_states.get(rid)
             input_stream_task = getattr(state, "input_stream_task", None)
             if input_stream_task is not None and not input_stream_task.done():
                 input_stream_task.cancel()
         if self.log_stats:
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
+
+    @staticmethod
+    def _synthetic_abort_output_message(request_id: str) -> OutputMessage:
+        """Terminal abort OutputMessage used when the engine returned none."""
+        engine_output = OmniRequestOutput(
+            request_id=request_id,
+            finished=True,
+            stage_id=0,
+            final_output_type="text",
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text="",
+                    token_ids=[],
+                    cumulative_logprob=None,
+                    logprobs=None,
+                    finish_reason="abort",
+                    stop_reason=None,
+                )
+            ],
+        )
+        return OutputMessage(
+            request_id=request_id,
+            stage_id=0,
+            replica_id=None,
+            engine_outputs=engine_output,
+            metrics=None,
+            finished=True,
+            stage_submit_ts=None,
+        )
 
     def _split_stage_ids_by_type(self, stage_ids: list[int] | None = None) -> tuple[list[int], list[int]]:
         """Split stage ids into AR/LLM (EngineCore) vs diffusion (worker RPC)."""
@@ -1145,6 +1276,47 @@ class AsyncOmni(EngineClient, OmniBase):
             else:
                 ar_stage_ids.append(sid)
         return ar_stage_ids, diffusion_stage_ids
+
+    def _sleeping_tags_for_stages(self, stage_ids: list[int]) -> set[str]:
+        """Union of sleeping tags recorded for the given stages."""
+        per_stage = getattr(self, "_stage_sleeping_tags", None) or {}
+        tags: set[str] = set()
+        for sid in stage_ids:
+            tags.update(per_stage.get(sid, set()))
+        return tags
+
+    def _refresh_union_sleeping_tags(self) -> None:
+        """Keep ``_sleeping_tags`` as the engine-wide union of per-stage tags."""
+        per_stage = getattr(self, "_stage_sleeping_tags", None) or {}
+        union: set[str] = set()
+        for stage_tags in per_stage.values():
+            union.update(stage_tags)
+        self._sleeping_tags = union
+
+    def _record_stage_sleep(self, stage_ids: list[int], tags: Iterable[str]) -> None:
+        per_stage = getattr(self, "_stage_sleeping_tags", None)
+        if per_stage is None:
+            per_stage = {}
+            self._stage_sleeping_tags = per_stage
+        tag_set = set(tags)
+        for sid in stage_ids:
+            per_stage.setdefault(sid, set()).update(tag_set)
+        self._refresh_union_sleeping_tags()
+
+    def _clear_stage_sleep(self, stage_ids: list[int], tags: Iterable[str]) -> None:
+        per_stage = getattr(self, "_stage_sleeping_tags", None)
+        if per_stage is None:
+            self._sleeping_tags = set()
+            return
+        tag_set = set(tags)
+        for sid in stage_ids:
+            remaining = per_stage.get(sid)
+            if remaining is None:
+                continue
+            remaining.difference_update(tag_set)
+            if not remaining:
+                per_stage.pop(sid, None)
+        self._refresh_union_sleeping_tags()
 
     async def pause_generation(
         self,
@@ -1244,11 +1416,24 @@ class AsyncOmni(EngineClient, OmniBase):
         return await self.collective_rpc(method="profile", args=(False, None), stage_ids=stages)
 
     async def reset_mm_cache(self) -> None:
-        """Reset the multi-modal cache for all stages.
+        """Reset the frontend (P0) multimodal processor cache.
 
-        TODO: Forward to Orchestrator process via message.
+        ``EngineCore.sleep(level>=1)`` already clears the P1 receiver cache.
+        Clearing P0 avoids hash-only follow-up requests after that reset.
         """
-        logger.warning("[AsyncOmni] reset_mm_cache not yet supported with Orchestrator process")
+        processor = getattr(self, "input_processor", None)
+        if processor is None:
+            processor = getattr(self.engine, "input_processor", None)
+        cache = getattr(processor, "mm_processor_cache", None)
+        if cache is None:
+            logger.debug("[AsyncOmni] reset_mm_cache: no frontend mm_processor_cache")
+            return
+        for name in ("clear", "reset", "clear_cache"):
+            fn = getattr(cache, name, None)
+            if callable(fn):
+                fn()
+                return
+        logger.debug("[AsyncOmni] reset_mm_cache: cache has no clear/reset method")
 
     async def reset_encoder_cache(self) -> None:
         """Reset the encoder cache for all stages.
@@ -1292,10 +1477,15 @@ class AsyncOmni(EngineClient, OmniBase):
         admission and ``sleep → wake → generate`` keeps working.
         """
         # Block admission before any sleep RPC so generate() waits on
-        # _pause_cond during the drain/offload window. EngineCore.sleep will
-        # pause the AR scheduler itself; avoid a second pause_scheduler here.
+        # _pause_cond during the drain/offload window. Wait until generate()
+        # coroutines that already passed the pause check have submitted (or
+        # failed) so EngineCore does not see ADD frames while sleeping.
         async with self._pause_cond:
             self._paused = True
+            await self._pause_cond.wait_for(lambda: getattr(self, "_admitting", 0) == 0)
+
+        # P0 sender cache must drop hashes before EngineCore.sleep clears P1.
+        await self.reset_mm_cache()
 
         self._final_output_handler()
         ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
@@ -1331,9 +1521,10 @@ class AsyncOmni(EngineClient, OmniBase):
         if diffusion_stage_ids:
             final_acks.extend(await self._sleep_diffusion(diffusion_stage_ids, level))
 
-        if not hasattr(self, "_sleeping_tags"):
-            self._sleeping_tags = set()
-        self._sleeping_tags.update([CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value])
+        self._record_stage_sleep(
+            ar_stage_ids + diffusion_stage_ids,
+            [CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value],
+        )
         if level == 2:
             self._level2_sleeping = True
         return final_acks
@@ -1377,7 +1568,12 @@ class AsyncOmni(EngineClient, OmniBase):
                 "Use sleep(level=1) instead, which offloads weights to CPU RAM "
                 "and supports fast DMA restore."
             )
-        _current_tags = getattr(self, "_sleeping_tags", set())
+        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+        target_stage_ids = ar_stage_ids + diffusion_stage_ids
+        _current_tags = self._sleeping_tags_for_stages(target_stage_ids)
+        per_stage = getattr(self, "_stage_sleeping_tags", None) or {}
+        if not _current_tags and not per_stage:
+            _current_tags = set(getattr(self, "_sleeping_tags", set()))
         if tags is None:
             requested_tags = list(_current_tags)
         else:
@@ -1385,8 +1581,6 @@ class AsyncOmni(EngineClient, OmniBase):
         if not requested_tags:
             logger.info(f"[{self._name}] Requested tags {tags} are already warm. Skipping wake_up.")
             return []
-
-        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
 
         final_acks: list[OmniACK] = []
         if ar_stage_ids:
@@ -1411,9 +1605,7 @@ class AsyncOmni(EngineClient, OmniBase):
         if diffusion_stage_ids:
             final_acks.extend(await self._wake_diffusion(diffusion_stage_ids, requested_tags))
 
-        for t in requested_tags:
-            if hasattr(self, "_sleeping_tags"):
-                self._sleeping_tags.discard(t)
+        self._clear_stage_sleep(target_stage_ids, requested_tags)
         # Only clear the level-2 flag once all tags are warm, in case partial
         # wake support (e.g. tags=["kv_cache"] only) is added in the future.
         if not getattr(self, "_sleeping_tags", None):
@@ -1447,7 +1639,6 @@ class AsyncOmni(EngineClient, OmniBase):
                 if ack is not None:
                     await self.event_resolver.resolve(ack)
                     final_acks.append(ack)
-        current_omni_platform.synchronize()
         await asyncio.sleep(0.1)
         return final_acks
 

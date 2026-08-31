@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -290,6 +290,7 @@ def test_minus_one_max_model_len_is_auto_fitted_by_native_cache_sizing() -> None
         dtype=torch.bfloat16,
         non_causal=True,
     )
+    model_limit = vllm_config.model_config.max_model_len
 
     initialization.build_native_kv_cache_configs(
         vllm_config,
@@ -298,4 +299,8 @@ def test_minus_one_max_model_len_is_auto_fitted_by_native_cache_sizing() -> None
     )
 
     assert vllm_config.model_config.original_max_model_len == -1
-    assert vllm_config.model_config.max_model_len == 256
+    # Sixteen physical pages provide ``16 * block_size`` tokens.  The native
+    # backend chooses the block geometry, so keep this assertion backend
+    # independent instead of assuming the generic 16-token block size.
+    expected_max_model_len = min(model_limit, spec.block_size * 16)
+    assert vllm_config.model_config.max_model_len == expected_max_model_len

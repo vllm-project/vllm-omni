@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -10,7 +10,7 @@ import torch
 from torch import nn
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig, validate_dlo_host_registration_options
 
 logger = init_logger(__name__)
 
@@ -52,6 +52,9 @@ class OffloadConfig:
     # blocks from the loader-selected host backing with H2D only.
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = 0  # leading DiT layers kept on device
+    # Optional per-worker ceiling for registering an HWR mmap. Zero means no
+    # additional ceiling; pin_cpu_memory controls whether registration is tried.
+    dlo_host_registration_limit_gib: float = 0.0
 
     @classmethod
     def from_od_config(cls, od_config: OmniDiffusionConfig) -> "OffloadConfig":
@@ -122,6 +125,12 @@ class OffloadConfig:
         # requirements (concurrent requests, dummy run skip).
         dlo_use_allgather = getattr(od_config, "dlo_use_allgather", True)
         dlo_resident_layers = int(getattr(od_config, "dlo_resident_layers", 0))
+        dlo_host_registration_limit_gib = validate_dlo_host_registration_options(
+            limit_gib=getattr(od_config, "dlo_host_registration_limit_gib", 0.0),
+            enable_dlo=enable_distributed_layerwise_offload,
+            use_allgather=dlo_use_allgather,
+            hwr_mode=getattr(od_config, "host_weight_runtime_mode", "disabled"),
+        )
         if dlo_resident_layers < 0:
             raise ValueError(f"dlo_resident_layers must be >= 0, got {dlo_resident_layers}")
         if dlo_resident_layers and dlo_use_allgather:
@@ -157,6 +166,7 @@ class OffloadConfig:
             dp_size=dp_size,
             dlo_use_allgather=dlo_use_allgather,
             dlo_resident_layers=dlo_resident_layers,
+            dlo_host_registration_limit_gib=dlo_host_registration_limit_gib,
         )
 
 

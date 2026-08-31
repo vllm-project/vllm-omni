@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """API-server surface guards for the OpenAI Omni entrypoint.
 
 Purpose
@@ -20,8 +20,8 @@ Common wrong changes these tests are meant to catch
 * Route accidentally removed, renamed, method-changed, or double-registered
   after a move (census / assembled-app checks).
 * OpenAPI drops an Omni HTTP path while the router still has it (or the reverse).
-* Assembly forgets to strip upstream ``/v1/chat/completions`` (batch) /
-  ``/v1/models``, or also deletes unrelated upstream routes.
+* Assembly forgets to strip overridden upstream chat / models / profiler
+  routes, or also deletes unrelated upstream routes.
 * Profiler / Omni router not mounted; storage not started; Omni engine
   exception handlers not registered.
 * Timestamp middleware stops stamping HTTP, or starts mutating WebSocket scopes.
@@ -351,9 +351,10 @@ def test_router_openapi_paths_cover_http_manifest() -> None:
 async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_router(monkeypatch) -> None:
     """Lock worker assembly: override, mount, storage, handlers, full census.
 
-    Fails if assembly stops replacing upstream chat/batch/models, deletes
-    unrelated upstream routes, forgets Omni/profiler mounts, skips storage
-    start, or drops Omni ``EngineDeadError`` / ``EngineGenerateError`` handlers.
+    Fails if assembly stops replacing upstream chat/batch/models/profiler,
+    deletes unrelated upstream routes, forgets Omni/profiler mounts, skips
+    storage start, or drops Omni ``EngineDeadError`` / ``EngineGenerateError``
+    handlers.
     """
     captured: dict[str, object] = {}
 
@@ -370,6 +371,14 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
 
         @app.get("/v1/models")
         async def upstream_models():
+            return {"owner": "upstream"}
+
+        @app.post("/start_profile")
+        async def upstream_start_profile():
+            return {"owner": "upstream"}
+
+        @app.post("/stop_profile")
+        async def upstream_stop_profile():
             return {"owner": "upstream"}
 
         @app.get("/v1/upstream-only")
@@ -389,6 +398,12 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     async def fake_omni_init_app_state(engine_client, state, args):
         state.engine_client = engine_client
         state.initialized_by_omni = True
+        state.openai_serving_video = SimpleNamespace(
+            shutdown=lambda: captured.__setitem__("video_shutdown", True),
+        )
+        state.openai_serving_speech = SimpleNamespace(
+            shutdown=lambda: captured.__setitem__("speech_shutdown", True),
+        )
 
     async def fake_storage_start():
         captured["storage_started"] = True
@@ -424,6 +439,8 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     assert captured["supported_tasks"] == ("generate",)
     assert captured["storage_started"] is True
     assert captured["restrictions"] == {}
+    assert captured["video_shutdown"] is True
+    assert captured["speech_shutdown"] is True
     assert sock.closed is True
     assert served_app.state.initialized_by_omni is True
 
@@ -437,6 +454,8 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
         is api_server.create_batch_chat_completion
     )
     assert _single_http_route(routes, "GET", "/v1/models").endpoint is api_server.show_available_models
+    assert _single_http_route(routes, "POST", "/start_profile").endpoint is api_server.start_profile
+    assert _single_http_route(routes, "POST", "/stop_profile").endpoint is api_server.stop_profile
 
     # Assembled app includes Omni router HTTP/WS surface + profiler.
     for item in _EXPECTED_ROUTER_ROUTES:
@@ -728,7 +747,11 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
     )
 
     state = State()
-    await api_server.omni_init_app_state(engine, state, _minimal_args())
+    await api_server.omni_init_app_state(
+        engine,
+        state,
+        _minimal_args(),
+    )
 
     _assert_app_state_snapshot(
         state,
@@ -737,6 +760,55 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
         must_be_none=_DIFFUSION_MUST_BE_NONE,
     )
     assert state.diffusion_engine is engine
+
+
+@pytest.mark.asyncio
+async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch) -> None:
+    stage = SimpleNamespace(engine_args={})
+    engine = _FakeEngineClient(stage_configs=[stage])
+    speech_kwargs = {}
+
+    def _for_diffusion_factory(label: str):
+        @classmethod
+        def _factory(cls, *args, **kwargs):
+            return _marker(label)
+
+        return _factory
+
+    @classmethod
+    def _speech_factory(cls, *args, **kwargs):
+        speech_kwargs.update(kwargs)
+        return _marker("speech")
+
+    monkeypatch.setattr(api_server, "get_stage_type", lambda _cfg: "diffusion")
+    monkeypatch.setattr(api_server.OmniOpenAIServingChat, "for_diffusion", _for_diffusion_factory("chat"))
+    monkeypatch.setattr(api_server.OmniOpenAIServingChatBatch, "for_diffusion", _for_diffusion_factory("chat_batch"))
+    monkeypatch.setattr(
+        api_server.OmniOpenAIServingAudioGenerate,
+        "for_diffusion",
+        _for_diffusion_factory("audio_generate"),
+    )
+    monkeypatch.setattr(api_server.OmniOpenAIServingVideo, "for_diffusion", _for_diffusion_factory("video"))
+    monkeypatch.setattr(api_server.OmniStreamingVideoOutputHandler, "__init__", lambda self, *a, **k: None)
+    monkeypatch.setattr(api_server.OmniOpenAIServingSpeech, "for_diffusion", _speech_factory)
+    monkeypatch.setattr(
+        api_server.ServingRealtimeRobotOpenPI,
+        "create_policy_server",
+        classmethod(lambda cls, *a, **k: _marker("openpi")),
+    )
+
+    state = State()
+    await api_server.omni_init_app_state(
+        engine,
+        state,
+        _minimal_args(
+            allowed_local_media_path="/allowed/media",
+            allowed_media_domains=["media.example.com"],
+        ),
+    )
+
+    assert speech_kwargs["allowed_local_media_path"] == "/allowed/media"
+    assert speech_kwargs["allowed_media_domains"] == ["media.example.com"]
 
 
 @pytest.mark.asyncio

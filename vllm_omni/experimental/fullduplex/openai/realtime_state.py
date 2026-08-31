@@ -48,6 +48,9 @@ REALTIME_ERROR_TYPES_BY_CODE = {
     "input_audio_buffer_empty": "invalid_request_error",
     "missing_item_id": "invalid_request_error",
     "item_not_found": "invalid_request_error",
+    "playback_item_mismatch": "invalid_request_error",
+    "playback_item_not_found": "invalid_request_error",
+    "playback_ack_too_late": "invalid_request_error",
     "unsupported_audio_format": "invalid_request_error",
     "unsupported_ref_audio_path": "invalid_request_error",
     "ref_audio_required": "invalid_request_error",
@@ -57,6 +60,7 @@ REALTIME_ERROR_TYPES_BY_CODE = {
     "native_text_append_unsupported": "invalid_request_error",
     "runtime_native_stage_role_required": "server_error",
     "runtime_native_runner_kv_required": "server_error",
+    "server_vad_unavailable": "server_error",
 }
 
 
@@ -105,6 +109,9 @@ class RealtimeSessionState:
     _input_sample_rate_hz: int = 16000
     _output_audio_format: str = "pcm16"
     _overlap_silence_rms: float = 0.003
+    _turn_detection: dict[str, object] | None = None
+    _server_vad: object | None = None
+    _pending_turn_detection_update: tuple[dict[str, object] | None, object | None, asyncio.Event] | None = None
     _send_realtime_json: Any = None
     _initial_session_update: bool = False
     _input_speech_started: bool = False
@@ -180,6 +187,11 @@ class RealtimeStateOwner:
     _input_sample_rate_hz: int = _RealtimeStateField()
     _output_audio_format: str = _RealtimeStateField()
     _overlap_silence_rms: float = _RealtimeStateField()
+    _turn_detection: dict[str, object] | None = _RealtimeStateField()
+    _server_vad: object | None = _RealtimeStateField()
+    _pending_turn_detection_update: tuple[dict[str, object] | None, object | None, asyncio.Event] | None = (
+        _RealtimeStateField()
+    )
     _send_realtime_json: Any = _RealtimeStateField()
     _initial_session_update: bool = _RealtimeStateField()
     _input_speech_started: bool = _RealtimeStateField()

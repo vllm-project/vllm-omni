@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Quantization mapping helpers for nested Qwen3-Omni stages."""
 
 from vllm.model_executor.models.interfaces import SupportsQuant
@@ -25,8 +25,8 @@ def apply_nested_quant_config_mapping(model: SupportsQuant) -> None:
 
     # The outer model maps names, while the nested model still contributes
     # fused-module metadata needed by quantization scheme matching.
-    if model.packed_modules_mapping is not None:
-        quant_config.packed_modules_mapping.update(model.packed_modules_mapping)
+    if packed_modules_mapping := getattr(model, "packed_modules_mapping", None):
+        quant_config.packed_modules_mapping.update(packed_modules_mapping)
 
 
 class Qwen3OmniNestedSupportsQuant(SupportsQuant):

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Online serving L2 smoke tests for ``nvidia/Cosmos3-Nano``.
 
@@ -8,6 +8,7 @@ broader image/video similarity checks stay in ``tests/e2e/accuracy``.
 """
 
 import os
+from typing import Any
 
 import pytest
 
@@ -16,7 +17,7 @@ from tests.helpers.media import generate_synthetic_image, generate_synthetic_vid
 from tests.helpers.runtime import (
     OmniServer,
     OmniServerParams,
-    OpenAIClientHandler,
+    OnlineOmniClient,
 )
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -56,9 +57,9 @@ def _get_diffusion_feature_cases(model: str):
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
-def test_text_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
+def test_text_to_image_001(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:
     """Default Cosmos3 T2I smoke through ``/v1/images/generations``."""
-    responses = openai_client.send_images_generations_http_request(
+    responses = online_client.send_images_generations_http_request(
         {
             "json": {
                 "model": omni_server.model,
@@ -85,12 +86,12 @@ def test_text_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientH
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
-def test_video_generation_modes_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
+def test_video_generation_modes_001(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:
     """Default Cosmos3 T2V, I2V, and V2V smoke through the async ``/v1/videos`` endpoint."""
     image_reference = f"data:image/jpeg;base64,{generate_synthetic_image(256, 256, seed=42)['base64']}"
     video_reference = f"data:video/mp4;base64,{generate_synthetic_video(256, 256, 5)['base64']}"
 
-    video_cases = [
+    video_cases: list[dict[str, Any]] = [
         {
             "form_data": {
                 **VIDEO_SHAPE,
@@ -118,8 +119,8 @@ def test_video_generation_modes_001(omni_server: OmniServer, openai_client: Open
     ]
 
     for case in video_cases:
-        request_config = {
+        request_config: dict[str, Any] = {
             "model": omni_server.model,
             **case,
         }
-        openai_client.send_video_diffusion_request(request_config)
+        online_client.send_video_diffusion_request(request_config)

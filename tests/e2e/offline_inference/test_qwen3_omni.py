@@ -1,5 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 E2E offline tests for Omni model with video input and audio output.
+
+Abort / sleep-admission lives in ``test_qwen3_omni_colocate_async.py`` so it
+does not overlap this module's OmniRunners.
 """
 
 import os
@@ -57,23 +63,23 @@ def get_question(prompt_type="video"):
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
-def test_video_to_audio(omni_runner, omni_runner_handler) -> None:
+def test_video_to_audio(omni_runner, offline_client) -> None:
     """Test processing video, generating audio output."""
     video = generate_synthetic_video(224, 224, 300)["np_array"]
 
     request_config = {"prompts": get_question(), "videos": video, "modalities": ["audio"]}
 
     # Test single completion
-    omni_runner_handler.send_omni_request(request_config)
+    offline_client.send_omni_request(request_config)
 
 
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", thinker_test_params, indirect=True)
-def test_thinker_only_model_request(omni_runner, omni_runner_handler) -> None:
+def test_thinker_only_model_request(omni_runner, offline_client) -> None:
     """Test that we can load and run a request through a model that only has the thinker stage."""
     request_config = {"prompts": "what color is the sky?", "modalities": ["text"]}
 
     # Test single completion
-    omni_runner_handler.send_omni_request(request_config)
+    offline_client.send_omni_request(request_config)

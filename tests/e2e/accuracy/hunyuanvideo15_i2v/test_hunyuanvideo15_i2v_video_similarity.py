@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import os
@@ -149,7 +152,7 @@ def _generate_offline_video(*, image_source: str) -> Path:
 def _generate_online_video(
     *,
     omni_server,
-    openai_client,
+    online_client,
     image_source: str,
     timeout_seconds: int,
 ) -> Path:
@@ -171,7 +174,7 @@ def _generate_online_video(
         "image_reference": build_online_image_reference(online_image_source),
     }
     online_video_bytes = send_video_request_with_timeout(
-        openai_client,
+        online_client,
         request_config,
         timeout_seconds=timeout_seconds,
     )
@@ -204,7 +207,7 @@ def test_hunyuanvideo15_i2v_diffusers_offline_generates_video(
 @pytest.mark.parametrize("omni_server", SERVER_CASES, indirect=True)
 def test_hunyuanvideo15_i2v_online_serving_generates_video(
     omni_server,
-    openai_client,
+    online_client,
     hunyuanvideo15_i2v_image_source: str | None,
     hunyuanvideo15_online_timeout_seconds: int,
 ) -> None:
@@ -216,7 +219,7 @@ def test_hunyuanvideo15_i2v_online_serving_generates_video(
     validate_image_source(image_source)
     online_path = _generate_online_video(
         omni_server=omni_server,
-        openai_client=openai_client,
+        online_client=online_client,
         image_source=image_source,
         timeout_seconds=hunyuanvideo15_online_timeout_seconds,
     )

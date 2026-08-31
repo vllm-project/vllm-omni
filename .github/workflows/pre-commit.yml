@@ -27,4 +27,4 @@ jobs:
         # Don't run historical-debt hooks against the whole tree in CI yet.
         # They still run locally on changed files.
         env:
-          SKIP: check-test-ci-coverage,markdownlint-cli2,shellcheck,check-spdx-header,mypy-3.10
+          SKIP: check-mark,markdownlint-cli2,shellcheck,check-spdx-header,mypy-3.10

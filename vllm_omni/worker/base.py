@@ -201,11 +201,19 @@ class OmniGPUWorkerBase(GPUWorker):
         """
         from vllm.device_allocator.cumem import CuMemAllocator
 
+        # Drain in-flight kernels before CuMem unmap. Abort/decode can still
+        # have GPU work after the scheduler reports idle; unmapping then
+        # returns CUDA_ERROR_INVALID_VALUE (cudaErrorInvalidValue).
+        current_omni_platform.synchronize()
+        gc.collect()
+
         mem_before = current_omni_platform.get_current_memory_usage(self.device)
         offload_tags = ("weights",) if level == 1 else tuple()
         allocator = CuMemAllocator.get_instance()
         allocator.sleep(offload_tags=offload_tags)
-        current_omni_platform.empty_cache()
+        # allocator.sleep already gc.collects and empty_cache()s. A second
+        # empty_cache on the pluggable allocator is a known CUDA invalid
+        # argument (pytorch/pytorch#145168). Only sync for the readout.
         current_omni_platform.synchronize()
         mem_after = current_omni_platform.get_current_memory_usage(self.device)
         freed = max(0, mem_before - mem_after)

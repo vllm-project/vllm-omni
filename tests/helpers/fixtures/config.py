@@ -1,14 +1,47 @@
-"""Fixtures config creation & out of tree registry management."""
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+"""Session-scoped config and environment fixtures."""
+
+from __future__ import annotations
+
+import os
 
 import pytest
+import torch
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 
-from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 
-
-@pytest.fixture
-def clean_pipeline_registry():
-    """Ensure the OMNI_PIPELINES are in a clean state for a test that mutates it."""
-    snapshot = dict(OMNI_PIPELINES)
+@pytest.fixture(scope="session", autouse=True)
+def default_env():
+    # Keep behavior but avoid import-time side effects (RFC #2299).
+    keys = ("VLLM_WORKER_MULTIPROC_METHOD", "VLLM_TARGET_DEVICE")
+    previous = {key: os.environ.get(key) for key in keys}
+    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = previous["VLLM_WORKER_MULTIPROC_METHOD"] or "spawn"
+    os.environ["VLLM_TARGET_DEVICE"] = previous["VLLM_TARGET_DEVICE"] or (
+        "cuda" if torch.cuda.is_available() and torch.accelerator.device_count() > 0 else "cpu"
+    )
     yield
-    OMNI_PIPELINES.clear()
-    OMNI_PIPELINES.update(snapshot)
+    for key, value in previous.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+@pytest.fixture(scope="session", autouse=True)
+def default_vllm_config():
+    """Set a default VllmConfig for the whole test session.
+
+    Session scope ensures module-scoped fixtures (e.g. ``omni_runner``) and
+    deferred imports of ``tests.helpers.runtime`` both see the same context.
+    Function-scoped autouse ran too late for ``OmniRunner`` setup and could
+    desynchronize vLLM init vs request preprocessing (e.g. renderer state).
+    """
+    # Use CPU device if no GPU is available (e.g., in CI environments)
+    has_gpu = torch.cuda.is_available() and torch.accelerator.device_count() > 0
+    device = "cuda" if has_gpu else "cpu"
+    device_config = DeviceConfig(device=device)
+
+    with set_current_vllm_config(VllmConfig(device_config=device_config)):
+        yield

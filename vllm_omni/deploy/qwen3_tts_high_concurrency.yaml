@@ -38,6 +38,17 @@ connectors:
       # initial_codec_chunk_frames (including the per-request API field).
       # Example:
       #   codec_chunk_ramp: [4, 4, 8, 16, 25]
+      # Adaptive chunk ramp (opt-in, takes precedence over fixed codec_chunk_ramp):
+      # Chunk 0 uses dynamic IC; chunk 1+ sizes from live buffer-depth feedback.
+      # Self-tunes across hardware (NPU/NVIDIA) and load conditions.
+      # codec_chunk_adaptive: true
+      # codec_chunk_min_frames: 2
+      # Code2Wav decode + transfer margin
+      # codec_chunk_safety_margin_ms: 50
+      # EWMA->delta divisor (delta=max(delta_min, int(ewma/divisor))); higher=gentler ramp
+      # codec_chunk_ramp_divisor: 15
+      # min chunk-size growth per emit
+      # codec_chunk_ramp_delta_min: 2
       # async_chunk derives stateful ICL/xvec graph shapes from the ramp when
       # enabled, otherwise from the fixed chunk settings above, and ignores
       # decode_cudagraph_capture_sizes. Keep B>1

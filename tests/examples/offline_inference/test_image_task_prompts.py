@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -65,3 +65,38 @@ def test_image_to_video_builds_canonical_prompt() -> None:
         "multi_modal_data": {"image": image},
         "negative_prompt": "flicker",
     }
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "module_name"),
+    [
+        ("offline_inference/text_to_video/text_to_video.py", "text_to_video_output_example"),
+        ("offline_inference/image_to_video/image_to_video.py", "image_to_video_output_example"),
+    ],
+)
+@pytest.mark.parametrize("output_type", ["video", "image"])
+def test_video_examples_accept_semantic_and_legacy_output_types(
+    relative_path: str,
+    module_name: str,
+    output_type: str,
+) -> None:
+    mod = _load_example_module(relative_path, module_name)
+
+    mod._validate_video_output_type(output_type)
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "module_name"),
+    [
+        ("offline_inference/text_to_video/text_to_video.py", "text_to_video_invalid_output_example"),
+        ("offline_inference/image_to_video/image_to_video.py", "image_to_video_invalid_output_example"),
+    ],
+)
+def test_video_examples_reject_unrelated_output_types(
+    relative_path: str,
+    module_name: str,
+) -> None:
+    mod = _load_example_module(relative_path, module_name)
+
+    with pytest.raises(ValueError, match="Unexpected output type 'audio'"):
+        mod._validate_video_output_type("audio")

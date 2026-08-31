@@ -1,9 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 import torch
 from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_model_runner import (
@@ -105,6 +109,23 @@ class DummyReqState:
     """A minimal request state container."""
 
     pass
+
+
+def test_model_forward_passes_request_ids_to_decode_metadata(monkeypatch):
+    received = {}
+    model = SimpleNamespace(
+        supports_omni_decode_step_metadata=True,
+        update_decode_step_metadata=lambda **kwargs: received.update(kwargs),
+    )
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner.input_batch = DummyInputBatch(["request-a", "request-b"])
+    runner._build_model_kwargs_extra = lambda: {}
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: torch.zeros(1))
+
+    OmniGPUModelRunner._model_forward(runner, input_ids=torch.ones(2, dtype=torch.long))
+
+    assert received["req_ids"] == ["request-a", "request-b"]
 
 
 class MiMoAudioForConditionalGeneration(torch.nn.Module):

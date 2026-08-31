@@ -52,6 +52,11 @@ def client(mock_engine):
         c.shutdown()
 
 
+def test_inline_client_implements_shared_prompt_hook_protocol(client):
+    assert client.prompt_transform_func is None
+    assert client.prompt_expand_func is None
+
+
 @pytest.mark.asyncio
 async def test_inline_dispatch_request_success(client, mock_engine):
     mock_result = OmniRequestOutput.from_diffusion(request_id="req-1", images=[MagicMock()])

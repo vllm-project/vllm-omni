@@ -1,25 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import gc
+from typing import Any
 
 import numpy as np
 import pytest
 import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
-from tests.helpers.env import DeviceMemoryMonitor
 from tests.helpers.mark import hardware_test
+from tests.helpers.monitor import DeviceMemoryMonitor
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
-AUDIO_MODEL = {
+AUDIO_MODEL: dict[str, dict[str, int | None]] = {
     "stabilityai/stable-audio-open-1.0": {"cuda": 100, "rocm": None},
 }
 
-IMAGE_MODELS = {
+IMAGE_MODELS: dict[str, dict[str, int | None]] = {
     "riverclouds/qwen_image_random": {"cuda": 2200, "rocm": 2100},
 }
 
-MODELS = {**AUDIO_MODEL, **IMAGE_MODELS}
+MODELS: dict[str, dict[str, int | None]] = {**AUDIO_MODEL, **IMAGE_MODELS}
 
 MODEL_MARKS = {
     "riverclouds/qwen_image_random": pytest.mark.core_model,
@@ -29,12 +33,12 @@ MODEL_MARKS = {
 _GATED_MODELS = {"stabilityai/stable-audio-open-1.0"}
 
 
-AUDIO_MODEL_PARAMS = {
+AUDIO_MODEL_PARAMS: dict[str, dict[str, Any]] = {
     "runner_params": {},
     "sampler_params": {},
 }
 
-IMAGE_MODEL_PARAMS = {
+IMAGE_MODEL_PARAMS: dict[str, dict[str, Any]] = {
     "runner_params": {},
     "sampler_params": {
         "height": 256,
@@ -43,7 +47,7 @@ IMAGE_MODEL_PARAMS = {
 }
 
 
-def inference(model_name: str, offload: bool = True):
+def inference(model_name: str, offload: bool = True) -> tuple[float, Any]:
     gc.collect()
     current_omni_platform.empty_cache()
     device_index = current_omni_platform.current_device()
@@ -133,6 +137,7 @@ def test_cpu_offload_diffusion_model(model_name: str):
     threshold = MODELS[model_name][platform]
     if threshold is None:
         pytest.skip(f"Threshold not defined for {platform} on {model_name}")
+    assert threshold is not None
 
     assert offload_peak_memory + threshold < no_offload_peak_memory, (
         f"Offload peak memory {offload_peak_memory} MB should be less than "

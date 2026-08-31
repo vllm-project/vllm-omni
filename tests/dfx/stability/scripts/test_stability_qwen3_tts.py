@@ -13,7 +13,7 @@ import pytest
 from tests.dfx.conftest import (
     create_benchmark_indices,
     create_test_parameter_mapping,
-    create_unique_server_params,
+    create_unique_server_pytest_params,
     load_configs,
 )
 from tests.dfx.stability.helpers import _run_one_vllm_bench_batch, run_stability_benchmark_loop
@@ -29,7 +29,7 @@ try:
 except FileNotFoundError:
     BENCHMARK_CONFIGS = []
 
-test_params = create_unique_server_params(BENCHMARK_CONFIGS, DEPLOY_CONFIGS_DIR) if BENCHMARK_CONFIGS else []
+test_params = create_unique_server_pytest_params(BENCHMARK_CONFIGS, DEPLOY_CONFIGS_DIR) if BENCHMARK_CONFIGS else []
 server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS) if BENCHMARK_CONFIGS else {}
 benchmark_indices = create_benchmark_indices(BENCHMARK_CONFIGS, server_to_benchmark_mapping)
 

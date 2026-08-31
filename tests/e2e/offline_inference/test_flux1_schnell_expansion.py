@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Tests for Flux1 Schnell."""
 
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OmniRunnerHandler
+from tests.helpers.runtime import OfflineOmniClient
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 MODEL = "black-forest-labs/FLUX.1-schnell"
@@ -21,7 +21,7 @@ pytestmark = [
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-def test_flux_schnell_text_to_image(omni_runner_handler: OmniRunnerHandler):
+def test_flux_schnell_text_to_image(offline_client: OfflineOmniClient):
     """Test FLUX.1-schnell text-to-image generation."""
     request_config = {
         "model": MODEL,
@@ -33,4 +33,4 @@ def test_flux_schnell_text_to_image(omni_runner_handler: OmniRunnerHandler):
             seed=42,
         ),
     }
-    omni_runner_handler.send_diffusion_request(request_config)
+    offline_client.send_diffusion_request(request_config)

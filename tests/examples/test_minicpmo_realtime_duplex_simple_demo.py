@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import base64
 import importlib.util
 import sys
@@ -167,6 +170,64 @@ def test_open_streaming_response_requires_post_commit_drain():
             {"type": "response.done"},
         ]
     )
+
+
+def _asymmetric_image():
+    from PIL import Image
+
+    image = Image.new("RGB", (4, 2), (0, 0, 0))
+    image.putpixel((0, 0), (255, 0, 0))
+    return image
+
+
+@pytest.mark.parametrize(
+    "rotation,expected_corner",
+    [
+        (0, (0, 0)),
+        (90, (0, 3)),
+        (180, (3, 1)),
+        (-90, (1, 0)),
+        (270, (1, 0)),
+        (-270, (0, 3)),
+    ],
+)
+def test_upright_applies_the_display_matrix_quarter_turn(rotation, expected_corner):
+    demo = _load_demo_module()
+
+    rotated = demo._upright(_asymmetric_image(), rotation)
+
+    assert rotated.getpixel(expected_corner) == (255, 0, 0)
+
+
+def test_decoded_frames_apply_the_container_display_matrix(monkeypatch, tmp_path):
+    """A -90 phone clip must reach the model upright, not on its side."""
+    demo = _load_demo_module()
+    source = _asymmetric_image()
+
+    class _Frame:
+        rotation = -90
+
+        def to_image(self):
+            return source
+
+    class _Container:
+        streams = type("_Streams", (), {"video": [type("_Stream", (), {})()]})()
+
+        def decode(self, stream):
+            yield _Frame()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setitem(sys.modules, "av", type("_Av", (), {"open": staticmethod(lambda path: _Container())}))
+
+    (image,) = demo._decode_video_frames_rgb(tmp_path / "clip.mp4", [0])
+
+    assert image.size == (2, 4)
+    assert image.getpixel((1, 0)) == (255, 0, 0)
 
 
 def test_streaming_output_writer_persists_audio_deltas_as_they_arrive(tmp_path, capsys):

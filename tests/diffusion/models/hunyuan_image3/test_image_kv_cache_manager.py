@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for ImageKVCacheManager.
 
 Covers: cache → reuse flow, AR KV injection, CFG (sequential & parallel), SP, cross-request isolation.
@@ -37,12 +37,21 @@ class MockAttention(nn.Module):
         super().__init__()
         self.paged_kv_active = False
         self.calls = []
+        self.paged_calls = []
+        self.paged_metadata = []
 
     def is_paged_kv_active(self):
         return self.paged_kv_active
 
     def forward(self, query, key, value, attn_metadata=None, **kwargs):
         self.calls.append((query, key, value))
+        from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
+        if is_forward_context_available() and get_forward_context().paged_kv_adapter is not None:
+            self.paged_calls.append((query, key, value))
+            self.paged_metadata.append(attn_metadata)
+        if attn_metadata is not None and attn_metadata.joint_query is not None:
+            return torch.cat((attn_metadata.joint_query, query), dim=1)
         return query
 
 
@@ -105,6 +114,7 @@ def _call_mgr(
     shard_image_size=None,
     gen_timestep_scatter_index=None,
     position_ids=None,
+    full_attn_spans=None,
 ):
     query = torch.randn(bs * q_len, NUM_HEADS, HEAD_DIM)
     attn_mask = torch.zeros(bs, 1, seq_len, seq_len)
@@ -121,6 +131,7 @@ def _call_mgr(
         shard_image_size=shard_image_size,
         gen_timestep_scatter_index=gen_timestep_scatter_index,
         position_ids=position_ids,
+        full_attn_spans=full_attn_spans,
     )
 
 
@@ -130,6 +141,83 @@ def test_cache_manager_registers_attention_without_adding_dense_state() -> None:
     assert isinstance(mgr, nn.Module)
     assert dict(mgr.named_modules())["attn"] is mgr.attn
     assert mgr.state_dict() == {}
+
+
+def test_scheduler_paged_kv_runs_piecewise_for_first_and_later_steps() -> None:
+    from vllm_omni.diffusion.forward_context import override_paged_kv_adapter, set_forward_context
+
+    mgr = _make_cache_mgr()
+    mgr.attn.paged_kv_active = True
+    bs = 2
+    prefix_lens = torch.tensor([[2], [4]], dtype=torch.long)
+    first_q_len = 12
+    first_k, first_v = _make_known_kv(bs * first_q_len, base=1.0)
+    full_attn_spans = [[(2, 12)], [(2, 12)]]
+
+    with set_forward_context(), override_paged_kv_adapter(object()):
+        _call_mgr(
+            mgr,
+            bs,
+            q_len=first_q_len,
+            seq_len=first_q_len,
+            key_flat=first_k,
+            value_flat=first_v,
+            first_step=True,
+            gen_timestep_scatter_index=prefix_lens,
+            full_attn_spans=full_attn_spans,
+        )
+
+        assert mgr.image_kv_cache_map is None
+        assert mgr.image_kv_cache_lens is None
+        assert len(mgr.attn.paged_calls) == 1
+        assert mgr.attn.paged_calls[0][0].shape == (bs, first_q_len, NUM_HEADS, HEAD_DIM)
+        assert mgr.attn.paged_calls[0][1].shape == (bs, first_q_len, NUM_KV_HEADS, HEAD_DIM)
+        assert mgr.attn.paged_calls[0][2].shape == (bs, first_q_len, NUM_KV_HEADS, HEAD_DIM)
+        assert mgr.attn.paged_metadata[0].full_attn_spans == full_attn_spans
+
+        current_q_len = IMAGE_TOKEN_LEN
+        current_k, current_v = _make_known_kv(bs * current_q_len, base=50.0)
+        _call_mgr(
+            mgr,
+            bs,
+            q_len=current_q_len,
+            seq_len=prefix_lens[-1].item() + current_q_len,
+            key_flat=current_k,
+            value_flat=current_v,
+            position_ids=torch.arange(4, 4 + current_q_len).repeat(bs, 1),
+            full_attn_spans=full_attn_spans,
+        )
+
+    assert len(mgr.attn.paged_calls) == 2
+    assert mgr.attn.paged_calls[1][0].shape == (bs, current_q_len, NUM_HEADS, HEAD_DIM)
+    assert mgr.attn.paged_calls[1][1].shape == (bs, current_q_len, NUM_KV_HEADS, HEAD_DIM)
+    assert mgr.attn.paged_calls[1][2].shape == (bs, current_q_len, NUM_KV_HEADS, HEAD_DIM)
+    assert mgr.attn.paged_metadata[1].full_attn_spans == full_attn_spans
+
+
+def test_cache_manager_rejects_dense_imported_prefix_for_paged_attention() -> None:
+    from vllm_omni.diffusion.forward_context import override_paged_kv_adapter, set_forward_context
+
+    mgr = _make_cache_mgr()
+    mgr.attn.paged_kv_active = True
+    prefix_len = 4
+    prefix_key, prefix_value = _make_known_kv(prefix_len, base=100.0)
+    mgr._injected_ar_kv = [(prefix_key, prefix_value)]
+    current_key, current_value = _make_known_kv(3, base=1.0)
+
+    with set_forward_context(), override_paged_kv_adapter(object()):
+        with pytest.raises(NotImplementedError, match="does not support imported AR KV"):
+            _call_mgr(
+                mgr,
+                bs=1,
+                q_len=3,
+                seq_len=7,
+                key_flat=current_key,
+                value_flat=current_value,
+                first_step=True,
+                gen_timestep_scatter_index=torch.tensor([[0]]),
+                full_attn_spans=[[(4, 7)]],
+            )
 
 
 @pytest.mark.parametrize(
@@ -155,6 +243,7 @@ def test_gqa_kv_stays_compressed_for_paged_attention(
         first_step=True,
         num_image_tokens=0,
         gen_timestep_scatter_index=_gen_timestep_index(1, 0),
+        full_attn_spans=[[(0, q_len)]] if paged_kv_active else None,
     )
 
     _, key_input, value_input = mgr.attn.calls[-1]

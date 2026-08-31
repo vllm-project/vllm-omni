@@ -199,7 +199,14 @@ def test_sleep_offload_tags_by_level(monkeypatch, level, expected_tags):
     worker = object.__new__(OmniGPUWorkerBase)
     worker.rank = 0
     worker.device = "cuda:0"
-    monkeypatch.setattr(base, "current_omni_platform", _fake_platform())
+    order: list[str] = []
+    platform = SimpleNamespace(
+        get_current_memory_usage=lambda device: 0,
+        empty_cache=lambda: order.append("empty_cache"),
+        synchronize=lambda: order.append("sync"),
+        collect=lambda: None,
+    )
+    monkeypatch.setattr(base, "current_omni_platform", platform)
 
     calls = {}
 
@@ -209,12 +216,17 @@ def test_sleep_offload_tags_by_level(monkeypatch, level, expected_tags):
             return cls()
 
         def sleep(self, offload_tags):
+            order.append("allocator_sleep")
             calls["offload_tags"] = offload_tags
 
     monkeypatch.setattr(cumem_mod, "CuMemAllocator", FakeAllocator)
 
     assert OmniGPUWorkerBase.sleep(worker, level=level) is True
     assert calls["offload_tags"] == expected_tags
+    assert order[0] == "sync"
+    assert "allocator_sleep" in order
+    assert order.index("sync") < order.index("allocator_sleep")
+    assert "empty_cache" not in order
 
 
 def test_wake_up_forwards_tags_to_allocator(monkeypatch):

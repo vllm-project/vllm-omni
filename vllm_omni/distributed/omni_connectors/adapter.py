@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import time
 from collections.abc import Callable
 from typing import Any
+
+from vllm.v1.request import Request
 
 from vllm_omni.metrics import OrchestratorAggregator
 
@@ -216,34 +218,154 @@ def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
     return sum_user_len + assistant_len
 
 
-def construct_next_stage_streaming_input_prompt(payload_data: dict[str, Any], request: Any) -> bool:
+def construct_next_stage_streaming_input_prompt(
+    payload_data: dict[str, Any],
+    request: Request,
+    *,
+    max_model_len: int | None = None,
+    previous_condition_len: int | None = None,
+    previous_condition_seq: int | None = None,
+    condition_seq: int | None = None,
+    recompute_previous_chunks: int = 0,
+) -> bool:
     """Update a downstream streaming request prompt from connector payload ids.
 
     Async-chunk downstream stages are prewarmed before the real Talker prompt is
     known. When a Thinker payload carries ``ids.prompt``, this helper:
 
-    * Preserves ``num_computed_tokens`` while extending the current prompt.
-      Explicit replacements reset it with the prompt.
+    * Preserves ``num_computed_tokens`` while extending a non-window prompt.
+      Explicit replacements and one-condition window recomputes reset it.
     * Moves already-computed output tokens into ``prompt_token_ids``.
     * Appends a new placeholder prompt slice sized from the upstream ids.
     * Refreshes block hashes so the scheduler allocates KV slots for the
       extended prompt without discarding prior computed state.
     """
-    ids = payload_data.get("ids", {})
-    meta = payload_data.get("meta", {})
-    next_stage_prompt_len = meta.get("next_stage_prompt_len") if isinstance(meta, dict) else None
-    replace_prompt = isinstance(meta, dict) and meta.get("replace_streaming_prompt") is True
-    if replace_prompt and isinstance(next_stage_prompt_len, int) and next_stage_prompt_len > 0:
+    ids = payload_data.get("ids")
+    if not isinstance(ids, dict):
+        ids = {}
+        payload_data["ids"] = ids
+    meta = payload_data.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+        payload_data["meta"] = meta
+    # This flag is transported through a merge-based runtime buffer. Set it on
+    # every condition so a prior rollover cannot be replayed by a later append.
+    meta["streaming_prompt_recompute"] = False
+    next_stage_prompt_len = meta.get("next_stage_prompt_len")
+    if "next_stage_generation_tokens" in meta:
+        next_generation_tokens = meta["next_stage_generation_tokens"]
+        if (
+            not isinstance(next_generation_tokens, int)
+            or isinstance(next_generation_tokens, bool)
+            or next_generation_tokens <= 0
+        ):
+            raise ValueError("next_stage_generation_tokens must be a positive integer")
+        generation_reserve = next_generation_tokens
+    else:
+        generation_reserve = 0
+    capacity_limit = (
+        max_model_len
+        if isinstance(max_model_len, int) and not isinstance(max_model_len, bool) and max_model_len > 0
+        else None
+    )
+    managed_prompt_len: int | None = None
+    if generation_reserve > 0 and capacity_limit is not None:
+        if (
+            not isinstance(next_stage_prompt_len, int)
+            or isinstance(next_stage_prompt_len, bool)
+            or next_stage_prompt_len <= 0
+        ):
+            raise ValueError("capacity-managed streaming prompt requires a positive next_stage_prompt_len")
+        managed_prompt_len = next_stage_prompt_len
+        if managed_prompt_len + generation_reserve > capacity_limit:
+            raise ValueError(
+                "fresh streaming prompt plus generation reserve exceeds max_model_len: "
+                f"prompt={managed_prompt_len}, reserve={generation_reserve}, limit={capacity_limit}"
+            )
+    explicit_replacement = meta.get("replace_streaming_prompt") is True
+    if isinstance(recompute_previous_chunks, bool) or recompute_previous_chunks not in (0, 1):
+        raise ValueError("streaming prompt recompute supports exactly one previous chunk")
+    has_window_contract = recompute_previous_chunks == 1
+    window_recompute = not explicit_replacement and has_window_contract and previous_condition_seq is not None
+    exceeds_accumulated_capacity = (
+        managed_prompt_len is not None
+        and capacity_limit is not None
+        and request.num_computed_tokens + managed_prompt_len + generation_reserve > capacity_limit
+    )
+    if not explicit_replacement and exceeds_accumulated_capacity and not window_recompute:
+        raise ValueError("capacity-managed streaming prompt rollover requires window_size=1")
+    replacement_prompt_len = next_stage_prompt_len
+    if window_recompute:
+        if managed_prompt_len is None or capacity_limit is None:
+            raise ValueError("streaming prompt window requires a positive generation reserve and max_model_len")
+        if (
+            not isinstance(previous_condition_len, int)
+            or isinstance(previous_condition_len, bool)
+            or previous_condition_len <= 0
+            or not isinstance(previous_condition_seq, int)
+            or isinstance(previous_condition_seq, bool)
+            or previous_condition_seq < 0
+            or not isinstance(condition_seq, int)
+            or isinstance(condition_seq, bool)
+            or condition_seq < 0
+        ):
+            raise ValueError("streaming prompt recompute requires condition lengths and monotonic sequence metadata")
+        if condition_seq != previous_condition_seq + 1:
+            raise ValueError(
+                "streaming prompt recompute skipped a Talker condition: "
+                f"previous={previous_condition_seq}, current={condition_seq}"
+            )
+
+        num_placeholders = int(getattr(request, "num_output_placeholders", 0) or 0)
+        confirmed_num_computed_tokens = max(0, int(request.num_computed_tokens) - num_placeholders)
+        if confirmed_num_computed_tokens < request.num_prompt_tokens:
+            raise ValueError(
+                "confirmed streaming output ends before the current condition: "
+                f"confirmed={confirmed_num_computed_tokens}, prompt={request.num_prompt_tokens}"
+            )
+        previous_codec_ids = list(request._all_token_ids[request.num_prompt_tokens : confirmed_num_computed_tokens])
+        max_confirmed_codec_tokens = generation_reserve - 1
+        if len(previous_codec_ids) > max_confirmed_codec_tokens:
+            raise ValueError(
+                "streaming prompt recompute retained too many codec tokens: "
+                f"retained={len(previous_codec_ids)}, limit={max_confirmed_codec_tokens}"
+            )
+
+        replacement_prompt_len = previous_condition_len + len(previous_codec_ids) + managed_prompt_len
+        if replacement_prompt_len + generation_reserve > capacity_limit:
+            raise ValueError(
+                "sliding streaming prompt plus generation reserve exceeds max_model_len: "
+                f"previous={previous_condition_len}, codec={len(previous_codec_ids)}, "
+                f"current={managed_prompt_len}, reserve={generation_reserve}, limit={capacity_limit}"
+            )
+        ids["streaming_prompt_previous_codes"] = previous_codec_ids
+        meta.update(
+            {
+                "streaming_prompt_recompute": True,
+                "streaming_condition_seq": condition_seq,
+            }
+        )
+        logger.debug(
+            "Recomputing a one-chunk streaming prompt window: previous=%d, codec=%d, current=%d, reserve=%d, limit=%d",
+            previous_condition_len,
+            len(previous_codec_ids),
+            managed_prompt_len,
+            generation_reserve,
+            capacity_limit,
+        )
+
+    replace_prompt = explicit_replacement or window_recompute
+    if replace_prompt and isinstance(replacement_prompt_len, int) and replacement_prompt_len > 0:
         # Some downstream stages consume complete, independently conditioned
         # segments instead of extending an existing KV prefix. The producer
         # declares that transport behavior explicitly in payload metadata.
-        new_prompt = [0] * next_stage_prompt_len
+        new_prompt = [0] * replacement_prompt_len
         request._output_token_ids.clear()
         request._all_token_ids.clear()
         request._all_token_ids.extend(new_prompt)
         request.prompt_token_ids = new_prompt
         request.num_computed_tokens = 0
-        request.num_prompt_tokens = next_stage_prompt_len
+        request.num_prompt_tokens = replacement_prompt_len
         request.update_block_hashes()
         return True
     prompt_token_ids = ids.get("prompt", None)

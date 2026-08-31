@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Distributed Layerwise Offload backend with double-buffered H2D.
 
 This module implements the RFC-1 "Distributed Layerwise Offload" mechanism that:
@@ -18,6 +18,8 @@ This module implements the RFC-1 "Distributed Layerwise Offload" mechanism that:
 
 from __future__ import annotations
 
+import threading
+import time
 from itertools import chain
 from typing import Any
 
@@ -30,10 +32,17 @@ from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
 )
+from vllm_omni.host_weight_runtime import HostWeightLease
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig
 from .block_discovery import get_blocks_from_dit
+from .host_registration import (
+    HostRegistration,
+    HostRegistrationCleanupError,
+    HostRegistrationError,
+    register_host_mappings,
+)
 from .module_collector import ModuleDiscovery
 from .offload_plan import (
     OffloadPlan,
@@ -49,6 +58,38 @@ from .tensor_utils import (
 )
 
 logger = init_logger(__name__)
+
+# A backend normally owns both objects below. This process-lifetime safety
+# owner prevents HostWeightLease.__del__ from unmapping storage when cleanup
+# failure unwinds startup and the backend itself becomes unreachable. A clean
+# retry removes the pair before closing the lease.
+_ACTIVE_HWR_REGISTRATIONS: list[tuple[HostRegistration, HostWeightLease]] = []
+_ACTIVE_HWR_REGISTRATIONS_LOCK = threading.Lock()
+
+
+def _retain_active_hwr_registration(
+    registration: HostRegistration,
+    lease: HostWeightLease,
+) -> None:
+    with _ACTIVE_HWR_REGISTRATIONS_LOCK:
+        if not any(
+            candidate is registration and candidate_lease is lease
+            for candidate, candidate_lease in _ACTIVE_HWR_REGISTRATIONS
+        ):
+            _ACTIVE_HWR_REGISTRATIONS.append((registration, lease))
+
+
+def _forget_active_hwr_registration(
+    registration: HostRegistration,
+    lease: HostWeightLease,
+) -> None:
+    with _ACTIVE_HWR_REGISTRATIONS_LOCK:
+        _ACTIVE_HWR_REGISTRATIONS[:] = [
+            (candidate, candidate_lease)
+            for candidate, candidate_lease in _ACTIVE_HWR_REGISTRATIONS
+            if candidate is not registration or candidate_lease is not lease
+        ]
+
 
 # Threshold (in MB) for deciding whether a non-block DiT submodule should
 # use layerwise offload (streaming hooks) or be moved to GPU as a resident
@@ -93,6 +134,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.rank = rank
         self.pin_memory = pin_memory
         self.rank_local_mmap = rank_local_mmap
+        self.registered_mmap = False
         self.tensor_transforms = tensor_transforms or {}
 
         self.copy_stream = copy_stream or current_omni_platform.Stream()
@@ -445,6 +487,26 @@ class DistributedLayerwiseOffloadHook(ModelHook):
     # ------------------------------------------------------------------ #
 
     @staticmethod
+    def _resolve_mmap_source(
+        source_info: dict[str, Any],
+        meta: dict[str, Any],
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        source = source_info["tensor"]
+        transform = source_info["transform"]
+        if callable(transform):
+            source = transform(source)
+        if source.dtype != dtype or source.shape != meta["shape"] or source.stride() != meta["stride"]:
+            raise ValueError(
+                "mmap weight transform changed tensor layout for "
+                f"{source_info['name']!r}: expected dtype={dtype}, "
+                f"shape={tuple(meta['shape'])}, stride={meta['stride']}; "
+                f"got dtype={source.dtype}, shape={tuple(source.shape)}, "
+                f"stride={source.stride()}"
+            )
+        return source
+
+    @staticmethod
     def _pack_mmap_sources(
         cpu_sources: dict[torch.dtype, list[dict[str, Any]]],
         metadata: dict[torch.dtype, list[dict[str, Any]]],
@@ -456,18 +518,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             destination = slot_buffers[dtype][:total_numel]
             sources = cpu_sources[dtype]
             for source_info, meta in zip(sources, metas, strict=True):
-                source = source_info["tensor"]
-                transform = source_info["transform"]
-                if callable(transform):
-                    source = transform(source)
-                if source.dtype != dtype or source.shape != meta["shape"] or source.stride() != meta["stride"]:
-                    raise ValueError(
-                        "mmap weight transform changed tensor layout for "
-                        f"{source_info['name']!r}: expected dtype={dtype}, "
-                        f"shape={tuple(meta['shape'])}, stride={meta['stride']}; "
-                        f"got dtype={source.dtype}, shape={tuple(source.shape)}, "
-                        f"stride={source.stride()}"
-                    )
+                source = DistributedLayerwiseOffloadHook._resolve_mmap_source(source_info, meta, dtype)
                 start = meta["offset"]
                 physical_storage = destination[start : start + meta["numel"]]
                 if source.is_contiguous():
@@ -499,6 +550,32 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             raise RuntimeError(f"cpu_staging_buffers[{slot}] was not allocated")
         return self._pack_mmap_sources(self.cpu_sources, self.metadata, slot_buffers)
 
+    @staticmethod
+    def _copy_mmap_sources_to_device(
+        cpu_sources: dict[torch.dtype, list[dict[str, Any]]],
+        metadata: dict[torch.dtype, list[dict[str, Any]]],
+        gpu_buffers: dict[torch.dtype, torch.Tensor],
+        *,
+        non_blocking: bool,
+    ) -> None:
+        """Copy registered source views directly into flattened device buffers."""
+        for dtype, metas in metadata.items():
+            destination = gpu_buffers[dtype]
+            sources = cpu_sources[dtype]
+            for source_info, meta in zip(sources, metas, strict=True):
+                source = DistributedLayerwiseOffloadHook._resolve_mmap_source(source_info, meta, dtype)
+                start = meta["offset"]
+                physical_storage = destination[start : start + meta["numel"]]
+                async_copy = non_blocking and source.is_pinned()
+                if source.is_contiguous():
+                    physical_storage.copy_(source.flatten(), non_blocking=async_copy)
+                else:
+                    torch.as_strided(
+                        physical_storage,
+                        size=source.shape,
+                        stride=source.stride(),
+                    ).copy_(source, non_blocking=async_copy)
+
     @torch.compiler.disable
     def prefetch_layer(self, slot: int, non_blocking: bool = True) -> None:
         """Prepare next block's weights into the shared device buffer for *slot*.
@@ -514,17 +591,27 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         assert gpu_weights is not None, f"gpu_buffers[{slot}] not allocated"
 
         if self.dp_size <= 1 or self.dp_group is None:
-            cpu_weights = self._stage_mmap_sources(slot) if self.rank_local_mmap else self.cpu_shards
-            with current_omni_platform.stream(self.copy_stream):
-                for dtype, cpu_shard in cpu_weights.items():
-                    gw = gpu_weights[dtype]
-                    async_copy = non_blocking and cpu_shard.is_pinned()
-                    gw[: cpu_shard.numel()].copy_(cpu_shard, non_blocking=async_copy)
-                evt.record(self.copy_stream)
-            if self.rank_local_mmap:
-                # The CPU slot may be overwritten only after this H2D copy has
-                # finished.  The shared event protects reuse by another hook.
-                self.cpu_staging_events[slot] = evt
+            if self.rank_local_mmap and self.registered_mmap:
+                with current_omni_platform.stream(self.copy_stream):
+                    self._copy_mmap_sources_to_device(
+                        self.cpu_sources,
+                        self.metadata,
+                        gpu_weights,
+                        non_blocking=non_blocking,
+                    )
+                    evt.record(self.copy_stream)
+            else:
+                cpu_weights = self._stage_mmap_sources(slot) if self.rank_local_mmap else self.cpu_shards
+                with current_omni_platform.stream(self.copy_stream):
+                    for dtype, cpu_shard in cpu_weights.items():
+                        gw = gpu_weights[dtype]
+                        async_copy = non_blocking and cpu_shard.is_pinned()
+                        gw[: cpu_shard.numel()].copy_(cpu_shard, non_blocking=async_copy)
+                    evt.record(self.copy_stream)
+                if self.rank_local_mmap:
+                    # The CPU slot may be overwritten only after this H2D copy has
+                    # finished.  The shared event protects reuse by another hook.
+                    self.cpu_staging_events[slot] = evt
         else:
             gpu_shards: dict[torch.dtype, torch.Tensor] = {}
             shard_bufs = self.gpu_shard_buffers[slot]
@@ -734,6 +821,7 @@ class PinnedResidentLayerGroup:
         self.copy_stream = copy_stream
         self.loaded = False
         self.rank_local_mmap = rank_local_mmap
+        self.registered_mmap = False
         self.pin_memory = pin_memory
         self._states: list[dict[str, Any]] = []
         self._gpu_buffers: list[dict[torch.dtype, torch.Tensor]] = []
@@ -804,6 +892,14 @@ class PinnedResidentLayerGroup:
         ready = current_omni_platform.Event()
         with current_omni_platform.stream(self.copy_stream):
             for index, (state, block_buffers) in enumerate(zip(self._states, gpu_buffers)):
+                if self.rank_local_mmap and self.registered_mmap:
+                    DistributedLayerwiseOffloadHook._copy_mmap_sources_to_device(
+                        state["cpu_sources"],
+                        state["metadata"],
+                        block_buffers,
+                        non_blocking=True,
+                    )
+                    continue
                 if self.rank_local_mmap:
                     slot = index % 2
                     previous_copy = self._cpu_staging_events[slot]
@@ -901,7 +997,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._resident_layer_group: PinnedResidentLayerGroup | None = None
         self._using_mmap = False
         self._using_rank_local_mmap = False
+        self._using_registered_mmap = False
         self.host_weight_plan = host_weight_plan
+        self._host_weight_lease: HostWeightLease | None = None
+        self._host_registration: HostRegistration | None = None
         self._mmap_transforms_by_tensor_id: dict[int, Any] = {}
 
     def load_resident_layers(self) -> None:
@@ -913,6 +1012,136 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         """Release leading blocks before VAE decode to bound peak HBM."""
         if self._resident_layer_group is not None:
             self._resident_layer_group.offload()
+
+    def _rank_local_source_tensors(
+        self,
+        hooks: list[DistributedLayerwiseOffloadHook],
+    ) -> tuple[torch.Tensor, ...]:
+        """Return the exact CPU sources that direct H2D would consume."""
+        tensors: list[torch.Tensor] = []
+        seen: set[int] = set()
+
+        def collect(cpu_sources: dict[torch.dtype, list[dict[str, Any]]]) -> None:
+            for sources in cpu_sources.values():
+                for source in sources:
+                    tensor = source["tensor"]
+                    if id(tensor) not in seen:
+                        seen.add(id(tensor))
+                        tensors.append(tensor)
+
+        for hook in hooks:
+            collect(hook.cpu_sources)
+        if self._resident_layer_group is not None:
+            for state in self._resident_layer_group._states:
+                collect(state["cpu_sources"])
+        return tuple(tensors)
+
+    def _try_register_hwr_mmap(self, source_tensors: tuple[torch.Tensor, ...]) -> bool:
+        """Register the complete final-layout lease under pinned-memory policy."""
+        lease = self._host_weight_lease
+        if lease is None:
+            return False
+        if not self.config.pin_cpu_memory:
+            logger.info("HWR mmap registration disabled by pin_cpu_memory=False; using bounded host staging")
+            return False
+        if not lease.mapped_regions or not source_tensors:
+            logger.warning("HWR mmap registration found no mapped sources; using bounded host staging")
+            return False
+
+        limit_gib = self.config.dlo_host_registration_limit_gib
+        max_bytes = int(limit_gib * 1024**3) if limit_gib > 0 else None
+        started = time.perf_counter()
+        try:
+            registration = register_host_mappings(
+                lease.mapped_regions,
+                device=self.device,
+                max_bytes=max_bytes,
+            )
+            try:
+                unpinned = [tensor for tensor in source_tensors if tensor.numel() and not tensor.is_pinned()]
+            except Exception as exc:
+                errors = registration.close()
+                if errors:
+                    self._host_registration = registration
+                    _retain_active_hwr_registration(registration, lease)
+                    raise HostRegistrationCleanupError(
+                        "CUDA registration succeeded but pinned-source verification failed, "
+                        f"and rollback failed: {errors[:3]}"
+                    ) from exc
+                raise HostRegistrationError(f"cannot verify registered HWR sources: {exc}") from exc
+            if unpinned:
+                errors = registration.close()
+                if errors:
+                    self._host_registration = registration
+                    _retain_active_hwr_registration(registration, lease)
+                    raise HostRegistrationCleanupError(
+                        "CUDA registration succeeded but PyTorch rejected mapped sources, "
+                        f"and rollback failed: {errors[:3]}"
+                    )
+                raise HostRegistrationError(
+                    "CUDA registration succeeded but PyTorch did not recognize "
+                    f"{len(unpinned)} mapped source(s) as pinned"
+                )
+        except HostRegistrationCleanupError as exc:
+            # Falling back could close a lease while the platform still owns
+            # one of its mappings. Fail startup and retain ownership for retry.
+            active_registration = exc.active_registration
+            if active_registration is not None:
+                self._host_registration = active_registration
+                _retain_active_hwr_registration(active_registration, lease)
+            logger.exception("HWR mmap registration rollback failed")
+            raise
+        except HostRegistrationError as exc:
+            logger.warning("HWR registered direct H2D unavailable (%s); using bounded host staging", exc)
+            return False
+
+        self._host_registration = registration
+        _retain_active_hwr_registration(registration, lease)
+        logger.info(
+            "Registered %.2f GiB of HWR mmap in %d range(s) for direct H2D in %.3f s",
+            registration.total_bytes / 1024**3,
+            registration.region_count,
+            time.perf_counter() - started,
+        )
+        return True
+
+    def _configure_hwr_transfer(self, hooks: list[DistributedLayerwiseOffloadHook]) -> None:
+        """Select registered direct H2D or bounded staging once per backend."""
+        plan = self.host_weight_plan
+        if (
+            (not hooks and self._resident_layer_group is None)
+            or not self._using_rank_local_mmap
+            or plan is None
+            or plan.backing_kind != "host_weight_runtime"
+        ):
+            return
+
+        source_tensors = self._rank_local_source_tensors(hooks)
+        self._using_registered_mmap = self._try_register_hwr_mmap(source_tensors)
+        for hook in hooks:
+            hook.registered_mmap = self._using_registered_mmap
+        if self._resident_layer_group is not None:
+            self._resident_layer_group.registered_mmap = self._using_registered_mmap
+            if self._using_registered_mmap:
+                self._resident_layer_group._cpu_staging_buffers.clear()
+
+    def _release_registered_mmap(self) -> None:
+        """Release every platform registration before closing the HWR lease."""
+        registration = self._host_registration
+        if registration is None:
+            return
+        errors = registration.close()
+        if errors:
+            lease = self._host_weight_lease
+            if lease is not None and not lease.closed:
+                _retain_active_hwr_registration(registration, lease)
+            logger.error("HWR mmap unregistration failed; retaining lease mappings for retry: %s", errors[:3])
+            raise HostRegistrationCleanupError(f"failed to unregister {len(errors)} HWR mmap range(s)")
+        lease = self._host_weight_lease
+        if lease is not None:
+            _forget_active_hwr_registration(registration, lease)
+        self._host_registration = None
+        logger.info("Unregistered HWR mmap ranges")
 
     def _load_weights_via_mmap(
         self,
@@ -1405,6 +1634,17 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 buffer.data = buffer.data.to(self.device, non_blocking=True)
 
     def enable(self, pipeline: nn.Module) -> None:
+        """Enable DLO and make partial startup failures transactional."""
+        try:
+            self._enable(pipeline)
+        except BaseException:
+            try:
+                self.disable()
+            except BaseException:
+                logger.exception("DLO cleanup failed while handling an enable failure")
+            raise
+
+    def _enable(self, pipeline: nn.Module) -> None:
         if self.enabled:
             logger.warning("DistributedLayerwiseOffloadBackend already enabled")
             return
@@ -1443,17 +1683,34 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._using_mmap = self.host_weight_plan is not None
         self._using_rank_local_mmap = self._using_mmap and self.dp_size <= 1
         if self._using_mmap:
-            if self.host_weight_plan.backing_kind != "checkpoint_mmap":
+            if self.host_weight_plan.backing_kind == "host_weight_runtime":
+                carrier = self.host_weight_plan.lease_carrier
+                if carrier is None:
+                    raise RuntimeError("DLO received a Host Weight Runtime plan without a lease carrier")
+                self._host_weight_lease = carrier.take()
+                if self._host_weight_lease.closed:
+                    raise RuntimeError("DLO received a closed Host Weight Runtime lease")
+                # The final-layout restorer has already rebound the model to
+                # immutable host tensors.  Treat those tensors as mmap-like
+                # sources; transport setup below selects registered direct
+                # H2D or the bounded two-slot staging fallback.
+                self._using_rank_local_mmap = True
+                logger.info(
+                    "DLO consuming final-layout Host Weight Runtime lease %s",
+                    self._host_weight_lease.provenance.resolution_id,
+                )
+            elif self.host_weight_plan.backing_kind == "checkpoint_mmap":
+                self._load_weights_via_mmap(
+                    pipeline,
+                    modules,
+                    self.host_weight_plan,
+                )
+            else:
                 raise ValueError(f"Unsupported DLO host-weight backing: {self.host_weight_plan.backing_kind}")
-            self._load_weights_via_mmap(
-                pipeline,
-                modules,
-                self.host_weight_plan,
-            )
             if self._using_rank_local_mmap:
                 logger.info(
-                    "DLO rank-local mmap storage enabled: checkpoint pages are "
-                    "node-shared; each worker owns only two bounded host staging slots"
+                    "DLO rank-local host storage enabled: source pages are "
+                    "node-shared; transfer setup will select registered direct H2D or bounded host staging"
                 )
         else:
             remaining_meta = [
@@ -1623,6 +1880,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             )
             pipeline._dlo_residency_controller = self
 
+        all_hooks = [hook for group in self._all_hook_groups for hook in group]
+        self._configure_hwr_transfer(all_hooks)
+
         if not self._all_hook_groups:
             self.enabled = bool(self._resident_blocks)
             if self._using_mmap and not self.enabled:
@@ -1632,17 +1892,13 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # Unified allocation: 2 shared output buffers + 2 shared shard buffers
         # sized to the max block across ALL module groups (gen_layers +
         # language_model).  Groups execute sequentially, so 2 buffers suffice.
-        all_hooks: list[DistributedLayerwiseOffloadHook] = []
-        for group in self._all_hook_groups:
-            all_hooks.extend(group)
-
         unified_buffers = self._allocate_shared_buffers(all_hooks)
         unified_shard_buffers = None
         if self.dp_size > 1:
             unified_shard_buffers = self._allocate_shared_shard_buffers(all_hooks)
         unified_cpu_staging = None
         cpu_staging_events = None
-        if self._using_rank_local_mmap:
+        if self._using_rank_local_mmap and not self._using_registered_mmap:
             unified_cpu_staging = self._allocate_shared_cpu_staging_buffers(
                 all_hooks,
                 self._resident_layer_group,
@@ -1722,12 +1978,21 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._cleanup_after_loading()
 
     def _release_mmap_handles(self) -> None:
-        """Release safetensors mmap file handles."""
+        """Release source handles and the transport-owned HWR lease."""
+        if self._host_registration is not None:
+            raise HostRegistrationCleanupError("cannot close HWR mappings while host registration is still active")
         self._mmap_transforms_by_tensor_id.clear()
         if hasattr(self, "_mmap_file_cache"):
             self._mmap_file_cache.clear()
             del self._mmap_file_cache
             logger.info("Released safetensors mmap file handles")
+        lease = self._host_weight_lease
+        self._host_weight_lease = None
+        if lease is not None and not lease.closed:
+            lease.close()
+            logger.info("Released Host Weight Runtime lease %s", lease.provenance.resolution_id)
+        if self.host_weight_plan is not None and self.host_weight_plan.lease_carrier is not None:
+            self.host_weight_plan.lease_carrier.close()
 
     def _cleanup_after_loading(self) -> None:
         """Synchronize and release freed device/CPU memory after sharding."""
@@ -1743,10 +2008,30 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             pass
 
     def disable(self) -> None:
-        if not self.enabled and not hasattr(self, "_mmap_file_cache"):
+        has_open_lease = self._host_weight_lease is not None and not self._host_weight_lease.closed
+        has_registration = self._host_registration is not None
+        has_carrier = (
+            self.host_weight_plan is not None
+            and self.host_weight_plan.lease_carrier is not None
+            and not self.host_weight_plan.lease_carrier.closed
+        )
+        has_partial_hooks = bool(
+            self._blocks
+            or self._all_hook_groups
+            or getattr(self, "_on_demand_handles", ())
+            or self._resident_layer_group is not None
+        )
+        if (
+            not self.enabled
+            and not hasattr(self, "_mmap_file_cache")
+            and not has_open_lease
+            and not has_registration
+            and not has_carrier
+            and not has_partial_hooks
+        ):
             return
 
-        if self._using_rank_local_mmap:
+        if self._using_rank_local_mmap or has_registration:
             current_omni_platform.synchronize()
 
         for blocks in self._blocks:
@@ -1763,9 +2048,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._all_hook_groups.clear()
         self._resident_blocks.clear()
         self._resident_layer_group = None
+        self._release_registered_mmap()
         self._release_mmap_handles()
         self._using_mmap = False
         self._using_rank_local_mmap = False
+        self._using_registered_mmap = False
         self.enabled = False
         logger.info("Distributed layer-wise offloading disabled")
 

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Analogous to test_common_offline, but for server tests. Validates the full
 online serving stack (CLI arg parsing, subprocess, API routing, response
@@ -6,7 +9,7 @@ encoding) using tiny models.
 
 import pytest
 
-from tests.helpers.runtime import OmniServer, OpenAIClientHandler
+from tests.helpers.runtime import OmniServer, OnlineOmniClient
 from tests.model_tests.diffusion.case_filtering import get_parametrized_options
 from tests.model_tests.diffusion.config_types import (
     DiffusionAccs,
@@ -50,7 +53,7 @@ def test_online_on_supported_tasks(
         # TODO: We may want to revisit run_level validation here,
         # because checks for things like image size etc should not
         # depend on whether or not the weights are real or random
-        client = OpenAIClientHandler(
+        client = OnlineOmniClient(
             host=server.host,
             port=server.port,
             api_key="EMPTY",

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen3-TTS serving adapter."""
 
 from collections.abc import Mapping
@@ -12,7 +13,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     DEFAULT_TTS_LANGUAGES,
     ARTTSAdapter,
     PreparedRequest,
-    apply_max_new_tokens,
+    TTSGenerationError,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_precomputed_speakers
 from vllm_omni.utils.speaker_cache import validate_qwen3_tts_profile
@@ -22,11 +23,23 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY = "_qwen3_tts_effective_max_tokens"
+_MIN_CODEC_FRAMES = 192
+_MAX_CODEC_FRAMES_PER_TEXT_TOKEN = 12
+
+
+class Qwen3TTSCodecLimitError(TTSGenerationError):
+    """Qwen3-TTS Base exhausted its codec budget without emitting EOS."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, retryable=True)
+
 
 @register_tts_adapter
 class Qwen3TTSAdapter(ARTTSAdapter):
     """Adapter for Qwen3-TTS (AR ``engine_client`` backend)."""
 
+    validates_generation = True
     stage_keys = frozenset({"qwen3_tts"})
     name = "qwen3_tts"
 
@@ -226,4 +239,95 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         prompt: dict[str, Any] | None = None,
         request_id: str | None = None,
     ) -> list:
-        return apply_max_new_tokens(sampling_params_list, request)
+        """Apply a text-scaled safety ceiling to Base codec generation.
+
+        Qwen3-TTS can rarely enter a repetitive state in which codec EOS is no
+        longer reachable through top-k sampling. A fixed 4096-frame ceiling
+        turns that into several minutes of unusable audio. Bound the default
+        Base-task budget by text length, while preserving an explicit caller
+        ``max_new_tokens`` override and the configured budget for other tasks.
+        """
+        import copy
+
+        del request_id
+        server = self.ctx.server
+        # Only scalar fields on stage 0 are changed below. Shallow-copy each
+        # stage so the shared defaults stay immutable without deep-copying the
+        # complete sampling configuration on every request.
+        sampling_params_list = [copy.copy(params) for params in sampling_params_list]
+        configured_cap = getattr(sampling_params_list[0], "max_tokens", None)
+        task_type = request.task_type or "CustomVoice"
+        text_tokens = None
+        dynamic_cap = None
+        effective_cap: int | None
+
+        if request.max_new_tokens is not None:
+            # An explicit request budget is an opt-out from the automatic
+            # ceiling. It remains an upper bound, and a length finish is still
+            # surfaced as an incomplete generation rather than valid audio.
+            effective_cap = int(request.max_new_tokens)
+        elif task_type == "Base":
+            counted_text_tokens = server._count_usage_text_tokens(request.input)
+            if counted_text_tokens > 0:
+                text_tokens = counted_text_tokens
+                dynamic_cap = max(_MIN_CODEC_FRAMES, text_tokens * _MAX_CODEC_FRAMES_PER_TEXT_TOKEN)
+                effective_cap = min(dynamic_cap, int(configured_cap)) if configured_cap is not None else dynamic_cap
+            else:
+                # Token counting is best-effort. If the tokenizer is missing or
+                # rejects the input, preserve the configured budget instead of
+                # truncating an otherwise valid request at the minimum ceiling.
+                effective_cap = int(configured_cap) if configured_cap is not None else None
+        else:
+            effective_cap = int(configured_cap) if configured_cap is not None else None
+
+        if effective_cap is not None:
+            effective_cap = max(1, effective_cap)
+            sampling_params_list[0].max_tokens = effective_cap
+            sampling_params_list[0].min_tokens = min(
+                int(getattr(sampling_params_list[0], "min_tokens", 0) or 0),
+                effective_cap,
+            )
+
+        if isinstance(prompt, dict):
+            additional_information = prompt.get("additional_information")
+            if isinstance(additional_information, dict) and effective_cap is not None:
+                additional_information[QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY] = [effective_cap]
+
+        logger.debug(
+            "Qwen3-TTS codec budget: task_type=%s text_tokens=%s dynamic_cap=%s "
+            "configured_cap=%s request_cap=%s effective_cap=%s",
+            task_type,
+            text_tokens,
+            dynamic_cap,
+            configured_cap,
+            request.max_new_tokens,
+            effective_cap,
+        )
+        return sampling_params_list
+
+    def validate_generation(
+        self,
+        tts_params: Mapping[str, object],
+        *,
+        stage0_finish_reason: str | None,
+        output_tokens: int,
+    ) -> None:
+        if QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY not in tts_params:
+            return
+        task_type = tts_params.get("task_type")
+        if isinstance(task_type, (list, tuple)):
+            task_type = task_type[0] if task_type else None
+        if task_type != "Base" or stage0_finish_reason != "length":
+            return
+
+        raw_limit = tts_params.get(QWEN3_TTS_EFFECTIVE_MAX_TOKENS_KEY)
+        if isinstance(raw_limit, (list, tuple)):
+            raw_limit = raw_limit[0] if raw_limit else None
+        try:
+            limit = int(raw_limit) if isinstance(raw_limit, (str, bytes, bytearray, int, float)) else 0
+        except (TypeError, ValueError):
+            limit = 0
+        raise Qwen3TTSCodecLimitError(
+            "Qwen3-TTS Base did not emit codec EOS before its token budget "
+            f"({output_tokens}/{limit} codec tokens); the generated audio is incomplete."
+        )

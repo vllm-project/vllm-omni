@@ -1,5 +1,6 @@
 """Stage input processor for Qwen3-TTS: Talker -> Code2Wav."""
 
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -14,9 +15,12 @@ from vllm_omni.data_entry_keys import (
     to_dict,
 )
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
+    AdaptiveChunkController,
+    compute_adaptive_emit,
     compute_dynamic_initial_chunk_size,
     compute_ramp_emit,
     max_ic_for_chunk_size,
+    parse_adaptive_config,
     parse_chunk_ramp,
 )
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
@@ -108,6 +112,18 @@ def talker2code2wav_async_chunk(
         transfer_manager._ramp_parsed = parse_chunk_ramp(cfg, steady=chunk_size)
     ramp = transfer_manager._ramp_parsed
 
+    # Adaptive: parse once per transfer_manager.
+    # Takes precedence over fixed ramp when both are configured.
+    if not hasattr(transfer_manager, "_adaptive_parsed"):
+        transfer_manager._adaptive_parsed = parse_adaptive_config(cfg)
+    (
+        adaptive_enabled,
+        adaptive_min,
+        adaptive_margin,
+        adaptive_divisor,
+        adaptive_delta_min,
+    ) = transfer_manager._adaptive_parsed
+
     # Per-request override takes priority over dynamic IC.
     fixed_initial_chunk_size = configured_initial_chunk_size > 0
     initial_chunk_size = configured_initial_chunk_size
@@ -124,8 +140,12 @@ def talker2code2wav_async_chunk(
             fixed_initial_chunk_size = True
 
     # Dynamic IC: cache per request so boundaries stay stable for its lifetime.
-    # Skipped when ramp is active (ramp replaces IC/steady entirely).
-    if ramp is None and not fixed_initial_chunk_size:
+    # Skipped when fixed ramp is active (ramp replaces IC/steady entirely) or
+    # a fixed IC is configured — unless adaptive is active, in which case
+    # dynamic IC always runs (used for chunk 0), even if
+    # initial_codec_chunk_frames is configured.
+    skip_dynamic_ic = (ramp is not None or fixed_initial_chunk_size) and not adaptive_enabled
+    if not skip_dynamic_ic:
         _ic_cache = getattr(transfer_manager, "_cached_ic", None)
         if _ic_cache is None:
             _ic_cache = {}
@@ -172,7 +192,71 @@ def talker2code2wav_async_chunk(
             )
         return None
 
-    if ramp is not None:
+    if adaptive_enabled:
+        _adaptive_states = getattr(transfer_manager, "_adaptive_states", None)
+        if _adaptive_states is None:
+            _adaptive_states = {}
+            transfer_manager._adaptive_states = _adaptive_states
+
+        ctrl = _adaptive_states.get(request_id)
+        chunk_index = transfer_manager.ramp_chunk_count.get(request_id, 0)
+        first_chunk = chunk_index <= 0
+
+        if ctrl is None or chunk_index == 0:
+            use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < chunk_size
+
+            if use_first_chunk and length <= initial_chunk_size:
+                if not finished and length < initial_chunk_size:
+                    return None
+                context_length = length if finished and length < initial_chunk_size else initial_chunk_size
+            else:
+                initial_coverage = initial_chunk_size if use_first_chunk else 0
+                adjusted = length - initial_coverage
+                if not finished and adjusted % chunk_size != 0:
+                    return None
+                chunk_length = adjusted % chunk_size
+                context_length = chunk_length if chunk_length != 0 else chunk_size
+
+            # Chunk 0: target_size equals context_length (no overshoot possible
+            # — IC logic emits exactly what's accumulated up to the IC boundary).
+            target_size = context_length
+
+            now = time.monotonic()
+            ctrl = AdaptiveChunkController(
+                first_emit_time=now,
+                last_emit_time=now,
+                ramp_divisor=adaptive_divisor,
+                ramp_delta_min=adaptive_delta_min,
+            )
+            _adaptive_states[request_id] = ctrl
+        else:
+            now = time.monotonic()
+            target_size = ctrl.compute_next_chunk_size(
+                now,
+                adaptive_min,
+                chunk_size,
+                adaptive_margin,
+            )
+            emit, context_length = compute_adaptive_emit(
+                length,
+                ctrl.accumulated_at_last_emit,
+                target_size,
+                finished,
+            )
+            if not emit:
+                return None
+            if context_length == 0:
+                ctrl.log_summary(request_id)
+                return OmniPayloadStruct(
+                    codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                    meta=MetaStruct(
+                        request_id=request_id,
+                        left_context_size=0,
+                        finished=torch.tensor(True, dtype=torch.bool),
+                    ),
+                )
+
+    elif ramp is not None:
         chunk_index = transfer_manager.ramp_chunk_count.get(request_id, 0)
         first_chunk = chunk_index <= 0
         emit, context_length = compute_ramp_emit(length, chunk_index, ramp, chunk_size, finished)
@@ -205,6 +289,13 @@ def talker2code2wav_async_chunk(
 
     if finished and first_chunk:
         context_length = length
+
+    if adaptive_enabled:
+        ctrl = transfer_manager._adaptive_states.get(request_id)
+        if ctrl is not None:
+            ctrl.record_emit(time.monotonic(), context_length, length, target_size)
+            if finished:
+                ctrl.log_summary(request_id)
 
     # Code2Wav keeps the quantizer/conv/Transformer context per request. Ship
     # only the newly completed codec frames after the first chunk.

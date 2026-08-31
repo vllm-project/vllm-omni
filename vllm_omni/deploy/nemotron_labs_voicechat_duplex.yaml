@@ -1,0 +1,47 @@
+# Nemotron VoiceChat native Full-Duplex deployment.
+#
+# One scheduler segment consumes one 1280-sample (80 ms) microphone frame.
+# Stage 0 remains one resumable request, so its NemotronH KV/Mamba state is
+# preserved between frame appends. Stage 1 and the codec overlap per frame.
+base_config: nemotron_labs_voicechat_streaming.yaml
+pipeline: nemotron_voicechat
+session_mode: duplex
+active_stream_window: 1
+
+duplex_session:
+  idle_ttl_s: 300
+  disconnect_grace_s: 30
+  reaper_interval_s: 5
+  resume_replay_ttl_s: 60
+  resume_replay_max_bytes_per_session: 8388608
+  max_pending_input_bytes_per_session: 16777216
+  max_pending_turns_per_session: 4
+  max_sessions: 1
+  completed_append_cache_size: 256
+
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      codec_chunk_frames: 1
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    async_scheduling: false
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1
+      ignore_eos: true
+      seed: 0
+
+  - stage_id: 1
+    max_num_seqs: 1
+    async_scheduling: false
+
+  - stage_id: 2
+    max_num_seqs: 1
+    async_scheduling: false

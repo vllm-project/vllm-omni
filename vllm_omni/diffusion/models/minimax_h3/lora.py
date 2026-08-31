@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+"""Loader for the LightX2V Turbo MiniMax-H3 LoRA.
+
+Keyed by ``key_format=minimax-h3-diffusers``. The native FlashGen contract lives
+in ``.npu.lora``; the two artifacts differ in rank, target naming and QKV
+layout, so each owns its own parsing and packing.
+"""
+
 from __future__ import annotations
 
 import math

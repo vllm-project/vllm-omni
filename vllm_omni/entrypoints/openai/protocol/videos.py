@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 OpenAI-compatible protocol definitions for video generation.
 
@@ -19,6 +19,10 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_vali
 
 from vllm_omni.entrypoints.openai.image_api_utils import parse_size
 from vllm_omni.inputs.data import DIFFUSION_QUALITY_LEVELS
+
+# Bound int request fields to avoid overflow issues.
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
 
 
 class VideoGenerationStatus(str, Enum):
@@ -48,10 +52,10 @@ def file_extension(media_type: str):
 class VideoParams(BaseModel):
     """Optional block for video-specific parameters."""
 
-    width: int | None = Field(default=None, ge=1, description="Video width in pixels")
-    height: int | None = Field(default=None, ge=1, description="Video height in pixels")
-    num_frames: int | None = Field(default=None, ge=1, description="Number of frames")
-    fps: int | None = Field(default=None, ge=1, description="Frames per second for output video")
+    width: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Video width in pixels")
+    height: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Video height in pixels")
+    num_frames: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Number of frames")
+    fps: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Frames per second for output video")
 
     @property
     def size(self) -> str | None:
@@ -140,10 +144,10 @@ class VideoGenerationRequest(BaseModel):
     user: str | None = Field(default=None, description="User identifier for tracking")
 
     # Video-specific fields (top-level for OpenAI-style compatibility)
-    width: int | None = Field(default=None, ge=1, description="Video width in pixels")
-    height: int | None = Field(default=None, ge=1, description="Video height in pixels")
-    fps: int | None = Field(default=None, ge=1, description="Frames per second for output video")
-    num_frames: int | None = Field(default=None, ge=1, description="Number of frames to generate")
+    width: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Video width in pixels")
+    height: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Video height in pixels")
+    fps: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Frames per second for output video")
+    num_frames: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Number of frames to generate")
     aspect_ratio: str | None = Field(
         default=None,
         description=(
@@ -151,7 +155,12 @@ class VideoGenerationRequest(BaseModel):
             "FL2VA follows the input image; Ref2VA defaults to 16:9."
         ),
     )
-    short_edge: int | None = Field(default=None, ge=1, description="MiniMax H3 output short edge in pixels")
+    short_edge: int | None = Field(
+        default=None,
+        ge=1,
+        le=_INT64_MAX,
+        description="MiniMax H3 output short edge in pixels",
+    )
     num_outputs_per_prompt: int = Field(
         default=1,
         ge=1,
@@ -218,7 +227,7 @@ class VideoGenerationRequest(BaseModel):
         le=20.0,
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
-    seed: int | None = Field(default=None, description="Random seed for reproducibility")
+    seed: int | None = Field(default=None, ge=_INT64_MIN, le=_INT64_MAX, description="Random seed for reproducibility")
     generate_sound: bool = Field(
         default=False,
         description="Request model-generated audio for video models that support sound generation.",
@@ -237,6 +246,7 @@ class VideoGenerationRequest(BaseModel):
     frame_interpolation_exp: int = Field(
         default=1,
         ge=1,
+        le=_INT64_MAX,
         description="Interpolation exponent: 1=2x temporal resolution, 2=4x, etc.",
     )
     frame_interpolation_scale: float = Field(

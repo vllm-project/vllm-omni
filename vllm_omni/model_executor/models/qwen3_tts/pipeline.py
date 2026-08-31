@@ -52,6 +52,7 @@ QWEN3_TTS_PIPELINE = PipelineConfig(
             sync_process_input_func=f"{_PROC}.talker2code2wav_token_only",
             sampling_constraints={"detokenize": True},
             extras={"tts_args": {"max_instructions_length": 500}},
+            requires_full_payload_input=True,
         ),
     ),
 )

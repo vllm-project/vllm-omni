@@ -8,6 +8,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
+from tests.helpers.stage_config import get_deploy_duplex_max_sessions
 from vllm_omni.config.stage_config import (
     DuplexSessionRuntimeConfig,
     load_deploy_config,
@@ -66,3 +67,18 @@ def test_duplex_session_runtime_rejects_non_positive_values(tmp_path, name: str,
 
     with pytest.raises(ValueError, match=rf"duplex_session\.{name} must be positive"):
         load_deploy_config(deploy_path)
+
+
+@pytest.mark.parametrize(
+    ("deploy_yaml", "expected"),
+    [
+        ("minicpmo_4_5.yaml", 4),
+        ("minicpmo_4_5_8x4090.yaml", 1),
+        ("minicpmo_4_5_3gpu_stage1_replicas.yaml", 4),
+    ],
+)
+def test_deploy_duplex_max_sessions_tracks_the_deploy_config(deploy_yaml: str, expected: int) -> None:
+    # Guards the admission probe. A capacity edit, a config that declares none,
+    # or an overlay inheriting one from its base must surface here rather than
+    # as another nightly duplex admission timeout.
+    assert get_deploy_duplex_max_sessions(deploy_yaml) == expected
