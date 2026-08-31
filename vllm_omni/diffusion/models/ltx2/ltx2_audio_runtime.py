@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Audio-only runtime for full LTX family checkpoints."""
 
@@ -308,11 +308,7 @@ class LTXAudioRuntime(
             ring_degree = getattr(parallel, "ring_degree", 1)
             allgather_degree = getattr(parallel, "allgather_degree", 1)
             ulysses_mode = getattr(parallel, "ulysses_mode", "strict")
-            if (
-                ulysses_degree != parallel.sequence_parallel_size
-                or ring_degree != 1
-                or allgather_degree != 1
-            ):
+            if ulysses_degree != parallel.sequence_parallel_size or ring_degree != 1 or allgather_degree != 1:
                 errors.append("sequence parallelism must use pure Ulysses")
             if ulysses_mode != "strict":
                 errors.append("sequence parallelism requires ulysses_mode='strict'")

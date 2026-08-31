@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Audio-only projection of the full LTX Transformer checkpoint."""
 
@@ -14,7 +14,6 @@ import torch
 from cache_dit import ForwardPattern
 from diffusers.models.embeddings import PixArtAlphaTextProjection
 from torch import nn
-from torch.utils.checkpoint import checkpoint
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
@@ -194,7 +193,6 @@ class LTX2AudioTransformerModel(nn.Module):
         check_forward_pattern=False,
     )
 
-    _supports_gradient_checkpointing = True
     _skip_layerwise_casting_patterns = ["norm"]
     _repeated_blocks = ["LTX2AudioTransformerBlock"]
     _layerwise_offload_blocks_attrs = ["transformer_blocks"]
@@ -338,14 +336,7 @@ class LTX2AudioTransformerModel(nn.Module):
         )
         self.audio_norm_out = nn.LayerNorm(audio_inner_dim, eps=1e-6, elementwise_affine=False)
         self.audio_proj_out = nn.Linear(audio_inner_dim, audio_out_channels)
-        self.gradient_checkpointing = False
         self._sp_plan = self._build_sp_plan(rope_type)
-
-    def enable_gradient_checkpointing(self) -> None:
-        self.gradient_checkpointing = True
-
-    def disable_gradient_checkpointing(self) -> None:
-        self.gradient_checkpointing = False
 
     def prepare_static_conditioning(
         self,
@@ -447,16 +438,7 @@ class LTX2AudioTransformerModel(nn.Module):
                 "audio_self_attention_mask": audio_attention_mask,
                 "audio_self_attention_perturbation_mask": perturbation_mask,
             }
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                audio_hidden_states = checkpoint(
-                    block,
-                    audio_hidden_states,
-                    audio_encoder_hidden_states,
-                    use_reentrant=False,
-                    **kwargs,
-                )
-            else:
-                audio_hidden_states = block(audio_hidden_states, audio_encoder_hidden_states, **kwargs)
+            audio_hidden_states = block(audio_hidden_states, audio_encoder_hidden_states, **kwargs)
 
         values = self.audio_scale_shift_table[None, None] + embedded_timestep[:, :, None]
         shift, scale = values[:, :, 0], values[:, :, 1]
