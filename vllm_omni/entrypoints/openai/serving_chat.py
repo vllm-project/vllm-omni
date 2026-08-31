@@ -189,6 +189,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             "guidance_scale_2",
             "layers",
             "resolution",
+            "pid_decode",
         }
     )
     _diffusion_existing_control_fields = frozenset(
@@ -3631,6 +3632,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 num_outputs_per_prompt=num_outputs_per_prompt,
                 seed=seed,
             )
+            if extra_body.get("pid_decode") is not None:
+                gen_params.pid_decode = extra_body["pid_decode"]
 
             # Only override defaults when the user explicitly provides values
             if num_inference_steps is not None:
