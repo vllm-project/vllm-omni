@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import threading
-from collections import deque
+from collections import defaultdict, deque
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -2380,6 +2380,121 @@ def test_omni_ar_scheduler_finish_requests(mocker: MockerFixture):
         OmniARScheduler.finish_requests(sched, ["r1"], RequestStatus.FINISHED_ABORTED)
 
     assert order == ["adapter", "super"]
+
+
+def _parked_sender_scheduler(adapter, session):
+    """A minimal OmniARScheduler holding one parked streaming session."""
+    scheduler = OmniARScheduler.__new__(OmniARScheduler)
+    scheduler.chunk_transfer_adapter = adapter
+    scheduler.input_coordinator = None
+    scheduler.requests = {session.request_id: session}
+    scheduler.running = []
+    scheduler.waiting = DummyWaitingQueue()
+    scheduler.skipped_waiting = DummyWaitingQueue([session])
+    scheduler.num_waiting_for_streaming_input = 1
+    scheduler.finished_req_ids_dict = {}
+
+    def _free_request(self, request, delay_free_blocks=False):
+        del delay_free_blocks
+        self.requests.pop(request.request_id, None)
+        return None, None
+
+    scheduler._free_request = MethodType(_free_request, scheduler)
+    return scheduler
+
+
+def test_parked_streaming_final_update_emits_downstream_terminal(build_adapter):
+    """#6670: a final update on a parked sender must terminate the receiver.
+
+    Upstream turns "final update while parked in WAITING_FOR_STREAMING_REQ"
+    into a silent local abort. The downstream stage only learns a stream ended
+    from a chunk carrying ``finished``, so the abort used to leave it in
+    WAITING_FOR_CHUNK until the 600s input deadline.
+    """
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    session = _req(
+        "req-parked-final",
+        RequestStatus.WAITING_FOR_STREAMING_REQ,
+        external_req_id="ext-parked-final",
+    )
+    session.resumable = True
+    session._omni_segment_generation = 0
+    # A segment stop already ran: it sent chunk 0 and armed the next
+    # segment's dedup watermark.
+    adapter.put_req_chunk["ext-parked-final"] = 1
+    adapter._segment_generation = defaultdict(int)
+    adapter._segment_generation["ext-parked-final"] = 1
+
+    scheduler = _parked_sender_scheduler(adapter, session)
+
+    final_update = _req(session.request_id, RequestStatus.WAITING)
+    final_update.resumable = False
+    OmniARScheduler.add_request(scheduler, final_update)
+
+    # Local teardown happened...
+    assert session.request_id not in scheduler.requests
+    # ...but only after a terminal chunk was queued for the next stage.
+    assert len(adapter._pending_save_reqs) == 1
+
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    connector.put.assert_called_once()
+    payload = connector.put.call_args.kwargs["data"]
+    assert bool(payload.meta.finished.item()) is True
+    assert bool(payload.meta.is_segment_finished.item()) is False
+
+
+def test_queued_terminal_chunk_survives_sender_cleanup(build_adapter):
+    """#6670: ``cleanup_sender`` must not discard an already-queued terminal."""
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("req-terminal", RequestStatus.FINISHED_STOPPED, external_req_id="ext-terminal")
+    request.resumable = False
+
+    adapter.save_async(None, request, is_segment_finished=False)
+    assert len(adapter._pending_save_reqs) == 1
+
+    # The scheduler tears the request down before the save_loop drains.
+    adapter.cleanup_sender("ext-terminal")
+
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    connector.put.assert_called_once()
+    assert bool(connector.put.call_args.kwargs["data"].meta.finished.item()) is True
+    # The terminal put reclaims the generation it kept alive.
+    assert "ext-terminal" not in adapter._sender_tokens
+
+
+def test_non_terminal_chunk_is_still_dropped_by_sender_cleanup(build_adapter):
+    """The #6670 fence is terminal-only: ordinary queued chunks still drop."""
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("req-mid", RequestStatus.RUNNING, external_req_id="ext-mid")
+    request.resumable = True
+
+    adapter.save_async(None, request, is_segment_finished=False)
+    adapter.cleanup_sender("ext-mid")
+
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    connector.put.assert_not_called()
+
+
+def test_final_update_on_non_sender_stage_keeps_upstream_abort(build_adapter):
+    """A final stage never put a chunk, so it must keep the upstream path."""
+    adapter, _connector = build_adapter(stage_id=2, model_mode="generation")
+    session = _req(
+        "req-final-stage",
+        RequestStatus.WAITING_FOR_STREAMING_REQ,
+        external_req_id="ext-final-stage",
+    )
+    session.resumable = True
+    scheduler = _parked_sender_scheduler(adapter, session)
+
+    final_update = _req(session.request_id, RequestStatus.WAITING)
+    final_update.resumable = False
+
+    with patch.object(VLLMScheduler, "add_request") as base_add:
+        OmniARScheduler.add_request(scheduler, final_update)
+
+    base_add.assert_called_once()
+    assert not adapter._pending_save_reqs
 
 
 def test_wire_round_trip_struct_to_dict_contract():
