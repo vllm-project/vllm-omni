@@ -207,7 +207,7 @@ class PidInferenceModel(nn.Module):
         if net is None:
             net = self.net
         x = noise
-        n_steps = len(t_list) - 1  
+        n_steps = len(t_list) - 1
         with autocast_ctx:
             for i, (t_cur, t_next) in enumerate(zip(t_list[:-1], t_list[1:])):
                 t_cur_batch = t_cur.expand(B)

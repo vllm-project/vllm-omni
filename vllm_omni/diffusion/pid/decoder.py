@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -20,7 +21,6 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.pid.checkpoint import load_pid_checkpoint
 from vllm_omni.diffusion.pid.config import (
     PID_SAMPLING_CONFIG,
-    _PID_HF_REPO,
     get_pid_net_config,
 )
 from vllm_omni.diffusion.pid.pid_model import PidInferenceModel
@@ -72,12 +72,14 @@ class PidDecoder(nn.Module):
         config: PidDecodeConfig,
         backbone: str,
         enforce_eager: bool = False,
+        od_config: Any = None,
     ):
         super().__init__()
         self.device = get_local_device()
         self._config = config
         self._backbone = backbone
         self._enforce_eager = enforce_eager
+        self._od_config = od_config
         self._model: PidInferenceModel | None = None
 
     # -- weight loading ----------------------------------------------------

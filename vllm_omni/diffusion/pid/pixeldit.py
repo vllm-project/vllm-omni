@@ -16,6 +16,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.functional import scaled_dot_product_attention
+from vllm.logger import init_logger
+
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
+logger = init_logger(__name__)
 
 # =============================================================================
 # From pixdit_core/modules.py
@@ -247,6 +255,17 @@ class RotaryAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
+        # vLLM-Omni Attention layer: dispatches Ulysses / Ring / AllGather-KV
+        # automatically when sequence parallelism is active. When SP is off it
+        # is unused (the original SDPA path below keeps identical numerics).
+        self.vattn = Attention(
+            num_heads=num_heads,
+            head_size=self.head_dim,
+            causal=False,
+            softmax_scale=self.scale,
+            prefix="pid.rotary_attn",
+        )
+
     def forward(self, x: torch.Tensor, pos, mask) -> torch.Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 1, 3, 4)
@@ -254,16 +273,27 @@ class RotaryAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
         q, k = apply_rotary_emb(q, k, freqs_cis=pos)
-        q = q.view(B, -1, self.num_heads, C // self.num_heads).transpose(1, 2)
-        k = k.view(B, -1, self.num_heads, C // self.num_heads).transpose(1, 2).contiguous()
-        v = v.view(B, -1, self.num_heads, C // self.num_heads).transpose(1, 2).contiguous()
+        if self._sp_active():
+            # SP: sequence already sharded along N by _sp_plan; vLLM-Omni
+            # Attention handles Ulysses (all-to-all) / Ring / AllGather-KV.
+            if mask is not None:
+                logger.warning_once("RotaryAttention: attention mask ignored under sequence parallelism.")
+            out = self.vattn(q, k, v, None)
+            out = out.reshape(B, N, C)
+        else:
+            q = q.view(B, -1, self.num_heads, C // self.num_heads).transpose(1, 2)
+            k = k.view(B, -1, self.num_heads, C // self.num_heads).transpose(1, 2).contiguous()
+            v = v.view(B, -1, self.num_heads, C // self.num_heads).transpose(1, 2).contiguous()
 
-        x = scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+            out = scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 
-        x = x.transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+            out = out.transpose(1, 2).reshape(B, N, C)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        return out
+
+    def _sp_active(self) -> bool:
+        return is_forward_context_available() and bool(get_forward_context().sp_active)
 
 
 class MLP(nn.Module):
@@ -448,9 +478,17 @@ class PiTBlock(nn.Module):
         return pos
 
     def forward(
-        self, x: torch.Tensor, s_cond: torch.Tensor, image_height: int, image_width: int, patch_size: int, mask=None
+        self,
+        x: torch.Tensor,
+        s_cond: torch.Tensor,
+        image_height: int,
+        image_width: int,
+        patch_size: int,
+        mask=None,
+        patch_count: int | None = None,
     ) -> torch.Tensor:
-        # x: [B*L, P2, C] where L = Hs*Ws patch tokens.
+        # x: [B*L, P2, C] where L = Hs*Ws patch tokens. Under sequence
+        # parallelism `patch_count` carries the *local* (sharded) patch count.
         BL, P2, C = x.shape
         if C != self.pixel_dim:
             raise ValueError(f"PiTBlock expected pixel_dim={self.pixel_dim}, got {C}")
@@ -460,7 +498,7 @@ class PiTBlock(nn.Module):
             "H and W must be divisible by patch_size"
         )
         Hs, Ws = image_height // patch_size, image_width // patch_size
-        L = Hs * Ws
+        L = patch_count if patch_count is not None else Hs * Ws
         assert s_cond.shape[0] == BL, "s_cond batch must match x batch"
         assert BL % L == 0, "Total sequences must be a multiple of patch count"
         B = BL // L
@@ -486,6 +524,38 @@ class PiTBlock(nn.Module):
 # =============================================================================
 # From pixdit_core/pixeldit_t2i.py
 # =============================================================================
+
+
+class PiDPrepare(nn.Module):
+    """Sequence-parallel shard boundary for :class:`PixDiT_T2I`.
+
+    Produces the three tensors that must be sharded *together* along the
+    patch-token sequence ``L`` so that tokens and their RoPE freqs stay
+    aligned:
+
+      - ``x_patches`` ``[B, L, patch_size**2 * C]`` (patch-token condition path)
+      - ``x_pixels``  ``[B*L, P2, pixel_hidden]``   (pixel pathway)
+      - ``pos_img``   ``[L, ...]``                  (image-stream RoPE freqs)
+
+    Pure-function wrapper (holds no submodules) to avoid a cyclic parent
+    reference back to :class:`PixDiT_T2I`.
+    """
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        h: int,
+        w: int,
+        hs: int,
+        ws: int,
+        patch_size: int,
+        pixel_embedder: nn.Module,
+        fetch_pos,
+    ):
+        x_patches = torch.nn.functional.unfold(x, kernel_size=patch_size, stride=patch_size).transpose(1, 2)
+        x_pixels = pixel_embedder(x, img_height=h, img_width=w, patch_size=patch_size)
+        pos_img = fetch_pos(hs, ws, x.device)
+        return x_patches, x_pixels, pos_img
 
 
 class MMDiTJointAttention(nn.Module):
@@ -520,12 +590,20 @@ class MMDiTJointAttention(nn.Module):
         self.proj_drop_x = nn.Dropout(proj_drop)
         self.proj_drop_y = nn.Dropout(proj_drop)
 
+        self.vattn = Attention(
+            num_heads=num_heads,
+            head_size=self.head_dim,
+            causal=False,
+            softmax_scale=self.head_dim**-0.5,
+            prefix="pid.mmdit_attn",
+        )
+
     def forward(
         self,
-        x: torch.Tensor,  # [B, Nx, C] image stream
-        y: torch.Tensor,  # [B, Ny, C] text stream
-        pos_img: torch.Tensor,  # [Nx_full, head_dim/2] complex RoPE freqs
-        pos_txt: torch.Tensor = None,  # [Ny, head_dim/2] complex RoPE freqs for text (optional)
+        x: torch.Tensor,  # [B, Nx, C] image stream (Nx sharded under SP)
+        y: torch.Tensor,  # [B, Ny, C] text stream (always replicated)
+        pos_img: torch.Tensor,  # [Nx_local, head_dim/2] RoPE freqs (sharded with x)
+        pos_txt: torch.Tensor = None,  # [Ny, head_dim/2] RoPE freqs for text (optional)
         attn_mask: torch.Tensor = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         B, Nx, C = x.shape
@@ -549,32 +627,57 @@ class MMDiTJointAttention(nn.Module):
         if pos_txt is not None:
             qy, ky = apply_rotary_emb(qy, ky, freqs_cis=pos_txt)
 
-        # SDPA expects [B, H, S, Hc]; build joint sequence [text, image].
-        qx = qx.transpose(1, 2)
-        kx = kx.transpose(1, 2)
-        vx = vx.transpose(1, 2)
+        if self._sp_active():
+            # SP: image stream sharded along Nx, text stream replicated as a
+            # joint-front KV context. vLLM-Omni Attention internally handles
+            # Ulysses (all-to-all) / Ring / AllGather-KV for the image query.
+            # The text stream's own attention output is not produced (same as
+            # Qwen-Image under SP) -> its residual stays unchanged.
+            if attn_mask is not None:
+                logger.warning_once("MMDiTJointAttention: attention mask ignored under sequence parallelism.")
+            md = AttentionMetadata(
+                joint_query=qy,
+                joint_key=ky,
+                joint_value=vy,
+                joint_strategy="front",
+            )
+            # The Ulysses/Ring strategies re-concatenate the joint text to the
+            # front of the output ([Ny + Nx, H, Hc]), so drop the text part and
+            # keep only the (sharded) image tokens.
+            out_x = self.vattn(qx, kx, vx, md)  # [B, Ny + Nx, H, Hc]
+            out_x = out_x[:, Ny:, :, :]
+            out_x = out_x.reshape(B, Nx, C)
+            out_y = torch.zeros_like(y)
+        else:
+            # SDPA expects [B, H, S, Hc]; build joint sequence [text, image].
+            qx = qx.transpose(1, 2)
+            kx = kx.transpose(1, 2)
+            vx = vx.transpose(1, 2)
 
-        qy = qy.transpose(1, 2)  # [B, H, Ny, Hc]
-        ky = ky.transpose(1, 2)
-        vy = vy.transpose(1, 2)
+            qy = qy.transpose(1, 2)  # [B, H, Ny, Hc]
+            ky = ky.transpose(1, 2)
+            vy = vy.transpose(1, 2)
 
-        q_joint = torch.cat([qy, qx], dim=2)  # [B, H, Ny + Nx, Hc]
-        k_joint = torch.cat([ky, kx], dim=2)  # [B, H, Ny + Nx, Hc]
-        v_joint = torch.cat([vy, vx], dim=2)
+            q_joint = torch.cat([qy, qx], dim=2)  # [B, H, Ny + Nx, Hc]
+            k_joint = torch.cat([ky, kx], dim=2)  # [B, H, Ny + Nx, Hc]
+            v_joint = torch.cat([vy, vx], dim=2)
 
-        out_joint = F.scaled_dot_product_attention(q_joint, k_joint, v_joint, dropout_p=0.0, attn_mask=attn_mask)
-        # Split back to [text, image]
-        out_y = out_joint[:, :, :Ny, :]
-        out_x = out_joint[:, :, Ny:, :]
+            out_joint = F.scaled_dot_product_attention(q_joint, k_joint, v_joint, dropout_p=0.0, attn_mask=attn_mask)
+            # Split back to [text, image]
+            out_y = out_joint[:, :, :Ny, :]
+            out_x = out_joint[:, :, Ny:, :]
 
-        # Merge heads
-        out_y = out_y.transpose(1, 2).reshape(B, Ny, C)
-        out_x = out_x.transpose(1, 2).reshape(B, Nx, C)
+            # Merge heads
+            out_y = out_y.transpose(1, 2).reshape(B, Ny, C)
+            out_x = out_x.transpose(1, 2).reshape(B, Nx, C)
 
         # Output projections
         out_x = self.proj_drop_x(self.proj_x(out_x))
         out_y = self.proj_drop_y(self.proj_y(out_y))
         return out_x, out_y
+
+    def _sp_active(self) -> bool:
+        return is_forward_context_available() and bool(get_forward_context().sp_active)
 
 
 class MMDiTBlockT2I(nn.Module):
@@ -611,12 +714,12 @@ class MMDiTBlockT2I(nn.Module):
 
     def forward(self, x, y, c, pos_img, pos_txt=None, attn_mask=None):
         # c: [B, 1, C] typically, broadcast across tokens
-        shift_msa_x, scale_msa_x, gate_msa_x, shift_mlp_x, scale_mlp_x, gate_mlp_x = self.adaLN_modulation_img(
-            c
-        ).chunk(6, dim=-1)
-        shift_msa_y, scale_msa_y, gate_msa_y, shift_mlp_y, scale_mlp_y, gate_mlp_y = self.adaLN_modulation_txt(
-            c
-        ).chunk(6, dim=-1)
+        shift_msa_x, scale_msa_x, gate_msa_x, shift_mlp_x, scale_mlp_x, gate_mlp_x = self.adaLN_modulation_img(c).chunk(
+            6, dim=-1
+        )
+        shift_msa_y, scale_msa_y, gate_msa_y, shift_mlp_y, scale_mlp_y, gate_mlp_y = self.adaLN_modulation_txt(c).chunk(
+            6, dim=-1
+        )
 
         # 1) Joint attention with dual-stream
         x_norm = apply_adaln(self.norm_x1(x), shift_msa_x, scale_msa_x)
@@ -636,6 +739,22 @@ class MMDiTBlockT2I(nn.Module):
 
 
 class PixDiT_T2I(nn.Module):
+    # Sequence parallelism plan (vLLM-Omni). Patch/pixel token streams and
+    # their image-stream RoPE are sharded together along the patch sequence L;
+    # the pixel-block RoPE is sharded at the attention input; the output is
+    # gathered at final_layer (before fold).
+    _sp_plan = {
+        "pid_prepare": {
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True),
+            1: SequenceParallelInput(split_dim=0, expected_dims=3, split_output=True),
+            2: SequenceParallelInput(split_dim=0, expected_dims=3, split_output=True),
+        },
+        "pixel_blocks.*.attn": {
+            "pos": SequenceParallelInput(split_dim=0, expected_dims=3),
+        },
+        "final_layer": SequenceParallelOutput(gather_dim=0, expected_dims=3),
+    }
+
     def __init__(
         self,
         in_channels=3,
@@ -730,9 +849,16 @@ class PixDiT_T2I(nn.Module):
 
         self.final_layer = FinalLayer(self.pixel_hidden_size, self.out_channels)
 
+        # Sequence-parallel shard boundary (no params; a pure wrapper that
+        # produces the patch/pixel/RoPE tensors the _sp_plan shards together).
+        self.pid_prepare = PiDPrepare()
+
         self.precompute_pos = dict()
         self.precompute_pos_txt = dict()  # cache for 1D text RoPE
         self.last_repa_tokens = None
+
+    def _sp_active(self) -> bool:
+        return is_forward_context_available() and bool(get_forward_context().sp_active)
 
     def fetch_pos(self, height, width, device):
         if (height, width) in self.precompute_pos:
@@ -787,9 +913,14 @@ class PixDiT_T2I(nn.Module):
         Ws = W // self.patch_size
         L = Hs * Ws
 
-        # Patch tokens for condition pathway
-        pos = self.fetch_pos(Hs, Ws, x.device)
-        x_patches = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
+        # Sequence-parallel shard boundary: the post-forward hook splits the
+        # patch tokens, pixel tokens and image-stream RoPE together along L so
+        # tokens and their freqs stay aligned. Without SP this returns the full
+        # tensors (L_local == L) and the flow is unchanged.
+        x_patches, x_pixels, pos = self.pid_prepare(
+            x, H, W, Hs, Ws, self.patch_size, self.pixel_embedder, self.fetch_pos
+        )
+        L_local = x_patches.shape[1]
 
         t_emb = self.t_embedder(t.view(-1)).view(B, -1, self.hidden_size)
 
@@ -840,23 +971,24 @@ class PixDiT_T2I(nn.Module):
         if not (0 < self.repa_encoder_index <= self.patch_depth):
             self.last_repa_tokens = s
 
-        # Ensure the patch token length matches the spatial grid L
+        # Ensure the patch token length matches the (sharded) local grid
         batch_size, length, _ = s.shape
-        if length != L:
-            if length > L:
-                s = s[:, :L, :]
+        if length != L_local:
+            if length > L_local:
+                s = s[:, :L_local, :]
             else:
-                pad_len = L - length
+                pad_len = L_local - length
                 s = torch.cat([s, s.new_zeros(B, pad_len, s.shape[2])], dim=1)
-            length = L
+            length = L_local
 
-        # Pixel pathway
-        s_cond = s.view(B * L, self.hidden_size)
-        x_pixels = self.pixel_embedder(x, img_height=H, img_width=W, patch_size=self.patch_size)
+        # Pixel pathway (x_pixels already produced by pid_prepare; under SP it
+        # is sharded along B*L, so the local patch count is passed to PiTBlock)
+        s_cond = s.view(B * L_local, self.hidden_size)
         for blk in self.pixel_blocks:
-            x_pixels = blk(x_pixels, s_cond, H, W, self.patch_size, mask)
+            x_pixels = blk(x_pixels, s_cond, H, W, self.patch_size, mask, patch_count=L_local)
 
-        # Project back to image and fold
+        # Project back to image and fold. The final_layer gather hook restores
+        # the full patch count (L) before the fold.
         x_pixels = self.final_layer(x_pixels)  # [B*L, P2, C]
         C_out = self.out_channels
         P2 = self.patch_size * self.patch_size
