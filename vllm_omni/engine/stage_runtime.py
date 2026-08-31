@@ -58,6 +58,7 @@ from vllm_omni.engine.stage_init_utils import (
     load_omni_transfer_config_for_model,
     prepare_engine_environment,
     release_device_locks,
+    stage_runtime_env,
 )
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.entrypoints.stage_utils import resolve_stage_physical_devices
@@ -323,9 +324,9 @@ class StageRuntime:
 
     @contextmanager
     def _stage_device_scope(self, stage_id: int, runtime_cfg: Any) -> Iterator[None]:
-        """Temporarily apply the stage device env while launching a replica."""
+        """Temporarily apply the stage runtime and device env for a replica."""
         physical_devices = self._resolve_replica_physical_devices(stage_id, runtime_cfg)
-        with self._scoped_spawn_device_env(physical_devices):
+        with stage_runtime_env(stage_id, runtime_cfg), self._scoped_spawn_device_env(physical_devices):
             yield
 
     # ---- Internal methods ----
@@ -572,18 +573,25 @@ class StageRuntime:
             # Serialize engine-core spawning across all LLM replicas to avoid
             # ZMQ port-allocation races and simultaneous CUDA context init.
             with self._replica_launch_lock:
-                with launch_stage_replica(
-                    vllm_config=vllm_config,
-                    executor_class=executor_class,
-                    log_stats=False,
-                    stage_id=plan.metadata.stage_id,
-                    replica_id=plan.replica_id,
-                    stage_config=plan.stage_cfg,
-                    omni_master_server=self._get_omni_master_server(),
-                    omni_coordinator_address=self._get_coordinator_address(),
-                    stage_visible_devices=physical_devices,
-                    spawn_device_lock=self._spawn_device_lock,
-                ) as resources:
+                # ``runtime.env`` has to be set while multiprocessing spawns the
+                # EngineCore, not only while the deploy config is parsed: the
+                # worker process inherits the environment it is spawned with, so
+                # applying it any earlier leaves every worker-side switch unset.
+                with (
+                    stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg),
+                    launch_stage_replica(
+                        vllm_config=vllm_config,
+                        executor_class=executor_class,
+                        log_stats=False,
+                        stage_id=plan.metadata.stage_id,
+                        replica_id=plan.replica_id,
+                        stage_config=plan.stage_cfg,
+                        omni_master_server=self._get_omni_master_server(),
+                        omni_coordinator_address=self._get_coordinator_address(),
+                        stage_visible_devices=physical_devices,
+                        spawn_device_lock=self._spawn_device_lock,
+                    ) as resources,
+                ):
                     pass
 
             logger.info("[StageRuntime] Stage %s engine startup completed", plan.metadata.stage_id)
