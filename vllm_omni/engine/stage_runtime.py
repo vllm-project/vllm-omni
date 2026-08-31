@@ -523,16 +523,21 @@ class StageRuntime:
 
     def _run_stage_admission(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
         """Pre-launch per-device admission for parallel stage init (fail-fast)."""
-        from vllm_omni.engine.stage_admission import check_admission
+        from vllm_omni.engine.stage_admission import (
+            ADMISSION_EXEMPT,
+            AdmissionExempt,
+            check_admission,
+        )
 
-        def _resolve(replica: ReplicaInitPlan) -> list[int] | None:
+        def _resolve(replica: ReplicaInitPlan) -> list[int] | AdmissionExempt | None:
             if replica.launch_mode == "remote":
                 # Remote replicas consume a remote node's memory and the ledger
                 # is per-LOCAL-device. Remote LLM plans already carry
                 # runtime_cfg=None, but remote diffusion replicas keep their
-                # cfg — exclude both explicitly so they land in the
-                # operator-isolated skip list instead of the local ledger.
-                return None
+                # cfg — mark both exempt explicitly. Only this exemption may
+                # skip the ledger: a LOCAL replica that resolves to None below
+                # fails admission (fail-closed in check_admission).
+                return ADMISSION_EXEMPT
             resolved = self._resolve_replica_physical_devices(replica.metadata.stage_id, replica.metadata.runtime_cfg)
             if not resolved:
                 return None

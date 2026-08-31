@@ -48,6 +48,22 @@ class StageAdmissionError(RuntimeError):
     """Raised when the planned stage budgets do not fit the available devices."""
 
 
+class AdmissionExempt:
+    """Type of :data:`ADMISSION_EXEMPT`; not meant to be instantiated elsewhere."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "ADMISSION_EXEMPT"
+
+
+ADMISSION_EXEMPT = AdmissionExempt()
+"""Resolver sentinel: the replica is deliberately outside local admission
+(e.g. it runs on a remote node and consumes that node's memory). Only replicas
+marked exempt may skip the ledger — a local replica the resolver cannot account
+for fails admission instead (see :func:`check_admission`)."""
+
+
 @dataclass
 class StageDemand:
     """One replica's claim on a set of physical devices."""
@@ -176,7 +192,7 @@ def evaluate(
 def check_admission(
     stage_plans: Sequence[Any],
     *,
-    resolve_physical_devices: Callable[[Any], list[int] | None],
+    resolve_physical_devices: Callable[[Any], list[int] | AdmissionExempt | None],
     device_total_memory: Callable[[int], int],
     external_reserve_bytes: int = _DEFAULT_EXTERNAL_RESERVE_BYTES,
     safety_margin_bytes: int = _DEFAULT_SAFETY_MARGIN_BYTES,
@@ -185,27 +201,39 @@ def check_admission(
     """Extract demands from the orchestrator's stage plans and admit them.
 
     ``resolve_physical_devices(replica)`` returns the physical GPU ids a replica
-    occupies (or None/[] if unresolved — such replicas are skipped with a
-    warning). ``device_total_memory(id)`` returns a device's total bytes.
+    occupies, or :data:`ADMISSION_EXEMPT` for replicas deliberately outside
+    local admission (e.g. running on a remote node). Any *other* replica that
+    cannot be accounted — unresolved or non-integer devices, or a diffusion
+    stage without an explicit ``gpu_memory_utilization`` — raises
+    ``StageAdmissionError``: under parallel init every local replica gets its
+    own init group and no parent holds a whole-init exclusive lock, so a
+    consumer invisible to the ledger would initialize concurrently with
+    unbounded demand, defeating admission (fail-closed).
+    ``device_total_memory(id)`` returns a device's total bytes.
     """
     demands: list[StageDemand] = []
-    skipped: list[str] = []
+    exempt: list[str] = []
+    unaccounted: list[str] = []
     for plan in stage_plans:
         for replica in getattr(plan, "replicas", []):
             metadata = replica.metadata
             label = f"stage{metadata.stage_id}/replica{replica.replica_id}"
             device_ids = resolve_physical_devices(replica)
+            if isinstance(device_ids, AdmissionExempt):
+                exempt.append(label)
+                continue
             if not device_ids:
-                skipped.append(f"{label} (unresolved devices)")
+                unaccounted.append(f"{label} (unresolved devices)")
                 continue
             vllm_config = replica.stage_vllm_config
             if vllm_config is None:
                 # Diffusion stages have no resolved vllm_config pre-launch and
-                # skip profile/capture; admit them with their raw util if known,
-                # else skip with a note (they run their own memory accounting).
+                # skip profile/capture; admit them with their raw util. A local
+                # diffusion stage without one has unknowable demand and must
+                # fail admission below, not bypass it.
                 util = _diffusion_utilization(replica)
                 if util is None:
-                    skipped.append(f"{label} (diffusion, no util)")
+                    unaccounted.append(f"{label} (diffusion, no gpu_memory_utilization)")
                     continue
                 demands.append(
                     StageDemand(
@@ -228,11 +256,20 @@ def check_admission(
                 )
             )
 
-    if skipped:
-        logger.warning(
-            "[admission] not accounted for (operator-isolated): %s. Admission covers only "
-            "resolved LLM stages; ensure skipped consumers fit the remaining headroom.",
-            skipped,
+    if unaccounted:
+        raise StageAdmissionError(
+            "parallel_stage_init admission cannot account for local replicas: "
+            f"{unaccounted}. Every local stage must resolve to integer physical "
+            "device ids and declare a memory budget (diffusion stages: set "
+            "gpu_memory_utilization in engine_args); otherwise it would "
+            "initialize concurrently without bounding its demand. Fix the "
+            "stage config or disable parallel_stage_init."
+        )
+    if exempt:
+        logger.info(
+            "[admission] exempt from local admission (remote/operator-isolated): %s. "
+            "These replicas consume no local device memory.",
+            exempt,
         )
 
     capacities: dict[int, int] = {}

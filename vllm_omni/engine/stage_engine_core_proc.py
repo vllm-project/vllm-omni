@@ -41,6 +41,35 @@ logger = init_logger(__name__)
 _SIGNAL_EXIT_BASE = 128
 
 
+def _install_phase_locks(kwargs: dict[str, Any], local_dp_rank: int) -> None:
+    """Wrap ``kwargs["executor_class"]`` with the SH/EX phase-lock guard.
+
+    Fail-closed: ``parallel_stage_init`` promises that every memory-mutating
+    init phase in this child runs under the per-device locks, so a missing
+    ``vllm_config`` or ``executor_class`` must abort the launch rather than
+    silently proceed with an unguarded parallel initialization.
+    """
+    from vllm_omni.engine.stage_phase_lock import (
+        DevicePhaseLock,
+        wrap_executor_with_phase_locks,
+    )
+
+    missing = [key for key in ("vllm_config", "executor_class") if kwargs.get(key) is None]
+    if missing:
+        raise RuntimeError(
+            f"parallel_stage_init is enabled but EngineCore kwargs are missing {missing}, "
+            "so the SH/EX phase-lock guard cannot be installed. Refusing to run an "
+            "unguarded parallel initialization; fix the launch plumbing or disable "
+            "parallel_stage_init."
+        )
+    locker = DevicePhaseLock.from_child(kwargs["vllm_config"], local_dp_rank)
+    kwargs["executor_class"] = wrap_executor_with_phase_locks(kwargs["executor_class"], locker)
+    logger.info(
+        "[StageEngineCoreProc] parallel_stage_init: SH/EX phase locks on devices %s",
+        locker.device_ids,
+    )
+
+
 def _signal_exit_code(signum: int) -> int:
     """Return the conventional process exit code for signal-driven exits."""
     return _SIGNAL_EXIT_BASE + signum
@@ -147,25 +176,7 @@ class StageEngineCoreProc(EngineCoreProc):
             # phase boundaries live inside EngineCore.__init__, invisible to the
             # orchestrator. See vllm_omni.engine.stage_phase_lock.
             if omni_parallel_stage_init:
-                from vllm_omni.engine.stage_phase_lock import (
-                    DevicePhaseLock,
-                    wrap_executor_with_phase_locks,
-                )
-
-                vllm_config = kwargs.get("vllm_config")
-                executor_class = kwargs.get("executor_class")
-                if vllm_config is not None and executor_class is not None:
-                    locker = DevicePhaseLock.from_child(vllm_config, local_dp_rank)
-                    kwargs["executor_class"] = wrap_executor_with_phase_locks(executor_class, locker)
-                    logger.info(
-                        "[StageEngineCoreProc] parallel_stage_init: SH/EX phase locks on devices %s",
-                        locker.device_ids,
-                    )
-                else:
-                    logger.warning(
-                        "[StageEngineCoreProc] parallel_stage_init set but vllm_config/executor_class "
-                        "missing from kwargs; phase locks NOT installed."
-                    )
+                _install_phase_locks(kwargs, local_dp_rank)
 
             engine_core = StageEngineCoreProc(
                 *args,

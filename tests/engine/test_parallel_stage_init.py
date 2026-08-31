@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from vllm_omni.engine.stage_admission import (
+    ADMISSION_EXEMPT,
     DeviceLedger,
     StageAdmissionError,
     StageDemand,
@@ -27,6 +28,7 @@ from vllm_omni.engine.stage_admission import (
     evaluate,
     graph_reserve_bytes,
 )
+from vllm_omni.engine.stage_engine_core_proc import _install_phase_locks
 from vllm_omni.engine.stage_init_utils import LogicalStageInitPlan, ReplicaInitPlan
 from vllm_omni.engine.stage_phase_lock import (
     DeviceLockTimeoutError,
@@ -201,20 +203,21 @@ def test_check_admission_multi_device_and_grouping():
     assert ledgers[1].fits
 
 
-def test_check_admission_skips_unresolved_and_admits_diffusion_util():
-    cap = 80 * 1024**3
-    # diffusion replica: no vllm_config, but util available on engine_args
-    diff = _llm_replica(0, 0, "0")
-    diff.metadata.stage_type = "diffusion"
-    diff.stage_vllm_config = None
-    diff.stage_cfg.engine_args = {"gpu_memory_utilization": 0.3}
-    # unresolved-device replica -> skipped
-    unresolved = _llm_replica(1, 0, None, vllm_config=_fake_vllm_config(0.9, cudagraph_mode="NONE"))
+def _local_diffusion_replica(stage_id: int, replica_id: int, devices: str, *, util: float | None) -> ReplicaInitPlan:
+    replica = _llm_replica(stage_id, replica_id, devices)
+    replica.metadata.stage_type = "diffusion"
+    replica.stage_vllm_config = None
+    replica.stage_cfg.engine_args = {} if util is None else {"gpu_memory_utilization": util}
+    return replica
 
-    plan = LogicalStageInitPlan(stage_idx=0, stage_id=0, replicas=[diff, unresolved])
+
+def test_check_admission_admits_diffusion_with_explicit_util():
+    cap = 80 * 1024**3
+    diff = _local_diffusion_replica(0, 0, "0", util=0.3)
+    plan = LogicalStageInitPlan(stage_idx=0, stage_id=0, replicas=[diff])
     ledgers = check_admission(
         [plan],
-        resolve_physical_devices=lambda r: ([0] if r.metadata.runtime_cfg.get("devices") == "0" else None),
+        resolve_physical_devices=lambda _r: [0],
         device_total_memory=lambda _d: cap,
         external_reserve_bytes=0,
         safety_margin_bytes=0,
@@ -223,12 +226,63 @@ def test_check_admission_skips_unresolved_and_admits_diffusion_util():
     assert ledgers[0].kv_budget_bytes == int(cap * 0.3)
 
 
+def test_check_admission_unresolved_local_raises():
+    """A local replica invisible to the ledger must fail admission, not skip it:
+    it would otherwise initialize concurrently with unbounded demand."""
+    unresolved = _llm_replica(1, 0, None, vllm_config=_fake_vllm_config(0.9, cudagraph_mode="NONE"))
+    plan = LogicalStageInitPlan(stage_idx=0, stage_id=1, replicas=[unresolved])
+    with pytest.raises(StageAdmissionError, match="stage1/replica0.*unresolved"):
+        check_admission(
+            [plan],
+            resolve_physical_devices=lambda _r: None,
+            device_total_memory=lambda _d: 80 * 1024**3,
+        )
+
+
+def test_check_admission_local_diffusion_without_util_raises():
+    """The reviewer's repro: local LLM + local diffusion with no explicit util
+    used to leave the diffusion stage out of the ledger silently."""
+    llm = _llm_replica(0, 0, "0", vllm_config=_fake_vllm_config(0.45, cudagraph_mode="NONE"))
+    diff = _local_diffusion_replica(1, 0, "0", util=None)
+    plans = [
+        LogicalStageInitPlan(stage_idx=0, stage_id=0, replicas=[llm]),
+        LogicalStageInitPlan(stage_idx=1, stage_id=1, replicas=[diff]),
+    ]
+    with pytest.raises(StageAdmissionError, match="diffusion, no gpu_memory_utilization"):
+        check_admission(
+            plans,
+            resolve_physical_devices=lambda _r: [0],
+            device_total_memory=lambda _d: 80 * 1024**3,
+        )
+
+
+def test_check_admission_exempt_replicas_skip_without_error():
+    """Only ADMISSION_EXEMPT (remote/operator-isolated) may skip the ledger."""
+    cap = 80 * 1024**3
+    local = _llm_replica(0, 0, "0", vllm_config=_fake_vllm_config(0.4, cudagraph_mode="NONE"))
+    remote = _llm_replica(1, 0, None, vllm_config=_fake_vllm_config(0.9, cudagraph_mode="NONE"))
+    remote.launch_mode = "remote"
+    plan = LogicalStageInitPlan(stage_idx=0, stage_id=0, replicas=[local, remote])
+    ledgers = check_admission(
+        [plan],
+        resolve_physical_devices=lambda r: ADMISSION_EXEMPT if r.launch_mode == "remote" else [0],
+        device_total_memory=lambda _d: cap,
+        external_reserve_bytes=0,
+        safety_margin_bytes=0,
+    )
+    assert set(ledgers) == {0}
+    assert ledgers[0].contributors == ["stage0/replica0"]
+    assert ledgers[0].kv_budget_bytes == int(cap * 0.4)
+
+
 def test_run_stage_admission_excludes_remote_replicas(monkeypatch):
     """Remote replicas consume a remote node's memory — never the local ledger.
 
-    Remote LLM plans already carry runtime_cfg=None (resolver returns None),
-    but remote diffusion replicas keep their cfg + utilization, so without an
-    explicit launch_mode guard they would be counted against local devices.
+    Remote LLM plans already carry runtime_cfg=None, but remote diffusion
+    replicas keep their cfg + utilization, so without an explicit launch_mode
+    guard they would be counted against local devices. They must resolve to
+    ADMISSION_EXEMPT (not None): None now means an unaccountable LOCAL replica
+    and fails admission.
     """
     import vllm_omni.engine.stage_admission as admission_mod
 
@@ -252,7 +306,7 @@ def test_run_stage_admission_excludes_remote_replicas(monkeypatch):
     runtime._run_stage_admission([LogicalStageInitPlan(stage_idx=0, stage_id=0, replicas=[local, remote_diff])])
 
     assert captured["resolve"](local) == [0]
-    assert captured["resolve"](remote_diff) is None
+    assert captured["resolve"](remote_diff) is ADMISSION_EXEMPT
 
 
 # --------------------------------------------------------------------------- #
@@ -364,6 +418,37 @@ def test_wrapper_phase_ordering():
         "SH-enter",
         "SH-exit",  # KV alloc + capture
     ]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{}, {"vllm_config": object()}, {"executor_class": object}],
+    ids=["both-missing", "executor-missing", "config-missing"],
+)
+def test_install_phase_locks_fails_closed_on_missing_kwargs(kwargs):
+    """parallel_stage_init must never proceed with the phase-lock guard
+    uninstalled — a missing vllm_config/executor_class aborts the child."""
+    with pytest.raises(RuntimeError, match="phase-lock guard cannot be installed"):
+        _install_phase_locks(kwargs, local_dp_rank=0)
+
+
+def test_install_phase_locks_wraps_executor(monkeypatch):
+    import vllm_omni.engine.stage_phase_lock as phase_lock_mod
+
+    locker = _RecordingLocker()
+    locker.device_ids = [0]
+    monkeypatch.setattr(
+        phase_lock_mod.DevicePhaseLock,
+        "from_child",
+        classmethod(lambda _cls, _cfg, _rank: locker),
+    )
+    kwargs = {"vllm_config": object(), "executor_class": _FakeExecutor}
+
+    _install_phase_locks(kwargs, local_dp_rank=0)
+
+    exec_ = kwargs["executor_class"](vllm_config=object())
+    assert exec_.determine_available_memory() == 123
+    assert locker.events[:2] == ["SH-enter", "SH-exit"]
 
 
 # --------------------------------------------------------------------------- #
