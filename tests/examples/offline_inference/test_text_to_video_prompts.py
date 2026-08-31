@@ -44,27 +44,6 @@ def test_text_to_video_builds_canonical_prompt(
         assert result["negative_prompt"] == expected_negative_prompt
 
 
-def test_text_to_video_preserves_structured_prompt() -> None:
-    mod = _load_text_to_video()
-    prompt = {"shot": "tracking", "subject": {"description": "a courier"}}
-
-    result = mod.build_text_to_video_prompt(prompt, None)
-
-    assert result["prompt"] is prompt
-
-
-def test_load_prompt_json_requires_one_object(tmp_path) -> None:
-    mod = _load_text_to_video()
-    prompt_path = tmp_path / "prompt.json"
-    prompt_path.write_text('{"shot": "tracking"}')
-
-    assert mod._load_prompt_json(prompt_path) == {"shot": "tracking"}
-
-    prompt_path.write_text('["not", "an", "object"]')
-    with pytest.raises(ValueError, match="one structured prompt object"):
-        mod._load_prompt_json(prompt_path)
-
-
 @pytest.mark.parametrize(
     ("model", "model_class_name", "preset_name"),
     [

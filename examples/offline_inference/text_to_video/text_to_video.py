@@ -164,7 +164,7 @@ def _detect_preset(model: str, model_class_name: str | None = None) -> dict:
     return _MODEL_PRESETS["wan"]
 
 
-def build_text_to_video_prompt(prompt: Any, negative_prompt: str | None) -> dict[str, Any]:
+def build_text_to_video_prompt(prompt: str, negative_prompt: str | None) -> dict[str, Any]:
     """Build the canonical request envelope for the shared T2V example."""
     result: dict[str, Any] = {
         "prompt": prompt,
@@ -213,16 +213,6 @@ def parse_extra_body(value: str) -> dict[str, Any]:
     drive model-specific behaviour without bespoke per-model flags.
     """
     return _parse_json_object(value, "--extra-body")
-
-
-def _load_prompt_json(path: Path) -> dict[str, Any]:
-    try:
-        prompt = json.loads(path.read_text())
-    except json.JSONDecodeError as e:
-        raise ValueError(f"--prompt-json must contain valid JSON: {e}") from e
-    if not isinstance(prompt, dict):
-        raise ValueError("--prompt-json must contain one structured prompt object")
-    return prompt
 
 
 def _unwrap_first(output: Any) -> Any:
@@ -283,12 +273,6 @@ def parse_args() -> argparse.Namespace:
         help="Optional JSON object of engine-level, model-specific configuration.",
     )
     parser.add_argument("--prompt", default="A serene lakeside sunrise with mist over the water.", help="Text prompt.")
-    parser.add_argument(
-        "--prompt-json",
-        type=Path,
-        default=None,
-        help="Structured prompt JSON object; overrides --prompt.",
-    )
     parser.add_argument("--negative-prompt", default=None, help="Negative prompt. Default: model-specific.")
     parser.add_argument(
         "--extra-body",
@@ -629,10 +613,7 @@ def main():
     if negative_prompt is None and all(preset is not _MODEL_PRESETS[name] for name in ("lingbot", "ltx2", "ltx23")):
         # Preserve the historical empty-prompt behavior for non-LTX examples.
         negative_prompt = ""
-    prompt_value: Any = args.prompt
-    if args.prompt_json is not None:
-        prompt_value = _load_prompt_json(args.prompt_json)
-    prompt_dict = build_text_to_video_prompt(prompt_value, negative_prompt)
+    prompt_dict = build_text_to_video_prompt(args.prompt, negative_prompt)
 
     extra_args = {}
     if lora_request:

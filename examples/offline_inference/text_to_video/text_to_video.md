@@ -79,7 +79,7 @@ Optional features use the same command:
 
 - **Cache-DiT:** add `--cache-backend cache_dit --enforce-eager`. It requires
   sequential CFG and cannot be combined with HSDP or other distributed/model-
-  parallel modes. Use `--prompt-json` for official structured prompt JSON files.
+  parallel modes.
 - **Refiner:** enable it at startup and request it per generation:
 
   ```bash
