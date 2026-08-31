@@ -75,6 +75,48 @@ def test_tp_seed_same_across_ranks_and_varies_across_requests():
     assert len(set(seeds)) == n_requests, f"Expected {n_requests} unique seeds but got {len(set(seeds))}: {seeds}"
 
 
+def test_extra_args_seed_is_copied_without_removing_model_owned_value():
+    request = OmniDiffusionRequest(
+        prompt={"prompt": "test"},
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"seed": 17}),
+        request_id="request-test",
+    )
+
+    assert request.sampling_params.seed == 17
+    assert request.sampling_params.extra_args["seed"] == 17
+
+
+def test_canonical_seed_does_not_remove_model_owned_extra_seed():
+    request = OmniDiffusionRequest(
+        prompt={"prompt": "test"},
+        sampling_params=OmniDiffusionSamplingParams(seed=42, extra_args={"seed": 17}),
+        request_id="request-test",
+    )
+
+    assert request.sampling_params.seed == 42
+    assert request.sampling_params.extra_args["seed"] == 17
+
+
+@pytest.mark.parametrize("seed", [True, 1.5, "17", -1, 2**63])
+def test_legacy_extra_args_seed_rejects_invalid_values(seed):
+    with pytest.raises(ValueError, match="seed must"):
+        OmniDiffusionRequest(
+            prompt={"prompt": "test"},
+            sampling_params=OmniDiffusionSamplingParams(extra_args={"seed": seed}),
+            request_id="request-test",
+        )
+
+
+@pytest.mark.parametrize("seed", [True, 1.5, "17", -1, 2**63])
+def test_canonical_seed_rejects_invalid_values(seed):
+    with pytest.raises(ValueError, match="seed must"):
+        OmniDiffusionRequest(
+            prompt={"prompt": "test"},
+            sampling_params=OmniDiffusionSamplingParams(seed=seed),
+            request_id="request-test",
+        )
+
+
 def _request_with_guidance(**sampling_kwargs) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
         prompt={"prompt": "a cup of coffee on a table"},

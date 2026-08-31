@@ -126,7 +126,7 @@ def run_e2e():
     if mm_processor_kwargs:
         prompts["mm_processor_kwargs"] = mm_processor_kwargs
 
-    sampling_params_list = [OmniDiffusionSamplingParams(extra_args={"seed": args.seed})]
+    sampling_params_list = [OmniDiffusionSamplingParams(seed=args.seed)]
 
     print(f"Generating speech for: {args.text}")
 

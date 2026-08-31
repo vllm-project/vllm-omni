@@ -47,8 +47,7 @@ def run_tts(args) -> None:
         "response_format": args.response_format,
     }
     if args.seed is not None:
-        payload["extra_params"] = {}
-        payload["extra_params"]["seed"] = args.seed
+        payload["seed"] = args.seed
 
     if args.voice:
         payload["voice"] = args.voice

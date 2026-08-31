@@ -75,6 +75,8 @@ class OmniVoiceConfig(PretrainedConfig):
         self.layer_penalty_factor = getattr(self, "layer_penalty_factor", 5.0)
         self.position_temperature = getattr(self, "position_temperature", 5.0)
         self.class_temperature = getattr(self, "class_temperature", 0.0)
+        self.audio_chunk_duration = getattr(self, "audio_chunk_duration", 15.0)
+        self.audio_chunk_threshold = getattr(self, "audio_chunk_threshold", 30.0)
 
         # Audio output
         self.sample_rate = getattr(self, "sample_rate", 24000)

@@ -430,6 +430,7 @@ class OmniVoiceModel(
             audio_mask=batch_audio_mask,
             attention_mask=batch_attention_mask,
             target_lens=[target_len],
+            conditional_lens=[cond_len],
             num_step=self.config.num_step,
             guidance_scale=self.config.guidance_scale,
             t_shift=self.config.t_shift,

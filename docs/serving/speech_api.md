@@ -120,8 +120,10 @@ Content-Type: application/json
 | `language` | string | "Auto" | Language (see supported languages below) |
 | `instructions` | string | "" | Voice style/emotion instructions |
 | `max_new_tokens` | integer | 2048 | Maximum tokens to generate |
+| `seed` | integer | null | Random seed for repeatable generation. |
 | `initial_codec_chunk_frames` | integer | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
 | `non_streaming_mode` | bool | null | Qwen3-TTS prompt construction mode override. Does not affect HTTP response streaming or async-chunk pipelining. When null, Qwen3-TTS uses model defaults: Base=false, CustomVoice/VoiceDesign=true. |
+| `extra_params` | object | null | Model-specific generation controls. See the model sections for supported fields. |
 | `stream` | bool | false | When true, stream OpenAI `speech.audio.*` SSE events (requires `response_format="pcm"` or `"wav"`). For raw PCM/WAV byte streaming, set `stream_format="audio"`. |
 | `stream_format` | string | null | Streaming output format. `"audio"` streams raw audio bytes as they are decoded; `"sse"` streams OpenAI `speech.audio.*` Server-Sent Events. If omitted, `stream=true` selects SSE and `stream=false` remains non-streaming. See [Response Format](#response-format). |
 
@@ -740,6 +742,25 @@ Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` ne
 | Model | Description |
 |-------|-------------|
 | `k2-fsa/OmniVoice` | Pure-diffusion TTS. Supports voice cloning via `ref_audio` (with optional `ref_text`); no built-in voice presets. |
+
+OmniVoice splits long input into smaller text chunks and joins the decoded audio. You can change the split behavior for one request through `extra_params`:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `audio_chunk_duration` | float | 15.0 | Target duration in seconds for each generated text chunk. The value must be positive. |
+| `audio_chunk_threshold` | float | 30.0 | Estimated duration in seconds above which chunking starts. The value must be non-negative. |
+
+Use the defaults unless you have tested output quality for your workload. To retain protection from long text word loss, keep `audio_chunk_duration` at or below 15 seconds and `audio_chunk_threshold` at or below 30 seconds. Lower values create more chunks and audio joins, which can increase generation time and introduce audible pauses.
+
+```json
+{
+    "input": "A long passage to synthesize...",
+    "extra_params": {
+        "audio_chunk_duration": 15.0,
+        "audio_chunk_threshold": 30.0
+    }
+}
+```
 
 ### VoxCPM2
 

@@ -169,6 +169,7 @@ class TestAudioMixin:
 def create_mock_audio_output_for_test(
     request_id: str = "speech-mock-123",
     metrics: dict | None = None,
+    peak_memory_mb: float = 0.0,
 ) -> OmniRequestOutput:
     class MockCompletionOutput:
         def __init__(self, index: int = 0):
@@ -204,6 +205,7 @@ def create_mock_audio_output_for_test(
         final_output_type="audio",
     )
     output.metrics = metrics
+    output.peak_memory_mb = peak_memory_mb
     return output
 
 
@@ -751,19 +753,30 @@ class TestSpeechAPI:
         assert b"Invalid voice" in response.body
 
     @pytest.mark.asyncio
-    async def test_create_diffusion_speech_extra_params(self, mocker: MockerFixture):
-        """Test public diffusion speech success and extra_params propagation."""
+    @pytest.mark.parametrize(
+        ("request_seed", "extra_seed", "expected_seed"),
+        [(None, None, 99), (None, 17, 17), (42, 17, 42)],
+    )
+    async def test_create_diffusion_speech_extra_params(
+        self,
+        mocker: MockerFixture,
+        request_seed,
+        extra_seed,
+        expected_seed,
+    ):
+        """Test diffusion speech extra_params and seed propagation."""
         # Mock the engine client
         mock_engine = mocker.MagicMock()
 
         # Mock default sampling params
         mock_sampling_param = mocker.MagicMock()
+        mock_sampling_param.seed = 99
         mock_sampling_param.extra_args = {"existing_arg": "value"}
         mock_engine.default_sampling_params_list = [mock_sampling_param]
 
         # Mock generate to yield a valid OmniRequestOutput
         async def mock_generate(*args, **kwargs):
-            yield create_mock_audio_output_for_test()
+            yield create_mock_audio_output_for_test(peak_memory_mb=1234.25)
 
         mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
 
@@ -774,13 +787,21 @@ class TestSpeechAPI:
             server, "create_audio", return_value=mocker.MagicMock(audio_data=b"dummy", media_type="audio/wav")
         )
 
-        req = OpenAICreateSpeechRequest(input="Hello", extra_params={"new_arg": 123, "existing_arg": "new_value"})
+        extra_params = {"new_arg": 123, "existing_arg": "new_value"}
+        if extra_seed is not None:
+            extra_params["seed"] = extra_seed
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            seed=request_seed,
+            extra_params=extra_params,
+        )
 
         response = await server.create_speech(req)
 
         assert response.status_code == 200
         assert response.media_type == "audio/wav"
         assert response.body == b"dummy"
+        assert response.headers["x-peak-memory-mb"] == "1234.250"
 
         # Verify generate was called
         mock_engine.generate.assert_called_once()
@@ -791,7 +812,20 @@ class TestSpeechAPI:
 
         # Verify it was deepcopied and updated
         assert passed_params is not mock_engine.default_sampling_params_list
+        assert passed_params[0].seed == expected_seed
         assert passed_params[0].extra_args == {"existing_arg": "new_value", "new_arg": 123}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("seed", [True, 1.5, "17", -1, 2**63])
+    async def test_create_diffusion_speech_rejects_invalid_extra_seed(self, mocker: MockerFixture, seed):
+        mock_engine = mocker.MagicMock()
+        mock_engine.default_sampling_params_list = [mocker.MagicMock(seed=99, extra_args={})]
+        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+
+        response = await server.create_speech(OpenAICreateSpeechRequest(input="Hello", extra_params={"seed": seed}))
+
+        assert response.status_code == 400
+        mock_engine.generate.assert_not_called()
 
 
 class TestTTSMethods:

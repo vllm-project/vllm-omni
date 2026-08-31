@@ -17,6 +17,14 @@ DUMMY_DIFFUSION_REQUEST_ID = "dummy_req_id"
 _DUMMY_DIFFUSION_REQUEST_ID_PREFIX = f"{DUMMY_DIFFUSION_REQUEST_ID}/"
 
 
+def validate_diffusion_seed(seed: Any) -> int:
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("seed must be an integer")
+    if not 0 <= seed <= 2**63 - 1:
+        raise ValueError("seed must be between 0 and 2**63 - 1")
+    return seed
+
+
 def resolve_video_num_frames(
     num_frames: int | None,
     *,
@@ -77,6 +85,14 @@ class OmniDiffusionRequest:
         """Initialize dependent fields after dataclass initialization."""
         if not isinstance(self.request_id, str) or not self.request_id:
             raise ValueError("OmniDiffusionRequest.request_id must be a non-empty string.")
+
+        legacy_seed = self.sampling_params.extra_args.get("seed")
+        if legacy_seed is not None:
+            legacy_seed = validate_diffusion_seed(legacy_seed)
+        if self.sampling_params.seed is None and legacy_seed is not None:
+            self.sampling_params.seed = legacy_seed
+        if self.sampling_params.seed is not None:
+            self.sampling_params.seed = validate_diffusion_seed(self.sampling_params.seed)
 
         # When neither a generator nor a seed is provided, assign a random seed
         # so that all ranks derive the same generator state.
