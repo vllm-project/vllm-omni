@@ -147,6 +147,7 @@ class OmniServerParams(NamedTuple):
     use_stage_cli: bool = False
     init_timeout: int | None = None
     stage_init_timeout: int | None = None  # None: fixture supplies default (600 s)
+    capture_output: bool = False
 
 
 class OmniServer:
@@ -160,6 +161,7 @@ class OmniServer:
         port: int | None = None,
         env_dict: dict[str, str] | None = None,
         use_omni: bool = True,
+        capture_output: bool = False,
     ) -> None:
         cleanup_test_environment()
         self.model = model
@@ -171,6 +173,38 @@ class OmniServer:
         self.proc: subprocess.Popen | None = None
         self.host = "127.0.0.1"
         self.port = get_open_port() if port is None else port
+        self.capture_output = capture_output
+        # Selected tests capture server output so they can assert on runtime
+        # behavior that is not exposed by an HTTP response. Other tests keep
+        # inheriting stdout/stderr so their logs remain visible in real time.
+        self.log_path: Path | None = None
+        self._log_file: Any = None
+
+    def read_log(self) -> str:
+        """Return everything the server has written to stdout/stderr so far.
+
+        Returns an empty string for harnesses that do not capture output.
+        """
+        if self.log_path is None or not self.log_path.exists():
+            return ""
+        if self._log_file is not None:
+            self._log_file.flush()
+        return self.log_path.read_text(encoding="utf-8", errors="replace")
+
+    def _log_tail(self, lines: int = 60) -> str:
+        text = self.read_log()
+        if not text:
+            return ""
+        tail = "\n".join(text.splitlines()[-lines:])
+        return f"\n=== Last {lines} lines of server log ({self.log_path}) ===\n{tail}"
+
+    def _close_log(self) -> None:
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except OSError:
+                pass
+            self._log_file = None
 
     def _start_server(self) -> None:
         env = os.environ.copy()
@@ -193,11 +227,23 @@ class OmniServer:
         cmd += self.serve_args
 
         print(f"Launching OmniServer with: {' '.join(cmd)}")
+        if self.capture_output:
+            self._log_file = tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                prefix=f"omni_server_{self.port}_",
+                suffix=".log",
+                delete=False,
+                buffering=1,
+            )
+            self.log_path = Path(self._log_file.name)
         startup_t0 = time.perf_counter()
         self.proc = subprocess.Popen(
             cmd,
             env=env,
             cwd=_omni_subprocess_cwd(),
+            stdout=self._log_file if self.capture_output else None,
+            stderr=subprocess.STDOUT if self.capture_output else None,
         )
 
         max_wait = 1200
@@ -205,7 +251,7 @@ class OmniServer:
         while time.time() - start_time < max_wait:
             ret = self.proc.poll()
             if ret is not None:
-                raise RuntimeError(f"Server processes exited with code {ret} before becoming ready.")
+                raise RuntimeError(f"Server processes exited with code {ret} before becoming ready.{self._log_tail()}")
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1)
                 if sock.connect_ex((self.host, self.port)) == 0:
@@ -217,7 +263,7 @@ class OmniServer:
                         )
                     return
             time.sleep(2)
-        raise RuntimeError(f"Server failed to start within {max_wait} seconds")
+        raise RuntimeError(f"Server failed to start within {max_wait} seconds{self._log_tail()}")
 
     @staticmethod
     def _reap_zombie(proc: "psutil.Process") -> bool:
@@ -370,6 +416,13 @@ class OmniServer:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.proc:
             self._kill_process_tree(self.proc.pid)
+        if exc_type is not None:
+            # The test failed and the server output is no longer inherited by
+            # the test process, so surface it rather than losing it.
+            tail = self._log_tail()
+            if tail:
+                print(tail, flush=True)
+        self._close_log()
         cleanup_test_environment()
 
 
@@ -993,6 +1046,7 @@ def iter_omni_server(
                     port=port,
                     env_dict=params.env_dict,
                     use_omni=params.use_omni,
+                    capture_output=params.capture_output,
                 )
                 if port
                 else OmniServer(
@@ -1000,6 +1054,7 @@ def iter_omni_server(
                     server_args,
                     env_dict=params.env_dict,
                     use_omni=params.use_omni,
+                    capture_output=params.capture_output,
                 )
             ) as server:
                 if model != original_model:

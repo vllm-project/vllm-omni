@@ -16,6 +16,10 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput
 from vllm_omni.diffusion.distributed.sp_sharding import sp_shard
 from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.model_region import (
+    ModelRegion,
+    execute_model_region,
+)
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
     Transformer2DModelOutput,
     WanTransformer3DModel,
@@ -251,24 +255,36 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
                 sp_size,
             )
 
-        # VACE: embed context and run conditioning blocks
+        # VACE: expose the reference-hint computation as one semantic model region.
+        # With no framework handler, execute_model_region directly invokes this code.
         vsa_dit_seq_shape = (post_patch_num_frames, post_patch_height, post_patch_width)
         vace_hints = None
         if vace_context is not None and self.vace_blocks is not None:
-            full_seq_len = hidden_states.shape[1] * sp_size
-            control_hidden_states = self.embed_vace_context(vace_context.to(hidden_states.dtype), full_seq_len, sp_size)
-            vace_hints = []
-            for i, block in enumerate(self.vace_blocks):
-                conditioning_states, control_hidden_states = block(
-                    hidden_states,
-                    encoder_hidden_states,
-                    control_hidden_states,
-                    timestep_proj,
-                    rotary_emb,
-                    hidden_states_mask,
-                    vsa_dit_seq_shape,
+
+            def compute_vace_hints() -> list[torch.Tensor]:
+                full_seq_len = hidden_states.shape[1] * sp_size
+                control_hidden_states = self.embed_vace_context(
+                    vace_context.to(hidden_states.dtype), full_seq_len, sp_size
                 )
-                vace_hints.append(conditioning_states)
+                hints = []
+                for i, block in enumerate(self.vace_blocks):
+                    conditioning_states, control_hidden_states = block(
+                        hidden_states,
+                        encoder_hidden_states,
+                        control_hidden_states,
+                        timestep_proj,
+                        rotary_emb,
+                        hidden_states_mask,
+                        vsa_dit_seq_shape,
+                    )
+                    hints.append(conditioning_states)
+                return hints
+
+            vace_hints = execute_model_region(
+                ModelRegion.REFERENCE_HINTS,
+                self,
+                compute_vace_hints,
+            )
 
         # Normalize scale to per-layer list
         if vace_hints is not None and isinstance(vace_context_scale, (int, float)):

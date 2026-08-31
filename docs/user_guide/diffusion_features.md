@@ -23,12 +23,15 @@ vLLM-Omni supports various advanced features for diffusion models:
 
 #### Lossy Acceleration
 
-Cache methods trade minimal quality for significant speedup. Quality loss is typically imperceptible with proper tuning.
+Cache methods trade output quality, and sometimes additional memory, for
+speed. The magnitude depends on the model, backend, and configuration; evaluate
+each method on the intended workload.
 
 | Method | Description | Best For |
 |--------|-------------|----------|
 | **[TeaCache](diffusion/cache_acceleration/teacache.md)** | Adaptive caching using modulated inputs | Quick setup, balanced quality/speed on single GPU |
 | **[Cache-DiT](diffusion/cache_acceleration/cache_dit.md)** | Multiple caching techniques: DBCache, TaylorSeer, SCM | Fine-grained control, tunable quality-speed tradeoff |
+| **[Reference-Hint Cache](diffusion/cache_acceleration/ref_hint.md)** | Reuses or forecasts a model's reference-conditioning branch | Opt-in Wan-VACE acceleration when its measured quality and VRAM tradeoff is acceptable |
 
 
 #### Lossless Acceleration

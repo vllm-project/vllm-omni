@@ -3,6 +3,7 @@ from typing import Any
 from vllm_omni.diffusion.cache.base import CacheBackend
 from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend
 from vllm_omni.diffusion.cache.magcache import MagCacheBackend
+from vllm_omni.diffusion.cache.ref_hint_cache.backend import RefHintCacheBackend
 from vllm_omni.diffusion.cache.stepcache import StepCacheBackend
 from vllm_omni.diffusion.cache.teacache import TeaCacheBackend
 from vllm_omni.diffusion.data import DiffusionCacheConfig
@@ -16,10 +17,12 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
     - tea_cache: Uses TeaCacheBackend with enable()/refresh() interface
     - mag_cache: Uses MagCacheBackend with enable()/refresh() interface
     - step_cache: Uses StepCacheBackend for DreamZero velocity step skip
+    - ref_hint: Uses RefHintCacheBackend for reference-hint reuse/forecasting
+      through the generic model-region seam (RFC #4710, P1; currently Wan-VACE)
 
     Args:
         cache_backend: Cache backend name ("cache_dit", "tea_cache",
-            "mag_cache", "step_cache", or None).
+            "mag_cache", "step_cache", "ref_hint", or None).
         cache_config: Cache configuration (dict or DiffusionCacheConfig instance).
 
     Returns:
@@ -42,8 +45,10 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
         return MagCacheBackend(cache_config)
     elif cache_backend in ("step_cache", "stepcache", "step_cache_dit"):
         return StepCacheBackend(cache_config)
+    elif cache_backend == "ref_hint":
+        return RefHintCacheBackend(cache_config)
     else:
         raise ValueError(
             f"Unsupported cache backend: {cache_backend}. "
-            "Supported: 'cache_dit', 'tea_cache', 'mag_cache', 'step_cache'"
+            "Supported: 'cache_dit', 'tea_cache', 'mag_cache', 'step_cache', 'ref_hint'"
         )

@@ -489,6 +489,8 @@ class DiffusionCacheConfig:
                     mag_ratios, mag_calibrate
         - step_cache: step_cache_dit_enabled, velocity_sim_thresholds,
                           velocity_skip_countdowns, step_cache_dit_min_history
+        - ref_hint: ref_hint_refresh_interval, ref_hint_strategy,
+                    ref_hint_acknowledge_lossy
 
     Example:
         >>> # From dict (user-facing API) - partial config uses defaults for missing keys
@@ -517,6 +519,21 @@ class DiffusionCacheConfig:
     mag_ratios: list[float] | None = None
     # Default: False calibration mode (computes mag_ratios on first run)
     mag_calibrate: bool = False
+
+    # Reference-hint cache parameters [ref_hint only] (RFC #4710, P1 — lossy, opt-in)
+    # Recompute reference hints every K denoising steps and approximate them in between.
+    # Only applies to models exposing the reference-hints semantic region (e.g. Wan-VACE).
+    ref_hint_refresh_interval: int = 2
+    # "forecast50" (default): use the two latest fresh observations and a
+    # damped first-order prediction (nominal gain 0.5, with a trust-region cap
+    # to prevent early-step overshoot); "reuse": return the latest fresh hints.
+    # The published <=8% mean-DINOv2 quality result uses forecast50. This
+    # strategy retains two full hint sets per active branch and can materially
+    # increase peak VRAM; see the reference-hint cache guide.
+    ref_hint_strategy: str = "forecast50"
+    # Any skipped hint computation is approximate and must be explicitly acknowledged.
+    # ref_hint_refresh_interval=1 recomputes every step and is exempt.
+    ref_hint_acknowledge_lossy: bool = False
 
     # cache-dit parameters [cache-dit only]
     # Default: 1 forward compute block (optimized for single-transformer models)

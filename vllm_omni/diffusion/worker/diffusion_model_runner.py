@@ -575,11 +575,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if num_inference_steps is None and od_config.cache_backend in (
             "tea_cache",
             "step_cache",
+            "ref_hint",
         ):
             # When num_inference_steps is None, some pipelines defer to their
             # own defaults. TeaCache refresh ignores this value; step_cache
             # refresh is a no-op because per-chunk state resets in the denoise
-            # loop. Use the pipeline default when available to keep refresh
+            # loop; ref_hint ignores the value but must still reset to isolate
+            # requests. Use the pipeline default when available to keep refresh
             # behavior aligned with single-request execution.
             num_inference_steps = getattr(self.pipeline, "num_inference_steps", 0) or 0
 
@@ -655,15 +657,28 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if is_primary and record_output_peak_memory:
                 current_omni_platform.reset_peak_memory_stats()
 
-            with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=od_config):
-                with record_function(record_name):
-                    raw_outputs = self.pipeline.forward(batch)
-                    outputs = _normalize_pipeline_outputs(
-                        raw_outputs,
-                        expected_count=len(reqs),
-                        allow_single_output=allow_single_output,
-                        pipeline_name=type(self.pipeline).__name__,
-                    )
+            model_region_handler = (
+                self.cache_backend.get_model_region_handler()
+                if self.cache_backend is not None and self.cache_backend.is_enabled()
+                else None
+            )
+            try:
+                with set_forward_context(
+                    vllm_config=self.vllm_config,
+                    omni_diffusion_config=od_config,
+                    model_region_handler=model_region_handler,
+                ):
+                    with record_function(record_name):
+                        raw_outputs = self.pipeline.forward(batch)
+                        outputs = _normalize_pipeline_outputs(
+                            raw_outputs,
+                            expected_count=len(reqs),
+                            allow_single_output=allow_single_output,
+                            pipeline_name=type(self.pipeline).__name__,
+                        )
+            finally:
+                if self.cache_backend is not None and self.cache_backend.is_enabled():
+                    self.cache_backend.finish_request(self.pipeline)
 
             if is_primary and outputs and record_output_peak_memory:
                 batch_peak_memory_mb = self._sample_peak_memory_mb()

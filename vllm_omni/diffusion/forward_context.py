@@ -19,6 +19,8 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 if TYPE_CHECKING:
     import torch
 
+    from vllm_omni.diffusion.model_region import ModelRegionHandler
+
 
 @dataclass
 class ForwardContext:
@@ -36,6 +38,8 @@ class ForwardContext:
     paged_kv_adapter: Any | None = None
     split_text_embed_in_sp: bool = False
     denoise_step_idx: int | None = None
+    # Optional request-scoped handler for acceleration-neutral model regions.
+    model_region_handler: ModelRegionHandler | None = None
     denoise_timestep: float | None = None
     total_denoise_steps: int | None = None
     # Per-request reference latent for img2img DiT models (e.g. Ming)
@@ -156,6 +160,7 @@ def create_forward_context(
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
+    model_region_handler: ModelRegionHandler | None = None,
 ):
     return ForwardContext(
         vllm_config=vllm_config,
@@ -163,6 +168,7 @@ def create_forward_context(
         attn_metadata=attn_metadata,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
+        model_region_handler=model_region_handler,
     )
 
 
@@ -188,6 +194,7 @@ def set_forward_context(
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
+    model_region_handler: ModelRegionHandler | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, split_text_embed_in_sp, etc.
@@ -199,6 +206,7 @@ def set_forward_context(
         attn_metadata=attn_metadata,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
+        model_region_handler=model_region_handler,
     )
     # vLLM CustomOp dispatch (e.g. QKVParallelLinear) requires a global
     # vLLM config set via set_current_vllm_config().

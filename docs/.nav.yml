@@ -69,6 +69,7 @@ nav:
       - Cache Acceleration:
         - TeaCache: user_guide/diffusion/cache_acceleration/teacache.md
         - Cache-DiT: user_guide/diffusion/cache_acceleration/cache_dit.md
+        - Reference-Hint Cache: user_guide/diffusion/cache_acceleration/ref_hint.md
       - Parallelism:
         - Overview: user_guide/diffusion/parallelism/overview.md
         - CFG Parallel: user_guide/diffusion/parallelism/cfg_parallel.md
