@@ -74,7 +74,6 @@ LINGBOT_DMD_TIMESTEPS = (1000, 750, 500, 250)
 _CAMERA_SPATIAL_FOLD = 8
 _MAX_PIXEL_AREA = 480 * 832
 _MAX_SOURCE_IMAGE_PIXELS = 4096 * 4096
-_MAX_RAW_FRAMES = 117
 _REALTIME_CONDITION_BLOCKS = 2
 _MAX_SEQUENCE_LENGTH = 512
 _ACTION_ROOT_ENV = "VLLM_OMNI_LINGBOT_ACTION_ROOT"
@@ -692,8 +691,6 @@ class LingBotWorldCausalDMDPipeline(
         num_frames = getattr(sampling, "num_frames", None)
         if isinstance(num_frames, bool) or not isinstance(num_frames, int) or num_frames <= 0:
             raise ValueError(f"num_frames must be a positive integer, got {num_frames!r}.")
-        if num_frames > _MAX_RAW_FRAMES:
-            raise ValueError(f"num_frames must not exceed {_MAX_RAW_FRAMES}.")
         temporal_factor = self.vae_scale_factor_temporal
         if (num_frames - 1) % temporal_factor:
             raise ValueError(

@@ -1077,20 +1077,19 @@ def test_request_validation_rejects_unsupported_contracts(request_batch, message
         _pipeline(module)._parse_request(request_batch)
 
 
-def test_resource_limits_accept_exact_documented_boundaries() -> None:
+def test_request_validation_accepts_frames_beyond_previous_limit() -> None:
     module = _load_pipeline_module()
-    sampling = _SamplingParams(height=480, width=832, num_frames=117, max_sequence_length=512)
+    sampling = _SamplingParams(height=480, width=832, num_frames=129, max_sequence_length=512)
 
     parsed = _pipeline(module)._parse_request(_RequestBatch(_prompt(), sampling))
 
-    assert (parsed.height, parsed.width, parsed.num_frames, parsed.max_sequence_length) == (480, 832, 117, 512)
+    assert (parsed.height, parsed.width, parsed.num_frames, parsed.max_sequence_length) == (480, 832, 129, 512)
 
 
 @pytest.mark.parametrize(
     ("sampling", "message"),
     [
         (_SamplingParams(height=480, width=848), "pixel area|480.*832"),
-        (_SamplingParams(num_frames=129), "num_frames.*117"),
         (_SamplingParams(max_sequence_length=511), "max_sequence_length.*512"),
         (_SamplingParams(max_sequence_length=513), "max_sequence_length.*512"),
         (_SamplingParams(max_sequence_length=512.0), "max_sequence_length.*512"),
@@ -1718,25 +1717,25 @@ def test_request_cache_is_released_before_vae_decode() -> None:
     assert result.output.shape[2] == 21
 
 
-def test_117_frame_request_generates_ten_complete_latent_blocks() -> None:
+def test_129_frame_request_generates_eleven_complete_latent_blocks() -> None:
     module = _load_pipeline_module()
     transformer = _RecordingTransformer()
     pipeline = _pipeline(module, transformer=transformer)
     trajectory = _CameraTrajectory(
-        poses=torch.eye(4).repeat(117, 1, 1),
-        intrinsics=torch.tensor([[100.0, 100.0, 8.0, 8.0]]).repeat(117, 1),
+        poses=torch.eye(4).repeat(129, 1, 1),
+        intrinsics=torch.tensor([[100.0, 100.0, 8.0, 8.0]]).repeat(129, 1),
     )
     sampling = _SamplingParams(
-        num_frames=117,
+        num_frames=129,
         output_type="latent",
         extra_args={"_lingbot_camera_trajectory": trajectory},
     )
 
     result = pipeline(_request(sampling=sampling))
 
-    assert result.output.shape == (1, 16, 30, 2, 2)
-    assert len(transformer.calls) == 50
-    assert [call["start_frame"] for call in transformer.calls[::5]] == list(range(0, 30, 3))
+    assert result.output.shape == (1, 16, 33, 2, 2)
+    assert len(transformer.calls) == 55
+    assert [call["start_frame"] for call in transformer.calls[::5]] == list(range(0, 33, 3))
 
 
 def test_request_cache_becomes_unreachable_after_transformer_error() -> None:
