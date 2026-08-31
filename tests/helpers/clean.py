@@ -150,8 +150,16 @@ def _print_device_processes() -> None:
     elif current_omni_platform.is_npu():
         _run_smi("Ascend NPU Information (npu-smi info)", ["npu-smi", "info"], 40)
     elif current_omni_platform.is_rocm():
-        _run_smi("AMD GPU Information (amd-smi)", ["amd-smi"], 30)
-        _run_smi("Detailed AMD GPU Processes (amd-smi process)", ["amd-smi", "process"], 100, timeout=3)
+        # amd-smi can enter uninterruptible sleep in the amdgpu CPER ioctl
+        # (amdgpu_cper_ring_write). In that state subprocess.run's timeout
+        # cannot reap it, causing this diagnostic hook to hang the entire test.
+        # rocm-smi provides the information needed here without that ioctl.
+        _run_smi(
+            "AMD GPU Information (rocm-smi)",
+            ["rocm-smi", "--showuse", "--showmeminfo", "vram"],
+            60,
+        )
+        _run_smi("Detailed AMD GPU Processes (rocm-smi)", ["rocm-smi", "--showpids"], 100, timeout=3)
     elif current_omni_platform.is_xpu():
         _run_smi("Intel XPU Information (xpu-smi discovery)", ["xpu-smi", "discovery"], 40)
     elif current_omni_platform.is_musa():

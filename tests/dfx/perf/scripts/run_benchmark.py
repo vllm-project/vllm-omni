@@ -1,4 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import json
+import math
 import os
 import threading
 from collections.abc import Callable
@@ -159,6 +163,18 @@ def benchmark_params(request):
 
 def assert_result(result, params, num_prompt) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
+    baseline = params.get("baseline")
+    hardware = result.get("Hardware")
+    hardware_baseline = baseline.get(hardware) if isinstance(baseline, dict) and isinstance(hardware, str) else None
+    if isinstance(hardware_baseline, dict) and "mean_tpot_ms" in hardware_baseline:
+        num_tpot_samples = result.get("num_tpot_samples")
+        mean_tpot_ms = result.get("mean_tpot_ms")
+        assert isinstance(num_tpot_samples, int) and not isinstance(num_tpot_samples, bool) and num_tpot_samples > 0, (
+            "TPOT baseline is configured, but no measurable TPOT samples were produced"
+        )
+        assert (
+            isinstance(mean_tpot_ms, int | float) and not isinstance(mean_tpot_ms, bool) and math.isfinite(mean_tpot_ms)
+        ), "TPOT baseline is configured, but mean_tpot_ms is not finite"
     expected_audio_turns = params.get("expected_duplex_audio_turns_per_session")
     if expected_audio_turns is not None:
         session_metrics = result.get("duplex_session_metrics")

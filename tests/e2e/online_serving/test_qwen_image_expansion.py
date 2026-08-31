@@ -8,9 +8,8 @@ and are supported by the following text-to-image models:
 - Qwen-Image-2512
 
 One feature per test case, matching the Test Plan in PR #1682 (Qwen-Image-Edit).
-Supported features for Qwen-Image series: TeaCache, Cache-DiT, Ulysses-SP, Ring-Attention,
-CFG-Parallel, Tensor-Parallel, VAE-Patch-Parallel, CPU offload (layerwise).
-See docs/user_guide/diffusion_acceleration.md.
+Nightly covers each feature once, alternating models (5× Qwen-Image, 4× Qwen-Image-2512).
+Ulysses stays on Qwen-Image. See docs/user_guide/diffusion_acceleration.md.
 """
 
 import pytest
@@ -25,141 +24,116 @@ NEGATIVE_PROMPT = "blurry, low quality"
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
 PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
+MODEL_IMAGE = "Qwen/Qwen-Image"
+MODEL_2512 = "Qwen/Qwen-Image-2512"
 
-def _get_diffusion_feature_cases(model: str):
-    return [
-        pytest.param(
-            OmniServerParams(
-                model=model,
-                server_args=["--enable-cpu-offload"],
-            ),
-            id="cpu_offload",
-            marks=SINGLE_CARD_FEATURE_MARKS,
+# One server per feature. Alternate models; keep feature pytest ids unchanged.
+FEATURE_CASES = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL_IMAGE,
+            server_args=["--enable-cpu-offload"],
         ),
-        pytest.param(
-            OmniServerParams(model=model, server_args=["--step-execution"]),
-            id="step_execution",
-            marks=SINGLE_CARD_FEATURE_MARKS,
+        id="cpu_offload",
+        marks=SINGLE_CARD_FEATURE_MARKS,
+    ),
+    pytest.param(
+        OmniServerParams(model=MODEL_2512, server_args=["--step-execution"]),
+        id="step_execution",
+        marks=SINGLE_CARD_FEATURE_MARKS,
+    ),
+    pytest.param(
+        OmniServerParams(model=MODEL_IMAGE, server_args=["--cache-backend", "tea_cache"]),
+        id="cache_tea_cache",
+        marks=SINGLE_CARD_FEATURE_MARKS,
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL_2512,
+            server_args=[
+                "--cache-backend",
+                "cache_dit",
+                "--enable-layerwise-offload",
+            ],
         ),
-        pytest.param(
-            OmniServerParams(model=model, server_args=["--cache-backend", "tea_cache"]),
-            id="cache_tea_cache",
-            marks=SINGLE_CARD_FEATURE_MARKS,
+        id="layerwise_offload",
+        marks=SINGLE_CARD_FEATURE_MARKS,
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL_IMAGE,
+            server_args=[
+                "--cache-backend",
+                "cache_dit",
+                "--ulysses-degree",
+                "2",
+            ],
         ),
-        pytest.param(
-            OmniServerParams(
-                model=model,
-                server_args=[
-                    "--cache-backend",
-                    "cache_dit",
-                    "--enable-layerwise-offload",
-                ],
-            ),
-            id="layerwise_offload",
-            marks=SINGLE_CARD_FEATURE_MARKS,
+        id="ulysses_2",
+        marks=PARALLEL_FEATURE_MARKS,
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL_2512,
+            server_args=[
+                "--cache-backend",
+                "cache_dit",
+                "--ring",
+                "2",
+            ],
         ),
-        pytest.param(
-            OmniServerParams(
-                model=model,
-                server_args=[
-                    "--cache-backend",
-                    "cache_dit",
-                    "--ulysses-degree",
-                    "2",
-                ],
-            ),
-            id="ulysses_2",
-            marks=PARALLEL_FEATURE_MARKS,
+        id="ring_2",
+        marks=PARALLEL_FEATURE_MARKS,
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL_IMAGE,
+            server_args=[
+                "--cache-backend",
+                "tea_cache",
+                "--cfg-parallel-size",
+                "2",
+            ],
         ),
-        pytest.param(
-            OmniServerParams(
-                model=model,
-                server_args=[
-                    "--cache-backend",
-                    "cache_dit",
-                    "--ring",
-                    "2",
-                ],
-            ),
-            id="ring_2",
-            marks=PARALLEL_FEATURE_MARKS,
+        id="cfg_parallel_2",
+        marks=PARALLEL_FEATURE_MARKS,
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL_2512,
+            server_args=[
+                "--cache-backend",
+                "cache_dit",
+                "--tensor-parallel-size",
+                "2",
+                "--vae-patch-parallel-size",
+                "2",
+                "--vae-use-tiling",
+                "--diffusion-quantization-config",
+                '{"method":"fp8"}',
+            ],
         ),
-        pytest.param(
-            OmniServerParams(
-                model=model,
-                server_args=[
-                    "--cache-backend",
-                    "tea_cache",
-                    "--cfg-parallel-size",
-                    "2",
-                ],
-            ),
-            id="cfg_parallel_2",
-            marks=PARALLEL_FEATURE_MARKS,
+        id="vae_patch_parallel_2",
+        marks=PARALLEL_FEATURE_MARKS,
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL_IMAGE,
+            server_args=[
+                "--use-hsdp",
+                "--hsdp-shard-size",
+                "2",
+            ],
         ),
-        pytest.param(
-            OmniServerParams(
-                model=model,
-                server_args=[
-                    "--cache-backend",
-                    "cache_dit",
-                    "--tensor-parallel-size",
-                    "2",
-                    "--vae-patch-parallel-size",
-                    "2",
-                    "--vae-use-tiling",
-                    "--diffusion-quantization-config",
-                    '{"method":"fp8"}',
-                ],
-            ),
-            id="vae_patch_parallel_2",
-            marks=PARALLEL_FEATURE_MARKS,
-        ),
-        pytest.param(
-            OmniServerParams(
-                model=model,
-                server_args=[
-                    "--use-hsdp",
-                    "--hsdp-shard-size",
-                    "2",
-                ],
-            ),
-            id="parallel_hsdp",
-            marks=PARALLEL_FEATURE_MARKS,
-        ),
-    ]
+        id="parallel_hsdp",
+        marks=PARALLEL_FEATURE_MARKS,
+    ),
+]
 
 
-@pytest.mark.parametrize(
-    "omni_server",
-    _get_diffusion_feature_cases("Qwen/Qwen-Image"),
-    indirect=True,
-)
+@pytest.mark.parametrize("omni_server", FEATURE_CASES, indirect=True)
 def test_qwen_image(omni_server: OmniServer, online_client: OnlineOmniClient):
-    """Test each diffusion feature with Qwen-Image (text-to-image), one feature per case."""
-    messages = dummy_messages_from_mix_data(content_text=T2I_PROMPT)
-    request_config = {
-        "model": omni_server.model,
-        "messages": messages,
-        "extra_body": {
-            "height": 512,
-            "width": 512,
-            "num_inference_steps": 2,
-            "negative_prompt": NEGATIVE_PROMPT,
-            "true_cfg_scale": 4.0,
-            "seed": 42,
-        },
-    }
-    online_client.send_diffusion_request(request_config)
-
-
-@pytest.mark.parametrize(
-    "omni_server",
-    _get_diffusion_feature_cases("Qwen/Qwen-Image-2512"),
-    indirect=True,
-)
-def test_qwen_image_2512(omni_server: OmniServer, online_client: OnlineOmniClient):
-    """Test each diffusion feature with Qwen-Image-2512 (text-to-image), one feature per case."""
+    """One diffusion feature per case; model is chosen in FEATURE_CASES."""
     messages = dummy_messages_from_mix_data(content_text=T2I_PROMPT)
     request_config = {
         "model": omni_server.model,

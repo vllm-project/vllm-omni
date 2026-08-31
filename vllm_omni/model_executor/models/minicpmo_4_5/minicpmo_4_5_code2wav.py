@@ -272,6 +272,11 @@ class MiniCPMO45Code2Wav(nn.Module):
                 ref_audio,
                 meta.get("ref_audio_sr"),
             )
+            logger.debug(
+                "MiniCPM-o Code2Wav selected runtime reference prompt_cache_id=%s prompt_wav=%s",
+                entry.cache_id,
+                entry.path,
+            )
             return entry.cache_id, entry.path, cache_key
 
         if previous is not None:

@@ -6,7 +6,6 @@ Model specific tests for CacheDiT enablement.
 """
 
 import ast
-import sys
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -25,18 +24,9 @@ from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import L
 from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformer3DModel
 from vllm_omni.platforms import current_omni_platform
 
-# NOTE: We patch DreamID Omni's modules here with mocks so that we can import and inspect
-# the class even though the dependency may not be set up correctly; this is ok for these
-# tests because we just inspect it and never initialize the model.
-for mod in ("dreamid_omni", "dreamid_omni.modules", "dreamid_omni.modules.model"):
-    sys.modules.setdefault(mod, Mock())
-# isort: split
-from vllm_omni.diffusion.models.dreamid_omni.fusion import FusionModel as DreamIdOmniModel  # noqa: E402
-
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 SEPARATE_CFG_TRANSFORMERS = [
-    DreamIdOmniModel,
     HeliosTransformer3DModel,
     LongCatImageTransformer2DModel,
     Cosmos3VFMTransformer,

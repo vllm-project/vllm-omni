@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax H3 Qwen3-VL layer-50 text/vision encoder.
 
 The encoder is reimplemented on top of vLLM-style tensor-parallel building
@@ -42,6 +43,10 @@ from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMetho
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.layers.norm import RMSNorm as DiffusionRMSNorm
+from vllm_omni.diffusion.offloader.module_residency import (
+    BoundedAllocatorCache,
+    PinnedModuleStager,
+)
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
@@ -395,6 +400,25 @@ def _apply_rotary_pos_emb(
     q_embed = (q * cos) + (_rotate_half(q) * sin)
     k_embed = (k * cos) + (_rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def _scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    """Run causal SDPA with the reference expanded-K/V GQA behavior."""
+    num_key_value_groups = query.shape[1] // key.shape[1]
+    if num_key_value_groups != 1:
+        key = key.repeat_interleave(num_key_value_groups, dim=1)
+        value = value.repeat_interleave(num_key_value_groups, dim=1)
+    return F.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        dropout_p=0.0,
+        is_causal=True,
+    )
 
 
 def _apply_interleaved_mrope(freqs: torch.Tensor, mrope_section: list[int]) -> torch.Tensor:
@@ -805,19 +829,7 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # Expand GQA keys/values to the local query-head count so SDPA works
-        # uniformly across backends (mirrors the reference eager path).
-        num_key_value_groups = self.num_heads // self.num_kv_heads
-        key_states = key_states.repeat_interleave(num_key_value_groups, dim=1)
-        value_states = value_states.repeat_interleave(num_key_value_groups, dim=1)
-
-        attn_output = F.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            dropout_p=0.0,
-            is_causal=True,
-        )
+        attn_output = _scaled_dot_product_attention(query_states, key_states, value_states)
         attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output
@@ -902,10 +914,7 @@ class MiniMaxH3Qwen3VLTextDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, position_embeddings=position_embeddings)
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
@@ -1211,12 +1220,18 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         if not self.is_loaded:
             return
         if getattr(self, "_omni_layerwise_enabled", False):
-            for name, child in self.vision.named_children():
-                if name != "blocks":
-                    child.to(self.device_target)
-            for name, child in self.text_model.named_children():
-                if name != "layers":
-                    child.to(self.device_target)
+            stager = getattr(self, "_omni_non_block_stager", None)
+            if stager is None:
+                hooks = getattr(self, "_omni_layerwise_hooks", ())
+                pin_memory = bool(getattr(hooks[0], "pin_memory", True)) if hooks else True
+                stager = PinnedModuleStager(
+                    self._omni_non_block_modules(),
+                    self.device_target,
+                    pin_memory=pin_memory,
+                    cache_retention=getattr(self, "_omni_component_cache", None),
+                )
+                self._omni_non_block_stager = stager
+            stager.load()
             return
         self.vision.to(self.device_target)
         self.text_model.to(self.device_target)
@@ -1227,17 +1242,38 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         if getattr(self, "_omni_layerwise_enabled", False):
             for hook in self._omni_layerwise_hooks:
                 hook.offload_layer()
-            for name, child in self.vision.named_children():
-                if name != "blocks":
+            stager = getattr(self, "_omni_non_block_stager", None)
+            if stager is not None:
+                stager.offload()
+            else:
+                # The initial DLO setup reaches this branch before the first
+                # load. These modules were constructed on CPU, so this is not
+                # a device-to-host rematerialization.
+                for child in self._omni_non_block_modules():
                     child.to("cpu")
-            for name, child in self.text_model.named_children():
-                if name != "layers":
-                    child.to("cpu")
-            torch.accelerator.empty_cache()
+                self._release_omni_component_cache()
             return
         self.vision.to("cpu")
         self.text_model.to("cpu")
         torch.accelerator.empty_cache()
+
+    def _omni_non_block_modules(self) -> list[nn.Module]:
+        modules = [child for name, child in self.vision.named_children() if name != "blocks"]
+        modules.extend(child for name, child in self.text_model.named_children() if name != "layers")
+        return modules
+
+    def set_omni_component_cache(self, cache: BoundedAllocatorCache | None) -> None:
+        self._omni_component_cache = cache
+        stager = getattr(self, "_omni_non_block_stager", None)
+        if stager is not None:
+            stager.set_cache_retention(cache)
+
+    def _release_omni_component_cache(self) -> None:
+        cache = getattr(self, "_omni_component_cache", None)
+        if cache is None:
+            torch.accelerator.empty_cache()
+        else:
+            cache.release_if_needed()
 
     def enable_omni_layerwise_offload(self, *, pin_memory: bool = True) -> None:
         """Stream the TP-local Qwen vision/text blocks for low-HBM serving.
@@ -1428,15 +1464,19 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         if next(self.parameters()).device.type != self.device_target.type:
             raise RuntimeError("call load_to_device() before encode_ids()")
 
+        cudnn_sdp_enabled = torch.backends.cuda.cudnn_sdp_enabled()
         torch.backends.cuda.enable_cudnn_sdp(True)
-        hidden = self._encode(
-            input_ids,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw,
-        )
-        return hidden.cpu()
+        try:
+            hidden = self._encode(
+                input_ids,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                pixel_values_videos=pixel_values_videos,
+                video_grid_thw=video_grid_thw,
+            )
+            return hidden.cpu()
+        finally:
+            torch.backends.cuda.enable_cudnn_sdp(cudnn_sdp_enabled)
 
     def forward(
         self,

@@ -773,6 +773,19 @@ class TestRequestScheduler:
         assert third.num_running_reqs == 1
         assert third.num_waiting_reqs == 0
 
+    def test_records_initial_scheduler_queue_wait(self, mocker: MockerFixture) -> None:
+        perf_counter = mocker.patch(
+            "vllm_omni.diffusion.sched.base_scheduler.time.perf_counter",
+            side_effect=[10.0, 10.125],
+        )
+        request = _make_step_request("queue-wait", num_inference_steps=2)
+
+        self.scheduler.add_request(request)
+        self.scheduler.schedule()
+
+        assert request.scheduler_queue_wait_ms == pytest.approx(125.0)
+        assert perf_counter.call_count == 2
+
     def test_batches_compatible_requests_up_to_max_num_seqs(self) -> None:
         scheduler = RequestScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=2))

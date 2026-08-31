@@ -69,11 +69,12 @@ reference-video preparation and MP4 output.
 
 For CUDA and ROCm deployments, non-streaming MP4 responses are encoded on the
 host CPU through PyAV/libx264 after generation. The response encoder selects the
-path automatically at runtime: inputs with a supported frame shape, common dtype,
-and RGB per-channel contiguous layout use direct planar frames; other inputs
-fall back to the legacy path before the PyAV container is opened. No CLI flag,
-model declaration, or user configuration is required. Streaming fMP4 output is
-unchanged.
+path automatically at runtime. The server-owned parallel converter accepts
+supported frame shapes and dtypes with either per-channel-contiguous or strided
+RGB planes, including interleaved arrays materialized by output transport.
+Standalone callers without a parallel converter retain the legacy fallback for
+strided planes. No CLI flag, model declaration, or user configuration is
+required. Streaming fMP4 output is unchanged.
 
 A community benchmark on 2x Xeon 8480C reported the following comparison
 between the legacy and direct planar paths
@@ -839,7 +840,7 @@ hf download lightx2v/Minimax-h3-Turbo "${TURBO_FILE}" --local-dir "${TURBO_DIR}"
 export TURBO_LORA="${TURBO_DIR}/${TURBO_FILE}"
 ```
 
-Start from a non-offloaded FL2VA server command and add
+Start from a non-offloaded or DLO FL2VA server command and add
 `--task-type fl2va --lora-backend peft --lora-path "${TURBO_LORA}"`.
 `--lora-path` preloads the adapter; each request still activates it and uses
 the published sampling settings:
@@ -853,11 +854,69 @@ the published sampling settings:
 
 For FL2VA, change `task` and add `input_reference` as shown above. The 8-step,
 ComfyUI, Ref2VA, and v1.1 artifacts are not supported. This integration is
-dynamic-only and does not support prefusion, DLO, or LoRA composition.
-It also rejects model-level, layerwise, and distributed layerwise offload;
-the legacy dynamic LoRA tensors do not participate in those weight lifecycles.
+dynamic-only and does not support prefusion or LoRA composition. DLO is
+supported by keeping the request-switchable LoRA A/B buffers resident on the
+accelerator while DLO streams only the base blocks; budget for this additional
+fixed HBM usage. Model-level and standard layerwise offload remain unsupported.
 The five requested sigma points produce the four denoiser evaluations expected
 by the Turbo artifact.
+
+### FlashGen native LoRA
+
+The FlashGen 4-step T2VA artifact uses the native MiniMax-H3 module layout and
+declares its distilled sigma schedule in safetensors metadata. It is published on
+[ModelScope](https://modelscope.cn/models/FlashGen/Minimax-H3-4step-lora-flashgen):
+
+```text
+FlashGen/Minimax-H3-4step-lora-flashgen/minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors
+```
+
+Download only that file:
+
+```bash
+python -m pip install modelscope
+export FLASHGEN_DIR=/path/to/minimax-h3-flashgen-lora
+export FLASHGEN_FILE=minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors
+modelscope download FlashGen/Minimax-H3-4step-lora-flashgen \
+  --local_dir "${FLASHGEN_DIR}" \
+  --include "${FLASHGEN_FILE}"
+export FLASHGEN_LORA="${FLASHGEN_DIR}/${FLASHGEN_FILE}"
+```
+
+Start from a non-offloaded or DLO FL2VA server command and add
+`--task-type fl2va --lora-backend peft --lora-path "${FLASHGEN_LORA}"`.
+Each request must use T2VA and the distilled interval-count contract:
+
+```bash
+-F 'num_inference_steps=4' \
+-F 'extra_params={"task":"t2va","duration":5.2}' \
+-F "lora={\"name\":\"h3-flashgen-v1.0\",\"path\":\"${FLASHGEN_LORA}\",\"scale\":1.0}"
+```
+
+This path rejects Ref2VA and checkpoints that already pin `base_schedule` in
+`model_index.json`. The adapter metadata carries
+`base_schedule=1.0,0.7,0.4,0.15,0.0`, so `num_inference_steps=4` means four
+denoiser evaluations, not five sigma points. Request-mode generation may omit
+the field and take the count from the adapter schedule; `--step-execution`
+requires it explicitly, because the step scheduler reads the total step count
+off the request at admission, before the adapter schedule is known.
+
+DLO is supported in request-mode generation on the same terms as the Turbo
+adapter: the request-switchable LoRA A/B buffers stay resident on the
+accelerator while DLO streams only the base blocks, so budget for that
+additional fixed HBM usage. The native artifact is rank 64 over 259 target
+modules, and its packed `qkv_proj` and `fc1` layers reuse the full-input A
+tensor per slice while B carries slice-local output rows, so the resident
+footprint exceeds the on-disk payload; measure it for your parallel layout
+rather than assuming the checkpoint size. Pure Ulysses replicates the adapter
+on every rank, while DiT tensor parallelism shards the B buffers. Model-level
+and standard layerwise offload remain unsupported, and `--step-execution`
+cannot be combined with `--enable-distributed-layerwise-offload`.
+
+To validate a deployment, post the same fixed-seed T2VA request twice with the
+adapter and twice without it, then compare the four output digests. The adapter
+is bound and deterministic when each pair matches internally and the two pairs
+differ from each other.
 
 ## Key parameters
 

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 import torch
 
@@ -27,12 +27,13 @@ class AttentionBackend(ABC):
 
     @classmethod
     def supports_packed_mask_free(cls) -> bool:
-        """Whether packed attention never reads attn_mask on this platform.
+        """Whether [real, pad] packed layouts can run without attn_mask.
 
         When True, models that pack a [real, pad] two-document layout and
-        carry cu_seqlens/max_seqlen in ``AttentionMetadata.extra`` may skip
-        constructing the padding mask entirely. Backends whose mask-free
-        behavior is platform-dependent must check current_omni_platform.
+        provide ``AttentionMetadata.packed_padding`` alongside the packed
+        cu_seqlens/max_seqlen metadata may skip constructing the padding mask
+        entirely. Backends whose mask-free behavior is platform-dependent must
+        check current_omni_platform.
         """
         return False
 
@@ -125,8 +126,21 @@ class QueryRange:
 
 
 @dataclass(frozen=True, slots=True)
+class VideoTokenSpan:
+    """One physical video-grid slice in packed document 0."""
+
+    start: int
+    latent_grid: tuple[int, int, int]
+    role: Literal["reference", "target"]
+
+    @property
+    def length(self) -> int:
+        return self.latent_grid[0] * self.latent_grid[1] * self.latent_grid[2]
+
+
+@dataclass(frozen=True, slots=True)
 class VideoTokenLayout:
-    """Where the video segment sits inside a packed multimodal sequence.
+    """Video-grid slices in a packed multimodal sequence.
 
     A model that packs its sequence as ``[prefix | t*h*w video rows | padding]``
     publishes this so backends can recover spatiotemporal locality; the prefix
@@ -134,11 +148,32 @@ class VideoTokenLayout:
     Publishing it also asserts that any ``attn_mask`` masks only the trailing
     padding, so ``prefix_len + t*h*w`` is the used length of the sequence.
 
+    ``prefix_len``/``latent_grid`` retain the original one-tail contract. A
+    Ref2VA layout instead publishes ``used_len`` and every physical video
+    span, so audio and image rows between videos remain dense.
+
     Plain ints, so reading it never forces a device-to-host sync.
     """
 
-    prefix_len: int
-    latent_grid: tuple[int, int, int]
+    prefix_len: int | None = None
+    latent_grid: tuple[int, int, int] | None = None
+    used_len: int | None = None
+    video_spans: tuple[VideoTokenSpan, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PackedPaddingMetadata:
+    """Producer-validated mask-free view of padding in a [real, pad] packing.
+
+    The cumulative-length tensors are canonical two-element ``[0, length]``
+    views. Consumers may use them without reading device scalars because the
+    producer owns the packing.
+    """
+
+    q_length: int
+    kv_length: int
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
 
 
 @dataclass
@@ -187,6 +222,10 @@ class AttentionMetadata:
     # Geometry of the video segment for backends that exploit spatiotemporal
     # locality (block-sparse selection, tiled masks). Dense backends ignore it.
     video_layout: VideoTokenLayout | None = None
+
+    # Canonical mask-free view of structural suffix padding. Backends that do
+    # not advertise supports_packed_mask_free ignore it.
+    packed_padding: PackedPaddingMetadata | None = None
 
 
 T = TypeVar("T", bound=AttentionMetadata)
