@@ -32,7 +32,7 @@ guide. FP8 on Ampere may use a weight-only path where available.
 
 ## Model Type Support
 
-### Diffusion Model (Qwen-Image, Wan2.2)
+### Diffusion Model (Qwen-Image, Stable Diffusion 3.5, Wan2.2)
 
 These models run a diffusion transformer as the primary inference module. The
 default quantization target is the transformer; tokenizer, scheduler, text
@@ -41,7 +41,7 @@ otherwise.
 
 | Method | Guide | Mode | Example models | Status |
 |--------|-------|------|----------------|--------|
-| FP8 W8A8 | [FP8](fp8.md) | Online W8A8 or checkpoint FP8 | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image family and other DiT models |
+| FP8 W8A8 | [FP8](fp8.md) | Online W8A8 or checkpoint FP8 | Qwen-Image; Stable Diffusion 3.5 medium; Wan2.2 is not validated | Validated for Qwen-Image family and Stable Diffusion 3.5 medium with model-specific `ignored_layers`; Wan2.2 still needs model-specific validation |
 | Int8 W8A8 | [Int8](int8.md) | Online or serialized W8A8 | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image and Z-Image |
 | BitsAndBytes W4 | [BitsAndBytes](bitsandbytes.md) | Online W4 weight-only | Z-Image-Turbo; Qwen-Image/Wan2.2 not validated | Validated for Z-Image-Turbo |
 | ModelOpt | [ModelOpt](modelopt.md) | Pre-quantized FP8 checkpoints | Qwen-Image, Z-Image, FLUX.2, HunyuanImage-3.0 | Validated for ModelOpt FP8 diffusion checkpoints |

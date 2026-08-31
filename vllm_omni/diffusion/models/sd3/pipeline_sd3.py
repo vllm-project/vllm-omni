@@ -235,7 +235,10 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
             local_files_only=local_files_only,
             torch_dtype=dtype,
         )
-        self.transformer = SD3Transformer2DModel(od_config=od_config)
+        self.transformer = SD3Transformer2DModel(
+            od_config=od_config,
+            quant_config=od_config.quantization_config,
+        )
 
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKL.from_pretrained,

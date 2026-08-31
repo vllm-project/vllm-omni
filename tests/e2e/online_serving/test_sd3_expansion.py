@@ -18,6 +18,7 @@ from tests.helpers.runtime import (
 pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 FOUR_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"}, num_cards=4)
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"})
 POSITIVE_PROMPT = "A serene mountain landscape at sunset"
 NEGATIVE_PROMPT = "blurry, low quality, distorted"
 
@@ -27,6 +28,18 @@ NEGATIVE_PROMPT = "blurry, low quality, distorted"
 # that provide good performance improvements.
 def _get_diffusion_feature_cases(model: str):
     return [
+        # Single-card FP8 online serving smoke
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--quantization",
+                    "fp8",
+                ],
+            ),
+            id="fp8_single_card",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
         # CFG Parallel + Tensor Parallel + CPU offload
         pytest.param(
             OmniServerParams(

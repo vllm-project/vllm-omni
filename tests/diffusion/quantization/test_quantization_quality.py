@@ -207,6 +207,26 @@ QUALITY_CONFIGS = [
         num_inference_steps=20,
     ),
     QualityTestConfig(
+        id="fp8_sd35",
+        model="stabilityai/stable-diffusion-3.5-medium",
+        quantization={
+            "method": "fp8",
+            "ignored_layers": [
+                "proj_out",
+                "context_embedder",
+                *[f"transformer_blocks.{i}.ff.net.2" for i in range(24)],
+                *[f"transformer_blocks.{i}.ff_context.net.2" for i in range(24)],
+            ],
+        },
+        task="t2i",
+        prompt="a cozy reading corner with a chair, lamp, and books",
+        max_lpips=0.21,
+        height=512,
+        width=512,
+        num_inference_steps=20,
+        guidance_scale=4.5,
+    ),
+    QualityTestConfig(
         id="fp8_ltx2",
         model="Lightricks/LTX-2",
         quantization="fp8",
