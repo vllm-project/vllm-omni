@@ -332,6 +332,7 @@ def test_build_omni_output_uses_snapshots_and_connector_after_accumulation(monke
         scheduler_output=SimpleNamespace(
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 2},
+            scheduled_spec_decode_tokens={},
         ),
         hidden_states=torch.tensor([[1.0], [2.0], [3.0]]),
         staged_hidden_states_cpu=None,
@@ -377,6 +378,7 @@ def test_build_omni_output_copies_hidden_for_partial_downstream_batch(monkeypatc
         scheduler_output=SimpleNamespace(
             total_num_scheduled_tokens=6,
             num_scheduled_tokens={"r1": 1, "r2": 2, "r3": 3},
+            scheduled_spec_decode_tokens={},
         ),
         hidden_states=torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0], [6.0]]),
         staged_hidden_states_cpu=None,
@@ -400,6 +402,98 @@ def test_build_omni_output_copies_hidden_for_partial_downstream_batch(monkeypatc
     assert torch.equal(output.inter_stage_outputs[1]["hidden"], torch.tensor([[2.0], [3.0]]))
     assert output.inter_stage_outputs[2] is None
     assert output.multimodal_outputs is None
+
+
+def test_build_omni_output_drops_rejected_draft_rows(monkeypatch):
+    """A rejected draft's hidden state must not reach the downstream stage.
+
+    Both requests take a speculative step of 1 real position + 3 drafts, so the
+    step schedules 4 rows each. ``r1`` keeps 2 of them and ``r2`` keeps all 4;
+    only the accepted rows may be shipped.
+    """
+    runner = _make_async_output_runner()
+
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_resolve_pooler_payload_req_ids",
+        lambda self, req_ids: ("audio", req_ids),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=8,
+            num_scheduled_tokens={"r1": 4, "r2": 4},
+            scheduled_spec_decode_tokens={"r1": [11, 12, 13], "r2": [21, 22, 23]},
+        ),
+        hidden_states=torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0], [6.0], [7.0], [8.0]]),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={},
+        req_ids_output_copy=["r1", "r2"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1},
+        valid_sampled_token_ids=[[101, 102], [201, 202, 203, 204]],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=np.array([4, 4], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 4], dtype=torch.long),
+    )
+
+    assert output.inter_stage_outputs is not None
+    assert torch.equal(output.inter_stage_outputs[0]["hidden"], torch.tensor([[1.0], [2.0]]))
+    assert torch.equal(
+        output.inter_stage_outputs[1]["hidden"],
+        torch.tensor([[5.0], [6.0], [7.0], [8.0]]),
+    )
+
+
+def test_build_omni_output_drops_rejected_draft_rows_on_per_request_copy(monkeypatch):
+    """Same slice on the per-request D2H path (only part of the batch is downstream)."""
+    runner = _make_async_output_runner(engine_output_type="latent")
+
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_resolve_pooler_payload_req_ids",
+        lambda self, req_ids: ("latent", ["r2"]),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=5,
+            num_scheduled_tokens={"r1": 2, "r2": 3},
+            scheduled_spec_decode_tokens={"r1": [11], "r2": [21, 22]},
+        ),
+        hidden_states=torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0]]),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={},
+        req_ids_output_copy=["r1", "r2"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1},
+        valid_sampled_token_ids=[[101, 102], [201]],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=np.array([2, 3], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.long),
+    )
+
+    assert output.inter_stage_outputs is not None
+    assert output.inter_stage_outputs[0] is None
+    assert torch.equal(output.inter_stage_outputs[1]["hidden"], torch.tensor([[3.0]]))
 
 
 def test_process_additional_information_uses_snapshot_request_order(monkeypatch):
@@ -430,6 +524,7 @@ def test_process_additional_information_uses_snapshot_request_order(monkeypatch)
         scheduler_output=SimpleNamespace(
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 2},
+            scheduled_spec_decode_tokens={},
         ),
         hidden_states=torch.tensor([[1.0], [2.0], [3.0]]),
         staged_hidden_states_cpu=None,
@@ -490,6 +585,7 @@ def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
         scheduler_output=SimpleNamespace(
             total_num_scheduled_tokens=2,
             num_scheduled_tokens={"r1": 2},
+            scheduled_spec_decode_tokens={},
         ),
         hidden_states=torch.tensor([[1.0], [2.0]]),
         staged_hidden_states_cpu=None,
@@ -536,6 +632,7 @@ def test_build_omni_output_splits_mm_by_scheduled_tokens_when_hidden_is_tail_onl
         scheduler_output=SimpleNamespace(
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 1, "r3": 1},
+            scheduled_spec_decode_tokens={},
         ),
         hidden_states=torch.tensor([[1.0]]),
         staged_hidden_states_cpu=None,
@@ -582,6 +679,7 @@ def test_build_omni_output_splits_mm_by_hidden_len_when_scheduled_is_padded(monk
         scheduler_output=SimpleNamespace(
             total_num_scheduled_tokens=5,
             num_scheduled_tokens={"r1": 1, "r2": 1, "r3": 1},
+            scheduled_spec_decode_tokens={},
         ),
         hidden_states=torch.randn(3, 4),
         staged_hidden_states_cpu=None,
@@ -669,6 +767,7 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
         SimpleNamespace(
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 2},
+            scheduled_spec_decode_tokens={},
         ),
         None,
         None,
@@ -781,6 +880,7 @@ def test_build_omni_output_falls_back_to_mm_cpu_without_prefix_merge(monkeypatch
         scheduler_output=SimpleNamespace(
             total_num_scheduled_tokens=2,
             num_scheduled_tokens={"r1": 1, "r2": 1},
+            scheduled_spec_decode_tokens={},
         ),
         hidden_states=torch.tensor([[1.0], [2.0]]),
         staged_hidden_states_cpu=None,
@@ -828,6 +928,7 @@ def test_build_omni_output_never_leaks_internal_pooler_output_on_wire(monkeypatc
         scheduler_output=SimpleNamespace(
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 2},
+            scheduled_spec_decode_tokens={},
         ),
         hidden_states=torch.tensor([[1.0], [2.0], [3.0]]),
         staged_hidden_states_cpu=None,
@@ -868,6 +969,7 @@ def test_build_omni_output_splits_client_mm_from_inter_stage_keys(monkeypatch):
         scheduler_output=SimpleNamespace(
             total_num_scheduled_tokens=3,
             num_scheduled_tokens={"r1": 1, "r2": 2},
+            scheduled_spec_decode_tokens={},
         ),
         hidden_states=torch.tensor([[1.0], [2.0], [3.0]]),
         staged_hidden_states_cpu=None,

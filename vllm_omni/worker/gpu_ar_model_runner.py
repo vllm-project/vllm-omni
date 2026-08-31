@@ -52,7 +52,7 @@ from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
-from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
+from vllm_omni.worker.sampling_utils import accepted_hidden_rows, sanitize_min_tokens_stop_ids
 
 logger = init_logger(__name__)
 
@@ -1750,8 +1750,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     for rid in downstream_req_ids:
                         idx = req_id_to_index_output_copy[rid]
                         start = int(query_start_loc_cpu[idx])
-                        sched = int(num_scheduled_tokens_np[idx])
-                        end = start + sched
+                        end = start + accepted_hidden_rows(
+                            req_id=rid,
+                            req_index=idx,
+                            num_scheduled_tokens=int(num_scheduled_tokens_np[idx]),
+                            scheduled_spec_decode_tokens=scheduler_output.scheduled_spec_decode_tokens,
+                            valid_sampled_token_ids=valid_sampled_token_ids,
+                        )
                         req_hidden_states_cpu[rid] = _to_cpu_contiguous(hidden_states[start:end])
 
         # NOTE: pooler_output here is used only for the full-payload accumulation
@@ -1803,8 +1808,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         continue
                     idx = req_id_to_index_output_copy[rid]
                     start = int(query_start_loc_cpu[idx])
-                    sched = int(num_scheduled_tokens_np[idx])
-                    end = start + sched
+                    end = start + accepted_hidden_rows(
+                        req_id=rid,
+                        req_index=idx,
+                        num_scheduled_tokens=int(num_scheduled_tokens_np[idx]),
+                        scheduled_spec_decode_tokens=scheduler_output.scheduled_spec_decode_tokens,
+                        valid_sampled_token_ids=valid_sampled_token_ids,
+                    )
                     payload = self._build_omni_pooler_payload(
                         rid=rid,
                         idx=idx,
