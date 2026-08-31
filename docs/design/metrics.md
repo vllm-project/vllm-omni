@@ -73,8 +73,8 @@ There are four independent paths for metric collection.
 `OmniModalityMetrics` registers seven audio families with `{model_name, stage, replica}` (plus an extra `threshold_ms` / `reason` label on the two extra-cardinality Counters). Three observation sites:
 
 - `observe_modality_at_finalize(...)` — called from `omni_base._process_single_result` inside the existing `e2e_done` finalize guard. For `output_type == "audio"` it emits `audio_frames_total`, `audio_duration_s`, `audio_rtf` (or `audio_skipped_requests_total{reason="no_audio_data"}` when no audio was produced). Sample rate is resolved from `engine_outputs.multimodal_output` via `definitions.resolve_audio_sample_rate(...)` (fallback chain mirrors `serving_chat.py`'s audio response path).
-- `observe_audio_first_packet(...)` — called from the OpenAI SSE audio branch in `serving_chat.py` on the first audio packet for a request. The once-per-request guard is held by `ClientRequestState.first_audio_ts`. The `request_arrival_ts` anchor is stored in `ClientRequestState` by `async_omni.generate()`, computed at request entry.
-- `observe_audio_streaming_finalize(...)` — called from `serving_chat.py` after the streaming chunk loop exhausts. It runs the per-chunk player simulation from `vllm_omni/benchmarks/audio_continuity.py` to compute the worst-case underrun and emits `audio_underrun_s` plus (when the request stayed below the threshold) `audio_continuity_ok_total{threshold_ms}`. Per-chunk PCM byte counts and arrival timestamps are recorded by the same audio branch that updates `first_audio_ts`.
+- `observe_audio_first_packet(...)` — called from the OpenAI SSE audio branch in `serving_chat.py` and the streaming TTS output paths in `serving_speech.py` on the first non-empty audio payload for a request. Streaming Speech observes the first PCM payload rather than a header-only WAV chunk. HTTP carries the middleware request timestamp through response generation; WebSocket uses the start of each sentence synthesis request. Non-streaming Speech does not emit TTFP and uses `e2e_request_latency_s` for overall latency instead.
+- `observe_audio_streaming_finalize(...)` — called from `serving_chat.py` and `serving_speech.py` after a streaming chunk loop exhausts normally. It runs the per-chunk player simulation from `vllm_omni/benchmarks/audio_continuity.py` to compute the worst-case underrun and emits `audio_underrun_s` plus (when the request stayed below the threshold) `audio_continuity_ok_total{threshold_ms}`. Per-chunk PCM byte counts and arrival timestamps are recorded by the same output paths that update TTFP. Speech records raw PCM payloads before raw/SSE/WebSocket encoding, excludes WAV headers and empty chunks, and does not emit continuity samples for failed, cancelled, or non-streaming requests.
 
 **Path 3: Cross-stage transfer metrics (`vllm:omni_transfer_*`)**
 
@@ -161,7 +161,7 @@ second.
 ### Pipeline (4)
 
 | Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
+| -------- | ------ | -------- | ------------- |
 | `vllm:omni_num_requests_running` | Gauge | `model_name` | Requests currently executing across all stages |
 | `vllm:omni_num_requests_waiting` | Gauge | `model_name` | Requests queued but not yet scheduled |
 | `vllm:omni_requests_success_total` | Counter | `model_name`, `finished_reason` | Total requests by completion reason ({stop, length, abort, ...}); aborts cover client-disconnect / cancellation paths in addition to upstream `FinishReason.ABORT` |
@@ -172,7 +172,7 @@ second.
 Labels: `{model_name, stage, replica}` plus the listed extra label.
 
 | Metric | Type | Extra label | Description |
-|--------|------|-------------|-------------|
+| -------- | ------ | ------------- | ------------- |
 | `vllm:omni_audio_ttfp_s` | Histogram | — | Time from request arrival to first audio packet/frame |
 | `vllm:omni_audio_duration_s` | Histogram | — | Audio content duration (`audio_frames / sample_rate`) |
 | `vllm:omni_audio_rtf` | Histogram | — | Real-time factor `stage_gen_time_s / audio_duration_s` (SLO `< 1`); uses `RTF_BUCKETS` |
@@ -186,7 +186,7 @@ Labels: `{model_name, stage, replica}` plus the listed extra label.
 Labels: `{model_name, from_stage, from_replica, to_stage, to_replica}`.
 
 | Metric | Type | Description |
-|--------|------|-------------|
+| -------- | ------ | ------------- |
 | `vllm:omni_transfer_size_bytes` | Histogram | Per-transfer payload size in bytes |
 | `vllm:omni_transfer_tx_s` | Histogram | Sender-side time (serialize + submit to connector) |
 | `vllm:omni_transfer_rx_s` | Histogram | Receiver-side time (recv + deserialize) |
@@ -199,8 +199,8 @@ After the wrap, every upstream `vllm:*` family — TTFT, ITL, TPOT, e2e latency,
 ## Naming Convention
 
 - All time-bearing metrics use the `_s` suffix (values in seconds). Two bucket families are used:
-  - `SECONDS_BUCKETS` (0.05 s – 300 s) for e2e / generation / TTFP style values.
-  - `SECONDS_FAST_BUCKETS` (0.001 s – 60 s) for fine-grained cross-stage transfer and audio-underrun values that need millisecond-level resolution.
+    - `SECONDS_BUCKETS` (0.05 s – 300 s) for e2e / generation / TTFP style values.
+    - `SECONDS_FAST_BUCKETS` (0.001 s – 60 s) for fine-grained cross-stage transfer and audio-underrun values that need millisecond-level resolution.
 - Counters use the `_total` suffix (auto-appended by `prometheus_client`).
 - Sizes use the `_bytes` suffix.
 - All omni-specific families are prefixed `vllm:omni_`. The upstream `unregister_vllm_metrics()` function is monkey-patched to a scoped version that still strips upstream `vllm:*` collectors (so multi-engine init within one process does not crash on duplicate registration) but preserves anything prefixed `vllm:omni_` / `vllm_omni`.

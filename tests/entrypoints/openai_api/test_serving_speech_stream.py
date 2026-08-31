@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import base64
 from types import SimpleNamespace
@@ -44,7 +47,15 @@ def _build_test_app(
         speech_service._prepare_speech_generation = mocker.AsyncMock(return_value=("req-1", object(), {}))
         speech_service.forced_aligner_enabled = False
 
-        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False, collect=None):
+        async def mock_generate_pcm_chunks(
+            _generator,
+            _request_id,
+            *,
+            request_start_s=None,
+            request_arrival_ts=None,
+            include_sample_rate=False,
+            collect=None,
+        ):
             for chunk in (b"\x01\x02", b"\x03\x04\x05"):
                 yield (chunk, 24000) if include_sample_rate else chunk
 
@@ -244,6 +255,7 @@ class TestStreamingSpeechWebSocket:
 
     def test_streaming_multiple_binary_frames(self, mocker: MockerFixture):
         captured_requests = []
+        captured_timing = {}
 
         speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
         speech_service._generate_audio_bytes = mocker.AsyncMock(return_value=(b"", "audio/wav"))
@@ -251,13 +263,26 @@ class TestStreamingSpeechWebSocket:
         speech_service.engine_client.abort = mocker.AsyncMock()
         speech_service.forced_aligner_enabled = False
 
-        async def mock_prepare_speech_generation(request):
+        async def mock_prepare_speech_generation(request, *, arrival_time=None):
             captured_requests.append(request)
+            assert arrival_time is not None
+            captured_timing["prepare_arrival"] = arrival_time
             return "req-stream", object(), {}
 
         speech_service._prepare_speech_generation = mock_prepare_speech_generation
 
-        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False):
+        async def mock_generate_pcm_chunks(
+            _generator,
+            _request_id,
+            *,
+            request_start_s=None,
+            request_arrival_ts=None,
+            include_sample_rate=False,
+        ):
+            assert request_start_s is not None
+            assert request_arrival_ts is not None
+            captured_timing["chunk_start"] = request_start_s
+            captured_timing["chunk_arrival"] = request_arrival_ts
             for chunk in (b"\x01\x02", b"\x03\x04\x05", b"\x06"):
                 yield (chunk, 24000) if include_sample_rate else chunk
 
@@ -302,6 +327,8 @@ class TestStreamingSpeechWebSocket:
         assert captured_requests[0].stream is True
         assert captured_requests[0].response_format == "pcm"
         assert captured_requests[0].initial_codec_chunk_frames == 12
+        assert captured_timing["prepare_arrival"] == captured_timing["chunk_arrival"]
+        assert captured_timing["chunk_start"] > 0
         assert speech_service._generate_audio_bytes.await_count == 0
 
     def test_word_timestamps_requires_configured_aligner(self, mocker: MockerFixture):
@@ -333,8 +360,9 @@ class TestStreamingSpeechWebSocket:
         speech_service.engine_client.abort = mocker.AsyncMock()
         speech_service.forced_aligner_enabled = True
 
-        async def mock_prepare_speech_generation(request):
+        async def mock_prepare_speech_generation(request, *, arrival_time=None):
             captured_requests.append(request)
+            assert arrival_time is not None
             return "req-stream", object(), {}
 
         speech_service._prepare_speech_generation = mock_prepare_speech_generation
@@ -344,7 +372,17 @@ class TestStreamingSpeechWebSocket:
 
         # The forced-aligner stage rides the same generator: its pooling output
         # is surfaced via the ``collect`` channel once the audio has streamed.
-        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False, collect=None):
+        async def mock_generate_pcm_chunks(
+            _generator,
+            _request_id,
+            *,
+            request_start_s=None,
+            request_arrival_ts=None,
+            include_sample_rate=False,
+            collect=None,
+        ):
+            assert request_start_s is not None
+            assert request_arrival_ts is not None
             for chunk in (first_chunk, second_chunk):
                 yield (chunk, 1000) if include_sample_rate else chunk
             if collect is not None:
@@ -427,7 +465,15 @@ class TestStreamingSpeechWebSocket:
         speech_service.forced_aligner_enabled = True
         speech_service._prepare_speech_generation = mocker.AsyncMock(return_value=("req", object(), {}))
 
-        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False, collect=None):
+        async def mock_generate_pcm_chunks(
+            _generator,
+            _request_id,
+            *,
+            request_start_s=None,
+            request_arrival_ts=None,
+            include_sample_rate=False,
+            collect=None,
+        ):
             chunk = b"\x01" * 1000
             yield (chunk, 1000) if include_sample_rate else chunk
             if collect is not None:
@@ -608,7 +654,14 @@ class TestStreamingSpeechWebSocket:
         speech_service.engine_client.abort = mocker.AsyncMock()
         speech_service.forced_aligner_enabled = False
 
-        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False):
+        async def mock_generate_pcm_chunks(
+            _generator,
+            _request_id,
+            *,
+            request_start_s=None,
+            request_arrival_ts=None,
+            include_sample_rate=False,
+        ):
             yield b"\x01\x02"
             raise RuntimeError("stream boom")
 
@@ -702,7 +755,14 @@ class TestStreamingSpeechWebSocket:
         speech_service.engine_client.abort = mocker.AsyncMock()
         speech_service.forced_aligner_enabled = False
 
-        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False):
+        async def mock_generate_pcm_chunks(
+            _generator,
+            _request_id,
+            *,
+            request_start_s=None,
+            request_arrival_ts=None,
+            include_sample_rate=False,
+        ):
             yield b"\x01\x02"
 
         speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
