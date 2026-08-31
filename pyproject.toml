@@ -85,6 +85,12 @@ demo = [
     "cn2an>=0.5.22",  # Chinese number normalization for TTS (e.g. "1次" -> "一次")
 ]
 
+cosmos-dreams-demo = [
+    "aiohttp>=3.10.0",
+    "aiortc>=1.14.0,<1.16.0",
+    "av>=14.0.0,<18.0.0",
+]
+
 server-vad = [
     "silero-vad==6.1",
 ]
