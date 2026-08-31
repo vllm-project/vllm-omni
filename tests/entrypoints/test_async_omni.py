@@ -331,25 +331,89 @@ def test_abort_enqueues_synthetic_finished_when_engine_returns_empty():
 
 @pytest.mark.cpu
 def test_abort_drops_consumed_metric_message_ids_with_state():
-    """Abort pops ``request_states[rid]`` and the per-request de-dup set
-    attached to it drops with the state (no class-level dict to maintain).
-    Regression guard for #6462 under the ``ClientRequestState``-attached
-    layout adopted in #6561 review — a stray class-level
-    ``_consumed_metric_messages`` re-introduction would resurface the leak.
+    """Exercise the production leak path from #6462: a metric-bearing
+    ``OutputMessage`` goes through ``_handle_output_message`` (which populates
+    the per-request de-dup set), the request is aborted (which, since #6367,
+    keeps ``request_states`` registered and enqueues a terminal abort output),
+    and the set must be released with the state by ``generate()``'s normal
+    cleanup — with no independent request-keyed metric state surviving on the
+    instance at any point. A reintroduced
+    class-level ``_consumed_metric_messages``-style map populated by the
+    production handler fails the sweep below.
     """
+    import time as _time
+    from collections.abc import Mapping
+
+    from vllm_omni.engine.messages import OutputMessage
     from vllm_omni.entrypoints.client_request_state import ClientRequestState
+    from vllm_omni.metrics.stats import OrchestratorAggregator
 
     async def run():
         omni = get_async_omni_instance()
-        state = ClientRequestState(request_id="req-1-cccc", external_request_id="req-1")
-        state.consumed_metric_message_ids.add(12345)
+        omni.engine.get_stage_metadata = lambda stage_id: SimpleNamespace(
+            stage_type="llm",
+            final_output=True,
+            final_output_type="text",
+        )
+
+        rid = "req-1-cccc"
+        state = ClientRequestState(request_id=rid, external_request_id="req-1")
+        state.metrics = OrchestratorAggregator(
+            num_stages=1,
+            log_stats=False,
+            wall_start_ts=_time.time(),
+            final_stage_id_for_e2e=0,
+        )
         state.input_stream_task = None
-        omni.request_states["req-1-cccc"] = state
+        omni.request_states[rid] = state
+
+        msg = OutputMessage(
+            request_id=rid,
+            stage_id=0,
+            engine_outputs=SimpleNamespace(final_output_type="text"),
+            metrics=SimpleNamespace(
+                num_tokens_in=3,
+                num_tokens_out=5,
+                stage_gen_time_ms=1.0,
+                rx_transfer_bytes=0,
+                rx_decode_time_ms=0.0,
+                rx_in_flight_time_ms=0.0,
+            ),
+            finished=False,
+        )
+        handled, out_rid, out_stage, out_state = omni._handle_output_message(msg)
+        assert handled is False and out_state is state
+        # The production handler recorded the de-dup entry on the state...
+        assert id(msg) in state.consumed_metric_message_ids
+        # ...and de-duplicates a replay of the same message object.
+        omni._handle_output_message(msg)
+        assert len(state.consumed_metric_message_ids) == 1
 
         assert not hasattr(omni, "_consumed_metric_messages")
 
+        # #6367 contract: abort() keeps the state registered and enqueues a
+        # terminal abort output; generate()'s ``finally`` owns the cleanup.
         await omni.abort("req-1")
-        assert "req-1-cccc" not in omni.request_states
+        assert rid in omni.request_states
+        terminal = state.queue.get_nowait()
+        assert terminal.finished is True
+        assert terminal.engine_outputs.outputs[0].finish_reason == "abort"
+        # The de-dup set still lives only on the (still-registered) state.
+        for name, value in vars(omni).items():
+            if name == "request_states":
+                continue
+            assert not (isinstance(value, Mapping) and rid in value), (
+                f"request-keyed metric state kept outside request_states in {name!r}"
+            )
+
+        # generate()'s normal cleanup releases the state and the set with it.
+        omni._log_summary_and_cleanup(rid)
+        assert rid not in omni.request_states
+        for name, value in vars(omni).items():
+            assert not (isinstance(value, Mapping) and rid in value), (
+                f"request-keyed state survived cleanup in {name!r}"
+            )
+        assert not hasattr(omni, "_consumed_metric_messages")
 
     asyncio.run(run())
 
