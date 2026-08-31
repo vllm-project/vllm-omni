@@ -335,9 +335,9 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None
             else:
-                # When PP and flashcomm1 are enabled, during dummy_run the estimated space should divide num_tokens by
-                # tp_size; otherwise, on non-first PP ranks it would effectively perform an extra all-gather, leading
-                # to incorrect memory estimation and potentially causing OOM.
+                # When PP and sequence parallelism are enabled, during dummy_run the estimated space should divide
+                # num_tokens by tp_size; otherwise, on non-first PP ranks it would effectively perform an extra
+                # all-gather, leading to incorrect memory estimation and potentially causing OOM.
                 intermediate_tokens = num_tokens_padded
                 if enable_sp():
                     tp_size = get_tensor_model_parallel_world_size()
@@ -448,7 +448,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         1. Accepts num_tokens_padded as required by NPUModelRunner
         2. Injects omni-specific kwargs (runtime_additional_information)
         3. Caches model output for multimodal results
-        4. Handles NPU-specific post-forward logic (graph params update, SP all-gather)
+        4. Handles NPU-specific post-forward logic (graph params update)
         """
         # Omni-specific: build and inject extra model kwargs
         model_kwargs_extra = self._build_model_kwargs_extra()
@@ -481,10 +481,6 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
 
         # Omni-specific: cache model output for later sample_tokens
         self._omni_last_model_output = model_output
-
-        # NPU-specific: all-gather for sequence parallelism
-        if forward_context.flash_comm_v1_enabled and not isinstance(model_output, IntermediateTensors):
-            model_output = self._all_gather_hidden_states_and_aux(model_output)
 
         return model_output
 

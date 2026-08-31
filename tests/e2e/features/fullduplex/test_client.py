@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import asyncio
 import base64
 import wave
 from urllib.parse import parse_qs, urlsplit
@@ -14,13 +18,17 @@ from vllm_omni.experimental.fullduplex.client import (
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
     MiniCPMO45DuplexPolicy,
 )
+from vllm_omni.experimental.fullduplex.video_stacking import (
+    concat_frames,
+    unit_subframe_offsets,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_realtime_client_builds_explicit_native_duplex_url():
     url = build_realtime_url(
-        "ws://localhost:8099/v1/realtime?custom=1",
+        "ws://localhost:8099/v1/realtime?custom=1&duplex=0&model=stale&minicpmo45_native_duplex=0&session_id=stale",
         "openbmb/MiniCPM-o-4_5",
         session_id="session-a",
     )
@@ -50,7 +58,7 @@ def test_seed_tts_initial_text_is_part_of_native_duplex_context():
 
 def test_realtime_client_builds_resume_only_url_when_autostart_disabled():
     url = build_realtime_url(
-        "ws://localhost:8099/v1/realtime?duplex=1",
+        "ws://localhost:8099/v1/realtime?duplex=1&autostart=1",
         "openbmb/MiniCPM-o-4_5",
         autostart=False,
     )
@@ -73,10 +81,15 @@ async def test_realtime_client_configure_omits_ref_audio_by_default():
 
     client = Client()
 
-    await client.configure("openbmb/MiniCPM-o-4_5", timeout_s=1)
+    await client.configure(
+        "openbmb/MiniCPM-o-4_5",
+        idle_timeout_s=900,
+        timeout_s=1,
+    )
 
     session = client.sent[0]["session"]
     assert "ref_audio" not in session
+    assert session["idle_timeout_s"] == 900
 
 
 @pytest.mark.asyncio
@@ -100,6 +113,74 @@ async def test_realtime_client_configure_sends_explicit_ref_audio():
 
     session = client.sent[0]["session"]
     assert session["ref_audio"] == "data:audio/wav;base64,AAAA"
+    assert "idle_timeout_s" not in session
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_reports_reader_exit_to_event_waiters():
+    client = RealtimeDuplexClient("ws://unused")
+
+    async def stopped():
+        return None
+
+    client._reader_task = asyncio.create_task(stopped())
+    await client._reader_task
+
+    with pytest.raises(ConnectionError, match="closed before"):
+        client.raise_if_reader_stopped()
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_configure_reports_reader_failure_immediately():
+    class Client(RealtimeDuplexClient):
+        async def send(self, event):
+            async def fail():
+                raise RuntimeError("reader failed")
+
+            self._reader_task = asyncio.create_task(fail())
+            await asyncio.sleep(0)
+
+    client = Client("ws://unused")
+    with pytest.raises(ConnectionError, match="reader failed"):
+        await client.configure("model", timeout_s=10.0)
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_close_reports_reader_cancellation_immediately():
+    class Client(RealtimeDuplexClient):
+        async def send(self, event):
+            async def wait_forever():
+                await asyncio.Future()
+
+            self._reader_task = asyncio.create_task(wait_forever())
+            self._reader_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await self._reader_task
+
+    client = Client("ws://unused")
+    with pytest.raises(ConnectionError, match="reader was cancelled"):
+        await client.close_session(timeout_s=10.0)
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_close_waits_for_a_new_session_closed_event():
+    class Client(RealtimeDuplexClient):
+        async def send(self, event):
+            assert event["type"] == "session.close"
+
+            async def acknowledge_close():
+                await asyncio.sleep(0.02)
+                self.events.add({"type": "session.closed"})
+
+            asyncio.create_task(acknowledge_close())
+
+    client = Client("ws://unused")
+    client.events.add({"type": "session.closed", "reason": "old"})
+    started_at = asyncio.get_running_loop().time()
+
+    await client.close_session(timeout_s=0.2)
+
+    assert asyncio.get_running_loop().time() - started_at >= 0.01
 
 
 @pytest.mark.asyncio
@@ -235,6 +316,7 @@ def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
         "output_token_count": 4,
         "ttft_ms": 120.0,
         "tpot_ms": 15.0,
+        "itls_ms": [10.0, 14.0, 18.0],
         "inter_token_interval_ms": {
             "count": 3,
             "mean": 14.0,
@@ -340,3 +422,62 @@ def test_realtime_client_pcm16_wav_round_trip(tmp_path):
         assert wav_file.getnchannels() == 1
         assert wav_file.getframerate() == 16_000
     assert read_pcm16_wav(path) == pcm16
+
+
+def _stack_test_image(color, size=(40, 30)):
+    from PIL import Image
+
+    return Image.new("RGB", size, color)
+
+
+def test_video_stacking_tiles_a_units_subframes_into_one_image():
+    frames = [_stack_test_image((255, 0, 0)), _stack_test_image((0, 255, 0))]
+
+    composite = concat_frames(frames)
+
+    # Landscape cells stack into a column because that canvas is squarer, and
+    # the interior seam carries the separator band that lets the model tell the
+    # sub-frames apart.
+    assert composite.size == (40, 30 * 2 + 6)
+    assert composite.getpixel((20, 30 + 3)) == (0, 0, 0)
+
+
+def test_video_stacking_picks_the_squarest_grid():
+    portrait = [_stack_test_image((255, 0, 0), size=(20, 60)) for _ in range(2)]
+    four = [_stack_test_image((0, 0, 255)) for _ in range(4)]
+
+    # A portrait clip tiles side by side, four frames always tile 2x2.
+    assert concat_frames(portrait).size == (20 * 2 + 6, 60)
+    assert concat_frames(four).size == (40 * 2 + 6, 30 * 2 + 6)
+
+
+def test_video_stacking_skips_the_subframe_that_duplicates_the_base_frame():
+    # Official samples stack_frames=5 as 0.2/0.4/0.6/0.8 s: offset 0 is the base
+    # frame, already sent as frame_list[0].
+    assert unit_subframe_offsets(5) == pytest.approx([0.2, 0.4, 0.6, 0.8])
+    assert unit_subframe_offsets(1) == []
+
+
+def test_realtime_client_sends_each_units_composite_beside_its_base_frame():
+    sent: list[dict] = []
+
+    class _Client(RealtimeDuplexClient):
+        def __init__(self):
+            pass
+
+        async def send(self, event):
+            sent.append(event)
+
+    asyncio.run(
+        _Client().stream_pcm16(
+            b"\x01\x00" * (16_000 * 3),
+            chunk_ms=200,
+            realtime=False,
+            video_frames=["f0", "f1"],
+            stacked_video_frames=["s0", None],
+        )
+    )
+
+    # A composite belongs to the unit it was captured in, so it rides the same
+    # append as that unit's base frame; a unit without one sends the base alone.
+    assert [event["video_frames"] for event in sent if "video_frames" in event] == [["f0", "s0"], ["f1"]]

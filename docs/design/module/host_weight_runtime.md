@@ -16,7 +16,7 @@ validation_paths:
   - tests/host_weight_runtime/**
 upstream_refs:
   - https://github.com/vllm-project/vllm-omni/issues/6414
-last_reviewed: 2026-08-21
+last_reviewed: 2026-08-25
 ---
 
 # Host Weight Runtime
@@ -83,6 +83,13 @@ another. `WeightArtifactIdentity` includes:
 - static adaptation identity; and
 - producer version, implementation fingerprint, manifest schema, and restorer
   schema.
+
+Loader integrations may persist content digests for canonical source shards in
+the selected storage domain. Reuse requires the same path, inode, size,
+timestamps, symlink target, and cache-record checksum. Corrupt records are
+rebuilt, and coordination or cache-I/O failure falls back to hashing the
+canonical source directly. This is an identity-computation optimization, not a
+second source of truth or an artifact substitution rule.
 
 The identity excludes transfer policy such as registered mmap versus private
 pinned staging. Those paths move the same host representation and must not
@@ -237,12 +244,65 @@ Every publication computes full file and tensor hashes. Local lookup supports:
   and
 - `full_checksum`, which additionally reads and hashes every payload file.
 
+An ordered producer may compute file and tensor digests while payload bytes are
+written and overlap each closed payload's `fsync` with later producer work. An
+unordered producer retains parallel readback hashing. In both cases manifest
+and `READY` publication wait for every payload digest and `fsync`; the atomic
+publication and validation contract is unchanged.
+
 Filesystem verity is modeled but unsupported. Invalid artifacts receive an
 external deny marker before their shared lookup lock is released; a build owner
 then quarantines the immutable directory under the exclusive lock.
 Lookup checks the marker both before validation and after constructing the
 lease so a weaker overlapping lookup cannot return a lease after a stronger
 validation has denied the artifact.
+
+If publishing the external deny marker fails, lookup returns a retryable
+storage failure and marks the artifact directory with a persistent invalidation
+mode before releasing the shared lock. Cooperating readers check that mode both
+while opening and immediately before returning a lease. Lookup then makes a
+bounded attempt to take the exclusive artifact lock and quarantine the entry;
+the quarantine transition removes the internal mode marker. If a cooperating
+builder replaces the marked inode while the locks are exchanged, containment
+preserves that new publication instead of quarantining it. If neither the
+external marker nor the directory-mode marker can be persisted, cross-process
+exclusion cannot be guaranteed on an unavailable filesystem and the domain
+must remain failed rather than treating the artifact as an ordinary invalid
+cache entry.
+
+New publications carry the internal invalidation mode through the staging
+rename. Hardening clears it and is the logical authority transition for a
+process crash; the temporary- and artifact-parent syncs then make the rename
+durable, with an artifact-inode sync first making the hardened mode durable. A
+process that dies before hardening leaves a persistently denied
+entry, while one that dies after successful hardening leaves an authoritative
+ready entry. Any synchronous failure after rename is marked invalid and
+contained in quarantine before `PUBLICATION_FAILED` is returned, so that
+nonretryable result cannot later resolve as a ready hit. If the filesystem
+refuses both the inode marker and the quarantine move, the store instead returns
+a retryable storage failure with `outcome_uncertain` details; as with deny-marker
+double failure, cross-process exclusion cannot be guaranteed until storage
+recovers. Once the artifact-parent sync succeeds, a later artifact- or
+build-lock release error is logged and lookup resolves the committed entry
+instead of reporting a contradictory publication failure. The same authority
+rule applies when a competing publisher already installed byte-identical
+semantic content; staging-cleanup errors are retried without downgrading that
+validated ready entry to publication failure.
+
+Before widening a hardened artifact for a lifecycle move, the store durably
+sets the same invalidation mode. A process crash before rename therefore leaves
+the writable source denied. After rename, the store re-hardens the destination
+but retains the marker until both parent-directory syncs make the move durable;
+only then does it durably clear the marker. An interrupted move therefore leaves
+a marked transition that the next exact-key lifecycle operation re-hardens.
+Explicit cleanup uses the locked move and retries exact-key
+`.cleanup.*` tombstones left by an interrupted removal; a later build performs
+the same tombstone reconciliation before producing replacement content.
+
+An operational failure while inspecting a noncooperative competing publication
+is a retryable storage failure. The competing entry remains authoritative and
+is not mislabeled as corrupt or quarantined merely because its manifest could
+not be read transiently.
 
 `inspect_domain()` and `inspect_artifact()` return typed, read-only snapshots.
 Inspection validation does not create a deny marker. Reported lock activity is

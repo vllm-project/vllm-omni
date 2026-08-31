@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 import torch
 from pytest_mock import MockerFixture
@@ -12,6 +15,104 @@ from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+class _SyntheticSyncQueueShutDownError(Exception):
+    pass
+
+
+def test_abort_is_noop_for_empty_request_ids(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    engine._shutdown_called = False
+    engine.request_queue = mocker.Mock()
+
+    engine.abort([])
+
+    engine.request_queue.sync_q.put.assert_not_called()
+
+
+def test_abort_is_noop_after_shutdown_starts(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    engine._shutdown_called = True
+    engine.request_queue = mocker.Mock()
+
+    engine.abort(["req-1"])
+
+    engine.request_queue.sync_q.put.assert_not_called()
+
+
+def test_abort_tolerates_queue_close_race_during_shutdown(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    engine._shutdown_called = False
+    engine.request_queue = mocker.Mock()
+    mocker.patch(
+        "vllm_omni.engine.async_engine_utils._JANUS_SYNC_QUEUE_SHUTDOWN",
+        _SyntheticSyncQueueShutDownError,
+    )
+
+    def close_queue_during_abort(*args, **kwargs):
+        del args, kwargs
+        engine._shutdown_called = True
+        raise _SyntheticSyncQueueShutDownError
+
+    engine.request_queue.sync_q.put.side_effect = close_queue_during_abort
+
+    engine.abort(["req-1"])
+
+
+def test_abort_tolerates_legacy_janus_close_error_during_shutdown(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    engine._shutdown_called = False
+    engine.request_queue = mocker.Mock()
+    mocker.patch(
+        "vllm_omni.engine.async_engine_utils._JANUS_SYNC_QUEUE_SHUTDOWN",
+        None,
+    )
+
+    def close_queue_during_abort(*args, **kwargs):
+        del args, kwargs
+        engine._shutdown_called = True
+        raise RuntimeError("Operation on the closed queue is forbidden")
+
+    engine.request_queue.sync_q.put.side_effect = close_queue_during_abort
+
+    engine.abort(["req-1"])
+
+
+def test_abort_surfaces_unrelated_legacy_runtime_error_during_shutdown(
+    mocker: MockerFixture,
+):
+    engine = object.__new__(AsyncOmniEngine)
+    engine._shutdown_called = False
+    engine.request_queue = mocker.Mock()
+    mocker.patch(
+        "vllm_omni.engine.async_engine_utils._JANUS_SYNC_QUEUE_SHUTDOWN",
+        None,
+    )
+
+    def fail_during_abort(*args, **kwargs):
+        del args, kwargs
+        engine._shutdown_called = True
+        raise RuntimeError("unrelated queue failure")
+
+    engine.request_queue.sync_q.put.side_effect = fail_during_abort
+
+    with pytest.raises(RuntimeError, match="unrelated queue failure"):
+        engine.abort(["req-1"])
+
+
+def test_abort_surfaces_unexpected_closed_queue(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    engine._shutdown_called = False
+    engine.request_queue = mocker.Mock()
+    mocker.patch(
+        "vllm_omni.engine.async_engine_utils._JANUS_SYNC_QUEUE_SHUTDOWN",
+        _SyntheticSyncQueueShutDownError,
+    )
+    engine.request_queue.sync_q.put.side_effect = _SyntheticSyncQueueShutDownError
+
+    with pytest.raises(_SyntheticSyncQueueShutDownError):
+        engine.abort(["req-1"])
 
 
 def _make_engine_core_request(request_id: str = "req-1") -> EngineCoreRequest:
@@ -65,6 +166,39 @@ def test_build_add_request_message_preserves_additional_information(mocker: Mock
     assert request.additional_information.entries["text"].list_data == ["hello world"]
     assert request.additional_information.entries["speaker"].list_data == ["vivian"]
     output_processor.add_request.assert_not_called()
+
+
+def test_build_add_request_message_injects_global_id_before_prompt_transform(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("speech",)
+
+    input_processor = mocker.Mock()
+    input_processor.process_inputs.return_value = _make_engine_core_request()
+    engine.input_processor = input_processor
+    engine.output_processors = [mocker.Mock()]
+
+    seen_global_ids: list[list[str]] = []
+
+    def transform(prompt, _sampling_params):
+        seen_global_ids.append(prompt["additional_information"]["global_request_id"])
+        return prompt
+
+    engine.prompt_transform_func = transform
+    prompt = {"prompt_token_ids": [1, 1, 1]}
+
+    message = engine._build_add_request_message(
+        request_id="req-1",
+        prompt=prompt,
+        sampling_params_list=[params],
+        final_stage_id=0,
+        arrival_time=0.0,
+    )
+
+    assert seen_global_ids == [["req-1"]]
+    assert message.original_prompt["additional_information"]["global_request_id"] == ["req-1"]
 
 
 def test_build_add_request_message_preserves_model_intermediate_buffer(mocker: MockerFixture):
