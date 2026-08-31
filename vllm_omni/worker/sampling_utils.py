@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Sampling-state guards shared by the GPU and NPU AR model runners."""
+"""Sampling-state helpers shared by the GPU and NPU AR model runners."""
+
+from collections.abc import Mapping, Sequence
 
 import torch
 from vllm.logger import init_logger
@@ -8,7 +10,40 @@ from vllm.v1.sample.logits_processor import LogitsProcessors, MinTokensLogitsPro
 
 logger = init_logger(__name__)
 
-__all__ = ["sanitize_min_tokens_stop_ids"]
+__all__ = ["accepted_hidden_rows", "sanitize_min_tokens_stop_ids"]
+
+
+def accepted_hidden_rows(
+    *,
+    req_id: str,
+    req_index: int,
+    num_scheduled_tokens: int,
+    scheduled_spec_decode_tokens: Mapping[str, Sequence[int]],
+    valid_sampled_token_ids: Sequence[Sequence[int]],
+) -> int:
+    """Rows of this step's hidden states that ``req_id`` actually emitted.
+
+    A speculative step forwards one real position plus the drafts, and
+    rejection sampling keeps a *prefix* of them. Slicing an Omni payload by
+    ``num_scheduled_tokens`` therefore also ships the rows past that prefix:
+    hidden states for draft tokens the model never emitted. A downstream AR
+    stage that conditions on them -- a codec talker, say -- renders text that
+    does not exist.
+
+    ``num_scheduled_tokens`` is returned unchanged whenever the step cannot
+    carry a rejection remainder for this request: no drafts were scheduled for
+    it (a prefill step schedules the prompt, and the downstream stage needs all
+    of it), or its accepted-token bookkeeping is not available yet (async
+    scheduling fills ``valid_sampled_token_ids`` in after this point).
+    """
+    if not scheduled_spec_decode_tokens.get(req_id):
+        return num_scheduled_tokens
+    if req_index >= len(valid_sampled_token_ids):
+        return num_scheduled_tokens
+    num_accepted = len(valid_sampled_token_ids[req_index])
+    if num_accepted <= 0:
+        return num_scheduled_tokens
+    return min(num_scheduled_tokens, num_accepted)
 
 
 def sanitize_min_tokens_stop_ids(logitsprocs: LogitsProcessors, logits_vocab: int) -> None:

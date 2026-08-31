@@ -49,7 +49,7 @@ from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
-from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
+from vllm_omni.worker.sampling_utils import accepted_hidden_rows, sanitize_min_tokens_stop_ids
 
 
 def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]:
@@ -1125,8 +1125,13 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 for rid in downstream_req_ids:
                     idx = req_id_to_index_output_copy[rid]
                     start = int(query_start_loc_cpu[idx])
-                    sched = int(num_scheduled_tokens_np[idx])
-                    end = start + sched
+                    end = start + accepted_hidden_rows(
+                        req_id=rid,
+                        req_index=idx,
+                        num_scheduled_tokens=int(num_scheduled_tokens_np[idx]),
+                        scheduled_spec_decode_tokens=scheduler_output.scheduled_spec_decode_tokens,
+                        valid_sampled_token_ids=valid_sampled_token_ids,
+                    )
                     req_hidden_states_cpu[rid] = hidden_states[start:end].detach().to("cpu").contiguous()
 
             pooler_output = []
@@ -1136,8 +1141,13 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     continue
                 idx = req_id_to_index_output_copy[rid]
                 start = int(query_start_loc_cpu[idx])
-                sched = int(num_scheduled_tokens_np[idx])
-                end = start + sched
+                end = start + accepted_hidden_rows(
+                    req_id=rid,
+                    req_index=idx,
+                    num_scheduled_tokens=int(num_scheduled_tokens_np[idx]),
+                    scheduled_spec_decode_tokens=scheduler_output.scheduled_spec_decode_tokens,
+                    valid_sampled_token_ids=valid_sampled_token_ids,
+                )
                 payload: dict[str, object] = {}
                 if not audio_sparse_output:
                     if req_hidden_states_cpu is not None and combined_hidden_states is None:
