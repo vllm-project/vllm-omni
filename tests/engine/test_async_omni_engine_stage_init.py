@@ -571,6 +571,83 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
     assert captured_timeout == 302
 
 
+def test_initialize_local_llm_replica_applies_stage_runtime_env_while_spawning(monkeypatch):
+    """A stage's ``runtime.env`` has to be set while the replica is spawned.
+
+    The worker process inherits the environment of the spawn, so an env var that
+    is applied only while the deploy config is parsed never reaches it, and every
+    worker-side switch configured that way is silently inert.
+    """
+    import vllm_omni.engine.stage_runtime as runtime_mod
+    from vllm_omni.platforms import current_omni_platform
+
+    runtime = StageRuntime(
+        stage_configs=[],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=302,
+        diffusion_batch_size=1,
+        async_chunk=False,
+    )
+
+    env_key = "VLLM_OMNI_TEST_STAGE_RUNTIME_ENV"
+    assert env_key not in os.environ
+
+    fake_addresses = types.SimpleNamespace(inputs=["in"], outputs=["out"], frontend_stats_publish_address=None)
+    seen_at_spawn: str | None = None
+
+    plan = ReplicaInitPlan(
+        replica_id=0,
+        num_replicas=1,
+        launch_mode="local",
+        stage_cfg=types.SimpleNamespace(engine_args={}, runtime=types.SimpleNamespace(devices="0")),
+        metadata=types.SimpleNamespace(
+            stage_id=0,
+            runtime_cfg={"devices": "0", "env": {env_key: "enabled"}},
+        ),
+        stage_connector_spec={},
+        omni_kv_connector=(None, None, None),
+        stage_vllm_config=types.SimpleNamespace(),
+        executor_class=object,
+        engine_args_dict={},
+    )
+
+    device_env_var = current_omni_platform.device_control_env_var
+    prev_device_env = os.environ.get(device_env_var)
+    os.environ[device_env_var] = "0"
+
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", lambda *_args: [])
+
+    from vllm_omni.engine.stage_engine_startup import StageReplicaResources
+
+    @contextlib.contextmanager
+    def _fake_launch_stage_replica(**_kwargs):
+        nonlocal seen_at_spawn
+        seen_at_spawn = os.environ.get(env_key)
+        yield StageReplicaResources(
+            manager=types.SimpleNamespace(shutdown=lambda: None),
+            addresses=fake_addresses,
+        )
+
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", _fake_launch_stage_replica)
+    monkeypatch.setattr(
+        runtime_mod.StageEngineCoreClientBase,
+        "make_async_mp_client",
+        staticmethod(lambda **_: types.SimpleNamespace(shutdown=lambda: None)),
+    )
+
+    try:
+        runtime._initialize_local_llm_replica(plan, 302)
+    finally:
+        if prev_device_env is None:
+            os.environ.pop(device_env_var, None)
+        else:
+            os.environ[device_env_var] = prev_device_env
+
+    assert seen_at_spawn == "enabled"
+    assert env_key not in os.environ
+
+
 def test_build_engine_args_cli_tokenizer_overrides_inferred_base_tokenizer(tmp_path):
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
