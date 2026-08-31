@@ -729,9 +729,7 @@ def _make_patched_code2wav(target, *, code2wav_dtype=None):
     return target.Qwen3TTSCode2Wav(
         vllm_config=SimpleNamespace(
             device_config=SimpleNamespace(device=torch.device("cpu")),
-            model_config=SimpleNamespace(
-                stage_connector_config={"extra": {"code2wav_dtype": code2wav_dtype}},
-            ),
+            additional_config={"code2wav_dtype": code2wav_dtype},
         ),
         prefix="stage1",
     )
@@ -770,31 +768,26 @@ def test_qwen3_tts_code2wav_npu_dtype_resolution(
 ) -> None:
     module, _, _, _ = _load_qwen3_tts_code2wav_npu_patch(monkeypatch)
     config = SimpleNamespace(
-        model_config=SimpleNamespace(
-            stage_connector_config={"extra": {"code2wav_dtype": configured_dtype}},
-        )
+        additional_config={"code2wav_dtype": configured_dtype},
     )
 
     assert module.resolve_npu_code2wav_runtime_dtype(config) is expected_dtype
 
 
-_STAGE_CONNECTOR_CONFIG_CASES: list[object | None] = [
+_ADDITIONAL_CONFIG_CASES: list[object | None] = [
     None,
     {},
-    {"extra": {}},
-    {"extra": None},
+    {"code2wav_dtype": None},
 ]
 
 
-@pytest.mark.parametrize("stage_connector_config", _STAGE_CONNECTOR_CONFIG_CASES)
-def test_qwen3_tts_code2wav_npu_dtype_defaults_without_connector_extra(
+@pytest.mark.parametrize("additional_config", _ADDITIONAL_CONFIG_CASES)
+def test_qwen3_tts_code2wav_npu_dtype_defaults_without_additional_config_value(
     monkeypatch: pytest.MonkeyPatch,
-    stage_connector_config,
+    additional_config,
 ) -> None:
     module, _, _, _ = _load_qwen3_tts_code2wav_npu_patch(monkeypatch)
-    config = SimpleNamespace(
-        model_config=SimpleNamespace(stage_connector_config=stage_connector_config),
-    )
+    config = SimpleNamespace(additional_config=additional_config)
 
     assert module.resolve_npu_code2wav_runtime_dtype(config) is torch.float16
 
@@ -806,9 +799,7 @@ def test_qwen3_tts_code2wav_npu_dtype_rejects_non_enum_value(
 ) -> None:
     module, _, _, _ = _load_qwen3_tts_code2wav_npu_patch(monkeypatch)
     config = SimpleNamespace(
-        model_config=SimpleNamespace(
-            stage_connector_config={"extra": {"code2wav_dtype": configured_dtype}},
-        )
+        additional_config={"code2wav_dtype": configured_dtype},
     )
 
     with pytest.raises(ValueError, match="expected one of: fp32, bf16, fp16"):

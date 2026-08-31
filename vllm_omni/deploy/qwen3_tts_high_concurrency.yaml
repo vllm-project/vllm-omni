@@ -45,9 +45,6 @@ connectors:
       decode_cudagraph_batch_sizes: [1]
       decode_batch_max_size: 1
       decode_enable_tf32: false
-      # Qwen3-TTS Code2Wav decoder compute dtype on NPU.
-      # Supported values: fp32, bf16, fp16. The implementation defaults to fp16.
-      code2wav_dtype: fp16
 
 stages:
   - stage_id: 0
@@ -100,3 +97,8 @@ platforms:
     stages:
       - stage_id: 0
         enforce_eager: true
+      - stage_id: 1
+        additional_config:
+          # Qwen3-TTS Code2Wav decoder compute dtype on NPU.
+          # Supported values: fp32, bf16, fp16. Defaults to fp16.
+          code2wav_dtype: fp16

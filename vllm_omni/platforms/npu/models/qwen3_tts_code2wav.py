@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Patch Qwen3-TTS Code2Wav NPU runtime setup and weight preparation."""
 
@@ -73,13 +73,11 @@ def _prepare_npu_decoder_weights(decoder: nn.Module) -> None:
 
 
 def resolve_npu_code2wav_runtime_dtype(vllm_config: VllmConfig) -> torch.dtype:
-    """Resolve Code2Wav dtype from connector extras, defaulting to FP16."""
-    model_config = getattr(vllm_config, "model_config", None)
-    stage_connector_config = getattr(model_config, "stage_connector_config", None)
-    connector_extra = stage_connector_config.get("extra", {}) if isinstance(stage_connector_config, Mapping) else {}
+    """Resolve Code2Wav dtype from stage additional config, defaulting to FP16."""
+    additional_config = getattr(vllm_config, "additional_config", None)
     configured_dtype = (
-        connector_extra.get("code2wav_dtype", Code2WavDtype.FP16)
-        if isinstance(connector_extra, Mapping)
+        additional_config.get("code2wav_dtype", Code2WavDtype.FP16)
+        if isinstance(additional_config, Mapping)
         else Code2WavDtype.FP16
     )
     if configured_dtype is None:

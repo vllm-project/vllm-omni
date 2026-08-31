@@ -52,13 +52,13 @@ def test_stage_connector_extra_is_propagated_to_model_config(mocker):
         stage_id=1,
         stage_connector_spec={
             "name": "SharedMemoryConnector",
-            "extra": {"code2wav_dtype": "fp16"},
+            "extra": {"codec_chunk_frames": 25},
         },
     ).create_model_config()
 
     assert convert.call_args.kwargs["stage_connector_config"] == {
         "name": "SharedMemoryConnector",
-        "extra": {"code2wav_dtype": "fp16", "stage_id": 1},
+        "extra": {"codec_chunk_frames": 25, "stage_id": 1},
     }
 
 

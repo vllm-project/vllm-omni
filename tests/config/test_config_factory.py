@@ -2400,15 +2400,16 @@ class TestPlatformOverrides:
         assert rocm.stages[1].enforce_eager is True
 
     @pytest.mark.parametrize("deploy_name", ["qwen3_tts.yaml", "qwen3_tts_high_concurrency.yaml"])
-    def test_qwen3_tts_npu_keeps_code2wav_dtype_in_connector_extra(self, deploy_name):
+    def test_qwen3_tts_npu_keeps_code2wav_dtype_in_stage_additional_config(self, deploy_name):
         deploy_path = Path(get_deploy_config_path(deploy_name))
 
         deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
         connector = deploy.connectors["connector_of_shared_memory"]
-        assert connector["extra"]["code2wav_dtype"] == "fp16"
+        assert "code2wav_dtype" not in connector["extra"]
 
         stages = merge_pipeline_deploy(resolve_pipeline_config("qwen3_tts"), deploy)
-        assert all("code2wav_dtype" not in stage.yaml_engine_args for stage in stages)
+        assert "additional_config" not in stages[0].yaml_engine_args
+        assert stages[1].yaml_engine_args["additional_config"] == {"code2wav_dtype": "fp16"}
 
     def test_qwen3_omni_cuda_uses_thinker_rotary_custom_op(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
