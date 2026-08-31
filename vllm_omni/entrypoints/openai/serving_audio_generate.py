@@ -87,17 +87,21 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
                 sampling_params_list[0].num_inference_steps = request.num_inference_steps
 
             # Set up audio duration parameters
+            audio_extra_args = {}
             if request.audio_length is not None:
                 audio_length = request.audio_length
                 audio_start = request.audio_start if request.audio_start is not None else 0.0
                 audio_end_in_s = audio_start + audio_length
-                sampling_params_list[0].extra_args = {
-                    "audio_length": audio_length,
-                    "audio_start_in_s": audio_start,
-                    "audio_end_in_s": audio_end_in_s,
-                }
-            elif request.num_frames is not None:
-                sampling_params_list[0].extra_args = {"num_frames": request.num_frames}
+                audio_extra_args.update(
+                    {
+                        "audio_length": audio_length,
+                        "audio_start_in_s": audio_start,
+                        "audio_end_in_s": audio_end_in_s,
+                    }
+                )
+            if request.num_frames is not None:
+                audio_extra_args["num_frames"] = request.num_frames
+            sampling_params_list[0].extra_args = audio_extra_args
             if request.frame_rate is not None:
                 sampling_params_list[0].frame_rate = request.frame_rate
 

@@ -192,15 +192,11 @@ class TestRequestValidation:
         req = OpenAICreateAudioGenerateRequest(input="test", stream_format="audio")
         assert req.stream_format == "audio"
 
-    def test_ltx_exact_num_frames_and_audio_length_are_mutually_exclusive(self):
-        with pytest.raises(Exception, match="mutually exclusive"):
-            OpenAICreateAudioGenerateRequest(input="test", audio_length=5.0, num_frames=121)
-
     def test_audio_length_must_be_positive(self):
         with pytest.raises(Exception):
             OpenAICreateAudioGenerateRequest(input="test", audio_length=0.0)
 
-    def test_ltx_exact_num_frames_and_frame_rate_are_accepted(self):
+    def test_exact_num_frames_and_frame_rate_are_accepted(self):
         req = OpenAICreateAudioGenerateRequest(input="test", num_frames=121, frame_rate=24.0)
         assert req.num_frames == 121
         assert req.frame_rate == 24.0
@@ -332,7 +328,7 @@ class TestParameterWiring:
         assert sp.extra_args["audio_length"] == 10.0
 
     @pytest.mark.asyncio
-    async def test_ltx_exact_num_frames_wiring(self, server_and_engine):
+    async def test_exact_num_frames_wiring(self, server_and_engine):
         server, engine = server_and_engine
         req = OpenAICreateAudioGenerateRequest(input="test", num_frames=121, frame_rate=24.0)
         await server.create_audio_generate(req)
@@ -340,6 +336,17 @@ class TestParameterWiring:
         sp = engine.generate.call_args[1]["sampling_params_list"][0]
         assert sp.extra_args["num_frames"] == 121
         assert sp.frame_rate == 24.0
+
+    @pytest.mark.asyncio
+    async def test_audio_length_and_num_frames_are_both_forwarded(self, server_and_engine):
+        server, engine = server_and_engine
+        req = OpenAICreateAudioGenerateRequest(input="test", audio_length=5.0, num_frames=121)
+
+        await server.create_audio_generate(req)
+
+        sp = engine.generate.call_args[1]["sampling_params_list"][0]
+        assert sp.extra_args["audio_length"] == 5.0
+        assert sp.extra_args["num_frames"] == 121
 
     @pytest.mark.asyncio
     async def test_audio_length_default_start(self, server_and_engine):

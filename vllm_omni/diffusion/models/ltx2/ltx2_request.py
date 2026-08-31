@@ -55,6 +55,89 @@ class LTXRequestInputs:
 LTXCheckpointKind = Literal["distilled", "regular"]
 
 
+@dataclass(frozen=True)
+class LTX2AudioResourceLimits:
+    """Deployment bounds applied before LTX text-to-audio allocations."""
+
+    max_duration_seconds: float = 20.1
+    max_latent_frames: int = 512
+
+    @classmethod
+    def from_additional_config(cls, additional_config: Mapping[str, Any] | None) -> LTX2AudioResourceLimits:
+        if additional_config is None:
+            return cls()
+        if not isinstance(additional_config, Mapping):
+            raise TypeError("additional_config must be a mapping or None")
+        if "ltx2_audio_limits" not in additional_config:
+            return cls()
+        raw = additional_config["ltx2_audio_limits"]
+        if not isinstance(raw, Mapping):
+            raise TypeError("additional_config.ltx2_audio_limits must be a mapping")
+
+        unknown = set(raw) - {"max_duration_seconds", "max_latent_frames"}
+        if unknown:
+            names = ", ".join(sorted(str(name) for name in unknown))
+            raise ValueError(f"Unknown LTX2 audio resource limit option(s): {names}")
+
+        max_duration_seconds = raw.get("max_duration_seconds", cls.max_duration_seconds)
+        if isinstance(max_duration_seconds, bool) or not isinstance(max_duration_seconds, (int, float)):
+            raise TypeError("LTX2 audio max_duration_seconds must be a finite and positive number")
+        max_duration_seconds = float(max_duration_seconds)
+        if not math.isfinite(max_duration_seconds) or max_duration_seconds <= 0:
+            raise ValueError("LTX2 audio max_duration_seconds must be a finite and positive number")
+
+        max_latent_frames = raw.get("max_latent_frames", cls.max_latent_frames)
+        if type(max_latent_frames) is not int or max_latent_frames < 1:
+            raise ValueError("LTX2 audio max_latent_frames must be a positive integer")
+        return cls(
+            max_duration_seconds=max_duration_seconds,
+            max_latent_frames=max_latent_frames,
+        )
+
+    def validate_resolved_duration(
+        self,
+        *,
+        num_frames: int,
+        frame_rate: float,
+        expected_frame_rate: float,
+    ) -> float:
+        """Validate the final LTX clock after causal-grid alignment."""
+        if not math.isfinite(frame_rate) or not math.isclose(
+            frame_rate,
+            expected_frame_rate,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise ValueError(f"LTX text-to-audio requires frame_rate={expected_frame_rate:g}, got {frame_rate!r}.")
+        duration_s = num_frames / frame_rate
+        if not math.isfinite(duration_s) or duration_s <= 0:
+            raise ValueError("LTX text-to-audio resolved duration must be finite and positive.")
+
+        if duration_s > self.max_duration_seconds:
+            raise ValueError(
+                "LTX text-to-audio resolved duration exceeds the deployment limit: "
+                f"{duration_s:.6g}s ({num_frames} frames) exceeds "
+                f"max_duration_seconds={self.max_duration_seconds:g}."
+            )
+        return duration_s
+
+    def validate_requested_duration(self, duration_s: float) -> None:
+        if not math.isfinite(duration_s) or duration_s <= 0:
+            raise ValueError("LTX text-to-audio requested duration must be finite and positive.")
+        if duration_s > self.max_duration_seconds:
+            raise ValueError(
+                "LTX text-to-audio requested duration exceeds the deployment limit: "
+                f"got {duration_s:.6g}s, max_duration_seconds={self.max_duration_seconds:g}."
+            )
+
+    def validate_latent_frames(self, latent_frames: int) -> None:
+        if latent_frames < 1 or latent_frames > self.max_latent_frames:
+            raise ValueError(
+                "LTX text-to-audio latent frames are outside the deployment budget: "
+                f"got {latent_frames}, allowed range is 1..{self.max_latent_frames}."
+            )
+
+
 def resolve_ltx_audio_num_frames(
     *,
     audio_length: float | None,
@@ -64,18 +147,23 @@ def resolve_ltx_audio_num_frames(
     temporal_compression_ratio: int = 8,
 ) -> int:
     """Resolve T2A duration onto LTX's causal ``ratio * k + 1`` clock."""
-    if frame_rate <= 0:
-        raise ValueError("LTX text-to-audio `frame_rate` must be positive.")
+    if not math.isfinite(frame_rate) or frame_rate <= 0:
+        raise ValueError("LTX text-to-audio `frame_rate` must be finite and positive.")
     if audio_length is not None and num_frames is not None:
         raise ValueError("`audio_length` and `num_frames` are mutually exclusive.")
     if audio_length is not None:
-        if audio_length <= 0:
-            raise ValueError("LTX text-to-audio `audio_length` must be positive.")
+        if not math.isfinite(audio_length) or audio_length <= 0:
+            raise ValueError("LTX text-to-audio `audio_length` must be finite and positive.")
         target_num_frames = audio_length * frame_rate
+        if not math.isfinite(target_num_frames):
+            raise ValueError("LTX text-to-audio duration clock must be finite.")
         interval_count = max(1, math.ceil((target_num_frames - 1) / temporal_compression_ratio))
         return interval_count * temporal_compression_ratio + 1
 
-    resolved = default_num_frames if num_frames is None else int(num_frames)
+    raw_num_frames = default_num_frames if num_frames is None else num_frames
+    if type(raw_num_frames) is not int:
+        raise ValueError(f"LTX text-to-audio `num_frames` must be an integer, got {raw_num_frames!r}.")
+    resolved = raw_num_frames
     if resolved < 1 or (resolved - 1) % temporal_compression_ratio:
         raise ValueError(
             f"LTX text-to-audio `num_frames` must be {temporal_compression_ratio} * k + 1, got {resolved}."

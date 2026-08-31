@@ -27,7 +27,10 @@ from vllm_omni.diffusion.models.ltx2.ltx2_recipes import (
     LTX25_T2A_RECIPE,
     resolve_ltx_pipeline_recipe,
 )
-from vllm_omni.diffusion.models.ltx2.ltx2_request import resolve_ltx_audio_num_frames
+from vllm_omni.diffusion.models.ltx2.ltx2_request import (
+    LTX2AudioResourceLimits,
+    resolve_ltx_audio_num_frames,
+)
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_audio import LTX2TextToAudioPipeline
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -108,6 +111,35 @@ def test_ltx_t2a_exact_num_frames_overrides_default_duration():
         )
         == 81
     )
+
+
+def test_ltx_t2a_audio_resource_limits_accept_deployment_overrides():
+    limits = LTX2AudioResourceLimits.from_additional_config(
+        {
+            "ltx2_audio_limits": {
+                "max_duration_seconds": 12.5,
+                "max_latent_frames": 320,
+            }
+        }
+    )
+
+    assert limits.max_duration_seconds == 12.5
+    assert limits.max_latent_frames == 320
+
+
+@pytest.mark.parametrize(
+    ("additional_config", "error"),
+    [
+        ({"ltx2_audio_limits": {"max_duration_seconds": float("inf")}}, "finite and positive"),
+        ({"ltx2_audio_limits": {"max_duration_seconds": 0}}, "finite and positive"),
+        ({"ltx2_audio_limits": {"max_latent_frames": 0}}, "positive integer"),
+        ({"ltx2_audio_limits": {"max_latent_frames": 2.5}}, "positive integer"),
+        ({"ltx2_audio_limits": {"unknown": 1}}, "Unknown"),
+    ],
+)
+def test_ltx_t2a_audio_resource_limits_reject_invalid_config(additional_config, error):
+    with pytest.raises((TypeError, ValueError), match=error):
+        LTX2AudioResourceLimits.from_additional_config(additional_config)
 
 
 def test_ltx_t2a_audio_graph_bucket_pads_without_consuming_request_rng():
@@ -191,6 +223,56 @@ def test_ltx_t2a_audio_graph_warms_first_bucket_without_padding(monkeypatch):
     assert inputs.num_frames == 25
 
 
+def test_ltx_t2a_rejects_cuda_graph_bucket_above_duration_limit():
+    pipe = object.__new__(LTXAudioRuntime)
+    torch.nn.Module.__init__(pipe)
+    pipe.pipeline_recipe = SimpleNamespace(frame_rate=24.0, num_frames=121)
+    pipe._audio_cuda_graph_config = SimpleNamespace(audio_length_buckets=(20.11,))
+    pipe._audio_resource_limits = LTX2AudioResourceLimits()
+
+    with pytest.raises(ValueError, match="max_duration_seconds"):
+        pipe._validate_audio_cuda_graph_buckets()
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "num_frames", "frame_rate", "is_dummy", "error"),
+    [
+        ({"audio_length": 5.0, "num_frames": 121}, 1, 24.0, False, "mutually exclusive"),
+        ({"audio_length": 20.11}, 1, 24.0, False, "max_duration_seconds"),
+        ({"audio_length": float("inf")}, 1, 24.0, False, "finite"),
+        ({"num_frames": 4097}, 1, 24.0, False, "duration"),
+        ({}, 9, 1.0, False, "frame_rate=24"),
+        ({}, 4097, 24.0, True, "duration"),
+    ],
+)
+def test_ltx_t2a_production_request_path_rejects_unsafe_shapes(
+    extra_args,
+    num_frames,
+    frame_rate,
+    is_dummy,
+    error,
+):
+    pipe = object.__new__(LTXAudioRuntime)
+    torch.nn.Module.__init__(pipe)
+    pipe.pipeline_recipe = SimpleNamespace(frame_rate=24.0, num_frames=121)
+    pipe._audio_cuda_graph_config = SimpleNamespace(audio_length_buckets=())
+    pipe._audio_resource_limits = LTX2AudioResourceLimits()
+    pipe._reject_video_options = lambda _sampling: None
+    pipe._resolve_request_inputs = lambda *_args, **_kwargs: pytest.fail("unsafe request reached normalization")
+    sampling = SimpleNamespace(
+        extra_args=extra_args,
+        num_frames=num_frames,
+        resolved_frame_rate=frame_rate,
+    )
+    request = SimpleNamespace(
+        sampling_params_list=[sampling],
+        is_dummy_run=lambda: is_dummy,
+    )
+
+    with pytest.raises(ValueError, match=error):
+        pipe._resolve_audio_request_inputs(request)
+
+
 def test_ltx_t2a_audio_graph_bucket_appends_zero_padding():
     pipe = object.__new__(LTXAudioRuntime)
     torch.nn.Module.__init__(pipe)
@@ -224,12 +306,67 @@ def test_ltx_t2a_audio_graph_bucket_appends_zero_padding():
     torch.testing.assert_close(audio_latents[:, 25:], torch.zeros(1, 24, 8))
 
 
+def test_ltx_t2a_rejects_latent_budget_before_allocation():
+    pipe = object.__new__(LTXAudioRuntime)
+    torch.nn.Module.__init__(pipe)
+    pipe.audio_sampling_rate = 100
+    pipe.audio_hop_length = 1
+    pipe.audio_vae_temporal_compression_ratio = 1
+    pipe._audio_resource_limits = LTX2AudioResourceLimits(max_latent_frames=100)
+    pipe.prepare_audio_latents = lambda *_args, **_kwargs: pytest.fail("latent allocation must not run")
+    inputs = SimpleNamespace(num_frames=25, frame_rate=24.0)
+    prompt_context = SimpleNamespace(batch_size=1)
+
+    with pytest.raises(ValueError, match="latent frames"):
+        pipe._prepare_audio_state(inputs, prompt_context)
+
+
+def test_ltx_t2a_rejects_sp_padded_latent_budget_before_allocation():
+    pipe = object.__new__(LTXAudioRuntime)
+    torch.nn.Module.__init__(pipe)
+    pipe.audio_sampling_rate = 96
+    pipe.audio_hop_length = 1
+    pipe.audio_vae_temporal_compression_ratio = 1
+    pipe._audio_resource_limits = LTX2AudioResourceLimits(max_latent_frames=100)
+    pipe.od_config = SimpleNamespace(parallel_config=SimpleNamespace(sequence_parallel_size=8))
+    pipe.prepare_audio_latents = lambda *_args, **_kwargs: pytest.fail("latent allocation must not run")
+    inputs = SimpleNamespace(num_frames=25, frame_rate=24.0)
+    prompt_context = SimpleNamespace(batch_size=1)
+
+    with pytest.raises(ValueError, match="latent frames"):
+        pipe._prepare_audio_state(inputs, prompt_context)
+
+
+def test_ltx_t2a_rejects_bucket_latent_budget_before_allocation():
+    pipe = object.__new__(LTXAudioRuntime)
+    torch.nn.Module.__init__(pipe)
+    pipe.audio_sampling_rate = 100
+    pipe.audio_hop_length = 1
+    pipe.audio_vae_temporal_compression_ratio = 1
+    pipe.pipeline_recipe = SimpleNamespace(num_frames=121, phases=(SimpleNamespace(noise_scale=1.0),))
+    pipe._audio_cuda_graph_config = SimpleNamespace(audio_length_buckets=(2.0,))
+    pipe._audio_resource_limits = LTX2AudioResourceLimits(max_latent_frames=150)
+    pipe.prepare_audio_latents = lambda *_args, **_kwargs: pytest.fail("latent allocation must not run")
+    inputs = SimpleNamespace(num_frames=25, frame_rate=24.0)
+    prompt_context = SimpleNamespace(batch_size=1)
+
+    with pytest.raises(ValueError, match="latent frames"):
+        pipe._prepare_audio_state(inputs, prompt_context)
+
+
 @pytest.mark.parametrize(
     ("audio_length", "num_frames", "frame_rate", "error"),
     [
         (1.0, 25, 24.0, "mutually exclusive"),
         (0.0, None, 24.0, "positive"),
         (1.0, None, 0.0, "frame_rate"),
+        (1.0, None, float("inf"), "finite"),
+        (float("nan"), None, 24.0, "finite"),
+        (None, 25.5, 24.0, "integer"),
+        (None, "25", 24.0, "integer"),
+        (None, True, 24.0, "integer"),
+        (None, float("nan"), 24.0, "integer"),
+        (None, float("inf"), 24.0, "integer"),
         (None, 24, 24.0, "8 \\* k \\+ 1"),
     ],
 )
@@ -241,6 +378,68 @@ def test_ltx_t2a_rejects_invalid_duration_inputs(audio_length, num_frames, frame
             frame_rate=frame_rate,
             default_num_frames=121,
         )
+
+
+@pytest.mark.parametrize(
+    ("num_frames", "frame_rate", "error"),
+    [
+        (9, 1.0, "frame_rate=24"),
+        (4097, 24.0, "duration"),
+    ],
+)
+def test_ltx_t2a_runtime_rejects_unsafe_resolved_duration(num_frames, frame_rate, error):
+    limits = LTX2AudioResourceLimits()
+
+    with pytest.raises(ValueError, match=error):
+        limits.validate_resolved_duration(
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            expected_frame_rate=24.0,
+        )
+
+
+def test_ltx_t2a_runtime_rejects_requested_duration_above_limit():
+    with pytest.raises(ValueError, match="max_duration_seconds"):
+        LTX2AudioResourceLimits().validate_requested_duration(20.11)
+
+
+def test_ltx_t2a_duration_limit_below_minimum_clock_rejects_minimum_shape():
+    with pytest.raises(ValueError, match="max_duration_seconds"):
+        LTX2AudioResourceLimits(max_duration_seconds=0.1).validate_resolved_duration(
+            num_frames=9,
+            frame_rate=24.0,
+            expected_frame_rate=24.0,
+        )
+
+
+def test_ltx_t2a_default_resource_limits_accept_twenty_second_boundary():
+    limits = LTX2AudioResourceLimits()
+    num_frames = resolve_ltx_audio_num_frames(
+        audio_length=20.0,
+        num_frames=None,
+        frame_rate=24.0,
+        default_num_frames=121,
+    )
+
+    limits.validate_requested_duration(20.0)
+    limits.validate_resolved_duration(
+        num_frames=num_frames,
+        frame_rate=24.0,
+        expected_frame_rate=24.0,
+    )
+    limits.validate_latent_frames(512)
+    with pytest.raises(ValueError, match="max_duration_seconds"):
+        limits.validate_resolved_duration(
+            num_frames=num_frames + 8,
+            frame_rate=24.0,
+            expected_frame_rate=24.0,
+        )
+
+
+@pytest.mark.parametrize("latent_frames", [0, 513])
+def test_ltx_t2a_runtime_rejects_latent_shape_outside_budget(latent_frames):
+    with pytest.raises(ValueError, match="latent frames"):
+        LTX2AudioResourceLimits().validate_latent_frames(latent_frames)
 
 
 def test_ltx_t2a_checkpoint_metadata_selects_profile(tmp_path, monkeypatch):

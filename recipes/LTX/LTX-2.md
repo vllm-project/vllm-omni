@@ -326,6 +326,22 @@ bundled offline CLI do not currently expose `sigmas`.
 
 ### Constraints
 
+- Text-to-audio uses the recipe clock rate of 24 FPS. Requests that override
+  `frame_rate` are rejected. Effective duration is limited to 20.1 seconds and the
+  causal-aligned allocation to 512 audio latent frames by default, before any
+  latent allocation. Deployments may lower or raise those bounds explicitly:
+
+  ```yaml
+  additional_config:
+    ltx2_audio_limits:
+      max_duration_seconds: 20.1
+      max_latent_frames: 512
+  ```
+
+  CUDA Graph `audio_length_buckets` are checked against the same limits, including
+  dummy warmup. In the OpenAI audio endpoint, `audio_length` is the LTX duration;
+  `audio_start`/`audio_end_in_s` remain compatibility fields for other audio
+  pipelines and do not offset an LTX generation.
 - LTX rejects non-default `timesteps`, `flow_shift`, `guidance_rescale`,
   `noise_scale`, `attention_kwargs`, and `return_dict=False`. Use final
   `sigmas`, modality rescale fields, startup attention configuration, and the

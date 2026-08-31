@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 from collections.abc import Iterable
 from contextlib import nullcontext
@@ -68,6 +69,7 @@ from .ltx2_guidance import (
 )
 from .ltx2_recipes import LTXPipelineRecipe, resolve_ltx_pipeline_recipe
 from .ltx2_request import (
+    LTX2AudioResourceLimits,
     LTXRequestMixin,
     resolve_ltx_audio_num_frames,
     validate_ltx_checkpoint,
@@ -250,6 +252,7 @@ class LTXAudioRuntime(
     dummy_run_num_frames: ClassVar[int] = 9
     connector_batches_cfg = False
     preserve_sp_padded_audio_duration = True
+    _default_audio_resource_limits: ClassVar[LTX2AudioResourceLimits] = LTX2AudioResourceLimits()
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         del prefix
@@ -257,9 +260,9 @@ class LTXAudioRuntime(
         if getattr(parallel_config, "ulysses_mode", "strict") == "advanced_uaa":
             raise ValueError(f"{type(self).__name__} does not support ulysses_mode='advanced_uaa'; use 'strict'.")
 
-        self._audio_cuda_graph_config = LTX2AudioCUDAGraphConfig.from_additional_config(
-            getattr(od_config, "additional_config", None)
-        )
+        additional_config = getattr(od_config, "additional_config", None)
+        self._audio_cuda_graph_config = LTX2AudioCUDAGraphConfig.from_additional_config(additional_config)
+        self._audio_resource_limits = LTX2AudioResourceLimits.from_additional_config(additional_config)
         cache_backend = getattr(od_config, "cache_backend", "none")
         if cache_backend not in (None, "", "none", "cache_dit"):
             raise ValueError(f"{type(self).__name__} does not support cache_backend={cache_backend!r}.")
@@ -275,6 +278,7 @@ class LTXAudioRuntime(
 
         self.component_profile = resolve_ltx_component_profile(self.pipeline_kind, self.model_version)
         self.pipeline_recipe = resolve_ltx_pipeline_recipe(self.pipeline_kind, self.model_version)
+        self._validate_audio_cuda_graph_buckets()
         if cache_backend == "cache_dit" and not self.pipeline_recipe.supports_cache_dit:
             raise ValueError(
                 f"{type(self).__name__} does not support cache_backend='cache_dit'. "
@@ -299,6 +303,21 @@ class LTXAudioRuntime(
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=getattr(od_config, "enable_diffusion_pipeline_profiler", False)
         )
+
+    def _validate_audio_cuda_graph_buckets(self) -> None:
+        for bucket_seconds in self._audio_cuda_graph_config.audio_length_buckets:
+            self._audio_resource_limits.validate_requested_duration(bucket_seconds)
+            bucket_num_frames = resolve_ltx_audio_num_frames(
+                audio_length=bucket_seconds,
+                num_frames=None,
+                frame_rate=self.pipeline_recipe.frame_rate,
+                default_num_frames=self.pipeline_recipe.num_frames,
+            )
+            self._audio_resource_limits.validate_resolved_duration(
+                num_frames=bucket_num_frames,
+                frame_rate=self.pipeline_recipe.frame_rate,
+                expected_frame_rate=self.pipeline_recipe.frame_rate,
+            )
 
     @staticmethod
     def _validate_audio_cuda_graph_support(od_config: OmniDiffusionConfig, device: torch.device) -> None:
@@ -414,18 +433,28 @@ class LTXAudioRuntime(
         exact_num_frames = extra.get("num_frames")
         if exact_num_frames is None and sampling.num_frames not in (None, 1):
             exact_num_frames = sampling.num_frames
-        frame_rate = float(sampling.resolved_frame_rate or self.pipeline_recipe.frame_rate)
+        requested_frame_rate = sampling.resolved_frame_rate
+        frame_rate = float(self.pipeline_recipe.frame_rate if requested_frame_rate is None else requested_frame_rate)
         if req.is_dummy_run() and self._audio_cuda_graph_config.audio_length_buckets:
             # Warm the first configured graph shape directly.  Padding the
             # minimal dummy shape would capture the attention-mask branch,
             # while an exact-length request normally uses the unmasked branch.
             audio_length = self._audio_cuda_graph_config.audio_length_buckets[0]
             exact_num_frames = None
+        limits = getattr(self, "_audio_resource_limits", self._default_audio_resource_limits)
+        if audio_length is not None:
+            audio_length = float(audio_length)
+            limits.validate_requested_duration(audio_length)
         resolved_num_frames = resolve_ltx_audio_num_frames(
-            audio_length=None if audio_length is None else float(audio_length),
+            audio_length=audio_length,
             num_frames=exact_num_frames,
             frame_rate=frame_rate,
             default_num_frames=self.pipeline_recipe.num_frames,
+        )
+        limits.validate_resolved_duration(
+            num_frames=resolved_num_frames,
+            frame_rate=frame_rate,
+            expected_frame_rate=self.pipeline_recipe.frame_rate,
         )
 
         inputs = self._resolve_request_inputs(
@@ -498,9 +527,39 @@ class LTXAudioRuntime(
         )
 
     def _prepare_audio_state(self, inputs, prompt_context):
-        duration_s = inputs.num_frames / inputs.frame_rate
+        limits = getattr(self, "_audio_resource_limits", self._default_audio_resource_limits)
+        expected_frame_rate = getattr(getattr(self, "pipeline_recipe", None), "frame_rate", 24.0)
+        duration_s = limits.validate_resolved_duration(
+            num_frames=inputs.num_frames,
+            frame_rate=inputs.frame_rate,
+            expected_frame_rate=expected_frame_rate,
+        )
         latent_rate = self.audio_sampling_rate / self.audio_hop_length / self.audio_vae_temporal_compression_ratio
-        requested_frames = round(duration_s * latent_rate)
+        if not math.isfinite(latent_rate) or latent_rate <= 0:
+            raise ValueError(f"LTX text-to-audio latent rate must be finite and positive, got {latent_rate!r}.")
+        requested_frames_float = duration_s * latent_rate
+        if not math.isfinite(requested_frames_float):
+            raise ValueError("LTX text-to-audio derived latent frame count must be finite.")
+        requested_frames = round(requested_frames_float)
+        limits.validate_latent_frames(requested_frames)
+        parallel_config = getattr(getattr(self, "od_config", None), "parallel_config", None)
+        sp_size = int(getattr(parallel_config, "sequence_parallel_size", 1) or 1)
+        limits.validate_latent_frames(latent_ops.get_sp_padded_audio_latent_length(requested_frames, sp_size))
+        bucket_audio_frames_list = []
+        for bucket_seconds in self._audio_cuda_graph_config.audio_length_buckets:
+            bucket_num_frames = resolve_ltx_audio_num_frames(
+                audio_length=bucket_seconds,
+                num_frames=None,
+                frame_rate=inputs.frame_rate,
+                default_num_frames=self.pipeline_recipe.num_frames,
+            )
+            bucket_duration_s = bucket_num_frames / inputs.frame_rate
+            bucket_audio_frames_float = bucket_duration_s * latent_rate
+            if not math.isfinite(bucket_audio_frames_float):
+                raise ValueError("LTX text-to-audio bucket latent frame count must be finite.")
+            bucket_audio_frames = round(bucket_audio_frames_float)
+            limits.validate_latent_frames(bucket_audio_frames)
+            bucket_audio_frames_list.append(bucket_audio_frames)
         num_mel_bins = self.audio_vae.config.mel_bins
         latent_mel_bins = num_mel_bins // self.audio_vae_mel_compression_ratio
         audio_latents, original_frames, padded_frames = self.prepare_audio_latents(
@@ -514,15 +573,7 @@ class LTXAudioRuntime(
             generator=inputs.generator,
             latents=inputs.audio_latents,
         )
-        for bucket_seconds in self._audio_cuda_graph_config.audio_length_buckets:
-            bucket_num_frames = resolve_ltx_audio_num_frames(
-                audio_length=bucket_seconds,
-                num_frames=None,
-                frame_rate=inputs.frame_rate,
-                default_num_frames=self.pipeline_recipe.num_frames,
-            )
-            bucket_duration_s = bucket_num_frames / inputs.frame_rate
-            bucket_audio_frames = round(bucket_duration_s * latent_rate)
+        for bucket_audio_frames in bucket_audio_frames_list:
             if bucket_audio_frames < original_frames:
                 continue
             if bucket_audio_frames > padded_frames:
