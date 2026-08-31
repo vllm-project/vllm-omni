@@ -11,7 +11,7 @@ from pathlib import Path
 
 import torch
 
-from vllm_omni.diffusion.pid.config import PID_CHECKPOINT_REGISTRY, _PID_HF_REPO
+from vllm_omni.diffusion.pid.config import _PID_HF_REPO, PID_CHECKPOINT_REGISTRY
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -37,7 +37,6 @@ def resolve_pid_checkpoint_path(
     checkpoint_path: str | None,
     backbone: str | None = None,
 ) -> str:
-
     if checkpoint_path:
         if Path(checkpoint_path).is_file():
             return checkpoint_path
@@ -47,21 +46,19 @@ def resolve_pid_checkpoint_path(
             filename = "/".join(parts[2:])
             return _download_pid_file(repo_id, filename)
         raise ValueError(
-            "pid_checkpoint must be a local .pth path or an HF reference "
-            "'<repo_id>/<subfolder>/<file>' (got %r)" % (checkpoint_path,)
+            f"pid_checkpoint must be a local .pth path or an HF reference "
+            f"'<repo_id>/<subfolder>/<file>' (got {checkpoint_path!r})"
         )
 
     if backbone is None:
         raise ValueError(
-            "No --pid-checkpoint configured and no backbone given to "
-            "auto-select a default PiD checkpoint."
+            "No --pid-checkpoint configured and no backbone given to auto-select a default PiD checkpoint."
         )
     try:
         _, in_repo_path, _ = PID_CHECKPOINT_REGISTRY[backbone]
     except KeyError:
         raise ValueError(
-            "No default PiD checkpoint registered for backbone %r; "
-            "set --pid-checkpoint explicitly." % (backbone,)
+            f"No default PiD checkpoint registered for backbone {backbone!r}; set --pid-checkpoint explicitly."
         ) from None
     return _download_pid_file(_PID_HF_REPO, in_repo_path)
 

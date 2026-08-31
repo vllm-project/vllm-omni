@@ -62,13 +62,18 @@ _SHARED_PID_SR = dict(
 )
 
 
-def _make_net_config(lq_latent_channels: int, latent_spatial_down_factor: int) -> dict:
+def _make_net_config(
+    lq_latent_channels: int,
+    latent_spatial_down_factor: int,
+    lq_latent_unpatchify_factor: int = 1,
+) -> dict:
     """Build a complete net config for a given VAE."""
     cfg = dict(_SHARED_BACKBONE)
     cfg.update(_SHARED_PID_SR)
     cfg.update(
         lq_latent_channels=lq_latent_channels,
         latent_spatial_down_factor=latent_spatial_down_factor,
+        lq_latent_unpatchify_factor=lq_latent_unpatchify_factor,
     )
     return cfg
 
@@ -81,7 +86,9 @@ QWENIMAGE_PID_NET_CONFIG = _make_net_config(lq_latent_channels=16, latent_spatia
 FLUX_PID_NET_CONFIG = _make_net_config(lq_latent_channels=16, latent_spatial_down_factor=8)
 SD3_PID_NET_CONFIG = _make_net_config(lq_latent_channels=16, latent_spatial_down_factor=8)
 SDXL_PID_NET_CONFIG = _make_net_config(lq_latent_channels=4, latent_spatial_down_factor=8)
-FLUX2_PID_NET_CONFIG = _make_net_config(lq_latent_channels=128, latent_spatial_down_factor=16)
+FLUX2_PID_NET_CONFIG = _make_net_config(
+    lq_latent_channels=128, latent_spatial_down_factor=16, lq_latent_unpatchify_factor=2
+)
 
 # ---------------------------------------------------------------------------
 # Sampling config (shared across all distill checkpoints)

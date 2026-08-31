@@ -7,6 +7,8 @@
 
 import torch
 
+from vllm_omni.diffusion.distributed.sp_sharding import sp_shard
+
 from .lq_projection_2d import LQProjection2D, _build_gate
 from .pixeldit import PixDiT_T2I
 
@@ -220,9 +222,20 @@ class PidNet(PixDiT_T2I):
             lq_outputs = self._compute_lq_features(lq_video_or_image, lq_latent, lq_mask, Hs, Ws)
             lq_features, pit_lq_feature = self._split_lq_outputs(lq_outputs)
 
-        # Patch tokens
-        pos = self.fetch_pos(Hs, Ws, x.device)
-        x_patches = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
+        # Sequence-parallel shard boundary: patch tokens, pixel tokens and the
+        # image-stream RoPE are produced together so the post-forward hook can
+        # shard them along L and keep tokens/freqs aligned.
+        x_patches, x_pixels, pos = self.pid_prepare(
+            x, H, W, Hs, Ws, self.patch_size, self.pixel_embedder, self.fetch_pos
+        )
+        L_local = x_patches.shape[1]
+
+        # Under SP the LQ patch-token features must be sharded to match the
+        # sharded s_main consumed by the controlnet-style gates below.
+        if self._sp_active() and lq_features is not None:
+            lq_features = [sp_shard(f, dim=1) for f in lq_features]
+            if pit_lq_feature is not None:
+                pit_lq_feature = sp_shard(pit_lq_feature, dim=1)
 
         t_emb = self.t_embedder(t.view(-1)).view(B, -1, self.hidden_size)
 
@@ -255,13 +268,13 @@ class PidNet(PixDiT_T2I):
             s_main = s0
             attn_mask_joint = None
             if pad is not None:
-                pad_img = torch.zeros((B, L), dtype=torch.bool, device=x.device)
+                pad_img = torch.zeros((B, L_local), dtype=torch.bool, device=x.device)
                 pad_txt = (
                     pad[:, :Ltxt]
                     if pad.size(1) >= Ltxt
                     else torch.nn.functional.pad(pad, (0, Ltxt - pad.size(1)), value=True)
                 )
-                attn_mask_joint = torch.cat([pad_txt, pad_img], dim=1).view(B, 1, 1, Ltxt + L)
+                attn_mask_joint = torch.cat([pad_txt, pad_img], dim=1).view(B, 1, 1, Ltxt + L_local)
 
             s_main, y_emb = self._run_patch_blocks(
                 s_main,
@@ -279,25 +292,27 @@ class PidNet(PixDiT_T2I):
         if not (0 < self.repa_encoder_index <= self.patch_depth):
             self.last_repa_tokens = s
 
-        # Ensure patch token length matches the spatial grid L
+        # Ensure patch token length matches the (sharded) local grid
         batch_size, length, _ = s.shape
-        if length != L:
-            if length > L:
-                s = s[:, :L, :]
+        if length != L_local:
+            if length > L_local:
+                s = s[:, :L_local, :]
             else:
-                pad_len = L - length
+                pad_len = L_local - length
                 s = torch.cat([s, s.new_zeros(B, pad_len, s.shape[2])], dim=1)
 
-        # Pixel pathway with optional PiT LQ injection
+        # Pixel pathway with optional PiT LQ injection (x_pixels already came
+        # from pid_prepare; under SP it is sharded along B*L so the local patch
+        # count is forwarded to PiTBlock)
         s_cond_tokens = s
         if self.pit_lq_inject and pit_lq_feature is not None:
             s_cond_tokens = self.pit_lq_gate(s_cond_tokens, pit_lq_feature, sigma=degrade_sigma)
-        s_cond = s_cond_tokens.reshape(B * L, self.hidden_size)
+        s_cond = s_cond_tokens.reshape(B * L_local, self.hidden_size)
 
-        x_pixels = self.pixel_embedder(x, img_height=H, img_width=W, patch_size=self.patch_size)
         for blk in self.pixel_blocks:
-            x_pixels = blk(x_pixels, s_cond, H, W, self.patch_size, mask)
+            x_pixels = blk(x_pixels, s_cond, H, W, self.patch_size, mask, patch_count=L_local)
 
+        # The final_layer gather hook restores the full patch count (L) first.
         x_pixels = self.final_layer(x_pixels)  # [B*L, P², C_out]
         C_out = self.out_channels
         P2 = self.patch_size * self.patch_size

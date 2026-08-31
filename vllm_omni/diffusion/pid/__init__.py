@@ -20,8 +20,16 @@ from .config import (
     get_pid_sampling_config,
 )
 from .decoder import PidDecodeConfig, PidDecoder
-from .mixin import PidDecodeMixin
+from .latent_forms import LATENT_FORMS, LatentForm, lookup_latent_form
 from .pid_model import PidInferenceModel
+from .runner_integration import (
+    PidPassthrough,
+    decode_stepwise_output,
+    decode_with_pid,
+    init_pid_decoder_on,
+    maybe_pid_passthrough,
+    stepwise_pid_active,
+)
 
 __all__ = [
     "PidInferenceModel",
@@ -30,7 +38,15 @@ __all__ = [
     "PidSamplingConfig",
     "PidDecodeConfig",
     "PidDecoder",
-    "PidDecodeMixin",
+    "LatentForm",
+    "LATENT_FORMS",
+    "lookup_latent_form",
+    "init_pid_decoder_on",
+    "decode_with_pid",
+    "maybe_pid_passthrough",
+    "PidPassthrough",
+    "stepwise_pid_active",
+    "decode_stepwise_output",
     "QWENIMAGE_PID_NET_CONFIG",
     "FLUX_PID_NET_CONFIG",
     "SD3_PID_NET_CONFIG",

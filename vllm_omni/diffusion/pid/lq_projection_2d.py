@@ -327,6 +327,20 @@ class LQProjection2D(nn.Module):
 
         Returns [B, effective_latent_channels_or_folded, ph, pw].
         """
+        # Fold patchified latent channels back to spatial dims first (e.g.
+        # Flux2 BN-normalized latents: [B, 128, H/16, W/16] -> [B, 32, H/8,
+        # W/8], no BN inverse normalization).  Mirrors Flux2Pipeline
+        # ._unpatchify_latents and must match the conv in-channels derived in
+        # __init__ from latent_unpatchify_factor.
+        if self.latent_unpatchify_factor > 1:
+            f = self.latent_unpatchify_factor
+            B_, C_patch, H, W = lq_latent.shape
+            lq_latent = (
+                lq_latent.reshape(B_, C_patch // (f * f), f, f, H, W)
+                .permute(0, 1, 4, 2, 5, 3)
+                .reshape(B_, C_patch // (f * f), H * f, W * f)
+            )
+
         B, z_dim = lq_latent.shape[:2]
 
         if self.z_to_patch_ratio > 1:
@@ -401,4 +415,3 @@ class LQProjection2D(nn.Module):
         if self.pit_head is not None:
             outputs.append(self.pit_head(tokens))
         return outputs
-
