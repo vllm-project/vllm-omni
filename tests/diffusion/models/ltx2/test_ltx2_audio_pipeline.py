@@ -4,6 +4,7 @@
 """Unit tests for the unified LTX text-to-audio pipeline."""
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -47,6 +48,7 @@ def test_ltx_t2a_uses_one_pipeline_with_version_specific_full_profiles(version, 
     assert profile.dit_modules == ("transformer",)
     assert profile.vae_modules == ("audio_vae",)
     assert "vae" not in profile.vae_modules
+    assert recipe.supports_cache_dit
     assert recipe.request_guidance.audio.modality_scale == 1.0
     assert LTXGuidancePlan.build(recipe.request_guidance).names == ("cond", "uncond", "ptb")
 
@@ -266,6 +268,32 @@ def test_ltx_t2a_checkpoint_metadata_selects_profile(tmp_path, monkeypatch):
     assert pipe.component_profile is LTX25_T2A_COMPONENT_PROFILE
     assert pipe.pipeline_recipe is LTX25_T2A_RECIPE
     assert pipe.audio_graph_runner is None
+
+
+def test_ltx_t2a_rejects_cache_dit_for_unqualified_recipe(tmp_path, monkeypatch):
+    from vllm_omni.diffusion.models.ltx2 import ltx2_audio_runtime
+
+    (tmp_path / "model_index.json").write_text(json.dumps({"model_version": "2.5"}))
+
+    def stub_components(pipe, od_config):
+        pipe.od_config = od_config
+        pipe.device = torch.device("cpu")
+
+    unsupported_recipe = replace(LTX25_T2A_RECIPE, supports_cache_dit=False)
+    monkeypatch.setattr(ltx2_audio_runtime, "resolve_ltx_pipeline_recipe", lambda *_args: unsupported_recipe)
+    monkeypatch.setattr(ltx2_audio_runtime, "initialize_audio_pipeline_components", stub_components)
+    monkeypatch.setattr(LTX2TextToAudioPipeline, "setup_diffusion_pipeline_profiler", lambda *_args, **_kwargs: None)
+
+    od_config = SimpleNamespace(
+        model=str(tmp_path),
+        revision=None,
+        parallel_config=SimpleNamespace(ulysses_mode="strict"),
+        cache_backend="cache_dit",
+        enable_diffusion_pipeline_profiler=False,
+    )
+
+    with pytest.raises(ValueError, match="Cache-DiT is not qualified for this LTX recipe"):
+        LTX2TextToAudioPipeline(od_config=od_config)
 
 
 def test_ltx_t2a_rejects_cache_dit_with_manual_cuda_graph():

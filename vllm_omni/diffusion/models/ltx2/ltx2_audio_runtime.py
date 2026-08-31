@@ -275,6 +275,11 @@ class LTXAudioRuntime(
 
         self.component_profile = resolve_ltx_component_profile(self.pipeline_kind, self.model_version)
         self.pipeline_recipe = resolve_ltx_pipeline_recipe(self.pipeline_kind, self.model_version)
+        if cache_backend == "cache_dit" and not self.pipeline_recipe.supports_cache_dit:
+            raise ValueError(
+                f"{type(self).__name__} does not support cache_backend='cache_dit'. "
+                "Cache-DiT is not qualified for this LTX recipe."
+            )
         self._dit_modules = list(self.component_profile.dit_modules)
         self._encoder_modules = list(self.component_profile.encoder_modules)
         self._vae_modules = list(self.component_profile.vae_modules)

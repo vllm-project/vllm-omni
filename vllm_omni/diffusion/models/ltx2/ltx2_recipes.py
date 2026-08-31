@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Declarative execution recipes for the LTX model family."""
 
@@ -155,13 +155,16 @@ LTX25_FULL_RECIPE = LTXPipelineRecipe(
     ),
 )
 LTX2_T2A_RECIPE = LTXPipelineRecipe(
+    supports_cache_dit=True,
     phases=(LTXPhaseRecipe(name="generate_audio", guidance=_official_audio_only_guidance(29)),),
 )
 LTX23_T2A_RECIPE = LTXPipelineRecipe(
+    supports_cache_dit=True,
     num_inference_steps=30,
     phases=(LTXPhaseRecipe(name="generate_audio", guidance=_official_audio_only_guidance(28)),),
 )
 LTX25_T2A_RECIPE = LTXPipelineRecipe(
+    supports_cache_dit=True,
     num_inference_steps=30,
     negative_prompt=LTX25_DEFAULT_NEGATIVE_PROMPT,
     phases=(LTXPhaseRecipe(name="generate_audio", guidance=_official_audio_only_guidance(28), noise_scale=1.0),),
