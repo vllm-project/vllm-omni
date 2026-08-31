@@ -187,7 +187,12 @@ class OmniBase(PDDisaggregationMixin):
         # override the deploy YAML's ``async_chunk: true`` default.
         async_chunk = kwargs.get("async_chunk")
         output_modalities = kwargs.pop("output_modalities", None)
-        diffusion_batch_size: int = kwargs.pop("diffusion_batch_size", 1)
+        # Stage init overwrites ``od_config.max_num_seqs`` with this value.
+        # ``vllm serve --omni --max-num-seqs N`` is the documented request-batch
+        # knob; use it when ``diffusion_batch_size`` is not passed explicitly.
+        explicit_batch = kwargs.pop("diffusion_batch_size", None)
+        max_num_seqs = kwargs.get("max_num_seqs") or 1
+        diffusion_batch_size = int(explicit_batch if explicit_batch is not None else max_num_seqs)
 
         if "log_requests" in kwargs:
             raise TypeError("`log_requests` has been removed in Omni/AsyncOmni. Use `log_stats`.")
