@@ -41,6 +41,13 @@ def enable_hunyuan_image3_teacache(pipeline: Any, config: DiffusionCacheConfig) 
 def enable_bagel_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
     """
     Enable TeaCache for Bagel model.
+
+    Bagel is an LLM + KV-cache model whose multi-branch CFG fan-out and the
+    ``_combine_cfg`` step both live *inside* ``Bagel.forward``.  The generic
+    hidden-residual hook replaces that forward with a single conditional-only
+    pass, silently dropping CFG and degrading prompt adherence.  Like
+    HunyuanImage3, we therefore attach the config and let the denoise path
+    cache per-branch velocities directly while always running ``_combine_cfg``.
     """
     teacache_config = TeaCacheConfig(
         transformer_type="Bagel",
@@ -48,11 +55,11 @@ def enable_bagel_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
         coefficients=config.coefficients,
     )
     transformer = pipeline.bagel
-    apply_teacache_hook(transformer, teacache_config)
+    transformer._tea_cache_config = teacache_config
     pipeline.transformer = transformer
 
     logger.info(
-        f"TeaCache applied with rel_l1_thresh={teacache_config.rel_l1_thresh}, "
+        f"TeaCache applied (direct, CFG-preserving) with rel_l1_thresh={teacache_config.rel_l1_thresh}, "
         f"transformer_class={teacache_config.transformer_type}"
     )
 

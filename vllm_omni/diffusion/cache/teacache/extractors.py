@@ -314,7 +314,18 @@ def extract_bagel_context(
     **kwargs: Any,
 ) -> CacheContext:
     """
-    Extract cache context for Bagel model.
+    Extract a *conditional-only* cache context for the Bagel model.
+
+    .. warning::
+        This runs a single conditional branch and does **not** perform the
+        multi-branch CFG fan-out or ``_combine_cfg`` that ``Bagel.forward``
+        does.  It must NOT be used as the inference caching path: wrapping
+        ``Bagel.forward`` with the generic hidden-residual hook via this
+        extractor silently drops CFG and degrades quality.  Inference caching
+        for Bagel goes through ``enable_bagel_teacache`` (direct, CFG-preserving
+        caching inside the denoise loop).  This extractor is retained only for
+        the offline coefficient calibrator (``coefficient_estimator.BagelAdapter``),
+        which probes single-branch behaviour by design.
 
     Args:
         module: Bagel instance
@@ -332,7 +343,6 @@ def extract_bagel_context(
     Returns:
         CacheContext with all information needed for generic caching
     """
-
     # 1. Embed text
     packed_text_embedding = module.language_model.model.embed_tokens(packed_text_ids)
     packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), module.hidden_size))
