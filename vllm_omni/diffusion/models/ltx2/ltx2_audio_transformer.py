@@ -60,14 +60,12 @@ class LTX2AudioTransformerBlock(nn.Module):
         eps: float = 1e-6,
         elementwise_affine: bool = False,
         rope_type: str = "interleaved",
-        perturbed_attn: bool = False,
         audio_ff_bias: bool = True,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.audio_cross_attn_adaln = audio_cross_attn_adaln
-        self.perturbed_attn = perturbed_attn
 
         self.audio_norm1 = _make_rms_norm(audio_dim, eps=eps, elementwise_affine=elementwise_affine)
         self.audio_attn1 = LTX2Attention(
@@ -274,7 +272,9 @@ class LTX2AudioTransformerModel(nn.Module):
             use_prompt_adaln_single=use_prompt_adaln_single,
         )
         self.prompt_modulation = audio_cross_attn_mod
-        self.perturbed_attn = perturbed_attn
+        # Kept in the model signature for compatibility with existing LTX
+        # configs. Perturbation is selected per forward via attention_kwargs.
+        del perturbed_attn
 
         self.audio_proj_in = nn.Linear(audio_in_channels, audio_inner_dim)
         if use_prompt_embeddings:
@@ -326,7 +326,6 @@ class LTX2AudioTransformerModel(nn.Module):
                     eps=norm_eps,
                     elementwise_affine=norm_elementwise_affine,
                     rope_type=rope_type,
-                    perturbed_attn=perturbed_attn,
                     audio_ff_bias=audio_ff_bias,
                     quant_config=quant_config,
                     prefix=f"transformer_blocks.{index}",
