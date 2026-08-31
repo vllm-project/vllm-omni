@@ -2363,6 +2363,21 @@ class TestBaseConfigInheritance:
         # CI overrides max_tokens
         assert s0["max_tokens"] == 150
 
+    def test_qwen3_omni_colocate_async_bounds_only_rocm_kv_cache(self):
+        ci_path = Path(get_deploy_config_path("ci/qwen3_omni_moe_colocate_async.yaml"))
+        pipeline = resolve_pipeline_config("qwen3_omni_moe_thinker_only")
+        assert isinstance(pipeline, PipelineConfig)
+
+        cuda = _apply_platform_overrides(load_deploy_config(ci_path), platform="cuda")
+        cuda_stage = merge_pipeline_deploy(pipeline, cuda)[0]
+        assert cuda_stage.yaml_engine_args["gpu_memory_utilization"] == 0.9
+        assert "kv_cache_memory_bytes" not in cuda_stage.yaml_engine_args
+
+        rocm = _apply_platform_overrides(load_deploy_config(ci_path), platform="rocm")
+        rocm_stage = merge_pipeline_deploy(pipeline, rocm)[0]
+        assert "gpu_memory_utilization" not in rocm_stage.yaml_engine_args
+        assert rocm_stage.yaml_engine_args["kv_cache_memory_bytes"] == 2 * 1024**3
+
     def test_pure_inheritance_overlay(self, tmp_path):
         """An overlay with only ``base_config`` inherits everything."""
         base = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
