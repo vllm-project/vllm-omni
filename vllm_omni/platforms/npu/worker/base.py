@@ -3,6 +3,7 @@
 
 """Base NPU worker class for vLLM-Omni with OmniProfiler support."""
 
+import logging
 import time
 
 from vllm_omni.platforms.npu._310p import is_310p
@@ -11,6 +12,8 @@ if is_310p():
     from vllm_ascend._310p.worker_310p import NPUWorker310 as NPUWorker
 else:
     from vllm_ascend.worker.worker import NPUWorker
+
+_NPU_WORKER_LOGGER = logging.getLogger(NPUWorker.__module__)
 
 
 class OmniNPUWorkerBase(NPUWorker):
@@ -35,6 +38,19 @@ class OmniNPUWorkerBase(NPUWorker):
                 worker_name=worker_name,
                 local_rank=self.local_rank,
             )
+
+    def profile_memory(self) -> None:
+        """Walk the NPU caching allocator only when someone will read the result.
+
+        ``NPUWorker.profile_memory`` samples ``torch.npu.memory_reserved`` and
+        ``memory_allocated`` on every ``execute_model`` call, and the values it
+        collects are consumed by nothing but its own DEBUG log line. Skip the
+        walk while the vLLM-Ascend worker logger is above DEBUG, and keep the
+        original diagnostics exactly as they were once it is turned on.
+        """
+        if not _NPU_WORKER_LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        super().profile_memory()
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         """Override to set trace filename before starting the profiler.
