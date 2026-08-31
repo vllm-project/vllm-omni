@@ -484,3 +484,108 @@ def _patch_cumem_free_callback_cuda() -> None:
 
 
 _patch_cumem_free_callback_cuda()
+
+
+def _patch_registry_inspection_trusts_its_output() -> None:
+    """Accept a model-info child that produced its result and then died.
+
+    vLLM inspects each model architecture in a subprocess: the child pickles its
+    ``_ModelInfo`` to a file and only *then* exits, and the parent calls
+    ``check_returncode()`` before reading it. So a process that finished the
+    inspection and crashed on the way out -- in a static destructor, an atexit
+    handler, a teardown in some unrelated library -- throws away a complete
+    answer and takes the server down with
+    ``Model architectures [...] failed to be inspected``.
+
+    That is not hypothetical. On an Atlas A3 image every ``import vllm_omni``
+    ends in a glibc ``corrupted size vs. prev_size`` abort inside
+    libtorch_python's static destructors, after the interpreter has done its
+    work. It stays invisible while vLLM's on-disk cache is warm and stops the
+    server the moment anything under the model's directory changes the hash
+    that keys it.
+
+    The output file is the honest signal: an interrupted child does not leave a
+    loadable pickle behind. So when the child exits non-zero, look at what it
+    left; if that is a complete result, keep the exit status as what it can
+    actually tell us -- something to warn about, with the child's stderr
+    attached -- and let the caller read the answer it already has. A child that
+    produced nothing raises exactly as before.
+
+    Implemented by recording the temporary directory and filtering the exit
+    status, rather than by re-implementing ``_run_in_subprocess``: a vendored
+    copy of that function would silently stop matching upstream the next time it
+    changes, and would have to import ``pickle`` and ``cloudpickle`` here, which
+    ``tools/pre_commit/check_pickle_imports.py`` rightly does not want. Nothing
+    new is serialized or deserialized -- the result is validated with the very
+    ``pickle.load`` the registry is about to run on the same file.
+    """
+    try:
+        from vllm.model_executor.models import registry as _registry
+    except ImportError:
+        _PATCH_LOGGER.debug("[registry] vLLM model registry not available; skipping patch")
+        return
+
+    if getattr(_registry, "_omni_registry_output_trusted", False):
+        return
+
+    real_tempfile = _registry.tempfile
+    real_subprocess = _registry.subprocess
+    # `_run_in_subprocess` names its output file inside a TemporaryDirectory it
+    # creates and destroys itself, so the path is only knowable from the inside.
+    latest_tempdir: dict[str, str | None] = {"path": None}
+
+    class _RecordingTemporaryDirectory(real_tempfile.TemporaryDirectory):  # type: ignore[misc]
+        def __enter__(self) -> str:
+            path = super().__enter__()
+            latest_tempdir["path"] = path
+            return path
+
+    def _run(*args: object, **kwargs: object) -> object:
+        returned = real_subprocess.run(*args, **kwargs)
+        if returned.returncode == 0:
+            return returned
+
+        tempdir = latest_tempdir["path"]
+        if tempdir is None:
+            return returned
+        output_filepath = os.path.join(tempdir, "registry_output.tmp")
+        try:
+            with open(output_filepath, "rb") as handle:
+                _registry.pickle.load(handle)
+        except Exception:  # noqa: BLE001
+            # Reading a missing, empty or half-written pickle can raise almost
+            # anything -- OSError, EOFError, UnpicklingError, MemoryError on a
+            # truncated frame header. Whatever it raises, the child left no
+            # usable result, so this is a real inspection failure and the caller
+            # must see the child's own error.
+            return returned
+
+        stderr = returned.stderr.decode(errors="replace") if returned.stderr else ""
+        _PATCH_LOGGER.warning(
+            "[registry] model inspection child exited %s after writing a complete result; "
+            "using the result. Tail of its stderr:\n%s",
+            returned.returncode,
+            stderr[-2000:],
+        )
+        return real_subprocess.CompletedProcess(returned.args, 0, returned.stdout, returned.stderr)
+
+    class _AttributeOverlay:
+        """`module`, with `overrides` in front of it."""
+
+        def __init__(self, module: object, **overrides: object) -> None:
+            self._module = module
+            self._overrides = overrides
+
+        def __getattr__(self, name: str) -> object:
+            try:
+                return self._overrides[name]
+            except KeyError:
+                return getattr(self._module, name)
+
+    _registry.tempfile = _AttributeOverlay(real_tempfile, TemporaryDirectory=_RecordingTemporaryDirectory)
+    _registry.subprocess = _AttributeOverlay(real_subprocess, run=_run)
+    _registry._omni_registry_output_trusted = True
+    _PATCH_LOGGER.info("[registry] model-info inspection now trusts the child's output file over its exit status.")
+
+
+_patch_registry_inspection_trusts_its_output()
