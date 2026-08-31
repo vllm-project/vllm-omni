@@ -91,6 +91,24 @@ outputs were byte-identical and full decode passed. This is evidence for host
 CPU response encoding. Actual gains depend on the CPU and runtime, and should
 not be interpreted as GPU, DiT, or stage 0 speedups.
 
+### Response codec and engine-side encoding
+
+Non-streaming responses support two optional controls via `extra_params`:
+
+- `video_codec` selects the response codec. The default `h264` keeps CPU
+  software encoding in the API server (PyAV/libx264). Selecting a hardware
+  codec (`h264_nvenc` / `hevc_nvenc` / `av1_nvenc`) moves encoding to
+  torchcodec's NVENC backend: MiniMax-H3 encodes each clip to MP4 bytes in
+  engine post-processing, so the engine-to-server hop transfers the encoded
+  bytes (with the audio track muxed in) instead of the raw uint8 frames, and
+  the response is not re-encoded. This requires torchcodec >= 0.10 and a GPU
+  with NVENC hardware, which datacenter parts such as A100/H100/B200 do not
+  have. NVENC failures fall back to raw frames / CPU H.264. The server default
+  can be set with `VLLM_VIDEO_ENCODE_CODEC`. NVENC engine-side encoding is
+  incompatible with the WebSocket streaming path.
+- `video_codec_options` forwards encoder options (e.g. `{"preset": "fast"}`
+  for libx264, or NVENC options such as `{"preset": "p4", "cq": "23"}`).
+
 ## Start a server
 
 Pass the repository ID directly. The pipeline uses `FL2VA` for model discovery

@@ -14,6 +14,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import av
 import httpx
@@ -1233,9 +1234,10 @@ def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFi
         audio=None,
         audio_sample_rate=None,
         video_codec_options=None,
+        video_codec="h264",
         frame_converter=None,
     ):
-        del video, fps, audio, video_codec_options, frame_converter
+        del video, fps, audio, video_codec_options, video_codec, frame_converter
         audio_sample_rates.append(audio_sample_rate)
         return b"fake-video"
 
@@ -1838,6 +1840,46 @@ def test_download_completed_job_uses_storage_open_and_download_name(test_client,
     assert response.content == video_bytes
     assert response.headers["content-type"] == "video/mp4"
     assert file_name in response.headers["content-disposition"]
+
+
+def test_engine_side_encoded_mp4_bypasses_server_encoding(test_client, mocker: MockerFixture):
+    """NVENC video_codec: engine returns MP4 bytes; the server must not re-encode."""
+    video_bytes = _make_test_video_bytes()
+    mock_encode = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        side_effect=AssertionError("server must not re-encode engine-side MP4 bytes"),
+    )
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        side_effect=AssertionError("server must not base64-encode engine-side MP4 bytes"),
+    )
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    captured: dict[str, Any] = {}
+
+    async def _generate(prompt, request_id, sampling_params_list):
+        captured["sampling_params_list"] = sampling_params_list
+        yield MockVideoResult([video_bytes])
+
+    engine.generate = _generate
+
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "engine-side encoded", "extra_params": json.dumps({"video_codec": "h264_nvenc"})},
+    )
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    mock_encode.assert_not_called()
+
+    # The codec is handed to the engine so pipelines can hardware-encode
+    # before the result transfer.
+    diffusion_params = captured["sampling_params_list"][-1]
+    assert diffusion_params.extra_args["video_codec"] == "h264_nvenc"
+
+    content = test_client.get(f"/v1/videos/{video_id}/content")
+    assert content.status_code == 200
+    assert content.content == video_bytes
 
 
 def test_delete_in_progress_job_cancels_task_and_removes_metadata(test_client):

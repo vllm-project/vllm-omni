@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import time
+from base64 import b64encode
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
@@ -18,6 +19,7 @@ from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+from vllm_omni.diffusion.utils.media_utils import NVENC_VIDEO_CODECS
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoAction,
@@ -34,6 +36,7 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
     _encode_video_bytes,
     _PlanarFrameConverter,
     encode_video_base64,
+    resolve_video_response_codec,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.model_extras import should_preserve_reference_image_size
@@ -310,6 +313,15 @@ class OmniOpenAIServingVideo:
                 loggable = {**loggable, **redacted}
             logger.info("Applied extra_params: %s", loggable)
 
+        # Hand NVENC codec requests to the engine so supported pipelines (e.g.
+        # MiniMax-H3) hardware-encode to MP4 bytes before the result transfer.
+        # Pipelines without engine-side encoding keep the raw-frames behavior
+        # and the response is encoded server-side instead.
+        video_codec, video_codec_options = resolve_video_response_codec(request.extra_params)
+        if video_codec in NVENC_VIDEO_CODECS:
+            gen_params.extra_args.setdefault("video_codec", video_codec)
+            gen_params.extra_args.setdefault("video_codec_options", video_codec_options)
+
         self._apply_lora(request.lora, gen_params)
 
         logger.info(
@@ -359,29 +371,33 @@ class OmniOpenAIServingVideo:
             reference_audio=reference_audio,
         )
 
-        video_codec_options = {"preset": "ultrafast", "threads": "0"}
-        if request.extra_params is not None and isinstance(request.extra_params, dict):
-            if "video_codec_options" in request.extra_params:
-                video_codec_options = request.extra_params["video_codec_options"]
+        video_codec, video_codec_options = resolve_video_response_codec(request.extra_params)
 
         _t_encode_start = time.perf_counter()
         video_data = [
             VideoData(
                 b64_json=(
-                    encode_video_base64(
-                        video,
-                        fps=artifacts.output_fps,
-                        video_codec_options=video_codec_options,
-                        frame_converter=self._video_frame_converter,
-                    )
-                    if artifacts.audios[idx] is None
-                    else encode_video_base64(
-                        video,
-                        fps=artifacts.output_fps,
-                        audio=artifacts.audios[idx],
-                        audio_sample_rate=artifacts.audio_sample_rate,
-                        video_codec_options=video_codec_options,
-                        frame_converter=self._video_frame_converter,
+                    # Engine-side encoded MP4 payloads only need base64.
+                    b64encode(bytes(video)).decode("utf-8")
+                    if isinstance(video, (bytes, bytearray))
+                    else (
+                        encode_video_base64(
+                            video,
+                            fps=artifacts.output_fps,
+                            video_codec_options=video_codec_options,
+                            video_codec=video_codec,
+                            frame_converter=self._video_frame_converter,
+                        )
+                        if artifacts.audios[idx] is None
+                        else encode_video_base64(
+                            video,
+                            fps=artifacts.output_fps,
+                            audio=artifacts.audios[idx],
+                            audio_sample_rate=artifacts.audio_sample_rate,
+                            video_codec_options=video_codec_options,
+                            video_codec=video_codec,
+                            frame_converter=self._video_frame_converter,
+                        )
                     )
                 ),
                 action=artifacts.actions[idx],
@@ -422,10 +438,7 @@ class OmniOpenAIServingVideo:
             )
         audio = artifacts.audios[0]
 
-        video_codec_options = {"preset": "ultrafast", "threads": "0"}
-        if request.extra_params is not None and isinstance(request.extra_params, dict):
-            if "video_codec_options" in request.extra_params:
-                video_codec_options = request.extra_params["video_codec_options"]
+        video_codec, video_codec_options = resolve_video_response_codec(request.extra_params)
 
         action = artifacts.actions[0]
         if action is not None and isinstance(artifacts.videos[0], dict):
@@ -433,13 +446,18 @@ class OmniOpenAIServingVideo:
             return b"", artifacts.stage_durations, artifacts.peak_memory_mb, action
 
         _t_encode_start = time.perf_counter()
-        video_bytes = _encode_video_bytes(
-            artifacts.videos[0],
-            fps=artifacts.output_fps,
-            **({"audio": audio, "audio_sample_rate": artifacts.audio_sample_rate} if audio is not None else {}),
-            video_codec_options=video_codec_options,
-            frame_converter=self._video_frame_converter,
-        )
+        if isinstance(artifacts.videos[0], (bytes, bytearray)):
+            # Engine-side encoded MP4 payload (NVENC video_codec).
+            video_bytes = bytes(artifacts.videos[0])
+        else:
+            video_bytes = _encode_video_bytes(
+                artifacts.videos[0],
+                fps=artifacts.output_fps,
+                **({"audio": audio, "audio_sample_rate": artifacts.audio_sample_rate} if audio is not None else {}),
+                video_codec_options=video_codec_options,
+                video_codec=video_codec,
+                frame_converter=self._video_frame_converter,
+            )
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)
         return video_bytes, artifacts.stage_durations, artifacts.peak_memory_mb, artifacts.actions[0]

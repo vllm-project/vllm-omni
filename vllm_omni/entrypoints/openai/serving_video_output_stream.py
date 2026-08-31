@@ -478,6 +478,14 @@ class OmniStreamingVideoOutputHandler:
                     raise RuntimeError(str(result.error))
                 videos = self._extract_video_outputs(result)
                 for video in videos:
+                    if isinstance(video, (bytes, bytearray)):
+                        raise HTTPException(
+                            status_code=HTTPStatus.BAD_REQUEST.value,
+                            detail=(
+                                "NVENC engine-side encoding (extra_params.video_codec) is incompatible "
+                                "with streaming; unset video_codec to stream raw-encoded chunks."
+                            ),
+                        )
                     chunk = encoder.encode(video)
                     if chunk:
                         yield (

@@ -350,7 +350,7 @@ def resolve_minimax_h3_diffusion_model_path(
     return str(model_root / subdir)
 
 
-def _minimax_h3_post_process(output, output_type: str = "np"):
+def _minimax_h3_post_process(output, output_type: str = "np", sampling_params=None):
     """Convert the joint video/audio output without capturing worker state.
 
     The callable crosses the multiprocessing result queue, so it must remain a
@@ -359,6 +359,13 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
     ``_prepare_minimax_h3_video_output`` already quantises the video to uint8
     frames on the accelerator, so there is nothing left to scale or transpose
     here.
+
+    When the request selects an NVENC ``video_codec`` (via extra_args), each
+    clip is hardware-encoded to MP4 bytes here so the engine-to-server hop
+    transfers the encoded bytes instead of the raw uint8 frames, and the
+    response skips server-side re-encoding. CPU software encoding keeps the
+    raw-frames behavior. NVENC failures fall back to raw frames, leaving the
+    API server to retry or fall back to CPU encoding.
     """
     if not isinstance(output, tuple) or len(output) != 2:
         return output
@@ -374,10 +381,52 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
     if output_type == "np":
         video = video.detach().cpu().numpy()
         audio = audio.detach().float().cpu().numpy()
+        extra_args = getattr(sampling_params, "extra_args", None) or {}
+        video_codec = str(extra_args.get("video_codec", "")).strip().lower()
+        if video_codec:
+            from vllm_omni.diffusion.utils import media_utils
+
+            if video_codec in media_utils.NVENC_VIDEO_CODECS:
+                try:
+                    return _minimax_h3_encode_output_nvenc(video, audio, video_codec, extra_args)
+                except Exception as exc:
+                    logger.warning_once(
+                        "MiniMax-H3 engine-side NVENC encoding failed (%s); transferring raw frames.",
+                        exc,
+                    )
         video = [sample for sample in video]
     return {
         "video": video,
         "audio": audio,
+        "audio_sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE,
+        "fps": MINIMAX_H3_FPS,
+    }
+
+
+def _minimax_h3_encode_output_nvenc(video: np.ndarray, audio: np.ndarray, video_codec: str, extra_args: dict) -> dict:
+    """Hardware-encode each (T, H, W, C) clip to MP4 bytes with its audio track muxed in."""
+    from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes_nvenc
+
+    video_codec_options = extra_args.get("video_codec_options")
+    if video_codec_options is not None and not isinstance(video_codec_options, dict):
+        raise OmniClientError("video_codec_options must be a dict of encoder options")
+
+    encoded_videos = []
+    for index in range(video.shape[0]):
+        encoded_videos.append(
+            mux_video_audio_bytes_nvenc(
+                np.ascontiguousarray(video[index][..., :3]),
+                audio[index] if audio is not None and audio.shape[0] == video.shape[0] else audio,
+                fps=float(MINIMAX_H3_FPS),
+                audio_sample_rate=MINIMAX_H3_AUDIO_SAMPLE_RATE,
+                video_codec=video_codec,
+                video_codec_options=video_codec_options,
+            )
+        )
+    return {
+        "video": encoded_videos,
+        # Audio is already muxed into the MP4 bytes.
+        "audio": None,
         "audio_sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE,
         "fps": MINIMAX_H3_FPS,
     }

@@ -531,6 +531,97 @@ def test_joint_video_output_is_quantized_before_transfer():
     np.testing.assert_array_equal(result["video"][0], expected[0].numpy())
 
 
+def test_joint_postprocess_nvenc_encodes_to_mp4_bytes(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _minimax_h3_post_process,
+    )
+    from vllm_omni.diffusion.utils import media_utils
+
+    captured: dict[str, Any] = {}
+
+    def fake_nvenc_mux(
+        video_frames, audio_waveform=None, *, fps, audio_sample_rate, video_codec, video_codec_options=None
+    ):
+        captured.setdefault("calls", []).append(
+            {
+                "video_frames": video_frames,
+                "audio": audio_waveform,
+                "fps": fps,
+                "audio_sample_rate": audio_sample_rate,
+                "video_codec": video_codec,
+                "video_codec_options": video_codec_options,
+            }
+        )
+        return b"nvenc-mp4"
+
+    monkeypatch.setattr(media_utils, "mux_video_audio_bytes_nvenc", fake_nvenc_mux)
+
+    video = torch.randint(0, 256, (2, 4, 8, 8, 3), dtype=torch.uint8)
+    audio = torch.zeros(2, 1, 2400, dtype=torch.float32)
+    sampling_params = SimpleNamespace(extra_args={"video_codec": "h264_nvenc", "video_codec_options": {"preset": "p4"}})
+
+    result = _minimax_h3_post_process((video, audio), sampling_params=sampling_params)
+
+    assert result["video"] == [b"nvenc-mp4", b"nvenc-mp4"]
+    # Audio is muxed into the MP4 payload, not transferred separately.
+    assert result["audio"] is None
+    assert result["fps"] == 24
+    assert result["audio_sample_rate"] == 32000
+    calls = captured["calls"]
+    assert len(calls) == 2
+    for index, call in enumerate(calls):
+        assert call["video_frames"].dtype == np.uint8
+        assert call["video_frames"].shape == (4, 8, 8, 3)
+        assert call["video_frames"].flags.c_contiguous
+        np.testing.assert_array_equal(call["video_frames"], video[index].numpy())
+        assert call["audio"].shape == (1, 2400)
+        assert call["fps"] == 24.0
+        assert call["audio_sample_rate"] == 32000
+        assert call["video_codec"] == "h264_nvenc"
+        assert call["video_codec_options"] == {"preset": "p4"}
+
+
+def test_joint_postprocess_nvenc_failure_falls_back_to_raw_frames(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _minimax_h3_post_process,
+    )
+    from vllm_omni.diffusion.utils import media_utils
+
+    def fail_nvenc(*args, **kwargs):
+        raise RuntimeError("NVENC unavailable")
+
+    monkeypatch.setattr(media_utils, "mux_video_audio_bytes_nvenc", fail_nvenc)
+
+    video = torch.randint(0, 256, (2, 4, 8, 8, 3), dtype=torch.uint8)
+    audio = torch.zeros(2, 1, 2400, dtype=torch.float32)
+    sampling_params = SimpleNamespace(extra_args={"video_codec": "h264_nvenc"})
+
+    result = _minimax_h3_post_process((video, audio), sampling_params=sampling_params)
+
+    # Raw frames keep flowing; the API server retries NVENC or falls back to CPU.
+    assert isinstance(result["video"], list)
+    assert result["video"][0].dtype == np.uint8
+    np.testing.assert_array_equal(result["video"][0], video[0].numpy())
+    assert result["audio"] is not None
+
+
+def test_joint_postprocess_cpu_codec_keeps_raw_frames():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _minimax_h3_post_process,
+    )
+
+    video = torch.randint(0, 256, (2, 4, 8, 8, 3), dtype=torch.uint8)
+    audio = torch.zeros(2, 1, 2400, dtype=torch.float32)
+    sampling_params = SimpleNamespace(extra_args={"video_codec": "h264"})
+
+    result = _minimax_h3_post_process((video, audio), sampling_params=sampling_params)
+
+    assert isinstance(result["video"], list)
+    assert result["video"][0].dtype == np.uint8
+    np.testing.assert_array_equal(result["video"][0], video[0].numpy())
+    assert result["audio"] is not None
+
+
 def test_cfg_parallel_is_rejected_for_distilled_checkpoint():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
