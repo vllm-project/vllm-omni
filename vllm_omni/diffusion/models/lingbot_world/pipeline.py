@@ -1157,20 +1157,12 @@ class LingBotWorldCausalDMDPipeline(
                     ),
                     dtype=dtype,
                 )
-            block_frames = int(self.transformer.config.num_frames_per_block)
-            condition_blocks = session_state.image_condition.shape[2] // block_frames
-            if condition_blocks != _REALTIME_CONDITION_BLOCKS:
-                raise RuntimeError(
-                    "LingBot realtime image condition must contain exactly "
-                    f"{_REALTIME_CONDITION_BLOCKS} latent blocks; got {condition_blocks}."
-                )
-            condition_block = min(tick.chunk_index, condition_blocks - 1)
+            condition_block = min(tick.chunk_index, _REALTIME_CONDITION_BLOCKS - 1)
             condition_start = condition_block * block_frames
-            condition_stop = condition_start + block_frames
             condition = session_state.image_condition[
                 :,
                 :,
-                condition_start:condition_stop,
+                condition_start : condition_start + block_frames,
             ]
         camera_pitch: float | None = None
         if inputs.camera_actions is not None:
