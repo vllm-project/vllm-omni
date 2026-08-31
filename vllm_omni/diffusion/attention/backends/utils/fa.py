@@ -35,6 +35,9 @@ def _is_blackwell() -> bool:
 flash_attn_func = None
 flash_attn_varlen_func = None
 
+# True when flash_attn_func is provided by aiter (ROCm only).
+HAS_AITER_FLASH_ATTN = False
+
 if current_omni_platform.is_rocm():
     # ROCm: try Aiter first
     try:
@@ -42,6 +45,8 @@ if current_omni_platform.is_rocm():
 
         if is_aiter_found_and_supported():
             from aiter import flash_attn_func, flash_attn_varlen_func  # noqa: F401
+
+            HAS_AITER_FLASH_ATTN = True
     except (ImportError, ModuleNotFoundError):
         pass
 elif current_omni_platform.is_xpu():

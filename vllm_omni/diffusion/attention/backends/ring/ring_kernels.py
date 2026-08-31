@@ -6,6 +6,8 @@ import math
 
 import torch
 
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
 from .ring_globals import (
     HAS_AITER,
     HAS_FA3,
@@ -252,6 +254,12 @@ def flash_attn_forward_aiter(
     return_softmax=False,
 ):
     assert HAS_AITER, "Aiter is not available"
+    mode = 2  # RTZ, Round Towards Zero
+    if is_forward_context_available():
+        cfg = get_forward_context().omni_diffusion_config
+        if cfg is not None:
+            mode = cfg.aiter_bf16_cvt_mode
+    fa_kwargs = {"how_v3_bf16_cvt": mode}
     block_out, block_lse = flash_attn_func_aiter(
         q,
         k,
@@ -262,8 +270,8 @@ def flash_attn_forward_aiter(
         window_size=window_size,
         alibi_slopes=alibi_slopes,
         return_lse=True,
+        **fa_kwargs,
     )
-
     return block_out, block_lse
 
 
