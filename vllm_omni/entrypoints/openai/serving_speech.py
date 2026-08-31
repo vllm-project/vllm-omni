@@ -295,6 +295,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except ValueError:
             logger.warning("Invalid SPEAKER_MAX_UPLOADED=%r; using default 1000", _raw_cap)
             self._max_uploaded_speakers = 1000
+        _policy = os.environ.get("SPEAKER_REGISTRATION_POLICY", "overwrite").lower()
+        if _policy not in ("overwrite", "immutable"):
+            logger.warning("Invalid SPEAKER_REGISTRATION_POLICY=%r; using 'overwrite'", _policy)
+            _policy = "overwrite"
+        self._registration_policy = _policy
         self.uploaded_speakers: dict[str, dict[str, Any]] = {}
         self._ref_audio_data_url_cache: dict[str, str] = {}
         self._ref_audio_resolve_cache: OrderedDict[str, tuple[list[float], int, int, str]] = OrderedDict()
@@ -1009,6 +1014,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 f"the cap via SPEAKER_MAX_UPLOADED."
             )
 
+    def _check_registration_allowed(self, voice_name_lower: str, name: str) -> None:
+        """Reject names that would shadow a built-in voice or, under the
+        immutable policy, silently overwrite an existing upload."""
+        caps = self._adapter.capabilities if self._adapter is not None else None
+        if caps is not None and (
+            voice_name_lower in caps.supported_speakers or voice_name_lower in caps.precomputed_speakers
+        ):
+            raise ValueError(
+                f"Voice name '{name}' is reserved by a built-in speaker of this model; choose a different name."
+            )
+        if self._registration_policy == "immutable" and voice_name_lower in self.uploaded_speakers:
+            raise ValueError(
+                f"Voice '{name}' already exists and SPEAKER_REGISTRATION_POLICY is 'immutable'; "
+                f"delete it first via DELETE /v1/audio/voices/{name}."
+            )
+
     def _evict_existing_upload(self, voice_name_lower: str, name: str) -> None:
         """Drop an existing upload with this name so the caller can re-register it."""
         if voice_name_lower not in self.uploaded_speakers:
@@ -1091,6 +1112,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         async with self._upload_lock:
             voice_name_lower = name.lower()
+            self._check_registration_allowed(voice_name_lower, name)
             self._evict_existing_upload(voice_name_lower, name)
             self._check_upload_cap()
 
@@ -1211,6 +1233,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         async with self._upload_lock:
             voice_name_lower = name.lower()
+            self._check_registration_allowed(voice_name_lower, name)
             self._evict_existing_upload(voice_name_lower, name)
             self._check_upload_cap()
 
