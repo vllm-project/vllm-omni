@@ -1,9 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 import torch
 from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_model_runner import (
@@ -105,6 +109,23 @@ class DummyReqState:
     """A minimal request state container."""
 
     pass
+
+
+def test_model_forward_passes_request_ids_to_decode_metadata(monkeypatch):
+    received = {}
+    model = SimpleNamespace(
+        supports_omni_decode_step_metadata=True,
+        update_decode_step_metadata=lambda **kwargs: received.update(kwargs),
+    )
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner.input_batch = DummyInputBatch(["request-a", "request-b"])
+    runner._build_model_kwargs_extra = lambda: {}
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: torch.zeros(1))
+
+    OmniGPUModelRunner._model_forward(runner, input_ids=torch.ones(2, dtype=torch.long))
+
+    assert received["req_ids"] == ["request-a", "request-b"]
 
 
 class MiMoAudioForConditionalGeneration(torch.nn.Module):
@@ -541,6 +562,80 @@ def test_update_additional_information_deserializes_new_request_payload():
         runner.model_intermediate_buffer["r1"]["tts_hidden_states"],
         conditioning["tts_hidden_states"],
     )
+
+
+def test_streaming_new_request_marker_replaces_terminal_chunk_snapshot():
+    from vllm_omni.engine.serialization import serialize_additional_information
+
+    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+    runner.model.replace_runtime_additional_information = True
+    terminal = {
+        "codes": {"audio": torch.tensor([1, 2])},
+        "meta": {"cache_epoch": 0, "chunk_seq": 2, "last_chunk": True},
+    }
+    peer = {
+        "codes": {"audio": torch.tensor([9])},
+        "meta": {"cache_epoch": 3, "chunk_seq": 1, "last_chunk": False},
+    }
+    runner.model_intermediate_buffer.update(r1=terminal, r2=peer)
+    marker = {
+        "meta": {
+            "finished": False,
+            "is_segment_finished": True,
+            "request_finished": False,
+            "replace_runtime_additional_information": True,
+        }
+    }
+    new_req = SimpleNamespace(
+        req_id="r1",
+        model_intermediate_buffer=marker,
+        additional_information=serialize_additional_information(terminal),
+    )
+
+    OmniGPUModelRunner._update_streaming_input_additional_info(runner, new_req, "r1")
+    OmniGPUModelRunner._update_additional_information(
+        runner,
+        SimpleNamespace(
+            scheduled_new_reqs=[new_req],
+            scheduled_cached_reqs=SimpleNamespace(),
+        ),
+    )
+
+    info = runner.model_intermediate_buffer["r1"]
+    assert "codes" not in info
+    assert info["meta"] == {
+        **marker["meta"],
+        "num_processed_tokens": 0,
+        "resumable": True,
+    }
+    assert runner.requests["r1"].additional_information_cpu == info
+    assert runner.model_intermediate_buffer["r2"] == peer
+
+
+def test_cached_empty_marker_replaces_terminal_chunk_snapshot():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.model.replace_runtime_additional_information = True
+    runner.model_intermediate_buffer["r1"] = {
+        "codes": {"audio": torch.tensor([1, 2])},
+        "meta": {"cache_epoch": 0, "chunk_seq": 2, "last_chunk": True},
+    }
+    marker = {
+        "meta": {
+            "is_segment_finished": torch.tensor(True, dtype=torch.bool),
+            "replace_runtime_additional_information": True,
+        }
+    }
+
+    OmniGPUModelRunner._update_additional_information(
+        runner,
+        SimpleNamespace(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=SimpleNamespace(additional_information={"r1": marker}),
+        ),
+    )
+
+    assert runner.model_intermediate_buffer["r1"] == marker
+    assert runner.requests["r1"].additional_information_cpu == marker
 
 
 def test_update_intermediate_buffer_skips_empty_update():

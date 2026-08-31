@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import os
@@ -338,7 +341,7 @@ def _artifact_paths(image_source: str) -> tuple[Path, Path, Path]:
 def _generate_online_video(
     *,
     omni_server,
-    openai_client,
+    online_client,
     image_source: str,
     online_timeout_seconds: int,
 ) -> Path:
@@ -360,7 +363,7 @@ def _generate_online_video(
         "image_reference": _build_online_image_reference(image_source),
     }
     online_video_bytes = _send_video_request_with_timeout(
-        openai_client,
+        online_client,
         request_config,
         timeout_seconds=_online_timeout_seconds(online_timeout_seconds),
     )
@@ -412,7 +415,7 @@ def test_wan22_i2v_diffusers_offline_generates_video(
 @pytest.mark.parametrize("omni_server", SERVER_CASES, indirect=True)
 def test_wan22_i2v_online_serving_generates_video(
     omni_server,
-    openai_client,
+    online_client,
     wan22_i2v_image_source: str | None,
     wan22_i2v_online_timeout_seconds: int,
 ) -> None:
@@ -424,7 +427,7 @@ def test_wan22_i2v_online_serving_generates_video(
     _validate_image_source(image_source)
     online_path = _generate_online_video(
         omni_server=omni_server,
-        openai_client=openai_client,
+        online_client=online_client,
         image_source=image_source,
         online_timeout_seconds=wan22_i2v_online_timeout_seconds,
     )

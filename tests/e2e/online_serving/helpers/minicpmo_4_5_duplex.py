@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Shared fixtures and argument builders for MiniCPM-o 4.5 duplex E2E tests."""
 
 from __future__ import annotations
@@ -11,21 +14,12 @@ from types import SimpleNamespace
 import pytest
 from huggingface_hub import snapshot_download
 
-from tests.helpers.runtime import OmniServerParams
-from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from tests.helpers.runtime import OmniServerParams, get_model_prefix
+from tests.helpers.stage_config import get_deploy_config_path, get_deploy_duplex_max_sessions
 
 MODEL = "openbmb/MiniCPM-o-4_5"
-DEPLOY_CONFIG = modify_stage_config(
-    get_deploy_config_path("minicpmo_4_5_duplex.yaml"),
-    updates={
-        "base_config": get_deploy_config_path("minicpmo_4_5.yaml"),
-        # Talker context is 4096 (tts_config.max_position_embeddings); KV sizing
-        # is left automatic so duplex matches the simplex deploy profiles.
-        "stages": {
-            1: {"max_model_len": 4096},
-        },
-    },
-)
+DEPLOY_CONFIG_REL = "minicpmo_4_5.yaml"
+DEPLOY_CONFIG = get_deploy_config_path(DEPLOY_CONFIG_REL)
 ASSET_DIR = Path(__file__).resolve().parents[3] / "assets" / "minicpmo_4_5"
 RESPONSE_REQUIRED_WAV = ASSET_DIR / "response_required_16k.wav"
 RESPONSE_REQUIRED_SHA256 = "2e5fd4eb3ee434ce107ee3a0591fa624a33f7683c7462f45fe651c443c9af941"
@@ -44,6 +38,16 @@ SERVER_PARAMS = [
         id="three-stage-single-gpu",
     )
 ]
+
+
+def deploy_max_sessions() -> int:
+    """Concurrent duplex sessions the deploy config under test admits.
+
+    The admission probe has to expect the capacity the server is actually
+    started with. Hardcoding it silently drifts the moment the deploy config
+    changes its capacity, turning that change into an unrelated probe timeout.
+    """
+    return get_deploy_duplex_max_sessions(DEPLOY_CONFIG_REL)
 
 
 def validated_wav(path: Path, expected_sha256: str) -> Path:
@@ -73,10 +77,11 @@ def validated_soft_interrupt_wav() -> Path:
     return validated_wav(SOFT_INTERRUPT_WAV, SOFT_INTERRUPT_SHA256)
 
 
-def resolve_ref_audio(model_prefix: str) -> Path:
+def resolve_ref_audio() -> Path:
     # ``MODEL`` may be a local checkpoint directory instead of a Hub repo id
     # (``Path("/prefix") / "/abs/path"`` collapses to the absolute path), so only
     # fall back to the Hub cache when no such directory exists on disk.
+    model_prefix = get_model_prefix()
     model_root = Path(model_prefix) / MODEL if model_prefix else Path(MODEL)
     if not model_root.is_dir():
         model_root = Path(snapshot_download(MODEL, local_files_only=True))
@@ -84,6 +89,20 @@ def resolve_ref_audio(model_prefix: str) -> Path:
     if not ref_audio.is_file():
         raise FileNotFoundError(f"MiniCPM-o checkpoint ref audio is missing: {ref_audio}")
     return ref_audio
+
+
+def duplex_camera_frames(*, seconds: int, cache_dir: Path) -> list[str]:
+    """Base64 JPEG frames of a moving synthetic scene, one per second.
+
+    Mirrors what the realtime web client captures (1 fps, no client-side
+    resize: the server normalizes at ``scale_resolution=448``).
+    """
+    from tests.e2e.online_serving.helpers.minicpmo_realtime_duplex_scenarios import _video_frames_from_file
+    from tests.helpers.media import generate_synthetic_video
+
+    video = generate_synthetic_video(448, 448, 30 * seconds, cache_dir=cache_dir)
+    frames, _ = _video_frames_from_file(Path(video["file_path"]))
+    return frames
 
 
 def realtime_url(omni_server) -> str:
@@ -108,6 +127,8 @@ def demo_args(
         output_audio_format="pcm16",
         chunk_ms=200,
         realtime_input=True,
+        input_video=None,
+        stack_frames=1,
         first_turn_ms=1400,
         turn_duration_ms=[],
         first_turn_transcript="duplex CI speech",

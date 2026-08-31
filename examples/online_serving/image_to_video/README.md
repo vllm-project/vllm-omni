@@ -1,5 +1,19 @@
 # Image-To-Video
 
+This example demonstrates how to deploy image-to-video models for online
+video generation using vLLM-Omni.
+
+## Supported Models
+
+| Model | Model ID |
+|-------|----------|
+| Wan2.2 I2V | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` |
+| SANA-Video 2B (480p) | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` |
+| SANA-Video 2B (720p) | `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` |
+
+For SANA-Video 2B image-to-video online serving, see the
+[SANA-Video 2B recipe](../../../recipes/NVIDIA/SANA-Video-2B.md).
+
 This example demonstrates online image-to-video generation with vLLM-Omni.
 The startup script defaults to Wan2.2, but `MODEL` can select any supported
 image-to-video model. The existing curl helper remains a concrete Wan2.2
