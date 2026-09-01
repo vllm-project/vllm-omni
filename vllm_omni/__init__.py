@@ -12,6 +12,11 @@ Architecture:
   processing
 """
 
+import os
+
+print(f"PYTHON_TRACER_CONFIG={os.environ.get('PYTHON_TRACER_CONFIG')}")
+print(f"PYTHON_TRACER_OUTDIR={os.environ.get('PYTHON_TRACER_OUTDIR')}")
+
 # We import version early, because it will warn if vLLM / vLLM Omni
 # are not using the same major + minor version (if vLLM is installed).
 # We should do this before applying patch, because vLLM imports might
