@@ -36,6 +36,17 @@ from vllm_omni.model_extras.ltx2 import (
     ltx_preserves_reference_image_size,
     ltx_transformer_config_subfolder,
 )
+from vllm_omni.model_extras.mammothmodal2_preview import (
+    MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS,
+    MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS,
+    MAMMOTHMODA2_PREVIEW_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+)
+from vllm_omni.model_extras.mammothmodal2_preview import (
+    build_text_to_image_prompt as build_mammothmoda2_text_to_image_prompt,
+)
+from vllm_omni.model_extras.mammothmodal2_preview import (
+    build_x_to_text_prompt as build_mammothmoda2_x_to_text_prompt,
+)
 from vllm_omni.model_extras.ming_flash_omni import (
     MING_FLASH_OMNI_EXTRA_BODY_PARAMS,
     MING_FLASH_OMNI_EXTRA_OUTPUT_PARAMS,
@@ -113,6 +124,7 @@ def default_x_to_text_prompt(
 _X_TO_TEXT_SPECS: dict[str, XToTextPromptBuilder] = {
     "bagel": build_bagel_x_to_text_prompt,
     "hunyuan_image3": build_hunyuan_x_to_text_prompt,
+    "mammoth_moda2": build_mammothmoda2_x_to_text_prompt,
 }
 
 
@@ -127,6 +139,8 @@ def get_x_to_text_model_family(model: str) -> str:
         return "bagel"
     if model_type == "hunyuan_image_3_moe" or any("hunyuanimage3" in value for value in architectures):
         return "hunyuan_image3"
+    if "mammoth" in model_type or any("mammothmoda2" in value for value in architectures):
+        return "mammoth_moda2"
     return "generic"
 
 
@@ -217,6 +231,12 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_output_params": VACE_EXTRA_OUTPUT_PARAMS,
         "image_to_video_prompt_builder": build_vace_image_to_video_prompt,
     },
+    "MammothModa2DiTPipeline": {
+        "extra_body_params": MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS,
+        "extra_output_params": MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS,
+        "init_extra_args_for_non_diffusion_stages": MAMMOTHMODA2_PREVIEW_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+        "text_to_image_prompt_builder": build_mammothmoda2_text_to_image_prompt,
+    },
     "MingImagePipeline": {
         "extra_body_params": MING_FLASH_OMNI_EXTRA_BODY_PARAMS,
         "extra_output_params": MING_FLASH_OMNI_EXTRA_OUTPUT_PARAMS,
@@ -228,6 +248,12 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
 
 for model_class_name in ("LTX2Pipeline", "LTX2TwoStagePipeline"):
     _EXTRA_SPECS[model_class_name]["transformer_config_subfolder_resolver"] = ltx_transformer_config_subfolder
+
+
+# Multi-stage discovery reports the top-level wrapper rather than its DiT
+# submodule, so both names must resolve to the same request builders.
+_EXTRA_SPECS["MammothModa2ForConditionalGeneration"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
+_EXTRA_SPECS["Mammothmoda2Model"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
 
 
 def _get_spec(model_class_name: str | None) -> dict[str, Any] | None:

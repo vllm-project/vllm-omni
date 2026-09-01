@@ -18,11 +18,11 @@ examples in this repository.
 
 Qwen3-TTS supports three task types, each backed by a dedicated model checkpoint:
 
-| Task Type     | Model                                    | Description                                                  |
-| ------------- | ---------------------------------------- | ------------------------------------------------------------ |
-| `CustomVoice` | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`  | Predefined speaker voices with optional style/emotion control |
-| `VoiceDesign` | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`  | Generate speech from a natural language voice description     |
-| `Base`        | `Qwen/Qwen3-TTS-12Hz-1.7B-Base`         | Voice cloning from reference audio + transcript              |
+| Task Type     | Model                                    | Description                                                   |
+| ------------- | ---------------------------------------- | ------------------------------------------------------------- |
+| `CustomVoice` | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`   | Predefined speaker voices with optional style/emotion control |
+| `VoiceDesign` | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`   | Generate speech from a natural language voice description     |
+| `Base`        | `Qwen/Qwen3-TTS-12Hz-1.7B-Base`          | Voice cloning from reference audio + transcript               |
 
 Smaller 0.6B variants are also available for `CustomVoice` and `Base`.
 
@@ -166,6 +166,15 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py --query-ty
 - Key flags: `--omni` is required. `--deploy-config` points to the bundled two-stage pipeline config.
 - Async chunking: Enabled by default in `qwen3_tts.yaml` for streaming-friendly first-audio latency. Raw audio streaming requires `stream=true`, `stream_format="audio"`, and `response_format="pcm"`.
 - Task/model matching: Each task type requires its matching model checkpoint. Using a CustomVoice model for a Base (voice clone) request will fail.
+- Base codec termination: Base requests without an explicit `max_new_tokens`
+  use a text-scaled safety ceiling (at least 192 codec frames and no more than
+  the configured model limit). If the Talker reaches that ceiling without
+  codec EOS, non-streaming serving discards the incomplete audio and retries
+  once with a fresh seed; an explicit `seed` or `max_new_tokens` disables the
+  retry. SSE and WebSocket clients receive structured errors and must discard
+  previously emitted audio when the error contains `"action":"discard"`;
+  raw PCM streams terminate with a connection error after any partial bytes
+  already sent.
 - Known limitations: The server serves one model variant at a time. To switch task types (e.g., CustomVoice to Base), restart the server with the corresponding model.
 
 ## Hardware Support

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax H3 cfg-distilled full denoise loop.
 
 Per step, the positive presentation is forwarded exactly once. Video and audio
@@ -14,11 +15,13 @@ from typing import Any
 
 import torch
 
-from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout
+from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout, VideoTokenSpan
 from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_step_idx,
     set_forward_context_denoise_timestep,
+    set_forward_context_denoise_total_steps,
 )
+from vllm_omni.platforms import current_omni_platform
 
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_euler_eta0_step,
@@ -34,15 +37,19 @@ MINIMAX_H3_VIDEO_ROW_WIDTH = 96
 MINIMAX_H3_AUDIO_ROW_WIDTH = 32
 
 
-def minimax_h3_publish_denoise_progress(step: int | None, sigma_video: float | None) -> None:
+def minimax_h3_publish_denoise_progress(
+    step: int | None, sigma_video: float | None, total_steps: int | None = None
+) -> None:
     """Publish denoise progress for step-gated attention features.
 
-    Both execution modes must publish the same pair: the step index drives the
-    dense warmup of RAINFUSION_ATTN, and the normalized descending timestep
-    drives the TRTLLM_ATTN skip gate, which stays dense while it is unset.
+    Both execution modes must publish the same trio: the step index drives the
+    dense warmup of RAINFUSION_ATTN, the normalized descending timestep
+    drives the TRTLLM_ATTN skip gate (which stays dense while it is unset),
+    and the total step count enables the ``end_step`` tail fallback.
     """
     set_forward_context_denoise_step_idx(step)
     set_forward_context_denoise_timestep(sigma_video)
+    set_forward_context_denoise_total_steps(total_steps)
 
 
 class MiniMaxH3DenoiseBranch:
@@ -119,10 +126,38 @@ class MiniMaxH3DenoiseBranch:
         }
         # Where the video segment sits in the packed sequence. Resolved to plain
         # ints here so the attention layers never sync on it per step.
-        grid = packed["latent_grid"].tolist()
-        self.static_kwargs["video_token_layout"] = VideoTokenLayout(
-            prefix_len=int(packed["video_row_start"]),
-            latent_grid=(int(grid[0]), int(grid[1]), int(grid[2])),
+        raw_spans = packed.get("video_spans")
+        if raw_spans:
+            spans = tuple(
+                VideoTokenSpan(
+                    start=int(span["start"]),
+                    latent_grid=tuple(int(dim) for dim in span["latent_grid"]),
+                    role=str(span["role"]),
+                )
+                for span in raw_spans
+            )
+            self.static_kwargs["video_token_layout"] = VideoTokenLayout(used_len=int(cu[1]), video_spans=spans)
+        else:
+            grid = packed["latent_grid"].tolist()
+            self.static_kwargs["video_token_layout"] = VideoTokenLayout(
+                prefix_len=int(packed["video_row_start"]),
+                latent_grid=(int(grid[0]), int(grid[1]), int(grid[2])),
+            )
+
+    def prepare_rope_table(self, model: Any) -> None:
+        """Materialize the branch-local DiT RoPE table once per denoise run.
+
+        ``img_position_ids`` is immutable for this branch while latents and
+        timesteps change every scheduler step. Keeping the table in
+        ``static_kwargs`` makes every model call reuse the exact same BF16
+        tensor without extending its lifetime beyond this request branch.
+        """
+        prepare = getattr(model, "prepare_rope_table", None)
+        if not callable(prepare):
+            return
+        self.static_kwargs["rope_table"] = prepare(
+            self.static_kwargs["img_position_ids"],
+            seq_len=self.seq_len,
         )
 
     def forward_kwargs(
@@ -241,6 +276,11 @@ def minimax_h3_denoise_loop(
         raise ValueError("video/audio sigma schedules must have equal length")
     if len(sigmas_video) < 2:
         raise ValueError("sigma schedules need at least 2 entries")
+    # Keep CUDA/CPU on the reference path: its accuracy CI compares the
+    # generated video against the official artifact. The table reuse is an
+    # Ascend-specific performance optimization and must not alter that path.
+    if current_omni_platform.is_npu():
+        positive.prepare_rope_table(model)
     video_rows, audio_rows, cond_anchor, audio_anchor = minimax_h3_prepare_denoise_rows(
         positive=positive,
         initial_video_rows=initial_video_rows,
@@ -262,7 +302,7 @@ def minimax_h3_denoise_loop(
             # warmup of RAINFUSION_ATTN, the timestep gate of TRTLLM_ATTN) can
             # see it. Gates use the scheduler-style descending timestep, which
             # for a rectified-flow schedule is the video sigma.
-            minimax_h3_publish_denoise_progress(step, s_v)
+            minimax_h3_publish_denoise_progress(step, s_v, num_steps)
             t_v, t_a = 1.0 - s_v, 1.0 - s_a
             imgvid_cond_t = max(t_v, float(imgvid_cond_noise_aug_for_inference))
             audio_ref_cond_t = max(t_a, float(audio_cond_noise_aug_for_inference))
@@ -306,7 +346,7 @@ def minimax_h3_denoise_loop(
             if on_step is not None:
                 on_step(step, video_rows, audio_rows)
 
-    minimax_h3_publish_denoise_progress(None, None)
+    minimax_h3_publish_denoise_progress(None, None, None)
     return video_rows, audio_rows
 
 

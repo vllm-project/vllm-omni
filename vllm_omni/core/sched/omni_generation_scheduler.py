@@ -101,7 +101,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Temporary queue: preserve waiting order while requests await input.
         skipped_waiting_requests = create_request_queue(self.policy)
         req_index = 0
+        self._drop_aborted_queued_requests()
         self._process_pending_omni_inputs(model_mode="generation")
+        self._drop_aborted_queued_requests()
+        self._resync_streaming_input_counter()
 
         # OMNI: Track requests that are already finished (e.g., marked by connector)
         # These should be removed from running and not scheduled

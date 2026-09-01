@@ -45,6 +45,7 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageDeployConfig,
     StageExecutionType,
+    StagePipelineConfig,
     load_deploy_config,
     merge_pipeline_deploy,
 )
@@ -90,6 +91,18 @@ def _from_pipeline_key(
         deploy_config_path=deploy_config_path,
         cli_overrides=cli_overrides,
     )
+
+
+def test_minimax_h3_text_encoder_tp_targets_only_structured_stage_zero() -> None:
+    config = _from_pipeline_key(
+        "minimax_h3_disaggregated",
+        cli_overrides={"text_encoder_tp_size": 4},
+    )
+
+    assert config.stage_by_id(0).parallel_config.tensor_parallel_size == 4
+    diffusion = config.stage_by_id(1)
+    assert diffusion.parallel_config.tensor_parallel_size == 1
+    assert diffusion.parallel_config.text_encoder_tp_size == 1
 
 
 def test_duplex_session_capacity_propagates_to_every_structured_stage() -> None:
@@ -641,10 +654,11 @@ def test_sub_config_fields_match_structured_scopes():
         "ring_degree",
         "allgather_degree",
         "ulysses_mode",
+        "ulysses_a2a_permute",
         "cfg_parallel_size",
         "vae_patch_parallel_size",
-        "text_encoder_tp_size",
         "vae_parallel_mode",
+        "text_encoder_tp_size",
         "use_hsdp",
         "mask_sp_padding",
         "hsdp_shard_size",
@@ -846,6 +860,23 @@ def test_from_pipeline_config_derives_sequence_parallel_size_from_allgather_degr
     assert stage.parallel_config.world_size == 2
 
 
+def test_from_pipeline_config_preserves_deployed_ulysses_a2a_permute() -> None:
+    pipeline = _resolve_pipeline_or_skip("dreamzero")
+    deploy = DeployConfig(
+        stages=[
+            StageDeployConfig(
+                stage_id=0,
+                ulysses_a2a_permute=True,
+            )
+        ]
+    )
+
+    stage = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_by_id(0)
+
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.parallel_config.ulysses_a2a_permute is True
+
+
 def test_diffusion_parallel_config_accepts_four_way_guidance_parallelism():
     cfg = OmniStageDiffusionParallelConfig(cfg_parallel_size=4)
 
@@ -940,6 +971,35 @@ def test_structured_diffusion_config_rejects_non_boolean_compile_dynamic():
         omni_config_module._DiffusionConfigProjection(diffusion_compile_dynamic="false")
 
 
+def test_from_pipeline_config_routes_ltx2_conv_vae_extra(tmp_path):
+    deploy_path = tmp_path / "dreamzero_ltx2_extras.yaml"
+    deploy_path.write_text(
+        "\n".join(
+            [
+                "pipeline: dreamzero",
+                "async_chunk: false",
+                "stages:",
+                "  - stage_id: 0",
+                "    extras:",
+                "      ltx2_use_conv_vae: true",
+            ]
+        )
+    )
+
+    stage = _from_pipeline_key("dreamzero", deploy_config_path=str(deploy_path)).stage_by_id(0)
+
+    assert stage.diffusion_config.extras["ltx2_use_conv_vae"] is True
+
+
+def test_stage_override_routes_ltx2_conv_vae_extra():
+    stage = _from_pipeline_key(
+        "dreamzero",
+        cli_overrides={"stage_0_extras": {"ltx2_use_conv_vae": True}},
+    ).stage_by_id(0)
+
+    assert stage.diffusion_config.extras["ltx2_use_conv_vae"] is True
+
+
 def test_structured_diffusion_config_rejects_invalid_compile_granularity():
     with pytest.raises(ValidationError, match="diffusion_compile_granularity"):
         omni_config_module._DiffusionConfigProjection(diffusion_compile_granularity="block")
@@ -980,7 +1040,10 @@ def test_from_pipeline_config_uses_hf_config_for_callable_resolver():
 
 
 def test_from_pipeline_config_accepts_pre_resolved_pipeline():
-    resolved_pipeline = PipelineConfig(model_type="callable_resolved_variant")
+    resolved_pipeline = PipelineConfig(
+        model_type="callable_resolved_variant",
+        stages=(StagePipelineConfig(stage_id=0, model_stage="a", final_output=True),),
+    )
 
     omni_config = VllmOmniConfig.from_pipeline_config(resolved_pipeline)
 
@@ -1013,6 +1076,7 @@ def test_from_pipeline_config_default_deploy_name_ignores_cwd(monkeypatch, tmp_p
     pipeline = PipelineConfig(
         model_type="pipeline_with_default",
         default_deploy_config_name=default_name,
+        stages=(StagePipelineConfig(stage_id=0, model_stage="a", final_output=True),),
     )
     loaded_paths = []
 
