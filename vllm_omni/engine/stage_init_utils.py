@@ -1813,7 +1813,6 @@ def initialize_diffusion_stage(
     stage_cfg: Any,
     metadata: StageMetadata,
     stage_init_timeout: int,
-    batch_size: int = 1,
     use_inline: bool = False,
 ) -> Any:
     """Build a diffusion stage client.
@@ -1823,15 +1822,12 @@ def initialize_diffusion_stage(
         stage_cfg: Stage configuration.
         metadata: Extracted stage metadata.
         stage_init_timeout: Timeout in seconds for stage initialization handshake
-        batch_size: Client-side request batch width. Does not set scheduler
-            ``max_num_seqs``; pass ``--max-num-seqs`` or stage YAML for that.
-            Forwarded to ``StageDiffusionClient``.
         use_inline: If True, uses the inline diffusion client instead of subprocess.
     """
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
-    return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
+    return create_diffusion_client(model, od_config, metadata, stage_init_timeout, use_inline)
 
 
 def _stage_declares_cfg_pairs(model_config: Any) -> bool:
