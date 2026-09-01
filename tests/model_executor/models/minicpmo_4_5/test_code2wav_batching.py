@@ -10,6 +10,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
+    apply_token2wav_cfg_rate,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -744,3 +745,24 @@ def test_reference_voice_and_duplex_metadata_follow_request_lifecycle():
     assert prompt_key not in model._runtime_prompts
     assert not Path(prompt_wav).exists()
     assert (prompt_cache_id, prompt_wav) not in model.backend._prompt_features
+
+
+def test_cfg_rate_override_reaches_the_flow_decoder() -> None:
+    token2wav = SimpleNamespace(flow=SimpleNamespace(decoder=SimpleNamespace(inference_cfg_rate=0.7)))
+
+    assert apply_token2wav_cfg_rate(token2wav, "0.3") == pytest.approx(0.3)
+    assert token2wav.flow.decoder.inference_cfg_rate == pytest.approx(0.3)
+
+
+@pytest.mark.parametrize(
+    "token2wav",
+    [
+        SimpleNamespace(),
+        SimpleNamespace(flow=SimpleNamespace()),
+        SimpleNamespace(flow=SimpleNamespace(decoder=SimpleNamespace())),
+    ],
+)
+def test_cfg_rate_override_refuses_to_pass_silently(token2wav) -> None:
+    # A configuration key that quietly does nothing is worse than a startup error.
+    with pytest.raises(ValueError, match="inference_cfg_rate"):
+        apply_token2wav_cfg_rate(token2wav, 0.3)
