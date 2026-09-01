@@ -108,6 +108,11 @@ class ChatFallbackProjectorMixin:
             kwargs["tool_choice"] = tool_choice
 
         request = ChatCompletionRequest(**kwargs)
+        # A duplex response runs as a streaming session: the orchestrator
+        # forwards stage 0 on segment boundaries and derives `is_final_update`
+        # from stage 0's output kind, so this path keeps the thinker
+        # final-only. See `_fix_minicpmo45_audio_stream_output_kinds`.
+        object.__setattr__(request, "omni_duplex_session", True)
         object.__setattr__(request, "modalities", response_config.modalities)
         object.__setattr__(request, "request_id", request_id)
         object.__setattr__(
