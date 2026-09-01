@@ -918,6 +918,72 @@ adapter and twice without it, then compare the four output digests. The adapter
 is bound and deterministic when each pair matches internally and the two pairs
 differ from each other.
 
+### FastH3 adapter
+
+[FastH3](https://haoailab.com/blogs/fasth3-preview/) is FastVideo's four-step
+DMD2 student of H3-Base. It reuses H3's text encoder, VAEs, tokenizers, and
+schedulers unchanged, replacing 49 denoiser evaluations with four. It is fused
+into the checkpoint at load time rather than switched per request, because it
+carries full-rank deltas that no LoRA layer can express.
+
+The bundle publishes four variants, so download one and point `--lora-path` at
+it; the repository root is refused rather than guessed at:
+
+```bash
+export FASTH3_DIR=/path/to/fasth3
+hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA \
+  dense-datafree/adapter_model.safetensors --local-dir "${FASTH3_DIR}"
+export FASTH3_LORA="${FASTH3_DIR}/dense-datafree/adapter_model.safetensors"
+```
+
+Add `--task-type fl2va --lora-path "${FASTH3_LORA}"` to a non-offloaded server
+command. T2VA is served by the FL2VA partition, so `--task-type fl2va` is
+correct even though FastH3 preview v1 distills T2VA only. Because the adapter is
+fused, `--lora-backend` does not apply and a request carrying a `lora=` field is
+rejected rather than served without the adapter it asked for.
+
+```bash
+-F 'num_inference_steps=4' \
+-F 'extra_params={"task":"t2va","duration":4.4}'
+```
+
+Requests must ask for `num_inference_steps=4` and `task=t2va`: the release's five
+sigma points bound four denoiser evaluations, and that count is what the step
+scheduler admits a request on. The server denoises on the release's own ladder,
+keeping H3's per-modality shifts at the checkpoint values, so a request that
+overrides `flow_shift` or `audio_flow_shift` is rejected - it would sample the
+student at noise levels it was never distilled at.
+
+Only a release that identifies itself as FastH3 is fused; any other
+`fastvideo-lora-v2` adapter stays on the dynamic LoRA route. A claimed artifact
+is then held to its own metadata: one that misdeclares its tensor counts or
+leaves a transformer block unedited is refused at startup instead of serving
+mostly base H3 weights on a four-step schedule. Offload is refused for the same
+reason - `--enable-cpu-offload`, `--enable-layerwise-offload` and
+`--enable-distributed-layerwise-offload` all bypass the fusion, so they fail fast.
+
+> [!NOTE]
+> Only the **Dense / Data-Free** variant is supported today. The three VSA
+> variants carry `.set_weight` compression gates for modules that do not exist
+> in vLLM-Omni's dense H3 attention, and the release states dense attention is
+> not a supported substitute for them, so they are refused at startup rather
+> than silently run wrong. Video Sparse Attention for H3's packed
+> `[text | cond | audio | video]` sequence is follow-up work.
+
+Measured on 8x NVIDIA B300 with USP8, VAE patch-parallel 8, `TRTLLM_ATTN`, at
+1344x768, 4.4 s, seed 1101, one warmup excluded and two runs recorded:
+
+| Adapter | Steps | End-to-end | Diffusion engine |
+| --- | ---: | ---: | ---: |
+| none (base H3) | 50 | 25.8 / 26.4 s | 16.22 / 16.28 s |
+| FastH3 Dense | 4 (5 sigma points) | 11.7 / 11.8 s | 2.37 / 2.36 s |
+
+The denoising speedup is 6.9x. End-to-end is 2.2x because text encoding, VAE
+decoding and muxing are a fixed cost that dominates a clip this short; longer
+generations move the end-to-end figure toward the denoising one. Fusing the
+adapter does not measurably change startup: weight loading took 77.3 s with it
+against 85.8 s without.
+
 ## Key parameters
 
 | Parameter | Recommended value | Notes |

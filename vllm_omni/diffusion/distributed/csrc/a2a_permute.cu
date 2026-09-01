@@ -7,6 +7,7 @@
 // cached per group — the PR's keyed-devcomm manager API is not in 2.11).
 
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <c10/macros/Macros.h>
 #include <ATen/native/cuda/MemoryAccess.cuh>
 #include <ATen/cuda/CUDAContext.h>
@@ -28,6 +29,37 @@ using namespace c10d::symmetric_memory;
 #ifndef NCCL_HAS_SYMMEM_DEVICE_SUPPORT
 #error "Build requires NCCL >= 2.28 with symmetric-memory device support"
 #endif
+
+void copy_rows(const at::Tensor& input, at::Tensor& out) {
+  TORCH_CHECK(input.is_cuda() && out.is_cuda(), "a2a_permute: copy_rows requires CUDA tensors");
+  TORCH_CHECK(input.device() == out.device(), "a2a_permute: copy_rows device mismatch");
+  TORCH_CHECK(input.scalar_type() == out.scalar_type(), "a2a_permute: copy_rows dtype mismatch");
+  TORCH_CHECK(input.dim() == 3, "a2a_permute: copy_rows input must be 3-D");
+  TORCH_CHECK(out.sizes() == input.sizes(), "a2a_permute: copy_rows shape mismatch");
+  TORCH_CHECK(out.is_contiguous(), "a2a_permute: copy_rows output must be contiguous");
+  TORCH_CHECK(
+      input.stride(2) == 1 && input.stride(1) == input.size(2),
+      "a2a_permute: copy_rows requires contiguous rows");
+
+  const int64_t row_elements = input.size(1) * input.size(2);
+  TORCH_CHECK(input.stride(0) >= row_elements, "a2a_permute: copy_rows input rows overlap");
+  const size_t rows = static_cast<size_t>(input.size(0));
+  const size_t row_bytes = static_cast<size_t>(row_elements) * input.element_size();
+  const size_t input_pitch =
+      static_cast<size_t>(input.stride(0) * input.element_size());
+
+  c10::cuda::CUDAGuard guard(input.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  C10_CUDA_CHECK(cudaMemcpy2DAsync(
+      out.data_ptr(),
+      row_bytes,
+      input.data_ptr(),
+      input_pitch,
+      row_bytes,
+      rows,
+      cudaMemcpyDeviceToDevice,
+      stream));
+}
 
 // ---- kernel (verbatim from PR) ----------------------------------------------
 __device__ inline void copy_bytes_vec16_aligned(
@@ -227,8 +259,10 @@ void all_to_all_permute(
 } // namespace
 
 TORCH_LIBRARY_FRAGMENT(a2ap, m) {
+  m.def("copy_rows(Tensor input, Tensor(a!) out) -> ()");
   m.def("all_to_all_permute(Tensor input, Tensor(a!) out, int scatter_dim, int gather_dim, str group_name) -> ()");
 }
 TORCH_LIBRARY_IMPL(a2ap, CUDA, m) {
+  m.impl("copy_rows", TORCH_FN(copy_rows));
   m.impl("all_to_all_permute", TORCH_FN(all_to_all_permute));
 }

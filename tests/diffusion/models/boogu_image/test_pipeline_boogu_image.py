@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """L1 unit tests for the native Boogu-Image pipeline.
 
@@ -131,6 +131,51 @@ def test_constructor_wires_components(boogu_pipeline, mock_dependencies):
 def test_constructor_strips_mllm_lm_head(boogu_pipeline, mock_dependencies):
     # Upstream encodes with the inner Qwen3VLModel, not the generation wrapper.
     assert boogu_pipeline.mllm is mock_dependencies["inner_encoder"]
+
+
+def test_constructor_forwards_revision_to_all_component_loaders(mock_dependencies, mocker):
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        BooguImagePipeline,
+    )
+
+    revision = "hotfix-1k-20260708"
+    prefetch = mocker.patch(f"{_MODULE}.prefetch_subfolders")
+    scheduler_loader = mocker.patch(
+        f"{_MODULE}.FlowMatchEulerDiscreteScheduler.from_pretrained",
+        return_value=mock_dependencies["scheduler"],
+    )
+    mllm_loader = mocker.patch(
+        f"{_MODULE}.Qwen3VLForConditionalGeneration.from_pretrained",
+        return_value=mock_dependencies["mllm_wrapper"],
+    )
+    processor_loader = mocker.patch(
+        f"{_MODULE}.Qwen3VLProcessor.from_pretrained",
+        return_value=mock_dependencies["processor"],
+    )
+    vae_loader = mocker.patch(
+        f"{_MODULE}.AutoencoderKL.from_pretrained",
+        return_value=mock_dependencies["vae"],
+    )
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        revision=revision,
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.float32,
+        num_gpus=1,
+    )
+
+    pipeline = BooguImagePipeline(od_config=od_config)
+
+    (source,) = pipeline.weights_sources
+    assert source.revision == revision
+    prefetch.assert_called_once_with(
+        "dummy-boogu",
+        ["scheduler", "vae", "mllm", "processor"],
+        local_files_only=True,
+        revision=revision,
+    )
+    for loader in (scheduler_loader, mllm_loader, processor_loader, vae_loader):
+        assert loader.call_args.kwargs["revision"] == revision
 
 
 def test_constructor_weights_sources(boogu_pipeline):

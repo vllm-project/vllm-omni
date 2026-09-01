@@ -598,6 +598,8 @@ class StageDiffusionProc:
           - ``omni_replica_id``: cluster-unique replica id within the
             stage (logging / metrics only).
         """
+        from vllm_omni.plugins import load_omni_general_plugins
+
         shutdown_requested = False
 
         set_death_signal(signal.SIGTERM)
@@ -610,6 +612,11 @@ class StageDiffusionProc:
 
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
+
+        # ``spawn`` starts this process with a fresh interpreter, so plugin
+        # side effects (for example, custom diffusion loader hooks) must be
+        # applied again before the engine is constructed.
+        load_omni_general_plugins()
 
         proc = cls(model, od_config)
         coord_client: OmniCoordClientForStage | None = None
