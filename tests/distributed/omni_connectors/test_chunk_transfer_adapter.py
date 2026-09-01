@@ -2497,6 +2497,153 @@ def test_final_update_on_non_sender_stage_keeps_upstream_abort(build_adapter):
     assert not adapter._pending_save_reqs
 
 
+def _queue_terminal(
+    adapter,
+    external_req_id: str,
+    req_id: str = "req-terminal",
+    segment_generation: int = 0,
+) -> None:
+    """Queue one request-terminal chunk on the adapter's save queue.
+
+    ``segment_generation`` must match the adapter's dedup watermark, which a
+    preceding segment stop advances; otherwise ``save_async`` drops the chunk
+    as a late duplicate.
+    """
+    request = _req(req_id, RequestStatus.FINISHED_STOPPED, external_req_id=external_req_id)
+    request.resumable = False
+    request._omni_segment_generation = segment_generation
+    adapter.save_async(None, request, is_segment_finished=False)
+
+
+def _assert_terminal_put(connector) -> None:
+    connector.put.assert_called_once()
+    assert bool(connector.put.call_args.kwargs["data"].meta.finished.item()) is True
+
+
+def test_terminal_chunk_survives_cleanup_after_dequeue(build_adapter):
+    """#6670: the fence must hold across the connector handoff, not just the queue.
+
+    ``_finish_parked_streaming_session`` queues the terminal and then calls
+    ``finish_requests``, so ``cleanup_sender`` can land *after* the save_loop
+    has already dequeued the terminal. Releasing the fence at dequeue left
+    that interleaving cancelling the chunk before ``put`` -- the same lost
+    terminal, and the same downstream WAITING_FOR_CHUNK hang.
+    """
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    _queue_terminal(adapter, "ext-late-cleanup")
+    task = adapter._pending_save_reqs.popleft()
+
+    real_send = adapter._send_single_request_for_generation
+
+    def send_with_cleanup_in_flight(inner_task, sender_token=None):
+        # The scheduler thread reaches cleanup_sender here: the save_loop owns
+        # the terminal but has not handed it to the connector yet.
+        adapter.cleanup_sender("ext-late-cleanup")
+        return real_send(inner_task, sender_token)
+
+    adapter._send_single_request_for_generation = send_with_cleanup_in_flight
+    adapter._send_single_request(task)
+
+    _assert_terminal_put(connector)
+    # The generation the fence kept alive is reclaimed, not leaked.
+    assert "ext-late-cleanup" not in adapter._sender_tokens
+    assert "ext-late-cleanup" not in adapter.put_req_chunk
+
+
+def test_terminal_chunk_survives_cleanup_racing_an_inflight_sibling(build_adapter):
+    """#6670: an in-flight ordinary chunk must not reclaim a fenced generation.
+
+    ``_send_single_request``'s ``finally`` also tears a cancelled generation
+    down. If the stop and the abort both land while an earlier chunk is on the
+    wire, that teardown would unregister the token and the queued terminal
+    would then fail the identity check.
+    """
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    running = _req("req-sibling", RequestStatus.RUNNING, external_req_id="ext-sibling")
+    running.resumable = True
+    adapter.save_async(None, running, is_segment_finished=True)
+    ordinary_task = adapter._pending_save_reqs.popleft()
+
+    real_send = adapter._send_single_request_for_generation
+
+    def send_then_stop_and_abort(inner_task, sender_token=None):
+        result = real_send(inner_task, sender_token)
+        # Terminal stop and abort both land while this chunk is on the wire.
+        # The segment stop above already armed the next segment's watermark.
+        _queue_terminal(adapter, "ext-sibling", req_id="req-sibling", segment_generation=1)
+        adapter.cleanup_sender("ext-sibling")
+        return result
+
+    adapter._send_single_request_for_generation = send_then_stop_and_abort
+    adapter._send_single_request(ordinary_task)
+    adapter._send_single_request_for_generation = real_send
+
+    assert len(adapter._pending_save_reqs) == 1
+    connector.put.reset_mock()
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    _assert_terminal_put(connector)
+    assert "ext-sibling" not in adapter._sender_tokens
+
+
+def test_new_request_cannot_join_a_generation_with_a_queued_terminal(build_adapter):
+    """#6670: the fence must not readmit a request reusing the external id.
+
+    ``save_async`` rejects chunks whose generation is ``cancelled``; that is
+    what stops a new request from inheriting a retiring generation's token and
+    chunk counters. Deferring the reclaim must not also defer that retirement.
+    """
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    _queue_terminal(adapter, "ext-shared", req_id="req-old")
+    adapter.cleanup_sender("ext-shared")
+
+    newcomer = _req("req-new", RequestStatus.RUNNING, external_req_id="ext-shared")
+    newcomer.resumable = True
+    adapter.save_async(None, newcomer, is_segment_finished=True)
+
+    # Rejected loudly, so the scheduler fails the newcomer now instead of its
+    # chunks being silently discarded at send time.
+    assert len(adapter._pending_save_reqs) == 1
+    assert adapter.collect_failed_send_request_ids() == {"req-new": "previous sender generation is still draining"}
+
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    _assert_terminal_put(connector)
+    assert "ext-shared" not in adapter._sender_tokens
+
+
+def test_failed_terminal_put_runs_the_deferred_cleanup(build_adapter):
+    """#6670: a silent connector drop must not strand the deferred cleanup.
+
+    ``connector.put`` returning False skips the success path that would have
+    called ``cleanup``. The reclaim ``cleanup_sender`` handed over is owed on
+    that path too, or the whole per-request sender state leaks for good.
+    """
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    _queue_terminal(adapter, "ext-put-failed")
+    adapter.cleanup_sender("ext-put-failed")
+    connector.put.return_value = (False, 0, {})
+
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    assert "ext-put-failed" not in adapter._sender_tokens
+    assert "ext-put-failed" not in adapter.put_req_chunk
+
+
+def test_raising_terminal_put_runs_the_deferred_cleanup(build_adapter):
+    """#6670: the same reclaim is owed when the connector raises."""
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    _queue_terminal(adapter, "ext-put-raised")
+    adapter.cleanup_sender("ext-put-raised")
+    connector.put.side_effect = RuntimeError("connector down")
+
+    # ``save_loop`` catches this and records a send failure.
+    with pytest.raises(RuntimeError):
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    assert "ext-put-raised" not in adapter._sender_tokens
+    assert "ext-put-raised" not in adapter.put_req_chunk
+
+
 def test_wire_round_trip_struct_to_dict_contract():
     """Pin the wire contract: encoding ``OmniPayloadStruct`` and decoding it
     yields a dict equivalent to ``to_dict(struct)``.
