@@ -1,12 +1,12 @@
 # Tensor Parallelism Guide
 
-
 ## Table of Content
 
 - [Overview](#overview)
 - [Quick Start](#quick-start)
 - [Example Script](#example-script)
 - [Configuration Parameters](#configuration-parameters)
+- [Model-Specific Options](#model-specific-options)
 - [Best Practices](#best-practices)
 - [Troubleshooting](#troubleshooting)
 - [Summary](#summary)
@@ -30,7 +30,6 @@ See supported models list in [Supported Models](../../diffusion_features.md#supp
 ---
 
 ## Quick Start
-
 
 ### Basic Usage
 
@@ -98,6 +97,37 @@ In `DiffusionParallelConfig`:
 |-----------|------|---------|-------------|
 | `tensor_parallel_size` | int | 1 | Number of GPUs to shard model weights across. Must divide number of heads. |
 
+---
+
+## Model-Specific Options
+
+### FLUX.1: sharded single-stream projections
+
+FLUX.1's 38 single-stream blocks (`FluxSingleTransformerBlock`) **replicate** their
+`proj_mlp`/`proj_out` layers on every TP rank: each rank all-gathers the attention output
+and runs the full projection GEMMs. Set `VLLM_OMNI_FLUX1_SHARDED_PROJ` before starting
+the engine to shard those two layers instead, so each rank holds one slice and the pair
+costs a single all-reduce:
+
+```bash
+VLLM_OMNI_FLUX1_SHARDED_PROJ=1 \
+    vllm serve black-forest-labs/FLUX.1-dev --omni --port 8091 \
+    --tensor-parallel-size 2
+```
+
+Enabling values are `1`, `true`, `yes` and `on`; anything else — including unset and
+`tensor_parallel_size=1` — keeps the replicated path. On FLUX.1-dev at
+`tensor_parallel_size=2` (28 steps, 1024x1024, BF16) this cut denoise step latency ~10%
+and peak memory ~12%; the gain varies with resolution, step count, and TP degree.
+
+It is opt-in because the sharded path uses its own checkpoint split loader, validated on
+unquantized checkpoints and on per-tensor/per-channel FP8 scales. Layouts it cannot split
+(a parameter missing on the split projections, or GPTQ/AWQ act-order group indices) raise
+an error naming this variable; other quantization layouts are untested, so verify output
+quality before enabling it on one. Output is **not bit-identical** to the replicated path
+because the reduction order differs, though each setting is reproducible on its own for a
+fixed seed. The double-stream blocks (`FluxTransformerBlock`) are always TP-sharded and
+are unaffected.
 
 ---
 
@@ -115,7 +145,6 @@ In `DiffusionParallelConfig`:
 - When maximum throughput is needed and memory is sufficient
 - Models with incompatible dimensions (e.g., Z-Image `num_heads=30`, which now supports `tensor_parallel_size=2`)
 
-
 ## Troubleshooting
 
 ### Common Issue 1: Out of Memory (OOM)
@@ -123,6 +152,7 @@ In `DiffusionParallelConfig`:
 **Symptoms**: CUDA OOM errors during model loading or inference, process crashes with memory errors
 
 **Solution**:
+
 ```python
 # Step 1: Enable TP with smallest degree
 parallel_config=DiffusionParallelConfig(tensor_parallel_size=2)
@@ -137,10 +167,10 @@ parallel_config=DiffusionParallelConfig(tensor_parallel_size=4)
 **Symptoms**: Error like "Model dimension X not divisible by tensor_parallel_size Y"
 
 **Solutions**:
+
 1. Check model-specific constraints (e.g., Z-Image only supports TP=2)
 2. Use a smaller TP size that divides model dimensions
 3. Consult [Supported Models](../../diffusion_features.md#supported-models) for compatible TP sizes
-
 
 ---
 
