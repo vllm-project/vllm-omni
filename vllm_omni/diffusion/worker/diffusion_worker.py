@@ -717,16 +717,9 @@ class DiffusionWorker:
         usage_before = allocator.get_current_usage()
 
         if level == 2 and self.model_runner is not None:
-            if hasattr(self.model_runner, "graph_runners"):
-                self.model_runner.graph_runners.clear()
-                logger.info(f"[Worker {self.rank}] CUDA Graphs cleared.")
+            self.model_runner.release_captured_graphs()
+            logger.info(f"[Worker {self.rank}] CUDA Graphs cleared.")
             model = self.model_runner.pipeline
-            # A pipeline may hold captures of its own across requests. Level 2
-            # discards the memory those were recorded against, so they have to
-            # go with `graph_runners`.
-            release = getattr(model, "release_captured_graphs", None)
-            if callable(release):
-                release()
             self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
 
         free_mem_before = current_omni_platform.get_free_memory()

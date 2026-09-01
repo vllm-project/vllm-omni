@@ -143,10 +143,10 @@ class TestDiffusionWorkerSleep:
         assert "buffer1" in mock_gpu_worker._sleep_saved_buffers
         assert "buffer2" in mock_gpu_worker._sleep_saved_buffers
 
-    def test_sleep_level_2_releases_pipeline_captures(self, mocker: MockerFixture, mock_gpu_worker):
-        """A pipeline may hold CUDA graphs across requests. Level 2 discards the
-        memory those were captured against, so they have to go the same way
-        `model_runner.graph_runners` does."""
+    def test_sleep_level_2_releases_captures_through_the_model_runner(self, mocker: MockerFixture, mock_gpu_worker):
+        """Level 2 discards the memory captures were recorded against, and the
+        runner owns the release. The worker asks it once and does not reach past
+        it into the pipeline."""
         mock_platform = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")
         mock_platform.get_free_memory.side_effect = [10 * 1024**3, 12 * 1024**3]
         mock_platform.get_device_total_memory.return_value = 80 * 1024**3
@@ -155,7 +155,8 @@ class TestDiffusionWorkerSleep:
 
         mock_gpu_worker.sleep(level=2)
 
-        mock_gpu_worker.model_runner.pipeline.release_captured_graphs.assert_called_once_with()
+        mock_gpu_worker.model_runner.release_captured_graphs.assert_called_once_with()
+        mock_gpu_worker.model_runner.pipeline.release_captured_graphs.assert_not_called()
 
     def test_sleep_memory_freed_validation(self, mocker: MockerFixture, mock_gpu_worker):
         """Test that sleep validates memory was actually freed."""

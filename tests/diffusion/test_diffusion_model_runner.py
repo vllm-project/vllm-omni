@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -177,6 +177,28 @@ def test_request_scoped_cache_dit_lifecycle_is_pipeline_opt_in():
     assert model_runner_module.adopt_request_scoped_cache_dit(request_scoped_pipeline, backend)
     assert model_runner_module.is_request_scoped_cache_dit_enabled(request_scoped_pipeline)
     assert events == [backend]
+
+
+def test_release_captured_graphs_clears_runners_and_delegates_to_the_pipeline():
+    """Both halves in one place, so a pipeline that keeps captures is collected
+    without the caller knowing which pipelines have one."""
+    released = []
+    runner = object.__new__(DiffusionModelRunner)
+    runner.graph_runners = {"decode": object()}
+    runner.pipeline = SimpleNamespace(release_captured_graphs=lambda: released.append(True))
+
+    runner.release_captured_graphs()
+
+    assert runner.graph_runners == {}
+    assert released == [True]
+
+
+def test_release_captured_graphs_tolerates_a_pipeline_without_captures():
+    """Most pipelines keep none, and the runner may not carry `graph_runners`."""
+    runner = object.__new__(DiffusionModelRunner)
+    runner.pipeline = object()
+
+    runner.release_captured_graphs()
 
 
 def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summary: bool = True):
