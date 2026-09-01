@@ -153,8 +153,10 @@ def test_non_streaming_mode_emits_full_utterance_on_finish():
 
 
 def test_non_streaming_mode_false_keeps_windowed_emit():
+    # Dynamic IC defers emit at 25 frames (see _CASES); 41 hits the first
+    # steady-state window boundary and proves streaming path is unchanged.
     tm = _tm()
-    tm.code_prompt_token_ids["r"] = [_FRAME[:] for _ in range(25)]
+    tm.code_prompt_token_ids["r"] = [_FRAME[:] for _ in range(41)]
     p = talker2code2wav_async_chunk(
         transfer_manager=tm,
         multimodal_output={"codes": {"audio": torch.zeros((0,))}},
