@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
+from torch.nn.utils import parametrize
 
 import vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav as batched_token2wav_module
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
@@ -20,6 +21,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
+    fold_weight_norm,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -1313,3 +1315,64 @@ def test_reference_voice_and_duplex_metadata_follow_request_lifecycle():
     assert prompt_key not in model._runtime_prompts
     assert not Path(prompt_wav).exists()
     assert (prompt_cache_id, prompt_wav) not in model.backend._prompt_features
+
+
+class _WeightNormedStack(nn.Module):
+    """A stand-in for HiFT's convolution stack, with weight norm live."""
+
+    def __init__(self, legacy: bool = False):
+        super().__init__()
+        if legacy:
+            import warnings
+
+            from torch.nn.utils import weight_norm
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                self.conv_pre = weight_norm(nn.Conv1d(4, 4, 3, padding=1))
+                self.body = nn.Sequential(weight_norm(nn.Conv1d(4, 4, 3, padding=1)))
+        else:
+            from torch.nn.utils.parametrizations import weight_norm
+
+            self.conv_pre = weight_norm(nn.Conv1d(4, 4, 3, padding=1))
+            self.body = nn.Sequential(weight_norm(nn.Conv1d(4, 4, 3, padding=1)))
+        self.plain = nn.Conv1d(4, 4, 1)
+
+    def forward(self, x):
+        return self.plain(self.body(self.conv_pre(x)))
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_fold_weight_norm_materializes_the_effective_inference_weight(legacy: bool) -> None:
+    torch.manual_seed(0)
+    model = _WeightNormedStack(legacy=legacy).eval()
+    x = torch.randn(1, 4, 16)
+
+    with torch.no_grad():
+        expected = model(x).clone()
+    effective = {
+        name: child.weight.detach().clone() for name, child in model.named_modules() if name in ("conv_pre", "body.0")
+    }
+
+    folded = fold_weight_norm(model)
+
+    assert set(folded) == {"conv_pre.weight", "body.0.weight"}
+    for name, child in model.named_modules():
+        if name in effective:
+            torch.testing.assert_close(child.weight, effective[name], rtol=0, atol=0)
+            assert not parametrize.is_parametrized(child, "weight")
+            assert not child._forward_pre_hooks
+    with torch.no_grad():
+        torch.testing.assert_close(model(x), expected, rtol=0, atol=0)
+
+
+def test_fold_weight_norm_leaves_plain_modules_untouched() -> None:
+    model = nn.Sequential(nn.Conv1d(2, 2, 1), nn.Linear(2, 2))
+    assert fold_weight_norm(model) == ()
+
+
+def test_fold_weight_norm_is_idempotent() -> None:
+    torch.manual_seed(1)
+    model = _WeightNormedStack().eval()
+    assert len(fold_weight_norm(model)) == 2
+    assert fold_weight_norm(model) == ()

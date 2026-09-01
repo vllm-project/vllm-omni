@@ -16,6 +16,7 @@ from typing import Any
 import soundfile as sf
 import torch
 import torch.nn as nn
+from torch.nn.utils import parametrize
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
@@ -42,6 +43,39 @@ def _resolve_model_dir(model_ref: str, revision: str | None = None) -> str:
     from huggingface_hub import snapshot_download
 
     return snapshot_download(model_ref, revision=revision, allow_patterns=["assets/*"])
+
+
+def fold_weight_norm(module: nn.Module) -> tuple[str, ...]:
+    """Materialize frozen weight-norm parametrizations once, for inference.
+
+    HiFT wraps every convolution in weight norm and keeps it live, so each
+    forward recomputes ``g * v / ||v||`` -- a norm reduction plus a broadcast
+    multiply per convolution -- even though an inference weight never changes.
+    Removing the parametrization with ``leave_parametrized=True`` stores the
+    weight the model is already using, so the arithmetic is unchanged and the
+    per-call kernels go away.
+
+    Both spellings are handled: ``torch.nn.utils.parametrizations.weight_norm``
+    (what ``flashcosyvoice`` uses when torch provides it) and the legacy
+    forward-pre-hook ``torch.nn.utils.weight_norm``.
+
+    Returns the qualified names of the weights that were folded.
+    """
+    from torch.nn.utils import remove_weight_norm
+    from torch.nn.utils.weight_norm import WeightNorm
+
+    folded: list[str] = []
+    for module_name, child in list(module.named_modules()):
+        qualified = f"{module_name}.weight" if module_name else "weight"
+        if parametrize.is_parametrized(child, "weight"):
+            if not any(type(item).__name__ == "_WeightNorm" for item in child.parametrizations.weight):
+                continue
+            parametrize.remove_parametrizations(child, "weight", leave_parametrized=True)
+            folded.append(qualified)
+        elif any(isinstance(hook, WeightNorm) for hook in child._forward_pre_hooks.values()):
+            remove_weight_norm(child)
+            folded.append(qualified)
+    return tuple(folded)
 
 
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
@@ -867,6 +901,10 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
         finally:
             torch.set_default_dtype(previous_dtype)
+
+        if bool(extra.get("token2wav_hift_fold_weight_norm", True)):
+            folded = fold_weight_norm(token2wav.hift)
+            logger.info("Folded weight norm into %d HiFT inference weights", len(folded))
 
         trt_stepper = None
         use_trt = bool(extra.get("token2wav_trt", False)) or os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1"
