@@ -2860,6 +2860,54 @@ stages:
         assert omega_config.engine_args.max_model_len == 8192
         assert omega_config.engine_args.enforce_eager is True
 
+    def test_cli_attention_shorthand_replaces_yaml_structured_default(self):
+        stage = StageConfig(
+            stage_id=0,
+            model_stage="dit",
+            stage_type=StageType.DIFFUSION,
+            yaml_engine_args={
+                "diffusion_attention_config": {
+                    "default": {"backend": "FLASH_ATTN"},
+                    "per_role": {"cross": {"backend": "TORCH_SDPA"}},
+                },
+            },
+            runtime_overrides={"diffusion_attention_backend": "SAGE_ATTN"},
+        )
+
+        engine_args = stage.to_omegaconf().engine_args
+
+        assert engine_args.diffusion_attention_backend == "SAGE_ATTN"
+        assert "default" not in engine_args.diffusion_attention_config
+        assert engine_args.diffusion_attention_config.per_role.cross.backend == "TORCH_SDPA"
+
+    def test_cli_attention_shorthand_keeps_yaml_per_role_only_config(self):
+        stage = StageConfig(
+            stage_id=0,
+            model_stage="dit",
+            stage_type=StageType.DIFFUSION,
+            yaml_engine_args={"diffusion_attention_config": {"per_role": {"cross": {"backend": "TORCH_SDPA"}}}},
+            runtime_overrides={"diffusion_attention_backend": "SAGE_ATTN"},
+        )
+
+        engine_args = stage.to_omegaconf().engine_args
+
+        assert engine_args.diffusion_attention_backend == "SAGE_ATTN"
+        assert engine_args.diffusion_attention_config == {"per_role": {"cross": {"backend": "TORCH_SDPA"}}}
+
+    def test_cli_attention_config_replaces_yaml_shorthand(self):
+        stage = StageConfig(
+            stage_id=0,
+            model_stage="dit",
+            stage_type=StageType.DIFFUSION,
+            yaml_engine_args={"diffusion_attention_backend": "TORCH_SDPA"},
+            runtime_overrides={"diffusion_attention_config": {"default": {"backend": "SAGE_ATTN"}}},
+        )
+
+        engine_args = stage.to_omegaconf().engine_args
+
+        assert "diffusion_attention_backend" not in engine_args
+        assert engine_args.diffusion_attention_config.default.backend == "SAGE_ATTN"
+
 
 class TestSentinelDefaultPrecedence:
     """Caller-typed (non-None) values win over YAML; None values fall through
