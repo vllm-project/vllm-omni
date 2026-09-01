@@ -1792,6 +1792,36 @@ class TestMmapValidation:
         assert result.plan is None
         assert result.fallback_reason == expected_reason
 
+    def test_int8_convrot_falls_back_to_run_quant_postprocessing(self, tmp_path):
+        from vllm_omni.quantization.int8_convrot_config import (
+            DiffusionInt8ConvRotConfig,
+            Int8ConvRotLayerConfig,
+            Int8ConvRotLinearMethod,
+        )
+
+        pipeline = nn.Module()
+        pipeline.transformer = nn.Linear(2, 2, bias=False)
+        pipeline.transformer.quant_method = Int8ConvRotLinearMethod(
+            DiffusionInt8ConvRotConfig(),
+            Int8ConvRotLayerConfig(convrot=True),
+            prefix="transformer",
+        )
+
+        result = build_checkpoint_mmap_plan(
+            pipeline,
+            dit_modules=(("transformer", pipeline.transformer),),
+            sources=(),
+            model_path=str(tmp_path),
+            tensor_parallel_size=1,
+            use_hsdp=False,
+            online_quantization=False,
+        )
+
+        assert result.plan is None
+        assert result.fallback_reason == (
+            "INT8 ConvRot requires the ordinary loader to run quantization post-processing"
+        )
+
     @pytest.mark.parametrize(
         ("checkpoint_tensor", "expected_reason"),
         [

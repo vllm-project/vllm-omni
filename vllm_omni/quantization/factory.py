@@ -88,6 +88,13 @@ def _build_int8(**kw: Any) -> QuantizationConfig:
     return DiffusionInt8Config(**kw)
 
 
+def _build_int8_convrot(**kw: Any) -> QuantizationConfig:
+    """Build the serialized ComfyUI tensor-wise INT8 ConvRot config."""
+    from .int8_convrot_config import DiffusionInt8ConvRotConfig
+
+    return DiffusionInt8ConvRotConfig(**kw)
+
+
 def _build_bitsandbytes(**kw: Any) -> QuantizationConfig:
     """Lazy import for BitsAndBytes 4-bit diffusion config (CUDA only)."""
     from .bitsandbytes_config import DiffusionBitsAndBytesConfig
@@ -148,6 +155,7 @@ def _build_inc(**kw: Any) -> QuantizationConfig:
 
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "int8": _build_int8,
+    "int8_convrot": _build_int8_convrot,
     "bitsandbytes": _build_bitsandbytes,
     "mxfp8": _build_mxfp8,
     "mxfp4": _build_mxfp4,

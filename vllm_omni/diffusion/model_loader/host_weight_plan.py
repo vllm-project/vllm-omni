@@ -84,6 +84,15 @@ def has_online_quantization(model: nn.Module) -> bool:
     return any(getattr(getattr(module, "quant_method", None), "uses_meta_device", False) for module in model.modules())
 
 
+def _has_int8_convrot_quantization(model: nn.Module) -> bool:
+    """Whether direct mmap would skip required ConvRot finalization."""
+    from vllm_omni.quantization.int8_convrot_config import (
+        Int8ConvRotLinearMethod,
+    )
+
+    return any(isinstance(getattr(module, "quant_method", None), Int8ConvRotLinearMethod) for module in model.modules())
+
+
 def _resolve_source_root(source: object) -> str:
     source_root = os.fspath(getattr(source, "model_or_path"))
     subfolder = getattr(source, "subfolder", None)
@@ -297,6 +306,11 @@ def build_checkpoint_mmap_plan(
         return HostWeightPlanResult(None, "HSDP requires the ordinary loader")
     if online_quantization:
         return HostWeightPlanResult(None, "online quantization requires the ordinary loader")
+    if _has_int8_convrot_quantization(pipeline):
+        return HostWeightPlanResult(
+            None,
+            "INT8 ConvRot requires the ordinary loader to run quantization post-processing",
+        )
 
     remap_fn = getattr(type(pipeline), "_remap_ckpt_key", None)
     if not callable(remap_fn):
