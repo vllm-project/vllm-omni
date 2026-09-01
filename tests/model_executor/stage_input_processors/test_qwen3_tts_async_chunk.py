@@ -32,11 +32,13 @@ _FRAME = [1, 2, 3, 4]
 _Q = len(_FRAME)
 
 
-def _req(rid, *, finished, initial_codec_chunk_frames=None):
-    ai = None
+def _req(rid, *, finished, initial_codec_chunk_frames=None, non_streaming_mode=None):
+    entries = {}
     if initial_codec_chunk_frames is not None:
-        entry = SimpleNamespace(list_data=[initial_codec_chunk_frames])
-        ai = SimpleNamespace(entries={"initial_codec_chunk_frames": entry})
+        entries["initial_codec_chunk_frames"] = SimpleNamespace(list_data=[initial_codec_chunk_frames])
+    if non_streaming_mode is not None:
+        entries["non_streaming_mode"] = SimpleNamespace(list_data=[non_streaming_mode])
+    ai = SimpleNamespace(entries=entries) if entries else None
     return SimpleNamespace(
         external_req_id=rid,
         is_finished=lambda: finished,
@@ -121,6 +123,46 @@ def test_flush_on_finish():
     assert p is not None
     assert p.meta.finished.item() is True
     assert len(p.codes.audio) == _Q * 24
+
+
+def test_non_streaming_mode_defers_until_finished():
+    """non_streaming_mode=True should not emit windowed chunks mid-utterance (#4371)."""
+    tm = _tm()
+    tm.code_prompt_token_ids["r"] = [_FRAME[:] for _ in range(50)]
+    p = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        multimodal_output=None,
+        request=_req("r", finished=False, non_streaming_mode=True),
+        is_finished=False,
+    )
+    assert p is None
+
+
+def test_non_streaming_mode_emits_full_utterance_on_finish():
+    tm = _tm()
+    tm.code_prompt_token_ids["r"] = [_FRAME[:] for _ in range(50)]
+    p = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        multimodal_output=None,
+        request=_req("r", finished=True, non_streaming_mode=True),
+        is_finished=True,
+    )
+    assert p is not None
+    assert p.meta.finished.item() is True
+    assert len(p.codes.audio) == _Q * 50
+
+
+def test_non_streaming_mode_false_keeps_windowed_emit():
+    tm = _tm()
+    tm.code_prompt_token_ids["r"] = [_FRAME[:] for _ in range(25)]
+    p = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        multimodal_output={"codes": {"audio": torch.zeros((0,))}},
+        request=_req("r", finished=False, non_streaming_mode=False),
+        is_finished=False,
+    )
+    assert p is not None
+    assert len(p.codes.audio) == _Q * 25
 
 
 _CASES = [

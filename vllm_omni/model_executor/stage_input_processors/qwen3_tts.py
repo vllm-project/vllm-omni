@@ -26,6 +26,7 @@ from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_language_from_prompt,
     extract_language_from_request,
+    extract_non_streaming_mode_from_request,
     extract_speaker_from_prompt,
     extract_speaker_from_request,
 )
@@ -180,6 +181,13 @@ def talker2code2wav_async_chunk(
         initial_chunk_size = chunk_size
     length = len(transfer_manager.code_prompt_token_ids[request_id])
 
+    # Batch/offline requests signal full-utterance Code2Wav via
+    # non_streaming_mode=True. Defer all connector chunks until the talker
+    # finishes so Code2Wav decodes once instead of windowed segments (#4371).
+    non_streaming_mode = extract_non_streaming_mode_from_request(request)
+    if non_streaming_mode is True and not finished:
+        return None
+
     if length <= 0:
         if finished:
             return OmniPayloadStruct(
@@ -192,7 +200,10 @@ def talker2code2wav_async_chunk(
             )
         return None
 
-    if adaptive_enabled:
+    if non_streaming_mode is True:
+        first_chunk = int(transfer_manager.put_req_chunk.get(request_id, 0)) <= 0
+        context_length = length
+    elif adaptive_enabled:
         _adaptive_states = getattr(transfer_manager, "_adaptive_states", None)
         if _adaptive_states is None:
             _adaptive_states = {}
