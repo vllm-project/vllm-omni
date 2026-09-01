@@ -124,7 +124,7 @@ def minimax_h3_packed_sequence(
     include_keyframe_cond: bool,
     keyframe_frame_indices: list[int] | tuple[int, ...] | None = None,
     frame_count: int | None = None,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, object]:
     """Build the packed-sequence structural fields for one CFG branch.
 
     The used length is padded up to a multiple of 64.
@@ -239,6 +239,14 @@ def minimax_h3_packed_sequence(
         # Extent of the video segment within the packed sequence.
         "latent_grid": torch.tensor([latent_t, ph, pw], dtype=torch.int64),
         "video_row_start": torch.tensor(video_sl.start, dtype=torch.int64),
+        # The single target video uses the same span contract as Ref2VA.
+        "video_spans": (
+            {
+                "start": video_sl.start,
+                "latent_grid": (latent_t, ph, pw),
+                "role": "target",
+            },
+        ),
     }
 
 
@@ -300,7 +308,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     ref_blocks: Sequence[Mapping[str, object]],
     audio_channel: int = 2,
     seq_len: int | None = None,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, object]:
     """General ref2va-family packed layout.
 
     ``ref_blocks`` are consumed in request/plan order:
@@ -399,6 +407,33 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     audio_sl = slice(cursor, cursor + audio_rows)
     video_sl = slice(audio_sl.stop, audio_sl.stop + video_rows)
     pad_sl = slice(video_sl.stop, seq_len)
+
+    # This is deliberately tensor-free metadata. It is constructed once by
+    # the denoise branch and consumed by every attention layer without a
+    # device-to-host synchronization.
+    video_spans: list[dict[str, object]] = []
+    for item in block_slices:
+        if item["kind"] in ("video", "video_audio"):
+            visual_sl = item["visual_sl"]
+            assert isinstance(visual_sl, slice)
+            video_spans.append(
+                {
+                    "start": visual_sl.start,
+                    "latent_grid": (
+                        int(item["latent_t"]),
+                        int(item["latent_h"]) // _PATCH_H,
+                        int(item["latent_w"]) // _PATCH_W,
+                    ),
+                    "role": "reference",
+                }
+            )
+    video_spans.append(
+        {
+            "start": video_sl.start,
+            "latent_grid": (latent_t, ph, pw),
+            "role": "target",
+        }
+    )
 
     input_ids = torch.full((seq_len,), MINIMAX_H3_PAD_ID, dtype=torch.int64)
     input_ids[text_sl] = MINIMAX_H3_TEXT_ID
@@ -560,6 +595,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
         # Extent of the video segment within the packed sequence.
         "latent_grid": torch.tensor([latent_t, ph, pw], dtype=torch.int64),
         "video_row_start": torch.tensor(video_sl.start, dtype=torch.int64),
+        "video_spans": tuple(video_spans),
     }
 
 

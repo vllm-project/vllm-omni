@@ -105,8 +105,8 @@ repos:
       <<: *mypy_common
       stages: [manual]
 
-    - id: check-test-ci-coverage
-      name: Ensure test files have pytestmarks
+    - id: check-mark
+      name: Ensure test files have CI marks (no direct SKU)
       entry: python tools/pre_commit/check_test_marks.py
       language: python
       types: [python]

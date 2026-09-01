@@ -5,14 +5,22 @@ nav:
     - getting_started/quickstart.md
     - getting_started/installation/*
   - Serving:
-    - OpenAI-Compatible API:
-      - Chat Completions API: serving/chat_completions_api.md
-      - Image Generation: serving/image_generation_api.md
-      - Image Edit: serving/image_edit_api.md
-      - Text to Speech: serving/speech_api.md
-      - Videos: serving/videos_api.md
-      - Audio Generation: serving/audio_generate_api.md
-      - Streaming Video Input: serving/video_stream_api.md
+    - API Server:
+      - Overview: serving/README.md
+      - Core APIs:
+        - Chat Completions: serving/chat_completions_api.md
+        - Text to Speech: serving/speech_api.md
+        - Audio Generation: serving/audio_generate_api.md
+        - Image Generation: serving/image_generation_api.md
+        - Image Edit: serving/image_edit_api.md
+        - Videos: serving/videos_api.md
+      - Streaming and Realtime:
+        - Realtime Audio: serving/realtime_api.md
+        - Full Duplex: serving/full_duplex_api.md
+        - Streaming Video Input: serving/video_stream_api.md
+        - Streaming Video Output: serving/streaming_video_output_api.md
+        - OpenPI Robot Policy: serving/openpi_api.md
+      - Standalone Experimental Servers: serving/standalone_servers.md
   - Examples:
     - examples/README.md
     - Offline Inference:
@@ -24,7 +32,6 @@ nav:
       - Text-To-Speech: user_guide/examples/offline_inference/text_to_speech.md
       - Text-To-Video: user_guide/examples/offline_inference/text_to_video.md
       - X-To-Text: user_guide/examples/offline_inference/x_to_text.md
-      - X-To-Video-Audio: user_guide/examples/offline_inference/x_to_video_audio.md
     - Online Serving:
       - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
       - Image-To-Video: user_guide/examples/online_serving/image_to_video.md
@@ -54,6 +61,7 @@ nav:
       - BitsAndBytes W4: user_guide/quantization/bitsandbytes.md
       - MXFP8 W8A8: user_guide/quantization/mxfp8.md
       - MXFP4 W4A4: user_guide/quantization/mxfp4.md
+      - SVDQuant W4A4: user_guide/quantization/svdquant.md
       - ModelOpt: user_guide/quantization/modelopt.md
       - AutoRound: user_guide/quantization/autoround.md
       - msModelSlim: user_guide/quantization/msmodelslim.md

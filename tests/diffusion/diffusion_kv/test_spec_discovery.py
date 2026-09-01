@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -25,9 +25,27 @@ class _Backend:
         return True
 
 
-def _attention(*, enabled: bool) -> Attention:
+class _RunnerKVBackend:
+    def __init__(self) -> None:
+        self.kv_cache_config = None
+
+    def register_kv_cache_layers(self, layers):
+        return {layer_name: spec for layer_name, (_layer, spec) in layers.items()}
+
+    def initialize_kv_cache(self, config) -> None:
+        configured_layers = {layer_name for group in config.kv_cache_groups for layer_name in group.layer_names}
+        if configured_layers != {"image_attention"}:
+            raise ValueError(
+                "Rank-local Diffusion KVCacheConfig layer mismatch: "
+                f"expected=['image_attention'], configured={sorted(configured_layers)}"
+            )
+        self.kv_cache_config = config
+
+
+def _attention(*, enabled: bool, prefix: str = "image_attention") -> Attention:
     attention = Attention.__new__(Attention)
     nn.Module.__init__(attention)
+    attention.prefix = prefix
     attention.paged_kv_cache_role = "primary" if enabled else None
     attention.paged_kv_cache_dtype = torch.bfloat16
     attention.num_kv_heads = 2
@@ -47,6 +65,7 @@ def _runner(attention: Attention) -> DiffusionModelRunner:
     pipeline = nn.Module()
     pipeline.image_attention = attention
     runner.pipeline = pipeline
+    runner.diffusion_kv_backend = _RunnerKVBackend()
     return runner
 
 
@@ -62,6 +81,23 @@ def test_runner_discovers_native_spec_from_loaded_attention() -> None:
     assert spec.dtype is torch.bfloat16
     assert spec.indexes_kv_by_block_stride is True
     assert spec.non_causal is True
+
+
+def test_runner_uses_attention_prefix_as_canonical_layer_name() -> None:
+    runner = _runner(_attention(enabled=True, prefix="layers.0.self_attn.image_attn.attn"))
+
+    specs = runner.get_kv_cache_spec()
+
+    assert set(specs) == {"layers.0.self_attn.image_attn.attn"}
+
+
+def test_runner_rejects_duplicate_attention_prefixes() -> None:
+    runner = _runner(_attention(enabled=True, prefix="shared"))
+    second_attention = _attention(enabled=True, prefix="shared")
+    runner.pipeline.second_image_attention = second_attention
+
+    with pytest.raises(RuntimeError, match="Duplicate canonical paged Diffusion Attention prefix 'shared'"):
+        runner.get_kv_cache_spec()
 
 
 def test_runner_rejects_paged_mode_without_cache_enabled_attention() -> None:
@@ -102,14 +138,21 @@ def test_worker_selects_its_rank_local_config() -> None:
     worker = object.__new__(DiffusionWorker)
     worker.rank = 1
     worker.od_config = SimpleNamespace(num_gpus=2)
+    worker.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=None),
+        cache_config=SimpleNamespace(num_gpu_blocks=None),
+    )
+    worker._maybe_get_memory_pool_context = lambda _tag: nullcontext()
     worker.model_runner = SimpleNamespace(set_kv_cache_config=lambda config: setattr(worker, "installed", config))
-    configs = [object(), object()]
+    configs = [SimpleNamespace(num_blocks=4), SimpleNamespace(num_blocks=8)]
 
-    worker.set_kv_cache_configs(configs)
+    worker.set_kv_cache_configs(configs, 64)
 
     assert worker.installed is configs[1]
+    assert worker.vllm_config.model_config.max_model_len == 64
+    assert worker.vllm_config.cache_config.num_gpu_blocks == 8
     with pytest.raises(ValueError, match="rank count mismatch"):
-        worker.set_kv_cache_configs(configs[:1])
+        worker.set_kv_cache_configs(configs[:1], 64)
 
 
 def test_worker_honors_explicit_kv_memory_budget(monkeypatch) -> None:

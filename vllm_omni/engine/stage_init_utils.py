@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Stage initialization helpers for vLLM-Omni multi-stage runtime.
 
@@ -11,19 +14,24 @@ from __future__ import annotations
 import copy
 import fcntl
 import importlib
+import json
 import multiprocessing as mp
 import os
 import time
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
+from pathlib import Path
 from typing import Any, Literal, cast
 
+import regex as re
 from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import cached_tokenizer_from_config
+from vllm.transformers_utils.repo_utils import hf_api
+from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.executor import Executor
@@ -79,22 +87,144 @@ class LogicalStageInitPlan:
     replicas: list[ReplicaInitPlan]
 
 
-def _resolve_model_to_local_path(model: str) -> str:
-    """Resolve an HF Hub model ID to a local cache path."""
+def _missing_stage_subdirs(base: str, subdirs: Sequence[str]) -> list[str]:
+    """Return the entries of ``subdirs`` that are not directories under ``base``."""
+    return [subdir for subdir in subdirs if not os.path.isdir(os.path.join(base, subdir))]
+
+
+# Artifacts that make a snapshot subfolder trustworthy. A directory that
+# exists but holds none of these is an interrupted download, not a snapshot;
+# treating it as complete strips the Hub fallback vLLM would need later.
+_WEIGHT_ARTIFACT_PATTERNS = ("*.safetensors", "*.bin", "*.pt", "*.gguf")
+# Vocabulary-bearing files. Configs and chat templates are small and download
+# first, so their presence alone cannot distinguish a tokenizer folder from an
+# interrupted download.
+_TOKENIZER_ARTIFACT_NAMES = (
+    "tokenizer.json",
+    "tokenizer.model",
+    "spiece.model",
+    "sentencepiece.bpe.model",
+    "vocab.json",
+    "vocab.txt",
+)
+# HF sharded checkpoints name their pieces `<stem>-NNNNN-of-NNNNN.<ext>` and
+# always ship an index; a shard-named file without one is a partial download.
+_SHARD_NAME_RE = re.compile(r"-\d+-of-\d+\.(safetensors|bin)$")
+
+
+def _indexed_shards_complete(folder: Path) -> bool | None:
+    """Check sharded weights against their index; ``None`` when no index exists."""
+    indexes = list(folder.rglob("*.index.json"))
+    if not indexes:
+        return None
+    for index in indexes:
+        try:
+            weight_map = json.loads(index.read_text()).get("weight_map") or {}
+        except (OSError, ValueError):
+            return False
+        shards = set(weight_map.values())
+        if not shards or any(not (index.parent / shard).is_file() for shard in shards):
+            return False
+    return True
+
+
+def _subdir_is_populated(base: str, subdir: str, needs_weights: bool) -> bool:
+    folder = Path(base) / subdir
+    if not folder.is_dir():
+        return False
+    if needs_weights:
+        indexed = _indexed_shards_complete(folder)
+        if indexed is not None:
+            return indexed
+        weights = [path for pattern in _WEIGHT_ARTIFACT_PATTERNS for path in folder.rglob(pattern)]
+        if not weights:
+            return False
+        return not any(_SHARD_NAME_RE.search(path.name) for path in weights)
+    return any((folder / name).is_file() for name in _TOKENIZER_ARTIFACT_NAMES)
+
+
+def _incomplete_stage_subdirs(
+    base: str,
+    subdirs: Sequence[str],
+    weight_subdirs: Collection[str] = (),
+) -> list[str]:
+    """Return the entries of ``subdirs`` without a POPULATED directory under ``base``.
+
+    Hub-snapshot paths use this stricter check: ``os.path.isdir`` alone accepts
+    a subfolder holding only config.json from an interrupted download, and the
+    warm-cache early return would then convert the Hub ID into a local path
+    vLLM cannot fetch missing weights for. ``weight_subdirs`` names the entries
+    that must contain a weight artifact, not merely any file.
+    """
+    return [
+        subdir for subdir in subdirs if not _subdir_is_populated(base, subdir, needs_weights=subdir in weight_subdirs)
+    ]
+
+
+def _resolve_model_to_local_path(
+    model: str,
+    required_subdirs: Sequence[str] = (),
+    weight_subdirs: Collection[str] = (),
+    *,
+    revision: str | None = None,
+    download_dir: str | None = None,
+) -> str:
+    """Resolve an HF Hub model ID to a local path that holds ``required_subdirs``.
+
+    ``snapshot_download(local_files_only=True)`` returns the snapshot root as
+    soon as *any* file of the repo is cached, even when the subfolders this
+    stage needs were never materialized. Joining a stage subdir onto such a
+    root produces a path that exists nowhere, and upstream ``EngineArgs``
+    forwards a non-directory ``model`` to HuggingFace as a repo id, which fails
+    with an ``HFValidationError`` about the cache path. Verify the subfolders
+    here and pull just the missing ones, so the join always lands on a real
+    directory or raises an error that names what is missing.
+
+    ``revision`` and ``download_dir`` mirror the engine args of the same name:
+    once the repo ID is replaced by a local path, downstream ModelConfig can no
+    longer correct either, so they must shape the snapshot selection here.
+    """
     if os.path.isdir(model):
         return model
 
+    # Keep the warm-cache path offline-friendly: no Hub round trip when the
+    # stage's subfolders are already there.
     try:
-        from huggingface_hub import snapshot_download
-
-        # Keep init path resolution offline-friendly.
-        return snapshot_download(model, local_files_only=True)
-    except Exception:
-        logger.warning(
-            "[stage_init] Could not resolve %s to local snapshot; using as-is",
-            model,
+        cached_root: str | None = hf_api().snapshot_download(
+            model, local_files_only=True, revision=revision, cache_dir=download_dir
         )
-        return model
+    except Exception:
+        cached_root = None
+    if cached_root is not None and not _incomplete_stage_subdirs(cached_root, required_subdirs, weight_subdirs):
+        return cached_root
+
+    # Cold cache, or a snapshot root whose stage subfolders were never (or
+    # only partially) downloaded: pull exactly the subfolders this stage asked
+    # for. snapshot_download resumes a partial subfolder for free.
+    allow_patterns = [f"{subdir.strip('/')}/*" for subdir in required_subdirs] or None
+    try:
+        resolved = hf_api().snapshot_download(
+            model, allow_patterns=allow_patterns, revision=revision, cache_dir=download_dir
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"[stage_init] Could not resolve {model!r} to a local snapshot containing "
+            f"{sorted(required_subdirs)}: the download failed and "
+            + (
+                f"the cached snapshot {cached_root!r} is missing or incomplete for "
+                f"{sorted(_incomplete_stage_subdirs(cached_root, required_subdirs, weight_subdirs))}."
+                if cached_root is not None
+                else "nothing is cached locally."
+            )
+        ) from exc
+
+    missing = _incomplete_stage_subdirs(resolved, required_subdirs, weight_subdirs)
+    if missing:
+        raise RuntimeError(
+            f"[stage_init] Snapshot {resolved!r} for {model!r} has no populated {sorted(missing)} "
+            "subfolder; the stage cannot be initialized from it."
+        )
+    return resolved
 
 
 def _resolve_model_tokenizer_paths(model: str, engine_args: dict[str, Any]) -> str:
@@ -104,14 +234,66 @@ def _resolve_model_tokenizer_paths(model: str, engine_args: dict[str, Any]) -> s
     if model_subdir is None and tokenizer_subdir is None:
         return model
 
-    resolved_base = _resolve_model_to_local_path(model)
+    revision = engine_args.get("revision")
+    tokenizer_revision = engine_args.get("tokenizer_revision")
+    download_dir = engine_args.get("download_dir")
+    # A tokenizer pinned to a different revision cannot come from the model's
+    # snapshot; resolve it against its own. An empty subdir means the snapshot
+    # root and still needs its own revision.
+    split_tokenizer = tokenizer_subdir is not None and tokenizer_revision is not None and tokenizer_revision != revision
+
+    required_subdirs = [subdir for subdir in (model_subdir, tokenizer_subdir) if subdir]
+    model_required = [subdir for subdir in (model_subdir,) if subdir] if split_tokenizer else required_subdirs
+    weight_subdirs = frozenset(subdir for subdir in (model_subdir,) if subdir)
+    if is_runai_obj_uri(model):
+        # Object-storage URIs stay opaque until each stage builds its own
+        # ModelConfig, so the joins below are resolved by vLLM's streamer
+        # rather than by the local filesystem.
+        resolved_base = model
+        tokenizer_base = model
+    else:
+        resolved_base = _resolve_model_to_local_path(
+            model, model_required, weight_subdirs, revision=revision, download_dir=download_dir
+        )
+        # Reachable for a local model directory; the Hub branch above has
+        # already failed closed on a missing subfolder.
+        missing = _missing_stage_subdirs(resolved_base, model_required)
+        if missing:
+            raise RuntimeError(
+                f"[stage_init] Model directory {resolved_base!r} has no {sorted(missing)} "
+                "subfolder; the stage cannot be initialized from it."
+            )
+        if split_tokenizer:
+            # An empty subdir targets the snapshot root, which cannot be
+            # subset by allow_patterns; resolve the whole revision.
+            tokenizer_required = [tokenizer_subdir] if tokenizer_subdir else []
+            tokenizer_base = _resolve_model_to_local_path(
+                model, tokenizer_required, revision=tokenizer_revision, download_dir=download_dir
+            )
+            missing = _missing_stage_subdirs(tokenizer_base, tokenizer_required)
+            if missing:
+                raise RuntimeError(
+                    f"[stage_init] Tokenizer directory {tokenizer_base!r} has no {sorted(missing)} "
+                    "subfolder; the stage cannot be initialized from it."
+                )
+            if not tokenizer_required and not _subdir_is_populated(tokenizer_base, "", False):
+                # An empty subdir means the tokenizer lives at the snapshot
+                # root, so there is no subfolder for the check above to look
+                # at and any resolved root would otherwise pass. Require the
+                # vocabulary artifacts themselves.
+                raise RuntimeError(
+                    f"[stage_init] Tokenizer directory {tokenizer_base!r} holds none of "
+                    f"{list(_TOKENIZER_ARTIFACT_NAMES)}; the stage cannot be initialized from it."
+                )
+        else:
+            tokenizer_base = resolved_base
 
     if model_subdir:
         model = os.path.join(resolved_base, model_subdir)
         logger.info("[stage_init] Using model subdirectory: %s", model)
 
     if tokenizer_subdir is not None:
-        tokenizer_path = os.path.join(resolved_base, tokenizer_subdir) if tokenizer_subdir else resolved_base
+        tokenizer_path = os.path.join(tokenizer_base, tokenizer_subdir) if tokenizer_subdir else tokenizer_base
         engine_args["tokenizer"] = tokenizer_path
         logger.info("[stage_init] Using tokenizer from: %s", tokenizer_path)
     elif model_subdir and "tokenizer" not in engine_args:
@@ -120,6 +302,23 @@ def _resolve_model_tokenizer_paths(model: str, engine_args: dict[str, Any]) -> s
         logger.info("[stage_init] Using tokenizer from base model path: %s", resolved_base)
 
     return model
+
+
+def _resolve_model_path(model: str, engine_args: dict[str, Any]) -> str:
+    """Apply a model-owned path resolver from stage engine args."""
+    resolver_path = engine_args.pop("model_path_resolver", None)
+    if resolver_path is None:
+        return model
+    resolver = _resolve_omni_metadata_hook(str(resolver_path))
+    if resolver is None:
+        return model
+    return str(
+        resolver(
+            model,
+            engine_args.get("revision"),
+            engine_args.get("task_type"),
+        )
+    )
 
 
 def apply_cli_tokenizer(
@@ -355,6 +554,7 @@ class StageMetadata:
     custom_process_input_func: Callable | None
     model_stage: str | None
     runtime_cfg: Any
+    prompt_transform_func: Callable | None = None
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
     # Multi-replica: replica_id distinguishes replicas of the same stage.
@@ -424,6 +624,12 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         mod_path, fn_name = _cpif_path.rsplit(".", 1)
         custom_process_input_func = getattr(importlib.import_module(mod_path), fn_name)
 
+    prompt_transform_func: Callable | None = None
+    _ptf_path = _get_attr_or_item(stage_config, "prompt_transform_func")
+    if _ptf_path:
+        _mod, _fn = _ptf_path.rsplit(".", 1)
+        prompt_transform_func = getattr(importlib.import_module(_mod), _fn)
+
     prompt_expand_func: Callable | None = None
     _pef_path = _get_attr_or_item(stage_config, "prompt_expand_func")
     if _pef_path:
@@ -452,6 +658,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
             custom_process_input_func=custom_process_input_func,
             model_stage=model_stage,
             runtime_cfg=runtime_cfg,
+            prompt_transform_func=prompt_transform_func,
             cfg_kv_collect_func=cfg_kv_collect_func,
         )
 
@@ -472,6 +679,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         custom_process_input_func=custom_process_input_func,
         model_stage=model_stage,
         runtime_cfg=runtime_cfg,
+        prompt_transform_func=prompt_transform_func,
         prompt_expand_func=prompt_expand_func,
     )
 
@@ -518,6 +726,7 @@ def extract_stage_metadata_from_omni_stage_config(
             custom_process_input_func=custom_process_input_func,
             model_stage=stage_config.model_stage,
             runtime_cfg=stage_config.runtime_config,
+            prompt_transform_func=_resolve_omni_metadata_hook(stage_config.prompt_transform_func),
             cfg_kv_collect_func=_resolve_omni_metadata_hook(stage_config.cfg_kv_collect_func),
         )
 
@@ -534,6 +743,7 @@ def extract_stage_metadata_from_omni_stage_config(
         custom_process_input_func=custom_process_input_func,
         model_stage=stage_config.model_stage,
         runtime_cfg=stage_config.runtime_config,
+        prompt_transform_func=_resolve_omni_metadata_hook(stage_config.prompt_transform_func),
         prompt_expand_func=_resolve_omni_metadata_hook(stage_config.prompt_expand_func),
     )
 
@@ -565,7 +775,7 @@ def _maybe_set_qwen3_omni_moe_env(engine_args_dict: dict[str, Any]) -> None:
 def split_devices_for_replicas(
     devices_str: str | None,
     num_replicas: int,
-    tp_size: int,
+    devices_per_replica: int,
     stage_id: int,
 ) -> list[str | None]:
     """Split a devices string into per-replica subsets.
@@ -578,19 +788,19 @@ def split_devices_for_replicas(
     When ``num_replicas`` is 1, returns ``[devices_str]`` unchanged.
     Otherwise, two YAML shapes are accepted:
 
-    1. **Legacy / pool mode** — ``len(devices) == num_replicas * tp_size``:
+    1. **Legacy / pool mode** — ``len(devices) == num_replicas * devices_per_replica``:
        the string enumerates the full per-stage pool. Each replica gets
-       ``tp_size`` consecutive entries. The values are logical indices
+       ``devices_per_replica`` consecutive entries. The values are logical indices
        into the launcher's ``CUDA_VISIBLE_DEVICES``.
 
        ``split_devices_for_replicas("1,2,3,4", 2, 2, 1) → ["1,2", "3,4"]``
 
-    2. **Template mode** — ``len(devices) == tp_size``: the YAML declares
+    2. **Template mode** — ``len(devices) == devices_per_replica``: the YAML declares
        a single per-replica template (the same shape one replica would
-       use), and is **dp-independent**. Each replica r gets the offsets
-       ``[r*tp_size + a for a in template]`` of the launcher's
+       use), and is **replica-count-independent**. Each replica r gets the offsets
+       ``[r*devices_per_replica + a for a in template]`` of the launcher's
        ``CUDA_VISIBLE_DEVICES``. The template's entries must lie in
-       ``[0, tp_size)``.
+       ``[0, devices_per_replica)``.
 
        ``split_devices_for_replicas("0,1", 2, 2, 1) → ["0,1", "2,3"]``
        ``split_devices_for_replicas("0,1", 4, 2, 1) → ["0,1", "2,3", "4,5", "6,7"]``
@@ -613,27 +823,29 @@ def split_devices_for_replicas(
 
     device_list = [d.strip() for d in devices_str.split(",") if d.strip()]
 
-    if len(device_list) == num_replicas * tp_size:
-        return [",".join(device_list[r * tp_size : (r + 1) * tp_size]) for r in range(num_replicas)]
+    if len(device_list) == num_replicas * devices_per_replica:
+        return [
+            ",".join(device_list[r * devices_per_replica : (r + 1) * devices_per_replica]) for r in range(num_replicas)
+        ]
 
-    if len(device_list) == tp_size:
+    if len(device_list) == devices_per_replica:
         try:
             offsets = [int(a) for a in device_list]
         except ValueError as e:
             raise ValueError(f"Stage {stage_id}: template-mode devices must be ints, got {devices_str!r}") from e
-        bad = [a for a in offsets if not (0 <= a < tp_size)]
+        bad = [a for a in offsets if not (0 <= a < devices_per_replica)]
         if bad:
             raise ValueError(
                 f"Stage {stage_id}: template-mode device offset(s) {bad} "
-                f"out of range [0, {tp_size}); devices={devices_str!r}"
+                f"out of range [0, {devices_per_replica}); devices={devices_str!r}"
             )
-        return [",".join(str(r * tp_size + a) for a in offsets) for r in range(num_replicas)]
+        return [",".join(str(r * devices_per_replica + a) for a in offsets) for r in range(num_replicas)]
 
     raise ValueError(
         f"Stage {stage_id}: devices={devices_str!r} has {len(device_list)} id(s); "
-        f"need either {tp_size} (template, dp-independent) or "
-        f"{num_replicas * tp_size} (pool / legacy). "
-        f"num_replicas={num_replicas}, tensor_parallel_size={tp_size}."
+        f"need either {devices_per_replica} (per-replica template) or "
+        f"{num_replicas * devices_per_replica} (pool / legacy). "
+        f"num_replicas={num_replicas}, devices_per_replica={devices_per_replica}."
     )
 
 
@@ -645,9 +857,32 @@ def get_stage_tp_size(stage_cfg: Any) -> int:
     return int(getattr(engine_args, "tensor_parallel_size", 1) or 1)
 
 
-def get_stage_devices_per_replica(stage_cfg: Any) -> int:
+def _get_local_llm_parallel_sizes(
+    stage_cfg: Any,
+    engine_args: Any | None = None,
+) -> tuple[int, int, int]:
+    """Return ``(tp, local_dp, pp)`` for one local LLM replica.
+
+    ``data_parallel_size`` is cluster-wide, whereas ``runtime.devices`` is
+    local to this process.  Prefer an explicitly resolved
+    ``data_parallel_size_local`` (including zero for a head process that owns
+    no local engines), and only fall back to the global DP width when it is
+    unset.
+    """
+    if engine_args is None:
+        engine_args = getattr(stage_cfg, "engine_args", {})
+    tp_size = int(_get_attr_or_item(engine_args, "tensor_parallel_size", 1) or 1)
+    pp_size = int(_get_attr_or_item(engine_args, "pipeline_parallel_size", 1) or 1)
+    local_dp_size = _get_attr_or_item(engine_args, "data_parallel_size_local", None)
+    if local_dp_size is None:
+        local_dp_size = _get_attr_or_item(engine_args, "data_parallel_size", 1)
+    return tp_size, int(local_dp_size if local_dp_size is not None else 1), pp_size
+
+
+def get_stage_devices_per_replica(stage_cfg: Any, engine_args: Any | None = None) -> int:
     """Return the number of devices consumed by one replica of *stage_cfg*."""
-    engine_args = getattr(stage_cfg, "engine_args", {})
+    if engine_args is None:
+        engine_args = getattr(stage_cfg, "engine_args", {})
     if getattr(stage_cfg, "stage_type", "llm") == "diffusion":
         parallel_config = _get_attr_or_item(engine_args, "parallel_config")
         if parallel_config is None:
@@ -664,14 +899,15 @@ def get_stage_devices_per_replica(stage_cfg: Any) -> int:
         except Exception:
             return 1
 
-    return get_stage_tp_size(stage_cfg)
+    tp_size, local_dp_size, pp_size = _get_local_llm_parallel_sizes(stage_cfg, engine_args)
+    return tp_size * max(1, local_dp_size) * pp_size
 
 
 def compute_replica_layout(
     stage_configs: Sequence[Any],
     *,
     allow_zero: bool = False,
-) -> tuple[list[int], dict[int, list[str]]]:
+) -> tuple[list[int], dict[int, list[str | None]]]:
     """Compute per-stage replica counts and device assignments.
 
     Args:
@@ -820,7 +1056,7 @@ def _project_upstream_config_fields(
     field_map: Mapping[str, str],
 ) -> dict[str, Any]:
     """Project every explicit upstream input, including newly added fields."""
-    explicit_fields = getattr(config, "_omni_explicit_fields", frozenset())
+    explicit_fields: frozenset[str] = getattr(config, "_omni_explicit_fields", frozenset())
     unprojected_fields = explicit_fields - frozenset(field_map)
     if unprojected_fields:
         names = ", ".join(sorted(unprojected_fields))
@@ -838,9 +1074,9 @@ def _project_omni_stage_engine_args(
     """Read backend inputs from one structured stage config."""
     engine_args: dict[str, Any] = {}
     is_diffusion = isinstance(stage_config, VllmOmniDiffusionStageConfig)
-
     if is_diffusion:
-        engine_args.update(_project_omni_config_fields(stage_config.diffusion_config))
+        diffusion_stage = cast(VllmOmniDiffusionStageConfig, stage_config)
+        engine_args.update(_project_omni_config_fields(diffusion_stage.diffusion_config))
 
     for config, excluded_fields in (
         (
@@ -891,6 +1127,7 @@ def _project_omni_stage_engine_args(
         "hf_config_name": stage_config.hf_config_name,
         "engine_output_type": stage_config.engine_output_type,
         "custom_process_next_stage_input_func": stage_config.custom_process_next_stage_input_func,
+        "model_path_resolver": topology.model_path_resolver,
         "retains_state_across_chunks": topology.retains_state_across_chunks,
     }
     engine_args.update(
@@ -957,6 +1194,7 @@ def _finalize_engine_args_dict(
     stage_defines_tokenizer = (
         engine_args_dict.get("tokenizer") is not None or engine_args_dict.get("tokenizer_subdir") is not None
     )
+    model = _resolve_model_path(model, engine_args_dict)
     audex_stage = str(engine_args_dict.get("model_stage") or "")
     if audex_stage == "audex_xcodec":
         # TTA stage 1 decodes with the external XCodec1 checkpoint, not a
@@ -1015,9 +1253,19 @@ def _finalize_engine_args_dict(
     if is_diffusion:
         from vllm_omni.diffusion.data import parse_attention_config
 
-        if engine_args_dict.get("diffusion_attention_config") is not None:
+        # Fold the attention shorthand into the structured config so only one
+        # representation reaches OmniDiffusionConfig.from_kwargs.
+        attention_backend = engine_args_dict.pop("diffusion_attention_backend", None)
+        fastvideo_vsa_topk = engine_args_dict.pop("fastvideo_vsa_topk", None)
+        if (
+            engine_args_dict.get("diffusion_attention_config") is not None
+            or attention_backend is not None
+            or fastvideo_vsa_topk is not None
+        ):
             engine_args_dict["diffusion_attention_config"] = parse_attention_config(
-                engine_args_dict["diffusion_attention_config"],
+                engine_args_dict.get("diffusion_attention_config"),
+                attention_backend=attention_backend,
+                fastvideo_vsa_topk=fastvideo_vsa_topk,
             )
     else:
         resolve_worker_cls(engine_args_dict)
@@ -1045,7 +1293,7 @@ def build_legacy_engine_args_dict(
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
     """Implement engine-argument building for the legacy stage representation."""
-    engine_args_dict = _to_dict(stage_config.engine_args)
+    engine_args_dict = copy.deepcopy(_to_dict(stage_config.engine_args))
     # Legacy configs can materialize an omitted optional TP size as None.
     # Remove it from the detached adapter dict so the backend default applies
     # without mutating stage_config.engine_args.
@@ -1112,6 +1360,74 @@ def build_engine_args_dict_from_omni_stage_config(
     )
 
 
+def _count_stage_devices(devices: Any) -> int | None:
+    if devices is None:
+        return None
+    if isinstance(devices, (list, tuple)):
+        return len(devices)
+    values = [device for device in str(devices).split(",") if device.strip()]
+    return len(values) or None
+
+
+def _check_stage_device_layout(stage_config: Any, engine_args_dict: dict[str, Any]) -> None:
+    """Fail early when a stage's world size cannot fit its assigned ``devices``.
+
+    Re-runs :func:`check_device_layout` (normally only reached on the
+    ``--strategy-config`` path) against the fully resolved per-stage layout, so
+    an inconsistent ``tensor_parallel_size`` vs ``devices`` (issue #5003) is
+    reported here with a clear message instead of surfacing later as an opaque
+    worker-side ``local rank ... out of bounds`` assertion.
+    """
+    from vllm_omni.config.composable_parallel import StrategyApplyError, check_device_layout
+
+    runtime = getattr(stage_config, "runtime", None)
+    devices = _get_attr_or_item(runtime, "devices", None) if runtime is not None else None
+    if devices is None:
+        # No explicit placement -> vLLM assigns devices itself; nothing to check.
+        return
+
+    num_replicas = _get_attr_or_item(runtime, "num_replicas", 1) if runtime is not None else 1
+    stage_id = getattr(stage_config, "stage_id", "?")
+    tp_size, local_dp_size, pp_size = _get_local_llm_parallel_sizes(stage_config, engine_args_dict)
+    if local_dp_size == 0:
+        # This process hosts no local DP engines, so its local device list does
+        # not describe the cluster-wide DP layout and must not be validated.
+        return
+
+    try:
+        check_device_layout(
+            devices,
+            tensor_parallel_size=tp_size,
+            data_parallel_size=local_dp_size,
+            pipeline_parallel_size=pp_size,
+            num_replicas=int(num_replicas or 1),
+            role=f"stage-{stage_id}",
+        )
+    except StrategyApplyError as e:
+        message = (
+            f"Stage {stage_id}: device layout is inconsistent — {e} "
+            "Set devices and the per-stage TP, local DP, PP, and replica counts "
+            "so the declared device count matches the local world size."
+        )
+        device_count = _count_stage_devices(devices)
+        world_without_tp = local_dp_size * pp_size
+        valid_without_tp = {world_without_tp, int(num_replicas or 1) * world_without_tp}
+        if tp_size > 1 and device_count in valid_without_tp:
+            message += (
+                " This layout is consistent with issue #5003: a top-level "
+                "--tensor-parallel-size is applied to every stage, but each stage's "
+                "`devices` is not adjusted automatically. Pass --stage-overrides "
+                "to set tensor_parallel_size and devices together on every stage, "
+                "so single-GPU stages get tensor_parallel_size=1, e.g. "
+                '\'{"0": {"tensor_parallel_size": 4, "devices": "0,1,2,3"}, '
+                '"1": {"tensor_parallel_size": 1, "devices": "0"}, '
+                '"2": {"tensor_parallel_size": 1, "devices": "1"}}\'. '
+                "Or omit the top-level --tensor-parallel-size and set it only in "
+                "stage-0's override."
+            )
+        raise ValueError(message) from e
+
+
 def build_vllm_config(
     stage_config: Any,
     model: str,
@@ -1146,6 +1462,16 @@ def build_vllm_config(
         filtered_engine_args_dict["structured_outputs_config"] = StructuredOutputsConfig(**soc)
 
     omni_engine_args = OmniEngineArgs(**filtered_engine_args_dict)
+
+    # Guard against a per-stage world size that its assigned ``devices`` cannot
+    # satisfy (issue #5003). A top-level ``--tensor-parallel-size`` is broadcast
+    # to every stage, but ``devices`` is not, so a stage can end up with e.g.
+    # tensor_parallel_size=4 while still holding a single-GPU deploy default.
+    # Without --strategy-config the strategy-path device check never runs, so
+    # the mismatch used to surface only as an opaque worker-side assertion
+    # ("DP adjusted local rank N is out of bounds for M devices."). Re-run the
+    # same check here, before workers spawn, to fail early with a clear message.
+    _check_stage_device_layout(stage_config, filtered_engine_args_dict)
 
     # Multi-stage pipelines (qwen3_tts code2wav, etc.) set max_model_len
     # larger than HF max_position_embeddings by design. vLLM's validator
@@ -1473,6 +1799,7 @@ def build_diffusion_config(
     num_devices_per_stage = od_config.parallel_config.world_size
     device_control_env = current_omni_platform.device_control_env_var
     visible_devices_str = os.environ.get(device_control_env) if device_control_env else None
+    physical_devices: list[str | int]
     if visible_devices_str:
         physical_devices = [device.strip() for device in visible_devices_str.split(",") if device.strip()]
     else:
@@ -1496,7 +1823,6 @@ def initialize_diffusion_stage(
     stage_cfg: Any,
     metadata: StageMetadata,
     stage_init_timeout: int,
-    batch_size: int = 1,
     use_inline: bool = False,
 ) -> Any:
     """Build a diffusion stage client.
@@ -1506,16 +1832,12 @@ def initialize_diffusion_stage(
         stage_cfg: Stage configuration.
         metadata: Extracted stage metadata.
         stage_init_timeout: Timeout in seconds for stage initialization handshake
-        batch_size: Maximum number of requests to batch together in the
-            diffusion engine.  Passed through to ``StageDiffusionClient``
-            and ultimately to ``AsyncOmni``.
         use_inline: If True, uses the inline diffusion client instead of subprocess.
     """
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
-    od_config.max_num_seqs = batch_size
-    return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
+    return create_diffusion_client(model, od_config, metadata, stage_init_timeout, use_inline)
 
 
 def _stage_declares_cfg_pairs(model_config: Any) -> bool:

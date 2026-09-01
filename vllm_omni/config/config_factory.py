@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Config factories for vllm-omni, e.g., StageConfigFactory."""
 
 from __future__ import annotations
@@ -29,8 +29,10 @@ from vllm_omni.config.stage_config import (
     build_stage_runtime_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
+    normalize_pipeline_cli_overrides,
 )
 from vllm_omni.config.yaml_util import create_config
+from vllm_omni.diffusion.io_support import get_diffusion_output_type
 from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
 logger = init_logger(__name__)
@@ -226,7 +228,10 @@ class StageConfigFactory:
                     # If we have a resolver, call it with the optional hf_config
                     # to get the default pipeline config for this key
                     pipeline_cfg = obj(hf_config) if callable(obj) else obj
-                    if pipeline_cfg is not None and pipeline_cfg.diffusers_class_name == class_name:
+                    if pipeline_cfg is not None and class_name in (
+                        pipeline_cfg.diffusers_class_name,
+                        *pipeline_cfg.diffusers_class_aliases,
+                    ):
                         logger.info(
                             "Detected pipeline %r from model_index.json (_class_name=%r)",
                             pipeline_cfg.model_type,
@@ -433,6 +438,8 @@ class StageConfigFactory:
         load-balancer policy (``None`` when no strategy set one) travels with the
         stages instead of through a mutable out-param.
         """
+        cli_overrides = normalize_pipeline_cli_overrides(pipeline_cfg, cli_overrides)
+        deploy_cfg: DeployConfig | None
         if user_deploy_config is not None:
             deploy_cfg = user_deploy_config
         elif deploy_config_path is not None:
@@ -440,8 +447,11 @@ class StageConfigFactory:
             assert deploy_cfg is not None
         elif pipeline_cfg.default_deploy_config_name is not None:
             deploy_cfg = load_deploy_config(_DEPLOY_DIR / pipeline_cfg.default_deploy_config_name)
+            assert deploy_cfg is not None
         else:
             deploy_cfg = DeployConfig()
+
+        assert deploy_cfg is not None
 
         cli_async_chunk = cli_overrides.get("async_chunk")
         if cli_async_chunk is not None:
@@ -621,6 +631,7 @@ class StageConfigFactory:
             engine_args["dtype"] = str(engine_args["dtype"])
 
         engine_args.setdefault("max_num_seqs", 1)
+        model_class_name = engine_args.get("model_class_name")
 
         config_dict: dict[str, Any] = {
             "stage_id": 0,
@@ -631,7 +642,7 @@ class StageConfigFactory:
             },
             "engine_args": create_config(engine_args),
             "final_output": True,
-            "final_output_type": "image",
+            "final_output_type": get_diffusion_output_type(model_class_name),
         }
 
         return [config_dict]

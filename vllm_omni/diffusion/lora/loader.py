@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import os
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable
@@ -41,7 +44,7 @@ def _prepare_lora_delta(
     lora_b_suffix: str = "lora_B.weight",
     lora_bias_suffix: str = "bias",
 ):
-    used_keys = set()
+    used_keys: set[str] = set()
     # stacked_params_mapping                       param_to_weight_names
     # [(".to_qkv", ".to_q.", "q")
     # (".to_qkv", ".to_k.", "k")  ========> {".to_qkv": [".to_q", ".to_k", ".to_v"]}
@@ -54,7 +57,10 @@ def _prepare_lora_delta(
     if param_to_weight_names is None:
         param_to_weight_names = defaultdict(list)
     for param_name, weight_names in param_to_weight_names.items():
-        if param_name not in base_key:
+        # Fused names can overlap by prefix (`.qkv_proj` is a substring of
+        # `.qkv_proj_mot_gen`), and a substring match stacks both mappings into
+        # one delta of twice the height.
+        if not base_key.endswith(param_name):
             continue
         is_stacked_param = True
         # handle lora_a_key and lora_b_key together
@@ -78,7 +84,7 @@ def _prepare_lora_delta(
                 stacked_deltas.append(delta)
                 used_keys.add(lora_a_key)
                 used_keys.add(lora_b_key)
-        continue
+        break
 
     if is_stacked_param:
         return torch.concat(stacked_deltas), used_keys
@@ -199,6 +205,10 @@ def _apply_diffusers_lora_alpha_scaling(state_dict: dict[str, torch.Tensor]) -> 
 
 class LoraLoaderMixin:
     transformer_name = "transformer"
+
+    # Set by the pipeline this mixin is combined with; annotated, not assigned.
+    transformer: torch.nn.Module
+    _lora_loaded: dict[str | None, dict[str, torch.Tensor]]
 
     # Lazy initialization to avoid MRO issues: __init__ may not be called
     # when mixin with nn.Module
@@ -373,6 +383,7 @@ class QwenImageLoraLoaderMixin(LoraLoaderMixin):
 
 class WanLoraLoaderMixin(LoraLoaderMixin):
     transformer_2_name = "transformer_2"
+    has_transformer_2: bool
 
     def load_lora_weights(
         self,

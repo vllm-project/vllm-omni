@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Build native vLLM configuration views for the Omni diffusion runtime."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -14,6 +14,7 @@ from vllm.transformers_utils.config import get_hf_text_config
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.platforms import current_omni_platform
 
 
 def resolve_diffusion_max_model_len(od_config: OmniDiffusionConfig) -> int:
@@ -80,6 +81,15 @@ class _DiffusionVllmModelConfig:
     logits_processors: tuple[str, ...] = ()
     use_mla: bool = False
     is_moe: bool = False
+    # Native vLLM attention layers/builders read these fields directly.  The
+    # diffusion model does not have a full vLLM ModelConfig, so keep the
+    # narrow compatibility surface here instead of manufacturing a second
+    # model configuration object in the Worker backend.
+    is_mm_prefix_lm: bool = False
+    rswa_window: int | None = None
+    _attention_num_heads: int | None = field(default=None, init=False, repr=False)
+    _attention_num_kv_heads: int | None = field(default=None, init=False, repr=False)
+    _attention_head_size: int | None = field(default=None, init=False, repr=False)
 
     # Needed for models that bundle things like LogitsProcessors, e.g., SenseNova
     head_dtype: torch.dtype | None = None
@@ -90,6 +100,56 @@ class _DiffusionVllmModelConfig:
 
     def is_nvfp4_quantized(self) -> bool:
         return self.quantization == "modelopt_fp4"
+
+    def set_attention_geometry(
+        self,
+        *,
+        num_heads: int,
+        num_kv_heads: int,
+        head_size: int,
+    ) -> None:
+        """Record rank-local geometry needed by native metadata builders.
+
+        Diffusion attention modules are loaded outside vLLM's model loader, so
+        their dimensions are not available when this lightweight config is
+        created.  The paged Worker backend fills them in after model loading
+        and before calling ``init_attn_backend``.
+        """
+
+        values = {
+            "num_heads": num_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_size": head_size,
+        }
+        invalid = {name: value for name, value in values.items() if type(value) is not int or value <= 0}
+        if invalid:
+            raise ValueError(f"Diffusion attention geometry must contain positive integers: {invalid!r}")
+        self._attention_num_heads = num_heads
+        self._attention_num_kv_heads = num_kv_heads
+        self._attention_head_size = head_size
+
+    def _require_attention_geometry(self) -> tuple[int, int, int]:
+        geometry = (
+            self._attention_num_heads,
+            self._attention_num_kv_heads,
+            self._attention_head_size,
+        )
+        if any(value is None for value in geometry):
+            raise RuntimeError("Diffusion attention geometry is unavailable before paged cache layer registration")
+        num_heads, num_kv_heads, head_size = geometry
+        assert num_heads is not None and num_kv_heads is not None and head_size is not None
+        return num_heads, num_kv_heads, head_size
+
+    def get_num_attention_heads(self, parallel_config: Any) -> int:
+        del parallel_config
+        return self._require_attention_geometry()[0]
+
+    def get_num_kv_heads(self, parallel_config: Any) -> int:
+        del parallel_config
+        return self._require_attention_geometry()[1]
+
+    def get_head_size(self) -> int:
+        return self._require_attention_geometry()[2]
 
     @property
     def is_diffusion(self) -> bool:
@@ -164,9 +224,11 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
         vllm_config.cache_config.kv_cache_memory_bytes = getattr(od_config, "kv_cache_memory_bytes", None)
         # Prefix hashes/publication are intentionally deferred to the next PR.
         vllm_config.cache_config.enable_prefix_caching = False
+        vllm_config.scheduler_config.max_num_seqs = int(od_config.max_num_seqs)
         max_num_batched_tokens = getattr(od_config, "max_num_batched_tokens", None)
         if max_num_batched_tokens is not None:
             vllm_config.scheduler_config.max_num_batched_tokens = int(max_num_batched_tokens)
+        current_omni_platform.configure_diffusion_vllm_config(vllm_config, od_config)
     return vllm_config
 
 

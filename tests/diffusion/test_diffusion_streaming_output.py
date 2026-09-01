@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Integration tests for diffusion pipeline streaming output mode.
 
 Covers:
@@ -311,8 +311,8 @@ class TestPipelineStreamingOutputToEntrypoint:
             lambda *, output_format, fps, video_codec_options=None: FakeStreamingVideoEncoder(),
         )
         mocker.patch(
-            "vllm_omni.entrypoints.openai.serving_video_output_stream.get_stage_type",
-            return_value="diffusion",
+            "vllm_omni.entrypoints.openai.serving_video_output_stream.is_video_generation_pipeline",
+            return_value=True,
         )
         mocker.patch(
             "vllm_omni.entrypoints.openai.serving_video_output_stream.build_stage_sampling_params_list",
@@ -441,7 +441,6 @@ class TestPipelineStreamingOutputToEntrypoint:
                     model="test_model",
                     od_config=od_config,
                     metadata=metadata,
-                    batch_size=1,
                 )
 
     @staticmethod
@@ -526,6 +525,7 @@ class TestSupportedPipelines:
         runner = object.__new__(DiffusionModelRunner)
         runner.vllm_config = _make_vllm_config()
         runner.od_config = SimpleNamespace(
+            max_num_seqs=1,
             enable_cpu_offload=False,
             enable_layerwise_offload=False,
             enforce_eager=True,
@@ -544,7 +544,11 @@ class TestSupportedPipelines:
 
         monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _FakeDiffusersPipelineLoader)
         monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _FakeDeviceMemoryProfiler)
-        monkeypatch.setattr(model_runner_module, "get_offload_backend", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            model_runner_module,
+            "enable_offload_backend",
+            lambda _config, pipeline, **_kwargs: (pipeline, None),
+        )
         monkeypatch.setattr(model_runner_module, "get_cache_backend", lambda *args, **kwargs: None)
 
         with pytest.raises(ValueError, match="NoStepPipeline"):

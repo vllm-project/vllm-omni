@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Helpers for launching and handshaking omni engine cores."""
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from vllm.utils.network_utils import get_open_ports_list, zmq_socket_ctx
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.utils import (
     CoreEngine,
+    CoreEngineLaunch,
     CoreEngineProcManager,
     EngineZmqAddresses,
     get_engine_zmq_addresses,
@@ -833,13 +837,16 @@ def connect_remote_engine_cores(
             )
             wait_for_engine_startup(
                 handshake_socket,
-                addresses,
                 engines_to_handshake,
                 vllm_config.parallel_config,
                 False,  # coordinated_dp
                 vllm_config.cache_config,
-                None,  # proc_manager (remote — no local procs)
-                None,  # coord_process
+                CoreEngineLaunch(
+                    engine_manager=None,  # remote — no local procs
+                    coordinator=None,
+                    addresses=addresses,
+                    tensor_queue=None,
+                ),
             )
     finally:
         omni_master_server.release_route_port_reservations(
@@ -875,13 +882,16 @@ def connect_remote_diffusion_proc(
             yield StageReplicaResources(addresses=addresses)
             wait_for_engine_startup(
                 handshake_socket,
-                addresses,
                 [CoreEngine(index=0, local=False)],
                 _single_diffusion_parallel_config(local_client=False),
                 False,
                 None,
-                None,
-                None,
+                CoreEngineLaunch(
+                    engine_manager=None,  # remote — no local procs
+                    coordinator=None,
+                    addresses=addresses,
+                    tensor_queue=None,
+                ),
             )
     finally:
         omni_master_server.release_route_port_reservations(
@@ -1077,13 +1087,16 @@ def _launch_omni_core_engines(
             yield local_engine_manager, coordinator, addresses
             wait_for_engine_startup(
                 handshake_socket,
-                addresses,
                 engines_to_handshake,
                 parallel_config,
                 parallel_config.data_parallel_size > 1 and vllm_config.model_config.is_moe,
                 vllm_config.cache_config,
-                local_engine_manager,
-                coordinator.proc if coordinator else None,
+                CoreEngineLaunch(
+                    engine_manager=local_engine_manager,
+                    coordinator=coordinator,
+                    addresses=addresses,
+                    tensor_queue=None,
+                ),
             )
     finally:
         omni_master_server.release_route_port_reservations(
@@ -1166,13 +1179,16 @@ def launch_stage_replica(
         )
         wait_for_engine_startup(
             handshake_socket,
-            addresses,
             engines_to_handshake,
             vllm_config.parallel_config,
             False,  # coordinated_dp
             vllm_config.cache_config,
-            engine_manager,
-            None,  # coordinator_proc
+            CoreEngineLaunch(
+                engine_manager=engine_manager,
+                coordinator=None,
+                addresses=addresses,
+                tensor_queue=None,
+            ),
         )
 
 
@@ -1530,7 +1546,6 @@ def launch_diffusion_stage_replica(
     stage_config: Any,
     metadata: Any,
     stage_init_timeout: int,
-    batch_size: int,
     use_inline: bool,
     replica_id: int = 0,
     omni_master_server: OmniMasterServer | None = None,
@@ -1549,7 +1564,6 @@ def launch_diffusion_stage_replica(
             stage_config,
             metadata,
             stage_init_timeout=stage_init_timeout,
-            batch_size=batch_size,
             use_inline=use_inline,
         )
         return client, StageReplicaResources()
@@ -1558,7 +1572,6 @@ def launch_diffusion_stage_replica(
     from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 
     od_config = build_diffusion_config(model, stage_config, metadata)
-    od_config.max_num_seqs = batch_size
     parallel_config = getattr(od_config, "parallel_config", None)
     world_size = getattr(parallel_config, "world_size", 1)
     try:
@@ -1609,7 +1622,6 @@ def launch_diffusion_stage_replica(
             request_address=proc_manager.addresses.inputs[0],
             response_address=proc_manager.addresses.outputs[0],
             proc_manager=proc_manager,
-            batch_size=batch_size,
         )
         return client, StageReplicaResources(
             manager=proc_manager,
