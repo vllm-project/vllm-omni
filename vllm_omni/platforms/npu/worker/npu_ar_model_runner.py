@@ -48,6 +48,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.platforms.npu.worker import decode_prep_fast
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
@@ -113,6 +114,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._decode_input_cache = decode_prep_fast.DecodeInputCache()
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
@@ -384,6 +386,31 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             return value.lower() in ("1", "true", "yes", "on")
         return bool(value)
     #  -------------------------------------- Omni-new -------------------------------------------------
+
+    def _dummy_run(self, *args, **kwargs):
+        """Invalidate the decode-input cache around a dummy run.
+
+        A dummy run rewrites the shared input buffers without going through
+        `_prepare_inputs`, so anything cached against them is stale afterwards.
+        """
+        self._decode_input_cache.invalidate()
+        return super()._dummy_run(*args, **kwargs)
+
+    def _prepare_inputs(self, scheduler_output, num_scheduled_tokens):
+        """Reuse the previous step's inputs when this is the same decode again.
+
+        The Talker spends ~112 consecutive steps on one request emitting one
+        codec frame each, and `_prepare_inputs` rebuilds every tensor from numpy
+        every time. See `decode_prep_fast` for the reuse rule, for what the fast
+        path still recomputes, and for why every gate degrades to this generic
+        path rather than to a guess.
+        """
+        fast = decode_prep_fast.try_fast_prepare(self, scheduler_output, num_scheduled_tokens)
+        if fast is not None:
+            return fast
+        result = super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
+        decode_prep_fast.note_generic(self, scheduler_output, num_scheduled_tokens, result)
+        return result
 
     @torch.inference_mode()
     def execute_model(
