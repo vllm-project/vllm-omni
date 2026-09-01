@@ -200,6 +200,8 @@ def test_release_captured_graphs_tolerates_a_pipeline_without_captures():
 
     runner.release_captured_graphs()
 
+    assert not hasattr(runner, "graph_runners")
+
 
 def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summary: bool = True):
     runner = object.__new__(DiffusionModelRunner)
