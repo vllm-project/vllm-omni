@@ -5,8 +5,8 @@ Loads the DAC codec from ``codec.pth`` and decodes codebook indices
 
 Analogous to ``Qwen3TTSCode2Wav`` in qwen3_tts.
 
-Requires the ``fish-speech`` package for the DAC model architecture.
-Install with: ``pip install fish-speech``
+The DAC model architecture is vendored in ``dac_modules`` -- no external
+``fish-speech`` package is required.
 """
 
 from __future__ import annotations

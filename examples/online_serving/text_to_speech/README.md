@@ -209,12 +209,8 @@ python examples/online_serving/text_to_speech/indextts2/speech_client.py \
 
 ## Fish Speech S2 Pro
 
-4B dual-AR TTS at 44.1 kHz. Server uses the DAC codec.
-
-### Prerequisites
-```bash
-pip install fish-speech
-```
+4B dual-AR TTS at 44.1 kHz. Server uses the DAC codec, which is vendored in
+vLLM-Omni (no extra packages required).
 
 ### Kvcache attention fast path
 
