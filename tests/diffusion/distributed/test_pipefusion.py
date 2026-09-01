@@ -11,17 +11,14 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from torch.nn import functional as F
 
 import vllm_omni.diffusion.distributed.pipefusion.pipefusion as pf_pipeline
-import vllm_omni.diffusion.distributed.pipefusion.pipefusion_conv as pf_conv
 import vllm_omni.diffusion.distributed.pipefusion.pipefusion_runtime as pf_runtime
 import vllm_omni.diffusion.distributed.pipefusion.pipefusion_scheduler as pf_scheduler
 import vllm_omni.diffusion.distributed.pipefusion.pipefusion_transformer as pf_transformer
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.pipefusion.pipefusion import PipeFusionPipelineMixin
-from vllm_omni.diffusion.distributed.pipefusion.pipefusion_conv import PipeFusionConvMixin
 from vllm_omni.diffusion.distributed.pipefusion.pipefusion_runtime import PipeFusionRuntime
 from vllm_omni.diffusion.distributed.pipefusion.pipefusion_scheduler import PipeFusionSchedulerMixin
 from vllm_omni.diffusion.distributed.pipefusion.pipefusion_transformer import (
@@ -493,93 +490,6 @@ class TestPipeFusionTransformerHelpers:
         output = transformer.pipefusion_unpatchify(hidden_states, (1, 4, 4, 4, 4))
 
         assert output.shape == (1, 1, 2, 4, 4)
-
-
-class DummyConv(PipeFusionConvMixin):
-    def __init__(self):
-        self.kernel_size = (1, 3, 1)
-        self.stride = (1, 1, 1)
-        self.padding = (0, 1, 0)
-        self.dilation = (1, 1, 1)
-        self.groups = 1
-        self.weight = torch.ones(1, 1, 1, 3, 1)
-        self.bias = None
-
-    def orig_forward(self, x: torch.Tensor, dims=None) -> torch.Tensor:
-        return F.conv3d(x, self.weight, self.bias, stride=self.stride, padding=self.padding)
-
-
-class TestPipeFusionConvMixin:
-    def test_reset_cache_accepts_request_scoped_args(self):
-        conv = DummyConv()
-        conv.activation_cache = torch.ones(1)
-        conv.pipefusion_reset_cache("req-a", 0)
-        assert conv.activation_cache is None
-
-    def test_conv3d_enabled_only_for_overlapping_patch_mode(self, monkeypatch):
-        runtime = PipeFusionRuntime()
-        runtime.patch_mode = True
-        runtime.num_pipeline_patch = 2
-        monkeypatch.setattr(pf_conv, "get_pipefusion_runtime", lambda: runtime)
-
-        conv = DummyConv()
-        assert conv.pipefusion_conv3d_enabled() is True
-
-        conv.stride = conv.kernel_size
-        assert conv.pipefusion_conv3d_enabled() is False
-
-        runtime.patch_mode = False
-        conv.stride = (1, 1, 1)
-        assert conv.pipefusion_conv3d_enabled() is False
-
-    def test_conv3d_forward_caches_activations_and_returns_patch_slice(self, monkeypatch):
-        runtime = PipeFusionRuntime()
-        runtime.patch_mode = True
-        runtime.num_pipeline_patch = 2
-        runtime.split_dim = "height"
-        runtime.pp_patches_start_end_idx = [(0, 2), (2, 6)]
-        runtime.pp_patches_post_start_end_idx = [(0, 2), (2, 6)]
-        monkeypatch.setattr(pf_conv, "get_pipefusion_runtime", lambda: runtime)
-
-        conv = DummyConv()
-        full_input = torch.arange(6, dtype=torch.float32).view(1, 1, 1, 6, 1)
-
-        runtime.pipeline_patch_idx = 0
-        _ = conv.pipefusion_conv3d_forward(full_input[:, :, :, :2, :], dims=full_input.shape)
-
-        runtime.pipeline_patch_idx = 1
-        patch_output = conv.pipefusion_conv3d_forward(full_input[:, :, :, 2:, :], dims=full_input.shape)
-        full_output = conv.orig_forward(full_input)
-
-        torch.testing.assert_close(patch_output, full_output[:, :, :, 2:6, :])
-        torch.testing.assert_close(conv.activation_cache, full_input)
-
-    def test_conv3d_forward_supports_temporal_split(self, monkeypatch):
-        runtime = PipeFusionRuntime()
-        runtime.patch_mode = True
-        runtime.num_pipeline_patch = 2
-        runtime.split_dim = "temporal"
-        runtime.pp_patches_start_end_idx = [(0, 2), (2, 6)]
-        runtime.pp_patches_post_start_end_idx = [(0, 2), (2, 6)]
-        monkeypatch.setattr(pf_conv, "get_pipefusion_runtime", lambda: runtime)
-
-        conv = DummyConv()
-        conv.kernel_size = (3, 1, 1)
-        conv.stride = (1, 1, 1)
-        conv.padding = (1, 0, 0)
-        conv.weight = torch.ones(1, 1, 3, 1, 1)
-
-        full_input = torch.arange(6, dtype=torch.float32).view(1, 1, 6, 1, 1)
-
-        runtime.pipeline_patch_idx = 0
-        _ = conv.pipefusion_conv3d_forward(full_input[:, :, :2, :, :], dims=full_input.shape)
-
-        runtime.pipeline_patch_idx = 1
-        patch_output = conv.pipefusion_conv3d_forward(full_input[:, :, 2:, :, :], dims=full_input.shape)
-        full_output = conv.orig_forward(full_input)
-
-        torch.testing.assert_close(patch_output, full_output[:, :, 2:6, :, :])
-        torch.testing.assert_close(conv.activation_cache, full_input)
 
 
 class TestPipeFusionPipelineMixin:

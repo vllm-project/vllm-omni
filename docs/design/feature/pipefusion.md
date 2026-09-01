@@ -13,7 +13,6 @@ Adding PipeFusion support requires:
 2. Implement `prepare_model_kwargs()` to handle `latents=None` on non-first PP stages
 3. Add scheduler patch-cache support with `PipeFusionSchedulerMixin`
 4. Add transformer patch support (RoPE slicing, KV-cache updates, unpatchify) with `PipeFusionTransformerMixin`, `PipeFusionRotaryEmbeddingMixin`, and `PipeFusionSelfAttentionMixin`
-5. Add Conv3d boundary caching for overlapping convolutions with `Conv3dLayer`
 
 ---
 
@@ -56,7 +55,6 @@ PipeFusion is a set of small mixins layered on top of existing PP and CFG abstra
 | `PipeFusionTransformerMixin`     | Provides patch-aware output shape helpers and unpatchify                                              |
 | `PipeFusionRotaryEmbeddingMixin` | Slices full RoPE embeddings to the current patch                                                      |
 | `PipeFusionSelfAttentionMixin`   | Maintains full K/V caches while updating the current patch slice                                      |
-| `PipeFusionConvMixin`            | Caches activations for overlapping Conv3d layers at patch boundaries                                  |
 | `PipelineParallelMixin`          | Provides the inter-stage communication PipeFusion relies on                                           |
 
 ### Execution Flow
@@ -194,31 +192,6 @@ class YourSelfAttention(PipeFusionSelfAttentionMixin, YourBaseAttention):
     ...
 ```
 
-### Step 5: Add Conv3d boundary caching
-
-For convolutions with `kernel_size != stride` (overlapping convolutions), use `Conv3dLayer` from
-`vllm_omni.diffusion.distributed.pipefusion.pipefusion_conv`. This layer stores a full activation cache and performs
-sliced convolutions to handle patch boundaries correctly.
-
-When calling the forward pass of these layers during patch mode, you must pass the original full input dimensions.
-
-```python
-from vllm_omni.diffusion.distributed.pipefusion.pipefusion_conv import Conv3dLayer
-
-class YourTransformer(nn.Module):
-    def __init__(self):
-        ...
-        self.patch_embedding = Conv3dLayer(...)
-
-    def forward(self, hidden_states, dims=None):
-        # hidden_states is the current patch input [B, C, T_patch, H_patch, W_patch]
-        # dims is the original full input dimensions [B, C, T, H, W]
-        hidden_states = self.patch_embedding(hidden_states, dims=dims)
-        ...
-```
-
----
-
 ## Testing
 
 PipeFusion testing consists of unit tests for the bookkeeping logic and manual inference checks for end-to-end parity.
@@ -232,7 +205,6 @@ Most PipeFusion bookkeeping can be tested on CPU:
 - RoPE slicing
 - height and temporal K/V cache writes
 - patch-aware unpatchify shape behavior
-- Conv3d activation cache behavior
 - mixin MRO and request config validation
 
 ### Manual inference
@@ -306,7 +278,6 @@ class YourPipeline(nn.Module, PipeFusionPipelineMixin, PipelineParallelMixin, CF
 | `PipeFusionRuntime`        | `vllm_omni/diffusion/distributed/pipefusion/pipefusion_runtime.py`     | Patch metadata, split dimension, cache key, buffer reset |
 | `PipeFusionSchedulerMixin` | `vllm_omni/diffusion/distributed/pipefusion/pipefusion_scheduler.py`   | Per-patch scheduler caches and state gating              |
 | Transformer mixins         | `vllm_omni/diffusion/distributed/pipefusion/pipefusion_transformer.py` | RoPE slicing, K/V cache patch updates, unpatchify        |
-| Conv mixin                 | `vllm_omni/diffusion/distributed/pipefusion/pipefusion_conv.py`        | Conv3d activation cache and sliced convolution           |
 | PP mixin                   | `vllm_omni/diffusion/distributed/pipeline_parallel.py`                 | `skip_sync`, `inter_comm_ids`, and `loopback_comm_id`    |
 | PP tests                   | `tests/diffusion/distributed/test_pipeline_parallel.py`                | GPU coverage for labeled PP communication                |
 | PipeFusion tests           | `tests/diffusion/distributed/test_pipefusion.py`                       | CPU coverage for PipeFusion bookkeeping                  |
