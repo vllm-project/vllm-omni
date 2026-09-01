@@ -266,8 +266,7 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         # moving every component to the device here would balloon peak VRAM
         # past the offload point (the DiT alone is ~34.6 GiB).
         managed_component_placement = bool(
-            getattr(od_config, "enable_cpu_offload", False)
-            or getattr(od_config, "enable_layerwise_offload", False)
+            getattr(od_config, "enable_cpu_offload", False) or getattr(od_config, "enable_layerwise_offload", False)
         )
 
         # See ``hub_prefetch.py`` for the transformers v5 multi-worker subfolder

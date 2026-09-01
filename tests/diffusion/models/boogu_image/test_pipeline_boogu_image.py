@@ -128,9 +128,7 @@ def test_offload_plan_declared():
     assert "mllm" in plan.on_demand_component_paths
     assert "vae" in plan.on_demand_component_paths
     assert "transformer" in plan.resident_dit_paths
-    assert plan.block_attrs == {
-        "transformer": ("single_stream_layers", "double_stream_layers")
-    }
+    assert plan.block_attrs == {"transformer": ("single_stream_layers", "double_stream_layers")}
 
 
 @pytest.mark.parametrize("offload_field", ["enable_cpu_offload", "enable_layerwise_offload"])
