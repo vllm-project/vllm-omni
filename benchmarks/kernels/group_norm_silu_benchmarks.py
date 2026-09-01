@@ -21,9 +21,11 @@ Usage:
 
 Two things to read carefully in the output:
 
-* ``split off`` is *this* kernel with the split disabled, not the kernel as it
-  shipped before the split existed -- the autotune space changed too. For an
-  honest before/after, compare against the released version directly.
+* ``split off`` is *this* kernel with the split disabled, but still on the
+  current autotune space. That is not the same as the kernel as it shipped:
+  the config space changed too. Pass ``--baseline released`` for the true
+  before/after, which restores the shipped ``BLOCK_SIZE=4096, num_warps=16``
+  space as well as disabling the split.
 * ``% copy`` is measured against a device-to-device copy of the same footprint,
   not a datasheet peak, because a copy is the realistic ceiling for a streaming
   kernel. The copy itself does not reach hardware peak (~480 of 600 GB/s on an
@@ -32,7 +34,9 @@ Two things to read carefully in the output:
 """
 
 import argparse
+import contextlib
 import os
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -71,6 +75,40 @@ def _bench(fn) -> float:
     return triton.testing.do_bench(fn, warmup=25, rep=100)
 
 
+# The autotune space these operators shipped with before the split reduction:
+# one block size, one warp count, varying only the pipeline depth. Kept here so
+# the "released vs now" numbers in the PR can be reproduced from this script
+# rather than taken on trust -- it is also the space under which the fused
+# operator loses to eager on small activations.
+_RELEASED_CONFIGS = [triton.Config({"BLOCK_SIZE": 4096}, num_warps=16, num_stages=s) for s in (1, 2, 4, 6)]
+
+
+@contextlib.contextmanager
+def _released_kernels():
+    """Re-decorate both operators' kernels with the pre-split autotune space."""
+    import vllm_omni.model_executor.models.common.ops._group_norm_reduction as reduction
+
+    plain = sys.modules["vllm_omni.model_executor.models.common.ops.fused_group_norm_silu"]
+    adaptive = sys.modules["vllm_omni.model_executor.models.common.ops.fused_adaptive_group_norm_silu"]
+    saved = (
+        plain._group_norm_silu_kernel,
+        adaptive._adaptive_group_norm_silu_kernel,
+        reduction.group_norm_partial_stats_kernel,
+    )
+    tune = triton.autotune(configs=_RELEASED_CONFIGS, key=reduction.SPLIT_REDUCTION_KEY)
+    plain._group_norm_silu_kernel = tune(saved[0].fn)
+    adaptive._adaptive_group_norm_silu_kernel = tune(saved[1].fn)
+    reduction.group_norm_partial_stats_kernel = tune(saved[2].fn)
+    try:
+        # Released behaviour is one CTA per (batch, group), so also disable the split.
+        with _waves(0):
+            yield
+    finally:
+        plain._group_norm_silu_kernel = saved[0]
+        adaptive._adaptive_group_norm_silu_kernel = saved[1]
+        reduction.group_norm_partial_stats_kernel = saved[2]
+
+
 def _copy_bandwidth(device, dtype, nbytes: int) -> float:
     """Achievable GB/s for a same-size device-to-device copy, as the reference.
 
@@ -107,12 +145,13 @@ def _make_case(op: str, batch: int, channels: int, hw, dtype, device):
     return x, eager, fused
 
 
-def _with_waves(waves, fn):
-    """Run ``fn`` with the split sized for ``waves`` CTA waves (0 = no split)."""
+@contextlib.contextmanager
+def _waves(waves):
+    """Size the split for ``waves`` CTA waves (0 = no split) inside the block."""
     prev = os.environ.get(_SPLIT_WAVES_ENV)
     os.environ[_SPLIT_WAVES_ENV] = str(waves)
     try:
-        return fn()
+        yield
     finally:
         if prev is None:
             os.environ.pop(_SPLIT_WAVES_ENV, None)
@@ -120,11 +159,20 @@ def _with_waves(waves, fn):
             os.environ[_SPLIT_WAVES_ENV] = prev
 
 
-def run_compare(op, batch, dtype, device, sms):
-    print(f"\n### op={op} batch={batch} dtype={str(dtype).replace('torch.', '')} groups={NUM_GROUPS}")
+def _with_waves(waves, fn):
+    """Run ``fn`` with the split sized for ``waves`` CTA waves (0 = no split)."""
+    with _waves(waves):
+        return fn()
+
+
+def run_compare(op, batch, dtype, device, sms, released=False):
+    baseline = "released" if released else "split off"
+    print(
+        f"\n### op={op} batch={batch} dtype={str(dtype).replace('torch.', '')} groups={NUM_GROUPS} baseline={baseline}"
+    )
     header = (
         f"{'shape':<12} {'C':>5} {'MB':>7} {'split':>6} {'CTAs':>6} "
-        f"{'eager ms':>9} {'split off':>10} {'split':>9} {'GB/s':>8} {'% copy':>7} {'vs off':>8}"
+        f"{'eager ms':>9} {baseline:>10} {'split':>9} {'GB/s':>8} {'% copy':>7} {'vs base':>8}"
     )
     print(header)
     print("-" * len(header))
@@ -180,6 +228,16 @@ def run_sweep(op, batch, dtype, device, waves_list):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--op", choices=["plain", "adaptive", "both"], default="both")
+    parser.add_argument(
+        "--baseline",
+        choices=["split-off", "released"],
+        default="split-off",
+        help=(
+            "what to compare against: 'split-off' is this kernel with the split disabled; "
+            "'released' also restores the pre-split BLOCK_SIZE=4096/num_warps=16 autotune "
+            "space, i.e. the operator as it shipped"
+        ),
+    )
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--dtype", default="bfloat16,float32")
     parser.add_argument(
@@ -203,7 +261,7 @@ def main():
             if args.sweep_waves:
                 run_sweep(op, args.batch, dtype, device, [int(w) for w in args.sweep_waves.split(",")])
             else:
-                run_compare(op, args.batch, dtype, device, sms)
+                run_compare(op, args.batch, dtype, device, sms, released=args.baseline == "released")
 
 
 if __name__ == "__main__":

@@ -169,7 +169,7 @@ def test_inventory_matches_reviewed_snapshot_counts():
         EnvironmentVariableCategory.PLATFORM_EXTERNAL: 30,
         EnvironmentVariableCategory.MODEL_SPECIFIC: 95,
         EnvironmentVariableCategory.BENCHMARK_TRANSITIONAL: 22,
-        EnvironmentVariableCategory.INTERNAL: 5,
+        EnvironmentVariableCategory.INTERNAL: 6,
     }
 
     disposition_counts = Counter(

@@ -49,7 +49,10 @@ import functools
 import os
 
 import torch
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+
+logger = init_logger(__name__)
 
 # Spatial chunks handed to a program are a multiple of this many elements. It
 # matches the largest autotuned ``BLOCK_SIZE`` so that every chunk boundary is
@@ -133,12 +136,27 @@ def _prune_oversized_blocks(configs, named_args, **kwargs):
 SPLIT_REDUCTION_PRUNE = {"early_config_prune": _prune_oversized_blocks}
 
 
+@functools.cache
+def _warn_ignored_waves(raw: str) -> None:
+    """Warn once per distinct bad value; ``_split_waves`` runs on every call."""
+    logger.warning(
+        "%s=%r is not a non-negative integer and was ignored; using the default of %d. "
+        "This knob takes a CTA-waves count, not a boolean -- set it to 0 to disable the "
+        "split reduction.",
+        _SPLIT_WAVES_ENV,
+        raw,
+        _DEFAULT_SPLIT_WAVES,
+    )
+
+
 def _split_waves() -> int:
     """Read the CTA-waves target. Uncached so tests and sweeps can retune it.
 
-    ``0`` means "do not split". A negative or unparsable value is treated as
-    unset rather than as a request, so a typo degrades to the default instead of
-    silently turning the optimization off.
+    ``0`` means "do not split". Anything unparsable or negative degrades to the
+    default rather than disabling the split, so a typo cannot silently switch the
+    optimization off -- but because that also means ``=false`` or ``=off`` leaves
+    the split *on*, which is not what someone writing that would expect, an
+    ignored value is logged rather than swallowed.
     """
     raw = os.environ.get(_SPLIT_WAVES_ENV)
     if raw is None or not raw.strip():
@@ -146,8 +164,12 @@ def _split_waves() -> int:
     try:
         waves = int(raw)
     except ValueError:
+        _warn_ignored_waves(raw)
         return _DEFAULT_SPLIT_WAVES
-    return waves if waves >= 0 else _DEFAULT_SPLIT_WAVES
+    if waves < 0:
+        _warn_ignored_waves(raw)
+        return _DEFAULT_SPLIT_WAVES
+    return waves
 
 
 @functools.cache
