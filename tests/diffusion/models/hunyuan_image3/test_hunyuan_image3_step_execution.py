@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -268,6 +268,17 @@ def test_grouped_denoise_allows_sdpa_attention_backend():
     pipeline = _pipeline()
 
     pipeline._ensure_grouped_attention_backend_supported(2)
+
+
+def test_scheduler_paged_step_execution_is_rejected():
+    pipeline = _pipeline()
+    pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER
+    state = _state("paged-step", 0)
+
+    with pytest.raises(ValueError, match="request-level execution only"):
+        pipeline.prepare_encode(state)
+    with pytest.raises(ValueError, match="request-level execution only"):
+        pipeline.denoise_step(InputBatch.make_batch([state]))
 
 
 def test_step_scheduler_preserves_latent_dtype_for_mixed_progress_batches():

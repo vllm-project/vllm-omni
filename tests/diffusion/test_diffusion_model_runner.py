@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -533,7 +533,14 @@ def test_profile_run_executes_forward_without_scheduler_kv_validation(monkeypatc
         return original_execute(*args, **kwargs)
 
     runner._execute_request_list = execute
-    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    forward_context_calls = []
+
+    @contextmanager
+    def record_forward_context(*args, **kwargs):
+        forward_context_calls.append((args, kwargs))
+        yield
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", record_forward_context)
     reset_peak_memory_stats = Mock()
     monkeypatch.setattr(
         model_runner_module.current_omni_platform,
@@ -549,6 +556,8 @@ def test_profile_run_executes_forward_without_scheduler_kv_validation(monkeypatc
 
     assert runner.pipeline.forward_calls == 1
     assert record_names == ["pipeline_memory_profile"]
+    assert len(forward_context_calls) == 1
+    assert forward_context_calls[0][1]["in_diffusion_kv_memory_profile"] is True
     runner._validate_diffusion_kv_metadata.assert_not_called()
     reset_peak_memory_stats.assert_not_called()
     synchronize.assert_called_once_with()
@@ -575,7 +584,14 @@ def test_profile_run_executes_maximum_step_batch_without_resetting_peak(monkeypa
 
     runner.pipeline.denoise_step = denoise_step
     runner._validate_diffusion_kv_metadata = Mock(side_effect=AssertionError("profile must bypass admission"))
-    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    forward_context_calls = []
+
+    @contextmanager
+    def record_forward_context(*args, **kwargs):
+        forward_context_calls.append((args, kwargs))
+        yield
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", record_forward_context)
     reset_peak_memory_stats = Mock()
     monkeypatch.setattr(
         model_runner_module.current_omni_platform,
@@ -592,6 +608,8 @@ def test_profile_run_executes_maximum_step_batch_without_resetting_peak(monkeypa
     assert observed_batch_rows == [(2, 2)]
     assert runner.state_cache == {}
     assert runner.input_batch is None
+    assert len(forward_context_calls) == 1
+    assert forward_context_calls[0][1]["in_diffusion_kv_memory_profile"] is True
     runner._validate_diffusion_kv_metadata.assert_not_called()
     reset_peak_memory_stats.assert_not_called()
     synchronize.assert_called_once_with()

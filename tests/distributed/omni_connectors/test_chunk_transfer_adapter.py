@@ -2959,3 +2959,34 @@ def test_abort_clears_native_codec_state_before_external_id_reuse(build_adapter)
     )
 
     assert torch.equal(replacement_payload.codes.audio, torch.full((1, 31), 202, dtype=torch.long))
+
+
+def test_save_async_boundary_holds_generation_without_request_counter(build_adapter):
+    """A boundary must not advance past a generation nothing can catch up to.
+
+    When the producing stage maintains ``_omni_segment_generation`` on the
+    request, a boundary may start the next segment's watermark at
+    ``generation + 1`` because the following frame will carry it. On paths
+    where the request has no such counter, that speculative advance makes every
+    subsequent frame look stale and starves the stream permanently
+    (vllm-project/vllm-omni#6816).
+    """
+    adapter, _ = build_adapter(stage_id=1)
+
+    request = _req("req-nogen", RequestStatus.WAITING, external_req_id="ext-nogen")
+    request.resumable = True
+    request._omni_segment_generation = None
+
+    adapter.save_async(multimodal_output=None, request=request, is_segment_finished=True)
+    assert adapter._segment_generation["ext-nogen"] == 0
+
+    follow_up = _req("req-nogen-next", RequestStatus.WAITING, external_req_id="ext-nogen")
+    follow_up.resumable = True
+    follow_up.num_computed_tokens = 3
+    follow_up._omni_segment_generation = None
+    queued_before = len(adapter._pending_save_reqs)
+
+    adapter.save_async(multimodal_output=None, request=follow_up, is_segment_finished=False)
+
+    assert len(adapter._pending_save_reqs) == queued_before + 1
+    assert adapter._pending_save_reqs[-1]["request"] is follow_up

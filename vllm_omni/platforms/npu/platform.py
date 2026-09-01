@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import nullcontext
+from functools import cache
 from typing import Any
 
 import torch
@@ -19,6 +20,28 @@ _DIFFUSION_PACKED_MODULES_MAPPING = {
         "experts": ["experts.0.gate_up_proj", "experts.0.down_proj"],
     },
 }
+
+
+@cache
+def _get_strict_ulysses_paged_backend() -> type:
+    """Return an Ascend backend that bypasses vLLM PCP dispatch."""
+
+    from vllm_ascend.attention.attention_v1 import (
+        AscendAttentionBackend,
+        AscendAttentionBackendImpl,
+        AscendAttentionMetadataBuilder,
+    )
+
+    class AscendStrictUlyssesPagedBackend(AscendAttentionBackend):
+        @staticmethod
+        def get_impl_cls() -> type:
+            return AscendAttentionBackendImpl
+
+        @staticmethod
+        def get_builder_cls() -> type:
+            return AscendAttentionMetadataBuilder
+
+    return AscendStrictUlyssesPagedBackend
 
 
 class NPUOmniPlatform(OmniPlatform, NPUPlatform):
@@ -77,8 +100,54 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     @classmethod
     def init_diffusion_worker_vllm_config(cls, vllm_config: Any) -> None:
         from vllm_ascend.ascend_config import init_ascend_config
+        from vllm_ascend.utils import adapt_patch
 
+        # Omni's custom DiffusionWorker does not pass through vLLM-Ascend's
+        # NPUWorker constructor, where worker-local patches are normally
+        # installed.  In particular, AscendBlockTables needs the patched
+        # non-UVA buffer implementation on NPU.
+        adapt_patch()
         init_ascend_config(vllm_config)
+
+    @classmethod
+    def configure_diffusion_vllm_config(cls, vllm_config: Any, od_config: Any) -> None:
+        """Use the block geometry required by Ascend's native paged kernel."""
+        if getattr(od_config, "diffusion_kv_mode", None) is None:
+            return
+        from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+
+        if od_config.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+            return
+        from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+
+        supported_sizes = [
+            size for size in AscendAttentionBackend.get_supported_kernel_block_sizes() if type(size) is int and size > 0
+        ]
+        if not supported_sizes:
+            raise RuntimeError("Ascend paged attention did not expose an integer kernel block size")
+        # vLLM's generic default is 16, while the Ascend FIA backend stores
+        # cache pages as 128-token blocks. Set the Manager geometry
+        # before KV specs are collected so Scheduler and Worker agree.
+        vllm_config.cache_config.block_size = supported_sizes[0]
+
+    @classmethod
+    def requires_diffusion_paged_kv_prewrite(cls) -> bool:
+        """Write the full K/V span once before piecewise FIA segments."""
+
+        return True
+
+    @classmethod
+    def get_diffusion_paged_kv_attn_backend(cls, attn_backend: type, *, ulysses_degree: int) -> type:
+        """Keep strict Ulysses paged FIA out of vLLM's PCP implementation."""
+
+        del cls
+        if ulysses_degree <= 1:
+            return attn_backend
+        from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+
+        if not isinstance(attn_backend, type) or not issubclass(attn_backend, AscendAttentionBackend):
+            return attn_backend
+        return _get_strict_ulysses_paged_backend()
 
     @classmethod
     def get_diffusion_kv_block_tables_cls(cls) -> type:
@@ -212,6 +281,14 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
 
     @classmethod
+    def supports_diffusion_dense_flash_attention(cls) -> bool:
+        """Return whether MindIE-SD is installed for dense NPU FlashAttention."""
+
+        from importlib.util import find_spec
+
+        return find_spec("mindiesd") is not None
+
+    @classmethod
     def supports_torch_inductor(cls) -> bool:
         return False
 
@@ -245,7 +322,12 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         """
         try:
             torch.npu.current_stream().synchronize()
-            event = torch.npu.Event()
+            # The async output worker uses the public ``torch.Stream`` API.
+            # With torch_npu 2.10, a native ``torch.npu.Event`` cannot be
+            # consumed by that wrapper stream (the reverse direction is
+            # supported), while ``torch.Event`` is dispatched to the active
+            # NPU backend and remains cross-stream compatible.
+            event = torch.Event()
             event.record()
             return event
         except Exception:

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 import time
@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass
 
 import pytest
 
+import vllm_omni.diffusion.stage_diffusion_proc as stage_diffusion_proc
+import vllm_omni.plugins as omni_plugins
 from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -24,6 +26,33 @@ BASE_HEIGHT = 512
 BASE_WIDTH = 512
 BASE_INFER_STEPS = 10
 DELAY_BASE = 0.01
+
+
+def test_run_diffusion_proc_sets_lifecycle_before_loading_plugins(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+
+    class StopProcessError(Exception):
+        pass
+
+    class TestStageDiffusionProc(StageDiffusionProc):
+        def __init__(self, model, od_config):
+            events.append("proc")
+            raise StopProcessError
+
+    monkeypatch.setattr(omni_plugins, "load_omni_general_plugins", lambda: events.append("plugins"))
+    monkeypatch.setattr(stage_diffusion_proc, "set_death_signal", lambda _: events.append("death_signal"))
+    monkeypatch.setattr(stage_diffusion_proc.signal, "signal", lambda *_: events.append("signal_handler"))
+
+    with pytest.raises(StopProcessError):
+        TestStageDiffusionProc.run_diffusion_proc(
+            model="test-model",
+            od_config=None,
+            handshake_address="test-address",
+            local_client=True,
+            headless=False,
+        )
+
+    assert events == ["death_signal", "signal_handler", "signal_handler", "plugins", "proc"]
 
 
 class MockDiffusionEngine:
