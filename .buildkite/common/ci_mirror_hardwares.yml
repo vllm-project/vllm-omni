@@ -1,7 +1,7 @@
 # Uploader-only hardware presets for CUDA / NPU test YAML.
 # Referenced as ``mirror_hardwares: l4_1`` on a step; ``upload_pipeline.py`` expands to
-# ``agents`` (+ optional top-level ``image`` for NPU) + ``plugins``, then strips
-# ``mirror_hardwares`` before Buildkite upload.
+# ``agents`` (+ optional top-level ``image`` for NPU) + ``plugins`` (+ ``retry``
+# for ``l4_*``), then strips ``mirror_hardwares`` before Buildkite upload.
 #
 # CUDA naming: {chip}_{count}
 #   l4_1, l4_2, l4_3, l4_4, h100_1 … h100_4
@@ -13,6 +13,7 @@
 # The ``l4_*`` presets run on the EKS ``l4-k8s`` queue (agent-stack-k8s),
 # packed onto g6.12xlarge L4 nodes (``vllm.ci/gpu-pool=l4x4``). GPU / CPU /
 # memory / shm requests scale with card count (1 GPU = 10 CPU / 40Gi / 24Gi shm).
+# Retry covers lost agents / killed pods, not pytest or OOM (exit 1 / 137).
 
 x-npu-k8s-plugins: &npu_k8s_plugins
   - kubernetes:
@@ -20,11 +21,25 @@ x-npu-k8s-plugins: &npu_k8s_plugins
         imagePullSecrets:
           - name: swr-secret
 
+# Infra-only retry. Omit exit 1 (pytest failed) and 137 (cgroup OOM / SIGKILL
+# of the test process). ci-infra ``K8S_RETRY`` still retries exit 1.
+x-l4-k8s-retry: &l4_k8s_retry
+  automatic:
+    - exit_status: -1
+      limit: 1
+    - exit_status: 128
+      limit: 1
+    - signal_reason: agent_stop
+      limit: 1
+    - signal_reason: agent_refused
+      limit: 1
+
 
 mirror_hardwares:
   l4_1:
     agents:
       queue: l4-k8s
+    retry: *l4_k8s_retry
     plugins:
       - kubernetes:
           metadata:
@@ -75,6 +90,7 @@ mirror_hardwares:
   l4_2:
     agents:
       queue: l4-k8s
+    retry: *l4_k8s_retry
     plugins:
       - kubernetes:
           metadata:
@@ -125,6 +141,7 @@ mirror_hardwares:
   l4_3:
     agents:
       queue: l4-k8s
+    retry: *l4_k8s_retry
     plugins:
       - kubernetes:
           metadata:
@@ -175,6 +192,7 @@ mirror_hardwares:
   l4_4:
     agents:
       queue: l4-k8s
+    retry: *l4_k8s_retry
     plugins:
       - kubernetes:
           metadata:

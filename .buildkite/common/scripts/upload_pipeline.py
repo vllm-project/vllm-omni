@@ -258,7 +258,11 @@ def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any]:
         )
 
     expanded = copy.deepcopy(preset)
-    return {key: value for key, value in step.items() if key != "mirror_hardwares"} | expanded
+    merged = {key: value for key, value in step.items() if key != "mirror_hardwares"} | expanded
+    # Preset retry (K8S_RETRY on l4_*) must not clobber a step that opted out.
+    if "retry" in step:
+        merged["retry"] = step["retry"]
+    return merged
 
 
 def _match_source_file(changed_files: list[str], prefixes: list[str]) -> bool:
