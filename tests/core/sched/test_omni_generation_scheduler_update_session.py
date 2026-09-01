@@ -138,6 +138,7 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
     sched.recompute_kv_load_failures = False
     sched.connector = None
     sched.kv_cache_manager.take_events.return_value = None
+    sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
 

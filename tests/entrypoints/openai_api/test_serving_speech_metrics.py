@@ -30,10 +30,11 @@ class _MetricsStub:
         self.continuity_calls.append((stage, replica, threshold_ms))
 
 
-def _serving(metrics: _MetricsStub) -> OmniOpenAIServingSpeech:
+def _serving(metrics: _MetricsStub, *, adapter=None) -> OmniOpenAIServingSpeech:
     serving = OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
     serving._tts_model_type = "qwen3_tts"
     serving.engine_client = SimpleNamespace(mod_metrics=metrics, request_states={})
+    serving._get_tts_adapter = lambda: adapter
     serving.create_audio = lambda audio_obj: SimpleNamespace(
         audio_data=b"\0\0" * int(audio_obj.audio_tensor.size),
         media_type="audio/pcm",
@@ -106,6 +107,31 @@ async def test_streaming_speech_does_not_finalize_continuity_on_error(monkeypatc
         request_arrival_ts=100.0,
     )
     with pytest.raises(RuntimeError, match="stream failed"):
+        _ = [chunk async for chunk in chunks]
+
+    assert len(metrics.ttfp_calls) == 1
+    assert metrics.underrun_calls == []
+    assert metrics.continuity_calls == []
+
+
+@pytest.mark.asyncio
+async def test_streaming_speech_does_not_finalize_continuity_on_validation_error(monkeypatch):
+    metrics = _MetricsStub()
+
+    def reject_generation(_tts_params, **_kwargs):
+        raise RuntimeError("generation validation failed")
+
+    adapter = SimpleNamespace(validates_generation=True, validate_generation=reject_generation)
+    serving = _serving(metrics, adapter=adapter)
+    monkeypatch.setattr("vllm_omni.entrypoints.openai.serving_speech.time.time", lambda: 100.25)
+
+    chunks = serving._generate_audio_chunks(
+        _generate(_result()),
+        request_id="speech-test",
+        request_arrival_ts=100.0,
+        tts_params={"task_type": ["Base"]},
+    )
+    with pytest.raises(RuntimeError, match="generation validation failed"):
         _ = [chunk async for chunk in chunks]
 
     assert len(metrics.ttfp_calls) == 1

@@ -335,7 +335,7 @@ class OmniStreamingSpeechHandler:
         request_id = None
         try:
             if config.stream_audio:
-                request_id, generator, _ = await self._speech_service._prepare_speech_generation(
+                request_id, generator, tts_params = await self._speech_service._prepare_speech_generation(
                     request,
                     arrival_time=request_arrival_ts,
                 )
@@ -350,6 +350,7 @@ class OmniStreamingSpeechHandler:
                         language=config.language,
                         request_start_s=request_start_s,
                         request_arrival_ts=request_arrival_ts,
+                        tts_params=tts_params,
                     )
                 else:
                     async with aclosing(
@@ -358,6 +359,7 @@ class OmniStreamingSpeechHandler:
                             request_id,
                             request_start_s=request_start_s,
                             request_arrival_ts=request_arrival_ts,
+                            tts_params=tts_params,
                         )
                     ) as stream:
                         async for chunk in stream:
@@ -388,6 +390,7 @@ class OmniStreamingSpeechHandler:
             await self._send_error(
                 websocket,
                 f"Generation failed for utterance {utterance_index}, sentence {sentence_index}: {e}",
+                partial_audio=total_bytes > 0,
             )
         finally:
             try:
@@ -415,6 +418,7 @@ class OmniStreamingSpeechHandler:
         request_start_s: float,
         request_arrival_ts: float,
         language: str | None = None,
+        tts_params: dict | None = None,
     ) -> int:
         """Stream PCM as JSON ``audio.chunk`` frames, aligned per sentence.
 
@@ -463,6 +467,7 @@ class OmniStreamingSpeechHandler:
                 request_start_s=request_start_s,
                 request_arrival_ts=request_arrival_ts,
                 include_sample_rate=True,
+                tts_params=tts_params,
                 collect=collect,
             )
         ) as stream:
@@ -488,14 +493,15 @@ class OmniStreamingSpeechHandler:
         return total_bytes
 
     @staticmethod
-    async def _send_error(websocket: WebSocket, message: str) -> None:
+    async def _send_error(websocket: WebSocket, message: str, *, partial_audio: bool = False) -> None:
         """Send an error message to the client."""
         try:
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "message": message,
-                }
-            )
+            payload: dict[str, object] = {
+                "type": "error",
+                "message": message,
+            }
+            if partial_audio:
+                payload.update(partial_audio=True, action="discard")
+            await websocket.send_json(payload)
         except Exception:
             pass  # Connection may already be closed; safe to ignore

@@ -56,6 +56,7 @@ from vllm_omni.entrypoints.openai.speech_usage import (
 )
 from vllm_omni.entrypoints.openai.tts_adapters import (
     SpeechServingContext,
+    TTSGenerationError,
     all_tts_stage_keys,
     detect_tts_model_type,
     resolve_adapter,
@@ -78,6 +79,7 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 logger = init_logger(__name__)
+
 
 _SPEECH_USAGE_INPUT_TOKENS_HEADER = "X-VLLM-OMNI-INPUT-TOKENS"
 _SPEECH_USAGE_OUTPUT_TOKENS_HEADER = "X-VLLM-OMNI-OUTPUT-TOKENS"
@@ -286,6 +288,8 @@ def _conditioning_cache_salt(request, tts_params: dict | None = None) -> str:
 
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     _diffusion_mode: bool = False
+    _media_connector: MediaConnector | None = None
+    _allowed_local_media_path: str = ""
     _tts_executor: ThreadPoolExecutor | None = None
 
     def _init_speaker_storage(self) -> None:
@@ -402,6 +406,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         diffusion_engine: "Any",
         model_name: str,
         stage_configs: "list[Any] | None" = None,
+        allowed_local_media_path: str = "",
+        allowed_media_domains: list[str] | None = None,
     ) -> "OmniOpenAIServingSpeech":
         """Create a speech serving instance for pure diffusion TTS models.
 
@@ -413,6 +419,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         instance._diffusion_engine = diffusion_engine
         instance._diffusion_model_name = model_name
         instance._diffusion_stage_configs = stage_configs
+        instance._allowed_local_media_path = allowed_local_media_path
+        instance._media_connector = MediaConnector(
+            allowed_local_media_path=allowed_local_media_path,
+            allowed_media_domains=allowed_media_domains,
+        )
         instance._tts_model_type = "omnivoice"
         instance._is_tts = False
         # Diffusion-only instances don't have a TTS stage; set None so any
@@ -423,6 +434,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return instance
 
     def __init__(self, *args, **kwargs):
+        self._media_connector = None
+        self._allowed_local_media_path = ""
         self.model_name = kwargs.pop("model_name", None)
         # True when the server was launched with --forced-aligner (a pooling
         # aligner stage is appended to the pipeline). Gates word_timestamps.
@@ -753,6 +766,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Assemble the full usage object (input breakdown + generated tokens)."""
         details = self._compute_speech_input_details(request, tts_params)
         return build_speech_usage(details, output_tokens)
+
+    def _validate_tts_generation(
+        self,
+        tts_params: dict[str, Any],
+        usage_acc: SpeechOutputTokenCounter,
+    ) -> None:
+        adapter = self._get_tts_adapter()
+        if adapter is None:
+            return
+        adapter.validate_generation(
+            tts_params,
+            stage0_finish_reason=usage_acc.stage0_finish_reason,
+            output_tokens=usage_acc.total(),
+        )
 
     @staticmethod
     def _build_speech_usage_headers(usage: SpeechTokenUsage | None) -> dict[str, str]:
@@ -1888,15 +1915,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         ref_audio_str = _coerce_ref_audio_str(ref_audio_str)
         # Pass the allowed-local-media-path so the stat is restricted to
         # paths the server operator has explicitly permitted.
-        allowed_path = None
-        if not self._diffusion_mode:
+        allowed_path: str | None
+        if self._diffusion_mode:
+            allowed_path = self._allowed_local_media_path
+        else:
             allowed_path = getattr(self.model_config, "allowed_local_media_path", None)
 
         wav_list: list[float] | None = None
         sr = 0
         artifact_key = ""
         post_key = ""
-        connector: MediaConnector | None = None
         for attempt in range(_REF_AUDIO_METADATA_FETCH_ATTEMPTS):
             cache_key = await self._ref_audio_cache_key(ref_audio_str, allowed_path)
             cached = self._ref_audio_resolve_cache.get(cache_key)
@@ -1911,19 +1939,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
                 return wav_list, sr, cache_key
 
-            if connector is None:
-                # In diffusion mode, model_config may not be available
-                if self._diffusion_mode:
-                    connector = MediaConnector()
-                else:
-                    model_config = self.model_config
-                    connector = MediaConnector(
-                        allowed_local_media_path=model_config.allowed_local_media_path,
-                        allowed_media_domains=model_config.allowed_media_domains,
-                    )
+            if self._media_connector is None:
+                model_config = self.model_config
+                self._media_connector = MediaConnector(
+                    allowed_local_media_path=model_config.allowed_local_media_path,
+                    allowed_media_domains=model_config.allowed_media_domains,
+                )
 
             fetch_start_s = time.perf_counter()
-            wav_np, fetched_sr = await connector.fetch_audio_async(ref_audio_str)
+            wav_np, fetched_sr = await self._media_connector.fetch_audio_async(ref_audio_str)
             fetch_decode_ms = (time.perf_counter() - fetch_start_s) * 1000.0
             tolist_start_s = time.perf_counter()
             wav_list, sr, artifact_key, duration = self._finalize_fetched_ref_audio(wav_np, fetched_sr)
@@ -2241,6 +2265,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_arrival_ts: float | None = None,
         include_sample_rate: bool = False,
         usage_acc: SpeechOutputTokenCounter | None = None,
+        tts_params: dict[str, Any] | None = None,
         collect: dict | None = None,
     ):
         """Generate audio chunks for streaming response.
@@ -2270,6 +2295,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         audio_stage_id: int | None = None
         audio_replica_id: int | None = None
         audio_channels = 1
+
+        # SSE supplies an accumulator for usage output. Raw-audio and WebSocket
+        # streams retain terminal metrics only when their model adapter needs
+        # generation validation.
+        adapter = self._get_tts_adapter()
+        if tts_params is not None and usage_acc is None and adapter is not None and adapter.validates_generation:
+            usage_acc = SpeechOutputTokenCounter()
 
         try:
             async for res in generator:
@@ -2359,6 +2391,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 # Audex contract: zero codec tokens must abort the stream, not
                 # complete it cleanly with zero audio bytes.
                 raise ValueError("Audex produced no audio (the thinker emitted zero or invalid codec tokens)")
+            # Check before committing the reference-audio artifact or logging
+            # success. Streaming protocols may already have emitted partial
+            # bytes, but they must terminate as an error rather than cleanly.
+            if tts_params is not None and usage_acc is not None:
+                self._validate_tts_generation(tts_params, usage_acc)
             mod_metrics = getattr(getattr(self, "engine_client", None), "mod_metrics", None)
             if mod_metrics is not None and audio_stage_id is not None and audio_replica_id is not None:
                 observe_audio_streaming_finalize(
@@ -2455,6 +2492,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         ``input_tokens`` is computed from the request text + reference audio.
         """
         usage_acc = SpeechOutputTokenCounter()
+        emitted_audio = False
         try:
             async for chunk in self._generate_audio_chunks(
                 generator,
@@ -2464,6 +2502,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 request_start_s=request_start_s,
                 request_arrival_ts=request_arrival_ts,
                 usage_acc=usage_acc,
+                tts_params=tts_params,
             ):
                 payload = {
                     "type": "speech.audio.delta",
@@ -2471,6 +2510,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     "response_format": response_format,
                 }
                 data = json.dumps(payload, separators=(",", ":"))
+                emitted_audio = True
                 yield f"event: speech.audio.delta\ndata: {data}\n\n"
             done_payload: dict[str, Any] = {"type": "speech.audio.done"}
             if request is not None:
@@ -2482,14 +2522,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            error: dict[str, Any] = {
+                "message": str(e),
+                "type": "server_error",
+                "param": None,
+                "code": HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            }
+            if emitted_audio:
+                error.update(partial_audio=True, action="discard")
             error_payload: dict[str, Any] = {
                 "type": "speech.audio.error",
-                "error": {
-                    "message": str(e),
-                    "type": "server_error",
-                    "param": None,
-                    "code": HTTPStatus.INTERNAL_SERVER_ERROR.value,
-                },
+                "error": error,
             }
             data = json.dumps(error_payload, separators=(",", ":"))
             yield f"event: speech.audio.error\ndata: {data}\n\n"
@@ -3218,6 +3261,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_start_s: float | None = None,
         request_arrival_ts: float | None = None,
         include_sample_rate: bool = False,
+        tts_params: dict[str, Any] | None = None,
         collect: dict | None = None,
     ):
         """Yield raw PCM byte chunks from the engine generator.
@@ -3234,15 +3278,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             request_start_s=request_start_s,
             request_arrival_ts=request_arrival_ts,
             include_sample_rate=include_sample_rate,
+            tts_params=tts_params,
             collect=collect,
         ):
             yield chunk
 
     async def _iter_pcm_audio_bytes(self, request: OpenAICreateSpeechRequest):
         """Yield raw PCM bytes for a speech request as soon as chunks are decoded."""
-        request_id, generator, _ = await self._prepare_speech_generation(request)
+        request_id, generator, tts_params = await self._prepare_speech_generation(request)
         try:
-            async for chunk in self._generate_pcm_chunks(generator, request_id):
+            async for chunk in self._generate_pcm_chunks(generator, request_id, tts_params=tts_params):
                 yield chunk
         finally:
             self._discard_ref_audio_artifact_warmup(request_id)
@@ -3318,6 +3363,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             if final_output is None:
                 raise ValueError("No output generated from the model.")
+
+            self._validate_tts_generation(bytes_tts_params or {}, usage_acc)
 
             # Extract audio from the audio-bearing res (not necessarily the last
             # yielded one, which may be the aligner's timestamps output).
@@ -3648,7 +3695,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     return error
 
                 media_type = "audio/wav" if response_format == "wav" else "audio/pcm"
-                _, generator, _ = await self._prepare_speech_generation(
+                _, generator, raw_tts_params = await self._prepare_speech_generation(
                     request,
                     request_id=request_id,
                     arrival_time=request_arrival_ts,
@@ -3661,6 +3708,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         raw_request=raw_request,
                         request_start_s=request_start_s,
                         request_arrival_ts=request_arrival_ts,
+                        tts_params=raw_tts_params,
                     ),
                     media_type=media_type,
                 )
@@ -3694,13 +3742,40 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             collect: dict = {}
             usage_box: list[SpeechTokenUsage] = []
-            audio_bytes, media_type = await self._generate_audio_bytes(
-                request,
-                request_id=request_id,
-                usage_out=usage_box,
-                collect=collect,
-                request_arrival_ts=request_arrival_ts,
-            )
+            try:
+                audio_bytes, media_type = await self._generate_audio_bytes(
+                    request,
+                    request_id=request_id,
+                    usage_out=usage_box,
+                    collect=collect,
+                    request_arrival_ts=request_arrival_ts,
+                )
+            except TTSGenerationError as error:
+                # An adapter can reject otherwise completed audio. Retry only
+                # retryable, stochastic, server-budgeted non-streaming
+                # requests: changing an explicit seed would violate
+                # reproducibility, and changing a caller-provided token limit
+                # would violate the requested budget.
+                if not error.retryable or request.seed is not None or request.max_new_tokens is not None:
+                    raise
+                retry_seed = int(random_uuid()[:8], 16)
+                retry_request = request.model_copy(update={"seed": retry_seed})
+                retry_request_id = f"speech-{random_uuid()}"
+                collect.clear()
+                usage_box.clear()
+                logger.warning(
+                    "TTS request %s failed generation validation; retrying once as %s with seed=%d",
+                    request_id,
+                    retry_request_id,
+                    retry_seed,
+                )
+                audio_bytes, media_type = await self._generate_audio_bytes(
+                    retry_request,
+                    request_id=retry_request_id,
+                    usage_out=usage_box,
+                    collect=collect,
+                    request_arrival_ts=request_arrival_ts,
+                )
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
             logger.info(
                 "[SpeechE2E] request_id=%s stream=false status=ok total_ms=%.2f response_bytes=%d",
@@ -3753,6 +3828,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 e,
             )
             return self.create_error_response(e)
+        except TTSGenerationError as e:
+            total_ms = (time.perf_counter() - request_start_s) * 1000.0
+            logger.error(
+                "[SpeechE2E] request_id=%s stream=%s status=invalid_generation total_ms=%.2f error=%s",
+                request_id,
+                bool(request.stream),
+                total_ms,
+                e,
+            )
+            return self._diffusion_error_response(str(e), status_code=500)
         except Exception as e:
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
             logger.exception(

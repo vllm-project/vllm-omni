@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import argparse
 import json
 import os
@@ -22,6 +25,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
     "dataset_name",
     [
         "daily-omni",
+        "omniinteract",
         "seed-tts",
         "seed-tts-text",
         "seed-tts-design",
@@ -55,6 +59,7 @@ def test_extend_omni_choices_updates_tracking_parser_shadow(dataset_name: str) -
     [
         (["--print-stage"], "print_stage", True),
         (["--daily-omni-input-mode", "audio"], "daily_omni_input_mode", "audio"),
+        (["--omniinteract-subsets", "1qna"], "omniinteract_subsets", ["1qna"]),
         (["--seed-tts-locale", "zh"], "seed_tts_locale", "zh"),
     ],
 )
@@ -80,12 +85,14 @@ def test_add_omni_args_preserves_implicit_defaults() -> None:
     args = parser.parse_args([])
     assert args.print_stage is False
     assert args.daily_omni_input_mode == "all"
+    assert args.omniinteract_subsets == ["1q1a", "1q1a_math", "1qna"]
     assert args.seed_tts_locale == "en"
     assert args.explicit_keys == set()
 
 
 def test_update_omni_help_updates_upstream_actions() -> None:
     parser = TrackingArgumentParser()
+    parser.add_argument("--num-prompts", default=1000, help="Number of prompts.")
     parser.add_argument("--percentile-metrics", help="Upstream percentile help.")
     parser.add_argument("--random-mm-limit-mm-per-prompt", help="Upstream limit help.")
     parser.add_argument("--random-mm-bucket-config", help="Upstream bucket help.")
@@ -93,6 +100,7 @@ def test_update_omni_help_updates_upstream_actions() -> None:
     update_omni_help(parser)
 
     actions = {action.dest: action for action in parser._actions}
+    assert "OmniInteract uses 3" in actions["num_prompts"].help
     assert all(metric in actions["percentile_metrics"].help for metric in ("ttfc", "tpop", "audio_rtf"))
     assert "probabilities are renormalized" in actions["random_mm_limit_mm_per_prompt"].help
     assert "Currently allows for 3 modalities" in actions["random_mm_bucket_config"].help
@@ -118,6 +126,31 @@ def test_preprocess_serve_args_merges_bot_task_without_overriding_extra_body(
     preprocess_serve_args(args)
 
     assert args.extra_body == expected
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        ([], 3),
+        (["--num-prompts", "0"], 0),
+        (["--num-prompts", "12"], 12),
+    ],
+)
+def test_preprocess_serve_args_applies_safe_omniinteract_prompt_default(
+    argv: list[str],
+    expected: int,
+) -> None:
+    parser = TrackingArgumentParser()
+    parser.add_argument("--dataset-name", default="omniinteract")
+    parser.add_argument("--backend", default="openai-realtime-duplex")
+    parser.add_argument("--endpoint", default="/v1/realtime")
+    parser.add_argument("--omniinteract-ref-audio", default="reference.wav")
+    parser.add_argument("--num-prompts", type=int, default=1000)
+    args = parser.parse_args(argv)
+
+    preprocess_serve_args(args)
+
+    assert args.num_prompts == expected
 
 
 @pytest.mark.parametrize(

@@ -22,47 +22,6 @@
     },
     "benchmark_params": [
       {
-        "dataset_name": "random",
-        "backend": "openai-chat-omni",
-        "endpoint": "/v1/chat/completions",
-        "num_prompts": [
-          4,
-          16,
-          32,
-          64,
-          128
-        ],
-        "max_concurrency": [
-          1,
-          4,
-          8,
-          16,
-          32
-        ],
-        "random_input_len": 2500,
-        "random_output_len": 900,
-        "ignore_eos": true,
-        "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
-        "baseline": {
-          "H100": {
-            "mean_e2el_ms": [
-              11701.3818,
-              27510.3956,
-              31907.9613,
-              42173.9832,
-              63970.0751
-            ],
-            "mean_audio_rtf": [
-              0.1175,
-              0.1647,
-              0.2003,
-              0.2726,
-              0.4195
-            ]
-          }
-        }
-      },
-      {
         "dataset_name": "random-mm",
         "backend": "openai-chat-omni",
         "endpoint": "/v1/chat/completions",
@@ -87,9 +46,6 @@
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "H100": {
-            "mean_e2el_ms": [
-              3646.797
-            ],
             "mean_audio_rtf": [
               0.1098
             ]
@@ -123,9 +79,6 @@
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "H100": {
-            "mean_e2el_ms": [
-              4059.0878
-            ],
             "mean_audio_rtf": [
               0.1335
             ]
@@ -161,50 +114,8 @@
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "H100": {
-            "mean_e2el_ms": [
-              5639.5769
-            ],
             "mean_audio_rtf": [
               0.1798
-            ]
-          }
-        }
-      },
-      {
-        "dataset_name": "random",
-        "backend": "openai-chat-omni",
-        "endpoint": "/v1/chat/completions",
-        "num_prompts": [
-          4,
-          16,
-          32,
-          64,
-          128
-        ],
-        "max_concurrency": [
-          1,
-          4,
-          8,
-          16,
-          32
-        ],
-        "random_input_len": 2500,
-        "random_output_len": 900,
-        "ignore_eos": true,
-        "extra_body": {
-          "modalities": [
-            "text"
-          ]
-        },
-        "percentile-metrics": "ttft,tpot,itl,e2el",
-        "baseline": {
-          "H100": {
-            "mean_e2el_ms": [
-              4354.8945,
-              7672.4248,
-              9861.1687,
-              13086.8865,
-              18716.709
             ]
           }
         }
@@ -319,6 +230,62 @@
           "H100": {
             "mean_e2el_ms": [
               1006.1663
+            ]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_qwen3_omni_chunk_cuda",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": "H100"
+          },
+          "num_cards": 2
+        }
+      },
+      "omni",
+      "slow"
+    ],
+    "server_params": {
+      "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+      "extra_cli_args": [
+        "--async-chunk"
+      ]
+    },
+    "benchmark_params": [
+      {
+        "dataset_name": "random",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [
+          4,
+          32,
+          128
+        ],
+        "max_concurrency": [
+          1,
+          8,
+          32
+        ],
+        "random_input_len": 100,
+        "random_output_len": 100,
+        "ignore_eos": true,
+        "extra_body": {
+          "modalities": [
+            "text"
+          ]
+        },
+        "percentile-metrics": "ttft,tpot,itl,e2el",
+        "baseline": {
+          "H100": {
+            "mean_e2el_ms": [
+              4354.8945,
+              9861.1687,
+              18716.709
             ]
           }
         }

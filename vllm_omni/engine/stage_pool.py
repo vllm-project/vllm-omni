@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unified stage-local runtime abstraction for vLLM-Omni."""
 
 from __future__ import annotations
@@ -630,6 +633,15 @@ class StagePool:
             if callable(pop_native_text_metrics):
                 native_text_metrics = pop_native_text_metrics(request_id)
         native_generation_tokens = native_text_metrics.get("num_generation_tokens")
+        finish_reason = next(
+            (
+                str(reason)
+                for request_output in reversed(request_outputs)
+                for completion in reversed(getattr(request_output, "outputs", []) or [])
+                if (reason := getattr(completion, "finish_reason", None)) is not None
+            ),
+            None,
+        )
         num_tokens_out = (
             max(int(native_generation_tokens), 0)
             if isinstance(native_generation_tokens, int) and not isinstance(native_generation_tokens, bool)
@@ -653,16 +665,16 @@ class StagePool:
         )
         image_pixels = self._count_image_pixels(request_outputs) if output_unit_type == "image" else 0
         num_inference_steps = coerce_positive_int_scalar(getattr(sampling_params, "num_inference_steps", None)) or 0
-        denoise_step_latency_ms = (
-            defs.compute_denoise_step_latency(stage_gen_time_ms, num_inference_steps)
-            if output_unit_type == "image"
-            else 0.0
-        )
         has_output_timestamps = bool(output_timestamps)
         first_ts = output_timestamps[0] if has_output_timestamps else now
         serving_time_to_first_output_ms = (
             max((non_empty_first_output_ts - request_timestamp) * 1000.0, 0.0)
             if non_empty_first_output_ts is not None
+            else 0.0
+        )
+        image_time_to_first_output_ms = (
+            max((non_empty_first_output_ts - submit_ts) * 1000.0, 0.0)
+            if non_empty_first_output_ts is not None and output_unit_type == "image"
             else 0.0
         )
         remaining_ms = max((now - first_ts) * 1000.0, 0.0)
@@ -698,6 +710,7 @@ class StagePool:
             # happens inside the model runner and is not observable here.
             batch_size=1,
             replica_id=replica_id,
+            finish_reason=finish_reason,
             rx_decode_time_ms=0.0,
             rx_transfer_bytes=0,
             rx_in_flight_time_ms=0.0,
@@ -709,10 +722,11 @@ class StagePool:
             audio_sample_rate=audio_sample_rate,
             audio_duration_s=audio_duration_s,
             image_pixels=image_pixels,
-            denoise_step_latency_ms=denoise_step_latency_ms,
+            num_inference_steps=num_inference_steps,
             output_unit_type=output_unit_type,
             output_unit_count=output_unit_count,
             serving_time_to_first_output_ms=serving_time_to_first_output_ms,
+            image_time_to_first_output_ms=image_time_to_first_output_ms,
             time_per_output_unit_ms=time_per_output_unit_ms,
             inter_output_latency_ms=inter_output_latency_ms,
             inter_output_latencies_ms=inter_output_latencies_ms,
@@ -1185,14 +1199,19 @@ class StagePool:
 
     # ---- Stage-local control plane ----
 
-    async def abort_requests(self, request_ids: list[str]) -> None:
+    async def abort_requests(self, request_ids: list[str]) -> list[tuple[str, Any]]:
         """Abort the given requests in this stage pool.
 
         Request-bound abort routing stays inside the pool because route affinity
         (``request_id -> replica_id``) is pool-owned.
+
+        For AR stages, collect terminal abort ``RequestOutput`` objects from
+        output-processor state *before* EngineCore abort so partial tokens
+        generated so far are preserved. Diffusion stages return no abort
+        outputs (whole-sample retry remains the recovery path).
         """
         if not request_ids:
-            return
+            return []
 
         request_ids_by_replica: dict[int, list[str]] = {}
         for request_id in request_ids:
@@ -1202,18 +1221,45 @@ class StagePool:
                 continue
             request_ids_by_replica.setdefault(replica_id, []).append(request_id)
 
+        abort_outputs: list[tuple[str, Any]] = []
+        is_diffusion = self.stage_type == "diffusion"
         for replica_id, replica_request_ids in request_ids_by_replica.items():
+            # Orchestrator ids are OP external ids; EngineCore may use a
+            # different internal request_id assigned by InputProcessor.
+            # Always key collected outputs by the orchestrator id we passed
+            # (internal=False), never by RequestOutput.request_id — some stages
+            # still surface EngineCore/internal ids and would drop the prefix.
+            engine_abort_ids = list(replica_request_ids)
+            if not is_diffusion and self._output_processor is not None:
+                collect = getattr(self._output_processor, "abort_requests_collecting_outputs", None)
+                if collect is not None:
+                    engine_abort_ids = []
+                    for orch_req_id in replica_request_ids:
+                        collected_ids, stage_outputs = collect(
+                            [orch_req_id],
+                            internal=False,
+                            commit_state=False,
+                        )
+                        for req_out in stage_outputs:
+                            abort_outputs.append((orch_req_id, req_out))
+                        if collected_ids:
+                            engine_abort_ids.extend(collected_ids)
+                        else:
+                            engine_abort_ids.append(orch_req_id)
+                else:
+                    aborted = self._output_processor.abort_requests(replica_request_ids, internal=False)
+                    if aborted:
+                        engine_abort_ids = list(aborted)
             client = self.clients[replica_id]
             if client is None:
                 continue
-            await client.abort_requests_async(replica_request_ids)
+            await client.abort_requests_async(engine_abort_ids)
+            if not is_diffusion and self._output_processor is not None:
+                commit = getattr(self._output_processor, "commit_aborted_request_state", None)
+                if callable(commit):
+                    commit(replica_request_ids, internal=False)
 
-        # Clean up OutputProcessor state (e.g. mm_accumulated tensors) that
-        # would otherwise leak — aborted requests never produce a final
-        # EngineCoreOutput, so process_outputs() never fires its cleanup path.
-        all_aborted = [rid for ids in request_ids_by_replica.values() for rid in ids]
-        if all_aborted and self._output_processor is not None:
-            self._output_processor.abort_requests(all_aborted, internal=True)
+        return abort_outputs
 
     async def collective_rpc(
         self,
@@ -1223,7 +1269,12 @@ class StagePool:
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any] | Any:
-        """Dispatch a stage-scoped control-plane RPC to one physical route."""
+        """Dispatch a stage-scoped control-plane RPC to one physical route.
+
+        EngineCore control methods (``pause_scheduler``, ``resume_scheduler``,
+        ``sleep``, ``wake_up``) propagate worker exceptions. Capability probes
+        and other RPCs still return ``{"supported": False, "error": ...}``.
+        """
         args = tuple(args or ())
         kwargs = dict(kwargs or {})
         client = self.clients[replica_id]
@@ -1254,9 +1305,15 @@ class StagePool:
                 replica_id,
                 method,
             )
+            if method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS:
+                raise
+            if isinstance(exc, TimeoutError):
+                error = f"{type(exc).__name__}: {method} timed out after {timeout}s"
+            else:
+                error = str(exc) or repr(exc)
             return {
                 "supported": False,
-                "error": str(exc),
+                "error": error,
             }
 
     def shutdown_replica(self, replica_id: int) -> None:

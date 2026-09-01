@@ -27,7 +27,10 @@ logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.model_loader.host_weights.identity_adapter import FinalLayoutIdentityContext
-    from vllm_omni.diffusion.model_loader.host_weights.source_identity import PreparedWeightSource
+    from vllm_omni.diffusion.model_loader.host_weights.source_identity import (
+        NodeSourceDigestCache,
+        PreparedWeightSource,
+    )
 
 
 class _HWRCommitError(RuntimeError):
@@ -215,6 +218,7 @@ class HWRLoaderMixin:
         *,
         load_format: str,
         sources: Sequence[object],
+        source_digest_cache: NodeSourceDigestCache | None = None,
     ) -> FinalLayoutIdentityContext:
         from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
@@ -293,6 +297,7 @@ class HWRLoaderMixin:
             prepared_sources=prepared_sources,
             request=request,
             policy=FINAL_LAYOUT_BF16_POLICY,
+            source_digest_cache=source_digest_cache,
         )
 
     def _resolve_hwr(
@@ -306,7 +311,10 @@ class HWRLoaderMixin:
         sources: Sequence[object],
     ) -> dict[str, object] | None:
         """Resolve an eligible no-AllGather final-layout HWR transaction."""
-        from vllm_omni.diffusion.model_loader.host_weights import FinalLayoutTensorRestorer
+        from vllm_omni.diffusion.model_loader.host_weights import (
+            FinalLayoutTensorRestorer,
+            NodeSourceDigestCache,
+        )
         from vllm_omni.host_weight_runtime import (
             HostWeightLeaseCarrier,
             HostWeightRuntime,
@@ -347,7 +355,6 @@ class HWRLoaderMixin:
                 raise ValueError(f"required Host Weight Runtime path is ineligible: {message}")
             logger.info("Host Weight Runtime is ineligible; using the canonical DLO path: %s", message)
             return None
-        context = self._build_hwr_context(model, modules, load_format=load_format, sources=sources)
         root_value = getattr(self.od_config, "host_weight_runtime_root", None)
         if not isinstance(root_value, str) or not root_value.strip():
             raise ValueError("enabled Host Weight Runtime requires host_weight_runtime_root")
@@ -361,6 +368,17 @@ class HWRLoaderMixin:
                     allow_post_load_publish=True,
                 ),
             )
+        )
+        source_digest_cache = NodeSourceDigestCache(
+            root,
+            timeout_seconds=runtime.config.wait.coordination_timeout_seconds,
+        )
+        context = self._build_hwr_context(
+            model,
+            modules,
+            load_format=load_format,
+            sources=sources,
+            source_digest_cache=source_digest_cache,
         )
         resolution = runtime.resolve(context.identity)
         state: dict[str, object] = {
