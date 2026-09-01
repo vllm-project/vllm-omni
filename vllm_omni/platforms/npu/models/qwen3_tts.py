@@ -11,7 +11,6 @@ prompt-embeds builder runs on CPU and the result is moved back to NPU
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch_npu
@@ -28,8 +27,6 @@ _A5_PATCHED = False
 _original_init = None
 _original_load_weights = None
 _ACL_FORMAT_FRACTAL_Z = 4
-
-_CPU_DEVICE = torch.device("cpu")
 
 
 def _prepare_npu_code2wav_runtime() -> None:
@@ -107,36 +104,7 @@ def _apply_a5_prompt_embeds_builder_patch() -> None:
     class _Qwen3TTSPromptEmbedsBuilderA5(prompt_embeds_builder.Qwen3TTSPromptEmbedsBuilder):
         """Qwen3-TTS prompt-embeds builder specialized for the A5 NPU path."""
 
-        def extract_speaker_embedding(self, wav, sr):
-            dev = self._device()
-            dtype = self._embedding_dtype
-            try:
-                spk_param = next(self._speaker_encoder.parameters())
-                if spk_param.device != dev or spk_param.dtype != dtype:
-                    self._speaker_encoder.to(device=dev, dtype=dtype)
-            except StopIteration:
-                pass
-
-            # Resample to 24kHz for speaker encoder.
-            target_sr = int(getattr(self._config.speaker_encoder_config, "sample_rate", 24000))
-            if sr != target_sr:
-                resampler = self._get_resampler(int(sr), target_sr)
-                wav = resampler.resample(wav.astype(np.float32), orig_sr=int(sr))
-
-            # A5 does not support torch.stft on NPU; compute the mel on CPU.
-            wav_tensor = torch.from_numpy(wav).to(device=_CPU_DEVICE, dtype=torch.float32).unsqueeze(0)
-            mels = prompt_embeds_builder.mel_spectrogram(
-                wav_tensor,
-                n_fft=1024,
-                num_mels=128,
-                sampling_rate=24000,
-                hop_size=256,
-                win_size=1024,
-                fmin=0,
-                fmax=12000,
-            ).transpose(1, 2)
-            spk = self._speaker_encoder(mels.to(device=dev, dtype=dtype))[0]
-            return spk.to(dtype=dtype)
+        _mel_spectrogram_on_cpu = True
 
     # The talker imports the builder by name at module scope, so its reference
     # must be swapped as well (same as the 310P patch).

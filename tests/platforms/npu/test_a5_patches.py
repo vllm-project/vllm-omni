@@ -3,7 +3,7 @@
 """Unit tests for A5 (Ascend 950 PR) patch wiring.
 
 The A5 logic lives in the shared NPU platform files (``npu/__init__.py`` for
-device detection, ``npu/models/qwen3_tts_code2wav.py`` for the Qwen3-TTS
+device detection, ``npu/models/qwen3_tts.py`` for the Qwen3-TTS
 patch). The tests load those modules from source with fake Qwen3-TTS
 dependencies, so they validate the patch contract without loading real model
 or NPU kernels. A5 device detection is exercised with a fake
@@ -121,7 +121,7 @@ def _load_qwen3_tts_code2wav_patch(
     _install_fake_module(monkeypatch, "vllm_ascend.utils", maybe_trans_nz=lambda weight: weight)
     _install_fake_module(monkeypatch, "torch_npu", npu_format_cast=lambda weight, _fmt: weight)
 
-    path = _repo_root() / "vllm_omni" / "platforms" / "npu" / "models" / "qwen3_tts_code2wav.py"
+    path = _repo_root() / "vllm_omni" / "platforms" / "npu" / "models" / "qwen3_tts.py"
     module = _load_source_module("vllm_omni_test_qwen3_tts_code2wav_patch", path)
     return module, fake_prompt_builder, fake_talker
 
@@ -174,42 +174,21 @@ def test_qwen3_tts_patch_keeps_prompt_builder_off_a5(monkeypatch: pytest.MonkeyP
     assert fake_talker.Qwen3TTSPromptEmbedsBuilder is original
 
 
-def test_a5_prompt_patch_runs_stft_frontend_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
-    module, fake_prompt_builder, _ = _load_qwen3_tts_code2wav_patch(monkeypatch, a5=True)
-    captured = {}
-
-    def fake_mel_spectrogram(wav_tensor, **kwargs):
-        captured["wav_device"] = wav_tensor.device
-        captured["wav_dtype"] = wav_tensor.dtype
-        captured["kwargs"] = kwargs
-        return torch.ones(1, 128, 3, dtype=torch.float32)
-
-    class FakeSpeakerEncoder(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.param = torch.nn.Parameter(torch.zeros(1, dtype=torch.float16))
-
-        def forward(self, mels):
-            captured["speaker_input_dtype"] = mels.dtype
-            captured["speaker_input_device"] = mels.device
-            return (torch.ones(4, dtype=mels.dtype),)
+def test_a5_prompt_patch_sets_cpu_mel_front_end_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, fake_prompt_builder, fake_talker = _load_qwen3_tts_code2wav_patch(
+        monkeypatch,
+        a5=True,
+    )
+    original = fake_prompt_builder.Qwen3TTSPromptEmbedsBuilder
 
     module.apply_qwen3_tts_patches()
-    monkeypatch.setattr(fake_prompt_builder, "mel_spectrogram", fake_mel_spectrogram)
-    builder = object.__new__(fake_prompt_builder.Qwen3TTSPromptEmbedsBuilder)
-    builder._device = lambda: torch.device("cpu")
-    builder._embedding_dtype = torch.float16
-    builder._speaker_encoder = FakeSpeakerEncoder()
-    builder._config = SimpleNamespace(speaker_encoder_config=SimpleNamespace(sample_rate=24000))
 
-    speaker = builder.extract_speaker_embedding(np.zeros(16, dtype=np.float32), 24000)
-
-    assert captured["wav_device"] == torch.device("cpu")
-    assert captured["wav_dtype"] is torch.float32
-    assert captured["kwargs"]["sampling_rate"] == 24000
-    assert captured["speaker_input_dtype"] is torch.float16
-    assert captured["speaker_input_device"] == torch.device("cpu")
-    assert speaker.dtype is torch.float16
+    # The A5 builder keeps the base implementation and only opts into the CPU
+    # mel front-end, because the NPU has no torch.stft.
+    builder_cls = fake_prompt_builder.Qwen3TTSPromptEmbedsBuilder
+    assert builder_cls is not original
+    assert builder_cls._mel_spectrogram_on_cpu is True
+    assert fake_talker.Qwen3TTSPromptEmbedsBuilder is builder_cls
 
 
 def test_qwen3_tts_code2wav_patch_skips_fractal_z_conv_cast_on_a5(

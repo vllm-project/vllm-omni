@@ -6,17 +6,16 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm_omni.platforms.npu.platform import NPUOmniPlatform
-
-logger = init_logger(__name__)
 
 __all__ = ["NPUOmniPlatform"]
 
 
 def is_a5(device: torch.device | None = None) -> bool:
+    """Return True on Ascend 950 (A5) devices, False otherwise.
+    """
     if device is not None and device.type != "npu":
         return False
     try:
@@ -24,9 +23,6 @@ def is_a5(device: torch.device | None = None) -> bool:
 
         return bool(is_950())
     except (ImportError, AttributeError):
-        return False
-    except Exception:
-        logger.debug("Failed to detect Ascend 950 device.", exc_info=True)
         return False
 
 

@@ -535,39 +535,16 @@ def test_qwen3_tts_talker_patch_uses_fp16_runtime_dtype(monkeypatch: pytest.Monk
     assert codes[0].shape == (4, 2)
 
 
-def test_qwen3_tts_prompt_patch_runs_stft_frontend_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_qwen3_tts_prompt_patch_sets_cpu_mel_front_end_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     module, _ = _load_qwen3_tts_patch(monkeypatch)
-    captured = {}
 
-    def fake_mel_spectrogram(wav_tensor, **kwargs):
-        captured["wav_device"] = wav_tensor.device
-        captured["wav_dtype"] = wav_tensor.dtype
-        captured["kwargs"] = kwargs
-        return torch.ones(1, 128, 3, dtype=torch.float32)
-
-    class FakeSpeakerEncoder(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.param = torch.nn.Parameter(torch.zeros(1, dtype=torch.float16))
-
-        def forward(self, mels):
-            captured["speaker_input_dtype"] = mels.dtype
-            return (torch.ones(4, dtype=mels.dtype),)
-
-    monkeypatch.setattr(module.prompt_embeds_builder, "mel_spectrogram", fake_mel_spectrogram)
-    builder = object.__new__(module._Qwen3TTSPromptEmbedsBuilder310P)
-    builder._device = lambda: torch.device("cpu")
-    builder._embedding_dtype = torch.float16
-    builder._speaker_encoder = FakeSpeakerEncoder()
-    builder._config = SimpleNamespace(speaker_encoder_config=SimpleNamespace(sample_rate=24000))
-
-    speaker = builder.extract_speaker_embedding(np.zeros(16, dtype=np.float32), 24000)
-
-    assert captured["wav_device"] == torch.device("cpu")
-    assert captured["wav_dtype"] is torch.float32
-    assert captured["kwargs"]["sampling_rate"] == 24000
-    assert captured["speaker_input_dtype"] is torch.float16
-    assert speaker.dtype is torch.float16
+    # The 310P builder keeps the base implementation and only opts into the
+    # CPU mel front-end, because the NPU has no torch.stft.
+    assert issubclass(
+        module._Qwen3TTSPromptEmbedsBuilder310P,
+        module.prompt_embeds_builder.Qwen3TTSPromptEmbedsBuilder,
+    )
+    assert module._Qwen3TTSPromptEmbedsBuilder310P._mel_spectrogram_on_cpu is True
 
 
 def test_qwen3_tts_tokenizer_npu_patch_dispatches_fused_ops(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -709,7 +686,7 @@ def test_qwen3_tts_code2wav_npu_patch_prepares_loaded_decoder(monkeypatch: pytes
     # Not A5: keep the FRACTAL_Z conv weight layout for 310P.
     _install_fake_module(monkeypatch, "vllm_omni.platforms.npu", is_a5=lambda: False)
 
-    path = _repo_root() / "vllm_omni" / "platforms" / "npu" / "models" / "qwen3_tts_code2wav.py"
+    path = _repo_root() / "vllm_omni" / "platforms" / "npu" / "models" / "qwen3_tts.py"
     module = _load_source_module("vllm_omni_test_qwen3_tts_code2wav_npu_patch", path)
     module.apply_qwen3_tts_code2wav_patch()
 
