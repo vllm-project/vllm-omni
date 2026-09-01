@@ -21,7 +21,7 @@ For the full list of supported architectures across all modalities, see
 | Ming-omni-tts | `inclusionAI/Ming-omni-tts-0.5B` | ✓ (`ref_audio` / `speaker_embedding`) | ✓ (PCM stream) | IP labels + structured `instructions` | — |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | — (caption-controlled) | — | caption fields (`instructions`) | — |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✓ (`ref_audio` required) | ✓ (PCM stream) | — | ✓ |
-| OmniVoice | `k2-fsa/OmniVoice` | ✓ | — | — | — |
+| OmniVoice | `k2-fsa/OmniVoice` | ✓ (`ref_audio`+`ref_text`) | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
@@ -422,13 +422,13 @@ Then open http://localhost:7860 in your browser.
 
 ## OmniVoice
 
-Zero-shot multilingual TTS (600+ languages). Online serving currently exposes **auto voice** only; voice cloning and voice design are available offline.
+Zero-shot multilingual TTS (600+ languages) with automatic voice, reference voice cloning, and voice design.
 
 ### Prerequisites
 ```bash
 huggingface-cli download k2-fsa/OmniVoice
 ```
-Voice cloning (offline) needs `transformers>=5.3.0`; auto voice works with `transformers>=4.57.0`.
+Voice cloning needs `transformers>=5.3.0`; auto voice and voice design work with `transformers>=4.57.0`.
 
 ### Launch
 ```bash

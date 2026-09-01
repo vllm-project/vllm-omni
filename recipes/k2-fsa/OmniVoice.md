@@ -7,7 +7,7 @@
 - Vendor: k2-fsa
 - Model: `k2-fsa/OmniVoice`
 - Task: Multilingual text to speech
-- Mode: Offline inference for all modes and online serving for automatic voice
+- Mode: Offline and online inference
 - Maintainer: Community
 
 ## References
@@ -86,7 +86,7 @@ python3 examples/offline_inference/text_to_speech/omnivoice/end2end.py \
 
 ## Online serving
 
-Online serving currently supports automatic voice:
+Online serving supports automatic voice, reference voice cloning, and voice design:
 
 ```bash
 vllm serve k2-fsa/OmniVoice --omni --port 8091 --trust-remote-code
@@ -95,4 +95,9 @@ vllm serve k2-fsa/OmniVoice --omni --port 8091 --trust-remote-code
 ```bash
 cd examples/online_serving/text_to_speech/omnivoice
 python speech_client.py --text "Hello, how are you?"
+python speech_client.py \
+    --text "Hello, this is a cloned voice." \
+    --ref-audio /path/to/ref.wav \
+    --ref-text "Exact transcript spoken in the reference audio." \
+    --output cloned.wav
 ```
