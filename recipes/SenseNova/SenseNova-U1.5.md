@@ -29,8 +29,9 @@ Use this recipe for U1.5 specifically, including its distilled few-step LoRA. Fo
 
 #### 1x A800 80GB
 
-- OS: Linux, Python 3.12
-- vLLM: 0.28.0
+- 1x NVIDIA A800 80GB PCIe with an Intel Xeon Gold 6336Y, driver 595.84, Linux
+- Python 3.12.13, vLLM 0.28.0, torch 2.13.0+cu130, CUDA 13.0, diffusers 0.40.0,
+  transformers 5.14.1, flashinfer 0.6.16.post3, BF16, TP=1
 - Peak GPU memory: 34.3 GB at 1024x1024, 36.4 GB at 1536x2720
 
 ##### Text-to-Image
@@ -98,7 +99,7 @@ python examples/online_serving/sensenova_u1/openai_chat_client.py \
 
 At 1536x2720 with 50 steps, end-to-end is 43.0 s.
 
-#### Measured on 1x NVIDIA H200 139GB
+#### Measured latency (1x NVIDIA H200 139GB, single run, no warmup)
 
 Reported by @hsliuustc0106 against PR head `29c090d`, on one reserved CUDA device.
 
