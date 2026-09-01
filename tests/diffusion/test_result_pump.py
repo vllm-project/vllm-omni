@@ -285,7 +285,10 @@ class TestResultPumpDispatch:
         assert fut.done()
         assert fut.result(timeout=1.0) is output
         assert async_output_id not in executor._output_futures
-        assert async_output_id not in executor._completed_outputs
+        # The resolved future is cached in _completed_outputs so a late
+        # wait_output_ready (drop → pump → wait) can still retrieve it;
+        # wait_output_ready.pop cleans it on actual consumption.
+        assert executor._completed_outputs.get(async_output_id) is fut
 
 
 class _FakeBatchOutput:
@@ -592,8 +595,12 @@ class TestDropOutput:
         _feed_one_msg_to_pump(executor, msg)
 
         with executor._futures_lock:
-            assert "aid-2" not in executor._completed_outputs
+            # The resolved placeholder is now cached in _completed_outputs
+            # for a potential late wait_output_ready (drop → pump → wait);
+            # it is not in _output_futures (popped by the pump).
             assert "aid-2" not in executor._output_futures
+            cached = executor._completed_outputs.get("aid-2")
+            assert cached is not None and cached.done()
 
     def test_leaves_real_waiter_untouched(self):
         executor = _make_executor()
@@ -604,6 +611,40 @@ class TestDropOutput:
         with executor._futures_lock:
             # A genuine waiter still drains via the normal path.
             assert executor._output_futures.get("aid-3") is real
+
+    def test_drop_then_pump_then_wait_reuses_placeholder(self):
+        """drop_output → pump resolves placeholder → wait_output_ready must
+        return the already-resolved placeholder, not a fresh never-completed
+        Future. This is the verl-omni fully-async abort ordering that hangs
+        without the reuse fix."""
+        executor = _make_executor()
+
+        # 1. Abort registers a placeholder.
+        executor.drop_output("aid-dpw")
+
+        # 2. Pump delivers OUTPUT_READY, resolving the placeholder.
+        output = DiffusionOutput(output="resolved")
+        msg = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id="aid-dpw",
+            output=output,
+        )
+        _feed_one_msg_to_pump(executor, msg)
+
+        # 3. Late consumer waits → must get the resolved future.
+        fut = executor.wait_output_ready("aid-dpw")
+        assert fut.done(), "wait_output_ready returned a never-completed future after drop+pump"
+
+    def test_drop_then_wait_share_same_future(self):
+        """drop_output → wait_output_ready (before pump) must return the same
+        placeholder so both paths agree on one future."""
+        executor = _make_executor()
+
+        executor.drop_output("aid-dw")
+        fut = executor.wait_output_ready("aid-dw")
+
+        with executor._futures_lock:
+            assert executor._output_futures.get("aid-dw") is fut
 
 
 class TestShutdownClearsCompletedOutputs:
