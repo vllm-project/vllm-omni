@@ -117,12 +117,15 @@ def test_audio_continuity_aggregation():
     bad = _make_output(100)
     bad.audio_underrun_s = 0.5
     bad.audio_continuity_ok = False
+    bad.audio_continuity_measured = True
     good_a = _make_output(100)
     good_a.audio_underrun_s = 0.02
     good_a.audio_continuity_ok = True
+    good_a.audio_continuity_measured = True
     good_b = _make_output(100)
     good_b.audio_underrun_s = 0.0
     good_b.audio_continuity_ok = True
+    good_b.audio_continuity_measured = True
 
     metrics, _ = calculate_metrics(
         input_requests=[],
@@ -142,6 +145,60 @@ def test_audio_continuity_aggregation():
     # p99 of [0.5, 0.02, 0.0] is dominated by the 0.5 outlier.
     p99 = dict(metrics.percentiles_audio_underrun_s).get(99.0)
     assert p99 is not None and p99 > 0.4
+
+
+def test_a_request_nobody_measured_is_not_counted_as_continuous():
+    """An unmeasured request must not be folded in as a pass.
+
+    ``audio_continuity_ok`` defaults to ``True`` and ``audio_underrun_s`` to
+    ``0.0``, so a backend that records no chunk arrival times used to make every
+    one of its requests look perfect. Only ``audio_continuity_measured`` outputs
+    may reach the aggregate.
+    """
+    measured_bad = _make_output(100)
+    measured_bad.audio_underrun_s = 0.5
+    measured_bad.audio_continuity_ok = False
+    measured_bad.audio_continuity_measured = True
+    unmeasured = _make_output(100)  # defaults: ok=True, underrun=0.0, measured=False
+
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[measured_bad, unmeasured],
+        dur_s=10.0,
+        tokenizer=None,
+        selected_percentiles=[50.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=["audio_underrun"],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=10.0,
+    )
+
+    # One measured request, and it failed.
+    assert metrics.audio_continuity_ok_rate == pytest.approx(0.0, abs=1e-6)
+    assert metrics.mean_audio_underrun_s == pytest.approx(0.5, abs=1e-6)
+
+
+def test_continuity_rate_is_not_a_number_when_nothing_was_measured():
+    """With no backend measuring, the rate has to abstain rather than print 100%."""
+    outputs = [_make_output(100), _make_output(100)]
+
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=outputs,
+        dur_s=10.0,
+        tokenizer=None,
+        selected_percentiles=[50.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=["audio_underrun"],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=10.0,
+    )
+
+    assert math.isnan(metrics.audio_continuity_ok_rate)
 
 
 def test_unmeasured_duplex_latency_does_not_add_zero_samples():

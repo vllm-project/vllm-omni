@@ -660,15 +660,23 @@ class MixRequestFuncOutput(RequestFuncOutput):
     text_latency: float = 0.0
     tpot_measured: bool = True
     #: Worst-case streaming-audio underrun (wall-clock seconds the player
-    #: would have been starved). Populated by the audio-speech backend; ``0.0``
-    #: for backends that do not run continuity analysis.
+    #: would have been starved). Only meaningful when
+    #: ``audio_continuity_measured`` is set.
     audio_underrun_s: float = 0.0
     #: Whether the request stayed under the continuity threshold (default
-    #: 100 ms). Mirrors ``audio_underrun_s <= threshold``.
+    #: 100 ms). Mirrors ``audio_underrun_s <= threshold``. Only meaningful when
+    #: ``audio_continuity_measured`` is set.
     audio_continuity_ok: bool = True
     #: Number of inter-chunk intervals during which the player buffer went
     #: negative.
     audio_underrun_event_count: int = 0
+    #: Whether continuity analysis actually ran for this request. It needs the
+    #: arrival time and the *PCM* byte count of every audio chunk, so a backend
+    #: that does not record them -- or a response format whose chunks are
+    #: encoded rather than PCM -- leaves this ``False`` and the three fields
+    #: above at their defaults. Aggregation must not read them without it, or a
+    #: request nobody measured is counted as continuous.
+    audio_continuity_measured: bool = False
     #: Raw PCM s16le mono at 24 kHz for Seed-TTS WER: from ``/v1/audio/speech`` stream or
     #: resampled export after ``openai-chat-omni`` audio deltas.
     tts_output_pcm_bytes: bytes | None = None
@@ -1008,6 +1016,12 @@ async def async_request_openai_chat_omni_completions(
         first_inconsistent_wav_params: tuple[int, int, int] | None = None
         # For non-wav responses, accumulate encoded bytes then decode once.
         audio_bytes_buffer = bytearray()
+        # Arrival time and PCM byte count of every audio chunk, for continuity
+        # analysis. Only filled on the wav path: there the chunk's own header
+        # tells us the PCM it carries, while an encoded format's byte count says
+        # nothing about how long it plays for.
+        chunk_arrival_times_s: list[float] = []
+        chunk_pcm_bytes: list[int] = []
         st = time.perf_counter()
         output.start_time = st
         most_recent_timestamp = st
@@ -1119,9 +1133,11 @@ async def async_request_openai_chat_omni_completions(
                                                             if first_inconsistent_wav_params is None:
                                                                 first_inconsistent_wav_params = params
                                                             continue
-                                                        wav_pcm_buffer.extend(
-                                                            wav_reader.readframes(wav_reader.getnframes())
-                                                        )
+                                                        chunk_pcm = wav_reader.readframes(wav_reader.getnframes())
+                                                        wav_pcm_buffer.extend(chunk_pcm)
+                                                        if chunk_pcm:
+                                                            chunk_arrival_times_s.append(timestamp - st)
+                                                            chunk_pcm_bytes.append(len(chunk_pcm))
                                                 except Exception as ex:
                                                     logger.warning("Failed to parse wav audio chunk: %s", ex)
                                             else:
@@ -1193,6 +1209,19 @@ async def async_request_openai_chat_omni_completions(
                                 channels,
                                 frame_rate,
                             )
+                        if chunk_arrival_times_s and frame_rate > 0:
+                            continuity = compute_continuity_stats(
+                                chunk_arrival_times_s=chunk_arrival_times_s,
+                                chunk_bytes=chunk_pcm_bytes,
+                                sample_rate=frame_rate,
+                                sample_width=sample_width,
+                                channels=channels,
+                                threshold_s=_audio_continuity_threshold_s(),
+                            )
+                            output.audio_underrun_s = continuity.max_underrun_s
+                            output.audio_continuity_ok = continuity.is_continuous
+                            output.audio_underrun_event_count = continuity.underrun_event_count
+                            output.audio_continuity_measured = True
                     elif audio_bytes_buffer:
                         try:
                             from vllm.multimodal.audio import get_audio_duration
@@ -1498,6 +1527,7 @@ async def async_request_openai_audio_speech(
                 output.audio_underrun_s = continuity.max_underrun_s
                 output.audio_continuity_ok = continuity.is_continuous
                 output.audio_underrun_event_count = continuity.underrun_event_count
+                output.audio_continuity_measured = True
                 if pcm_capture is not None and pcm_capture:
                     try:
                         output.tts_output_pcm_bytes = _pcm_s16le_to_seed_tts_wer_bytes(

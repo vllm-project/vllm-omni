@@ -7,8 +7,10 @@ Unit tests for patch.py
 
 import asyncio
 import base64
+import io
 import json
 import time
+import wave
 from argparse import Namespace
 from types import SimpleNamespace
 
@@ -1194,6 +1196,138 @@ async def test_prompt_len_assigned_from_usage(mocker: MockerFixture):
     assert output.prompt_len == 4992, (
         "prompt_len should be overridden by usage.prompt_tokens to reflect the true multimodal input token count"
     )
+
+
+def _wav_chunk_b64(seconds: float, sample_rate: int = 24000) -> str:
+    """One base64 WAV container carrying ``seconds`` of silence, as the server streams it."""
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(sample_rate)
+        writer.writeframes(b"\x00\x00" * int(seconds * sample_rate))
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+def _audio_chunks(count: int, seconds_each: float) -> list[bytes]:
+    payload = _wav_chunk_b64(seconds_each)
+    chunks = [
+        create_sse_chunk({"choices": [{"delta": {"content": payload}}], "modality": "audio"}) for _ in range(count)
+    ]
+    return [*chunks, b"data: [DONE]\n\n"]
+
+
+class TestChatOmniStreamingContinuity:
+    """The chat path has to measure playback continuity, not inherit its default.
+
+    ``compute_continuity_stats`` already lives in the repo, but only
+    ``/v1/audio/speech`` ever called it. Every audio benchmark that runs through
+    ``/v1/chat/completions`` therefore reported ``audio_continuity_ok`` as ``True``
+    and ``audio_underrun_s`` as ``0.0`` no matter what the stream did.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_starved_stream_is_reported_as_a_starved_stream(self, mocker: MockerFixture):
+        """Chunks 80 ms apart carrying 5 ms of audio each: the player runs dry."""
+        request_input = RequestFuncInput(
+            model="test-model",
+            model_name="test-model",
+            prompt="test prompt",
+            api_url="http://test.com/v1/chat/completions",
+            prompt_len=10,
+            output_len=20,
+        )
+        mock_response = MockResponse(200, _audio_chunks(4, seconds_each=0.005), delay_between_chunks=0.08)
+        mock_session = mocker.AsyncMock()
+        mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+        output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+        assert output.success is True
+        assert output.audio_continuity_measured is True
+        assert output.audio_continuity_ok is False
+        assert output.audio_underrun_s > 0.1
+        assert output.audio_underrun_event_count > 0
+
+    @pytest.mark.asyncio
+    async def test_a_stream_that_keeps_ahead_is_continuous(self, mocker: MockerFixture):
+        """Chunks 20 ms apart carrying 200 ms of audio each: the buffer only grows."""
+        request_input = RequestFuncInput(
+            model="test-model",
+            model_name="test-model",
+            prompt="test prompt",
+            api_url="http://test.com/v1/chat/completions",
+            prompt_len=10,
+            output_len=20,
+        )
+        mock_response = MockResponse(200, _audio_chunks(4, seconds_each=0.2), delay_between_chunks=0.02)
+        mock_session = mocker.AsyncMock()
+        mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+        output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+        assert output.success is True
+        assert output.audio_continuity_measured is True
+        assert output.audio_continuity_ok is True
+        assert output.audio_underrun_s == 0.0
+
+    @pytest.mark.asyncio
+    async def test_continuity_uses_pcm_bytes_not_container_bytes(self, mocker: MockerFixture):
+        """Each chunk is a WAV container; its 44-byte header must not count as audio.
+
+        Counting the header would inflate every chunk by 44 bytes, which is 0.9 ms
+        of 24 kHz mono s16le -- small, but it would make the metric optimistic in
+        exactly the regime it exists to catch, one where chunks are short.
+        """
+        request_input = RequestFuncInput(
+            model="test-model",
+            model_name="test-model",
+            prompt="test prompt",
+            api_url="http://test.com/v1/chat/completions",
+            prompt_len=10,
+            output_len=20,
+        )
+        seconds_each = 0.005
+        mock_response = MockResponse(200, _audio_chunks(4, seconds_each=seconds_each), delay_between_chunks=0.08)
+        mock_session = mocker.AsyncMock()
+        mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+        output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+        # Four chunks of 5 ms is 20 ms of audio; the duration the run reports has
+        # to match that, i.e. be derived from frames rather than from bytes on the
+        # wire (a container-counting bug would show up here as ~24 ms).
+        assert output.audio_duration == pytest.approx(4 * seconds_each, abs=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_an_encoded_format_is_left_unmeasured_rather_than_reported_ok(self, mocker: MockerFixture):
+        """mp3 chunk bytes say nothing about play time, so continuity must abstain."""
+        request_input = RequestFuncInput(
+            model="test-model",
+            model_name="test-model",
+            prompt="test prompt",
+            api_url="http://test.com/v1/chat/completions",
+            prompt_len=10,
+            output_len=20,
+            extra_body={"response_format": "mp3"},
+        )
+        chunks = [
+            create_sse_chunk(
+                {
+                    "choices": [{"delta": {"content": base64.b64encode(b"\xff\xfb" * 64).decode()}}],
+                    "modality": "audio",
+                }
+            ),
+            b"data: [DONE]\n\n",
+        ]
+        mock_response = MockResponse(200, chunks)
+        mock_session = mocker.AsyncMock()
+        mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+        output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+        assert output.success is True
+        assert output.audio_continuity_measured is False
 
 
 if __name__ == "__main__":
