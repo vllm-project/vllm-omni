@@ -98,6 +98,36 @@ python examples/online_serving/sensenova_u1/openai_chat_client.py \
 
 At 1536x2720 with 50 steps, end-to-end is 43.0 s.
 
+#### Measured on 1x NVIDIA H200 139GB
+
+Reported by @hsliuustc0106 against PR head `29c090d`, on one reserved CUDA device.
+
+- Python 3.12.13, vLLM 0.28.0, torch 2.13.0+cu130, CUDA 13.0, diffusers 0.40.0,
+  transformers 5.14.1, flashinfer 0.6.16.post3, BF16, TP=1
+- `sensenova/SenseNova-U1.5-8B-MoT` with `SenseNova-U1.5-8B-MoT-LoRA-8step.safetensors`,
+  seed 42, 1024x1024
+
+| Case | Stage latency | Peak GPU memory |
+| --- | --- | --- |
+| 50 steps, cfg 4.0, think off | 9017 ms | 34384 MiB |
+| 8 steps, cfg 1.0, no LoRA control | 624.00 ms, 77.85 ms/step | 34376 MiB |
+| 8 steps, cfg 1.0, distilled LoRA | 623.85 ms, 77.98 ms/step | 34364 MiB |
+| 50 steps, cfg 4.0, think on, `VLLM_OMNI_SENSENOVA_PAGED_DECODE=1` | 81622 ms | 34594 MiB |
+
+Single runs without a preceding warmup, so the think-on row carries the first-request
+compile rather than a steady state. The distilled LoRA fused into 168 parameters, and its
+image differs from the same-seed no-LoRA control in 1,048,574 of 1,048,576 pixels, MAE 58.62.
+
+```bash
+pytest -m "cpu and not cuda" tests/diffusion/models/sensenova_u1/ tests/diffusion/lora/test_loader.py -q
+pytest -m "cpu and not cuda" tests/config/test_environment_variables.py tests/diffusion/test_diffusion_worker.py -q
+pytest -m cuda tests/diffusion/models/sensenova_u1/test_sensenova_u1_attention_gqa.py \
+    tests/diffusion/models/sensenova_u1/test_sensenova_u1_paged_decode.py -q --tb=short
+```
+
+71, 13 and 9 passed. Serving reached `/health`; `img2text` returned a 1921-character
+description and `text2text` the expected answer.
+
 #### Verification
 
 ```bash
