@@ -129,8 +129,46 @@ def test_mirror_hardwares_l4_1_expands_to_agents_and_plugins() -> None:
     rendered = _render_test_pipeline(doc, changed_files=None)
     step = rendered["steps"][0]
     assert "mirror_hardwares" not in step
-    assert step["agents"]["queue"] == "gpu_1_queue"
-    assert step["plugins"][0]["docker#v5.2.0"]["image"].endswith("$BUILDKITE_COMMIT")
+    assert step["agents"]["queue"] == "l4-k8s"
+    container = step["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]
+    assert container["image"].endswith("$BUILDKITE_COMMIT")
+    assert container["resources"]["limits"]["nvidia.com/gpu"] == 1
+
+
+def test_mirror_hardwares_l4_2_expands_to_two_gpus() -> None:
+    doc = {
+        "steps": [
+            {
+                "label": "Two-GPU Test",
+                "mirror_hardwares": "l4_2",
+                "commands": ["pytest -sv tests/example"],
+            },
+        ],
+    }
+    rendered = _render_test_pipeline(doc, changed_files=None)
+    step = rendered["steps"][0]
+    assert step["agents"]["queue"] == "l4-k8s"
+    container = step["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]
+    assert container["resources"]["limits"]["nvidia.com/gpu"] == 2
+    assert container["resources"]["requests"]["cpu"] == "20"
+
+
+def test_mirror_hardwares_l4_3_expands_to_three_gpus() -> None:
+    doc = {
+        "steps": [
+            {
+                "label": "Three-GPU Test",
+                "mirror_hardwares": "l4_3",
+                "commands": ["pytest -sv tests/example"],
+            },
+        ],
+    }
+    rendered = _render_test_pipeline(doc, changed_files=None)
+    step = rendered["steps"][0]
+    assert step["agents"]["queue"] == "l4-k8s"
+    container = step["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]
+    assert container["resources"]["limits"]["nvidia.com/gpu"] == 3
+    assert container["resources"]["requests"]["cpu"] == "30"
 
 
 def test_mirror_hardwares_conflicts_with_explicit_agents() -> None:

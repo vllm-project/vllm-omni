@@ -51,7 +51,17 @@ steps:
           - timeout 15m pytest -sv tests/diffusion/batching -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_1
 
-      - label: "Diffusion · Distributed & Attention Test"
+      - label: "Diffusion · Distributed Test · Single-GPU"
+        commands:
+          - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda and cards_1' --run-level "core_model"
+        mirror_hardwares: l4_1
+
+      - label: "Diffusion · Distributed Test · 2-GPU"
+        commands:
+          - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda and cards_2' --run-level "core_model"
+        mirror_hardwares: l4_2
+
+      - label: "Diffusion · Distributed & Attention Test · 4-GPU"
         source_file_dependencies:
           - tests/diffusion/distributed/
           - tests/diffusion/attention/test_attention_sp.py
@@ -60,8 +70,8 @@ steps:
           - vllm_omni/diffusion/data.py
           - vllm_omni/diffusion/models/
         commands:
-          - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda' --run-level "core_model"
-          - timeout 20m pytest -sv tests/diffusion/attention/test_attention_sp.py -m 'core_model and cuda' --run-level "core_model"
+          - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda and cards_4' --run-level "core_model"
+          - timeout 20m pytest -sv tests/diffusion/attention/test_attention_sp.py -m 'core_model and cuda and cards_4' --run-level "core_model"
         mirror_hardwares: l4_4
 
       - label: "Diffusion · Model Test"
