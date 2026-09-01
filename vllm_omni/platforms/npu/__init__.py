@@ -14,8 +14,7 @@ __all__ = ["NPUOmniPlatform"]
 
 
 def is_a5(device: torch.device | None = None) -> bool:
-    """Return True on Ascend 950 (A5) devices, False otherwise.
-    """
+    """Return True on Ascend 950 (A5) devices, False otherwise."""
     if device is not None and device.type != "npu":
         return False
     try:

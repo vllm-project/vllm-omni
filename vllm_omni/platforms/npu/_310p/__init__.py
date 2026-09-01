@@ -9,8 +9,7 @@ import torch
 
 
 def is_310p(device: torch.device | None = None) -> bool:
-    """Return True on Ascend 310P devices, False otherwise.
-    """
+    """Return True on Ascend 310P devices, False otherwise."""
     if device is not None and device.type != "npu":
         return False
     try:
