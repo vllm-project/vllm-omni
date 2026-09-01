@@ -30,6 +30,29 @@ from .batched_token2wav import (
 logger = init_logger(__name__)
 
 
+def apply_token2wav_cfg_rate(token2wav: Any, cfg_rate: Any) -> float:
+    """Override the flow decoder's classifier-free guidance weight.
+
+    ``inference_cfg_rate`` ships in the checkpoint and is the one Token2Wav
+    constant that has to be re-derived whenever ``token2wav_n_timesteps``
+    changes: guidance is applied once per solver step, so a weight chosen for
+    one schedule is not the right weight for another. There is no way to reach
+    it from a deploy config today, which makes the pair impossible to sweep
+    together without patching the tree.
+
+    Raises rather than warning if the decoder has no such attribute: a
+    configuration key that silently does nothing is worse than a startup error.
+    """
+    decoder = getattr(getattr(token2wav, "flow", None), "decoder", None)
+    if decoder is None or not hasattr(decoder, "inference_cfg_rate"):
+        raise ValueError(
+            "token2wav_cfg_rate was set, but this Token2Wav's flow decoder exposes no inference_cfg_rate to override"
+        )
+    value = float(cfg_rate)
+    decoder.inference_cfg_rate = value
+    return value
+
+
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
     payload = {"reason": reason, **details}
     return RuntimeError(f"MiniCPMO45Code2WavBatchError {json.dumps(payload, sort_keys=True)}")
@@ -775,4 +798,10 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
         finally:
             torch.set_default_dtype(previous_dtype)
+        cfg_rate = extra.get("token2wav_cfg_rate")
+        if cfg_rate is not None:
+            logger.info(
+                "Token2wav inference_cfg_rate overridden to %s",
+                apply_token2wav_cfg_rate(token2wav, cfg_rate),
+            )
         self.backend = BatchedToken2Wav(token2wav)
