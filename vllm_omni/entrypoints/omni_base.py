@@ -461,11 +461,18 @@ class OmniBase(PDDisaggregationMixin):
         stage_id: int,
         metrics: Any,
         final_output_type: str | None,
+        stage_submit_ts: float | None = None,
     ) -> None:
         turn = req_state.duplex_turn
         if turn is None or metrics is None:
             return
-        accumulate_turn_stage_metrics(turn, stage_id, metrics, final_output_type=final_output_type)
+        accumulate_turn_stage_metrics(
+            turn,
+            stage_id,
+            metrics,
+            final_output_type=final_output_type,
+            stage_submit_ts=stage_submit_ts,
+        )
 
     def _compute_final_stage_id(self, output_modalities: list[str] | None) -> int:
         return get_final_stage_id_for_e2e(
@@ -500,7 +507,13 @@ class OmniBase(PDDisaggregationMixin):
             if req_state.metrics.stage_first_ts[stage_id] is None:
                 req_state.metrics.stage_first_ts[stage_id] = submit_ts if submit_ts is not None else now
             req_state.metrics.stage_last_ts[stage_id] = max(req_state.metrics.stage_last_ts[stage_id] or 0.0, now)
-        self._accumulate_duplex_turn_metrics(req_state, stage_id, _m, stage_meta.final_output_type)
+        self._accumulate_duplex_turn_metrics(
+            req_state,
+            stage_id,
+            _m,
+            stage_meta.final_output_type,
+            msg.stage_submit_ts,
+        )
 
     def _handle_output_message(
         self,
@@ -563,7 +576,7 @@ class OmniBase(PDDisaggregationMixin):
                 output_type = getattr(msg.engine_outputs, "final_output_type", None)
                 if output_type is None:
                     output_type = self.engine.get_stage_metadata(stage_id).final_output_type
-                self._accumulate_duplex_turn_metrics(req_state, stage_id, msg.metrics, output_type)
+                self._accumulate_duplex_turn_metrics(req_state, stage_id, msg.metrics, output_type, msg.stage_submit_ts)
 
         return False, req_id, stage_id, req_state
 

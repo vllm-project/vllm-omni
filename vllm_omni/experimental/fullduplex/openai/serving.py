@@ -229,7 +229,7 @@ class OmniDuplexSessionHandler(
             with suppress(asyncio.CancelledError):
                 await data_plane_task
         if session.active_response_id is not None:
-            session.end_response(commit_text=False, finished_reason="abort")
+            session.end_response(commit_text=False, finished_reason="close")
         self._cleanup_duplex_session_state(session)
         self._registry.close(session.session_id)
         self._realtime_protocols.pop(session.session_id, None)
@@ -1872,7 +1872,7 @@ class OmniDuplexSessionHandler(
         committed_message = session.end_response(
             commit_text=self._should_commit_response_to_history(session, old_response_id),
             playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
-            finished_reason="abort",
+            finished_reason="barge_in",
         )
         if old_response_id is not None:
             item_id = f"item_{old_response_id}"

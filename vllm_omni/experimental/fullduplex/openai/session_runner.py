@@ -390,7 +390,7 @@ class DuplexSessionRunnerMixin:
                         and precreated_response_id is not None
                         and session.active_response_id == precreated_response_id
                     ):
-                        session.end_response(commit_text=False, finished_reason="abort")
+                        session.end_response(commit_text=False, finished_reason="error")
                         await emit_event(
                             {
                                 "type": "response.done",

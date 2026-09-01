@@ -169,6 +169,71 @@ def test_finalize_logs_once_with_identity_line(mocker) -> None:
     assert "resp-turn" in identity.args
     assert "stop" in identity.args
     assert "resp-turn" in aggregator.e2e_done
+    assert turn.finished_reason == "stop"
+
+
+def test_finished_reason_passthrough(mocker) -> None:
+    logged = mocker.patch("vllm_omni.metrics.duplex_turn.logger.info")
+    for reason in ("barge_in", "cancel", "close", "abort", "error"):
+        turn = DuplexTurnMetrics(
+            request_id=_request_id(),
+            response_id=f"resp-{reason}",
+            arrival_ts=1.0,
+            aggregator=make_turn_aggregator(num_stages=1, log_stats=True, wall_start_ts=1.0),
+        )
+        assert finalize_duplex_turn_metrics(turn, reason=reason) is True
+        assert turn.finished_reason == reason
+    identity = next(call for call in logged.call_args_list if call.args and "barge_in" in call.args)
+    assert identity.args[-1] == "barge_in"
+    unknown = DuplexTurnMetrics(
+        request_id=_request_id(),
+        response_id="resp-unknown",
+        arrival_ts=1.0,
+        aggregator=make_turn_aggregator(num_stages=1, log_stats=False, wall_start_ts=1.0),
+    )
+    assert finalize_duplex_turn_metrics(unknown, reason="oops") is True
+    assert unknown.finished_reason == "abort"
+
+
+def test_accumulate_prefers_stage_submit_ts(mocker) -> None:
+    mocker.patch("vllm_omni.metrics.duplex_turn.time.time", return_value=200.0)
+    turn = DuplexTurnMetrics(
+        request_id=_request_id(),
+        response_id="resp-ts",
+        arrival_ts=1.0,
+        aggregator=make_turn_aggregator(num_stages=2, log_stats=False, wall_start_ts=1.0),
+    )
+    accumulate_turn_stage_metrics(
+        turn,
+        0,
+        _stage_stats(num_tokens_out=1, stage_gen_time_ms=5.0),
+        stage_submit_ts=100.0,
+    )
+    accumulate_turn_stage_metrics(turn, 1, _stage_stats(num_tokens_out=1, stage_gen_time_ms=5.0))
+    assert turn.aggregator.stage_first_ts[0] == 100.0
+    assert turn.aggregator.stage_last_ts[0] == 200.0
+    assert turn.aggregator.stage_first_ts[1] == 200.0
+
+
+def test_stage_metrics_message_forwards_submit_ts() -> None:
+    obj = _omni_base()
+    request_id = _request_id()
+    client = _client(request_states=obj.request_states, num_stages=3)
+    req_state = ClientRequestState(request_id)
+    obj.request_states[request_id] = req_state
+    client.begin_turn_metrics(request_id, response_id="resp-submit", turn_id=1, arrival_ts=1.0)
+
+    obj._handle_output_message(
+        StageMetricsMessage(
+            request_id=request_id,
+            stage_id=0,
+            metrics=_stage_stats(num_tokens_out=2, stage_gen_time_ms=8.0),
+            stage_submit_ts=50.0,
+        )
+    )
+    turn = req_state.duplex_turn
+    assert turn is not None
+    assert turn.aggregator.stage_first_ts[0] == 50.0
 
 
 def test_metrics_before_begin_are_dropped() -> None:
@@ -320,6 +385,15 @@ async def test_signal_barge_in_finalizes_before_pop(mocker) -> None:
     client = _client()
     turn = client.begin_turn_metrics(request_id, response_id="resp-barge", turn_id=1, arrival_ts=1.0)
     accumulate_turn_stage_metrics(turn, 0, _stage_stats(num_tokens_out=3, stage_gen_time_ms=9.0))
+    reasons: list[str] = []
+    real_finalize = finalize_duplex_turn_metrics
+
+    def capture_finalize(captured_turn, *, reason):
+        emitted = real_finalize(captured_turn, reason=reason)
+        reasons.append(captured_turn.finished_reason or "")
+        return emitted
+
+    mocker.patch("vllm_omni.experimental.fullduplex.request_client.finalize_duplex_turn_metrics", capture_finalize)
 
     async def signal_duplex_turn_async(session_id, **kwargs):
         return {"ok": True}
@@ -338,6 +412,7 @@ async def test_signal_barge_in_finalizes_before_pop(mocker) -> None:
     assert request_id not in client.output_port.request_states
     assert len(logged) == 1
     assert "resp-barge" in logged[0]
+    assert reasons == ["barge_in"]
 
 
 @pytest.mark.asyncio
@@ -354,6 +429,32 @@ async def test_close_without_open_turn_does_not_log(mocker) -> None:
     client.engine = SimpleNamespace(close_duplex_session_async=close_duplex_session_async)
     await client.close("sid-metrics", reason="done", fence=fence, timeout=1.0)
     spy.assert_not_called()
+    assert request_id not in client.output_port.request_states
+
+
+@pytest.mark.asyncio
+async def test_close_open_turn_emits_close(mocker) -> None:
+    fence = _fence()
+    request_id = _request_id(fence)
+    reasons: list[str] = []
+    real_finalize = finalize_duplex_turn_metrics
+
+    def capture_finalize(captured_turn, *, reason):
+        emitted = real_finalize(captured_turn, reason=reason)
+        reasons.append(captured_turn.finished_reason or "")
+        return emitted
+
+    mocker.patch("vllm_omni.experimental.fullduplex.request_client.finalize_duplex_turn_metrics", capture_finalize)
+    client = _client()
+    turn = client.begin_turn_metrics(request_id, response_id="resp-close", turn_id=1, arrival_ts=1.0)
+    accumulate_turn_stage_metrics(turn, 0, _stage_stats(num_tokens_out=1, stage_gen_time_ms=4.0))
+
+    async def close_duplex_session_async(session_id, **kwargs):
+        return {"ok": True}
+
+    client.engine = SimpleNamespace(close_duplex_session_async=close_duplex_session_async)
+    await client.close("sid-metrics", reason="done", fence=fence, timeout=1.0)
+    assert reasons == ["close"]
     assert request_id not in client.output_port.request_states
 
 

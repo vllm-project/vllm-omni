@@ -219,7 +219,8 @@ class DuplexRequestClient:
         result = await self.engine.signal_duplex_turn_async(session_id, **kwargs)
         if event in {"barge_in", "input.cancel", "response.cancel"}:
             resource_id = duplex_resource_request_id(fence, "stage0")
-            self.finalize_turn_metrics(resource_id, reason="abort")
+            reason = "barge_in" if event == "barge_in" else "cancel"
+            self.finalize_turn_metrics(resource_id, reason=reason)
             self.output_port.request_states.pop(resource_id, None)
         return result
 
@@ -238,7 +239,7 @@ class DuplexRequestClient:
             timeout=timeout,
         )
         resource_id = duplex_resource_request_id(fence, "stage0")
-        self.finalize_turn_metrics(resource_id, reason="abort")
+        self.finalize_turn_metrics(resource_id, reason="close")
         self.output_port.request_states.pop(resource_id, None)
         return result
 

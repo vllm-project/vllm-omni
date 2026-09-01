@@ -887,7 +887,7 @@ class NativeRuntimeBridgeMixin:
                 }
             )
             if response_id is not None:
-                session.end_response(commit_text=False, finished_reason="abort")
+                session.end_response(commit_text=False, finished_reason="error")
                 await send_json(
                     {
                         "type": "response.done",

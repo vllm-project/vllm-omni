@@ -21,6 +21,7 @@ from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats, S
 logger = init_logger(__name__)
 
 _DUPLEX_RESOURCE_PREFIX = "duplex-s."
+_KNOWN_FINISHED_REASONS = frozenset({"stop", "barge_in", "cancel", "close", "abort", "error"})
 
 
 def is_duplex_resource_request_id(request_id: str | None) -> bool:
@@ -32,7 +33,9 @@ def is_duplex_resource_request_id(request_id: str | None) -> bool:
 
 
 def _normalize_finished_reason(reason: str) -> str:
-    return "stop" if reason == "stop" else "abort"
+    if reason in _KNOWN_FINISHED_REASONS:
+        return reason
+    return "abort"
 
 
 @dataclass
@@ -79,6 +82,7 @@ def accumulate_turn_stage_metrics(
     metrics: StageRequestStats,
     *,
     final_output_type: str | None = None,
+    stage_submit_ts: float | None = None,
 ) -> None:
     """Append one stage snapshot; segments collapse at finalize."""
     aggregator = turn.aggregator
@@ -92,11 +96,12 @@ def accumulate_turn_stage_metrics(
     )
     aggregator.on_stage_metrics(stage_id, turn.response_id, stats, final_output_type)
     now = time.time()
+    first_value = stage_submit_ts if stage_submit_ts is not None else now
     if 0 <= stage_id < aggregator.num_stages:
         first_ts = cast(list[float | None], aggregator.stage_first_ts)
         last_ts = cast(list[float | None], aggregator.stage_last_ts)
         if first_ts[stage_id] is None:
-            first_ts[stage_id] = now
+            first_ts[stage_id] = first_value
         last_ts[stage_id] = max(last_ts[stage_id] or 0.0, now)
 
 
@@ -114,10 +119,22 @@ def _collapse_stage_events(aggregator: OrchestratorAggregator, request_id: str) 
     field_aliases = {"audio_frames": "audio_generated_frames"}
     for sid in sorted(merged_rows):
         base = first_evt[sid]
+        unmapped: list[str] = []
         for key, value in merged_rows[sid].items():
             attr = field_aliases.get(key, key)
-            if attr != "stage_id" and hasattr(base, attr):
+            if attr == "stage_id":
+                continue
+            if hasattr(base, attr):
                 setattr(base, attr, value)
+            else:
+                unmapped.append(key)
+        if unmapped:
+            logger.debug(
+                "duplex turn collapse dropped unmapped keys request_id=%s stage=%s keys=%s",
+                request_id,
+                sid,
+                unmapped,
+            )
         collapsed.append(base)
     aggregator.stage_events[request_id] = collapsed
 
