@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import logging
 import os
@@ -246,6 +246,191 @@ def test_transformer_instantiates():
     assert model.x_embedder.out_features == HIDDEN_SIZE
 
 
+def test_final_projection_forward_matches_reference():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        LuminaLayerNormContinuous,
+    )
+
+    layer = LuminaLayerNormContinuous(
+        embedding_dim=HIDDEN_SIZE,
+        conditioning_embedding_dim=32,
+        elementwise_affine=False,
+        out_dim=16,
+        prefix="norm_out",
+    )
+    _randomize_parameters(layer)
+    hidden_states = torch.randn(2, 4, HIDDEN_SIZE)
+    conditioning = torch.randn(2, 32)
+
+    output = layer(hidden_states, conditioning)
+    scale = torch.nn.functional.linear(
+        layer.silu(conditioning),
+        layer.linear_1.weight,
+        layer.linear_1.bias,
+    )
+    normalized = torch.nn.functional.layer_norm(hidden_states, (HIDDEN_SIZE,), eps=1e-5)
+    expected = torch.nn.functional.linear(
+        normalized * (1 + scale[:, None, :]),
+        layer.linear_2.weight,
+        layer.linear_2.bias,
+    )
+
+    torch.testing.assert_close(output, expected)
+
+
+def _expected_quant_aware_prefixes() -> set[str]:
+    prefixes = {"norm_out.linear_1", "norm_out.linear_2"}
+
+    def add_single_stream(prefix: str, *, modulation: bool) -> None:
+        prefixes.update(
+            {
+                f"{prefix}.attn.to_qkv",
+                f"{prefix}.attn.to_out",
+                f"{prefix}.feed_forward.gate_up_proj",
+                f"{prefix}.feed_forward.linear_2",
+            }
+        )
+        if modulation:
+            prefixes.add(f"{prefix}.norm1.linear")
+
+    for stack in ("noise_refiner", "ref_image_refiner"):
+        for index in range(2):
+            add_single_stream(f"{stack}.{index}", modulation=True)
+    for index in range(2):
+        add_single_stream(f"context_refiner.{index}", modulation=False)
+        add_single_stream(f"single_stream_layers.{index}", modulation=True)
+
+    double_stream_suffixes = {
+        "img_instruct_attn.img_to_qkv",
+        "img_instruct_attn.instruct_to_qkv",
+        "img_instruct_attn.instruct_out",
+        "img_instruct_attn.img_out",
+        "img_instruct_attn.to_out",
+        "img_self_attn.to_qkv",
+        "img_self_attn.to_out",
+        "img_feed_forward.gate_up_proj",
+        "img_feed_forward.linear_2",
+        "instruct_feed_forward.gate_up_proj",
+        "instruct_feed_forward.linear_2",
+        "img_norm1.linear",
+        "img_norm2.linear",
+        "img_norm3.linear",
+        "instruct_norm1.linear",
+        "instruct_norm2.linear",
+    }
+    for index in range(2):
+        prefixes.update(f"double_stream_layers.{index}.{suffix}" for suffix in double_stream_suffixes)
+
+    return prefixes
+
+
+def test_transformer_quant_config_targets_supported_boogu_linears():
+    from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformer2DModel,
+    )
+
+    class _RecordingQuantConfig(QuantizationConfig):
+        def __init__(self) -> None:
+            self.prefixes: list[str] = []
+
+        def get_name(self) -> str:
+            return "recording"
+
+        def get_quant_method(self, layer, prefix: str):
+            self.prefixes.append(prefix)
+            return UnquantizedLinearMethod()
+
+        @classmethod
+        def get_supported_act_dtypes(cls):
+            return [torch.float32]
+
+        def get_min_capability(self) -> int:
+            return 0
+
+        @classmethod
+        def from_config(cls, config):
+            return cls()
+
+        def get_config_filenames(self):
+            return []
+
+    quant_config = _RecordingQuantConfig()
+    model = BooguImageTransformer2DModel(
+        od_config=_tiny_od_config(),
+        quant_config=quant_config,
+    )
+    expected = _expected_quant_aware_prefixes()
+
+    assert len(quant_config.prefixes) == len(set(quant_config.prefixes))
+    assert set(quant_config.prefixes) == expected
+
+    configured = {
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, LinearBase) and module.quant_config is quant_config
+    }
+    assert configured == expected
+
+    # Patch/caption/time projections remain ordinary torch linears and do not
+    # receive the vLLM quantization config.
+    assert isinstance(model.x_embedder, torch.nn.Linear)
+    assert isinstance(model.ref_image_patch_embedder, torch.nn.Linear)
+    assert isinstance(model.time_caption_embed.timestep_embedder.linear_1, torch.nn.Linear)
+    assert isinstance(model.time_caption_embed.caption_embedder[1], torch.nn.Linear)
+
+
+def test_transformer_without_quant_config_uses_unquantized_linears():
+    from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformer2DModel,
+    )
+
+    model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
+    linears = [module for module in model.modules() if isinstance(module, LinearBase)]
+
+    assert linears
+    assert all(module.quant_config is None for module in linears)
+    assert all(isinstance(module.quant_method, UnquantizedLinearMethod) for module in linears)
+
+
+@pytest.mark.parametrize(
+    ("module_name", "expected"),
+    [
+        (
+            "double_stream_layers.0.img_instruct_attn.instruct_to_qkv",
+            ("instruct_to_qkv", ["instruct_to_q", "instruct_to_k", "instruct_to_v"]),
+        ),
+        (
+            "double_stream_layers.0.img_instruct_attn.img_to_qkv",
+            ("img_to_qkv", ["img_to_q", "img_to_k", "img_to_v"]),
+        ),
+        (
+            "single_stream_layers.0.attn.to_qkv",
+            ("to_qkv", ["to_q", "to_k", "to_v"]),
+        ),
+    ],
+)
+def test_transformer_packed_mapping_matches_weight_remapping(module_name, expected):
+    from vllm.model_executor.model_loader.utils import ParamMapping
+
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformer2DModel,
+    )
+
+    assert BooguImageTransformer2DModel.packed_modules_mapping == {
+        "instruct_to_qkv": ["instruct_to_q", "instruct_to_k", "instruct_to_v"],
+        "img_to_qkv": ["img_to_q", "img_to_k", "img_to_v"],
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "gate_up_proj": ["linear_1", "linear_3"],
+    }
+    mapping = ParamMapping(BooguImageTransformer2DModel.packed_modules_mapping)
+    assert mapping.get_sub_modules(module_name) == expected
+
+
 def test_transformer_preprocesses_multiple_instruction_feature_layers():
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
         BooguImageTransformer2DModel,
@@ -286,29 +471,58 @@ def test_transformer_rejects_prompt_tuning():
         BooguImageTransformer2DModel(od_config=_tiny_od_config(prompt_tuning_configs={"use_prompt_tuning": True}))
 
 
-def _native_to_checkpoint_name(name: str) -> str:
-    """Inverse of ``load_weights`` remapping: native param name -> diffusers name.
+_QKV_FANOUT = {
+    "to_qkv": ("to_q", "to_k", "to_v"),
+    "img_to_qkv": ("img_to_q", "img_to_k", "img_to_v"),
+    "instruct_to_qkv": ("instruct_to_q", "instruct_to_k", "instruct_to_v"),
+}
+
+
+def _native_to_checkpoint_weights(name: str, param: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+    """Inverse of ``load_weights`` remapping: native param -> diffusers weights.
+
+    The diffusers checkpoint stores fused projections as separate matrices, so a
+    single merged native param (QKV or FFN gate/up) fans out into several
+    checkpoint weights. Returns ``(diffusers_name, value)`` pairs whose values,
+    when fed through ``load_weights``, reassemble into the original ``param``.
 
     - ``.to_out.<suffix>`` -> ``.to_out.0.<suffix>`` (diffusers ModuleList wrap).
     - promoted joint-attention projections move back under ``.processor.``.
     """
+    q_size = NUM_HEADS * HEAD_DIM
+    kv_size = NUM_KV_HEADS * HEAD_DIM
+
+    # Fused QKV projections split back into per-matrix q/k/v weights.
+    for token, (q_name, k_name, v_name) in _QKV_FANOUT.items():
+        marker = f".{token}."
+        if marker in name:
+            q, k, v = param[:q_size], param[q_size : q_size + kv_size], param[q_size + kv_size :]
+            results = []
+            for sub_name, value in ((q_name, q), (k_name, k), (v_name, v)):
+                ckpt_name = name.replace(marker, f".{sub_name}.")
+                if token != "to_qkv":
+                    # Joint-attention projections live under `.processor.` upstream.
+                    ckpt_name = ckpt_name.replace(".img_instruct_attn.", ".img_instruct_attn.processor.")
+                results.append((ckpt_name, value))
+            return results
+
+    # Fused FFN gate/up splits into linear_1 (gate) / linear_3 (input).
+    if ".gate_up_proj." in name:
+        inner = param.shape[0] // 2
+        return [
+            (name.replace(".gate_up_proj.", ".linear_1."), param[:inner]),
+            (name.replace(".gate_up_proj.", ".linear_3."), param[inner:]),
+        ]
+
+    # Default: 1:1 with the existing diffusers name promotions.
     if ".to_out." in name:
         name = name.replace(".to_out.", ".to_out.0.")
-    for proj in (
-        "img_to_q",
-        "img_to_k",
-        "img_to_v",
-        "instruct_to_q",
-        "instruct_to_k",
-        "instruct_to_v",
-        "instruct_out",
-        "img_out",
-    ):
+    for proj in ("instruct_out", "img_out"):
         token = f".img_instruct_attn.{proj}."
         if token in name:
             name = name.replace(token, f".img_instruct_attn.processor.{proj}.")
             break
-    return name
+    return [(name, param)]
 
 
 def test_transformer_load_weights_round_trip():
@@ -319,24 +533,29 @@ def test_transformer_load_weights_round_trip():
     model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
     native_params = dict(model.named_parameters())
 
-    # Build synthetic diffusers-named weights (one per native parameter).
-    checkpoint_weights = {}
+    # Build synthetic diffusers-named weights. Fused native projections fan out
+    # into the separate matrices the diffusers checkpoint stores.
+    expected: dict[str, torch.Tensor] = {}
+    checkpoint_weights: dict[str, torch.Tensor] = {}
     for native_name, param in native_params.items():
-        checkpoint_weights[_native_to_checkpoint_name(native_name)] = torch.randn_like(param)
+        full = torch.randn_like(param)
+        expected[native_name] = full
+        for ckpt_name, value in _native_to_checkpoint_weights(native_name, full):
+            checkpoint_weights[ckpt_name] = value
 
-    # The remapping must be a bijection over the parameter set.
-    assert len(checkpoint_weights) == len(native_params)
+    # Every checkpoint name is unique; merged params fan out to >=1 weight.
+    assert len(checkpoint_weights) >= len(native_params)
 
     loaded = model.load_weights(list(checkpoint_weights.items()))
 
     # No missing / unexpected parameters.
     assert loaded == set(native_params.keys())
 
-    # Values landed on the right parameters (TP=1: weight_loader copies verbatim).
+    # Values landed on the right parameters (TP=1: weight_loader copies verbatim;
+    # fused shards are placed at their q/k/v / gate/up offsets).
     reloaded = dict(model.named_parameters())
     for native_name in native_params:
-        expected = checkpoint_weights[_native_to_checkpoint_name(native_name)]
-        assert torch.allclose(reloaded[native_name], expected)
+        assert torch.allclose(reloaded[native_name], expected[native_name])
 
 
 def test_transformer_load_weights_warns_for_unexpected_and_unloaded():
@@ -360,11 +579,13 @@ def test_transformer_load_weights_warns_for_unexpected_and_unloaded():
         model = BooguImageTransformer2DModel(od_config=_tiny_od_config())
         native_params = dict(model.named_parameters())
         loaded_name = next(iter(native_params))
-        checkpoint_name = _native_to_checkpoint_name(loaded_name)
+        # For fused projections, load just one of the fan-out checkpoint matrices.
+        (checkpoint_name, checkpoint_value), *_ = _native_to_checkpoint_weights(loaded_name, native_params[loaded_name])
+        checkpoint_value = torch.randn_like(checkpoint_value)
 
         loaded = model.load_weights(
             [
-                (checkpoint_name, torch.randn_like(native_params[loaded_name])),
+                (checkpoint_name, checkpoint_value),
                 ("unexpected.weight", torch.ones(1)),
             ]
         )

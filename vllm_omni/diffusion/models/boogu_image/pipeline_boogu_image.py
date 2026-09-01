@@ -33,6 +33,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -52,6 +53,7 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.quantization import resolve_component_quant_config as _resolve_component_quant_config
 
 logger = init_logger(__name__)
 
@@ -279,7 +281,13 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             revision=od_config.revision,
         ).to(self._execution_device)
 
-        self.transformer = BooguImageTransformer2DModel(od_config=od_config)
+        transformer_quant_config = _resolve_component_quant_config(od_config.quantization_config, "transformer")
+        if transformer_quant_config is not None:
+            configure_quant_config(transformer_quant_config, BooguImageTransformer2DModel)
+        self.transformer = BooguImageTransformer2DModel(
+            od_config=od_config,
+            quant_config=transformer_quant_config,
+        )
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.default_sample_size = 128

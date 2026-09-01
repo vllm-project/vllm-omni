@@ -84,6 +84,7 @@ def mock_dependencies(mocker, monkeypatch):
         "vae": mock_vae,
         "scheduler": mock_scheduler,
         "transformer": mock_transformer_instance,
+        "transformer_cls": mock_transformer_cls,
     }
 
 
@@ -184,6 +185,38 @@ def test_constructor_weights_sources(boogu_pipeline):
     assert source.subfolder == "transformer"
     assert source.prefix == "transformer."
     assert source.fall_back_to_pt is True
+
+
+def test_constructor_passes_transformer_component_quant_config(mock_dependencies, mocker):
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
+
+    quant_config = mocker.MagicMock(spec_set=QuantizationConfig)
+    resolve_quant_config = mocker.patch(
+        f"{_MODULE}._resolve_component_quant_config",
+        return_value=quant_config,
+    )
+    configure_quant_config = mocker.patch(f"{_MODULE}.configure_quant_config")
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.float32,
+        num_gpus=1,
+    )
+
+    BooguImagePipeline(od_config=od_config)
+
+    resolve_quant_config.assert_called_once_with(od_config.quantization_config, "transformer")
+    configure_quant_config.assert_called_once_with(
+        quant_config,
+        mock_dependencies["transformer_cls"],
+    )
+    assert not hasattr(quant_config, "packed_modules_mapping")
+    assert mock_dependencies["transformer_cls"].call_args.kwargs == {
+        "od_config": od_config,
+        "quant_config": quant_config,
+    }
 
 
 @pytest.mark.parametrize(
