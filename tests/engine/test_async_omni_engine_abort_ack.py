@@ -67,7 +67,8 @@ def test_abort_async_waits_for_ack(mocker: MockerFixture):
         assert not task.done()
 
         rpc_q.put(AbortResultMessage(rpc_id="abort-rpc-1", success=True))
-        await task
+        result = await task
+        assert result == []
 
     try:
         asyncio.run(_run())

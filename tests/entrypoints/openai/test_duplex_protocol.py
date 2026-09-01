@@ -462,6 +462,15 @@ def test_minicpmo_native_capabilities_separate_model_state_from_core_kv_lease():
     assert caps["stage_handoff_transport"] == "scheduler_data_plane"
 
 
+def test_duplex_overlap_policy_auto_falls_back_to_listen_only():
+    from vllm_omni.experimental.fullduplex.openai.protocol import (
+        DuplexOverlapPolicy,
+        DuplexSessionConfig,
+    )
+
+    assert DuplexSessionConfig._normalize_overlap_policy("auto") == DuplexOverlapPolicy.LISTEN_ONLY.value
+
+
 def test_minicpmo_native_capabilities_do_not_overclaim_single_session_deployment():
     caps = DuplexCapabilities.minicpmo45_native(max_sessions=1).as_dict()
 

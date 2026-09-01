@@ -700,3 +700,62 @@ def test_num_cache_creation_tokens_reaches_direct_request_output():
 
     assert direct.num_cached_tokens == 3
     assert direct.num_cache_creation_tokens == 2
+
+
+def _abort_processor_with_parent(child_ids: list[str]):
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor.request_states = {}
+    processor.external_req_ids = {}
+    processor.parent_requests = {}
+    processor._native_text_metrics_by_request = {}
+    processor.lora_states = SimpleNamespace(request_finished=lambda *_args, **_kwargs: None)
+    parent = SimpleNamespace(request_id="parent", child_requests=set(child_ids))
+    processor.parent_requests["parent"] = parent
+    for child_id in child_ids:
+        req_state = SimpleNamespace(
+            parent_req=parent,
+            lora_name=None,
+            output_kind=RequestOutputKind.CUMULATIVE,
+            detokenizer=SimpleNamespace(output_token_ids=[7, 8]),
+            queue=None,
+            external_req_id="parent",
+            make_request_output=MagicMock(return_value=SimpleNamespace(request_id=child_id)),
+        )
+        processor.request_states[child_id] = req_state
+    return processor, parent
+
+
+def test_abort_last_parallel_child_drops_parent_request():
+    processor, parent = _abort_processor_with_parent(["0_parent", "1_parent"])
+
+    aborted, _outputs = processor.abort_requests_collecting_outputs(["0_parent"], internal=True)
+    assert aborted == ["0_parent"]
+    assert "parent" in processor.parent_requests
+    assert parent.child_requests == {"1_parent"}
+
+    aborted, _outputs = processor.abort_requests_collecting_outputs(["1_parent"], internal=True)
+    assert aborted == ["1_parent"]
+    assert "parent" not in processor.parent_requests
+    assert not parent.child_requests
+
+
+def test_abort_snapshot_leaves_state_until_commit():
+    processor, parent = _abort_processor_with_parent(["0_parent"])
+    processor.external_req_ids["parent"] = ["0_parent"]
+
+    aborted, outputs = processor.abort_requests_collecting_outputs(
+        ["parent"],
+        internal=False,
+        commit_state=False,
+    )
+    assert aborted == ["0_parent"]
+    assert outputs
+    assert "0_parent" in processor.request_states
+    assert processor.external_req_ids["parent"] == ["0_parent"]
+    assert "parent" in processor.parent_requests
+    assert parent.child_requests == {"0_parent"}
+
+    processor.commit_aborted_request_state(["parent"], internal=False)
+    assert "0_parent" not in processor.request_states
+    assert "parent" not in processor.parent_requests
+    assert "parent" not in processor.external_req_ids

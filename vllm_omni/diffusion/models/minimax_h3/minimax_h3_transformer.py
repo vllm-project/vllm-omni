@@ -49,6 +49,7 @@ from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
+from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -179,6 +180,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "packed_seq_params",
         "refiner_packed_seq_params",
         "video_token_layout",
+        "rope_table",
     }
 )
 
@@ -1139,6 +1141,54 @@ class MiniMaxH3DiTModel(nn.Module):
         for _, param in self.named_parameters():
             param.missing_param_init = "error"
 
+    def _rope_local_span(self, seq_len: int) -> tuple[int, int]:
+        """Return the sequence-parallel rows owned by this DiT rank."""
+        local_sp_registry = getattr(self.local_sp_prepare, "_hook_registry", None)
+        hooks_applied = local_sp_registry is not None
+        if local_sp_registry is not None:
+            local_sp_hook = local_sp_registry.get_hook(_LOCAL_SP_PREPARE_HOOK)
+            hooks_applied = local_sp_hook is not None
+        return _sequence_parallel_local_span(
+            seq_len,
+            hooks_applied=hooks_applied,
+        )
+
+    def prepare_rope_table(
+        self,
+        img_position_ids: torch.Tensor,
+        *,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """Build the static local RoPE table once for one denoise branch.
+
+        A MiniMax-H3 denoise branch reuses its packed position IDs at every
+        scheduler step. The returned table is local to the current sequence-
+        parallel rank, and therefore must be built by the model that will
+        consume it rather than cached globally across requests or ranks.
+        """
+        local_start, local_len = self._rope_local_span(seq_len)
+        rope_position_ids = img_position_ids.narrow(1, local_start, local_len)
+        return _build_rope_table(self.rope(rope_position_ids).to(img_position_ids.device))
+
+    def _validate_prepared_rope_table(
+        self,
+        rope_table: torch.Tensor,
+        *,
+        local_len: int,
+        device: torch.device,
+    ) -> None:
+        expected_width = 6 * self.arch.rope_inv_freq_len
+        if rope_table.dim() != 2 or tuple(rope_table.shape) != (local_len, expected_width):
+            raise ValueError(
+                "rope_table must be [local_seq_len, rotary_dim] for the current "
+                f"sequence-parallel rank, got {list(rope_table.shape)}; expected "
+                f"[{local_len}, {expected_width}]."
+            )
+        if rope_table.device != device:
+            raise ValueError(f"rope_table device {rope_table.device} must match x device {device}.")
+        if rope_table.dtype != _BF16_DTYPE:
+            raise ValueError(f"rope_table must be {_BF16_DTYPE}, got {rope_table.dtype}.")
+
     def post_load_weights(self) -> None:
         for name, param in self.named_parameters():
             if name in MINIMAX_H3_FP32_PARAM_NAMES and param.dtype != _FP32_DTYPE:
@@ -1362,18 +1412,26 @@ class MiniMaxH3DiTModel(nn.Module):
         if inverse_indices.shape[0] != seq_len:
             raise ValueError(f"inverse_indices must be [{seq_len}], got {list(inverse_indices.shape)}")
         device = x.device
-        local_sp_registry = getattr(self.local_sp_prepare, "_hook_registry", None)
-        hooks_applied = local_sp_registry is not None
-        if local_sp_registry is not None:
-            local_sp_hook = local_sp_registry.get_hook(_LOCAL_SP_PREPARE_HOOK)
-            hooks_applied = local_sp_hook is not None
-        local_span = _sequence_parallel_local_span(
-            seq_len,
-            hooks_applied=hooks_applied,
-        )
+        local_span = self._rope_local_span(seq_len)
         local_start, local_len = local_span
-        rope_position_ids = img_position_ids.narrow(1, local_start, local_len)
-        rope_table = _build_rope_table(self.rope(rope_position_ids).to(device))
+        rope_table = kwargs.get("rope_table")
+        if rope_table is None:
+            if current_omni_platform.is_npu():
+                rope_table = self.prepare_rope_table(
+                    img_position_ids,
+                    seq_len=seq_len,
+                )
+            else:
+                # Keep CUDA/CPU numerically and structurally identical to the
+                # main-branch reference path used by the H100 accuracy suite.
+                rope_position_ids = img_position_ids.narrow(1, local_start, local_len)
+                rope_table = _build_rope_table(self.rope(rope_position_ids).to(device))
+        else:
+            self._validate_prepared_rope_table(
+                rope_table,
+                local_len=local_len,
+                device=device,
+            )
 
         decoder_input, t_emb = self._embed(
             x=x,

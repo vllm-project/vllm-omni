@@ -630,8 +630,24 @@ def test_typed_ming_image_engine_args_defer_diffusion_batch_default():
     assert OmniDiffusionConfig(**typed_backend_args).max_num_seqs == 1
 
 
+def _fake_model_root(pipeline, tmp_path):
+    """A model directory carrying every subfolder the pipeline's stages declare.
+
+    Stage init fails closed when a declared ``model_subdir``/``tokenizer_subdir``
+    is not a real directory, because the joined path would otherwise reach
+    HuggingFace as a malformed repo id (issue #6638).
+    """
+    root = tmp_path / "model"
+    root.mkdir(exist_ok=True)
+    for stage in pipeline.stages:
+        for subdir in (stage.model_subdir, stage.tokenizer_subdir):
+            if subdir:
+                (root / subdir).mkdir(parents=True, exist_ok=True)
+    return str(root)
+
+
 @pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
-def test_typed_engine_args_match_current_registry_backend_semantics(model_type):
+def test_typed_engine_args_match_current_registry_backend_semantics(model_type, tmp_path):
     pipeline = resolve_pipeline_config(model_type)
     if pipeline is None:
         pytest.skip(f"Pipeline {model_type!r} requires an HF config to resolve")
@@ -641,18 +657,19 @@ def test_typed_engine_args_match_current_registry_backend_semantics(model_type):
         if pipeline.default_deploy_config_name is not None
         else DeployConfig()
     )
+    model = _fake_model_root(pipeline, tmp_path)
     legacy_stages, omni_config = _legacy_and_typed_stages(
         pipeline,
         deploy,
-        model="/tmp",
+        model=model,
     )
 
     for legacy_stage in legacy_stages:
         stage_id = legacy_stage.stage_id
-        legacy_args = build_legacy_engine_args_dict(legacy_stage, model="/tmp")
+        legacy_args = build_legacy_engine_args_dict(legacy_stage, model=model)
         typed_args = build_engine_args_dict_from_omni_stage_config(
             omni_config.stage_by_id(stage_id),
-            model="/tmp",
+            model=model,
         )
         if legacy_stage.stage_type == StageType.DIFFUSION:
             backend_fields = _DIFFUSION_BACKEND_FIELDS

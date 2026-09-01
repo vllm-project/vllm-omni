@@ -24,6 +24,18 @@ if TYPE_CHECKING:
 omni_fixture_lock = threading.Lock()
 
 
+@pytest.fixture
+def _normalized_hardware_marks(request: pytest.FixtureRequest):
+    """Dummy carrier for mixed-``num_cards`` ``@hardware_test`` mark normalization.
+
+    Pytest has no API to clone an item and only change marks. ``@hardware_test``
+    therefore parametrizes this fixture (``indirect=True``) so each collected
+    item gets one platform's SKU and ``cards_{n}`` without changing test
+    signatures. The returned platform id is unused by test bodies.
+    """
+    return request.param
+
+
 @pytest.fixture(scope="function")
 def omni_server_function(
     request: pytest.FixtureRequest,

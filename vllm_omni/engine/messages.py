@@ -48,17 +48,6 @@ class AbortRequestMessage(EngineQueueMessage, kw_only=True):
     rpc_id: str | None = None
 
 
-class AbortResultMessage(EngineQueueMessage, kw_only=True):
-    type: Literal["abort_result"] = "abort_result"
-    rpc_id: str
-    success: bool
-    error: str | None = None
-
-    @property
-    def rpc_correlation_key(self) -> tuple[str, str]:
-        return ("abort", self.rpc_id)
-
-
 class InteractionMessage(EngineQueueMessage, kw_only=True):
     type: Literal["interaction"] = "interaction"
     request_id: str
@@ -111,6 +100,20 @@ class OutputMessage(EngineQueueMessage, kw_only=True):
     metrics: StageRequestMetrics | None = None
     finished: bool
     stage_submit_ts: float | None = None
+
+
+class AbortResultMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["abort_result"] = "abort_result"
+    rpc_id: str
+    success: bool
+    error: str | None = None
+    # Final-stage AR abort outputs (partial tokens) for frontend delivery.
+    # Empty for diffusion / requests with no output-processor state.
+    abort_outputs: list[OutputMessage] | None = None
+
+    @property
+    def rpc_correlation_key(self) -> tuple[str, str]:
+        return ("abort", self.rpc_id)
 
 
 class StageMetricsMessage(EngineQueueMessage, kw_only=True):

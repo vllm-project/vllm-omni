@@ -44,10 +44,16 @@ steps:
           - pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m "slow"
         mirror_hardwares: h100_4
 
-      - label: "Reliability Test · Invalid parameters · H100"
-        timeout_in_minutes: 120
+      - label: "Reliability Test · Invalid parameters · H100 · Single-GPU"
+        timeout_in_minutes: 90
         commands:
-          - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and H100"
+          - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and H100 and cards_1"
+        mirror_hardwares: h100_1
+
+      - label: "Reliability Test · Invalid parameters · H100 · 2-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and H100 and cards_2"
         mirror_hardwares: h100_2
 
       - label: "Reliability Test · Invalid parameters · L4"
@@ -105,27 +111,37 @@ steps:
     if: build.env("NON_CRITICAL") == "1"
     steps:
 
-      - label: "Omni · L4"
+      # Qwen2.5 expansion (CUDA 4-card / online 2-card) stays on this l4_4 job.
+      - label: "Omni · L4 · Multi-GPU"
         timeout_in_minutes: 90
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          - pytest -s -v tests/e2e/*/test_qwen2_5_omni_expansion.py --run-level "core_model"
+          - pytest -s -v tests/e2e/*/test_qwen2_5_omni_expansion.py -m "slow and L4 and omni and not cards_1" --run-level "core_model"
           - >-
             pytest -s -v tests/e2e/
             --ignore=tests/e2e/online_serving/test_qwen2_5_omni_expansion.py
             --ignore=tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py
-            -m "slow and L4 and omni"
+            -m "slow and L4 and omni and not cards_1"
             --run-level "full_model"
         mirror_hardwares: l4_4
 
-      - label: "Omni · H100"
+      - label: "Omni · H100 · Single-GPU"
         timeout_in_minutes: 90
         commands:
           - >-
             pytest -sv
-            tests/e2e/ -m "slow and H100 and omni"
+            tests/e2e/ -m "slow and H100 and omni and cards_1"
             --run-level "full_model"
-        mirror_hardwares: h100_2
+        mirror_hardwares: h100_1
+
+      - label: "Omni · H100 · 4-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/ -m "slow and H100 and omni and cards_4"
+            --run-level "full_model"
+        mirror_hardwares: h100_4
 
       - label: "TTS · L4"
         timeout_in_minutes: 120
@@ -169,12 +185,21 @@ steps:
             --run-level "full_model"
         mirror_hardwares: l4_1
 
-      - label: "Diffusion · L4"
+      - label: "Diffusion · L4 · Single-GPU"
         timeout_in_minutes: 60
         commands:
           - >-
             pytest -sv
-            tests/e2e/ -m "slow and diffusion and L4"
+            tests/e2e/ -m "slow and diffusion and L4 and cards_1"
+            --run-level "full_model"
+        mirror_hardwares: l4_1
+
+      - label: "Diffusion · L4 · Multi-GPU"
+        timeout_in_minutes: 60
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/ -m "slow and diffusion and L4 and not cards_1"
             --run-level "full_model"
         mirror_hardwares: l4_4
 
@@ -183,15 +208,24 @@ steps:
         commands:
           - >-
             pytest -sv
-            tests/e2e/ -m "slow and diffusion and H100 and not distributed_cuda"
+            tests/e2e/ -m "slow and diffusion and H100 and cards_1"
             --run-level "full_model"
         mirror_hardwares: h100_1
 
-      - label: "Diffusion · H100 · Multi-GPU"
+      - label: "Diffusion · H100 · 2-GPU"
         timeout_in_minutes: 90
         commands:
           - >-
             pytest -sv
-            tests/e2e/ -m "slow and diffusion and H100 and distributed_cuda"
+            tests/e2e/ -m "slow and diffusion and H100 and cards_2"
+            --run-level "full_model"
+        mirror_hardwares: h100_2
+
+      - label: "Diffusion · H100 · 4-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/ -m "slow and diffusion and H100 and cards_4"
             --run-level "full_model"
         mirror_hardwares: h100_4

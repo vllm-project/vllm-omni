@@ -157,7 +157,13 @@ def test_speech_missing_required_fields(omni_server: OmniServer, online_client: 
                 "ref_audio": None,
                 "ref_text": None,
             },
-            ("Invalid voice", "vivian"),
+            # NOTE: This is delegating down the TTS adapter, so the message is both specific
+            # to the Qwen3TTS adapter and dependent on whether or not the model has any speakers
+            # (as opposed to having valida speakers, but getting an invalid speaker). it would
+            # be more ideal to validate that this is landing on `.validate()` on the adapter
+            # and ensuring that the returned message matches what we would get from calling the
+            # adapter validate directly.
+            ("no speakers configured",),
             id="customvoice_invalid_voice",
         ),
         pytest.param(

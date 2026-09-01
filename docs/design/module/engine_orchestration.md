@@ -37,6 +37,7 @@ validation_paths:
   - tests/engine/test_async_omni_engine_input.py
   - tests/engine/test_async_omni_engine_outputs.py
   - tests/engine/test_async_omni_engine_abort.py
+  - tests/e2e/offline_inference/test_qwen3_omni.py
   - tests/engine/test_async_omni_engine_stage_init.py
   - tests/engine/test_orchestrator.py
   - tests/engine/test_orchestrator_error_handling.py
@@ -113,6 +114,15 @@ Numbers become append-only after normative promotion.
 
 Test routing, output ordering, queue correlation, cancellation, failure
 propagation, shutdown ordering, and representative multi-stage execution.
+AR abort of a final-stage LLM request must deliver a terminal output with
+`finish_reason="abort"` and the generated prefix so collocated training can
+resume; diffusion abort remains whole-sample retry. Aborting a parallel-sampling
+child must drop `parent_requests` once no children remain. EngineCore control
+RPCs (`sleep` / `wake_up` / `pause_scheduler` / `resume_scheduler`) must
+propagate worker exceptions rather than returning `{"supported": False}`.
+When a request has multiple final output stages, only the last abort message
+is request-terminal. Output-processor abort state is committed only after the
+physical EngineCore abort succeeds.
 Changes that cross into stage runtime or public error behavior require review
 from that contract's owners.
 
