@@ -401,7 +401,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 if is_segment_finished:
                     # The queued FIFO item now owns the old segment. Start the next
                     # segment's deduplication watermark before the worker sends it.
-                    self._segment_generation[external_req_id] = generation + 1
+                    # Only advance past the current generation when the producer
+                    # maintains a request-side counter that can catch up. On paths
+                    # where the request carries no `_omni_segment_generation`, a
+                    # speculative +1 makes every subsequent frame look stale and
+                    # starves the stream permanently (see #6816).
+                    if getattr(request, "_omni_segment_generation", None) is not None:
+                        self._segment_generation[external_req_id] = generation + 1
+                    else:
+                        self._segment_generation[external_req_id] = generation
                     self.requests_num_chunks_sent.pop(external_req_id, None)
         if reject_reason is not None:
             logger.error("Cannot enqueue %s: %s", external_req_id, reject_reason)

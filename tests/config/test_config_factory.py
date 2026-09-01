@@ -41,6 +41,11 @@ from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+SINGLE_STAGE_PIPE_CFG = (StagePipelineConfig(stage_id=0, model_stage="a", final_output=True),)
+# Validation strings to match against in post init
+NO_STAGES_MATCH_STR = "no stages"
+NO_TERMINAL_STAGE_MATCH_STR = "No terminal stage"
+
 
 @pytest.fixture(autouse=True)
 def _stable_test_platform(monkeypatch):
@@ -618,6 +623,7 @@ class TestPipelineDiscovery:
         p = PipelineConfig(
             model_type="custom_collide",
             hf_architectures=("SomeCollidingArch",),
+            stages=SINGLE_STAGE_PIPE_CFG,
         )
         assert p.hf_architectures == ("SomeCollidingArch",)
 
@@ -639,33 +645,63 @@ class TestStagePipelineConfig:
 
 
 class TestPipelineConfigNew:
-    def test_frozen(self):
-        p = PipelineConfig(model_type="t", model_arch="A")
-        with pytest.raises(AttributeError):
-            p.model_type = "changed"
+    def test_simple_init(self):
+        # Ensure pipeline config validates in post init.
+        PipelineConfig(
+            model_type="t",
+            model_arch="A",
+            stages=SINGLE_STAGE_PIPE_CFG,
+        )
 
-    def test_validate_valid(self):
+    def test_frozen(self):
         p = PipelineConfig(
             model_type="t",
             model_arch="A",
+            stages=SINGLE_STAGE_PIPE_CFG,
+        )
+        with pytest.raises(AttributeError):
+            p.model_type = "changed"
+
+    def test_validate_no_stages(self):
+        with pytest.raises(ValueError, match=NO_STAGES_MATCH_STR):
+            PipelineConfig(model_type="t", model_arch="A")
+
+    def test_validate_no_terminal_stage(self):
+        """A pipeline with no ``final_output`` stage can never emit a result."""
+        with pytest.raises(ValueError, match=NO_TERMINAL_STAGE_MATCH_STR):
+            PipelineConfig(
+                model_type="t",
+                model_arch="A",
+                stages=(
+                    StagePipelineConfig(stage_id=0, model_stage="a"),
+                    StagePipelineConfig(stage_id=1, model_stage="b", input_sources=(0,)),
+                ),
+            )
+
+    def test_pipeline_can_have_final_output_in_any_stage(self):
+        """Ensure any stage may carry ``final_output``."""
+        PipelineConfig(
+            model_type="t",
+            model_arch="A",
             stages=(
-                StagePipelineConfig(stage_id=0, model_stage="a"),
+                StagePipelineConfig(stage_id=0, model_stage="a", final_output=True),
                 StagePipelineConfig(stage_id=1, model_stage="b", input_sources=(0,)),
             ),
         )
-        assert p.validate() == []
-
-    def test_validate_no_stages(self):
-        p = PipelineConfig(model_type="t", model_arch="A")
-        assert any("no stages" in e.lower() for e in p.validate())
 
 
 class TestPipelineRegistration:
     def test_resolve_pipeline_prefers_deploy_pipeline_key(self, clean_pipeline_registry, tmp_path):
         deploy_key = "deploy_selected_pipeline"
         model_type_key = "hf_model_type_pipeline"
-        deploy_pipe = PipelineConfig(model_type=deploy_key)
-        model_type_pipe = PipelineConfig(model_type=model_type_key)
+        deploy_pipe = PipelineConfig(
+            model_type=deploy_key,
+            stages=SINGLE_STAGE_PIPE_CFG,
+        )
+        model_type_pipe = PipelineConfig(
+            model_type=model_type_key,
+            stages=SINGLE_STAGE_PIPE_CFG,
+        )
         register_pipeline(deploy_pipe)
         register_pipeline(model_type_pipe)
 
@@ -691,7 +727,11 @@ class TestPipelineRegistration:
         tmp_path,
     ):
         model_type_key = "registered_model_type_pipeline"
-        register_pipeline(PipelineConfig(model_type=model_type_key))
+        pipeline_cfg = PipelineConfig(
+            model_type=model_type_key,
+            stages=SINGLE_STAGE_PIPE_CFG,
+        )
+        register_pipeline(pipeline_cfg)
 
         deploy_path = tmp_path / "deploy.yaml"
         deploy_path.write_text("pipeline: missing_pipeline\n", encoding="utf-8")
@@ -726,6 +766,7 @@ class TestPipelineRegistration:
         pipe_cfg = PipelineConfig(
             model_type=pipeline_key,
             hf_architectures=("ArchitectureFallbackForTest",),
+            stages=SINGLE_STAGE_PIPE_CFG,
         )
         register_pipeline(pipe_cfg)
 
@@ -756,15 +797,18 @@ class TestPipelineRegistration:
             model_type="rejected_by_predicate",
             hf_architectures=(shared_arch,),
             hf_config_predicate=rejecting_predicate,
+            stages=SINGLE_STAGE_PIPE_CFG,
         )
         raises_cfg = PipelineConfig(
             model_type="raises_in_predicate",
             hf_architectures=(shared_arch,),
             hf_config_predicate=raising_predicate,
+            stages=SINGLE_STAGE_PIPE_CFG,
         )
         accept_cfg = PipelineConfig(
             model_type="accepted_by_predicate",
             hf_architectures=(shared_arch,),
+            stages=SINGLE_STAGE_PIPE_CFG,
         )
         register_pipeline(reject_cfg)
         register_pipeline(raises_cfg)
@@ -798,6 +842,7 @@ class TestPipelineRegistration:
             model_type="predicate_without_arch_match",
             hf_architectures=("DifferentArchitectureForTest",),
             hf_config_predicate=predicate,
+            stages=SINGLE_STAGE_PIPE_CFG,
         )
         register_pipeline(pipe_cfg)
 
@@ -821,6 +866,7 @@ class TestPipelineRegistration:
         resolved_cfg = PipelineConfig(
             model_type="callable_resolved_pipeline",
             hf_architectures=("CallableArchitectureForTest",),
+            stages=SINGLE_STAGE_PIPE_CFG,
         )
         seen_hf_configs = []
 
@@ -894,7 +940,10 @@ class TestPipelineRegistration:
     def test_pipeline_registration(self, clean_pipeline_registry):
         """Ensure that we can register and create a custom pipeline config."""
         new_model_type = "new_model_type"
-        pipe_cfg = PipelineConfig(model_type=new_model_type)
+        pipe_cfg = PipelineConfig(
+            model_type=new_model_type,
+            stages=SINGLE_STAGE_PIPE_CFG,
+        )
 
         # Register the new PipelineConfig
         assert new_model_type not in OMNI_PIPELINES
@@ -937,7 +986,10 @@ class TestPipelineRegistration:
         def custom_resolver(
             hf_config: FakeConfig,
         ) -> PipelineConfig:
-            return PipelineConfig(model_type=resolved_type)
+            return PipelineConfig(
+                model_type=resolved_type,
+                stages=SINGLE_STAGE_PIPE_CFG,
+            )
 
         # Register the new PipelineConfig
         assert new_model_type not in OMNI_PIPELINES
@@ -994,7 +1046,7 @@ class TestPipelineRegistration:
         pipe_cfg = PipelineConfig(
             model_type=pipeline_key,
             model_arch="DeployOnlyArch",
-            stages=(StagePipelineConfig(stage_id=0, model_stage="diffusion"),),
+            stages=SINGLE_STAGE_PIPE_CFG,
         )
         register_pipeline(pipe_cfg)
 
@@ -1027,7 +1079,11 @@ class TestPipelineRegistration:
 
     def test_structured_path_loads_explicit_deploy_config_once(self, clean_pipeline_registry, tmp_path):
         pipeline_key = "single_load_pipeline"
-        register_pipeline(PipelineConfig(model_type=pipeline_key))
+        pipeline_cfg = PipelineConfig(
+            model_type=pipeline_key,
+            stages=SINGLE_STAGE_PIPE_CFG,
+        )
+        register_pipeline(pipeline_cfg)
         deploy_path = tmp_path / "single_load.yaml"
         deploy_path.write_text(f"pipeline: {pipeline_key}\n", encoding="utf-8")
 
@@ -1057,6 +1113,7 @@ class TestPipelineRegistration:
         pipeline = PipelineConfig(
             model_type="pipeline_with_default",
             default_deploy_config_name=default_name,
+            stages=SINGLE_STAGE_PIPE_CFG,
         )
 
         with patch(
@@ -1076,8 +1133,16 @@ class TestPipelineRegistration:
             OmniServingCapability.COMPLETIONS,
             "pipeline_a blocks completions",
         )
-        pipe_a = PipelineConfig(model_type="detect_type", endpoint_restrictions=(restriction,))
-        pipe_b = PipelineConfig(model_type="override_type", endpoint_restrictions=())
+        pipe_a = PipelineConfig(
+            model_type="detect_type",
+            endpoint_restrictions=(restriction,),
+            stages=SINGLE_STAGE_PIPE_CFG,
+        )
+        pipe_b = PipelineConfig(
+            model_type="override_type",
+            endpoint_restrictions=(),
+            stages=SINGLE_STAGE_PIPE_CFG,
+        )
         register_pipeline(pipe_a)
         register_pipeline(pipe_b)
 
@@ -1617,6 +1682,7 @@ stages:
                     model_stage="ar",
                     execution_type=StageExecutionType.LLM_AR,
                     requires_multimodal_data=True,
+                    final_output=True,
                 ),
             ),
         )
@@ -1637,6 +1703,7 @@ stages:
                     model_stage="ar",
                     execution_type=StageExecutionType.LLM_AR,
                     scheduler_cls=scheduler_cls,
+                    final_output=True,
                 ),
             ),
         )
@@ -1882,7 +1949,6 @@ class TestQwen3OmniPipeline:
         assert isinstance(p, PipelineConfig)
         assert p.model_arch == "Qwen3OmniMoeForConditionalGeneration"
         assert len(p.stages) == 3
-        assert p.validate() == []
 
     def test_thinker(self):
         p = resolve_pipeline_config(
@@ -1936,7 +2002,6 @@ class TestQwen2_5OmniPipeline:
         assert isinstance(p, PipelineConfig)
         assert p.model_arch == "Qwen2_5OmniForConditionalGeneration"
         assert len(p.stages) == 3
-        assert p.validate() == []
 
     def test_thinker(self):
         p = resolve_pipeline_config("qwen2_5_omni")
@@ -1985,7 +2050,6 @@ class TestQwen3TTSPipeline:
         assert p is not None
         assert p.model_arch == "Qwen3TTSTalkerForConditionalGeneration"
         assert len(p.stages) == 2
-        assert p.validate() == []
 
     def test_talker_stage(self):
         p = resolve_pipeline_config("qwen3_tts")
@@ -2065,7 +2129,6 @@ class TestMingFlashOmniPipeline:
         assert isinstance(p, PipelineConfig)
         assert p.model_arch == "MingFlashOmniForConditionalGeneration"
         assert len(p.stages) == 2
-        assert p.validate() == []
 
     def test_thinker_stage(self):
         p = resolve_pipeline_config("ming_flash_omni")
@@ -2122,7 +2185,6 @@ class TestMingFlashOmniPipeline:
         assert isinstance(p, PipelineConfig)
         assert p.model_arch == "MingFlashOmniTalkerForConditionalGeneration"
         assert len(p.stages) == 1
-        assert p.validate() == []
 
     def test_tts_stage(self):
         p = resolve_pipeline_config("ming_flash_omni_tts")
@@ -2179,7 +2241,6 @@ class TestMingFlashOmniPipeline:
         assert isinstance(p, PipelineConfig)
         assert p.model_arch == "MingFlashOmniForConditionalGeneration"
         assert len(p.stages) == 1
-        assert p.validate() == []
 
     def test_thinker_only_stage(self):
         p = resolve_pipeline_config("ming_flash_omni_thinker_only")
@@ -2218,7 +2279,6 @@ class TestMingFlashOmniPipeline:
         assert p is not None
         assert p.model_arch == "MingFlashOmniForConditionalGeneration"
         assert len(p.stages) == 2
-        assert p.validate() == []
 
     def test_image_thinker_stage(self):
         s = resolve_pipeline_config("ming_flash_omni_image").get_stage(0)
@@ -2398,6 +2458,20 @@ class TestPlatformOverrides:
         rocm = _apply_platform_overrides(base, platform="rocm")
         assert rocm.stages[0].enforce_eager is None
         assert rocm.stages[1].enforce_eager is True
+
+    def test_higgs_audio_v3_rocm_uses_triton_attention(self):
+        deploy_path = Path(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
+
+        base = load_deploy_config(deploy_path)
+        assert base.stages[0].engine_extras["attention_backend"] == "FLASHINFER"
+
+        rocm = _apply_platform_overrides(base, platform="rocm")
+        assert rocm.stages[0].engine_extras["attention_backend"] == "TRITON_ATTN"
+
+        pipeline = resolve_pipeline_config("higgs_multimodal_qwen3")
+        assert isinstance(pipeline, PipelineConfig)
+        stages = merge_pipeline_deploy(pipeline, rocm)
+        assert stages[0].yaml_engine_args["attention_backend"] == "TRITON_ATTN"
 
     def test_qwen3_omni_cuda_uses_thinker_rotary_custom_op(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))

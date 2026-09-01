@@ -30,6 +30,7 @@ RUN python3 -m pip install -v --no-deps \
       "stepaudio2-minicpmo>=0.1.1" \
       "step-audio2>=1.0.0"
 
+ENV VLLM_TARGET_DEVICE=npu
 ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 ENTRYPOINT []

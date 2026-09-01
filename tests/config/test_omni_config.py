@@ -45,6 +45,7 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageDeployConfig,
     StageExecutionType,
+    StagePipelineConfig,
     load_deploy_config,
     merge_pipeline_deploy,
 )
@@ -653,6 +654,7 @@ def test_sub_config_fields_match_structured_scopes():
         "ring_degree",
         "allgather_degree",
         "ulysses_mode",
+        "ulysses_a2a_permute",
         "cfg_parallel_size",
         "vae_patch_parallel_size",
         "vae_parallel_mode",
@@ -858,6 +860,23 @@ def test_from_pipeline_config_derives_sequence_parallel_size_from_allgather_degr
     assert stage.parallel_config.world_size == 2
 
 
+def test_from_pipeline_config_preserves_deployed_ulysses_a2a_permute() -> None:
+    pipeline = _resolve_pipeline_or_skip("dreamzero")
+    deploy = DeployConfig(
+        stages=[
+            StageDeployConfig(
+                stage_id=0,
+                ulysses_a2a_permute=True,
+            )
+        ]
+    )
+
+    stage = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_by_id(0)
+
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.parallel_config.ulysses_a2a_permute is True
+
+
 def test_diffusion_parallel_config_accepts_four_way_guidance_parallelism():
     cfg = OmniStageDiffusionParallelConfig(cfg_parallel_size=4)
 
@@ -1021,7 +1040,10 @@ def test_from_pipeline_config_uses_hf_config_for_callable_resolver():
 
 
 def test_from_pipeline_config_accepts_pre_resolved_pipeline():
-    resolved_pipeline = PipelineConfig(model_type="callable_resolved_variant")
+    resolved_pipeline = PipelineConfig(
+        model_type="callable_resolved_variant",
+        stages=(StagePipelineConfig(stage_id=0, model_stage="a", final_output=True),),
+    )
 
     omni_config = VllmOmniConfig.from_pipeline_config(resolved_pipeline)
 
@@ -1054,6 +1076,7 @@ def test_from_pipeline_config_default_deploy_name_ignores_cwd(monkeypatch, tmp_p
     pipeline = PipelineConfig(
         model_type="pipeline_with_default",
         default_deploy_config_name=default_name,
+        stages=(StagePipelineConfig(stage_id=0, model_stage="a", final_output=True),),
     )
     loaded_paths = []
 

@@ -302,6 +302,17 @@ class PipelineConfig:
     # Global CLI spelling -> (stage id, stage-local spelling).
     stage_cli_aliases: dict[str, tuple[int, str]] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        errors = self.get_validation_errors()
+
+        if errors:
+            # If we have multiple errors, put them on separate indented lines for readability
+            multi_sep = "\n\t"
+            error_str = multi_sep.join(errors)
+            if len(errors) > 1:
+                error_str = f"{multi_sep}{error_str}"
+            raise ValueError(f"PipelineConfig initialization failed with the following error(s): {error_str}")
+
     def get_stage(self, stage_id: int) -> StagePipelineConfig | None:
         """Look up a stage by its ID."""
         for stage in self.stages:
@@ -309,7 +320,7 @@ class PipelineConfig:
                 return stage
         return None
 
-    def validate(self) -> list[str]:
+    def get_validation_errors(self) -> list[str]:
         """Return list of topology errors (empty if valid)."""
         errors: list[str] = []
         if not self.stages:
@@ -327,6 +338,11 @@ class PipelineConfig:
                     errors.append(f"Stage {stage.stage_id} references itself")
         if not any(not s.input_sources for s in self.stages):
             errors.append("No entry point (stage with empty input_sources)")
+        # Request completion and client-visible output are both driven by stages
+        # that declare ``final_output`` (see ``Orchestrator._route_output``). A
+        # pipeline without one can never emit a result, so every request hangs.
+        if not any(s.final_output for s in self.stages):
+            errors.append("No terminal stage (stage with final_output=True)")
         return errors
 
 
@@ -389,6 +405,7 @@ class StageDeployConfig:
     # Diffusion parallel_config deploy/runtime override fields.
     ulysses_degree: int | None = None
     ulysses_mode: str | None = None
+    ulysses_a2a_permute: bool | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     sequence_parallel_size: int | None = None

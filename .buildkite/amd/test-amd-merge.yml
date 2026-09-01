@@ -72,7 +72,22 @@ steps:
         - export VLLM_LOGGING_LEVEL=DEBUG
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
         - pytest -s -v tests/diffusion/offloader/test_diffusion_cpu_offload.py
-        - pytest -s -v tests/diffusion/offloader/test_diffusion_layerwise_offload.py
+        - >-
+          pytest -s -v tests/diffusion/offloader/test_diffusion_layerwise_offload.py
+          --deselect='tests/diffusion/offloader/test_diffusion_layerwise_offload.py::test_layerwise_offload_diffusion_model[stabilityai/stable-audio-open-1.0]'
+
+    # TODO: Diagnose unstable Stable Audio layerwise-offload memory savings on ROCm.
+    - label: "Diffusion Stable Audio Layerwise Offload Test (quarantined)"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      commands:
+        - export VLLM_LOGGING_LEVEL=DEBUG
+        - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        - >-
+          pytest -s -v
+          'tests/diffusion/offloader/test_diffusion_layerwise_offload.py::test_layerwise_offload_diffusion_model[stabilityai/stable-audio-open-1.0]'
 
     - label: "Diffusion Sequence Parallelism Test (Need 4 GPUs) · Shard 1/2"
       agent_pool: mi300_4

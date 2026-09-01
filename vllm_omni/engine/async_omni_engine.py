@@ -129,7 +129,6 @@ class AsyncOmniEngine:
         model: str,
         stage_init_timeout: int = 300,
         init_timeout: int = 600,
-        diffusion_batch_size: int = 1,
         single_stage_mode: bool = False,
         transfer_emitter: Any = None,
         prom_metrics: Any = None,
@@ -140,7 +139,6 @@ class AsyncOmniEngine:
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
-        self.diffusion_batch_size = diffusion_batch_size
         # Cached by get_diffusion_od_config().
         self._diffusion_od_config_view: Any = None
         startup_timeout = int(init_timeout)
@@ -320,7 +318,6 @@ class AsyncOmniEngine:
             config_path=self.config_path,
             single_stage_mode=self.single_stage_mode,
             stage_init_timeout=stage_init_timeout,
-            diffusion_batch_size=self.diffusion_batch_size,
             async_chunk=self.async_chunk,
             tokenizer=self.tokenizer,
             single_stage_id_filter=self._single_stage_id_filter,
@@ -1051,6 +1048,7 @@ class AsyncOmniEngine:
             ring_degree = normalized_kwargs.get("ring_degree") or 1
             allgather_degree = normalized_kwargs.get("allgather_degree") or 1
             ulysses_mode = normalized_kwargs.get("ulysses_mode") or "strict"
+            ulysses_a2a_permute = bool(normalized_kwargs.get("ulysses_a2a_permute", False))
             sequence_parallel_size = normalized_kwargs.get("sequence_parallel_size")
             pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
             data_parallel_size = normalized_kwargs.get("data_parallel_size")
@@ -1077,6 +1075,7 @@ class AsyncOmniEngine:
                 ring_degree=ring_degree,
                 allgather_degree=allgather_degree,
                 ulysses_mode=ulysses_mode,
+                ulysses_a2a_permute=ulysses_a2a_permute,
                 cfg_parallel_size=cfg_parallel_size,
                 vae_patch_parallel_size=vae_patch_parallel_size,
                 vae_parallel_mode=vae_parallel_mode,

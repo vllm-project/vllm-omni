@@ -1,7 +1,6 @@
 # Wan2.2 TI2V-5B deploy.
 #
 # Single GPU by default. Increase tensor_parallel_size and devices for A14B MoE variants.
-# Request-level batching uses scheduler max_num_seqs, not diffusion_batch_size.
 async_chunk: false
 trust_remote_code: true
 distributed_executor_backend: mp

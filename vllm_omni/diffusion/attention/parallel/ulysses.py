@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -14,6 +14,11 @@ from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
 from vllm_omni.diffusion.forward_context import get_ulysses_mode
+
+
+def _a2a_permute_enabled(enabled: bool, scatter_idx: int, gather_idx: int, world_size: int) -> bool:
+    """Whether the fused permute-free all-to-all applies (strict layout only)."""
+    return enabled and world_size > 1 and scatter_idx == 2 and gather_idx == 1
 
 
 def _ceil_div(n: int, d: int) -> int:
@@ -181,12 +186,23 @@ class UlyssesParallelAttention:
         scatter_idx: int,
         gather_idx: int,
         use_sync: bool,
+        ulysses_a2a_permute: bool = False,
     ) -> None:
         self._sp_group = sp_group
         self._ulysses_pg = sp_group.ulysses_group
         self._scatter_idx = scatter_idx
         self._gather_idx = gather_idx
         self._use_sync = use_sync
+        self._ulysses_a2a_permute = ulysses_a2a_permute
+        if _a2a_permute_enabled(
+            ulysses_a2a_permute,
+            scatter_idx,
+            gather_idx,
+            sp_group.ulysses_world_size,
+        ):
+            from vllm_omni.diffusion.distributed.a2a_permute import ensure_a2a_permute_available
+
+            ensure_a2a_permute_available()
 
     @property
     def enabled(self) -> bool:
@@ -347,9 +363,26 @@ class UlyssesParallelAttention:
                     )
 
             # (bs, seq_len/P, head_cnt, head_size) -> (bs, seq_len, head_cnt/P, head_size)
-            query = SeqAllToAll4D.apply(self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync)
-            key = SeqAllToAll4D.apply(self._ulysses_pg, key, self._scatter_idx, self._gather_idx, self._use_sync)
-            value = SeqAllToAll4D.apply(self._ulysses_pg, value, self._scatter_idx, self._gather_idx, self._use_sync)
+            if _a2a_permute_enabled(
+                self._ulysses_a2a_permute,
+                self._scatter_idx,
+                self._gather_idx,
+                ulysses_world_size,
+            ):
+                from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd
+
+                group_name = self._ulysses_pg.group_name
+                query = ulysses_qkv_fwd(query, group_name, ulysses_world_size)
+                key = ulysses_qkv_fwd(key, group_name, ulysses_world_size)
+                value = ulysses_qkv_fwd(value, group_name, ulysses_world_size)
+            else:
+                query = SeqAllToAll4D.apply(
+                    self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync
+                )
+                key = SeqAllToAll4D.apply(self._ulysses_pg, key, self._scatter_idx, self._gather_idx, self._use_sync)
+                value = SeqAllToAll4D.apply(
+                    self._ulysses_pg, value, self._scatter_idx, self._gather_idx, self._use_sync
+                )
             seq_lens = []
             local_seq_len = 0
             orig_head_cnt = 0
@@ -456,6 +489,19 @@ class UlyssesParallelAttention:
                     orig_head_cnt=ctx.orig_head_cnt,
                     use_sync=ctx.use_sync,
                 )
+            elif _a2a_permute_enabled(
+                self._ulysses_a2a_permute,
+                ctx.scatter_idx,
+                ctx.gather_idx,
+                dist.get_world_size(ctx.ulysses_pg),
+            ):
+                from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
+
+                output_img = ulysses_o_rev(
+                    output_img,
+                    ctx.ulysses_pg.group_name,
+                    dist.get_world_size(ctx.ulysses_pg),
+                )
             else:
                 output_img = SeqAllToAll4D.apply(
                     ctx.ulysses_pg, output_img, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync
@@ -487,5 +533,18 @@ class UlyssesParallelAttention:
                 local_seq_len=ctx.uaa_local_seq_len,
                 orig_head_cnt=ctx.orig_head_cnt,
                 use_sync=ctx.use_sync,
+            )
+        if _a2a_permute_enabled(
+            self._ulysses_a2a_permute,
+            ctx.scatter_idx,
+            ctx.gather_idx,
+            dist.get_world_size(ctx.ulysses_pg),
+        ):
+            from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
+
+            return ulysses_o_rev(
+                attn_output,
+                ctx.ulysses_pg.group_name,
+                dist.get_world_size(ctx.ulysses_pg),
             )
         return SeqAllToAll4D.apply(ctx.ulysses_pg, attn_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync)

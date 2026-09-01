@@ -540,6 +540,111 @@ def test_realtime_duplex_soft_interrupt_accepts_multi_delta_handoff_sequence(tmp
     assert summary["response_summaries"][1]["transcript"] == "一加一等于二。"
 
 
+def test_realtime_duplex_soft_interrupt_accepts_followup_done_after_commit(tmp_path):
+    """A follow-up response can drain a residual model unit past the final commit.
+
+    Sequence: ``r1.done -> listen -> r2.created -> ... -> commit -> r2.done -> listen``.
+
+    The globally-last ``response.done`` (r2) lands *after* the commit, so anchoring
+    ``listen_after_response_before_commit`` on it leaves the ``(last_done, commit)``
+    interval empty and fails the contract even though the turn yielded the floor
+    correctly. The check must anchor on the last done strictly before the commit
+    (r1.done), with the listen at 3.1 s satisfying the sandwich.
+    """
+    demo = _load_soft_interrupt_demo_module()
+    output = tmp_path / "soft_interrupt_residual_drain"
+    output.mkdir()
+    first_response_id = "resp-first"
+    second_response_id = "resp-second"
+    events = [
+        {"type": "response.listen", "_client_received_at_s": 1.0},
+        {"type": "response.created", "response": {"id": first_response_id}, "_client_received_at_s": 2.0},
+        {"type": "response.speak", "response_id": first_response_id, "_client_received_at_s": 2.0},
+        {
+            "type": "response.audio.delta",
+            "response_id": first_response_id,
+            "delta": "AAAA",
+            "_client_received_at_s": 2.1,
+        },
+        {
+            "type": "response.audio_transcript.delta",
+            "response_id": first_response_id,
+            "delta": "中国古代四大发明",
+            "_client_received_at_s": 2.1,
+        },
+        {
+            "type": "response.audio.delta",
+            "response_id": first_response_id,
+            "delta": "AAAA",
+            "_client_received_at_s": 2.6,
+        },
+        {
+            "type": "response.audio_transcript.delta",
+            "response_id": first_response_id,
+            "delta": "是造纸术。",
+            "_client_received_at_s": 2.6,
+        },
+        {"type": "response.done", "response_id": first_response_id, "_client_received_at_s": 3.0},
+        {"type": "response.listen", "_client_received_at_s": 3.1},
+        {"type": "response.created", "response": {"id": second_response_id}, "_client_received_at_s": 3.5},
+        {"type": "response.speak", "response_id": second_response_id, "_client_received_at_s": 3.5},
+        {
+            "type": "response.audio.delta",
+            "response_id": second_response_id,
+            "delta": "AAAA",
+            "_client_received_at_s": 3.6,
+        },
+        {
+            "type": "response.audio_transcript.delta",
+            "response_id": second_response_id,
+            "delta": "一加一等于",
+            "_client_received_at_s": 3.6,
+        },
+        {
+            "type": "response.audio.delta",
+            "response_id": second_response_id,
+            "delta": "AAAA",
+            "_client_received_at_s": 3.7,
+        },
+        {
+            "type": "response.audio_transcript.delta",
+            "response_id": second_response_id,
+            "delta": "二。",
+            "_client_received_at_s": 3.7,
+        },
+        # The final commit lands while the follow-up response is still draining.
+        {"type": "input_audio_buffer.committed", "_client_received_at_s": 4.0},
+        {"type": "response.done", "response_id": second_response_id, "_client_received_at_s": 4.5},
+        {"type": "response.listen", "_client_received_at_s": 4.6},
+    ]
+    (output / "events.jsonl").write_text(
+        "".join(demo.json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    (output / "result.json").write_text(
+        demo.json.dumps({"ok": True, "response_ids": [first_response_id, second_response_id]}),
+        encoding="utf-8",
+    )
+
+    summary = demo.summarize_artifacts(
+        output_dir=output,
+        validation_mode="response-required",
+        min_responses=2,
+        min_audio_deltas_per_response=2,
+        expect_followup_response_substring="一加一等于二",
+    )
+
+    assert summary["ok"] is True
+    # Anchored on r1.done (the last done before the commit), not the late r2.done.
+    assert summary["listen_after_response_before_commit"] is True
+    # listen_after_last_done still keys off the globally-last done, hence the final listen.
+    assert summary["listen_after_last_done"] is True
+    assert summary["final_listen_after_commit"] is True
+    assert summary["second_response_before_final_commit"] is True
+    assert summary["followup_response_transcript_ok"] is True
+    assert summary["response_summaries"][1]["transcript"] == "一加一等于二。"
+
+
 def test_realtime_duplex_soft_interrupt_model_policy_accepts_single_response(tmp_path):
     demo = _load_soft_interrupt_demo_module()
     output = tmp_path / "model_policy"

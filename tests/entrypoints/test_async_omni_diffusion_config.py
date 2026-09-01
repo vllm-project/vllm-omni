@@ -33,6 +33,19 @@ def test_default_stage_config_includes_cache_backend():
     assert engine_args["model_stage"] == "diffusion"
 
 
+def test_default_stage_config_preserves_ulysses_a2a_permute() -> None:
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "ulysses_degree": 4,
+            "ulysses_a2a_permute": True,
+        }
+    )[0]
+
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config.ulysses_degree == 4
+    assert parallel_config.ulysses_a2a_permute is True
+
+
 def test_default_stage_config_preserves_model_extras():
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg({"extras": {"ltx2_use_conv_vae": True}})[0]
 
