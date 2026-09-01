@@ -72,6 +72,12 @@ class TestAttentionSpec:
         assert bk["dtype_vo"] == "fp8_e4m3"
         assert bk["flashinfer_backend"] == "trtllm-gen"
 
+    def test_quant_flashinfer_backend_serialized_without_dtype(self):
+        spec = AttentionSpec(backend="FLASHINFER_ATTN", quant={"flashinfer_backend": "fa2"})
+        assert spec.quant is not None
+        assert spec.quant.enabled is True
+        assert spec.backend_kwargs() == {"quant": {"flashinfer_backend": "fa2"}}
+
     def test_quant_and_skip_softmax_coexist(self):
         bk = AttentionSpec(
             backend="TRTLLM_ATTN", quant={"dtype_qk": "int8"}, skip_softmax={"target_sparsity": 0.5}
@@ -149,8 +155,8 @@ class TestAttentionSpec:
     def test_block_sparse_precision_enum_input_normalized(self):
         """RainFusionPrecision enum members must normalize to their string value.
 
-        Regression: the str,Enum members passed the value check but str() later
-        produced "RainFusionPrecision.MIX" instead of "mix" (StrEnum fixes it).
+        Regression: ``str(str, Enum)`` later produced ``RainFusionPrecision.MIX``
+        instead of ``mix``. ``BlockSparseSpec`` stores ``member.value``.
         """
         from vllm_omni.diffusion.attention.backends.rainfusion_attn import RainFusionConfig
         from vllm_omni.diffusion.data import RainFusionPrecision
@@ -549,6 +555,49 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
         assert attn.ring_runner is not None
         assert attn.ring_runner.attn_backend_pref == "TRTLLM_ATTN"
         assert attn.ring_runner.attn_backend_explicit is True
+
+    def test_attention_init_forwards_flashinfer_backend_without_dtype(self, monkeypatch):
+        class _FakeAttentionImpl:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class _FakeBackend:
+            @staticmethod
+            def get_name() -> str:
+                return "FLASHINFER_ATTN"
+
+            @staticmethod
+            def get_impl_cls():
+                return _FakeAttentionImpl
+
+        spec = AttentionSpec(backend="FLASHINFER_ATTN", quant={"flashinfer_backend": "fa2"})
+
+        monkeypatch.setattr(layer_mod, "get_attn_backend_for_role", lambda **kwargs: (_FakeBackend, spec))
+        monkeypatch.setattr(layer_mod.SDPABackend, "get_impl_cls", staticmethod(lambda: _FakeAttentionImpl))
+        monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: object())
+        monkeypatch.setattr(layer_mod, "get_sp_group", lambda: None)
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: False)
+
+        od_config = SimpleNamespace(
+            diffusion_attention_config=AttentionConfig(default=spec),
+            parallel_config=SimpleNamespace(ring_degree=1),
+            diffusion_kv_cache_dtype=None,
+            diffusion_kv_cache_skip_step_indices=None,
+            diffusion_kv_cache_skip_layer_indices=None,
+        )
+
+        with set_current_diffusion_config(od_config):
+            attn = Attention(
+                num_heads=4,
+                head_size=64,
+                causal=False,
+                softmax_scale=1.0,
+                role="self",
+            )
+
+        assert attn.backend_pref == "FLASHINFER_ATTN"
+        assert attn.attention.kwargs["backend_kwargs"] == {"quant": {"flashinfer_backend": "fa2"}}
+        assert attn.attention.kwargs["backend_explicit"] is True
 
     def test_attention_init_propagates_ring_setup_failure(self, monkeypatch):
         class _FakeAttentionImpl:

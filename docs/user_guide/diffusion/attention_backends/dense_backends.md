@@ -20,10 +20,11 @@ vllm-omni serve <model> --diffusion-attention-backend TORCH_SDPA
 ## `FLASH_ATTN`
 
 `FLASH_ATTN` uses the installed FlashAttention implementation. On Blackwell it
-prefers the CuTe-based FlashAttention 4 path and falls back to
-FlashAttention 3 or 2 when that path is unavailable. On Hopper, Ada, and
-Ampere it is the preferred automatic route when a compatible package is
-installed.
+is FA4 only (`flash_attn.cute` / `vllm-omni[fa4]`). If FA4 is unavailable,
+explicit `FLASH_ATTN` is rejected and automatic selection continues to another
+compatible Blackwell backend. Hopper-only FA2/FA3 wheels are not used, even if
+they import. On Hopper, Ada, and Ampere it is the preferred automatic route
+when a compatible package is installed.
 
 ```bash
 vllm-omni serve <model> --diffusion-attention-backend FLASH_ATTN

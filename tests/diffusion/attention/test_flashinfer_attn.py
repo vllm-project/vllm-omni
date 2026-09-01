@@ -83,6 +83,28 @@ def test_explicit_fa2_flashinfer_is_mask_capable(monkeypatch):
     assert FlashInferAttentionBackend.supports_attention_mask(spec) is True
 
 
+def test_explicit_fa2_backend_kwargs_select_fa2_on_blackwell(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 0))
+    spec = AttentionSpec(backend="FLASHINFER_ATTN", quant=AttnQuantSpec(flashinfer_backend="fa2"))
+    kwargs = spec.backend_kwargs() or {}
+    requested = (kwargs.get("quant") or {}).get("flashinfer_backend", "auto")
+
+    assert kwargs == {"quant": {"flashinfer_backend": "fa2"}}
+    assert FlashInferAttentionImpl._select_backend(requested) == "fa2"
+    assert FlashInferAttentionBackend.supports_attention_mask(spec) is True
+
+
+def test_auto_flashinfer_backend_kwargs_select_cute_dsl_on_blackwell(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 0))
+    spec = AttentionSpec(backend="FLASHINFER_ATTN")
+    kwargs = spec.backend_kwargs() or {}
+    requested = (kwargs.get("quant") or {}).get("flashinfer_backend", "auto")
+
+    assert "quant" not in kwargs
+    assert FlashInferAttentionImpl._select_backend(requested) == "cute-dsl"
+    assert FlashInferAttentionBackend.supports_attention_mask(spec) is False
+
+
 def test_hopper_explicit_flashinfer_is_mask_capable(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (9, 0))
     spec = AttentionSpec(backend="FLASHINFER_ATTN")
