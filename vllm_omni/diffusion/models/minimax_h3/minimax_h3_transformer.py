@@ -1088,6 +1088,13 @@ class MiniMaxH3DiTModel(nn.Module):
         self.arch = arch
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
+        # Comfy's serialized INT8 ConvRot checkpoint already stores fused QKV
+        # rows in runtime [Q-all, K-all, V-all] order.  Dense and online
+        # quantized MiniMax checkpoints retain the original grouped layout and
+        # still need the transform in load_weights().
+        self._qkv_checkpoint_is_runtime_layout = bool(
+            getattr(quant_config, "is_checkpoint_int8_convrot_serialized", False)
+        )
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
         self.num_channels_latents = arch.latents_dim
@@ -1276,14 +1283,15 @@ class MiniMaxH3DiTModel(nn.Module):
             if name.endswith(".attn.qkv_proj.weight") or (
                 name.endswith(".attn.qkv_proj.weight_scale") and is_channel_scale
             ):
-                # Transform checkpoint layout before entering vLLM's loader so
-                # online FP8 can keep ``online_process_loader`` outermost.
-                loaded_weight = _reorder_grouped_qkv_to_qkv(
-                    loaded_weight,
-                    num_query_groups=self.arch.num_attention_heads,
-                    heads_per_group=1,
-                    head_dim=self.arch.attention_head_dim,
-                )
+                if not getattr(self, "_qkv_checkpoint_is_runtime_layout", False):
+                    # Transform checkpoint layout before entering vLLM's loader
+                    # so online FP8 can keep ``online_process_loader`` outermost.
+                    loaded_weight = _reorder_grouped_qkv_to_qkv(
+                        loaded_weight,
+                        num_query_groups=self.arch.num_attention_heads,
+                        heads_per_group=1,
+                        head_dim=self.arch.attention_head_dim,
+                    )
                 weight_loader(param, loaded_weight)
             elif name.endswith(".mlp.fc1.weight") or (name.endswith(".mlp.fc1.weight_scale") and is_channel_scale):
                 if loaded_weight.shape[0] % 2:

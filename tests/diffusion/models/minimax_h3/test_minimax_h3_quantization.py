@@ -279,6 +279,53 @@ def test_model_load_weights_applies_fused_transforms_to_int8_scales(monkeypatch)
     assert other_scale_calls[0].shape == (3,)
 
 
+def test_model_load_weights_preserves_comfy_int8_runtime_qkv_layout(monkeypatch):
+    import vllm.model_executor.parameter as parameter_module
+
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3DiTArchConfig,
+        MiniMaxH3DiTModel,
+    )
+
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_world_size", lambda: 1)
+
+    weight_calls = []
+    scale_calls = []
+    model = object.__new__(MiniMaxH3DiTModel)
+    nn.Module.__init__(model)
+    model.arch = MiniMaxH3DiTArchConfig(
+        hidden_size=1,
+        num_attention_heads=2,
+        attention_head_dim=1,
+        ffn_hidden_size=2,
+    )
+    model._qkv_checkpoint_is_runtime_layout = True
+    model.blocks = nn.ModuleList([nn.Module()])
+    model.blocks[0].attn = nn.Module()
+    model.blocks[0].attn.qkv_proj = _QuantWeightTarget(
+        lambda _param, value: weight_calls.append(value.clone()),
+        lambda _param, value: scale_calls.append(value.clone()),
+    )
+
+    # Comfy serializes all query rows first, then key rows, then value rows.
+    qkv = torch.arange(6, dtype=torch.float32).reshape(6, 1)
+    qkv_scale = torch.arange(6, dtype=torch.float32)
+    loaded = model.load_weights(
+        [
+            ("blocks.0.attn.qkv_proj.weight", qkv),
+            ("blocks.0.attn.qkv_proj.weight_scale", qkv_scale),
+        ]
+    )
+
+    assert loaded == {
+        "blocks.0.attn.qkv_proj.weight",
+        "blocks.0.attn.qkv_proj.weight_scale",
+    }
+    torch.testing.assert_close(weight_calls[0], qkv)
+    torch.testing.assert_close(scale_calls[0], qkv_scale.unsqueeze(1))
+
+
 def test_model_load_weights_leaves_non_channel_fused_scales_to_their_loader():
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         MiniMaxH3DiTArchConfig,
@@ -455,7 +502,9 @@ def test_int8_convrot_apply_resolves_native_cuda_backend_once(monkeypatch, mocke
     activation = mocker.Mock(spec=torch.Tensor)
     activation.is_cuda = True
     activation.dtype = torch.bfloat16
-    layer = SimpleNamespace(weight=object(), weight_scale=object())
+    layer = nn.Module()
+    layer.weight = object()
+    layer.weight_scale = object()
 
     assert method.apply(layer, activation) is output
     assert method.apply(layer, activation) is output
