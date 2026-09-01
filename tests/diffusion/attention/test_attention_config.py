@@ -585,7 +585,9 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
 
         assert len(calls) == 1
         assert attention.attn_backend is _DenseBackend
-        assert attention.backend_pref is None
+        # Auto path records the resolved backend name for Ring/SP; it is not explicit.
+        assert attention.backend_pref == _DenseBackend.get_name()
+        assert attention.backend_explicit is False
 
     def test_attention_init_uses_current_diffusion_config_without_forward_context(self, monkeypatch):
         class _FakeAttentionImpl:
