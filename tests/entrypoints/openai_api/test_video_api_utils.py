@@ -520,6 +520,32 @@ def test_interleaved_video_uses_legacy_fallback_automatically(monkeypatch):
     assert len(coerce_calls) == 1
 
 
+def test_uint8_frames_reach_the_muxer_without_a_float_round_trip():
+    """uint8 is the muxer's own dtype, so normalisation must leave it alone.
+
+    MiniMax-H3 quantises on the accelerator to keep the response small across
+    its two process hops. Re-normalising to float here would undo that at the
+    last step and cost a full-size conversion in each direction.
+    """
+    video = np.arange(2 * 4 * 5 * 3, dtype=np.uint8).reshape(2, 4, 5, 3)
+
+    frames, frame_shape, common_dtype = video_api_utils._prepare_video_frames(video)
+
+    assert common_dtype == np.dtype(np.uint8)
+    assert frame_shape == (4, 5, 3)
+    np.testing.assert_array_equal(np.stack(frames), video)
+
+
+def test_non_uint8_integer_frames_are_still_normalised():
+    """Only uint8 is the muxer's dtype; other integer payloads still scale."""
+    video = np.full((2, 4, 5, 3), 255, dtype=np.int32)
+
+    frames, _, common_dtype = video_api_utils._prepare_video_frames(video)
+
+    assert np.issubdtype(common_dtype, np.floating)
+    np.testing.assert_allclose(frames[0], 1.0)
+
+
 @pytest.mark.parametrize(
     "video",
     [
@@ -552,9 +578,10 @@ def test_prepared_automatic_fallback_preserves_legacy_quantization(monkeypatch, 
     monkeypatch.setattr(media_utils, "mux_video_audio_bytes", fake_compat_mux)
 
     prepared_frames, frame_shape, _ = video_api_utils._prepare_video_frames(video)
-    reference = np.rint(np.clip(np.stack([frame[..., :3] for frame in prepared_frames]), 0.0, 1.0) * 255.0).astype(
-        np.uint8
-    )
+    stacked = np.stack([frame[..., :3] for frame in prepared_frames])
+    # uint8 frames are the muxer's own dtype and reach it unchanged; everything
+    # else is still quantised out of the normalised [0, 1] range.
+    reference = stacked if stacked.dtype == np.uint8 else np.rint(np.clip(stacked, 0.0, 1.0) * 255.0).astype(np.uint8)
 
     assert video_api_utils._encode_video_bytes(video, fps=12) == b"legacy-video"
     assert len(mux_inputs) == 1

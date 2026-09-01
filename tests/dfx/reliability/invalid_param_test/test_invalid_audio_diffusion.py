@@ -70,10 +70,14 @@ _PARAMS = [
         pytest.param({"guidance_scale": -1.0}, "guidance_scale", id="guidance_scale_negative", marks=_SKIP_ISSUE_3649),
         pytest.param({"guidance_scale": 0}, "guidance_scale", id="guidance_scale_zero", marks=_SKIP_ISSUE_3649),
         pytest.param(
-            {"num_inference_steps": 0}, "num_inference_steps", id="num_inference_steps_zero", marks=_SKIP_ISSUE_3649
+            {"num_inference_steps": 0},
+            ("num_inference_steps", "greater than or equal to 1"),
+            id="num_inference_steps_zero",
         ),
         pytest.param(
-            {"num_inference_steps": -1}, ("number of steps", "non-negative"), id="num_inference_steps_negative"
+            {"num_inference_steps": -1},
+            ("num_inference_steps", "greater than or equal to 1"),
+            id="num_inference_steps_negative",
         ),
         pytest.param(
             {"num_inference_steps": 6000},

@@ -43,21 +43,16 @@ def test_jit_build_includes_cuda_headers_from_nvidia_wheels(tmp_path, monkeypatc
 
 @dataclass
 class _FakeAllocation:
+    """Byte workspace stand-in that slices and reinterprets like ``symm_mem.empty()``."""
+
     size: int
     device: torch.device
 
+    def __post_init__(self) -> None:
+        self.buffer = torch.empty(self.size, dtype=torch.uint8)
 
-class _FakeHandle:
-    rank = 0
-
-    def __init__(self, allocation: _FakeAllocation) -> None:
-        self.allocation = allocation
-        self.views: list[tuple[tuple[int, ...], torch.dtype]] = []
-
-    def get_buffer(self, rank, shape, dtype):
-        assert rank == self.rank
-        self.views.append((shape, dtype))
-        return self.allocation, shape, dtype
+    def __getitem__(self, item: slice) -> torch.Tensor:
+        return self.buffer[item]
 
 
 def test_workspace_reuses_peak_capacity_across_shapes(monkeypatch) -> None:
@@ -93,16 +88,20 @@ def test_workspace_reuses_peak_capacity_across_shapes(monkeypatch) -> None:
         return allocation
 
     monkeypatch.setattr(a2a_permute.symm_mem, "empty", empty)
-    monkeypatch.setattr(a2a_permute.symm_mem, "rendezvous", lambda allocation, _group: _FakeHandle(allocation))
+    # The handle is only retained to keep the rendezvous registration alive.
+    monkeypatch.setattr(a2a_permute.symm_mem, "rendezvous", lambda _allocation, _group: object())
 
     device = torch.device("cuda:0")
     first = a2a_permute._get_symm_buffer((2, 3), torch.float16, device, "group")
     smaller = a2a_permute._get_symm_buffer((1, 4), torch.float16, device, "group")
     larger = a2a_permute._get_symm_buffer((4, 3), torch.float16, device, "group")
 
-    assert first[0].size == 12
-    assert smaller[0] is first[0]
-    assert larger[0].size == 24
+    assert (first.shape, first.dtype) == ((2, 3), torch.float16)
+    assert (smaller.shape, smaller.dtype) == ((1, 4), torch.float16)
+    assert (larger.shape, larger.dtype) == ((4, 3), torch.float16)
+    # A sub-capacity request reuses the workspace; only growth allocates again.
+    assert smaller.untyped_storage().data_ptr() == first.untyped_storage().data_ptr()
+    assert larger.untyped_storage().data_ptr() != first.untyped_storage().data_ptr()
     assert [allocation.size for allocation in allocations] == [12, 24]
     assert len(a2a_permute._SYMM_WORKSPACES) == 1
     assert len(all_reduce_calls) == 1

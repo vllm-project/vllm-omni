@@ -85,6 +85,9 @@ steps:
           - vllm_omni/model_executor/models/common/alias_free_activation.py
           - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
           - vllm_omni/deploy/qwen3_tts.yaml
+          - vllm_omni/entrypoints/openai/serving_speech.py
+          - vllm_omni/entrypoints/openai/tts_adapters/
+          - vllm_omni/engine/stage_pool.py
         commands:
           - |
             timeout 40m bash -c "
@@ -104,6 +107,9 @@ steps:
           - vllm_omni/model_executor/models/common/alias_free_activation.py
           - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
           - vllm_omni/deploy/qwen3_tts.yaml
+          - vllm_omni/entrypoints/openai/serving_speech.py
+          - vllm_omni/entrypoints/openai/tts_adapters/
+          - vllm_omni/engine/stage_pool.py
           - .buildkite/common/scripts/run_cov_split.sh
           - pyproject.toml
         # 40 -> 60: the coverage split runs the model twice.

@@ -397,7 +397,7 @@ class OmniEngineArgs(EngineArgs):
                         candidate = os.path.join(local_dir, tokenizer_subfolder)
                         if os.path.isdir(candidate):
                             self.tokenizer = candidate
-                            logger.info("Downloaded tokenizer from %s/%s", model_path, subfolder)
+                            logger.info("Downloaded tokenizer from %s/%s", model_path, tokenizer_subfolder)
                     except Exception as e:
                         logger.warning("Failed to download tokenizer subfolder: %s", e)
 
