@@ -472,6 +472,16 @@ class Attention(nn.Module):
     def _run_local_attention(self, query, key, value, attn_metadata):
         self._assert_piecewise_compatible(attn_metadata)
 
+        if self._mask_needs_sdpa(attn_metadata):
+            logger.warning_once(
+                "Attention backend '%s' cannot honor a %dD attn_mask on this platform; "
+                "running this layer on SDPA. Set DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA "
+                "to select it everywhere.",
+                self.attn_backend.get_name(),
+                attn_metadata.attn_mask.ndim,
+            )
+            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+
         if query.dtype == torch.float32:
             logger.warning_once(
                 f"Only SDPA supports float32. Overriding user config {type(self.attention)} "
@@ -500,13 +510,36 @@ class Attention(nn.Module):
 
         return self.attention.forward(query, key, value, attn_metadata)
 
+    def _mask_needs_sdpa(self, attn_metadata: AttentionMetadata | None) -> bool:
+        """Whether a >2D mask has to run on SDPA because the backend cannot express it.
+
+        A backend can report mask support and still only accept a 2D ``[batch, seq]``
+        padding mask on the platform actually dispatched to -- flash ``forward_xpu``
+        routes a mask through ``_forward_varlen_masked``, which asserts 2D, and has no
+        piecewise path to fall back on. SDPA consumes an arbitrary broadcastable mask
+        verbatim, so run those layers there.
+
+        Scoped to backends that claim mask support so the reroute cannot preempt
+        ``TRTLLM_ATTN``'s deliberate, actionable ValueError on CUDA. ``SAGE_ATTN``,
+        ``SAGE_ATTN_3`` and ``RAINFUSION_ATTN`` also report no mask support but simply
+        ignore the mask; that pre-existing silent drop is left alone here rather than
+        papered over by a reroute this method cannot make correct for them.
+        """
+        if attn_metadata is None or attn_metadata.attn_mask is None:
+            return False
+        if attn_metadata.attn_mask.ndim <= 2:
+            return False
+        if not self.attn_backend.supports_attention_mask():
+            return False
+        return not self.attn_backend.supports_dense_attention_mask()
+
     def _assert_piecewise_compatible(self, attn_metadata: AttentionMetadata | None) -> None:
         if attn_metadata is None or attn_metadata.full_attn_spans is None:
             return
         if attn_metadata.attn_mask is not None and attn_metadata.attn_mask.ndim == 4:
             return
         backend_name = self.attn_backend.get_name()
-        if not self.attn_backend.supports_piecewise_spans:
+        if not self.attn_backend.supports_piecewise_spans():
             raise ValueError(
                 f"Attention backend '{backend_name}' does not support "
                 f"piecewise attention (full_attn_spans without a 4D attn_mask). "

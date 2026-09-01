@@ -403,22 +403,33 @@ class SequenceParallelSplitHook(ModelHook):
 
         # Check backend compatibility
         attention_config = None
+        mask_sp_padding = False
         if is_forward_context_available():
             od_config = get_forward_context().omni_diffusion_config
             if od_config is not None:
                 attention_config = od_config.diffusion_attention_config
+                if od_config.parallel_config is not None:
+                    mask_sp_padding = od_config.parallel_config.mask_sp_padding
 
-        attn_backend, _ = get_attn_backend_for_role(
-            role="self",
-            head_size=-1,
-            attention_config=attention_config,
-        )
-        if not attn_backend.supports_attention_mask:
-            raise ValueError(
-                f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "
-                f"Cannot use {attn_backend.get_name()} which does not support attention_mask. "
-                f"Please switch to SDPA or Ascend attention backend."
+        # Only relevant when a padding mask will actually be built. mask_sp_padding
+        # defaults to False, in which case the models leave the zero-padded tokens
+        # unmasked on purpose (they warning_once about it) and never construct a mask,
+        # so the backend's mask capability does not matter. This guard was dead until
+        # the missing call parens below were fixed; without the gate it would reject
+        # that documented default path.
+        if mask_sp_padding:
+            attn_backend, _ = get_attn_backend_for_role(
+                role="self",
+                head_size=-1,
+                attention_config=attention_config,
             )
+            if not attn_backend.supports_attention_mask():
+                raise ValueError(
+                    f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}) "
+                    f"and parallel_config.mask_sp_padding is set, but {attn_backend.get_name()} does "
+                    f"not support attention_mask. Switch to SDPA or the Ascend attention backend, "
+                    f"or set mask_sp_padding=False to pad without masking."
+                )
 
         # Ring attention does not support attention_mask
         if get_ring_parallel_world_size() > 1:

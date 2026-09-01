@@ -10,6 +10,7 @@ This script tests two main scenarios:
 """
 
 import sys
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -728,6 +729,210 @@ def test_prefix_kv_slice_no_scaling_without_factor(monkeypatch):
     torch.testing.assert_close(captured["query"], q)
     assert captured["scale"] == pytest.approx(0.5)
     torch.testing.assert_close(out, torch.ones(1, 8, 2, 4))
+
+
+def _spy(calls: list[dict], result: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+    """A patched kernel that records the kwargs it was called with, then returns ``result``.
+
+    A ``def`` rather than ``lambda ...: calls.append(kw) or q``: ``list.append`` returns
+    ``None``, so the ``or`` form is an expression whose value depends on the recorded
+    object being falsy, and mypy rejects it outright (``func-returns-value``).
+    """
+
+    def _call(*args, **kwargs) -> torch.Tensor:
+        calls.append(kwargs)
+        return result(*args, **kwargs)
+
+    return _call
+
+
+# --- Test group D: mask conventions (mask_excludes_tokens) -------------------
+#
+# ``_unpad_input`` documents a *keep*-mask: 1 == valid. An additive float mask means the
+# opposite (0.0 == valid, finfo.min == invalid), so the two cannot be told apart by shape
+# and must be told apart by dtype.
+
+
+@pytest.mark.parametrize("dtype", [torch.bool, torch.int32, torch.int64, torch.uint8])
+def test_mask_excludes_tokens_reads_int_and_bool_keep_masks(dtype):
+    """Int keep-masks must answer False when nothing is padded.
+
+    This is the ``~1 == -2`` bug: ``torch.any(~mask)`` is True for an all-valid int mask,
+    so every int-masked call took the slower masked-varlen path instead of the dense one.
+    """
+    all_valid = torch.ones(2, 4, dtype=dtype)
+    assert fa.mask_excludes_tokens(all_valid) is False
+
+    padded = torch.ones(2, 4, dtype=dtype)
+    padded[1, 3] = 0
+    assert fa.mask_excludes_tokens(padded) is True
+
+
+def test_mask_excludes_tokens_bool_is_unchanged_by_the_fix():
+    """The bool convention behaved correctly before and must keep behaving identically."""
+    for mask in (
+        torch.ones(2, 4, dtype=torch.bool),
+        torch.tensor([[True, True, False, False], [True, True, True, False]]),
+        torch.zeros(2, 4, dtype=torch.bool),
+    ):
+        assert fa.mask_excludes_tokens(mask) is bool(torch.any(~mask))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_mask_excludes_tokens_rejects_additive_float_masks(dtype):
+    """An additive mask inverts the convention, so consuming it would invert attention.
+
+    ``_unpad_input`` would keep exactly the ``finfo.min`` padding entries and drop the
+    valid ``0.0`` ones. Refuse with an actionable message rather than fail deep inside
+    ``~mask`` with an opaque ``operator.invert`` error.
+    """
+    additive = torch.zeros(2, 1, 4, 4, dtype=dtype)
+    additive[..., 2:] = torch.finfo(dtype).min
+
+    with pytest.raises(ValueError, match="bool or int keep-mask"):
+        fa.mask_excludes_tokens(additive)
+
+    # Rejected on dtype alone: an all-zero additive mask is indistinguishable from a
+    # keep-mask that drops everything, so it cannot be waved through either.
+    with pytest.raises(ValueError, match="bool or int keep-mask"):
+        fa.mask_excludes_tokens(torch.zeros(2, 4, dtype=dtype))
+
+
+def test_int_keep_mask_without_padding_takes_the_dense_path(monkeypatch):
+    """End-to-end consequence of the fix, on the Qwen-Image mask dtype (int64).
+
+    An all-ones int mask restricts nothing, so the dense ``flash_attn_func`` must be
+    used. Before the fix this reached the varlen unpad route instead.
+    """
+    dense_calls: list[dict] = []
+    varlen_calls: list[dict] = []
+
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "flash_attn_func", _spy(dense_calls, lambda q, *a, **kw: q))
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", _spy(varlen_calls, lambda q, *a, **kw: q))
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=8, softmax_scale=0.5, causal=False)
+    query = torch.randn(2, 4, 2, 8)
+    metadata = AttentionMetadata(attn_mask=torch.ones(2, 4, dtype=torch.int64))
+
+    out = impl.forward_cuda(query, query, query, metadata)
+
+    assert out.shape == query.shape
+    assert len(dense_calls) == 1
+    assert varlen_calls == []
+
+
+def test_int_keep_mask_with_padding_still_takes_the_masked_path(monkeypatch):
+    """The fix must not lose real padding: an int mask with zeros still unpads."""
+    dense_calls: list[dict] = []
+    varlen_calls: list[dict] = []
+
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "flash_attn_func", _spy(dense_calls, lambda q, *a, **kw: q))
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", _spy(varlen_calls, lambda q, *a, **kw: q))
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=8, softmax_scale=0.5, causal=False)
+    query = torch.randn(2, 4, 2, 8)
+    mask = torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0]], dtype=torch.int64)
+    metadata = AttentionMetadata(attn_mask=mask)
+
+    out = impl.forward_cuda(query, query, query, metadata)
+
+    assert out.shape == query.shape
+    assert dense_calls == []
+    assert len(varlen_calls) == 1
+    assert varlen_calls[0]["cu_seqlens_k"].tolist() == [0, 4, 6]
+
+
+# --- Test group E: masks the NPU KV-quant path cannot apply -----------------
+
+
+@pytest.mark.parametrize(
+    ("mask", "expected"),
+    [
+        (None, False),
+        # Keep-mask convention: 0 == drop.
+        (torch.ones(2, 4, dtype=torch.bool), False),
+        (torch.tensor([[True, True, False, False]]), True),
+        (torch.ones(2, 4, dtype=torch.int64), False),
+        (torch.tensor([[1, 1, 0, 0]], dtype=torch.int64), True),
+        # Additive convention: 0.0 == keep. Same numbers, opposite meaning.
+        (torch.zeros(1, 1, 4, 4), False),
+        (torch.full((1, 1, 4, 4), torch.finfo(torch.float32).min), True),
+        # A float *keep*-mask (1.0 valid / 0.0 pad) is not additive. Reading float as
+        # additive would call the all-valid one restrictive and raise on a no-op mask.
+        # A negative entry is what distinguishes the two, so neither of these has one.
+        (torch.ones(2, 4), False),
+        (torch.tensor([[1.0, 1.0, 0.0, 0.0]]), True),
+        # Uniformly finfo.min is additive and forbids *everything*, so "uniform" is not
+        # a stand-in for "unrestricted" -- the sign is what settles it.
+        (torch.full((1, 1, 4), torch.finfo(torch.float32).min), True),
+    ],
+)
+def test_mask_restricts_attention_reads_both_conventions(mask, expected):
+    """Guards a path that would *drop* the mask, so it reads both and never raises."""
+    assert FlashAttentionImpl._mask_restricts_attention(mask) is expected
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        AttentionMetadata(attn_mask=torch.tensor([[True, True, False, False]])),
+        AttentionMetadata(attn_mask=torch.full((1, 1, 4, 4), torch.finfo(torch.float32).min)),
+        AttentionMetadata(attn_mask=torch.tensor([[1.0, 1.0, 0.0, 0.0]])),
+        AttentionMetadata(full_attn_spans=[[(0, 2)]]),
+        # An empty span list is the *most* restrictive case, not the least:
+        # build_segments emits one causal segment spanning the whole sequence when it
+        # finds no spans. Testing spans for truthiness let exactly these through.
+        AttentionMetadata(full_attn_spans=[]),
+        AttentionMetadata(full_attn_spans=[[]]),
+        AttentionMetadata(full_attn_spans=[[], []]),
+    ],
+)
+def test_npu_kv_quant_refuses_a_mask_it_cannot_apply(monkeypatch, metadata):
+    """``fp8_rotate_quant_fa`` takes no mask argument, so it would silently run dense."""
+    called: list[dict] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_omni.platforms.npu.quant.kv_quant_npu",
+        SimpleNamespace(fp8_rotate_quant_fa=_spy(called, lambda *a, **kw: torch.zeros(1))),
+    )
+    impl = _npu_impl()
+    q = torch.randn(1, 4, 2, 4)
+
+    with pytest.raises(ValueError, match="cannot apply an attn_mask or full_attn_spans"):
+        impl.forward_fa_quant_npu(q, q, q, metadata)
+    assert called == []
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        None,
+        AttentionMetadata(),
+        # Restricts nothing, so dropping it was always correct: keep the fast path.
+        AttentionMetadata(attn_mask=torch.ones(1, 4, dtype=torch.bool)),
+        AttentionMetadata(attn_mask=torch.ones(1, 4, dtype=torch.int64)),
+        AttentionMetadata(attn_mask=torch.zeros(1, 1, 4, 4)),
+        AttentionMetadata(attn_mask=torch.ones(1, 4)),
+    ],
+)
+def test_npu_kv_quant_allows_masks_that_restrict_nothing(monkeypatch, metadata):
+    """The *mask* is tested for effect: an all-keep mask must not become a hard error.
+
+    Spans are the opposite -- tested for presence, see the refusal cases above.
+    """
+    called: list[dict] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_omni.platforms.npu.quant.kv_quant_npu",
+        SimpleNamespace(fp8_rotate_quant_fa=_spy(called, lambda q, *a, **kw: torch.zeros_like(q.transpose(1, 2)))),
+    )
+    impl = _npu_impl()
+    q = torch.randn(1, 4, 2, 4)
+
+    impl.forward_fa_quant_npu(q, q, q, metadata)
+    assert len(called) == 1
 
 
 if __name__ == "__main__":

@@ -183,6 +183,28 @@ def _index_first_axis(tensor, indices):
     return reshaped_tensor[indices]
 
 
+def mask_excludes_tokens(attention_mask: torch.Tensor) -> bool:
+    """Whether a keep-mask drops anything, i.e. whether unpadding is needed.
+
+    ``_unpad_input`` accepts the bool *or* int keep-mask convention (1 == valid), but
+    not an additive float mask, which inverts it: ``nonzero`` would select the
+    ``finfo.min`` entries and drop the ``0.0`` ones, so only the padding would be kept,
+    and ``sum(dtype=torch.int32)`` over ``finfo.min`` is garbage. Reject that instead of
+    failing inside ``~mask`` with an opaque operator.invert error.
+
+    Compares against 0 rather than using ``~``: bitwise-not of an int keep-mask is
+    nonzero for valid tokens too (``~1 == -2``), so ``any(~mask)`` was always True and
+    sent every int-masked call down the slower masked-varlen path.
+    """
+    if attention_mask.dtype.is_floating_point:
+        raise ValueError(
+            "FlashAttention needs a bool or int keep-mask (1 == valid) for masked varlen "
+            f"attention, got additive attn_mask dtype {attention_mask.dtype}. Pass a keep-mask, "
+            "or select SDPA (DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA) for additive masks."
+        )
+    return bool((attention_mask == 0).any())
+
+
 def _unpad_input(hidden_states, attention_mask, unused_mask=None):
     """
     unpad_input function for flash attention variants that do not have them within their pkg themselves, e.g. fa3.
