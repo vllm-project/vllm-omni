@@ -927,6 +927,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                                     try_set_exception(pending, exc)
                                 else:
                                     try_set_result(pending, output_result)
+                                # Cache if the resolve succeeded so a late
+                                # wait_output_ready (drop → pump → wait) can
+                                # still retrieve the result. Skip if a racing
+                                # cancel won the set (pending.cancelled()).
+                                if pending.done() and not pending.cancelled():
+                                    self._completed_outputs[batch_id] = pending
                             # else: waiter registered but already cancelled/done
                             # (e.g. aborted request) -> discard, do not re-cache.
 
@@ -992,6 +998,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             cached = self._completed_outputs.pop(async_output_id, None)
             if cached is not None:
                 return cached
+            # Reuse an existing entry (e.g. a drop_output placeholder that the
+            # pump may have already resolved) instead of clobbering it with a
+            # new Future that would never complete.
+            existing = self._output_futures.get(async_output_id)
+            if existing is not None:
+                return existing
             fut: concurrent.futures.Future = concurrent.futures.Future()
             self._output_futures[async_output_id] = fut
         return fut
