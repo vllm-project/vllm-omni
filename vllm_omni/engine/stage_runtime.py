@@ -673,7 +673,8 @@ class StageRuntime:
                     metadata=plan.metadata,
                     stage_init_timeout=stage_init_timeout,
                     batch_size=self._diffusion_batch_size,
-                    use_inline=plan.num_replicas == 1 and bool(inline_diffusion or custom_pipeline_args),
+                    use_inline=plan.num_replicas == 1
+                    and bool(self._num_stages == 1 or inline_diffusion or custom_pipeline_args),
                     replica_id=plan.replica_id,
                     omni_master_server=self._get_omni_master_server(),
                     omni_coordinator_address=self._get_coordinator_address(),

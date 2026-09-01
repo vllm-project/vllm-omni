@@ -252,6 +252,19 @@ def summarize_artifacts(
         (summary["done_indices"][0] for summary in reversed(response_summaries) if summary.get("done_indices")),
         None,
     )
+    # A soft interrupt's follow-up response can drain past the commit (residual
+    # model unit), so its response.done lands after input_audio_buffer.committed.
+    # Anchor the "listen after last done, before commit" sandwich on the last
+    # turn that closed its floor strictly before the commit, not the
+    # globally-last done (which may sit after the commit and leave the interval empty).
+    last_done_before_commit_index = next(
+        (
+            summary["done_indices"][0]
+            for summary in reversed(response_summaries)
+            if summary.get("done_indices") and commit_index is not None and summary["done_indices"][0] < commit_index
+        ),
+        None,
+    )
     listen_indices = [index for index, event in enumerate(events) if event.get("type") == "response.listen"]
     effective_min_responses = min_responses if validation_mode == "response-required" else 1
     enough_responses = len(response_summaries) >= effective_min_responses
@@ -279,9 +292,9 @@ def summarize_artifacts(
     )
     listen_after_last_done = last_done_index is not None and any(index > last_done_index for index in listen_indices)
     listen_after_response_before_commit = (
-        last_done_index is not None
+        last_done_before_commit_index is not None
         and commit_index is not None
-        and any(last_done_index < index < commit_index for index in listen_indices)
+        and any(last_done_before_commit_index < index < commit_index for index in listen_indices)
     )
     final_listen_after_commit = commit_index is not None and any(index > commit_index for index in listen_indices)
     transcript = "".join(str(summary.get("transcript") or "") for summary in response_summaries)

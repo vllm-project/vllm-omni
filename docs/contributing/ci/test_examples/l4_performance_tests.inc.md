@@ -81,8 +81,8 @@ Supported form:
 
 | Form | Example | Effect |
 | ---- | ------- | ------ |
-| Array (single platform) | `"mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2}}, "full_model", "diffusion"]` | Hardware marks from `hardware_marks(...)`; `num_cards` > 1 adds `distributed_*` (+ CUDA `skipif_cuda` when applicable). String entries become extra pytest marks. |
-| Array (multi-platform) | `"mark": [{"hardware_marks": {"res": {"cuda": "H100", "rocm": "MI325", "npu": "A2"}, "num_cards": {"cuda": 2, "rocm": 2, "npu": 1}}}, "full_model", "omni"]` | Same as above, but declares **multiple platforms** in one case. Filter examples: `-m "full_model and H100 and cuda"`, `-m "full_model and MI325 and rocm"`. |
+| Array (single platform) | `"mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2}}, "full_model", "diffusion"]` | Hardware marks from `hardware_marks(...)`; `num_cards` adds `cards_{n}` (including `cards_1` when omitted). String entries become extra pytest marks. |
+| Array (multi-platform) | `"mark": [{"hardware_marks": {"res": {"cuda": "H100", "rocm": "MI325"}, "num_cards": 2}}, "full_model", "omni"]` | Same as above, but declares **multiple platforms** on one item. All platforms must share the same `num_cards` (int or identical dict values). Different counts need `@hardware_test` or one `hardware_marks()` per `pytest.param`. Filter examples: `-m "full_model and H100 and cards_2 and cuda"`, `-m "full_model and MI325 and cards_2 and rocm"`. |
 
 Recommended for L4 perf cases:
 
@@ -157,7 +157,7 @@ pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
 ```
 
 <!-- markdownlint-disable-next-line MD051 -->
-See also [Markers for Tests](#markers-for-tests) for registered hardware markers (`H100`, `L4`, `cuda`, `distributed_cuda`, …).
+See also [Markers for Tests](#markers-for-tests) for registered hardware markers (`H100`, `L4`, `cuda`, `cards_1`, …).
 
 #### `server_params` Configuration
 

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import contextlib
 import inspect
 from collections.abc import Callable
@@ -1988,6 +1991,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 positions=positions,
                 inputs_embeds=inputs_embeds,
                 omni_query_start_loc=model_kwargs_extra.get("omni_query_start_loc"),
+                req_ids=self.input_batch.req_ids,
             )
 
         model_output = super()._model_forward(

@@ -73,3 +73,20 @@ def test_minimax_h3_disaggregation_is_explicit_opt_in():
     pipeline = OMNI_PIPELINES["minimax_h3_disaggregated"]
     assert isinstance(pipeline, PipelineConfig)
     assert pipeline.model_type == "minimax_h3_disaggregated"
+
+
+def test_in_tree_pipelines_pass_topology_validation():
+    """Every statically registered in-tree pipeline must have a valid topology.
+
+    ``PipelineConfig.validate()`` only runs on ``register_pipeline``, which
+    in-tree pipelines never go through, so a shipped topology error would
+    otherwise stay invisible until serving hangs or misroutes.
+    Resolver entries are skipped: they need an ``hf_config`` to produce a
+    ``PipelineConfig``.
+    """
+    failures = {
+        model_type: errors
+        for model_type, pipeline in OMNI_PIPELINES.items()
+        if isinstance(pipeline, PipelineConfig) and (errors := pipeline.validate())
+    }
+    assert not failures, f"in-tree pipelines failed topology validation: {failures}"

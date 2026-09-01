@@ -327,6 +327,11 @@ class PipelineConfig:
                     errors.append(f"Stage {stage.stage_id} references itself")
         if not any(not s.input_sources for s in self.stages):
             errors.append("No entry point (stage with empty input_sources)")
+        # Request completion and client-visible output are both driven by stages
+        # that declare ``final_output`` (see ``Orchestrator._route_output``). A
+        # pipeline without one can never emit a result, so every request hangs.
+        if not any(s.final_output for s in self.stages):
+            errors.append("No terminal stage (stage with final_output=True)")
         return errors
 
 
@@ -389,6 +394,7 @@ class StageDeployConfig:
     # Diffusion parallel_config deploy/runtime override fields.
     ulysses_degree: int | None = None
     ulysses_mode: str | None = None
+    ulysses_a2a_permute: bool | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     sequence_parallel_size: int | None = None

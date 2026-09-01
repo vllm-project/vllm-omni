@@ -117,11 +117,16 @@ from .denoise_loop import (
     minimax_h3_publish_denoise_progress,
 )
 from .encoder import MiniMaxH3Qwen3VLEncoder
+from .fasth3 import FastH3WeightFusion, resolve_fasth3_fusion
 from .lora import load_minimax_h3_turbo_lora
 from .minimax_h3_transformer import (
     MiniMaxH3Attention,
     MiniMaxH3DiTModel,
     _attention_isolates_packed_requests,
+)
+from .npu.lora import (
+    MINIMAX_H3_NATIVE_INFERENCE_STEPS,
+    load_minimax_h3_native_lora,
 )
 from .packed_sequence import (
     minimax_h3_packed_sequence,
@@ -350,14 +355,24 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
 
     The callable crosses the multiprocessing result queue, so it must remain a
     module-level function that the standard pickle module can resolve.
+
+    ``_prepare_minimax_h3_video_output`` already quantises the video to uint8
+    frames on the accelerator, so there is nothing left to scale or transpose
+    here.
     """
     if not isinstance(output, tuple) or len(output) != 2:
         return output
     video, audio = output
+    if video.dtype != torch.uint8 or video.ndim != 5 or video.shape[-1] not in (3, 4):
+        # Float or channel-first frames would reach the muxer as a black or
+        # banded video rather than as an error.
+        raise ValueError(
+            f"MiniMax-H3 post-processing expects (B, T, H, W, C) uint8, got {tuple(video.shape)} {video.dtype}"
+        )
     if output_type == "latent":
         return output
     if output_type == "np":
-        video = video.detach().float().cpu().permute(0, 2, 3, 4, 1).clamp(0, 1).numpy()
+        video = video.detach().cpu().numpy()
         audio = audio.detach().float().cpu().numpy()
         video = [sample for sample in video]
     return {
@@ -366,6 +381,16 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
         "audio_sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE,
         "fps": MINIMAX_H3_FPS,
     }
+
+
+def _prepare_minimax_h3_video_output(video: torch.Tensor) -> torch.Tensor:
+    """Quantize decoded frames in place before worker-to-engine transfer."""
+    video = video.detach().float()
+    video.clamp_(0, 1).mul_(255).round_()
+    return video.permute(0, 2, 3, 4, 1).to(
+        dtype=torch.uint8,
+        memory_format=torch.contiguous_format,
+    )
 
 
 def _register_dlo_component_cache(cache: BoundedAllocatorCache, *components: Any) -> None:
@@ -661,6 +686,8 @@ class MiniMaxH3Pipeline(
     # Only distilled releases pin a schedule, so the default keeps the legacy
     # uniform path available to partially constructed pipelines.
     _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
+    # Set from --lora-path during construction; absent means no FastH3 adapter.
+    _fasth3: FastH3WeightFusion | None = None
 
     def _load_diffusion_lora_adapter(
         self,
@@ -672,6 +699,8 @@ class MiniMaxH3Pipeline(
         # A cache eviction may be followed by a different adapter reusing the
         # same client-supplied ID. Every real load replaces the classification.
         self._turbo_lora_adapter_ids.discard(lora_request.lora_int_id)
+        self._native_lora_adapter_ids.discard(lora_request.lora_int_id)
+        self._lora_sigma_schedules.pop(lora_request.lora_int_id, None)
         od_config = getattr(self, "od_config", None)
         offload_modes = []
         if getattr(od_config, "enable_cpu_offload", False):
@@ -687,7 +716,25 @@ class MiniMaxH3Pipeline(
         )
         if loaded is not None:
             self._turbo_lora_adapter_ids.add(lora_request.lora_int_id)
-        return loaded
+            return loaded
+
+        # Selection is by the artifact's safetensors ``key_format``, not by the
+        # running platform: the native loader is checkpoint-format parsing with
+        # no ``torch_npu`` dependency, so it needs no ``current_omni_platform``
+        # dispatch and binds the same adapter on NPU, CUDA and CPU.
+        native_loaded = load_minimax_h3_native_lora(
+            partition=self.partition,
+            lora_request=lora_request,
+            lora_path=lora_path,
+            dtype=dtype,
+            unsupported_offload_mode=" or ".join(offload_modes) or None,
+        )
+        if native_loaded is not None:
+            lora_model, peft_helper, sigma_schedule = native_loaded
+            self._native_lora_adapter_ids.add(lora_request.lora_int_id)
+            self._lora_sigma_schedules[lora_request.lora_int_id] = sigma_schedule
+            return lora_model, peft_helper
+        return None
 
     def _validate_diffusion_lora_binding(
         self,
@@ -695,12 +742,20 @@ class MiniMaxH3Pipeline(
         lora_model: LoRAModel,
         bound_lora_names: frozenset[str],
     ) -> None:
-        if lora_model.id not in self._turbo_lora_adapter_ids:
+        if lora_model.id in self._turbo_lora_adapter_ids:
+            missing = sorted(set(lora_model.loras) - bound_lora_names)
+            if missing:
+                raise ValueError(
+                    "MiniMax-H3 Turbo LoRA binding is incomplete: "
+                    f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, missing={missing[:5]}"
+                )
+            return
+        if lora_model.id not in self._native_lora_adapter_ids:
             return
         missing = sorted(set(lora_model.loras) - bound_lora_names)
         if missing:
             raise ValueError(
-                "MiniMax-H3 Turbo LoRA binding is incomplete: "
+                "MiniMax-H3 native LoRA binding is incomplete: "
                 f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, missing={missing[:5]}"
             )
 
@@ -711,6 +766,65 @@ class MiniMaxH3Pipeline(
             and not math.isclose(0.0, float(sampling.lora_scale))
             and lora_request.lora_int_id in self._turbo_lora_adapter_ids
         )
+
+    def _has_active_native_lora(self, sampling: Any) -> bool:
+        lora_request = sampling.lora_request
+        return (
+            lora_request is not None
+            and not math.isclose(0.0, float(sampling.lora_scale))
+            and lora_request.lora_int_id in self._native_lora_adapter_ids
+        )
+
+    def _validate_native_sampling(self, sampling: Any, *, task: str) -> None:
+        if task != "t2va":
+            raise OmniClientError("MiniMax-H3 native LoRA supports T2VA requests only")
+        # Derive the expected count from the adapter's own schedule so the
+        # message can never disagree with the schedule the denoise loop runs.
+        schedule = self._lora_sigma_schedules.get(sampling.lora_request.lora_int_id)
+        expected_steps = MINIMAX_H3_NATIVE_INFERENCE_STEPS if schedule is None else schedule.num_inference_steps
+        # Only request mode can take the count from the adapter schedule: step
+        # mode admits the request in ``StepScheduler``, which reads
+        # ``num_inference_steps`` off it before any pipeline hook runs. Reject
+        # omission there rather than advertise a contract that would either fail
+        # admission or disagree with the denoise loop.
+        od_config = getattr(self, "od_config", None)
+        omission_allowed = not getattr(od_config, "step_execution", False)
+        or_omitted = " or omitted" if omission_allowed else ""
+        sigma_steps = sampling.num_inference_steps
+        if sigma_steps is None:
+            if omission_allowed:
+                return
+            raise OmniClientError(
+                f"MiniMax-H3 native LoRA requires an explicit num_inference_steps={expected_steps} "
+                "under step execution, because the step scheduler derives the total step count from "
+                "the request before the adapter schedule is known"
+            )
+        if int(sigma_steps) == expected_steps + 1:
+            raise OmniClientError(
+                "MiniMax-H3 native LoRA uses the distilled interval-count contract; "
+                f"num_inference_steps must be {expected_steps}{or_omitted}, not {expected_steps + 1}"
+            )
+        if int(sigma_steps) != expected_steps:
+            raise OmniClientError(
+                f"MiniMax-H3 native LoRA requires num_inference_steps={expected_steps} "
+                f"(one denoiser evaluation per sigma interval){or_omitted}"
+            )
+
+    def _sigma_schedule_for_request(self, sampling: Any, task: str) -> DMD2SigmaSchedule | None:
+        lora_request = sampling.lora_request
+        if (
+            lora_request is not None
+            and not math.isclose(0.0, float(sampling.lora_scale))
+            and lora_request.lora_int_id in self._lora_sigma_schedules
+        ):
+            adapter_schedule = self._lora_sigma_schedules[lora_request.lora_int_id]
+            checkpoint_schedule = self._base_schedule_for_task(task)
+            if checkpoint_schedule is not None:
+                raise OmniClientError(
+                    "MiniMax-H3 native LoRA cannot be activated on a checkpoint that already pins base_schedule"
+                )
+            return adapter_schedule
+        return self._base_schedule_for_task(task)
 
     def _validate_turbo_sampling(self, sampling: Any) -> None:
         extra = sampling.extra_args or {}
@@ -766,6 +880,8 @@ class MiniMaxH3Pipeline(
             str(od_config.model),
         )
         self._turbo_lora_adapter_ids: set[int] = set()
+        self._native_lora_adapter_ids: set[int] = set()
+        self._lora_sigma_schedules: dict[int, DMD2SigmaSchedule] = {}
         model_root = _resolve_minimax_h3_model_root(
             str(od_config.model),
             od_config.revision,
@@ -840,6 +956,15 @@ class MiniMaxH3Pipeline(
             self.transformers_ref = MiniMaxH3DiTModel(
                 od_config,
                 quant_config=transformer_quant_config,
+            )
+
+        self._fasth3 = resolve_fasth3_fusion(od_config, self.transformer)
+        if self._fasth3 is not None:
+            self._fasth3.check_serving_contract(
+                partition=self.partition,
+                od_config=od_config,
+                video_shift=self.default_video_shift,
+                audio_shift=self.default_audio_shift,
             )
 
         if self.load_text_encoder:
@@ -950,7 +1075,12 @@ class MiniMaxH3Pipeline(
                 raise ValueError(f"MiniMax-H3 weight source {prefix!r} is not contiguous")
             loaded_prefixes.add(prefix)
             component = getattr(self, prefix.removesuffix("."))
-            loaded = component.load_weights((name[len(prefix) :], tensor) for name, tensor in grouped_weights)
+            stream = ((name[len(prefix) :], tensor) for name, tensor in grouped_weights)
+            if prefix == "transformer." and self._fasth3 is not None:
+                # Fuse before the model shards anything, which is also the only
+                # point where the checkpoint's fused QKV/MLP layouts are intact.
+                stream = self._fasth3.apply(stream)
+            loaded = component.load_weights(stream)
             if prefix != "text_encoder.":
                 component.post_load_weights()
             loaded_with_prefix.update(prefix + name for name in loaded)
@@ -963,12 +1093,48 @@ class MiniMaxH3Pipeline(
             if component is None:
                 continue
             loaded_with_prefix.update(f"{component_name}.{name}" for name, _ in component.named_parameters())
+        if self._fasth3 is not None:
+            self._fasth3.validate_fully_applied()
         return loaded_with_prefix
+
+    @property
+    def lora_is_fused(self) -> bool:
+        """True when --lora-path was consumed as a load-time weight fusion."""
+        return self._fasth3 is not None
 
     def _transformer_for_task(self, task: str) -> MiniMaxH3DiTModel:
         if task == "ref2va" and hasattr(self, "transformers_ref"):
             return self.transformers_ref
         return self.transformer
+
+    def _resolve_sigma_positions(self, task: str, sampling: Any) -> tuple[tuple[float, ...] | None, int]:
+        """Pick the rectified-flow positions this request denoises on.
+
+        Returns them explicitly, or ``None`` to leave the uniform ladder to be
+        derived from the step count, together with the count the rest of the
+        request speaks in.
+        """
+        if self._fasth3 is not None:
+            # A fused student carries its own positions; the checkpoint
+            # underneath it is the many-step teacher, whose schedule does not
+            # apply. Its five points bound four transformer forwards, and
+            # forwards is the unit ``check_request``, the pinned-schedule branch
+            # below and Cache-DiT all speak in.
+            positions = self._fasth3.base_schedule
+            return positions, len(positions) - 1
+        sigma_schedule = self._sigma_schedule_for_request(sampling, task)
+        if sigma_schedule is None:
+            return None, int(sampling.num_inference_steps or 50)
+        # The schedule lists sigma boundaries; the denoise loop runs one step
+        # per interval, and that count is what requests and Cache-DiT speak in.
+        num_steps = sigma_schedule.num_inference_steps
+        requested_steps = sampling.num_inference_steps
+        if requested_steps is not None and int(requested_steps) != num_steps:
+            raise OmniClientError(
+                "this MiniMax H3 checkpoint pins a distilled sigma schedule; num_inference_steps "
+                f"must be {num_steps} or omitted, got {int(requested_steps)}"
+            )
+        return sigma_schedule.base_schedule, num_steps
 
     def _base_schedule_for_task(self, task: str) -> DMD2SigmaSchedule | None:
         """Return the distilled schedule of the partition that serves ``task``."""
@@ -981,6 +1147,7 @@ class MiniMaxH3Pipeline(
         multi_modal_data: dict[str, Any],
         *,
         has_turbo_lora: bool = False,
+        has_native_lora: bool = False,
     ) -> str:
         if requested is None:
             # A Ref2VA-only startup has no FL2VA transformer; preserve its
@@ -1000,6 +1167,10 @@ class MiniMaxH3Pipeline(
             )
         if task == "ref2va" and has_turbo_lora:
             raise OmniClientError("MiniMax-H3 Turbo LoRA supports T2VA/FL2VA requests only")
+        if has_native_lora and task != "t2va":
+            raise OmniClientError("MiniMax-H3 native LoRA supports T2VA requests only")
+        if self._fasth3 is not None:
+            self._fasth3.check_task(task)
         return task
 
     def _resolve_shape(
@@ -2001,13 +2172,23 @@ class MiniMaxH3Pipeline(
         logger.debug("MiniMax H3 request quality=%s", quality)
         extra = sampling.extra_args or {}
         has_turbo_lora = self._has_active_turbo_lora(sampling)
+        has_native_lora = self._has_active_native_lora(sampling)
         task = self._resolve_task(
             extra.get("task"),
             multi_modal_data,
             has_turbo_lora=has_turbo_lora,
+            has_native_lora=has_native_lora,
         )
         if has_turbo_lora:
             self._validate_turbo_sampling(sampling)
+        if has_native_lora:
+            self._validate_native_sampling(sampling, task=task)
+        if self._fasth3 is not None:
+            self._fasth3.check_request(
+                sampling,
+                video_shift=self.default_video_shift,
+                audio_shift=self.default_audio_shift,
+            )
 
         raw_image = multi_modal_data.get("image")
         raw_videos = multi_modal_data.get("video")
@@ -2224,22 +2405,7 @@ class MiniMaxH3Pipeline(
                     ref_audio_t = audio_lengths[0]
 
         seed = int(sampling.seed if sampling.seed is not None else 42)
-        sigma_schedule = self._base_schedule_for_task(task)
-        if sigma_schedule is None:
-            base_schedule = None
-            num_steps = int(sampling.num_inference_steps or 50)
-        else:
-            # The schedule lists sigma boundaries; the denoise loop runs one
-            # step per interval, and that count is what requests and Cache-DiT
-            # speak in.
-            base_schedule = sigma_schedule.base_schedule
-            num_steps = sigma_schedule.num_inference_steps
-            requested_steps = sampling.num_inference_steps
-            if requested_steps is not None and int(requested_steps) != num_steps:
-                raise OmniClientError(
-                    "this MiniMax H3 checkpoint pins a distilled sigma schedule; num_inference_steps "
-                    f"must be {num_steps} or omitted, got {int(requested_steps)}"
-                )
+        base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
         video_shift = float(extra.get("flow_shift", self.default_video_shift))
         audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
         quality_plan = self._quality_policy.resolve(
@@ -2306,10 +2472,10 @@ class MiniMaxH3Pipeline(
                 height=context["height"],
                 width=context["width"],
             )
-            videos.append(video)
+            videos.append(_prepare_minimax_h3_video_output(video))
             audios.append(audio)
-        video = torch.cat(videos, dim=0)
-        audio = torch.cat(audios, dim=0)
+        video = videos[0] if len(videos) == 1 else torch.cat(videos, dim=0)
+        audio = audios[0] if len(audios) == 1 else torch.cat(audios, dim=0)
         return DiffusionOutput(
             output=(video, audio),
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
@@ -2467,8 +2633,11 @@ class MiniMaxH3Pipeline(
         # attention features. Requests can differ in both step index and sigma
         # schedule, so a batch that is not at one single point has nothing to
         # publish and those gates stay dense -- which is their safe default.
-        progress = {(state.step_index, schedule["sigma_video"]) for state, schedule in zip(batch_states, schedules)}
-        minimax_h3_publish_denoise_progress(*(progress.pop() if len(progress) == 1 else (None, None)))
+        progress = {
+            (state.step_index, schedule["sigma_video"], len(state.extra[_STEP_SIGMAS_VIDEO]) - 1)
+            for state, schedule in zip(batch_states, schedules)
+        }
+        minimax_h3_publish_denoise_progress(*(progress.pop() if len(progress) == 1 else (None, None, None)))
 
         if len(batch_states) > 1 and (mixed_transformers or not self._packed_batch_supported(transformers[0])):
             if mixed_transformers:
@@ -2608,6 +2777,7 @@ class MiniMaxH3Pipeline(
             height=shape["height"],
             width=shape["width"],
         )
+        video = _prepare_minimax_h3_video_output(video)
         return DiffusionOutput(
             output=(video, audio),
             post_process_func=get_minimax_h3_post_process_func(self.od_config),

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import base64
@@ -42,6 +45,20 @@ class _MiniCPMO45Stage0SessionState:
 class MiniCPMO45Stage0DuplexRuntime:
     """Build scheduler-owned MiniCPM-o 4.5 Stage0 duplex inputs."""
 
+    unit_token_id: int = -1
+    unit_end_token_id: int = -1
+    listen_token_id: int = -1
+    speak_token_id: int = -1
+    tts_bos_token_id: int = -1
+    tts_eos_token_id: int = -1
+    tts_pad_token_id: int = -1
+    chunk_eos_token_id: int = -1
+    chunk_tts_eos_token_id: int = -1
+    turn_eos_token_id: int = -1
+    audio_placeholder_token_id: int = -1
+    image_start_token_id: int = -1
+    image_end_token_id: int = -1
+
     def __init__(self, stage_model: Any, *, model_path: str | None = None, device: str = "cuda") -> None:
         self.stage_model = stage_model
         self.model_path = model_path
@@ -81,7 +98,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 processor._streaming_mel_processor = copy.deepcopy(shared_mel)
             state.streaming_processor = processor
         if processor is None:
-            return
+            return None
         set_streaming_mode = getattr(processor, "set_streaming_mode", None)
         if callable(set_streaming_mode):
             set_streaming_mode(
@@ -175,24 +192,40 @@ class MiniCPMO45Stage0DuplexRuntime:
         self._require_special_token_ids()
         if audio_waveform is None or len(audio_waveform) == 0:
             return self._stage_prefill_result(False, start_time, "empty audio")
-        # Omni duplex: encode this append's camera frames up front so the unit
-        # loop can interleave one <image> block per unit, mirroring official
-        # streaming_prefill (feed <unit>, then image embeds, then audio).
-        frame_blocks: list[Any] = []
-        if video_frames:
-            self._require_vision_token_ids()
-            frame_blocks = self._stage_vision_embeddings(video_frames)
-            if frame_blocks is None or len(frame_blocks) != len(video_frames):
-                return self._stage_prefill_result(False, start_time, "streaming vision embedding failed")
         state.audio_buffer = np.concatenate([state.audio_buffer, np.asarray(audio_waveform, dtype=np.float32)])
         chunk_size = self._streaming_chunk_size(processor)
         self._pad_first_audio_chunk_if_needed(state, processor)
         if len(state.audio_buffer) < chunk_size:
+            if video_frames:
+                # Frames belong to the unit this append closes, and the
+                # scheduler already reserved their vision tokens against this
+                # append. A frame arriving before its unit can close has
+                # nowhere to go, so report it instead of dropping it under a
+                # generic buffering result.
+                return self._stage_prefill_result(
+                    False,
+                    start_time,
+                    f"{len(video_frames)} video frame(s) on an append that closes no model unit "
+                    f"(need {chunk_size} samples, only {len(state.audio_buffer)}); "
+                    "send frames on unit boundaries",
+                )
             return self._stage_prefill_result(
                 False,
                 start_time,
                 f"audio not enough: need {chunk_size} samples, only {len(state.audio_buffer)}",
             )
+        # Omni duplex: encode this append's camera frames so the first unit can
+        # carry them, mirroring official streaming_prefill (feed <unit>, then
+        # every frame_list entry as its own <image> block, then the audio).
+        frame_blocks: list[Any] = []
+        if video_frames:
+            self._require_vision_token_ids()
+            encoded_frames = self._stage_vision_embeddings(video_frames)
+            if encoded_frames is None or len(encoded_frames) != len(video_frames):
+                return self._stage_prefill_result(False, start_time, "streaming vision embedding failed")
+            if any(not slices for slices in encoded_frames):
+                return self._stage_prefill_result(False, start_time, "streaming vision embedding failed")
+            frame_blocks = encoded_frames
 
         embed_parts: list[Any] = []
         token_ids: list[int] = []
@@ -246,16 +279,22 @@ class MiniCPMO45Stage0DuplexRuntime:
             embed_parts.append(self._embed_token(self.unit_token_id))
             token_ids.append(self.unit_token_id)
             if frame_blocks:
-                # Official order inside a unit: <image> + 64 resampler
-                # embeddings + </image> ahead of the unit's audio embeddings
-                # (max_slice_nums=1 in streaming, one frame per unit).
-                vision_block = self._as_2d_tensor(frame_blocks.pop(0))
-                embed_parts.append(self._embed_token(self.image_start_token_id))
-                token_ids.append(int(self.image_start_token_id))
-                embed_parts.append(vision_block)
-                token_ids.extend([self._vision_embedding_placeholder_token_id()] * int(vision_block.shape[0]))
-                embed_parts.append(self._embed_token(self.image_end_token_id))
-                token_ids.append(int(self.image_end_token_id))
+                # Official order inside a unit: every frame_list entry as
+                # <image> + 64 embeds + </image>, then any HD patches as
+                # <slice> + 64 embeds + </slice>, all ahead of this unit's
+                # *one* second of audio. stack_frames never stacks audio.
+                vision_placeholder = self._vision_embedding_placeholder_token_id()
+                for frame_slices in frame_blocks:
+                    for slice_index, frame_block in enumerate(frame_slices):
+                        vision_block = self._as_2d_tensor(frame_block)
+                        start_id, end_id = self._vision_slice_token_ids(is_source=slice_index == 0)
+                        embed_parts.append(self._embed_token(start_id))
+                        token_ids.append(int(start_id))
+                        embed_parts.append(vision_block)
+                        token_ids.extend([vision_placeholder] * int(vision_block.shape[0]))
+                        embed_parts.append(self._embed_token(end_id))
+                        token_ids.append(int(end_id))
+                frame_blocks = []
             embed_parts.append(audio_embeds)
             token_ids.extend(
                 [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
@@ -264,14 +303,6 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.audio_chunk_idx += 1
             units_built += 1
             chunk_size = self._streaming_chunk_size(processor)
-        if frame_blocks:
-            # Each frame reserves one image block in the append plan. A frame
-            # without a matching audio unit would desynchronize that plan.
-            return self._stage_prefill_result(
-                False,
-                start_time,
-                f"{len(frame_blocks)} video frame(s) left without a matching audio unit",
-            )
         # Match official streaming_prefill: per chunk feed ONLY <unit>+audio. The assistant
         # turn is opened once at session init; re-emitting the turn-open prefix per chunk
         # re-opened the turn each chunk -> degenerate repetition. tts_bos/listen/turn_eos are
@@ -330,6 +361,20 @@ class MiniCPMO45Stage0DuplexRuntime:
         embedder = self._token_embedder()
         embeds = embedder(token)
         return self._as_2d_tensor(embeds)
+
+    def _token_embedding_dtype(self) -> Any:
+        """dtype of the decoder token embeddings, the unit's reference dtype.
+
+        Official ``get_vllm_embedding`` casts vision hidden states to the token
+        embedding dtype before they enter the sequence, so the vision tower's
+        own dtype must not leak into the concatenated unit.
+        """
+        embedder = self._token_embedder()
+        weight = getattr(embedder, "weight", None)
+        dtype = getattr(weight, "dtype", None)
+        if dtype is not None:
+            return dtype
+        return getattr(next(self.thinker.parameters()), "dtype", None)
 
     def _token_embedder(self) -> Any:
         nested_embed = getattr(getattr(getattr(self.thinker, "llm", None), "model", None), "embed_tokens", None)
@@ -392,7 +437,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         )
         if len(state.audio_buffer) >= first_chunk_samples:
             return
-        padding = np.zeros(first_chunk_samples - len(state.audio_buffer), dtype=np.float32)
+        padding: np.ndarray = np.zeros(first_chunk_samples - len(state.audio_buffer), dtype=np.float32)
         state.audio_buffer = np.concatenate([padding, state.audio_buffer])
 
     def _stage_param(self, name: str, default: Any) -> Any:
@@ -454,7 +499,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         previous_audio_past_key_values = (
             getattr(self.thinker, "audio_past_key_values", None) if has_audio_cache else None
         )
-        if has_audio_cache:
+        if has_audio_cache and state is not None:
             self.thinker.audio_past_key_values = state.audio_past_key_values
         try:
             for target in (self.stage_model, self.thinker):
@@ -469,18 +514,18 @@ class MiniCPMO45Stage0DuplexRuntime:
                                 suffix_extra_frames=2,
                             )
                         )
-                        if has_audio_cache:
+                        if has_audio_cache and state is not None:
                             state.audio_past_key_values = getattr(self.thinker, "audio_past_key_values", None)
                         return result
                     except TypeError:
                         result = self._cat_nested_tensors(get_streaming(batch_feature))
-                        if has_audio_cache:
+                        if has_audio_cache and state is not None:
                             state.audio_past_key_values = getattr(self.thinker, "audio_past_key_values", None)
                         return result
                 get_hidden = getattr(target, "get_audio_hidden_states", None)
                 if callable(get_hidden):
                     result = self._cat_nested_tensors(get_hidden(batch_feature))
-                    if has_audio_cache:
+                    if has_audio_cache and state is not None:
                         state.audio_past_key_values = getattr(self.thinker, "audio_past_key_values", None)
                     return result
             return None
@@ -627,14 +672,14 @@ class MiniCPMO45Stage0DuplexRuntime:
                 return original_register(config_class, *args, **kwargs)
 
             with _MINICPMO45_PROCESSOR_LOAD_LOCK:
-                AutoImageProcessor.register = staticmethod(register_image_processor)
+                setattr(AutoImageProcessor, "register", staticmethod(register_image_processor))
                 try:
                     processor = AutoProcessor.from_pretrained(
                         model_path,
                         trust_remote_code=True,
                     )
                 finally:
-                    AutoImageProcessor.register = staticmethod(original_register)
+                    setattr(AutoImageProcessor, "register", staticmethod(original_register))
         except Exception as exc:
             raise RuntimeError(f"Failed to load MiniCPM-o duplex processor from {model_path!r}") from exc
         if getattr(processor, "tokenizer", None) is None:
@@ -764,21 +809,24 @@ class MiniCPMO45Stage0DuplexRuntime:
                 f"missing or unknown: {', '.join(missing)}"
             )
 
-    def _stage_vision_embeddings(self, frames: list[Any]) -> list[Any] | None:
-        """Encode camera frames for omni duplex via the loaded vision tower.
+    def _vision_slice_token_ids(self, *, is_source: bool) -> tuple[int, int]:
+        if is_source:
+            return int(self.image_start_token_id), int(self.image_end_token_id)
+        start = getattr(self, "slice_start_token_id", None)
+        end = getattr(self, "slice_end_token_id", None)
+        if isinstance(start, int) and start >= 0 and isinstance(end, int) and end >= 0:
+            return start, end
+        return int(self.image_start_token_id), int(self.image_end_token_id)
 
-        Semantics mirror ``MiniCPMODuplex.streaming_prefill`` (one 64-embedding
-        block per frame at ``max_slice_nums=1``), executed through the vLLM
-        wrapper's ``get_vision_hidden_states`` (vpm + resampler) since the
-        stage model does not expose the remote-code ``get_vision_embedding``.
-        """
-        process_image = getattr(self.processor, "process_image", None)
-        if not callable(process_image):
-            return None
-        try:
-            processed = process_image(frames, max_slice_nums=1)
-        except Exception:  # noqa: BLE001 - prefill fails with a reason
-            return None
+    def _official_max_slice_nums(self, frame_count: int) -> list[int]:
+        """Official stacked pair uses HD on the current frame only: ``[2, 1]``."""
+        if frame_count <= 0:
+            return []
+        if frame_count == 1:
+            return [1]
+        return [2] + [1] * (frame_count - 1)
+
+    def _encode_processed_vision(self, processed: Any) -> list[Any] | None:
         targets = (self.stage_model, self.thinker, getattr(self.stage_model, "model", None))
         for target in targets:
             if target is None:
@@ -801,17 +849,48 @@ class MiniCPMO45Stage0DuplexRuntime:
                         flat_pixels.append(slice_pixels.to(device=device, dtype=dtype))
                     tgt_tensor = image_tgt if hasattr(image_tgt, "reshape") else torch.tensor(image_tgt)
                     flat_tgt.append(tgt_tensor.reshape(-1, 2))
+                if not flat_pixels:
+                    return None
                 tgt_sizes = torch.cat(flat_tgt, dim=0).to(device=device, dtype=torch.int64)
                 with torch.no_grad():
                     hidden = get_hidden({"pixel_values": flat_pixels, "tgt_sizes": tgt_sizes})
             except Exception:  # noqa: BLE001 - prefill fails with a reason
                 return None
             expected = MiniCPMO45DuplexPolicy.VISION_EMBEDS_PER_FRAME
+            embed_dtype = self._token_embedding_dtype()
             out: list[Any] = []
             for block in hidden:
                 block_2d = self._as_2d_tensor(block)
                 if int(block_2d.shape[0]) != expected:
                     return None
+                if embed_dtype is not None and block_2d.dtype != embed_dtype:
+                    block_2d = block_2d.to(dtype=embed_dtype)
                 out.append(block_2d)
             return out
         return None
+
+    def _stage_vision_embeddings(self, frames: list[Any]) -> list[list[Any]] | None:
+        """Encode camera frames for omni duplex via the loaded vision tower.
+
+        Official ``streaming_prefill`` encodes each ``frame_list`` entry as its
+        own image (source + optional HD slices) and never stacks audio: the
+        unit still carries one second of soundtrack. A stacked pair uses
+        ``max_slice_nums=[2, 1]`` so the current frame keeps the elevator
+        display readable and the composite stays a single 448-normalized tile.
+        Frames are processed one at a time because ``process_image([a, b])``
+        packs both PILs into one batch item.
+        """
+        process_image = getattr(self.processor, "process_image", None)
+        if not callable(process_image):
+            return None
+        out: list[list[Any]] = []
+        for frame, max_slices in zip(frames, self._official_max_slice_nums(len(frames))):
+            try:
+                processed = process_image([frame], max_slice_nums=max_slices)
+            except Exception:  # noqa: BLE001 - prefill fails with a reason
+                return None
+            encoded = self._encode_processed_vision(processed)
+            if encoded is None:
+                return None
+            out.append(encoded)
+        return out

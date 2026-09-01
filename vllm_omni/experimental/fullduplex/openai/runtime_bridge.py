@@ -362,11 +362,13 @@ class NativeRuntimeBridgeMixin:
         *,
         session: DuplexSession,
         expected_epoch: int | None,
+        model_turn_id: int | None = None,
     ) -> None:
         """Close an auto-response whose final silence unit did not end it."""
         native = self._runtime_session_state(session)
         response_id = session.active_response_id
         response_epoch = session.epoch
+        response_turn_id = model_turn_id if model_turn_id is not None else session.active_response_turn_id
         if expected_epoch is not None and response_epoch != expected_epoch:
             return
         native.clear_continuation()
@@ -380,9 +382,13 @@ class NativeRuntimeBridgeMixin:
             }
         )
         if response_id is None:
+            if session.epoch == response_epoch and response_turn_id is not None:
+                session.complete_model_turn(response_turn_id)
             return
         if session.epoch != response_epoch or session.active_response_id != response_id:
             return
+        if response_turn_id is not None:
+            session.complete_model_turn(response_turn_id)
         session.end_response(commit_text=False, preserve_request=True)
         await send_json(
             {
@@ -469,6 +475,7 @@ class NativeRuntimeBridgeMixin:
                     send_json,
                     session=session,
                     expected_epoch=expected_epoch,
+                    model_turn_id=payload_turn_id,
                 )
             return
         payload = self._native_silence_unit_payload()
@@ -1003,6 +1010,12 @@ class NativeRuntimeBridgeMixin:
                     return close_reason, emitted_response
                 if auto_response:
                     self._runtime_session_state(session).clear_continuation()
+                    if not auto_continuations_remaining:
+                        completed_turn_id = model_turn_id
+                        if completed_turn_id is None:
+                            completed_turn_id = session.active_response_turn_id
+                        if completed_turn_id is not None:
+                            session.complete_model_turn(completed_turn_id)
                 session.end_response(commit_text=False, preserve_request=auto_response)
                 await send_json(
                     {
