@@ -989,7 +989,6 @@ class AsyncOmniEngine:
             data_parallel_size = normalized_kwargs.get("data_parallel_size")
             tensor_parallel_size = normalized_kwargs.get("tensor_parallel_size") or 1
             cfg_parallel_size = normalized_kwargs.get("cfg_parallel_size") or 1
-            pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
             vae_patch_parallel_size = normalized_kwargs.get("vae_patch_parallel_size") or 1
             vae_parallel_mode = normalized_kwargs.get("vae_parallel_mode") or "tile"
             text_encoder_tp_size = normalized_kwargs.get("text_encoder_tp_size") or 1
