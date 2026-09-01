@@ -6,7 +6,10 @@ Ascend-specific workarounds that must not live in the shared GPU model file:
 
 1. HiFT sine-source downsample — replace the failing 480x ``linear1d``
    downsample with its exact midpoint form while keeping HiFT on NPU.
-2. CosyVoice2 DiT SDPA — force MATH backend (+ DiT attn mask expand) to
+2. HiFT device constants — keep the harmonic multiplier and the STFT window
+   resident on the accelerator instead of copying them up from host memory on
+   every vocoder call.
+3. CosyVoice2 DiT SDPA — force MATH backend (+ DiT attn mask expand) to
    avoid fused FA rejecting CosyVoice ``(B,1,1,S)`` masks (error 161001).
 """
 
@@ -82,6 +85,84 @@ def _f02sine_with_npu_safe_downsample(self, f0_values: torch.Tensor) -> torch.Te
     return torch.sin(phase)
 
 
+def _sinegen2_forward_with_resident_harmonics(
+    self,
+    f0: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``SineGen2.forward``, reading its harmonic multiplier from the device.
+
+    Identical to upstream in every operation and in the order it draws from
+    the RNG; the only difference is that the multiplier is a tensor that
+    already lives on ``f0``'s device instead of one built on the host and
+    copied up.
+    """
+    multipliers = self._npu_resident_harmonics
+    if multipliers.device != f0.device or multipliers.dtype != torch.float32:
+        # Upstream builds a fresh FP32 tensor on the input device every call,
+        # so honour that invariant if the module is migrated after loading —
+        # without paying for it in steady state.
+        multipliers = multipliers.to(device=f0.device, dtype=torch.float32)
+        self._npu_resident_harmonics = multipliers
+    fn = torch.multiply(f0, multipliers)
+    sine_waves = self._f02sine(fn) * self.sine_amp
+    uv = self._f02uv(f0)
+    noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
+    noise = noise_amp * torch.randn_like(sine_waves)
+    sine_waves = sine_waves * uv + noise
+    return sine_waves, uv, noise
+
+
+def _make_hift_constants_resident(hift: torch.nn.Module, sine_gen: torch.nn.Module) -> int:
+    """Materialize HiFT's two immutable tensors once, on the model's device.
+
+    ``SineGen2.forward`` rebuilds ``torch.FloatTensor([[range(1, n + 2)]])`` on
+    the host and copies it to the device on every call, and ``_stft`` /
+    ``_istft`` each run ``self.stft_window.to(x.device)`` — the window is a
+    plain attribute rather than a registered buffer, so it never moved with
+    the module. That is three unpinned host-to-device copies per vocoder call.
+
+    On Ascend an unpinned copy costs far more than its bytes: it drains the
+    device queue, so the price is a pipeline stall on a hot streaming path.
+    Both tensors are constants, so hoisting them is numerically exact.
+
+    Returns the number of constants made resident, for the log line.
+    """
+    parameters = getattr(hift, "parameters", None)
+    if not callable(parameters):
+        return 0
+    parameter = next(parameters(), None)
+    if parameter is None:
+        return 0
+    device = parameter.device
+    resident = 0
+
+    harmonic_num = getattr(sine_gen, "harmonic_num", None)
+    if harmonic_num is not None and all(
+        hasattr(sine_gen, name) for name in ("sine_amp", "noise_std", "_f02uv", "forward")
+    ):
+        # Deliberately a plain attribute, not a registered buffer: a buffer
+        # would follow ``Module.half()`` away from the FP32 tensor upstream
+        # builds explicitly. The replacement forward repairs device and dtype
+        # once if the module is migrated later.
+        sine_gen._npu_resident_harmonics = torch.arange(
+            1,
+            int(harmonic_num) + 2,
+            device=device,
+            dtype=torch.float32,
+        ).view(1, 1, -1)
+        sine_gen._step_audio2_original_forward = sine_gen.forward
+        sine_gen.forward = MethodType(_sinegen2_forward_with_resident_harmonics, sine_gen)
+        resident += 1
+
+    window = getattr(hift, "stft_window", None)
+    if isinstance(window, torch.Tensor):
+        # ``_patched_ensure_models_loaded`` runs this after final placement, so
+        # the window lands on the device the convolutions are already on.
+        hift.stft_window = window.to(device=device)
+        resident += 1
+    return resident
+
+
 def patch_step_audio2_hift_for_npu(hift: torch.nn.Module) -> None:
     """Patch the non-causal Step-Audio2 HiFT implementation for Ascend.
 
@@ -93,6 +174,9 @@ def patch_step_audio2_hift_for_npu(hift: torch.nn.Module) -> None:
     The exact midpoint form keeps the common path on NPU. Unsupported or pulse
     configurations delegate only ``_f02sine`` to CPU, preserving upstream
     behavior without restoring the old whole-HiFT CPU offload.
+
+    It also makes HiFT's two host-built constants resident on the device — see
+    ``_make_hift_constants_resident``. Both are numerically exact.
     """
     if getattr(hift, "_step_audio2_npu_downsample_patched", False):
         return
@@ -108,8 +192,12 @@ def patch_step_audio2_hift_for_npu(hift: torch.nn.Module) -> None:
 
     sine_gen._step_audio2_original_f02sine = original_f02sine
     sine_gen._f02sine = MethodType(_f02sine_with_npu_safe_downsample, sine_gen)
+    resident = _make_hift_constants_resident(hift, sine_gen)
     hift._step_audio2_npu_downsample_patched = True
-    logger.info("Patched Step-Audio2 HiFT linear downsample for Ascend NPU")
+    logger.info(
+        "Patched Step-Audio2 HiFT for Ascend NPU: linear downsample, %d resident constants",
+        resident,
+    )
 
 
 @contextmanager
