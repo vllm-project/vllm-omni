@@ -35,16 +35,13 @@ Simplest working example:
 
 ```python
 from vllm_omni import Omni
-from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 omni = Omni(
     model="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-    parallel_config=DiffusionParallelConfig(
-        pipeline_parallel_size=4,
-        enable_pipefusion=True,
-        vae_patch_parallel_size=4,
-    ),
+    pipeline_parallel_size=4,
+    enable_pipefusion=True,
+    vae_patch_parallel_size=4,
 )
 
 outputs = omni.generate(
@@ -112,7 +109,7 @@ python examples/offline_inference/text_to_video/text_to_video.py \
 
 ## Configuration Parameters
 
-In `DiffusionParallelConfig`
+Pass parallelism settings as flat `Omni(...)` arguments.
 
 | Parameter                | Type | Default | Description                                                                  |
 |--------------------------|------|---------|------------------------------------------------------------------------------|
@@ -187,7 +184,8 @@ idle time during denoising.
 1. Set `pipeline_parallel_size` to a value greater than 1.
 
 ```python
-parallel_config = DiffusionParallelConfig(
+omni = Omni(
+    model="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
     pipeline_parallel_size=2,
     enable_pipefusion=True,
 )
