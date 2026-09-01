@@ -63,13 +63,13 @@ steps:
         mirror_hardwares: l4_2
 
       - label: "Diffusion · Distributed & Attention Test · 4-GPU"
-        source_file_dependencies:
-          - tests/diffusion/distributed/
-          - tests/diffusion/attention/test_attention_sp.py
-          - vllm_omni/diffusion/distributed/
-          - vllm_omni/diffusion/attention/
-          - vllm_omni/diffusion/data.py
-          - vllm_omni/diffusion/models/
+        # source_file_dependencies:
+        #   - tests/diffusion/distributed/
+        #   - tests/diffusion/attention/test_attention_sp.py
+        #   - vllm_omni/diffusion/distributed/
+        #   - vllm_omni/diffusion/attention/
+        #   - vllm_omni/diffusion/data.py
+        #   - vllm_omni/diffusion/models/
         commands:
           - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda and L4 and cards_4' --run-level "core_model"
           - timeout 20m pytest -sv tests/diffusion/attention/test_attention_sp.py -m 'core_model and cuda and L4 and cards_4' --run-level "core_model"
