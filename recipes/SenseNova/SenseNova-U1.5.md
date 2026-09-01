@@ -115,6 +115,10 @@ Reported by @hsliuustc0106 against PR head `29c090d`, on one reserved CUDA devic
 | 8 steps, cfg 1.0, distilled LoRA | 623.85 ms, 77.98 ms/step | 34364 MiB |
 | 50 steps, cfg 4.0, think on, `VLLM_OMNI_SENSENOVA_PAGED_DECODE=1` | 81622 ms | 34594 MiB |
 
+Each row runs the Text-to-Image command above with `--num-inference-steps` and
+`--cfg-scale` as listed and `think` set through `--extra-body`; the LoRA row adds
+`--lora-path` and `--lora-backend distill`.
+
 Single runs without a preceding warmup, so the think-on row carries the first-request
 compile rather than a steady state. The distilled LoRA fused into 168 parameters, and its
 image differs from the same-seed no-LoRA control in 1,048,574 of 1,048,576 pixels, MAE 58.62.
