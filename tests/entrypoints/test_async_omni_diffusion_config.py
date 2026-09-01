@@ -120,6 +120,39 @@ def test_stage_override_preserves_model_extras_for_default_diffusion_stage(mocke
     assert stage_configs[0]["engine_args"]["extras"]["ltx2_use_conv_vae"] is True
 
 
+@pytest.mark.parametrize("per_stage", [False, True])
+def test_default_diffusion_fallback_preserves_model_loading_overrides(mocker, per_stage):
+    """Single-stage fallback must retain component path/load overrides."""
+    mocker.patch(
+        "vllm_omni.config.resolver.StageConfigFactory.create_from_model",
+        return_value=None,
+    )
+    mocker.patch(
+        "vllm_omni.config.resolver._resolve_generic_diffusion_model_class",
+        return_value=(True, "MiniMaxH3Pipeline"),
+    )
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+    model_paths = {"transformer": "/models/convrot.safetensors"}
+    model_loaded = {"transformer": True, "vae": True, "text_encoder": False}
+    quantization_config = {"transformer": {"method": "int8_convrot"}}
+    overrides = {
+        "model_paths": model_paths,
+        "model_loaded": model_loaded,
+        "quantization_config": quantization_config,
+    }
+
+    _, stage_configs = engine._resolve_stage_configs(
+        "/models/MiniMax-H3",
+        {"stage_overrides": {"0": overrides}} if per_stage else overrides,
+        trust_remote_code=False,
+    )
+
+    engine_args = stage_configs[0]["engine_args"]
+    assert engine_args["model_paths"] == model_paths
+    assert engine_args["model_loaded"] == model_loaded
+    assert engine_args["quantization_config"] == quantization_config
+
+
 def test_default_stage_rejects_unknown_nested_parallel_config_key():
     unknown_key = "unknown_parallel_field"
     with pytest.raises(ValidationError, match=unknown_key):
