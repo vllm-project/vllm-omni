@@ -249,11 +249,6 @@ class DiffusionWorker:
         # requests, which only carry their request_id in subsequent ticks.
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
-        if self.od_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER:
-            logger.warning_once(
-                "paged_scheduler initializes native paged KV storage, but no production diffusion model uses the "
-                "paged-attention adapter yet; model attention remains on the dense path."
-            )
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
         #   1. explicit od_config.diffusion_model_runner_cls (user override),
@@ -538,7 +533,16 @@ class DiffusionWorker:
 
     def init_lora_manager(self) -> None:
         """Initialize the LoRA manager for this worker."""
-        if self.model_runner.pipeline is None:
+        pipeline = self.model_runner.pipeline
+        if pipeline is None:
+            return
+
+        # A release whose weights cannot be expressed as switchable LoRA layers
+        # is fused into the checkpoint while the pipeline loads. There is then
+        # no adapter left to register, and handing the same path to the manager
+        # would only fail on a format it does not accept.
+        if getattr(pipeline, "lora_is_fused", False):
+            logger.info("LoRA was fused into the checkpoint at load time; skipping the dynamic LoRA manager.")
             return
 
         lora_path = self.od_config.lora_path
@@ -739,11 +743,15 @@ class DiffusionWorker:
             logger.warning("LoRA activation skipped: %s", exc)
 
     def remove_lora(self, adapter_id: int) -> bool:
+        if self.lora_manager is None:
+            return False
         return self.lora_manager.remove_adapter(adapter_id)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         # NOTE (Alex): We have not implemented the API routing
         # for the frontend server yet.
+        if self.lora_manager is None:
+            return False
         return self.lora_manager.add_adapter(lora_request)
 
     def submit_interaction(
@@ -756,9 +764,13 @@ class DiffusionWorker:
         self.model_runner.submit_interaction(request_id, interaction)
 
     def list_loras(self) -> list[int]:
+        if self.lora_manager is None:
+            return []
         return self.lora_manager.list_adapters()
 
     def pin_lora(self, adapter_id: int) -> bool:
+        if self.lora_manager is None:
+            return False
         return self.lora_manager.pin_adapter(adapter_id)
 
     def sleep(self, level: int = 1) -> int:

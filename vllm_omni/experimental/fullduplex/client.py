@@ -269,6 +269,11 @@ class RealtimeEventCollector:
             }
         )
 
+    def response_is_done(self, response_id: str) -> bool:
+        return any(
+            event.get("type") == "response.done" and self.response_id(event) == response_id for event in self.events
+        )
+
     def errors(self) -> list[dict[str, object]]:
         return [event for event in self.events if event.get("type") == "error"]
 
@@ -673,7 +678,7 @@ class RealtimeDuplexClient:
     async def acknowledge_playback(self) -> None:
         for response_id in self.events.response_ids:
             pcm16 = self.events.audio_bytes(response_id)
-            if not pcm16:
+            if not pcm16 and self.events.response_is_done(response_id):
                 continue
             played_ms = len(pcm16) * 1000 // (self.events.output_sample_rate_hz * PCM16_BYTES_PER_SAMPLE)
             await self.send_playback_ack(response_id, played_ms)

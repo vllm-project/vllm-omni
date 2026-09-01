@@ -43,6 +43,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
     validates_generation = True
     stage_keys = frozenset({"qwen3_tts"})
     name = "qwen3_tts"
+    supported_output_sample_rates = frozenset({8000, 24000})
 
     def _get_model_variant(self) -> str | None:
         """Return the task supported by the loaded Qwen3-TTS checkpoint.

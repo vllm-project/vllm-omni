@@ -27,7 +27,16 @@ _MODEL = "openbmb/MiniCPM-o-4_5"
 _CI_DEPLOY = modify_stage_config(
     get_deploy_config_path("minicpmo_4_5.yaml"),
     updates={
-        "stages": {0: {"default_sampling_params.max_tokens": 64}, 1: {"default_sampling_params.max_tokens": 1024}}
+        "stages": {
+            0: {"default_sampling_params.max_tokens": 64},
+            1: {
+                "default_sampling_params.max_tokens": 1024,
+                # Content-consistency assertions must not depend on a random
+                # codec trajectory: different valid TTS samples can append an
+                # audible tail even when Thinker text is identical.
+                "default_sampling_params.temperature": 0.0,
+            },
+        },
     },
 )
 

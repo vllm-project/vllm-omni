@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for vllm_omni.entrypoints.utils module."""
 
 import os
@@ -420,6 +423,7 @@ class TestLoadAndResolveStageConfigs:
         """Ensure that kwargs survive default stage creation."""
         engine_backend = "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine"
         kwargs = {"dtype": torch.float32, "engine_backend": engine_backend}
+        kwargs["revision"] = "pinned-revision"
         mocker.patch("vllm_omni.entrypoints.utils.resolve_model_config_path", return_value=None)
         mocker.patch("vllm_omni.entrypoints.utils.load_stage_configs_from_model", return_value=([], None))
 
@@ -433,6 +437,7 @@ class TestLoadAndResolveStageConfigs:
         assert len(stage_configs) == 1
         assert "dtype" in stage_configs[0]["engine_args"]
         assert stage_configs[0]["engine_args"]["engine_backend"] == engine_backend
+        assert stage_configs[0]["engine_args"]["revision"] == "pinned-revision"
 
     def test_deploy_config_preserves_cli_overrides_and_replicas(self, tmp_path, mocker: MockerFixture):
         deploy_path = tmp_path / "qwen3_multi.yaml"

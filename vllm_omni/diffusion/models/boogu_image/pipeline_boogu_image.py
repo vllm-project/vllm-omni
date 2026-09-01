@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Native vLLM-Omni pipeline for Boogu-Image-0.1.
 
@@ -220,7 +220,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
                 subfolder="transformer",
-                revision=None,
+                revision=od_config.revision,
                 prefix="transformer.",
                 fall_back_to_pt=True,
             )
@@ -233,10 +233,18 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         # See ``hub_prefetch.py`` for the transformers v5 multi-worker subfolder
         # race; prefetch the whole component set before any from_pretrained.
         boogu_subfolders = ["scheduler", "vae", "mllm", "processor"]
-        prefetch_subfolders(model, boogu_subfolders, local_files_only=local_files_only)
+        prefetch_subfolders(
+            model,
+            boogu_subfolders,
+            local_files_only=local_files_only,
+            revision=od_config.revision,
+        )
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model, subfolder="scheduler", local_files_only=local_files_only
+            model,
+            subfolder="scheduler",
+            local_files_only=local_files_only,
+            revision=od_config.revision,
         )
 
         mllm = from_pretrained_with_prefetch(
@@ -246,6 +254,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             prefetch_list=boogu_subfolders,
             local_files_only=local_files_only,
             torch_dtype=od_config.dtype,
+            revision=od_config.revision,
         )
         # Upstream reuses the full VLM as an optional instruction rewriter and
         # encodes with its inner model (no ``lm_head``); the rewriter is not
@@ -255,7 +264,10 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         self.mllm = mllm.to(self._execution_device)
 
         self.processor = Qwen3VLProcessor.from_pretrained(
-            model, subfolder="processor", local_files_only=local_files_only
+            model,
+            subfolder="processor",
+            local_files_only=local_files_only,
+            revision=od_config.revision,
         )
 
         self.vae = from_pretrained_with_prefetch(
@@ -264,6 +276,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             subfolder="vae",
             prefetch_list=boogu_subfolders,
             local_files_only=local_files_only,
+            revision=od_config.revision,
         ).to(self._execution_device)
 
         self.transformer = BooguImageTransformer2DModel(od_config=od_config)

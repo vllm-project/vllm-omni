@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import asyncio
 import base64
 import importlib.util
 import sys
@@ -170,6 +171,29 @@ def test_open_streaming_response_requires_post_commit_drain():
             {"type": "response.done"},
         ]
     )
+
+
+def test_final_input_commit_checkpoints_playback_first():
+    demo = _load_demo_module()
+    client = demo.RealtimeDuplexClient("ws://unused")
+    client.events.add(
+        {
+            "type": "response.created",
+            "response": {"id": "resp-zero-audio"},
+        }
+    )
+    calls = []
+
+    async def send(event):
+        calls.append(event)
+
+    client.send = send
+    commit_sent_at_s = asyncio.run(demo._commit_input_after_playback_checkpoint(client))
+
+    assert [event["type"] for event in calls] == ["playback.ack", "input_audio_buffer.commit"]
+    assert calls[0]["response_id"] == "resp-zero-audio"
+    assert calls[0]["played_ms"] == 0
+    assert isinstance(commit_sent_at_s, float)
 
 
 def _asymmetric_image():
