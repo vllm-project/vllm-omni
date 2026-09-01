@@ -14,7 +14,7 @@ from vllm.inputs import tokens_input
 from vllm.utils import random_uuid
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
 from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
     INDEXTTS25_MAX_DURATION_FACTOR,
     INDEXTTS25_MIN_DURATION_FACTOR,
@@ -108,6 +108,8 @@ def indextts2_conditioning_cache_salt(
         "use_random",
         "lang",
         "text_normalization",
+        "ref_audio_cache_key",
+        "emo_audio_cache_key",
     ):
         h.update(b"\x00")
         h.update(key.encode("utf-8"))
@@ -241,6 +243,15 @@ class IndexTTS2Adapter(ARTTSAdapter):
         prompt["cache_salt"] = indextts2_conditioning_cache_salt(request, tts_params)
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type=self.name)
 
+    def apply_sampling_overrides(
+        self,
+        sampling_params_list: list,
+        request: OpenAICreateSpeechRequest,
+        prompt: dict[str, Any] | None = None,
+        request_id: str | None = None,
+    ) -> list:
+        return apply_max_new_tokens(sampling_params_list, request)
+
     async def _build_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         server = self.ctx.server
         params: dict[str, Any] = {"text": [request.input]}
@@ -251,8 +262,9 @@ class IndexTTS2Adapter(ARTTSAdapter):
             ref_audio_source = server._get_uploaded_audio_data(voice_lower)
             using_uploaded_voice = ref_audio_source is not None
         if ref_audio_source is not None and isinstance(ref_audio_source, str):
-            wav_list, sr = await server._resolve_ref_audio(ref_audio_source)
+            wav_list, sr, cache_key = await server._resolve_ref_audio(ref_audio_source)
             params["voice"] = [[wav_list, sr]]
+            params["ref_audio_cache_key"] = [cache_key]
         if using_uploaded_voice and voice_lower:
             params["voice_name"] = [voice_lower]
             params["voice_created_at"] = [server._voice_created_at(voice_lower)]
@@ -262,8 +274,9 @@ class IndexTTS2Adapter(ARTTSAdapter):
             if key not in extras:
                 continue
             if key == "emo_audio":
-                wav_list, sr = await server._resolve_ref_audio(extras[key])
+                wav_list, sr, emo_key = await server._resolve_ref_audio(extras[key])
                 params[key] = [[wav_list, sr]]
+                params["emo_audio_cache_key"] = [emo_key]
             else:
                 params[key] = [extras[key]]
         return params

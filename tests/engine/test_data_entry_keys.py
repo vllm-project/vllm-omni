@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for data_entry_keys."""
 
 import msgspec
@@ -70,6 +73,25 @@ class TestOmniPayloadStruct:
         assert sorted(d.keys()) == sorted(original.keys())
         for top, sub in original.items():
             assert sorted(d[top].keys()) == sorted(sub.keys())
+
+    def test_text_conditioning_uses_shared_payload_fields(self):
+        hidden = torch.zeros(4, 5120)
+        token_role_ids = torch.tensor([[1], [1], [0], [0]])
+
+        payload = to_dict(
+            to_struct(
+                {
+                    "hidden_states": {"output": hidden},
+                    "meta": {"token_role_ids": token_role_ids},
+                }
+            )
+        )
+
+        assert torch.equal(payload["hidden_states"]["output"], hidden)
+        assert torch.equal(payload["meta"]["token_role_ids"], token_role_ids)
+        for legacy_key in ("encoder_hidden_states", "token_tags"):
+            with pytest.raises(msgspec.ValidationError, match="unknown field"):
+                to_struct({legacy_key: torch.zeros(1)})
 
     def test_to_dict_drops_unset_fields(self):
         s = OmniPayloadStruct(meta=MetaStruct(left_context_size=10))
@@ -372,12 +394,12 @@ class TestSerializeDeserializePayload:
         assert torch.equal(restored["hidden_states"]["layers"][24], torch.tensor([3.0]))
 
     def test_tensor_dtype_preserved(self):
-        # bfloat16 excluded: numpy() doesn't support it; callers must cast before serializing.
-        for dtype in [torch.float16, torch.float32, torch.int64, torch.int32, torch.bool]:
+        for dtype in [torch.float16, torch.bfloat16, torch.float32, torch.int64, torch.int32, torch.bool]:
             original: OmniPayload = {"codes": {"audio": torch.tensor([1], dtype=dtype)}}
             wire = serialize_payload(original)
             restored = deserialize_payload(wire)
             assert restored["codes"]["audio"].dtype == dtype, f"dtype mismatch for {dtype}"
+            assert torch.equal(restored["codes"]["audio"], original["codes"]["audio"])
 
     def test_tensor_shape_preserved(self):
         t = torch.randn(3, 4, 5)
@@ -394,3 +416,12 @@ class TestSerializeDeserializePayload:
         original: OmniPayload = {"meta": {"finished": None}}
         wire = serialize_payload(original)
         assert wire is None
+
+    def test_minimax_h3_prepared_reference_video_descriptor_round_trip(self):
+        descriptor = '{"artifact_dir":"/tmp/h3","videos":[]}'
+
+        wire = serialize_payload({"meta": {"minimax_h3_prepared_reference_videos": descriptor}})
+        assert wire is not None
+        restored = deserialize_payload(wire)
+
+        assert restored["meta"]["minimax_h3_prepared_reference_videos"] == descriptor

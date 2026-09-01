@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """``POST /v1/audio/generate`` validation (live Stable Audio Open server)."""
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 
 pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
 
@@ -68,10 +70,14 @@ _PARAMS = [
         pytest.param({"guidance_scale": -1.0}, "guidance_scale", id="guidance_scale_negative", marks=_SKIP_ISSUE_3649),
         pytest.param({"guidance_scale": 0}, "guidance_scale", id="guidance_scale_zero", marks=_SKIP_ISSUE_3649),
         pytest.param(
-            {"num_inference_steps": 0}, "num_inference_steps", id="num_inference_steps_zero", marks=_SKIP_ISSUE_3649
+            {"num_inference_steps": 0},
+            ("num_inference_steps", "greater than or equal to 1"),
+            id="num_inference_steps_zero",
         ),
         pytest.param(
-            {"num_inference_steps": -1}, ("number of steps", "non-negative"), id="num_inference_steps_negative"
+            {"num_inference_steps": -1},
+            ("num_inference_steps", "greater than or equal to 1"),
+            id="num_inference_steps_negative",
         ),
         pytest.param(
             {"num_inference_steps": 6000},
@@ -95,20 +101,20 @@ _PARAMS = [
 @pytest.mark.parametrize("omni_server", _PARAMS, indirect=True)
 def test_audio_generate_invalid_field_values(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
     overrides: dict[str, object],
     err_message: str | tuple[str, ...],
 ) -> None:
-    body = {"model": omni_server.model, "input": "ambient electronic pad"}
+    body: dict[str, Any] = {"model": omni_server.model, "input": "ambient electronic pad"}
     body.update(overrides)
-    openai_client.send_audio_generate_http_request(
+    online_client.send_audio_generate_http_request(
         {"json": body, "timeout": 120, "err_code": 400, "err_message": err_message}
     )
 
 
 @pytest.mark.parametrize("omni_server", _PARAMS, indirect=True)
-def test_audio_generate_missing_input(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
-    openai_client.send_audio_generate_http_request(
+def test_audio_generate_missing_input(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:
+    online_client.send_audio_generate_http_request(
         {
             "json": {"model": omni_server.model},
             "timeout": 120,

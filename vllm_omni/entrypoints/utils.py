@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import json
 import os
 import types
@@ -641,6 +644,18 @@ def load_and_resolve_stage_configs(
             stage_configs = []
 
     stage_configs = filter_stages(config_path, stage_configs, kwargs)
+
+    # ``revision`` selects the model source for every stage. Keep the global
+    # CLI pin on each stage's engine args so diffusion config construction can
+    # pass it through to all component loaders. The registry-to-legacy-stage
+    # conversion currently drops this inherited vLLM EngineArgs field.
+    revision = (kwargs or {}).get("revision")
+    if revision is not None:
+        for stage_config in stage_configs:
+            engine_args = stage_config.get("engine_args") if hasattr(stage_config, "get") else None
+            if engine_args is not None and engine_args.get("revision") is None:
+                engine_args["revision"] = revision
+
     logger.debug(f"stage_configs: {stage_configs}")
 
     return config_path, stage_configs, omni_lb_policy

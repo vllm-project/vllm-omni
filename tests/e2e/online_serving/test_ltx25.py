@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Online serving smokes for all four canonical LTX-2.5 pipelines."""
 
@@ -20,7 +20,7 @@ MODEL = os.getenv("VLLM_TEST_LTX25_MODEL", DEFAULT_MODEL)
 MODEL_REVISION = os.getenv("VLLM_TEST_LTX25_MODEL_REVISION", DEFAULT_REVISION if MODEL == DEFAULT_MODEL else "")
 PROMPT = "A red fox walks through a snowy forest while the camera remains fixed."
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
 
 
@@ -73,8 +73,8 @@ def test_ltx25_pipeline_entries(
                 "form_data": {
                     "model": omni_server.model,
                     "prompt": PROMPT,
-                    "height": 128,
-                    "width": 128,
+                    "height": 256,
+                    "width": 256,
                     "num_frames": 9,
                     "fps": 24,
                     "num_inference_steps": num_inference_steps,

@@ -131,7 +131,7 @@ Content-Type: application/json
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `ref_audio` | string | null | Reference audio (HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`) |
+| `ref_audio` | string | null | Reference audio (HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`). Local files fold `mtime_ns` and `size` into cache keys to automatically reload on-disk edits; HTTP URLs and base64 URIs remain cached by string locator. |
 | `ref_text` | string | null | Transcript of reference audio |
 | `x_vector_only_mode` | bool | null | Use speaker embedding only (no ICL) |
 
@@ -141,7 +141,20 @@ The response shape depends on the streaming parameters:
 
 **Non-streaming (default).** With `stream=false` and no `stream_format`, returns the
 complete clip as binary audio data with an appropriate `Content-Type` header (e.g.
-`audio/wav`). The raw-bytes body has no JSON carrier, so no `usage` is reported.
+`audio/wav`). Because the raw-bytes body has no JSON carrier, successful
+non-streaming responses from non-diffusion speech servers report usage through
+response headers:
+
+| Header | Description |
+| --- | --- |
+| `x-vllm-omni-input-tokens` | Total input tokens (`text_tokens` + `audio_tokens`). |
+| `x-vllm-omni-output-tokens` | Generated codec/audio tokens. |
+| `x-vllm-omni-total-tokens` | `input_tokens` + `output_tokens`. |
+| `x-vllm-omni-input-text-tokens` | Tokens from the synthesized text (`input` plus `instructions`). |
+| `x-vllm-omni-input-audio-tokens` | Reference-audio codec frames, non-zero only for in-context voice cloning. |
+
+Diffusion-mode speech servers route through a separate response path and do not
+emit these headers.
 
 **Raw audio stream** (`stream_format="audio"`). Streams raw audio bytes (PCM or
 WAV) as they are decoded.
@@ -675,7 +688,7 @@ for result in response.json()["results"]:
 |-----------|--------|---------|-------------|
 | `tts_batch_max_items` | engine kwarg | 32 | Maximum number of items per batch request |
 
-All items are fanned out to `generate()` concurrently. The engine's stage worker automatically batches them up to the configured `max_batch_size` and queues the rest — no client-side throttling needed.
+All items are fanned out to `generate()` concurrently. The engine's stage worker automatically batches them up to the configured `max_num_seqs` and queues the rest — no client-side throttling needed.
 
 For best throughput, set both stages' `max_num_seqs` above 1 via `--stage-overrides`. On the current Qwen3-TTS CustomVoice benchmark, stage 1 performed best at `max_num_seqs: 10`:
 
@@ -797,6 +810,51 @@ If you encounter OOM errors:
 ### Unsupported Speaker
 
 Use `/v1/audio/voices` to list available voices for the loaded model.
+
+## Orchestration Loop (experimental)
+
+Multi-stage omni deployments route stage outputs through a single orchestrator
+loop. By default that loop polls every stage replica on a 1 ms cadence. An
+opt-in event-driven mode replaces the poll with one reader task per live stage
+replica awaiting its client directly, and switches the serving-side
+final-output drain to a condition-variable wakeup at the same time.
+
+**Configuration (environment variables):**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | `0` (off) | Switches the orchestration loop and the final-output drain from the legacy 1 ms poll to event-driven wakeups. Enabled by `1`, `true`, `yes`, or `on`, matched case-insensitively after surrounding whitespace is stripped; any other value leaves it off. |
+
+Set it on the process that runs the orchestrator (stage 0 of an omni
+deployment) before starting the server:
+
+```bash
+export VLLM_OMNI_EVENT_DRIVEN_ORCH=1
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --omni \
+    --port 8091
+```
+
+The server logs the selected loop mode and its reader/poller counts once at
+startup, so you can confirm which loop is live.
+
+Routing, output ordering, and terminal-state behavior are identical on both
+loops; only the poll cadence changes. Leaving the variable unset keeps the
+legacy poll loop, which is the supported default.
+
+**Known limitations:**
+
+- The measured serving A/B (idle CPU 2.43% to 0.07%; TTFP p99 -32% at
+  concurrency 8) predates the rebuild on the per-replica fault-isolation work
+  in [#4285](https://github.com/vllm-project/vllm-omni/pull/4285). That work
+  changed dead-replica handling and reader/poller lifecycle rather than the
+  steady-state output path, and the parity suite covers it, but the serving
+  A/B has not been re-run on the current head.
+- The diffusion-poller branch is covered by unit tests only. Deployments whose
+  stages all run as standard engine cores never exercise it, including GLM-TTS,
+  which deploys its DiT without `stage_type: diffusion`.
+- Concurrency 1 and 32 measured at parity with the legacy loop. At 32 the
+  latency is admission-bound, which this mode does not address.
 
 ## Development
 

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Subprocess entry point for the diffusion engine.
 
 StageDiffusionProc runs DiffusionEngine in a child process,
@@ -22,7 +25,12 @@ from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_zmq_ipc_path, zmq_socket_ctx
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.core import EngineCoreProc
-from vllm.v1.engine.utils import CoreEngine, EngineZmqAddresses, wait_for_engine_startup
+from vllm.v1.engine.utils import (
+    CoreEngine,
+    CoreEngineLaunch,
+    EngineZmqAddresses,
+    wait_for_engine_startup,
+)
 from vllm.v1.utils import shutdown
 
 from vllm_omni.diffusion.data import DiffusionRequestAbortedError
@@ -36,6 +44,7 @@ from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.metrics.utils import diffusion_exception_metrics
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
@@ -361,6 +370,16 @@ class StageDiffusionProc:
                     request_id,
                     str(e),
                 )
+                metrics = diffusion_exception_metrics(e)
+                if metrics:
+                    await response_socket.send(
+                        encoder.encode(
+                            {
+                                "type": "metrics",
+                                "metrics": metrics,
+                            }
+                        )
+                    )
             except Exception as e:
                 logger.exception("Diffusion request %s failed: %s", request_id, e)
                 status_code, error_type = client_error_metadata(e)
@@ -372,6 +391,7 @@ class StageDiffusionProc:
                             "error": str(e),
                             "status_code": status_code,
                             "error_type": error_type,
+                            "metrics": diffusion_exception_metrics(e),
                         }
                     )
                 )
@@ -426,9 +446,8 @@ class StageDiffusionProc:
 
                 elif msg_type == "abort":
                     for rid in msg.get("request_ids", []):
-                        task = tasks.pop(rid, None)
-                        if task:
-                            task.cancel()
+                        # Let the request task consume the terminal abort
+                        # output so it can publish the scheduler snapshot.
                         self._engine.abort(rid)
 
                 elif msg_type == "collective_rpc":
@@ -579,6 +598,8 @@ class StageDiffusionProc:
           - ``omni_replica_id``: cluster-unique replica id within the
             stage (logging / metrics only).
         """
+        from vllm_omni.plugins import load_omni_general_plugins
+
         shutdown_requested = False
 
         set_death_signal(signal.SIGTERM)
@@ -591,6 +612,11 @@ class StageDiffusionProc:
 
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
+
+        # ``spawn`` starts this process with a fresh interpreter, so plugin
+        # side effects (for example, custom diffusion loader hooks) must be
+        # applied again before the engine is constructed.
+        load_omni_general_plugins()
 
         proc = cls(model, od_config)
         coord_client: OmniCoordClientForStage | None = None
@@ -750,7 +776,6 @@ class StageDiffusionProcManager:
             with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
                 wait_for_engine_startup(
                     handshake_socket,
-                    self.addresses,
                     [CoreEngine(index=0, local=True)],
                     SimpleNamespace(
                         data_parallel_size_local=1,
@@ -759,8 +784,17 @@ class StageDiffusionProcManager:
                     ),
                     False,
                     None,
-                    self,
-                    None,
+                    CoreEngineLaunch(
+                        engine_manager=self,
+                        coordinator=None,
+                        addresses=self.addresses,
+                        tensor_queue=None,
+                        # StageDiffusionProcManager is not a CoreEngineProcManager,
+                        # so upstream's isinstance-gated sentinel registration would
+                        # be skipped; watch the subprocess directly so a proc death
+                        # during handshake is still detected.
+                        watched_frontend_processes=[self.proc],
+                    ),
                 )
         except Exception:
             shutdown([self.proc])

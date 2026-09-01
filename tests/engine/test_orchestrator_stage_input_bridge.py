@@ -17,6 +17,7 @@ from vllm.sampling_params import SamplingParams
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
+    StreamingSegmentState,
     _OrchestratorDuplexStagePort,
 )
 from vllm_omni.engine.stage_pool import StagePool
@@ -160,6 +161,26 @@ def _duplex_stage_port_submission():
     return port, stage_pools, request_states, prewarm, submission
 
 
+def test_duplex_bridge_state_catches_up_after_serving_turn_boundary() -> None:
+    port, _, request_states, _, submission = _duplex_stage_port_submission()
+    request_state = request_states[submission.context.request_id]
+    bridge_state = request_state.streaming.bridge_states["duplex"]
+    bridge_state["model_turn_id"] = 0
+
+    next_context = DuplexStageRequestContext(
+        request_id=submission.context.request_id,
+        session_id=submission.context.session_id,
+        fence=DuplexFence(submission.context.session_id, turn_id=1),
+        stage_id=submission.context.stage_id,
+        final_stage_id=submission.context.final_stage_id,
+        config_generation=submission.context.config_generation,
+        sampling_params=submission.context.sampling_params,
+    )
+    port.ensure_request(next_context)
+
+    assert bridge_state["model_turn_id"] == 1
+
+
 def _request_output(request_id: str) -> RequestOutput:
     completion = CompletionOutput(
         index=0,
@@ -256,12 +277,13 @@ async def test_async_prewarm_skips_outgoing_only_stage() -> None:
         duplex_identity=SimpleNamespace(),
     )
 
-    await orchestrator._prewarm_async_chunk_stages(
+    prewarmed = await orchestrator._prewarm_async_chunk_stages(
         "req-prewarm",
         SimpleNamespace(prompt_token_ids=[1, 2], resumable=True),
         req_state,
     )
 
+    assert prewarmed is True
     assert stage1.submitted == []
     assert len(stage2.submitted) == 1
     assert 1 not in req_state.stage_submit_ts
@@ -277,12 +299,37 @@ async def test_async_prewarm_skips_outgoing_only_stage() -> None:
 @pytest.mark.asyncio
 async def test_duplex_prewarm_runs_after_first_stage0_submission() -> None:
     port, stage_pools, request_states, prewarm, submission = _duplex_stage_port_submission()
+    prewarm.return_value = True
 
     result = await port.submit(submission)
 
     assert result.stage_id == 0
     stage_pools[0].submit_initial.assert_awaited_once()
     prewarm.assert_awaited_once_with("req-duplex", ANY, request_states["req-duplex"])
+
+
+@pytest.mark.asyncio
+async def test_duplex_submit_bails_out_when_prewarm_failed_the_request() -> None:
+    """A failed prewarm has already aborted the request and popped its state.
+
+    Returning a success result here would hand the control plane a replica for a
+    request that no longer exists, and the trailing bookkeeping would re-register
+    a running counter the cleanup just released -- a leak that never decrements.
+    """
+    port, stage_pools, request_states, prewarm, submission = _duplex_stage_port_submission()
+    counter = MagicMock()
+    port._running_counter = counter
+    prewarm.return_value = False
+    request_state = request_states["req-duplex"]
+
+    with pytest.raises(RuntimeError, match="prewarm failed"):
+        await port.submit(submission)
+
+    prewarm.assert_awaited_once()
+    assert request_state.duplex_stage_fences == {}
+    assert request_state.stage_submit_ts == {}
+    assert request_state.running_counter_registered is False
+    counter.increment.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -332,7 +379,7 @@ async def test_streaming_segment_does_not_complete_final_output_stage() -> None:
         final_output_stage_ids={0},
     )
     req_state.streaming.enabled = True
-    req_state.streaming.segment_finished = True
+    req_state.streaming.segments[0] = StreamingSegmentState(finished=True)
     output = SimpleNamespace(
         request_id=req_state.request_id,
         finished=True,

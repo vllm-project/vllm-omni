@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright (c) Microsoft Corporation and Jiarui Fang
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team & Jiarui Fang
@@ -11,8 +11,10 @@ from dataclasses import replace
 
 import torch
 import torch.nn as nn
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
@@ -21,8 +23,13 @@ from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
-from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    get_ulysses_mode,
+    is_forward_context_available,
+)
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -38,6 +45,8 @@ def _try_extract_layer_index(prefix: str) -> int | None:
 
 
 class Attention(nn.Module):
+    _scheduler_paged_kv = False
+
     def __init__(
         self,
         num_heads: int,
@@ -61,12 +70,28 @@ class Attention(nn.Module):
         # perf for this layer (e.g. Wan2.2 cross-attn has short sequences and
         # block-FP8 quant offers no win). Default False = follow global config.
         disable_kv_quant: bool = False,
+        # Opt-in marker for Scheduler-managed paged KV. Unmarked diffusion
+        # attention remains dense and contributes no native KVCacheSpec.
+        paged_kv_cache_role: str | None = None,
+        paged_kv_cache_dtype: torch.dtype | None = None,
     ):
         super().__init__()
 
         self.role = role
         self.role_category = role_category
         self.qkv_layout = qkv_layout
+        # ``prefix`` is also the stable layer identity used by vLLM's native
+        # KV-cache metadata.  Keep it on the Omni layer so the active paged
+        # adapter can dispatch the already-resharded Q/K/V to the matching
+        # native cache tensor without replacing this Omni execution path.
+        self.prefix = prefix
+        if paged_kv_cache_role == "":
+            raise ValueError("paged_kv_cache_role must be non-empty when provided")
+        self.paged_kv_cache_role = paged_kv_cache_role
+        self.paged_kv_cache_dtype = paged_kv_cache_dtype
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        self.head_size = head_size
 
         # Resolve backend via role-aware config.
         # The global diffusion config is set during model init via
@@ -89,6 +114,44 @@ class Attention(nn.Module):
             role_category=role_category,
             allow_trtllm_default=allow_trtllm_default,
         )
+        scheduler_paged_kv = (
+            config is not None
+            and getattr(config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+        )
+        self._scheduler_paged_kv = scheduler_paged_kv
+        if (
+            scheduler_paged_kv
+            and paged_kv_cache_role is not None
+            and spec is None
+            and not attn_backend_cls.supports_paged_kv
+        ):
+            # FLASH_ATTN is an Omni selector, not a device-specific kernel.
+            # vLLM resolves it to CUDA FlashAttention on GPU and Ascend native
+            # attention on NPU. A platform may legitimately default dense
+            # attention to SDPA (for example when an optional diffusion FA
+            # package is absent), but a paged layer must advertise the
+            # capability so the Worker can register its native cache view.
+            # Resolve the selector only for this marked layer; unmarked dense
+            # attention keeps the platform default unchanged.
+            from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+
+            dense_backend_name = attn_backend_cls.get_name()
+            paged_attention_config = AttentionConfig(default=AttentionSpec(backend="FLASH_ATTN"))
+            attn_backend_cls, spec = get_attn_backend_for_role(
+                role=role,
+                head_size=head_size,
+                attention_config=paged_attention_config,
+                role_category=role_category,
+                allow_trtllm_default=allow_trtllm_default,
+            )
+            logger.info(
+                "Resolved marked paged diffusion attention role=%r to %r because the platform default %r "
+                "does not support Scheduler-owned KV",
+                role,
+                attn_backend_cls.get_name(),
+                dense_backend_name,
+            )
         parallel_config = getattr(config, "parallel_config", None)
         allgather_degree = getattr(parallel_config, "allgather_degree", 1)
         # TODO: Move AllGather-KV compatibility into an AttentionBackend capability
@@ -170,6 +233,25 @@ class Attention(nn.Module):
         # Per-layer opt-out from KV-cache quantization (set by model author).
         self._disable_kv_quant: bool = disable_kv_quant
         self._init_kv_cache_quantization(config)
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        """Return native rank-local geometry for an opted-in paged cache."""
+
+        if self.paged_kv_cache_role is None:
+            return None
+        dtype = self.paged_kv_cache_dtype or vllm_config.model_config.dtype
+        # Keep backend layout discovery under the same config context used by
+        # upstream vLLM's attention-spec collector.
+        with set_current_vllm_config(vllm_config):
+            indexes_kv_by_block_stride = self.attn_backend.indexes_kv_by_block_stride()
+        return FullAttentionSpec(
+            block_size=vllm_config.cache_config.block_size,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_size,
+            dtype=dtype,
+            indexes_kv_by_block_stride=indexes_kv_by_block_stride,
+            non_causal=not self.causal,
+        )
 
     def _get_active_parallel_strategy(self):
         """Get the parallel strategy based on current SP active state.
@@ -279,25 +361,113 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         # Get the appropriate parallel strategy based on SP active state
         strategy = self._get_active_parallel_strategy()
+        paged_adapter = self._active_paged_kv_adapter()
+        in_kv_memory_profile = is_forward_context_available() and get_forward_context().in_diffusion_kv_memory_profile
+        if (
+            self._scheduler_paged_kv
+            and self.paged_kv_cache_role is not None
+            and paged_adapter is None
+            and not in_kv_memory_profile
+        ):
+            raise RuntimeError(
+                "Scheduler-paged diffusion attention reached model forward without an active Worker adapter. "
+                "Only the startup KV memory profile may execute before paged KV initialization."
+            )
+        use_paged_attention = paged_adapter is not None and self.paged_kv_cache_role is not None
+        if use_paged_attention and not getattr(self.attn_backend, "supports_paged_kv", False):
+            raise NotImplementedError(
+                f"Diffusion paged KV requires an Omni backend with paged support; "
+                f"selected {self.attn_backend.get_name()}"
+            )
+        if use_paged_attention and strategy is not self._no_parallel_strategy:
+            strategy_name = strategy.name
+            if self.use_ring or strategy_name == "ring":
+                raise NotImplementedError(
+                    "paged Scheduler KV is not supported with Ring attention; use strict Ulysses or no SP"
+                )
+            if strategy_name == "allgather_kv":
+                raise NotImplementedError("paged Scheduler KV is not supported with AllGather-KV sequence parallelism")
+            if strategy_name == "ulysses" and get_ulysses_mode(default="strict") != "strict":
+                raise NotImplementedError("paged Scheduler KV currently supports only strict Ulysses")
 
         # 1. Prepare inputs (Communication / Resharding)
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
         # For Ring: Concat joint_q
         query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
 
-        attn_metadata = self._with_kv_cache_dtype(attn_metadata)
+        # Scheduler rows describe the logical sequence, while strict Ulysses
+        # may append synthetic tokens solely to make the image shard divisible.
+        # Remove those tokens after the all-to-all and put zero placeholders
+        # back before the reverse all-to-all.
+        paged_sp_padding = 0
+        paged_sp_padding_offset = query.shape[1]
+        if use_paged_attention and strategy is not self._no_parallel_strategy and strategy.name == "ulysses":
+            forward_ctx = get_forward_context() if is_forward_context_available() else None
+            paged_sp_padding = int(getattr(forward_ctx, "sp_padding_size", 0))
+            if paged_sp_padding:
+                joint_len = int(getattr(ctx, "joint_len", 0))
+                joint_strategy = str(getattr(ctx, "joint_strategy", "front"))
+                paged_sp_padding_offset = query.shape[1] - (joint_len if joint_strategy == "rear" else 0)
+                padding_start = paged_sp_padding_offset - paged_sp_padding
+                if padding_start < 0:
+                    raise ValueError(
+                        "Paged Ulysses padding exceeds the post-all-to-all sequence: "
+                        f"padding={paged_sp_padding}, sequence={query.shape[1]}"
+                    )
 
-        # 2. Kernel Execution (Computation)
-        if self.use_ring and strategy is not self._no_parallel_strategy:
-            out = self._run_ring_attention(query, key, value, attn_metadata)
+                def _remove_paged_sp_padding(tensor: torch.Tensor) -> torch.Tensor:
+                    return torch.cat(
+                        (tensor[:, :padding_start], tensor[:, paged_sp_padding_offset:]),
+                        dim=1,
+                    ).contiguous()
+
+                query = _remove_paged_sp_padding(query)
+                key = _remove_paged_sp_padding(key)
+                value = _remove_paged_sp_padding(value)
+
+        # 2. This is the shared GPU/NPU boundary. The Worker adapter prepares
+        # the native page-table context after SP has produced rank-local Q/K/V;
+        # backend resolution below selects CUDA or Ascend execution.
+        if use_paged_attention:
+            assert paged_adapter is not None
+            paged_kv_context = paged_adapter.prepare_layer_context(
+                self.prefix,
+                query,
+                key,
+                value,
+                omni_attn_metadata=attn_metadata,
+            )
+            out = self.attention.forward_paged(paged_kv_context)
         else:
-            out = self._run_local_attention(query, key, value, attn_metadata)
+            attn_metadata = self._with_kv_cache_dtype(attn_metadata)
+            if self.use_ring and strategy is not self._no_parallel_strategy:
+                out = self._run_ring_attention(query, key, value, attn_metadata)
+            else:
+                out = self._run_local_attention(query, key, value, attn_metadata)
+
+        if paged_sp_padding:
+            padding_start = paged_sp_padding_offset - paged_sp_padding
+            output_padding = out.new_zeros((out.shape[0], paged_sp_padding, *out.shape[2:]))
+            out = torch.cat((out[:, :padding_start], output_padding, out[:, padding_start:]), dim=1)
 
         # 3. Post-processing (Reverse Communication)
         # For Ulysses: AllToAll Output, and AllGather Joint Output
         out = strategy.post_attention(out, ctx)
 
         return out
+
+    @staticmethod
+    def _active_paged_kv_adapter():
+        """Return the Worker adapter selected by Runner-owned metadata."""
+
+        if not is_forward_context_available():
+            return None
+        return getattr(get_forward_context(), "paged_kv_adapter", None)
+
+    def is_paged_kv_active(self) -> bool:
+        """Return whether this layer will use Scheduler-managed paged KV."""
+
+        return self.paged_kv_cache_role is not None and self._active_paged_kv_adapter() is not None
 
     def _run_local_attention(self, query, key, value, attn_metadata):
         self._assert_piecewise_compatible(attn_metadata)
@@ -309,7 +479,25 @@ class Attention(nn.Module):
             )
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
 
-        # Fallback to standard attention
+        in_kv_memory_profile = is_forward_context_available() and get_forward_context().in_diffusion_kv_memory_profile
+        # NPU only: the startup KV-capacity profile needs tensor shapes, not a
+        # paged attention result. If dense MindIE-SD is absent, SDPA provides
+        # that profile forward. Formal GPU/NPU paged requests never use this
+        # branch because their Worker adapter is active.
+        if (
+            self._scheduler_paged_kv
+            and self.paged_kv_cache_role is not None
+            and in_kv_memory_profile
+            and current_omni_platform.is_npu()
+            and self.attn_backend.get_name() == "FLASH_ATTN"
+            and not current_omni_platform.supports_diffusion_dense_flash_attention()
+        ):
+            logger.warning_once(
+                "The startup KV memory profile is using SDPA because MindIE-SD is unavailable. "
+                "Formal paged requests still use the platform-native paged attention backend."
+            )
+            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+
         return self.attention.forward(query, key, value, attn_metadata)
 
     def _assert_piecewise_compatible(self, attn_metadata: AttentionMetadata | None) -> None:

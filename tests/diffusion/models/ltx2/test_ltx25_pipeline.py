@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Focused LTX-2.5 pipeline correctness tests."""
 
 import json
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -170,7 +171,10 @@ def _resolve_request_inputs_for_test(
 
 
 def test_ltx25_missing_gemma4_recommends_supported_transformers_range(monkeypatch):
-    pipe = SimpleNamespace(component_profile=replace(LTX25_FULL_COMPONENT_PROFILE, text_encoder_cls=None))
+    pipe = SimpleNamespace(
+        component_profile=replace(LTX25_FULL_COMPONENT_PROFILE, text_encoder_cls=None),
+        use_diffusion_decoder=True,
+    )
     od_config = SimpleNamespace(model="Lightricks/LTX-2.5-Diffusers", dtype=torch.bfloat16)
 
     monkeypatch.setattr(ltx2_components, "get_local_device", lambda: torch.device("cpu"))
@@ -187,7 +191,19 @@ def test_ltx25_missing_gemma4_recommends_supported_transformers_range(monkeypatc
 
 def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
     revision = "pinned-revision"
-    calls = {"components": []}
+    calls: dict[str, Any] = {"components": []}
+    natten_processor = object()
+
+    class FakeDiffusionDecoder:
+        def set_attn_processor(self, processor):
+            calls["diffusion_decoder_processor"] = processor
+
+        def enable_tiling(self):
+            calls["diffusion_decoder_tiling"] = True
+
+        def set_parallel_size(self, parallel_size, mode):
+            calls["diffusion_decoder_parallel"] = (parallel_size, mode)
+
     profile = replace(
         LTX25_DISTILLED_COMPONENT_PROFILE,
         text_encoder_cls=object,
@@ -196,12 +212,19 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
         vocoder_fallback_cls=None,
         scheduler_use_dynamic_shifting=False,
     )
-    pipeline = SimpleNamespace(component_profile=profile, pipeline_kind="distilled_two_stage")
+    pipeline = SimpleNamespace(
+        component_profile=profile,
+        pipeline_kind="distilled_two_stage",
+        use_diffusion_decoder=True,
+    )
     od_config = SimpleNamespace(
         model="org/converted-ltx25",
         revision=revision,
         dtype=torch.bfloat16,
         quantization_config=None,
+        extras={},
+        vae_use_tiling=False,
+        parallel_config=SimpleNamespace(vae_patch_parallel_size=2, vae_parallel_mode="tile"),
     )
 
     monkeypatch.setattr(ltx2_components, "get_local_device", lambda: torch.device("cpu"))
@@ -227,6 +250,10 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
             )
         return object()
 
+    def fake_native_diffusion_decoder(model, **kwargs):
+        calls["native_diffusion_decoder"] = (model, kwargs)
+        return FakeDiffusionDecoder()
+
     def fake_transformer_config(model, subfolder, local_files_only, *, revision):
         calls["transformer_config"] = (model, subfolder, local_files_only, revision)
         return {"component": "transformer"}
@@ -234,7 +261,13 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
     monkeypatch.setattr(ltx2_components, "prefetch_subfolders", fake_prefetch)
     monkeypatch.setattr(ltx2_components.AutoTokenizer, "from_pretrained", fake_tokenizer)
     monkeypatch.setattr(ltx2_components, "_load_component", fake_component)
+    monkeypatch.setattr(ltx2_components, "_load_ltx25_native_diffusion_decoder", fake_native_diffusion_decoder)
     monkeypatch.setattr(ltx2_components, "load_transformer_config", fake_transformer_config)
+    monkeypatch.setattr(
+        ltx2_components,
+        "LTX2VideoVaeNeighborhoodNattenProcessor",
+        lambda: natten_processor,
+    )
     monkeypatch.setattr(
         ltx2_components,
         "create_transformer_from_config",
@@ -261,6 +294,14 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
         "latent_upsampler",
     }
     assert all(call[3]["revision"] == revision for call in calls["components"])
+    assert "diffusion_decoder" not in calls["prefetch"][1]
+    assert calls["native_diffusion_decoder"] == (
+        od_config.model,
+        {"local_files_only": False, "dtype": torch.bfloat16, "revision": revision},
+    )
+    assert calls["diffusion_decoder_processor"] is natten_processor
+    assert calls["diffusion_decoder_tiling"] is True
+    assert calls["diffusion_decoder_parallel"] == (2, "tile")
     assert calls["transformer_config"] == (
         od_config.model,
         profile.transformer_subfolder,
@@ -268,6 +309,85 @@ def test_ltx_converted_component_loading_propagates_revision(monkeypatch):
         revision,
     )
     assert calls["scheduler"][1]["revision"] == revision
+
+
+def test_ltx25_native_diffusion_decoder_uses_diffusers_config_and_canonical_artifact(monkeypatch):
+    revision = "diffusers-revision"
+    config = {"decoder_stage_channels": [8, 8, 8, 8, 8]}
+    calls: dict[str, Any] = {}
+
+    class FakeDecoder:
+        def init_distributed(self):
+            calls["init_distributed"] = True
+
+    expected = FakeDecoder()
+
+    def fake_load_config(model, **kwargs):
+        calls["config"] = (model, kwargs)
+        return config
+
+    def fake_resolve(model, repo_id, filename, **kwargs):
+        calls["artifact"] = (model, repo_id, filename, kwargs)
+        return "/models/native-diffvae.safetensors"
+
+    def fake_load(cls, path, passed_config, dtype):
+        calls["load"] = (path, passed_config, dtype)
+        return expected
+
+    monkeypatch.setattr(
+        ltx2_components.DistributedLTX2VideoDiffusionDecoderModel,
+        "load_config",
+        staticmethod(fake_load_config),
+    )
+    monkeypatch.setattr(ltx2_components, "resolve_ltx_artifact", fake_resolve)
+    monkeypatch.setattr(
+        ltx2_components.DistributedLTX2VideoDiffusionDecoderModel,
+        "from_ltx25_native_checkpoint",
+        classmethod(fake_load),
+    )
+
+    actual = ltx2_components._load_ltx25_native_diffusion_decoder(
+        "Lightricks/LTX-2.5-Diffusers",
+        local_files_only=False,
+        dtype=torch.bfloat16,
+        revision=revision,
+    )
+
+    assert actual is expected
+    assert calls["config"] == (
+        "Lightricks/LTX-2.5-Diffusers",
+        {
+            "subfolder": "diffusion_decoder",
+            "local_files_only": False,
+            "revision": revision,
+        },
+    )
+    assert calls["artifact"] == (
+        "Lightricks/LTX-2.5-Diffusers",
+        "Lightricks/LTX-2.5",
+        "vae/ltx-2.5-video-vae-bf16.safetensors",
+        {
+            "model_revision": revision,
+            "artifact_revision": ltx2_components.LTX25_NATIVE_ARTIFACT_REVISION,
+        },
+    )
+    assert calls["load"] == ("/models/native-diffvae.safetensors", config, torch.bfloat16)
+    assert calls["init_distributed"] is True
+
+
+def test_ltx25_natten_failure_has_actionable_omni_remedy(monkeypatch):
+    class MissingNattenProcessor:
+        def __init__(self):
+            raise ImportError("kernels is unavailable")
+
+    monkeypatch.setattr(
+        ltx2_components,
+        "LTX2VideoVaeNeighborhoodNattenProcessor",
+        MissingNattenProcessor,
+    )
+
+    with pytest.raises(RuntimeError, match=r"kernels==0\.14\.1.*supported GPU.*allow Hub access"):
+        ltx2_components._create_ltx25_natten_processor()
 
 
 def test_ltx_checkpoint_explicit_version_precedes_structural_heuristics(tmp_path):
@@ -409,6 +529,46 @@ def test_ltx25_four_public_pipeline_semantics_are_disjoint():
     assert LTX2TwoStagePipeline.pipeline_kind == "two_stage"
     assert LTX2DistilledOneStagePipeline.pipeline_kind == "distilled_one_stage"
     assert LTX2DistilledTwoStagePipeline.pipeline_kind == "distilled_two_stage"
+
+
+@pytest.mark.parametrize(
+    "pipeline_cls",
+    [
+        LTX2Pipeline,
+        LTX2TwoStagePipeline,
+        LTX2DistilledOneStagePipeline,
+        LTX2DistilledTwoStagePipeline,
+    ],
+)
+@pytest.mark.parametrize(
+    ("extras", "use_diffusion_decoder"),
+    [({}, True), ({"ltx2_use_conv_vae": True}, False)],
+)
+def test_ltx25_all_public_pipelines_default_to_diffvae_with_conv_opt_in(
+    tmp_path, monkeypatch, pipeline_cls, extras, use_diffusion_decoder
+):
+    (tmp_path / "model_index.json").write_text(
+        json.dumps({"text_encoder": ["transformers", "Gemma4UnifiedForConditionalGeneration"]})
+    )
+
+    def stub_components(pipe, od_config):
+        pipe.od_config = od_config
+        pipe.vae_spatial_compression_ratio = 32
+
+    monkeypatch.setattr(ltx2_runtime, "initialize_pipeline_components", stub_components)
+    monkeypatch.setattr(ltx2_runtime, "build_ltx_phase_adapter", lambda _pipe: None)
+    monkeypatch.setattr(LTXRuntime, "setup_diffusion_pipeline_profiler", lambda *_args, **_kwargs: None)
+
+    pipe = pipeline_cls(
+        od_config=SimpleNamespace(
+            model=str(tmp_path),
+            extras=extras,
+            enable_diffusion_pipeline_profiler=False,
+        )
+    )
+
+    assert pipe.use_diffusion_decoder is use_diffusion_decoder
+    assert pipe._vae_modules.count("diffusion_decoder") == int(use_diffusion_decoder)
 
 
 @pytest.mark.parametrize(
@@ -673,7 +833,7 @@ def test_ltx25_distilled_two_stage_executes_custom_phase_schedules():
         max_sequence_length=16,
     )
     prompt_context = object()
-    phase_calls = []
+    phase_calls: list[Any] = []
 
     def resolve_request_inputs(req, **kwargs):
         return request_inputs

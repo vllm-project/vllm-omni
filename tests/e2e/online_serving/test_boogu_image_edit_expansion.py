@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
-L4 expansion coverage for ``Boogu/Boogu-Image-0.1-Edit`` (image editing / TI2I).
+L4 expansion coverage for Boogu-Image Edit and Edit-Turbo (image editing / TI2I).
 
 The nightly smoke module (``test_boogu_image_edit.py``) already covers single-image
 text-guided editing and the text+image double-guidance path. This expansion
@@ -16,16 +16,17 @@ module adds the two edit paths smoke does not exercise:
   ``height`` / ``width``: asserts the output resolution follows the reference
   (upstream ``align_res``, on by default for a single reference).
 
-The Edit checkpoint shares ``BooguImagePipeline`` with the Base checkpoint; the
-TI2I path activates when the request carries a reference image. Only a single
-reference image is supported. Cases stay smoke-depth (``num_inference_steps=2``).
-CPU offload, Cache-DiT, and multi-GPU parallelism are not yet supported for this
-model and are intentionally omitted.
+Both Edit checkpoints share ``BooguImagePipeline`` with the Base checkpoint;
+the TI2I path activates when the request carries a reference image. Only a
+single reference image is supported. The regular Edit cases stay smoke-depth
+(``num_inference_steps=2``), while Edit-Turbo uses its tuned four-step
+configuration. CPU offload, Cache-DiT, and multi-GPU parallelism are not yet
+supported for these models and are intentionally omitted.
 
 From ``tests/``::
 
     pytest -s -v e2e/online_serving/test_boogu_image_edit_expansion.py \
-        -m "full_model and diffusion and H100" --run-level=full_model
+        -m "slow and diffusion and H100"
 """
 
 import os
@@ -38,9 +39,11 @@ from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHand
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 MODEL = "Boogu/Boogu-Image-0.1-Edit"
+EDIT_TURBO_MODEL = "Boogu/Boogu-Image-0.1-Edit-Turbo"
+EDIT_TURBO_REVISION = "hotfix-1k-20260708"
 EDIT_PROMPT = "Change the style to a colored pencil drawing."
 
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
@@ -52,6 +55,33 @@ def _get_diffusion_feature_cases(model: str):
         pytest.param(
             OmniServerParams(model=model),
             id="default",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
+    ]
+
+
+def _get_align_res_cases():
+    """Return regular and Turbo Edit configurations for align-res coverage."""
+    return [
+        pytest.param(
+            OmniServerParams(model=MODEL),
+            {
+                "num_inference_steps": 2,
+                "guidance_scale": 5.0,
+            },
+            id="edit",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=EDIT_TURBO_MODEL,
+                server_args=["--revision", EDIT_TURBO_REVISION],
+            ),
+            {
+                "num_inference_steps": 4,
+                "guidance_scale": 1.0,
+            },
+            id="edit-turbo-hotfix-1k",
             marks=SINGLE_CARD_FEATURE_MARKS,
         ),
     ]
@@ -76,8 +106,16 @@ def test_image_only_guidance(omni_server: OmniServer, openai_client: OpenAIClien
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
-def test_align_res_output_size(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
+@pytest.mark.parametrize(
+    ("omni_server", "sampling_params"),
+    _get_align_res_cases(),
+    indirect=["omni_server"],
+)
+def test_align_res_output_size(
+    omni_server: OmniServer,
+    sampling_params: dict,
+    openai_client: OpenAIClientHandler,
+) -> None:
     """Output resolution follows the reference image (upstream ``align_res``).
 
     No ``height`` / ``width`` is requested. The reference is 512x384 — both
@@ -92,8 +130,7 @@ def test_align_res_output_size(omni_server: OmniServer, openai_client: OpenAICli
         "model": omni_server.model,
         "messages": messages,
         "extra_body": {
-            "num_inference_steps": 2,
-            "guidance_scale": 5.0,
+            **sampling_params,
             "seed": 42,
         },
     }

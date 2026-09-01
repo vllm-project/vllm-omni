@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import math
 import time
@@ -9,7 +9,7 @@ from typing import get_args
 
 import torch
 import torch.nn as nn
-from vllm.config.lora import MaxLoRARanks
+from vllm.config.lora import LoRAConfig, MaxLoRARanks
 from vllm.logger import init_logger
 from vllm.lora.layers import BaseLayerWithLoRA
 from vllm.lora.lora_model import LoRAModel
@@ -23,7 +23,6 @@ from vllm.lora.utils import (
 )
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 
-from vllm_omni.config.lora import LoRAConfig
 from vllm_omni.diffusion.lora.utils import (
     _expand_expected_modules_for_packed_layers,
     _match_target_modules,
@@ -69,6 +68,12 @@ class DiffusionLoRAManager:
         self.pipeline = pipeline
         self.device = device
         self.dtype = dtype
+        od_config = getattr(pipeline, "od_config", None)
+        # DLO owns the base-weight lifecycle. Keep request-switchable LoRA
+        # sidecars resident instead of rebuilding DLO host shards per request.
+        self._resident_lora_device = (
+            device if getattr(od_config, "enable_distributed_layerwise_offload", False) is True else None
+        )
 
         # Cache supported/expected module suffixes once, before any layer
         # replacement happens. After LoRA layers are injected, the original
@@ -290,29 +295,41 @@ class DiffusionLoRAManager:
         lora_path = get_adapter_absolute_path(lora_request.lora_path)
         logger.debug("Resolved LoRA path: %s", lora_path)
 
-        peft_helper = PEFTHelper.from_local_dir(
-            lora_path,
-            max_position_embeddings=None,  # no need in diffusion
-            tensorizer_config_dict=lora_request.tensorizer_config_dict,
-        )
+        model_loader = getattr(self.pipeline, "_load_diffusion_lora_adapter", None)
+        loaded = None
+        if callable(model_loader):
+            loaded = model_loader(
+                lora_request=lora_request,
+                lora_path=lora_path,
+                dtype=self.dtype,
+            )
+
+        if loaded is None:
+            peft_helper = PEFTHelper.from_local_dir(
+                lora_path,
+                max_position_embeddings=None,  # no need in diffusion
+                tensorizer_config_dict=lora_request.tensorizer_config_dict,
+            )
+
+            lora_model = LoRAModel.from_local_checkpoint(
+                lora_path,
+                expected_lora_modules=self._expected_lora_modules,
+                peft_helper=peft_helper,
+                lora_model_id=lora_request.lora_int_id,
+                device="cpu",  # consistent w/ vllm's behavior
+                dtype=self.dtype,
+                model_vocab_size=None,
+                tensorizer_config_dict=lora_request.tensorizer_config_dict,
+                weights_mapper=None,
+            )
+        else:
+            lora_model, peft_helper = loaded
 
         logger.info(
             "Loaded PEFT config: r=%d, lora_alpha=%d, target_modules=%s",
             peft_helper.r,
             peft_helper.lora_alpha,
             peft_helper.target_modules,
-        )
-
-        lora_model = LoRAModel.from_local_checkpoint(
-            lora_path,
-            expected_lora_modules=self._expected_lora_modules,
-            peft_helper=peft_helper,
-            lora_model_id=lora_request.lora_int_id,
-            device="cpu",  # consistent w/ vllm's behavior
-            dtype=self.dtype,
-            model_vocab_size=None,
-            tensorizer_config_dict=lora_request.tensorizer_config_dict,
-            weights_mapper=None,
         )
 
         logger.info(
@@ -439,6 +456,13 @@ class DiffusionLoRAManager:
                 )
 
                 if lora_layer is not module and isinstance(lora_layer, BaseLayerWithLoRA):
+                    if self._resident_lora_device is not None:
+                        set_buffer_device = getattr(lora_layer, "_set_diffusion_lora_buffer_device", None)
+                        if not callable(set_buffer_device):
+                            raise RuntimeError(
+                                f"{type(lora_layer).__name__} cannot keep dynamic LoRA buffers resident for DLO"
+                            )
+                        set_buffer_device(self._resident_lora_device)
                     replace_submodule(component, module_name, lora_layer)
                     self._lora_modules[full_module_name] = lora_layer
                     logger.debug("Replaced layer: %s -> %s", full_module_name, type(lora_layer).__name__)
@@ -523,13 +547,17 @@ class DiffusionLoRAManager:
         matches_scale = self._adapter_scales.get(adapter_id) == rounded_scale
         return is_active and matches_scale
 
-    def _activate_adapter(self, adapter_id: int, scale: float) -> None:
-        if self._is_active_at_scale(adapter_id, scale):
-            logger.debug("Adapter %d already active at scale %.3f skipping", adapter_id, scale)
-            return
+    def _bind_adapter_weights(self, lora_model: LoRAModel, scale: float) -> None:
+        binding_validator = getattr(self.pipeline, "_validate_diffusion_lora_binding", None)
+        lora_names_by_id = (
+            {id(weights): name for name, weights in lora_model.loras.items()} if callable(binding_validator) else {}
+        )
+        bound_lora_names: set[str] = set()
 
-        logger.info("Activating adapter: id=%d", adapter_id)
-        lora_model = self._registered_adapters[adapter_id]
+        def _record_bound(weights: LoRALayerWeights | PackedLoRALayerWeights) -> None:
+            name = lora_names_by_id.get(id(weights))
+            if name is not None:
+                bound_lora_names.add(name)
 
         # activate weights in each LoRA layer
         for full_module_name, lora_layer in self._lora_modules.items():
@@ -571,6 +599,9 @@ class DiffusionLoRAManager:
                         lora_b_list.append(sub_lora.lora_b * scale)
 
                     lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
+                    for sub_lora in sub_loras:
+                        if sub_lora is not None:
+                            _record_bound(sub_lora)
                     logger.debug(
                         "Activated packed LoRA for %s via submodules=%s (scale=%.2f)",
                         full_module_name,
@@ -589,6 +620,7 @@ class DiffusionLoRAManager:
                     for b in lora_weights.lora_b
                 ]
                 lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
+                _record_bound(lora_weights)
                 logger.debug(
                     "Activated packed LoRA for %s (scale=%.2f)",
                     full_module_name,
@@ -619,6 +651,7 @@ class DiffusionLoRAManager:
                 lora_a_list = [lora_weights.lora_a] * n_slices
                 lora_b_list = [b * scale for b in b_splits]
                 lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
+                _record_bound(lora_weights)
                 logger.debug(
                     "Activated fused LoRA for packed layer %s (scale=%.2f)",
                     full_module_name,
@@ -628,6 +661,7 @@ class DiffusionLoRAManager:
 
             scaled_lora_b = lora_weights.lora_b * scale
             lora_layer.set_lora(index=0, lora_a=lora_weights.lora_a, lora_b=scaled_lora_b)
+            _record_bound(lora_weights)
             logger.debug(
                 "Activated LoRA for %s: lora_a shape=%s, lora_b shape=%s, scale=%.2f",
                 full_module_name,
@@ -635,6 +669,33 @@ class DiffusionLoRAManager:
                 lora_weights.lora_b.shape,
                 scale,
             )
+
+        if callable(binding_validator):
+            binding_validator(
+                lora_model=lora_model,
+                bound_lora_names=frozenset(bound_lora_names),
+            )
+
+    def _reset_lora_layers(self) -> None:
+        for lora_layer in self._lora_modules.values():
+            lora_layer.reset_lora(0)
+
+    def _activate_adapter(self, adapter_id: int, scale: float) -> None:
+        if self._is_active_at_scale(adapter_id, scale):
+            logger.debug("Adapter %d already active at scale %.3f skipping", adapter_id, scale)
+            return
+
+        logger.info("Activating adapter: id=%d", adapter_id)
+        lora_model = self._registered_adapters[adapter_id]
+        # Binding overwrites slot 0 incrementally. Invalidate the fast-path
+        # state before the first mutation and leave every wrapper inactive if
+        # any set_lora() call or model validator fails.
+        self._active_adapter_id = None
+        try:
+            self._bind_adapter_weights(lora_model, scale)
+        except Exception:
+            self._reset_lora_layers()
+            raise
 
         self._active_adapter_id = adapter_id
         self._update_adapter_scale(adapter_id, scale)
@@ -644,8 +705,7 @@ class DiffusionLoRAManager:
             logger.debug("All adapters already inactive")
             return
         logger.info("Deactivating all adapters: %d layers", len(self._lora_modules))
-        for lora_layer in self._lora_modules.values():
-            lora_layer.reset_lora(0)
+        self._reset_lora_layers()
         self._active_adapter_id = None
         logger.debug("All adapters deactivated")
 

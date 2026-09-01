@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E offline tests for Qwen3-TTS Base model with text input and audio output.
 
@@ -15,12 +15,12 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import load_test_audio_data_url
+from tests.helpers.media import get_asset_path
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 # See tests/e2e/online_serving/test_qwen3_tts_base.py for the vendored-asset rationale.
-REF_AUDIO_URL = load_test_audio_data_url("qwen3_tts/clone_2.wav")
+REF_AUDIO_URL = get_asset_path("qwen3_tts/clone_2.wav", as_data_url=True)
 REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 
 
@@ -70,7 +70,7 @@ def get_prompt():
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", tts_server_params, indirect=True)
-def test_text_to_audio_001(omni_runner, omni_runner_handler) -> None:
+def test_text_to_audio_001(omni_runner, offline_client) -> None:
     """
     Test text input processing and audio output via offline Omni runner.
     Deploy Setting: qwen3_tts_no_async_chunk.yaml + enforce_eager=true
@@ -87,4 +87,4 @@ def test_text_to_audio_001(omni_runner, omni_runner_handler) -> None:
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
     }
-    omni_runner_handler.send_audio_speech_request(request_config)
+    offline_client.send_audio_speech_request(request_config)

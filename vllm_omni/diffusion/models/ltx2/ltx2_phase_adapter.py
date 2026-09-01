@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Construction and execution of a fixed LTX refinement-phase adapter.
 
@@ -203,6 +203,11 @@ def _apply_unquantized_gemm_with_weight(
     weight: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
+    # GEMM dispatch is selected from the host platform, not the tensor device.
+    # In CPU tests on a ROCm host that selects rocm_unquantized_gemm, which has
+    # no CPU kernel. Keep that combination on PyTorch's portable implementation.
+    if current_platform.is_rocm() and input_.device.type == "cpu":
+        return F.linear(input_, weight, bias)
     if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
         return linear_batch_invariant(input_, weight, bias)
     return dispatch_unquantized_gemm()(layer, input_, weight, bias)
@@ -415,6 +420,8 @@ def build_ltx_phase_adapter(pipeline: Any) -> LTXPhaseAdapterRuntime | None:
         pipeline.od_config.model,
         profile.artifact_repo_id,
         profile.distilled_lora_filename,
+        model_revision=getattr(pipeline.od_config, "revision", None),
+        artifact_revision=profile.artifact_revision,
     )
 
     if layer_fused and pipeline.od_config.dtype is not torch.bfloat16:

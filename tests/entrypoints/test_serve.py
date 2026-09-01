@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for the Omni serve CLI helpers."""
 
 from __future__ import annotations
@@ -74,6 +77,17 @@ def test_serve_parser_accepts_four_way_cfg_parallelism() -> None:
     args = parser.parse_args(["serve", "fake-model", "--omni", "--cfg-parallel-size", "4"])
 
     assert args.cfg_parallel_size == 4
+
+
+def test_serve_parser_accepts_ulysses_a2a_permute() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--ulysses-a2a-permute"])
+
+    assert args.ulysses_a2a_permute is True
+    assert args.get_explicit_kwargs_dict()["ulysses_a2a_permute"] is True
 
 
 def _make_headless_args(**kwargs) -> TrackingNamespace:

@@ -9,7 +9,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
 from http import HTTPStatus
-from typing import Any, cast
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import HTTPException
 from PIL import Image
@@ -28,8 +29,12 @@ from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
 )
-from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
-from vllm_omni.entrypoints.openai.video_api_utils import _encode_video_bytes, encode_video_base64
+from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline, parse_lora_request
+from vllm_omni.entrypoints.openai.video_api_utils import (
+    _encode_video_bytes,
+    _PlanarFrameConverter,
+    encode_video_base64,
+)
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.model_extras import should_preserve_reference_image_size
 from vllm_omni.outputs.output_metadata import (
@@ -39,6 +44,11 @@ from vllm_omni.outputs.output_metadata import (
 )
 
 logger = init_logger(__name__)
+
+_VIDEO_RESPONSE_FRAME_CONVERSION_WORKERS = 8
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 
 @dataclass
@@ -89,6 +99,17 @@ class OmniOpenAIServingVideo:
         self._engine_client = engine_client
         self._model_name = model_name
         self._stage_configs = stage_configs
+        self._video_frame_converter = _PlanarFrameConverter(max_workers=_VIDEO_RESPONSE_FRAME_CONVERSION_WORKERS)
+        logger.info(
+            "Video response frame conversion pool configured: workers=%d",
+            self._video_frame_converter.max_workers,
+        )
+
+    def _resolve_diffusion_od_config(self) -> OmniDiffusionConfig | SimpleNamespace | None:
+        get_od_config = getattr(self._engine_client, "get_diffusion_od_config", None)
+        if callable(get_od_config):
+            return get_od_config()
+        return getattr(self._engine_client, "od_config", None)
 
     @property
     def model_name(self) -> str | None:
@@ -105,8 +126,7 @@ class OmniOpenAIServingVideo:
     @cached_property
     def preserves_reference_image_size(self) -> bool:
         """Return whether the active pipeline owns reference-image resizing."""
-        get_od_config = getattr(self._engine_client, "get_diffusion_od_config", None)
-        od_config = get_od_config() if callable(get_od_config) else getattr(self._engine_client, "od_config", None)
+        od_config = self._resolve_diffusion_od_config()
         model_class_name = None if od_config is None else getattr(od_config, "model_class_name", None)
         model = getattr(od_config, "model", None) if od_config is not None else None
         model = model or self.model_name
@@ -120,17 +140,30 @@ class OmniOpenAIServingVideo:
     @property
     def supports_mixed_reference_inputs(self) -> bool:
         """Return whether the configured diffusion model accepts mixed refs."""
-        get_od_config = getattr(self._engine_client, "get_diffusion_od_config", None)
-        od_config = get_od_config() if callable(get_od_config) else getattr(self._engine_client, "od_config", None)
+        od_config = self._resolve_diffusion_od_config()
         if od_config is None:
             return False
 
         capability = getattr(od_config, "supports_mixed_reference_inputs", None)
-        if isinstance(capability, bool):
-            return capability
-
         model_class_name = getattr(od_config, "model_class_name", None)
-        return get_diffusion_model_metadata(model_class_name).supports_mixed_reference_inputs
+        model_archs = [model_class_name]
+        for stage_config in self.stage_configs or ():
+            stage_get = (
+                stage_config.get if isinstance(stage_config, Mapping) else lambda key: getattr(stage_config, key, None)
+            )
+            engine_args = stage_get("engine_args") or {}
+            model_archs.extend(
+                (
+                    stage_get("model_arch"),
+                    engine_args.get("model_class_name")
+                    if isinstance(engine_args, Mapping)
+                    else getattr(engine_args, "model_class_name", None),
+                )
+            )
+        metadata_capability = any(
+            get_diffusion_model_metadata(model_arch).supports_mixed_reference_inputs for model_arch in model_archs
+        )
+        return capability is True or metadata_capability
 
     @classmethod
     def for_diffusion(
@@ -144,6 +177,9 @@ class OmniOpenAIServingVideo:
             model_name=model_name,
             stage_configs=stage_configs,
         )
+
+    def shutdown(self) -> None:
+        self._video_frame_converter.shutdown()
 
     async def _run_and_extract(
         self,
@@ -332,7 +368,12 @@ class OmniOpenAIServingVideo:
         video_data = [
             VideoData(
                 b64_json=(
-                    encode_video_base64(video, fps=artifacts.output_fps, video_codec_options=video_codec_options)
+                    encode_video_base64(
+                        video,
+                        fps=artifacts.output_fps,
+                        video_codec_options=video_codec_options,
+                        frame_converter=self._video_frame_converter,
+                    )
                     if artifacts.audios[idx] is None
                     else encode_video_base64(
                         video,
@@ -340,6 +381,7 @@ class OmniOpenAIServingVideo:
                         audio=artifacts.audios[idx],
                         audio_sample_rate=artifacts.audio_sample_rate,
                         video_codec_options=video_codec_options,
+                        frame_converter=self._video_frame_converter,
                     )
                 ),
                 action=artifacts.actions[idx],
@@ -396,6 +438,7 @@ class OmniOpenAIServingVideo:
             fps=artifacts.output_fps,
             **({"audio": audio, "audio_sample_rate": artifacts.audio_sample_rate} if audio is not None else {}),
             video_codec_options=video_codec_options,
+            frame_converter=self._video_frame_converter,
         )
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)
@@ -463,14 +506,13 @@ class OmniOpenAIServingVideo:
                 detail="Stage configs not found. Start server with an omni diffusion model.",
             )
 
-        # Video generation endpoint only supports diffusion stages.
-        for stage in stage_configs:
-            stage_type = get_stage_type(stage)
-            if stage_type != "diffusion":
-                raise HTTPException(
-                    status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-                    detail=f"Video generation only supports diffusion stages, found '{stage_type}' stage.",
-                )
+        # Video pipelines may use preparatory AR stages (for example, a
+        # vLLM-hosted text encoder) before the diffusion stage.
+        if not is_video_generation_pipeline(stage_configs):
+            raise HTTPException(
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                detail="No final video output stage found in video generation pipeline.",
+            )
 
         # Common generation logic for both paths
         engine_client = cast(AsyncOmni, self._engine_client)

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax H3 packed-token audio/video DiT for vLLM-Omni.
 
 vLLM tensor parallel linears and the unified attention layer provide TP and
@@ -26,16 +27,29 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
+from vllm_omni.diffusion.attention.backends.abstract import (
+    AttentionMetadata,
+    PackedPaddingMetadata,
+    VideoTokenLayout,
+)
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.ops.minimax_h3_modulation import (
+    indexed_gate,
+    indexed_gate_rms_norm_scale_shift,
+    indexed_scale_shift_,
+    rms_norm_indexed_scale_shift,
+)
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
+from vllm_omni.diffusion.layers.activation import SiluAndMul
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
+from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -45,6 +59,26 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
+
+
+# Packed multi-request forwards require the attention backend to actually
+# consume cu_seqlens as a block-diagonal plan (not a padding-mask rebuild that
+# spans the full packed row). The pipeline gates on this capability before
+# packing, and ``_run_packed_attention`` re-checks it per forward; a name-only
+# gate would let FLASH_ATTN's NPU/XPU code paths through even though those
+# variants would silently attend across request boundaries.
+def _attention_isolates_packed_requests(attention_layer: Any) -> bool:
+    """True if this attention layer keeps N-document packed boundaries.
+
+    Requires a backend advertising ``supports_multi_doc_packed_varlen`` *and*
+    that the layer is not running under ring sequence parallelism (the ring
+    kernel dispatches through its own attention that ignores the packed
+    cu_seqlens regardless of the configured backend).
+    """
+    backend = getattr(attention_layer, "attn_backend", None)
+    if backend is None or not backend.supports_multi_doc_packed_varlen():
+        return False
+    return not getattr(attention_layer, "use_ring", False)
 
 
 @dataclass
@@ -146,6 +180,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "packed_seq_params",
         "refiner_packed_seq_params",
         "video_token_layout",
+        "rope_table",
     }
 )
 
@@ -187,30 +222,6 @@ def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> RMSNorm
     # torch.nn.RMSNorm upcasts reduced-precision inputs for the variance
     # reduction, matching that accumulation semantic.
     return RMSNorm(size, eps=eps, dtype=dtype)
-
-
-def _modulate_scale_shift(
-    x: torch.Tensor,
-    shift: torch.Tensor,
-    scale: torch.Tensor,
-    indices: torch.Tensor,
-    *,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    # Apply per-index affine modulation: x * (1 + scale[idx]) + shift[idx].
-    return (x * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)).to(dtype)
-
-
-def _modulate_gate(
-    x: torch.Tensor,
-    gate: torch.Tensor,
-    other: torch.Tensor,
-    indices: torch.Tensor,
-    *,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    # Apply the per-index gated residual: x + gate[idx] * other.
-    return (x + gate.index_select(0, indices) * other).to(dtype)
 
 
 def _sequence_parallel_local_span(
@@ -448,6 +459,7 @@ class MiniMaxH3Attention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         packed_total: int,
+        num_requests: int = 1,
         video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
@@ -457,29 +469,61 @@ class MiniMaxH3Attention(nn.Module):
         narrow lets regional compile fuse projections, norms, RoPE, and the
         surrounding DiT block without repeated graph breaks.
         """
-        # max_seqlen is already the first (real) packed document length. Do
-        # not read the CUDA cu_seqlens scalars here: this function runs once
-        # per layer and .item() would serialize every attention launch.
+        # max_seqlen is already the longest packed document length. Do not read
+        # the CUDA cu_seqlens scalars here: this function runs once per layer
+        # and .item() would serialize every attention launch. ``num_requests``
+        # is carried as a Python int for the same reason.
         if not 0 < max_seqlen <= packed_total:
             raise ValueError(
                 f"max_seqlen must be within the packed sequence, got {max_seqlen} for length {packed_total}"
             )
-        used = min(max_seqlen, packed_total)
         attn_mask = None
-        # Ring attention can dispatch to a different implementation from the
-        # configured backend, so the no-mask fast paths are local-only.
-        # supports_prefix_kv_slicing: backend slices K/V itself (cuDNN).
-        # supports_packed_mask_free: backend consumes the packed metadata
-        # without ever reading attn_mask (CUDA packed varlen, NPU
-        # npu_attn_varlen opt-in with its own fallback rebuild).
-        no_mask = not getattr(self.attention, "use_ring", False) and (
-            self.attention.attn_backend.supports_prefix_kv_slicing
-            or self.attention.attn_backend.supports_packed_mask_free()
-        )
-        if used < packed_total and not no_mask:
-            attn_mask = torch.arange(packed_total, device=q.device)[None] < used
+        mask_free_packed_padding = False
+        if num_requests > 1:
+            # A step-mode batch packs one document per request, so its valid
+            # rows are block-diagonal rather than a prefix: neither a KV prefix
+            # length nor a 1-D key mask can describe them. Such a layout is
+            # only correct on a backend that actually attends by cu_seqlens as
+            # a block-diagonal plan. Check the capability (not the backend
+            # name): FLASH_ATTN's NPU/XPU variants would otherwise silently
+            # fall back to a padding-mask rebuild that spans the whole packed
+            # row and attend across request boundaries.
+            if not _attention_isolates_packed_requests(self.attention):
+                backend_name = self.attention.attn_backend.get_name()
+                raise ValueError(
+                    f"MiniMax H3 packed a {num_requests}-request batch, but the resolved "
+                    f"attention ({backend_name}, use_ring={getattr(self.attention, 'use_ring', False)}) "
+                    "does not isolate multi-document packed cu_seqlens. Run one request "
+                    "per forward on this backend."
+                )
+            used = packed_total
+        else:
+            used = min(max_seqlen, packed_total)
+            # Ring attention can dispatch to a different implementation from the
+            # configured backend, so the no-mask fast paths are local-only.
+            # supports_prefix_kv_slicing: backend slices K/V itself (cuDNN).
+            # supports_packed_mask_free: backend consumes the packed metadata
+            # without ever reading attn_mask (CUDA packed varlen, NPU
+            # npu_attn_varlen opt-in with its own fallback rebuild).
+            use_ring = getattr(self.attention, "use_ring", False)
+            mask_free_packed_padding = not use_ring and self.attention.attn_backend.supports_packed_mask_free()
+            no_mask = not use_ring and (
+                self.attention.attn_backend.supports_prefix_kv_slicing or mask_free_packed_padding
+            )
+            if used < packed_total and not no_mask:
+                attn_mask = torch.arange(packed_total, device=q.device)[None] < used
         metadata = AttentionMetadata(
             attn_mask=attn_mask,
+            packed_padding=(
+                PackedPaddingMetadata(
+                    q_length=used,
+                    kv_length=used,
+                    cu_seqlens_q=cu_seqlens[:2],
+                    cu_seqlens_k=cu_seqlens[:2],
+                )
+                if mask_free_packed_padding
+                else None
+            ),
             extra={
                 "cu_seqlens_q": cu_seqlens,
                 "cu_seqlens_k": cu_seqlens,
@@ -513,6 +557,7 @@ class MiniMaxH3Attention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         packed_total: int | None = None,
+        num_requests: int = 1,
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
@@ -548,9 +593,9 @@ class MiniMaxH3Attention(nn.Module):
                 self.q_norm.variance_epsilon,
             )
 
-        # The packed layout uses a second document for alignment padding.
-        # Local/Ulysses backends unpad it, while Ring keeps aligned rows for
-        # fixed-size P2P buffers.
+        # Each request contributes a document for its rows plus one for any
+        # nonempty alignment padding. Local/Ulysses backends unpad it, while
+        # Ring keeps aligned rows for fixed-size P2P buffers.
         out = self._run_packed_attention(
             q,
             k,
@@ -561,6 +606,7 @@ class MiniMaxH3Attention(nn.Module):
             # backend receives the global sequence after all-to-all, so carry
             # its Python length explicitly instead of inferring it from q.
             packed_total=packed_total if packed_total is not None else q.shape[0],
+            num_requests=num_requests,
             video_layout=video_layout,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
@@ -586,6 +632,7 @@ class MiniMaxH3MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.fc1",
         )
+        self.act_fn = SiluAndMul()
         # Chunk the fused fc1 output as [gate, up], then compute
         # silu(gate) * up.
         self.fc2 = RowParallelLinear(
@@ -600,8 +647,7 @@ class MiniMaxH3MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden, _ = self.fc1(x)
-        gate, up = hidden.chunk(2, dim=-1)
-        hidden = nn.functional.silu(gate) * up
+        hidden = self.act_fn(hidden)
         out, _ = self.fc2(hidden)
         return out
 
@@ -688,12 +734,14 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         *,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        num_requests: int = 1,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x),
             rope_table=None,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            num_requests=num_requests,
         )
         x = x + self.mlp(self.norm2(x))
         return x
@@ -726,9 +774,10 @@ class MiniMaxH3TokenRefiner(nn.Module):
         *,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        num_requests: int = 1,
     ) -> torch.Tensor:
         for block in self.blocks:
-            x = block(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            x = block(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, num_requests=num_requests)
         return self.final_norm(x)
 
 
@@ -774,6 +823,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         packed_total: int,
+        num_requests: int = 1,
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
@@ -794,24 +844,37 @@ class MiniMaxH3DiTBlock(nn.Module):
         ) = self.adaln_proj(t_emb)
 
         residual = x
-        h = self.norm1(x)
-        h = _modulate_scale_shift(h, shift_msa, scale_msa, combined_indices, dtype=_BF16_DTYPE)
+        h = rms_norm_indexed_scale_shift(
+            x,
+            self.norm1.weight,
+            shift_msa,
+            scale_msa,
+            combined_indices,
+            self.norm1.variance_epsilon,
+        )
         h = self.attn(
             h,
             rope_table=rope_table,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             packed_total=packed_total,
+            num_requests=num_requests,
             sp_seq_lens=sp_seq_lens,
             video_layout=video_layout,
         )
-        x = _modulate_gate(residual, gate_msa, h, combined_indices, dtype=_BF16_DTYPE)
-
+        x, h = indexed_gate_rms_norm_scale_shift(
+            residual,
+            gate_msa,
+            h,
+            self.norm2.weight,
+            shift_mlp,
+            scale_mlp,
+            combined_indices,
+            self.norm2.variance_epsilon,
+        )
         residual = x
-        h = self.norm2(x)
-        h = _modulate_scale_shift(h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE)
         h = self.mlp(h)
-        return _modulate_gate(residual, gate_mlp, h, combined_indices, dtype=_BF16_DTYPE)
+        return indexed_gate(residual, gate_mlp, h, combined_indices)
 
 
 class MiniMaxH3FinalLayer(nn.Module):
@@ -866,7 +929,7 @@ class MiniMaxH3FinalLayer(nn.Module):
         """
         shift, scale = self.adaln_proj(t_emb)
         h = self.norm(x)
-        h = _modulate_scale_shift(h, shift, scale, inverse_indices, dtype=_BF16_DTYPE)
+        h = indexed_scale_shift_(h, shift, scale, inverse_indices)
         # Preserve full precision through both final output projections.
         h = h.to(_FP32_DTYPE)
         video, _ = self.video_out(h)
@@ -894,6 +957,15 @@ class MiniMaxH3SPGather(nn.Module):
 
 
 class MiniMaxH3DiTModel(nn.Module):
+    # Loading is tensor-complete: constructor state plus final-layout
+    # parameters and persistent buffers is sufficient to reconstruct a ready
+    # inference model. The model-specific validator below checks the preserved
+    # FP32 portion after a lease-backed restore commits.
+    host_weight_restore_contract = FinalLayoutModelContract(
+        implementation_id="minimax-h3-dit",
+        version="1",
+    )
+
     _cache_dit_adapter_config = CacheDiTAdapterConfig(
         block_forward_patterns={"blocks": ForwardPattern.Pattern_3},
         # H3 is CFG-distilled and performs one transformer forward per step.
@@ -948,6 +1020,14 @@ class MiniMaxH3DiTModel(nn.Module):
     # quantization or LoRA to map onto. Address the fused layers directly, e.g.
     # ignored_layers=["blocks.0.attn.qkv_proj"].
     packed_modules_mapping = {}
+    # Turbo LoRA checkpoints publish separate Q/K/V adapters. This declaration
+    # lets the legacy diffusion LoRA manager bind them to the packed QKV layer;
+    # it does not change the fused base-checkpoint loading path above.
+    stacked_params_mapping = (
+        (".attn.qkv_proj", ".attn.to_q", "q"),
+        (".attn.qkv_proj", ".attn.to_k", "k"),
+        (".attn.qkv_proj", ".attn.to_v", "v"),
+    )
 
     def _validate_tp_config(self, *, arch: MiniMaxH3DiTArchConfig, tp_size: int) -> None:
         if tp_size < 1:
@@ -1061,6 +1141,54 @@ class MiniMaxH3DiTModel(nn.Module):
         for _, param in self.named_parameters():
             param.missing_param_init = "error"
 
+    def _rope_local_span(self, seq_len: int) -> tuple[int, int]:
+        """Return the sequence-parallel rows owned by this DiT rank."""
+        local_sp_registry = getattr(self.local_sp_prepare, "_hook_registry", None)
+        hooks_applied = local_sp_registry is not None
+        if local_sp_registry is not None:
+            local_sp_hook = local_sp_registry.get_hook(_LOCAL_SP_PREPARE_HOOK)
+            hooks_applied = local_sp_hook is not None
+        return _sequence_parallel_local_span(
+            seq_len,
+            hooks_applied=hooks_applied,
+        )
+
+    def prepare_rope_table(
+        self,
+        img_position_ids: torch.Tensor,
+        *,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """Build the static local RoPE table once for one denoise branch.
+
+        A MiniMax-H3 denoise branch reuses its packed position IDs at every
+        scheduler step. The returned table is local to the current sequence-
+        parallel rank, and therefore must be built by the model that will
+        consume it rather than cached globally across requests or ranks.
+        """
+        local_start, local_len = self._rope_local_span(seq_len)
+        rope_position_ids = img_position_ids.narrow(1, local_start, local_len)
+        return _build_rope_table(self.rope(rope_position_ids).to(img_position_ids.device))
+
+    def _validate_prepared_rope_table(
+        self,
+        rope_table: torch.Tensor,
+        *,
+        local_len: int,
+        device: torch.device,
+    ) -> None:
+        expected_width = 6 * self.arch.rope_inv_freq_len
+        if rope_table.dim() != 2 or tuple(rope_table.shape) != (local_len, expected_width):
+            raise ValueError(
+                "rope_table must be [local_seq_len, rotary_dim] for the current "
+                f"sequence-parallel rank, got {list(rope_table.shape)}; expected "
+                f"[{local_len}, {expected_width}]."
+            )
+        if rope_table.device != device:
+            raise ValueError(f"rope_table device {rope_table.device} must match x device {device}.")
+        if rope_table.dtype != _BF16_DTYPE:
+            raise ValueError(f"rope_table must be {_BF16_DTYPE}, got {rope_table.dtype}.")
+
     def post_load_weights(self) -> None:
         for name, param in self.named_parameters():
             if name in MINIMAX_H3_FP32_PARAM_NAMES and param.dtype != _FP32_DTYPE:
@@ -1068,6 +1196,10 @@ class MiniMaxH3DiTModel(nn.Module):
         for name, buffer in self.named_buffers():
             if name in MINIMAX_H3_FP32_BUFFER_NAMES and buffer.dtype != _FP32_DTYPE:
                 raise ValueError(f"{name} must stay fp32 after load, got {buffer.dtype}.")
+
+    def validate_restored_host_weights(self) -> None:
+        """Validate mixed-precision invariants after lease-backed restore."""
+        self.post_load_weights()
 
     def load_weights(
         self,
@@ -1127,6 +1259,11 @@ class MiniMaxH3DiTModel(nn.Module):
             raise ValueError(f"{key}.{field} is required")
         return value
 
+    @staticmethod
+    def _psp_optional(psp: Any, field: str, default: Any) -> Any:
+        value = psp.get(field) if isinstance(psp, dict) else getattr(psp, field, None)
+        return default if value is None else value
+
     def _embed(
         self,
         *,
@@ -1142,10 +1279,16 @@ class MiniMaxH3DiTModel(nn.Module):
         seq_len: int,
         device: torch.device,
         local_span: tuple[int, int],
+        num_requests: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build this rank's packed multimodal embedding rows.
 
         Returns (decoder_input [S_local, H] bf16, t_emb [M, t_dim] fp32).
+
+        ``num_requests`` defaults to a single packed request so callers that
+        pre-date the continuous-batching change (e.g. TeaCache's extractor
+        contract) do not silently miss the kwarg. ``forward()`` reads the real
+        value from ``packed_seq_params["num_requests"]``.
         """
         local_start, local_len = local_span
         local_end = local_start + local_len
@@ -1182,6 +1325,7 @@ class MiniMaxH3DiTModel(nn.Module):
             text_embed,
             cu_seqlens=refiner_cu_seqlens,
             max_seqlen=refiner_max_seqlen,
+            num_requests=num_requests,
         )
         if text_local_indices is not None:
             text_embed = text_embed.index_select(0, text_local_indices)
@@ -1251,6 +1395,10 @@ class MiniMaxH3DiTModel(nn.Module):
         psp = _required_kwarg(kwargs, "packed_seq_params")
         cu_seqlens = self._psp_field(psp, "packed_seq_params", "cu_seqlens_q").to(torch.int32)
         max_seqlen = int(self._psp_field(psp, "packed_seq_params", "max_seqlen_q"))
+        # How many requests share this packed sequence. Carried as a host int so
+        # attention never reads cu_seqlens scalars off the device; a producer
+        # that omits it is packing a single request.
+        num_requests = int(self._psp_optional(psp, "num_requests", 1))
         refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
         refiner_cu = self._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
         refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
@@ -1264,18 +1412,26 @@ class MiniMaxH3DiTModel(nn.Module):
         if inverse_indices.shape[0] != seq_len:
             raise ValueError(f"inverse_indices must be [{seq_len}], got {list(inverse_indices.shape)}")
         device = x.device
-        local_sp_registry = getattr(self.local_sp_prepare, "_hook_registry", None)
-        hooks_applied = local_sp_registry is not None
-        if local_sp_registry is not None:
-            local_sp_hook = local_sp_registry.get_hook(_LOCAL_SP_PREPARE_HOOK)
-            hooks_applied = local_sp_hook is not None
-        local_span = _sequence_parallel_local_span(
-            seq_len,
-            hooks_applied=hooks_applied,
-        )
+        local_span = self._rope_local_span(seq_len)
         local_start, local_len = local_span
-        rope_position_ids = img_position_ids.narrow(1, local_start, local_len)
-        rope_table = _build_rope_table(self.rope(rope_position_ids).to(device))
+        rope_table = kwargs.get("rope_table")
+        if rope_table is None:
+            if current_omni_platform.is_npu():
+                rope_table = self.prepare_rope_table(
+                    img_position_ids,
+                    seq_len=seq_len,
+                )
+            else:
+                # Keep CUDA/CPU numerically and structurally identical to the
+                # main-branch reference path used by the H100 accuracy suite.
+                rope_position_ids = img_position_ids.narrow(1, local_start, local_len)
+                rope_table = _build_rope_table(self.rope(rope_position_ids).to(device))
+        else:
+            self._validate_prepared_rope_table(
+                rope_table,
+                local_len=local_len,
+                device=device,
+            )
 
         decoder_input, t_emb = self._embed(
             x=x,
@@ -1287,6 +1443,7 @@ class MiniMaxH3DiTModel(nn.Module):
             text_pos=text_pos.to(device),
             refiner_cu_seqlens=refiner_cu.to(device),
             refiner_max_seqlen=refiner_max,
+            num_requests=num_requests,
             seq_len=seq_len,
             device=device,
             local_span=local_span,
@@ -1321,6 +1478,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 packed_total=seq_len,
+                num_requests=num_requests,
                 video_layout=video_layout,
             )
         if local_len == seq_len:

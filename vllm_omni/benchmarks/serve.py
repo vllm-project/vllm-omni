@@ -1,6 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from __future__ import annotations
+
 import argparse
 import asyncio
+import contextlib
 import os
+from pathlib import Path
 from typing import Any
 
 from vllm.benchmarks.serve import main_async
@@ -9,6 +16,7 @@ from vllm.benchmarks.serve import main_async
 # This monkey-patches vllm.benchmarks.datasets.get_samples before it's used
 # Must be imported before any vllm.benchmarks module usage
 import vllm_omni.benchmarks.patch.patch  # noqa: F401
+from vllm_omni.benchmarks.omniinteract import omniinteract_output_lock
 from vllm_omni.benchmarks.patch.patch import (
     maybe_enable_stage_metrics,
     set_print_stage,
@@ -28,4 +36,10 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
         getattr(args, "extra_body", None),
         enabled=should_request_stage_metrics(args),
     )
-    return asyncio.run(main_async(args))
+    lock = (
+        omniinteract_output_lock(Path(args.omniinteract_output_dir))
+        if getattr(args, "dataset_name", None) == "omniinteract"
+        else contextlib.nullcontext()
+    )
+    with lock:
+        return asyncio.run(main_async(args))

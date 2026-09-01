@@ -24,7 +24,6 @@ nav:
       - Text-To-Speech: user_guide/examples/offline_inference/text_to_speech.md
       - Text-To-Video: user_guide/examples/offline_inference/text_to_video.md
       - X-To-Text: user_guide/examples/offline_inference/x_to_text.md
-      - X-To-Video-Audio: user_guide/examples/offline_inference/x_to_video_audio.md
     - Online Serving:
       - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
       - Image-To-Video: user_guide/examples/online_serving/image_to_video.md
@@ -43,6 +42,7 @@ nav:
     - Overview: features/README.md
     - Runtime and Stage Execution:
       - Execution Modes and Streaming: user_guide/diffusion/execution_modes.md
+      - Prefill-Decode Disaggregation (experimental): features/pd_disaggregation.md
       - Sleep Mode: features/sleep_mode.md
     - Quantization:
       - Overview: user_guide/quantization/overview.md
@@ -53,6 +53,7 @@ nav:
       - BitsAndBytes W4: user_guide/quantization/bitsandbytes.md
       - MXFP8 W8A8: user_guide/quantization/mxfp8.md
       - MXFP4 W4A4: user_guide/quantization/mxfp4.md
+      - SVDQuant W4A4: user_guide/quantization/svdquant.md
       - ModelOpt: user_guide/quantization/modelopt.md
       - AutoRound: user_guide/quantization/autoround.md
       - msModelSlim: user_guide/quantization/msmodelslim.md
@@ -112,6 +113,7 @@ nav:
     - Feature Design:
       - Runtime and Stage Execution:
         - Disaggregated Inference: design/feature/disaggregated_inference.md
+        - Host Weight Runtime: design/feature/host_weight_runtime.md
         - Async Chunk: design/feature/async_chunk.md
         - Async Diffusion Output: design/feature/async_diffusion_output.md
         - Async Omni Output Materialization: design/feature/omni_async_output_materialization.md
@@ -168,6 +170,7 @@ nav:
         - Offloader: design/module/diffusion/offloader.md
       - Execution Platforms: design/module/execution_platforms.md
       - Cache Management: design/module/cache_management.md
+      - Host Weight Runtime: design/module/host_weight_runtime.md
       - Quantization: design/module/quantization.md
       - Observability: design/module/observability.md
       - Profiling: design/module/profiling.md

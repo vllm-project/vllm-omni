@@ -24,6 +24,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import scalar_bool
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
@@ -83,6 +84,7 @@ class NemotronVoiceChatCode2Wav(nn.Module):
 
         # Constructed in load_weights (owns the tts_model.audio_codec.* subtree).
         self.audio_codec: nn.Module | None = None
+        self._duplex_codec_caches: dict[str, object] = {}
 
     # ------------------------------------------------------------------
     # Runner-facing placeholder hooks.
@@ -147,6 +149,12 @@ class NemotronVoiceChatCode2Wav(nn.Module):
             meta = runtime_info.get("meta") if isinstance(runtime_info, Mapping) else None
             if isinstance(meta, Mapping) and meta.get("nemotron_voicechat_dummy_profile") is True:
                 continue
+            codec_streaming = scalar_bool(meta.get("codec_streaming")) if isinstance(meta, Mapping) else False
+            if isinstance(runtime_info, Mapping):
+                codec_streaming = codec_streaming or scalar_bool(runtime_info.get("meta.codec_streaming"))
+            cache_request_id = meta.get("request_id") if isinstance(meta, Mapping) else None
+            if cache_request_id is None and isinstance(runtime_info, Mapping):
+                cache_request_id = runtime_info.get("meta.request_id")
             codes = self._codes_from_runtime_info(runtime_info)
             if codes is None:
                 # No input_ids fallback (unlike PersonaPlexCode2Wav): this
@@ -159,6 +167,12 @@ class NemotronVoiceChatCode2Wav(nn.Module):
                     "code stack (placeholder input_ids are never decoded)."
                 )
             codes = validate_code_stack(codes, self._num_quantizers, self._codebook_size).to(device=device)
+            logger.debug(
+                "Nemotron VoiceChat code2wav input: request=%s shape=%s codec_streaming=%s",
+                cache_request_id,
+                tuple(codes.shape),
+                codec_streaming,
+            )
             frames = codes.shape[0]
             if frames == 0:
                 continue
@@ -176,18 +190,41 @@ class NemotronVoiceChatCode2Wav(nn.Module):
             if left_context_frames >= frames:
                 continue  # terminal empty chunk: all frames already emitted
             lens = torch.tensor([frames], device=device, dtype=torch.long)
+            codec_cache = None
+            if codec_streaming:
+                if not isinstance(cache_request_id, str) or not cache_request_id:
+                    raise ValueError("Nemotron VoiceChat incremental codec input lacks meta.request_id")
+                from vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored.ear_tts_vae_codec import (
+                    CausalConv1dCache,
+                )
+
+                codec_cache = self._duplex_codec_caches.setdefault(cache_request_id, CausalConv1dCache())
             # NeMo decodes the codec strictly in fp32.
             with torch.autocast(device_type=device.type, enabled=False):
-                wav, wav_len = self.audio_codec.decode(codes.unsqueeze(0), lens)
+                wav, wav_len = self.audio_codec.decode(
+                    codes.unsqueeze(0),
+                    lens,
+                    cache=codec_cache,
+                )
             wav = wav.reshape(-1)[: int(wav_len.reshape(-1)[0])]
-            if left_context_frames > 0:
+            if left_context_frames > 0 and not codec_streaming:
                 wav = wav[left_context_frames * self._wav_per_frame :]
             audios[i] = wav.detach().to(dtype=torch.float32).cpu()
+            logger.debug(
+                "Nemotron VoiceChat code2wav output: request=%s frames=%s samples=%s",
+                cache_request_id,
+                frames,
+                int(audios[i].numel()),
+            )
 
         return OmniOutput(
             text_hidden_states=None,
             multimodal_outputs={"model_outputs": audios, "sr": srs},
         )
+
+    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        for request_id in finished_req_ids:
+            self._duplex_codec_caches.pop(str(request_id), None)
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput | tuple, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):

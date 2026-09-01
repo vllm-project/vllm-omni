@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import inspect
 import logging
@@ -79,6 +79,13 @@ from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step
 from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+
+# ResBlock is platform-dispatched in the layers package __init__: CUDA gets
+# fused GroupNorm+SiLU and AdaGN kernels, every other backend gets the plain
+# PyTorch block. UNetDown and UNetUp below instantiate whichever one this
+# resolves to.
+from vllm_omni.diffusion.models.hunyuan_image3.layers import ResBlock
+from vllm_omni.diffusion.models.hunyuan_image3.layers.common import conv_nd, normalization
 from vllm_omni.diffusion.utils.kv_utils import repeat_kv
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 from vllm_omni.platforms import current_omni_platform
@@ -169,44 +176,6 @@ def real_batched_index_select(t, dim, idx):
     assert t.ndim >= 2 and idx.ndim >= 2, f"{t.ndim=} {idx.ndim=}"
     assert len(t) == len(idx), f"{len(t)=} != {len(idx)=}"
     return torch.stack([torch.index_select(t[i], dim - 1, idx[i]) for i in range(len(t))])
-
-
-def conv_nd(dims, *args, **kwargs):  # noqa: N802
-    """
-    Create a 1D, 2D, or 3D convolution module.
-    """
-    if dims == 1:
-        return nn.Conv1d(*args, **kwargs)
-    elif dims == 2:
-        return nn.Conv2d(*args, **kwargs)
-    elif dims == 3:
-        return nn.Conv3d(*args, **kwargs)
-    raise ValueError(f"unsupported dimensions: {dims}")
-
-
-def normalization(channels, **kwargs):
-    """
-    Make a standard normalization layer.
-    :param channels: number of input channels.
-    :return: a nn.Module for normalization.
-    """
-    return nn.GroupNorm(32, channels, **kwargs)
-
-
-def linear(*args, **kwargs):
-    """
-    Create a linear module.
-    """
-    return nn.Linear(*args, **kwargs)
-
-
-def zero_module(module):
-    """
-    Zero out the parameters of a module and return it.
-    """
-    for p in module.parameters():
-        p.detach().zero_()
-    return module
 
 
 def _to_tuple(x, dim=2):
@@ -913,7 +882,7 @@ class HunYuanRotary2DEmbedder:
         return q, k
 
 
-class ImageKVCacheManager:
+class ImageKVCacheManager(nn.Module):
     """
     Manages specialized caching and updating of KV-Cache for image tokens in multimodal models.
     """
@@ -932,6 +901,7 @@ class ImageKVCacheManager:
             image_token_len: Number of tokens per image (including special placeholders),
             default 4097 (timestamp + 4096 image tokens).
         """
+        super().__init__()
         # attention related
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -953,6 +923,10 @@ class ImageKVCacheManager:
             softmax_scale=self.scaling,
             num_kv_heads=self.num_kv_heads,
             prefix=f"{prefix}.attn" if prefix else "",
+            paged_kv_cache_role="primary",
+            # Hunyuan image RoPE produces bfloat16 K and denoising runs under
+            # bfloat16 autocast, independent of the weight-loading dtype.
+            paged_kv_cache_dtype=torch.bfloat16,
         )
 
     @staticmethod
@@ -1095,18 +1069,98 @@ class ImageKVCacheManager:
         )
         return key, value
 
-    def __call__(
+    def clear_legacy_prompt_kv_cache(self) -> None:
+        """Drop model-owned dense KV state before Scheduler-paged execution."""
+
+        self.image_kv_cache_map = None
+        self.image_kv_cache_lens = None
+
+    def _forward_paged(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        *,
+        first_step: bool,
+        query_lens: list[int],
+        seq_lens: list[int],
+        shard_image_size: int | None,
+        full_attn_spans: list[list[tuple[int, int]]],
+        uncond_cfg_prefill: bool,
+    ) -> torch.Tensor:
+        """Run Hunyuan attention against Worker-managed Scheduler pages.
+
+        This model boundary is shared by GPU and NPU: it describes Hunyuan's
+        Q/K/V layout and mixed-attention spans, while the common Attention
+        layer resolves the actual CUDA or Ascend paged kernel.
+        """
+
+        if uncond_cfg_prefill:
+            raise RuntimeError("Hunyuan negative-CFG prefill must run before paged row activation")
+        if self._injected_ar_kv is not None:
+            raise NotImplementedError("Hunyuan Scheduler-paged KV does not support imported AR KV")
+        if not query_lens or len(seq_lens) != len(query_lens):
+            raise ValueError("Hunyuan Scheduler-paged KV requires matching query and sequence lengths")
+        if len(full_attn_spans) != len(query_lens):
+            raise ValueError("Hunyuan Scheduler-paged KV requires one full-attention span row per sequence")
+
+        self.clear_legacy_prompt_kv_cache()
+        bs = len(query_lens)
+        q_len = query_lens[0]
+        seq_len = seq_lens[0]
+        assert query.shape[0] == bs * q_len, f"{query.shape[0]} != {bs * q_len}"
+
+        head_num_per_rank = query.shape[1]
+        kv_head_num_per_rank = key.shape[1]
+        head_dim = query.shape[2]
+
+        query = query.reshape(bs, q_len, head_num_per_rank, head_dim)
+        key = key.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
+        value = value.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
+
+        joint_text_query = joint_text_key = joint_text_value = None
+        if self.sp_size > 1 and first_step:
+            if shard_image_size is None or shard_image_size <= 0:
+                raise ValueError("Hunyuan paged Ulysses requires a positive local image shard size")
+            local_prompt_len = seq_len - shard_image_size
+            joint_query_len = query.shape[1] - shard_image_size
+            if local_prompt_len != joint_query_len:
+                raise ValueError(
+                    "Hunyuan paged Ulysses prompt layout mismatch: "
+                    f"key_prompt={local_prompt_len}, query_prompt={joint_query_len}"
+                )
+            joint_text_query = query[:, :joint_query_len]
+            joint_text_key = key[:, :local_prompt_len]
+            joint_text_value = value[:, :local_prompt_len]
+            query = query[:, joint_query_len:]
+            key = key[:, local_prompt_len:]
+            value = value[:, local_prompt_len:]
+
+        if joint_text_query is None:
+            attn_metadata = AttentionMetadata(full_attn_spans=full_attn_spans)
+        else:
+            attn_metadata = AttentionMetadata(
+                joint_query=joint_text_query,
+                joint_key=joint_text_key,
+                joint_value=joint_text_value,
+                joint_strategy="front",
+                full_attn_spans=full_attn_spans,
+            )
+        attn_output = self.attn(query, key, value, attn_metadata)
+        return attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+
+    def _forward_dense_legacy(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        self.image_token_len = kwargs.get("num_image_tokens")
+        """Run the device-neutral, model-owned dense prompt-KV compatibility path."""
+
         first_step = kwargs.get("first_step")
         uncond_cfg_prefill = kwargs.get("uncond_cfg_prefill", False)
-
         query_lens = kwargs.get("query_lens")
         seq_lens = kwargs.get("seq_lens")
         shard_image_size = kwargs.get("shard_image_size") if self.sp_size > 1 else None
@@ -1135,8 +1189,7 @@ class ImageKVCacheManager:
                 key = key[:, :0, :, :]
                 value = value[:, :0, :, :]
         elif first_step:
-            self.image_kv_cache_map = None  # reset first
-            self.image_kv_cache_lens = None
+            self.clear_legacy_prompt_kv_cache()
             key, value = self._cache_prompt_kv(
                 key,
                 value,
@@ -1188,6 +1241,34 @@ class ImageKVCacheManager:
         attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
         return attn_output
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        self.image_token_len = kwargs.get("num_image_tokens")
+        if self.attn.is_paged_kv_active():
+            full_attn_spans = kwargs.get("full_attn_spans")
+            if full_attn_spans is None:
+                raise ValueError("Hunyuan Scheduler-paged KV requires full_attn_spans metadata")
+            return self._forward_paged(
+                query,
+                key,
+                value,
+                first_step=bool(kwargs.get("first_step")),
+                query_lens=kwargs.get("query_lens"),
+                seq_lens=kwargs.get("seq_lens"),
+                shard_image_size=kwargs.get("shard_image_size") if self.sp_size > 1 else None,
+                full_attn_spans=full_attn_spans,
+                uncond_cfg_prefill=kwargs.get("uncond_cfg_prefill", False),
+            )
+        if attention_mask is None:
+            raise ValueError("Hunyuan dense attention requires an attention mask")
+        return self._forward_dense_legacy(query, key, value, attention_mask, **kwargs)
 
 
 @dataclass
@@ -2732,7 +2813,6 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         # List[List[...]] per-sample metadata indexed along the CFG batch dim
         if isinstance(model_kwargs.get("full_attn_spans"), list):
             model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"][s.start : s.stop]
-
         # custom_pos_emb: tuple of (cos, sin)
         if "custom_pos_emb" in model_kwargs and model_kwargs["custom_pos_emb"] is not None:
             cos, sin = model_kwargs["custom_pos_emb"]
@@ -3275,99 +3355,6 @@ class TimestepEmbedder(nn.Module):
         t_freq = timestep_embedding(t, self.frequency_embedding_size, self.max_period).type(self.mlp[0].weight.dtype)
         t_emb = self.mlp(t_freq)
         return t_emb
-
-
-class ResBlock(nn.Module):
-    r"""
-    A residual block that can optionally change the number of channels.
-
-    Args:
-        in_channels (`int`):
-            The number of input channels.
-        emb_channels (`int`):
-            The number of timestep embedding channels.
-        dropout (`float`):
-            The rate of dropout.
-        out_channels (`int`, *optional*):
-            If specified, the number of output channels.
-        use_conv (`bool`, *optional*):
-            If True and out_channels is specified, use a spatial convolution instead of a
-            smaller 1x1 convolution to change the channels in the skip connection.
-        dims (`int`, *optional*):
-            Determines if the signal is 1D, 2D, or 3D.
-        up (`bool`, *optional*):
-            If True, use this block for upsampling.
-        down (`bool`, *optional*):
-            If True, use this block for downsampling.
-
-    """
-
-    def __init__(
-        self,
-        in_channels,
-        emb_channels,
-        out_channels=None,
-        dropout=0.0,
-        use_conv=False,
-        dims=2,
-        up=False,
-        down=False,
-        device=None,
-        dtype=None,
-    ) -> None:
-        factory_kwargs = {"dtype": dtype, "device": device}
-        super().__init__()
-        self.in_channels = in_channels
-        self.dropout = dropout
-        self.out_channels = out_channels or self.in_channels
-        self.use_conv = use_conv
-
-        self.in_layers = nn.Sequential(
-            normalization(self.in_channels, **factory_kwargs),
-            nn.SiLU(),
-            conv_nd(dims, self.in_channels, self.out_channels, 3, padding=1, **factory_kwargs),  # noqa: N802
-        )
-
-        self.updown = up or down
-        self.h_upd = self.x_upd = nn.Identity()
-
-        self.emb_layers = nn.Sequential(nn.SiLU(), linear(emb_channels, 2 * self.out_channels, **factory_kwargs))
-
-        self.out_layers = nn.Sequential(
-            normalization(self.out_channels, **factory_kwargs),
-            nn.SiLU(),
-            nn.Dropout(p=dropout),
-            zero_module(conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1, **factory_kwargs)),  # noqa: N802
-        )
-
-        if self.out_channels == self.in_channels:
-            self.skip_connection = nn.Identity()
-        elif use_conv:
-            self.skip_connection = conv_nd(dims, self.in_channels, self.out_channels, 3, padding=1, **factory_kwargs)  # noqa: N802
-        else:
-            self.skip_connection = conv_nd(dims, self.in_channels, self.out_channels, 1, **factory_kwargs)  # noqa: N802
-
-    def forward(self, x, emb) -> torch.Tensor:
-        if self.updown:
-            in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
-            h = in_rest(x)
-            h = self.h_upd(h)
-            x = self.x_upd(x)
-            h = in_conv(h)
-        else:
-            h = self.in_layers(x)
-
-        emb_out = self.emb_layers(emb)
-        while len(emb_out.shape) < len(h.shape):
-            emb_out = emb_out[..., None]
-
-        # Adaptive Group Normalization
-        out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
-        scale, shift = torch.chunk(emb_out, 2, dim=1)
-        h = out_norm(h) * (1.0 + scale) + shift
-        h = out_rest(h)
-
-        return self.skip_connection(x) + h
 
 
 class UNetDown(nn.Module):
