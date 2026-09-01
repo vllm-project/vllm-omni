@@ -18,13 +18,14 @@ activations, where the saved memory traffic is what pays.
 Large activations additionally take a split reduction so the work is spread over
 the whole device instead of ``B * num_groups`` CTAs; see
 :mod:`._group_norm_reduction` for why and how. On an A10G (80 SMs), bf16, batch
-1, that is worth 1.46-1.48x over the unsplit kernel at every level of the
-HunyuanImage3 decode ladder, and puts the 1024^2 activation at 498 GB/s -- the
-same rate a plain device-to-device copy of that footprint sustains, so the
-kernel is now at the streaming limit rather than short of it. Small activations
-keep the single-launch path, where the widened autotune space is what helps
-instead (1.25-1.36x on the 32x32 sizes, which the old fixed 4096-wide block
-served badly).
+1, that is worth 1.46-1.48x over the unsplit kernel at the four decode-ladder
+levels large enough to split (1024^2 down to 128^2), and puts the 1024^2
+activation at 498 GB/s -- the same rate a plain device-to-device copy of that
+footprint sustains, so the kernel is now at the streaming limit rather than
+short of it. The 64^2 and 32^2 levels stay on the single-launch path and are
+unchanged by the split; what helps them is the widened autotune space
+(1.25-1.36x on the 32x32 sizes, which the old fixed 4096-wide block served
+badly).
 """
 
 import torch
@@ -142,8 +143,11 @@ def fused_group_norm_silu(
 ) -> torch.Tensor:
     """
     Fused GroupNorm + SiLU activation.
-    Computes SiLU(GroupNorm(x, num_groups, weight, bias, eps)) in a single Triton kernel,
-    avoiding intermediate tensors and reducing memory traffic and launch overhead.
+    Computes SiLU(GroupNorm(x, num_groups, weight, bias, eps)) without materializing
+    the intermediate tensors eager would, reducing memory traffic and launch overhead.
+    Small activations run as one Triton launch; large ones split the reduction over two
+    (statistics, then normalize) to spread the work across the device, which is still
+    two reads of the input either way.
 
     - x: (N, C, *spatial), any spatial rank.
     - weight, bias: per-channel parameters, shape (C,).

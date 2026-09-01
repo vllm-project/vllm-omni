@@ -300,8 +300,15 @@ def test_large_offset_small_variance(dtype):
 # ---------------------------------------------------------------------------
 # Above a size threshold each group's reduction is spread over several CTAs that
 # write partial statistics to a workspace, instead of one CTA owning the whole
-# group. Every case above this point is small enough to take the unsplit path,
-# so without these the split path would ship untested.
+# group.
+#
+# Which path a case takes is a function of the device, not just the shape:
+# split = min(ceil(waves * SMs / groups), ceil(spatial / 4096)). Some cases above
+# do cross into the split path incidentally -- test_hunyuan_vae_config's 128x128
+# row reaches split=4 on any of L4/A10G/H100 -- but incidentally is the problem:
+# none of them pin it, so on a narrower device they would quietly fall back to
+# the unsplit kernel and still pass. The cases below pin the environment so the
+# split path is exercised deterministically, and assert that premise.
 
 
 def _split_of(x, num_groups=32):
@@ -331,8 +338,9 @@ def _eager_adagn(x, weight, bias, scale, shift, num_groups=32, eps=1e-6):
         (64, (512, 512), torch.bfloat16),
     ],
 )
-def test_split_reduction_matches_eager(channels, hw, dtype):
+def test_split_reduction_matches_eager(channels, hw, dtype, monkeypatch):
     """Correctness at sizes that actually trigger the split."""
+    monkeypatch.setenv(_SPLIT_WAVES_ENV, "8")
     torch.manual_seed(0)
     x = torch.randn(1, channels, *hw, device="cuda", dtype=dtype)
     weight = torch.randn(channels, device="cuda", dtype=dtype)
@@ -341,7 +349,9 @@ def test_split_reduction_matches_eager(channels, hw, dtype):
 
     assert _split_of(x) > 1, (
         f"test premise: C={channels} {hw} should take the split path, got split=1. "
-        "If this fires on a very small GPU the shape needs raising, not the assert removing."
+        "split is min(ceil(waves*SMs/groups), ceil(spatial/4096)); raise waves via "
+        f"{_SPLIT_WAVES_ENV}, not the shape -- past ceil(spatial/4096) more spatial "
+        "buys nothing, and on a device with few enough SMs no shape can force a split."
     )
 
     fused_out = fused_adaptive_group_norm_silu(x, weight, bias, scale, shift, 32, 1e-6)
@@ -351,13 +361,14 @@ def test_split_reduction_matches_eager(channels, hw, dtype):
     torch.testing.assert_close(fused_out, ref_out, rtol=rtol, atol=atol)
 
 
-def test_split_reduction_ragged_tail():
+def test_split_reduction_ragged_tail(monkeypatch):
     """A spatial size that does not divide evenly into aligned chunks.
 
     The last cooperating program gets a short slice (here 192 of 4096 positions),
     which is the case that would silently drop or double-count elements if the
     chunk bookkeeping were off by one.
     """
+    monkeypatch.setenv(_SPLIT_WAVES_ENV, "8")
     torch.manual_seed(0)
     C, H, W = 64, 96, 130  # 12480 spatial positions: 3 full chunks plus 192
     x = torch.randn(1, C, H, W, device="cuda", dtype=torch.float32)
@@ -373,13 +384,14 @@ def test_split_reduction_ragged_tail():
     torch.testing.assert_close(fused_out, ref_out, rtol=1e-5, atol=1e-6)
 
 
-def test_split_reduction_large_offset():
+def test_split_reduction_large_offset(monkeypatch):
     """``10000 +- 0.1`` again, but big enough to be split across CTAs.
 
     Splitting adds a level to the reduction tree, so this is where a combine that
     reconstructed ``E[x^2] - E[x]^2`` from the partials -- rather than summing
     their M2s plus the between-partial spread -- would give itself away.
     """
+    monkeypatch.setenv(_SPLIT_WAVES_ENV, "8")
     torch.manual_seed(0)
     C, H, W = 64, 256, 256
     x = torch.full((1, C, H, W), 10000.0, device="cuda", dtype=torch.float32)
