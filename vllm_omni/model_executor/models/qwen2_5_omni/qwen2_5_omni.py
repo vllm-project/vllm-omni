@@ -862,13 +862,19 @@ class Qwen2_5OmniForConditionalGeneration(
         # Use thinker model for sampling
         return self.model.sample(logits, sampling_metadata)
 
-    def generate_speech(self, text_tokens: torch.Tensor, voice_type: str = "default") -> torch.Tensor:
+    def generate_speech(
+        self,
+        text_tokens: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        voice_type: str = "default",
+    ) -> torch.Tensor:
         """
         Generate speech from text tokens using the talker and token2wav models.
         This method is kept for backward compatibility and direct speech generation.
 
         Args:
             text_tokens: Text tokens from thinker model
+            sampling_metadata: Sampling metadata forwarded to the talker sampler
             voice_type: Voice type for speech generation
 
         Returns:
@@ -878,7 +884,7 @@ class Qwen2_5OmniForConditionalGeneration(
         talker_output = self.talker(input_ids=None, positions=None, inputs_embeds=text_tokens)
 
         # Convert talker output to codec tokens
-        codec_tokens = self._convert_to_codec_tokens(talker_output)
+        codec_tokens = self._convert_to_codec_tokens(talker_output, sampling_metadata)
 
         # Generate audio using token2wav model
         return self._codec_to_audio(codec_tokens, voice_type=voice_type)
@@ -942,8 +948,6 @@ class Qwen2_5OmniForConditionalGeneration(
                     self._token2wav_ref_mels[key] = torch.as_tensor(np.load(f), device=device)
 
     def _codec_to_audio(self, codec_tokens: torch.Tensor, voice_type: str = "default") -> torch.Tensor | None:
-        if self.token2wav is None:
-            self._init_token2wav_model()
         if self.token2wav is None:
             return None
         # Normalize voice type
