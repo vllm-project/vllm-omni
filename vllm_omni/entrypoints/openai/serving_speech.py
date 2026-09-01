@@ -15,7 +15,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
@@ -57,6 +57,7 @@ from vllm_omni.entrypoints.openai.speech_usage import (
 from vllm_omni.entrypoints.openai.tts_adapters import (
     SpeechServingContext,
     TTSGenerationError,
+    TTSModelAdapter,
     all_tts_stage_keys,
     detect_tts_model_type,
     resolve_adapter,
@@ -123,13 +124,6 @@ def _is_default_voice(voice, supported_speakers):
     """Check if a lowercased voice name is the placeholder default and not
     an actual registered/built-in speaker."""
     return voice == _DEFAULT_VOICE_NAME and voice not in supported_speakers
-
-
-def _coerce_ref_audio_str(ref_audio: str | list[str]) -> str:
-    """Normalize protocol ``ref_audio`` values to a single locator string."""
-    if isinstance(ref_audio, list):
-        return ref_audio[0]
-    return ref_audio
 
 
 def _create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
@@ -571,12 +565,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Find and return the TTS stage config, or None if not found."""
         tts_stage_keys = all_tts_stage_keys()
         entry_stage_archs = tts_entry_stage_archs()
-        all_stages = frozenset(
-            str(model_stage)
-            for stage in self.engine_client.stage_configs
-            for model_stage in [getattr(stage.engine_args, "model_stage", None)]
-            if model_stage is not None
-        )
+        all_stages = frozenset(stage.engine_args.model_stage for stage in self.engine_client.stage_configs)
         for stage in self.engine_client.stage_configs:
             engine_args = stage.engine_args
             model_stage = engine_args.model_stage
@@ -639,9 +628,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         The codec produces one frame per (output_sample_rate / encode_downsample_rate)
         audio samples, so ref_code_len = ceil(duration_seconds * codec_frame_rate).
         """
-        codec_frame_rate = None
-        if self._adapter is not None:
-            codec_frame_rate = self._adapter.capabilities.codec_frame_rate
+        adapter = cast(TTSModelAdapter, self._adapter)
+        codec_frame_rate = adapter.capabilities.codec_frame_rate
         if codec_frame_rate is None:
             return None
         try:
@@ -678,20 +666,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 Qwen3TTSPromptEmbedsBuilder,
             )
 
-            if self._tts_tokenizer is None:
+            tokenizer = self._tts_tokenizer
+            if tokenizer is None:
                 from transformers import AutoTokenizer
 
                 model_name = self.engine_client.model_config.model
-                self._tts_tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer = AutoTokenizer.from_pretrained(
                     model_name,
                     trust_remote_code=True,
                     padding_side="left",
                 )
+                self._tts_tokenizer = tokenizer
             hf_config = self.engine_client.model_config.hf_config
             talker_config = hf_config.talker_config
             task_type = (tts_params.get("task_type") or ["CustomVoice"])[0]
-            tokenizer = self._tts_tokenizer
-            assert tokenizer is not None
             return Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
                 additional_information=tts_params,
                 task_type=task_type,
@@ -861,12 +849,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         ref_sr = None
         voice_profile = None
         if request.ref_audio is not None:
-            ref_audio, ref_sr, _ = await self._resolve_ref_audio(request.ref_audio)
+            ref_audio, ref_sr, _ = await self._resolve_ref_audio(cast(str, request.ref_audio))
         elif uploaded_ref is not None:
             wav_np, ref_sr = uploaded_ref
             ref_audio = wav_np.tolist()
-        elif request.voice is not None and self._adapter is not None:
-            voice_profile = self._adapter.capabilities.precomputed_speakers.get(request.voice.lower())
+        elif request.voice is not None:
+            adapter = cast(TTSModelAdapter, self._adapter)
+            voice_profile = adapter.capabilities.precomputed_speakers.get(request.voice.lower())
         return build_voxcpm2_prompt(
             hf_config=self.engine_client.model_config.hf_config,
             tokenizer=self._voxcpm2_tokenizer,
@@ -1344,9 +1333,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         ids = self._voxcpm2_tokenizer.encode(text, add_special_tokens=True)
         return split_multichar_chinese(ids, self._voxcpm2_split_map)
 
-    def _validate_ref_audio_format(self, ref_audio: str | list[str]) -> str | None:
+    def _validate_ref_audio_format(self, ref_audio: str | list[str] | None) -> str | None:
         """Validate ref_audio is a supported URI format. Returns error or None."""
-        ref_audio = _coerce_ref_audio_str(ref_audio)
         if not isinstance(ref_audio, str):
             return "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
         scheme = (urlparse(ref_audio).scheme or "").lower()
@@ -1432,9 +1420,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             }
             if request.max_new_tokens is not None:
                 params["max_new_frames"] = [request.max_new_tokens]
-            if request.ref_audio is None:
-                raise ValueError("ref_audio is required for MOSS-TTS voice_clone mode")
-            wav_list, sr, cache_key = await self._resolve_ref_audio(request.ref_audio)
+            wav_list, sr, cache_key = await self._resolve_ref_audio(cast(str, request.ref_audio))
             params["prompt_audio_array"] = [[wav_list, sr]]
             params["ref_audio_cache_key"] = cache_key
             return params
@@ -1454,9 +1440,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             }
             if request.max_new_tokens is not None:
                 params["max_new_frames"] = [request.max_new_tokens]
-            if request.ref_audio is None:
-                raise ValueError("ref_audio is required for MOSS-TTS voice_clone mode")
-            wav_list, sr, cache_key = await self._resolve_ref_audio(request.ref_audio)
+            wav_list, sr, cache_key = await self._resolve_ref_audio(cast(str, request.ref_audio))
             params["prompt_audio_array"] = [[wav_list, sr]]
             params["ref_audio_cache_key"] = cache_key
             return params
@@ -1507,12 +1491,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             _resolve_keys.append(cache_key)
             return wav_list, sr, cache_key
 
-        async def _encode_ref(ref_str: str | list[str], *, named_voice: bool) -> torch.Tensor:
+        async def _encode_ref(ref_str: str, *, named_voice: bool) -> torch.Tensor:
             # Named-voice cache is (voice_name, created_at). TTSD speaker 2 is a
             # different clip, so it must stay anonymous or it reuses speaker 1.
             use_named = named_voice and bool(_voice)
             return await encode_reference_codes(
-                _coerce_ref_audio_str(ref_str),
+                ref_str,
                 processor=proc,
                 resolve_ref_audio=_tracked_resolve,
                 speaker_cache=self._speaker_cache,
@@ -1525,13 +1509,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         user_kwargs: dict[str, Any] = {"text": request.input or ""}
         if v in ("tts", "local"):
-            if request.ref_audio is None:
-                raise ValueError("ref_audio is required for MOSS-TTS voice_clone mode")
-            user_kwargs["reference"] = [await _encode_ref(request.ref_audio, named_voice=True)]
+            user_kwargs["reference"] = [await _encode_ref(cast(str, request.ref_audio), named_voice=True)]
         elif v == "ttsd":
-            if request.ref_audio is None:
-                raise ValueError("ref_audio is required for MOSS-TTS voice_clone mode")
-            refs = [await _encode_ref(request.ref_audio, named_voice=True)]
+            refs = [await _encode_ref(cast(str, request.ref_audio), named_voice=True)]
             if request.ref_audio_2:
                 refs.append(await _encode_ref(request.ref_audio_2, named_voice=False))
             user_kwargs["reference"] = refs
@@ -1599,7 +1579,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             prompt_token_ids = input_ids_to_python_list(inputs)
             return tokens_input(prompt_token_ids=prompt_token_ids)
 
-        wav_list, sr, _ = await self._resolve_ref_audio(request.ref_audio)
+        wav_list, sr, _ = await self._resolve_ref_audio(cast(str, request.ref_audio))
         wav = np.asarray(wav_list, dtype=np.float32)
         out = await asyncio.to_thread(
             build_voice_clone_prompt,
@@ -1668,7 +1648,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             encode_reference_audio,
         )
 
-        wav_list, sr, cache_key = await self._resolve_ref_audio(request.ref_audio)
+        wav_list, sr, cache_key = await self._resolve_ref_audio(cast(str, request.ref_audio))
         artifact_key = self._get_resolved_ref_audio_artifact_key(cache_key)
         wav = np.asarray(wav_list, dtype=np.float32)
         ref_codes_delayed, cache_hit, inflight_wait = await self._resolve_higgs_audio_v3_ref_codes(
@@ -1895,7 +1875,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         artifact_key = self._make_ref_audio_artifact_cache_key(wav_np, sr)
         return wav_np.tolist(), sr, artifact_key, duration
 
-    async def _resolve_ref_audio(self, ref_audio_str: str | list[str]) -> tuple[list[float], int, str]:
+    async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[list[float], int, str]:
         """Resolve ref_audio to (wav_samples, sample_rate, cache_key).
 
         Delegates to upstream vLLM's MediaConnector which handles http(s)
@@ -1912,7 +1892,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         After a cache miss the file is re-stat'd; a metadata change retries
         the fetch so the stored waveform matches the key.
         """
-        ref_audio_str = _coerce_ref_audio_str(ref_audio_str)
         # Pass the allowed-local-media-path so the stat is restricted to
         # paths the server operator has explicitly permitted.
         allowed_path: str | None
@@ -2310,11 +2289,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if usage_acc is not None:
                     usage_acc.observe(res)
                 audio_output, audio_key = self._extract_audio_output(res)
-                if audio_key is None or audio_output is None:
+                if audio_key is None:
                     # Stash the aligner's timestamps output for streaming callers.
                     if collect is not None and self._is_timestamps_output(res):
                         collect["aligner_res"] = res
                     continue
+                audio_output = cast(dict, audio_output)
 
                 sr_raw = audio_output.get("sr")
                 if sr_raw is not None:
@@ -2835,7 +2815,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if request.ref_audio is None:
             raise ValueError("ref_audio is required for CosyVoice3 voice cloning")
         # Resolve reference audio
-        wav_samples, sr, _ = await self._resolve_ref_audio(request.ref_audio)
+        wav_samples, sr, _ = await self._resolve_ref_audio(cast(str, request.ref_audio))
         audio_data = (np.asarray(wav_samples, dtype=np.float32), sr)
 
         # Wrap the reference transcript in the CosyVoice3 instruction template
@@ -2949,7 +2929,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """
         # Voice cloning requires ref_audio + ref_text
         if request.ref_audio is not None and request.ref_text:
-            wav_samples, sr, _ = await self._resolve_ref_audio(request.ref_audio)
+            wav_samples, sr, _ = await self._resolve_ref_audio(cast(str, request.ref_audio))
             audio_data = (np.asarray(wav_samples, dtype=np.float32), int(sr))
 
             mm_kwargs: dict[str, Any] = {
@@ -3053,10 +3033,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "sigma": 0.25,
             "temperature": 0.0,
         }
-        if has_spk_emb:
-            spk_emb = request.speaker_embedding
-            if spk_emb is not None:
-                additional_information["spk_emb"] = list(spk_emb)
+        if request.speaker_embedding is not None:
+            additional_information["spk_emb"] = list(request.speaker_embedding)
         prompt = tokens_input(prompt_token_ids=[0])
         prompt["additional_information"] = additional_information
         return prompt
@@ -3349,8 +3327,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     step_audio, step_key = self._extract_audio_output(res)
                 except Exception:
                     continue
-                if step_key is None or step_audio is None:
+                if step_key is None:
                     continue
+                step_audio = cast(dict, step_audio)
                 chunk = step_audio[step_key]
                 candidates = chunk if isinstance(chunk, list) else [chunk]
                 for cand in candidates:
@@ -3370,8 +3349,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # yielded one, which may be the aligner's timestamps output).
             audio_source = audio_res if audio_res is not None else final_output
             audio_output, audio_key = self._extract_audio_output(audio_source)
-            if audio_key is None or audio_output is None:
+            if audio_key is None:
                 raise ValueError("TTS model did not produce audio output.")
+            audio_output = cast(dict, audio_output)
 
             # Surface forced-aligner word timestamps to the caller (set as a
             # response header) when requested and an aligner stage produced them.
@@ -3497,7 +3477,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             request_id = f"speech-{random_uuid()}"
             prompt: dict[str, Any] = {"input": request.input}
             if request.ref_audio:
-                wav, sr, _ = await self._resolve_ref_audio(request.ref_audio)
+                wav, sr, _ = await self._resolve_ref_audio(cast(str, request.ref_audio))
                 prompt["ref_audio"] = (np.asarray(wav, dtype=np.float32), sr)
             if request.ref_text:
                 prompt["ref_text"] = request.ref_text
@@ -3553,8 +3533,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise ValueError("No output generated from the model.")
 
             audio_output, audio_key = self._extract_audio_output(final_output)
-            if audio_key is None or audio_output is None:
+            if audio_key is None:
                 raise ValueError("TTS model did not produce audio output.")
+            audio_output = cast(dict, audio_output)
 
             audio_tensor = audio_output[audio_key]
             sr_raw = audio_output.get("sr", 24000)
