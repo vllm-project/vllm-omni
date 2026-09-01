@@ -17,7 +17,7 @@ import pytest
 import torch
 
 import vllm_omni.diffusion.attention.layer as layer_mod
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.config import (
     get_current_diffusion_config,
@@ -27,6 +27,7 @@ from vllm_omni.diffusion.config import (
 from vllm_omni.diffusion.data import (
     AttentionConfig,
     AttentionSpec,
+    DiffusionParallelConfig,
     OmniDiffusionConfig,
     build_attention_config,
     parse_attention_config,
@@ -662,6 +663,111 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
         assert attn.use_ring is True
         assert attn.ring_runner is not None
         assert attn.ring_runner.attn_backend_pref == "TRTLLM_ATTN"
+
+
+class TestAllGatherKvBackendCapability:
+    @staticmethod
+    def _install_attention_init_stubs(monkeypatch, backend_cls):
+        class _FakeAttentionImpl:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def forward(self, query, key, value, attn_metadata=None):
+                return query
+
+            @staticmethod
+            def supports_kv_cache_dtype(kv_cache_dtype, platform_key) -> bool:
+                return True
+
+        backend_cls.get_impl_cls = staticmethod(lambda: _FakeAttentionImpl)
+        monkeypatch.setattr(
+            layer_mod,
+            "get_attn_backend_for_role",
+            lambda role, head_size, attention_config=None, role_category=None, allow_trtllm_default=False: (
+                backend_cls,
+                None,
+            ),
+        )
+        monkeypatch.setattr(layer_mod.SDPABackend, "get_impl_cls", staticmethod(lambda: _FakeAttentionImpl))
+        monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: object())
+
+    @staticmethod
+    def _make_attention(allgather_degree: int, *, skip_sequence_parallel: bool = False):
+        od_config = OmniDiffusionConfig(
+            diffusion_attention_config=AttentionConfig(),
+            parallel_config=DiffusionParallelConfig(allgather_degree=allgather_degree),
+        )
+        with set_current_diffusion_config(od_config):
+            return Attention(
+                num_heads=4,
+                head_size=64,
+                causal=False,
+                softmax_scale=1.0,
+                skip_sequence_parallel=skip_sequence_parallel,
+            )
+
+    def test_backend_capability_defaults_to_supported(self, monkeypatch):
+        class _DefaultBackend(AttentionBackend):
+            @staticmethod
+            def get_name() -> str:
+                return "DEFAULT_BACKEND"
+
+        self._install_attention_init_stubs(monkeypatch, _DefaultBackend)
+
+        attn = self._make_attention(allgather_degree=2)
+
+        assert attn.attn_backend is _DefaultBackend
+
+    @pytest.mark.parametrize(
+        ("allgather_degree", "skip_sequence_parallel"),
+        [(1, False), (2, True)],
+    )
+    def test_incompatible_backend_is_allowed_when_allgather_kv_is_inactive(
+        self, monkeypatch, allgather_degree, skip_sequence_parallel
+    ):
+        class _IncompatibleBackend(AttentionBackend):
+            supports_allgather_kv = False
+
+            @staticmethod
+            def get_name() -> str:
+                return "INCOMPATIBLE_BACKEND"
+
+        self._install_attention_init_stubs(monkeypatch, _IncompatibleBackend)
+
+        attn = self._make_attention(
+            allgather_degree=allgather_degree,
+            skip_sequence_parallel=skip_sequence_parallel,
+        )
+
+        assert attn.attn_backend is _IncompatibleBackend
+
+    def test_incompatible_backend_is_rejected_by_capability(self, monkeypatch):
+        class _RenamedBackend(AttentionBackend):
+            supports_allgather_kv = False
+
+            @staticmethod
+            def get_name() -> str:
+                return "RENAMED_BACKEND"
+
+        self._install_attention_init_stubs(monkeypatch, _RenamedBackend)
+
+        with pytest.raises(
+            ValueError,
+            match="RENAMED_BACKEND does not support AllGather-KV sequence parallelism",
+        ):
+            self._make_attention(allgather_degree=2)
+
+    def test_legacy_custom_backend_without_capability_defaults_to_supported(self, monkeypatch):
+        class _LegacyCustomBackend:
+            @staticmethod
+            def get_name() -> str:
+                return "LEGACY_CUSTOM_BACKEND"
+
+        self._install_attention_init_stubs(monkeypatch, _LegacyCustomBackend)
+
+        attn = self._make_attention(allgather_degree=2)
+
+        assert attn.attn_backend is _LegacyCustomBackend
 
 
 class TestDiffusionKvCacheQuantization:
