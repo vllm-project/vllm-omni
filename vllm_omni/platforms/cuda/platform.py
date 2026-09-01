@@ -16,6 +16,17 @@ from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
 logger = init_logger(__name__)
 
+# Compute capabilities that SageAttention3 actually builds kernels for.
+# ``sageattention3_blackwell/setup.py`` matches (major, minor) exactly and
+# raises "Unsupported GPU" otherwise, emitting one gencode per entry:
+#   (10, 0) -> sm_100a   B200 / GB200
+#   (12, 0) -> sm_120a   RTX PRO 6000, RTX 50-series
+#   (12, 1) -> sm_121a   consumer Blackwell refresh
+# sm_103 (B300 / GB300) is deliberately absent: the kernel takes the SM120
+# warp-level mma.sync path, while SM103 requires the tcgen05 implementation,
+# so an sm_103a build reaches CUTLASS invalid-control-path guards at runtime.
+_SAGE_ATTN3_SUPPORTED_SMS = frozenset({(10, 0), (12, 0), (12, 1)})
+
 
 class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
     """CUDA/GPU implementation of OmniPlatform (default).
@@ -171,11 +182,22 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
                 logger.debug("Defaulting to diffusion attention backend SDPA")
                 return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
             if backend_upper == "SAGE_ATTN_3":
-                sage_attn3_supported = compute_capability is not None and compute_capability.major >= 10
+                # Match the kernel's own build targets exactly. A ``major >= 10``
+                # test also admits sm_103, where the import succeeds and the
+                # failure only surfaces inside the kernel.
+                sage_attn3_supported = (
+                    compute_capability is not None
+                    and (compute_capability.major, compute_capability.minor) in _SAGE_ATTN3_SUPPORTED_SMS
+                )
                 if not sage_attn3_supported:
+                    supported_sms = ", ".join(
+                        f"sm_{major}{minor}" for major, minor in sorted(_SAGE_ATTN3_SUPPORTED_SMS)
+                    )
                     logger.warning(
-                        "SageAttention3 requires a Blackwell-class GPU with compute capability >= 10.0. "
-                        "Falling back to TORCH_SDPA backend."
+                        "SageAttention3 does not build kernels for %s; it supports %s only. "
+                        "Falling back to TORCH_SDPA backend.",
+                        sm_str or "an unknown GPU",
+                        supported_sms,
                     )
                     return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
                 try:
