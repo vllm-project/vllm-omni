@@ -1,3 +1,5 @@
+import json
+import os
 from functools import partial
 from pathlib import Path
 
@@ -264,3 +266,73 @@ def tiny_flux2_builder() -> str:
             "transformer": partial(_shrink_dit_rope_config, num_single_layers=2, joint_attention_dim=96),
         },
     )
+
+
+def _shrink_krea2_text_encoder(config: dict) -> dict:
+    tc = config["text_config"]
+    old_head_dim = tc["head_dim"]
+    tc["num_hidden_layers"] = 3
+    tc["hidden_size"] = 32
+    tc["intermediate_size"] = 64
+    tc["num_attention_heads"] = 2
+    tc["num_key_value_heads"] = 2
+    tc["head_dim"] = 16
+    if "rope_parameters" in tc:
+        rp = tc["rope_parameters"]
+        if "mrope_section" in rp:
+            factor = old_head_dim / 16
+            rp["mrope_section"] = [max(1, round(d / factor)) for d in rp["mrope_section"]]
+    vc = config["vision_config"]
+    vc["depth"] = 2
+    vc["intermediate_size"] = 64
+    vc["num_heads"] = 2
+    vc["out_hidden_size"] = 32
+    if "deepstack_visual_indexes" in vc:
+        vc["deepstack_visual_indexes"] = [0, 1]
+    return config
+
+
+def _shrink_krea2_transformer(config: dict) -> dict:
+    config["num_layers"] = 2
+    config["attention_head_dim"] = 32
+    config["num_attention_heads"] = 4
+    config["num_key_value_heads"] = 2
+    config["intermediate_size"] = 128
+    config["timestep_embed_dim"] = 32
+    config["text_hidden_dim"] = 32
+    config["num_text_layers"] = 3
+    config["text_num_attention_heads"] = 2
+    config["text_num_key_value_heads"] = 2
+    config["text_intermediate_size"] = 64
+    config["num_layerwise_text_blocks"] = 1
+    config["num_refiner_text_blocks"] = 1
+    config["axes_dims_rope"] = [8, 12, 12]
+    return config
+
+
+def _shrink_krea2_vae(config: dict) -> dict:
+    config["base_dim"] = 32
+    return config
+
+
+def tiny_krea2_builder() -> str:
+    """Build a tiny Krea2 model with random weights using diffusers building blocks."""
+    model_dir = build_tiny_from_configs(
+        "Krea2Pipeline",
+        "krea/Krea-2-Turbo",
+        transform={
+            "text_encoder": _shrink_krea2_text_encoder,
+            "transformer": _shrink_krea2_transformer,
+            "vae": _shrink_krea2_vae,
+        },
+    )
+
+    # Add text_encoder_select_layers to model_index.json to match shrunk text encoder
+    idx_path = os.path.join(model_dir, "model_index.json")
+    with open(idx_path) as f:
+        model_index = json.load(f)
+    model_index["text_encoder_select_layers"] = [0, 1, 2]
+    with open(idx_path, "w") as f:
+        json.dump(model_index, f, indent=2)
+
+    return model_dir

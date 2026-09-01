@@ -110,4 +110,9 @@ DIFFUSION_TEST_SETTINGS = {
         builder=diff_model_builders.tiny_qwen_image_edit_plus_builder,
         supported_tasks=[DiffusionTasks.IMAGE_TO_IMAGE],
     ),
+    "Krea2Pipeline": DiffusionModelTestOpts(
+        model="krea/Krea-2-Turbo",
+        builder=diff_model_builders.tiny_krea2_builder,
+        supported_tasks=[DiffusionTasks.TEXT_TO_IMAGE],
+    ),
 }
