@@ -29,6 +29,7 @@ from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_stage_id_for_e2e
 from vllm_omni.errors import raise_client_error_or
+from vllm_omni.metrics.duplex_turn import accumulate_turn_stage_metrics
 from vllm_omni.metrics.modality import OmniModalityMetrics, observe_modality_at_finalize
 from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
 from vllm_omni.metrics.stats import OrchestratorAggregator
@@ -454,6 +455,18 @@ class OmniBase(PDDisaggregationMixin):
             # is still in self.request_states) is corrected after the pop.
             self._publish_request_gauges(len(self.request_states))
 
+    def _accumulate_duplex_turn_metrics(
+        self,
+        req_state: ClientRequestState,
+        stage_id: int,
+        metrics: Any,
+        final_output_type: str | None,
+    ) -> None:
+        turn = req_state.duplex_turn
+        if turn is None or metrics is None:
+            return
+        accumulate_turn_stage_metrics(turn, stage_id, metrics, final_output_type=final_output_type)
+
     def _compute_final_stage_id(self, output_modalities: list[str] | None) -> int:
         return get_final_stage_id_for_e2e(
             output_modalities,
@@ -475,17 +488,19 @@ class OmniBase(PDDisaggregationMixin):
     def _process_stage_metrics_message(self, msg: StageMetricsMessage) -> None:
         req_id = msg.request_id
         req_state = self.request_states.get(req_id)
-        if req_state is None or req_state.metrics is None:
+        if req_state is None:
             return
         _m = msg.metrics
         stage_id = msg.stage_id
         stage_meta = self.engine.get_stage_metadata(stage_id)
-        req_state.metrics.on_stage_metrics(stage_id, req_id, _m, stage_meta.final_output_type)
-        submit_ts = msg.stage_submit_ts
-        now = time.time()
-        if req_state.metrics.stage_first_ts[stage_id] is None:
-            req_state.metrics.stage_first_ts[stage_id] = submit_ts if submit_ts is not None else now
-        req_state.metrics.stage_last_ts[stage_id] = max(req_state.metrics.stage_last_ts[stage_id] or 0.0, now)
+        if req_state.metrics is not None:
+            req_state.metrics.on_stage_metrics(stage_id, req_id, _m, stage_meta.final_output_type)
+            submit_ts = msg.stage_submit_ts
+            now = time.time()
+            if req_state.metrics.stage_first_ts[stage_id] is None:
+                req_state.metrics.stage_first_ts[stage_id] = submit_ts if submit_ts is not None else now
+            req_state.metrics.stage_last_ts[stage_id] = max(req_state.metrics.stage_last_ts[stage_id] or 0.0, now)
+        self._accumulate_duplex_turn_metrics(req_state, stage_id, _m, stage_meta.final_output_type)
 
     def _handle_output_message(
         self,
@@ -538,6 +553,17 @@ class OmniBase(PDDisaggregationMixin):
                     req_state.metrics.stage_first_ts[stage_id] = submit_ts if submit_ts is not None else now
                 req_state.metrics.stage_last_ts[stage_id] = max(req_state.metrics.stage_last_ts[stage_id] or 0.0, now)
                 consumed.add(msg_id)
+
+        if msg.metrics is not None and req_state.duplex_turn is not None:
+            from vllm_omni.experimental.fullduplex.output import get_duplex_output_decision
+
+            # Listen units already arrive as StageMetricsMessage; the matching
+            # finished OutputMessage is the same snapshot and must not be added again.
+            if get_duplex_output_decision(msg.engine_outputs) is None:
+                output_type = getattr(msg.engine_outputs, "final_output_type", None)
+                if output_type is None:
+                    output_type = self.engine.get_stage_metadata(stage_id).final_output_type
+                self._accumulate_duplex_turn_metrics(req_state, stage_id, msg.metrics, output_type)
 
         return False, req_id, stage_id, req_state
 

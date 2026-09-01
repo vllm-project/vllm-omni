@@ -25,50 +25,48 @@ python openai_chat_completion_client_for_multimodal_generation.py --query-type u
 
 With `--log-stats` enabled, the server will output detailed metrics logs after each request. Example output:
 
-
 #### Overall Summary
 
-| Field                       | Value        |
-|-----------------------------|--------------|
-| e2e_requests                | 1            |
-| e2e_wall_time_ms            | 41,299.190   |
-| e2e_total_tokens            | 5,202        |
-| e2e_avg_time_per_request_ms | 41,299.190   |
-| e2e_avg_tokens_per_s        | 125.959      |
-| e2e_stage_0_wall_time_ms    | 10,192.289   |
-| e2e_stage_1_wall_time_ms    | 30,541.409   |
-| e2e_stage_2_wall_time_ms    |    207.496   |
+| Field                         | Value          |
+| ----------------------------- | -------------- |
+| e2e_requests                  | 1              |
+| e2e_wall_time_ms              | 41,299.190     |
+| e2e_total_tokens              | 5,202          |
+| e2e_avg_time_per_request_ms   | 41,299.190     |
+| e2e_avg_tokens_per_s          | 125.959        |
+| e2e_stage_0_wall_time_ms      | 10,192.289     |
+| e2e_stage_1_wall_time_ms      | 30,541.409     |
+| e2e_stage_2_wall_time_ms      | 207.496        |
 
 #### RequestE2EStats
 
-| Field                   | Value      |
-|-------------------------|------------|
-| e2e_total_ms            | 41,299.133 |
-| e2e_total_tokens        | 5,202      |
-| transfers_total_time_ms | 245.895    |
-| transfers_total_kbytes  | 138,089.939|
+| Field                     | Value        |
+| ------------------------- | ------------ |
+| e2e_total_ms              | 41,299.133   |
+| e2e_total_tokens          | 5,202        |
+| transfers_total_time_ms   | 245.895      |
+| transfers_total_kbytes    | 138,089.939  |
 
 #### StageRequestStats
 
-| Field                  | 0      | 1      | 2      |
-|------------------------|--------|--------|--------|
-| audio_generated_frames | 0      | 0      | 525,525|
-| batch_id               | 38     | 274    | 0      |
-| batch_size             | 1      | 1      | 1      |
-| num_tokens_in          | 4,860  | 4,826  | 4,384  |
-| num_tokens_out         | 67     | 275    | 0      |
-| postprocess_time_ms    | 256.158| 0.491  | 0.000  |
-| stage_gen_time_ms      | 9,910.007|30,379.198|160.745|
+| Field                    | 0           | 1            | 2         |
+| ------------------------ | ----------- | ------------ | --------- |
+| audio_generated_frames   | 0           | 0            | 525,525   |
+| batch_id                 | 38          | 274          | 0         |
+| batch_size               | 1           | 1            | 1         |
+| num_tokens_in            | 4,860       | 4,826        | 4,384     |
+| num_tokens_out           | 67          | 275          | 0         |
+| postprocess_time_ms      | 256.158     | 0.491        | 0.000     |
+| stage_gen_time_ms        | 9,910.007   | 30,379.198   | 160.745   |
 
 #### TransferEdgeStats
 
-| Field               | 0->1        | 1->2       |
-|---------------------|-------------|------------|
-| size_kbytes         | 109,277.349 | 28,812.591 |
-| tx_time_ms          | 78.701      | 18.790     |
-| rx_decode_time_ms   | 111.865     | 31.706     |
-| in_flight_time_ms   | 2.015       | 2.819      |
-
+| Field                 | 0->1          | 1->2         |
+| --------------------- | ------------- | ------------ |
+| size_kbytes           | 109,277.349   | 28,812.591   |
+| tx_time_ms            | 78.701        | 18.790       |
+| rx_decode_time_ms     | 111.865       | 31.706       |
+| in_flight_time_ms     | 2.015         | 2.819        |
 
 These logs include:
 
@@ -82,12 +80,13 @@ These logs include:
 
 You can use these logs to monitor system health, debug performance, and analyze request-level metrics as described above.
 
-
 ## Metrics Scope: Offline vs Online Inference
 
 For **offline inference** (batch mode), the summary includes both system-level metrics (aggregated across all requests) and per-request metrics. In this case, `e2e_requests` can be greater than 1, reflecting multiple completed requests in a batch.
 
 For **online inference** (serving mode), the summary is always per-request. `e2e_requests` is always 1, and only request-level metrics are reported for each completion.
+
+For native full-duplex (`/v1/realtime?duplex=1`), `--log-stats` emits the same tables once per assistant turn. The table `request_id` is that turn's `response_id`. The long-lived stage-0 session request is not finalized as a chat completion.
 
 ---
 
@@ -95,53 +94,51 @@ For **online inference** (serving mode), the summary is always per-request. `e2e
 
 ### Summary Metrics
 
-| Field                     | Meaning                                                                                       |
-|---------------------------|----------------------------------------------------------------------------------------------|
-| `e2e_requests`            | Number of completed requests.                                                                |
-| `e2e_wall_time_ms`        | Wall-clock time span from run start to last completion, in ms.                               |
-| `e2e_total_tokens`        | Total tokens counted across all completed requests (stage0 input + all stage outputs).       |
-| `e2e_avg_time_per_request_ms` | Average wall time per request: `e2e_wall_time_ms / e2e_requests`.                        |
-| `e2e_avg_tokens_per_s`    | Average token throughput over wall time: `e2e_total_tokens * 1000 / e2e_wall_time_ms`.      |
-| `e2e_stage_{i}_wall_time_ms` | Wall-clock time span for stage i, in ms. Each stage's wall time is reported as a separate field, e.g., `e2e_stage_0_wall_time_ms`, `e2e_stage_1_wall_time_ms`, etc. |
+| Field                           | Meaning                                                                                                                                                              |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `e2e_requests`                  | Number of completed requests.                                                                                                                                        |
+| `e2e_wall_time_ms`              | Wall-clock time span from run start to last completion, in ms.                                                                                                       |
+| `e2e_total_tokens`              | Total tokens counted across all completed requests (stage0 input + all stage outputs).                                                                               |
+| `e2e_avg_time_per_request_ms`   | Average wall time per request: `e2e_wall_time_ms / e2e_requests`.                                                                                                    |
+| `e2e_avg_tokens_per_s`          | Average token throughput over wall time: `e2e_total_tokens * 1000 / e2e_wall_time_ms`.                                                                               |
+| `e2e_stage_{i}_wall_time_ms`    | Wall-clock time span for stage i, in ms. Each stage's wall time is reported as a separate field, e.g., `e2e_stage_0_wall_time_ms`, `e2e_stage_1_wall_time_ms`, etc.  |
 
 ---
 
 ### E2E Table (per request)
 
-| Field                     | Meaning                                                               |
-|---------------------------|-----------------------------------------------------------------------|
-| `e2e_total_ms`            | End-to-end latency in ms.                                             |
-| `e2e_total_tokens`        | Total tokens for the request (stage0 input + all stage outputs).      |
-| `transfers_total_time_ms` | Sum of transfer edge `total_time_ms` for this request.                |
-| `transfers_total_kbytes`  | Sum of transfer kbytes for this request.                              |
-
+| Field                       | Meaning                                                                 |
+| --------------------------- | ----------------------------------------------------------------------- |
+| `e2e_total_ms`              | End-to-end latency in ms.                                               |
+| `e2e_total_tokens`          | Total tokens for the request (stage0 input + all stage outputs).        |
+| `transfers_total_time_ms`   | Sum of transfer edge `total_time_ms` for this request.                  |
+| `transfers_total_kbytes`    | Sum of transfer kbytes for this request.                                |
 
 ---
 
 ### Stage Table (per stage event / request)
 
-| Field                     | Meaning                                                                                         |
-|---------------------------|-------------------------------------------------------------------------------------------------|
-| `batch_id`                | Batch index.                                                                                    |
-| `batch_size`              | Batch size.                                                                                     |
-| `num_tokens_in`           | Input tokens to the stage.                                                                      |
-| `num_tokens_out`          | Output tokens from the stage.                                                                   |
-| `stage_gen_time_ms`       | Stage compute time in ms, excluding postprocessing time (reported separately as `postprocess_time_ms`). |
-| `image_num`               | Number of images generated (for diffusion/image stages).                                        |
-| `resolution`              | Image resolution (for diffusion/image stages).                                                                  |
-| `postprocess_time_ms` | Diffusion/image: post-processing time in ms.                                                    |
+| Field                   | Meaning                                                                                                   |
+| ----------------------- | --------------------------------------------------------------------------------------------------------- |
+| `batch_id`              | Batch index.                                                                                              |
+| `batch_size`            | Batch size.                                                                                               |
+| `num_tokens_in`         | Input tokens to the stage.                                                                                |
+| `num_tokens_out`        | Output tokens from the stage.                                                                             |
+| `stage_gen_time_ms`     | Stage compute time in ms, excluding postprocessing time (reported separately as `postprocess_time_ms`).   |
+| `image_num`             | Number of images generated (for diffusion/image stages).                                                  |
+| `resolution`            | Image resolution (for diffusion/image stages).                                                            |
+| `postprocess_time_ms`   | Diffusion/image: post-processing time in ms.                                                              |
 
 ---
 
 ### Transfer Table (per edge / request)
 
-| Field                | Meaning                                                                   |
-|----------------------|---------------------------------------------------------------------------|
-| `size_kbytes`        | Total kbytes transferred.                                                 |
-| `tx_time_ms`         | Sender transfer time in ms.                                               |
-| `rx_decode_time_ms`  | Receiver decode time in ms.                                               |
-| `in_flight_time_ms`  | In-flight time in ms.                                                     |
-
+| Field                  | Meaning                                                                     |
+| ---------------------- | --------------------------------------------------------------------------- |
+| `size_kbytes`          | Total kbytes transferred.                                                   |
+| `tx_time_ms`           | Sender transfer time in ms.                                                 |
+| `rx_decode_time_ms`    | Receiver decode time in ms.                                                 |
+| `in_flight_time_ms`    | In-flight time in ms.                                                       |
 
 ### Expectation of the Numbers (Verification)
 
@@ -153,7 +150,7 @@ For **online inference** (serving mode), the summary is always per-request. `e2e
 
 **Using the example above:**
 
-**e2e_total_tokens**
+#### e2e_total_tokens
 
 - Stage0's `num_tokens_in`: **4,860**
 - Stage0's `num_tokens_out`: **67**
@@ -162,7 +159,7 @@ For **online inference** (serving mode), the summary is always per-request. `e2e
 
 so `e2e_total_tokens = 4,860 + 67 + 275 + 0 = 5,202`, which matches the table value `e2e_total_tokens`.
 
-**transfers_total_time_ms**
+#### transfers_total_time_ms
 
 For each edge:
 

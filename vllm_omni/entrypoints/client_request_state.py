@@ -1,6 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from __future__ import annotations
+
 import asyncio
+from typing import TYPE_CHECKING
 
 from vllm_omni.metrics import OrchestratorAggregator
+
+if TYPE_CHECKING:
+    from vllm_omni.metrics.duplex_turn import DuplexTurnMetrics
 
 
 class ClientRequestState:
@@ -39,3 +48,6 @@ class ClientRequestState:
         # without re-querying stage_pools.
         self.audio_emit_stage_id: int | None = None
         self.audio_emit_replica_id: int | None = None
+        # Turn-scoped aggregator for the current duplex assistant response.
+        # Session-scoped metrics stays on collect_outputs cursor snapshots.
+        self.duplex_turn: DuplexTurnMetrics | None = None

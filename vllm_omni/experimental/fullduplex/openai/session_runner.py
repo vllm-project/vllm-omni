@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import asyncio
@@ -387,7 +390,7 @@ class DuplexSessionRunnerMixin:
                         and precreated_response_id is not None
                         and session.active_response_id == precreated_response_id
                     ):
-                        session.end_response(commit_text=False)
+                        session.end_response(commit_text=False, finished_reason="abort")
                         await emit_event(
                             {
                                 "type": "response.done",

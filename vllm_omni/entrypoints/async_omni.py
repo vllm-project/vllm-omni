@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 AsyncOmni - Refactored async orchestrator using AsyncOmniEngine.
 
@@ -430,6 +433,24 @@ class AsyncOmni(EngineClient, OmniBase):
             )
             self._duplex_request_client = client
         return client
+
+    def begin_duplex_turn_metrics(
+        self,
+        request_id: str,
+        *,
+        response_id: str,
+        turn_id: int | None = None,
+        arrival_ts: float | None = None,
+    ):
+        return self._get_duplex_request_client().begin_turn_metrics(
+            request_id,
+            response_id=response_id,
+            turn_id=turn_id,
+            arrival_ts=arrival_ts,
+        )
+
+    def finalize_duplex_turn_metrics(self, request_id: str, *, reason: str) -> bool:
+        return self._get_duplex_request_client().finalize_turn_metrics(request_id, reason=reason)
 
     @staticmethod
     def _duplex_data_plane_request_info(result: dict[str, object]) -> tuple[str | None, int | None]:
@@ -1216,6 +1237,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     await state.queue.put(self._synthetic_abort_output_message(rid))
                     delivered.add(rid)
         for rid in request_ids:
+            self.finalize_duplex_turn_metrics(rid, reason="abort")
             self._record_request_failure_once(rid, reason="client_abort")
             state = self.request_states.get(rid)
             input_stream_task = getattr(state, "input_stream_task", None)

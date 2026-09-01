@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -17,6 +17,12 @@ from vllm_omni.experimental.fullduplex.engine.contracts import (
 from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 from vllm_omni.experimental.fullduplex.output import get_duplex_output_decision
+from vllm_omni.metrics.duplex_turn import (
+    DuplexTurnMetrics,
+    finalize_duplex_turn_metrics,
+    is_duplex_resource_request_id,
+    make_turn_aggregator,
+)
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -212,7 +218,9 @@ class DuplexRequestClient:
             kwargs["runtime_config"] = runtime_config
         result = await self.engine.signal_duplex_turn_async(session_id, **kwargs)
         if event in {"barge_in", "input.cancel", "response.cancel"}:
-            self.output_port.request_states.pop(duplex_resource_request_id(fence, "stage0"), None)
+            resource_id = duplex_resource_request_id(fence, "stage0")
+            self.finalize_turn_metrics(resource_id, reason="abort")
+            self.output_port.request_states.pop(resource_id, None)
         return result
 
     async def close(
@@ -229,7 +237,9 @@ class DuplexRequestClient:
             fence=fence,
             timeout=timeout,
         )
-        self.output_port.request_states.pop(duplex_resource_request_id(fence, "stage0"), None)
+        resource_id = duplex_resource_request_id(fence, "stage0")
+        self.finalize_turn_metrics(resource_id, reason="abort")
+        self.output_port.request_states.pop(resource_id, None)
         return result
 
     async def touch(
@@ -261,6 +271,59 @@ class DuplexRequestClient:
             expected_lease_generation=expected_lease_generation,
             timeout=timeout,
         )
+
+    def begin_turn_metrics(
+        self,
+        request_id: str,
+        *,
+        response_id: str,
+        turn_id: int | None = None,
+        arrival_ts: float | None = None,
+    ):
+        """Open a turn-scoped aggregator keyed by response_id.
+
+        Created only at response begin. Earlier stage metrics are dropped.
+        """
+        if not response_id or not is_duplex_resource_request_id(request_id):
+            return None
+        req_state = self.output_port.request_states.get(request_id)
+        if req_state is None:
+            req_state = ClientRequestState(request_id)
+            self.output_port.request_states[request_id] = req_state
+        existing = req_state.duplex_turn
+        if existing is not None and not existing.finalized:
+            if existing.response_id == response_id:
+                return existing
+            finalize_duplex_turn_metrics(existing, reason="abort")
+            req_state.duplex_turn = None
+        wall_start = float(arrival_ts) if arrival_ts is not None else time.time()
+        if wall_start <= 0:
+            wall_start = time.time()
+        turn = DuplexTurnMetrics(
+            request_id=request_id,
+            response_id=response_id,
+            turn_id=turn_id,
+            arrival_ts=wall_start,
+            aggregator=make_turn_aggregator(
+                num_stages=max(1, int(self.output_port.num_stages)),
+                log_stats=bool(self.output_port.log_stats),
+                wall_start_ts=wall_start,
+            ),
+        )
+        req_state.duplex_turn = turn
+        return turn
+
+    def finalize_turn_metrics(self, request_id: str, *, reason: str) -> bool:
+        """Log one duplex turn table. No-op when already finalized or missing."""
+        req_state = self.output_port.request_states.get(request_id)
+        if req_state is None:
+            return False
+        turn = req_state.duplex_turn
+        if turn is None:
+            return False
+        emitted = finalize_duplex_turn_metrics(turn, reason=reason)
+        req_state.duplex_turn = None
+        return emitted
 
     async def collect_outputs(
         self,
