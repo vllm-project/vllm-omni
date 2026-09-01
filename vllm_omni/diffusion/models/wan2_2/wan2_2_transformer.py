@@ -17,6 +17,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.conv import Conv3dLayer
 from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -35,7 +36,6 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     is_pipeline_first_stage,
     is_pipeline_last_stage,
 )
-from vllm_omni.diffusion.distributed.pipefusion.pipefusion_conv import Conv3dLayer
 from vllm_omni.diffusion.distributed.pipefusion.pipefusion_transformer import (
     PipeFusionRotaryEmbeddingMixin,
     PipeFusionSelfAttentionMixin,
@@ -1041,7 +1041,7 @@ class WanTransformer3DModel(nn.Module, PipeFusionTransformerMixin):
         if is_pipeline_first_stage():
             # Patch embedding and flatten to sequence. SP sharding happens at
             # _sp_shard_point so downstream block wrappers see local tensors.
-            hidden_states = self.patch_embedding(hidden_states, dims=dims)
+            hidden_states = self.patch_embedding(hidden_states)
             hidden_states = hidden_states.flatten(2).transpose(1, 2)
             hidden_states = self._sp_shard_point(hidden_states)
         else:
