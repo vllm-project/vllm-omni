@@ -207,23 +207,41 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         self,
         sampling_params_list: list[Any],
         output_modalities: list[str] | tuple[str, ...] | None,
+        request: Any = None,
     ) -> list[Any]:
-        """Keep MiniCPM-o 4.5's thinker final-only during audio streaming.
+        """Set each MiniCPM-o 4.5 stage's output kind for an audio chat stream.
 
-        Chat ``stream=true`` normally coerces every AR stage to DELTA output.
-        That is correct for token-level text streaming, but MiniCPM-o 4.5's
-        Talker consumes the completed TTS span plus aligned thinker hidden
-        states. If Stage0 is DELTA, llm2tts receives one generated token at a
-        time and repeatedly starts tiny, independent TTS streams. The API then
-        never represents one coherent audio response.
+        The Talker streams; that half was never in question. The thinker used to
+        be forced to ``FINAL_ONLY`` here too, on the grounds that a DELTA thinker
+        would make ``llm2tts`` receive one generated token at a time and start a
+        tiny independent TTS stream per token. On a simplex request that does not
+        happen:
 
-        For this model, stream the audio stage, not the thinker-to-talker
-        boundary.
+        * The orchestrator forwards stage 0 to stage 1 only once the stage-0
+          request is **finished** -- ``_route_output``'s gate is
+          ``finished or (streaming.enabled and segment_finished)``, and
+          ``streaming.enabled`` describes a streaming *input* session, not
+          ``stream=true``. A per-token delta never reaches the bridge.
+        * ``llm2tts`` already reads ``cumulative_token_ids``, precisely because
+          "DELTA outputs carry only the newest tokens, while the forwarded hidden
+          states span prompt + whole reply".
+
+        Meanwhile the client asked for a stream and got one response at the end,
+        which is the contract this restores. It also fixes what TTFT reports:
+        ``serving_time_to_first_output_ms`` is the age of a stage's first
+        *non-empty* output, so under ``FINAL_ONLY`` it timed the thinker's last
+        token rather than its first.
+
+        Duplex sessions keep ``FINAL_ONLY``. There ``streaming.enabled`` is true,
+        the orchestrator forwards on segment boundaries, and it derives
+        ``is_final_update`` from this very output kind.
         """
         if not output_modalities or "audio" not in output_modalities:
             return sampling_params_list
         if not self._has_minicpmo45_stage():
             return sampling_params_list
+
+        duplex_session = bool(getattr(request, "omni_duplex_session", False))
 
         stage_configs = getattr(self.engine_client, "stage_configs", []) or []
         for idx, stage in enumerate(stage_configs):
@@ -239,7 +257,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             model_stage = self._stage_get(engine_args, "model_stage")
             if model_stage == "llm":
-                sp.output_kind = RequestOutputKind.FINAL_ONLY
+                sp.output_kind = RequestOutputKind.FINAL_ONLY if duplex_session else RequestOutputKind.DELTA
             elif model_stage == "tts":
                 sp.output_kind = RequestOutputKind.DELTA
         return sampling_params_list
@@ -666,6 +684,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     sampling_params_list = self._fix_minicpmo45_audio_stream_output_kinds(
                         sampling_params_list,
                         output_modalities,
+                        request,
                     )
 
                 # Apply user-specified overrides to diffusion stage(s) for image generation
