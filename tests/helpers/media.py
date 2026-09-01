@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Synthetic media generation and media/text utilities for tests."""
 
 import atexit
@@ -7,18 +10,20 @@ import hashlib
 import io
 import logging
 import math
+import mimetypes
 import multiprocessing
 import os
 import random
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypedDict, overload
 
 import numpy as np
 import soundfile as sf
@@ -392,8 +397,16 @@ def generate_synthetic_video(
     import cv2
     import imageio
 
+    class _BouncingBall(TypedDict):
+        x: float
+        y: float
+        vx: float
+        vy: float
+        radius: int
+        color_bgr: tuple[int, int, int]
+
     num_balls = random.randint(3, 8)
-    balls = []
+    balls: list[_BouncingBall] = []
     for _ in range(num_balls):
         radius = min(width, height) // 8
         if radius < 1:
@@ -405,7 +418,16 @@ def generate_synthetic_video(
         vx = speed * math.cos(angle)
         vy = speed * math.sin(angle)
         color_bgr = (random.randint(50, 255), random.randint(50, 255), random.randint(50, 255))
-        balls.append({"x": x, "y": y, "vx": vx, "vy": vy, "radius": radius, "color_bgr": color_bgr})
+        balls.append(
+            {
+                "x": float(x),
+                "y": float(y),
+                "vx": float(vx),
+                "vy": float(vy),
+                "radius": radius,
+                "color_bgr": color_bgr,
+            }
+        )
 
     video_frames = []
     for _ in range(num_frames):
@@ -525,27 +547,34 @@ _AUDIO_MIME_BY_SUFFIX = {
 }
 
 
-def get_asset_path(relative_path: str | os.PathLike) -> Path:
-    """Resolve a path under ``tests/assets/`` to its absolute on-disk location."""
-    return _TEST_ASSETS_ROOT / Path(relative_path)
+def _asset_mime_type(path: Path) -> str:
+    mime = _AUDIO_MIME_BY_SUFFIX.get(path.suffix.lower())
+    if mime is not None:
+        return mime
+    guessed, _ = mimetypes.guess_type(path.name)
+    return guessed or "application/octet-stream"
 
 
-def load_test_audio_data_url(relative_path: str | os.PathLike) -> str:
-    """Load a vendored test audio file under ``tests/assets/`` as a base64 data URL.
+@overload
+def get_asset_path(relative_path: str | os.PathLike, *, as_data_url: Literal[False] = False) -> Path: ...
 
-    Used by tests that need real reference audio (e.g. voice cloning) without
-    relying on the server's ability to fetch external URLs at request time.
+
+@overload
+def get_asset_path(relative_path: str | os.PathLike, *, as_data_url: Literal[True]) -> str: ...
+
+
+def get_asset_path(relative_path: str | os.PathLike, *, as_data_url: bool = False) -> Path | str:
+    """Resolve a path under ``tests/assets/``.
+
+    When ``as_data_url`` is true, read the file and return a base64 data URL
+    suitable for embedding reference media in API requests without external URLs.
     """
-    path = get_asset_path(relative_path)
-    mime = _AUDIO_MIME_BY_SUFFIX.get(path.suffix.lower(), "application/octet-stream")
+    path = _TEST_ASSETS_ROOT / Path(relative_path)
+    if not as_data_url:
+        return path
+
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:{mime};base64,{encoded}"
-
-
-def decode_b64_image(b64: str):
-    img = Image.open(io.BytesIO(base64.b64decode(b64)))
-    img.load()
-    return img
+    return f"data:{_asset_mime_type(path)};base64,{encoded}"
 
 
 def concat_audio(audio_val) -> np.ndarray:
@@ -658,6 +687,10 @@ def _merge_base64_audio_to_segment(base64_list: list[str]) -> _AudioBuffer:
 @contextmanager
 def _serialize_whisper_model_download(model_size: str = "small"):
     """Serialize Whisper cache writes across processes (Linux/Unix), per model."""
+    if sys.platform == "win32":
+        yield
+        return
+
     import fcntl
 
     lock_path = Path.home() / ".cache" / "whisper" / f".{model_size}_model_download.lock"
@@ -836,12 +869,10 @@ __all__ = [
     "convert_audio_bytes_to_text",
     "convert_audio_file_to_text",
     "cosine_similarity_text",
-    "decode_b64_image",
     "generate_synthetic_audio",
     "generate_synthetic_image",
     "generate_synthetic_video",
     "get_asset_path",
-    "load_test_audio_data_url",
     "preprocess_text",
     "release_audio_transcriber",
 ]

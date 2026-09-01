@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import threading
 from collections import deque
@@ -9,9 +9,10 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.metrics.stats import PrefillStats, PromptTokenStats
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -56,6 +57,19 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
     return request
 
 
+def _streaming_request(mocker: MockerFixture, num_computed_tokens: int) -> SimpleNamespace:
+    prompt_token_ids = [0] * num_computed_tokens
+    return SimpleNamespace(
+        _all_token_ids=prompt_token_ids.copy(),
+        _output_token_ids=[],
+        prompt_token_ids=prompt_token_ids,
+        num_computed_tokens=num_computed_tokens,
+        num_prompt_tokens=num_computed_tokens,
+        num_output_placeholders=0,
+        update_block_hashes=mocker.Mock(),
+    )
+
+
 def test_streaming_payload_can_replace_placeholder_prompt(mocker: MockerFixture) -> None:
     request = SimpleNamespace(
         _all_token_ids=[0, 0, 7, 8],
@@ -83,28 +97,217 @@ def test_streaming_payload_can_replace_placeholder_prompt(mocker: MockerFixture)
     request.update_block_hashes.assert_called_once_with()
 
 
-def test_streaming_payload_can_append_exact_prompt_length(mocker: MockerFixture) -> None:
+def test_turn_start_replacement_ignores_accumulated_prompt_capacity(mocker: MockerFixture) -> None:
+    request = _streaming_request(mocker, num_computed_tokens=4064)
+    payload = {
+        "ids": {"prompt": [1]},
+        "meta": {
+            "replace_streaming_prompt": True,
+            "next_stage_prompt_len": 10,
+            "next_stage_generation_tokens": 26,
+        },
+    }
+
+    replaced = construct_next_stage_streaming_input_prompt(
+        payload,
+        request,
+        max_model_len=4096,
+        previous_condition_len=10,
+        previous_condition_seq=7,
+        condition_seq=8,
+        recompute_previous_chunks=1,
+    )
+
+    assert replaced is True
+    assert request.prompt_token_ids == [0] * 10
+    assert payload["meta"]["streaming_prompt_recompute"] is False
+    assert "streaming_prompt_previous_codes" not in payload["ids"]
+
+
+@pytest.mark.parametrize("reserve", [True, 0, -1, 1.5, "26", None])
+def test_streaming_prompt_rejects_invalid_generation_reserve(
+    mocker: MockerFixture,
+    reserve: object,
+) -> None:
+    request = _streaming_request(mocker, num_computed_tokens=10)
+    payload = {
+        "ids": {"prompt": [1]},
+        "meta": {
+            "next_stage_prompt_len": 10,
+            "next_stage_generation_tokens": reserve,
+        },
+    }
+
+    with pytest.raises(ValueError, match="next_stage_generation_tokens must be a positive integer"):
+        construct_next_stage_streaming_input_prompt(payload, request, max_model_len=4096)
+
+
+def test_capacity_managed_streaming_prompt_at_limit_still_appends(mocker: MockerFixture) -> None:
+    request = _streaming_request(mocker, num_computed_tokens=4060)
+    payload = {
+        "ids": {"prompt": [1]},
+        "meta": {
+            "next_stage_prompt_len": 10,
+            "next_stage_generation_tokens": 26,
+        },
+    }
+
+    replaced = construct_next_stage_streaming_input_prompt(payload, request, max_model_len=4096)
+
+    assert replaced is False
+    assert request.num_computed_tokens == 4060
+    assert request.num_prompt_tokens == 4070
+
+
+def test_streaming_window_builds_one_chunk_recompute_recipe(mocker: MockerFixture) -> None:
+    previous_condition_len = 10
+    previous_codes = list(range(25))
     request = SimpleNamespace(
-        _all_token_ids=[0, 0, 7, 8],
-        _output_token_ids=[7, 8],
-        prompt_token_ids=[0, 0],
-        num_computed_tokens=4,
-        num_prompt_tokens=2,
+        _all_token_ids=[0] * 4039 + previous_codes + [999],
+        _output_token_ids=previous_codes + [999],
+        prompt_token_ids=[0] * 4039,
+        num_computed_tokens=4065,
+        num_prompt_tokens=4039,
+        num_output_placeholders=1,
         update_block_hashes=mocker.Mock(),
     )
     payload = {
-        "ids": {"prompt": [1, 2, 3]},
-        "meta": {"next_stage_prompt_len": 3},
+        "ids": {"prompt": [1]},
+        "meta": {
+            "next_stage_prompt_len": 10,
+            "next_stage_generation_tokens": 26,
+        },
     }
 
-    construct_next_stage_streaming_input_prompt(payload, request)
+    replaced = construct_next_stage_streaming_input_prompt(
+        payload,
+        request,
+        max_model_len=4096,
+        previous_condition_len=previous_condition_len,
+        previous_condition_seq=7,
+        condition_seq=8,
+        recompute_previous_chunks=1,
+    )
 
-    assert request.prompt_token_ids == [0, 0, 7, 8, 0, 0, 0]
-    assert request._all_token_ids == [0, 0, 7, 8, 0, 0, 0]
-    assert request._output_token_ids == []
-    assert request.num_computed_tokens == 4
-    assert request.num_prompt_tokens == 7
+    assert replaced is True
+    assert request.prompt_token_ids == [0] * 45
+    assert request.num_prompt_tokens == 45
+    assert request.num_computed_tokens == 0
+    assert payload["ids"]["streaming_prompt_previous_codes"] == previous_codes
+    assert payload["meta"] == {
+        "next_stage_prompt_len": 10,
+        "next_stage_generation_tokens": 26,
+        "streaming_prompt_recompute": True,
+        "streaming_condition_seq": 8,
+    }
     request.update_block_hashes.assert_called_once_with()
+
+
+def test_streaming_window_recomputes_each_condition_without_accumulating(mocker: MockerFixture) -> None:
+    request = SimpleNamespace(
+        _all_token_ids=[0] * 10 + [101, 102],
+        _output_token_ids=[101, 102],
+        prompt_token_ids=[0] * 10,
+        num_computed_tokens=12,
+        num_prompt_tokens=10,
+        num_output_placeholders=0,
+        update_block_hashes=mocker.Mock(),
+    )
+    second = {
+        "ids": {"prompt": [1]},
+        "meta": {
+            "next_stage_prompt_len": 12,
+            "next_stage_generation_tokens": 26,
+        },
+    }
+
+    assert construct_next_stage_streaming_input_prompt(
+        second,
+        request,
+        max_model_len=4096,
+        previous_condition_len=10,
+        previous_condition_seq=0,
+        condition_seq=1,
+        recompute_previous_chunks=1,
+    )
+    assert request.num_prompt_tokens == 24
+    assert second["ids"]["streaming_prompt_previous_codes"] == [101, 102]
+
+    request._all_token_ids.extend([201, 202, 203])
+    request._output_token_ids.extend([201, 202, 203])
+    request.num_computed_tokens = 27
+    third = {
+        "ids": {"prompt": [2]},
+        "meta": {
+            "next_stage_prompt_len": 8,
+            "next_stage_generation_tokens": 26,
+        },
+    }
+
+    assert construct_next_stage_streaming_input_prompt(
+        third,
+        request,
+        max_model_len=4096,
+        previous_condition_len=12,
+        previous_condition_seq=1,
+        condition_seq=2,
+        recompute_previous_chunks=1,
+    )
+    assert request.num_prompt_tokens == 23
+    assert third["ids"]["streaming_prompt_previous_codes"] == [201, 202, 203]
+    assert third["meta"]["streaming_condition_seq"] == 2
+
+
+def test_capacity_rollover_requires_explicit_window_contract(mocker: MockerFixture) -> None:
+    request = _streaming_request(mocker, num_computed_tokens=4064)
+    payload = {
+        "ids": {"prompt": [1]},
+        "meta": {
+            "next_stage_prompt_len": 10,
+            "next_stage_generation_tokens": 26,
+        },
+    }
+
+    with pytest.raises(ValueError, match="requires window_size=1"):
+        construct_next_stage_streaming_input_prompt(
+            payload,
+            request,
+            max_model_len=4096,
+            previous_condition_len=10,
+            previous_condition_seq=0,
+            condition_seq=1,
+        )
+
+
+@pytest.mark.parametrize("next_stage_prompt_len", [0, -1])
+def test_capacity_managed_streaming_prompt_rejects_nonpositive_length(
+    mocker: MockerFixture, next_stage_prompt_len: int
+) -> None:
+    request = _streaming_request(mocker, num_computed_tokens=0)
+    payload = {
+        "ids": {"prompt": [1]},
+        "meta": {
+            "next_stage_prompt_len": next_stage_prompt_len,
+            "next_stage_generation_tokens": 26,
+        },
+    }
+
+    with pytest.raises(ValueError, match="positive next_stage_prompt_len"):
+        construct_next_stage_streaming_input_prompt(payload, request, max_model_len=4096)
+
+
+def test_capacity_managed_streaming_prompt_rejects_fresh_overflow(mocker: MockerFixture) -> None:
+    request = _streaming_request(mocker, num_computed_tokens=0)
+    payload = {
+        "ids": {"prompt": [1]},
+        "meta": {
+            "next_stage_prompt_len": 4071,
+            "next_stage_generation_tokens": 26,
+        },
+    }
+
+    with pytest.raises(ValueError, match="exceeds max_model_len"):
+        construct_next_stage_streaming_input_prompt(payload, request, max_model_len=4096)
 
 
 @pytest.fixture
@@ -114,6 +317,10 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         stage_id: int = 1,
         model_mode: str = "ar",
         max_num_seqs: int = 2,
+        max_model_len: int = 0,
+        tts_max_model_len: int = 0,
+        tts_attention_type: str = "full_attention",
+        flat_tts_config: bool = False,
         active_stream_window: int = 0,
         connector_extra: dict | None = None,
     ):
@@ -130,6 +337,10 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             self._cancelled_load_reqs = set()
             self._pending_save_reqs = deque()
             self._finished_save_reqs = set()
+            self._send_failures = {}
+            self._send_failure_lock = threading.Lock()
+            self._receive_failures = {}
+            self._receive_failure_lock = threading.Lock()
             self.stop_event = threading.Event()
             self._recv_cond = threading.Condition()
             self._save_cond = threading.Condition()
@@ -141,9 +352,23 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             classmethod(lambda cls, _model_config: connector),
         )
 
+        hf_config = SimpleNamespace(
+            model_type="minicpmtts",
+            max_position_embeddings=tts_max_model_len,
+            attention_type=tts_attention_type,
+        )
+        if not flat_tts_config:
+            hf_config = SimpleNamespace(
+                tts_config=SimpleNamespace(
+                    max_position_embeddings=tts_max_model_len,
+                    attention_type=tts_attention_type,
+                )
+            )
         model_config = SimpleNamespace(
             worker_type=model_mode,
             max_num_seqs=max_num_seqs,
+            max_model_len=max_model_len,
+            hf_config=hf_config,
             active_stream_window=active_stream_window,
             stage_connector_config={
                 "name": "SharedMemoryConnector",
@@ -157,6 +382,27 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         return adapter, connector
 
     return _build
+
+
+def _dequeue_load_entry(adapter, request):
+    """Register and take the entry as the background recv loop would."""
+    adapter.load_async(request)
+    entry = adapter._registered_load_entries[request.request_id]
+    try:
+        adapter._pending_load_reqs.remove(entry)
+    except ValueError:
+        pass
+    return entry
+
+
+@pytest.mark.parametrize(
+    ("attention_type", "expected_previous_chunks"),
+    [("full_attention", 0), ("sliding_recompute", 1)],
+)
+def test_talker_attention_policy_controls_streaming_recompute(build_adapter, attention_type, expected_previous_chunks):
+    adapter, _ = build_adapter(tts_attention_type=attention_type)
+
+    assert adapter._streaming_prompt_previous_chunks == expected_previous_chunks
 
 
 @pytest.mark.parametrize(
@@ -199,13 +445,76 @@ def test_load_poll(build_adapter):
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
     }
     connector.get.return_value = (payload, 16)
-    adapter._poll_single_request(request)
+    adapter._poll_single_request(_dequeue_load_entry(adapter, request))
 
+    assert request.additional_information is None
+    assert "req-1" in adapter._finished_load_reqs
+    request.status = RequestStatus.WAITING_FOR_CHUNK
+    adapter.process_pending_chunks(
+        DummyWaitingQueue(),
+        [request],
+        scheduler_requests={request.request_id: request},
+    )
     assert request.additional_information == payload
     assert adapter.get_req_chunk["req-1"] == 1
-    assert "req-1" in adapter._finished_load_reqs
+    assert "req-1" not in adapter._finished_load_reqs
     assert "req-1" in adapter.upstream_exhausted_requests
     assert "req-1" not in adapter._pending_load_reqs
+
+
+def test_load_async_does_not_requeue_registered_inflight_request(build_adapter):
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("req-inflight", RequestStatus.RUNNING, external_req_id="ext-inflight")
+
+    entry = _dequeue_load_entry(adapter, request)
+
+    # The recv loop owns the popped request until polling completes. A
+    # scheduler-side duplicate registration must not append a second copy.
+    adapter.load_async(request)
+    assert adapter._pending_load_reqs == deque()
+
+    connector.get.return_value = (
+        {
+            "ids": {"prompt": [1]},
+            "meta": {"finished": True},
+        },
+        1,
+    )
+    assert adapter._poll_single_request(entry) is True
+
+    # Successful polling releases the registration for the next chunk.
+    adapter.load_async(request)
+    assert [queued.request for queued in adapter._pending_load_reqs] == [request]
+
+
+def test_cleanup_then_reregister_drops_stale_queued_entry(build_adapter):
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("req-resume", RequestStatus.WAITING, external_req_id="ext-resume")
+
+    adapter.load_async(request)
+    stale_entry = adapter._pending_load_reqs[0]
+    adapter.cleanup_receiver(request.request_id)
+    adapter.load_async(request)
+    fresh_entry = adapter._pending_load_reqs[-1]
+    assert len(adapter._pending_load_reqs) == 2
+    assert adapter._pending_load_reqs.popleft() is stale_entry
+    assert adapter._pending_load_reqs.popleft() is fresh_entry
+
+    connector.get.return_value = (
+        {
+            "ids": {"prompt": [1]},
+            "meta": {"finished": True},
+        },
+        1,
+    )
+    assert adapter._poll_single_request(stale_entry) is True
+    connector.get.assert_not_called()
+    assert adapter._registered_load_entries[request.request_id] is fresh_entry
+
+    assert adapter._poll_single_request(fresh_entry) is True
+    connector.get.assert_called_once()
+    assert request.request_id not in adapter._registered_load_entries
+    assert adapter.get_req_chunk[request.request_id] == 1
 
 
 def test_load_poll_ar_requeues_explicitly_replaced_running_prompt(build_adapter):
@@ -233,15 +542,18 @@ def test_load_poll_ar_requeues_explicitly_replaced_running_prompt(build_adapter)
         1,
     )
 
-    assert adapter._poll_single_request(request) is True
-    assert request.num_computed_tokens == 0
-    assert request.prompt_token_ids == [0] * 10
-    assert request.request_id in adapter.replaced_streaming_prompt_ids
-
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
     request.status = RequestStatus.WAITING_FOR_CHUNK
     running_queue = [request]
     waiting_queue = DummyWaitingQueue()
-    adapter.process_pending_chunks(waiting_queue, running_queue)
+    adapter.process_pending_chunks(
+        waiting_queue,
+        running_queue,
+        scheduler_requests={request.request_id: request},
+    )
+    assert request.num_computed_tokens == 0
+    assert request.prompt_token_ids == [0] * 10
+    assert request.request_id in adapter.replaced_streaming_prompt_ids
     assert running_queue == []
     assert waiting_queue == [request]
     assert request.status == RequestStatus.WAITING
@@ -255,6 +567,134 @@ def test_load_poll_ar_requeues_explicitly_replaced_running_prompt(build_adapter)
     )
     assert request.request_id not in adapter.replaced_streaming_prompt_ids
     assert request.external_req_id not in adapter.requests_num_chunks_sent
+
+
+@pytest.mark.parametrize("flat_tts_config", [False, True])
+def test_load_poll_ar_recomputes_native_duplex_prompt_each_condition(build_adapter, flat_tts_config):
+    adapter, connector = build_adapter(
+        stage_id=1,
+        model_mode="ar",
+        max_model_len=8192,
+        tts_max_model_len=4096,
+        tts_attention_type="sliding_recompute",
+        flat_tts_config=flat_tts_config,
+    )
+    request = _req("req-rollover", RequestStatus.RUNNING, external_req_id="external-rollover")
+    request.resumable = True
+    previous_codes = list(range(25))
+    request.prompt_token_ids = [0] * 10
+    request._all_token_ids = [0] * 10 + previous_codes
+    request._output_token_ids = previous_codes.copy()
+    request.num_prompt_tokens = 10
+    request.num_computed_tokens = 35
+    request.num_output_placeholders = 0
+    request.update_block_hashes = Mock()
+    adapter.get_req_chunk[request.request_id] = 1
+    adapter.request_ids_mapping[request.request_id] = request.external_req_id
+    adapter._streaming_condition_lengths[request.request_id] = 10
+    adapter._streaming_condition_seqs[request.request_id] = 0
+    connector.get.return_value = (
+        {
+            "ids": {"prompt": [1]},
+            "meta": {
+                "next_stage_prompt_len": 10,
+                "next_stage_generation_tokens": 26,
+                "finished": True,
+            },
+        },
+        1,
+    )
+
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
+    request.status = RequestStatus.WAITING_FOR_CHUNK
+    running_queue = [request]
+    waiting_queue = DummyWaitingQueue()
+    adapter.process_pending_chunks(
+        waiting_queue,
+        running_queue,
+        scheduler_requests={request.request_id: request},
+    )
+
+    assert request.num_computed_tokens == 0
+    assert request.prompt_token_ids == [0] * 45
+    assert request.additional_information["ids"]["streaming_prompt_previous_codes"] == previous_codes
+    assert request.additional_information["meta"]["streaming_prompt_recompute"] is True
+    assert request.resumable is False
+    assert request.request_id in adapter.replaced_streaming_prompt_ids
+    assert adapter._max_model_len == 4096
+    assert running_queue == []
+    assert waiting_queue == [request]
+
+
+def test_window_condition_sequence_ignores_control_only_chunks(build_adapter) -> None:
+    adapter, connector = build_adapter(
+        stage_id=1,
+        model_mode="ar",
+        tts_attention_type="sliding_recompute",
+    )
+    request = _req("req-condition-seq", RequestStatus.RUNNING)
+
+    def receive(payload):
+        connector.get.return_value = (payload, 1)
+        assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
+        adapter.requests_with_ready_chunks.add(request.request_id)
+        adapter._apply_pending_ar_prompt_updates({request.request_id: request})
+        adapter.requests_with_ready_chunks.discard(request.request_id)
+        return request.additional_information
+
+    first = receive(
+        {
+            "ids": {"prompt": [1]},
+            "meta": {"next_stage_prompt_len": 10},
+        }
+    )
+    assert first["meta"]["streaming_condition_seq"] == 0
+    assert adapter._streaming_condition_seqs[request.request_id] == 0
+
+    control = receive({"meta": {"is_segment_finished": True}})
+    assert "streaming_condition_seq" not in control["meta"]
+    assert adapter._streaming_condition_seqs[request.request_id] == 0
+
+    second = receive(
+        {
+            "ids": {"prompt": [2]},
+            "meta": {"next_stage_prompt_len": 12},
+        }
+    )
+    assert second["meta"]["streaming_condition_seq"] == 1
+    assert adapter._streaming_condition_lengths[request.request_id] == 12
+
+
+def test_load_poll_ar_reports_invalid_capacity_metadata(build_adapter):
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar", max_model_len=4096)
+    request = _req("req-invalid-capacity", RequestStatus.RUNNING)
+    request.resumable = True
+    adapter.get_req_chunk[request.request_id] = 1
+    connector.get.return_value = (
+        {
+            "ids": {"prompt": [1]},
+            "meta": {
+                "next_stage_prompt_len": 4096,
+                "next_stage_generation_tokens": 26,
+                "finished": False,
+            },
+        },
+        1,
+    )
+
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
+    request.status = RequestStatus.WAITING_FOR_CHUNK
+    running_queue = [request]
+    adapter.process_pending_chunks(
+        DummyWaitingQueue(),
+        running_queue,
+        scheduler_requests={request.request_id: request},
+    )
+    assert adapter.collect_failed_receive_request_ids() == {
+        request.request_id: "fresh streaming prompt plus generation reserve exceeds max_model_len: "
+        "prompt=4096, reserve=26, limit=4096"
+    }
+    assert request.request_id not in adapter._finished_load_reqs
 
 
 def test_load_poll_generation_tensor_codes_use_placeholder_prompt(build_adapter):
@@ -271,7 +711,7 @@ def test_load_poll_generation_tensor_codes_use_placeholder_prompt(build_adapter)
     }
     connector.get.return_value = (payload, 16)
 
-    adapter._poll_single_request(request)
+    adapter._poll_single_request(_dequeue_load_entry(adapter, request))
 
     assert request.prompt_token_ids == [0]
     assert request.num_computed_tokens == 0
@@ -301,12 +741,13 @@ def test_load_poll_generation_empty_nonterminal_chunk_keeps_polling(build_adapte
     }
     connector.get.side_effect = [(empty_payload, 16), (ready_payload, 16)]
 
-    assert adapter._poll_single_request(request) is False
+    entry = _dequeue_load_entry(adapter, request)
+    assert adapter._poll_single_request(entry) is False
     assert request.request_id not in adapter._finished_load_reqs
     assert request.request_id not in adapter.requests_with_ready_chunks
     assert adapter.get_req_chunk[request.request_id] == 1
 
-    assert adapter._poll_single_request(request) is True
+    assert adapter._poll_single_request(entry) is True
     assert request.request_id in adapter._finished_load_reqs
     assert torch.equal(request.additional_information["codes"]["audio"], ready_payload["codes"]["audio"])
     assert adapter.get_req_chunk[request.request_id] == 2
@@ -335,6 +776,126 @@ def test_save_async_uses_confirmed_tokens_for_async_scheduler_watermark(build_ad
 
     assert adapter.requests_num_chunks_sent["external-async"] == 8
     assert len(adapter._pending_save_reqs) == 1
+
+
+def test_segment_boundary_starts_new_send_watermark_before_background_flush(build_adapter):
+    """A queued boundary owns the end of its deduplication generation.
+
+    The next segment can start before the save thread sends the old boundary.
+    Sending that old task later must not erase the new segment's watermark.
+    """
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
+    request.resumable = True
+    request._omni_segment_generation = 1
+    request.num_computed_tokens = 0
+    adapter.requests_num_chunks_sent["ext-stream"] = 26
+
+    adapter.save_async(
+        multimodal_output=None,
+        request=request,
+        is_segment_finished=True,
+        confirmed_num_computed_tokens=26,
+        segment_generation=0,
+    )
+
+    assert len(adapter._pending_save_reqs) == 1
+    boundary_task = adapter._pending_save_reqs.popleft()
+    assert boundary_task["segment_generation"] == 0
+    assert "ext-stream" not in adapter.requests_num_chunks_sent
+
+    request.num_computed_tokens = 3
+    request._omni_segment_generation = 1
+    adapter.save_async(
+        multimodal_output=None,
+        request=request,
+        is_segment_finished=False,
+    )
+
+    assert len(adapter._pending_save_reqs) == 1
+    assert adapter.requests_num_chunks_sent["ext-stream"] == 3
+
+    adapter._send_single_request(boundary_task)
+
+    assert adapter.requests_num_chunks_sent["ext-stream"] == 3
+
+
+def test_background_send_uses_enqueued_request_snapshot(build_adapter):
+    """A queued segment must not observe later in-place request mutations."""
+    adapter, _ = build_adapter(stage_id=1)
+    request = Request(
+        request_id="req-stream",
+        prompt_token_ids=[1, 2],
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        resumable=True,
+    )
+    request.external_req_id = "ext-stream"
+    ref_audio = torch.tensor([0.1, -0.1])
+    request.additional_information = {"codes": {"ref": ref_audio}, "meta": {"segment": "old"}}
+    request.append_output_token_ids([7])
+    seen_requests = []
+
+    def recording_processor(**kwargs):
+        queued = kwargs["request"]
+        seen_requests.append(
+            (
+                queued.additional_information["meta"]["segment"],
+                list(queued.prompt_token_ids),
+                list(queued.output_token_ids),
+                list(queued.all_token_ids),
+                queued.additional_information["codes"]["ref"] is ref_audio,
+            )
+        )
+        return OmniPayloadStruct()
+
+    adapter.custom_process_next_stage_input_func = recording_processor
+    adapter.save_async(
+        multimodal_output=None,
+        request=request,
+        is_segment_finished=True,
+    )
+    request.additional_information["meta"]["segment"] = "next"
+    request.prompt_token_ids.append(3)
+    request.append_output_token_ids([8])
+    request._omni_segment_generation = 1
+    adapter.save_async(
+        multimodal_output=None,
+        request=request,
+        is_segment_finished=True,
+    )
+    request.additional_information["meta"]["segment"] = "later"
+    request.prompt_token_ids.append(4)
+    request.append_output_token_ids([9])
+
+    assert len(adapter._pending_save_reqs) == 2
+    first_task = adapter._pending_save_reqs.popleft()
+    second_task = adapter._pending_save_reqs.popleft()
+    assert first_task["request"].additional_information is not request.additional_information
+    assert first_task["request"].additional_information["meta"] is not request.additional_information["meta"]
+
+    adapter._send_single_request(first_task)
+    adapter._send_single_request(second_task)
+
+    assert seen_requests == [
+        ("old", [1, 2], [7], [1, 2, 7], True),
+        ("next", [1, 2, 3], [7, 8], [1, 2, 7, 8], True),
+    ]
+
+
+def test_save_without_custom_processor_does_not_snapshot_request(build_adapter, mocker):
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-direct", RequestStatus.RUNNING, external_req_id="ext-direct")
+    snapshot = mocker.patch.object(
+        adapter,
+        "_snapshot_processor_request",
+        side_effect=AssertionError("unexpected snapshot"),
+    )
+
+    adapter.save_async(multimodal_output=None, request=request)
+
+    snapshot.assert_not_called()
+    assert adapter._pending_save_reqs.popleft()["request"] is request
 
 
 def test_send_single_request_terminal_chunk_still_flushes_processor(build_adapter, monkeypatch):
@@ -546,7 +1107,7 @@ def test_personaplex_sender_cleanup_drops_delayed_frame_state(build_adapter):
     assert second.codes is None
 
 
-def test_save_async_skips_stale_resumable_chunk_until_dedup_is_reset(build_adapter):
+def test_save_async_skips_stale_resumable_chunk_within_segment(build_adapter):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
     request.resumable = True
@@ -563,6 +1124,51 @@ def test_save_async_skips_stale_resumable_chunk_until_dedup_is_reset(build_adapt
 
     assert len(adapter._pending_save_reqs) == 1
     assert adapter.requests_num_chunks_sent["ext-stream"] == 0
+
+
+def test_save_async_drops_late_previous_segment_after_boundary_reset(build_adapter):
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
+    request.resumable = True
+    request._omni_segment_generation = 0
+    adapter.requests_num_chunks_sent["ext-stream"] = 111
+
+    adapter.save_async(multimodal_output=None, request=request, is_segment_finished=True)
+
+    late = _req("req-stream-late", RequestStatus.WAITING, external_req_id="ext-stream")
+    late.resumable = True
+    late.num_computed_tokens = 111
+    late._omni_segment_generation = 0
+    adapter.save_async(multimodal_output=None, request=late, is_segment_finished=False)
+
+    next_segment = _req("req-stream-next", RequestStatus.WAITING, external_req_id="ext-stream")
+    next_segment.resumable = True
+    next_segment.num_computed_tokens = 3
+    next_segment._omni_segment_generation = 1
+    adapter.save_async(multimodal_output=None, request=next_segment, is_segment_finished=False)
+
+    assert len(adapter._pending_save_reqs) == 2
+    assert adapter.requests_num_chunks_sent["ext-stream"] == 3
+    assert adapter._pending_save_reqs[-1]["request"] is next_segment
+
+
+def test_send_single_request_preserves_queued_preboundary_chunk(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(meta=MetaStruct())
+    request = _req("req-queued-old", RequestStatus.WAITING, external_req_id="ext-queued-old")
+    request.resumable = True
+    request._omni_segment_generation = 0
+
+    adapter.save_async(multimodal_output=None, request=request, is_segment_finished=False)
+    adapter.save_async(multimodal_output=None, request=request, is_segment_finished=True)
+
+    old_task = adapter._pending_save_reqs.popleft()
+    adapter._send_single_request(old_task)
+    connector.put.assert_called_once()
+
+    boundary_task = adapter._pending_save_reqs.popleft()
+    adapter._send_single_request(boundary_task)
+    assert connector.put.call_count == 2
 
 
 def test_send_single_request_cleans_up_after_finished_payload(build_adapter, monkeypatch):
@@ -585,6 +1191,77 @@ def test_send_single_request_cleans_up_after_finished_payload(build_adapter, mon
     assert args[1] == "ext-finished"
 
 
+def test_old_turn_terminal_send_preserves_new_turn_state_and_sender(build_adapter):
+    adapter, connector = build_adapter(
+        stage_id=1,
+        model_mode="ar",
+        max_model_len=4096,
+        tts_attention_type="sliding_recompute",
+    )
+    request = _req("req-live", RequestStatus.RUNNING, external_req_id="ext-live")
+    request.resumable = True
+    request._all_token_ids = []
+    request._output_token_ids = []
+    request.update_block_hashes = Mock()
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+        meta=MetaStruct(
+            finished=torch.tensor(True, dtype=torch.bool),
+            codec_streaming=True,
+        )
+    )
+
+    put_started = threading.Event()
+    release_put = threading.Event()
+    put_keys = []
+
+    def blocking_first_put(*_args, **kwargs):
+        put_keys.append(kwargs["put_key"])
+        if len(put_keys) == 1:
+            put_started.set()
+            assert release_put.wait(timeout=5)
+        return True, 1, {}
+
+    connector.put.side_effect = blocking_first_put
+    adapter.save_async(multimodal_output=None, request=request)
+    first_task = adapter._pending_save_reqs.popleft()
+    first_sender_token = first_task["sender_token"]
+    send_thread = threading.Thread(target=lambda: adapter._send_single_request(first_task))
+    send_thread.start()
+    assert put_started.wait(timeout=5)
+
+    entry = _dequeue_load_entry(adapter, request)
+    connector.get.return_value = (
+        {
+            "ids": {"prompt": [1]},
+            "meta": {
+                "replace_streaming_prompt": True,
+                "next_stage_prompt_len": 10,
+                "next_stage_generation_tokens": 26,
+            },
+        },
+        1,
+    )
+    assert adapter._poll_single_request(entry) is True
+    adapter.requests_with_ready_chunks.add(request.request_id)
+    adapter._apply_pending_ar_prompt_updates({request.request_id: request})
+    assert adapter._streaming_condition_seqs[request.request_id] == 0
+
+    request.num_computed_tokens = 1
+    adapter.save_async(multimodal_output=None, request=request)
+    second_task = adapter._pending_save_reqs.popleft()
+    assert second_task["sender_token"] is first_sender_token
+
+    release_put.set()
+    send_thread.join(timeout=5)
+    assert not send_thread.is_alive()
+    assert adapter._streaming_condition_seqs[request.request_id] == 0
+    assert adapter._sender_tokens[request.external_req_id] is first_sender_token
+    assert first_sender_token.cancelled is False
+
+    adapter._send_single_request(second_task)
+    assert put_keys == ["ext-live_1_0", "ext-live_1_1"]
+
+
 def test_load_poll_non_ar_merges_into_existing_additional_information(build_adapter):
     adapter, connector = build_adapter(stage_id=2, model_mode="diffusion")
     request = _req("req-non-ar", RequestStatus.WAITING, external_req_id="ext-non-ar")
@@ -604,7 +1281,7 @@ def test_load_poll_non_ar_merges_into_existing_additional_information(build_adap
     }
     connector.get.return_value = (payload, 8)
 
-    assert adapter._poll_single_request(request) is True
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
 
     assert request.prompt_token_ids == [7, 8]
     assert request.num_computed_tokens == 0
@@ -645,7 +1322,7 @@ def test_load_poll_generation_segment_marker_replaces_previous_chunk(build_adapt
         1,
     )
 
-    assert adapter._poll_single_request(request) is True
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
 
     assert request.prompt_token_ids == [7, 8]
     assert "audio" not in request.additional_information["codes"]
@@ -674,7 +1351,7 @@ def test_load_poll_generation_empty_replacement_snapshot_is_ready(build_adapter)
         1,
     )
 
-    assert adapter._poll_single_request(request) is True
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
 
     assert request.prompt_token_ids == [0]
     assert "codes" not in request.additional_information
@@ -700,7 +1377,7 @@ def test_load_poll_generation_without_snapshot_marker_keeps_incremental_state(bu
         1,
     )
 
-    assert adapter._poll_single_request(request) is False
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is False
 
     assert torch.equal(request.additional_information["codes"]["audio"], torch.tensor([1, 2]))
     assert request.additional_information["meta"]["cache_epoch"] == 3
@@ -724,9 +1401,17 @@ def test_load_poll_ar_request_additional_information_concats_tensors(build_adapt
     }
     connector.get.return_value = (payload, 8)
 
-    adapter._poll_single_request(request)
+    adapter._poll_single_request(_dequeue_load_entry(adapter, request))
 
-    # AR mode now forwards the latest payload directly.
+    # The recv thread records the latest payload; scheduler-side queue
+    # restoration publishes it onto the Request.
+    assert torch.equal(request.additional_information["hidden_states"]["output"], torch.tensor([[1.0]]))
+    request.status = RequestStatus.WAITING_FOR_CHUNK
+    adapter.process_pending_chunks(
+        DummyWaitingQueue(),
+        [request],
+        scheduler_requests={request.request_id: request},
+    )
     assert request.additional_information == payload
     assert request.additional_information["meta"]["finished"].item() is True
 
@@ -744,7 +1429,7 @@ def test_non_ar_poll_reinitializes_prefill_stats_for_later_chunks(build_adapter)
         },
         8,
     )
-    assert adapter._poll_single_request(request) is True
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
     OmniGenerationScheduler._record_prefill_stats(request)
     first_chunk_stats = request.prefill_stats
     request.prefill_stats = None
@@ -756,7 +1441,7 @@ def test_non_ar_poll_reinitializes_prefill_stats_for_later_chunks(build_adapter)
         },
         8,
     )
-    assert adapter._poll_single_request(request) is True
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
     assert isinstance(request.prefill_stats, PrefillStats)
     OmniGenerationScheduler._record_prefill_stats(request)
     second_chunk_stats = request.prefill_stats
@@ -855,7 +1540,7 @@ def test_non_active_waiting_request_is_held_off_scheduler(build_adapter):
     assert waiting_queue == []
     assert active.status == RequestStatus.WAITING_FOR_CHUNK
     assert non_active.status == RequestStatus.WAITING
-    assert list(adapter._pending_load_reqs) == [active]
+    assert [entry.request for entry in adapter._pending_load_reqs] == [active]
     assert list(adapter.waiting_for_chunk_waiting_requests) == [active, non_active]
 
 
@@ -1006,8 +1691,19 @@ def _populate_adapter_state(adapter, req_id="req-1", ext_id="ext-1"):
     adapter.get_req_chunk[req_id] = 3
     adapter.requests_with_ready_chunks.add(req_id)
     adapter.request_ids_mapping[req_id] = ext_id
-    adapter._pending_load_reqs.append(SimpleNamespace(request_id=req_id))
+    entry = SimpleNamespace(request_id=req_id)
+    adapter._pending_load_reqs.append(entry)
+    adapter._registered_load_entries[req_id] = entry
     adapter._finished_load_reqs.add(req_id)
+    adapter._pending_ar_prompt_updates[req_id] = (
+        SimpleNamespace(request_id=req_id),
+        {},
+        False,
+        False,
+        False,
+    )
+    adapter._streaming_condition_lengths[req_id] = 10
+    adapter._streaming_condition_seqs[req_id] = 2
 
     adapter.put_req_chunk[ext_id] = 5
     adapter.request_payload[ext_id] = {"hidden": [1, 2]}
@@ -1029,10 +1725,69 @@ def test_cleanup_clears_all_state(build_adapter):
     assert req_id not in adapter.request_ids_mapping
     assert req_id in adapter._cancelled_load_reqs
     assert req_id not in adapter._finished_load_reqs
+    assert req_id not in adapter._pending_ar_prompt_updates
+    assert req_id not in adapter._streaming_condition_lengths
+    assert req_id not in adapter._streaming_condition_seqs
+    assert req_id not in adapter._registered_load_entries
 
     assert ext_id not in adapter.put_req_chunk
     assert ext_id not in adapter.request_payload
     assert ext_id not in adapter.code_prompt_token_ids
+
+
+def test_cleanup_and_reregister_discards_inflight_old_segment_chunk(build_adapter):
+    """A late old-segment chunk cannot overwrite a resumed registration."""
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("req-late", RequestStatus.RUNNING, external_req_id="ext-late")
+    request.resumable = True
+    entry = _dequeue_load_entry(adapter, request)
+
+    get_started = threading.Event()
+    release_get = threading.Event()
+
+    def blocking_get(*_args):
+        get_started.set()
+        assert release_get.wait(timeout=5)
+        return (
+            {
+                "ids": {"prompt": [1]},
+                "meta": {
+                    "next_stage_prompt_len": 10,
+                },
+            },
+            1,
+        )
+
+    connector.get.side_effect = blocking_get
+    poll_results = []
+    poll_thread = threading.Thread(target=lambda: poll_results.append(adapter._poll_single_request(entry)))
+    poll_thread.start()
+    assert get_started.wait(timeout=5)
+
+    adapter.cleanup_receiver(request.request_id)
+    fresh_entry = _dequeue_load_entry(adapter, request)
+    release_get.set()
+    poll_thread.join(timeout=5)
+
+    assert not poll_thread.is_alive()
+    assert poll_results == [True]
+    assert request.additional_information is None
+    assert request.request_id not in adapter._pending_ar_prompt_updates
+    assert request.request_id not in adapter._streaming_condition_seqs
+    assert adapter.get_req_chunk[request.request_id] == 0
+    assert adapter._registered_load_entries[request.request_id] is fresh_entry
+
+    connector.get.side_effect = None
+    connector.get.return_value = (
+        {
+            "ids": {"prompt": [2]},
+            "meta": {"finished": True},
+        },
+        1,
+    )
+    assert adapter._poll_single_request(fresh_entry) is True
+    assert adapter.get_req_chunk[request.request_id] == 1
+    assert request.request_id not in adapter._registered_load_entries
 
 
 def test_cleanup_infers_external_id(build_adapter):
@@ -1093,6 +1848,67 @@ def test_cleanup_preserves_pending_save(build_adapter):
     assert len(adapter._pending_save_reqs) == 1
 
 
+def test_abort_invalidates_queued_sender_task_before_external_id_reuse(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-old", RequestStatus.WAITING, external_req_id="ext-reused")
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.tensor([1], dtype=torch.long))
+    )
+
+    adapter.save_async(multimodal_output=None, request=request)
+    stale_task = adapter._pending_save_reqs.popleft()
+    adapter.cleanup(request.request_id, request.external_req_id)
+    adapter._send_single_request(stale_task)
+
+    connector.put.assert_not_called()
+    assert request.external_req_id not in adapter.put_req_chunk
+
+    replacement = _req("req-new", RequestStatus.WAITING, external_req_id=request.external_req_id)
+    adapter.save_async(multimodal_output=None, request=replacement)
+    current_task = adapter._pending_save_reqs.popleft()
+    adapter._send_single_request(current_task)
+
+    connector.put.assert_called_once()
+    assert connector.put.call_args.kwargs["put_key"] == "ext-reused_1_0"
+
+
+def test_finish_requests_does_not_wait_for_inflight_send(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    first = _req("req-first", RequestStatus.WAITING, external_req_id="ext-first")
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct()
+    put_started = threading.Event()
+    release_put = threading.Event()
+
+    def blocking_put(**kwargs):
+        put_started.set()
+        release_put.wait(timeout=2)
+        return True, 1, {}
+
+    connector.put.side_effect = blocking_put
+    adapter.save_async(multimodal_output=None, request=first)
+    task = adapter._pending_save_reqs.popleft()
+    sender = threading.Thread(target=adapter._send_single_request, args=(task,))
+    sender.start()
+    assert put_started.wait(timeout=1)
+    cleaner = threading.Thread(
+        target=adapter.finish_requests,
+        args=([first.request_id], RequestStatus.FINISHED_ABORTED, {first.request_id: first}),
+    )
+    cleaner.start()
+    try:
+        cleaner.join(timeout=0.5)
+        assert not cleaner.is_alive()
+        assert task["sender_token"].cancelled
+        assert first.external_req_id in adapter._sender_tokens
+    finally:
+        release_put.set()
+        sender.join(timeout=1)
+        cleaner.join(timeout=1)
+    assert not sender.is_alive()
+    assert first.external_req_id not in adapter._sender_tokens
+    assert first.external_req_id not in adapter.put_req_chunk
+
+
 def test_cleanup_only_affects_target_request(build_adapter):
     """Cleanup for one request must not affect another request's state."""
     adapter, _ = build_adapter(stage_id=1)
@@ -1122,7 +1938,7 @@ def test_cleanup_after_poll_flow(build_adapter):
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
     }
     connector.get.return_value = (payload, 8)
-    adapter._poll_single_request(request)
+    adapter._poll_single_request(_dequeue_load_entry(adapter, request))
 
     assert "req-flow" in adapter.upstream_exhausted_requests
     assert adapter.get_req_chunk["req-flow"] == 1
@@ -1391,6 +2207,7 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
     scheduler.structured_output_manager.should_advance.return_value = False
     scheduler.finished_req_ids_dict = {}
     scheduler.kv_cache_manager.take_events.return_value = None
+    scheduler.kv_cache_manager.estimate_cached_tokens.return_value = 0
     scheduler.kv_event_publisher = mocker.MagicMock()
 
     request = _HashableRequest(
@@ -1471,6 +2288,7 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
     scheduler.finished_req_ids_dict = {}
     scheduler.kv_cache_manager = mocker.MagicMock()
     scheduler.kv_cache_manager.take_events.return_value = None
+    scheduler.kv_cache_manager.estimate_cached_tokens.return_value = 0
     scheduler.kv_event_publisher = mocker.MagicMock()
     scheduler.waiting_for_transfer_free = set()
     scheduler.transfer_triggered_requests = set()
@@ -1626,6 +2444,7 @@ def _build_deferred_finish_scheduler(mocker, *, running, pending_finish_reqs):
     scheduler.structured_output_manager.should_advance.return_value = False
     scheduler.finished_req_ids_dict = {}
     scheduler.kv_cache_manager.take_events.return_value = None
+    scheduler.kv_cache_manager.estimate_cached_tokens.return_value = 0
     scheduler.kv_event_publisher = mocker.MagicMock()
     scheduler._pending_finish_reqs = list(pending_finish_reqs)
 
@@ -2100,3 +2919,74 @@ def test_expiry_is_per_request(build_adapter):
 
     assert adapter.collect_timed_out_request_ids(timeout_s=600.0) == {"stalled"}
     assert "healthy" in adapter._waiting_since
+
+
+def test_abort_clears_native_codec_state_before_external_id_reuse(build_adapter):
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import (
+        talker2code2wav_async_chunk,
+    )
+
+    adapter, _ = build_adapter(stage_id=1, connector_extra={"codec_chunk_frames": 1})
+    external_req_id = "ext-native-abort"
+    first = _req("req-native-abort", RequestStatus.WAITING, external_req_id=external_req_id)
+    first.resumable = True
+    first.model_intermediate_buffer = None
+    first.additional_information = {"meta": {"codec_streaming": True}, "nvc_logical_prompt_len": 1}
+    first_frame = torch.full((1, 31), 101, dtype=torch.long)
+
+    talker2code2wav_async_chunk(
+        adapter,
+        {"codes": {"audio": first_frame}, "meta": {"codec_streaming": True}},
+        first,
+        is_finished=False,
+    )
+
+    adapter.requests_num_chunks_sent[external_req_id] = 1
+    adapter.finish_requests([first.request_id], RequestStatus.FINISHED_ABORTED, {first.request_id: first})
+
+    assert external_req_id not in adapter.request_payload
+    assert external_req_id not in adapter.requests_num_chunks_sent
+
+    replacement = _req("req-native-abort", RequestStatus.WAITING, external_req_id=external_req_id)
+    replacement.resumable = True
+    replacement.model_intermediate_buffer = None
+    replacement.additional_information = first.additional_information
+    replacement_payload = talker2code2wav_async_chunk(
+        adapter,
+        {"codes": {"audio": torch.full((1, 31), 202, dtype=torch.long)}, "meta": {"codec_streaming": True}},
+        replacement,
+        is_finished=False,
+    )
+
+    assert torch.equal(replacement_payload.codes.audio, torch.full((1, 31), 202, dtype=torch.long))
+
+
+def test_save_async_boundary_holds_generation_without_request_counter(build_adapter):
+    """A boundary must not advance past a generation nothing can catch up to.
+
+    When the producing stage maintains ``_omni_segment_generation`` on the
+    request, a boundary may start the next segment's watermark at
+    ``generation + 1`` because the following frame will carry it. On paths
+    where the request has no such counter, that speculative advance makes every
+    subsequent frame look stale and starves the stream permanently
+    (vllm-project/vllm-omni#6816).
+    """
+    adapter, _ = build_adapter(stage_id=1)
+
+    request = _req("req-nogen", RequestStatus.WAITING, external_req_id="ext-nogen")
+    request.resumable = True
+    request._omni_segment_generation = None
+
+    adapter.save_async(multimodal_output=None, request=request, is_segment_finished=True)
+    assert adapter._segment_generation["ext-nogen"] == 0
+
+    follow_up = _req("req-nogen-next", RequestStatus.WAITING, external_req_id="ext-nogen")
+    follow_up.resumable = True
+    follow_up.num_computed_tokens = 3
+    follow_up._omni_segment_generation = None
+    queued_before = len(adapter._pending_save_reqs)
+
+    adapter.save_async(multimodal_output=None, request=follow_up, is_segment_finished=False)
+
+    assert len(adapter._pending_save_reqs) == queued_before + 1
+    assert adapter._pending_save_reqs[-1]["request"] is follow_up

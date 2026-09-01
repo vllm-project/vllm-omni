@@ -121,7 +121,7 @@ class TrtContextWrapper:
         for _ in range(trt_concurrent):
             ctx = engine.create_execution_context()
             assert ctx is not None, "failed to create TRT execution context (out of memory?)"
-            stream = torch.cuda.stream(torch.cuda.Stream(torch.device(device)))
+            stream = torch.cuda.Stream(torch.device(device))
             self._pool.put([ctx, stream])
 
     def acquire_estimator(self):

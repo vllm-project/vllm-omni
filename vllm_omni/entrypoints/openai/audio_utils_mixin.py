@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from io import BytesIO
 
 import numpy as np
@@ -13,6 +16,88 @@ except ImportError:
     soundfile = None
 
 logger = init_logger(__name__)
+
+
+class StreamingAudioResampler:
+    """Stateful resampler for streaming mono audio.
+
+    Only integer downsampling ratios are supported so every input chunk can
+    produce output without buffering the complete stream.
+    """
+
+    def __init__(self, source_rate: int, target_rate: int):
+        if source_rate <= 0 or target_rate <= 0:
+            raise ValueError("Audio sample rates must be positive")
+        self.source_rate = source_rate
+        self.target_rate = target_rate
+        if source_rate < target_rate or source_rate % target_rate != 0:
+            raise ValueError(
+                "Streaming audio resampling requires an integer downsampling ratio, "
+                f"got {source_rate} Hz to {target_rate} Hz"
+            )
+
+        self._ratio = source_rate // target_rate
+        self._buffer = np.empty((0,), dtype=np.float32)
+        self._buffer_start = 0
+        self._total_samples = 0
+        self._next_center = 0
+
+        if self._ratio == 1:
+            self._taps = np.ones((1,), dtype=np.float32)
+        else:
+            # Use a Kaiser-windowed sinc and leave a small transition band
+            # below the target Nyquist frequency.
+            num_taps = 20 * self._ratio + 1
+            half = num_taps // 2
+            offsets = np.arange(num_taps, dtype=np.float64) - half
+            cutoff = 0.95 / self._ratio
+            taps = cutoff * np.sinc(cutoff * offsets) * np.kaiser(num_taps, 5.0)
+            self._taps = (taps / taps.sum()).astype(np.float32)
+
+    def process(self, audio: np.ndarray, *, final: bool = False) -> np.ndarray:
+        chunk = np.asarray(audio, dtype=np.float32)
+        if chunk.ndim != 1:
+            raise ValueError(f"Streaming audio resampling only supports mono audio, got shape {chunk.shape}")
+
+        if self._ratio == 1:
+            return chunk
+
+        if chunk.size:
+            self._buffer = np.concatenate((self._buffer, chunk))
+            self._total_samples += int(chunk.size)
+
+        half = self._taps.size // 2
+        max_center = self._total_samples - 1 if final else self._total_samples - 1 - half
+        if self._next_center > max_center:
+            return np.empty((0,), dtype=np.float32)
+
+        centers = np.arange(self._next_center, max_center + 1, self._ratio, dtype=np.int64)
+        first_center = int(centers[0])
+        last_center = int(centers[-1])
+        window_start = first_center - half
+        window_end = last_center + half
+        segment = np.zeros((window_end - window_start + 1,), dtype=np.float32)
+
+        copy_start = max(window_start, self._buffer_start, 0)
+        copy_end = min(window_end + 1, self._buffer_start + self._buffer.size)
+        if copy_end > copy_start:
+            dst_start = copy_start - window_start
+            src_start = copy_start - self._buffer_start
+            segment[dst_start : dst_start + copy_end - copy_start] = self._buffer[
+                src_start : src_start + copy_end - copy_start
+            ]
+
+        windows = np.lib.stride_tricks.sliding_window_view(segment, self._taps.size)[:: self._ratio]
+        output = windows @ self._taps[::-1]
+        self._next_center = last_center + self._ratio
+
+        keep_from = max(0, self._next_center - half)
+        drop = min(max(keep_from - self._buffer_start, 0), self._buffer.size)
+        if drop:
+            self._buffer = self._buffer[drop:]
+            self._buffer_start += int(drop)
+
+        return np.asarray(output, dtype=np.float32)
 
 
 class AudioMixin:
@@ -44,6 +129,10 @@ class AudioMixin:
 
         audio_tensor, sample_rate = self._apply_speed_adjustment(audio_tensor, speed, sample_rate)
 
+        if audio_obj.output_sample_rate is not None and audio_obj.output_sample_rate != sample_rate:
+            audio_tensor = self._resample_audio(audio_tensor, sample_rate, audio_obj.output_sample_rate)
+            sample_rate = audio_obj.output_sample_rate
+
         supported_formats = {
             "wav": ("WAV", "audio/wav", {}),
             "pcm": ("RAW", "audio/pcm", {"subtype": "PCM_16"}),
@@ -68,6 +157,19 @@ class AudioMixin:
             audio_data = base64.b64encode(audio_data).decode("utf-8")
 
         return AudioResponse(audio_data=audio_data, media_type=media_type)
+
+    @staticmethod
+    def _resample_audio(audio_tensor: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
+        """Resample complete audio while preserving soundfile's channels-last layout."""
+        if source_rate == target_rate:
+            return audio_tensor
+
+        audio_array = np.asarray(audio_tensor)
+        if not np.issubdtype(audio_array.dtype, np.floating):
+            audio_array = audio_array.astype(np.float32)
+        waveform = torch.from_numpy(audio_array.T.copy() if audio_array.ndim == 2 else audio_array.copy())
+        resampled = torchaudio.functional.resample(waveform, source_rate, target_rate).cpu().numpy()
+        return resampled.T if audio_array.ndim == 2 else resampled
 
     def _apply_speed_adjustment(self, audio_tensor: np.ndarray, speed: float, sample_rate: int):
         """Apply speed adjustment to the audio tensor while preserving pitch.

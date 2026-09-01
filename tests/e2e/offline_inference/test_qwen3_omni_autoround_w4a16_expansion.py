@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E tests for Qwen3-Omni AutoRound W4A16 quantized inference.
 
 These tests cover text, audio, image, video, and mixed-modality inputs
@@ -80,13 +80,13 @@ quant_params = [(QUANTIZED_MODEL, stage_config)]
 @_SKIP_ISSUE_5652
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
-def test_text_to_text(omni_runner, omni_runner_handler):
+def test_text_to_text(omni_runner, offline_client):
     """Text input → text output with W4A16 quantized Qwen3-Omni."""
     request_config = {
         "prompts": "What is the capital of France?",
         "modalities": ["text"],
     }
-    response = omni_runner_handler.send_request(request_config)
+    response = offline_client.send_request(request_config)
     assert response.success, "Request failed"
     assert response.text_content and len(response.text_content.strip()) > 0
 
@@ -99,7 +99,7 @@ def test_text_to_text(omni_runner, omni_runner_handler):
 @_SKIP_ISSUE_5652
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
-def test_audio_to_text(omni_runner, omni_runner_handler):
+def test_audio_to_text(omni_runner, offline_client):
     """Audio input → text output with W4A16 quantized Qwen3-Omni."""
     audio = generate_synthetic_audio(1, 1, 16000)["np_array"]
     if len(audio.shape) == 2:
@@ -110,7 +110,7 @@ def test_audio_to_text(omni_runner, omni_runner_handler):
         "audios": (audio, 16000),
         "modalities": ["text"],
     }
-    response = omni_runner_handler.send_request(request_config)
+    response = offline_client.send_request(request_config)
     assert response.success, "Request failed"
     assert response.text_content and len(response.text_content.strip()) > 0
 
@@ -123,7 +123,7 @@ def test_audio_to_text(omni_runner, omni_runner_handler):
 @_SKIP_ISSUE_5652
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
-def test_image_to_text(omni_runner, omni_runner_handler):
+def test_image_to_text(omni_runner, offline_client):
     """Image input → text output with W4A16 quantized Qwen3-Omni."""
     image = generate_synthetic_image(16, 16)["np_array"]
 
@@ -132,7 +132,7 @@ def test_image_to_text(omni_runner, omni_runner_handler):
         "images": image,
         "modalities": ["text"],
     }
-    response = omni_runner_handler.send_request(request_config)
+    response = offline_client.send_request(request_config)
     assert response.success, "Request failed"
     assert response.text_content and len(response.text_content.strip()) > 0
 
@@ -145,7 +145,7 @@ def test_image_to_text(omni_runner, omni_runner_handler):
 @_SKIP_ISSUE_5652
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
-def test_video_to_text(omni_runner, omni_runner_handler):
+def test_video_to_text(omni_runner, offline_client):
     """Video input → text output with W4A16 quantized Qwen3-Omni."""
     video = generate_synthetic_video(224, 224, 300)["np_array"]
 
@@ -154,7 +154,7 @@ def test_video_to_text(omni_runner, omni_runner_handler):
         "videos": video,
         "modalities": ["text"],
     }
-    response = omni_runner_handler.send_request(request_config)
+    response = offline_client.send_request(request_config)
     assert response.success, "Request failed"
     assert response.text_content and len(response.text_content.strip()) > 0
 
@@ -167,7 +167,7 @@ def test_video_to_text(omni_runner, omni_runner_handler):
 @_SKIP_ISSUE_5652
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
-def test_video_to_audio(omni_runner, omni_runner_handler):
+def test_video_to_audio(omni_runner, offline_client):
     """Video input → audio output with W4A16 quantized Qwen3-Omni."""
     video = generate_synthetic_video(224, 224, 300)["np_array"]
 
@@ -176,7 +176,7 @@ def test_video_to_audio(omni_runner, omni_runner_handler):
         "videos": video,
         "modalities": ["audio"],
     }
-    response = omni_runner_handler.send_request(request_config)
+    response = offline_client.send_request(request_config)
     assert response.success, "Request failed"
 
 
@@ -188,7 +188,7 @@ def test_video_to_audio(omni_runner, omni_runner_handler):
 @_SKIP_ISSUE_5652
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
-def test_mix_to_audio(omni_runner, omni_runner_handler):
+def test_mix_to_audio(omni_runner, offline_client):
     """Mixed-modality input → audio output with W4A16 quantized Qwen3-Omni."""
     video = generate_synthetic_video(224, 224, 300)["np_array"]
     image = generate_synthetic_image(16, 16)["np_array"]
@@ -203,5 +203,5 @@ def test_mix_to_audio(omni_runner, omni_runner_handler):
         "audios": (audio, 16000),
         "modalities": ["audio"],
     }
-    response = omni_runner_handler.send_request(request_config)
+    response = offline_client.send_request(request_config)
     assert response.success, "Request failed"

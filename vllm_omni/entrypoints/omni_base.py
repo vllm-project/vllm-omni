@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import os
@@ -30,6 +33,11 @@ from vllm_omni.metrics.modality import OmniModalityMetrics, observe_modality_at_
 from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
 from vllm_omni.metrics.stats import OrchestratorAggregator
 from vllm_omni.metrics.transfer import OmniTransferMetrics
+from vllm_omni.metrics.utils import (
+    extract_queue_wait_s,
+    normalize_failure_reason,
+    observe_stage_workload_metrics,
+)
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.tracking_parser import TrackingNamespace
@@ -179,7 +187,9 @@ class OmniBase(PDDisaggregationMixin):
         # override the deploy YAML's ``async_chunk: true`` default.
         async_chunk = kwargs.get("async_chunk")
         output_modalities = kwargs.pop("output_modalities", None)
-        diffusion_batch_size: int = kwargs.pop("diffusion_batch_size", 1)
+
+        if "diffusion_batch_size" in kwargs:
+            raise TypeError("`diffusion_batch_size` has been removed in Omni/AsyncOmni. Use `max_num_seqs`.")
 
         if "log_requests" in kwargs:
             raise TypeError("`log_requests` has been removed in Omni/AsyncOmni. Use `log_stats`.")
@@ -199,13 +209,14 @@ class OmniBase(PDDisaggregationMixin):
         # (which forwards it to the Orchestrator background thread for
         # TX-side emit; see Orchestrator._forward_to_next_stage).
         self.transfer_metrics = OmniTransferMetrics(model_name=model, log_stats=log_stats)
+        self.prom_metrics = OmniPrometheusMetrics(model_name=model, log_stats=log_stats)
         st = time.time()
         self.engine = AsyncOmniEngine(
             model=model,
             init_timeout=init_timeout,
             stage_init_timeout=stage_init_timeout,
-            diffusion_batch_size=diffusion_batch_size,
             transfer_emitter=self.transfer_metrics,
+            prom_metrics=self.prom_metrics,
             log_stats=log_stats,
             **kwargs,
         )
@@ -221,7 +232,6 @@ class OmniBase(PDDisaggregationMixin):
 
         self.request_states: dict[str, ClientRequestState] = {}
         self._consumed_metric_messages: dict[str, set[int]] = {}
-        self.prom_metrics = OmniPrometheusMetrics(model_name=model, log_stats=log_stats)
         self.mod_metrics = OmniModalityMetrics(model_name=model, log_stats=log_stats)
 
         self.default_sampling_params_list = self.engine.default_sampling_params_list
@@ -384,29 +394,46 @@ class OmniBase(PDDisaggregationMixin):
             raise TypeError(f"Expected a mapping, dataclass, or msgspec struct, got {type(params).__name__}")
         return type(params)(**{**values, **constraints})
 
-    def _fire_failure_counter_if_alive(self, request_id: str) -> None:
-        """Fire the abort/exception bucket of requests_success_total.
-
-        Called from cancel / exception paths in async_omni.generate() BEFORE
-        _abort_internal_requests pops request_states — that method resolves
-        the internal id by dict lookup, so popping first would no-op it. We
-        keep this counter fire separate from _log_summary_and_cleanup (which
-        pops) so the abort path can still find the state to clean up.
-        """
+    def _record_request_failure_once(self, request_id: str, reason: str) -> None:
         req_state = self.request_states.get(request_id)
         prom = getattr(self, "prom_metrics", None)
-        if req_state is None or req_state.metrics is None or prom is None:
+        metrics = getattr(req_state, "metrics", None)
+        if metrics is None or prom is None:
             return
-        if str(request_id) not in req_state.metrics.e2e_done:
-            prom.request_failed()
+        if str(request_id) in metrics.e2e_done or getattr(req_state, "failure_recorded", False):
+            return
 
-    def _log_summary_and_cleanup(self, request_id: str) -> None:
+        req_state.failure_recorded = True
+        prom.request_failed()
+        prom.inc_requests_failed(normalize_failure_reason(reason))
+
+    def _publish_request_gauges(self, total: int) -> None:
+        """Publish num_requests_running / num_requests_waiting for ``total`` in-flight requests.
+
+        ``_running_counter`` counts requests from the moment the orchestrator
+        dispatches them to a stage engine, which includes requests still queued
+        inside a stage scheduler. The orchestrator reports those via
+        ``_engines_waiting_counter``.
+        """
+        prom = getattr(self, "prom_metrics", None)
+        if prom is None:
+            return
+        engine = getattr(self, "engine", None)
+        counter = getattr(engine, "_running_counter", None)
+        waiting_counter = getattr(engine, "_engines_waiting_counter", None)
+        dispatched = counter.value if counter is not None else total
+        in_engine_waiting = waiting_counter.value if waiting_counter is not None else 0
+        in_engine_waiting = min(max(0, in_engine_waiting), dispatched)
+        prom.set_running(max(0, dispatched - in_engine_waiting))
+        prom.set_waiting(max(0, total - dispatched) + in_engine_waiting)
+
+    def _log_summary_and_cleanup(self, request_id: str, reason: str = "stage_error") -> None:
         req_state = self.request_states.get(request_id)
         try:
             if req_state is None or req_state.metrics is None:
                 return
             if str(request_id) not in req_state.metrics.e2e_done:
-                self.prom_metrics.request_failed()
+                self._record_request_failure_once(request_id, reason)
             if self.log_stats:
                 # Emit per-request orchestrator timing (including e2e_total_ms)
                 # before dropping request state.
@@ -425,13 +452,7 @@ class OmniBase(PDDisaggregationMixin):
             # Republish gauges so any stale value left by the per-stage
             # publish in _process_single_result (which runs while the request
             # is still in self.request_states) is corrected after the pop.
-            prom = getattr(self, "prom_metrics", None)
-            counter = getattr(getattr(self, "engine", None), "_running_counter", None)
-            if prom is not None:
-                total = len(self.request_states)
-                running = counter.value if counter is not None else total
-                prom.set_running(running)
-                prom.set_waiting(max(0, total - running))
+            self._publish_request_gauges(len(self.request_states))
 
     def _compute_final_stage_id(self, output_modalities: list[str] | None) -> int:
         return get_final_stage_id_for_e2e(
@@ -623,6 +644,30 @@ class OmniBase(PDDisaggregationMixin):
                 metrics.accumulate_diffusion_metrics(stage_meta.stage_type, req_id, engine_outputs)
                 metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
                 consumed.add(msg_id)
+                if peak_memory_mb > 0:
+                    self.prom_metrics.set_peak_memory(stage_id, peak_memory_mb)
+                self.prom_metrics.observe_stage_gen_time(
+                    stage_id,
+                    stage_meta.stage_type,
+                    _m.stage_gen_time_ms / 1000.0,
+                )
+                observe_stage_workload_metrics(
+                    self.prom_metrics,
+                    stage_type=stage_meta.stage_type,
+                    stage_metrics=_m,
+                )
+                # Only meaningful for diffusion stages (text stages have no exec key).
+                _diff_m = _m.diffusion_metrics or {}
+                stage_in_queue_s = _diff_m.get("scheduler_queue_wait_s")
+                if stage_in_queue_s is not None:
+                    self.prom_metrics.observe_stage_in_queue(stage_id, float(stage_in_queue_s))
+                if _m.output_unit_type == "image":
+                    if result.replica_id is not None:
+                        self.mod_metrics.observe_image_ttfp(
+                            str(stage_id),
+                            str(result.replica_id),
+                            _m.image_time_to_first_output_ms / 1000.0,
+                        )
 
         if not stage_meta.final_output:
             return None
@@ -656,6 +701,10 @@ class OmniBase(PDDisaggregationMixin):
                     _gen_tok += int(evt.num_tokens_out)
                 self.prom_metrics.observe_tokens(_prompt_tok, _gen_tok)
 
+                queue_wait_s = extract_queue_wait_s(_m.pipeline_timings if _m is not None else None)
+                if queue_wait_s is not None:
+                    self.prom_metrics.observe_queue_wait(queue_wait_s)
+
                 # Modality observe inside the same finalize guard so it fires
                 # once per request and inherits the try/except isolation.
                 observe_modality_at_finalize(
@@ -674,12 +723,8 @@ class OmniBase(PDDisaggregationMixin):
         # hasn't popped self.request_states yet — exclude the finalizing
         # request from `total` so waiting doesn't read 1 and stay stuck
         # there until the next request arrives.
-        counter = getattr(self.engine, "_running_counter", None)
         is_finalizing = finished and stage_id == final_stage_id_for_e2e
-        total = max(0, len(self.request_states) - (1 if is_finalizing else 0))
-        running = counter.value if counter is not None else total
-        self.prom_metrics.set_running(running)
-        self.prom_metrics.set_waiting(max(0, total - running))
+        self._publish_request_gauges(max(0, len(self.request_states) - (1 if is_finalizing else 0)))
 
         response_metrics: dict[str, Any] = {}
         stage_metrics: dict[str, dict[str, Any]] = {}

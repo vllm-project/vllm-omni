@@ -419,7 +419,8 @@ def test_weekly_yaml_source_key_selects_matching_job() -> None:
     doc = yaml.safe_load(Path(".buildkite/cuda/test-weekly.yml").read_text(encoding="utf-8"))
     labels = _surviving_labels(doc, ["vllm_omni/diffusion/models/wan2_2/transformer.py"])
     assert "Reliability Test · wan22" in labels
-    assert "Reliability Test · Invalid parameters · H100" in labels
+    assert "Reliability Test · Invalid parameters · H100 · Single-GPU" in labels
+    assert "Reliability Test · Invalid parameters · H100 · 2-GPU" in labels
     assert "Reliability Test · qwen3-omni" not in labels
     assert "Reliability Test · Invalid parameters · L4" not in labels
     assert not any("Perf Test · vLLM Text" in label for label in labels)
