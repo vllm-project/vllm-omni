@@ -286,6 +286,28 @@ def test_qwen3_tts_code2wav_injects_max_position_embeddings(monkeypatch):
     }
 
 
+def test_remote_tokenizer_subfolder_download_does_not_report_failure(tmp_path, monkeypatch, mocker):
+    """A successful remote tokenizer download must not enter the error path."""
+    tokenizer_dir = tmp_path / "CosyVoice-BlankEN"
+    tokenizer_dir.mkdir()
+    baseline_config = Mock()
+    warning = mocker.patch("vllm_omni.engine.arg_utils.logger.warning")
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", lambda *args, **kwargs: str(tmp_path))
+    monkeypatch.setattr(OmniEngineArgs, "_patch_empty_hf_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(EngineArgs, "create_model_config", lambda _self: baseline_config)
+    monkeypatch.setattr(
+        OmniModelConfig,
+        "from_vllm_model_config",
+        classmethod(lambda cls, model_config, **omni_kwargs: model_config),
+    )
+
+    args = OmniEngineArgs(model="remote/cosyvoice3", model_arch="CosyVoice3Model")
+    assert args.create_model_config() is baseline_config
+    assert args.tokenizer == str(tokenizer_dir)
+    warning.assert_not_called()
+
+
 def test_patch_missing_local_hf_config(tmp_path):
     """Native model bundles may only contain a checkpoints/ directory."""
     (tmp_path / "checkpoints").mkdir()

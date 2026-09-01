@@ -773,25 +773,33 @@ def calculate_metrics(
                     output_len = len(tokenizer(outputs[i].generated_text, add_special_tokens=False).input_ids)
             actual_output_lens.append(output_len)
             total_input += outputs[i].prompt_len
-            tpot: float | None = 0.0
+            tpot: float | None = None
             if output_len > 1:
                 if outputs[i].itl:
                     # Use mean(ITL) directly so per-request TPOT == mean(ITL).
                     # The ITL list records one entry per SSE chunk; server may
                     # bundle multiple tokens per chunk, so len(itl)+1 != output_len.
                     # Using mean(itl) keeps TPOT and ITL on the same footing.
-                    tpot = sum(outputs[i].itl) / len(outputs[i].itl)
+                    measured_tpot = sum(outputs[i].itl) / len(outputs[i].itl)
+                    if np.isfinite(measured_tpot) and measured_tpot > 0:
+                        tpot = measured_tpot
                 elif getattr(outputs[i], "tpot_measured", True):
-                    try:
-                        latency_minus_ttft = outputs[i].text_latency - outputs[i].ttft
-                    except Exception:
-                        latency_minus_ttft = outputs[i].latency - outputs[i].ttft
-                    tpot = latency_minus_ttft / (output_len - 1)
-                else:
-                    tpot = None
+                    text_latency = getattr(outputs[i], "text_latency", None)
+                    ttft = getattr(outputs[i], "ttft", None)
+                    if (
+                        isinstance(text_latency, (int, float))
+                        and isinstance(ttft, (int, float))
+                        and np.isfinite(text_latency)
+                        and np.isfinite(ttft)
+                        and text_latency > ttft > 0
+                    ):
+                        tpot = (text_latency - ttft) / (output_len - 1)
                 if tpot is not None:
                     tpots.append(tpot)
-            # Note: if output_len <= 1, we regard tpot as 0 for goodput
+            # TPOT is not measurable for a single-token response or when the
+            # client did not observe a positive decode interval. In
+            # particular, stage-level output token counts alone must not turn
+            # an unset text_latency into a negative TPOT sample.
             all_tpots.append(tpot)
             itls += outputs[i].itl
             session_metrics = getattr(outputs[i], "duplex_session_metrics", None)
@@ -949,10 +957,10 @@ def calculate_metrics(
         std_ttft_ms=np.std(ttfts or missing_duplex_value) * 1000,
         median_ttft_ms=np.median(ttfts or missing_duplex_value) * 1000,
         percentiles_ttft_ms=[(p, np.percentile(ttfts or missing_duplex_value, p) * 1000) for p in selected_percentiles],
-        mean_tpot_ms=np.mean(tpots or missing_duplex_value) * 1000,
-        std_tpot_ms=np.std(tpots or missing_duplex_value) * 1000,
-        median_tpot_ms=np.median(tpots or missing_duplex_value) * 1000,
-        percentiles_tpot_ms=[(p, np.percentile(tpots or missing_duplex_value, p) * 1000) for p in selected_percentiles],
+        mean_tpot_ms=np.mean(tpots or float("nan")) * 1000,
+        std_tpot_ms=np.std(tpots or float("nan")) * 1000,
+        median_tpot_ms=np.median(tpots or float("nan")) * 1000,
+        percentiles_tpot_ms=[(p, np.percentile(tpots or float("nan"), p) * 1000) for p in selected_percentiles],
         mean_itl_ms=np.mean(itls or missing_duplex_value) * 1000,
         std_itl_ms=np.std(itls or missing_duplex_value) * 1000,
         median_itl_ms=np.median(itls or missing_duplex_value) * 1000,

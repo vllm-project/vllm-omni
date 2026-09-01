@@ -72,6 +72,7 @@ def _effective_backend_values(config_cls: type, engine_args: dict) -> dict[str, 
 
 _LLM_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniEngineArgs))
 _DIFFUSION_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniDiffusionConfig))
+_TOPOLOGY_ONLY_ENGINE_ARGS = frozenset({"inline_diffusion"})
 _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
     {
         "active_stream_window",
@@ -368,7 +369,9 @@ def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
         )
         typed_args_by_stage[stage_id] = typed_args
 
-        assert {name: typed_args[name] for name in legacy_args} == legacy_args
+        expected_args = {name: value for name, value in legacy_args.items() if name not in _TOPOLOGY_ONLY_ENGINE_ARGS}
+        assert {name: typed_args[name] for name in expected_args} == expected_args
+        assert _TOPOLOGY_ONLY_ENGINE_ARGS.isdisjoint(typed_args)
 
     thinker_args = typed_args_by_stage[0]
     inherited_vllm_fields = {
@@ -627,8 +630,24 @@ def test_typed_ming_image_engine_args_defer_diffusion_batch_default():
     assert OmniDiffusionConfig(**typed_backend_args).max_num_seqs == 1
 
 
+def _fake_model_root(pipeline, tmp_path):
+    """A model directory carrying every subfolder the pipeline's stages declare.
+
+    Stage init fails closed when a declared ``model_subdir``/``tokenizer_subdir``
+    is not a real directory, because the joined path would otherwise reach
+    HuggingFace as a malformed repo id (issue #6638).
+    """
+    root = tmp_path / "model"
+    root.mkdir(exist_ok=True)
+    for stage in pipeline.stages:
+        for subdir in (stage.model_subdir, stage.tokenizer_subdir):
+            if subdir:
+                (root / subdir).mkdir(parents=True, exist_ok=True)
+    return str(root)
+
+
 @pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
-def test_typed_engine_args_match_current_registry_backend_semantics(model_type):
+def test_typed_engine_args_match_current_registry_backend_semantics(model_type, tmp_path):
     pipeline = resolve_pipeline_config(model_type)
     if pipeline is None:
         pytest.skip(f"Pipeline {model_type!r} requires an HF config to resolve")
@@ -638,18 +657,19 @@ def test_typed_engine_args_match_current_registry_backend_semantics(model_type):
         if pipeline.default_deploy_config_name is not None
         else DeployConfig()
     )
+    model = _fake_model_root(pipeline, tmp_path)
     legacy_stages, omni_config = _legacy_and_typed_stages(
         pipeline,
         deploy,
-        model="/tmp",
+        model=model,
     )
 
     for legacy_stage in legacy_stages:
         stage_id = legacy_stage.stage_id
-        legacy_args = build_legacy_engine_args_dict(legacy_stage, model="/tmp")
+        legacy_args = build_legacy_engine_args_dict(legacy_stage, model=model)
         typed_args = build_engine_args_dict_from_omni_stage_config(
             omni_config.stage_by_id(stage_id),
-            model="/tmp",
+            model=model,
         )
         if legacy_stage.stage_type == StageType.DIFFUSION:
             backend_fields = _DIFFUSION_BACKEND_FIELDS
@@ -658,6 +678,7 @@ def test_typed_engine_args_match_current_registry_backend_semantics(model_type):
             backend_fields = _LLM_BACKEND_FIELDS
             backend_config_cls = OmniEngineArgs
 
+        backend_fields -= _TOPOLOGY_ONLY_ENGINE_ARGS
         missing_fields = (legacy_args.keys() & backend_fields) - typed_args.keys()
         assert not missing_fields, f"{model_type} stage {stage_id} lost backend fields: {sorted(missing_fields)}"
 

@@ -92,6 +92,18 @@ def _from_pipeline_key(
     )
 
 
+def test_minimax_h3_text_encoder_tp_targets_only_structured_stage_zero() -> None:
+    config = _from_pipeline_key(
+        "minimax_h3_disaggregated",
+        cli_overrides={"text_encoder_tp_size": 4},
+    )
+
+    assert config.stage_by_id(0).parallel_config.tensor_parallel_size == 4
+    diffusion = config.stage_by_id(1)
+    assert diffusion.parallel_config.tensor_parallel_size == 1
+    assert diffusion.parallel_config.text_encoder_tp_size == 1
+
+
 def test_duplex_session_capacity_propagates_to_every_structured_stage() -> None:
     omni_config = _from_pipeline_key("personaplex")
 
@@ -641,10 +653,11 @@ def test_sub_config_fields_match_structured_scopes():
         "ring_degree",
         "allgather_degree",
         "ulysses_mode",
+        "ulysses_a2a_permute",
         "cfg_parallel_size",
         "vae_patch_parallel_size",
-        "text_encoder_tp_size",
         "vae_parallel_mode",
+        "text_encoder_tp_size",
         "use_hsdp",
         "mask_sp_padding",
         "hsdp_shard_size",
@@ -844,6 +857,23 @@ def test_from_pipeline_config_derives_sequence_parallel_size_from_allgather_degr
     assert stage.parallel_config.allgather_degree == 2
     assert stage.parallel_config.sequence_parallel_size == 2
     assert stage.parallel_config.world_size == 2
+
+
+def test_from_pipeline_config_preserves_deployed_ulysses_a2a_permute() -> None:
+    pipeline = _resolve_pipeline_or_skip("dreamzero")
+    deploy = DeployConfig(
+        stages=[
+            StageDeployConfig(
+                stage_id=0,
+                ulysses_a2a_permute=True,
+            )
+        ]
+    )
+
+    stage = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_by_id(0)
+
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.parallel_config.ulysses_a2a_permute is True
 
 
 def test_diffusion_parallel_config_accepts_four_way_guidance_parallelism():

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for the Sequence Parallelism (SP) framework.
 
 These tests verify the SP plan mechanism and hooks work correctly without
@@ -17,6 +17,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -419,13 +420,14 @@ class TestHookRegistration:
 # =============================================================================
 
 
-@pytest.mark.L4
 class TestModelSpPlans:
     """Test that model _sp_plan definitions are valid.
 
     These tests import actual model classes to verify _sp_plan structure.
     May require GPU for model imports.
     """
+
+    pytestmark = hardware_marks(res={"cuda": "L4"})
 
     def test_zimage_transformer_sp_plan(self):
         """Test ZImageTransformer2DModel _sp_plan structure.

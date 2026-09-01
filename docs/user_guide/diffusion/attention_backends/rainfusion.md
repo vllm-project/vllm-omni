@@ -17,6 +17,8 @@ globally.
 | --- | --- | --- |
 | `sparsity` | finite, `[0, 1]` | Nominal dropped-key-block fraction; default `0.8`; `0` disables sparsity |
 | `start_step` | integer, `>= 0` | Number of early denoise steps kept dense |
+| `end_step` | integer, `>= 0` | Number of final denoise steps kept dense (tail fallback) |
+| `precision` | `"bf16"`, `"fp8"`, `"mix"` | Kernel precision mode; default `"bf16"`. Requires MindIE-SD with `sparse_attention(precision=...)` |
 | `skip_layers` | selector such as `"0-3,38"` | DiT blocks kept dense |
 
 ```bash
@@ -51,6 +53,12 @@ RainFusion requires Ascend NPU and `mindiesd`. Selecting it on another
 platform raises. It is incompatible with ring sequence parallelism because
 the kernel needs the complete key sequence for ranking; use Ulysses sequence
 parallelism with `ring_degree=1`.
+
+The `precision` knob requires a MindIE-SD release whose `sparse_attention`
+accepts `precision=`; older releases accept it through `**kwargs` but
+silently ignore it and run the BF16 path. `RAINFUSION_ATTN` raises at runtime
+when a non-`bf16` precision is requested without that support, so pin a
+compatible MindIE-SD release when using `precision="mix"` or `"fp8"`.
 
 ## Geometry handling
 

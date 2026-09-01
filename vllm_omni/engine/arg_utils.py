@@ -397,7 +397,7 @@ class OmniEngineArgs(EngineArgs):
                         candidate = os.path.join(local_dir, tokenizer_subfolder)
                         if os.path.isdir(candidate):
                             self.tokenizer = candidate
-                            logger.info("Downloaded tokenizer from %s/%s", model_path, subfolder)
+                            logger.info("Downloaded tokenizer from %s/%s", model_path, tokenizer_subfolder)
                     except Exception as e:
                         logger.warning("Failed to download tokenizer subfolder: %s", e)
 
@@ -548,6 +548,7 @@ class OrchestratorArgs:
     diffusers_call_kwargs: str = "{}"
     ulysses_degree: int | None = None
     ulysses_mode: str = "strict"
+    ulysses_a2a_permute: bool | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     diffusion_quantization_config: str | None = None
@@ -583,7 +584,6 @@ class OrchestratorArgs:
     cfg_parallel_size: int = 1
     vae_patch_parallel_size: int = 1
     vae_parallel_mode: str = "tile"
-    text_encoder_tp_size: int = 1
     default_sampling_params: str | None = None
     max_generated_image_size: int | None = None
     tts_max_instructions_length: int | None = None

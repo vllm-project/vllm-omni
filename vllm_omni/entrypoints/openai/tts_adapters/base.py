@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Base contract for per-model TTS serving adapters.
 
 This package factors the per-model ``if self._tts_model_type == ...`` dispatch
@@ -11,7 +12,7 @@ See the RFC for the full design (issue #4327).
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -67,6 +68,14 @@ def apply_max_new_tokens(
     sampling_params_list = copy.deepcopy(sampling_params_list)
     sampling_params_list[0].max_tokens = request.max_new_tokens
     return sampling_params_list
+
+
+class TTSGenerationError(RuntimeError):
+    """A completed TTS generation that must not be returned as valid audio."""
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 @dataclass
@@ -153,6 +162,8 @@ class TTSModelAdapter(ABC):
     detect_priority: ClassVar[int] = 100
     #: Serving backend: ``"ar"`` (engine_client) or ``"diffusion"``.
     backend: ClassVar[str] = "ar"
+    #: Whether streaming entrypoints must retain terminal metrics for validation.
+    validates_generation: ClassVar[bool] = False
     #: Whether the model consumes ``request.speed`` in its native parameters.
     native_speed_control: ClassVar[bool] = False
 
@@ -233,6 +244,21 @@ class TTSModelAdapter(ABC):
         """
         return sampling_params_list
 
+    def validate_generation(
+        self,
+        tts_params: Mapping[str, object],
+        *,
+        stage0_finish_reason: str | None,
+        output_tokens: int,
+    ) -> None:
+        """Reject a completed generation that is invalid for this model.
+
+        Adapters that override this hook must also set
+        :attr:`validates_generation` so streaming entrypoints retain the
+        terminal metrics needed by the validation without charging that cost
+        to unrelated TTS models.
+        """
+
     async def warmup(self) -> None:
         return
 
@@ -304,5 +330,6 @@ __all__ = [
     "OutputPolicy",
     "PreparedRequest",
     "SpeechServingContext",
+    "TTSGenerationError",
     "TTSModelAdapter",
 ]

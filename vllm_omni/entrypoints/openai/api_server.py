@@ -64,7 +64,14 @@ from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAISer
 from vllm.entrypoints.pooling.pooling.serving import ServingPooling
 from vllm.entrypoints.pooling.scoring.serving import ServingScores
 from vllm.entrypoints.scale_out.token_in_token_out.serving import ServingTokens
-from vllm.entrypoints.serve import create_error_response
+
+# vLLM < 0.28 keeps create_error_response under serve.utils (it is not
+# re-exported from vllm.entrypoints.serve); 0.28+ moved it under
+# serve.exception_handling and re-exports it from the package root.
+try:
+    from vllm.entrypoints.serve import create_error_response
+except ImportError:
+    from vllm.entrypoints.serve.utils.error_response import create_error_response
 
 # vLLM moved `base` from openai.basic.api_router to serve.instrumentator.basic.
 # Keep a fallback for older/newer upstream layouts during rebase windows.
@@ -615,6 +622,9 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             await shutdown_task
         finally:
             state = getattr(app, "state", None)
+            serving_video = getattr(state, "openai_serving_video", None) if state is not None else None
+            if serving_video is not None:
+                serving_video.shutdown()
             serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
             if serving_speech is not None:
                 serving_speech.shutdown()
@@ -825,6 +835,8 @@ async def omni_init_app_state(
             diffusion_engine=engine_client,
             model_name=model_name,
             stage_configs=diffusion_stage_configs,
+            allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
+            allowed_media_domains=getattr(args, "allowed_media_domains", None),
         )
         state.openai_serving_duplex = None
         state.openai_streaming_speech = None

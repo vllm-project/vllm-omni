@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -47,6 +47,7 @@ def build_parallel_attention_strategy(
     ulysses_degree = getattr(p, "ulysses_degree", 1)
     ring_degree = getattr(p, "ring_degree", 1)
     allgather_degree = getattr(p, "allgather_degree", 1)
+    ulysses_a2a_permute = getattr(p, "ulysses_a2a_permute", False)
 
     try:
         sp_group = get_sp_group()
@@ -83,6 +84,7 @@ def build_parallel_attention_strategy(
             scatter_idx=scatter_idx,
             gather_idx=gather_idx,
             use_sync=use_sync,
+            ulysses_a2a_permute=ulysses_a2a_permute,
         )
 
     # Pure Ring Attention

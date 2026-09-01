@@ -91,6 +91,20 @@ def resolve_ref_audio() -> Path:
     return ref_audio
 
 
+def duplex_camera_frames(*, seconds: int, cache_dir: Path) -> list[str]:
+    """Base64 JPEG frames of a moving synthetic scene, one per second.
+
+    Mirrors what the realtime web client captures (1 fps, no client-side
+    resize: the server normalizes at ``scale_resolution=448``).
+    """
+    from tests.e2e.online_serving.helpers.minicpmo_realtime_duplex_scenarios import _video_frames_from_file
+    from tests.helpers.media import generate_synthetic_video
+
+    video = generate_synthetic_video(448, 448, 30 * seconds, cache_dir=cache_dir)
+    frames, _ = _video_frames_from_file(Path(video["file_path"]))
+    return frames
+
+
 def realtime_url(omni_server) -> str:
     return f"ws://{omni_server.host}:{omni_server.port}/v1/realtime?duplex=1"
 
@@ -113,6 +127,8 @@ def demo_args(
         output_audio_format="pcm16",
         chunk_ms=200,
         realtime_input=True,
+        input_video=None,
+        stack_frames=1,
         first_turn_ms=1400,
         turn_duration_ms=[],
         first_turn_transcript="duplex CI speech",

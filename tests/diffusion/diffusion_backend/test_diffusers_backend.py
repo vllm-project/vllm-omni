@@ -9,6 +9,7 @@ import torch
 from diffusers import DiffusionPipeline  # pyright: ignore[reportPrivateImportUsage]
 from PIL import Image
 
+import vllm_omni.diffusion.data as diffusion_data
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient, dummy_messages_from_mix_data
 from vllm_omni.diffusion.data import (
@@ -628,6 +629,46 @@ class TestPipelineArgumentsHandling:
         )
         with pytest.raises(ValueError):
             pipeline.forward(DiffusionRequestBatch(requests=[problematic_request]))
+
+        interpolation_request = _make_request(
+            sampling_params=OmniDiffusionSamplingParams(
+                enable_frame_interpolation=True,
+            ),
+        )
+        with pytest.raises(ValueError, match="Frame interpolation is not supported with the Diffusers backend"):
+            pipeline.forward(DiffusionRequestBatch(requests=[interpolation_request]))
+
+    def test_diffusers_config_preserves_checkpoint_class_for_metadata(self, mocker):
+        class MockWanImageToVideoPipeline:
+            pass
+
+        od_config = _make_od_config(model_class_name=None)
+        mocker.patch(
+            "vllm_omni.diffusion.utils.hf_utils.get_diffusion_model_index",
+            return_value={"_class_name": "WanImageToVideoPipeline"},
+        )
+        mocker.patch.object(
+            diffusion_data,
+            "diffusers",
+            SimpleNamespace(WanImageToVideoPipeline=MockWanImageToVideoPipeline),
+        )
+        mocker.patch.object(OmniDiffusionConfig, "update_multimodal_support")
+
+        od_config.enrich_config()
+
+        assert od_config.model_class_name == "WanImageToVideoPipeline"
+        assert od_config.diffusers_pipeline_cls is MockWanImageToVideoPipeline
+
+    def test_diffusers_config_falls_back_to_adapter_without_pipeline_index(self, mocker):
+        od_config = _make_od_config(model_class_name=None)
+        mocker.patch(
+            "vllm_omni.diffusion.utils.hf_utils.get_diffusion_model_index",
+            return_value=None,
+        )
+
+        od_config.enrich_config()
+
+        assert od_config.model_class_name == "DiffusersAdapterPipeline"
 
 
 @pytest.mark.advanced_model

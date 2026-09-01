@@ -245,6 +245,160 @@ class TestDistributedLayerwiseOffloadHook:
         )
         torch.testing.assert_close(rank0_block.weight_scale, expected_scale)
 
+    def test_allgather_reconstructs_online_int8_weight_and_scale(
+        self,
+        patched_offload_runtime,
+        monkeypatch,
+    ):
+        """DLO must reconstruct finalized online-INT8 tensors byte-for-byte.
+
+        One block carries both finalized online-INT8 layouts: the NPU method
+        leaves a contiguous pre-transposed (K, N) int8 weight with a 1-D fp32
+        per-channel scale, while the CUDA method leaves a transposed-view
+        weight (stride (1, K)) with a scalar fp32 scale.  The int8 and fp32
+        dtype groups must survive the flat-shard AllGather independently.
+        """
+
+        class OnlineInt8Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                logical = torch.arange(1.0, 13.0).reshape(3, 4)
+                # NPU online int8: qweight.t().contiguous() -> (K, N), 1-D scale
+                self.npu_weight = nn.Parameter(logical.t().contiguous().to(torch.int8), requires_grad=False)
+                self.npu_weight_scale = nn.Parameter(torch.tensor([2.0, 3.0, 4.0]), requires_grad=False)
+                # CUDA online int8: Parameter(qweight.t().data) -> transposed
+                # view (stride (1, K)) over the (N, K) storage, scalar scale
+                self.cuda_weight = nn.Parameter((logical + 100).to(torch.int8).t(), requires_grad=False)
+                self.cuda_weight_scale = nn.Parameter(torch.tensor([0.5]), requires_grad=False)
+
+        current_block = OnlineInt8Block()
+        rank0_block = OnlineInt8Block()
+        rank1_block = OnlineInt8Block()
+        expected = {name: tensor.detach().clone() for name, tensor in rank0_block.named_parameters()}
+        expected_strides = {name: tensor.stride() for name, tensor in rank0_block.named_parameters()}
+
+        def make_hook(block: OnlineInt8Block, rank: int) -> DistributedLayerwiseOffloadHook:
+            return DistributedLayerwiseOffloadHook(
+                next_block=block,
+                device=torch.device("cpu"),
+                dp_group=object(),
+                dp_size=2,
+                rank=rank,
+                copy_stream=DummyStream(),
+                comm_stream=DummyStream(),
+                pin_memory=False,
+            )
+
+        rank0_hook = make_hook(rank0_block, 0)
+        rank1_hook = make_hook(rank1_block, 1)
+        rank0_hook.initialize_hook(current_block)
+        rank1_hook.initialize_hook(OnlineInt8Block())
+        rank0_hook.gpu_shard_buffers = [
+            {dtype: torch.empty_like(shard) for dtype, shard in rank0_hook.cpu_shards.items()} for _ in range(2)
+        ]
+
+        def fake_allgather(output, local_shard, *, group):
+            del group
+            remote_shard = rank1_hook.cpu_shards[local_shard.dtype]
+            shard_size = local_shard.numel()
+            output[:shard_size].copy_(local_shard)
+            output[shard_size : 2 * shard_size].copy_(remote_shard)
+
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_allgather)
+        rank0_hook.prefetch_layer(slot=0, non_blocking=False)
+
+        for name, tensor in rank0_block.named_parameters():
+            assert tensor.stride() == expected_strides[name]
+            torch.testing.assert_close(
+                tensor.float(),
+                expected[name].float(),
+                rtol=0,
+                atol=0,
+            )
+
+    def test_allgather_reconstructs_online_mxfp8_weight_and_scale(
+        self,
+        patched_offload_runtime,
+        monkeypatch,
+    ):
+        """DLO must reconstruct finalized online-MXFP8 tensors byte-for-byte.
+
+        One block carries both finalized online-MXFP8 layouts: the NPU method
+        leaves a contiguous pre-transposed (K, N) fp8 weight with a contiguous
+        (K_groups/2, N, 2) e8m0 block scale, while the vLLM-kernel method
+        (XPU) leaves an (N, K) fp8 weight whose e8m0 scale is a transposed
+        view over a contiguous (K/32, N) buffer.  The fp8 and e8m0 dtype
+        groups must survive the flat-shard AllGather independently.
+        """
+
+        class OnlineMxfp8Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                logical = torch.arange(1.0, 13.0).reshape(3, 4)
+                # Build scales from raw e8m0 bit patterns (1 byte/elem).
+                npu_scale_bits = torch.arange(1, 13, dtype=torch.uint8).reshape(2, 3, 2)
+                kernel_scale_bits = torch.arange(1, 7, dtype=torch.uint8).reshape(2, 3)
+                # NPU online mxfp8: (N, K).t().contiguous() -> (K, N) fp8
+                # weight, contiguous (K_groups/2, N, 2) e8m0 scale
+                self.npu_weight = nn.Parameter(logical.t().contiguous().to(torch.float8_e4m3fn), requires_grad=False)
+                self.npu_weight_scale = nn.Parameter(npu_scale_bits.view(torch.float8_e8m0fnu), requires_grad=False)
+                # vLLM-kernel online mxfp8 (XPU): (N, K) fp8 weight, e8m0
+                # scale kept as a transposed view (stride (1, K/32)) over the
+                # contiguous (K/32, N) storage
+                self.kernel_weight = nn.Parameter((logical + 100).to(torch.float8_e4m3fn), requires_grad=False)
+                self.kernel_weight_scale = nn.Parameter(
+                    kernel_scale_bits.view(torch.float8_e8m0fnu).t(), requires_grad=False
+                )
+
+        current_block = OnlineMxfp8Block()
+        rank0_block = OnlineMxfp8Block()
+        rank1_block = OnlineMxfp8Block()
+        expected = {name: tensor.detach().clone() for name, tensor in rank0_block.named_parameters()}
+        expected_strides = {name: tensor.stride() for name, tensor in rank0_block.named_parameters()}
+
+        def make_hook(block: OnlineMxfp8Block, rank: int) -> DistributedLayerwiseOffloadHook:
+            return DistributedLayerwiseOffloadHook(
+                next_block=block,
+                device=torch.device("cpu"),
+                dp_group=object(),
+                dp_size=2,
+                rank=rank,
+                copy_stream=DummyStream(),
+                comm_stream=DummyStream(),
+                pin_memory=False,
+            )
+
+        rank0_hook = make_hook(rank0_block, 0)
+        rank1_hook = make_hook(rank1_block, 1)
+        rank0_hook.initialize_hook(current_block)
+        rank1_hook.initialize_hook(OnlineMxfp8Block())
+        rank0_hook.gpu_shard_buffers = [
+            {dtype: torch.empty_like(shard) for dtype, shard in rank0_hook.cpu_shards.items()} for _ in range(2)
+        ]
+
+        def fake_allgather(output, local_shard, *, group):
+            del group
+            remote_shard = rank1_hook.cpu_shards[local_shard.dtype]
+            shard_size = local_shard.numel()
+            output[:shard_size].copy_(local_shard)
+            output[shard_size : 2 * shard_size].copy_(remote_shard)
+
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_allgather)
+        rank0_hook.prefetch_layer(slot=0, non_blocking=False)
+
+        for name, tensor in rank0_block.named_parameters():
+            assert tensor.stride() == expected_strides[name]
+            # Compare raw bytes in logical order: float8/e8m0 CPU upcasts are
+            # version-sensitive, while contiguous().view(uint8) is an exact
+            # byte-level comparison for both contiguous and transposed-view
+            # parameters.
+            torch.testing.assert_close(
+                tensor.detach().contiguous().view(torch.uint8),
+                expected[name].contiguous().view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+
     def test_dtensor_wrapper_preserved_across_prefetch_and_offload(self, dist_group, patched_offload_runtime):
         """DTensor wrapper should be preserved through prefetch/offload cycle."""
         current_block = TinyBlock(_make_values(1.0))

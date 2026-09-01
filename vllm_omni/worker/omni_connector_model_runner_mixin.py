@@ -179,6 +179,7 @@ class OmniConnectorModelRunnerMixin:
         # does not have segment boundary infrastructure; multi-segment support
         # is only available via chunk_transfer_adapter (distributed path).
         self._ramp_chunk_count: dict[str, int] = defaultdict(int)
+        self._adaptive_states: dict[str, Any] = {}
         # Send-side async accumulation / staging buffer. Receive-side payload
         # ownership lives in ``_local_stage_payload_cache``.
         self._send_side_request_payload: dict[str, dict[str, Any]] = {}
@@ -329,6 +330,7 @@ class OmniConnectorModelRunnerMixin:
                 self._code_prompt_token_ids.pop(k, None)
                 self._cached_ic.pop(k, None)
                 self._ramp_chunk_count.pop(k, None)
+                self._adaptive_states.pop(k, None)
             self._kv_pending_transfers.pop(req_id, None)
             self._kv_active_transfers.discard(req_id)
             self._kv_completed_transfers.discard(req_id)
@@ -2027,6 +2029,7 @@ class OmniConnectorModelRunnerMixin:
                 self._code_prompt_token_ids.pop(cleanup_req_id, None)
                 self._cached_ic.pop(cleanup_req_id, None)
                 self._ramp_chunk_count.pop(cleanup_req_id, None)
+                self._adaptive_states.pop(cleanup_req_id, None)
 
     # ------------------------------------------------------------------ #
     #  Payload accumulation  (ported from OmniChunkTransferAdapter)
