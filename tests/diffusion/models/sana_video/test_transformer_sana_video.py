@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 import torch
@@ -450,6 +450,203 @@ def test_linear_attention_requires_rotary_embeddings():
 
     with pytest.raises(ValueError, match="requires rotary_emb"):
         attention(torch.randn(1, 4, 24))
+
+
+def test_paired_rope_falls_back_to_eager_on_cpu(monkeypatch):
+    import vllm_omni.diffusion.models.sana_video.transformer_sana_video as sana_video
+
+    query = torch.randn(2, 7, 3, 12, dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    cos = torch.randn(1, 7, 1, 12, dtype=torch.bfloat16)
+    sin = torch.randn_like(cos)
+    assert not sana_video.can_use_fused_interleaved_rope(query, key, cos, sin)
+    monkeypatch.setattr(
+        sana_video,
+        "fused_interleaved_rope",
+        lambda *_args: pytest.fail("CPU fallback must not launch the fused kernel"),
+    )
+
+    query_out, key_out = sana_video.apply_interleaved_rotary_emb_pair(query, key, cos, sin)
+
+    assert torch.equal(query_out, sana_video.apply_interleaved_rotary_emb(query, cos, sin))
+    assert torch.equal(key_out, sana_video.apply_interleaved_rotary_emb(key, cos, sin))
+
+
+def test_paired_rope_first_sight_success_enters_fused_steady_state(monkeypatch):
+    import vllm_omni.diffusion.models.sana_video.transformer_sana_video as sana_video
+
+    query = torch.randn(1, 3, 2, 12, dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    cos = torch.randn(1, 3, 1, 12, dtype=torch.bfloat16)
+    sin = torch.randn_like(cos)
+    state = sana_video._SanaVideoRoPEFusionState()
+    original_eager = sana_video.apply_interleaved_rotary_emb
+    eager_calls = 0
+    fused_calls = 0
+
+    def counting_eager(*args):
+        nonlocal eager_calls
+        eager_calls += 1
+        return original_eager(*args)
+
+    def exact_fused(q, k, table_cos, table_sin):
+        nonlocal fused_calls
+        fused_calls += 1
+        return original_eager(q, table_cos, table_sin), original_eager(k, table_cos, table_sin)
+
+    monkeypatch.setattr(sana_video, "_SANA_VIDEO_ROPE_FUSION_STATE", state)
+    monkeypatch.setattr(sana_video, "can_use_fused_interleaved_rope", lambda *_args: True)
+    monkeypatch.setattr(sana_video, "fused_interleaved_rope", exact_fused)
+    monkeypatch.setattr(sana_video, "apply_interleaved_rotary_emb", counting_eager)
+    monkeypatch.setattr(sana_video, "_can_verify_sana_video_rope", lambda: True)
+
+    first = sana_video.apply_interleaved_rotary_emb_pair(query, key, cos, sin)
+    entry = state.entry_for(query, cos)
+    assert entry.verified
+    assert not entry.disabled
+    assert fused_calls == 1
+    assert eager_calls == 2
+
+    monkeypatch.setattr(sana_video, "_can_verify_sana_video_rope", lambda: False)
+    second = sana_video.apply_interleaved_rotary_emb_pair(query, key, cos, sin)
+
+    assert fused_calls == 2
+    assert eager_calls == 2
+    assert all(torch.equal(a, b) for a, b in zip(first, second, strict=True))
+
+
+def test_paired_rope_verifies_table_dtypes_independently(monkeypatch):
+    import vllm_omni.diffusion.models.sana_video.transformer_sana_video as sana_video
+
+    query = torch.randn(1, 3, 2, 12, dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    cos_bf16 = torch.randn(1, 3, 1, 12, dtype=torch.bfloat16)
+    sin_bf16 = torch.randn_like(cos_bf16)
+    cos_fp32 = cos_bf16.float()
+    sin_fp32 = sin_bf16.float()
+    state = sana_video._SanaVideoRoPEFusionState()
+    original_eager = sana_video.apply_interleaved_rotary_emb
+    fused_table_dtypes = []
+
+    def exact_fused(q, k, table_cos, table_sin):
+        fused_table_dtypes.append(table_cos.dtype)
+        return original_eager(q, table_cos, table_sin), original_eager(k, table_cos, table_sin)
+
+    monkeypatch.setattr(sana_video, "_SANA_VIDEO_ROPE_FUSION_STATE", state)
+    monkeypatch.setattr(sana_video, "can_use_fused_interleaved_rope", lambda *_args: True)
+    monkeypatch.setattr(sana_video, "fused_interleaved_rope", exact_fused)
+    monkeypatch.setattr(sana_video, "_can_verify_sana_video_rope", lambda: True)
+
+    sana_video.apply_interleaved_rotary_emb_pair(query, key, cos_bf16, sin_bf16)
+    sana_video.apply_interleaved_rotary_emb_pair(query, key, cos_fp32, sin_fp32)
+
+    assert fused_table_dtypes == [torch.bfloat16, torch.float32]
+    assert state.entry_for(query, cos_bf16).verified
+    assert state.entry_for(query, cos_fp32).verified
+
+
+def test_paired_rope_disables_fusion_after_first_sight_mismatch(monkeypatch):
+    import vllm_omni.diffusion.models.sana_video.transformer_sana_video as sana_video
+
+    query = torch.randn(1, 3, 2, 12, dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    cos = torch.randn(1, 3, 1, 12, dtype=torch.bfloat16)
+    sin = torch.randn_like(cos)
+    state = sana_video._SanaVideoRoPEFusionState()
+    fused_calls = 0
+
+    def mismatched_fused(q, k, _cos, _sin):
+        nonlocal fused_calls
+        fused_calls += 1
+        return torch.zeros_like(q), torch.zeros_like(k)
+
+    monkeypatch.setattr(sana_video, "_SANA_VIDEO_ROPE_FUSION_STATE", state)
+    monkeypatch.setattr(sana_video, "can_use_fused_interleaved_rope", lambda *_args: True)
+    monkeypatch.setattr(sana_video, "fused_interleaved_rope", mismatched_fused)
+    monkeypatch.setattr(sana_video, "_can_verify_sana_video_rope", lambda: True)
+
+    expected = (
+        sana_video.apply_interleaved_rotary_emb(query, cos, sin),
+        sana_video.apply_interleaved_rotary_emb(key, cos, sin),
+    )
+    first = sana_video.apply_interleaved_rotary_emb_pair(query, key, cos, sin)
+    second = sana_video.apply_interleaved_rotary_emb_pair(query, key, cos, sin)
+
+    entry = state.entry_for(query, cos)
+    assert entry.disabled
+    assert not entry.verified
+    assert fused_calls == 1
+    assert all(torch.equal(actual, reference) for actual, reference in zip(first, expected, strict=True))
+    assert all(torch.equal(actual, reference) for actual, reference in zip(second, expected, strict=True))
+
+
+def test_paired_rope_disables_fusion_after_kernel_exception(monkeypatch):
+    import vllm_omni.diffusion.models.sana_video.transformer_sana_video as sana_video
+
+    query = torch.randn(1, 3, 2, 12, dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    cos = torch.randn(1, 3, 1, 12, dtype=torch.bfloat16)
+    sin = torch.randn_like(cos)
+    state = sana_video._SanaVideoRoPEFusionState()
+    fused_calls = 0
+
+    def failing_fused(*_args):
+        nonlocal fused_calls
+        fused_calls += 1
+        raise RuntimeError("synthetic kernel failure")
+
+    monkeypatch.setattr(sana_video, "_SANA_VIDEO_ROPE_FUSION_STATE", state)
+    monkeypatch.setattr(sana_video, "can_use_fused_interleaved_rope", lambda *_args: True)
+    monkeypatch.setattr(sana_video, "fused_interleaved_rope", failing_fused)
+    monkeypatch.setattr(sana_video, "_can_verify_sana_video_rope", lambda: True)
+
+    expected = (
+        sana_video.apply_interleaved_rotary_emb(query, cos, sin),
+        sana_video.apply_interleaved_rotary_emb(key, cos, sin),
+    )
+    first = sana_video.apply_interleaved_rotary_emb_pair(query, key, cos, sin)
+    second = sana_video.apply_interleaved_rotary_emb_pair(query, key, cos, sin)
+
+    entry = state.entry_for(query, cos)
+    assert entry.disabled
+    assert not entry.verified
+    assert fused_calls == 1
+    assert all(torch.equal(actual, reference) for actual, reference in zip(first, expected, strict=True))
+    assert all(torch.equal(actual, reference) for actual, reference in zip(second, expected, strict=True))
+
+
+@pytest.mark.parametrize(("is_compiling", "is_capturing"), [(True, False), (False, True)])
+def test_paired_rope_skips_first_sight_during_compile_or_capture(
+    monkeypatch,
+    is_compiling,
+    is_capturing,
+):
+    import vllm_omni.diffusion.models.sana_video.transformer_sana_video as sana_video
+
+    query = torch.randn(1, 3, 2, 12, dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    cos = torch.randn(1, 3, 1, 12, dtype=torch.bfloat16)
+    sin = torch.randn_like(cos)
+    state = sana_video._SanaVideoRoPEFusionState()
+
+    monkeypatch.setattr(sana_video, "_SANA_VIDEO_ROPE_FUSION_STATE", state)
+    monkeypatch.setattr(sana_video, "can_use_fused_interleaved_rope", lambda *_args: True)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: is_compiling)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: is_capturing)
+    monkeypatch.setattr(
+        sana_video,
+        "fused_interleaved_rope",
+        lambda *_args: pytest.fail("fused path must not run before first-sight verification"),
+    )
+
+    actual = sana_video.apply_interleaved_rotary_emb_pair(query, key, cos, sin)
+
+    entry = state.entry_for(query, cos)
+    assert not entry.disabled
+    assert not entry.verified
+    assert torch.equal(actual[0], sana_video.apply_interleaved_rotary_emb(query, cos, sin))
+    assert torch.equal(actual[1], sana_video.apply_interleaved_rotary_emb(key, cos, sin))
 
 
 def test_linear_attention_bfloat16_matches_diffusers_mixed_precision():

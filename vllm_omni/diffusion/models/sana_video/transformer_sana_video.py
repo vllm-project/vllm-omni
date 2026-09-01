@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2025 The HuggingFace Team and SANA-Video Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,15 +17,148 @@
 
 import math
 import numbers
+import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, fields
 
 import torch
 from torch import nn
+from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
+from vllm_omni.diffusion.layers.fused_interleaved_rope import (
+    can_use_fused_interleaved_rope,
+    fused_interleaved_rope,
+)
+
+logger = init_logger(__name__)
+
+
+class _SanaVideoRoPEFusionEntry:
+    def __init__(self) -> None:
+        self.verified = False
+        self.disabled = False
+        self.verification_lock = threading.Lock()
+
+    def disable(self) -> None:
+        self.verified = False
+        self.disabled = True
+
+
+class _SanaVideoRoPEFusionState:
+    """Process-local first-sight state for each compiled arithmetic variant."""
+
+    def __init__(self) -> None:
+        self._entries: dict[tuple[torch.device, torch.dtype, int, int], _SanaVideoRoPEFusionEntry] = {}
+        self._entries_lock = threading.Lock()
+        self._unverified_entry = _SanaVideoRoPEFusionEntry()
+
+    def entry_for(
+        self,
+        query: torch.Tensor,
+        freqs_cos: torch.Tensor,
+    ) -> _SanaVideoRoPEFusionEntry:
+        # Sequence length is a non-specialized runtime kernel argument. Device,
+        # table dtype, heads, and head dimension still select distinct Triton
+        # variants, so each gets independent verification and JIT warmup.
+        key = (query.device, freqs_cos.dtype, query.shape[2], query.shape[3])
+        entry = self._entries.get(key)
+        if entry is not None:
+            return entry
+        if torch.compiler.is_compiling():
+            # Dynamo cannot enter a Python lock in a full graph.  Compilation
+            # is read-only: a prewarmed key selects fused, while an unseen key
+            # receives this immutable-in-practice sentinel and stays eager.
+            return self._unverified_entry
+        with self._entries_lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = _SanaVideoRoPEFusionEntry()
+                self._entries[key] = entry
+            return entry
+
+
+_SANA_VIDEO_ROPE_FUSION_STATE = _SanaVideoRoPEFusionState()
+
+
+def apply_interleaved_rotary_emb(
+    hidden_states: torch.Tensor,
+    freqs_cos: torch.Tensor,
+    freqs_sin: torch.Tensor,
+) -> torch.Tensor:
+    """Apply Diffusers-compatible interleaved real RoPE to ``[B, N, H, D]``."""
+    x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
+    cos = freqs_cos[..., 0::2]
+    sin = freqs_sin[..., 1::2]
+    output = torch.empty_like(hidden_states)
+    output[..., 0::2] = x1 * cos - x2 * sin
+    output[..., 1::2] = x1 * sin + x2 * cos
+    return output.type_as(hidden_states)
+
+
+def _can_verify_sana_video_rope() -> bool:
+    if torch.compiler.is_compiling():
+        return False
+    return not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+
+
+def apply_interleaved_rotary_emb_pair(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    freqs_cos: torch.Tensor,
+    freqs_sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply paired RoPE with first-sight bit-exact verification and fallback."""
+
+    def eager() -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            apply_interleaved_rotary_emb(query, freqs_cos, freqs_sin),
+            apply_interleaved_rotary_emb(key, freqs_cos, freqs_sin),
+        )
+
+    supported = can_use_fused_interleaved_rope(query, key, freqs_cos, freqs_sin)
+    if not supported:
+        return eager()
+
+    entry = _SANA_VIDEO_ROPE_FUSION_STATE.entry_for(query, freqs_cos)
+    if entry.disabled:
+        return eager()
+
+    def run_fused(*, verify: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        try:
+            fused = fused_interleaved_rope(query, key, freqs_cos, freqs_sin)
+        except Exception as exc:
+            if torch.compiler.is_compiling():
+                raise
+            entry.disable()
+            logger.warning_once("Disabling SANA-Video fused RoPE fast path: %s", exc)
+            return eager()
+
+        if not verify:
+            return fused
+
+        reference = eager()
+        if torch.equal(fused[0], reference[0]) and torch.equal(fused[1], reference[1]):
+            entry.verified = True
+            return fused
+        entry.disable()
+        logger.warning_once("SANA-Video fused RoPE is not bit-exact on this platform; falling back to eager")
+        return reference
+
+    if entry.verified:
+        return run_fused(verify=False)
+    if not _can_verify_sana_video_rope():
+        return eager()
+
+    # Only the first eligible request for a device/table-dtype pair pays for
+    # JIT plus eager comparison.  Concurrent requests wait and then use the
+    # already verified (or permanently disabled) result.
+    with entry.verification_lock:
+        if entry.disabled:
+            return eager()
+        return run_fused(verify=not entry.verified)
 
 
 @dataclass
@@ -474,21 +610,7 @@ class SanaLinearAttention(nn.Module):
         query = torch.relu(query)
         key = torch.relu(key)
 
-        def apply_rotary_emb(
-            hidden_states: torch.Tensor,
-            freqs_cos: torch.Tensor,
-            freqs_sin: torch.Tensor,
-        ):
-            x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
-            cos = freqs_cos[..., 0::2]
-            sin = freqs_sin[..., 1::2]
-            out = torch.empty_like(hidden_states)
-            out[..., 0::2] = x1 * cos - x2 * sin
-            out[..., 1::2] = x1 * sin + x2 * cos
-            return out.type_as(hidden_states)
-
-        query_rotate = apply_rotary_emb(query, *rotary_emb)
-        key_rotate = apply_rotary_emb(key, *rotary_emb)
+        query_rotate, key_rotate = apply_interleaved_rotary_emb_pair(query, key, *rotary_emb)
 
         # B,H,C,N
         query = query.permute(0, 2, 3, 1)
