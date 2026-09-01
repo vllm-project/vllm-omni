@@ -59,7 +59,7 @@ def _parse_chunk_metadata(output: OmniRequestOutput) -> ARDiffusionChunkMetadata
         raise ValueError("AR-Diffusion output metadata request_id must be a non-empty string.")
     if isinstance(chunk_index, bool) or not isinstance(chunk_index, int) or chunk_index < 0:
         raise ValueError("AR-Diffusion output metadata chunk_index must be a non-negative integer.")
-    if not isinstance(applied_event_ids, Sequence) or isinstance(applied_event_ids, str | bytes | bytearray):
+    if not isinstance(applied_event_ids, Sequence) or isinstance(applied_event_ids, (str, bytes, bytearray)):
         raise ValueError("AR-Diffusion output metadata applied_event_ids must be a sequence.")
     event_ids = tuple(applied_event_ids)
     if any(isinstance(event_id, bool) or not isinstance(event_id, int) or event_id < 0 for event_id in event_ids):

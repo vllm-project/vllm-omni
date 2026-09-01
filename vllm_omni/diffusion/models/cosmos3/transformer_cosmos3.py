@@ -1490,6 +1490,61 @@ class Cosmos3VFMTransformer(nn.Module):
 
     # -- RoPE computation ----------------------------------------------------
 
+    def encode_und_kv(
+        self,
+        text_ids: torch.Tensor,
+        text_mask: torch.Tensor,
+        *,
+        dtype: torch.dtype | None = None,
+        freqs_und: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], int]:
+        """Encode UND text tokens and return K/V trimmed to real prompt length.
+
+        ``freqs_und`` lets the regular Cosmos3 forward reuse the text mRoPE
+        frequencies it computes alongside GEN frequencies. Specialized
+        pipelines can omit it and reuse the complete UND encoding path.
+        """
+        if text_ids.ndim != 2 or text_ids.shape != text_mask.shape:
+            raise ValueError(
+                "Cosmos3 text IDs/mask must have matching rank-two shapes, "
+                f"got {tuple(text_ids.shape)} and {tuple(text_mask.shape)}."
+            )
+        text_lengths = text_mask.sum(dim=1).long()
+        min_real_len = int(text_lengths.min().item())
+        max_real_len = int(text_lengths.max().item())
+        if min_real_len <= 0:
+            raise ValueError("Cosmos3 prompts must contain at least one real text token.")
+        if min_real_len != max_real_len:
+            raise ValueError(
+                "Cosmos3 requires identical real text lengths within a batch "
+                f"(got min={min_real_len}, max={max_real_len})."
+            )
+
+        if freqs_und is None:
+            text_positions = []
+            padded_length = text_ids.shape[1]
+            for real_len_tensor in text_lengths:
+                real_len = int(real_len_tensor.item())
+                position_ids, _ = compute_mrope_position_ids_text(real_len, temporal_offset=0)
+                if real_len < padded_length:
+                    position_ids = torch.cat(
+                        [position_ids, torch.zeros(3, padded_length - real_len, dtype=position_ids.dtype)],
+                        dim=1,
+                    )
+                text_positions.append(position_ids)
+            position_ids = torch.stack(text_positions, dim=1).to(text_ids.device)
+            rotary_dtype = dtype if dtype is not None else self.proj_in.weight.dtype
+            dummy = torch.empty(0, device=text_ids.device, dtype=rotary_dtype)
+            cos_und, sin_und = self.language_model.rotary_emb(dummy, position_ids=position_ids)
+            freqs_und = cos_und.unsqueeze(2), sin_und.unsqueeze(2)
+
+        with self._offload_context("reasoner"):
+            full_kv = self.language_model(text_ids, freqs_und)
+        # K/V stay replicated; framework Attention head-slices them through
+        # joint_key/value when tensor parallelism is active.
+        trimmed_kv = [(key[:, :max_real_len], value[:, :max_real_len]) for key, value in full_kv]
+        return trimmed_kv, max_real_len
+
     def _compute_rope_freqs(
         self,
         text_mask: torch.Tensor,
@@ -1836,11 +1891,17 @@ class Cosmos3VFMTransformer(nn.Module):
             self.cached_freqs_gen = freqs_gen
 
             if need_kv:
-                with self._offload_context("reasoner"):
-                    cached_kv_full = self.language_model(text_ids, freqs_und)
-                # Trim to real text length (remove padding).  K/V stay replicated;
-                # the framework Attention layer head-slices them via joint_key/value.
-                self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
+                self.cached_kv, encoded_text_len = self.encode_und_kv(
+                    text_ids,
+                    text_mask,
+                    dtype=hidden_states.dtype,
+                    freqs_und=freqs_und,
+                )
+                if encoded_text_len != max_real_len:
+                    raise RuntimeError(
+                        "Cosmos3 UND encoder returned an inconsistent real text length: "
+                        f"{encoded_text_len} != {max_real_len}."
+                    )
 
         with self._offload_context("generator"):
             # Patchify latents and project to hidden space after UND cache

@@ -29,7 +29,7 @@ def _non_negative_int(value: object, *, field: str) -> int:
 
 def _freeze_transport_value(value: Any, *, path: str) -> Any:
     """Copy JSON-like transport data into recursively immutable containers."""
-    if value is None or isinstance(value, str | bool | int | float):
+    if value is None or isinstance(value, (str, bool, int, float)):
         return value
     if isinstance(value, Mapping):
         frozen: dict[str, Any] = {}
@@ -38,7 +38,7 @@ def _freeze_transport_value(value: Any, *, path: str) -> Any:
                 raise ValueError(f"{path} mapping keys must be strings.")
             frozen[key] = _freeze_transport_value(item, path=f"{path}.{key}")
         return MappingProxyType(frozen)
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return tuple(_freeze_transport_value(item, path=f"{path}[]") for item in value)
     raise ValueError(
         f"{path} must contain only transport-safe mappings, sequences, and scalar values; got {type(value).__name__}."
@@ -159,9 +159,9 @@ class ARDiffusionTickRequest:
             raise ValueError(f"{AR_DIFFUSION_TICK_KEY} must be a mapping.")
         raw_event_ids = value.get("applied_event_ids", ())
         raw_controls = value.get("controls", ())
-        if not isinstance(raw_event_ids, Sequence) or isinstance(raw_event_ids, str | bytes):
+        if not isinstance(raw_event_ids, Sequence) or isinstance(raw_event_ids, (str, bytes)):
             raise ValueError("applied_event_ids must be a sequence.")
-        if not isinstance(raw_controls, Sequence) or isinstance(raw_controls, str | bytes):
+        if not isinstance(raw_controls, Sequence) or isinstance(raw_controls, (str, bytes)):
             raise ValueError("controls must be a sequence.")
         return cls(
             session_id=value.get("session_id"),  # type: ignore[arg-type]

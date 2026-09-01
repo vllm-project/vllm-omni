@@ -1,17 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Conditioning-neutral chunk, cache-accounting, and hashing helpers."""
+"""Pure packing, mRoPE, and hashing helpers."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import math
-from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator, Sequence
 
 import torch
 
-from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest
+from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
+    compute_mrope_position_ids_action,
+    compute_mrope_position_ids_vision,
+)
 
 
 def iter_ar_chunk_ranges(start_frame: int, num_frames: int, chunk_size: int) -> Iterator[tuple[int, int]]:
@@ -54,6 +55,146 @@ def iter_clean_commit_frames(
         yield local_idx, frame_idx
 
 
+def interleave_action_vision_tokens(
+    action_tokens: torch.Tensor,
+    vision_tokens: torch.Tensor,
+) -> torch.Tensor:
+    """Pack per-frame hidden states as ``[action, vision]`` supertokens.
+
+    Args:
+        action_tokens: ``[B, T, A, D]``.
+        vision_tokens: ``[B, T, P, D]``.
+    """
+    if action_tokens.ndim != 4 or vision_tokens.ndim != 4:
+        raise ValueError(
+            "Cosmos-Dreams interleaving expects action [B,T,A,D] and vision [B,T,P,D], "
+            f"got {tuple(action_tokens.shape)} and {tuple(vision_tokens.shape)}"
+        )
+    if action_tokens.shape[:2] != vision_tokens.shape[:2] or action_tokens.shape[-1] != vision_tokens.shape[-1]:
+        raise ValueError(
+            "Cosmos-Dreams action/vision batch, frame, and hidden dimensions must match; "
+            f"got {tuple(action_tokens.shape)} and {tuple(vision_tokens.shape)}"
+        )
+    return torch.cat([action_tokens, vision_tokens], dim=2).flatten(1, 2)
+
+
+def split_interleaved_action_vision_tokens(
+    tokens: torch.Tensor,
+    *,
+    num_frames: int,
+    action_tokens_per_frame: int,
+    vision_tokens_per_frame: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Inverse of :func:`interleave_action_vision_tokens`."""
+    if tokens.ndim != 3:
+        raise ValueError(f"Cosmos-Dreams packed tokens must have shape [B,S,D], got {tuple(tokens.shape)}")
+    tokens_per_frame = action_tokens_per_frame + vision_tokens_per_frame
+    expected = num_frames * tokens_per_frame
+    if tokens.shape[1] != expected:
+        raise ValueError(f"Cosmos-Dreams packed length must be {expected}, got {tokens.shape[1]}")
+    framed = tokens.view(tokens.shape[0], num_frames, tokens_per_frame, tokens.shape[-1])
+    return framed[:, :, :action_tokens_per_frame], framed[:, :, action_tokens_per_frame:]
+
+
+def build_interleaved_mrope_position_ids(
+    *,
+    frame_start: int,
+    num_frames: int,
+    grid_h: int,
+    grid_w: int,
+    text_temporal_offset: int,
+    temporal_modality_margin: int,
+    fps: float,
+    base_fps: float = 24.0,
+    temporal_compression_factor: int = 4,
+    enable_fps_modulation: bool = True,
+    action_tokens_per_frame: int = 4,
+    null_action_frames: Iterable[int] = (),
+) -> torch.Tensor:
+    """Build reference-compatible mRoPE IDs in interleaved supertoken order.
+
+    Real action sub-tokens span the interval ending at their associated latent
+    frame. The first null-action supertoken in an AR unit is co-located with
+    its vision frame. Later all-null supertokens retain the architectural real-
+    action IDs used by the reference packer, even though their values are zero.
+    """
+    if frame_start < 0 or num_frames <= 0 or grid_h <= 0 or grid_w <= 0:
+        raise ValueError(
+            "Cosmos-Dreams mRoPE dimensions must be positive and frame_start non-negative; "
+            f"got start={frame_start}, frames={num_frames}, grid={grid_h}x{grid_w}"
+        )
+    if fps <= 0 or base_fps <= 0:
+        raise ValueError(f"Cosmos-Dreams FPS values must be positive, got fps={fps}, base_fps={base_fps}")
+    if action_tokens_per_frame <= 0:
+        raise ValueError(f"Cosmos-Dreams action_tokens_per_frame must be positive, got {action_tokens_per_frame}")
+
+    null_frames = {int(frame) for frame in null_action_frames}
+    patch_count = grid_h * grid_w
+    base_offset = float(text_temporal_offset + temporal_modality_margin)
+    vision_ids, _ = compute_mrope_position_ids_vision(
+        grid_t=num_frames,
+        grid_h=grid_h,
+        grid_w=grid_w,
+        temporal_offset=base_offset,
+        fps=fps,
+        base_fps=base_fps,
+        temporal_compression_factor=temporal_compression_factor,
+        base_temporal_compression_factor=temporal_compression_factor,
+        enable_fps_modulation=enable_fps_modulation,
+        start_frame_offset=frame_start,
+    )
+    # Each action token represents one pixel-rate step ending at its latent
+    # frame. Flattening the frame/action axes gives the base helper the exact
+    # sequence it expects; Dreams only owns the final per-frame interleaving.
+    action_start_offset = frame_start * action_tokens_per_frame - action_tokens_per_frame + 1
+    action_ids, _ = compute_mrope_position_ids_action(
+        grid_t=num_frames * action_tokens_per_frame,
+        temporal_offset=base_offset,
+        action_fps=fps,
+        base_fps=base_fps,
+        base_temporal_compression_factor=temporal_compression_factor,
+        enable_fps_modulation=enable_fps_modulation,
+        start_frame_offset=action_start_offset,
+    )
+
+    action_ids = action_ids.view(3, num_frames, action_tokens_per_frame)
+    vision_ids = vision_ids.view(3, num_frames, patch_count)
+    if frame_start in null_frames:
+        # The first null-action supertoken in an AR unit is colocated with its
+        # vision frame; later null frames retain the architectural action IDs.
+        action_ids[0, 0].fill_(vision_ids[0, 0, 0])
+    return torch.cat([action_ids, vision_ids], dim=2).flatten(1, 2)
+
+
+def zero_null_action_values(
+    value: torch.Tensor,
+    *,
+    num_frames: int,
+    tokens_per_frame: int,
+    action_tokens_per_frame: int,
+    null_frame_indexes: Sequence[int],
+) -> torch.Tensor:
+    """Zero V (not K) for null action slots before persistent storage."""
+    if value.ndim != 4:
+        raise ValueError(f"Cosmos-Dreams K/V must have shape [B,S,H,D], got {tuple(value.shape)}")
+    if value.shape[1] != num_frames * tokens_per_frame:
+        raise ValueError(
+            "Cosmos-Dreams K/V length does not match frame geometry: "
+            f"length={value.shape[1]}, frames={num_frames}, tokens_per_frame={tokens_per_frame}"
+        )
+    if not null_frame_indexes:
+        return value
+    result = value.clone()
+    positions: list[int] = []
+    for frame in null_frame_indexes:
+        if frame < 0 or frame >= num_frames:
+            raise ValueError(f"Cosmos-Dreams null action frame {frame} is outside [0, {num_frames})")
+        start = frame * tokens_per_frame
+        positions.extend(range(start, start + action_tokens_per_frame))
+    result[:, positions] = 0
+    return result
+
+
 def prompt_token_hash(token_ids: Sequence[int] | torch.Tensor) -> str:
     """Stable SHA-256 over prompt token IDs, independent of tensor dtype."""
     if isinstance(token_ids, torch.Tensor):
@@ -62,69 +203,3 @@ def prompt_token_hash(token_ids: Sequence[int] | torch.Tensor) -> str:
         values = [int(value) for value in token_ids]
     payload = json.dumps(values, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()
-
-
-@dataclass(frozen=True)
-class CosmosDreamsKVMemoryEstimate:
-    page_bytes: int
-    managed_blocks: int
-    scratch_blocks: int
-    self_attention_bytes: int
-    scratch_bytes: int
-    cross_attention_bytes: int
-    total_bytes: int
-
-
-def estimate_kv_memory_bytes(
-    manifest: CosmosDreamsManifest,
-    *,
-    num_layers: int,
-    num_kv_heads: int,
-    head_size: int,
-    dtype: torch.dtype,
-    num_local_kv_branches: int = 1,
-    num_logical_kv_branches: int = 1,
-    session_capacity: int = 1,
-    frames_per_block: int = 1,
-    max_scratch_tokens_per_branch: int = 0,
-) -> CosmosDreamsKVMemoryEstimate:
-    """Estimate the manager floor, scratch reservation, and text pools."""
-    positive = {
-        "num_layers": num_layers,
-        "num_kv_heads": num_kv_heads,
-        "head_size": head_size,
-        "num_local_kv_branches": num_local_kv_branches,
-        "num_logical_kv_branches": num_logical_kv_branches,
-        "session_capacity": session_capacity,
-        "frames_per_block": frames_per_block,
-    }
-    for name, value in positive.items():
-        if value <= 0:
-            raise ValueError(f"Cosmos-Dreams KV estimate {name} must be positive, got {value}")
-    if max_scratch_tokens_per_branch < 0:
-        raise ValueError("Cosmos-Dreams max_scratch_tokens_per_branch must be non-negative")
-    page_bytes = int(2 * manifest.tokens_per_frame * num_kv_heads * head_size * dtype.itemsize * num_layers)
-    managed_blocks = num_local_kv_branches * (manifest.sink_frames + manifest.window_frames + frames_per_block) + 2
-    scratch_per_branch = frames_per_block + math.ceil(max_scratch_tokens_per_branch / manifest.tokens_per_frame)
-    scratch_blocks = num_local_kv_branches * scratch_per_branch
-    self_attention_bytes = managed_blocks * page_bytes
-    scratch_bytes = scratch_blocks * page_bytes
-    cross_attention_bytes = int(
-        2
-        * session_capacity
-        * num_logical_kv_branches
-        * manifest.text_cache_max_len
-        * num_kv_heads
-        * head_size
-        * dtype.itemsize
-        * num_layers
-    )
-    return CosmosDreamsKVMemoryEstimate(
-        page_bytes=page_bytes,
-        managed_blocks=managed_blocks,
-        scratch_blocks=scratch_blocks,
-        self_attention_bytes=self_attention_bytes,
-        scratch_bytes=scratch_bytes,
-        cross_attention_bytes=cross_attention_bytes,
-        total_bytes=self_attention_bytes + scratch_bytes + cross_attention_bytes,
-    )

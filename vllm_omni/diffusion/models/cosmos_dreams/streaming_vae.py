@@ -3,35 +3,30 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
 
 
 def snapshot_feature_cache(cache: list[Any]) -> list[Any]:
-    """Snapshot a Wan cache list without losing non-tensor sentinels.
+    """Snapshot a Wan decoder cache list without losing non-tensor sentinels.
 
     Wan's temporal upsamplers use the string sentinel ``"Rep"`` alongside
     tensors and ``None``. Decoder layers replace list entries rather than
     mutating cached tensors in place, so a detached list copy is sufficient to
     isolate the committed session state from the next decode transaction.
+
+    DreamZero's ``_vae_clone_feat_map`` looks interchangeable but is not: it
+    snapshots the *encoder* cache and clones, because its chunked encode hands
+    the same list back for in-place reuse. Cloning here would copy the whole
+    decoder cache on every realtime tick to protect against a write the
+    decoder never makes.
     """
 
     return [entry.detach() if isinstance(entry, torch.Tensor) else entry for entry in cache]
-
-
-def _unpatchify(video: torch.Tensor, patch_size: int) -> torch.Tensor:
-    if patch_size <= 1:
-        return video
-    batch, channels, frames, height, width = video.shape
-    patch_area = patch_size * patch_size
-    if channels % patch_area != 0:
-        raise ValueError(f"Wan decoder output channels {channels} are not divisible by patch_size^2={patch_area}.")
-    channels //= patch_area
-    video = video.reshape(batch, channels, patch_size, patch_size, frames, height, width)
-    video = video.permute(0, 1, 4, 5, 2, 6, 3).contiguous()
-    return video.reshape(batch, channels, frames, height * patch_size, width * patch_size)
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,10 +44,11 @@ def decode_wan_causal_chunk(
 ) -> WanStreamingDecodeResult:
     """Decode only new latent frames while preserving causal decoder state.
 
-    This is the streaming form of diffusers ``AutoencoderKLWan._decode``: the
-    post-quant projection is applied to the incoming latent block, each latent
-    frame advances the decoder feature cache once, and only the very first
-    frame in a session uses ``first_chunk=True``.
+    Same per-frame loop as ``wan_spatial_shard.spatial_shard_decode`` and
+    diffusers ``AutoencoderKLWan._decode``, and it cannot call either: both
+    clear the feature cache on entry, which is exactly the state this must
+    carry across ticks. The session therefore owns the cache, and
+    ``first_chunk`` tracks the session rather than this call's frame index.
     """
 
     if denormalized_latents.ndim != 5 or denormalized_latents.shape[0] != 1:
@@ -70,22 +66,22 @@ def decode_wan_causal_chunk(
 
     vae._feat_map = snapshot_feature_cache(feature_cache)
     try:
-        projected = vae.post_quant_conv(denormalized_latents)
-        decoded_parts: list[torch.Tensor] = []
-        for latent_idx in range(projected.shape[2]):
-            vae._conv_idx = [0]
-            decoded = vae.decoder(
-                projected[:, :, latent_idx : latent_idx + 1],
-                feat_cache=vae._feat_map,
-                feat_idx=vae._conv_idx,
-                first_chunk=not initialized and latent_idx == 0,
-            )
-            decoded_parts.append(decoded)
+        with vae._execution_context() if hasattr(vae, "_execution_context") else nullcontext():
+            projected = vae.post_quant_conv(denormalized_latents)
+            decoded_parts: list[torch.Tensor] = []
+            for latent_idx in range(projected.shape[2]):
+                vae._conv_idx = [0]
+                decoded = vae.decoder(
+                    projected[:, :, latent_idx : latent_idx + 1],
+                    feat_cache=vae._feat_map,
+                    feat_idx=vae._conv_idx,
+                    first_chunk=not initialized and latent_idx == 0,
+                )
+                decoded_parts.append(decoded)
 
-        video = torch.cat(decoded_parts, dim=2)
-        patch_size = getattr(getattr(vae, "config", None), "patch_size", None)
-        if patch_size is not None:
-            video = _unpatchify(video, int(patch_size))
+            video = torch.cat(decoded_parts, dim=2)
+            if vae.config.patch_size is not None:
+                video = unpatchify(video, patch_size=vae.config.patch_size)
         committed_cache = snapshot_feature_cache(vae._feat_map)
     finally:
         # The state owns the committed cache; the shared VAE must not retain a

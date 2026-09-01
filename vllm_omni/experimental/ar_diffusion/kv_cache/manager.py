@@ -173,13 +173,14 @@ class ARDiffusionKVCache:
         cross_attention_lengths: dict[str, int] | None = None,
         device: torch.device | None = None,
         frames_per_block: int = 1,
+        max_scratch_frames_per_branch: int | None = None,
         max_scratch_tokens_per_branch: int = 0,
         model_owned_state_bytes_per_session: int = 0,
     ) -> None:
         if not config.enable:
             raise ValueError("ARDiffusionKVCache built with a disabled ARDiffusionKVConfig")
         if config.window_chunks is None:
-            raise ValueError("AR-Diffusion paged KV requires a bounded window (window_chunks)")
+            raise ValueError("Phase 1 requires a bounded window (window_chunks)")
         if config.chunk_size <= 0:
             raise ValueError("ARDiffusionKVConfig.chunk_size must be set (> 0)")
         if not kv_branches:
@@ -203,6 +204,8 @@ class ARDiffusionKVCache:
         self.num_local_kv_branches = max(local_indices) + 1
         if frames_per_block <= 0:
             raise ValueError(f"frames_per_block must be positive, got {frames_per_block}")
+        if max_scratch_frames_per_branch is not None and max_scratch_frames_per_branch < 0:
+            raise ValueError(f"max_scratch_frames_per_branch must be non-negative, got {max_scratch_frames_per_branch}")
         if max_scratch_tokens_per_branch < 0:
             raise ValueError(f"max_scratch_tokens_per_branch must be non-negative, got {max_scratch_tokens_per_branch}")
         if model_owned_state_bytes_per_session < 0:
@@ -210,6 +213,9 @@ class ARDiffusionKVCache:
                 f"model_owned_state_bytes_per_session must be non-negative, got {model_owned_state_bytes_per_session}"
             )
         self.frames_per_block = int(frames_per_block)
+        self.max_scratch_frames_per_branch = int(
+            frames_per_block if max_scratch_frames_per_branch is None else max_scratch_frames_per_branch
+        )
         self.block_size = block_size
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -241,9 +247,9 @@ class ARDiffusionKVCache:
 
         # Scratch blocks are outside KVCacheManager ownership. A non-committing
         # forward needs one block per current frame plus space for any
-        # model-declared action/state tokens that coexist with video KV.
+        # model-declared auxiliary tokens that coexist with video KV.
         declared_scratch_blocks = (max_scratch_tokens_per_branch + block_size - 1) // block_size
-        minimum_scratch_blocks = self.frames_per_block + declared_scratch_blocks
+        minimum_scratch_blocks = self.max_scratch_frames_per_branch + declared_scratch_blocks
         override = os.environ.get("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH")
         override_blocks = int(override) if override is not None else 0
         if override_blocks < 0:
@@ -595,31 +601,6 @@ class ARDiffusionKVCache:
 
     def value_cache(self, layer_idx: int) -> torch.Tensor:
         return self._kv_pools[layer_idx][1]
-
-    def write_token_kv(
-        self,
-        layer_idx: int,
-        slot_mapping: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-    ) -> None:
-        """Copy dense token K/V into explicit flat pool slots for one layer."""
-        if layer_idx < 0 or layer_idx >= self.num_layers:
-            raise IndexError(f"AR-Diffusion layer index {layer_idx} is outside [0, {self.num_layers})")
-        slots = slot_mapping.to(device=self._k_pools[layer_idx].device, dtype=torch.long)
-        if slots.numel() != key.shape[0] or slots.numel() != value.shape[0]:
-            raise ValueError(
-                "AR-Diffusion slot/K/V length mismatch: "
-                f"slots={slots.numel()}, key={key.shape[0]}, value={value.shape[0]}"
-            )
-        self._k_pools[layer_idx][slots] = key.to(
-            device=self._k_pools[layer_idx].device,
-            dtype=self._k_pools[layer_idx].dtype,
-        )
-        self._v_pools[layer_idx][slots] = value.to(
-            device=self._v_pools[layer_idx].device,
-            dtype=self._v_pools[layer_idx].dtype,
-        )
 
     def window_block_ids(self, adapter: ARDiffusionRequestAdapter) -> list[int]:
         """Resident (non-null) managed blocks visible to paged attention."""

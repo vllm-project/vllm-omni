@@ -85,12 +85,6 @@ demo = [
     "cn2an>=0.5.22",  # Chinese number normalization for TTS (e.g. "1次" -> "一次")
 ]
 
-cosmos-dreams-demo = [
-    "aiohttp>=3.10.0",
-    "aiortc>=1.14.0,<1.16.0",
-    "av>=14.0.0,<18.0.0",
-]
-
 server-vad = [
     "silero-vad==6.1",
 ]
@@ -173,16 +167,6 @@ include = ["vllm_omni*"]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm
-
-[tool.uv]
-# aiortc currently requires PyAV <18, while the dev extra pins PyAV 18 for
-# ComfyUI tests. Resolve them as intentionally separate deployment/dev forks.
-conflicts = [
-    [
-        { extra = "cosmos-dreams-demo" },
-        { extra = "dev" },
-    ],
-]
 
 [tool.ruff]
 line-length = 120

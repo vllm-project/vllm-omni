@@ -94,17 +94,11 @@ manifest-driven dense oracle.
   It maintains dense per-layer history and is the numerical reference for the
   gathered-paged path.
 
-The v1 attention compute gathers one paged layer at a time and runs the exact
-joint softmax over `[real text | committed history | current]`. It does not use
-the fused paged-attention output because that kernel has no dense text prefix.
-Compile/CUDA graphs, fused joint paged attention, RF/CFG checkpoints, and
-multi-session serving remain follow-up work.
+Attention runs one joint softmax over `[real text | committed history |
+current]`. The paged path uses the fused `paged_write_attn` operator and carries
+the real text K/V in the auxiliary scratch slots; the dense path concatenates the
+same three spans. Compile/CUDA graphs, RF/CFG checkpoints, and multi-session
+serving remain follow-up work.
 
 See the [offline parity runner](../../examples/offline_inference/cosmos_dreams/README.md)
 for jsonl/pickle input and latent-output examples.
-
-The required Phase-3 serving artifact is the
-[single-user keyboard/WebRTC demo](../../examples/online_serving/cosmos_dreams/README.md).
-It sends one four-latent tick per request, builds only raw AgiBot `[16,29]`
-actions client-side, incrementally decodes the new 5/4 latent frames with
-session-owned Wan features, and applies bounded presentation backpressure.

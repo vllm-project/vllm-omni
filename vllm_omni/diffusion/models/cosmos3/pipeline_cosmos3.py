@@ -222,6 +222,7 @@ def _format_json_object_prompt(
     width: int,
     aspect_ratio: str | None,
 ) -> str | None:
+    """Match Imaginaire4 metadata injection for JSON-object prompts."""
     try:
         prompt_obj = json.loads(prompt)
     except (json.JSONDecodeError, TypeError, ValueError):

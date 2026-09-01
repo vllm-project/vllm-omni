@@ -68,40 +68,6 @@ declares the maximum model-specific tokens, such as action/state registers, that
 must coexist with it. `AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH` may increase
 that derived minimum for deployment experiments but cannot reduce it.
 
-## Gathered-dense joint attention
-
-Joint-attention models may need a single softmax over a dense conditioning
-prefix, persistent video history, and the current noisy chunk. The fused paged
-operator does not currently accept that dense prefix, so a layer context also
-exposes a storage-only protocol:
-
-```python
-contexts = state.get_kv_caches("main", seq_len=current_tokens, commit_current=False)
-history_k, history_v = contexts[layer_index].gather_history()
-# Run dense attention over [real_text_kv | history_kv | current_kv].
-state.commit_paged_context("main")  # closes the read-only context; writes nothing
-
-contexts = state.get_kv_caches("main", seq_len=tokens_per_frame, commit_current=True)
-contexts[layer_index].write_only(clean_key, clean_value)
-state.commit_paged_context("main")
-```
-
-`gather_history()` reads the immutable block snapshot captured when
-`get_kv_caches()` created the context. It never re-reads the live block table,
-which may already contain an in-flight current page after another layer writes.
-The snapshot is trimmed to the declared sink + sliding-window span before the
-gather: pool eviction is lazy (it runs inside the next allocation), so between
-a commit and the following forward the raw snapshot can transiently hold one
-chunk beyond the window, which attention must never see.
-Gather one layer at a time to avoid duplicating the full pool transiently.
-
-`write_only()` is legal only on a committing context, allocates the current
-page at most once, and records exactly one write per layer. The final commit
-fails unless every configured layer wrote successfully. Non-committing denoise
-contexts are read-only, so noisy K/V cannot accidentally become persistent.
-Models that commit multiple frames must open and commit one clean context per
-frame in causal order when later frames depend on earlier refreshed K/V.
-
 ## Admission rejection vs. forward failure
 
 A pipeline that rejects a request during validation — before touching session

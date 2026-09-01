@@ -9,38 +9,22 @@ from vllm_omni.diffusion.models.cosmos_dreams.control_contract import (
 )
 
 __all__ = [
-    "AgiBotKeyboardController",
-    "AgiBotKeyboardResampler",
-    "AgiBotSceneState",
-    "Cosmos3InteractivePipeline",
     "CosmosDreamsActionSchema",
     "CosmosDreamsActionConditioning",
     "CosmosDreamsControlVideoConditioning",
     "CosmosDreamsManifest",
-    "CosmosDreamsOmniPipeline",
     "CosmosDreamsPipeline",
     "CosmosDreamsTransferPipeline",
     "CosmosDreamsTransferOmniPipeline",
     "Cosmos3TransferInteractivePipeline",
-    "CosmosDreamsTickRuntime",
     "get_cosmos_dreams_post_process_func",
     "get_cosmos_dreams_pre_process_func",
 ]
 
 
 def __getattr__(name: str):
-    if name in {"AgiBotKeyboardController", "AgiBotKeyboardResampler", "AgiBotSceneState"}:
-        from vllm_omni.diffusion.models.cosmos_dreams import controller
-
-        return getattr(controller, name)
-    if name == "CosmosDreamsTickRuntime":
-        from vllm_omni.diffusion.models.cosmos_dreams import runtime
-
-        return runtime.CosmosDreamsTickRuntime
     if name in {
         "CosmosDreamsPipeline",
-        "CosmosDreamsOmniPipeline",
-        "Cosmos3InteractivePipeline",
         "get_cosmos_dreams_pre_process_func",
         "get_cosmos_dreams_post_process_func",
     }:

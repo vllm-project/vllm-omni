@@ -96,14 +96,6 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,
     ),
-    "CosmosDreamsOmniPipeline": DiffusionModelMetadata(
-        supports_multimodal_inputs=True,
-        max_multimodal_image_inputs=1,
-    ),
-    "Cosmos3InteractivePipeline": DiffusionModelMetadata(
-        supports_multimodal_inputs=True,
-        max_multimodal_image_inputs=1,
-    ),
 }
 
 _DIFFUSION_MODEL_METADATA_ALIASES = {

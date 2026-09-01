@@ -1,5 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Strict, self-verifying Cosmos-Dreams action contract."""
+"""Cosmos-Dreams action contract as consumed by inference.
+
+The exported artifact also records how it was produced: the training
+experiment, the dataset classes it was resolved from, and the repository
+revision and content hash of each normalizer source file. Whether the exporter
+assembled those correctly is the exporter's concern, and serving cannot act on
+the answer, so this module accepts those blocks without interpreting them and
+validates only what changes model output: the affine transform applied to raw
+actions, the embodiment/domain table, and the raw action widths.
+"""
 
 from __future__ import annotations
 
@@ -7,97 +16,18 @@ import hashlib
 import json
 import math
 import struct
-from dataclasses import dataclass
+from collections.abc import Mapping
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, model_validator
 
-ACTION_SCHEMA_VERSION = 3
-NORMALIZER_SCHEMA_VERSION = 1
 AGIBOT_RAW_ACTION_DIM = 29
-YAM_RAW_ACTION_DIM = 20
 CAMERA_RAW_ACTION_DIM = 9
-MODEL_ACTION_DIM = 64
-ACTION_TOKENS_PER_FRAME = 4
 NUM_EMBODIMENT_DOMAINS = 32
 AGIBOT_DOMAIN_ID = 15
-YAM_DOMAIN_ID = 16
-CAMERA_DOMAIN_ID = 2
+# Training-time floor on a quantile range; the runtime normalizer warns when a
+# scale sits close enough to it to indicate a degenerate channel.
 RANGE_FLOOR = 1e-8
-AGIBOT_LAYOUT_ID = "agibot_backward_framewise_rot6d_v1"
-# Backward-compatible alias for callers that imported the original AgiBot-only constant.
-LAYOUT_ID = AGIBOT_LAYOUT_ID
-YAM_LAYOUT_ID = "legacy_yam_fk_backward_framewise_rot6d_v1"
-CAMERA_LAYOUT_ID = "camera_pose_backward_framewise_rot6d_v1"
-ACTION_NORMALIZERS_RELATIVE_DIR = "projects/cosmos3/cosmos3/datasets/action/normalizers"
-LEGACY_YAM_NORMALIZERS_RELATIVE_DIR = "projects/cosmos3/cosmos3/datasets/action/legacy/normalizers"
-SHARED_AGIBOT_STATS = "agibot_backward_framewise_rot6d.json"
-LEGACY_GEAR_STATS = "agibot_gear_gripper_backward_framewise_rot6d.json"
-ABC_YAM_STATS = "abc_yam_backward_framewise_rot6d.json"
-MOLMOACT2_YAM_STATS = "molmoact2_yam_backward_framewise_rot6d.json"
-XDOF_YAM_STATS = "xdof_yam_backward_framewise_rot6d.json"
-
-
-@dataclass(frozen=True)
-class _DatasetContractSpec:
-    embodiment: str
-    domain_id: int
-    raw_action_dim: int
-    layout_id: str
-    normalizers_relative_dir: str
-    allowed_stats_filenames: frozenset[str]
-
-
-_SUPPORTED_DATASETS: dict[str, _DatasetContractSpec] = {
-    "AgiBotWorldBetaDataset": _DatasetContractSpec(
-        embodiment="agibotworld",
-        domain_id=AGIBOT_DOMAIN_ID,
-        raw_action_dim=AGIBOT_RAW_ACTION_DIM,
-        layout_id=AGIBOT_LAYOUT_ID,
-        normalizers_relative_dir=ACTION_NORMALIZERS_RELATIVE_DIR,
-        allowed_stats_filenames=frozenset({SHARED_AGIBOT_STATS}),
-    ),
-    "AgibotGEARGripperDataset": _DatasetContractSpec(
-        embodiment="agibot_gear_gripper",
-        domain_id=AGIBOT_DOMAIN_ID,
-        raw_action_dim=AGIBOT_RAW_ACTION_DIM,
-        layout_id=AGIBOT_LAYOUT_ID,
-        normalizers_relative_dir=ACTION_NORMALIZERS_RELATIVE_DIR,
-        allowed_stats_filenames=frozenset({SHARED_AGIBOT_STATS, LEGACY_GEAR_STATS}),
-    ),
-    "AgibotGEARGripperExtDataset": _DatasetContractSpec(
-        embodiment="agibot_gear_gripper_ext",
-        domain_id=AGIBOT_DOMAIN_ID,
-        raw_action_dim=AGIBOT_RAW_ACTION_DIM,
-        layout_id=AGIBOT_LAYOUT_ID,
-        normalizers_relative_dir=ACTION_NORMALIZERS_RELATIVE_DIR,
-        allowed_stats_filenames=frozenset({SHARED_AGIBOT_STATS, LEGACY_GEAR_STATS}),
-    ),
-    "ABCYAMLeRobotDataset": _DatasetContractSpec(
-        embodiment="abc_yam",
-        domain_id=YAM_DOMAIN_ID,
-        raw_action_dim=YAM_RAW_ACTION_DIM,
-        layout_id=YAM_LAYOUT_ID,
-        normalizers_relative_dir=LEGACY_YAM_NORMALIZERS_RELATIVE_DIR,
-        allowed_stats_filenames=frozenset({ABC_YAM_STATS}),
-    ),
-    "MolmoAct2YAMDataset": _DatasetContractSpec(
-        embodiment="molmoact2_yam",
-        domain_id=YAM_DOMAIN_ID,
-        raw_action_dim=YAM_RAW_ACTION_DIM,
-        layout_id=YAM_LAYOUT_ID,
-        normalizers_relative_dir=LEGACY_YAM_NORMALIZERS_RELATIVE_DIR,
-        allowed_stats_filenames=frozenset({MOLMOACT2_YAM_STATS}),
-    ),
-    "XDOFYAMDataset": _DatasetContractSpec(
-        embodiment="xdof_yam",
-        domain_id=YAM_DOMAIN_ID,
-        raw_action_dim=YAM_RAW_ACTION_DIM,
-        layout_id=YAM_LAYOUT_ID,
-        normalizers_relative_dir=LEGACY_YAM_NORMALIZERS_RELATIVE_DIR,
-        allowed_stats_filenames=frozenset({XDOF_YAM_STATS}),
-    ),
-}
 
 
 def float32_value(value: float) -> float:
@@ -136,6 +66,13 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+# Exporter-recorded provenance. Declared so that ``extra="forbid"`` still
+# accepts a real artifact, but deliberately left opaque: serving neither reads
+# these blocks nor includes them in any hashed payload, so a newer exporter can
+# extend them without breaking model load.
+Provenance = Mapping[str, Any]
+
+
 class ActionLayoutField(_StrictModel):
     name: str
     offset: StrictInt = Field(ge=0)
@@ -147,6 +84,12 @@ class ActionLayoutField(_StrictModel):
 
 
 class ActionLayout(_StrictModel):
+    """Field map of one raw action row.
+
+    Retained as a typed model because ``contract_sha256`` is computed over its
+    ``exclude_none`` dump; the runtime itself never reads individual fields.
+    """
+
     id: Literal[
         "agibot_backward_framewise_rot6d_v1",
         "legacy_yam_fk_backward_framewise_rot6d_v1",
@@ -156,49 +99,6 @@ class ActionLayout(_StrictModel):
     delta_equation: Literal["T_i^-1 @ T_{i+1}"]
     rotation_representation: Literal["rot6d_columns"]
     fields: tuple[ActionLayoutField, ...]
-
-    @model_validator(mode="after")
-    def validate_target_layout(self) -> ActionLayout:
-        if self.id == AGIBOT_LAYOUT_ID:
-            expected = (
-                ("head_translation", 0, 3, "meter", None, None, None),
-                ("head_rotation", 3, 6, "dimensionless", "rot6d_columns", None, None),
-                ("right_translation", 9, 3, "meter", None, None, None),
-                ("right_rotation", 12, 6, "dimensionless", "rot6d_columns", None, None),
-                ("right_gripper", 18, 1, "open_fraction", None, 0.0, 1.0),
-                ("left_translation", 19, 3, "meter", None, None, None),
-                ("left_rotation", 22, 6, "dimensionless", "rot6d_columns", None, None),
-                ("left_gripper", 28, 1, "open_fraction", None, 0.0, 1.0),
-            )
-        elif self.id == YAM_LAYOUT_ID:
-            expected = (
-                ("left_translation", 0, 3, "meter", None, None, None),
-                ("left_rotation", 3, 6, "dimensionless", "rot6d_columns", None, None),
-                ("left_gripper", 9, 1, "open_fraction", None, 0.0, 1.0),
-                ("right_translation", 10, 3, "meter", None, None, None),
-                ("right_rotation", 13, 6, "dimensionless", "rot6d_columns", None, None),
-                ("right_gripper", 19, 1, "open_fraction", None, 0.0, 1.0),
-            )
-        else:
-            expected = (
-                ("camera_translation", 0, 3, "meter", None, None, None),
-                ("camera_rotation", 3, 6, "dimensionless", "rot6d_columns", None, None),
-            )
-        actual = tuple(
-            (
-                field.name,
-                field.offset,
-                field.size,
-                field.unit,
-                field.representation,
-                field.closed_value,
-                field.open_value,
-            )
-            for field in self.fields
-        )
-        if actual != expected:
-            raise ValueError(f"Cosmos-Dreams action layout must exactly match {self.id!r}.")
-        return self
 
 
 class ActionPadding(_StrictModel):
@@ -231,126 +131,14 @@ class QuantileRotDerivation(_StrictModel):
     high_key: Literal["q99"]
     range_floor: StrictFloat
 
-    @model_validator(mode="after")
-    def validate_range_floor(self) -> QuantileRotDerivation:
-        if self.range_floor != float32_value(RANGE_FLOOR):
-            raise ValueError("Cosmos-Dreams quantile_rot range_floor must equal the training value 1e-8.")
-        return self
-
-
-class SourceProvenance(_StrictModel):
-    path: str = Field(min_length=1)
-    artifact_path: str = Field(min_length=1)
-    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    repository_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
-
-    @model_validator(mode="after")
-    def validate_artifact_paths(self) -> SourceProvenance:
-        allowed_paths = {
-            f"{spec.normalizers_relative_dir}/{filename}"
-            for spec in _SUPPORTED_DATASETS.values()
-            for filename in spec.allowed_stats_filenames
-        }
-        if self.path not in allowed_paths:
-            raise ValueError(f"Cosmos-Dreams normalizer source path is not a supported target artifact: {self.path!r}.")
-        expected_artifact_path = f"cosmos_dreams_action_sources/{self.sha256}.json"
-        if self.artifact_path != expected_artifact_path:
-            raise ValueError(
-                "Cosmos-Dreams normalizer artifact_path must be content-addressed under "
-                f"cosmos_dreams_action_sources/: expected {expected_artifact_path!r}."
-            )
-        return self
-
-
-class TrainingConfigProvenance(_StrictModel):
-    experiment: str = Field(min_length=1)
-    resolved_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    repository_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
-
-
-class ResolvedDatasetDescriptor(_StrictModel):
-    dataset_class: Literal[
-        "AgiBotWorldBetaDataset",
-        "AgibotGEARGripperDataset",
-        "AgibotGEARGripperExtDataset",
-        "ABCYAMLeRobotDataset",
-        "MolmoAct2YAMDataset",
-        "XDOFYAMDataset",
-    ]
-    embodiment: Literal[
-        "agibotworld",
-        "agibot_gear_gripper",
-        "agibot_gear_gripper_ext",
-        "abc_yam",
-        "molmoact2_yam",
-        "xdof_yam",
-    ]
-    method: Literal["quantile_rot"]
-    apply_forward_clamp: Literal[False]
-    pose_convention: Literal["backward_framewise"]
-    rotation_format: Literal["rot6d"]
-    stats_filename: Literal[
-        "agibot_backward_framewise_rot6d.json",
-        "agibot_gear_gripper_backward_framewise_rot6d.json",
-        "abc_yam_backward_framewise_rot6d.json",
-        "molmoact2_yam_backward_framewise_rot6d.json",
-        "xdof_yam_backward_framewise_rot6d.json",
-    ]
-
-    @model_validator(mode="after")
-    def validate_association(self) -> ResolvedDatasetDescriptor:
-        spec = _SUPPORTED_DATASETS[self.dataset_class]
-        if self.embodiment != spec.embodiment or self.stats_filename not in spec.allowed_stats_filenames:
-            raise ValueError(
-                "Cosmos-Dreams training dataset descriptor has an invalid class/embodiment/statistics association."
-            )
-        return self
-
-
-class CameraResolvedDatasetDescriptor(_StrictModel):
-    dataset_class: Literal["CameraDatasetSharded"]
-    embodiment: Literal["camera_pose"]
-    method: Literal["pose_scale"]
-    apply_forward_clamp: Literal[False]
-    mode: Literal["forward_dynamics"]
-    pose_convention: Literal["backward_framewise"]
-    rotation_format: Literal["rot6d"]
-    translation_scale: StrictFloat = Field(gt=0)
-    rotation_scale: StrictFloat = Field(gt=0)
-
-    @model_validator(mode="after")
-    def validate_scale_precision(self) -> CameraResolvedDatasetDescriptor:
-        if self.translation_scale != float32_value(self.translation_scale) or self.rotation_scale != float32_value(
-            self.rotation_scale
-        ):
-            raise ValueError("Cosmos-Dreams camera action scale factors must be encoded at float32 precision.")
-        return self
-
-
-ActionResolvedDatasetDescriptor = Annotated[
-    ResolvedDatasetDescriptor | CameraResolvedDatasetDescriptor,
-    Field(discriminator="dataset_class"),
-]
-
-
-class ResolvedTrainingConfigExcerpt(_StrictModel):
-    datasets: tuple[ActionResolvedDatasetDescriptor, ...]
-    experiment: str = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def validate_datasets(self) -> ResolvedTrainingConfigExcerpt:
-        if not self.datasets:
-            raise ValueError("Cosmos-Dreams resolved training config must contain datasets.")
-        return self
-
 
 class QuantileRotNormalizerContract(_StrictModel):
     schema_version: Literal[1]
     method: Literal["quantile_rot"]
     transform: AffineTransform
     derivation: QuantileRotDerivation
-    source: SourceProvenance
-    training_config: TrainingConfigProvenance
+    source: Provenance
+    training_config: Provenance
     transform_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     def behavioral_payload(self) -> dict[str, Any]:
@@ -363,12 +151,6 @@ class QuantileRotNormalizerContract(_StrictModel):
 
     @model_validator(mode="after")
     def verify_transform_hash(self) -> QuantileRotNormalizerContract:
-        if len(self.transform.offset) not in {AGIBOT_RAW_ACTION_DIM, YAM_RAW_ACTION_DIM}:
-            raise ValueError(
-                "Cosmos-Dreams quantile_rot offset/scale lengths must equal a supported raw_action_dim "
-                f"({YAM_RAW_ACTION_DIM} or {AGIBOT_RAW_ACTION_DIM}), "
-                f"got {len(self.transform.offset)} and {len(self.transform.scale)}."
-            )
         expected = canonical_sha256(self.behavioral_payload())
         if self.transform_sha256 != expected:
             raise ValueError(
@@ -382,21 +164,13 @@ class PoseScaleDerivation(_StrictModel):
     translation_scale: StrictFloat = Field(gt=0)
     rotation_scale: StrictFloat = Field(gt=0)
 
-    @model_validator(mode="after")
-    def validate_scale_precision(self) -> PoseScaleDerivation:
-        if self.translation_scale != float32_value(self.translation_scale) or self.rotation_scale != float32_value(
-            self.rotation_scale
-        ):
-            raise ValueError("Cosmos-Dreams pose_scale factors must be encoded at float32 precision.")
-        return self
-
 
 class PoseScaleNormalizerContract(_StrictModel):
     schema_version: Literal[1]
     method: Literal["pose_scale"]
     transform: AffineTransform
     derivation: PoseScaleDerivation
-    training_config: TrainingConfigProvenance
+    training_config: Provenance
     transform_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     def behavioral_payload(self) -> dict[str, Any]:
@@ -438,7 +212,7 @@ ActionNormalizerContract = Annotated[
 
 
 class CosmosDreamsEmbodimentContract(_StrictModel):
-    """Per-embodiment raw action semantics for schema v3."""
+    """Per-embodiment raw action semantics."""
 
     domain_id: StrictInt = Field(ge=0, lt=NUM_EMBODIMENT_DOMAINS)
     raw_action_dim: Literal[9, 20, 29]
@@ -446,30 +220,13 @@ class CosmosDreamsEmbodimentContract(_StrictModel):
     normalizer: ActionNormalizerContract
 
     @model_validator(mode="after")
-    def verify_layout_family(self) -> CosmosDreamsEmbodimentContract:
-        layout_specs = {
-            AGIBOT_LAYOUT_ID: (AGIBOT_DOMAIN_ID, AGIBOT_RAW_ACTION_DIM, QuantileRotNormalizerContract),
-            YAM_LAYOUT_ID: (YAM_DOMAIN_ID, YAM_RAW_ACTION_DIM, QuantileRotNormalizerContract),
-            CAMERA_LAYOUT_ID: (CAMERA_DOMAIN_ID, CAMERA_RAW_ACTION_DIM, PoseScaleNormalizerContract),
-        }
-        expected_domain_id, expected_raw_action_dim, expected_normalizer_type = layout_specs[self.layout.id]
-        if self.domain_id != expected_domain_id:
+    def verify_normalizer_width(self) -> CosmosDreamsEmbodimentContract:
+        # A normalizer narrower or wider than the declared raw width would
+        # accept a request-shaped action and then fail inside normalize().
+        if len(self.normalizer.transform.offset) != self.raw_action_dim:
             raise ValueError(
-                f"Cosmos-Dreams layout {self.layout.id!r} requires domain_id={expected_domain_id}, "
-                f"got {self.domain_id}."
-            )
-        if self.raw_action_dim != expected_raw_action_dim:
-            raise ValueError(
-                f"Cosmos-Dreams layout {self.layout.id!r} requires raw_action_dim={expected_raw_action_dim}, "
-                f"got {self.raw_action_dim}."
-            )
-        if not isinstance(self.normalizer, expected_normalizer_type):
-            expected_method = "pose_scale" if self.layout.id == CAMERA_LAYOUT_ID else "quantile_rot"
-            raise ValueError(f"Cosmos-Dreams layout {self.layout.id!r} requires method={expected_method!r}.")
-        if len(self.normalizer.transform.offset) != expected_raw_action_dim:
-            raise ValueError(
-                f"Cosmos-Dreams layout {self.layout.id!r} requires normalizer dimension "
-                f"{expected_raw_action_dim}, got {len(self.normalizer.transform.offset)}."
+                f"Cosmos-Dreams normalizer dimension must equal raw_action_dim={self.raw_action_dim}, "
+                f"got {len(self.normalizer.transform.offset)}."
             )
         return self
 
@@ -484,7 +241,7 @@ class CosmosDreamsActionSchema(_StrictModel):
     default_embodiment: str = Field(min_length=1)
     embodiments: dict[str, CosmosDreamsEmbodimentContract]
     padding: ActionPadding
-    training_config_excerpt: ResolvedTrainingConfigExcerpt
+    training_config_excerpt: Provenance | None = None
     contract_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     def behavioral_payload(self) -> dict[str, Any]:
@@ -508,6 +265,13 @@ class CosmosDreamsActionSchema(_StrictModel):
 
     @property
     def digest(self) -> str:
+        """Identity of the whole contract, provenance included.
+
+        Reached dynamically as ``getattr(conditioning, "digest")`` by
+        ``CosmosDreamsManifest.conditioning_digest``, so a search for
+        ``.digest`` callers will not find it.
+        """
+
         return canonical_sha256(self.model_dump(mode="json", exclude_none=True))
 
     @property
@@ -537,62 +301,6 @@ class CosmosDreamsActionSchema(_StrictModel):
             raise ValueError("Cosmos-Dreams action contract must declare at least one embodiment.")
         if self.default_embodiment not in self.embodiments:
             raise ValueError("Cosmos-Dreams default_embodiment must name one declared embodiment.")
-
-        descriptor_by_embodiment: dict[
-            str,
-            ResolvedDatasetDescriptor | CameraResolvedDatasetDescriptor,
-        ] = {}
-        for descriptor in self.training_config_excerpt.datasets:
-            previous = descriptor_by_embodiment.get(descriptor.embodiment)
-            if previous is not None and previous != descriptor:
-                raise ValueError(f"Cosmos-Dreams embodiment {descriptor.embodiment!r} has conflicting semantics.")
-            descriptor_by_embodiment[descriptor.embodiment] = descriptor
-        if set(descriptor_by_embodiment) != set(self.embodiments):
-            raise ValueError("Cosmos-Dreams embodiment contracts must exactly cover the resolved dataset descriptors.")
-
-        resolved_sha256 = canonical_sha256(self.training_config_excerpt.model_dump(mode="json"))
-        repository_revisions: set[str] = set()
-        for embodiment, contract in self.embodiments.items():
-            descriptor = descriptor_by_embodiment[embodiment]
-            if isinstance(descriptor, CameraResolvedDatasetDescriptor):
-                expected_layout_id = CAMERA_LAYOUT_ID
-            else:
-                expected_layout_id = _SUPPORTED_DATASETS[descriptor.dataset_class].layout_id
-            if contract.layout.id != expected_layout_id:
-                raise ValueError(
-                    f"Cosmos-Dreams embodiment {embodiment!r} layout disagrees with its dataset descriptor."
-                )
-            normalizer = contract.normalizer
-            if normalizer.training_config.experiment != self.training_config_excerpt.experiment:
-                raise ValueError(f"Cosmos-Dreams normalizer {embodiment!r} disagrees with the training experiment.")
-            if normalizer.training_config.resolved_sha256 != resolved_sha256:
-                raise ValueError(
-                    f"Cosmos-Dreams normalizer {embodiment!r} has the wrong resolved training-config hash."
-                )
-            repository_revisions.add(normalizer.training_config.repository_revision)
-            if isinstance(normalizer, QuantileRotNormalizerContract):
-                if normalizer.source.repository_revision != normalizer.training_config.repository_revision:
-                    raise ValueError(f"Cosmos-Dreams normalizer {embodiment!r} mixes source and training revisions.")
-                if not isinstance(descriptor, ResolvedDatasetDescriptor):
-                    raise ValueError("Cosmos-Dreams quantile_rot normalizer requires an action dataset descriptor.")
-                spec = _SUPPORTED_DATASETS[descriptor.dataset_class]
-                expected_source_path = f"{spec.normalizers_relative_dir}/{descriptor.stats_filename}"
-                if normalizer.source.path != expected_source_path:
-                    raise ValueError(
-                        f"Cosmos-Dreams normalizer {embodiment!r} source does not match its resolved dataset config."
-                    )
-            else:
-                if not isinstance(descriptor, CameraResolvedDatasetDescriptor):
-                    raise ValueError("Cosmos-Dreams pose_scale normalizer requires a camera dataset descriptor.")
-                if (
-                    normalizer.derivation.translation_scale != descriptor.translation_scale
-                    or normalizer.derivation.rotation_scale != descriptor.rotation_scale
-                ):
-                    raise ValueError(
-                        f"Cosmos-Dreams normalizer {embodiment!r} disagrees with its resolved camera scale config."
-                    )
-        if len(repository_revisions) != 1:
-            raise ValueError("Cosmos-Dreams normalizers must come from one pinned repository revision.")
         expected = canonical_sha256(self.behavioral_payload())
         if self.contract_sha256 != expected:
             raise ValueError(
@@ -634,11 +342,3 @@ class CosmosDreamsActionSchema(_StrictModel):
     def raw_action_dim_for(self, embodiment: str) -> int:
         resolved = self.resolve_embodiment(embodiment, None)
         return self.embodiments[resolved].raw_action_dim
-
-    def layout_for(self, embodiment: str) -> ActionLayout:
-        resolved = self.resolve_embodiment(embodiment, None)
-        return self.embodiments[resolved].layout
-
-    def normalizer_for(self, embodiment: str) -> ActionNormalizerContract:
-        resolved = self.resolve_embodiment(embodiment, None)
-        return self.embodiments[resolved].normalizer

@@ -72,30 +72,51 @@ class ARDiffusionKVState:
         kv_branch: str,
         seq_len: int | None = None,
         commit_current: bool = False,
+        *,
+        extra_visible_tokens: int = 0,
     ) -> list[ARDiffusionPagedLayerContext]:
         if seq_len is None:
             raise ValueError("AR-Diffusion paged self-attention requires seq_len in get_kv_caches()")
-        return self.prepare_paged_context(kv_branch, seq_len, commit_current)
+        return self.prepare_paged_context(
+            kv_branch,
+            seq_len,
+            commit_current,
+            extra_visible_tokens=extra_visible_tokens,
+        )
 
     def prepare_paged_context(
         self,
         kv_branch: str,
         seq_len: int,
         commit_current: bool,
+        *,
+        extra_visible_tokens: int = 0,
     ) -> list[ARDiffusionPagedLayerContext]:
         """Return per-layer paged attention contexts for one KV branch forward.
 
         Allocation is lazy so distributed workers allocate only for KV branches
-        they actually execute.
+        they actually execute. ``extra_visible_tokens`` extends only the
+        attention view, not the retained manager window; models whose window is
+        defined as history can use it to include the current chunk in addition.
         """
         cs = self.kv_cache.spec.chunk_size
         if int(seq_len) % cs != 0:
             raise AssertionError(
                 f"AR-Diffusion expects frame-aligned seq_len (multiple of chunk_size={cs}), got {seq_len}"
             )
+        if (
+            isinstance(extra_visible_tokens, bool)
+            or not isinstance(extra_visible_tokens, int)
+            or extra_visible_tokens < 0
+            or extra_visible_tokens % cs != 0
+        ):
+            raise AssertionError(
+                "AR-Diffusion extra_visible_tokens must be a non-negative multiple "
+                f"of chunk_size={cs}, got {extra_visible_tokens}"
+            )
 
         pending = self._paged_pending.get(kv_branch)
-        if pending is not None and pending.commit_current and not pending._committed:
+        if pending is not None and pending.commit_current and pending._allocated_video and not pending._committed:
             raise RuntimeError("AR-Diffusion paged context replaced before its managed current chunk was committed")
 
         adapter = self.adapter(kv_branch)
@@ -107,7 +128,9 @@ class ARDiffusionKVState:
             seq_len=int(seq_len),
             commit_current=bool(commit_current),
             max_video_tokens=int(
-                self.kv_cache.spec.sliding_window + self.kv_cache.spec.sink_chunks * self.kv_cache.spec.chunk_size
+                self.kv_cache.spec.sliding_window
+                + self.kv_cache.spec.sink_chunks * self.kv_cache.spec.chunk_size
+                + extra_visible_tokens
             ),
         )
         self._paged_pending[kv_branch] = forward_ctx
@@ -127,8 +150,6 @@ class ARDiffusionKVState:
         ctx = self._paged_pending.get(kv_branch)
         if ctx is None:
             return
-        if ctx.commit_current:
-            ctx.validate_commit_complete()
         if ctx.commit_current and ctx._allocated_video:
             n_chunks = ctx.seq_len // self.kv_cache.spec.chunk_size
             for _ in range(n_chunks):

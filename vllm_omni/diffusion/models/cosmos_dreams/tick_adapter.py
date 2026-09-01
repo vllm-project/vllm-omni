@@ -8,12 +8,9 @@ from typing import Any
 
 import torch
 
-from vllm_omni.diffusion.models.cosmos_dreams.controller import (
-    ACTION_COORDINATE_VERSION,
-    ACTION_STEPS_PER_TICK,
-    AGIBOT_ACTION_DIM,
+from vllm_omni.diffusion.models.cosmos_dreams.action_contract import (
     AGIBOT_DOMAIN_ID,
-    AGIBOT_EMBODIMENT,
+    AGIBOT_RAW_ACTION_DIM,
 )
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionControlInput,
@@ -23,6 +20,8 @@ from vllm_omni.experimental.ar_diffusion.tick_protocol import (
 COSMOS_DREAMS_ACTION_TRACK = "robot_action"
 COSMOS_DREAMS_ACTION_SCHEMA = "robot_action.v1"
 COSMOS_DREAMS_LATENT_FRAMES_PER_TICK = 4
+COSMOS_DREAMS_ACTION_STEPS_PER_TICK = 16
+COSMOS_DREAMS_EMBODIMENT = "agibotworld"
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,39 +39,24 @@ class CosmosDreamsTickInputs:
 def build_cosmos_dreams_action_control(
     action: torch.Tensor,
     *,
-    frame_idx: int,
-    measure_tick_latency: bool,
+    measure_tick_latency: bool = False,
 ) -> ARDiffusionControlInput:
     """Serialize a raw AgiBot chunk into the model-neutral tick contract."""
 
     tensor = torch.as_tensor(action, dtype=torch.float32).detach().cpu().contiguous()
-    expected = (ACTION_STEPS_PER_TICK, AGIBOT_ACTION_DIM)
+    expected = (COSMOS_DREAMS_ACTION_STEPS_PER_TICK, AGIBOT_RAW_ACTION_DIM)
     if tuple(tensor.shape) != expected:
         raise ValueError(f"Cosmos-Dreams ticks require raw action shape {expected}, got {tuple(tensor.shape)}.")
     if not torch.isfinite(tensor).all():
         raise ValueError("Cosmos-Dreams raw action contains NaN or Inf values.")
-    if isinstance(frame_idx, bool) or not isinstance(frame_idx, int) or frame_idx < 0:
-        raise ValueError("Cosmos-Dreams frame_idx must be a non-negative integer.")
+    data: dict[str, Any] = {"values": tensor.tolist()}
+    if measure_tick_latency:
+        data["measure_tick_latency"] = True
     return ARDiffusionControlInput(
         track=COSMOS_DREAMS_ACTION_TRACK,
         schema=COSMOS_DREAMS_ACTION_SCHEMA,
-        data={
-            "values": tensor.tolist(),
-            "frame_idx": frame_idx,
-            "num_latent_frames": COSMOS_DREAMS_LATENT_FRAMES_PER_TICK,
-            "domain_name": AGIBOT_EMBODIMENT,
-            "domain_id": AGIBOT_DOMAIN_ID,
-            "coordinate_version": ACTION_COORDINATE_VERSION,
-            "measure_tick_latency": bool(measure_tick_latency),
-        },
+        data=data,
     )
-
-
-def _int_field(data: Any, name: str) -> int:
-    value = data.get(name) if hasattr(data, "get") else None
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{COSMOS_DREAMS_ACTION_SCHEMA}.{name} must be an integer.")
-    return value
 
 
 def parse_cosmos_dreams_tick(tick: ARDiffusionTickRequest) -> CosmosDreamsTickInputs:
@@ -87,24 +71,13 @@ def parse_cosmos_dreams_tick(tick: ARDiffusionTickRequest) -> CosmosDreamsTickIn
             f"Cosmos-Dreams robot_action schema must be {COSMOS_DREAMS_ACTION_SCHEMA!r}, got {control.schema!r}."
         )
     data = control.data
-    frame_idx = _int_field(data, "frame_idx")
-    expected_frame_idx = 0 if tick.chunk_index == 0 else 1 + tick.chunk_index * COSMOS_DREAMS_LATENT_FRAMES_PER_TICK
-    if frame_idx != expected_frame_idx:
+    unexpected_fields = sorted(set(data) - {"values", "measure_tick_latency"})
+    if unexpected_fields:
         raise ValueError(
-            "Cosmos-Dreams robot_action frame_idx does not match chunk_index: "
-            f"expected {expected_frame_idx}, got {frame_idx}."
+            f"{COSMOS_DREAMS_ACTION_SCHEMA} contains unsupported fields: {unexpected_fields}. "
+            "Frame geometry and embodiment are derived from chunk_index and the schema."
         )
-    num_latent_frames = _int_field(data, "num_latent_frames")
-    if num_latent_frames != COSMOS_DREAMS_LATENT_FRAMES_PER_TICK:
-        raise ValueError(
-            f"Cosmos-Dreams typed ticks require exactly {COSMOS_DREAMS_LATENT_FRAMES_PER_TICK} generated latent frames."
-        )
-    domain_name = data.get("domain_name")
-    domain_id = _int_field(data, "domain_id")
-    if domain_name != AGIBOT_EMBODIMENT or domain_id != AGIBOT_DOMAIN_ID:
-        raise ValueError(f"Cosmos-Dreams typed ticks are pinned to {AGIBOT_EMBODIMENT}/domain {AGIBOT_DOMAIN_ID}.")
-    if data.get("coordinate_version") != ACTION_COORDINATE_VERSION:
-        raise ValueError("Cosmos-Dreams robot_action coordinate_version does not match the controller contract.")
+    frame_idx = 0 if tick.chunk_index == 0 else 1 + tick.chunk_index * COSMOS_DREAMS_LATENT_FRAMES_PER_TICK
     measure_tick_latency = data.get("measure_tick_latency", False)
     if not isinstance(measure_tick_latency, bool):
         raise ValueError(f"{COSMOS_DREAMS_ACTION_SCHEMA}.measure_tick_latency must be a boolean.")
@@ -112,7 +85,7 @@ def parse_cosmos_dreams_tick(tick: ARDiffusionTickRequest) -> CosmosDreamsTickIn
         action = torch.tensor(data["values"], dtype=torch.float32)
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"{COSMOS_DREAMS_ACTION_SCHEMA}.values must contain numeric action rows.") from exc
-    expected_shape = (ACTION_STEPS_PER_TICK, AGIBOT_ACTION_DIM)
+    expected_shape = (COSMOS_DREAMS_ACTION_STEPS_PER_TICK, AGIBOT_RAW_ACTION_DIM)
     if tuple(action.shape) != expected_shape:
         raise ValueError(
             f"{COSMOS_DREAMS_ACTION_SCHEMA}.values must have shape {expected_shape}, got {tuple(action.shape)}."
@@ -122,9 +95,9 @@ def parse_cosmos_dreams_tick(tick: ARDiffusionTickRequest) -> CosmosDreamsTickIn
     return CosmosDreamsTickInputs(
         action=action.contiguous(),
         frame_idx=frame_idx,
-        num_latent_frames=num_latent_frames,
-        domain_name=domain_name,
-        domain_id=domain_id,
+        num_latent_frames=COSMOS_DREAMS_LATENT_FRAMES_PER_TICK,
+        domain_name=COSMOS_DREAMS_EMBODIMENT,
+        domain_id=AGIBOT_DOMAIN_ID,
         measure_tick_latency=measure_tick_latency,
     )
 

@@ -61,25 +61,3 @@ class ActionAffineNormalizer:
         if not torch.isfinite(normalized).all():
             raise ValueError("Cosmos-Dreams normalized actions must contain only finite values.")
         return normalized
-
-    def denormalize(self, action: torch.Tensor) -> torch.Tensor:
-        """Invert the affine transform in float32."""
-
-        if action.shape[-1] != len(self.offset):
-            raise ValueError(
-                "Cosmos-Dreams normalized action dimension does not match the action contract: "
-                f"{action.shape[-1]} != {len(self.offset)}."
-            )
-        action_f32 = action.to(dtype=torch.float32)
-        if not torch.isfinite(action_f32).all():
-            raise ValueError("Cosmos-Dreams normalized actions must contain only finite values.")
-        offset = action_f32.new_tensor(self.offset)
-        scale = action_f32.new_tensor(self.scale)
-        denormalized = action_f32 * scale + offset
-        if not torch.isfinite(denormalized).all():
-            raise ValueError("Cosmos-Dreams denormalized actions must contain only finite values.")
-        return denormalized
-
-
-class QuantileRotAffineNormalizer(ActionAffineNormalizer):
-    """Backward-compatible name for the original AgiBot-only runtime API."""

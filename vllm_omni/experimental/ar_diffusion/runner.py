@@ -138,6 +138,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             session_capacity=spec.session_capacity,
             cross_attention_lengths=spec.cross_attention_lengths,
             frames_per_block=spec.frames_per_block,
+            max_scratch_frames_per_branch=spec.max_scratch_frames_per_branch,
             max_scratch_tokens_per_branch=spec.max_scratch_tokens_per_branch,
             model_owned_state_bytes_per_session=spec.model_owned_state_bytes_per_session,
             device=self.device,
@@ -145,7 +146,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self._session_capacity = self.kv_cache.session_capacity
         logger.info(
             "AR-Diffusion KV cache: blocks=%d layers=%d local_kv_heads=%d head_size=%d "
-            "tokens/frame=%d frames/block=%d window=%d sink=%d kv_branches=%s cross=%s "
+            "tokens/frame=%d frames/block=%d scratch-frames/branch=%d window=%d sink=%d kv_branches=%s cross=%s "
             "resident_capacity=%d requested_capacity=%d",
             self.kv_cache.num_blocks,
             spec.num_layers,
@@ -153,6 +154,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             spec.head_size,
             spec.tokens_per_frame,
             spec.frames_per_block,
+            self.kv_cache.max_scratch_frames_per_branch,
             config.window_chunks,
             config.sink_chunks,
             [(kv_branch.name, kv_branch.local_index) for kv_branch in spec.kv_branches],

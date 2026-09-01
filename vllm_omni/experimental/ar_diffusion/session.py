@@ -167,7 +167,7 @@ def _collect_rpc_support_results(value: Any, *, errors: list[str], supported: li
     if isinstance(value, bool):
         supported.append(value)
         return
-    if isinstance(value, list | tuple):
+    if isinstance(value, (list, tuple)):
         for item in value:
             _collect_rpc_support_results(item, errors=errors, supported=supported)
         return

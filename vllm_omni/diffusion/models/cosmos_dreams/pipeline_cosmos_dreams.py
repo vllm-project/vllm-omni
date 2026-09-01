@@ -3,12 +3,11 @@
 
 from __future__ import annotations
 
-import logging
 import math
 import time
 from collections import OrderedDict
-from collections.abc import Iterable, Mapping
-from contextlib import contextmanager, nullcontext
+from collections.abc import Callable, Iterable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -25,9 +24,8 @@ from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
     get_cosmos3_post_process_func,
     get_cosmos3_pre_process_func,
 )
-from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest
+from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest, deploy_option
 from vllm_omni.diffusion.models.cosmos_dreams.normalizer import ActionAffineNormalizer
-from vllm_omni.diffusion.models.cosmos_dreams.sampler import CosmosDreamsDistilledSampler
 from vllm_omni.diffusion.models.cosmos_dreams.state_cosmos_dreams import (
     CosmosDreamsSessionFingerprint,
     CosmosDreamsSessionState,
@@ -40,7 +38,6 @@ from vllm_omni.diffusion.models.cosmos_dreams.transformer_cosmos_dreams import (
     CosmosDreamsTransformerOutput,
 )
 from vllm_omni.diffusion.models.cosmos_dreams.utils import (
-    estimate_kv_memory_bytes,
     iter_ar_chunk_ranges,
     iter_clean_commit_frames,
     prompt_token_hash,
@@ -57,8 +54,6 @@ from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionTickRequest,
 )
 
-logger = logging.getLogger(__name__)
-
 
 @dataclass(frozen=True, slots=True)
 class _ActionRequestContract:
@@ -72,35 +67,6 @@ class _ActionConditioning:
     raw_action: torch.Tensor | None
     layout: str | None
     domain_ids: torch.Tensor
-
-
-def _nested_config_value(config: Any, key: str, default: Any = None) -> Any:
-    """Read one deploy/checkpoint option from the known config envelopes."""
-
-    roots = [
-        getattr(config, "custom_pipeline_args", None),
-        getattr(config, "model_config", None),
-        getattr(config, "tf_model_config", None),
-    ]
-    nested_names = (
-        "cosmos_dreams",
-        "causal_manifest",
-        "interactive_config",
-        "diffusion_expert_config",
-    )
-    for root in roots:
-        if not isinstance(root, dict):
-            to_dict = getattr(root, "to_dict", None)
-            root = to_dict() if callable(to_dict) else getattr(root, "params", None)
-        if not isinstance(root, dict):
-            continue
-        for nested_name in nested_names:
-            nested = root.get(nested_name)
-            if isinstance(nested, dict) and nested.get(key) is not None:
-                return nested[key]
-        if root.get(key) is not None:
-            return root[key]
-    return default
 
 
 def _first_not_none(*values: Any) -> Any:
@@ -148,6 +114,9 @@ def get_cosmos_dreams_pre_process_func(od_config: OmniDiffusionConfig):
     return pre_process_func
 
 
+# The registry resolves process funcs by name against this model's own
+# module, so reusing the Cosmos3 implementations means re-exporting them
+# under a Cosmos-Dreams name rather than registering them directly.
 def get_cosmos_dreams_post_process_func(od_config: OmniDiffusionConfig):
     return get_cosmos3_post_process_func(od_config)
 
@@ -159,9 +128,9 @@ def get_cosmos_dreams_ir_op_priority_func(od_config: OmniDiffusionConfig):
 class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
     """Cosmos3-Interactive inference with dense-or-paged persistent GEN K/V.
 
-    The default diffusion engine exercises the dense numerical-oracle path.
-    When the AR-Diffusion runner binds a state, the exact same attention uses
-    paged storage and gathers one layer of immutable history at a time.
+    The default diffusion engine exercises the dense numerical-oracle path,
+    which Cosmos-Dreams-Transfer also runs on. When the AR-Diffusion runner
+    binds a state, the exact same attention uses paged storage instead.
     """
 
     # The engine's generic warmup request is 512x512 with a one-step sampler,
@@ -185,44 +154,39 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             )
         if not self.is_distilled_model:
             raise ValueError("Cosmos-Dreams requires a distilled fixed-step checkpoint.")
-        if len(self.manifest.t_list) != 4:
+        scheduler_t_list = tuple(float(value) for value in self._scheduler_init_t_list)
+        if len(scheduler_t_list) != 4:
             raise ValueError(
-                f"Cosmos-Dreams requires exactly four distilled denoise steps, got {len(self.manifest.t_list)}."
+                f"Cosmos-Dreams requires exactly four distilled denoise steps, got {len(scheduler_t_list)}."
             )
+        if len(scheduler_t_list) != len(self.manifest.t_list) or any(
+            not math.isclose(scheduler_value, manifest_value, rel_tol=0.0, abs_tol=1e-8)
+            for scheduler_value, manifest_value in zip(scheduler_t_list, self.manifest.t_list, strict=True)
+        ):
+            raise ValueError(
+                "Cosmos-Dreams scheduler and transformer manifests define different fixed-step schedules: "
+                f"scheduler={scheduler_t_list}, transformer={self.manifest.t_list}."
+            )
+        scheduler_train_timesteps = int(self.scheduler.config.num_train_timesteps)
+        if scheduler_train_timesteps != self.manifest.num_train_timesteps:
+            raise ValueError(
+                "Cosmos-Dreams scheduler and transformer manifests define different training timestep counts: "
+                f"scheduler={scheduler_train_timesteps}, transformer={self.manifest.num_train_timesteps}."
+            )
+        self._distilled_num_steps = len(scheduler_t_list)
         if od_config.parallel_config.sequence_parallel_size > 1:
             raise ValueError(
                 "Cosmos-Dreams supports tensor parallelism but not sequence parallelism; "
                 f"got sequence_parallel_size={od_config.parallel_config.sequence_parallel_size}."
             )
-        self.distilled_sampler = CosmosDreamsDistilledSampler(
-            self.manifest.t_list,
-            sample_type=self.manifest.sample_type,
-            num_train_timesteps=self.manifest.num_train_timesteps,
-        )
         self._init_conditioning(od_config)
-        self.default_fps = float(_nested_config_value(od_config, "default_fps", 15.0))
+        self.default_fps = float(deploy_option(od_config, "default_fps", 15.0))
         if not math.isfinite(self.default_fps) or self.default_fps <= 0:
             raise ValueError(f"Cosmos-Dreams default_fps must be positive, got {self.default_fps}.")
         self.checkpoint_id = (
             self.manifest.checkpoint_id if self.manifest.checkpoint_id != "unknown" else str(od_config.model)
         )
         self._states: OrderedDict[str, CosmosDreamsSessionState] = OrderedDict()
-
-        estimate = estimate_kv_memory_bytes(
-            self.manifest,
-            num_layers=self.transformer.num_hidden_layers,
-            num_kv_heads=self.transformer.num_kv_heads_local,
-            head_size=self.transformer.head_dim,
-            dtype=self.dtype,
-            session_capacity=self._SESSION_CAPACITY,
-        )
-        logger.info(
-            "Cosmos-Dreams KV floor estimate: %.2f GiB (managed %.2f, scratch %.2f, text %.2f)",
-            estimate.total_bytes / 2**30,
-            estimate.self_attention_bytes / 2**30,
-            estimate.scratch_bytes / 2**30,
-            estimate.cross_attention_bytes / 2**30,
-        )
 
     def _load_manifest(self, od_config: OmniDiffusionConfig) -> CosmosDreamsManifest:
         return CosmosDreamsManifest.from_od_config(od_config, require_explicit=True)
@@ -238,7 +202,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             embodiment: ActionAffineNormalizer.from_contract(contract)
             for embodiment, contract in action_schema.normalizers.items()
         }
-        configured_domain_id = _nested_config_value(od_config, "default_domain_id")
+        configured_domain_id = deploy_option(od_config, "default_domain_id")
         artifact_domain_id = action_schema.embodiment_to_domain[action_schema.default_embodiment]
         self.default_domain_id = int(artifact_domain_id if configured_domain_id is None else configured_domain_id)
         self.default_embodiment = action_schema.resolve_embodiment(
@@ -278,39 +242,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
     # -- AR-Diffusion pipeline capability ---------------------------------
 
-    def _validate_ar_diffusion_deploy_overrides(self) -> None:
-        od_config = getattr(self, "od_config", None)
-        raw = getattr(od_config, "ar_diffusion_kv_config", None)
-        if raw is None:
-            model_config = getattr(od_config, "model_config", None)
-            if isinstance(model_config, dict):
-                raw = model_config.get("ar_diffusion_kv_config")
-        if raw is None:
-            return
-
-        def configured(name: str, default: Any) -> Any:
-            if isinstance(raw, dict):
-                return raw.get(name, default)
-            return getattr(raw, name, default)
-
-        actual_window = configured("window_chunks", None) or self.manifest.window_frames
-        actual_sink = configured("sink_chunks", 0) or self.manifest.sink_frames
-        actual_reset = bool(configured("reset_at_boundary", False))
-        mismatches = []
-        if int(actual_window) != self.manifest.window_frames:
-            mismatches.append(f"window_chunks={actual_window} (manifest={self.manifest.window_frames})")
-        if int(actual_sink) != self.manifest.sink_frames:
-            mismatches.append(f"sink_chunks={actual_sink} (manifest={self.manifest.sink_frames})")
-        if actual_reset:
-            mismatches.append("reset_at_boundary=True (manifest=False)")
-        if mismatches:
-            raise ValueError(
-                "Cosmos-Dreams AR-Diffusion window geometry is fixed by the model manifest; "
-                "deployment overrides would diverge from the dense oracle: " + ", ".join(mismatches)
-            )
-
     def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
-        self._validate_ar_diffusion_deploy_overrides()
         return ARDiffusionKVCacheSpec(
             num_layers=self.transformer.num_hidden_layers,
             num_kv_heads=self.transformer.num_kv_heads_local,
@@ -322,16 +254,19 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             kv_branches=(ARDiffusionKVBranchSpec(self._MAIN_BRANCH, 0),),
             session_capacity=self._SESSION_CAPACITY,
             cross_attention=(ARDiffusionCrossAttentionKVSpec("text", self.manifest.text_cache_max_len),),
-            max_scratch_tokens_per_branch=0,
+            max_scratch_frames_per_branch=self.manifest.chunk_size,
+            max_scratch_tokens_per_branch=self.manifest.text_cache_max_len,
         )
 
     def _validate_bound_kv_geometry(self, state) -> None:
-        """Reject engine overrides that would diverge from the dense oracle.
+        """Reject a resolved KV cache that contradicts the model manifest.
 
         ``window_frames`` and ``sink_frames`` are checkpoint-manifest semantics
-        for Cosmos-Dreams, not performance-only engine knobs. The generic AR
-        runner permits deployment overrides for other models, so validate the
-        resolved cache here before it can be bound to a model session.
+        for Cosmos-Dreams, not performance-only engine knobs, but the generic AR
+        runner lets a deployment override the values this pipeline reports in
+        ``ar_diffusion_kv_cache_spec()``. This is the single geometry gate: it
+        reads the cache the runner actually built, so it covers both an
+        override and any clamping the runner applied on top of it.
         """
 
         cache = state.kv_cache
@@ -340,6 +275,8 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             "num_kv_heads": int(cache.num_kv_heads),
             "head_size": int(cache.head_size),
             "tokens_per_frame": int(cache.block_size),
+            "frames_per_block": int(cache.frames_per_block),
+            "max_scratch_frames_per_branch": int(cache.max_scratch_frames_per_branch),
             "window_frames": int(cache.spec.window_chunks),
             "sink_frames": int(cache.spec.sink_chunks),
             "reset_at_boundary": bool(cache.spec.reset_at_boundary),
@@ -350,6 +287,8 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             "num_kv_heads": int(self.transformer.num_kv_heads_local),
             "head_size": int(self.transformer.head_dim),
             "tokens_per_frame": int(self.manifest.tokens_per_frame),
+            "frames_per_block": 1,
+            "max_scratch_frames_per_branch": int(self.manifest.chunk_size),
             "window_frames": int(self.manifest.window_frames),
             "sink_frames": int(self.manifest.sink_frames),
             "reset_at_boundary": False,
@@ -584,7 +523,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             pooled = paged_state.get_cross_attention_kv(self._MAIN_BRANCH, "text")
             cached = [(entry["k"], entry["v"]) for entry in pooled]
         else:
-            raw_kv, real_len = self.transformer.encode_text_kv(text_ids, text_mask)
+            raw_kv, real_len = self.transformer.encode_und_kv(text_ids, text_mask)
             if real_len > self.manifest.text_cache_max_len:
                 raise ValueError(
                     f"Cosmos-Dreams prompt exceeds text_cache_max_len: {real_len} > {self.manifest.text_cache_max_len}."
@@ -663,6 +602,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 self._MAIN_BRANCH,
                 seq_len=seq_len,
                 commit_current=commit_current,
+                extra_visible_tokens=seq_len,
             )
         else:
             dense_history = state.dense_kv_by_branch.get(self._MAIN_BRANCH)
@@ -689,13 +629,10 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
     def _prepare_raw_action(
         self,
-        sp,
         *,
         embodiment: str,
-        action_value: Any = None,
+        action_value: Any,
     ) -> torch.Tensor | None:
-        if action_value is None:
-            action_value = self._get_sp_param(sp, "action", None)
         if action_value is None:
             return None
         action = load_action_tensor(action_value)
@@ -886,11 +823,10 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             "denoise_s",
             enabled=measure_tick_latency,
         ):
-            return self.distilled_sampler.sample(
+            return self._sample_distilled(
                 velocity_fn,
                 initial_noise,
-                seed=seed,
-                frame_idx=chunk_start,
+                generator=noise_generator,
             ).to(self.dtype)
 
     def _run_chunk(
@@ -1029,14 +965,12 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
     ) -> torch.Tensor:
         """Decode only the new tick block with session-owned Wan features."""
 
-        execution_context = getattr(self.vae, "_execution_context", None)
-        with execution_context() if callable(execution_context) else nullcontext():
-            result = decode_wan_causal_chunk(
-                self.vae,
-                self._denormalize_vae_latents(latents),
-                feature_cache=state.vae_decoder_feat_cache,
-                initialized=state.vae_decoder_initialized,
-            )
+        result = decode_wan_causal_chunk(
+            self.vae,
+            self._denormalize_vae_latents(latents),
+            feature_cache=state.vae_decoder_feat_cache,
+            initialized=state.vae_decoder_initialized,
+        )
         state.record_incremental_decode(
             input_frames=int(latents.shape[2]),
             feature_cache=result.feature_cache,
@@ -1044,6 +978,32 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         return result.video
 
     # -- Generation --------------------------------------------------------
+
+    def _sample_distilled(
+        self,
+        velocity_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        initial_noise: torch.Tensor,
+        *,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        """Run one state-aware chunk with the inherited distilled scheduler."""
+        self._set_timesteps(
+            self._distilled_num_steps,
+            device=initial_noise.device,
+            shift=1.0,
+        )
+        latents = initial_noise.float()
+        for timestep in self.scheduler.timesteps:
+            model_timestep = timestep.expand(latents.shape[0])
+            velocity = velocity_fn(latents, model_timestep)
+            latents = self.scheduler.step(
+                velocity,
+                timestep,
+                latents,
+                generator=generator,
+                return_dict=False,
+            )[0]
+        return latents
 
     @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
@@ -1152,7 +1112,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             raise ARDiffusionRequestRejectedError(
                 f"Cosmos-Dreams distilled inference requires guidance_scale=1.0, got {guidance_scale}."
             )
-        if sp.num_inference_steps not in (None, len(self.manifest.t_list)):
+        if sp.num_inference_steps not in (None, self._distilled_num_steps):
             raise ARDiffusionRequestRejectedError(
                 "Cosmos-Dreams distilled inference uses the checkpoint-defined four-step schedule; "
                 f"got num_inference_steps={sp.num_inference_steps}."
@@ -1356,8 +1316,3 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         if close_session and self._ar_diffusion_kv_state is None:
             self._drop_session(session_id)
         return result
-
-
-# Export-manifest aliases used while the upstream name settles.
-CosmosDreamsOmniPipeline = CosmosDreamsPipeline
-Cosmos3InteractivePipeline = CosmosDreamsPipeline

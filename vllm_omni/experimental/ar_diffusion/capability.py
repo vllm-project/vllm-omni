@@ -75,8 +75,11 @@ class ARDiffusionKVCacheSpec:
     recent sliding tail and ``sink_frames`` is the separately retained prefix;
     both are expressed in the same frame/block unit.
 
-    ``max_scratch_tokens_per_branch`` is the maximum non-video KV (for example,
-    action/state registers) that must coexist with an uncommitted video block.
+    ``max_scratch_frames_per_branch`` is the maximum current-video span that a
+    non-committing forward writes to scratch. It defaults to
+    ``frames_per_block``. ``max_scratch_tokens_per_branch`` is the maximum
+    additional non-video KV (for example, action/state registers) that must
+    coexist with that video span.
     ``model_owned_state_bytes_per_session`` is a conservative upper bound for
     persistent per-session CUDA state outside runner-owned self/cross-attention
     KV and scratch pools.
@@ -102,6 +105,7 @@ class ARDiffusionKVCacheSpec:
     max_model_len: int = 1 << 20
     max_scratch_tokens_per_branch: int = 0
     model_owned_state_bytes_per_session: int = 0
+    max_scratch_frames_per_branch: int | None = None
 
     def __post_init__(self) -> None:
         positive_fields = {
@@ -119,6 +123,11 @@ class ARDiffusionKVCacheSpec:
                 raise ValueError(f"AR-Diffusion {name} must be positive, got {value}")
         if self.sink_frames < 0:
             raise ValueError(f"AR-Diffusion sink_frames must be non-negative, got {self.sink_frames}")
+        if self.max_scratch_frames_per_branch is not None and self.max_scratch_frames_per_branch < 0:
+            raise ValueError(
+                "AR-Diffusion max_scratch_frames_per_branch must be non-negative, "
+                f"got {self.max_scratch_frames_per_branch}"
+            )
         if self.max_scratch_tokens_per_branch < 0:
             raise ValueError(
                 "AR-Diffusion max_scratch_tokens_per_branch must be non-negative, "

@@ -200,16 +200,9 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
     },
-    **{
-        model_class_name: {
-            "extra_body_params": COSMOS_DREAMS_EXTRA_BODY_PARAMS,
-            "extra_output_params": COSMOS_DREAMS_EXTRA_OUTPUT_PARAMS,
-        }
-        for model_class_name in (
-            "CosmosDreamsPipeline",
-            "CosmosDreamsOmniPipeline",
-            "Cosmos3InteractivePipeline",
-        )
+    "CosmosDreamsPipeline": {
+        "extra_body_params": COSMOS_DREAMS_EXTRA_BODY_PARAMS,
+        "extra_output_params": COSMOS_DREAMS_EXTRA_OUTPUT_PARAMS,
     },
     **{
         model_class_name: {
