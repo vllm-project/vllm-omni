@@ -39,6 +39,14 @@ class DiffusionTasks(str, Enum):
     # Text to audio, etc should be added here as needed
 
 
+class ModelTypeMarker(str, Enum):
+    """Model type markers for pytest parametrization."""
+
+    DIFFUSION = "diffusion"
+    OMNI = "omni"
+    TTS = "tts"
+
+
 class DiffusionModelTestOpts(NamedTuple):
     """Configuration for one Diffusion model's tests."""
 
@@ -53,6 +61,10 @@ class DiffusionModelTestOpts(NamedTuple):
 
     # Actual tasks which controls the tests actually run
     supported_tasks: list[DiffusionTasks]
+
+    # Function module marker applied per-test-case via parametrization.
+    # Set to ModelTypeMarker.OMNI or ModelTypeMarker.TTS for non-diffusion models.
+    model_type_marker: ModelTypeMarker
 
     # Additional acceleration groups to run beyond the base case (no acceleration).
     # The base case is always run for every model in the test settings. None means
