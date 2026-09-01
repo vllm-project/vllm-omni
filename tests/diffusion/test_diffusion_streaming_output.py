@@ -441,7 +441,6 @@ class TestPipelineStreamingOutputToEntrypoint:
                     model="test_model",
                     od_config=od_config,
                     metadata=metadata,
-                    batch_size=1,
                 )
 
     @staticmethod
@@ -526,6 +525,7 @@ class TestSupportedPipelines:
         runner = object.__new__(DiffusionModelRunner)
         runner.vllm_config = _make_vllm_config()
         runner.od_config = SimpleNamespace(
+            max_num_seqs=1,
             enable_cpu_offload=False,
             enable_layerwise_offload=False,
             enforce_eager=True,

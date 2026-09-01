@@ -575,7 +575,6 @@ class TestSingleStageInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=2,
             async_chunk=False,
             single_stage_id_filter=stage_id_filter,
             omni_master_address="127.0.0.1",
@@ -807,7 +806,6 @@ class TestSingleStageInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=2,
             async_chunk=False,
         )
         mocker.patch.object(runtime_mod, "prepare_engine_environment")
@@ -860,7 +858,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=2,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
@@ -928,7 +925,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=2,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
@@ -950,7 +946,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=2,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
@@ -1002,7 +997,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=2,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
@@ -1068,7 +1062,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=4,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
@@ -1120,7 +1113,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=4,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
@@ -1141,7 +1133,7 @@ class TestSingleStageReplicaInitialization:
         runtime._init_visible_devices_baseline = "0"
 
         mocker.patch.object(runtime_mod, "inject_kv_stage_info")
-        od_config = SimpleNamespace(max_num_seqs=None, parallel_config=SimpleNamespace(world_size=1))
+        od_config = SimpleNamespace(max_num_seqs=4, parallel_config=SimpleNamespace(world_size=1))
         mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value=od_config)
         mock_register = mocker.patch(
             "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
@@ -1178,7 +1170,7 @@ class TestSingleStageReplicaInitialization:
                 os.environ[device_env_var] = prev_device_env
 
         assert result is sentinel_client
-        assert od_config.max_num_seqs is None
+        assert od_config.max_num_seqs == 4
         mock_register.assert_called_once_with(
             omni_master_address="127.0.0.1",
             omni_master_port=25000,
@@ -1203,7 +1195,6 @@ class TestSingleStageReplicaInitialization:
             request_address="tcp://127.0.0.1:26002",
             response_address="tcp://127.0.0.1:26003",
             proc_manager=mocker.ANY,
-            batch_size=4,
         )
         assert mock_from_addresses.call_args.kwargs["proc_manager"].proc is proc
 
@@ -1216,7 +1207,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=4,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
@@ -1258,7 +1248,6 @@ class TestSingleStageReplicaInitialization:
             model="fake-model",
             config_path="/fake/stages.yaml",
             stage_init_timeout=60,
-            diffusion_batch_size=4,
             async_chunk=False,
             single_stage_id_filter=None,
             omni_master_address="127.0.0.1",
