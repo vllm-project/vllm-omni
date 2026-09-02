@@ -162,6 +162,41 @@ class ARDiffusionKVCacheSpec:
         return {cache.name: cache.num_tokens for cache in self.cross_attention}
 
 
+@dataclass(frozen=True)
+class ARDiffusionRequestKVSpec:
+    """Request-specific KV requirements plus an opaque session geometry key."""
+
+    kv_spec: ARDiffusionKVCacheSpec
+    geometry_key: object
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kv_spec, ARDiffusionKVCacheSpec):
+            raise TypeError(
+                f"AR-Diffusion request kv_spec must be ARDiffusionKVCacheSpec, got {type(self.kv_spec).__name__}"
+            )
+
+
+@runtime_checkable
+class SupportsDynamicARDiffusion(Protocol):
+    """Optional capability for pipelines whose KV geometry varies per request."""
+
+    def ar_diffusion_default_request_spec(self) -> ARDiffusionRequestKVSpec:
+        """Return the request spec used for initial pool allocation."""
+        ...
+
+    def ar_diffusion_request_spec(self, request: OmniDiffusionRequest) -> ARDiffusionRequestKVSpec:
+        """Resolve one serialized request before runner session admission."""
+        ...
+
+    def ar_diffusion_worst_case_request_specs(self) -> Iterable[ARDiffusionRequestKVSpec]:
+        """Yield model-computed worst-case specs for startup capacity validation."""
+        ...
+
+    def validate_ar_diffusion_effective_spec(self, spec: ARDiffusionKVCacheSpec) -> None:
+        """Validate the runner's effective structure after deployment overrides."""
+        ...
+
+
 @runtime_checkable
 class SupportsARDiffusionPipeline(Protocol):
     """Required pipeline capability for :class:`ARDiffusionModelRunner`.

@@ -33,7 +33,7 @@ import json
 import math
 import os
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import fields
 from typing import Any, ClassVar
 
@@ -305,7 +305,7 @@ def resolve_cosmos3_transformer_cls(model_config: Any) -> type[Cosmos3VFMTransfo
 def get_cosmos3_pre_process_func(
     od_config: OmniDiffusionConfig,
     *,
-    transfer_target_size: tuple[int, int] | None = None,
+    transfer_target_size: tuple[int, int] | Callable[[OmniDiffusionRequest], tuple[int, int]] | None = None,
 ):
     """Build the request preprocessor for Cosmos3 image/video inputs.
 
@@ -350,7 +350,8 @@ def get_cosmos3_pre_process_func(
             resolution = extra.get("resolution", extra.get("image_size", 720))
             target_w, target_h = find_closest_target_size(image.height, image.width, resolution)
         else:
-            target_h, target_w = (int(value) for value in transfer_target_size)
+            resolved_target = transfer_target_size(request) if callable(transfer_target_size) else transfer_target_size
+            target_h, target_w = (int(value) for value in resolved_target)
             if target_h <= 0 or target_w <= 0:
                 raise ValueError(
                     f"Cosmos3 fixed Transfer target dimensions must be positive, got {target_h}x{target_w}."

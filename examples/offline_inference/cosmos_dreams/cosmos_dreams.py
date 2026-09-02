@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Run a Cosmos-Dreams sample from the reference jsonl/pickle format."""
+"""Run a Cosmos-Dreams sample from the reference JSONL/NPZ format."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import pickle
 from pathlib import Path
 from typing import Any
 
@@ -24,15 +23,18 @@ def _load_record(jsonl_path: Path, sample_index: int) -> dict[str, Any]:
     if sample_index < 0 or sample_index >= len(records):
         raise IndexError(f"sample-index {sample_index} is outside a {len(records)}-record jsonl file.")
     record = records[sample_index]
-    pickle_path = record.get("pickle_path") or record.get("data_path") or record.get("pkl_path")
-    if pickle_path is not None:
-        resolved = Path(pickle_path)
+    npz_path = record.get("npz_path") or record.get("data_path")
+    if npz_path is not None:
+        resolved = Path(npz_path)
         if not resolved.is_absolute():
             resolved = jsonl_path.parent / resolved
-        with resolved.open("rb") as file:
-            payload = pickle.load(file)  # noqa: S301 - parity input is explicitly user-selected
-        if not isinstance(payload, dict):
-            raise TypeError(f"Expected a dict in {resolved}, got {type(payload).__name__}.")
+        if resolved.suffix.lower() != ".npz":
+            raise ValueError(f"Expected an .npz data file, got {resolved}.")
+        with np.load(resolved, allow_pickle=False) as archive:
+            payload = {}
+            for key in archive.files:
+                value = archive[key]
+                payload[key] = value.item() if value.ndim == 0 else value
         record = {**payload, **record}
     return record
 
@@ -114,8 +116,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deploy-config", default="vllm_omni/deploy/cosmos_dreams.yaml")
     parser.add_argument("--output", type=Path, default=Path("cosmos_dreams.mp4"))
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--height", type=int, default=720)
-    parser.add_argument("--width", type=int, default=1280)
+    parser.add_argument("--height", type=int, default=None)
+    parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--fps", type=float, default=None)
     parser.add_argument("--num-frames", type=int, default=None)
     parser.add_argument("--output-type", choices=("video", "latent"), default="video")

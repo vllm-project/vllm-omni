@@ -18,13 +18,14 @@ from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
     _apply_rotary_pos_emb,
     _tf_config_get,
 )
-from vllm_omni.diffusion.models.cosmos_dreams.action_packing import (
+from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest
+from vllm_omni.diffusion.models.cosmos_dreams.geometry import CosmosDreamsGeometry
+from vllm_omni.diffusion.models.cosmos_dreams.utils import (
     build_interleaved_mrope_position_ids,
     interleave_action_vision_tokens,
     split_interleaved_action_vision_tokens,
     zero_null_action_values,
 )
-from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
     ARDiffusionPagedLayerInputs,
     paged_write_attn,
@@ -216,7 +217,7 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
         sound_dim: int | None = None,
         sound_latent_fps: float | None = None,
     ) -> None:
-        self.manifest = CosmosDreamsManifest.from_od_config(od_config, require_explicit=True)
+        self.manifest = CosmosDreamsManifest.from_od_config(od_config)
         self.manifest.require_exported_artifact()
         if sound_gen:
             raise ValueError("Cosmos-Dreams v1 does not support joint sound generation")
@@ -380,6 +381,7 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         *,
+        geometry: CosmosDreamsGeometry,
         text_kv: list[tuple[torch.Tensor, torch.Tensor]],
         real_text_kv_len: int,
         frame_start: int,
@@ -415,6 +417,16 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
 
         _, _, num_frames, latent_h, latent_w = hidden_states.shape
         grid_h, grid_w, _, _ = self._pad_to_patch_size(latent_h, latent_w)
+        if (latent_h, latent_w) != (geometry.latent_height, geometry.latent_width):
+            raise RuntimeError(
+                "Cosmos-Dreams transformer latent shape does not match resolved geometry: "
+                f"{(latent_h, latent_w)} != {(geometry.latent_height, geometry.latent_width)}"
+            )
+        if (grid_h, grid_w) != geometry.patch_grid:
+            raise RuntimeError(
+                "Cosmos-Dreams transformer patch grid does not match resolved geometry: "
+                f"{(grid_h, grid_w)} != {geometry.patch_grid}"
+            )
         vision_tokens = self.patchify(hidden_states, num_frames, latent_h, latent_w)
         vision_tokens = self.proj_in(vision_tokens).view(
             1,
@@ -434,6 +446,7 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
             action_domain_ids=action_domain_ids,
         )
         conditioning_count = int(conditioning_tokens.shape[2])
+        actual_tokens_per_frame = conditioning_count + grid_h * grid_w
         hidden = self._pack_tokens(conditioning_tokens, vision_tokens)
         freqs_cos, freqs_sin = self._current_rope(
             hidden,
@@ -478,7 +491,7 @@ class CosmosDreamsTransformer(Cosmos3VFMTransformer):
                     dense_history=None if dense_history is None else dense_history[layer_idx],
                     paged_context=None if paged_kv is None else paged_kv[layer_idx],
                     num_frames=num_frames,
-                    tokens_per_frame=self.manifest.tokens_per_frame,
+                    tokens_per_frame=actual_tokens_per_frame,
                     action_tokens_per_frame=conditioning_count or None,
                     null_action_frame_indexes=null_action_frame_indexes,
                 )

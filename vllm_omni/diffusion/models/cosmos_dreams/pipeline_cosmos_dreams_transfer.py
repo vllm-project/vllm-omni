@@ -12,6 +12,7 @@ from typing import Any, ClassVar
 import torch
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.models.cosmos3.action import find_closest_target_size
 from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
     COSMOS3_DURATION_TEMPLATE,
     COSMOS3_RESOLUTION_TEMPLATE,
@@ -24,18 +25,25 @@ from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
 from vllm_omni.diffusion.models.cosmos3.transfer import (
     Cosmos3TransferHint,
     load_or_compute_control_frames,
+    media_hw,
     normalized_video_to_uint8_cthw,
     parse_transfer_hint,
     uint8_cthw_to_normalized_5d,
 )
+from vllm_omni.diffusion.models.cosmos3.utils import VIDEO_RES_SIZE_INFO
 from vllm_omni.diffusion.models.cosmos_dreams.control_contract import (
     TRANSFER_HINTS,
     TransferHint,
+)
+from vllm_omni.diffusion.models.cosmos_dreams.geometry import (
+    CosmosDreamsGeometry,
+    CosmosDreamsResolutionPolicy,
 )
 from vllm_omni.diffusion.models.cosmos_dreams.pipeline_cosmos_dreams import (
     CosmosDreamsPipeline,
     _admission_float,
     _admission_int,
+    _resolution_policy,
     get_cosmos_dreams_ir_op_priority_func,
     get_cosmos_dreams_post_process_func,
 )
@@ -70,6 +78,112 @@ def _prompt_value(prompt_data: Any, key: str) -> Any:
     if isinstance(additional, Mapping):
         return additional.get(key)
     return None
+
+
+def _request_value(sampling_params: Any, prompt_data: Any, key: str, default: Any = None) -> Any:
+    extra = getattr(sampling_params, "extra_args", None)
+    if isinstance(extra, Mapping) and extra.get(key) is not None:
+        return extra[key]
+    value = getattr(sampling_params, key, None)
+    if value is not None:
+        return value
+    value = _prompt_value(prompt_data, key)
+    return default if value is None else value
+
+
+def _transfer_media_source(sampling_params: Any, prompt_data: Any) -> Any:
+    """Select the same bucket-driving source used by Transfer execution."""
+
+    if isinstance(prompt_data, Mapping):
+        additional = prompt_data.get("additional_information")
+        if isinstance(additional, Mapping) and additional.get("preprocessed_transfer_video") is not None:
+            return additional["preprocessed_transfer_video"]
+        multi_modal = prompt_data.get("multi_modal_data")
+        if isinstance(multi_modal, Mapping):
+            for key in ("video", "image"):
+                if multi_modal.get(key) is not None:
+                    return multi_modal[key]
+
+    control_video = _request_value(sampling_params, prompt_data, "control_video")
+    if control_video is not None:
+        return control_video
+    for hint in TRANSFER_HINTS:
+        raw_hint = _request_value(sampling_params, prompt_data, hint)
+        if isinstance(raw_hint, Mapping):
+            for key in ("control", "control_path"):
+                if raw_hint.get(key) is not None:
+                    return raw_hint[key]
+    return None
+
+
+def _transfer_media_hw(value: Any) -> tuple[int, int] | None:
+    if isinstance(value, Mapping):
+        height, width = value.get("height"), value.get("width")
+        if height is not None and width is not None:
+            return int(height), int(width)
+        for key in ("video", "frames", "data", "image", "control", "control_path"):
+            if value.get(key) is not None:
+                resolved = _transfer_media_hw(value[key])
+                if resolved is not None:
+                    return resolved
+        return None
+    return media_hw(value)
+
+
+def _default_transfer_resolution(policy: CosmosDreamsResolutionPolicy) -> str:
+    height, width = policy.default_resolution
+    matching = [
+        key
+        for key, sizes in VIDEO_RES_SIZE_INFO.items()
+        if (width, height) in sizes.values()
+    ]
+    if not matching:
+        raise ValueError(
+            "Cosmos-Dreams-Transfer default_resolution must be a canonical Cosmos3 bucket, "
+            f"got {height}x{width}."
+        )
+    return max(matching, key=int)
+
+
+def resolve_cosmos_dreams_transfer_geometry(
+    sampling_params: Any,
+    prompt_data: Any,
+    policy: CosmosDreamsResolutionPolicy,
+) -> CosmosDreamsGeometry:
+    """Snap the prioritized Transfer source to a policy-valid Cosmos3 bucket."""
+
+    resolution = _request_value(
+        sampling_params,
+        prompt_data,
+        "resolution",
+        _request_value(
+            sampling_params,
+            prompt_data,
+            "image_size",
+            _default_transfer_resolution(policy),
+        ),
+    )
+    source_hw = _transfer_media_hw(_transfer_media_source(sampling_params, prompt_data))
+    if source_hw is None:
+        source_hw = policy.default_resolution
+    try:
+        target_width, target_height = find_closest_target_size(*source_hw, resolution)
+    except ValueError as exc:
+        raise ValueError(
+            f"Cosmos-Dreams-Transfer resolution bucket is invalid: {resolution!r}."
+        ) from exc
+    geometry = policy.resolve(target_height, target_width)
+
+    requested_height = getattr(sampling_params, "height", None)
+    requested_width = getattr(sampling_params, "width", None)
+    if (requested_height is None) != (requested_width is None):
+        raise ValueError("Cosmos-Dreams-Transfer height and width must be supplied together.")
+    if requested_height is not None and (int(requested_height), int(requested_width)) != geometry.session_key:
+        raise ValueError(
+            "Cosmos-Dreams-Transfer serialized dimensions do not match the control-selected bucket: "
+            f"requested {requested_height}x{requested_width}, selected {geometry.height}x{geometry.width}."
+        )
+    return geometry
 
 
 def _strict_frame_count(value: Any) -> int:
@@ -120,45 +234,38 @@ def format_cosmos_dreams_transfer_prompt(
 
 
 def get_cosmos_dreams_transfer_pre_process_func(od_config: OmniDiffusionConfig):
-    """Use Cosmos3 Transfer media preprocessing at manifest-fixed geometry."""
+    """Resolve a Transfer bucket, preprocess to it, and serialize final H/W."""
 
     from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest
 
-    manifest = CosmosDreamsManifest.from_od_config(od_config, require_explicit=True)
+    manifest = CosmosDreamsManifest.from_od_config(od_config)
     manifest.require_control_video_conditioning()
+    policy = _resolution_policy(od_config, manifest)
+
+    def transfer_target_size(request) -> tuple[int, int]:
+        geometry = resolve_cosmos_dreams_transfer_geometry(
+            request.sampling_params,
+            request.prompt,
+            policy,
+        )
+        return geometry.height, geometry.width
+
     cosmos3_pre_process = get_cosmos3_pre_process_func(
         od_config,
-        transfer_target_size=(manifest.height, manifest.width),
+        transfer_target_size=transfer_target_size,
     )
 
     def pre_process_func(request):
         sp = request.sampling_params
-        if sp.height is not None and int(sp.height) != manifest.height:
-            raise ValueError(
-                "Cosmos-Dreams-Transfer resolution is fixed per deployment: "
-                f"requested height={sp.height}, configured height={manifest.height}."
-            )
-        if sp.width is not None and int(sp.width) != manifest.width:
-            raise ValueError(
-                "Cosmos-Dreams-Transfer resolution is fixed per deployment: "
-                f"requested width={sp.width}, configured width={manifest.width}."
-            )
         extra = sp.extra_args
         if extra is None:
             extra = {}
             sp.extra_args = extra
         if not isinstance(extra, dict):
             raise ValueError("Cosmos-Dreams-Transfer extra_args must be a mutable mapping during preprocessing.")
-        requested_resolution = extra.get("resolution", extra.get("image_size"))
-        if requested_resolution is not None and str(requested_resolution) != str(manifest.height):
-            raise ValueError(
-                "Cosmos-Dreams-Transfer resolution bucket is fixed per deployment: "
-                f"requested {requested_resolution!r}, configured {manifest.height!r}."
-            )
-        extra["resolution"] = str(manifest.height)
-        sp.height = manifest.height
-        sp.width = manifest.width
         prompt_data = request.prompt
+        geometry = resolve_cosmos_dreams_transfer_geometry(sp, prompt_data, policy)
+        sp.height, sp.width = geometry.height, geometry.width
 
         def request_param(key: str) -> Any:
             if extra.get(key) is not None:
@@ -190,11 +297,9 @@ def get_cosmos_dreams_transfer_pre_process_func(od_config: OmniDiffusionConfig):
                     extra[injected_hint] = injected_hint_previous
                 else:
                     extra.pop(injected_hint, None)
-        if (int(sp.height), int(sp.width)) != (manifest.height, manifest.width):
-            raise ValueError(
-                "Cosmos-Dreams-Transfer control media selected a different aspect bucket: "
-                f"{sp.height}x{sp.width}, configured {manifest.height}x{manifest.width}."
-            )
+        final_sp = processed.sampling_params
+        final_geometry = resolve_cosmos_dreams_transfer_geometry(final_sp, processed.prompt, policy)
+        final_sp.height, final_sp.width = final_geometry.height, final_geometry.width
         return processed
 
     return pre_process_func
@@ -222,10 +327,6 @@ class CosmosDreamsTransferPipeline(CosmosDreamsPipeline):
             )
 
     def _init_conditioning(self, od_config: OmniDiffusionConfig) -> None:
-        if self.manifest.schema_version != 3:
-            raise ValueError(
-                f"Cosmos-Dreams-Transfer requires manifest schema_version=3, got {self.manifest.schema_version}."
-            )
         contract = self.manifest.require_control_video_conditioning()
         if self.manifest.sink_frames != 0:
             raise ValueError("Cosmos-Dreams-Transfer requires sink_frames=0.")
@@ -290,6 +391,9 @@ class CosmosDreamsTransferPipeline(CosmosDreamsPipeline):
             if math.isfinite(resolved_input_fps) and resolved_input_fps > 0:
                 return resolved_input_fps
         return super()._resolve_request_fps(sp, prompt_data)
+
+    def _resolve_request_geometry(self, sp: Any, prompt_data: Any) -> CosmosDreamsGeometry:
+        return resolve_cosmos_dreams_transfer_geometry(sp, prompt_data, self.resolution_policy)
 
     def _resolve_requested_pixel_frames(
         self,
@@ -427,6 +531,7 @@ class CosmosDreamsTransferPipeline(CosmosDreamsPipeline):
         *,
         sampling_params: Any,
         prompt_data: Any,
+        geometry: CosmosDreamsGeometry,
         fps: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         request = self._validate_conditioning_request(
@@ -439,8 +544,8 @@ class CosmosDreamsTransferPipeline(CosmosDreamsPipeline):
             hint=request.hint,
             num_frames=request.num_pixel_frames,
             fps=fps,
-            height=self.manifest.height,
-            width=self.manifest.width,
+            height=geometry.height,
+            width=geometry.width,
         )
         return self._tokenize_prompt(
             formatted,
@@ -455,6 +560,7 @@ class CosmosDreamsTransferPipeline(CosmosDreamsPipeline):
         *,
         typed_inputs: Any | None,
         request: _TransferRequestContract,
+        geometry: CosmosDreamsGeometry,
         start_frame: int,
         target_frame: int,
         prompt_data: Any = None,
@@ -479,8 +585,8 @@ class CosmosDreamsTransferPipeline(CosmosDreamsPipeline):
         )
         control_frames = load_or_compute_control_frames(
             hint,
-            height=self.manifest.height,
-            width=self.manifest.width,
+            height=geometry.height,
+            width=geometry.width,
             max_frames=request.num_pixel_frames,
             input_frames=input_frames,
         )
@@ -495,8 +601,8 @@ class CosmosDreamsTransferPipeline(CosmosDreamsPipeline):
             1,
             self.transformer.latent_channel_size,
             target_frame,
-            self.manifest.latent_height,
-            self.manifest.latent_width,
+            geometry.latent_height,
+            geometry.latent_width,
         )
         if tuple(control_latents.shape) != expected:
             raise ValueError(
@@ -505,7 +611,8 @@ class CosmosDreamsTransferPipeline(CosmosDreamsPipeline):
             )
         return _TransferConditioning(request=request, control_latents=control_latents)
 
-    def _initial_condition_latent(self, prompt_data: Any, sp) -> None:
+    def _initial_condition_latent(self, prompt_data: Any, sp, geometry: CosmosDreamsGeometry) -> None:
+        del geometry
         if (
             self._get_sp_param(sp, "initial_latent", None) is not None
             or _prompt_value(prompt_data, "initial_latent") is not None
@@ -532,6 +639,7 @@ class CosmosDreamsTransferPipeline(CosmosDreamsPipeline):
         self,
         state: CosmosDreamsSessionState,
         *,
+        geometry: CosmosDreamsGeometry,
         chunk_start: int,
         chunk_end: int,
         target_frame: int,
@@ -556,6 +664,7 @@ class CosmosDreamsTransferPipeline(CosmosDreamsPipeline):
                 state,
                 control_chunk.to(self.dtype),
                 torch.zeros(1, device=self.device, dtype=torch.float32),
+                geometry=geometry,
                 text_kv=text_kv,
                 real_text_kv_len=real_text_kv_len,
                 frame_start=chunk_start,
@@ -567,6 +676,7 @@ class CosmosDreamsTransferPipeline(CosmosDreamsPipeline):
 
         clean_chunk = self._denoise_chunk(
             state,
+            geometry=geometry,
             chunk_start=chunk_start,
             chunk_end=chunk_end,
             seed=seed,
@@ -591,6 +701,7 @@ class CosmosDreamsTransferPipeline(CosmosDreamsPipeline):
                 self._commit_clean_frame(
                     state,
                     clean_chunk[:, :, local_idx : local_idx + 1],
+                    geometry=geometry,
                     frame_idx=frame_idx,
                     text_kv=text_kv,
                     real_text_kv_len=real_text_kv_len,
@@ -611,4 +722,5 @@ __all__ = [
     "get_cosmos_dreams_transfer_ir_op_priority_func",
     "get_cosmos_dreams_transfer_post_process_func",
     "get_cosmos_dreams_transfer_pre_process_func",
+    "resolve_cosmos_dreams_transfer_geometry",
 ]

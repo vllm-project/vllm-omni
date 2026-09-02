@@ -1,10 +1,11 @@
 # Cosmos-Dreams offline parity runner
 
-This runner accepts the reference interactive jsonl plus its optional pickle
+This runner accepts the reference interactive JSONL plus an optional NPZ
 payload. A record may contain `prompt`/`ai_caption`, `input_video`/`video`/`image`,
 `action`, `fps`/`conditioning_fps`, `domain_id`, and
-`domain_name`/`embodiment`, or point to a pickle with `pickle_path`,
-`pkl_path`, or `data_path`. The first source frame is used as the causal prefix;
+`domain_name`/`embodiment`, or point to an NPZ file with `npz_path` or
+`data_path`. NPZ object arrays are rejected; store strings as NumPy Unicode
+scalars and tensors as numeric arrays. The first source frame is used as the causal prefix;
 action rows are validated and normalized using the selected embodiment's
 exported raw dimension, layout, and normalizer before being padded to 64
 dimensions. Mixed-layout checkpoints select the entry through `domain_name` or
@@ -28,6 +29,10 @@ Use `--output-type latent --output sample_0.pt` for the pre-VAE parity gate.
 Full rollouts send both `reset=True` and `close_session=True`, preventing the
 default session from leaking history into the next sample.
 
+Omit both `--height` and `--width` to infer an aligned, aspect-preserving
+canvas from the input media, or to use the deployment default when the record
+has no media. Supply both flags to request any policy-valid explicit canvas.
+
 ## Transfer variant
 
 `cosmos_dreams_transfer.py` accepts the imaginaire4 Transfer JSON shape:
@@ -36,11 +41,16 @@ default session from leaking history into the next sample.
 depth and segmentation records normally provide `control_path` inside the
 selected hint object. T1 accepts only full clips with `F >= 17` and
 `(F - 1) % 16 == 0` and runs through the dense oracle deployment.
+The Transfer source priority is the input vision clip, then `control_video`,
+then the selected hint's `control` or `control_path`. Its aspect ratio is
+snapped to the requested canonical bucket family and the resulting dimensions
+are validated by the same Cosmos-Dreams policy used during model execution.
 
 ```bash
 python examples/offline_inference/cosmos_dreams/cosmos_dreams_transfer.py \
   --model /checkpoints/cosmos-dreams-transfer-diffusers \
   --input-json /data/transfer_video_edge.json \
+  --resolution 480 \
   --num-frames 97 \
   --seed 42 \
   --output cosmos_dreams_transfer.mp4

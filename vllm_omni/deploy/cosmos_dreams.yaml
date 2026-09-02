@@ -1,11 +1,11 @@
 # Cosmos-Dreams / Cosmos3-Interactive distilled forward-dynamics deployment.
-# The checkpoint path is supplied to the CLI. Resolution and KV block geometry
-# are immutable after model load.
 
 pipeline: cosmos_dreams
 async_chunk: false
 distributed_executor_backend: mp
 dtype: bfloat16
+default_resolution: [720, 1280]
+max_pixels: 921600
 
 stages:
   - stage_id: 0
@@ -22,22 +22,3 @@ stages:
       ar_diffusion_kv_config:
         gpu_memory_fraction: 0.35
         warmup_cudagraph: false
-      cosmos_dreams:
-        schema_version: 2
-        chunk_size: 4
-        window_frames: 96
-        sink_frames: 0
-        text_cache_max_len: 512
-        deploy_resolution: [720, 1280]
-        latent_patch_size: 2
-        vae_spatial_compression_factor: 16
-        temporal_compression_factor: 4
-        attention_mode: three_way
-        video_temporal_causal: true
-        temporal_modality_margin: 15000
-        base_fps: 24.0
-        enable_fps_modulation: true
-        fixed_step_sampler_config:
-          sample_type: sde
-          t_list: [1.0, 0.9375, 0.8333333333333334, 0.625]
-          num_train_timesteps: 1000

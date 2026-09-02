@@ -14,10 +14,7 @@ from typing import Any, ClassVar
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.models.cosmos3.action import (
-    load_action_tensor,
-    pad_action_to_dim,
-)
+from vllm_omni.diffusion.models.cosmos3.action import load_action_tensor, pad_action_to_dim
 from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
     Cosmos3OmniDiffusersPipeline,
     get_cosmos3_ir_op_priority_func,
@@ -25,6 +22,11 @@ from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
     get_cosmos3_pre_process_func,
 )
 from vllm_omni.diffusion.models.cosmos_dreams.config import CosmosDreamsManifest, deploy_option
+from vllm_omni.diffusion.models.cosmos_dreams.geometry import (
+    CosmosDreamsGeometry,
+    CosmosDreamsResolutionPolicy,
+    resolve_cosmos_dreams_geometry,
+)
 from vllm_omni.diffusion.models.cosmos_dreams.normalizer import ActionAffineNormalizer
 from vllm_omni.diffusion.models.cosmos_dreams.state_cosmos_dreams import (
     CosmosDreamsSessionFingerprint,
@@ -47,6 +49,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
     ARDiffusionKVCacheSpec,
+    ARDiffusionRequestKVSpec,
     ARDiffusionRequestRejectedError,
 )
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
@@ -89,27 +92,48 @@ def _admission_float(value: Any, name: str) -> float:
         raise ARDiffusionRequestRejectedError(f"Cosmos-Dreams {name} must be numeric, got {value!r}.") from exc
 
 
-def get_cosmos_dreams_pre_process_func(od_config: OmniDiffusionConfig):
-    """Use Cosmos3 media preprocessing with the deployment-fixed resolution."""
+def _resolution_policy(
+    od_config: OmniDiffusionConfig,
+    manifest: CosmosDreamsManifest,
+) -> CosmosDreamsResolutionPolicy:
+    return CosmosDreamsResolutionPolicy(
+        default_resolution=deploy_option(od_config, "default_resolution", (720, 1280)),
+        max_pixels=deploy_option(od_config, "max_pixels", 921_600),
+        vae_spatial_compression_factor=manifest.vae_spatial_compression_factor,
+        latent_patch_size=manifest.latent_patch_size,
+    )
 
-    manifest = CosmosDreamsManifest.from_od_config(od_config, require_explicit=True)
+
+def _request_media(prompt: Any) -> Any:
+    if not isinstance(prompt, Mapping):
+        return None
+    media = prompt.get("multi_modal_data")
+    if not isinstance(media, Mapping):
+        return None
+    return _first_not_none(media.get("image"), media.get("video"))
+
+
+def get_cosmos_dreams_pre_process_func(od_config: OmniDiffusionConfig):
+    """Resolve serializable geometry, delegate media work, and validate its result."""
+
+    manifest = CosmosDreamsManifest.from_od_config(od_config)
+    policy = _resolution_policy(od_config, manifest)
     cosmos3_pre_process = get_cosmos3_pre_process_func(od_config)
 
     def pre_process_func(request):
         sp = request.sampling_params
-        if sp.height is not None and int(sp.height) != manifest.height:
-            raise ValueError(
-                "Cosmos-Dreams resolution is fixed per deployment: "
-                f"requested height={sp.height}, configured height={manifest.height}."
-            )
-        if sp.width is not None and int(sp.width) != manifest.width:
-            raise ValueError(
-                "Cosmos-Dreams resolution is fixed per deployment: "
-                f"requested width={sp.width}, configured width={manifest.width}."
-            )
-        sp.height = manifest.height
-        sp.width = manifest.width
-        return cosmos3_pre_process(request)
+        prompt = request.prompt
+        media = _request_media(prompt)
+        geometry = resolve_cosmos_dreams_geometry(sp, media, policy)
+        sp.height, sp.width = geometry.height, geometry.width
+
+        result = cosmos3_pre_process(request)
+        # Re-resolving explicit final dimensions catches any downstream
+        # alignment, area, aspect, or model-grid violation.
+        final_sp = result.sampling_params
+        geometry = resolve_cosmos_dreams_geometry(final_sp, None, policy)
+        final_sp.height, final_sp.width = geometry.height, geometry.width
+        return result
 
     return pre_process_func
 
@@ -134,7 +158,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
     """
 
     # The engine's generic warmup request is 512x512 with a one-step sampler,
-    # while Cosmos-Dreams has artifact-fixed geometry and a four-step sampler.
+    # while Cosmos-Dreams has request-resolved geometry and a four-step sampler.
     # Skip that incompatible request; AR-Diffusion owns any model-valid rollout
     # warmup when CUDA graphs are enabled.
     dummy_run_num_frames: ClassVar[int] = 0
@@ -147,6 +171,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)
         self.manifest = self._load_manifest(od_config)
+        self.resolution_policy = _resolution_policy(od_config, self.manifest)
         self.manifest.require_exported_artifact()
         if not isinstance(self.transformer, CosmosDreamsTransformer):
             raise TypeError(
@@ -189,14 +214,14 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         self._states: OrderedDict[str, CosmosDreamsSessionState] = OrderedDict()
 
     def _load_manifest(self, od_config: OmniDiffusionConfig) -> CosmosDreamsManifest:
-        return CosmosDreamsManifest.from_od_config(od_config, require_explicit=True)
+        return CosmosDreamsManifest.from_od_config(od_config)
 
     def _init_conditioning(self, od_config: OmniDiffusionConfig) -> None:
         """Initialize action adapters from the exported contract."""
 
         action_schema = self.manifest.action_schema
         if action_schema is None:
-            raise ValueError("Cosmos-Dreams requires a validated action_schema.")
+            raise ValueError("Cosmos-Dreams action pipeline requires validated schema-v1 action conditioning.")
         action_schema.validate_temporal_compression_factor(self.manifest.temporal_compression_factor)
         self.action_normalizers = {
             embodiment: ActionAffineNormalizer.from_contract(contract)
@@ -242,12 +267,12 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
 
     # -- AR-Diffusion pipeline capability ---------------------------------
 
-    def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
+    def _kv_spec_for_geometry(self, geometry: CosmosDreamsGeometry) -> ARDiffusionKVCacheSpec:
         return ARDiffusionKVCacheSpec(
             num_layers=self.transformer.num_hidden_layers,
             num_kv_heads=self.transformer.num_kv_heads_local,
             head_size=self.transformer.head_dim,
-            tokens_per_frame=self.manifest.tokens_per_frame,
+            tokens_per_frame=geometry.tokens_per_frame(self.manifest.conditioning_tokens_per_frame),
             frames_per_block=1,
             window_frames=self.manifest.window_frames,
             sink_frames=self.manifest.sink_frames,
@@ -258,15 +283,78 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             max_scratch_tokens_per_branch=self.manifest.text_cache_max_len,
         )
 
-    def _validate_bound_kv_geometry(self, state) -> None:
-        """Reject a resolved KV cache that contradicts the model manifest.
+    def ar_diffusion_kv_cache_spec(self) -> ARDiffusionKVCacheSpec:
+        """Return the default-resolution specification for static consumers."""
+
+        geometry = self.resolution_policy.resolve(*self.resolution_policy.default_resolution)
+        return self._kv_spec_for_geometry(geometry)
+
+    def _request_kv_spec(self, geometry: CosmosDreamsGeometry) -> ARDiffusionRequestKVSpec:
+        return ARDiffusionRequestKVSpec(
+            kv_spec=self._kv_spec_for_geometry(geometry),
+            geometry_key=geometry.session_key,
+        )
+
+    def ar_diffusion_default_request_spec(self) -> ARDiffusionRequestKVSpec:
+        geometry = self.resolution_policy.resolve(*self.resolution_policy.default_resolution)
+        return self._request_kv_spec(geometry)
+
+    def ar_diffusion_request_spec(self, request: Any) -> ARDiffusionRequestKVSpec:
+        geometry = resolve_cosmos_dreams_geometry(request.sampling_params, None, self.resolution_policy)
+        return self._request_kv_spec(geometry)
+
+    def ar_diffusion_worst_case_request_specs(self) -> Iterable[ARDiffusionRequestKVSpec]:
+        """Yield the largest admitted request after enumerating the policy space."""
+
+        worst = max(
+            self.resolution_policy.iter_valid_geometries(),
+            key=lambda geometry: (geometry.vision_tokens_per_frame, geometry.height * geometry.width),
+        )
+        yield self._request_kv_spec(worst)
+
+    def validate_ar_diffusion_effective_spec(self, spec: ARDiffusionKVCacheSpec) -> None:
+        """Validate runner overrides against immutable model structure at load time."""
+
+        expected = self.ar_diffusion_kv_cache_spec()
+        fields = (
+            "num_layers",
+            "num_kv_heads",
+            "head_size",
+            "frames_per_block",
+            "window_frames",
+            "sink_frames",
+            "reset_at_boundary",
+            "kv_branches",
+            "session_capacity",
+            "cross_attention",
+            "max_model_len",
+            "max_scratch_frames_per_branch",
+            "max_scratch_tokens_per_branch",
+            "model_owned_state_bytes_per_session",
+        )
+        mismatches = {
+            name: (getattr(expected, name), getattr(spec, name))
+            for name in fields
+            if getattr(expected, name) != getattr(spec, name)
+        }
+        if mismatches:
+            detail = ", ".join(
+                f"{name}=expected {expected_value!r}, got {actual_value!r}"
+                for name, (expected_value, actual_value) in mismatches.items()
+            )
+            raise ValueError(f"Cosmos-Dreams AR-Diffusion structural specification is invalid ({detail}).")
+
+    def _validate_bound_kv_geometry(
+        self,
+        state: Any,
+        geometry: CosmosDreamsGeometry | None = None,
+    ) -> None:
+        """Treat every bound-pool mismatch as an internal invariant failure.
 
         ``window_frames`` and ``sink_frames`` are checkpoint-manifest semantics
         for Cosmos-Dreams, not performance-only engine knobs, but the generic AR
-        runner lets a deployment override the values this pipeline reports in
-        ``ar_diffusion_kv_cache_spec()``. This is the single geometry gate: it
-        reads the cache the runner actually built, so it covers both an
-        override and any clamping the runner applied on top of it.
+        runner can apply deployment overrides. Startup validates those values;
+        this bound-time gate defensively checks the cache that was actually built.
         """
 
         cache = state.kv_cache
@@ -277,23 +365,40 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             "tokens_per_frame": int(cache.block_size),
             "frames_per_block": int(cache.frames_per_block),
             "max_scratch_frames_per_branch": int(cache.max_scratch_frames_per_branch),
+            "max_scratch_tokens_per_branch": int(cache.max_scratch_tokens_per_branch),
             "window_frames": int(cache.spec.window_chunks),
             "sink_frames": int(cache.spec.sink_chunks),
             "reset_at_boundary": bool(cache.spec.reset_at_boundary),
             "text_cache_max_len": int(cache.cross_attention_lengths.get("text", -1)),
+            "max_model_len": int(cache.max_model_len),
+            "kv_branches": tuple(cache.kv_branches),
+            "model_owned_state_bytes_per_session": int(cache.model_owned_state_bytes_per_session),
         }
+        expected_spec = self._kv_spec_for_geometry(
+            geometry or self.resolution_policy.resolve(*self.resolution_policy.default_resolution)
+        )
         expected = {
             "num_layers": int(self.transformer.num_hidden_layers),
             "num_kv_heads": int(self.transformer.num_kv_heads_local),
             "head_size": int(self.transformer.head_dim),
-            "tokens_per_frame": int(self.manifest.tokens_per_frame),
+            "tokens_per_frame": int(expected_spec.tokens_per_frame),
             "frames_per_block": 1,
             "max_scratch_frames_per_branch": int(self.manifest.chunk_size),
+            "max_scratch_tokens_per_branch": int(self.manifest.text_cache_max_len),
             "window_frames": int(self.manifest.window_frames),
             "sink_frames": int(self.manifest.sink_frames),
             "reset_at_boundary": False,
             "text_cache_max_len": int(self.manifest.text_cache_max_len),
+            "max_model_len": int(expected_spec.max_model_len),
+            "kv_branches": expected_spec.kv_branches,
+            "model_owned_state_bytes_per_session": int(expected_spec.model_owned_state_bytes_per_session),
         }
+        if geometry is None:
+            # The request is resolved independently in ``forward``. At bind
+            # time only the geometry-dependent block size is intentionally
+            # deferred.
+            expected.pop("tokens_per_frame")
+            actual.pop("tokens_per_frame")
         mismatches = {name: (expected[name], actual[name]) for name in expected if expected[name] != actual[name]}
         if mismatches:
             details = ", ".join(
@@ -301,8 +406,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 for name, (expected_value, actual_value) in mismatches.items()
             )
             raise RuntimeError(
-                "Cosmos-Dreams AR-Diffusion KV geometry differs from the immutable "
-                f"model manifest ({details}). Fix the deployment configuration and restart."
+                f"Cosmos-Dreams bound AR-Diffusion KV cache violates the resolved model specification ({details})."
             )
 
     @contextmanager
@@ -395,6 +499,12 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             "FPS",
         )
 
+    def _resolve_request_geometry(self, sp: Any, prompt_data: Any) -> CosmosDreamsGeometry:
+        """Resolve the serialized request canvas at worker admission."""
+
+        del prompt_data
+        return resolve_cosmos_dreams_geometry(sp, None, self.resolution_policy)
+
     def _resolve_requested_pixel_frames(
         self,
         sp: Any,
@@ -448,17 +558,21 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         *,
         typed_inputs: Any | None,
         request: _ActionRequestContract,
+        geometry: CosmosDreamsGeometry,
         start_frame: int,
         target_frame: int,
         prompt_data: Any = None,
     ) -> _ActionConditioning:
         """Normalize action rows and freeze their request-wide indexing mode."""
 
-        del prompt_data
+        del prompt_data, geometry
         raw_action = self._prepare_raw_action(
-            sp,
             embodiment=request.embodiment,
-            action_value=typed_inputs.action if typed_inputs is not None else None,
+            action_value=(
+                typed_inputs.action
+                if typed_inputs is not None
+                else self._get_sp_param(sp, "action", None)
+            ),
         )
         layout = self._resolve_action_layout(
             raw_action,
@@ -486,11 +600,12 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         *,
         sampling_params: Any,
         prompt_data: Any,
+        geometry: CosmosDreamsGeometry,
         fps: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build the Humanoid AR prompt without a system prompt."""
 
-        del sampling_params, prompt_data, fps
+        del sampling_params, prompt_data, geometry, fps
         return self._tokenize_prompt(
             prompt,
             max_sequence_length=1 << 30,
@@ -546,16 +661,15 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         text_ids: torch.Tensor,
         *,
         real_text_kv_len: int,
-        height: int,
-        width: int,
+        geometry: CosmosDreamsGeometry,
         fps: float,
         conditioning_request: Any,
     ) -> CosmosDreamsSessionFingerprint:
         return CosmosDreamsSessionFingerprint(
             prompt_hash=prompt_token_hash(text_ids),
             real_text_kv_lengths=((self._MAIN_BRANCH, real_text_kv_len),),
-            height=height,
-            width=width,
+            height=geometry.height,
+            width=geometry.width,
             fps=fps,
             conditioning=self._conditioning_fingerprint(conditioning_request),
             checkpoint_id=self.checkpoint_id,
@@ -569,12 +683,13 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         self,
         state: CosmosDreamsSessionState,
         current_kv: list[tuple[torch.Tensor, torch.Tensor]],
+        geometry: CosmosDreamsGeometry,
     ) -> None:
         history = state.dense_kv_by_branch.get(self._MAIN_BRANCH)
         state.dense_kv_by_branch[self._MAIN_BRANCH] = append_dense_kv_history(
             history,
             current_kv,
-            tokens_per_frame=self.manifest.tokens_per_frame,
+            tokens_per_frame=geometry.tokens_per_frame(self.manifest.conditioning_tokens_per_frame),
             sink_frames=self.manifest.sink_frames,
             window_frames=self.manifest.window_frames,
         )
@@ -585,6 +700,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         *,
+        geometry: CosmosDreamsGeometry,
         text_kv: list[tuple[torch.Tensor, torch.Tensor]],
         real_text_kv_len: int,
         frame_start: int,
@@ -594,7 +710,8 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         commit_current: bool,
     ) -> CosmosDreamsTransformerOutput:
         paged_state = self._ar_diffusion_kv_state
-        seq_len = hidden_states.shape[2] * self.manifest.tokens_per_frame
+        tokens_per_frame = geometry.tokens_per_frame(self.manifest.conditioning_tokens_per_frame)
+        seq_len = hidden_states.shape[2] * tokens_per_frame
         paged_kv = None
         dense_history = None
         if paged_state is not None:
@@ -610,6 +727,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         output = self.transformer(
             hidden_states,
             timestep,
+            geometry=geometry,
             text_kv=text_kv,
             real_text_kv_len=real_text_kv_len,
             frame_start=frame_start,
@@ -622,7 +740,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         if paged_state is not None:
             paged_state.commit_paged_context(self._MAIN_BRANCH)
         elif commit_current:
-            self._append_dense_kv(state, output.current_kv)
+            self._append_dense_kv(state, output.current_kv, geometry)
         return output
 
     # -- Action and latent preparation ------------------------------------
@@ -716,7 +834,12 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             rows.append(raw_action[start : start + action_count])
         return torch.cat(rows, dim=0).unsqueeze(0), tuple(null_indexes)
 
-    def _initial_condition_latent(self, prompt_data: Any, sp) -> torch.Tensor | None:
+    def _initial_condition_latent(
+        self,
+        prompt_data: Any,
+        sp: Any,
+        geometry: CosmosDreamsGeometry,
+    ) -> torch.Tensor | None:
         explicit = self._get_sp_param(sp, "initial_latent", None)
         if explicit is not None:
             latent = explicit if isinstance(explicit, torch.Tensor) else torch.as_tensor(explicit)
@@ -726,8 +849,8 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 1,
                 self.transformer.latent_channel_size,
                 1,
-                self.manifest.latent_height,
-                self.manifest.latent_width,
+                geometry.latent_height,
+                geometry.latent_width,
             )
             if tuple(latent.shape) != expected:
                 raise ValueError(f"Cosmos-Dreams initial_latent must have shape {expected}, got {tuple(latent.shape)}.")
@@ -748,13 +871,27 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             return None
         if not isinstance(image, torch.Tensor):
             raise TypeError("Cosmos-Dreams preprocessed image must be a torch.Tensor.")
-        return self._encode_conditioning_image_latent(image)
+        latent = self._encode_conditioning_image_latent(image)
+        expected = (
+            1,
+            self.transformer.latent_channel_size,
+            1,
+            geometry.latent_height,
+            geometry.latent_width,
+        )
+        if tuple(latent.shape) != expected:
+            raise ValueError(
+                "Cosmos-Dreams encoded conditioning media does not match resolved geometry: "
+                f"expected {expected}, got {tuple(latent.shape)}."
+            )
+        return latent
 
     def _commit_clean_frame(
         self,
         state: CosmosDreamsSessionState,
         latent: torch.Tensor,
         *,
+        geometry: CosmosDreamsGeometry,
         frame_idx: int,
         text_kv: list[tuple[torch.Tensor, torch.Tensor]],
         real_text_kv_len: int,
@@ -765,6 +902,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             state,
             latent.to(self.dtype),
             torch.zeros(1, device=self.device, dtype=torch.float32),
+            geometry=geometry,
             text_kv=text_kv,
             real_text_kv_len=real_text_kv_len,
             frame_start=frame_idx,
@@ -778,6 +916,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         self,
         state: CosmosDreamsSessionState,
         *,
+        geometry: CosmosDreamsGeometry,
         chunk_start: int,
         chunk_end: int,
         seed: int,
@@ -796,8 +935,8 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             1,
             self.transformer.latent_channel_size,
             chunk_frames,
-            self.manifest.latent_height,
-            self.manifest.latent_width,
+            geometry.latent_height,
+            geometry.latent_width,
             generator=noise_generator,
             device=self.device,
             dtype=self.dtype,
@@ -808,6 +947,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 state,
                 x.to(self.dtype),
                 timestep,
+                geometry=geometry,
                 text_kv=text_kv,
                 real_text_kv_len=real_text_kv_len,
                 frame_start=chunk_start,
@@ -833,6 +973,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         self,
         state: CosmosDreamsSessionState,
         *,
+        geometry: CosmosDreamsGeometry,
         chunk_start: int,
         chunk_end: int,
         target_frame: int,
@@ -862,6 +1003,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         }
         clean_chunk = self._denoise_chunk(
             state,
+            geometry=geometry,
             chunk_start=chunk_start,
             chunk_end=chunk_end,
             seed=seed,
@@ -890,6 +1032,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 self._commit_clean_frame(
                     state,
                     clean_chunk[:, :, local_idx : local_idx + 1],
+                    geometry=geometry,
                     frame_idx=frame_idx,
                     text_kv=text_kv,
                     real_text_kv_len=real_text_kv_len,
@@ -907,6 +1050,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         state: CosmosDreamsSessionState,
         initial_latent: torch.Tensor | None,
         *,
+        geometry: CosmosDreamsGeometry,
         target_frame: int,
         terminal_request: bool,
         request_start_frame: int,
@@ -938,6 +1082,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 self._commit_clean_frame(
                     state,
                     initial_latent,
+                    geometry=geometry,
                     frame_idx=0,
                     text_kv=text_kv,
                     real_text_kv_len=real_text_kv_len,
@@ -1088,13 +1233,15 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             close_session=close_session,
         )
 
-        height = _admission_int(_first_not_none(sp.height, self.manifest.height), "height")
-        width = _admission_int(_first_not_none(sp.width, self.manifest.width), "width")
-        if (height, width) != (self.manifest.height, self.manifest.width):
-            raise ARDiffusionRequestRejectedError(
-                "Cosmos-Dreams resolution is fixed per deployment: "
-                f"requested {height}x{width}, configured {self.manifest.height}x{self.manifest.width}."
-            )
+        try:
+            geometry = self._resolve_request_geometry(sp, prompt_data)
+        except (TypeError, ValueError) as exc:
+            raise ARDiffusionRequestRejectedError(str(exc)) from exc
+        if self._ar_diffusion_kv_state is not None:
+            # The runner resolved the same serialized H/W to select this pool.
+            # A mismatch here is an internal invariant failure, not a client
+            # admission error, and therefore follows failed-forward cleanup.
+            self._validate_bound_kv_geometry(self._ar_diffusion_kv_state, geometry)
         fps = self._resolve_request_fps(sp, prompt_data)
         if not math.isfinite(fps) or fps <= 0:
             raise ARDiffusionRequestRejectedError(f"Cosmos-Dreams FPS must be positive, got {fps}.")
@@ -1122,6 +1269,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
             prompt,
             sampling_params=sp,
             prompt_data=prompt_data,
+            geometry=geometry,
             fps=fps,
         )
         real_text_kv_len = int(text_mask[0].sum().item())
@@ -1133,8 +1281,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         fingerprint = self._fingerprint(
             text_ids,
             real_text_kv_len=real_text_kv_len,
-            height=height,
-            width=width,
+            geometry=geometry,
             fps=fps,
             conditioning_request=conditioning_request,
         )
@@ -1159,7 +1306,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 )
 
         try:
-            initial_latent = self._initial_condition_latent(prompt_data, sp)
+            initial_latent = self._initial_condition_latent(prompt_data, sp, geometry)
         except (TypeError, ValueError) as exc:
             raise ARDiffusionRequestRejectedError(str(exc)) from exc
         if start_frame > 0 and initial_latent is not None:
@@ -1212,6 +1359,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
                 sp,
                 typed_inputs=typed_inputs,
                 request=conditioning_request,
+                geometry=geometry,
                 start_frame=start_frame,
                 target_frame=target_frame,
                 prompt_data=prompt_data,
@@ -1239,6 +1387,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         prefilled = self._prefill_first_frame(
             state,
             initial_latent,
+            geometry=geometry,
             target_frame=target_frame,
             terminal_request=terminal_request,
             request_start_frame=start_frame,
@@ -1261,6 +1410,7 @@ class CosmosDreamsPipeline(Cosmos3OmniDiffusersPipeline):
         ):
             clean_chunk = self._run_chunk(
                 state,
+                geometry=geometry,
                 chunk_start=chunk_start,
                 chunk_end=chunk_end,
                 target_frame=target_frame,

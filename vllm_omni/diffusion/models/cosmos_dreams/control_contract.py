@@ -20,13 +20,13 @@ TransferHint = Literal["edge", "blur", "depth", "seg"]
 
 
 class CosmosDreamsActionConditioning(CosmosDreamsActionSchema):
-    """Schema-v3 action-conditioning branch."""
+    """Schema-v1 action-conditioning branch."""
 
     mode: Literal["action"]
 
 
 class CosmosDreamsControlVideoConditioning(BaseModel):
-    """Immutable schema-v3 payload pinned to the target Transfer checkpoint."""
+    """Immutable schema-v1 payload pinned to the target Transfer checkpoint."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -63,26 +63,26 @@ class CosmosDreamsControlVideoConditioning(BaseModel):
         return canonical_sha256(self.model_dump(mode="json"))
 
 
-CosmosDreamsV3Conditioning = Annotated[
+CosmosDreamsConditioning = Annotated[
     CosmosDreamsActionConditioning | CosmosDreamsControlVideoConditioning,
     Field(discriminator="mode"),
 ]
-_V3_CONDITIONING_ADAPTER = TypeAdapter(CosmosDreamsV3Conditioning)
+_CONDITIONING_ADAPTER = TypeAdapter(CosmosDreamsConditioning)
 
 
-def parse_cosmos_dreams_v3_conditioning(value: object) -> CosmosDreamsV3Conditioning:
-    """Parse schema-v3 conditioning by its required ``mode`` discriminator."""
+def parse_cosmos_dreams_conditioning(value: object) -> CosmosDreamsConditioning:
+    """Parse schema-v1 conditioning by its required ``mode`` discriminator."""
 
-    return _V3_CONDITIONING_ADAPTER.validate_python(value)
+    return _CONDITIONING_ADAPTER.validate_python(value)
 
 
 __all__ = [
     "CosmosDreamsActionConditioning",
     "CosmosDreamsControlVideoConditioning",
-    "CosmosDreamsV3Conditioning",
+    "CosmosDreamsConditioning",
     "TRANSFER_CONTROL_ATTENTION_MODE",
     "TRANSFER_HINTS",
     "TRANSFER_SYSTEM_PROMPT_ID",
     "TransferHint",
-    "parse_cosmos_dreams_v3_conditioning",
+    "parse_cosmos_dreams_conditioning",
 ]

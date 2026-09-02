@@ -17,7 +17,7 @@ headers and per-shard SHA-256 hashes.
 
 Raw DCP is intentionally not accepted by Stage 2.
 
-Schema-v3 artifacts may also contain the frozen pre-unification YAM datasets
+Schema-v1 artifacts may also contain the frozen pre-unification YAM datasets
 exported by imaginaire4: `abc_yam`, `molmoact2_yam`, and `xdof_yam`. vLLM-Omni
 validates their 20D left-arm/right-arm layout, domain 16, and separate legacy
 normalizer sources before serving them. The unified `yam_dataset` classes have
@@ -57,17 +57,16 @@ inventory. Keep `cosmos_dreams_artifact.json` with the model directory.
 
 Start from [`cosmos_dreams.yaml`](../../vllm_omni/deploy/cosmos_dreams.yaml).
 The default is eager, batch size one, 720×1280, one resident session, and a
-96-latent-frame window. Resolution is fixed at load time because one paged KV
-block equals one frame (`924` tokens at 720p: four action tokens plus a 23×40
-vision grid).
+96-latent-frame window. Each request resolves an aligned canvas and selects a
+matching paged KV pool; the maximum permitted geometry is validated at load.
 
 Checkpoint identity, hash, domain map, and normalizer data are deliberately not
 template defaults: they must be read from `transformer/config.json`. Startup
 rejects a deploy override that contradicts those embedded artifact fields.
 
 The KV startup allocation is a hard floor. At TP=1/BF16, one 720p frame across
-36 layers is about 133 MiB; the configured window, the mandatory one-page
-scratch reservation, and the 512-token text pool are all counted before model
+36 layers is about 133 MiB; the configured window, scratch reservation, and
+the 512-token text pool are all counted before model
 execution. If the manager reports an insufficient memory budget, use a
 checkpoint artifact exported with a smaller `window_frames`; runtime overrides
 are rejected. The physical window does not cap the logical session at that
@@ -101,4 +100,4 @@ same three spans. Compile/CUDA graphs, RF/CFG checkpoints, and multi-session
 serving remain follow-up work.
 
 See the [offline parity runner](../../examples/offline_inference/cosmos_dreams/README.md)
-for jsonl/pickle input and latent-output examples.
+for JSONL/NPZ input and latent-output examples.

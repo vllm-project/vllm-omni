@@ -124,6 +124,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deploy-config", default="vllm_omni/deploy/cosmos_dreams_transfer.yaml")
     parser.add_argument("--output", type=Path, default=Path("cosmos_dreams_transfer.mp4"))
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--resolution",
+        choices=("256", "480", "704", "720"),
+        default="480",
+        help="Cosmos3 Transfer bucket family; aspect ratio is inferred from the prioritized control source.",
+    )
     parser.add_argument("--fps", type=float, default=None)
     parser.add_argument("--num-frames", type=int, default=None)
     parser.add_argument("--output-type", choices=("video", "latent"), default="video")
@@ -162,7 +168,7 @@ def main() -> None:
         "session_id": f"transfer-{args.input_json.stem}",
         "reset": True,
         "close_session": True,
-        "resolution": "480",
+        "resolution": args.resolution,
         hint: hint_config,
     }
     omni = Omni(
@@ -172,8 +178,8 @@ def main() -> None:
         enforce_eager=True,
     )
     sampling_params = OmniDiffusionSamplingParams(
-        height=480,
-        width=832,
+        height=None,
+        width=None,
         num_frames=num_frames,
         num_inference_steps=4,
         guidance_scale=1.0,
