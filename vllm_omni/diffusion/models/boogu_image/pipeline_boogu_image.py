@@ -303,7 +303,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             raise NotImplementedError("CFG parallelism is not supported by BooguImagePipeline.")
         if parallel_config.use_hsdp:
             raise NotImplementedError("HSDP is not supported by BooguImagePipeline.")
-        if self.od_config.cache_backend not in (None, "", "none"):
+        if self.od_config.cache_backend not in (None, "", "none", "tea_cache"):
             raise NotImplementedError(
                 f"Cache backend '{self.od_config.cache_backend}' is not supported by BooguImagePipeline."
             )
@@ -665,6 +665,9 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         # Negative instruction embeddings are needed whenever text guidance is
         # active (t2i text CFG, ti2i text-only, and ti2i double guidance).
         do_classifier_free_guidance = text_guidance_scale > 1.0
+        # Lets TeaCache alternate cache state across the sequential CFG
+        # branches issued as separate `predict()` calls below.
+        self.transformer.do_true_cfg = do_classifier_free_guidance or image_guidance_scale > 1.0
 
         batch_size = len(prompt)
 
