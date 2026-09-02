@@ -168,6 +168,11 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         "bagel.connector",
         "bagel.vit_pos_embed",
     ]
+    # LoRA scanning target. ``_dit_modules`` holds the dotted path
+    # "language_model.model", which DiffusionLoRAManager cannot resolve as a
+    # pipeline attribute, so the top-level ``bagel`` module (LLM plus ViT,
+    # connector, and VAE projections) is declared explicitly here.
+    _lora_components: ClassVar[list[str]] = ["bagel"]
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()

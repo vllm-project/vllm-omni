@@ -389,17 +389,20 @@ class DiffusionLoRAManager:
             fully_sharded_loras=False,
         )
 
-        # Default denoising components, declared DiT components, and any a
-        # pipeline opts into via ``_lora_components``.
+        # Components scanned for LoRA-capable layers: framework defaults,
+        # declared DiT components, and any a pipeline opts into via
+        # ``_lora_components``. The defaults only cover the generic diffusers
+        # naming convention: ``transformer`` (plus ``transformer_2`` for
+        # dual-DiT pipelines such as Wan2.2) and ``unet`` for SDXL-style
+        # pipelines. Model-specific attribute names must be declared by the
+        # pipeline itself via ``_dit_modules`` or ``_lora_components``.
         #
-        # NOTE: SDXL-style pipelines expose the denoiser as ``unet``.
-        # Without scanning this component, adapters can load/activate while
-        # effectively applying to zero layers, producing base-identical output.
+        # NOTE: if the denoiser component is not scanned here, adapters can
+        # load/activate while effectively applying to zero layers, producing
+        # base-identical output.
         default_components = (
             "transformer",
             "transformer_2",
-            "dit",
-            "bagel",
             "unet",
         )
         declared_components = tuple(getattr(self.pipeline, "_dit_modules", ()) or ())

@@ -661,8 +661,10 @@ def test_lora_manager_discovers_bagel_component(monkeypatch):
         lambda root, name, sub: fake_replace_submodule(root, name, sub, replace_calls),
     )
 
-    # Pipeline with a 'bagel' component (no 'transformer')
+    # Pipeline with a 'bagel' component (no 'transformer') declared via
+    # _lora_components, matching how BagelPipeline opts in.
     pipeline = torch.nn.Module()
+    pipeline._lora_components = ["bagel"]
     pipeline.bagel = torch.nn.Module()
     pipeline.bagel.language_model = torch.nn.Module()
     pipeline.bagel.language_model.qkv_proj = _FakeLinearBase()
