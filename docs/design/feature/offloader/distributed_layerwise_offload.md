@@ -26,6 +26,8 @@ Legend: ✅ supported, ⚠️ compatibility path or limited validation, ❌ unsu
 | **TP > 1** | ⚠️ Ordinary TP-aware loader only; no direct checkpoint mmap. | ⚠️ Ordinary TP-aware loader only; no direct checkpoint mmap. |
 | **HSDP** | ❌ Rejected to avoid double-sharding parameters. | ⚠️ Limited end-to-end coverage. |
 | **Per-tensor online FP8 linears** | ✅ Ordinary loader finalizes weights and scales before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
+| **Online INT8 linears** | ✅ Ordinary loader finalizes the int8 weight (contiguous or transposed view) and fp32 scale before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
+| **Online MXFP8 linears** | ✅ Ordinary loader finalizes the fp8 weight (contiguous) and e8m0 block scale (contiguous or transposed view) before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
 | **Other online quantization methods** | ❌ Rejected until runtime packing and scale layouts are validated. | ⚠️ Allowed through the ordinary loader; validation is method-specific. |
 | **Model-level or standard layerwise CPU offload** | ❌ Disabled because DLO takes priority. | ❌ Disabled because DLO takes priority. |
 | **Resident leading layers** | ❌ Rejected. | ✅ Requires eligible resident paths in the model's `OffloadPlan`. |
@@ -220,9 +222,15 @@ model revision and parallel layout with `required`. TP coordinates have distinct
 identities, while equivalent DP replicas share them.
 
 The current producer/consumer boundary is the model-declared final-layout BF16
-contract (MiniMax H3 today). It supports ordinary-loader final layouts for TP1
-and TP2 rank identities plus SP layout identities; online quantization, HSDP,
-LoRA/adapted weights, and non-default load formats remain ineligible. HWR mode
+contract (MiniMax H3 and `black-forest-labs/FLUX.2-klein-4B`). The FLUX.2-klein
+contract covers both transformer block stacks, constructor-stable packed QKV
+mapping state, BF16 parameters, and any persistent loader-owned `beta`/`eps`
+buffers. The shared HWR machinery supports ordinary-loader final layouts for
+TP1 and TP2 rank identities plus SP layout identities. FLUX.2-klein evidence
+in this change is TP1-only; its TP2/SP layouts rely on the existing
+per-coordinate identity mechanics and remain unmeasured. Online quantization,
+HSDP, LoRA/adapted weights, and non-default load formats remain ineligible.
+HWR mode
 `disabled`, DLO-disabled, and DLO AllGather configurations stop before source
 identity or store construction and retain the existing checkpoint-mmap or
 ordinary-loader path.
@@ -432,11 +440,15 @@ requirements.
 
 Direct checkpoint mmap can back either transfer path. It is currently limited
 to proven TP1, non-HSDP, non-online-quantized layouts. Other layouts use the
-ordinary loader. Per-tensor online FP8 linears can use DLO AllGather after the
-ordinary loader finalizes their runtime weights and scales; DLO then shards and
-reconstructs those tensors with their recorded layouts. Other online methods
-must use `--dlo-no-use-allgather` or disable online quantization until their
-runtime layouts are validated.
+ordinary loader. Per-tensor online FP8, online INT8, and online MXFP8 linears
+can use DLO AllGather after the ordinary loader finalizes their runtime
+weights and scales; DLO then shards and reconstructs those tensors with their
+recorded layouts (they all keep plain 1-byte dtypes over ordinary strided
+views: online INT8 has an int8 weight plus fp32 scale, online MXFP8 has an
+fp8 weight plus e8m0 block scale, each with a contiguous or transposed-view
+finalized tensor, all covered by the same physical-order packing as online
+FP8). Other online methods must use `--dlo-no-use-allgather` or disable
+online quantization until their runtime layouts are validated.
 
 The Host Weight Runtime representation, publication, and no-AllGather consumer
 contracts are merged; see
@@ -453,8 +465,8 @@ Current source-level validation includes:
 - HSDP + DLO without AllGather acceptance at configuration level;
 - loader preflight fallback for TP, HSDP, online quantization, unknown custom
   loaders, missing keys, and shape/dtype mismatches;
-- ordinary-loader fallback for per-tensor online FP8 linears followed by DLO
-  sharding of finalized weights and scales;
+- ordinary-loader fallback for per-tensor online FP8, online INT8, and online
+  MXFP8 linears followed by DLO sharding of finalized weights and scales;
 - exact loader-to-backend plan transfer and ordinary-loader fallback;
 - ordered publication hashing, overlapped durability, unordered parallel
   checksum fallback, and node-local source-digest reuse/invalidation;

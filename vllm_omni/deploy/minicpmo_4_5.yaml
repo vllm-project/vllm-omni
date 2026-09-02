@@ -4,7 +4,9 @@ async_chunk: true
 # Native full-duplex shares this profile with /v1/chat/completions. Every other
 # duplex_session knob keeps its runtime default.
 session_mode: duplex
-active_stream_window: 1
+# Keep the active window aligned with the session and stage capacities below.
+# A smaller window serializes first-packet generation for concurrent chat turns.
+active_stream_window: 4
 duplex_session:
   # Matches Stage 0/1 max_num_seqs below.
   max_sessions: 4
@@ -62,6 +64,13 @@ stages:
 
   - stage_id: 1
     max_num_seqs: 4
+    # Native duplex uses MiniCPMTTS.generate_with_buffer's supported
+    # sliding_recompute policy: retain one completed condition/codec chunk
+    # when the next condition arrives. Other deploy profiles continue to use
+    # the checkpoint's full_attention policy.
+    hf_overrides:
+      tts_config:
+        attention_type: sliding_recompute
     # Leave device-level headroom for the colocated HiFi-GAN cuDNN workspace.
     gpu_memory_utilization: 0.15
     enforce_eager: false

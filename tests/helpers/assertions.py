@@ -665,7 +665,7 @@ def _speech_assertion_needs_audio_transcript(request_config: dict[str, Any], run
         return False
     if request_config.get("response_format") == "pcm":
         return False
-    return bool(request_config.get("input"))
+    return bool(request_config.get("transcript_expected_text", request_config.get("input")))
 
 
 def _resolve_audio_transcript(
@@ -873,6 +873,13 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
     elif req_fmt == "wav" and response.audio_format:
         assert req_fmt in response.audio_format
 
+    expected_sample_rate = request_config.get("sample_rate")
+    if expected_sample_rate is not None and req_fmt == "wav" and response.audio_bytes:
+        info = sf.info(io.BytesIO(response.audio_bytes))
+        assert info.samplerate == int(expected_sample_rate), (
+            f"Expected sample_rate={expected_sample_rate}, got {info.samplerate}"
+        )
+
     if run_level in {"advanced_model", "full_model"}:
         if req_fmt == "pcm" and response.audio_bytes:
             min_hnr_db = float(request_config.get("min_hnr_db", _MIN_PCM_SPEECH_HNR_DB))
@@ -880,7 +887,7 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
 
         transcript = _resolve_audio_transcript(response, request_config, run_level, speech_api=True)
         if transcript is not None:
-            expected_text = request_config.get("input")
+            expected_text = request_config.get("transcript_expected_text", request_config.get("input"))
             if expected_text:
                 print(f"audio content is: {transcript}")
                 print(f"input text is: {expected_text}")

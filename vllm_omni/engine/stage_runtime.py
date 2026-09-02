@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Stage Runtime implementations for single-node and distributed omni stages."""
 
@@ -12,7 +12,7 @@ import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import janus
 from omegaconf import OmegaConf
@@ -87,7 +87,6 @@ class StageRemoteFactoryContext:
     base_metadata: Any
     vllm_config: Any | None = None
     executor_class: type | None = None
-    diffusion_batch_size: int = 1
 
 
 def _build_load_balancer_factory(policy: str) -> Callable[[], LoadBalancer]:
@@ -124,7 +123,6 @@ class StageRuntime:
         config_path: str,
         *,
         stage_init_timeout: int,
-        diffusion_batch_size: int,
         async_chunk: bool,
         tokenizer: str | None = None,
         log_stats: bool = False,
@@ -133,7 +131,6 @@ class StageRuntime:
         self._model = model
         self._config_path = config_path
         self._stage_init_timeout = stage_init_timeout
-        self._diffusion_batch_size = diffusion_batch_size
         self._async_chunk = async_chunk
         self._tokenizer = tokenizer
         self._log_stats = log_stats
@@ -545,7 +542,7 @@ class StageRuntime:
         self,
         plan: ReplicaInitPlan,
         stage_init_timeout: int,
-    ) -> StageEngineCoreClientBase:
+    ) -> StagePoolClient:
         """Initialize one local LLM replica using vLLM's launch/attach pattern."""
         resources: StageReplicaResources | None = None
         stage_client = None
@@ -608,7 +605,7 @@ class StageRuntime:
             )
 
             logger.info("[StageRuntime] Stage %s initialized", plan.metadata.stage_id)
-            return stage_client
+            return cast(StagePoolClient, stage_client)
         except Exception:
             if stage_client is not None:
                 try:
@@ -641,7 +638,7 @@ class StageRuntime:
         self,
         plan: ReplicaInitPlan,
         stage_init_timeout: int,
-    ) -> Any:
+    ) -> StagePoolClient:
         """Initialize one local diffusion replica end-to-end."""
         client = None
         resources = None
@@ -652,27 +649,39 @@ class StageRuntime:
             ):
                 omni_conn_cfg, omni_from, omni_to = plan.omni_kv_connector
                 if omni_conn_cfg:
+                    if omni_from is None or omni_to is None:
+                        raise RuntimeError("Omni KV connector requires source and destination stages")
                     inject_omni_kv_config(plan.stage_cfg, omni_conn_cfg, omni_from, omni_to)
                 inject_kv_stage_info(plan.stage_cfg, plan.metadata.stage_id, self._stage_configs)
+                engine_args = getattr(plan.stage_cfg, "engine_args", {})
+                inline_diffusion = (
+                    engine_args.get("inline_diffusion", False)
+                    if hasattr(engine_args, "get")
+                    else getattr(engine_args, "inline_diffusion", False)
+                )
+                custom_pipeline_args = (
+                    engine_args.get("custom_pipeline_args")
+                    if hasattr(engine_args, "get")
+                    else getattr(engine_args, "custom_pipeline_args", None)
+                )
                 client, resources = launch_diffusion_stage_replica(
                     model=self._model,
                     stage_config=plan.stage_cfg,
                     metadata=plan.metadata,
                     stage_init_timeout=stage_init_timeout,
-                    batch_size=self._diffusion_batch_size,
-                    use_inline=self._num_stages == 1 and plan.num_replicas == 1,
+                    use_inline=plan.num_replicas == 1
+                    and bool(self._num_stages == 1 or inline_diffusion or custom_pipeline_args),
                     replica_id=plan.replica_id,
                     omni_master_server=self._get_omni_master_server(),
                     omni_coordinator_address=self._get_coordinator_address(),
                 )
 
             logger.info(
-                "[StageRuntime] Stage %s replica %s initialized (diffusion, batch_size=%d)",
+                "[StageRuntime] Stage %s replica %s initialized (diffusion)",
                 plan.metadata.stage_id,
                 plan.replica_id,
-                self._diffusion_batch_size,
             )
-            return client
+            return cast(StagePoolClient, client)
         except Exception:
             if client is not None:
                 try:
@@ -754,7 +763,6 @@ class DistStageRuntime(StageRuntime):
         config_path: str,
         *,
         stage_init_timeout: int,
-        diffusion_batch_size: int,
         async_chunk: bool,
         single_stage_id_filter: int | None,
         omni_master_address: str,
@@ -771,7 +779,6 @@ class DistStageRuntime(StageRuntime):
             model=model,
             config_path=config_path,
             stage_init_timeout=stage_init_timeout,
-            diffusion_batch_size=diffusion_batch_size,
             async_chunk=async_chunk,
             tokenizer=tokenizer,
             log_stats=log_stats,
@@ -900,7 +907,6 @@ class DistStageRuntime(StageRuntime):
             base_metadata=metadata,
             vllm_config=plan.stage_vllm_config,
             executor_class=plan.executor_class,
-            diffusion_batch_size=self._diffusion_batch_size,
         )
         return self._create_remote_replica_client(ctx, plan.replica_id)
 
@@ -963,7 +969,6 @@ class DistStageRuntime(StageRuntime):
                 base_metadata=template.metadata,
                 vllm_config=template.stage_vllm_config,
                 executor_class=template.executor_class,
-                diffusion_batch_size=self._diffusion_batch_size,
             )
         return contexts
 
@@ -1031,14 +1036,13 @@ class DistStageRuntime(StageRuntime):
                 metadata,
                 request_address=resources.addresses.inputs[0],
                 response_address=resources.addresses.outputs[0],
-                batch_size=ctx.diffusion_batch_size,
             )
             logger.info(
                 "[DistStageRuntime] Remote diffusion replica attached stage=%d replica=%d",
                 stage_id,
                 replica_id,
             )
-            return client
+            return cast(StagePoolClient, client)
 
         if ctx.vllm_config is None:
             raise RuntimeError(f"Remote LLM stage {stage_id} is missing vllm_config")
@@ -1095,7 +1099,6 @@ def create_stage_runtime(
     *,
     single_stage_mode: bool,
     stage_init_timeout: int,
-    diffusion_batch_size: int,
     async_chunk: bool,
     tokenizer: str | None = None,
     # Distributed-only params:
@@ -1117,7 +1120,6 @@ def create_stage_runtime(
             model=model,
             config_path=config_path,
             stage_init_timeout=stage_init_timeout,
-            diffusion_batch_size=diffusion_batch_size,
             async_chunk=async_chunk,
             tokenizer=tokenizer,
             log_stats=log_stats,
@@ -1134,7 +1136,6 @@ def create_stage_runtime(
         model=model,
         config_path=config_path,
         stage_init_timeout=stage_init_timeout,
-        diffusion_batch_size=diffusion_batch_size,
         async_chunk=async_chunk,
         tokenizer=tokenizer,
         log_stats=log_stats,

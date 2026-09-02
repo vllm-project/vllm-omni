@@ -61,12 +61,6 @@ EXCLUDED_MODELS = [
     "HunyuanVideo15Pipeline",
     "HunyuanVideo15ImageToVideoPipeline",
     "LingBotVideoPipeline",
-    # The common harness does not yet define an image-to-video task or supply
-    # an input image. SANA I2V is covered by
-    # tests/diffusion/models/sana_video/test_pipeline_sana_video.py and
-    # tests/e2e/online_serving/test_sana_video_expansion.py. SANA T2V is exercised through
-    # the common tiny-model setting in model_settings.py.
-    "SanaImageToVideoPipeline",
     # Requires camera/action assets and persistent AR state; covered by its
     # dedicated contract tests and real-checkpoint E2E smoke instead.
     "LingBotWorldCausalDMDPipeline",

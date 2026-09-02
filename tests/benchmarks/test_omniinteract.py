@@ -585,7 +585,7 @@ async def test_adapter_requires_and_forwards_exact_prepared_payload(tmp_path: Pa
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("request_metrics", "expected_itl", "expected_text_latency"),
+    ("request_metrics", "expected_itl", "expected_text_latency", "expected_tpot_measured"),
     [
         (
             [
@@ -594,6 +594,7 @@ async def test_adapter_requires_and_forwards_exact_prepared_payload(tmp_path: Pa
             ],
             [0.01, 0.02, 0.03],
             0.16,
+            True,
         ),
         (
             [
@@ -602,6 +603,7 @@ async def test_adapter_requires_and_forwards_exact_prepared_payload(tmp_path: Pa
             ],
             [],
             0.18,
+            True,
         ),
         (
             [
@@ -610,6 +612,7 @@ async def test_adapter_requires_and_forwards_exact_prepared_payload(tmp_path: Pa
             ],
             [],
             0.1,
+            False,
         ),
     ],
 )
@@ -619,6 +622,7 @@ async def test_adapter_reports_exact_or_weighted_token_timing(
     request_metrics: list[dict[str, object]],
     expected_itl: list[float],
     expected_text_latency: float,
+    expected_tpot_measured: bool,
 ):
     case, options = _case(tmp_path), _session_options(tmp_path)
     request = _request(case, options)
@@ -643,7 +647,7 @@ async def test_adapter_reports_exact_or_weighted_token_timing(
     assert output.success
     assert output.itl == expected_itl
     assert output.text_latency == pytest.approx(expected_text_latency)
-    assert output.tpot_measured is True
+    assert output.tpot_measured is expected_tpot_measured
 
 
 def test_batch_finalization_publishes_only_measured_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

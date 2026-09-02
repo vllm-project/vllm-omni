@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
-E2E expansion tests for MiMo-Audio online serving (nightly Omni · Function Test with H100).
+E2E expansion tests for MiMo-Audio online serving (nightly Omni · Function Test with H100 · Single-GPU).
 """
 
 import os

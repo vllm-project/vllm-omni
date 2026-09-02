@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import time as _time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -65,6 +66,12 @@ from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+def cleanup_request_artifact_dirs(artifact_dirs: set[str] | list[str]) -> None:
+    for artifact_dir in artifact_dirs:
+        shutil.rmtree(artifact_dir, ignore_errors=True)
+
 
 # VLLM_OMNI_EVENT_DRIVEN_ORCH=1 switches the orchestration loop (and the
 # serving-side final-output drain in entrypoints/async_omni.py) from the legacy
@@ -220,26 +227,55 @@ class OrchestratorRequestState:
     duplex_stage_fences: dict[int, DuplexFence] = field(default_factory=dict)
     duplex_config_generation: int = -1
     running_counter_registered: bool = False
+    request_artifact_dirs: set[str] = field(default_factory=set)
+
+
+@dataclass
+class StreamingSegmentState:
+    """Streaming segment-boundary state for one stage of a request.
+
+    Every stage of a multi-stage pipeline reaches its own segment boundaries
+    independently, so this is tracked per stage rather than per request.
+    """
+
+    # Flag of segment of streaming input finished
+    finished: bool = False
+    # Tokens from the current raw segment boundary. The vLLM output processor
+    # does not guarantee that EngineCoreOutput.new_token_ids survives on the
+    # processed RequestOutput used by the routing layer.
+    token_ids: list[int] = field(default_factory=list)
+    output_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class StreamingInputState:
     # Flag of streaming input request
     enabled: bool = False
-    # Flag of segment of streaming input finished
-    segment_finished: bool = False
-    # Tokens from the current raw segment boundary. The vLLM output processor
-    # does not guarantee that EngineCoreOutput.new_token_ids survives on the
-    # processed RequestOutput used by the routing layer.
-    segment_token_ids: list[int] = field(default_factory=list)
-    segment_output_metadata: dict[str, Any] = field(default_factory=dict)
-    # Streaming update prompt length
+    # Keyed by stage. ``_orchestration_loop`` records a boundary per stage poll
+    # into this one ``req_state``, while every consumer reads it for a specific
+    # ``stage_id``, so a flat slot is only correct as long as each read happens in
+    # the same iteration as its own stage's write. It is not for a stage that
+    # never records one (the ``poll_diffusion_output`` branch reaches
+    # ``_handle_processed_outputs`` without the raw-output loop) or for any
+    # consumer reading outside the writing iteration.
+    segments: dict[int, StreamingSegmentState] = field(default_factory=dict)
+    # Streaming update prompt length. NOT stage-keyed: its only consumer reads it
+    # through the streaming context on the stage-input-bridge path, not by stage
+    # id. Do not assume the rest of this struct is stage-safe.
     new_prompt_len_snapshot: int | None = None
     # Model/bridge-specific runtime states (e.g., thinker->talker)
     bridge_states: dict[str, Any] = field(default_factory=dict)
     # Synchronous stage-transition capability installed by the orchestrator
     # while the downstream input processor consumes upstream token output.
     source_token_decoder: Callable[..., str] | None = None
+
+    def segment(self, stage_id: int | None) -> StreamingSegmentState:
+        """Return ``stage_id``'s segment state, or a fresh empty one if unreported.
+
+        Fresh rather than shared: ``output_metadata`` is handed out by reference.
+        """
+        segment = self.segments.get(stage_id)
+        return segment if segment is not None else StreamingSegmentState()
 
 
 class _OrchestratorDuplexStagePort:
@@ -282,7 +318,15 @@ class _OrchestratorDuplexStagePort:
             duplex_state = {}
             request_state.streaming.bridge_states["duplex"] = duplex_state
         previous_epoch = duplex_state.get("epoch")
-        if not isinstance(duplex_state.get("model_turn_id"), int) or previous_epoch != context.fence.epoch:
+        current_model_turn_id = duplex_state.get("model_turn_id")
+        if (
+            not isinstance(current_model_turn_id, int)
+            or previous_epoch != context.fence.epoch
+            or current_model_turn_id < context.fence.turn_id
+        ):
+            # A serving-side safety boundary can close a Realtime response
+            # before the model emits its normal turn_eos. Catch up the
+            # engine-owned identity when the next fenced append starts.
             duplex_state["model_turn_id"] = context.fence.turn_id
         duplex_state.update(
             {
@@ -379,6 +423,7 @@ class Orchestrator:
     # Class-level defaults so tests that bypass __init__ via object.__new__
     # don't AttributeError when transfer / counter emit paths access them.
     _running_counter: OmniRequestCounter | None = None
+    _engines_waiting_counter: OmniRequestCounter | None = None
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
@@ -395,6 +440,7 @@ class Orchestrator:
         pd_config: dict[str, Any] | None = None,
         membership_controller: MembershipController | None = None,
         running_counter: OmniRequestCounter | None = None,
+        engines_waiting_counter: OmniRequestCounter | None = None,
         transfer_emitter: Any = None,
         prom_metrics: Any = None,
         log_stats: bool = False,
@@ -431,7 +477,13 @@ class Orchestrator:
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
-        self._init_metrics_state(stage_pools, running_counter, transfer_emitter, log_stats=log_stats)
+        self._init_metrics_state(
+            stage_pools,
+            running_counter,
+            transfer_emitter,
+            engines_waiting_counter=engines_waiting_counter,
+            log_stats=log_stats,
+        )
 
         self._cfg_tracker = CfgCompanionTracker()
         self._stage_input_processors: dict[int, Any] = {}
@@ -477,6 +529,7 @@ class Orchestrator:
         stage_pools: list[StagePool],
         running_counter: OmniRequestCounter | None,
         transfer_emitter: Any,
+        engines_waiting_counter: OmniRequestCounter | None = None,
         log_stats: bool = False,
     ) -> None:
         """Wire up all metric-related orchestrator state.
@@ -502,6 +555,7 @@ class Orchestrator:
         from iteration_stats independently of scheduler gauges.
         """
         self._running_counter = running_counter
+        self._engines_waiting_counter = engines_waiting_counter
         self._transfer_emitter = transfer_emitter
 
         # Flat engine_idx ↔ (stage, replica) maps. The reverse map is
@@ -723,6 +777,7 @@ class Orchestrator:
             final_output_stage_ids=final_output_stage_ids,
             request_timestamp=float(msg.request_timestamp or _time.time()),
             mm_features=getattr(prompt, "mm_features", None),
+            request_artifact_dirs=set(msg.request_artifact_dirs or ()),
         )
         self.request_states[request_id] = req_state
         self._register_running_request(req_state)
@@ -852,14 +907,19 @@ class Orchestrator:
         When ``msg.rpc_id`` is set, emit :class:`AbortResultMessage` after
         stage aborts, binding release, and request cleanup complete so the
         caller can await acknowledgment. Fire-and-forget aborts omit rpc_id.
+
+        AR final-stage abort outputs (partial tokens) are attached to the
+        result message when ``rpc_id`` is set, or enqueued on
+        ``output_async_queue`` for fire-and-forget aborts.
         """
         request_ids = msg.request_ids
         error: str | None = None
+        abort_outputs: list[OutputMessage] = []
         try:
             # _cleanup_request_ids is CFG-aware: it expands aborted parents to
             # their companions and fails a deferred parent whose companion is
             # aborted before its output arrived.
-            await self._cleanup_request_ids(list(request_ids), abort=True)
+            abort_outputs = await self._cleanup_request_ids(list(request_ids), abort=True)
             logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
         except Exception as exc:
             error = str(exc)
@@ -874,8 +934,12 @@ class Orchestrator:
                     rpc_id=msg.rpc_id,
                     success=error is None,
                     error=error,
+                    abort_outputs=abort_outputs or None,
                 )
             )
+        elif abort_outputs:
+            for output_msg in abort_outputs:
+                await self.output_async_queue.put(output_msg)
 
     async def _handle_interaction(self, msg: InteractionMessage) -> None:
         """Handle a midway interaction for an active streaming diffusion request."""
@@ -915,13 +979,53 @@ class Orchestrator:
                 )
             )
 
-    async def _abort_request_ids(self, request_ids: list[str]) -> None:
-        """Forward abort requests to all stage pools."""
+    async def _abort_request_ids(self, request_ids: list[str]) -> list[OutputMessage]:
+        """Forward abort requests to all stage pools.
+
+        Collects final-stage AR abort outputs (partial tokens) while request
+        state is still available for stage-id filtering. Diffusion pools do
+        not contribute abort outputs.
+        """
         if not request_ids:
-            return
+            return []
+        abort_outputs: list[OutputMessage] = []
         for pool in self.stage_pools:
-            await pool.abort_requests(request_ids)
+            stage_outputs = await pool.abort_requests(request_ids) or []
+            if bool(getattr(pool, "final_output", False)) and getattr(pool, "stage_type", None) != "diffusion":
+                final_output_type = getattr(pool.stage_client, "final_output_type", None) or "text"
+                for orch_req_id, request_output in stage_outputs:
+                    req_state = self.request_states.get(orch_req_id)
+                    if req_state is None:
+                        continue
+                    final_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
+                    if pool.stage_id not in final_stage_ids:
+                        continue
+                    engine_output = OmniRequestOutput.from_stage_output(
+                        request_output,
+                        request_id=orch_req_id,
+                        finished=True,
+                        stage_id=pool.stage_id,
+                        replica_id=pool.get_bound_replica_id(orch_req_id),
+                        final_output_type=final_output_type,
+                    )
+                    abort_outputs.append(
+                        OutputMessage(
+                            request_id=orch_req_id,
+                            stage_id=pool.stage_id,
+                            replica_id=pool.get_bound_replica_id(orch_req_id),
+                            engine_outputs=engine_output,
+                            metrics=None,
+                            finished=False,
+                            stage_submit_ts=req_state.stage_submit_ts.get(pool.stage_id),
+                        )
+                    )
             pool.release_bindings(request_ids)
+        last_index_by_req: dict[str, int] = {}
+        for index, output_msg in enumerate(abort_outputs):
+            last_index_by_req[output_msg.request_id] = index
+        for index, output_msg in enumerate(abort_outputs):
+            output_msg.finished = index == last_index_by_req[output_msg.request_id]
+        return abort_outputs
 
     def _release_request_bindings(self, request_ids: list[str]) -> None:
         """Release all stage-local route bindings for the given request ids."""
@@ -1025,15 +1129,12 @@ class Orchestrator:
             req_state = self.request_states.get(getattr(eco, "request_id", None))
             if req_state is None or not req_state.streaming.enabled:
                 continue
-            req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
-            req_state.streaming.segment_token_ids = (
-                self._coerce_int_list(getattr(eco, "new_token_ids", None))
-                if req_state.streaming.segment_finished
-                else []
-            )
+            segment_finished = bool(getattr(eco, "is_segment_finished", False))
             raw_mm = self._completion_multimodal_output(eco, None)
-            req_state.streaming.segment_output_metadata = (
-                dict(raw_mm) if req_state.streaming.segment_finished and isinstance(raw_mm, dict) else {}
+            req_state.streaming.segments[stage_id] = StreamingSegmentState(
+                finished=segment_finished,
+                token_ids=(self._coerce_int_list(getattr(eco, "new_token_ids", None)) if segment_finished else []),
+                output_metadata=(dict(raw_mm) if segment_finished and isinstance(raw_mm, dict) else {}),
             )
             req_state.streaming.new_prompt_len_snapshot = getattr(
                 eco,
@@ -1411,7 +1512,7 @@ class Orchestrator:
                 continue
 
             stage_metrics = None
-            segment_finished = req_state.streaming.enabled and req_state.streaming.segment_finished
+            segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
             if output.finished or segment_finished:
                 stage_metrics = pool.build_stage_metrics(
                     [output],
@@ -1449,11 +1550,20 @@ class Orchestrator:
         """Update one replica snapshot and expose the stage-wide total."""
         self._stage_replica_waiting[(stage_id, replica_id)] = max(int(n_waiting), 0)
         self._set_stage_waiting_total(stage_id)
+        self._sync_engines_waiting_counter()
 
     def _remove_stage_replica_waiting(self, stage_id: int, replica_id: int) -> None:
         """Drop a dead replica's snapshot and refresh the stage total."""
         self._stage_replica_waiting.pop((stage_id, replica_id), None)
         self._set_stage_waiting_total(stage_id)
+        self._sync_engines_waiting_counter()
+
+    def _sync_engines_waiting_counter(self) -> None:
+        """Aggregate per-replica waiting into the counter shared with the
+        frontend so engine-queued requests show as waiting, not running."""
+        counter = self._engines_waiting_counter
+        if counter is not None:
+            counter.value = sum(self._stage_replica_waiting.values())
 
     def _set_stage_waiting_total(self, stage_id: int) -> None:
         if self._prom_metrics is None:
@@ -1660,7 +1770,7 @@ class Orchestrator:
         *,
         abort: bool = False,
         close_duplex_sessions: bool = False,
-    ) -> None:
+    ) -> list[OutputMessage]:
         """Release pool bindings and logical request state for the given ids.
 
         CFG-aware: cleaning a parent releases its tracker state and pulls its
@@ -1669,9 +1779,13 @@ class Orchestrator:
         can never complete). Every teardown path (stage error, abort, replica
         loss, membership unregister) funnels through here, so tracker state
         cannot outlive its requests.
+
+        Returns:
+            Final-stage AR abort ``OutputMessage`` list when ``abort=True``;
+            otherwise an empty list.
         """
         if not request_ids:
-            return
+            return []
 
         cleanup_ids = list(dict.fromkeys(request_ids))
         batch = set(cleanup_ids)
@@ -1713,13 +1827,16 @@ class Orchestrator:
                 cleanup_ids.extend(stale_request_ids)
             cleanup_ids = list(dict.fromkeys(cleanup_ids))
 
+        abort_outputs: list[OutputMessage] = []
         try:
             if abort:
-                await self._abort_request_ids(cleanup_ids)
+                abort_outputs = await self._abort_request_ids(cleanup_ids)
             self._release_request_bindings(cleanup_ids)
             for request_id in cleanup_ids:
                 self._pd_kv_params.pop(request_id, None)
                 req_state = self.request_states.pop(request_id, None)
+                if req_state is not None:
+                    cleanup_request_artifact_dirs(getattr(req_state, "request_artifact_dirs", ()))
                 if req_state is not None and req_state.running_counter_registered and self._running_counter is not None:
                     self._running_counter.decrement()
                     req_state.running_counter_registered = False
@@ -1729,6 +1846,7 @@ class Orchestrator:
             raise
         if closing_session_ids and self.duplex_control_plane is not None:
             self.duplex_control_plane.finalize_closed_sessions(closing_session_ids)
+        return abort_outputs
 
     async def _apply_raw_terminal_stage_finish(
         self,
@@ -1861,6 +1979,7 @@ class Orchestrator:
         req_id = output.request_id
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
+        segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
         # CFG companion: stash output so parent can bundle [parent, *companions]
         # into source_outputs for the bridge (e.g. thinker2imagegen).
         if finished and self._cfg_tracker.is_companion(req_id):
@@ -1870,11 +1989,7 @@ class Orchestrator:
             return
 
         request_finished = False
-        if (
-            finished
-            and self.stage_pools[stage_id].final_output
-            and not (req_state.streaming.enabled and req_state.streaming.segment_finished)
-        ):
+        if finished and self.stage_pools[stage_id].final_output and not segment_finished:
             req_state.finished_final_output_stage_ids.add(stage_id)
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
             request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
@@ -1886,7 +2001,7 @@ class Orchestrator:
         # filter out again (the official implementation returns exactly one
         # result per audio chunk).
         is_duplex_stage0_segment = (
-            stage_id == 0 and self._is_duplex_session_request(req_state) and req_state.streaming.segment_finished
+            stage_id == 0 and self._is_duplex_session_request(req_state) and req_state.streaming.segment(0).finished
         )
         if self.stage_pools[stage_id].final_output and not is_duplex_stage0_segment:
             await self.output_async_queue.put(
@@ -1898,7 +2013,10 @@ class Orchestrator:
                     metrics=stage_metrics,
                     finished=(
                         request_finished
-                        or (self._is_duplex_session_request(req_state) and req_state.streaming.segment_finished)
+                        or (
+                            self._is_duplex_session_request(req_state)
+                            and req_state.streaming.segment(stage_id).finished
+                        )
                     ),
                     stage_submit_ts=submit_ts,
                 )
@@ -1933,7 +2051,7 @@ class Orchestrator:
             return
 
         if (
-            (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
+            (finished or segment_finished)
             and stage_id < req_state.final_stage_id
             and (not self.async_chunk or not self._stage_receives_async_chunks(stage_id + 1))
             and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
@@ -2072,7 +2190,9 @@ class Orchestrator:
     def _duplex_output_context(
         req_state: OrchestratorRequestState,
         *,
-        stage_id: int | None = None,
+        # Required: segment state is stage-keyed, so a caller that omitted this
+        # would silently read "no boundary" rather than the intended stage's.
+        stage_id: int | None,
     ) -> DuplexOutputContext | None:
         identity = req_state.duplex_identity
         if identity is None:
@@ -2083,15 +2203,16 @@ class Orchestrator:
         )
 
         fence = req_state.duplex_stage_fences.get(stage_id, identity.fence) if stage_id is not None else identity.fence
+        segment = req_state.streaming.segment(stage_id)
         return DuplexOutputContext(
             identity=DuplexRequestIdentity(
                 session_id=identity.session_id,
                 fence=fence,
             ),
             final_stage_id=req_state.final_stage_id,
-            segment_finished=req_state.streaming.enabled and req_state.streaming.segment_finished,
-            segment_token_ids=tuple(req_state.streaming.segment_token_ids),
-            segment_output_metadata=req_state.streaming.segment_output_metadata,
+            segment_finished=req_state.streaming.enabled and segment.finished,
+            segment_token_ids=tuple(segment.token_ids),
+            segment_output_metadata=segment.output_metadata,
         )
 
     @staticmethod
@@ -2627,13 +2748,28 @@ class Orchestrator:
                 req_state.prompt,
                 streaming_context=req_state.streaming,
             )
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "[Orchestrator] req=%s process_engine_inputs FAILED for stage-%s",
                 req_id,
                 next_logical,
             )
-            raise
+            if not self._is_duplex_session_request(req_state):
+                raise
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    request_id=req_id,
+                    stage_id=next_logical,
+                    error=f"Stage-{next_logical} input processor failed: {type(exc).__name__}: {exc}",
+                    error_type=type(exc).__name__,
+                )
+            )
+            await self._cleanup_request_ids(
+                [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                abort=True,
+                close_duplex_sessions=True,
+            )
+            return
         finally:
             req_state.streaming.source_token_decoder = previous_decoder
 

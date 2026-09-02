@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import copy
 import re
@@ -893,6 +896,7 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
         "_bookkeeping_sync",
         lambda *args, **kwargs: (
             0,
+            None,
             None,
             [],
             None,
