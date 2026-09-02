@@ -239,7 +239,6 @@ steps:
         timeout_in_minutes: 60
         commands:
           - pytest -s -v tests/examples/*/test_text_to_image.py -m "full_model and example and H100" --run-level "full_model"
-        # H100-only (FLUX.2-dev gated HF 403 on B200). String h100_2 is skipped when MIRROR_HW=b200.
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Accuracy Test"
@@ -262,7 +261,6 @@ steps:
         timeout_in_minutes: 180
         commands:
           - pytest -s -v tests/e2e/accuracy/test_hidream_o1_image.py -m full_model --run-level full_model
-        # H100-only (test marked cuda H100). String h100_2 is skipped when MIRROR_HW=b200.
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image · Single-GPU"
@@ -358,7 +356,6 @@ steps:
         timeout_in_minutes: 180
         commands:
           - pytest -s -v tests/e2e/accuracy/minimax_h3/test_minimax_h3_i2va_ref2va_similarity.py -m full_model --run-level full_model
-        # H100-only (#6295 hailuo CDN). String h100_4 is skipped when MIRROR_HW=b200.
         mirror_hardwares: h100_4
 
       - label: ":full_moon: Diffusion X2V · Other Accuracy Test"
