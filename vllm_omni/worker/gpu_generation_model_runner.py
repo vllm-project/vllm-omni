@@ -39,7 +39,7 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.utils.mm_outputs import partition_payload_list
+from vllm_omni.utils.mm_outputs import extract_generation_step_finished, partition_payload_list
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
@@ -406,6 +406,11 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         ) = self.execute_model_state
         self.execute_model_state = None
 
+        multimodal_outputs_raw, generation_step_finished = extract_generation_step_finished(
+            multimodal_outputs_raw,
+            self.input_batch.num_reqs,
+        )
+
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward.
         if self.speculative_config is not None:
@@ -490,6 +495,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             pooler_output=None,
             multimodal_outputs=multimodal_outputs,
             inter_stage_outputs=inter_stage_outputs,
+            generation_step_finished=generation_step_finished,
             kv_connector_output=kv_connector_output,
             num_nans_in_logits={},
             cudagraph_stats=cudagraph_stats,

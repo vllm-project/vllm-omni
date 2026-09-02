@@ -1,13 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 import torch
 
 from vllm_omni.utils import mm_outputs as mm_outputs_mod
-from vllm_omni.utils.mm_outputs import build_mm_cpu
+from vllm_omni.utils.mm_outputs import (
+    build_mm_cpu,
+    extract_generation_step_finished,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 TOTAL_TOKENS = 5
 NUM_TOKEN_ALIGNED_TENSORS = 3  # codes.audio, meta.ref_code_len, meta.codec_streaming
+
+
+def test_generation_step_marker_is_separated_from_media_payload():
+    payload, flags = extract_generation_step_finished(
+        {"audio": torch.zeros(1), "_generation_step_finished": [False]},
+        1,
+    )
+
+    assert isinstance(payload, dict)
+    assert set(payload) == {"audio"}
+    torch.testing.assert_close(payload["audio"], torch.zeros(1))
+    assert flags == [False]
+
+
+def test_generation_step_marker_requires_one_boolean_per_request():
+    with pytest.raises(ValueError, match="list of 2 booleans"):
+        extract_generation_step_finished({"_generation_step_finished": [False]}, 2)
 
 
 def make_talker_passthrough_payload(num_requests: int, device: str = "cpu") -> dict:

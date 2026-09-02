@@ -244,6 +244,9 @@ class StagePipelineConfig:
     # The model keeps per-request execution state while awaiting the next
     # async chunk, so the parked request continues to consume model capacity.
     retains_state_across_chunks: bool = False
+    # The generation model advances retained request state over multiple
+    # scheduler ticks before producing one client-visible output.
+    stepwise_generation: bool = False
     sampling_constraints: dict[str, Any] = field(default_factory=dict)
     custom_process_input_func: str | None = None
     custom_process_next_stage_input_func: str | None = None
@@ -910,6 +913,7 @@ def _build_engine_args(
     """
     engine_args: dict[str, Any] = {"model_arch": ps.model_arch or pipeline.model_arch or None}
     engine_args["retains_state_across_chunks"] = ps.retains_state_across_chunks
+    engine_args["stepwise_generation"] = ps.stepwise_generation
     if ps.execution_type == StageExecutionType.DIFFUSION and ps.model_arch:
         engine_args.setdefault("model_class_name", ps.model_arch)
     if ps.engine_output_type:

@@ -169,6 +169,7 @@ def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, st
                 execution_type=StageExecutionType.LLM_GENERATION,
                 input_sources=(0,),
                 engine_output_type="audio_tokens",
+                stepwise_generation=True,
             ),
             StagePipelineConfig(
                 stage_id=2,
@@ -398,6 +399,7 @@ def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
     assert thinker_args["limit_mm_per_prompt"] == {"audio": 1}
     assert thinker_args["logits_processors"] == ["test.custom.LogitsProcessor"]
     assert thinker_args["retains_state_across_chunks"] is True
+    assert thinker_args["stepwise_generation"] is False
     assert thinker_args["kv_cache_memory_bytes"] == 1024
     assert thinker_args["max_cudagraph_capture_size"] == 0
 
@@ -405,6 +407,7 @@ def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
     assert talker_args["model"] == model
     assert talker_args["tokenizer"] == cli_tokenizer
     assert talker_args["worker_cls"] == "test.generation.Worker"
+    assert talker_args["stepwise_generation"] is True
     assert talker_args["disable_hybrid_kv_cache_manager"] is True
     assert talker_args["enable_prefix_caching"] is False
 

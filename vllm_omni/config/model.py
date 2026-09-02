@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from dataclasses import MISSING, field
 from typing import Any
 
@@ -124,6 +127,7 @@ class OmniModelConfig(ModelConfig):
     async_chunk: bool = False
     session_mode: str = "turn"
     retains_state_across_chunks: bool = False
+    stepwise_generation: bool = False
     # Stage-1 active stream slots; 0 keeps legacy chunk-level round-robin.
     active_stream_window: int = 0
     duplex_max_sessions: int = 1

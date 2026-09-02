@@ -128,6 +128,20 @@ class TestDiTAttention:
 
     @pytest.mark.core_model
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_padding_does_not_change_valid_prefix(self, attention):
+        """Valid queries must not attend padded K/V positions."""
+        valid_len, padded_len, dim = 9, 16, 512
+        valid = torch.randn(1, valid_len, dim)
+        padded = torch.cat([valid, torch.randn(1, padded_len - valid_len, dim)], dim=1)
+        mask = torch.arange(padded_len).unsqueeze(0) < valid_len
+
+        expected = attention(valid)
+        actual = attention(padded, mask=mask)
+
+        torch.testing.assert_close(actual[:, :valid_len], expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.core_model
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_qkv_projections(self, attention):
         """Test that Q/K/V projections exist and have correct dimensions."""
         assert hasattr(attention, "to_q")
@@ -491,3 +505,149 @@ def test_code2wav_forward_finalizes_hift_tail():
     assert out.shape == (1, 1, 8)
     assert model.hift.finalize_calls == [True]
     assert forward_mel_calls[0]["token_offset_tokens"] == 0
+
+
+def test_code2wav_streaming_hift_cache_is_bounded_and_device_resident():
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
+
+    class DummyHiFT(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.m_source = SimpleNamespace(l_linear=SimpleNamespace(weight=torch.ones(1, dtype=torch.float32)))
+            self.calls: list[tuple[int, int, bool]] = []
+
+        def inference(self, speech_feat, finalize=True, cache_source=None):
+            cached = 0 if cache_source is None else int(cache_source.shape[-1])
+            self.calls.append((int(speech_feat.shape[-1]), cached, bool(finalize)))
+            samples = int(speech_feat.shape[-1]) * 2
+            speech = torch.ones((speech_feat.shape[0], 1, samples), device=speech_feat.device)
+            source = torch.ones_like(speech)
+            return speech, source
+
+    model = object.__new__(CosyVoice3Code2Wav)
+    nn.Module.__init__(model)
+    model.hift = DummyHiFT()
+    model.mel_cache_len = 2
+    model.source_cache_len = 4
+    model.speech_cache_len = 4
+    model.speech_window = torch.hamming_window(8, periodic=False)
+
+    chunk = torch.ones((1, 80, 4), dtype=torch.float32)
+    first_audio, first_state = model.decode_streaming_mel(chunk, finalize=False)
+    assert first_state is not None
+    assert first_audio.shape[-1] == 4
+    assert first_state["mel"].shape[-1] == 2
+    assert first_state["source"].shape[-1] == 4
+    assert first_state["speech"].shape[-1] == 4
+    assert all(value.device == chunk.device for value in first_state.values())
+
+    second_audio, second_state = model.decode_streaming_mel(chunk, cache_state=first_state, finalize=False)
+    assert second_state is not None
+    assert second_audio.shape[-1] == 8
+    assert second_state["mel"].shape[-1] == 2
+    assert model.hift.calls[:2] == [(4, 0, False), (6, 4, False)]
+
+    final_audio, final_state = model.decode_streaming_mel(chunk, cache_state=second_state, finalize=True)
+    assert final_audio.shape[-1] == 12
+    assert final_state is None
+    assert model.hift.calls[-1] == (6, 4, True)
+
+
+def test_causal_hift_f0_predictor_stays_on_hift_device():
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import CausalHiFTGenerator
+
+    class DummyF0Predictor(nn.Module):
+        def to(self, *args, **kwargs):
+            raise AssertionError("F0 predictor must not move devices during inference")
+
+        def forward(self, speech_feat, finalize=True):
+            return torch.ones(
+                (speech_feat.shape[0], speech_feat.shape[-1]),
+                device=speech_feat.device,
+                dtype=speech_feat.dtype,
+            )
+
+    class DummySource(nn.Module):
+        def forward(self, source):
+            return source, None, None
+
+    hift = object.__new__(CausalHiFTGenerator)
+    nn.Module.__init__(hift)
+    hift.f0_predictor = DummyF0Predictor()
+    hift.f0_upsamp = nn.Identity()
+    hift.m_source = DummySource()
+    hift.decode = lambda x, s, finalize: s
+
+    speech_feat = torch.ones((1, 80, 5), dtype=torch.float32)
+    cached_source = torch.full((1, 1, 2), 9.0, dtype=torch.float32)
+    speech, source = hift.inference(speech_feat, finalize=True, cache_source=cached_source)
+
+    assert speech.device == speech_feat.device
+    torch.testing.assert_close(source[:, :, :2], cached_source)
+
+
+def test_code2wav_flow_step_pads_variable_lengths_and_timesteps():
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import (
+        CosyVoice3Code2Wav,
+        CosyVoice3FlowState,
+    )
+
+    class DummyDecoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.batch_shapes: list[tuple[int, ...]] = []
+
+        def solve_euler_step(self, *, x, t, dt, mu, mask, spks, cond):
+            self.batch_shapes.append(tuple(x.shape))
+            velocity = (mu + cond + spks[:, :1, None] + t[:, None, None]) * mask
+            return x + dt[:, None, None] * velocity
+
+    class DummyFlow(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = DummyDecoder()
+
+    model = object.__new__(CosyVoice3Code2Wav)
+    nn.Module.__init__(model)
+    model.flow_model = DummyFlow()
+
+    def make_state(seq_len: int, t_span: torch.Tensor, step_index: int, scale: float):
+        return CosyVoice3FlowState(
+            x=torch.full((1, 2, seq_len), scale),
+            mu=torch.full((1, 2, seq_len), 2 * scale),
+            mask=torch.ones((1, 1, seq_len)),
+            spks=torch.full((1, 2), 3 * scale),
+            cond=torch.full((1, 2, seq_len), 4 * scale),
+            t_span=t_span,
+            step_index=step_index,
+            prompt_mel_len=0,
+            generated_mel_len=seq_len,
+            trim_mel=0,
+        )
+
+    states = [
+        make_state(7, torch.tensor([0.0, 0.25, 1.0]), 0, 1.0),
+        make_state(4, torch.tensor([0.0, 0.1, 0.6, 1.0]), 1, 2.0),
+    ]
+    expected = []
+    for state in states:
+        expected.append(
+            model.decoder.solve_euler_step(
+                x=state.x,
+                t=state.t_span[state.step_index].reshape(1),
+                dt=(state.t_span[state.step_index + 1] - state.t_span[state.step_index]).reshape(1),
+                mu=state.mu,
+                mask=state.mask,
+                spks=state.spks,
+                cond=state.cond,
+            )
+        )
+
+    completed = model.forward_flow_step(states)
+
+    assert model.decoder.batch_shapes[-1] == (2, 2, 7)
+    assert completed == [False, False]
+    assert states[0].step_index == 1
+    assert states[1].step_index == 2
+    torch.testing.assert_close(states[0].x, expected[0])
+    torch.testing.assert_close(states[1].x, expected[1])

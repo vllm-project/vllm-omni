@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import os
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from functools import partial
 from math import gcd
 from threading import Lock
@@ -60,6 +61,14 @@ logger = init_logger(__name__)
 # feat_extractor, campplus session/engine). The mm processor is re-created per
 # request (mm_processor_cache_gb: 0), so this avoids rebuilding them every time.
 _RUNTIME_COMPONENTS_CACHE: dict[str, dict] = {}
+
+
+@dataclass
+class _PendingCosyVoice3Flow:
+    state: object
+    external_req_id: str | None
+    stream_finished: bool
+    streaming: bool
 
 
 def _cosyvoice3_trt_enabled() -> bool:
@@ -493,9 +502,12 @@ class CosyVoice3Model(
             self.hift = self.code2wav.hift
             # Keep additional information synchronized for async_chunk updates.
             self.enable_update_additional_information = True
+            self.requires_request_ids = True
 
             self._stream_audio_cache_lock = Lock()
             self._stream_vocoder_cache_by_req: dict[str, dict[str, torch.Tensor]] = {}
+            self._flow_state_by_req: dict[str, _PendingCosyVoice3Flow] = {}
+            self._external_req_id_by_request: dict[str, str] = {}
         else:
             raise ValueError(f"Model stage not supported {self.model_stage}")
 
@@ -529,6 +541,20 @@ class CosyVoice3Model(
             with self._stream_audio_cache_lock:
                 self._stream_vocoder_cache_by_req.pop(req_id, None)
         return audio
+
+    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        """Release step-wise Flow and streaming vocoder state on abort/end."""
+        if self.model_stage != "cosyvoice3_code2wav":
+            return
+        for request_id in finished_req_ids:
+            state_id = str(request_id)
+            pending = self._flow_state_by_req.pop(state_id, None)
+            external_req_id = self._external_req_id_by_request.pop(state_id, None)
+            if external_req_id is None and pending is not None:
+                external_req_id = pending.external_req_id
+            if external_req_id is not None:
+                with self._stream_audio_cache_lock:
+                    self._stream_vocoder_cache_by_req.pop(external_req_id, None)
 
     @staticmethod
     def _split_request_ids(ids: torch.Tensor, seq_token_counts: list[int] | None = None) -> list[torch.Tensor]:
@@ -1024,10 +1050,14 @@ class CosyVoice3Model(
 
             return OmniOutput(text_hidden_states=hidden_states, multimodal_outputs=multimodal_outputs)
         elif self.model_stage == "cosyvoice3_code2wav":
+            runner_request_ids = kwargs.get("request_ids")
             # Lazily swap the flow-decoder estimator to a TensorRT engine on the
             # first code2wav step (after weights are loaded), gated by the same
-            # COSYVOICE3_TRT env toggle as the talker speaker embedding.
-            self._maybe_enable_code2wav_trt()
+            # COSYVOICE3_TRT env toggle as the talker speaker embedding. The
+            # existing ONNX/TRT engine has a fixed CFG batch of 2, so retain the
+            # torch estimator for request-ID-driven continuous batching.
+            if runner_request_ids is None:
+                self._maybe_enable_code2wav_trt()
 
             runtime_info = kwargs.get("model_intermediate_buffer")
             if runtime_info is None:
@@ -1040,14 +1070,30 @@ class CosyVoice3Model(
             request_ids_list = self._split_request_ids(flat_ids, seq_token_counts)
 
             num_reqs = max(1, len(request_ids_list))
+            step_execution = isinstance(runner_request_ids, Sequence) and len(runner_request_ids) == num_reqs
+            if step_execution:
+                state_ids = [str(request_id) for request_id in runner_request_ids]
+            else:
+                # Keep direct model calls and older runners compatible: they
+                # complete all Flow steps synchronously below.
+                state_ids = [f"__cosyvoice3_sync_{idx}" for idx in range(num_reqs)]
             sample_rate = torch.tensor(int(self.config.sample_rate), dtype=torch.int32)
             empty_audio = torch.zeros((0,), dtype=torch.float32, device=input_ids.device)
             audios: list[torch.Tensor] = [empty_audio] * num_reqs
             srs: list[torch.Tensor] = [sample_rate] * num_reqs
+            flow_step_finished = [True] * num_reqs
+            active_indices: list[int] = []
+            active_pending: list[_PendingCosyVoice3Flow] = []
             if not isinstance(runtime_info, list):
                 runtime_info = []
 
-            for idx, req_ids in enumerate(request_ids_list):
+            for idx, (state_id, req_ids) in enumerate(zip(state_ids, request_ids_list)):
+                pending = self._flow_state_by_req.get(state_id) if step_execution else None
+                if pending is not None:
+                    active_indices.append(idx)
+                    active_pending.append(pending)
+                    continue
+
                 raw = runtime_info[idx] if idx < len(runtime_info) and isinstance(runtime_info[idx], dict) else {}
                 payload = to_struct(raw)
                 meta = payload.meta
@@ -1101,50 +1147,124 @@ class CosyVoice3Model(
                 # `generated_len` is injected for many models by the generic
                 # runner, so only explicit chunk-routing fields should switch
                 # code2wav into the streaming path.
-                uses_streaming_decode = meta and (
-                    meta.stream_finished is not None or meta.left_context_size is not None
+                uses_streaming_decode = bool(
+                    meta and (meta.stream_finished is not None or meta.left_context_size is not None)
                 )
                 if uses_streaming_decode:
                     token_offset = max(0, meta.left_context_size or 0)
-
-                    cache_state = None
-                    if req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
-                        with self._stream_audio_cache_lock:
-                            cache_state = self._stream_vocoder_cache_by_req.get(req_id)
-
-                    tts_speech, new_cache_state = self.code2wav.forward_streaming(
-                        token=token.unsqueeze(0),
-                        prompt_token=speech_token[:1],
-                        prompt_feat=speech_feat[:1],
-                        embedding=embedding[:1],
-                        cache_state=cache_state,
-                        n_timesteps=10,
-                        token_offset_tokens=token_offset,
-                        finalize=stream_finished,
-                    )
-
-                    if req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
-                        with self._stream_audio_cache_lock:
-                            if new_cache_state is None or stream_finished:
-                                self._stream_vocoder_cache_by_req.pop(req_id, None)
-                            else:
-                                self._stream_vocoder_cache_by_req[req_id] = new_cache_state
+                    flow_finalize = stream_finished
                 else:
                     token_offset = max(0, meta.talker_prefill_offset or 0) if meta else 0
-                    tts_speech = self.code2wav.forward(
-                        token=token.unsqueeze(0),
-                        prompt_token=speech_token[:1],
-                        prompt_feat=speech_feat[:1],
-                        embedding=embedding[:1],
-                        n_timesteps=10,
-                        token_offset_tokens=token_offset,
+                    flow_finalize = True
+
+                if not step_execution:
+                    if uses_streaming_decode:
+                        cache_state = None
+                        if req_id is not None:
+                            with self._stream_audio_cache_lock:
+                                cache_state = self._stream_vocoder_cache_by_req.get(req_id)
+                        tts_speech, new_cache_state = self.code2wav.forward_streaming(
+                            token=token.unsqueeze(0),
+                            prompt_token=speech_token[:1],
+                            prompt_feat=speech_feat[:1],
+                            embedding=embedding[:1],
+                            cache_state=cache_state,
+                            n_timesteps=10,
+                            token_offset_tokens=token_offset,
+                            finalize=stream_finished,
+                        )
+                        if req_id is not None:
+                            with self._stream_audio_cache_lock:
+                                if new_cache_state is None or stream_finished:
+                                    self._stream_vocoder_cache_by_req.pop(req_id, None)
+                                else:
+                                    self._stream_vocoder_cache_by_req[req_id] = new_cache_state
+                    else:
+                        tts_speech = self.code2wav.forward(
+                            token=token.unsqueeze(0),
+                            prompt_token=speech_token[:1],
+                            prompt_feat=speech_feat[:1],
+                            embedding=embedding[:1],
+                            n_timesteps=10,
+                            token_offset_tokens=token_offset,
+                        )
+                    audios[idx] = self._stitch_stream_audio(
+                        req_id,
+                        tts_speech.reshape(-1).to(dtype=torch.float32),
+                        stream_finished,
                     )
+                    continue
 
-                audio = tts_speech.reshape(-1).to(dtype=torch.float32)
+                flow_state = self.code2wav.prepare_flow_state(
+                    token=token.unsqueeze(0),
+                    prompt_token=speech_token[:1],
+                    prompt_feat=speech_feat[:1],
+                    embedding=embedding[:1],
+                    n_timesteps=10,
+                    token_offset_tokens=token_offset,
+                    finalize=flow_finalize,
+                )
+                pending = _PendingCosyVoice3Flow(
+                    state=flow_state,
+                    external_req_id=req_id,
+                    stream_finished=stream_finished,
+                    streaming=uses_streaming_decode,
+                )
+                self._flow_state_by_req[state_id] = pending
+                if req_id is not None:
+                    self._external_req_id_by_request[state_id] = req_id
+                active_indices.append(idx)
+                active_pending.append(pending)
 
-                audios[idx] = self._stitch_stream_audio(req_id, audio, stream_finished)
+            if active_pending:
+                completed = self.code2wav.forward_flow_step([pending.state for pending in active_pending])
 
-            return OmniOutput(text_hidden_states=None, multimodal_outputs={"audio": audios, "sr": srs})
+                for idx, state_id, pending, is_complete in zip(
+                    active_indices,
+                    (state_ids[idx] for idx in active_indices),
+                    active_pending,
+                    completed,
+                ):
+                    flow_step_finished[idx] = is_complete
+                    if not is_complete:
+                        continue
+
+                    feat = self.code2wav.flow_state_to_mel(pending.state)
+                    if pending.streaming:
+                        cache_state = None
+                        if pending.external_req_id is not None:
+                            with self._stream_audio_cache_lock:
+                                cache_state = self._stream_vocoder_cache_by_req.get(pending.external_req_id)
+                        tts_speech, new_cache_state = self.code2wav.decode_streaming_mel(
+                            feat,
+                            cache_state=cache_state,
+                            finalize=pending.stream_finished,
+                        )
+                        if pending.external_req_id is not None:
+                            with self._stream_audio_cache_lock:
+                                if new_cache_state is None or pending.stream_finished:
+                                    self._stream_vocoder_cache_by_req.pop(pending.external_req_id, None)
+                                else:
+                                    self._stream_vocoder_cache_by_req[pending.external_req_id] = new_cache_state
+                    else:
+                        tts_speech = self.code2wav.decode_mel(feat)
+
+                    audio = tts_speech.reshape(-1).to(dtype=torch.float32)
+                    audios[idx] = self._stitch_stream_audio(
+                        pending.external_req_id,
+                        audio,
+                        pending.stream_finished,
+                    )
+                    self._flow_state_by_req.pop(state_id, None)
+
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={
+                    "audio": audios,
+                    "sr": srs,
+                    "_generation_step_finished": flow_step_finished,
+                },
+            )
         else:
             raise ValueError(f"Unsupported model_stage: {self.model_stage}")
 

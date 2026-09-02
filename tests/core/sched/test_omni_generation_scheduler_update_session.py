@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for generation streaming session replacement.
 
 These tests pin the behavior of `_update_request_as_session` against
@@ -13,6 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 # Imports must run in this order: vllm_omni applies patches to vllm.v1.request before
 # Request / StreamingUpdate are bound in this module. Ruff isort would reorder them.
@@ -26,6 +30,10 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
+    OmniChunkTransferAdapter,
+)
+from vllm_omni.outputs import OmniModelRunnerOutput
 
 # isort: on
 
@@ -117,6 +125,7 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
     sched = MagicMock()
     sched.requests = {session.request_id: session}
     sched.perf_metrics = None
+    sched._stepwise_generation = False
     sched.chunk_transfer_adapter = SimpleNamespace(
         is_done_receiving_chunks=lambda _request_id: True,
         segment_finished_requests={session.request_id},
@@ -152,6 +161,7 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
     model_runner_output.logprobs = None
     model_runner_output.prompt_logprobs_dict = {}
     model_runner_output.pooler_output = None
+    model_runner_output.generation_step_finished = None
     model_runner_output.num_nans_in_logits = None
     model_runner_output.kv_connector_output = None
     model_runner_output.cudagraph_stats = None
@@ -169,6 +179,76 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
     assert output.is_segment_finished is True
     sched._handle_stopped_request.assert_called_once_with(session)
     assert sched._pending_finish_reqs == []
+
+
+@pytest.mark.parametrize(
+    ("prompt_token_ids", "num_tokens_scheduled"),
+    [([1, 2, 3], 3), ([], 1)],
+)
+def test_generation_step_marker_replays_one_token_without_client_output(
+    prompt_token_ids: list[int], num_tokens_scheduled: int, mocker
+) -> None:
+    request = _make_request(request_id="req-flow-step", prompt_token_ids=prompt_token_ids)
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = len(request.prompt_token_ids)
+    request.num_in_flight_tokens = num_tokens_scheduled
+
+    sched = mocker.MagicMock()
+    sched.requests = {request.request_id: request}
+    sched.perf_metrics = None
+    sched.chunk_transfer_adapter = None
+    sched.structured_output_manager.should_advance.return_value = False
+    # Async scheduling can observe the current chunk boundary while this model
+    # step is still in flight and queue the request for finish prematurely.
+    sched._pending_finish_reqs = [request]
+    sched.recompute_kv_load_failures = False
+    sched.connector = None
+    sched.running = [request]
+    sched.waiting = mocker.MagicMock()
+    sched.finished_req_ids_dict = {}
+    sched.make_stats.return_value = None
+    sched._stepwise_generation = True
+    sched._step_continuation_req_ids = set()
+
+    scheduler_output = mocker.MagicMock(spec=SchedulerOutput)
+    scheduler_output.num_scheduled_tokens = {request.request_id: num_tokens_scheduled}
+    scheduler_output.scheduled_spec_decode_tokens = {}
+    scheduler_output.num_invalid_spec_tokens = 0
+    mm_output = {"audio": torch.zeros(0), "sr": torch.tensor(24000)}
+    model_runner_output = OmniModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=None,
+        multimodal_outputs=[mm_output],
+        generation_step_finished=[False],
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        cudagraph_stats=None,
+    )
+
+    outputs = OmniGenerationScheduler.update_from_output(sched, scheduler_output, model_runner_output)
+
+    assert outputs == {}
+    assert request.status == RequestStatus.RUNNING
+    assert request.num_computed_tokens == max(0, len(request.prompt_token_ids) - 1)
+    assert request.num_in_flight_tokens == 0
+    assert sched._step_continuation_req_ids == {request.request_id}
+    assert sched._pending_finish_reqs == []
+    sched._handle_stopped_request.assert_not_called()
+
+
+def test_chunk_payload_in_use_reuses_adapter_ready_marker() -> None:
+    adapter = object.__new__(OmniChunkTransferAdapter)
+    adapter.requests_with_ready_chunks = set()
+
+    adapter.set_payload_in_use("req-flow", True)
+    assert adapter.requests_with_ready_chunks == {"req-flow"}
+
+    adapter.set_payload_in_use("req-flow", False)
+    assert adapter.requests_with_ready_chunks == set()
 
 
 def test_async_chunk_resumable_stop_rearms_connector_polling() -> None:

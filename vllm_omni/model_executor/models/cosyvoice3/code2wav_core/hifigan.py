@@ -751,15 +751,36 @@ class CausalHiFTGenerator(HiFTGenerator):
         return x
 
     @torch.inference_mode()
-    def inference(self, speech_feat: torch.Tensor, finalize: bool = True) -> torch.Tensor:
-        # mel->f0 NOTE f0_predictor precision is crucial for causal inference, move
-        # self.f0_predictor to cpu if necessary
-        self.f0_predictor.to("cpu")
-        f0 = self.f0_predictor(speech_feat.cpu(), finalize=finalize).to(speech_feat)
+    def inference(
+        self,
+        speech_feat: torch.Tensor,
+        finalize: bool = True,
+        cache_source: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Keep F0 prediction in float32, but run it on the same device as HiFT.
+        # Moving the predictor and mel to CPU for every streaming chunk creates a
+        # synchronization point and two full device transfers. CosyVoice3Code2Wav
+        # loads the complete float32 HiFT module, including this predictor, onto
+        # the code2wav device.
+        if speech_feat.device.type == "cuda":
+            # The F0 stack is sensitive to TF32 accumulation (not just its
+            # tensor dtype). Keep IEEE FP32 convolution behavior while still
+            # avoiding the per-chunk GPU->CPU->GPU round trip.
+            with torch.backends.cudnn.flags(allow_tf32=False):
+                f0 = self.f0_predictor(speech_feat, finalize=finalize)
+        else:
+            f0 = self.f0_predictor(speech_feat, finalize=finalize)
         # f0->source
         s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
         s, _, _ = self.m_source(s)
         s = s.transpose(1, 2)
+        if cache_source is not None and cache_source.numel() > 0:
+            cache_source = cache_source.to(device=s.device, dtype=s.dtype)
+            source_overlap = min(int(cache_source.shape[-1]), int(s.shape[-1]))
+            if source_overlap > 0:
+                # Reuse the excitation corresponding to the cached mel context
+                # so independently decoded chunks join at the same source phase.
+                s[:, :, :source_overlap] = cache_source[:, :, -source_overlap:]
         if finalize is True:
             generated_speech = self.decode(x=speech_feat, s=s, finalize=finalize)
         else:

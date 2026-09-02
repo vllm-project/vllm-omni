@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CosyVoice3 pipeline topology (frozen).
 
 Stage 0: Talker   — text prompt → speech tokens (LLM autoregressive).
@@ -43,6 +43,8 @@ COSYVOICE3_PIPELINE = PipelineConfig(
             stage_id=1,
             model_stage="cosyvoice3_code2wav",
             execution_type=StageExecutionType.LLM_GENERATION,
+            retains_state_across_chunks=True,
+            stepwise_generation=True,
             input_sources=(0,),
             final_output=True,
             final_output_type="audio",

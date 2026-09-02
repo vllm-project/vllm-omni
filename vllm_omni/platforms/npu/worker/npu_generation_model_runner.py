@@ -37,7 +37,7 @@ from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
-from vllm_omni.utils.mm_outputs import partition_payload_list
+from vllm_omni.utils.mm_outputs import extract_generation_step_finished, partition_payload_list
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
@@ -460,6 +460,11 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        multimodal_outputs_raw, generation_step_finished = extract_generation_step_finished(
+            multimodal_outputs_raw,
+            self.input_batch.num_reqs,
+        )
+
         #  -------------------------------------- Omni-new -------------------------------------------------
         # Build per-request multimodal_outputs list (dedicated channel).
         # pooler_output is no longer used for multimodal data.
@@ -528,6 +533,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             pooler_output=None,
             multimodal_outputs=multimodal_outputs,
             inter_stage_outputs=inter_stage_outputs,
+            generation_step_finished=generation_step_finished,
             kv_connector_output=kv_connector_output,
             num_nans_in_logits={},
             cudagraph_stats=cudagraph_stats,

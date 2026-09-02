@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from https://github.com/FunAudioLLM/CosyVoice/tree/main/cosyvoice/flow/DiT
 # Refactored to use vllm_omni diffusion infrastructure for optimized attention backends
 
@@ -15,6 +15,7 @@ from torch import nn
 from vllm.logger import init_logger
 from x_transformers.x_transformers import RotaryEmbedding, apply_rotary_pos_emb
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
 
@@ -131,9 +132,18 @@ class DiTAttention(nn.Module):
         key = key.view(batch_size, seq_len, self.heads, self.dim_head)
         value = value.view(batch_size, seq_len, self.heads, self.dim_head)
 
-        # Use diffusion attention backend
-        # The diffusion Attention layer expects (batch, seq, heads, head_dim)
-        out = self.attn(query, key, value, attn_metadata=None)
+        # Use the real key-padding mask inside attention.  Previously the mask
+        # was only applied to the output below, which let valid queries attend
+        # to padded K/V rows and made results depend on the amount of padding.
+        attn_metadata = AttentionMetadata(attn_mask=mask) if mask is not None else None
+        if mask is not None and not self.attn.attn_backend.supports_attention_mask():
+            # CosyVoice3 does not use sequence parallelism.  Keep correctness
+            # when a mask-free backend (for example SageAttention) is selected.
+            out = self.attn.sdpa_fallback.forward(query, key, value, attn_metadata)
+        else:
+            # The diffusion Attention layer expects
+            # (batch, seq, heads, head_dim).
+            out = self.attn(query, key, value, attn_metadata=attn_metadata)
 
         # Some attention backends return a non-contiguous layout.
         out = out.reshape(batch_size, seq_len, self.inner_dim)
@@ -146,9 +156,6 @@ class DiTAttention(nn.Module):
         if mask is not None:
             if mask.dim() == 2:
                 mask = mask.unsqueeze(-1)
-            elif mask.dim() == 4:
-                # (batch, heads, seq, seq) -> use last dim
-                mask = mask[:, 0, -1].unsqueeze(-1)
             out = out.masked_fill(~mask.bool(), 0.0)
 
         return out
@@ -402,7 +409,10 @@ class DiT(nn.Module):
         if self.long_skip_connection is not None:
             residual = x
 
-        attn_mask = mask.bool().repeat(1, x.size(1), 1).unsqueeze(dim=1)
+        # ``mask`` arrives as [B, 1, T].  A 2-D key-padding mask is enough for
+        # all queries and lets FlashAttention backends unpad variable-length
+        # batches internally instead of materializing a [B, 1, T, T] mask.
+        attn_mask = mask.squeeze(1).bool()
 
         for block in self.transformer_blocks:
             x = block(x, t, mask=attn_mask.bool(), rope=rope)

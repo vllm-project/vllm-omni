@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from https://github.com/FunAudioLLM/CosyVoice/tree/main/cosyvoice/flow
 """Conditional Flow Matching (CFM) classes for audio generation."""
 
@@ -104,38 +104,54 @@ class ConditionalCFM(BASECFM):
                 shape: (batch_size, spk_emb_dim)
             cond (Optional[Any], optional): Not used but kept for future purposes
         """
-        t, _, dt = t_span[0], t_span[-1], t_span[1] - t_span[0]
-        t = t.unsqueeze(dim=0)
-
-        sol = []
-
-        # Do not use concat, it may cause memory format changed and trt infer with wrong results!
-        # NOTE when flow run in amp mode, x.dtype is float32, which cause nan in trt fp16
-        # inference, so set dtype=spks.dtype
-        x_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=spks.dtype)
-        mask_in = torch.zeros([2, 1, x.size(2)], device=x.device, dtype=spks.dtype)
-        mu_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=spks.dtype)
-        t_in = torch.zeros([2], device=x.device, dtype=spks.dtype)
-        spks_in = torch.zeros([2, 80], device=x.device, dtype=spks.dtype)
-        cond_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=spks.dtype)
+        batch_size = x.size(0)
+        t = t_span[0].expand(batch_size)
         for step in range(1, len(t_span)):
-            # Classifier-Free Guidance inference introduced in VoiceBox
-            x_in[:] = x
-            mask_in[:] = mask
-            mu_in[0] = mu
-            t_in[:] = t.unsqueeze(0)
-            spks_in[0] = spks
-            cond_in[0] = cond
-            dphi_dt = self.forward_estimator(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
-            dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
-            dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
-            x = x + dt * dphi_dt
+            dt = (t_span[step] - t).to(dtype=x.dtype)
+            x = self.solve_euler_step(
+                x=x,
+                t=t,
+                dt=dt,
+                mu=mu,
+                mask=mask,
+                spks=spks,
+                cond=cond,
+            )
             t = t + dt
-            sol.append(x)
-            if step < len(t_span) - 1:
-                dt = t_span[step + 1] - t
 
-        return sol[-1].float()
+        return x.float()
+
+    def solve_euler_step(self, *, x, t, dt, mu, mask, spks, cond):
+        """Advance a padded request batch by one CFG Euler step.
+
+        Every row may carry a different sequence length (described by
+        ``mask``), timestep, and step size.  CFG doubles the logical request
+        batch while preserving the padded time dimension.
+        """
+        batch_size = x.size(0)
+        work_dtype = spks.dtype
+
+        x_work = x.to(dtype=work_dtype)
+        mask_work = mask.to(dtype=work_dtype)
+        mu_work = mu.to(dtype=work_dtype)
+        t_work = t.to(device=x.device, dtype=work_dtype).reshape(batch_size)
+        spks_work = spks.to(dtype=work_dtype)
+        cond_work = cond.to(dtype=work_dtype)
+
+        # Positive rows carry all conditioning; negative CFG rows keep only
+        # the noised input and validity mask, matching the original batch=1
+        # implementation.
+        x_in = torch.cat([x_work, x_work], dim=0).contiguous()
+        mask_in = torch.cat([mask_work, mask_work], dim=0).contiguous()
+        mu_in = torch.cat([mu_work, torch.zeros_like(mu_work)], dim=0).contiguous()
+        t_in = torch.cat([t_work, t_work], dim=0).contiguous()
+        spks_in = torch.cat([spks_work, torch.zeros_like(spks_work)], dim=0).contiguous()
+        cond_in = torch.cat([cond_work, torch.zeros_like(cond_work)], dim=0).contiguous()
+
+        dphi_dt = self.forward_estimator(x_in, mask_in, mu_in, t_in, spks_in, cond_in)
+        dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, batch_size, dim=0)
+        dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
+        return x + dt.to(device=x.device, dtype=x.dtype).view(batch_size, 1, 1) * dphi_dt.to(x.dtype)
 
     def forward_estimator(self, x, mask, mu, t, spks, cond):
         if isinstance(self.estimator, torch.nn.Module):
@@ -299,17 +315,58 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         finalize: bool = False,
         n_timesteps: int = 10,
     ):
+        decoder_inputs = self.prepare_inference_inputs(
+            token=token,
+            token_len=token_len,
+            prompt_token=prompt_token,
+            prompt_token_len=prompt_token_len,
+            prompt_feat=prompt_feat,
+            prompt_feat_len=prompt_feat_len,
+            embedding=embedding,
+            finalize=finalize,
+        )
+        feat, _ = self.decoder(
+            mu=decoder_inputs["mu"],
+            mask=decoder_inputs["mask"],
+            spks=decoder_inputs["spks"],
+            cond=decoder_inputs["cond"],
+            n_timesteps=max(1, int(n_timesteps)),
+            streaming=streaming,
+        )
+
+        mel_len1 = decoder_inputs["prompt_mel_len"]
+        mel_len2 = decoder_inputs["generated_mel_len"]
+        feat = feat[:, :, mel_len1 : mel_len1 + mel_len2]
+        assert feat.shape[2] == mel_len2
+        return feat.float(), None
+
+    @torch.inference_mode()
+    def prepare_inference_inputs(
+        self,
+        *,
+        token,
+        token_len,
+        prompt_token,
+        prompt_token_len,
+        prompt_feat,
+        prompt_feat_len,
+        embedding,
+        finalize: bool = False,
+    ) -> dict[str, torch.Tensor | int]:
+        """Prepare one request's static Flow inputs without denoising.
+
+        Request-local preprocessing remains independent so causal convolutions
+        cannot cross request boundaries.  The returned tensors can then be
+        padded and batched for every DiT/Flow step.
+        """
         assert token.shape[0] == 1
-        # xvec projection
-
         embedding = F.normalize(embedding, dim=1)
-
         embedding = self.spk_embed_affine_layer(embedding)
 
         # concat text and prompt_text
         token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
-        mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
-        token = self.input_embedding(torch.clamp(token, min=0)) * mask
+        token_mask = (~make_pad_mask(token_len, max_len=token.shape[1])).unsqueeze(-1).to(embedding)
+        token = self.input_embedding(torch.clamp(token, min=0)) * token_mask
         # text encode
         if finalize is True:
             h = self.pre_lookahead_layer(token)
@@ -328,16 +385,14 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
 
         conds = conds.transpose(1, 2)
 
-        mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
-        feat, _ = self.decoder(
-            mu=h.transpose(1, 2).contiguous(),
-            mask=mask.unsqueeze(1),
-            spks=embedding,
-            cond=conds,
-            n_timesteps=max(1, int(n_timesteps)),
-            streaming=streaming,
-        )
-
-        feat = feat[:, :, mel_len1:]
-        assert feat.shape[2] == mel_len2
-        return feat.float(), None
+        total_mel_len = mel_len1 + mel_len2
+        mel_lengths = torch.tensor([total_mel_len], device=h.device, dtype=torch.long)
+        mask = (~make_pad_mask(mel_lengths, max_len=total_mel_len)).to(h).unsqueeze(1)
+        return {
+            "mu": h.transpose(1, 2).contiguous(),
+            "mask": mask,
+            "spks": embedding,
+            "cond": conds,
+            "prompt_mel_len": mel_len1,
+            "generated_mel_len": mel_len2,
+        }

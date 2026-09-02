@@ -774,6 +774,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """
         return request_id in self.upstream_exhausted_requests or request_id in self.segment_finished_requests
 
+    def set_payload_in_use(self, request_id: str, in_use: bool) -> None:
+        """Prevent replacement of a ready chunk while a model step uses it."""
+        if in_use:
+            self.requests_with_ready_chunks.add(request_id)
+        else:
+            self.requests_with_ready_chunks.discard(request_id)
+
     ########################################################################
     # Cleanup
     ########################################################################

@@ -38,7 +38,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         model_config = self.vllm_config.model_config
         self._init_omni_io_scheduling_state()
         self._retains_state_across_chunks = bool(getattr(model_config, "retains_state_across_chunks", False))
+        self._stepwise_generation = bool(getattr(model_config, "stepwise_generation", False))
         self._pending_finish_reqs: list[Request] = []
+        self._step_continuation_req_ids: set[str] = set()
 
     @staticmethod
     def _record_prefill_stats(request: Request) -> None:
@@ -121,6 +123,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             num_computed_tokens = request.num_computed_tokens
             required_tokens = len(request.prompt_token_ids) - num_computed_tokens
+            if request.request_id in self._step_continuation_req_ids:
+                # Step-wise generation models ignore this replay/placeholder
+                # token and advance request-local model state instead.
+                required_tokens = max(required_tokens, 1)
             if not self.scheduler_config.enable_chunked_prefill and required_tokens > token_budget:
                 # If chunked_prefill is disabled,
                 # we can stop the scheduling here.
@@ -155,6 +161,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             cached_additional_information[request.request_id] = getattr(request, "additional_information", None)
             token_budget -= num_new_tokens
             scheduled_running_reqs.append(request)
+            self._step_continuation_req_ids.discard(request.request_id)
             req_index += 1
 
         # OMNI: Remove already finished requests from running queue
@@ -334,11 +341,21 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         finally:
             self._restore_omni_wait_queues()
 
+        if self._stepwise_generation and self.chunk_transfer_adapter is not None:
+            # postprocess_scheduler_output clears the ordinary chunk-ready
+            # marker after admission. Step-wise models retain it until their
+            # current payload has completed, preventing premature prefetch.
+            for request_id in num_scheduled_tokens:
+                self.chunk_transfer_adapter.set_payload_in_use(request_id, True)
+
         return self._wrap_omni_scheduler_output(scheduler_output)
 
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        getattr(self, "_step_continuation_req_ids", set()).discard(request.request_id)
+        if self._stepwise_generation and self.chunk_transfer_adapter is not None:
+            self.chunk_transfer_adapter.set_payload_in_use(request.request_id, False)
         if self.input_coordinator is None:
             return super()._free_request(request, delay_free_blocks)
 
@@ -359,6 +376,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         mm_outputs = getattr(model_runner_output, "multimodal_outputs", None)
+        generation_step_finished_flags = getattr(model_runner_output, "generation_step_finished", None)
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         ec_connector_output = getattr(model_runner_output, "ec_connector_output", None)
@@ -400,9 +418,14 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        continuing_generation_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
+            # The scheduled model call has returned. A step-wise model marks
+            # the payload in use again below if it needs another Flow step.
+            if self._stepwise_generation and self.chunk_transfer_adapter is not None:
+                self.chunk_transfer_adapter.set_payload_in_use(req_id, False)
             if request is not None:
                 # vLLM 0.26: settle the in-flight tokens counted in schedule().
                 # Must happen before the skips below — failed-KV-load and
@@ -475,6 +498,24 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             ec_transfer_params = None
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
+            generation_step_finished = (
+                generation_step_finished_flags[req_index] if generation_step_finished_flags is not None else None
+            )
+            if generation_step_finished is False:
+                # Generation stages normally consume a request in one call.
+                # A step-wise model keeps one input token logically pending so
+                # schedule() admits the same request on the next tick alongside
+                # newly arrived requests. The model keys its retained state by
+                # request ID and ignores this replayed token.
+                self._step_continuation_req_ids.add(req_id)
+                if self.chunk_transfer_adapter is not None:
+                    self.chunk_transfer_adapter.set_payload_in_use(req_id, True)
+                if request.num_computed_tokens > 0:
+                    request.num_computed_tokens -= 1
+                continuing_generation_reqs.add(request)
+                # Intermediate Flow steps are internal and must not emit empty
+                # audio chunks to the client.
+                mm_output = None
             status_before_stop = request.status
             finish_reason = None
             is_segment_finished = False
@@ -493,7 +534,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # One-shot generation request: finish after its current input unit
             # has been fully processed.
-            if (
+            if generation_step_finished is not False and (
                 request.status == RequestStatus.FINISHED_ERROR
                 or request.status == RequestStatus.FINISHED_STOPPED
                 or (self.chunk_transfer_adapter is None and request.num_computed_tokens >= request.num_prompt_tokens)
@@ -587,7 +628,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Finish async_chunk requests that schedule() collected because their
         # upstream completed with no remaining codec tokens.
         for request in self._pending_finish_reqs:
-            if request in stopped_running_reqs or request.is_finished():
+            if request in continuing_generation_reqs or request in stopped_running_reqs or request.is_finished():
                 continue
             request.status = RequestStatus.FINISHED_STOPPED
             finish_reason = request.get_finished_reason()

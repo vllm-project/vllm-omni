@@ -195,6 +195,7 @@ class OmniEngineArgs(EngineArgs):
     async_chunk: bool = False
     session_mode: str = "turn"
     retains_state_across_chunks: bool = False
+    stepwise_generation: bool = False
     # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
     # Must be declared here so engine_args dict propagation does not silently
     # drop the value when constructing OmniEngineArgs from kwargs.
@@ -419,6 +420,7 @@ class OmniEngineArgs(EngineArgs):
             async_chunk=self.async_chunk,
             session_mode=self.session_mode,
             retains_state_across_chunks=self.retains_state_across_chunks,
+            stepwise_generation=self.stepwise_generation,
             active_stream_window=self.active_stream_window,
             duplex_max_sessions=self.duplex_max_sessions,
             model_stage=self.model_stage,
