@@ -959,6 +959,13 @@ class MiniMaxH3Pipeline(
             )
 
         self._fasth3 = resolve_fasth3_fusion(od_config, self.transformer)
+        if self._fasth3 is not None and self._fasth3.requires_vsa:
+            # The artifact assigns a compression gate per DiT block, so those
+            # modules have to exist before load_weights streams them in. Only
+            # the ``transformer.`` stream is fused, and ``check_task`` admits
+            # T2VA only, so the Ref2VA DiT would carry 50 gates that nothing
+            # ever fills or reads.
+            self.transformer.enable_vsa_gates()
         if self._fasth3 is not None:
             self._fasth3.check_serving_contract(
                 partition=self.partition,
@@ -1070,6 +1077,7 @@ class MiniMaxH3Pipeline(
 
         loaded_with_prefix: set[str] = set()
         loaded_prefixes: set[str] = set()
+        transformer_loaded: set[str] = set()
         for prefix, grouped_weights in groupby(weights, key=source_prefix):
             if prefix in loaded_prefixes:
                 raise ValueError(f"MiniMax-H3 weight source {prefix!r} is not contiguous")
@@ -1081,6 +1089,8 @@ class MiniMaxH3Pipeline(
                 # point where the checkpoint's fused QKV/MLP layouts are intact.
                 stream = self._fasth3.apply(stream)
             loaded = component.load_weights(stream)
+            if prefix == "transformer.":
+                transformer_loaded = set(loaded)
             if prefix != "text_encoder.":
                 component.post_load_weights()
             loaded_with_prefix.update(prefix + name for name in loaded)
@@ -1094,7 +1104,9 @@ class MiniMaxH3Pipeline(
                 continue
             loaded_with_prefix.update(f"{component_name}.{name}" for name, _ in component.named_parameters())
         if self._fasth3 is not None:
-            self._fasth3.validate_fully_applied()
+            # load_weights only warns on a parameter the model does not have, so
+            # close the adapter against what the DiT actually consumed.
+            self._fasth3.validate_fully_applied(transformer_loaded)
         return loaded_with_prefix
 
     @property
