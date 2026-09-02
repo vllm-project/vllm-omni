@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """DiT-stage load state aggregator (Orchestrator-side).
 
 ``DitLoadState`` aggregates each DiT replica's scheduler queue depth

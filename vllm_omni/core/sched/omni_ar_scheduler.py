@@ -217,8 +217,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 **({"dit_load_threshold": threshold} if threshold is not None else {}),
             )
             logger.info(
-                "[OmniDTPS] AR stage %s: aging_threshold=%.1fs, "
-                "dit_load_threshold=%d",
+                "[OmniDTPS] AR stage %s: aging_threshold=%.1fs, dit_load_threshold=%d",
                 stage_id,
                 self._dtps.aging_s,
                 self._dtps.dit_load_threshold,

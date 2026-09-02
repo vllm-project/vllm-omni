@@ -1121,7 +1121,6 @@ class Orchestrator:
             logger.debug("[Orchestrator] _orchestration_output_handler cancelled")
             return
 
-<<<<<<< HEAD
     async def _process_llm_stage_outputs(
         self,
         stage_id: int,
@@ -1209,7 +1208,7 @@ class Orchestrator:
             if n_waiting is not None:
                 self._update_stage_replica_waiting(stage_id, replica_id, int(n_waiting))
         return diffusion_output.request_id == DIFFUSION_METRICS_ONLY_REQUEST_ID
-=======
+
     async def _poll_dit_load_throttled(
         self,
         stage_id: int,
@@ -1271,21 +1270,6 @@ class Orchestrator:
         if changed:
             await self._push_dit_load_to_ar(state)
 
-<<<<<<< HEAD
-    def _refresh_dit_load_shared(self, state: DitLoadState) -> None:
-        """Write the current aggregate snapshot into the cross-process shared buffer."""
-        shm = self._dit_load_shared_state
-        if shm is None:
-            return
-        try:
-            shm.write(state.snapshot())
-        except Exception:
-            logger.debug(
-                "[Orchestrator] DitLoadSharedState.write failed",
-                exc_info=True,
-            )
->>>>>>> cb711f05 ([Core] DTPS DiT-load-aware Type-Priority Scheduling)
-=======
     async def _push_dit_load_to_ar(self, state: DitLoadState) -> None:
         if not self._dit_load_aware:
             return
@@ -1295,7 +1279,6 @@ class Orchestrator:
             if pool.stage_type != "llm":
                 continue
             await pool.push_dit_load(snapshot)
->>>>>>> 41cf391b ([Core][DTPS] Refactor Orchestrator-to-AR DiT-load IPC from SHM to ZMQ UTILITY)
 
     async def _orchestration_loop(self) -> None:
         """Poll stage pools and route logical outputs."""

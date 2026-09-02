@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """DTPS (DiT-priority Type-based Scheduling) for AR+DiT deployments.
 
 Reorders the AR waiting queue by task type + DiT load to prevent DiT

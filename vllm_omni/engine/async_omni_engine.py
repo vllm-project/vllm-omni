@@ -38,7 +38,6 @@ from vllm_omni.config.stage_config import (
     DuplexSessionRuntimeConfig,
     load_deploy_config,
 )
-
 from vllm_omni.data_entry_keys import REQUEST_ARTIFACT_DIRS_KEY, TRANSFORM_OWNED_META_KEYS
 from vllm_omni.diffusion.data import (
     DiffusionParallelConfig,
