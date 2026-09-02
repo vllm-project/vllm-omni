@@ -94,6 +94,8 @@ class StagePoolLLMClient(StagePoolClient, Protocol):
         kv_transfer_port_offset: int = ...,
     ) -> dict[str, Any] | None: ...
 
+    def get_payload_sender_info(self) -> dict[str, Any] | None: ...
+
 
 class StagePoolDiffusionClient(StagePoolClient, Protocol):
     """Pool-facing API for diffusion stages."""

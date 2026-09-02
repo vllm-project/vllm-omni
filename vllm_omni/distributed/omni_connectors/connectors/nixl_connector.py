@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 import msgspec
@@ -36,6 +37,22 @@ _META_NOT_FOUND = b"nixl_meta_not_found"
 _ACK = b"nixl_ack"
 
 
+@dataclass
+class _DeferredTransfer:
+    tensors: list[torch.Tensor]
+    registrations: list[Any] = field(default_factory=list)
+    dlists: list[Any] = field(default_factory=list)
+    handles: list[Any] = field(default_factory=list)
+    remote_agent: Any = None
+
+
+@dataclass
+class _PendingPayload:
+    tensors: list[torch.Tensor]
+    registrations: list[Any]
+    deadline: float
+
+
 class NixlConnector(OmniConnectorBase):
     """OmniConnector backed by vLLM's native NIXL wrapper.
 
@@ -59,9 +76,10 @@ class NixlConnector(OmniConnectorBase):
 
     def __init__(self, config: dict[str, Any]):
         self.config = dict(config or {})
+        self.stage_id = int(self.config.get("stage_id", 0))
         self._closed = True
         self._registered_descs: list[Any] = []
-        self._pending: dict[str, tuple[list[torch.Tensor], list[Any], float]] = {}
+        self._pending: dict[str, _PendingPayload] = {}
         self._published: dict[str, dict[str, Any]] = {}
         self._state_lock = threading.RLock()
         self._remote_agents: list[str] = []
@@ -108,6 +126,25 @@ class NixlConnector(OmniConnectorBase):
         self._poll_interval_s = float(self.config.get("poll_interval_s", 0.001))
         self._closed = False
         self._init_handshake()
+        self._lease_wakeup = threading.Event()
+        self._lease_thread: threading.Thread | None = None
+        if self._role != "receiver":
+            self._lease_thread = threading.Thread(
+                target=self._lease_reaper_loop,
+                name="nixl-lease-reaper",
+                daemon=True,
+            )
+            self._lease_thread.start()
+        self._transfer_wakeup = threading.Event()
+        self._deferred_transfers: list[_DeferredTransfer] = []
+        self._transfer_thread: threading.Thread | None = None
+        if self._role != "sender":
+            self._transfer_thread = threading.Thread(
+                target=self._transfer_reaper_loop,
+                name="nixl-transfer-reaper",
+                daemon=True,
+            )
+            self._transfer_thread.start()
 
     def _init_handshake(self) -> None:
         """Set up the ZMQ control plane used when ``get`` receives no metadata.
@@ -188,29 +225,58 @@ class NixlConnector(OmniConnectorBase):
                 tensors, tensor_specs = self._normalize_tensor_payload(tensor)
                 kind = _KIND_OBJECT
 
-            memory_type = self._resolve_memory_type(tensors[0])
-            regions = [self._tensor_region(tensor) for tensor in tensors]
-            reg_descs = self._agent.get_reg_descs(regions, memory_type)
-            self._agent.register_memory(reg_descs, backends=self._backends)
-            self._registered_descs.append(reg_descs)
+            grouped_tensors: dict[str, list[tuple[int, torch.Tensor]]] = {}
+            for tensor_index, tensor in enumerate(tensors):
+                memory_type = self._resolve_memory_type(tensor)
+                grouped_tensors.setdefault(memory_type, []).append((tensor_index, tensor))
+
+            descriptor_groups = []
+            registered_descs = []
+            try:
+                for memory_type, indexed_tensors in grouped_tensors.items():
+                    tensor_indices = [tensor_index for tensor_index, _ in indexed_tensors]
+                    regions = [self._tensor_region(tensor) for _, tensor in indexed_tensors]
+                    reg_descs = self._agent.get_reg_descs(regions, memory_type)
+                    self._agent.register_memory(reg_descs, backends=self._backends)
+                    registered_descs.append(reg_descs)
+                    descriptor_groups.append(
+                        {
+                            "memory_type": memory_type,
+                            "tensor_indices": tensor_indices,
+                            "regions": regions,
+                        }
+                    )
+            except Exception:
+                for reg_descs in registered_descs:
+                    self._safe_call(self._agent.deregister_memory, reg_descs)
+                raise
+            with self._state_lock:
+                self._registered_descs.extend(registered_descs)
 
             size = sum(spec["size"] for spec in tensor_specs)
             metadata = {
                 "schema_version": _SCHEMA_VERSION,
                 "kind": kind,
                 "agent_metadata": self._agent.get_agent_metadata(),
-                "memory_type": memory_type,
-                "regions": regions,
+                "descriptor_groups": descriptor_groups,
                 "tensor_specs": tensor_specs,
                 "size": size,
             }
             if self._serving_handshake:
                 metadata["sender_host"] = self.host
                 metadata["sender_zmq_port"] = self._zmq_port
+            previous = self._take_pending(put_key)
+            if previous is not None:
+                self._release_pending(previous)
             with self._state_lock:
-                self._pending[put_key] = (tensors, [reg_descs], time.monotonic() + self._lease_seconds)
+                self._pending[put_key] = _PendingPayload(
+                    tensors=tensors,
+                    registrations=registered_descs,
+                    deadline=time.monotonic() + self._lease_seconds,
+                )
                 if self._serving_handshake:
                     self._published[put_key] = metadata
+            self._lease_wakeup.set()
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
             logger.debug("NixlConnector put %s->%s key=%s size=%d", from_stage, to_stage, put_key, size)
@@ -231,10 +297,9 @@ class NixlConnector(OmniConnectorBase):
             raise RuntimeError("Cannot get data: NixlConnector is closed")
 
         remote_agent = None
-        local_reg_descs = None
-        local_dlist = None
-        remote_dlist = None
-        xfer_handle = None
+        local_reg_descs_list = []
+        dlist_handles = []
+        xfer_handles = []
         try:
             metadata = self._resolve_metadata(get_key, metadata)
             if not isinstance(metadata, dict) or metadata.get("schema_version") != _SCHEMA_VERSION:
@@ -242,43 +307,72 @@ class NixlConnector(OmniConnectorBase):
                 return None
 
             tensor_specs = metadata.get("tensor_specs")
-            regions = metadata.get("regions")
-            if not isinstance(tensor_specs, list) or not isinstance(regions, list):
-                raise RuntimeError(f"Invalid NIXL metadata for {get_key}: missing tensor_specs/regions")
-
-            # Metadata may be serialized (e.g. msgpack over ZMQ) between ``put``
-            # and ``get``, which turns the region descriptor tuples into lists.
-            # Restore tuples and strip to the 3-tuple ``(addr, len, dev)`` form
-            # that NIXL's ``get_xfer_descs`` requires; the 4th reg-desc metadata
-            # field is only valid for ``get_reg_descs`` (registration).
-            remote_xfer_regions = [tuple(region)[:3] for region in regions]
+            if not isinstance(tensor_specs, list):
+                raise RuntimeError(f"Invalid NIXL metadata for {get_key}: missing tensor_specs")
+            descriptor_groups = self._validated_descriptor_groups(metadata, len(tensor_specs))
 
             local_tensors = [self._allocate_tensor_from_spec(spec, metadata.get("kind")) for spec in tensor_specs]
-            local_memory_type = self._resolve_memory_type(local_tensors[0])
-            local_regions = [self._tensor_region(tensor) for tensor in local_tensors]
-            local_reg_descs = self._agent.get_reg_descs(local_regions, local_memory_type)
-            self._agent.register_memory(local_reg_descs, backends=self._backends)
-
             remote_agent = self._agent.add_remote_agent(metadata["agent_metadata"])
             self._remote_agents.append(remote_agent)
-            remote_descs = self._agent.get_xfer_descs(remote_xfer_regions, metadata.get("memory_type", "DRAM"))
-            local_xfer_regions = [tuple(region)[:3] for region in local_regions]
-            local_descs = self._agent.get_xfer_descs(local_xfer_regions, local_memory_type)
-            remote_dlist = self._agent.prep_xfer_dlist(remote_agent, remote_descs)
-            local_dlist = self._agent.prep_xfer_dlist(_INIT_AGENT, local_descs)
+            for descriptor_group in descriptor_groups:
+                remote_memory_type = descriptor_group["memory_type"]
+                indexed_regions = list(
+                    zip(descriptor_group["tensor_indices"], descriptor_group["regions"], strict=True)
+                )
+                local_groups: dict[str, list[tuple[int, Any]]] = {}
+                for tensor_index, remote_region in indexed_regions:
+                    local_memory_type = self._resolve_memory_type(local_tensors[tensor_index])
+                    local_groups.setdefault(local_memory_type, []).append((tensor_index, remote_region))
 
-            desc_ids = list(range(len(local_tensors)))
-            xfer_handle = self._agent.make_prepped_xfer(
-                "READ",
-                local_dlist,
-                desc_ids,
-                remote_dlist,
-                desc_ids,
-            )
-            self._agent.transfer(xfer_handle)
-            self._wait_for_transfer(xfer_handle, get_key)
-            self._agent.release_xfer_handle(xfer_handle)
-            xfer_handle = None
+                for local_memory_type, entries in local_groups.items():
+                    group_tensors = [local_tensors[tensor_index] for tensor_index, _ in entries]
+                    local_regions = [self._tensor_region(tensor) for tensor in group_tensors]
+                    local_reg_descs = self._agent.get_reg_descs(local_regions, local_memory_type)
+                    self._agent.register_memory(local_reg_descs, backends=self._backends)
+                    local_reg_descs_list.append(local_reg_descs)
+
+                    remote_regions = [tuple(region)[:3] for _, region in entries]
+                    remote_descs = self._agent.get_xfer_descs(remote_regions, remote_memory_type)
+                    local_descs = self._agent.get_xfer_descs(
+                        [tuple(region)[:3] for region in local_regions], local_memory_type
+                    )
+                    remote_dlist = self._agent.prep_xfer_dlist(remote_agent, remote_descs)
+                    local_dlist = self._agent.prep_xfer_dlist(_INIT_AGENT, local_descs)
+                    dlist_handles.extend([local_dlist, remote_dlist])
+
+                    desc_ids = list(range(len(entries)))
+                    xfer_handle = self._agent.make_prepped_xfer(
+                        "READ",
+                        local_dlist,
+                        desc_ids,
+                        remote_dlist,
+                        desc_ids,
+                    )
+                    xfer_handles.append(xfer_handle)
+                    self._agent.transfer(xfer_handle)
+
+            for xfer_handle in xfer_handles:
+                try:
+                    self._wait_for_transfer(xfer_handle, get_key)
+                except TimeoutError:
+                    self._defer_transfer(
+                        _DeferredTransfer(
+                            tensors=local_tensors,
+                            registrations=local_reg_descs_list,
+                            dlists=dlist_handles,
+                            handles=xfer_handles,
+                            remote_agent=remote_agent,
+                        )
+                    )
+                    local_tensors = []
+                    local_reg_descs_list = []
+                    dlist_handles = []
+                    xfer_handles = []
+                    remote_agent = None
+                    raise
+            for xfer_handle in xfer_handles:
+                self._agent.release_xfer_handle(xfer_handle)
+            xfer_handles.clear()
 
             size = int(metadata.get("size", sum(spec.get("size", 0) for spec in tensor_specs)))
             if metadata.get("kind") == _KIND_OBJECT:
@@ -300,39 +394,58 @@ class NixlConnector(OmniConnectorBase):
             logger.error("NixlConnector get failed for %s", get_key, exc_info=True)
             return None
         finally:
-            if xfer_handle is not None:
+            for xfer_handle in xfer_handles:
                 self._safe_call(self._agent.release_xfer_handle, xfer_handle)
-            if local_dlist is not None:
-                self._safe_call(self._agent.release_dlist_handle, local_dlist)
-            if remote_dlist is not None:
-                self._safe_call(self._agent.release_dlist_handle, remote_dlist)
+            for dlist_handle in dlist_handles:
+                self._safe_call(self._agent.release_dlist_handle, dlist_handle)
             if remote_agent is not None:
                 self._safe_call(self._agent.remove_remote_agent, remote_agent)
                 if remote_agent in self._remote_agents:
                     self._remote_agents.remove(remote_agent)
-            if local_reg_descs is not None:
+            for local_reg_descs in local_reg_descs_list:
                 self._safe_call(self._agent.deregister_memory, local_reg_descs)
 
     def cleanup(self, request_id: str) -> None:
-        with self._state_lock:
-            self._published.pop(request_id, None)
-            pending = self._pending.pop(request_id, None)
+        pending = self._take_pending(request_id)
         if pending is None:
             return
-        _, reg_descs_list, _ = pending
-        for reg_descs in reg_descs_list:
+        self._release_pending(pending)
+
+    def _release_pending(self, pending: _PendingPayload) -> None:
+        for reg_descs in pending.registrations:
             self._safe_call(self._agent.deregister_memory, reg_descs)
-            if reg_descs in self._registered_descs:
-                self._registered_descs.remove(reg_descs)
+            with self._state_lock:
+                if reg_descs in self._registered_descs:
+                    self._registered_descs.remove(reg_descs)
+
+    def _take_pending(self, request_id: str, expected: _PendingPayload | None = None) -> _PendingPayload | None:
+        with self._state_lock:
+            pending = self._pending.get(request_id)
+            if pending is None or (expected is not None and pending is not expected):
+                return None
+            self._published.pop(request_id, None)
+            return self._pending.pop(request_id)
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         self._stop_event.set()
+        self._lease_wakeup.set()
+        self._transfer_wakeup.set()
         if self._listener_thread is not None:
             self._listener_thread.join(timeout=5.0)
             self._listener_thread = None
+        if self._lease_thread is not None:
+            self._lease_thread.join(timeout=5.0)
+            self._lease_thread = None
+        if self._transfer_thread is not None:
+            self._transfer_thread.join(timeout=5.0)
+            self._transfer_thread = None
+        while self._deferred_transfers:
+            self._reap_deferred_transfers()
+            if self._deferred_transfers:
+                time.sleep(max(self._poll_interval_s, 0.01))
         if self._zmq_ctx is not None:
             # destroy() rather than term(): REQ sockets live in thread-local
             # caches this thread cannot reach, and term() blocks until every
@@ -341,9 +454,12 @@ class NixlConnector(OmniConnectorBase):
             self._zmq_ctx = None
         for request_id in list(self._pending):
             self.cleanup(request_id)
-        for agent_name in list(self._remote_agents):
+        deferred_agents = {
+            transfer.remote_agent for transfer in self._deferred_transfers if transfer.remote_agent is not None
+        }
+        for agent_name in [agent for agent in self._remote_agents if agent not in deferred_agents]:
             self._safe_call(self._agent.remove_remote_agent, agent_name)
-        self._remote_agents.clear()
+            self._remote_agents.remove(agent_name)
         for reg_descs in list(self._registered_descs):
             self._safe_call(self._agent.deregister_memory, reg_descs)
         self._registered_descs.clear()
@@ -371,6 +487,19 @@ class NixlConnector(OmniConnectorBase):
             self._zmq_ctx = zmq.Context()
             self._handshake_enabled = True
 
+    @staticmethod
+    def _metadata_endpoint(metadata: dict[str, Any] | None) -> tuple[str, int] | None:
+        if not isinstance(metadata, dict):
+            return None
+        host = metadata.get("sender_host")
+        port = metadata.get("sender_zmq_port")
+        if not host or not port:
+            host = metadata.get("source_host")
+            port = metadata.get("source_port")
+        if not host or not port:
+            return None
+        return str(host), int(port)
+
     def _resolve_metadata(self, get_key: str, metadata: dict[str, Any] | None) -> dict[str, Any] | None:
         """Return complete NIXL transfer metadata for ``get_key``.
 
@@ -381,15 +510,15 @@ class NixlConnector(OmniConnectorBase):
         if isinstance(metadata, dict) and metadata.get("schema_version") == _SCHEMA_VERSION:
             return metadata
 
-        if isinstance(metadata, dict) and metadata.get("sender_host") and metadata.get("sender_zmq_port"):
-            endpoint = (str(metadata["sender_host"]), int(metadata["sender_zmq_port"]))
-        elif self._sender_host and self._sender_zmq_port:
+        endpoint = self._metadata_endpoint(metadata)
+        if endpoint is None and self._sender_host and self._sender_zmq_port:
             endpoint = (str(self._sender_host), int(self._sender_zmq_port))
-        else:
+        if endpoint is None:
             logger.error(
                 "NixlConnector get(%s) received no usable metadata and no producer handshake "
-                "endpoint is configured. Set sender_host/sender_zmq_port on the consumer "
-                "connector, or forward the metadata returned by put().",
+                "endpoint is configured. Set sender_host/sender_zmq_port on the consumer, "
+                "pass source_host/source_port for the producer rank, or forward the metadata "
+                "returned by put().",
                 get_key,
             )
             return None
@@ -440,11 +569,11 @@ class NixlConnector(OmniConnectorBase):
         Without this the producer would hold the registration until the lease
         expires, which for long-lived stages means unbounded growth.
         """
-        host = metadata.get("sender_host")
-        port = metadata.get("sender_zmq_port")
-        if not host or not port or self._zmq_ctx is None:
+        endpoint = self._metadata_endpoint(metadata)
+        if endpoint is None or self._zmq_ctx is None:
             return
-        zmq_addr = f"tcp://{host}:{int(port)}"
+        host, port = endpoint
+        zmq_addr = f"tcp://{host}:{port}"
         sock = self._get_req_socket(zmq_addr)
         try:
             sock.send(_XFER_DONE_MSG + msgspec.msgpack.encode({"key": get_key}))
@@ -548,11 +677,11 @@ class NixlConnector(OmniConnectorBase):
         now = time.monotonic()
         with self._state_lock:
             expired = [
-                (key, sum(t.numel() * t.element_size() for t in tensors))
-                for key, (tensors, _, deadline) in self._pending.items()
-                if now >= deadline
+                (key, pending, sum(t.numel() * t.element_size() for t in pending.tensors))
+                for key, pending in self._pending.items()
+                if now >= pending.deadline
             ]
-        for request_id, size in expired:
+        for request_id, pending, size in expired:
             logger.warning(
                 "NixlConnector lease expired for request %s after %.0fs; its %d bytes are "
                 "being reclaimed while a consumer may still read them, which yields "
@@ -562,7 +691,82 @@ class NixlConnector(OmniConnectorBase):
                 self._lease_seconds,
                 size,
             )
-            self.cleanup(request_id)
+            claimed = self._take_pending(request_id, expected=pending)
+            if claimed is not None:
+                self._release_pending(claimed)
+
+    def _lease_reaper_loop(self) -> None:
+        while not self._stop_event.is_set():
+            now = time.monotonic()
+            with self._state_lock:
+                next_deadline = min((pending.deadline for pending in self._pending.values()), default=None)
+            if next_deadline is None:
+                timeout = None
+            else:
+                timeout = max(0.0, next_deadline - now)
+            self._lease_wakeup.wait(timeout=timeout)
+            self._lease_wakeup.clear()
+            if not self._stop_event.is_set():
+                self._cleanup_expired_pending()
+
+    def _defer_transfer(self, transfer: _DeferredTransfer) -> None:
+        with self._state_lock:
+            self._deferred_transfers.append(transfer)
+        self._transfer_wakeup.set()
+
+    def _transfer_reaper_loop(self) -> None:
+        while not self._stop_event.is_set():
+            self._transfer_wakeup.wait(timeout=max(self._poll_interval_s, 0.01))
+            self._transfer_wakeup.clear()
+            self._reap_deferred_transfers()
+
+    def _reap_deferred_transfers(self) -> None:
+        with self._state_lock:
+            transfers = list(self._deferred_transfers)
+        for transfer in transfers:
+            try:
+                states = [self._agent.check_xfer_state(handle) for handle in transfer.handles]
+            except Exception:
+                logger.debug("Failed to poll deferred NIXL transfer", exc_info=True)
+                continue
+            if any(state == "PROC" for state in states):
+                continue
+            self._release_deferred_transfer(transfer)
+            if (
+                not transfer.handles
+                and not transfer.dlists
+                and not transfer.registrations
+                and transfer.remote_agent is None
+            ):
+                transfer.tensors.clear()
+                with self._state_lock:
+                    if transfer in self._deferred_transfers:
+                        self._deferred_transfers.remove(transfer)
+
+    def _release_deferred_transfer(self, transfer: _DeferredTransfer) -> None:
+        transfer.handles = self._release_owned_resources(self._agent.release_xfer_handle, transfer.handles)
+        transfer.dlists = self._release_owned_resources(self._agent.release_dlist_handle, transfer.dlists)
+        if transfer.remote_agent is not None:
+            try:
+                self._agent.remove_remote_agent(transfer.remote_agent)
+            except Exception:
+                logger.debug("Failed to remove deferred NIXL remote agent", exc_info=True)
+            else:
+                if transfer.remote_agent in self._remote_agents:
+                    self._remote_agents.remove(transfer.remote_agent)
+                transfer.remote_agent = None
+        transfer.registrations = self._release_owned_resources(self._agent.deregister_memory, transfer.registrations)
+
+    @staticmethod
+    def _release_owned_resources(release: Any, resources: list[Any]) -> list[Any]:
+        remaining = []
+        for resource in resources:
+            try:
+                release(resource)
+            except Exception:
+                logger.debug("Failed to release deferred NIXL resource", exc_info=True)
+                remaining.append(resource)
+        return remaining
 
     def _resolve_memory_type(self, tensor: torch.Tensor) -> str:
         if self._default_memory_type is not None:
@@ -570,6 +774,28 @@ class NixlConnector(OmniConnectorBase):
         if tensor.device.type == "cpu":
             return "DRAM"
         return "VRAM"
+
+    @staticmethod
+    def _validated_descriptor_groups(metadata: dict[str, Any], tensor_count: int) -> list[dict[str, Any]]:
+        groups = metadata.get("descriptor_groups")
+        if not isinstance(groups, list) or not groups:
+            raise RuntimeError("Invalid NIXL metadata: missing descriptor_groups")
+
+        seen_indices = []
+        for group in groups:
+            if not isinstance(group, dict):
+                raise RuntimeError("Invalid NIXL metadata: descriptor group must be a mapping")
+            indices = group.get("tensor_indices")
+            regions = group.get("regions")
+            if not isinstance(indices, list) or not isinstance(regions, list) or len(indices) != len(regions):
+                raise RuntimeError("Invalid NIXL metadata: tensor_indices and regions must have equal lengths")
+            if not group.get("memory_type"):
+                raise RuntimeError("Invalid NIXL metadata: descriptor group is missing memory_type")
+            seen_indices.extend(indices)
+
+        if sorted(seen_indices) != list(range(tensor_count)):
+            raise RuntimeError("Invalid NIXL metadata: tensor indices must form an exact partition")
+        return groups
 
     @staticmethod
     def _tensor_region(tensor: torch.Tensor) -> tuple[int, int, int, str]:

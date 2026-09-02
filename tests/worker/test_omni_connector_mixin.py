@@ -20,7 +20,10 @@ import torch
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVTransferManager,
 )
-from vllm_omni.distributed.omni_connectors.utils.kv_utils import kv_zmq_port
+from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
+from vllm_omni.distributed.omni_connectors.utils.initialization import (
+    resolve_connector_spec,
+)
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
@@ -550,6 +553,17 @@ class TestChunkStreamCompletedGuard(unittest.TestCase):
             "register_chunk_recv should add request to pending when stream is not yet complete",
         )
 
+        host.shutdown_omni_connectors()
+
+    def test_register_updates_payload_sender_endpoint(self):
+        host = self._make_host(stage_id=1)
+        host._omni_connector.update_sender_info = MagicMock()
+        req = _make_request("req-1", "ext-req-1")
+        req.payload_sender_info = {"host": "10.0.0.1", "zmq_port": 50051}
+
+        host.register_chunk_recv(req)
+
+        host._omni_connector.update_sender_info.assert_called_once_with("10.0.0.1", 50051)
         host.shutdown_omni_connectors()
 
     def test_finish_sentinel_populates_completed_set(self):
@@ -1335,30 +1349,39 @@ class TestRankAwareHandshakePort(unittest.TestCase):
 
     @staticmethod
     def _resolve(name, extra, local_rank=0):
-        with patch(
-            "vllm_omni.worker.omni_connector_model_runner_mixin.get_local_tp_rank",
-            return_value=local_rank,
-        ):
-            return OmniConnectorModelRunnerMixin._rank_aware_extra(name, extra)
+        spec = resolve_connector_spec(
+            ConnectorSpec(name=name, extra=extra),
+            stage_id=int(extra.get("stage_id", 0)),
+            role=extra.get("role"),
+            local_rank=local_rank,
+        )
+        return spec.extra
 
     def test_sender_port_matches_the_orchestrator_formula(self):
         for local_rank in (0, 1, 3):
             with self.subTest(local_rank=local_rank):
                 extra = {"zmq_port": 50071, "stage_id": 2, "role": "sender"}
                 resolved = self._resolve("NixlConnector", extra, local_rank=local_rank)
-                self.assertEqual(resolved["zmq_port"], kv_zmq_port(50071, 2, local_rank))
+                self.assertEqual(resolved["zmq_port"], 50071 + 2 + local_rank * 16)
                 self.assertEqual(extra["zmq_port"], 50071, "the source config must not be mutated")
 
-    def test_receiver_and_handshake_less_connectors_keep_their_port(self):
-        receiver = self._resolve("NixlConnector", {"zmq_port": 50071, "role": "receiver"}, local_rank=1)
-        self.assertEqual(receiver["zmq_port"], 50071)
+    def test_receiver_gets_sender_endpoint_without_a_bind_port(self):
+        receiver = self._resolve(
+            "NixlConnector",
+            {"zmq_port": 50071, "stage_id": 3, "from_stage": 2, "role": "receiver"},
+            local_rank=1,
+        )
+        self.assertNotIn("zmq_port", receiver)
+        self.assertEqual(receiver["sender_zmq_port"], 50071 + 2 + 16)
 
+    def test_handshake_less_connector_keeps_its_config(self):
         shm = self._resolve("SharedMemoryConnector", {"zmq_port": 50071, "role": "sender"}, local_rank=1)
         self.assertEqual(shm["zmq_port"], 50071)
 
-    def test_unresolvable_port_is_left_as_configured(self):
+    def test_unresolvable_port_is_rejected(self):
         extra = {"zmq_port": "${MISSING_PORT_VAR}", "stage_id": 0, "role": "sender"}
-        self.assertEqual(self._resolve("NixlConnector", extra), extra)
+        with self.assertRaises(ValueError):
+            self._resolve("NixlConnector", extra)
 
 
 class _FailingConnector:

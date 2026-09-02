@@ -431,7 +431,7 @@ def test_create_connector_config_parsing(monkeypatch, raw_cfg, expected_name, ex
     assert connector == "ok"
     assert isinstance(captured["spec"], ConnectorSpec)
     assert captured["spec"].name == expected_name
-    assert captured["spec"].extra == expected_extra
+    assert captured["spec"].extra == {**expected_extra, "stage_id": 0}
 
 
 def test_load_poll(build_adapter):

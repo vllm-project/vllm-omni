@@ -16,6 +16,10 @@ tensors and let the consumer pull them with a NIXL `READ`.
 - Control Plane: either the caller forwards the metadata returned by `put()`, or --
   when `zmq_port` is set -- a ZMQ ROUTER socket serves it to the consumer by key.
 
+Transfer metadata uses schema version 1. Tensor descriptors are grouped by NIXL
+memory type (`DRAM`, `VRAM`, and so on), while each descriptor retains its global
+tensor index so mixed CPU/accelerator payloads can be reconstructed in order.
+
 Payloads are not restricted to tensors. A single tensor or a list of tensors is
 transferred as-is; a nested structure has its tensor leaves extracted and shipped
 alongside a msgpack-encoded skeleton; anything else is msgpack-encoded into one
@@ -29,8 +33,8 @@ CUDA hosts can install the published wheel:
 pip install nixl
 ```
 
-Intel XPU needs NIXL built against a Level-Zero-enabled UCX. The image build does
-this via `docker/build_ucx_wheel.sh` and `docker/build_nixl_wheels.sh`.
+For Intel XPU, use `docker/Dockerfile.xpu`. Its upstream vLLM XPU base image
+provides a matching torch-xpu, UCX with Level Zero support, and NIXL runtime.
 
 ## Configuration
 
@@ -57,9 +61,10 @@ Parameters:
 
 - `host`: address the producer binds its handshake socket to (`"auto"` to detect).
 - `zmq_port`: handshake port. Omit it when the pipeline forwards `put()`'s metadata
-  itself, in which case no socket is opened. Stages colocated on one host each need
-  a distinct port. The value in the deploy YAML is the base port: stage and rank
-  offsets are added to it, so a tensor-parallel stage does not need one entry per rank.
+  itself, in which case no socket is opened. The value in the deploy YAML is a
+  base port. Purpose, replica, rank, and producer-stage offsets are added centrally,
+  so colocated connectors and tensor-parallel workers receive distinct endpoints
+  without one config entry per rank.
 - `sender_host` / `sender_zmq_port`: consumer-side override naming the producer's
   handshake endpoint. Only needed when the consumer cannot learn it from metadata.
 - `backends`: NIXL backends to register memory with. Defaults to `["UCX"]`.
@@ -69,8 +74,12 @@ Parameters:
   and `VRAM` for accelerator tensors.
 - `lease_seconds`: how long a `put()` payload stays registered while waiting to be
   read (default 3600). The consumer reports completion, so this only bounds payloads
-  nobody ever reads. `VLLM_OMNI_NIXL_LEASE_S` overrides it.
+  nobody ever reads. An internal reaper releases expired registrations.
+  `VLLM_OMNI_NIXL_LEASE_S` overrides it.
 - `transfer_timeout_s`: how long a `get()` waits for its `READ` to complete
-  (default 300). `VLLM_OMNI_NIXL_XFER_TIMEOUT_S` overrides it.
+  (default 300). NIXL 1.3 has no transfer cancellation API, so a timed-out transfer's
+  buffers and registrations remain owned by the connector until NIXL reports a
+  terminal state; `close()` waits for that state before releasing them.
+  `VLLM_OMNI_NIXL_XFER_TIMEOUT_S` overrides it.
 
 For more details, refer to the [NIXL repository](https://github.com/ai-dynamo/nixl).

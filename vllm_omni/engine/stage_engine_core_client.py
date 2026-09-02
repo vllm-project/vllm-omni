@@ -153,6 +153,7 @@ class StageEngineCoreClientBase(StageClientBase):
         self._kv_sender_host = self._resolve_contact_host()
         self._kv_sender_info: dict[str, Any] | None = None
         self._kv_sender_initialized = False
+        self._payload_sender_info = self._build_payload_sender_info()
 
         client_name = self.__class__.__name__
         logger.info(
@@ -289,6 +290,35 @@ class StageEngineCoreClientBase(StageClientBase):
         if not isinstance(connector_config, dict):
             return None
         return connector_config
+
+    def _build_payload_sender_info(self) -> dict[str, Any] | None:
+        model_config = getattr(self.vllm_config, "model_config", None)
+        connector_config = getattr(model_config, "stage_connector_config", None)
+        if not isinstance(connector_config, dict):
+            return None
+        extra = connector_config.get("extra")
+        if not isinstance(extra, dict) or extra.get("role") != "sender":
+            return None
+        base_port = extra.get("zmq_port")
+        if base_port is None:
+            return None
+        sender_host = self._resolve_sender_host_from_config(extra)
+        if sender_host is None:
+            return None
+        from vllm_omni.distributed.omni_connectors.utils.initialization import connector_zmq_port
+
+        return {
+            "host": sender_host,
+            "zmq_port": connector_zmq_port(
+                int(os.path.expandvars(str(base_port))),
+                purpose="request_forwarding",
+                from_stage=int(extra.get("from_stage", self.stage_id)),
+                replica_id=self.replica_id,
+            ),
+        }
+
+    def get_payload_sender_info(self) -> dict[str, Any] | None:
+        return dict(self._payload_sender_info) if self._payload_sender_info is not None else None
 
     def _resolve_sender_host_from_config(self, connector_config: dict[str, Any]) -> str | None:
         host = connector_config.get("sender_host") or connector_config.get("host")

@@ -16,7 +16,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.logger import init_logger
 
-from .initialization import KV_RANK_PORT_STRIDE, KV_REPLICA_PORT_STRIDE, KV_TRANSFER_PORT_OFFSET
+from .initialization import connector_zmq_port
 
 logger = init_logger(__name__)
 
@@ -123,12 +123,12 @@ def kv_zmq_port(
 
     """
     replica = get_omni_replica_id() if replica_id is None else max(int(replica_id), 0)
-    return (
-        base_port
-        + KV_TRANSFER_PORT_OFFSET
-        + replica * KV_REPLICA_PORT_STRIDE
-        + local_rank * KV_RANK_PORT_STRIDE
-        + from_stage
+    return connector_zmq_port(
+        base_port,
+        purpose="kv_transfer",
+        from_stage=from_stage,
+        local_rank=local_rank,
+        replica_id=replica,
     )
 
 

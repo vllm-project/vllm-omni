@@ -20,6 +20,8 @@ from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_p
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec, stage_receives_chunks
+from ..utils.initialization import resolve_connector_spec
+from ..utils.kv_utils import get_local_tp_rank, get_omni_replica_id
 from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
 
@@ -254,11 +256,20 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 "extra": getattr(connector_config, "extra", {}),
             }
 
-        connector_specs = ConnectorSpec(
+        connector_spec = ConnectorSpec(
             name=connector_config.get("name", "SharedMemoryConnector"),
             extra=connector_config.get("extra", {}),
         )
-        return OmniConnectorFactory.create_connector(connector_specs)
+        stage_id = int(getattr(model_config, "stage_id", connector_spec.extra.get("stage_id", 0)))
+        role = connector_spec.extra.get("role")
+        resolved_spec = resolve_connector_spec(
+            connector_spec,
+            stage_id=stage_id,
+            role=str(role) if role is not None else None,
+            local_rank=get_local_tp_rank(),
+            replica_id=get_omni_replica_id(),
+        )
+        return OmniConnectorFactory.create_connector(resolved_spec)
 
     def load_async(self, request: Request):
         """Register a request for asynchronous chunk retrieval.

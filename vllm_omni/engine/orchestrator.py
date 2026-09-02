@@ -2151,6 +2151,7 @@ class Orchestrator:
         *,
         mm_features: list | None = None,
         resumable: bool = False,
+        payload_sender_info: dict[str, Any] | None = None,
     ) -> Any:
         next_pool = self.stage_pools[next_stage_id]
         if self._next_stage_input_is_tokens(next_input):
@@ -2163,6 +2164,7 @@ class Orchestrator:
                 resumable=resumable,
             )
             request.external_req_id = request.request_id
+            request.payload_sender_info = payload_sender_info
             return request
 
         processor = self._get_stage_input_processor(next_stage_id)
@@ -2184,6 +2186,7 @@ class Orchestrator:
         )
         request = self._upgrade_processed_stage_request(request, next_input)
         request.external_req_id = req_id
+        request.payload_sender_info = payload_sender_info
         return request
 
     @staticmethod
@@ -2829,6 +2832,7 @@ class Orchestrator:
                 params=params,
                 mm_features=mm_features,
                 resumable=next_stage_resumable,
+                payload_sender_info=self._build_payload_sender_info(src_stage_id, request_id=req_id),
             )
 
             if already_submitted:
@@ -3029,6 +3033,23 @@ class Orchestrator:
             sender_infos[sender_stage_id] = sender_info
 
         return sender_infos or None
+
+    def _build_payload_sender_info(
+        self,
+        sender_stage_id: int,
+        *,
+        request_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        if sender_stage_id < 0 or sender_stage_id >= len(self.stage_pools):
+            return None
+        sender_pool = self.stage_pools[sender_stage_id]
+        sender_stage = sender_pool.get_bound_client(request_id) if request_id is not None else None
+        if sender_stage is None:
+            sender_stage = sender_pool.stage_client
+        get_sender_info = getattr(sender_stage, "get_payload_sender_info", None)
+        if not callable(get_sender_info):
+            return None
+        return get_sender_info()
 
     # ---- Shutdown / lifecycle ----
 

@@ -1768,10 +1768,12 @@ def get_stage_connector_spec(
     # sender-only so the scheduler does not park orchestrator-provided inputs
     # waiting for an upstream payload.
     target_stage = str(stage_id)
-    for (from_stage, _to_stage), spec in getattr(omni_transfer_config, "connectors", {}).items():
+    for (from_stage, to_stage), spec in getattr(omni_transfer_config, "connectors", {}).items():
         if from_stage == target_stage:
             extra = dict(spec.extra or {})
             extra.setdefault("role", "sender")
+            extra["from_stage"] = int(from_stage)
+            extra["to_stage"] = int(to_stage)
             return {"name": spec.name, "extra": extra}
     return {}
 
