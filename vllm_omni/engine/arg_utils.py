@@ -507,6 +507,7 @@ class OrchestratorArgs:
 
     # === Cross-stage Communication ===
     batch_timeout: int = 10
+    cfg_companion_timeout: float = 600.0
 
     # === Cluster / Backend ===
     worker_backend: str = "multi_process"

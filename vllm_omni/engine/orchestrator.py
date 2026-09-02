@@ -15,6 +15,7 @@ handled by :class:`MembershipController`, which is injected optionally.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import shutil
 import time as _time
@@ -428,6 +429,8 @@ class Orchestrator:
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
     duplex_control_plane: DuplexControlPlanePort | None = None
+    _cfg_companion_timeout_s: float = 600.0
+    _cfg_companion_reaper_interval_s: float = 1.0
 
     def __init__(
         self,
@@ -448,6 +451,7 @@ class Orchestrator:
         duplex_runtime_extension: DuplexRuntimeExtension | None = None,
         enable_duplex_control: bool = False,
         duplex_session_config: DuplexSessionRuntimeConfig | None = None,
+        cfg_companion_timeout: float = 600.0,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -486,6 +490,13 @@ class Orchestrator:
         )
 
         self._cfg_tracker = CfgCompanionTracker()
+        self._cfg_companion_timeout_s = float(cfg_companion_timeout)
+        if not math.isfinite(self._cfg_companion_timeout_s) or self._cfg_companion_timeout_s <= 0:
+            raise ValueError(f"cfg_companion_timeout must be finite and > 0, got {self._cfg_companion_timeout_s}")
+        self._cfg_companion_reaper_interval_s = min(
+            1.0,
+            self._cfg_companion_timeout_s,
+        )
         self._stage_input_processors: dict[int, Any] = {}
 
         self.duplex_control_plane: DuplexControlPlanePort | None = None
@@ -626,6 +637,12 @@ class Orchestrator:
             membership_watcher = self._membership.start()
 
         tasks = [request_task, output_task]
+        tasks.append(
+            asyncio.create_task(
+                self._cfg_companion_reaper_loop(),
+                name="orchestrator-cfg-companion-reaper",
+            )
+        )
         if self.duplex_control_plane is not None:
             tasks.append(asyncio.create_task(self._duplex_reaper_loop(), name="orchestrator-duplex-reaper"))
         if membership_watcher is not None:
@@ -737,6 +754,56 @@ class Orchestrator:
                         await plane.reap_expired()
                     except Exception:
                         logger.exception("[Orchestrator] Duplex expiry cleanup failed; retrying on next tick")
+
+    async def _cfg_companion_reaper_loop(self) -> None:
+        """Fail deferred CFG parents whose companion bundle stops progressing."""
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=self._cfg_companion_reaper_interval_s,
+                )
+            except TimeoutError:
+                # Unlike the duplex reaper, expired parents are claimed before
+                # cleanup. Propagate failures so run() tears the orchestrator
+                # down instead of losing the only retry owner silently.
+                await self._reap_expired_cfg_parents()
+
+    async def _reap_expired_cfg_parents(self, *, now: float | None = None) -> int:
+        expired = self._cfg_tracker.pop_expired_parents(
+            self._cfg_companion_timeout_s,
+            now=now,
+        )
+        for parent_id, deferred in expired:
+            companion_ids = list(self._cfg_tracker.get_companion_request_ids(parent_id).values())
+            pending_companions = [
+                companion_id for companion_id in companion_ids if not self._cfg_tracker.is_companion_done(companion_id)
+            ]
+            pending_summary = ", ".join(pending_companions) or "<unknown>"
+            logger.error(
+                "[Orchestrator] CFG companion deadline exceeded for parent %s after %.3fs; pending=%s",
+                parent_id,
+                self._cfg_companion_timeout_s,
+                pending_companions,
+            )
+            await self.output_async_queue.put(
+                ErrorMessage(
+                    request_id=parent_id,
+                    stage_id=deferred["stage_id"],
+                    status_code=HTTPStatus.GATEWAY_TIMEOUT.value,
+                    error=(
+                        "CFG companion deadline exceeded after "
+                        f"{self._cfg_companion_timeout_s:g}s while waiting for "
+                        f"companion requests: {pending_summary}"
+                    ),
+                )
+            )
+            await self._cleanup_request_ids(
+                [parent_id],
+                abort=True,
+                close_duplex_sessions=True,
+            )
+        return len(expired)
 
     async def _handle_add_request(self, msg: StageSubmissionMessage) -> None:
         """Handle an add_request message from the main thread."""

@@ -1289,6 +1289,7 @@ class VllmOmniOrchestratorConfig:
     omni_lb_policy: str = "random"
     omni_heartbeat_timeout: float = Field(default=30.0, gt=0.0)
     batch_timeout: int = Field(default=10, ge=0)
+    cfg_companion_timeout: float = Field(default=600.0, gt=0.0, allow_inf_nan=False)
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
