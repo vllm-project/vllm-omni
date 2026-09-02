@@ -20,6 +20,7 @@ from vllm_omni.metrics.duplex_turn import (
     DuplexTurnMetrics,
     accumulate_turn_stage_metrics,
     finalize_duplex_turn_metrics,
+    finished_reason_for_cancel,
     is_duplex_resource_request_id,
     make_turn_aggregator,
 )
@@ -142,7 +143,7 @@ def test_accumulate_appends_segments_collapse_at_finalize() -> None:
     assert stage0.stage_gen_time_ms == 35.0
     assert stage0.vllm_ttft_ms == 12.0
     assert stage0.vllm_itls_ms == [8.0, 9.0]
-    assert stage0.vllm_tpot_ms == 20.0
+    assert stage0.vllm_tpot_ms == pytest.approx((10.0 * 3 + 20.0 * 5) / 8.0)
     assert collapsed[1].audio_duration_s == 0.75
     assert collapsed[1].audio_generated_frames == 12000
 
@@ -151,7 +152,7 @@ def test_finalize_logs_once_with_identity_line(mocker) -> None:
     request_id = _request_id()
     aggregator = make_turn_aggregator(num_stages=2, log_stats=True, wall_start_ts=1.0)
     spy = mocker.spy(aggregator, "build_and_log_summary")
-    logged = mocker.patch("vllm_omni.metrics.duplex_turn.logger.info")
+    logged = mocker.patch("vllm_omni.metrics.stats.logger.info")
     turn = DuplexTurnMetrics(
         request_id=request_id,
         response_id="resp-turn",
@@ -164,16 +165,19 @@ def test_finalize_logs_once_with_identity_line(mocker) -> None:
     assert finalize_duplex_turn_metrics(turn, reason="stop") is True
     assert finalize_duplex_turn_metrics(turn, reason="abort") is False
     spy.assert_called_once_with()
-    identity = next(call for call in logged.call_args_list if call.args and call.args[0].startswith("[OmniTiming]"))
-    assert request_id in identity.args
-    assert "resp-turn" in identity.args
-    assert "stop" in identity.args
+    timing = [call for call in logged.call_args_list if call.args and call.args[0] == "[OmniTiming] %s"]
+    assert len(timing) == 1
+    identity = timing[0].args[1]
+    assert request_id in identity
+    assert "response=resp-turn" in identity
+    assert "turn=3" in identity
+    assert "reason=stop" in identity
     assert "resp-turn" in aggregator.e2e_done
     assert turn.finished_reason == "stop"
 
 
 def test_finished_reason_passthrough(mocker) -> None:
-    logged = mocker.patch("vllm_omni.metrics.duplex_turn.logger.info")
+    logged = mocker.patch("vllm_omni.metrics.stats.logger.info")
     for reason in ("barge_in", "cancel", "close", "abort", "error"):
         turn = DuplexTurnMetrics(
             request_id=_request_id(),
@@ -183,8 +187,12 @@ def test_finished_reason_passthrough(mocker) -> None:
         )
         assert finalize_duplex_turn_metrics(turn, reason=reason) is True
         assert turn.finished_reason == reason
-    identity = next(call for call in logged.call_args_list if call.args and "barge_in" in call.args)
-    assert identity.args[-1] == "barge_in"
+    barge_lines = [
+        call.args[1]
+        for call in logged.call_args_list
+        if call.args and call.args[0] == "[OmniTiming] %s" and "reason=barge_in" in call.args[1]
+    ]
+    assert barge_lines
     unknown = DuplexTurnMetrics(
         request_id=_request_id(),
         response_id="resp-unknown",
@@ -193,6 +201,18 @@ def test_finished_reason_passthrough(mocker) -> None:
     )
     assert finalize_duplex_turn_metrics(unknown, reason="oops") is True
     assert unknown.finished_reason == "abort"
+
+
+def test_finished_reason_for_cancel_mapping() -> None:
+    assert finished_reason_for_cancel("barge_in") == "barge_in"
+    assert finished_reason_for_cancel("session_close") == "close"
+    assert finished_reason_for_cancel("disconnect") == "close"
+    assert finished_reason_for_cancel("disconnect_grace_expired") == "close"
+    assert finished_reason_for_cancel("timeout") == "cancel"
+    assert finished_reason_for_cancel("new_response") == "cancel"
+    assert finished_reason_for_cancel("output_audio_buffer_clear") == "cancel"
+    assert finished_reason_for_cancel("client_cancelled") == "cancel"
+    assert finished_reason_for_cancel("stop") == "stop"
 
 
 def test_accumulate_prefers_stage_submit_ts(mocker) -> None:
@@ -236,9 +256,10 @@ def test_stage_metrics_message_forwards_submit_ts() -> None:
     assert turn.aggregator.stage_first_ts[0] == 50.0
 
 
-def test_metrics_before_begin_are_dropped() -> None:
+def test_metrics_before_begin_are_flushed_on_begin() -> None:
     obj = _omni_base()
     request_id = _request_id()
+    client = _client(request_states=obj.request_states, num_stages=3)
     req_state = ClientRequestState(request_id)
     req_state.metrics = OrchestratorAggregator(3, True, 0.0, 2)
     obj.request_states[request_id] = req_state
@@ -248,11 +269,24 @@ def test_metrics_before_begin_are_dropped() -> None:
             request_id=request_id,
             stage_id=0,
             metrics=_stage_stats(num_tokens_out=7, stage_gen_time_ms=30.0),
+            stage_submit_ts=50.0,
         )
     )
 
     assert req_state.duplex_turn is None
     assert req_state.metrics.stage_events[request_id][0].num_tokens_out == 7
+    assert len(req_state.duplex_turn_pending) == 1
+    assert req_state.duplex_turn_arrival_ts == 50.0
+
+    turn = client.begin_turn_metrics(request_id, response_id="resp-auto")
+    assert turn is not None
+    assert turn.arrival_ts == 50.0
+    events = turn.aggregator.stage_events[turn.response_id]
+    assert len(events) == 1
+    assert events[0].num_tokens_out == 7
+    assert events[0].stage_gen_time_ms == 30.0
+    assert req_state.duplex_turn_pending == []
+    assert req_state.duplex_turn_arrival_ts is None
 
 
 def test_finalize_noop_when_log_stats_off(mocker) -> None:
@@ -456,6 +490,60 @@ async def test_close_open_turn_emits_close(mocker) -> None:
     await client.close("sid-metrics", reason="done", fence=fence, timeout=1.0)
     assert reasons == ["close"]
     assert request_id not in client.output_port.request_states
+
+
+@pytest.mark.asyncio
+async def test_session_close_cancel_then_close_logs_once(mocker) -> None:
+    fence = _fence()
+    request_id = _request_id(fence)
+    logged = []
+
+    def fake_summary(self):
+        logged.append(self.timing_identity)
+        return {}
+
+    mocker.patch("vllm_omni.metrics.stats.OrchestratorAggregator.build_and_log_summary", fake_summary)
+    client = _client()
+    turn = client.begin_turn_metrics(request_id, response_id="resp-close-once", turn_id=1, arrival_ts=1.0)
+    accumulate_turn_stage_metrics(turn, 0, _stage_stats(num_tokens_out=1, stage_gen_time_ms=4.0))
+    assert client.finalize_turn_metrics(request_id, reason="close") is True
+
+    async def close_duplex_session_async(session_id, **kwargs):
+        return {"ok": True}
+
+    client.engine = SimpleNamespace(close_duplex_session_async=close_duplex_session_async)
+    await client.close("sid-metrics", reason="session_close", fence=fence, timeout=1.0)
+    assert len(logged) == 1
+    assert logged[0]["reason"] == "close"
+
+
+def test_session_transfer_tx_copied_into_turn() -> None:
+    request_id = _request_id()
+    client = _client(num_stages=2)
+    req_state = ClientRequestState(request_id)
+    req_state.metrics = OrchestratorAggregator(2, False, 1.0, 1)
+    client.output_port.request_states[request_id] = req_state
+    req_state.metrics.on_forward(0, 1, request_id, 512, 3.0, False)
+
+    turn = client.begin_turn_metrics(request_id, response_id="resp-tx", turn_id=1, arrival_ts=1.0)
+    req_state.metrics.on_forward(0, 1, request_id, 1024, 7.5, True)
+    accumulate_turn_stage_metrics(
+        turn,
+        1,
+        _stage_stats(
+            num_tokens_out=1,
+            stage_gen_time_ms=5.0,
+            rx_transfer_bytes=1024,
+            rx_decode_time_ms=1.0,
+            rx_in_flight_time_ms=0.5,
+        ),
+        final_output_type="audio",
+    )
+    assert client.finalize_turn_metrics(request_id, reason="stop") is True
+    evt = turn.aggregator.transfer_events[(0, 1, "resp-tx")]
+    assert evt.tx_time_ms == pytest.approx(7.5)
+    assert evt.rx_decode_time_ms == pytest.approx(1.0)
+    assert evt.in_flight_time_ms == pytest.approx(0.5)
 
 
 @pytest.mark.asyncio

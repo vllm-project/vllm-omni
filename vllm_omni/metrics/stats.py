@@ -174,6 +174,8 @@ class OrchestratorAggregator:
         # by the orchestrator's cleanup path (e.g. final-stage cleanup races
         # the omni_base finalize emit).
         self._replica_cache: dict[tuple[int, str], int] = {}
+        # Optional identity fields merged into the single [OmniTiming] row.
+        self.timing_identity: dict[str, Any] | None = None
 
     def init_run_state(self, wall_start_ts: float) -> None:
         # Per-run aggregates and timing state
@@ -465,6 +467,15 @@ class OrchestratorAggregator:
                 req_id,
             )
 
+    _TPOT_WEIGHTED_MS = "_vllm_tpot_weighted_ms"
+    _TPOT_WEIGHT = "_vllm_tpot_weight"
+
+    @staticmethod
+    def _tpot_segment_weight(num_tokens_out: int, tpot_ms: float) -> int:
+        if tpot_ms <= 0:
+            return 0
+        return max(int(num_tokens_out) - 1, 1)
+
     @staticmethod
     def _merge_stage_metric_event(
         current: dict[str, Any] | None,
@@ -497,6 +508,10 @@ class OrchestratorAggregator:
                 defs.VLLM_ITL_MS: float(evt.vllm_itl_ms),
                 defs.VLLM_ITLS_MS: list(evt.vllm_itls_ms or []),
             }
+            tpot_ms = float(evt.vllm_tpot_ms)
+            tpot_weight = OrchestratorAggregator._tpot_segment_weight(int(evt.num_tokens_out), tpot_ms)
+            current[OrchestratorAggregator._TPOT_WEIGHT] = tpot_weight
+            current[OrchestratorAggregator._TPOT_WEIGHTED_MS] = tpot_ms * tpot_weight
             return current
 
         current[defs.NUM_TOKENS_IN] = int(current.get(defs.NUM_TOKENS_IN, 0)) + int(evt.num_tokens_in)
@@ -546,8 +561,21 @@ class OrchestratorAggregator:
         if current_vllm_ttft_ms <= 0 < vllm_ttft_ms:
             current[defs.VLLM_TTFT_MS] = vllm_ttft_ms
         vllm_tpot_ms = float(evt.vllm_tpot_ms)
-        if vllm_tpot_ms > 0:
-            current[defs.VLLM_TPOT_MS] = vllm_tpot_ms
+        evt_weight = OrchestratorAggregator._tpot_segment_weight(int(evt.num_tokens_out), vllm_tpot_ms)
+        if evt_weight > 0:
+            prev_weight = int(current.get(OrchestratorAggregator._TPOT_WEIGHT, 0) or 0)
+            prev_weighted = float(current.get(OrchestratorAggregator._TPOT_WEIGHTED_MS, 0.0) or 0.0)
+            if prev_weight <= 0:
+                prev_tpot = float(current.get(defs.VLLM_TPOT_MS, 0.0) or 0.0)
+                if prev_tpot > 0:
+                    prev_tokens = int(current.get(defs.NUM_TOKENS_OUT, 0)) - int(evt.num_tokens_out)
+                    prev_weight = OrchestratorAggregator._tpot_segment_weight(prev_tokens, prev_tpot)
+                    prev_weighted = prev_tpot * prev_weight
+            new_weight = prev_weight + evt_weight
+            new_weighted = prev_weighted + vllm_tpot_ms * evt_weight
+            current[OrchestratorAggregator._TPOT_WEIGHT] = new_weight
+            current[OrchestratorAggregator._TPOT_WEIGHTED_MS] = new_weighted
+            current[defs.VLLM_TPOT_MS] = new_weighted / float(new_weight)
         vllm_itls = list(current.get(defs.VLLM_ITLS_MS) or [])
         vllm_itls.extend(list(evt.vllm_itls_ms or []))
         current[defs.VLLM_ITLS_MS] = vllm_itls
@@ -852,7 +880,20 @@ class OrchestratorAggregator:
             if stage_evts:
                 pt = stage_evts[-1].pipeline_timings or {}
             if pt or e2e_evt:
-                parts = [f"req={rid}"]
+                identity = self.timing_identity
+                req_label = rid
+                extra_parts: list[str] = []
+                if identity:
+                    req_override = identity.get("req")
+                    if req_override:
+                        req_label = str(req_override)
+                    if identity.get("response") is not None:
+                        extra_parts.append(f"response={identity['response']}")
+                    if identity.get("turn") is not None:
+                        extra_parts.append(f"turn={identity['turn']}")
+                    if identity.get("reason") is not None:
+                        extra_parts.append(f"reason={identity['reason']}")
+                parts = [f"req={req_label}", *extra_parts]
                 if e2e_evt:
                     parts.append(f"total={e2e_evt.e2e_total_ms / 1000.0:.2f}s")
                 if "preprocess_ms" in pt:

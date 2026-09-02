@@ -19,9 +19,12 @@ from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 from vllm_omni.experimental.fullduplex.output import get_duplex_output_decision
 from vllm_omni.metrics.duplex_turn import (
     DuplexTurnMetrics,
+    copy_session_transfer_tx,
     finalize_duplex_turn_metrics,
+    flush_pending_turn_metrics,
     is_duplex_resource_request_id,
     make_turn_aggregator,
+    snapshot_transfer_tx,
 )
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
@@ -148,6 +151,8 @@ class DuplexRequestClient:
                 max(0, self.output_port.num_stages - 1),
             )
             request_state.request_arrival_ts = wall_start_ts
+        if request_state.duplex_turn is None and request_state.duplex_turn_arrival_ts is None:
+            request_state.duplex_turn_arrival_ts = time.time()
         self.output_port.start_output_handler()
         try:
             result = await self.engine.append_duplex_input_async(session_id, **kwargs)
@@ -283,7 +288,9 @@ class DuplexRequestClient:
     ):
         """Open a turn-scoped aggregator keyed by response_id.
 
-        Created only at response begin. Earlier stage metrics are dropped.
+        Stage snapshots that arrived before begin (auto_response) are replayed
+        into the new aggregator. ``arrival_ts`` prefers the caller, then the
+        commit/first-append stamp, then now.
         """
         if not response_id or not is_duplex_resource_request_id(request_id):
             return None
@@ -295,9 +302,12 @@ class DuplexRequestClient:
         if existing is not None and not existing.finalized:
             if existing.response_id == response_id:
                 return existing
+            copy_session_transfer_tx(existing, req_state.metrics)
             finalize_duplex_turn_metrics(existing, reason="abort")
             req_state.duplex_turn = None
-        wall_start = float(arrival_ts) if arrival_ts is not None else time.time()
+        wall_start = float(arrival_ts) if arrival_ts is not None else 0.0
+        if wall_start <= 0 and req_state.duplex_turn_arrival_ts is not None:
+            wall_start = float(req_state.duplex_turn_arrival_ts)
         if wall_start <= 0:
             wall_start = time.time()
         turn = DuplexTurnMetrics(
@@ -310,8 +320,11 @@ class DuplexRequestClient:
                 log_stats=bool(self.output_port.log_stats),
                 wall_start_ts=wall_start,
             ),
+            tx_baseline=snapshot_transfer_tx(req_state.metrics),
         )
         req_state.duplex_turn = turn
+        flush_pending_turn_metrics(req_state)
+        req_state.duplex_turn_arrival_ts = None
         return turn
 
     def finalize_turn_metrics(self, request_id: str, *, reason: str) -> bool:
@@ -322,8 +335,11 @@ class DuplexRequestClient:
         turn = req_state.duplex_turn
         if turn is None:
             return False
+        copy_session_transfer_tx(turn, req_state.metrics)
         emitted = finalize_duplex_turn_metrics(turn, reason=reason)
         req_state.duplex_turn = None
+        req_state.duplex_turn_pending = []
+        req_state.duplex_turn_arrival_ts = None
         return emitted
 
     async def collect_outputs(

@@ -4886,6 +4886,44 @@ async def test_cancel_active_native_data_plane_request_aborts_stage_request_id()
 
 
 @pytest.mark.asyncio
+async def test_cancel_active_response_maps_session_close_finished_reason():
+    engine = FakeEngineClient()
+    chat_service = FakeChatService(engine)
+    handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
+    ws = TimedWebSocket()
+    session = DuplexSession(session_id="sid-metrics-close", config=DuplexSessionConfig())
+    session.bind_request("duplex-sid-metrics-close-e0-stage0-s1")
+    reasons: list[str] = []
+    session.on_response_end = lambda _sess, **kwargs: reasons.append(kwargs["reason"])
+    session.begin_response()
+
+    cancelled = await handler._cancel_active_response(session, None, ws.send_json, reason="session_close")
+
+    assert cancelled is True
+    assert reasons == ["close"]
+    event = next(m for m in ws.sent if m.get("type") == "audio.cancelled")
+    assert event["reason"] == "session_close"
+    assert session.active_response_id is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_active_response_maps_timeout_to_cancel():
+    engine = FakeEngineClient()
+    chat_service = FakeChatService(engine)
+    handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
+    ws = TimedWebSocket()
+    session = DuplexSession(session_id="sid-metrics-timeout", config=DuplexSessionConfig())
+    reasons: list[str] = []
+    session.on_response_end = lambda _sess, **kwargs: reasons.append(kwargs["reason"])
+    session.begin_response()
+
+    cancelled = await handler._cancel_active_response(session, None, ws.send_json, reason="timeout")
+
+    assert cancelled is True
+    assert reasons == ["cancel"]
+
+
+@pytest.mark.asyncio
 async def test_duplex_handler_explicit_close_closes_runtime_once_with_client_reason():
     engine = FakeEngineClient()
     chat_service = FakeChatService(engine)

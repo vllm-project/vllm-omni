@@ -66,6 +66,7 @@ from vllm_omni.experimental.fullduplex.openai.websocket import (
     DuplexSessionTasks,
     DuplexWebSocketActor,
 )
+from vllm_omni.metrics.duplex_turn import finished_reason_for_cancel
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
@@ -1872,7 +1873,7 @@ class OmniDuplexSessionHandler(
         committed_message = session.end_response(
             commit_text=self._should_commit_response_to_history(session, old_response_id),
             playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
-            finished_reason="barge_in",
+            finished_reason=finished_reason_for_cancel(reason),
         )
         if old_response_id is not None:
             item_id = f"item_{old_response_id}"

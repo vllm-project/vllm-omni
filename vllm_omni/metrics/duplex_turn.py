@@ -11,17 +11,32 @@ response_id.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, replace
-from typing import cast
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, cast
 
 from vllm.logger import init_logger
 
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats, StageStats
 
+if TYPE_CHECKING:
+    from vllm_omni.entrypoints.client_request_state import ClientRequestState
+
 logger = init_logger(__name__)
 
 _DUPLEX_RESOURCE_PREFIX = "duplex-s."
 _KNOWN_FINISHED_REASONS = frozenset({"stop", "barge_in", "cancel", "close", "abort", "error"})
+_CANCEL_SOURCE_TO_FINISHED = {
+    "barge_in": "barge_in",
+    "session_close": "close",
+    "disconnect": "close",
+    "disconnect_grace_expired": "close",
+    "timeout": "cancel",
+    "new_response": "cancel",
+    "output_audio_buffer_clear": "cancel",
+    "input.cancel": "cancel",
+    "response.cancel": "cancel",
+    "client_cancelled": "cancel",
+}
 
 
 def is_duplex_resource_request_id(request_id: str | None) -> bool:
@@ -38,6 +53,23 @@ def _normalize_finished_reason(reason: str) -> str:
     return "abort"
 
 
+def finished_reason_for_cancel(reason: str) -> str:
+    """Map a native cancel source onto a log-table finished_reason."""
+    if reason in _KNOWN_FINISHED_REASONS:
+        return reason
+    return _CANCEL_SOURCE_TO_FINISHED.get(reason, "cancel")
+
+
+@dataclass(frozen=True)
+class PendingTurnStageMetric:
+    """Stage snapshot that arrived before the assistant response began."""
+
+    stage_id: int
+    metrics: StageRequestStats
+    final_output_type: str | None
+    stage_submit_ts: float | None
+
+
 @dataclass
 class DuplexTurnMetrics:
     """Metrics owner for one duplex assistant turn (one response_id)."""
@@ -49,6 +81,7 @@ class DuplexTurnMetrics:
     aggregator: OrchestratorAggregator | None = None
     finalized: bool = False
     finished_reason: str | None = None
+    tx_baseline: dict[tuple[int, int, str], tuple[float, int]] = field(default_factory=dict)
 
 
 def _copy_stage_request_stats(
@@ -105,6 +138,95 @@ def accumulate_turn_stage_metrics(
         last_ts[stage_id] = max(last_ts[stage_id] or 0.0, now)
 
 
+def queue_turn_stage_metrics(
+    req_state: ClientRequestState,
+    stage_id: int,
+    metrics: StageRequestStats,
+    *,
+    final_output_type: str | None = None,
+    stage_submit_ts: float | None = None,
+) -> None:
+    """Accumulate into the open turn, or buffer until ``begin_response``."""
+    if metrics is None:
+        return
+    turn = req_state.duplex_turn
+    if turn is None or turn.finalized:
+        copied = _copy_stage_request_stats(
+            metrics,
+            stage_id=stage_id,
+            request_id="",
+            final_output_type=final_output_type,
+        )
+        req_state.duplex_turn_pending.append(
+            PendingTurnStageMetric(
+                stage_id=stage_id,
+                metrics=copied,
+                final_output_type=final_output_type,
+                stage_submit_ts=stage_submit_ts,
+            )
+        )
+        if req_state.duplex_turn_arrival_ts is None:
+            req_state.duplex_turn_arrival_ts = float(stage_submit_ts) if stage_submit_ts is not None else time.time()
+        return
+    accumulate_turn_stage_metrics(
+        turn,
+        stage_id,
+        metrics,
+        final_output_type=final_output_type,
+        stage_submit_ts=stage_submit_ts,
+    )
+
+
+def flush_pending_turn_metrics(req_state: ClientRequestState) -> None:
+    """Replay snapshots that arrived before the turn aggregator existed."""
+    pending = req_state.duplex_turn_pending
+    req_state.duplex_turn_pending = []
+    turn = req_state.duplex_turn
+    if turn is None:
+        return
+    for item in pending:
+        accumulate_turn_stage_metrics(
+            turn,
+            item.stage_id,
+            item.metrics,
+            final_output_type=item.final_output_type,
+            stage_submit_ts=item.stage_submit_ts,
+        )
+
+
+def snapshot_transfer_tx(
+    aggregator: OrchestratorAggregator | None,
+) -> dict[tuple[int, int, str], tuple[float, int]]:
+    if aggregator is None:
+        return {}
+    return {key: (float(evt.tx_time_ms), int(evt.size_bytes)) for key, evt in aggregator.transfer_events.items()}
+
+
+def copy_session_transfer_tx(
+    turn: DuplexTurnMetrics,
+    session_aggregator: OrchestratorAggregator | None,
+) -> None:
+    """Copy connector TX that landed on the long-lived session aggregator."""
+    turn_agg = turn.aggregator
+    if turn_agg is None or session_aggregator is None:
+        return
+    baseline = turn.tx_baseline
+    for key, evt in session_aggregator.transfer_events.items():
+        from_stage, to_stage, rid = key
+        if rid != turn.request_id:
+            continue
+        prev_tx, prev_size = baseline.get(key, (0.0, 0))
+        d_tx = float(evt.tx_time_ms) - prev_tx
+        d_size = int(evt.size_bytes) - prev_size
+        if d_tx <= 0 and d_size <= 0:
+            continue
+        dest = turn_agg._get_or_create_transfer_event(from_stage, to_stage, turn.response_id)
+        dest.tx_time_ms += max(d_tx, 0.0)
+        dest.used_shm = dest.used_shm or bool(evt.used_shm)
+        if dest.size_bytes == 0 and d_size > 0:
+            dest.size_bytes = d_size
+
+
 def _collapse_stage_events(aggregator: OrchestratorAggregator, request_id: str) -> None:
     events = aggregator.stage_events.get(request_id) or []
     if len(events) <= 1:
@@ -121,6 +243,8 @@ def _collapse_stage_events(aggregator: OrchestratorAggregator, request_id: str) 
         base = first_evt[sid]
         unmapped: list[str] = []
         for key, value in merged_rows[sid].items():
+            if key.startswith("_"):
+                continue
             attr = field_aliases.get(key, key)
             if attr == "stage_id":
                 continue
@@ -159,13 +283,12 @@ def finalize_duplex_turn_metrics(turn: DuplexTurnMetrics, *, reason: str) -> boo
                 final_stage = aggregator.num_stages - 1
             aggregator.on_finalize_request(final_stage, e2e_key, turn.arrival_ts or aggregator.wall_start_ts)
         if aggregator.log_stats:
-            logger.info(
-                "[OmniTiming] req=%s response=%s turn=%s reason=%s",
-                turn.request_id,
-                turn.response_id,
-                turn.turn_id,
-                turn.finished_reason,
-            )
+            aggregator.timing_identity = {
+                "req": turn.request_id,
+                "response": turn.response_id,
+                "turn": turn.turn_id,
+                "reason": turn.finished_reason,
+            }
             aggregator.build_and_log_summary()
     except Exception:
         logger.exception(
@@ -187,8 +310,14 @@ def make_turn_aggregator(*, num_stages: int, log_stats: bool, wall_start_ts: flo
 
 __all__ = [
     "DuplexTurnMetrics",
+    "PendingTurnStageMetric",
     "accumulate_turn_stage_metrics",
+    "copy_session_transfer_tx",
     "finalize_duplex_turn_metrics",
+    "finished_reason_for_cancel",
+    "flush_pending_turn_metrics",
     "is_duplex_resource_request_id",
     "make_turn_aggregator",
+    "queue_turn_stage_metrics",
+    "snapshot_transfer_tx",
 ]

@@ -51,3 +51,8 @@ class ClientRequestState:
         # Turn-scoped aggregator for the current duplex assistant response.
         # Session-scoped metrics stays on collect_outputs cursor snapshots.
         self.duplex_turn: DuplexTurnMetrics | None = None
+        # Stage snapshots that arrived before begin_response (auto_response).
+        self.duplex_turn_pending: list = []
+        # Wall-clock t0 for the next assistant turn: commit/first append, or
+        # the first buffered stage snapshot if that arrives first.
+        self.duplex_turn_arrival_ts: float | None = None

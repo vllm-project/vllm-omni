@@ -29,7 +29,7 @@ from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_stage_id_for_e2e
 from vllm_omni.errors import raise_client_error_or
-from vllm_omni.metrics.duplex_turn import accumulate_turn_stage_metrics
+from vllm_omni.metrics.duplex_turn import queue_turn_stage_metrics
 from vllm_omni.metrics.modality import OmniModalityMetrics, observe_modality_at_finalize
 from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
 from vllm_omni.metrics.stats import OrchestratorAggregator
@@ -463,11 +463,8 @@ class OmniBase(PDDisaggregationMixin):
         final_output_type: str | None,
         stage_submit_ts: float | None = None,
     ) -> None:
-        turn = req_state.duplex_turn
-        if turn is None or metrics is None:
-            return
-        accumulate_turn_stage_metrics(
-            turn,
+        queue_turn_stage_metrics(
+            req_state,
             stage_id,
             metrics,
             final_output_type=final_output_type,
@@ -567,7 +564,7 @@ class OmniBase(PDDisaggregationMixin):
                 req_state.metrics.stage_last_ts[stage_id] = max(req_state.metrics.stage_last_ts[stage_id] or 0.0, now)
                 consumed.add(msg_id)
 
-        if msg.metrics is not None and req_state.duplex_turn is not None:
+        if msg.metrics is not None:
             from vllm_omni.experimental.fullduplex.output import get_duplex_output_decision
 
             # Listen units already arrive as StageMetricsMessage; the matching

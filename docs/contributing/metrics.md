@@ -86,7 +86,9 @@ For **offline inference** (batch mode), the summary includes both system-level m
 
 For **online inference** (serving mode), the summary is always per-request. `e2e_requests` is always 1, and only request-level metrics are reported for each completion.
 
-For native full-duplex (`/v1/realtime?duplex=1`), `--log-stats` emits the same tables once per assistant turn. The table `request_id` is that turn's `response_id`. The long-lived stage-0 session request is not finalized as a chat completion. The `[OmniTiming]` `reason` is `stop`, `barge_in`, `cancel`, `close`, `abort`, or `error`.
+For native full-duplex (`/v1/realtime?duplex=1`), `--log-stats` emits the same tables once per assistant turn. The table `request_id` is that turn's `response_id`. The long-lived stage-0 session request is not finalized as a chat completion.
+
+Duplex `stage_gen_time_ms` is the **turn-accumulated** compute time (every decode/TTS segment in that assistant response), not a single chat decode step. Collapsed `vllm_tpot_ms` is token-weighted across those segments, matching the websocket sidecar (`weight = max(num_tokens_out - 1, 1)`). One `[OmniTiming]` row is logged per turn and includes `reason`: `stop`, `barge_in`, `cancel`, `close`, `abort`, or `error`.
 
 ---
 

@@ -916,13 +916,14 @@ class DuplexSessionRunnerMixin:
                     continue
 
                 if event_type in {"input.cancel", "response.cancel", "barge_in", "output_audio_buffer.clear"}:
-                    cancel_reason = (
-                        "output_audio_buffer_clear"
-                        if event_type == "output_audio_buffer.clear"
-                        else "client_cancelled"
-                        if event_type == "response.cancel"
-                        else "barge_in"
-                    )
+                    if event_type == "barge_in":
+                        cancel_reason = "barge_in"
+                    elif event_type == "output_audio_buffer.clear":
+                        cancel_reason = "output_audio_buffer_clear"
+                    elif event_type == "response.cancel":
+                        cancel_reason = "client_cancelled"
+                    else:
+                        cancel_reason = "cancel"
                     cancelled_fence = DuplexFence(
                         session.session_id,
                         epoch=session.epoch,
