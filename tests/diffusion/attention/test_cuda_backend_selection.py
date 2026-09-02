@@ -3,6 +3,7 @@
 
 import sys
 import types
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,6 +11,11 @@ from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.selector import _cached_get_backend_cls
+from vllm_omni.diffusion.config import set_current_diffusion_config
+from vllm_omni.diffusion.data import AttentionConfig
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.envs import PACKAGES_CHECKER
 
 # Importing CudaOmniPlatform pulls in vllm.platforms.cuda, which imports the
@@ -192,6 +198,31 @@ def test_explicit_flash_attn_accepts_blackwell_when_fa4_available(monkeypatch: p
     assert path == DiffusionAttentionBackendEnum.FLASH_ATTN.get_path()
 
 
+def test_blackwell_dense_flash_capability_tracks_fa4(monkeypatch: pytest.MonkeyPatch):
+    _blackwell_sm120(monkeypatch)
+
+    assert CudaOmniPlatform.supports_diffusion_dense_flash_attention() is False
+
+    monkeypatch.setattr(CudaOmniPlatform, "has_flash_attn_4", classmethod(lambda cls: True))
+
+    assert CudaOmniPlatform.supports_diffusion_dense_flash_attention() is True
+
+
+def test_hopper_dense_flash_capability_tracks_fa_package(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        CudaOmniPlatform,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(9, 0)),
+    )
+    monkeypatch.setattr(CudaOmniPlatform, "has_flash_attn_package", classmethod(lambda cls: False))
+
+    assert CudaOmniPlatform.supports_diffusion_dense_flash_attention() is False
+
+    monkeypatch.setattr(CudaOmniPlatform, "has_flash_attn_package", classmethod(lambda cls: True))
+
+    assert CudaOmniPlatform.supports_diffusion_dense_flash_attention() is True
+
+
 def test_auto_selects_flash_attn_on_blackwell_when_cudnn_old_and_fa4_available(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -202,3 +233,33 @@ def test_auto_selects_flash_attn_on_blackwell_when_cudnn_old_and_fa4_available(
     path = CudaOmniPlatform.get_diffusion_attn_backend_cls(None, head_size=128)
 
     assert path == DiffusionAttentionBackendEnum.FLASH_ATTN.get_path()
+
+
+def test_marked_paged_layer_constructs_on_blackwell_cudnn_without_fa4(monkeypatch: pytest.MonkeyPatch):
+    """Scheduler-paged remap must not require dense FA4 when CUDNN is the default."""
+    _blackwell_sm120(monkeypatch)
+    _cached_get_backend_cls.cache_clear()
+
+    od_config = SimpleNamespace(
+        diffusion_attention_config=AttentionConfig(),
+        diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+        parallel_config=SimpleNamespace(ring_degree=1, allgather_degree=1),
+        diffusion_kv_cache_dtype=None,
+        diffusion_kv_cache_skip_step_indices=None,
+        diffusion_kv_cache_skip_layer_indices=None,
+        model_class_name=None,
+    )
+
+    with set_current_diffusion_config(od_config):
+        attention = Attention(
+            num_heads=4,
+            head_size=64,
+            causal=False,
+            softmax_scale=1.0,
+            paged_kv_cache_role="primary",
+        )
+
+    assert attention.attn_backend.get_name() == "FLASH_ATTN"
+    assert attention.backend_pref == "FLASH_ATTN"
+    assert attention.backend_explicit is False
+    assert attention.attn_spec is None

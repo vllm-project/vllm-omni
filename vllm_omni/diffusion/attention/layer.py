@@ -130,22 +130,17 @@ class Attention(nn.Module):
             # FLASH_ATTN is an Omni selector, not a device-specific kernel.
             # vLLM resolves it to CUDA FlashAttention on GPU and Ascend native
             # attention on NPU. A platform may legitimately default dense
-            # attention to SDPA (for example when an optional diffusion FA
-            # package is absent), but a paged layer must advertise the
+            # attention to CUDNN/SDPA (for example when optional dense FA
+            # extras are absent), but a paged layer must advertise the
             # capability so the Worker can register its native cache view.
-            # Resolve the selector only for this marked layer; unmarked dense
-            # attention keeps the platform default unchanged.
-            from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+            # Load that selector from the registry: this is not a user-explicit
+            # dense FLASH_ATTN request, so skip platform explicit-backend
+            # validation (Blackwell would otherwise require CuTe FA4). Formal
+            # paged execution still delegates to vLLM's native paged backend.
+            from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 
             dense_backend_name = attn_backend_cls.get_name()
-            paged_attention_config = AttentionConfig(default=AttentionSpec(backend="FLASH_ATTN"))
-            attn_backend_cls, spec = get_attn_backend_for_role(
-                role=role,
-                head_size=head_size,
-                attention_config=paged_attention_config,
-                role_category=role_category,
-                allow_trtllm_default=allow_trtllm_default,
-            )
+            attn_backend_cls = DiffusionAttentionBackendEnum.FLASH_ATTN.get_class()
             logger.info(
                 "Resolved marked paged diffusion attention role=%r to %r because the platform default %r "
                 "does not support Scheduler-owned KV",
@@ -475,22 +470,21 @@ class Attention(nn.Module):
         self._assert_metadata_compatible(attn_metadata)
 
         in_kv_memory_profile = is_forward_context_available() and get_forward_context().in_diffusion_kv_memory_profile
-        # NPU only: the startup KV-capacity profile needs tensor shapes, not a
-        # paged attention result. If dense MindIE-SD is absent, SDPA provides
-        # that profile forward. Formal GPU/NPU paged requests never use this
-        # branch because their Worker adapter is active.
-        # Do not silently remap float32 (or other dtypes) to SDPA: an explicit
-        # backend must run or raise.
+        # The startup KV-capacity profile needs tensor shapes, not a paged
+        # attention result. If dense FLASH_ATTN deps are absent (NPU MindIE-SD
+        # or CUDA CuTe FA4), SDPA provides that profile forward. Formal paged
+        # requests never use this branch because their Worker adapter is active.
+        # Do not silently remap float32 (or other dtypes) to SDPA: a
+        # user-explicit backend must run or raise.
         if (
             self._scheduler_paged_kv
             and self.paged_kv_cache_role is not None
             and in_kv_memory_profile
-            and current_omni_platform.is_npu()
             and self.attn_backend.get_name() == "FLASH_ATTN"
             and not current_omni_platform.supports_diffusion_dense_flash_attention()
         ):
             logger.warning_once(
-                "The startup KV memory profile is using SDPA because MindIE-SD is unavailable. "
+                "The startup KV memory profile is using SDPA because dense FLASH_ATTN is unavailable. "
                 "Formal paged requests still use the platform-native paged attention backend."
             )
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)

@@ -18,6 +18,7 @@ import torch
 
 import vllm_omni.diffusion.attention.layer as layer_mod
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.config import (
     get_current_diffusion_config,
@@ -515,6 +516,49 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
             dense_flash.assert_not_called()
             sdpa.assert_called_once()
 
+    @pytest.mark.parametrize("fa4_available", [False, True])
+    def test_paged_cuda_memory_profile_uses_sdpa_without_dense_fa4(self, monkeypatch, fa4_available):
+        attention = Attention.__new__(Attention)
+        attention._scheduler_paged_kv = True
+        attention.paged_kv_cache_role = "primary"
+        attention.backend_pref = "FLASH_ATTN"
+        attention.attn_backend = SimpleNamespace(supports_piecewise_spans=True, get_name=lambda: "FLASH_ATTN")
+        flash_output = torch.ones(1)
+        sdpa_output = torch.zeros(1)
+        dense_flash = Mock(return_value=flash_output)
+        sdpa = Mock(return_value=sdpa_output)
+        attention.attention = SimpleNamespace(forward=dense_flash)
+        attention.sdpa_fallback = SimpleNamespace(forward=sdpa)
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: True)
+        monkeypatch.setattr(
+            layer_mod,
+            "get_forward_context",
+            lambda: SimpleNamespace(in_diffusion_kv_memory_profile=True),
+        )
+        monkeypatch.setattr(layer_mod.current_omni_platform, "is_npu", lambda: False)
+        monkeypatch.setattr(layer_mod.current_omni_platform, "is_cuda", lambda: True)
+        monkeypatch.setattr(
+            layer_mod.current_omni_platform,
+            "supports_diffusion_dense_flash_attention",
+            lambda: fa4_available,
+        )
+
+        result = attention._run_local_attention(
+            torch.zeros(1, dtype=torch.bfloat16),
+            torch.zeros(1, dtype=torch.bfloat16),
+            torch.zeros(1, dtype=torch.bfloat16),
+            AttentionMetadata(),
+        )
+
+        if fa4_available:
+            assert result is flash_output
+            dense_flash.assert_called_once()
+            sdpa.assert_not_called()
+        else:
+            assert result is sdpa_output
+            dense_flash.assert_not_called()
+            sdpa.assert_called_once()
+
     def test_dense_flash_import_error_is_not_reclassified(self, monkeypatch):
         attention = Attention.__new__(Attention)
         attention._scheduler_paged_kv = False
@@ -588,6 +632,103 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
         # Auto path records the resolved backend name for Ring/SP; it is not explicit.
         assert attention.backend_pref == _DenseBackend.get_name()
         assert attention.backend_explicit is False
+
+    def test_internal_paged_selector_does_not_require_dense_fa4(self, monkeypatch):
+        """Blackwell CUDNN default + marked paged layer must not act as explicit FLASH_ATTN."""
+
+        class _FakeAttentionImpl:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def forward(self, query, key, value, attn_metadata=None):
+                return query
+
+        class _CuDNNBackend:
+            supports_paged_kv = False
+
+            @staticmethod
+            def get_name() -> str:
+                return "CUDNN_ATTN"
+
+            @staticmethod
+            def get_impl_cls():
+                return _FakeAttentionImpl
+
+        def _fake_get_attn_backend_for_role(*args, attention_config=None, **kwargs):
+            if attention_config is not None:
+                spec, _ = attention_config.resolve_with_source(role="self", role_category=None)
+                if spec is not None and spec.backend.upper() == "FLASH_ATTN":
+                    raise ValueError(
+                        "FLASH_ATTN was explicitly selected but is unsupported "
+                        "(Blackwell requires CuTe FlashAttention-4 "
+                        "(flash_attn.cute / vllm-omni[fa4]); FA2/FA3 kernels are Hopper-only). "
+                        "Select a compatible backend."
+                    )
+            return _CuDNNBackend, None
+
+        monkeypatch.setattr(layer_mod, "get_attn_backend_for_role", _fake_get_attn_backend_for_role)
+        monkeypatch.setattr(layer_mod.SDPABackend, "get_impl_cls", staticmethod(lambda: _FakeAttentionImpl))
+        monkeypatch.setattr(FlashAttentionBackend, "get_impl_cls", staticmethod(lambda: _FakeAttentionImpl))
+        monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: object())
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: False)
+
+        od_config = SimpleNamespace(
+            diffusion_attention_config=AttentionConfig(),
+            diffusion_kv_mode=layer_mod.DiffusionKVCacheMode.PAGED_SCHEDULER,
+            parallel_config=SimpleNamespace(ring_degree=1),
+            diffusion_kv_cache_dtype=None,
+            diffusion_kv_cache_skip_step_indices=None,
+            diffusion_kv_cache_skip_layer_indices=None,
+        )
+
+        with set_current_diffusion_config(od_config):
+            attention = Attention(
+                num_heads=4,
+                head_size=64,
+                causal=False,
+                softmax_scale=1.0,
+                paged_kv_cache_role="primary",
+            )
+
+        assert attention.attn_backend is FlashAttentionBackend
+        assert attention.backend_pref == "FLASH_ATTN"
+        assert attention.backend_explicit is False
+        assert attention.attn_spec is None
+
+    def test_user_explicit_flash_attn_still_requires_dense_fa4(self, monkeypatch):
+        def _fake_get_attn_backend_for_role(*args, attention_config=None, **kwargs):
+            if attention_config is not None:
+                spec, _ = attention_config.resolve_with_source(role="self", role_category=None)
+                if spec is not None and spec.backend.upper() == "FLASH_ATTN":
+                    raise ValueError(
+                        "FLASH_ATTN was explicitly selected but is unsupported "
+                        "(Blackwell requires CuTe FlashAttention-4 "
+                        "(flash_attn.cute / vllm-omni[fa4]); FA2/FA3 kernels are Hopper-only). "
+                        "Select a compatible backend."
+                    )
+            raise AssertionError("explicit FLASH_ATTN must not fall through to the platform default")
+
+        monkeypatch.setattr(layer_mod, "get_attn_backend_for_role", _fake_get_attn_backend_for_role)
+        monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: object())
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: False)
+
+        od_config = SimpleNamespace(
+            diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="FLASH_ATTN")),
+            diffusion_kv_mode=layer_mod.DiffusionKVCacheMode.PAGED_SCHEDULER,
+            parallel_config=SimpleNamespace(ring_degree=1),
+            diffusion_kv_cache_dtype=None,
+            diffusion_kv_cache_skip_step_indices=None,
+            diffusion_kv_cache_skip_layer_indices=None,
+        )
+
+        with set_current_diffusion_config(od_config), pytest.raises(ValueError, match="explicitly selected"):
+            Attention(
+                num_heads=4,
+                head_size=64,
+                causal=False,
+                softmax_scale=1.0,
+                paged_kv_cache_role="primary",
+            )
 
     def test_attention_init_uses_current_diffusion_config_without_forward_context(self, monkeypatch):
         class _FakeAttentionImpl:

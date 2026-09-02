@@ -60,6 +60,14 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         return is_flash_attn_4_available()
 
     @classmethod
+    def supports_diffusion_dense_flash_attention(cls) -> bool:
+        """Dense FLASH_ATTN is FA4 on Blackwell; FA2/FA3 on older CUDA GPUs."""
+        capability = cls.get_device_capability()
+        if capability is not None and capability.major in (10, 11, 12):
+            return cls.has_flash_attn_4()
+        return cls.has_flash_attn_package()
+
+    @classmethod
     def get_diffusion_attn_backend_cls(
         cls,
         selected_backend: str | None,
