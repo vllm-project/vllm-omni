@@ -4,6 +4,7 @@
 import sys
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import nullcontext
+from multiprocessing.context import BaseContext
 from types import SimpleNamespace
 
 import numpy as np
@@ -61,6 +62,7 @@ class _FakeExecutor:
 
     def __init__(self, outcomes=()):
         self._outcomes = list(outcomes)
+        self.init_kwargs: dict[str, object] = {}
         self.submitted: list[tuple] = []
         self.shutdown_calls = 0
 
@@ -177,7 +179,9 @@ def test_parent_reuses_one_spawned_worker_across_calls(monkeypatch):
     assert len(created) == 1
     assert len(created[0].submitted) == 2
     assert created[0].init_kwargs["max_workers"] == 1
-    assert created[0].init_kwargs["mp_context"].get_start_method() == "spawn"
+    mp_context = created[0].init_kwargs["mp_context"]
+    assert isinstance(mp_context, BaseContext)
+    assert mp_context.get_start_method() == "spawn"
 
 
 def test_release_forces_a_new_process_pool(monkeypatch):
