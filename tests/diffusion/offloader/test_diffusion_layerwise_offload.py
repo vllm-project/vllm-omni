@@ -251,9 +251,7 @@ def test_layerwise_offload_diffusion_model(model_name: str):
                 f"Skipping: gated HF repo {model_name!r} inaccessible "
                 f"({exc}). See docs/contributing/ci/hf_credentials.md."
             )
-        pytest.fail(f"Inference failed: {exc}")
-    except Exception as exc:
-        pytest.fail(f"Inference failed: {exc}")
+        raise
 
     _assert_offload_state(no_offload, expected_enabled=False)
     _assert_offload_state(layerwise_offload, expected_enabled=True)
