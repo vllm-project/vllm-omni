@@ -27,10 +27,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
-from vllm_omni.diffusion.distributed.sp_plan import (
-    SequenceParallelInput,
-    SequenceParallelOutput,
-)
+from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelOutput
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -624,15 +621,37 @@ class HeliosTransformer3DModel(nn.Module):
     _hsdp_shard_conditions = [_is_transformer_block]
 
     _sp_plan = {
-        "rope": {
-            0: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True, auto_pad=True),
-            1: SequenceParallelInput(split_dim=1, expected_dims=4, split_output=True, auto_pad=True),
-        },
-        "blocks.0": {
-            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),
-        },
+        # "rope" and "blocks.0" are intentionally omitted.
+        # The rope hook splits along dim=1 of the 5D output [B, D, T, H, W],
+        # which is the frequency dimension, NOT the sequence dimension.
+        # The blocks.0 hook splits the concatenated hidden_states as a whole,
+        # which can put all history tokens in one rank (original_context_length=0).
+        # Instead, hidden_states and rotary_emb are split per-component in
+        # forward() after flatten+transpose, ensuring each rank gets half
+        # of each component (history and current).
         "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
+
+    def _sp_split_seq(self, x: torch.Tensor) -> torch.Tensor:
+        """Split tensor along sequence dim (dim=1) for Ulysses SP."""
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_sequence_parallel_rank,
+            get_sequence_parallel_world_size,
+        )
+
+        ws = get_sequence_parallel_world_size()
+        if ws > 1 and x.dim() >= 2 and x.shape[1] > 0:
+            seq_len = x.shape[1]
+            if seq_len % ws != 0:
+                raise ValueError(
+                    f"Sequence length {seq_len} is not divisible by "
+                    f"sequence parallel world size {ws}. "
+                    f"Consider adjusting resolution or SP degree."
+                )
+            r = get_sequence_parallel_rank()
+            n = seq_len // ws
+            x = x[:, r * n : (r + 1) * n, ...].contiguous()
+        return x
 
     def __init__(
         self,
@@ -860,6 +879,9 @@ class HeliosTransformer3DModel(nn.Module):
             device=hidden_states.device,
         )
         rotary_emb = rotary_emb.flatten(2).transpose(1, 2)
+        # USP: per-component split (each rank gets half of current frames)
+        hidden_states = self._sp_split_seq(hidden_states)
+        rotary_emb = self._sp_split_seq(rotary_emb)
         original_context_length = hidden_states.shape[1]
 
         # 2. Process short history latents
@@ -876,6 +898,9 @@ class HeliosTransformer3DModel(nn.Module):
                 device=latents_history_short.device,
             )
             rotary_emb_history_short = rotary_emb_history_short.flatten(2).transpose(1, 2)
+            # USP: per-component split
+            latents_history_short = self._sp_split_seq(latents_history_short)
+            rotary_emb_history_short = self._sp_split_seq(rotary_emb_history_short)
 
             hidden_states = torch.cat([latents_history_short, hidden_states], dim=1)
             rotary_emb = torch.cat([rotary_emb_history_short, rotary_emb], dim=1)
@@ -896,6 +921,9 @@ class HeliosTransformer3DModel(nn.Module):
             rotary_emb_history_mid = pad_for_3d_conv(rotary_emb_history_mid, (2, 2, 2))
             rotary_emb_history_mid = center_down_sample_3d(rotary_emb_history_mid, (2, 2, 2))
             rotary_emb_history_mid = rotary_emb_history_mid.flatten(2).transpose(1, 2)
+            # USP: per-component split
+            latents_history_mid = self._sp_split_seq(latents_history_mid)
+            rotary_emb_history_mid = self._sp_split_seq(rotary_emb_history_mid)
 
             hidden_states = torch.cat([latents_history_mid, hidden_states], dim=1)
             rotary_emb = torch.cat([rotary_emb_history_mid, rotary_emb], dim=1)
@@ -916,6 +944,9 @@ class HeliosTransformer3DModel(nn.Module):
             rotary_emb_history_long = pad_for_3d_conv(rotary_emb_history_long, (4, 4, 4))
             rotary_emb_history_long = center_down_sample_3d(rotary_emb_history_long, (4, 4, 4))
             rotary_emb_history_long = rotary_emb_history_long.flatten(2).transpose(1, 2)
+            # USP: per-component split
+            latents_history_long = self._sp_split_seq(latents_history_long)
+            rotary_emb_history_long = self._sp_split_seq(rotary_emb_history_long)
 
             hidden_states = torch.cat([latents_history_long, hidden_states], dim=1)
             rotary_emb = torch.cat([rotary_emb_history_long, rotary_emb], dim=1)
