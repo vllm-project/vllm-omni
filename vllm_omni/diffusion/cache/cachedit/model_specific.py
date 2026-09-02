@@ -29,6 +29,7 @@ from vllm_omni.diffusion.cache.cachedit.backend import (
     RefreshCacheContextFunc,
     _build_cache_context_refresh,
     _default_get_pipeline_transformer,
+    _make_pipeline_transformer_getter,
     _maybe_build_block_adapter,
     enable_cache_for_dit,
 )
@@ -86,17 +87,31 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
     db_cache_config = projected_config.to_db_cache_config()
     calibrator_config = projected_config.to_calibrator_config()
 
-    if getattr(pipeline, "transformer_2", None) is None:
-        logger.info("transformer_2 not found, enabling cache-dit for single transformer mode")
+    transformer = getattr(pipeline, "transformer", None)
+    transformer_2 = getattr(pipeline, "transformer_2", None)
+
+    if transformer is None and transformer_2 is None:
+        raise ValueError(f"{type(pipeline).__name__} has no loaded transformer to enable cache-dit on")
+
+    if transformer is None or transformer_2 is None:
+        # Only one expert is resident.  Either the checkpoint is single-expert
+        # (Wan2.1-style), or it is a Wan2.2 MoE checkpoint run with
+        # boundary_ratio pinned to 1.0 / 0.0, which makes Wan22Pipeline load
+        # only the low-noise / high-noise expert respectively.  Both cases must
+        # key off whichever attribute actually holds a module: assuming the
+        # survivor is always ``transformer`` crashes the low-noise-only run.
+        active_name = "transformer" if transformer is not None else "transformer_2"
+        active_transformer = transformer if transformer is not None else transformer_2
+        logger.info("Enabling cache-dit for single transformer mode on %s", active_name)
         cache_dit.enable_cache(
             BlockAdapter(
-                transformer=pipeline.transformer,
+                transformer=active_transformer,
                 # For VACE, cache only the main denoising blocks. The
                 # conditioning branch (vace_blocks) has a different forward
                 # contract and produces per-step hints from the current latent
                 # plus vace_context; keeping it outside CacheDiT preserves the
                 # control signal while still accelerating the repeated backbone.
-                blocks=[pipeline.transformer.blocks],
+                blocks=[active_transformer.blocks],
                 forward_pattern=[ForwardPattern.Pattern_2],
                 params_modifiers=[
                     ParamsModifier(cache_config=db_cache_config, calibrator_config=calibrator_config),
@@ -106,7 +121,11 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
             cache_config=db_cache_config,
             calibrator_config=calibrator_config,
         )
-        return _build_cache_context_refresh(cache_config)
+        # The refresh callback must read the same attribute we cached; the
+        # default getter hardcodes ``pipeline.transformer``, which is None here
+        # when only the low-noise expert was loaded.  A single expert also runs
+        # every step, so no high/low split is applied.
+        return _build_cache_context_refresh(cache_config, _make_pipeline_transformer_getter(active_name))
 
     cache_dit.enable_cache(
         BlockAdapter(
