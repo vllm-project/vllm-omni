@@ -18,6 +18,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, fields
 
 import torch
+from cache_dit import ForwardPattern
 from torch import nn
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -30,6 +31,7 @@ from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 
 
 def validate_sana_video_parallel_config(parallel_config) -> None:
@@ -962,6 +964,12 @@ class SanaVideoTransformer3DModel(nn.Module):
     """
 
     _no_split_modules = ["SanaVideoTransformerBlock", "SanaModulatedNorm"]
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "transformer_blocks": ForwardPattern.Pattern_3,
+        },
+    )
+    _layerwise_offload_blocks_attrs = ["transformer_blocks"]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return AutoWeightsLoader(self).load_weights(weights)

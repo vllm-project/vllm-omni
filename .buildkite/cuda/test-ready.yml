@@ -1,3 +1,6 @@
+# CUDA CI L2 (`core_model` e2e) plus L1 CPU Simple Test (`core_model and cpu`).
+# Uploaded by Upload Ready Pipeline: PR label `ready`, or main+WEEKLY=1 with --e2e.
+
 env:
   VLLM_WORKER_MULTIPROC_METHOD: spawn
   VLLM_USE_FLASHINFER_MOE_FP16: 0
