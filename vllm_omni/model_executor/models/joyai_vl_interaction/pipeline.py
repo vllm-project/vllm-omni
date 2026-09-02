@@ -57,6 +57,7 @@ JOYAI_VL_INTERACTION_PIPELINE = PipelineConfig(
             engine_output_type="audio",
             model_arch="Qwen3TTSCode2Wav",
             sync_process_input_func=f"{_QWEN3_TTS_INPUT_PROCESSOR}.talker2code2wav_token_only",
+            requires_full_payload_input=True,
             sampling_constraints={"detokenize": True},
             extras={"tts_args": {"max_instructions_length": 500}},
         ),

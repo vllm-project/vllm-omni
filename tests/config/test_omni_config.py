@@ -532,6 +532,21 @@ def test_from_pipeline_config_dispatches_async_chunk_processors_without_mutating
     assert pipeline.get_stage(1).custom_process_input_func is None
 
 
+def test_joyai_code2wav_waits_for_full_payload():
+    config = _from_pipeline_key("joyai_vl_interaction")
+    talker = config.stage_by_id(1)
+    code2wav = config.stage_by_id(2)
+
+    assert talker.custom_process_next_stage_input_func.endswith(
+        "talker2code2wav_full_payload"
+    )
+    assert code2wav.custom_process_input_func.endswith(
+        "talker2code2wav_token_only"
+    )
+    assert code2wav.model_config.async_chunk is False
+    assert code2wav.model_config.requires_full_payload_input is True
+
+
 def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
     assert not hasattr(BaseVllmOmniStageConfig, "from_stage_config")
     assert not hasattr(BaseVllmOmniStageConfig, "to_legacy_stage_config")
