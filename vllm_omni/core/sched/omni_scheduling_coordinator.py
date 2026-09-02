@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Scheduling-side coordination for full_payload input waiting.
 
 Manages WAITING_FOR_INPUT state transitions based on readiness signals
