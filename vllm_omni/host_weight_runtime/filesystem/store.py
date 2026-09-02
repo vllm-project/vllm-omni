@@ -301,22 +301,27 @@ def _write_atomic_json(path: Path, value: object, *, mode: int = 0o444) -> None:
     temporary = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_CLOEXEC, 0o600)
     try:
-        offset = 0
-        while offset < len(data):
-            count = os.write(fd, data[offset:])
-            if count <= 0:
-                raise OSError(errno.EIO, f"short write for {temporary}")
-            offset += count
-        os.fsync(fd)
-        os.fchmod(fd, mode)
-        os.fsync(fd)
+        try:
+            offset = 0
+            while offset < len(data):
+                count = os.write(fd, data[offset:])
+                if count <= 0:
+                    raise OSError(errno.EIO, f"short write for {temporary}")
+                offset += count
+            os.fsync(fd)
+            os.fchmod(fd, mode)
+            os.fsync(fd)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            raise
+        else:
+            os.close(fd)
+        os.replace(temporary, path)
     except BaseException:
-        os.close(fd)
-        temporary.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            temporary.unlink(missing_ok=True)
         raise
-    else:
-        os.close(fd)
-    os.replace(temporary, path)
     _fsync_directory(path.parent)
 
 

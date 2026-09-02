@@ -408,6 +408,163 @@ def _make_store(
     return FilesystemHostWeightStore(domain, capacity or CapacityPolicy(), integrity or IntegrityPolicy())
 
 
+def test_atomic_json_replace_failure_removes_temporary_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "domain.json"
+    path.write_bytes(b"existing metadata")
+    replace_error = OSError(errno.EIO, "injected replace failure")
+
+    def fail_replace(source: os.PathLike[str], destination: os.PathLike[str]) -> None:
+        raise replace_error
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(OSError) as error:
+        filesystem_store_module._write_atomic_json(path, {"schema_version": 1})
+
+    assert error.value is replace_error
+    assert path.read_bytes() == b"existing metadata"
+    assert not list(tmp_path.glob(".domain.json.*.tmp"))
+
+
+def test_atomic_json_cleanup_failure_preserves_replace_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "domain.json"
+    replace_error = OSError(errno.EIO, "injected replace failure")
+    original_unlink = Path.unlink
+    cleanup_attempted = False
+
+    def fail_replace(source: os.PathLike[str], destination: os.PathLike[str]) -> None:
+        raise replace_error
+
+    def fail_temporary_unlink(target: Path, missing_ok: bool = False) -> None:
+        nonlocal cleanup_attempted
+        if target.parent == tmp_path and target.name.startswith(".domain.json."):
+            cleanup_attempted = True
+            raise PermissionError(errno.EACCES, "injected cleanup failure")
+        original_unlink(target, missing_ok=missing_ok)
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    monkeypatch.setattr(Path, "unlink", fail_temporary_unlink)
+
+    with pytest.raises(OSError) as error:
+        filesystem_store_module._write_atomic_json(path, {"schema_version": 1})
+
+    assert cleanup_attempted
+    assert error.value is replace_error
+    assert len(list(tmp_path.glob(".domain.json.*.tmp"))) == 1
+
+
+def test_atomic_json_write_failure_preserves_error_when_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "domain.json"
+    write_error = OSError(errno.EIO, "injected write failure")
+    close_error = OSError(errno.EIO, "injected close failure")
+    original_open = os.open
+    original_write = os.write
+    original_close = os.close
+    original_unlink = Path.unlink
+    temporary_fd = None
+    close_attempted = False
+    cleanup_attempted = False
+
+    def track_temporary_open(
+        target: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal temporary_fd
+        fd = original_open(target, flags, mode, dir_fd=dir_fd)
+        if Path(os.fsdecode(target)).parent == tmp_path:
+            temporary_fd = fd
+        return fd
+
+    def fail_temporary_write(fd: int, data: bytes) -> int:
+        if fd == temporary_fd:
+            raise write_error
+        return original_write(fd, data)
+
+    def fail_temporary_close(fd: int) -> None:
+        nonlocal close_attempted
+        if fd == temporary_fd:
+            close_attempted = True
+            original_close(fd)
+            raise close_error
+        original_close(fd)
+
+    def fail_temporary_unlink(target: Path, missing_ok: bool = False) -> None:
+        nonlocal cleanup_attempted
+        if target.parent == tmp_path and target.name.startswith(".domain.json."):
+            cleanup_attempted = True
+            raise PermissionError(errno.EACCES, "injected cleanup failure")
+        original_unlink(target, missing_ok=missing_ok)
+
+    monkeypatch.setattr(os, "open", track_temporary_open)
+    monkeypatch.setattr(os, "write", fail_temporary_write)
+    monkeypatch.setattr(os, "close", fail_temporary_close)
+    monkeypatch.setattr(Path, "unlink", fail_temporary_unlink)
+
+    with pytest.raises(OSError) as error:
+        filesystem_store_module._write_atomic_json(path, {"schema_version": 1})
+
+    assert close_attempted
+    assert cleanup_attempted
+    assert error.value is write_error
+    assert len(list(tmp_path.glob(".domain.json.*.tmp"))) == 1
+
+
+def test_atomic_json_close_failure_removes_temporary_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "domain.json"
+    close_error = OSError(errno.EIO, "injected close failure")
+    original_open = os.open
+    original_close = os.close
+    temporary_fd = None
+    close_attempted = False
+
+    def track_temporary_open(
+        target: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal temporary_fd
+        fd = original_open(target, flags, mode, dir_fd=dir_fd)
+        if Path(os.fsdecode(target)).parent == tmp_path:
+            temporary_fd = fd
+        return fd
+
+    def fail_temporary_close(fd: int) -> None:
+        nonlocal close_attempted
+        if fd == temporary_fd:
+            close_attempted = True
+            original_close(fd)
+            raise close_error
+        original_close(fd)
+
+    monkeypatch.setattr(os, "open", track_temporary_open)
+    monkeypatch.setattr(os, "close", fail_temporary_close)
+
+    with pytest.raises(OSError) as error:
+        filesystem_store_module._write_atomic_json(path, {"schema_version": 1})
+
+    assert close_attempted
+    assert error.value is close_error
+    assert not path.exists()
+    assert not list(tmp_path.glob(".domain.json.*.tmp"))
+
+
 def _publish_test_artifact(
     store: FilesystemHostWeightStore,
     identity: WeightArtifactIdentity | None = None,
