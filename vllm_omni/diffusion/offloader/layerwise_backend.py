@@ -232,8 +232,10 @@ class LayerwiseOffloadHook(ModelHook):
         gpu_weights: dict[torch.dtype, torch.Tensor] = {}
 
         if self._timing_sink is not None:
-            self._copy_start = current_omni_platform.Event()
-            self._copy_end = current_omni_platform.Event()
+            # Timing events need ``enable_timing=True`` for ``elapsed_time``;
+            # the platform Event() default disables timing.
+            self._copy_start = torch.cuda.Event(enable_timing=True)
+            self._copy_end = torch.cuda.Event(enable_timing=True)
             self._h2d_bytes = int(
                 sum(
                     cpu_weight.numel() * cpu_weight.element_size()
@@ -299,7 +301,7 @@ class LayerwiseOffloadHook(ModelHook):
             self._prev_hook.prefetch_layer(non_blocking=False)
 
         if self._timing_sink is not None:
-            self._compute_start = current_omni_platform.Event()
+            self._compute_start = torch.cuda.Event(enable_timing=True)
             self._compute_start.record(current_omni_platform.current_stream())
 
         self.prefetch_layer(non_blocking=True)
@@ -315,62 +317,77 @@ class LayerwiseOffloadHook(ModelHook):
         return output
 
     def _report_timing(self) -> None:
-        """Aggregate one block's H2D/compute durations into the round sink.
+        """Aggregate one block's H2D/compute events into the round sink.
 
-        Called from ``post_forward`` after ``offload_layer`` waited on the
-        prefetch event, so the copy events are complete and their elapsed
-        times are safe to read.  Every ``num_blocks``-th block closes a full
-        transformer pass and logs the per-round summary (one denoise step for
-        diffusion pipelines).
+        Called from ``post_forward``.  Durations are NOT read here: the CUDA
+        events may still be in flight (reading ``elapsed_time`` too early
+        raises "Both events must be completed").  The events are stashed per
+        layer and the round is closed by the ``num_blocks``-th block, which
+        synchronizes once (one sync per denoise step, so the pipelined
+        overlap measurement is not perturbed per layer) and then computes all
+        durations.
         """
         sink = self._timing_sink
         assert sink is not None
         if self._compute_start is not None:
-            self._compute_end = current_omni_platform.Event()
+            self._compute_end = torch.cuda.Event(enable_timing=True)
             self._compute_end.record(current_omni_platform.current_stream())
 
-        h2d_ms = 0.0
-        compute_ms = 0.0
         if (
             self._copy_start is not None
             and self._copy_end is not None
             and self._compute_start is not None
             and self._compute_end is not None
         ):
-            h2d_ms = self._copy_start.elapsed_time(self._copy_end)
-            compute_ms = self._compute_start.elapsed_time(self._compute_end)
-
-        if sink["count"] == 0:
-            sink["wall_start"] = self._copy_start if self._copy_start is not None else None
-        sink["last_compute_end"] = self._compute_end
-        sink["h2d_ms"] += h2d_ms
-        sink["compute_ms"] += compute_ms
-        sink["h2d_bytes"] += self._h2d_bytes
+            sink["layers"].append(
+                (
+                    self._copy_start,
+                    self._copy_end,
+                    self._compute_start,
+                    self._compute_end,
+                    self._h2d_bytes,
+                )
+            )
         sink["count"] += 1
 
         num_blocks = int(sink["num_blocks"])
         if sink["count"] >= num_blocks:
+            # One synchronize per full transformer pass; by then every stashed
+            # event has completed, so elapsed_time reads are valid.
+            current_omni_platform.synchronize()
+
+            h2d_ms = 0.0
+            compute_ms = 0.0
+            h2d_bytes = 0
+            first_copy_start: torch.cuda.Event | None = None
+            last_compute_end: torch.cuda.Event | None = None
+            for copy_start, copy_end, compute_start, compute_end, bytes_ in sink["layers"]:
+                h2d_ms += copy_start.elapsed_time(copy_end)
+                compute_ms += compute_start.elapsed_time(compute_end)
+                h2d_bytes += bytes_
+                if first_copy_start is None:
+                    first_copy_start = copy_start
+                last_compute_end = compute_end
+
             wall_ms = 0.0
-            if sink["wall_start"] is not None and sink["last_compute_end"] is not None:
-                wall_ms = sink["wall_start"].elapsed_time(sink["last_compute_end"])
-            total_ms = sink["h2d_ms"] + sink["compute_ms"]
+            if first_copy_start is not None and last_compute_end is not None:
+                wall_ms = first_copy_start.elapsed_time(last_compute_end)
+            total_ms = h2d_ms + compute_ms
             overlap_ms = max(0.0, total_ms - wall_ms)
             logger.info(
                 "layerwise offload timing (round of %d blocks): h2d=%.1f ms "
                 "(%.2f MiB), compute=%.1f ms, wall=%.1f ms, overlap=%.1f ms "
                 "(%.0f%% of h2d hidden behind compute)",
                 num_blocks,
-                sink["h2d_ms"],
-                sink["h2d_bytes"] / (1024 * 1024),
-                sink["compute_ms"],
+                h2d_ms,
+                h2d_bytes / (1024 * 1024),
+                compute_ms,
                 wall_ms,
                 overlap_ms,
-                100.0 * overlap_ms / sink["h2d_ms"] if sink["h2d_ms"] > 0 else 0.0,
+                100.0 * overlap_ms / h2d_ms if h2d_ms > 0 else 0.0,
             )
-            for key in ("h2d_ms", "compute_ms", "h2d_bytes", "count"):
-                sink[key] = 0
-            sink["wall_start"] = None
-            sink["last_compute_end"] = None
+            sink["layers"].clear()
+            sink["count"] = 0
 
 
 def apply_block_hook(
@@ -491,11 +508,7 @@ class LayerWiseOffloadBackend(OffloadBackend):
                 timing_sink = {
                     "num_blocks": num_blocks,
                     "count": 0,
-                    "h2d_ms": 0.0,
-                    "compute_ms": 0.0,
-                    "h2d_bytes": 0,
-                    "wall_start": None,
-                    "last_compute_end": None,
+                    "layers": [],
                 }
                 logger.info("layerwise offload timing instrumentation enabled (VLLM_OMNI_OFFLOAD_TIMING=1)")
 
