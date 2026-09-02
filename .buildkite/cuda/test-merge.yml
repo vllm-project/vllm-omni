@@ -237,3 +237,38 @@ steps:
               pytest -s -v tests/e2e/online_serving/test_hunyuan_video_15_expansion.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
             "
         mirror_hardwares: h100_1
+
+      - label: "Diffusion · MiniMax-H3 L3 DLO DP2 and FastH3"
+        source_file_dependencies:
+          - tests/e2e/online_serving/minimax_h3/
+          - tests/helpers/assertions.py
+          - tests/helpers/mark.py
+          - tests/helpers/media.py
+          - tests/helpers/runtime.py
+          - vllm_omni/diffusion/models/minimax_h3/
+          - vllm_omni/diffusion/lora/
+          - vllm_omni/diffusion/offloader/
+          - vllm_omni/diffusion/distributed/
+          - vllm_omni/entrypoints/openai/
+        # Keep four server lifecycles in one Buildkite job, but never in one
+        # pytest process. DLO uses multiprocessing shared-memory queues; the
+        # parent's resource_tracker can retain a stale /psm_* entry during
+        # teardown and strand the next Ref2VA collective.
+        # A per-file process plus a hard timeout also makes a regression fail
+        # instead of leaving the merge queue stuck indefinitely.
+        timeout_in_minutes: 150
+        commands:
+          - |
+            set -eu
+            export VLLM_IMAGE_FETCH_TIMEOUT=60
+            if [ -f vllm_omni/diffusion/models/minimax_h3/lora.py ]; then
+              export VLLM_TEST_MINIMAX_H3_TURBO_LORA=$(python3 -c 'from huggingface_hub import hf_hub_download; print(hf_hub_download(repo_id="lightx2v/Minimax-h3-Turbo", filename="minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"))')
+            fi
+            if [ -f vllm_omni/diffusion/models/minimax_h3/fasth3.py ]; then
+              export VLLM_TEST_MINIMAX_H3_FASTH3_LORA=$(python3 -c 'from huggingface_hub import hf_hub_download; print(hf_hub_download(repo_id="FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA", filename="dense-datafree/adapter_model.safetensors"))')
+            fi
+            timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_dlo_dp2_fl2va.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
+            timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_dlo_dp2_ref2va.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
+            timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_turbo_lora.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
+            timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_fasth3_lora.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
+        mirror_hardwares: h100_2

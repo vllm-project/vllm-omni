@@ -467,7 +467,8 @@ class _FakeTransformer:
         "reduce_type": "mean",
     }
 
-    def __call__(self, latents, timestep, instruction_embeds, freqs_cis, instruction_attention_mask, **kwargs):
+    def __call__(self, latents, timestep, instruction_embeds, freqs_real, instruction_attention_mask, **kwargs):
+        assert all(not freqs.is_complex() for pair in freqs_real for freqs in pair)
         return torch.zeros_like(latents)
 
 
@@ -812,7 +813,7 @@ class _RecordingRefTransformer(_FakeTransformer):
     def __init__(self):
         self.calls = []
 
-    def __call__(self, latents, timestep, instruction_embeds, freqs_cis, instruction_attention_mask, **kwargs):
+    def __call__(self, latents, timestep, instruction_embeds, freqs_real, instruction_attention_mask, **kwargs):
         self.calls.append(kwargs.get("ref_image_hidden_states"))
         return torch.zeros_like(latents)
 

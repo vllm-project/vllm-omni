@@ -1349,8 +1349,8 @@ class AsyncOmniEngine:
                     or kwargs.get("fastvideo_vsa_topk") is not None
                 ):
                     has_stage_attention = (
-                        hasattr(cfg.engine_args, "diffusion_attention_config")
-                        and cfg.engine_args.diffusion_attention_config is not None
+                        getattr(cfg.engine_args, "diffusion_attention_config", None) is not None
+                        or getattr(cfg.engine_args, "diffusion_attention_backend", None) is not None
                     )
                     if not has_stage_attention:
                         cfg.engine_args.diffusion_attention_config = parse_attention_config(
