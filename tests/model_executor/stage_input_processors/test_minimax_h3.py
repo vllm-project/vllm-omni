@@ -29,6 +29,7 @@ from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MINIMAX_H3_TEXT_HIDDEN_SIZE,
     MiniMaxH3TextConditioning,
 )
+from vllm_omni.model_executor.models.minimax_h3.pipeline import MINIMAX_H3_PIPELINE
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     minimax_h3_ref2va_presentation,
     minimax_h3_ref2va_video_presentation,
@@ -37,7 +38,6 @@ from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     MINIMAX_H3_PREPARED_REFERENCE_VIDEOS_KEY,
     deserialize_prepared_reference_videos,
 )
-from vllm_omni.model_executor.models.minimax_h3.pipeline import MINIMAX_H3_PIPELINE
 from vllm_omni.model_executor.models.minimax_h3.text_encoder import (
     MiniMaxH3MultiModalProcessor,
     _build_minimax_h3_presentation,
