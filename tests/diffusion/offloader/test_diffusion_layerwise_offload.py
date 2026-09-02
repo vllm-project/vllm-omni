@@ -4,6 +4,7 @@
 import concurrent.futures
 import gc
 import multiprocessing as mp
+import os
 from typing import Any
 
 import numpy as np
@@ -48,6 +49,13 @@ IMAGE_VIDEO_MODELS_PARAMS: dict[str, dict[str, Any]] = {
 }
 
 _OFFLOAD_STATE_PROBE = "vllm_omni_layerwise_offload_test"
+# A second CI build can reverse the same exact-head measurement without a
+# source edit; the default keeps the existing baseline-first workload.
+_MEASUREMENT_ORDER_ENV = "VLLM_OMNI_OFFLOAD_TEST_ORDER"
+_MEASUREMENT_ORDERS: dict[str, tuple[bool, bool]] = {
+    "baseline-first": (False, True),
+    "offload-first": (True, False),
+}
 
 
 class OffloadStateProbe:
@@ -114,6 +122,16 @@ def _collect_offload_states(value: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _measurement_order() -> tuple[bool, bool]:
+    """Return the requested order without changing the default CI workload."""
+    configured = os.environ.get(_MEASUREMENT_ORDER_ENV, "baseline-first")
+    try:
+        return _MEASUREMENT_ORDERS[configured]
+    except KeyError as exc:
+        allowed = ", ".join(_MEASUREMENT_ORDERS)
+        raise ValueError(f"{_MEASUREMENT_ORDER_ENV} must be one of: {allowed}; got {configured!r}") from exc
+
+
 def run_inference(
     model_name: str,
     layerwise_offload: bool = False,
@@ -170,9 +188,10 @@ def run_inference(
         del output
 
     # DeviceMemoryMonitor reports absolute device usage. Subtract this run's
-    # starting usage. Each mode runs in its own spawned process below, so model,
-    # compiler, allocator, and backend workspace state cannot carry into the
-    # other measurement.
+    # starting usage. Each mode runs in its own spawned process below, so model
+    # objects and process-local allocator/compiler/backend workspace state cannot
+    # carry into the other measurement. Shared filesystem caches can persist;
+    # _MEASUREMENT_ORDER_ENV enables a reversed-order validation run for that.
     peak_used_mb = monitor.peak_used_mb
     incremental_peak_mb = max(0.0, peak_used_mb - initial_used_mb)
 
@@ -228,6 +247,36 @@ def _print_measurement(label: str, measurement: dict[str, Any]) -> None:
 
 
 @pytest.mark.diffusion
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        (None, (False, True)),
+        ("baseline-first", (False, True)),
+        ("offload-first", (True, False)),
+    ],
+)
+def test_measurement_order(monkeypatch, configured: str | None, expected: tuple[bool, bool]) -> None:
+    if configured is None:
+        monkeypatch.delenv(_MEASUREMENT_ORDER_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_MEASUREMENT_ORDER_ENV, configured)
+
+    assert _measurement_order() == expected
+
+
+@pytest.mark.diffusion
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_measurement_order_rejects_unknown_value(monkeypatch) -> None:
+    monkeypatch.setenv(_MEASUREMENT_ORDER_ENV, "unknown")
+
+    with pytest.raises(ValueError, match=_MEASUREMENT_ORDER_ENV):
+        _measurement_order()
+
+
+@pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 @pytest.mark.parametrize(
     "model_name",
@@ -241,9 +290,15 @@ def test_layerwise_offload_diffusion_model(model_name: str):
     offloader keeps only a single transformer block on GPU at a time, with
     prefetching for compute-memory overlap.
     """
+    measurements: dict[bool, dict[str, Any]] = {}
     try:
-        no_offload = run_inference_isolated(model_name, layerwise_offload=False)
-        layerwise_offload = run_inference_isolated(model_name, layerwise_offload=True)
+        measurement_order = _measurement_order()
+        print(
+            "Measurement order: "
+            + " -> ".join("layerwise-offload" if enabled else "baseline" for enabled in measurement_order)
+        )
+        for enabled in measurement_order:
+            measurements[enabled] = run_inference_isolated(model_name, layerwise_offload=enabled)
     except ValueError as exc:
         # omni_snapshot_download wraps GatedRepoError in a ValueError; skip instead of failing.
         if "Access to model" in str(exc) and "is restricted" in str(exc):
@@ -253,6 +308,8 @@ def test_layerwise_offload_diffusion_model(model_name: str):
             )
         raise
 
+    no_offload = measurements[False]
+    layerwise_offload = measurements[True]
     _assert_offload_state(no_offload, expected_enabled=False)
     _assert_offload_state(layerwise_offload, expected_enabled=True)
     _print_measurement("No offload", no_offload)
