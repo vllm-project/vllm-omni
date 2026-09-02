@@ -117,44 +117,60 @@ def test_transformer_to_keeps_sensitive_modules_in_fp32():
     assert model.norm_out_modulation[1].weight.dtype == torch.float32
 
 
-def test_router_group_limited_topk_uses_bias_corrected_choice():
+def test_sparse_moe_configures_common_runner_with_lingbot_router_semantics(mocker):
     from vllm_omni.diffusion.models.lingbot_video import lingbot_video_transformer as module
 
-    router = module.LingBotVideoRouter(
-        hidden_size=2,
-        num_experts=4,
+    gate = torch.nn.Linear(16, 8, bias=False)
+    runner = torch.nn.Identity()
+    gate_factory = mocker.patch.object(module, "GateLinear", return_value=gate)
+    fused_moe_factory = mocker.patch.object(module, "FusedMoE", return_value=runner)
+
+    block = module.LingBotVideoSparseMoeBlock(
+        hidden_size=16,
+        num_experts=8,
         top_k=2,
+        moe_intermediate_size=8,
         score_func="sigmoid",
         norm_topk_prob=True,
-        n_group=2,
+        n_group=4,
         topk_group=1,
-        route_scale=2.5,
+        routed_scaling_factor=2.5,
+        n_shared_experts=None,
+        prefix="transformer.blocks.0.ffn.experts",
     )
-    with torch.no_grad():
-        router.weight.copy_(
-            torch.tensor(
-                [
-                    [8.0, 0.0],
-                    [7.0, 0.0],
-                    [-8.0, 0.0],
-                    [-7.0, 0.0],
-                ]
-            )
-        )
-        router.e_score_correction_bias.copy_(torch.tensor([0.0, 0.0, 2.0, 2.0]))
 
-    top_indices, top_scores = router(torch.tensor([[1.0, 0.0]]))
+    assert block.experts is runner
+    gate_factory.assert_called_once_with(
+        16,
+        8,
+        bias=False,
+        out_dtype=torch.float32,
+        params_dtype=torch.float32,
+        force_fp32_compute=True,
+        prefix="transformer.blocks.0.ffn.experts.gate",
+    )
+    kwargs = fused_moe_factory.call_args.kwargs
+    assert kwargs["renormalize"] is True
+    assert kwargs["use_grouped_topk"] is True
+    assert kwargs["num_expert_group"] == 4
+    assert kwargs["topk_group"] == 1
+    assert kwargs["scoring_func"] == "sigmoid"
+    assert kwargs["routed_scaling_factor"] == 2.5
+    assert kwargs["gate"] is gate
+    assert kwargs["ckpt_names"] == ("w1", "w2", "w3")
+    assert kwargs["e_score_correction_bias"].dtype == torch.float32
+    assert not kwargs["e_score_correction_bias"].requires_grad
 
-    assert set(top_indices[0].tolist()) == {2, 3}
-    assert torch.allclose(top_scores.sum(dim=-1), torch.tensor([2.5]))
-    low_score, high_score = sorted(top_scores[0].tolist())
-    assert low_score < 0.8
-    assert high_score > 1.7
 
-
-def test_sparse_moe_block_masks_padding_tokens():
+def test_sparse_moe_block_compacts_and_restores_padding_tokens(mocker):
     from vllm_omni.diffusion.models.lingbot_video import lingbot_video_transformer as module
 
+    mocker.patch.object(
+        module,
+        "GateLinear",
+        return_value=torch.nn.Linear(4, 2, bias=False),
+    )
+    mocker.patch.object(module, "FusedMoE", return_value=torch.nn.Identity())
     block = module.LingBotVideoSparseMoeBlock(
         hidden_size=4,
         num_experts=2,
@@ -167,19 +183,11 @@ def test_sparse_moe_block_masks_padding_tokens():
         routed_scaling_factor=1.0,
         n_shared_experts=None,
     )
-    with torch.no_grad():
-        block.router.weight.copy_(
-            torch.tensor(
-                [
-                    [8.0, 0.0, 0.0, 0.0],
-                    [-8.0, 0.0, 0.0, 0.0],
-                ]
-            )
-        )
-        block.router.e_score_correction_bias.zero_()
-        block.experts.w1.fill_(0.5)
-        block.experts.w2.fill_(0.5)
-        block.experts.w3.fill_(0.5)
+    routed = mocker.patch.object(
+        block,
+        "_run_routed_experts",
+        side_effect=lambda tokens: tokens * 2,
+    )
 
     hidden_states = torch.tensor([[[1.0, 0.0, 0.0, 0.0], [-1.0, 0.0, 0.0, 0.0]]])
     padding_mask = torch.tensor([1.0, 0.0])
@@ -188,79 +196,125 @@ def test_sparse_moe_block_masks_padding_tokens():
 
     assert out.shape == hidden_states.shape
     assert torch.isfinite(out).all()
-    assert not torch.allclose(out[0, 0], torch.zeros_like(out[0, 0]))
+    torch.testing.assert_close(out[0, 0], hidden_states[0, 0] * 2)
     assert torch.allclose(out[0, 1], torch.zeros_like(out[0, 1]))
+    routed.assert_called_once()
+    torch.testing.assert_close(routed.call_args.args[0], hidden_states[:, :1].reshape(1, 4))
 
 
-@pytest.mark.parametrize(
-    "counts_list",
-    [
-        [0, 0, 0, 0],
-        [1, 0, 7, 8, 9],
-        [16, 0, 1, 0],
-        [0, 0, 33, 0],
-    ],
-)
-def test_grouped_padding_matches_reference(counts_list):
+def test_sparse_moe_runner_is_a_narrow_compile_boundary():
     from vllm_omni.diffusion.models.lingbot_video import lingbot_video_transformer as module
 
-    align = 8
-    counts = torch.tensor(counts_list, dtype=torch.int64)
-    num_tokens = int(counts.sum())
-    tokens = torch.arange(num_tokens * 4, dtype=torch.float32).reshape(num_tokens, 4)
-
-    actual = module.LingBotVideoSparseMoeBlock._pad_grouped_tokens(
-        tokens,
-        counts,
-        align,
+    assert getattr(
+        module.LingBotVideoSparseMoeBlock._run_routed_experts,
+        "_torchdynamo_disable",
+        False,
     )
 
-    num_experts = len(counts_list)
-    max_len = ((num_tokens + num_experts * align + align - 1) // align) * align
-    aligned_counts = [((max(count, align) + align - 1) // align) * align for count in counts_list]
-    expected_indices = [num_tokens] * max_len
-    source_start = 0
-    write_start = 0
-    for count, aligned_count in zip(counts_list, aligned_counts):
-        expected_indices[write_start : write_start + count] = range(
-            source_start,
-            source_start + count,
-        )
-        source_start += count
-        write_start += aligned_count
 
-    expected_indices_tensor = torch.tensor(expected_indices, dtype=torch.int64)
-    tokens_with_pad = torch.vstack((tokens, tokens.new_zeros((tokens.shape[-1],))))
-    expected_aligned_counts = torch.tensor(aligned_counts, dtype=torch.int32)
-
-    assert actual[0] == tokens_with_pad.shape
-    torch.testing.assert_close(actual[1], tokens_with_pad[expected_indices_tensor])
-    torch.testing.assert_close(actual[2], expected_indices_tensor)
-    torch.testing.assert_close(actual[3], expected_aligned_counts)
-
-
-def test_tiny_transformer_constructs_moe_and_dense_layers():
+def test_sparse_moe_packs_checkpoint_weights_for_common_runner(mocker):
     from vllm_omni.diffusion.models.lingbot_video import lingbot_video_transformer as module
 
+    class FakeRoutedExperts(torch.nn.Module):
+        def __init__(self, num_experts, hidden_size, intermediate_size, correction_bias):
+            super().__init__()
+            self.w13_weight = torch.nn.Parameter(torch.empty(num_experts, 2 * intermediate_size, hidden_size))
+            self.w2_weight = torch.nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
+            self.e_score_correction_bias = correction_bias
+
+            def load_w13(param, loaded_weight, name, shard_id, expert_id):
+                del name
+                offset = 0 if shard_id == "w1" else intermediate_size
+                param.data[expert_id, offset : offset + intermediate_size].copy_(loaded_weight)
+
+            def load_w2(param, loaded_weight, name, shard_id, expert_id):
+                del name, shard_id
+                param.data[expert_id].copy_(loaded_weight)
+
+            self.w13_weight.weight_loader = load_w13
+            self.w2_weight.weight_loader = load_w2
+
+    class FakeRunner(torch.nn.Module):
+        def __init__(self, kwargs):
+            super().__init__()
+            self.gate = kwargs["gate"]
+            self.routed_experts = FakeRoutedExperts(
+                kwargs["num_experts"],
+                kwargs["hidden_size"],
+                kwargs["intermediate_size"],
+                kwargs["e_score_correction_bias"],
+            )
+
+    mocker.patch.object(
+        module,
+        "GateLinear",
+        side_effect=lambda input_size, output_size, **kwargs: torch.nn.Linear(
+            input_size,
+            output_size,
+            bias=kwargs["bias"],
+        ),
+    )
+    mocker.patch.object(
+        module,
+        "FusedMoE",
+        side_effect=lambda **kwargs: FakeRunner(kwargs),
+    )
+    mocker.patch.object(
+        module,
+        "LingBotVideoAttention",
+        side_effect=lambda *args, **kwargs: torch.nn.Identity(),
+    )
     model = _tiny_transformer(
-        depth=2,
+        depth=1,
         num_experts=4,
         num_experts_per_tok=2,
         moe_intermediate_size=8,
-        decoder_sparse_step=1,
-        mlp_only_layers=(1,),
         n_shared_experts=1,
         n_group=2,
         topk_group=1,
         routed_scaling_factor=2.5,
     )
+    w1 = torch.randn(4, 8, 16)
+    w2 = torch.randn(4, 16, 8)
+    w3 = torch.randn(4, 8, 16)
+    gate = torch.randn(4, 16)
+    correction_bias = torch.randn(4)
 
-    assert isinstance(model.blocks[0].ffn, module.LingBotVideoSparseMoeBlock)
-    assert isinstance(model.blocks[1].ffn, module.LingBotVideoMLP)
-    assert "blocks.0.ffn.experts.w1" in model.state_dict()
-    assert "blocks.0.ffn.shared_experts.gate_proj.weight" in model.state_dict()
+    loaded = model.load_weights(
+        [
+            ("blocks.0.ffn.experts.w1", w1),
+            ("blocks.0.ffn.experts.w2", w2),
+            ("blocks.0.ffn.experts.w3", w3),
+            ("blocks.0.ffn.router.weight", gate),
+            (
+                "blocks.0.ffn.router.e_score_correction_bias",
+                correction_bias,
+            ),
+        ]
+    )
+    params = dict(model.named_parameters())
+    w13 = params["blocks.0.ffn.experts.routed_experts.w13_weight"]
+
+    assert loaded == {
+        "blocks.0.ffn.experts.gate.weight",
+        "blocks.0.ffn.experts.routed_experts.e_score_correction_bias",
+        "blocks.0.ffn.experts.routed_experts.w13_weight",
+        "blocks.0.ffn.experts.routed_experts.w2_weight",
+    }
+    torch.testing.assert_close(w13[:, :8], w1)
+    torch.testing.assert_close(w13[:, 8:], w3)
+    torch.testing.assert_close(
+        params["blocks.0.ffn.experts.routed_experts.w2_weight"],
+        w2,
+    )
+    torch.testing.assert_close(params["blocks.0.ffn.experts.gate.weight"], gate)
+    torch.testing.assert_close(
+        params["blocks.0.ffn.experts.routed_experts.e_score_correction_bias"],
+        correction_bias,
+    )
 
     model.to(dtype=torch.bfloat16)
 
-    assert model.blocks[0].ffn.router.weight.dtype == torch.float32
-    assert model.blocks[0].ffn.experts.w1.dtype == torch.bfloat16
+    assert model.blocks[0].ffn.experts.gate.weight.dtype == torch.float32
+    assert model.blocks[0].ffn.experts.routed_experts.e_score_correction_bias.dtype == torch.float32
+    assert model.blocks[0].ffn.experts.routed_experts.w13_weight.dtype == torch.bfloat16
