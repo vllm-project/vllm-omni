@@ -19,6 +19,7 @@ from vllm_omni.model_extras import (
     get_extra_output_params,
     get_output_tensor_range,
     get_x_to_text_model_family,
+    resize_reference_images,
     should_init_extra_args_for_non_diffusion_stages,
     should_preserve_reference_image_size,
 )
@@ -269,6 +270,80 @@ def test_reference_image_size_policy_threads_revision(monkeypatch: pytest.Monkey
         revision="pinned-revision",
     )
     assert captured == {"model": "org/model", "revision": "pinned-revision"}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_default_reference_image_resizer_resamples_to_requested_box() -> None:
+    image = Image.new("RGB", (48, 32))
+
+    resized = resize_reference_images(
+        "UnregisteredPipeline",
+        image,
+        width=96,
+        height=64,
+        model="org/model",
+    )
+
+    assert isinstance(resized, Image.Image)
+    assert resized.size == (96, 64)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_default_reference_image_resizer_preserves_list_shape() -> None:
+    images = [Image.new("RGB", (48, 32)), Image.new("RGB", (96, 64))]
+
+    resized = resize_reference_images(
+        "UnregisteredPipeline",
+        images,
+        width=96,
+        height=64,
+        model="org/model",
+    )
+
+    assert isinstance(resized, list)
+    assert [image.size for image in resized] == [(96, 64), (96, 64)]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_reference_image_resizer_hook_owns_geometry() -> None:
+    # LingBot-Video declares the passthrough hook: its pipeline applies its own
+    # aspect-preserving resize + crop, so the shared layer must not pre-stretch.
+    image = Image.new("RGB", (48, 32))
+
+    resized = resize_reference_images(
+        "LingBotVideoPipeline",
+        image,
+        width=96,
+        height=64,
+        model="org/model",
+    )
+
+    assert resized is image
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_reference_image_resizer_honours_legacy_preserve_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Models still declaring only the boolean reference_image_size_resolver keep
+    # working: an opt-in resolver passes the raw image through.
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.ltx2.ltx2_components.preserves_reference_image_size",
+        lambda *, model, revision=None: True,
+    )
+    image = Image.new("RGB", (48, 32))
+
+    resized = resize_reference_images(
+        "LTX2Pipeline",
+        image,
+        width=96,
+        height=64,
+        model="org/model",
+    )
+
+    assert resized is image
 
 
 @pytest.mark.core_model
