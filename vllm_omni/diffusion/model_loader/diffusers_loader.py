@@ -31,6 +31,7 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig, apply_hsdp_to_model
+from vllm_omni.diffusion.lora.manager import LoRABackend
 from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
     get_checkpoint_adapter,
 )
@@ -465,6 +466,39 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             return all_parameter_names
         return {name for name in all_parameter_names if name.startswith(source_prefixes)}
 
+    def _maybe_fuse_distilled_lora(self, model: nn.Module) -> None:
+        """Fuse distilled LoRA weights into the model before sharding or quantization."""
+        if self.od_config is None:
+            return
+        lora_backend = getattr(self.od_config, "lora_backend", None)
+        is_distill = (
+            lora_backend == LoRABackend.DISTILL
+            or lora_backend == "distill"
+            or getattr(lora_backend, "value", None) == "distill"
+        )
+        if not is_distill:
+            return
+
+        if getattr(model, "lora_is_fused", False):
+            return
+
+        lora_path = getattr(self.od_config, "lora_path", None)
+        if not lora_path:
+            return
+
+        if isinstance(lora_path, list) and len(lora_path) == 1:
+            lora_path = lora_path[0]
+
+        if hasattr(model, "load_lora_weights"):
+            lora_scale = getattr(self.od_config, "lora_scale", 1.0)
+            if lora_scale > 1.0:
+                logger.warning("lora_scale > 1.0 may not take any effect when using distilled LoRA backend.")
+            logger.info("Fusing distilled LoRA weights from %s into %s", lora_path, model.__class__.__name__)
+            model.load_lora_weights(lora_path)
+            setattr(model, "lora_is_fused", True)
+        else:
+            logger.warning("Pipeline %s does not support loading distilled LoRA weights.", model.__class__.__name__)
+
     def load_model(
         self,
         load_device: str,
@@ -587,6 +621,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                             sources=ordinary_sources,
                             planned_weights=host_weight_plan.bindings,
                         )
+                    self._maybe_fuse_distilled_lora(model)
                 else:
                     if _dist_offload and _use_ag and _dlo_group_size > 1 and _has_online_quant:
                         # An effective DLO group size of one performs no weight
@@ -625,6 +660,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                             self.load_weights(model, stream_online_quant_to_cpu=True)
                         else:
                             self.load_weights(model)
+                    self._maybe_fuse_distilled_lora(model)
                     self._process_weights_after_loading(model, target_device)
 
                 # A warm final-layout hit has already completed all
@@ -1019,6 +1055,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             raise ValueError("HSDP is not supported with the diffusers adapter load format")
         model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=True)
         self.load_weights(model)
+        self._maybe_fuse_distilled_lora(model)
 
         # Quantization methods must finish while parameters are ordinary local
         # tensors. Some post-load transforms use operations (for example,

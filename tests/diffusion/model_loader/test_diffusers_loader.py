@@ -1038,6 +1038,156 @@ def test_hsdp_processes_quantized_weights_before_sharding(mocker):
     assert events == ["load", "process", "prepare", "shard"]
 
 
+def test_hsdp_fuses_distilled_lora_before_sharding(mocker):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+    from vllm_omni.diffusion.offloader.module_collector import PipelineModules
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(
+            use_hsdp=True,
+            hsdp_replicate_size=1,
+            hsdp_shard_size=2,
+        ),
+        quantization_config=None,
+        lora_backend="distill",
+        lora_path="/path/to/lora.safetensors",
+        lora_scale=1.0,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    loader.quant_config = None
+
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    events: list[str] = []
+
+    model.load_lora_weights = mocker.Mock(side_effect=lambda path: events.append(f"fuse_lora:{path}"))
+
+    loader._init_from_load_format = mocker.Mock(return_value=model)
+    loader.load_weights = mocker.Mock(side_effect=lambda _model: events.append("load"))
+    loader._process_weights_after_loading = mocker.Mock(side_effect=lambda _model, _device: events.append("process"))
+    mocker.patch.object(
+        loader_mod.ModuleDiscovery,
+        "discover",
+        return_value=PipelineModules(
+            dits=[model.transformer],
+            dit_names=["transformer"],
+            vaes=[],
+            encoders=[],
+            encoder_names=[],
+            resident_modules=[],
+            resident_names=[],
+        ),
+    )
+    mocker.patch.object(
+        loader_mod,
+        "apply_hsdp_to_model",
+        side_effect=lambda *_args, **_kwargs: events.append("shard"),
+    )
+
+    loader._load_model_with_hsdp(torch.device("cpu"))
+
+    assert events == ["load", "fuse_lora:/path/to/lora.safetensors", "process", "shard"]
+    assert getattr(model, "lora_is_fused", False) is True
+
+
+def test_hsdp_fuses_multi_file_distilled_lora_wan22(mocker):
+    import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+    from vllm_omni.diffusion.offloader.module_collector import PipelineModules
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(
+            use_hsdp=True,
+            hsdp_replicate_size=1,
+            hsdp_shard_size=2,
+        ),
+        quantization_config=None,
+        lora_backend="distill",
+        lora_path=["/path/to/high.safetensors", "/path/to/low.safetensors"],
+        lora_scale=1.0,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    loader.quant_config = None
+
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    model.transformer_2 = nn.Linear(2, 2, bias=False)
+    events: list[str] = []
+
+    model.load_lora_weights = mocker.Mock(side_effect=lambda paths: events.append(f"fuse_lora:{paths}"))
+
+    loader._init_from_load_format = mocker.Mock(return_value=model)
+    loader.load_weights = mocker.Mock(side_effect=lambda _model: events.append("load"))
+    loader._process_weights_after_loading = mocker.Mock(side_effect=lambda _model, _device: events.append("process"))
+    mocker.patch.object(
+        loader_mod.ModuleDiscovery,
+        "discover",
+        return_value=PipelineModules(
+            dits=[model.transformer, model.transformer_2],
+            dit_names=["transformer", "transformer_2"],
+            vaes=[],
+            encoders=[],
+            encoder_names=[],
+            resident_modules=[],
+            resident_names=[],
+        ),
+    )
+    mocker.patch.object(
+        loader_mod,
+        "apply_hsdp_to_model",
+        side_effect=lambda *_args, **_kwargs: events.append("shard"),
+    )
+
+    loader._load_model_with_hsdp(torch.device("cpu"))
+
+    assert events == [
+        "load",
+        "fuse_lora:['/path/to/high.safetensors', '/path/to/low.safetensors']",
+        "process",
+        "shard",
+        "shard",
+    ]
+    assert getattr(model, "lora_is_fused", False) is True
+
+
+def test_load_model_fuses_distilled_lora_non_hsdp(mocker):
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(
+            use_hsdp=False,
+            tensor_parallel_size=1,
+            data_parallel_size=1,
+            sequence_parallel_size=1,
+        ),
+        enable_cpu_offload=False,
+        quantization_config=None,
+        lora_backend="distill",
+        lora_path="/path/to/lora.safetensors",
+        lora_scale=1.0,
+        host_weight_runtime_mode="disabled",
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    loader._force_canonical_load = True
+
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    events: list[str] = []
+
+    model.load_lora_weights = mocker.Mock(side_effect=lambda path: events.append(f"fuse_lora:{path}"))
+
+    loader._init_from_load_format = mocker.Mock(return_value=model)
+    loader.load_weights = mocker.Mock(side_effect=lambda _model: events.append("load"))
+    loader._process_weights_after_loading = mocker.Mock(side_effect=lambda _model, _device: events.append("process"))
+    loader._apply_skip_softmax_calibration = mocker.Mock()
+
+    res = loader.load_model(load_device="cpu", device=torch.device("cpu"))
+
+    assert res is model
+    assert events == ["load", "fuse_lora:/path/to/lora.safetensors", "process"]
+    assert getattr(model, "lora_is_fused", False) is True
+
+
 def test_get_all_weights(prefetch_helios_model, mock_tp_group):
     """Ensure that get all weights on a tiny model resolves to nonempty weights."""
     od_config = OmniDiffusionConfig(

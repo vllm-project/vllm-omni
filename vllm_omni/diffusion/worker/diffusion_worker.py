@@ -565,6 +565,7 @@ class DiffusionWorker:
                 if self.od_config.lora_scale > 1.0:
                     logger.warning("lora_scale > 1.0 may not take any effect when using distilled LoRA backend.")
                 pipeline.load_lora_weights(lora_path)
+                pipeline.lora_is_fused = True
             else:
                 logger.warning("Pipeline does not support loading distilled LoRA weights for now.")
         else:

@@ -312,3 +312,41 @@ class TestDiffusionWorkerWakeUp:
         mock_buffer2.data.copy_.assert_not_called()
 
         assert result is True
+
+
+class TestDiffusionWorkerInitLoraManager:
+    """Test DiffusionWorker.init_lora_manager method."""
+
+    def test_skips_when_lora_already_fused(self, mocker: MockerFixture, mock_gpu_worker):
+        """When pipeline.lora_is_fused is True, init_lora_manager returns immediately."""
+        from vllm_omni.diffusion.lora.manager import LoRABackend
+
+        mock_gpu_worker.od_config.lora_backend = LoRABackend.DISTILL
+        mock_gpu_worker.od_config.lora_path = "/path/to/lora.safetensors"
+        mock_gpu_worker.od_config.lora_scale = 1.0
+
+        pipeline = mock_gpu_worker.model_runner.pipeline
+        pipeline.lora_is_fused = True
+        pipeline.load_lora_weights = mocker.Mock()
+
+        mock_gpu_worker.init_lora_manager()
+
+        pipeline.load_lora_weights.assert_not_called()
+        assert mock_gpu_worker.lora_manager is None
+
+    def test_distill_backend_fuses_and_marks_flag_when_not_pre_fused(self, mocker: MockerFixture, mock_gpu_worker):
+        """When lora_is_fused is False, distill backend calls load_lora_weights and sets flag."""
+        from vllm_omni.diffusion.lora.manager import LoRABackend
+
+        mock_gpu_worker.od_config.lora_backend = LoRABackend.DISTILL
+        mock_gpu_worker.od_config.lora_path = "/path/to/lora.safetensors"
+        mock_gpu_worker.od_config.lora_scale = 1.0
+
+        pipeline = mock_gpu_worker.model_runner.pipeline
+        pipeline.lora_is_fused = False
+        pipeline.load_lora_weights = mocker.Mock()
+
+        mock_gpu_worker.init_lora_manager()
+
+        pipeline.load_lora_weights.assert_called_once_with("/path/to/lora.safetensors")
+        assert pipeline.lora_is_fused is True

@@ -209,6 +209,7 @@ class LoraLoaderMixin:
     # Set by the pipeline this mixin is combined with; annotated, not assigned.
     transformer: torch.nn.Module
     _lora_loaded: dict[str | None, dict[str, torch.Tensor]]
+    _lora_is_fused: bool = False
 
     # Lazy initialization to avoid MRO issues: __init__ may not be called
     # when mixin with nn.Module
@@ -221,6 +222,14 @@ class LoraLoaderMixin:
     @lora_loaded.setter
     def lora_loaded(self, value):
         self._lora_loaded = value
+
+    @property
+    def lora_is_fused(self) -> bool:
+        return getattr(self, "_lora_is_fused", False) or bool(getattr(self, "_lora_loaded", None))
+
+    @lora_is_fused.setter
+    def lora_is_fused(self, value: bool):
+        self._lora_is_fused = value
 
     @classmethod
     def load_lora_into_module(
