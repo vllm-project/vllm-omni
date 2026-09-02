@@ -275,13 +275,13 @@ bash examples/online_serving/text_to_speech/glm_tts/run_gradio_demo.sh
 
 ## OmniVoice
 
-Zero-shot multilingual TTS (600+ languages). Online serving currently exposes **auto voice** only; voice cloning and voice design are available offline.
+OmniVoice creates speech in more than 600 languages. It supports text-to-speech without a reference clip, voice cloning, and voice design.
 
 ### Prerequisites
 ```bash
 huggingface-cli download k2-fsa/OmniVoice
 ```
-Voice cloning (offline) needs `transformers>=5.3.0`; auto voice works with `transformers>=4.57.0`.
+Voice cloning needs `transformers>=5.3.0`. When `ref_text` is omitted, OmniVoice loads `openai/whisper-large-v3-turbo` on the worker device to transcribe the reference audio. Set `additional_config.omnivoice_asr.load_asr_on_startup` to `true` to load Whisper during worker startup, or set `additional_config.omnivoice_asr.asr_device` to use another GPU or the CPU.
 
 ### Launch
 ```bash
@@ -295,12 +295,34 @@ vllm serve k2-fsa/OmniVoice --omni --port 8091 --trust-remote-code
 cd examples/online_serving/text_to_speech/omnivoice
 python speech_client.py --text "Hello, how are you?"
 python speech_client.py --text "Bonjour, comment allez-vous?" --language French
+python speech_client.py --text "hello" --ref-audio /path/to/ref_audio.wav
 ```
 
-The client supports `--api-base`, `--model`, `--text`, `--response-format`, `--language`, `--output`.
+The client supports `--api-base`, `--model`, `--text`, `--response-format`,
+`--language`, `--voice`, `--ref-audio`, `--ref-text`, `--instructions`,
+`--seed`, and `--output`.
 
 ### Notes
-- Voice cloning and voice design require offline inference; see the [offline OmniVoice section](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_speech/README.md#omnivoice).
+- The explicit `--ref-text` path is faster because it does not load Whisper.
+- By default, the first request with reference audio and no reference text loads
+  `openai/whisper-large-v3-turbo` on the worker device, which adds latency and
+  device memory use. Set `additional_config.omnivoice_asr.load_asr_on_startup` to
+  `true` to move that load to worker startup. Generated audio is mono at 24 kHz.
+
+### Reference audio and output processing
+
+When a request includes `ref_audio`, OmniVoice prepares the reference clip before it transcribes the clip or builds the voice cloning input. It performs these steps:
+
+- It converts the clip to mono and resamples it to 24 kHz.
+- It measures the original root mean square (RMS) level. When the RMS is greater than zero and below `0.1`, it raises the waveform level to `0.1` and keeps the original RMS for output volume control.
+- When `ref_text` is omitted, it trims a clip longer than 20 seconds at a detected silence.
+- It removes middle silence and trims silence at both edges whether the transcript is automatic or supplied by the caller.
+- It aligns the sample count down to the audio tokenizer hop size.
+- When `ref_text` is omitted, it sends the prepared waveform to Whisper.
+- It adds a final period for English text or a Chinese full stop for Chinese text when the reference text has no ending punctuation.
+- It sends the same prepared waveform to the audio tokenizer.
+
+After decoding, OmniVoice processes voice cloning output by removing middle gaps of at least 500 milliseconds and trimming edge silence while keeping 100 milliseconds at each edge. It uses the original reference RMS when the RMS is below `0.1`, and it leaves the level unchanged when the RMS is at least `0.1`. It fades the first and last 100 milliseconds, then adds 100 milliseconds of silence at both edges. Text only output returns the decoder tensor without this processing.
 
 ---
 

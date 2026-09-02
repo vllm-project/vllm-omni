@@ -11,14 +11,17 @@ Uses request-mode execution (all steps in one forward() call).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
-from collections.abc import Iterable
+from collections import OrderedDict
+from collections.abc import Iterable, Mapping
 from typing import ClassVar
 
 import numpy as np
 import torch
+import torchaudio
 from tokenizers import Tokenizer as HFTokenizer
 from torch import nn
 from vllm.logger import init_logger
@@ -26,6 +29,11 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.interface import SupportAudioOutput
+from vllm_omni.diffusion.models.omnivoice.audio import (
+    add_reference_punctuation,
+    postprocess_generated_audio,
+    prepare_reference_audio,
+)
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.models.omnivoice.duration import RuleDurationEstimator
 from vllm_omni.model_executor.models.omnivoice.omnivoice_decoder import OmniVoiceDecoder
@@ -38,9 +46,43 @@ try:
 except ImportError:
     HiggsAudioV2TokenizerModel = None
 
-import torchaudio
+try:
+    from transformers import pipeline as hf_pipeline
+except ImportError:
+    hf_pipeline = None
 
 logger = init_logger(__name__)
+
+_ASR_MODEL_NAME = "openai/whisper-large-v3-turbo"
+_INLINE_CACHE_MAX_ENTRIES = 8
+
+
+def _parse_asr_config(additional_config: Mapping[str, object] | None) -> tuple[bool, str, str | None]:
+    """Return validated OmniVoice ASR settings from the model config."""
+    if additional_config is None:
+        additional_config = {}
+    if not isinstance(additional_config, Mapping):
+        raise TypeError(f"additional_config must be a mapping or None, got {type(additional_config)!r}")
+
+    raw_config = additional_config.get("omnivoice_asr", {})
+    if raw_config is None:
+        raise TypeError("additional_config['omnivoice_asr'] must be a mapping")
+    if not isinstance(raw_config, Mapping):
+        raise TypeError(f"additional_config['omnivoice_asr'] must be a mapping, got {type(raw_config)!r}")
+
+    load_asr_on_startup = raw_config.get("load_asr_on_startup", False)
+    if not isinstance(load_asr_on_startup, bool):
+        raise TypeError("additional_config['omnivoice_asr']['load_asr_on_startup'] must be a bool")
+
+    model_name = raw_config.get("asr_model_name", _ASR_MODEL_NAME)
+    if not isinstance(model_name, str) or not model_name.strip():
+        raise ValueError("additional_config['omnivoice_asr']['asr_model_name'] must be a non-empty string")
+
+    asr_device = raw_config.get("asr_device")
+    if asr_device is not None and (not isinstance(asr_device, str) or not asr_device.strip()):
+        raise ValueError("additional_config['omnivoice_asr']['asr_device'] must be a non-empty string")
+
+    return load_asr_on_startup, model_name.strip(), asr_device.strip() if asr_device is not None else None
 
 
 def get_omnivoice_post_process_func(od_config: OmniDiffusionConfig):
@@ -138,6 +180,8 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         self.od_config = od_config
         self.device = get_local_device()
         self.model_path = od_config.model
+        self._initialize_asr(getattr(od_config, "additional_config", None))
+        self._inline_reference_cache: OrderedDict[tuple[object, ...], dict[str, object]] = OrderedDict()
 
         # Resolve model path (HF hub ID → local cache)
         if not os.path.isdir(self.model_path):
@@ -185,6 +229,100 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         self.class_temperature = self.config.class_temperature
         self.sample_rate = self.config.sample_rate
 
+    def _initialize_asr(self, additional_config: Mapping[str, object] | None) -> None:
+        self._load_asr_on_startup, self._asr_model_name, self._asr_device = _parse_asr_config(additional_config)
+        self._asr_pipeline = None
+        if self._load_asr_on_startup:
+            self._load_asr_pipeline()
+
+    def _load_asr_pipeline(self):
+        """Load the configured reference-audio ASR pipeline."""
+        if self._asr_pipeline is not None:
+            return self._asr_pipeline
+        asr_device = self._asr_device if self._asr_device is not None else self.device
+        if hf_pipeline is None:
+            raise RuntimeError(
+                "OmniVoice automatic transcription requires the Hugging Face "
+                f"ASR pipeline ({self._asr_model_name!r}) on device {asr_device}."
+            )
+
+        asr_dtype = torch.float16 if str(asr_device).lower().startswith(("cuda", "xpu")) else torch.float32
+        logger.info(
+            "Loading OmniVoice ASR model %s on %s",
+            self._asr_model_name,
+            asr_device,
+        )
+        try:
+            self._asr_pipeline = hf_pipeline(
+                "automatic-speech-recognition",
+                model=self._asr_model_name,
+                dtype=asr_dtype,
+                device=asr_device,
+            )
+            # Transformers keeps a newly loaded pipeline model on CPU when a
+            # torch.distributed process group is already initialized. vLLM
+            # workers always have one, so explicitly honor the configured
+            # device after construction, as other auxiliary models do here.
+            target_device = torch.device(asr_device)
+            self._asr_pipeline.model = self._asr_pipeline.model.to(target_device)
+            self._asr_pipeline.device = target_device
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load OmniVoice ASR model {self._asr_model_name!r} on device {asr_device}: {exc}"
+            ) from exc
+        logger.info("OmniVoice ASR model loaded on %s", asr_device)
+        return self._asr_pipeline
+
+    @torch.inference_mode()
+    def _transcribe_ref_audio(self, ref_audio) -> str:
+        """Transcribe a reference waveform with the lazily loaded ASR model."""
+        waveform, sr = ref_audio
+        if isinstance(waveform, torch.Tensor):
+            waveform = waveform.detach().cpu().numpy()
+        waveform = np.squeeze(np.array(waveform, copy=True))
+        result = self._load_asr_pipeline()(
+            {
+                "array": waveform,
+                "sampling_rate": int(sr),
+            }
+        )
+        if not isinstance(result, dict) or "text" not in result:
+            raise RuntimeError("OmniVoice ASR returned a malformed result without a 'text' field.")
+        transcript = result["text"]
+        if not isinstance(transcript, str):
+            raise RuntimeError("OmniVoice ASR returned a malformed result: 'text' must be a string.")
+        transcript = transcript.strip()
+        if not transcript:
+            raise ValueError("OmniVoice ASR returned an empty reference transcription.")
+        return transcript
+
+    def _resolve_ref_text(self, ref_audio, ref_text: str | None) -> str | None:
+        """Resolve missing reference text only when reference audio is present."""
+        if ref_audio is not None and (ref_text is None or not ref_text.strip()):
+            logger.debug("Automatically transcribing OmniVoice reference audio")
+            return self._transcribe_ref_audio(ref_audio)
+        return ref_text
+
+    def _estimate_target_len(
+        self,
+        text: str,
+        ref_text: str | None,
+        ref_audio_tokens: torch.Tensor | None,
+    ) -> int:
+        """Estimate target audio tokens using resolved voice-clone conditioning."""
+        if ref_audio_tokens is None or not ref_text:
+            ref_text = "Nice to meet you."
+            num_ref_audio_tokens = 25
+        else:
+            num_ref_audio_tokens = ref_audio_tokens.size(-1)
+
+        target_len = self.duration_estimator.estimate_duration(
+            text,
+            ref_text,
+            num_ref_audio_tokens,
+        )
+        return max(1, int(target_len))
+
     def _encode_ref_audio(self, audio_signal: torch.Tensor, sr: int) -> torch.Tensor:
         """Encode reference audio to 8-codebook tokens for voice cloning."""
         if self.audio_tokenizer is None:
@@ -204,6 +342,30 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             )  # [B, 8, T_ref]
             tokens = tokens.squeeze(0)  # [8, T_ref]
         return tokens
+
+    @staticmethod
+    def _inline_cache_key(prepared_audio, preparation_mode: str) -> tuple[object, ...]:
+        waveform = np.ascontiguousarray(prepared_audio.waveform, dtype=np.float32)
+        digest = hashlib.sha256(waveform.tobytes()).digest()
+        return (
+            preparation_mode,
+            digest,
+            tuple(waveform.shape),
+            int(prepared_audio.sample_rate),
+            float(prepared_audio.original_rms),
+        )
+
+    def _get_inline_cache(self, key: tuple[object, ...]) -> dict[str, object] | None:
+        cached = self._inline_reference_cache.pop(key, None)
+        if cached is not None:
+            self._inline_reference_cache[key] = cached
+        return cached
+
+    def _put_inline_cache(self, key: tuple[object, ...], artifacts: dict[str, object]) -> None:
+        self._inline_reference_cache[key] = artifacts
+        self._inline_reference_cache.move_to_end(key)
+        while len(self._inline_reference_cache) > _INLINE_CACHE_MAX_ENTRIES:
+            self._inline_reference_cache.popitem(last=False)
 
     @torch.inference_mode()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
@@ -265,6 +427,9 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             if instruct is None:
                 instruct = mm_kwargs.get("instruct")
 
+            if isinstance(ref_text, str):
+                ref_text = ref_text.strip() or None
+
             if not text:
                 return DiffusionOutput(error="Empty text prompt")
             lang = lang or "None"
@@ -278,9 +443,103 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         num_cb = self.config.num_audio_codebook
         mask_id = self.config.audio_mask_id
 
-        # Estimate target duration
-        target_len = self.duration_estimator.estimate_duration(text, "Nice to meet you.", 25)
-        target_len = max(1, int(target_len))
+        ref_audio_tokens = None
+        reference_rms = None
+        if ref_audio is not None:
+            needs_asr = ref_text is None
+            if self.audio_tokenizer is None:
+                raise RuntimeError(
+                    "Voice cloning requires transformers>=5.3.0. Try: uv pip install 'transformers>=5.3.0'"
+                )
+            preparation_mode = "asr" if needs_asr else "explicit"
+            _cache_key = None
+            if voice_name:
+                _cache_key = self._speaker_cache.make_cache_key(
+                    voice_name,
+                    model_type=f"omnivoice_{preparation_mode}",
+                    created_at=int(prompt.get("voice_created_at") or 0),
+                )
+                cached = self._speaker_cache.get(_cache_key)
+                if cached is not None and (not needs_asr or cached.get("ref_text")):
+                    ref_audio_tokens = cached["ref_audio_tokens"].to(device)
+                    reference_rms = cached["reference_rms"]
+                    if needs_asr:
+                        ref_text = cached["ref_text"]
+                    _cache_key = None  # hit → don't store again
+                    logger.debug("Speaker cache HIT for OmniVoice speaker '%s'", voice_name)
+
+            if ref_audio_tokens is None:
+                audio_signal, sample_rate = ref_audio
+                try:
+                    prepared_audio = prepare_reference_audio(
+                        audio_signal,
+                        int(sample_rate),
+                        target_sample_rate=self.audio_tokenizer.config.sample_rate,
+                        hop_length=self.audio_tokenizer.config.hop_length,
+                        trim_long=needs_asr,
+                    )
+                except (RuntimeError, ValueError) as exc:
+                    return DiffusionOutput(error=str(exc))
+                reference_rms = prepared_audio.original_rms
+                reference_duration = prepared_audio.waveform.shape[-1] / prepared_audio.sample_rate
+                if reference_duration > 20.0:
+                    logger.warning(
+                        "OmniVoice reference audio is %.1fs long (>20s); this may increase memory use "
+                        "and reduce cloning quality.",
+                        reference_duration,
+                    )
+
+                inline_cache_key = None
+                if not voice_name:
+                    inline_cache_key = self._inline_cache_key(prepared_audio, preparation_mode)
+                    cached = self._get_inline_cache(inline_cache_key)
+                    if cached is not None:
+                        ref_audio_tokens = cached["ref_audio_tokens"].to(device)
+                        reference_rms = cached["reference_rms"]
+                        if needs_asr:
+                            ref_text = cached["ref_text"]
+                        logger.debug("Inline OmniVoice reference cache HIT")
+
+                if ref_audio_tokens is None and needs_asr:
+                    try:
+                        ref_text = self._resolve_ref_text(
+                            (prepared_audio.waveform, prepared_audio.sample_rate),
+                            ref_text,
+                        )
+                    except (RuntimeError, ValueError) as exc:
+                        return DiffusionOutput(error=str(exc))
+            if ref_audio_tokens is None:
+                ref_audio_tokens = self._encode_ref_audio(
+                    torch.from_numpy(prepared_audio.waveform),
+                    prepared_audio.sample_rate,
+                ).to(device)
+
+                # Store named and inline entries for the matching preparation mode.
+                if _cache_key is not None:
+                    self._speaker_cache.put(
+                        _cache_key,
+                        {
+                            "ref_audio_tokens": ref_audio_tokens.cpu(),
+                            "ref_text": ref_text if needs_asr else None,
+                            "reference_rms": reference_rms,
+                        },
+                    )
+                    logger.debug("Speaker cache STORE for OmniVoice speaker '%s'", voice_name)
+                elif not voice_name:
+                    self._put_inline_cache(
+                        inline_cache_key,
+                        {
+                            "ref_audio_tokens": ref_audio_tokens.cpu(),
+                            "ref_text": ref_text if needs_asr else None,
+                            "reference_rms": reference_rms,
+                        },
+                    )
+                    logger.debug("Inline OmniVoice reference cache STORE")
+
+            if ref_text:
+                ref_text = add_reference_punctuation(ref_text)
+
+        target_len = self._estimate_target_len(text, ref_text, ref_audio_tokens)
 
         # Build text prompt with control tokens
         style_text = f"<|denoise|><|lang_start|>{lang}<|lang_end|><|instruct_start|>{instruct}<|instruct_end|>"
@@ -291,38 +550,6 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         encoding_ids = style_tokens + text_tokens
         text_tokens = torch.tensor(encoding_ids, dtype=torch.long, device=device)
         text_len = text_tokens.shape[0]
-
-        # Encode reference audio tokens if provided (with voice caching)
-        ref_audio_tokens = None
-        if ref_audio is not None:
-            if self.audio_tokenizer is None:
-                raise RuntimeError(
-                    "Voice cloning requires transformers>=5.3.0. Try: uv pip install 'transformers>=5.3.0'"
-                )
-            # Check speaker cache first
-            _cache_key = None
-            if voice_name:
-                _cache_key = self._speaker_cache.make_cache_key(
-                    voice_name,
-                    model_type="omnivoice",
-                    created_at=int(prompt.get("voice_created_at") or 0),
-                )
-                cached = self._speaker_cache.get(_cache_key)
-                if cached is not None:
-                    ref_audio_tokens = cached["ref_audio_tokens"].to(device)
-                    _cache_key = None  # hit → don't store again
-                    logger.debug("Speaker cache HIT for OmniVoice speaker '%s'", voice_name)
-
-            if ref_audio_tokens is None:
-                audio_signal, sr = ref_audio
-                if isinstance(audio_signal, np.ndarray):
-                    audio_signal = torch.from_numpy(audio_signal).float()
-                ref_audio_tokens = self._encode_ref_audio(audio_signal, int(sr)).to(device)
-
-                # Store in cache for next request
-                if _cache_key is not None:
-                    self._speaker_cache.put(_cache_key, {"ref_audio_tokens": ref_audio_tokens.cpu()})
-                    logger.debug("Speaker cache STORE for OmniVoice speaker '%s'", voice_name)
 
         # Build conditional + unconditional batches [2, 8, max_len]
         text_ids = text_tokens.unsqueeze(0).repeat(num_cb, 1)
@@ -371,6 +598,16 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         )
         # Decode tokens to audio
         audio = self.decoder(tokens)  # [1, 1, samples]
+        if ref_audio_tokens is None:
+            return DiffusionOutput(output=audio)
+
+        audio_np = audio.squeeze(0).detach().cpu().float().numpy()
+        audio_np = postprocess_generated_audio(
+            audio_np,
+            sample_rate=self.sample_rate,
+            reference_rms=reference_rms,
+        )
+        audio = torch.from_numpy(audio_np).unsqueeze(0)
 
         return DiffusionOutput(output=audio)
 

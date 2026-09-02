@@ -36,7 +36,7 @@ python examples/offline_inference/text_to_speech/<model>/end2end.py \
     --ref-text  "Transcript of the reference audio."
 ```
 
-`--ref-audio` and `--ref-text` are optional (text-only synthesis works without them) and must be provided together for voice cloning. The exotic scripts — Qwen3-TTS, Voxtral TTS, CosyVoice3 — accept additional model-specific flags documented in their per-model section below.
+For most models, `--ref-audio` and `--ref-text` are optional for text-only synthesis but must be provided together for voice cloning. OmniVoice also accepts `--ref-audio` without `--ref-text` and transcribes the reference lazily with Whisper. Qwen3-TTS, Voxtral TTS, and CosyVoice3 accept additional model-specific flags documented in their sections below.
 
 ---
 
@@ -191,13 +191,13 @@ Text → [Stage 0: AR] → Speech Tokens → [Stage 1: DiT + HiFT] → Audio (24
 
 ## OmniVoice
 
-Zero-shot multilingual TTS supporting 600+ languages, with three modes (auto / clone / design).
+OmniVoice creates speech in more than 600 languages. It supports text-to-speech without a reference clip, voice cloning, and voice design.
 
 ### Prerequisites
 ```bash
 huggingface-cli download k2-fsa/OmniVoice
 ```
-Voice cloning requires `transformers>=5.3.0`. Auto and design modes work with `transformers>=4.57.0`.
+Voice cloning requires `transformers>=5.3.0`. Automatic voice and voice design use `transformers>=4.57.0`.
 
 ### Quick start (auto voice)
 ```bash
@@ -207,6 +207,9 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
 ```
 
 ### Voice cloning
+
+With an explicit transcript, voice cloning does not load Whisper:
+
 ```bash
 python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --model k2-fsa/OmniVoice \
@@ -214,6 +217,30 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --ref-audio ref.wav \
     --ref-text  "This is the reference transcription."
 ```
+
+If `--ref-text` is omitted, OmniVoice loads `openai/whisper-large-v3-turbo` on the worker device and transcribes the reference audio after it prepares the waveform. The first request downloads and loads Whisper, so it takes longer and uses more device memory. Set `additional_config.omnivoice_asr.load_asr_on_startup` to `true` to load Whisper during worker startup, or set `additional_config.omnivoice_asr.asr_device` to use another GPU or the CPU.
+
+```bash
+python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
+    --model k2-fsa/OmniVoice \
+    --text "hello" \
+    --ref-audio trump_ref.wav
+```
+
+### Reference audio processing
+
+OmniVoice prepares the reference clip before it transcribes the clip or builds the voice cloning input. It performs these steps:
+
+- It converts the clip to mono and resamples it to 24 kHz.
+- It measures the original root mean square (RMS) level. When the RMS is greater than zero and below `0.1`, it raises the waveform level to `0.1` and keeps the original RMS for output volume control.
+- When `--ref-text` is omitted, it trims a clip longer than 20 seconds at a detected silence.
+- It removes middle silence and trims silence at both edges whether the transcript is automatic or supplied by the caller.
+- It aligns the sample count down to the audio tokenizer hop size.
+- When `--ref-text` is omitted, it sends the prepared waveform to Whisper.
+- It adds a final period for English text or a Chinese full stop for Chinese text when the reference text has no ending punctuation.
+- It sends the same prepared waveform to the audio tokenizer and uses the resulting reference tokens to estimate the target duration.
+
+OmniVoice processes voice cloning audio after decoding. It removes middle gaps of at least 500 milliseconds and trims edge silence while keeping 100 milliseconds at each edge. It uses the original reference RMS when the RMS is below `0.1`, and it leaves the level unchanged when the RMS is at least `0.1`. It fades the first and last 100 milliseconds, then adds 100 milliseconds of silence at both edges. Text only output returns the decoder tensor without this processing.
 
 ### Voice design
 ```bash
@@ -234,6 +261,11 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
 ### Notes
 - Stage 0 (Generator): Qwen3-0.6B with 32-step iterative unmasking.
 - Stage 1 (Decoder): HiggsAudioV2 RVQ + DAC at 24 kHz.
+- By default, the first request with reference audio and no `--ref-text` downloads
+  and loads `openai/whisper-large-v3-turbo`, so it has extra latency and GPU
+  memory use. Set `additional_config.omnivoice_asr.load_asr_on_startup` to `true`
+  to move that load to worker startup.
+- Generated audio remains mono at 24 kHz.
 
 ---
 

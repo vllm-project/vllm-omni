@@ -11,3 +11,10 @@ stages:
     trust_remote_code: true
     distributed_executor_backend: "mp"
     dtype: "float32"
+    additional_config:
+      omnivoice_asr:
+        # false defers Whisper until ref_audio is sent without ref_text;
+        # it does not disable automatic transcription. Set true to load at startup.
+        load_asr_on_startup: false
+        asr_model_name: "openai/whisper-large-v3-turbo"
+        asr_device: null
