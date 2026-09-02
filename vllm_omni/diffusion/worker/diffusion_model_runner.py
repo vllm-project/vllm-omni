@@ -519,6 +519,23 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if self.prompt_embed_cache is not None:
             self.prompt_embed_cache.clear()
 
+    def release_captured_graphs(self) -> None:
+        """Drop every CUDA graph held for this model, wherever it is kept.
+
+        Sleep level 2 discards the memory a capture was recorded against, so a
+        graph that outlives it replays over freed storage. The runner owns
+        compilation and execution resources, so it owns the release: a pipeline
+        that captures graphs of its own implements ``release_captured_graphs``
+        and is collected here, instead of every caller having to know which
+        pipelines have one.
+        """
+        runners = getattr(self, "graph_runners", None)
+        if runners is not None:
+            runners.clear()
+        release = getattr(self.pipeline, "release_captured_graphs", None)
+        if callable(release):
+            release()
+
     def get_prompt_embed_cache_stats(self) -> dict | None:
         """Return hit/miss statistics for the prompt-embedding cache, if enabled.
 
