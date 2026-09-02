@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Vendored from vllm/model_executor/models/hunyuan_v1.py at vllm@2cf0a6915c
 # (the upstream base vllm-omni origin/main was rebased against). Upstream

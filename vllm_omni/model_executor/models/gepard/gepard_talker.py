@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Gepard-1.0 native-AR talker.
 
 Single-stage AR TTS on a vLLM-native Qwen3.5 backbone. Each step samples one

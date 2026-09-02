@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for multi-modal streaming finish_reason behavior (commit 44c799bc).
 
 Verifies that the /v1/chat/completions streaming endpoint emits exactly one

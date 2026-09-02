@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import pytest
 import torch
 from torch import nn
 from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_omni.model_executor.models.weight_loader import AutoWeightsLoader
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _TinyModel(nn.Module):

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Shared scaffolding for OmniOpenAIServingChat unit tests.
 
 Provides factories for a minimal serving-chat instance, chat requests, and

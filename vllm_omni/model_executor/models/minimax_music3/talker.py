@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage-0 talker for MiniMax Music 3.
 
 A Qwen3 backbone predicts one audio frame per decode step. Each frame is
