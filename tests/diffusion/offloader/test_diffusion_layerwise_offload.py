@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import concurrent.futures
 import gc
+import multiprocessing as mp
 from typing import Any
 
 import numpy as np
@@ -45,32 +47,81 @@ IMAGE_VIDEO_MODELS_PARAMS: dict[str, dict[str, Any]] = {
     "sampler_params": {"height": 480, "width": 640, "num_frames": 5},
 }
 
+_OFFLOAD_STATE_PROBE = "vllm_omni_layerwise_offload_test"
 
-def check_audio_determinism(audio1, audio2, atol=1e-2):
-    device = current_omni_platform.device_type
-    if isinstance(audio1, np.ndarray):
-        audio1 = torch.from_numpy(audio1).to(device)
-    if isinstance(audio2, np.ndarray):
-        audio2 = torch.from_numpy(audio2).to(device)
 
-    if not torch.allclose(audio1, audio2, atol=atol):
-        diff = torch.abs(audio1 - audio2)
-        print(f"Max difference: {diff.max().item()}")
-        print(f"Mean difference: {diff.mean().item()}")
+class OffloadStateProbe:
+    """Test-only worker extension exposing the configured offloader state."""
+
+    model_runner: Any
+
+    def get_offload_state_for_test(self) -> dict[str, Any]:
+        backend = getattr(self.model_runner, "offload_backend", None)
+        block_groups = getattr(backend, "_blocks", ())
+        group_sizes = [len(group) for group in block_groups] if isinstance(block_groups, (list, tuple)) else []
+
+        return {
+            "probe": _OFFLOAD_STATE_PROBE,
+            "backend_type": (
+                None if backend is None else f"{backend.__class__.__module__}.{backend.__class__.__qualname__}"
+            ),
+            "requested": bool(getattr(self.model_runner.od_config, "enable_layerwise_offload", False)),
+            "enabled": bool(backend is not None and backend.is_enabled()),
+            "block_group_count": len(group_sizes),
+            "block_group_sizes": group_sizes,
+            "block_count": sum(group_sizes),
+        }
+
+
+def check_audio_determinism(audio1: np.ndarray, audio2: np.ndarray, atol: float = 1e-2) -> bool:
+    if not np.allclose(audio1, audio2, atol=atol):
+        diff = np.abs(audio1 - audio2)
+        print(f"Max difference: {diff.max()}")
+        print(f"Mean difference: {diff.mean()}")
         raise AssertionError(f"Audio outputs differ beyond tolerance atol={atol}")
     return True
+
+
+def _device_used_mb(device_index: int) -> float:
+    current_omni_platform.synchronize()
+    with current_omni_platform.device(device_index):
+        free_bytes, total_bytes = current_omni_platform.mem_get_info()
+    return (total_bytes - free_bytes) / (1024**2)
+
+
+def _extract_audio(output: Any) -> np.ndarray | None:
+    if not output:
+        return None
+    multimodal_output = getattr(output[0], "multimodal_output", None)
+    if not isinstance(multimodal_output, dict):
+        return None
+    audio = multimodal_output.get("audio")
+    if audio is None:
+        return None
+    if isinstance(audio, torch.Tensor):
+        return audio.detach().cpu().numpy()
+    return np.asarray(audio)
+
+
+def _collect_offload_states(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        return [value] if value.get("probe") == _OFFLOAD_STATE_PROBE else []
+    if isinstance(value, (list, tuple)):
+        states: list[dict[str, Any]] = []
+        for item in value:
+            states.extend(_collect_offload_states(item))
+        return states
+    return []
 
 
 def run_inference(
     model_name: str,
     layerwise_offload: bool = False,
     num_inference_steps: int = 3,
-) -> tuple[float, Any]:
+) -> dict[str, Any]:
     current_omni_platform.empty_cache()
     device_index = current_omni_platform.current_device()
-    with current_omni_platform.device(device_index):
-        free_bytes, total_bytes = current_omni_platform.mem_get_info()
-    initial_used_mb = (total_bytes - free_bytes) / (1024**2)
+    initial_used_mb = _device_used_mb(device_index)
 
     if model_name in AUDIO_MODEL:
         params = AUDIO_MODEL_PARAMS
@@ -80,10 +131,17 @@ def run_inference(
     with OmniRunner(
         model_name,
         enable_layerwise_offload=layerwise_offload,
+        worker_extension_cls=f"{OffloadStateProbe.__module__}.{OffloadStateProbe.__qualname__}",
         # TODO: we might want to add overlapped feature e2e tests
         # cache_backend="cache_dit",
         **params["runner_params"],
     ) as runner:
+        offload_states = _collect_offload_states(
+            runner.omni.engine.collective_rpc(method="get_offload_state_for_test", timeout=60)
+        )
+        if not offload_states:
+            raise AssertionError("The offload-state worker probe returned no diffusion worker results")
+
         # Measure steady-state inference memory, not model construction. Enabling
         # layerwise offload first loads the model and then replaces each block's
         # device storage with CPU-backed weights.  Monitoring that transition
@@ -108,20 +166,73 @@ def run_inference(
         finally:
             monitor.stop()
 
+        audio = _extract_audio(output)
+        del output
+
     # DeviceMemoryMonitor reports absolute device usage. Subtract this run's
-    # starting usage so process-wide compiler/workspace caches retained from a
-    # previous run do not make the second measurement order-dependent.
-    peak = max(0.0, monitor.peak_used_mb - initial_used_mb)
+    # starting usage. Each mode runs in its own spawned process below, so model,
+    # compiler, allocator, and backend workspace state cannot carry into the
+    # other measurement.
+    peak_used_mb = monitor.peak_used_mb
+    incremental_peak_mb = max(0.0, peak_used_mb - initial_used_mb)
 
+    del runner
     gc.collect()
+    cleanup_dist_env_and_memory()
     current_omni_platform.empty_cache()
+    post_cleanup_used_mb = _device_used_mb(device_index)
 
-    return peak, output
+    return {
+        "initial_used_mb": initial_used_mb,
+        "peak_used_mb": peak_used_mb,
+        "incremental_peak_mb": incremental_peak_mb,
+        "post_cleanup_used_mb": post_cleanup_used_mb,
+        "audio": audio,
+        "offload_states": offload_states,
+    }
+
+
+def run_inference_isolated(
+    model_name: str,
+    layerwise_offload: bool = False,
+    num_inference_steps: int = 3,
+) -> dict[str, Any]:
+    """Run one measurement in a fresh interpreter and accelerator context."""
+    with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn")) as executor:
+        return executor.submit(run_inference, model_name, layerwise_offload, num_inference_steps).result()
+
+
+def _assert_offload_state(measurement: dict[str, Any], *, expected_enabled: bool) -> None:
+    states = measurement["offload_states"]
+    assert states, "Expected at least one offload-state result"
+    for state in states:
+        assert state["requested"] is expected_enabled, f"Unexpected offload request state: {state}"
+        assert state["enabled"] is expected_enabled, f"Unexpected offload state: {state}"
+        if expected_enabled:
+            assert state["backend_type"], f"Enabled offloader has no backend type: {state}"
+            assert state["block_group_count"] > 0, f"Enabled offloader has no block groups: {state}"
+            assert state["block_count"] > 0, f"Enabled offloader has no managed blocks: {state}"
+        else:
+            assert state["block_group_count"] == 0, f"Disabled offloader retained block groups: {state}"
+            assert state["block_count"] == 0, f"Disabled offloader retained managed blocks: {state}"
+
+
+def _print_measurement(label: str, measurement: dict[str, Any]) -> None:
+    print(
+        f"{label}: initial={measurement['initial_used_mb']:.1f} MB, "
+        f"peak={measurement['peak_used_mb']:.1f} MB, "
+        f"incremental_peak={measurement['incremental_peak_mb']:.1f} MB, "
+        f"post_cleanup={measurement['post_cleanup_used_mb']:.1f} MB"
+    )
+    print(f"{label} offload state: {measurement['offload_states']}")
 
 
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
-@pytest.mark.parametrize("model_name", list(MODELS.keys()))
+@pytest.mark.parametrize(
+    "model_name",
+    [pytest.param(name, marks=MODEL_MARKS[name]) for name in MODELS],
+)
 def test_layerwise_offload_diffusion_model(model_name: str):
     """Test that layerwise offloading reduces GPU memory usage.
 
@@ -131,13 +242,8 @@ def test_layerwise_offload_diffusion_model(model_name: str):
     prefetching for compute-memory overlap.
     """
     try:
-        # Run without layerwise offloading (baseline)
-        no_offload_peak_memory, output_no_offload = run_inference(model_name, layerwise_offload=False)
-        cleanup_dist_env_and_memory()
-
-        # Run with layerwise offloading (1 layer on device)
-        layerwise_offload_peak_memory, output_offload = run_inference(model_name, layerwise_offload=True)
-        cleanup_dist_env_and_memory()
+        no_offload = run_inference_isolated(model_name, layerwise_offload=False)
+        layerwise_offload = run_inference_isolated(model_name, layerwise_offload=True)
     except ValueError as exc:
         # omni_snapshot_download wraps GatedRepoError in a ValueError; skip instead of failing.
         if "Access to model" in str(exc) and "is restricted" in str(exc):
@@ -146,15 +252,20 @@ def test_layerwise_offload_diffusion_model(model_name: str):
                 f"({exc}). See docs/contributing/ci/hf_credentials.md."
             )
         pytest.fail(f"Inference failed: {exc}")
-    except Exception:
-        pytest.fail("Inference failed")
+    except Exception as exc:
+        pytest.fail(f"Inference failed: {exc}")
 
-    print(f"Layerwise offload peak memory (1 GPU layer): {layerwise_offload_peak_memory} MB")
-    print(f"No offload peak memory: {no_offload_peak_memory} MB")
+    _assert_offload_state(no_offload, expected_enabled=False)
+    _assert_offload_state(layerwise_offload, expected_enabled=True)
+    _print_measurement("No offload", no_offload)
+    _print_measurement("Layerwise offload", layerwise_offload)
 
-    if model_name == "stabilityai/stable-audio-open-1.0":
-        audio_offload = output_offload[0].multimodal_output.get("audio")
-        audio_no_offload = output_no_offload[0].multimodal_output.get("audio")
+    audio_no_offload = no_offload["audio"]
+    audio_offload = layerwise_offload["audio"]
+    if audio_no_offload is not None or audio_offload is not None:
+        assert audio_no_offload is not None and audio_offload is not None, (
+            "Both isolated modes must return audio when either mode returns audio"
+        )
         # Match the sibling cpu-offload test's tolerance: layerwise offload moves
         # blocks across the PCIe bus on a side stream, which can perturb cuBLAS
         # algorithm selection and produce ~ULP-level drift larger than 1e-3.
@@ -170,6 +281,8 @@ def test_layerwise_offload_diffusion_model(model_name: str):
 
     # Verify that layerwise offloading significantly reduces memory usage
     # Passes only if the actual savings meets the expected savings
+    no_offload_peak_memory = no_offload["incremental_peak_mb"]
+    layerwise_offload_peak_memory = layerwise_offload["incremental_peak_mb"]
     actual_saved_memory = no_offload_peak_memory - layerwise_offload_peak_memory
     assert layerwise_offload_peak_memory + expected_saved_memory <= no_offload_peak_memory, (
         f"Layerwise offload peak memory {layerwise_offload_peak_memory} MB "
