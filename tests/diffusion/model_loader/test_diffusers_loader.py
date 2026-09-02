@@ -8,6 +8,7 @@ Tests for the DiffusersPipelineLoader.
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -18,6 +19,7 @@ from vllm.config.load import LoadConfig
 
 from vllm_omni.diffusion.config import get_current_diffusion_config, get_current_diffusion_config_or_none
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.lora.manager import LoRABackend
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
@@ -217,6 +219,48 @@ def test_hwr_cold_publication_and_warm_restore_skip_ordinary_dit_loading(
     warm_plan.lease_carrier.close()
     assert hash_calls == 1
     assert len(tuple((store_root / "source-digests-v1" / "entries").glob("*.json"))) == 1
+
+
+def test_maybe_fuse_distilled_lora_skips_when_hwr_warm_snapshot_present():
+    cfg = SimpleNamespace(
+        lora_backend="distill",
+        lora_path="/path/to/lora.safetensors",
+        lora_scale=1.0,
+        dtype=torch.bfloat16,
+        quantization_config=None,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), cfg)
+    loader._hwr_state = {"warm_snapshot": {"transformer.weight": (1234, "hash")}}
+
+    model = nn.Module()
+    model.load_lora_weights = MagicMock()
+
+    loader._maybe_fuse_distilled_lora(model)
+
+    model.load_lora_weights.assert_not_called()
+    assert getattr(model, "lora_is_fused", False) is True
+
+
+def test_maybe_fuse_distilled_lora_fuses_when_not_warm_snapshot():
+    cfg = SimpleNamespace(
+        lora_backend=LoRABackend.DISTILL,
+        lora_path="/path/to/lora.safetensors",
+        lora_scale=1.0,
+        dtype=torch.bfloat16,
+        quantization_config=None,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), cfg)
+    loader._hwr_state = None
+
+    model = nn.Module()
+    model.load_lora_weights = MagicMock()
+
+    loader._maybe_fuse_distilled_lora(model)
+
+    model.load_lora_weights.assert_called_once_with("/path/to/lora.safetensors")
+    assert getattr(model, "lora_is_fused", False) is True
 
 
 def test_hwr_commit_failure_discards_model_and_reloads_without_hwr_or_mmap(tmp_path: Path, monkeypatch):

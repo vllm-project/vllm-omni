@@ -471,15 +471,15 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         if self.od_config is None:
             return
         lora_backend = getattr(self.od_config, "lora_backend", None)
-        is_distill = (
-            lora_backend == LoRABackend.DISTILL
-            or lora_backend == "distill"
-            or getattr(lora_backend, "value", None) == "distill"
-        )
-        if not is_distill:
+        if lora_backend != LoRABackend.DISTILL and lora_backend != "distill":
             return
 
         if getattr(model, "lora_is_fused", False):
+            return
+
+        # A warm HWR restore already brings back the fused final-layout weights.
+        if self._hwr_state is not None and self._hwr_state.get("warm_snapshot") is not None:
+            setattr(model, "lora_is_fused", True)
             return
 
         lora_path = getattr(self.od_config, "lora_path", None)

@@ -209,7 +209,7 @@ class LoraLoaderMixin:
     # Set by the pipeline this mixin is combined with; annotated, not assigned.
     transformer: torch.nn.Module
     _lora_loaded: dict[str | None, dict[str, torch.Tensor]]
-    _lora_is_fused: bool = False
+    _lora_is_fused: bool
 
     # Lazy initialization to avoid MRO issues: __init__ may not be called
     # when mixin with nn.Module
@@ -225,6 +225,10 @@ class LoraLoaderMixin:
 
     @property
     def lora_is_fused(self) -> bool:
+        """True when LoRA weights are fused into base weights.
+
+        Mixin loads are in-place fusions, so non-empty `_lora_loaded` implies fused.
+        """
         return getattr(self, "_lora_is_fused", False) or bool(getattr(self, "_lora_loaded", None))
 
     @lora_is_fused.setter
