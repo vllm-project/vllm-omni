@@ -1253,9 +1253,19 @@ def _finalize_engine_args_dict(
     if is_diffusion:
         from vllm_omni.diffusion.data import parse_attention_config
 
-        if engine_args_dict.get("diffusion_attention_config") is not None:
+        # Fold the attention shorthand into the structured config so only one
+        # representation reaches OmniDiffusionConfig.from_kwargs.
+        attention_backend = engine_args_dict.pop("diffusion_attention_backend", None)
+        fastvideo_vsa_topk = engine_args_dict.pop("fastvideo_vsa_topk", None)
+        if (
+            engine_args_dict.get("diffusion_attention_config") is not None
+            or attention_backend is not None
+            or fastvideo_vsa_topk is not None
+        ):
             engine_args_dict["diffusion_attention_config"] = parse_attention_config(
-                engine_args_dict["diffusion_attention_config"],
+                engine_args_dict.get("diffusion_attention_config"),
+                attention_backend=attention_backend,
+                fastvideo_vsa_topk=fastvideo_vsa_topk,
             )
     else:
         resolve_worker_cls(engine_args_dict)
@@ -1283,7 +1293,7 @@ def build_legacy_engine_args_dict(
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
     """Implement engine-argument building for the legacy stage representation."""
-    engine_args_dict = _to_dict(stage_config.engine_args)
+    engine_args_dict = copy.deepcopy(_to_dict(stage_config.engine_args))
     # Legacy configs can materialize an omitted optional TP size as None.
     # Remove it from the detached adapter dict so the backend default applies
     # without mutating stage_config.engine_args.
@@ -1813,7 +1823,6 @@ def initialize_diffusion_stage(
     stage_cfg: Any,
     metadata: StageMetadata,
     stage_init_timeout: int,
-    batch_size: int = 1,
     use_inline: bool = False,
 ) -> Any:
     """Build a diffusion stage client.
@@ -1823,15 +1832,12 @@ def initialize_diffusion_stage(
         stage_cfg: Stage configuration.
         metadata: Extracted stage metadata.
         stage_init_timeout: Timeout in seconds for stage initialization handshake
-        batch_size: Client-side request batch width. Does not set scheduler
-            ``max_num_seqs``; pass ``--max-num-seqs`` or stage YAML for that.
-            Forwarded to ``StageDiffusionClient``.
         use_inline: If True, uses the inline diffusion client instead of subprocess.
     """
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
-    return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
+    return create_diffusion_client(model, od_config, metadata, stage_init_timeout, use_inline)
 
 
 def _stage_declares_cfg_pairs(model_config: Any) -> bool:

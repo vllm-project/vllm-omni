@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -177,6 +177,30 @@ def test_request_scoped_cache_dit_lifecycle_is_pipeline_opt_in():
     assert model_runner_module.adopt_request_scoped_cache_dit(request_scoped_pipeline, backend)
     assert model_runner_module.is_request_scoped_cache_dit_enabled(request_scoped_pipeline)
     assert events == [backend]
+
+
+def test_release_captured_graphs_clears_runners_and_delegates_to_the_pipeline():
+    """Both halves in one place, so a pipeline that keeps captures is collected
+    without the caller knowing which pipelines have one."""
+    released = []
+    runner = object.__new__(DiffusionModelRunner)
+    runner.graph_runners = {"decode": object()}
+    runner.pipeline = SimpleNamespace(release_captured_graphs=lambda: released.append(True))
+
+    runner.release_captured_graphs()
+
+    assert runner.graph_runners == {}
+    assert released == [True]
+
+
+def test_release_captured_graphs_tolerates_a_pipeline_without_captures():
+    """Most pipelines keep none, and the runner may not carry `graph_runners`."""
+    runner = object.__new__(DiffusionModelRunner)
+    runner.pipeline = object()
+
+    runner.release_captured_graphs()
+
+    assert not hasattr(runner, "graph_runners")
 
 
 def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summary: bool = True):
@@ -533,7 +557,14 @@ def test_profile_run_executes_forward_without_scheduler_kv_validation(monkeypatc
         return original_execute(*args, **kwargs)
 
     runner._execute_request_list = execute
-    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    forward_context_calls = []
+
+    @contextmanager
+    def record_forward_context(*args, **kwargs):
+        forward_context_calls.append((args, kwargs))
+        yield
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", record_forward_context)
     reset_peak_memory_stats = Mock()
     monkeypatch.setattr(
         model_runner_module.current_omni_platform,
@@ -549,6 +580,8 @@ def test_profile_run_executes_forward_without_scheduler_kv_validation(monkeypatc
 
     assert runner.pipeline.forward_calls == 1
     assert record_names == ["pipeline_memory_profile"]
+    assert len(forward_context_calls) == 1
+    assert forward_context_calls[0][1]["in_diffusion_kv_memory_profile"] is True
     runner._validate_diffusion_kv_metadata.assert_not_called()
     reset_peak_memory_stats.assert_not_called()
     synchronize.assert_called_once_with()
@@ -575,7 +608,14 @@ def test_profile_run_executes_maximum_step_batch_without_resetting_peak(monkeypa
 
     runner.pipeline.denoise_step = denoise_step
     runner._validate_diffusion_kv_metadata = Mock(side_effect=AssertionError("profile must bypass admission"))
-    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    forward_context_calls = []
+
+    @contextmanager
+    def record_forward_context(*args, **kwargs):
+        forward_context_calls.append((args, kwargs))
+        yield
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", record_forward_context)
     reset_peak_memory_stats = Mock()
     monkeypatch.setattr(
         model_runner_module.current_omni_platform,
@@ -592,6 +632,8 @@ def test_profile_run_executes_maximum_step_batch_without_resetting_peak(monkeypa
     assert observed_batch_rows == [(2, 2)]
     assert runner.state_cache == {}
     assert runner.input_batch is None
+    assert len(forward_context_calls) == 1
+    assert forward_context_calls[0][1]["in_diffusion_kv_memory_profile"] is True
     runner._validate_diffusion_kv_metadata.assert_not_called()
     reset_peak_memory_stats.assert_not_called()
     synchronize.assert_called_once_with()

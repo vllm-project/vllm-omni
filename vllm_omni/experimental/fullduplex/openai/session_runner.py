@@ -1261,6 +1261,7 @@ class DuplexSessionRunnerMixin:
                                 session.truncate_history_item(
                                     item_id,
                                     audio_end_ms=int(audio_end_ms) if isinstance(audio_end_ms, int | float) else 0,
+                                    hard=True,
                                 )
                                 if isinstance(item_id, str)
                                 else False

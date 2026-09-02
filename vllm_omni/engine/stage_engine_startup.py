@@ -1546,7 +1546,6 @@ def launch_diffusion_stage_replica(
     stage_config: Any,
     metadata: Any,
     stage_init_timeout: int,
-    batch_size: int,
     use_inline: bool,
     replica_id: int = 0,
     omni_master_server: OmniMasterServer | None = None,
@@ -1565,7 +1564,6 @@ def launch_diffusion_stage_replica(
             stage_config,
             metadata,
             stage_init_timeout=stage_init_timeout,
-            batch_size=batch_size,
             use_inline=use_inline,
         )
         return client, StageReplicaResources()
@@ -1624,7 +1622,6 @@ def launch_diffusion_stage_replica(
             request_address=proc_manager.addresses.inputs[0],
             response_address=proc_manager.addresses.outputs[0],
             proc_manager=proc_manager,
-            batch_size=batch_size,
         )
         return client, StageReplicaResources(
             manager=proc_manager,

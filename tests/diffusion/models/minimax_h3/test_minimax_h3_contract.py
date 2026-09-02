@@ -496,13 +496,16 @@ def test_joint_postprocess_is_multiprocessing_picklable():
 
     postprocess = get_minimax_h3_post_process_func(SimpleNamespace())
     postprocess = ForkingPickler.loads(ForkingPickler.dumps(postprocess))
-    video = torch.linspace(0, 1, 2 * 3 * 2 * 4 * 5).reshape(2, 3, 2, 4, 5)
+    # decode() hands over quantised frames already laid out as (B, T, H, W, C).
+    video = torch.arange(2 * 2 * 4 * 5 * 3, dtype=torch.uint8).reshape(2, 2, 4, 5, 3)
     audio = torch.arange(12, dtype=torch.float32).reshape(1, 2, 6)
 
     result = postprocess((video, audio), output_type="np")
 
     assert isinstance(result["video"], list)
+    assert result["video"][0].dtype == np.uint8
     assert result["video"][0].shape == (2, 4, 5, 3)
+    np.testing.assert_array_equal(result["video"][0], video[0].numpy())
     np.testing.assert_array_equal(result["audio"], audio.numpy())
     assert result["audio_sample_rate"] == 32000
     assert result["fps"] == 24
@@ -595,7 +598,7 @@ def test_base_schedule_overrides_the_uniform_sigma_positions():
 @pytest.mark.parametrize(
     "base_schedule",
     [
-        [0.9, 0.5, 0.0],
+        [1.5, 0.5, 0.0],
         [1.0, 0.5, 0.1],
         [1.0, 0.5, 0.5, 0.0],
         [1.0],

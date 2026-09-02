@@ -259,7 +259,11 @@ def test_h3_native_rejects_schedule_with_wrong_interval_count(tmp_path):
         ("", "must not be empty"),
         (",,", "must not be empty"),
         ("1.0,oops,0.15,0.0", "is malformed"),
-        ("0.9,0.7,0.4,0.15,0.0", "is malformed"),
+        # A capped opening rung below 1.0 is a legal DMD2 schedule, so the
+        # out-of-range cases are a first position above 1.0 and a tail that
+        # never reaches clean latents.
+        ("1.5,0.7,0.4,0.15,0.0", "is malformed"),
+        ("1.0,0.7,0.4,0.15", "is malformed"),
     ],
 )
 def test_h3_native_rejects_malformed_schedule_metadata(tmp_path, raw_schedule, message):

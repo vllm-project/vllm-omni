@@ -187,7 +187,9 @@ class OmniBase(PDDisaggregationMixin):
         # override the deploy YAML's ``async_chunk: true`` default.
         async_chunk = kwargs.get("async_chunk")
         output_modalities = kwargs.pop("output_modalities", None)
-        diffusion_batch_size: int = kwargs.pop("diffusion_batch_size", 1)
+
+        if "diffusion_batch_size" in kwargs:
+            raise TypeError("`diffusion_batch_size` has been removed in Omni/AsyncOmni. Use `max_num_seqs`.")
 
         if "log_requests" in kwargs:
             raise TypeError("`log_requests` has been removed in Omni/AsyncOmni. Use `log_stats`.")
@@ -213,7 +215,6 @@ class OmniBase(PDDisaggregationMixin):
             model=model,
             init_timeout=init_timeout,
             stage_init_timeout=stage_init_timeout,
-            diffusion_batch_size=diffusion_batch_size,
             transfer_emitter=self.transfer_metrics,
             prom_metrics=self.prom_metrics,
             log_stats=log_stats,

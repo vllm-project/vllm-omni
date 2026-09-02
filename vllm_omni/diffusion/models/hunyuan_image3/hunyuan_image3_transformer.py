@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import inspect
 import logging
@@ -1069,18 +1069,98 @@ class ImageKVCacheManager(nn.Module):
         )
         return key, value
 
-    def forward(
+    def clear_legacy_prompt_kv_cache(self) -> None:
+        """Drop model-owned dense KV state before Scheduler-paged execution."""
+
+        self.image_kv_cache_map = None
+        self.image_kv_cache_lens = None
+
+    def _forward_paged(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        *,
+        first_step: bool,
+        query_lens: list[int],
+        seq_lens: list[int],
+        shard_image_size: int | None,
+        full_attn_spans: list[list[tuple[int, int]]],
+        uncond_cfg_prefill: bool,
+    ) -> torch.Tensor:
+        """Run Hunyuan attention against Worker-managed Scheduler pages.
+
+        This model boundary is shared by GPU and NPU: it describes Hunyuan's
+        Q/K/V layout and mixed-attention spans, while the common Attention
+        layer resolves the actual CUDA or Ascend paged kernel.
+        """
+
+        if uncond_cfg_prefill:
+            raise RuntimeError("Hunyuan negative-CFG prefill must run before paged row activation")
+        if self._injected_ar_kv is not None:
+            raise NotImplementedError("Hunyuan Scheduler-paged KV does not support imported AR KV")
+        if not query_lens or len(seq_lens) != len(query_lens):
+            raise ValueError("Hunyuan Scheduler-paged KV requires matching query and sequence lengths")
+        if len(full_attn_spans) != len(query_lens):
+            raise ValueError("Hunyuan Scheduler-paged KV requires one full-attention span row per sequence")
+
+        self.clear_legacy_prompt_kv_cache()
+        bs = len(query_lens)
+        q_len = query_lens[0]
+        seq_len = seq_lens[0]
+        assert query.shape[0] == bs * q_len, f"{query.shape[0]} != {bs * q_len}"
+
+        head_num_per_rank = query.shape[1]
+        kv_head_num_per_rank = key.shape[1]
+        head_dim = query.shape[2]
+
+        query = query.reshape(bs, q_len, head_num_per_rank, head_dim)
+        key = key.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
+        value = value.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
+
+        joint_text_query = joint_text_key = joint_text_value = None
+        if self.sp_size > 1 and first_step:
+            if shard_image_size is None or shard_image_size <= 0:
+                raise ValueError("Hunyuan paged Ulysses requires a positive local image shard size")
+            local_prompt_len = seq_len - shard_image_size
+            joint_query_len = query.shape[1] - shard_image_size
+            if local_prompt_len != joint_query_len:
+                raise ValueError(
+                    "Hunyuan paged Ulysses prompt layout mismatch: "
+                    f"key_prompt={local_prompt_len}, query_prompt={joint_query_len}"
+                )
+            joint_text_query = query[:, :joint_query_len]
+            joint_text_key = key[:, :local_prompt_len]
+            joint_text_value = value[:, :local_prompt_len]
+            query = query[:, joint_query_len:]
+            key = key[:, local_prompt_len:]
+            value = value[:, local_prompt_len:]
+
+        if joint_text_query is None:
+            attn_metadata = AttentionMetadata(full_attn_spans=full_attn_spans)
+        else:
+            attn_metadata = AttentionMetadata(
+                joint_query=joint_text_query,
+                joint_key=joint_text_key,
+                joint_value=joint_text_value,
+                joint_strategy="front",
+                full_attn_spans=full_attn_spans,
+            )
+        attn_output = self.attn(query, key, value, attn_metadata)
+        return attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+
+    def _forward_dense_legacy(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        self.image_token_len = kwargs.get("num_image_tokens")
+        """Run the device-neutral, model-owned dense prompt-KV compatibility path."""
+
         first_step = kwargs.get("first_step")
         uncond_cfg_prefill = kwargs.get("uncond_cfg_prefill", False)
-
         query_lens = kwargs.get("query_lens")
         seq_lens = kwargs.get("seq_lens")
         shard_image_size = kwargs.get("shard_image_size") if self.sp_size > 1 else None
@@ -1109,8 +1189,7 @@ class ImageKVCacheManager(nn.Module):
                 key = key[:, :0, :, :]
                 value = value[:, :0, :, :]
         elif first_step:
-            self.image_kv_cache_map = None  # reset first
-            self.image_kv_cache_lens = None
+            self.clear_legacy_prompt_kv_cache()
             key, value = self._cache_prompt_kv(
                 key,
                 value,
@@ -1134,7 +1213,7 @@ class ImageKVCacheManager(nn.Module):
                 joint_text_query = query[:, :0, :, :]
                 joint_text_key, joint_text_value = self._reuse_prompt_kv(key, value, seq_len, bs, shard_image_size)
 
-        if not keep_kv_compressed and not self.attn.is_paged_kv_active():
+        if not keep_kv_compressed:
             key = repeat_kv(key, repeat_num)
             value = repeat_kv(value, repeat_num)
             if self.sp_size > 1:
@@ -1162,6 +1241,34 @@ class ImageKVCacheManager(nn.Module):
         attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
         return attn_output
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        self.image_token_len = kwargs.get("num_image_tokens")
+        if self.attn.is_paged_kv_active():
+            full_attn_spans = kwargs.get("full_attn_spans")
+            if full_attn_spans is None:
+                raise ValueError("Hunyuan Scheduler-paged KV requires full_attn_spans metadata")
+            return self._forward_paged(
+                query,
+                key,
+                value,
+                first_step=bool(kwargs.get("first_step")),
+                query_lens=kwargs.get("query_lens"),
+                seq_lens=kwargs.get("seq_lens"),
+                shard_image_size=kwargs.get("shard_image_size") if self.sp_size > 1 else None,
+                full_attn_spans=full_attn_spans,
+                uncond_cfg_prefill=kwargs.get("uncond_cfg_prefill", False),
+            )
+        if attention_mask is None:
+            raise ValueError("Hunyuan dense attention requires an attention mask")
+        return self._forward_dense_legacy(query, key, value, attention_mask, **kwargs)
 
 
 @dataclass
@@ -2706,7 +2813,6 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         # List[List[...]] per-sample metadata indexed along the CFG batch dim
         if isinstance(model_kwargs.get("full_attn_spans"), list):
             model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"][s.start : s.stop]
-
         # custom_pos_emb: tuple of (cos, sin)
         if "custom_pos_emb" in model_kwargs and model_kwargs["custom_pos_emb"] is not None:
             cos, sin = model_kwargs["custom_pos_emb"]

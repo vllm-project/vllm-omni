@@ -396,7 +396,7 @@ def _normalize_video_tensor(video_tensor: torch.Tensor) -> np.ndarray:
         # Cast to float32 first: bf16 (e.g. SANA-WM's refiner output) has no
         # numpy dtype, so ``.numpy()`` below raises on it.
         video_tensor = video_tensor.float().clamp(-1, 1) * 0.5 + 0.5
-    else:
+    elif video_tensor.dtype != torch.uint8:
         video_tensor = video_tensor.to(torch.float32) / 255.0
     video_array = video_tensor.numpy()
     return _normalize_single_video_array(video_array)
@@ -419,7 +419,7 @@ def _normalize_single_video_array(video_array: np.ndarray) -> np.ndarray:
     if np.issubdtype(video_array.dtype, np.floating):
         if video_array.size and (video_array.min() < 0.0 or video_array.max() > 1.0):
             video_array = np.clip(video_array, -1.0, 1.0) * 0.5 + 0.5
-    elif np.issubdtype(video_array.dtype, np.integer):
+    elif video_array.dtype != np.uint8 and np.issubdtype(video_array.dtype, np.integer):
         video_array = video_array.astype(np.float32) / 255.0
     return video_array
 
@@ -435,7 +435,7 @@ def _normalize_video_array(video_array: np.ndarray) -> list[np.ndarray] | np.nda
 
 
 def _normalize_frames(frames: list[Any]) -> list[np.ndarray]:
-    """Normalize a list of frames into numpy arrays with values in [0,1]."""
+    """Normalize a list of frames into numpy arrays, uint8 ones unchanged."""
     normalized: list[np.ndarray] = []
     for frame in frames:
         if isinstance(frame, torch.Tensor):
@@ -453,7 +453,7 @@ def _normalize_frames(frames: list[Any]) -> list[np.ndarray]:
         if np.issubdtype(frame_array.dtype, np.floating):
             if frame_array.size and (frame_array.min() < 0.0 or frame_array.max() > 1.0):
                 frame_array = np.clip(frame_array, -1.0, 1.0) * 0.5 + 0.5
-        elif np.issubdtype(frame_array.dtype, np.integer):
+        elif frame_array.dtype != np.uint8 and np.issubdtype(frame_array.dtype, np.integer):
             frame_array = frame_array.astype(np.float32) / 255.0
 
         normalized.append(frame_array)
@@ -461,7 +461,14 @@ def _normalize_frames(frames: list[Any]) -> list[np.ndarray]:
 
 
 def _coerce_video_to_frames(video: Any) -> list[np.ndarray]:
-    """Convert a video payload into a list of normalized float32 frames."""
+    """Convert a video payload into a list of normalized frames.
+
+    Frames are float32 in [0, 1], except uint8 ones, which pass through: the
+    muxer's own dtype is uint8, so normalising here would only pay for a
+    full-size conversion each way. The direct planar path additionally needs
+    contiguous channel planes and falls back for interleaved RGB whatever the
+    dtype; the standard muxer takes the uint8 frames as they are.
+    """
     if isinstance(video, torch.Tensor):
         video_array = _normalize_video_tensor(video)
         return list(video_array)
