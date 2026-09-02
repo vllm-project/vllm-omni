@@ -306,6 +306,44 @@ def test_ltx_t2a_audio_graph_bucket_appends_zero_padding():
     torch.testing.assert_close(audio_latents[:, 25:], torch.zeros(1, 24, 8))
 
 
+def test_ltx_t2a_audio_graph_bucket_uses_sp_padded_capture_shape():
+    pipe = object.__new__(LTXAudioRuntime)
+    torch.nn.Module.__init__(pipe)
+    pipe.device = torch.device("cpu")
+    pipe.audio_sampling_rate = 24
+    pipe.audio_hop_length = 1
+    pipe.audio_vae_temporal_compression_ratio = 1
+    pipe.audio_vae_mel_compression_ratio = 2
+    pipe.audio_vae = SimpleNamespace(config=SimpleNamespace(mel_bins=8, latent_channels=2))
+    pipe.pipeline_recipe = SimpleNamespace(num_frames=121, phases=(SimpleNamespace(noise_scale=1.0),))
+    pipe._audio_cuda_graph_config = SimpleNamespace(audio_length_buckets=(2.0,))
+    pipe.od_config = SimpleNamespace(parallel_config=SimpleNamespace(sequence_parallel_size=2))
+    logical = torch.ones(1, 25, 8)
+    initially_padded = torch.cat([logical, torch.zeros(1, 1, 8)], dim=1)
+    pipe.prepare_audio_latents = lambda *_args, **_kwargs: (initially_padded.clone(), 25, 26)
+    inputs = SimpleNamespace(
+        num_frames=25,
+        frame_rate=24.0,
+        num_videos_per_prompt=1,
+        generator=None,
+        audio_latents=None,
+    )
+    prompt_context = SimpleNamespace(
+        batch_size=1,
+        positive_connector_audio_prompt_embeds=torch.zeros(1, 1, 1),
+    )
+
+    audio_latents, original, padded, _latent_mel_bins = pipe._prepare_audio_state(inputs, prompt_context)
+
+    # A two-second bucket resolves to 49 logical latent frames.  SP=2 must
+    # normalize both dummy warmup and real requests to the same 50-token graph.
+    assert original == 25
+    assert padded == 50
+    assert padded % 2 == 0
+    torch.testing.assert_close(audio_latents[:, :25], logical)
+    torch.testing.assert_close(audio_latents[:, 25:], torch.zeros(1, 25, 8))
+
+
 def test_ltx_t2a_rejects_latent_budget_before_allocation():
     pipe = object.__new__(LTXAudioRuntime)
     torch.nn.Module.__init__(pipe)
@@ -346,6 +384,24 @@ def test_ltx_t2a_rejects_bucket_latent_budget_before_allocation():
     pipe.pipeline_recipe = SimpleNamespace(num_frames=121, phases=(SimpleNamespace(noise_scale=1.0),))
     pipe._audio_cuda_graph_config = SimpleNamespace(audio_length_buckets=(2.0,))
     pipe._audio_resource_limits = LTX2AudioResourceLimits(max_latent_frames=150)
+    pipe.prepare_audio_latents = lambda *_args, **_kwargs: pytest.fail("latent allocation must not run")
+    inputs = SimpleNamespace(num_frames=25, frame_rate=24.0)
+    prompt_context = SimpleNamespace(batch_size=1)
+
+    with pytest.raises(ValueError, match="latent frames"):
+        pipe._prepare_audio_state(inputs, prompt_context)
+
+
+def test_ltx_t2a_rejects_sp_padded_bucket_budget_before_allocation():
+    pipe = object.__new__(LTXAudioRuntime)
+    torch.nn.Module.__init__(pipe)
+    pipe.audio_sampling_rate = 24
+    pipe.audio_hop_length = 1
+    pipe.audio_vae_temporal_compression_ratio = 1
+    pipe.pipeline_recipe = SimpleNamespace(num_frames=121, phases=(SimpleNamespace(noise_scale=1.0),))
+    pipe._audio_cuda_graph_config = SimpleNamespace(audio_length_buckets=(2.0,))
+    pipe._audio_resource_limits = LTX2AudioResourceLimits(max_latent_frames=49)
+    pipe.od_config = SimpleNamespace(parallel_config=SimpleNamespace(sequence_parallel_size=2))
     pipe.prepare_audio_latents = lambda *_args, **_kwargs: pytest.fail("latent allocation must not run")
     inputs = SimpleNamespace(num_frames=25, frame_rate=24.0)
     prompt_context = SimpleNamespace(batch_size=1)

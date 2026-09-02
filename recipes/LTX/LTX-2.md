@@ -326,6 +326,24 @@ bundled offline CLI do not currently expose `sigmas`.
 
 ### Constraints
 
+- LTX text-to-audio can enable runtime-owned CUDA Graph replay independently
+  of compiler-managed graphing:
+
+  ```yaml
+  additional_config:
+    ltx2_audio_cuda_graph:
+      enabled: true
+      max_entries: 4
+      audio_length_buckets: [5.0, 10.0, 20.0]
+  ```
+
+  The path requires CUDA and BF16. TP and strict pure-Ulysses SP are supported;
+  CPU/layerwise offload, quantization, dynamic LoRA, advanced UAA, Ring SP, and
+  Cache-DiT are rejected while it is enabled. Captures are created lazily per
+  structural signature over the eager Transformer; regional/compiler-managed
+  Transformer graphing is bypassed while the runtime-owned graph is enabled.
+  Captures are released through the model runner during level-2 sleep, shutdown,
+  or pipeline replacement.
 - Text-to-audio uses the recipe clock rate of 24 FPS. Requests that override
   `frame_rate` are rejected. Effective duration is limited to 20.1 seconds and the
   causal-aligned allocation to 512 audio latent frames by default, before any
@@ -339,7 +357,9 @@ bundled offline CLI do not currently expose `sigmas`.
   ```
 
   CUDA Graph `audio_length_buckets` are checked against the same limits, including
-  dummy warmup. In the OpenAI audio endpoint, `audio_length` is the LTX duration;
+  dummy warmup, and are rounded up to the active sequence-parallel degree so
+  warmup and real requests use the same graph shape. In the OpenAI audio endpoint,
+  `audio_length` is the LTX duration;
   `audio_start`/`audio_end_in_s` remain compatibility fields for other audio
   pipelines and do not offset an LTX generation.
 - LTX rejects non-default `timesteps`, `flow_shift`, `guidance_rescale`,

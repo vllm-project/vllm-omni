@@ -21,7 +21,6 @@ from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
-from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
@@ -349,32 +348,23 @@ class LTXAudioRuntime(
         if errors:
             raise ValueError("LTX2 audio CUDA Graph configuration is unsupported: " + "; ".join(errors))
 
-    def setup_audio_cuda_graph_compile(self) -> None:
-        """Compile the audio Transformer without compiler-managed graphing."""
+    def setup_audio_cuda_graph_runtime(self) -> None:
+        """Keep the manual graph runner bound to the eager Transformer.
+
+        Regional ``torch.compile`` and the runtime-owned whole-Transformer
+        CUDA Graph are each valid independently, but nesting the compiled
+        blocks inside the manual capture produces run-to-run numerical drift
+        on real LTX-2.5 text-to-audio workloads.  The manual graph already
+        removes Python and launch overhead across the complete Transformer, so
+        prefer the stable eager module as its capture target.
+        """
         runner = self.audio_graph_runner
         if runner is None:
             return
-
-        try:
-            self.transformer = regionally_compile(
-                self.transformer,
-                dynamic=self.od_config.diffusion_compile_dynamic,
-                options={
-                    "triton.cudagraphs": False,
-                    "triton.cudagraph_trees": False,
-                },
-            )
-            runner.transformer = self.transformer
-        except Exception as exc:
-            logger.warning(
-                "LTX2 audio regional compilation for manual CUDA Graph failed (%s); "
-                "continuing with the eager Transformer inside the manual graph.",
-                exc,
-            )
-
+        runner.transformer = self.transformer
         logger.info(
-            "LTX2 audio Runtime-owned CUDA Graph replay enabled (max_entries=%d); "
-            "compiler-managed Transformer graphing is bypassed.",
+            "LTX2 audio runtime-owned CUDA Graph replay enabled (max_entries=%d); "
+            "regional and compiler-managed Transformer graphing are bypassed.",
             self._audio_cuda_graph_config.max_entries,
         )
 
@@ -558,6 +548,12 @@ class LTXAudioRuntime(
             if not math.isfinite(bucket_audio_frames_float):
                 raise ValueError("LTX text-to-audio bucket latent frame count must be finite.")
             bucket_audio_frames = round(bucket_audio_frames_float)
+            # Keep configured buckets on the same structural shape used by
+            # ``prepare_audio_latents``.  Without this normalization, dummy
+            # warmup captures the SP-padded bucket while a shorter real
+            # request is padded back to the raw (possibly non-divisible)
+            # bucket, so it misses the warmed graph and may not shard evenly.
+            bucket_audio_frames = latent_ops.get_sp_padded_audio_latent_length(bucket_audio_frames, sp_size)
             limits.validate_latent_frames(bucket_audio_frames)
             bucket_audio_frames_list.append(bucket_audio_frames)
         num_mel_bins = self.audio_vae.config.mel_bins

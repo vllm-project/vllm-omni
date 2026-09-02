@@ -8,7 +8,6 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-import vllm_omni.diffusion.models.ltx2.ltx2_audio_runtime as ltx2_audio_runtime_module
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
@@ -159,51 +158,16 @@ def _make_ltx2_graph_pipeline(**overrides):
     )
 
 
-def test_ltx2_audio_graph_keeps_regional_compile_without_compiler_graphs(monkeypatch):
+def test_ltx2_audio_graph_keeps_eager_transformer_as_capture_target(caplog):
     pipeline = _make_ltx2_graph_pipeline(enforce_eager=False)
     original = pipeline.transformer
-    compiled = object()
-    compile_calls = []
+    pipeline.audio_graph_runner.transformer = object()
 
-    monkeypatch.setattr(
-        ltx2_audio_runtime_module,
-        "regionally_compile",
-        lambda transformer, **kwargs: compile_calls.append((transformer, kwargs)) or compiled,
-    )
-    LTXAudioRuntime.setup_audio_cuda_graph_compile(pipeline)
-
-    assert compile_calls == [
-        (
-            original,
-            {
-                "dynamic": True,
-                "options": {
-                    "triton.cudagraphs": False,
-                    "triton.cudagraph_trees": False,
-                },
-            },
-        )
-    ]
-    assert pipeline.transformer is compiled
-    assert pipeline.audio_graph_runner.transformer is compiled
-
-
-def test_ltx2_audio_graph_compile_failure_keeps_runner(monkeypatch, caplog):
-    pipeline = _make_ltx2_graph_pipeline(enforce_eager=False)
-    original = pipeline.transformer
-    runner = pipeline.audio_graph_runner
-    runner.transformer = original
-    monkeypatch.setattr(
-        ltx2_audio_runtime_module,
-        "regionally_compile",
-        Mock(side_effect=RuntimeError("compile failed")),
-    )
-
-    LTXAudioRuntime.setup_audio_cuda_graph_compile(pipeline)
+    LTXAudioRuntime.setup_audio_cuda_graph_runtime(pipeline)
 
     assert pipeline.transformer is original
-    assert runner.transformer is original
-    assert "continuing with the eager Transformer" in caplog.text
+    assert pipeline.audio_graph_runner.transformer is original
+    assert "regional and compiler-managed Transformer graphing are bypassed" in caplog.text
 
 
 def test_ltx2_audio_graph_release_is_model_local_and_keeps_runner():
