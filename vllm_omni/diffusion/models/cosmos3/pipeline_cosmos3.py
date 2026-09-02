@@ -2223,7 +2223,7 @@ class Cosmos3OmniDiffusersPipeline(
         if prompt_suffix:
             prompt = f"{prompt.rstrip()} {prompt_suffix.lstrip()}".strip()
         if _is_rank_zero():
-            logger.info("Final prompt: '%s'", prompt)
+            logger.debug("Final prompt: '%s'", prompt)
 
         if negative_metadata_mode == "none":
             negative_dur_tmpl = None

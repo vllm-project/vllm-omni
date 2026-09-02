@@ -786,9 +786,8 @@ class DiffusionWorker:
         usage_before = allocator.get_current_usage()
 
         if level == 2 and self.model_runner is not None:
-            if hasattr(self.model_runner, "graph_runners"):
-                self.model_runner.graph_runners.clear()
-                logger.info(f"[Worker {self.rank}] CUDA Graphs cleared.")
+            self.model_runner.release_captured_graphs()
+            logger.info(f"[Worker {self.rank}] CUDA Graphs cleared.")
             model = self.model_runner.pipeline
             self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
 

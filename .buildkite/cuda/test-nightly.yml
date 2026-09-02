@@ -17,7 +17,7 @@ steps:
     steps:
 
       - label: ":full_moon: Omni · Function Test with H100 · Single-GPU"
-        timeout_in_minutes: 90
+        timeout_in_minutes: 120
         commands:
           - pytest -sv tests/e2e --run-level "full_model" -m "full_model and H100 and B200 and omni and cards_1" --ignore=tests/e2e/accuracy --ignore=tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py
 
@@ -32,11 +32,11 @@ steps:
           - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py -m "full_model and cuda and H100 and omni and cards_1" --run-level "full_model"
         mirror_hardwares: h100_1
 
-      - label: ":full_moon: Omni · Doc Test with L4"
+      - label: ":full_moon: Omni · Doc Test with L4 · 4-GPU"
         timeout_in_minutes: 90
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          - pytest -s -v tests/examples/ -m "full_model and omni and L4" --run-level "full_model"
+          - pytest -s -v tests/examples/ -m "full_model and omni and L4 and cards_4" --run-level "full_model"
         mirror_hardwares: l4_4
 
       - label: ":full_moon: Omni · Doc Test with H100 · 2-GPU"
@@ -180,7 +180,7 @@ steps:
       build.pull_request.labels includes "nightly-test"
     steps:
 
-      - label: ":full_moon: Tiny Model Tests · Diffusion (Multi-GPU accelerations)"
+      - label: ":full_moon: Tiny Model Tests · Diffusion (Multi-GPU accelerations) · 2-GPU"
         timeout_in_minutes: 30
         # NOTE: Single-GPU (core_model) tiny model tests run on the ready label,
         # so nightly only adds the multi-GPU parallelism configurations.
@@ -190,7 +190,14 @@ steps:
         # for the CI, since these tests should pass irrespective of whether or not we use
         # the full weights or not.
         commands:
-          - timeout 25m pytest -sv tests/model_tests/diffusion -m 'full_model and cuda' --run-level "core_model"
+          - pytest -sv tests/model_tests/diffusion -m 'full_model and cuda and cards_2' --run-level "core_model"
+        mirror_hardwares: l4_2
+
+      - label: ":full_moon: Tiny Model Tests · Diffusion (Multi-GPU accelerations) · 4-GPU"
+        timeout_in_minutes: 30
+        # CFG+TP extra_test_groups request 2×2=4 devices (see get_required_device_count).
+        commands:
+          - pytest -sv tests/model_tests/diffusion -m 'full_model and cuda and cards_4' --run-level "core_model"
         mirror_hardwares: l4_4
 
   - group: ":card_index_dividers: Diffusion X2I(&A&T) Model Test"
@@ -222,10 +229,10 @@ steps:
             --run-level "full_model"
         mirror_hardwares: h100_2
 
-      - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with L4 · Multi-GPU"
+      - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with L4 · 4-GPU"
         timeout_in_minutes: 120
         commands:
-          - pytest -sv tests/e2e/ -k "not test_wan and not hunyuan" -m "full_model and diffusion and L4 and not cards_1" --run-level "full_model" --ignore=tests/e2e/accuracy
+          - pytest -sv tests/e2e/ -k "not test_wan and not hunyuan" -m "full_model and diffusion and L4 and cards_4" --run-level "full_model" --ignore=tests/e2e/accuracy
         mirror_hardwares: l4_4
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Doc Test"
@@ -429,10 +436,22 @@ steps:
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     steps:
-      - label: ":full_moon: Diffusion · Distributed Test with L4"
+      - label: ":full_moon: Diffusion · Distributed Test with L4 · 2-GPU"
         timeout_in_minutes: 60
         commands:
-          - pytest -sv tests/diffusion/distributed/ -m 'full_model and cuda and L4' --run-level "full_model"
+          - pytest -sv tests/diffusion/distributed/ -m 'full_model and cuda and L4 and cards_2' --run-level "full_model"
+        mirror_hardwares: l4_2
+
+      - label: ":full_moon: Diffusion · Distributed Test with L4 · 3-GPU"
+        timeout_in_minutes: 60
+        commands:
+          - pytest -sv tests/diffusion/distributed/ -m 'full_model and cuda and L4 and cards_3' --run-level "full_model"
+        mirror_hardwares: l4_3
+
+      - label: ":full_moon: Diffusion · Distributed Test with L4 · 4-GPU"
+        timeout_in_minutes: 60
+        commands:
+          - pytest -sv tests/diffusion/distributed/ -m 'full_model and cuda and L4 and cards_4' --run-level "full_model"
         mirror_hardwares: l4_4
 
       - label: ":full_moon: Diffusion · Distributed Test with H100 · 2-GPU"

@@ -223,12 +223,26 @@ class TestPipelineArgumentsHandling:
 
     @pytest.mark.parametrize(
         "feature_id",
-        ["cfg_parallel", "ulysses", "ring", "teacache", "cache_dit", "enforce_eager", "unsupported_quantization"],
+        [
+            "cfg_parallel",
+            "tensor_parallel",
+            "ulysses",
+            "ring",
+            "teacache",
+            "cache_dit",
+            "enforce_eager",
+            "unsupported_quantization",
+        ],
     )
     def test_adapter_guard_unsupported_feature(self, feature_id):
         if feature_id == "cfg_parallel":
             od_config = _make_od_config(
                 parallel_config=DiffusionParallelConfig(cfg_parallel_size=2, sequence_parallel_size=1),
+                cache_backend="none",
+            )
+        elif feature_id == "tensor_parallel":
+            od_config = _make_od_config(
+                parallel_config=DiffusionParallelConfig(tensor_parallel_size=2, sequence_parallel_size=1),
                 cache_backend="none",
             )
         elif feature_id == "ulysses":

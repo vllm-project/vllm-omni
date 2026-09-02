@@ -16,6 +16,7 @@ Easy, fast, and cheap omni-modality model serving for everyone
 
 *Latest News* 🔥
 
+- [2026/08] We released [0.28.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.28.0), featuring production-ready [MiniMax H3](recipes/MiniMaxAI/MiniMax-H3.md) serving on GPU and NPU, a unified AR/DiT paged KV cache runtime, and enhanced realtime full-duplex serving for the [MiniCPM-o series](recipes/OpenBMB/MiniCPM-o-4_5.md).
 - [2026/08] [VeRL-Omni](https://github.com/verl-project/verl-omni) `v0.2.0` is released: faster diffusion RL powered by vLLM-Omni (request-level/step-wise batching with FA3), rebuilt Qwen3-Omni multimodal training (DPO & GSPO), plus LTX-2.3, Qwen-Image-Edit support and more. See the [release notes](https://github.com/verl-project/verl-omni/releases/tag/v0.2.0).
 - [2026/08] We released [0.26.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.26.0) - aligned with the vLLM 0.26 release line, featuring [MiniMax H3](recipes/MiniMaxAI/MiniMax-H3.md) joint video/audio generation, an experimental full-duplex realtime runtime for [MiniCPM-o 4.5](recipes/OpenBMB/MiniCPM-o-4_5.md), distributed layerwise diffusion offload, and broader model, hardware, streaming, TTS, and quantization support.
 - [2026/07] We released [0.24.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.24.0) - aligned with the vLLM 0.24 release line, expanding production-ready coverage across TTS, speech, diffusion, image/video generation, and robot-policy serving, with major Omni stage runtime refactoring, diffusion request-level batching, async output materialization, quantization/cache/memory improvements, and broad CUDA/ROCm/XPU/NPU support.
@@ -57,9 +58,9 @@ vLLM-Omni is flexible and easy to use with:
 vLLM-Omni seamlessly supports most popular open-source models on HuggingFace, including:
 
 - **Omni-modality models** (e.g. Qwen3-Omni, MiniCPM-o 4.5, Cosmos3, HunyuanImage, BAGEL)
-- **TTS models** (e.g. Qwen3-TTS, VoxCPM2, Ming-Omni-TTS, CosyVoice3)
-- **Diffusion models** — image, video, and audio generation (e.g. MiniMax H3, Qwen-Image, Wan2.2, FLUX)
-- **Robot-policy and action models** (e.g. GR00T-N1.7, DreamZero-DROID, InternVLA-A1, Cosmos3 action policy)
+- **TTS models** (e.g. Qwen3-TTS, IndexTTS 2.5, dots.tts, CosyVoice3)
+- **Diffusion models** — image, video, and audio generation (e.g. MiniMax H3, LTX-2.5, SANA-Video, Wan2.2)
+- **Robot-policy and action models** (e.g. π0, GR00T-N1.7, DreamZero-DROID, InternVLA-A1)
 
 ## Getting Started
 
@@ -67,6 +68,7 @@ Visit our [documentation](https://vllm-omni.readthedocs.io/en/latest/) to learn 
 
 - [Installation](https://vllm-omni.readthedocs.io/en/latest/getting_started/installation/)
 - [Quickstart](https://vllm-omni.readthedocs.io/en/latest/getting_started/quickstart/)
+- [Nightly CUDA Docker images](https://hub.docker.com/r/vllm/vllm-omni/tags?name=nightly) built from the latest `main`
 - [List of Supported Models](https://vllm-omni.readthedocs.io/en/latest/models/supported_models/)
 - [Deployment Recipes](https://recipes.vllm.ai) for vLLM-Omni model serving
 
