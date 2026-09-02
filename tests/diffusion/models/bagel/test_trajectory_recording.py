@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for BAGEL trajectory recording in the denoising loop."""
 
-import types
 from dataclasses import dataclass
 
 import pytest
 import torch
-from pytest_mock import MockerFixture
+from torch import nn
 
 from vllm_omni.diffusion.models.bagel.bagel_transformer import (
     Bagel,
@@ -24,25 +23,17 @@ NUM_TIMESTEPS = 5
 EXPECTED_STEPS = NUM_TIMESTEPS - 1
 
 
-def _make_mock_bagel(mocker: MockerFixture):
-    """Create a mock Bagel with forward returning constant velocity."""
-    mock = mocker.MagicMock(spec=Bagel)
-    mock._sp_size = 1
-    # MagicMock would otherwise auto-return a truthy stub for this flag; pin it
-    # to the official BAGEL schedule convention (num_timesteps points).
-    mock._denoise_schedule_extra_step = False
+class _StubBagel(Bagel):
+    """CPU stand-in: stub ``forward``, inherit the rest of ``generate_image``."""
 
-    # forward returns a small constant velocity so x_t changes each step
-    def fake_forward(self, x_t, **kwargs):
-        return torch.ones_like(x_t) * 0.1
+    def __init__(self) -> None:
+        # Skip Bagel.__init__ (LLM/VAE). parallel_config=None => _sp_size == 1.
+        nn.Module.__init__(self)
+        self.parallel_config = None
 
-    mock.forward = types.MethodType(fake_forward, mock)
-    # _merge_naive_caches is called in the batched CFG path
-    mock._merge_naive_caches = types.MethodType(lambda self, caches: NaiveCache(1), mock)
-
-    # Bind the real generate_image to our mock
-    mock.generate_image = types.MethodType(Bagel.generate_image, mock)
-    return mock
+    def forward(self, x_t, **kwargs):
+        v = torch.ones_like(x_t) * 0.1
+        return [v] * len(kwargs["cfg_branch_pids"])
 
 
 def _make_generate_args(num_tokens=NUM_TOKENS, hidden_dim=HIDDEN_DIM, cfg=False):
@@ -79,9 +70,8 @@ def _make_generate_args(num_tokens=NUM_TOKENS, hidden_dim=HIDDEN_DIM, cfg=False)
 def bagel_and_args(
     request,
     monkeypatch: pytest.MonkeyPatch,
-    mocker: MockerFixture,
 ):
-    """Mock Bagel instance and generate_image arguments.
+    """Stub Bagel instance and generate_image arguments.
 
     Parametrized over CFG mode so every test runs on both the no-CFG
     and batched-CFG code paths.
@@ -91,7 +81,7 @@ def bagel_and_args(
         "vllm_omni.diffusion.models.bagel.bagel_transformer.get_classifier_free_guidance_world_size",
         lambda: 1,
     )
-    yield _make_mock_bagel(mocker), _make_generate_args(cfg=cfg)
+    yield _StubBagel(), _make_generate_args(cfg=cfg)
 
 
 class TestTrajectoryRecording:
@@ -242,13 +232,12 @@ class TestTrajectoryLogProbs:
     def bagel_scheduler_args(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        mocker: MockerFixture,
     ):
         monkeypatch.setattr(
             "vllm_omni.diffusion.models.bagel.bagel_transformer.get_classifier_free_guidance_world_size",
             lambda: 1,
         )
-        yield _make_mock_bagel(mocker), _make_generate_args(), _MockScheduler()
+        yield _StubBagel(), _make_generate_args(), _MockScheduler()
 
     def test_log_probs_recorded_with_scheduler(self, bagel_scheduler_args):
         bagel, args, scheduler = bagel_scheduler_args

@@ -308,69 +308,101 @@ def extract_bagel_context(
     packed_vae_position_ids: torch.LongTensor,
     packed_text_ids: torch.LongTensor,
     packed_text_indexes: torch.LongTensor,
-    packed_position_ids: torch.LongTensor,
     packed_seqlens: torch.IntTensor,
-    past_key_values: Any,
+    cfg_branch_pids: list[torch.Tensor],
+    cfg_branch_caches: list[Any],
     **kwargs: Any,
 ) -> CacheContext:
+    """Extract cache context for Bagel's packed / single-branch ``forward``.
+
+    Mirrors ``Bagel.forward`` so TeaCache residuals match the packed query
+    sequence (including CFG packing). ``postprocess`` returns a list of
+    per-branch velocities, matching ``Bagel.forward``.
     """
-    Extract cache context for Bagel model.
+    from vllm_omni.diffusion.models.bagel.bagel_transformer import NaiveCache
 
-    Args:
-        module: Bagel instance
-        x_t: Latent image input
-        timestep: Current timestep
-        packed_vae_token_indexes: Indexes for VAE tokens in packed sequence
-        packed_vae_position_ids: Position IDs for VAE tokens
-        packed_text_ids: Text token IDs
-        packed_text_indexes: Indexes for text tokens in packed sequence
-        packed_position_ids: Global position IDs
-        packed_seqlens: Sequence lengths
-        past_key_values: KV cache
-        **kwargs: Additional keyword arguments
-
-    Returns:
-        CacheContext with all information needed for generic caching
-    """
-
-    # 1. Embed text
-    packed_text_embedding = module.language_model.model.embed_tokens(packed_text_ids)
-    packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), module.hidden_size))
-    packed_sequence[packed_text_indexes] = packed_text_embedding
-
-    # 2. Embed timestep
     if not isinstance(timestep, torch.Tensor):
         timestep = torch.tensor([timestep], device=x_t.device)
     if timestep.dim() == 0:
         timestep = timestep.unsqueeze(0)
 
-    # 3. Embed image (x_t)
+    num_branches = len(cfg_branch_pids)
+    packing = num_branches > 1
+    use_sp = getattr(module, "_sp_size", 1) > 1
+    branch_position_ids = cfg_branch_pids[0]
+    vae_per_branch = packed_vae_token_indexes.shape[0]
+
+    if use_sp:
+        if packing:
+            raise ValueError(
+                "Packed CFG + sequence parallel is not supported. "
+                "Run SP+CFG as sequential single-branch forwards (len(cfg_branch_pids)==1)."
+            )
+        (
+            x_t,
+            packed_vae_position_ids,
+            packed_vae_token_indexes,
+            packed_text_indexes,
+            packed_seqlens,
+            branch_position_ids,
+            timestep,
+        ) = module._split_vae_for_sp(
+            x_t,
+            packed_vae_position_ids,
+            packed_vae_token_indexes,
+            packed_text_indexes,
+            packed_seqlens,
+            branch_position_ids,
+            timestep,
+        )
+
+    packed_text_embedding = module.language_model.forward(
+        packed_text_ids=packed_text_ids,
+        return_embeddings_only=True,
+    ).packed_query_sequence
+    packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), module.hidden_size))
+    packed_sequence[packed_text_indexes] = packed_text_embedding
+
     packed_pos_embed = module.latent_pos_embed(packed_vae_position_ids)
     packed_timestep_embeds = module.time_embedder(timestep)
-
     x_t_emb = module.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed
     if x_t_emb.dtype != packed_sequence.dtype:
         x_t_emb = x_t_emb.to(packed_sequence.dtype)
-
     packed_sequence[packed_vae_token_indexes] = x_t_emb
 
-    # Use the full packed sequence as modulated input to match hidden_states size
-    modulated_input = packed_sequence
+    extra_inputs = {}
+    if module.use_moe:
+        extra_inputs = {
+            "mode": "gen",
+            "packed_vae_token_indexes": packed_vae_token_indexes,
+            "packed_text_indexes": packed_text_indexes,
+        }
+
+    if packing:
+        seq_len = int(packed_seqlens.sum())
+        packed_query_sequence = packed_sequence.repeat(num_branches, 1)
+        vae_indexes = torch.cat([packed_vae_token_indexes + i * seq_len for i in range(num_branches)])
+        query_position_ids = torch.cat(cfg_branch_pids, dim=1 if cfg_branch_pids[0].ndim == 2 else 0)
+        query_lens = packed_seqlens.repeat(num_branches)
+        cache = NaiveCache.merge(cfg_branch_caches)
+        if module.use_moe:
+            extra_inputs["packed_vae_token_indexes"] = vae_indexes
+            extra_inputs["packed_text_indexes"] = torch.cat(
+                [packed_text_indexes + i * seq_len for i in range(num_branches)]
+            )
+    else:
+        packed_query_sequence = packed_sequence
+        query_lens = packed_seqlens
+        query_position_ids = branch_position_ids
+        cache = cfg_branch_caches[0]
+        vae_indexes = packed_vae_token_indexes
 
     def run_transformer_blocks():
-        extra_inputs = {}
-        if module.use_moe:
-            extra_inputs = {
-                "mode": "gen",
-                "packed_vae_token_indexes": packed_vae_token_indexes,
-                "packed_text_indexes": packed_text_indexes,
-            }
-
         output = module.language_model.forward(
-            packed_query_sequence=packed_sequence,
-            query_lens=packed_seqlens,
-            packed_query_position_ids=packed_position_ids,
-            past_key_values=past_key_values,
+            packed_query_sequence=packed_query_sequence,
+            query_lens=query_lens,
+            packed_query_position_ids=query_position_ids,
+            past_key_values=cache,
             update_past_key_values=False,
             is_causal=False,
             **extra_inputs,
@@ -378,15 +410,18 @@ def extract_bagel_context(
         return (output.packed_query_sequence,)
 
     def postprocess(h):
-        v_t = module.llm2vae(h)
-        v_t = v_t[packed_vae_token_indexes]
-        return v_t
+        v_t = module.llm2vae(h)[vae_indexes]
+        if packing:
+            return list(v_t.split(vae_per_branch))
+        if use_sp:
+            v_t = module._gather_vae_for_sp(v_t)
+        return [v_t]
 
     return CacheContext(
-        modulated_input=modulated_input,
-        hidden_states=packed_sequence,  # Use full packed sequence
+        modulated_input=packed_query_sequence,
+        hidden_states=packed_query_sequence,
         encoder_hidden_states=None,
-        temb=packed_timestep_embeds,  # Approximate
+        temb=packed_timestep_embeds,
         run_transformer_blocks=run_transformer_blocks,
         postprocess=postprocess,
     )

@@ -1,6 +1,7 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates.
 # Copyright (c) 2024 The Qwen Team and The HuggingFace Inc. team.
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # This file has been modified by ByteDance Ltd. and/or its affiliates.
 #
@@ -1320,11 +1321,13 @@ class Bagel(CFGParallelMixin, nn.Module):
         packed_text_indexes: torch.Tensor,
         packed_seqlens: torch.Tensor,
         packed_position_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        timestep: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Split VAE tokens across SP ranks for the denoising loop.
 
         Returns adjusted (x_t, packed_vae_position_ids, packed_vae_token_indexes,
-        packed_text_indexes, packed_seqlens, packed_position_ids) for the local rank.
+        packed_text_indexes, packed_seqlens, packed_position_ids, timestep) for the
+        local rank.
         """
         sp_size = self._sp_size
         sp_rank = get_sequence_parallel_rank()
@@ -1336,6 +1339,7 @@ class Bagel(CFGParallelMixin, nn.Module):
 
         local_x_t = x_t[start:end]
         local_vae_pos_ids = packed_vae_position_ids[start:end]
+        local_timestep = timestep[start:end]
 
         # Rebuild local packed indices:
         # packed sequence = [start_of_image, local_vae_tokens..., end_of_image]
@@ -1365,7 +1369,15 @@ class Bagel(CFGParallelMixin, nn.Module):
         local_position_ids[local_text_indexes] = text_pos_ids
         local_position_ids[local_vae_indexes] = local_vae_pos
 
-        return local_x_t, local_vae_pos_ids, local_vae_indexes, local_text_indexes, local_seqlens, local_position_ids
+        return (
+            local_x_t,
+            local_vae_pos_ids,
+            local_vae_indexes,
+            local_text_indexes,
+            local_seqlens,
+            local_position_ids,
+            local_timestep,
+        )
 
     def _gather_vae_for_sp(self, local_v_t: torch.Tensor) -> torch.Tensor:
         """Gather VAE velocity outputs from all SP ranks."""
@@ -1811,13 +1823,6 @@ class Bagel(CFGParallelMixin, nn.Module):
         frame_condition_token_indexes: torch.LongTensor | None = None,
     ):
         x_t = packed_init_noises
-        # Snapshot the pinned subtensor BEFORE the denoise loop touches
-        # x_t; the cond positions in packed_init_noises hold the
-        # VAE-encoded conditioning latent that must be preserved verbatim.
-        pinned_x_t = None
-        if frame_condition_token_indexes is not None:
-            frame_condition_token_indexes = frame_condition_token_indexes.to(x_t.device).long()
-            pinned_x_t = x_t[frame_condition_token_indexes].clone()
 
         # Build the flow-matching schedule. BAGEL drops the terminal t=0 for
         # ``num_timesteps - 1`` Euler steps; Lance keeps it for ``num_timesteps``.
@@ -1838,157 +1843,43 @@ class Bagel(CFGParallelMixin, nn.Module):
 
         use_cfg_text = cfg_text_scale > 1.0
         use_cfg_img = cfg_img_scale > 1.0
-
-        # ── Detect CFG parallel mode ──
-        cfg_parallel_ready = use_cfg_text and get_classifier_free_guidance_world_size() > 1
+        use_sp = self._sp_size > 1
+        cfg_world_size = get_classifier_free_guidance_world_size()
+        cfg_parallel_ready = use_cfg_text and cfg_world_size > 1
 
         if cfg_parallel_ready:
-            return self._generate_image_parallel(
-                x_t=x_t,
-                timesteps=timesteps,
-                dts=dts,
-                packed_text_ids=packed_text_ids,
-                packed_text_indexes=packed_text_indexes,
-                packed_vae_position_ids=packed_vae_position_ids,
-                packed_vae_token_indexes=packed_vae_token_indexes,
-                packed_seqlens=packed_seqlens,
-                packed_position_ids=packed_position_ids,
-                past_key_values=past_key_values,
-                cfg_renorm_min=cfg_renorm_min,
-                cfg_renorm_type=cfg_renorm_type,
-                cfg_interval=cfg_interval,
-                cfg_text_scale=cfg_text_scale,
-                cfg_text_packed_position_ids=cfg_text_packed_position_ids,
-                cfg_text_past_key_values=cfg_text_past_key_values,
-                cfg_img_scale=cfg_img_scale,
-                cfg_img_packed_position_ids=cfg_img_packed_position_ids,
-                cfg_img_past_key_values=cfg_img_past_key_values,
-                return_trajectory_latents=return_trajectory_latents,
-                scheduler=scheduler,
-                scheduler_kwargs=scheduler_kwargs,
-            )
-
-        # ── SP + CFG: sequential single-branch forwards ──
-        use_sp = self._sp_size > 1
-        if use_sp and use_cfg_text:
-            if return_trajectory_latents and len(timesteps) > 0:
-                trajectory_latents.append(x_t.clone())
-            for i, t in enumerate(timesteps.tolist()):  # host floats; a 0-d tensor t would sync each step
-                timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
-                if frame_condition_token_indexes is not None:
-                    # Cond positions stay at t=0 (clean signal).  Matches upstream
-                    # PR #33 lance.py line 1605:
-                    #     timestep[current_vae_mse_indexes_local_in_vae] = t
-                    # (cond positions remain at the ``torch.zeros`` init value).
-                    timestep[frame_condition_token_indexes] = 0.0
-                in_cfg_window = t > cfg_interval[0] and t <= cfg_interval[1]
-                cfg_text_scale_ = cfg_text_scale if in_cfg_window else 1.0
-                cfg_img_scale_ = cfg_img_scale if in_cfg_window else 1.0
-
-                common = dict(
-                    x_t=x_t,
-                    timestep=timestep,
-                    packed_vae_token_indexes=packed_vae_token_indexes,
-                    packed_vae_position_ids=packed_vae_position_ids,
-                    packed_text_ids=packed_text_ids,
-                    packed_text_indexes=packed_text_indexes,
-                    packed_seqlens=packed_seqlens,
+            # Validate cfg_parallel_size vs cfg_img_scale consistency
+            if cfg_world_size == 3 and not use_cfg_img:
+                raise ValueError(
+                    f"cfg_parallel_size=3 requires cfg_img_scale > 1.0, "
+                    f"but got cfg_img_scale={cfg_img_scale}. "
+                    f"Use cfg_parallel_size=2 for text-only CFG parallel(text2img), "
+                    f"or set cfg_img_scale > 1.0."
+                )
+            if cfg_world_size == 2 and use_cfg_img:
+                raise ValueError(
+                    f"Image CFG (cfg_img_scale={cfg_img_scale}) requires cfg_parallel_size=3, "
+                    f"but got cfg_parallel_size=2. "
+                    f"Use cfg_parallel_size=3 to enable image CFG in parallel mode."
                 )
 
-                v_t = self.forward_single_branch(
-                    **common,
-                    packed_position_ids=packed_position_ids,
-                    past_key_values=past_key_values,
-                )
+            # Ensure all ranks start with the same x_t (initial noise may differ
+            # across ranks when no per-request seed is set).
+            x_t = x_t.contiguous()
+            get_cfg_group().broadcast(x_t, src=0)
 
-                if cfg_text_scale_ > 1.0:
-                    cfg_text_v_t = self.forward_single_branch(
-                        **common,
-                        packed_position_ids=cfg_text_packed_position_ids,
-                        past_key_values=cfg_text_past_key_values,
-                    )
-                    cfg_img_v_t = None
-                    if cfg_img_scale_ > 1.0:
-                        cfg_img_v_t = self.forward_single_branch(
-                            **common,
-                            packed_position_ids=cfg_img_packed_position_ids,
-                            past_key_values=cfg_img_past_key_values,
-                        )
-                    v_t = self._combine_cfg(
-                        v_t,
-                        cfg_text_v_t,
-                        cfg_img_v_t,
-                        cfg_text_scale_,
-                        cfg_img_scale_,
-                        cfg_renorm_type,
-                        cfg_renorm_min,
-                    )
+        pinned_x_t = None
+        if frame_condition_token_indexes is not None:
+            frame_condition_token_indexes = frame_condition_token_indexes.to(x_t.device).long()
+            pinned_x_t = x_t[frame_condition_token_indexes].clone()
 
-                if scheduler is not None:
-                    out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
-                    x_t = out.prev_sample
-                    if trajectory_log_probs is not None and out.log_prob is not None:
-                        trajectory_log_probs.append(out.log_prob)
-                else:
-                    x_t = x_t - v_t.to(x_t.device) * dts[i]
-                if return_trajectory_latents:
-                    trajectory_latents.append(x_t.clone())
-                    trajectory_timesteps.append(timesteps[i])
-
-            unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
-            return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
-
-        # ── SP without CFG: direct single-branch loop ──
-        if use_sp:
-            if return_trajectory_latents and len(timesteps) > 0:
-                trajectory_latents.append(x_t.clone())
-            for i, t in enumerate(timesteps.tolist()):  # host floats; a 0-d tensor t would sync each step
-                timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
-                if frame_condition_token_indexes is not None:
-                    # Cond positions stay at t=0 (clean signal).  Matches upstream
-                    # PR #33 lance.py line 1605:
-                    #     timestep[current_vae_mse_indexes_local_in_vae] = t
-                    # (cond positions remain at the ``torch.zeros`` init value).
-                    timestep[frame_condition_token_indexes] = 0.0
-                v_t = self.forward_single_branch(
-                    x_t=x_t,
-                    timestep=timestep,
-                    packed_vae_token_indexes=packed_vae_token_indexes,
-                    packed_vae_position_ids=packed_vae_position_ids,
-                    packed_text_ids=packed_text_ids,
-                    packed_text_indexes=packed_text_indexes,
-                    packed_position_ids=packed_position_ids,
-                    packed_seqlens=packed_seqlens,
-                    past_key_values=past_key_values,
-                )
-                if scheduler is not None:
-                    out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
-                    x_t = out.prev_sample
-                    out_log_prob = getattr(out, "log_prob", None)
-                    if trajectory_log_probs is not None and out_log_prob is not None:
-                        trajectory_log_probs.append(out_log_prob)
-                else:
-                    x_t = x_t - v_t.to(x_t.device) * dts[i]
-                if return_trajectory_latents:
-                    trajectory_latents.append(x_t.clone())
-                    trajectory_timesteps.append(timesteps[i])
-
-            unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
-            return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
-
-        # ── Sequential CFG mode (cfg_parallel_size=1, no SP) ──
-        # Each CFG branch runs its own LLM forward; we just need the
-        # per-branch packed_position_ids and past_key_values for
-        # ``Bagel.forward`` to dispatch through.
-        cfg_branch_pids: list[torch.Tensor] | None = None
-        cfg_branch_caches: list[NaiveCache] | None = None
-
-        if use_cfg_text:
-            cfg_branch_pids = [packed_position_ids, cfg_text_packed_position_ids]
-            cfg_branch_caches = [past_key_values, cfg_text_past_key_values]
-            if use_cfg_img:
-                cfg_branch_pids.append(cfg_img_packed_position_ids)
-                cfg_branch_caches.append(cfg_img_past_key_values)
+        pack_cfg = use_cfg_text and not use_sp and not cfg_parallel_ready
+        true_cfg_scale = {
+            "cfg_text_scale": cfg_text_scale,
+            "cfg_img_scale": cfg_img_scale,
+            "cfg_renorm_type": cfg_renorm_type,
+            "cfg_renorm_min": cfg_renorm_min,
+        }
 
         if return_trajectory_latents and len(timesteps) > 0:
             trajectory_latents.append(x_t.clone())
@@ -2001,129 +1892,8 @@ class Bagel(CFGParallelMixin, nn.Module):
                 #     timestep[current_vae_mse_indexes_local_in_vae] = t
                 # (cond positions remain at the ``torch.zeros`` init value).
                 timestep[frame_condition_token_indexes] = 0.0
-            if t > cfg_interval[0] and t <= cfg_interval[1]:
-                cfg_text_scale_ = cfg_text_scale
-                cfg_img_scale_ = cfg_img_scale
-            else:
-                cfg_text_scale_ = 1.0
-                cfg_img_scale_ = 1.0
-            v_t = self.forward(
-                x_t=x_t,
-                timestep=timestep,
-                packed_vae_token_indexes=packed_vae_token_indexes,
-                packed_vae_position_ids=packed_vae_position_ids,
-                packed_text_ids=packed_text_ids,
-                packed_text_indexes=packed_text_indexes,
-                packed_position_ids=packed_position_ids,
-                packed_seqlens=packed_seqlens,
-                past_key_values=past_key_values,
-                cfg_renorm_min=cfg_renorm_min,
-                cfg_renorm_type=cfg_renorm_type,
-                cfg_text_scale=cfg_text_scale_,
-                cfg_img_scale=cfg_img_scale_,
-                cfg_branch_pids=cfg_branch_pids,
-                cfg_branch_caches=cfg_branch_caches,
-            )
+            use_cfg_this_step = t > cfg_interval[0] and t <= cfg_interval[1] and use_cfg_text
 
-            if scheduler is not None:
-                out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
-                x_t = out.prev_sample
-                if trajectory_log_probs is not None and out.log_prob is not None:
-                    trajectory_log_probs.append(out.log_prob)
-            else:
-                x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
-                if pinned_x_t is not None:
-                    # i2v: restore cond positions to their encoded-image
-                    # latent.  Matches upstream PR #33 lance.py line 1712:
-                    #     x_t[mse_indexes] = x_t[mse_indexes] - v_t[mse_indexes] * dts[i]
-                    # (cond positions are excluded from the update).
-                    x_t[frame_condition_token_indexes] = pinned_x_t
-            if return_trajectory_latents:
-                trajectory_latents.append(x_t.clone())
-                trajectory_timesteps.append(timesteps[i])
-
-        unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
-        return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
-
-    def _generate_image_parallel(
-        self,
-        x_t: torch.Tensor,
-        timesteps: torch.Tensor,
-        dts: torch.Tensor,
-        packed_text_ids: torch.LongTensor,
-        packed_text_indexes: torch.LongTensor,
-        packed_vae_position_ids: torch.LongTensor,
-        packed_vae_token_indexes: torch.LongTensor,
-        packed_seqlens: torch.IntTensor,
-        packed_position_ids: torch.LongTensor,
-        past_key_values: NaiveCache,
-        cfg_renorm_min: float,
-        cfg_renorm_type: str,
-        cfg_interval: tuple[float, float],
-        cfg_text_scale: float,
-        cfg_text_packed_position_ids: torch.LongTensor | None,
-        cfg_text_past_key_values: NaiveCache | None,
-        cfg_img_scale: float,
-        cfg_img_packed_position_ids: torch.LongTensor | None,
-        cfg_img_past_key_values: NaiveCache | None,
-        return_trajectory_latents: bool = False,
-        scheduler: object | None = None,
-        scheduler_kwargs: dict | None = None,
-        frame_condition_token_indexes: torch.LongTensor | None = None,
-    ):
-        """CFG parallel denoising loop: each rank computes one CFG branch.
-
-        Rank 0: gen branch (full conditioning)
-        Rank 1: text_cfg branch (unconditional text)
-        Rank 2: img_cfg branch (no image condition), only when cfg_img_scale > 1.0
-        """
-        cfg_group = get_cfg_group()
-        cfg_world_size = get_classifier_free_guidance_world_size()
-        use_cfg_img = cfg_img_scale > 1.0
-
-        # Validate cfg_parallel_size vs cfg_img_scale consistency
-        if cfg_world_size == 3 and not use_cfg_img:
-            raise ValueError(
-                f"cfg_parallel_size=3 requires cfg_img_scale > 1.0, "
-                f"but got cfg_img_scale={cfg_img_scale}. "
-                f"Use cfg_parallel_size=2 for text-only CFG parallel(text2img), or set cfg_img_scale > 1.0."
-            )
-        if cfg_world_size == 2 and use_cfg_img:
-            raise ValueError(
-                f"Image CFG (cfg_img_scale={cfg_img_scale}) requires cfg_parallel_size=3, "
-                f"but got cfg_parallel_size=2. "
-                f"Use cfg_parallel_size=3 to enable image CFG in parallel mode."
-            )
-
-        # Ensure all ranks start with the same x_t (initial noise may differ
-        # across ranks when no per-request seed is set).
-        x_t = x_t.contiguous()
-        cfg_group.broadcast(x_t, src=0)
-
-        trajectory_latents: list[torch.Tensor] | None = [] if return_trajectory_latents else None
-        trajectory_timesteps: list[torch.Tensor] | None = [] if return_trajectory_latents else None
-        trajectory_log_probs: list[torch.Tensor] | None = (
-            [] if (return_trajectory_latents and scheduler is not None) else None
-        )
-        _sched_kw = scheduler_kwargs or {}
-
-        if return_trajectory_latents and len(timesteps) > 0:
-            trajectory_latents.append(x_t.clone())
-
-        for i, t in enumerate(timesteps.tolist()):  # host floats; a 0-d tensor t would sync each step
-            timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
-            if frame_condition_token_indexes is not None:
-                # Cond positions stay at t=0 (clean signal).  Matches upstream
-                # PR #33 lance.py line 1605:
-                #     timestep[current_vae_mse_indexes_local_in_vae] = t
-                # (cond positions remain at the ``torch.zeros`` init value).
-                timestep[frame_condition_token_indexes] = 0.0
-            use_cfg_this_step = t > cfg_interval[0] and t <= cfg_interval[1] and cfg_text_scale > 1.0
-
-            # Per-branch kwargs. Branch 0 (gen, full conditioning) is also the
-            # branch used by all ranks when do_true_cfg is False (outside the
-            # CFG interval) — CFGParallelMixin only runs branches_kwargs[0] then,
-            # mirroring the previous "all ranks compute gen inputs, no comm" path.
             common = dict(
                 x_t=x_t,
                 timestep=timestep,
@@ -2133,33 +1903,31 @@ class Bagel(CFGParallelMixin, nn.Module):
                 packed_text_indexes=packed_text_indexes,
                 packed_seqlens=packed_seqlens,
             )
-            branches_kwargs = [
-                dict(**common, packed_position_ids=packed_position_ids, past_key_values=past_key_values),
-                dict(
-                    **common, packed_position_ids=cfg_text_packed_position_ids, past_key_values=cfg_text_past_key_values
-                ),
-            ]
-            if use_cfg_img:
-                branches_kwargs.append(
-                    dict(
-                        **common,
-                        packed_position_ids=cfg_img_packed_position_ids,
-                        past_key_values=cfg_img_past_key_values,
-                    )
-                )
+            branch_pids_caches = [(packed_position_ids, past_key_values)]
 
-            # Each rank computes its assigned branch, then all_gather + combine
-            # happen inside the mixin (identical result on every rank).
-            v_t = self.predict_noise_with_multi_branch_cfg(
-                do_true_cfg=use_cfg_this_step,
-                true_cfg_scale={
-                    "cfg_text_scale": cfg_text_scale,
-                    "cfg_img_scale": cfg_img_scale,
-                    "cfg_renorm_type": cfg_renorm_type,
-                    "cfg_renorm_min": cfg_renorm_min,
-                },
-                branches_kwargs=branches_kwargs,
-            )
+            if use_cfg_this_step:
+                branch_pids_caches.append((cfg_text_packed_position_ids, cfg_text_past_key_values))
+                if use_cfg_img:
+                    branch_pids_caches.append((cfg_img_packed_position_ids, cfg_img_past_key_values))
+
+            if pack_cfg and use_cfg_this_step:
+                v_t = self.combine_multi_branch_cfg_noise(
+                    self.forward(
+                        **common,
+                        cfg_branch_pids=[pids for pids, _ in branch_pids_caches],
+                        cfg_branch_caches=[cache for _, cache in branch_pids_caches],
+                    ),
+                    true_cfg_scale,
+                )
+            else:
+                v_t = self.predict_noise_with_multi_branch_cfg(
+                    do_true_cfg=use_cfg_this_step,
+                    true_cfg_scale=true_cfg_scale,
+                    branches_kwargs=[
+                        dict(**common, cfg_branch_pids=[pids], cfg_branch_caches=[cache])
+                        for pids, cache in branch_pids_caches
+                    ],
+                )
 
             if scheduler is not None:
                 out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
@@ -2168,6 +1936,14 @@ class Bagel(CFGParallelMixin, nn.Module):
                     trajectory_log_probs.append(out.log_prob)
             else:
                 x_t = x_t - v_t.to(x_t.device) * dts[i]
+
+            if pinned_x_t is not None:
+                # i2v: restore cond positions to their encoded-image
+                # latent.  Matches upstream PR #33 lance.py line 1712:
+                #     x_t[mse_indexes] = x_t[mse_indexes] - v_t[mse_indexes] * dts[i]
+                # (cond positions are excluded from the update).
+                x_t[frame_condition_token_indexes] = pinned_x_t
+
             if return_trajectory_latents:
                 trajectory_latents.append(x_t.clone())
                 trajectory_timesteps.append(timesteps[i])
@@ -2237,12 +2013,8 @@ class Bagel(CFGParallelMixin, nn.Module):
 
     def predict_noise(self, **kwargs) -> torch.Tensor:
         """Single-branch velocity prediction for CFGParallelMixin.
-
-        Each CFG branch differs only by ``packed_position_ids`` and
-        ``past_key_values`` (carried in ``kwargs``); the heavy lifting is the
-        per-branch ``forward_single_branch`` pass.
-        """
-        return self.forward_single_branch(**kwargs)
+        Assumes only 1 CFG branch is provided in the kwargs."""
+        return self.forward(**kwargs)[0]
 
     def combine_multi_branch_cfg_noise(
         self,
@@ -2267,7 +2039,7 @@ class Bagel(CFGParallelMixin, nn.Module):
             true_cfg_scale["cfg_renorm_min"],
         )
 
-    def forward_single_branch(
+    def forward(
         self,
         x_t: torch.Tensor,
         timestep: torch.LongTensor,
@@ -2275,73 +2047,49 @@ class Bagel(CFGParallelMixin, nn.Module):
         packed_vae_position_ids: torch.LongTensor,
         packed_text_ids: torch.LongTensor,
         packed_text_indexes: torch.LongTensor,
-        packed_position_ids: torch.LongTensor,
         packed_seqlens: torch.IntTensor,
-        past_key_values: NaiveCache,
-    ) -> torch.Tensor:
-        """Run a single-branch forward pass (no CFG batching).
+        cfg_branch_pids: list[torch.Tensor],
+        cfg_branch_caches: list[NaiveCache],
+    ) -> list[torch.Tensor]:
+        """Packed query forward. Returns uncombined VAE velocities (length 1 or N).
 
-        Used by CFG parallel mode where each rank computes one branch.
-        Returns the velocity v_t for the given branch.
-        Supports Ulysses / Ring SP when parallel_config.sequence_parallel_size > 1.
+        Per-branch RoPE position ids and KV caches are passed via
+        ``cfg_branch_pids`` and ``cfg_branch_caches`` (length 1 for a single
+        forward, length N for batched multi-branch CFG). When N > 1, query
+        sequences are stacked and caches are merged via ``NaiveCache.merge``.
+
+        Batched multi-branch CFG + sequence parallel is not supported and raises.
         """
+        num_branches = len(cfg_branch_pids)
+        packing = num_branches > 1
         use_sp = self._sp_size > 1
+        branch_position_ids = cfg_branch_pids[0]
 
         if use_sp:
-            # Split VAE tokens across SP ranks
+            if packing:
+                raise ValueError(
+                    "Packed CFG + sequence parallel is not supported. "
+                    "Run SP+CFG as sequential single-branch forwards (len(cfg_branch_pids)==1)."
+                )
             (
-                local_x_t,
-                local_vae_pos_ids,
-                local_vae_indexes,
-                local_text_indexes,
-                local_seqlens,
-                local_position_ids,
+                x_t,
+                packed_vae_position_ids,
+                packed_vae_token_indexes,
+                packed_text_indexes,
+                packed_seqlens,
+                branch_position_ids,
+                timestep,
             ) = self._split_vae_for_sp(
                 x_t,
                 packed_vae_position_ids,
                 packed_vae_token_indexes,
                 packed_text_indexes,
                 packed_seqlens,
-                packed_position_ids,
+                branch_position_ids,
+                timestep,
             )
 
-            packed_text_embedding = self.language_model.forward(
-                packed_text_ids=packed_text_ids,
-                return_embeddings_only=True,
-            ).packed_query_sequence
-            packed_sequence = packed_text_embedding.new_zeros((int(local_seqlens.sum()), self.hidden_size))
-            packed_sequence[local_text_indexes] = packed_text_embedding
-
-            # i2v relaxes this: per-token timestep (cond=0, noncond=t) is valid.
-            packed_pos_embed = self.latent_pos_embed(local_vae_pos_ids)
-            local_timestep = timestep[: local_x_t.shape[0]]
-            packed_timestep_embeds = self.time_embedder(local_timestep)
-            x_t_emb = self.vae2llm(local_x_t) + packed_timestep_embeds + packed_pos_embed
-            if x_t_emb.dtype != packed_sequence.dtype:
-                x_t_emb = x_t_emb.to(packed_sequence.dtype)
-            packed_sequence[local_vae_indexes] = x_t_emb
-
-            extra_inputs = {}
-            if self.use_moe:
-                extra_inputs["mode"] = "gen"
-                extra_inputs["packed_vae_token_indexes"] = local_vae_indexes
-                extra_inputs["packed_text_indexes"] = local_text_indexes
-
-            output = self.language_model.forward(
-                packed_query_sequence=packed_sequence,
-                query_lens=local_seqlens,
-                packed_query_position_ids=local_position_ids,
-                past_key_values=past_key_values,
-                update_past_key_values=False,
-                is_causal=False,
-                **extra_inputs,
-            )
-
-            local_v_t = self.llm2vae(output.packed_query_sequence)
-            local_v_t = local_v_t[local_vae_indexes]
-            return self._gather_vae_for_sp(local_v_t)
-
-        # Original non-SP path
+        # Build query sequence (identical for all CFG branches; local if SP)
         packed_text_embedding = self.language_model.forward(
             packed_text_ids=packed_text_ids,
             return_embeddings_only=True,
@@ -2363,117 +2111,37 @@ class Bagel(CFGParallelMixin, nn.Module):
             extra_inputs["packed_vae_token_indexes"] = packed_vae_token_indexes
             extra_inputs["packed_text_indexes"] = packed_text_indexes
 
+        if packing:
+            seq_len = int(packed_seqlens.sum())
+            packed_query_sequence = packed_sequence.repeat(num_branches, 1)
+            vae_indexes = torch.cat([packed_vae_token_indexes + i * seq_len for i in range(num_branches)])
+            query_position_ids = torch.cat(cfg_branch_pids, dim=1 if cfg_branch_pids[0].ndim == 2 else 0)
+            query_lens = packed_seqlens.repeat(num_branches)
+            cache = NaiveCache.merge(cfg_branch_caches)
+            if self.use_moe:
+                extra_inputs["packed_vae_token_indexes"] = vae_indexes
+                extra_inputs["packed_text_indexes"] = torch.cat(
+                    [packed_text_indexes + i * seq_len for i in range(num_branches)]
+                )
+        else:
+            packed_query_sequence = packed_sequence
+            query_lens = packed_seqlens
+            query_position_ids = branch_position_ids
+            cache = cfg_branch_caches[0]
+            vae_indexes = packed_vae_token_indexes
+
         output = self.language_model.forward(
-            packed_query_sequence=packed_sequence,
-            query_lens=packed_seqlens,
-            packed_query_position_ids=packed_position_ids,
-            past_key_values=past_key_values,
+            packed_query_sequence=packed_query_sequence,
+            query_lens=query_lens,
+            packed_query_position_ids=query_position_ids,
+            past_key_values=cache,
             update_past_key_values=False,
             is_causal=False,
             **extra_inputs,
         )
-        v_t = self.llm2vae(output.packed_query_sequence)
-        v_t = v_t[packed_vae_token_indexes]
-        return v_t
-
-    def forward(
-        self,
-        x_t: torch.Tensor,
-        timestep: torch.LongTensor,
-        packed_vae_token_indexes: torch.LongTensor,
-        packed_vae_position_ids: torch.LongTensor,
-        packed_text_ids: torch.LongTensor,
-        packed_text_indexes: torch.LongTensor,
-        packed_position_ids: torch.LongTensor,
-        packed_seqlens: torch.IntTensor,
-        past_key_values: NaiveCache,
-        cfg_renorm_min: float = 0.0,
-        cfg_renorm_type: str = "global",
-        cfg_text_scale: float = 1.0,
-        cfg_img_scale: float = 1.0,
-        cfg_branch_pids: list[torch.Tensor] | None = None,
-        cfg_branch_caches: list[NaiveCache] | None = None,
-    ):
-        # Build query sequence (identical for all CFG branches)
-        packed_text_embedding = self.language_model.forward(
-            packed_text_ids=packed_text_ids,
-            return_embeddings_only=True,
-        ).packed_query_sequence
-        packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
-        packed_sequence[packed_text_indexes] = packed_text_embedding
-
-        # i2v relaxes this: per-token timestep (cond=0, noncond=t) is valid.
-        packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
-        packed_timestep_embeds = self.time_embedder(timestep)
-        x_t = self.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed
-        if x_t.dtype != packed_sequence.dtype:
-            x_t = x_t.to(packed_sequence.dtype)
-        packed_sequence[packed_vae_token_indexes] = x_t
-
-        extra_inputs = {}
-        if self.use_moe:
-            extra_inputs["mode"] = "gen"
-            extra_inputs["packed_vae_token_indexes"] = packed_vae_token_indexes
-            extra_inputs["packed_text_indexes"] = packed_text_indexes
-
-        use_cfg = cfg_text_scale > 1.0
-        cfg_text_v_t = None
-        cfg_img_v_t = None
-
-        if use_cfg and cfg_branch_pids is not None and cfg_branch_caches is not None:
-            num_branches = len(cfg_branch_pids)
-            seq_len = int(packed_seqlens.sum())
-
-            batched_sequence = packed_sequence.repeat(num_branches, 1)
-            batched_vae_indexes = torch.cat([packed_vae_token_indexes + i * seq_len for i in range(num_branches)])
-            batched_position_ids = torch.cat(cfg_branch_pids, dim=1 if cfg_branch_pids[0].ndim == 2 else 0)
-            batched_seqlens = packed_seqlens.repeat(num_branches)
-            merged_cache = NaiveCache.merge(cfg_branch_caches)
-
-            if self.use_moe:
-                batched_text_indices = torch.cat([packed_text_indexes + i * seq_len for i in range(num_branches)])
-                extra_inputs["packed_vae_token_indexes"] = batched_vae_indexes
-                extra_inputs["packed_text_indexes"] = batched_text_indices
-
-            output = self.language_model.forward(
-                packed_query_sequence=batched_sequence,
-                query_lens=batched_seqlens,
-                packed_query_position_ids=batched_position_ids,
-                past_key_values=merged_cache,
-                update_past_key_values=False,
-                is_causal=False,
-                **extra_inputs,
-            )
-
-            all_vae_v_t = self.llm2vae(output.packed_query_sequence)[batched_vae_indexes]
-            vae_per_branch = packed_vae_token_indexes.shape[0]
-            branch_v_ts = all_vae_v_t.split(vae_per_branch)
-            v_t = branch_v_ts[0]
-            cfg_text_v_t = branch_v_ts[1]
-            cfg_img_v_t = branch_v_ts[2] if len(branch_v_ts) > 2 else None
-        else:
-            # Single forward (no CFG or outside cfg_interval).
-            output = self.language_model.forward(
-                packed_query_sequence=packed_sequence,
-                query_lens=packed_seqlens,
-                packed_query_position_ids=packed_position_ids,
-                past_key_values=past_key_values,
-                update_past_key_values=False,
-                is_causal=False,
-                **extra_inputs,
-            )
-            v_t = self.llm2vae(output.packed_query_sequence)[packed_vae_token_indexes]
-
-        # ── CFG combination ──
-        if use_cfg:
-            v_t = self._combine_cfg(
-                v_t,
-                cfg_text_v_t,
-                cfg_img_v_t,
-                cfg_text_scale,
-                cfg_img_scale,
-                cfg_renorm_type,
-                cfg_renorm_min,
-            )
-
-        return v_t
+        v_t = self.llm2vae(output.packed_query_sequence)[vae_indexes]
+        if packing:
+            return list(v_t.split(packed_vae_token_indexes.shape[0]))
+        if use_sp:
+            v_t = self._gather_vae_for_sp(v_t)
+        return [v_t]
