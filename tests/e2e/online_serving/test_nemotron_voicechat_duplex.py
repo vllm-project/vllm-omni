@@ -18,6 +18,17 @@ from tests.helpers.stage_config import get_deploy_config_path
 MODEL = os.environ.get("VLLM_TEST_NEMOTRON_VOICECHAT_MODEL", "nvidia/NVIDIA-NemotronLabs-VoiceChat-11B")
 DEPLOY_CONFIG = get_deploy_config_path("nemotron_labs_voicechat_duplex.yaml")
 TOKENIZER = os.environ.get("VLLM_TEST_NEMOTRON_VOICECHAT_LLM_PATH")
+
+# The client gives up after CLIENT_TIMEOUT_S. The server-side stage-input
+# deadline must fire first, otherwise a stalled stream surfaces as a bare
+# client TimeoutError with no server-side error at all. See #6816.
+CLIENT_TIMEOUT_S = 300
+SERVER_INPUT_WAIT_TIMEOUT_S = 240
+
+_SERVER_ENV: dict[str, str] = {"VLLM_OMNI_INPUT_WAIT_TIMEOUT_S": str(SERVER_INPUT_WAIT_TIMEOUT_S)}
+if TOKENIZER:
+    _SERVER_ENV["NEMOTRON_VOICECHAT_LLM_PATH"] = TOKENIZER
+
 pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 
 
@@ -29,7 +40,7 @@ pytestmark = [pytest.mark.full_model, pytest.mark.omni]
             OmniServerParams(
                 model=MODEL,
                 stage_config_path=DEPLOY_CONFIG,
-                env_dict={"NEMOTRON_VOICECHAT_LLM_PATH": TOKENIZER} if TOKENIZER else None,
+                env_dict=_SERVER_ENV,
             ),
             id="native-duplex",
         )
@@ -45,7 +56,7 @@ def test_native_duplex_turn_taking_streams_model_audio(omni_server, tmp_path: Pa
         (
             f"--url ws://{omni_server.host}:{omni_server.port}/v1/realtime --model {omni_server.model} "
             f"--input-wav {root / 'turn_taking.wav'} --input-channel 0 --max-frames 190 "
-            f"--minimum-audio-chunks 48 --minimum-audio-rms 0.001 --no-realtime --timeout-s 300 "
+            f"--minimum-audio-chunks 48 --minimum-audio-rms 0.001 --no-realtime --timeout-s {CLIENT_TIMEOUT_S} "
             f"--output-dir {tmp_path / 'native_duplex'}"
         ).split()
     )

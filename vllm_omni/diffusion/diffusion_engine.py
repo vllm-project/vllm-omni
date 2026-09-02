@@ -29,6 +29,7 @@ from vllm_omni.diffusion.data import (
     DiffusionOutput,
     DiffusionRequestAbortedError,
     OmniDiffusionConfig,
+    uses_diffusers_adapter,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode, is_scheduler_paged_kv_mode
 from vllm_omni.diffusion.diffusion_kv.initialization import initialize_diffusion_kv_control_plane
@@ -157,8 +158,14 @@ def _resolve_custom_pipeline_cls(custom_pipeline_args: dict[str, Any] | None) ->
 
 def supports_request_batch(od_config: OmniDiffusionConfig) -> bool:
     model_cls = _resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
-    if model_cls is None:
-        model_cls = DiffusionModelRegistry._try_load_model_cls(getattr(od_config, "model_class_name", None))
+    if model_cls is not None:
+        return bool(getattr(model_cls, "supports_request_batch", False))
+
+    if uses_diffusers_adapter(od_config):
+        model_cls = DiffusionModelRegistry._try_load_model_cls("DiffusersAdapterPipeline")
+        return bool(getattr(model_cls, "supports_request_batch", False))
+
+    model_cls = DiffusionModelRegistry._try_load_model_cls(getattr(od_config, "model_class_name", None))
     if model_cls is None:
         return False
     return bool(getattr(model_cls, "supports_request_batch", False))

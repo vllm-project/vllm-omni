@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniCPM-o 4.5 pipeline topology (frozen).
 
 Stage 0: Thinker — multimodal understanding + text generation.
@@ -17,6 +17,7 @@ from vllm_omni.config.stage_config import (
 )
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni"
+MINICPMO45_REFERENCE_AUDIO_KEY = "_minicpmo45_reference_audio"
 
 
 MINICPMO_4_5_PIPELINE = PipelineConfig(

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Native vLLM-Omni pipeline for Boogu-Image-0.1.
 
@@ -220,7 +220,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
                 subfolder="transformer",
-                revision=None,
+                revision=od_config.revision,
                 prefix="transformer.",
                 fall_back_to_pt=True,
             )
@@ -233,10 +233,18 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         # See ``hub_prefetch.py`` for the transformers v5 multi-worker subfolder
         # race; prefetch the whole component set before any from_pretrained.
         boogu_subfolders = ["scheduler", "vae", "mllm", "processor"]
-        prefetch_subfolders(model, boogu_subfolders, local_files_only=local_files_only)
+        prefetch_subfolders(
+            model,
+            boogu_subfolders,
+            local_files_only=local_files_only,
+            revision=od_config.revision,
+        )
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model, subfolder="scheduler", local_files_only=local_files_only
+            model,
+            subfolder="scheduler",
+            local_files_only=local_files_only,
+            revision=od_config.revision,
         )
 
         mllm = from_pretrained_with_prefetch(
@@ -246,6 +254,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             prefetch_list=boogu_subfolders,
             local_files_only=local_files_only,
             torch_dtype=od_config.dtype,
+            revision=od_config.revision,
         )
         # Upstream reuses the full VLM as an optional instruction rewriter and
         # encodes with its inner model (no ``lm_head``); the rewriter is not
@@ -255,7 +264,10 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         self.mllm = mllm.to(self._execution_device)
 
         self.processor = Qwen3VLProcessor.from_pretrained(
-            model, subfolder="processor", local_files_only=local_files_only
+            model,
+            subfolder="processor",
+            local_files_only=local_files_only,
+            revision=od_config.revision,
         )
 
         self.vae = from_pretrained_with_prefetch(
@@ -264,6 +276,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             subfolder="vae",
             prefetch_list=boogu_subfolders,
             local_files_only=local_files_only,
+            revision=od_config.revision,
         ).to(self._execution_device)
 
         self.transformer = BooguImageTransformer2DModel(od_config=od_config)
@@ -531,7 +544,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         return height, width, ori_height, ori_width
 
     def predict(
-        self, t, latents, instruction_embeds, freqs_cis, instruction_attention_mask, ref_image_hidden_states=None
+        self, t, latents, instruction_embeds, freqs_real, instruction_attention_mask, ref_image_hidden_states=None
     ):
         """One transformer velocity prediction (upstream ``predict``).
 
@@ -544,7 +557,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             latents,
             timestep,
             instruction_embeds,
-            freqs_cis,
+            freqs_real,
             instruction_attention_mask,
             ref_image_hidden_states=ref_image_hidden_states,
         )
@@ -697,7 +710,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             generator,
         )
 
-        freqs_cis = BooguImageDoubleStreamRotaryPosEmbed.get_freqs_cis(
+        freqs_real = BooguImageDoubleStreamRotaryPosEmbed.get_freqs_real(
             self.transformer.axes_dim_rope,
             self.transformer.axes_lens,
             theta=10000,
@@ -720,7 +733,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
                 image_gs = image_guidance_scale if in_cfg_range else 1.0
 
                 model_pred = self.predict(
-                    t, latents, instruction_embeds, freqs_cis, instruction_attention_mask, ref_latents
+                    t, latents, instruction_embeds, freqs_real, instruction_attention_mask, ref_latents
                 )
 
                 if task_type == "ti2i" and text_gs > 1.0 and image_gs > 1.0:
@@ -729,7 +742,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
                         t,
                         latents,
                         negative_instruction_embeds,
-                        freqs_cis,
+                        freqs_real,
                         negative_instruction_attention_mask,
                         ref_latents,
                     )
@@ -737,7 +750,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
                         t,
                         latents,
                         negative_instruction_embeds,
-                        freqs_cis,
+                        freqs_real,
                         negative_instruction_attention_mask,
                         None,
                     )
@@ -750,7 +763,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
                         t,
                         latents,
                         negative_instruction_embeds,
-                        freqs_cis,
+                        freqs_real,
                         negative_instruction_attention_mask,
                         ref_latents,
                     )
@@ -758,7 +771,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
                 elif task_type == "ti2i" and image_gs > 1.0:
                     # Image-only ti2i guidance: drop the reference in the uncond pred.
                     model_pred_drop_image = self.predict(
-                        t, latents, instruction_embeds, freqs_cis, instruction_attention_mask, None
+                        t, latents, instruction_embeds, freqs_real, instruction_attention_mask, None
                     )
                     model_pred = model_pred + (image_gs - 1) * (model_pred - model_pred_drop_image)
                 elif text_gs > 1.0:
@@ -767,7 +780,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
                         t,
                         latents,
                         negative_instruction_embeds,
-                        freqs_cis,
+                        freqs_real,
                         negative_instruction_attention_mask,
                         None,
                     )

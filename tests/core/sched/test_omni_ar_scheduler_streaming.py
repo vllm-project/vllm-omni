@@ -18,7 +18,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
-from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 
 # isort: on
 
@@ -28,7 +28,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARScheduler:
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched._new_prompt_len_snapshot = {}
-    sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=stage_id, session_mode=session_mode))
+    sched.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(stage_id=stage_id, session_mode=session_mode),
+    )
     sched.num_waiting_for_streaming_input = 0
     sched.log_stats = False
     sched.chunk_transfer_adapter = None
@@ -185,6 +187,7 @@ def test_resumable_segment_boundary_keeps_pre_transition_send_watermark() -> Non
 
     def replace_with_next_segment(request: Request) -> bool:
         request.num_computed_tokens = 0
+        request._omni_segment_generation = 1
         request.status = RequestStatus.WAITING
         return False
 
@@ -201,6 +204,7 @@ def test_resumable_segment_boundary_keeps_pre_transition_send_watermark() -> Non
         True,
         new_token_ids=[42],
         confirmed_num_computed_tokens=26,
+        segment_generation=0,
     )
 
 
@@ -284,6 +288,140 @@ def test_queued_streaming_update_on_async_stop_fences_in_flight_once() -> None:
     # Exactly the one unreported decode, so the drain reaches zero before the
     # new segment's first frame arrives.
     assert session.num_stale_output_tokens == session.num_in_flight_tokens == 1
+
+
+def test_stale_async_frame_is_dropped_before_output_processing() -> None:
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+    session.num_in_flight_tokens = 2
+    session.num_computed_tokens = session.num_tokens + 1
+    session.num_output_placeholders = 1
+    session.async_tokens_to_discard = 1
+    session.sampling_params = SimpleNamespace(num_logprobs=1)
+    num_computed_tokens = session.num_computed_tokens
+    num_output_placeholders = session.num_output_placeholders
+
+    sched = MagicMock()
+    sched.requests = {session.request_id: session}
+    sched.perf_metrics = None
+    sched.structured_output_manager.should_advance.return_value = False
+
+    def discard_stale_output(request: Request, token_ids: list[int]) -> tuple[list[int], bool]:
+        request.async_tokens_to_discard = 0
+        return token_ids, False
+
+    sched._update_request_with_output.side_effect = discard_stale_output
+    sched._process_kv_transfer_trigger.return_value = False
+    sched.chunk_transfer_adapter = MagicMock()
+    sched.running = [session]
+    sched.waiting_for_transfer_free = set()
+    sched.transfer_triggered_requests = set()
+    sched.active_kv_transfers = set()
+    sched.pending_stop_after_extraction = set()
+    sched.connector = None
+    sched.kv_cache_manager.take_events.return_value = None
+    sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
+    sched.finished_req_ids_dict = {}
+    sched.make_stats.return_value = None
+
+    scheduler_output = MagicMock(spec=SchedulerOutput)
+    scheduler_output.num_scheduled_tokens = {session.request_id: 1}
+    scheduler_output.scheduled_spec_decode_tokens = {}
+    scheduler_output.num_invalid_spec_tokens = 0
+
+    model_runner_output = MagicMock(spec=ModelRunnerOutput)
+    model_runner_output.sampled_token_ids = [[42]]
+    model_runner_output.logprobs = None
+    model_runner_output.prompt_logprobs_dict = {}
+    model_runner_output.pooler_output = None
+    model_runner_output.multimodal_outputs = None
+    model_runner_output.inter_stage_outputs = [{"hidden": object()}]
+    model_runner_output.num_nans_in_logits = None
+    model_runner_output.kv_connector_output = None
+    model_runner_output.cudagraph_stats = None
+    model_runner_output.req_id_to_index = {session.request_id: 0}
+    model_runner_output.routed_experts = None
+
+    OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
+
+    assert session.async_tokens_to_discard == 0
+    assert session.status == RequestStatus.RUNNING
+    assert session.num_computed_tokens == num_computed_tokens
+    assert session.num_output_placeholders == num_output_placeholders
+    sched.chunk_transfer_adapter.save_async.assert_not_called()
+
+    session.sampling_params = SamplingParams(max_tokens=8)
+    next_payload = {"hidden": object()}
+    sched._update_request_with_output.side_effect = None
+    sched._update_request_with_output.return_value = ([43], False)
+    model_runner_output.sampled_token_ids = [[43]]
+    model_runner_output.inter_stage_outputs = [next_payload]
+
+    OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
+
+    sched.chunk_transfer_adapter.save_async.assert_called_once_with(
+        next_payload,
+        session,
+        False,
+        new_token_ids=[43],
+        confirmed_num_computed_tokens=None,
+    )
+
+
+def test_legacy_stale_async_marker_bypasses_real_placeholder_accounting() -> None:
+    request = _make_request()
+    request.status = RequestStatus.RUNNING
+    request.num_in_flight_tokens = 1
+    request.num_output_placeholders = 0
+    request.async_tokens_to_discard = 1
+    request.num_stale_output_tokens = 0
+
+    sched = OmniARAsyncScheduler.__new__(OmniARAsyncScheduler)
+    sched.requests = {request.request_id: request}
+    sched.perf_metrics = None
+    sched.chunk_transfer_adapter = None
+    sched.connector = None
+    sched.ec_connector = None
+    sched.waiting_for_transfer_free = set()
+    sched.transfer_triggered_requests = set()
+    sched.active_kv_transfers = set()
+    sched.pending_stop_after_extraction = set()
+    sched.finished_req_ids_dict = {}
+    sched._new_prompt_len_snapshot = {}
+    sched.kv_cache_manager = MagicMock()
+    sched.kv_cache_manager.take_events.return_value = None
+    sched._remove_stopped_requests_from_queues = MagicMock()
+    sched._handle_failed_kv_load_outputs = MagicMock(return_value=[])
+    sched._cleanup_kv_tracking = MagicMock()
+    sched._aggregate_kv_connector_stats = MagicMock(return_value=None)
+    sched._publish_kv_cache_events = MagicMock()
+    sched._attach_finished_request_sets = MagicMock()
+    sched._attach_scheduler_stats = MagicMock()
+    sched._capture_omni_connector_output = MagicMock()
+
+    scheduler_output = MagicMock(spec=SchedulerOutput)
+    scheduler_output.num_scheduled_tokens = {request.request_id: 1}
+    scheduler_output.scheduled_spec_decode_tokens = {}
+    scheduler_output.num_invalid_spec_tokens = 0
+
+    model_runner_output = MagicMock(spec=ModelRunnerOutput)
+    model_runner_output.sampled_token_ids = [[42]]
+    model_runner_output.logprobs = None
+    model_runner_output.prompt_logprobs_dict = {}
+    model_runner_output.pooler_output = None
+    model_runner_output.multimodal_outputs = None
+    model_runner_output.inter_stage_outputs = None
+    model_runner_output.num_nans_in_logits = None
+    model_runner_output.kv_connector_output = None
+    model_runner_output.cudagraph_stats = None
+    model_runner_output.req_id_to_index = {request.request_id: 0}
+    model_runner_output.routed_experts = None
+
+    OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
+
+    assert request.async_tokens_to_discard == 0
+    assert request.num_output_placeholders == 0
+    assert request._output_token_ids == []
 
 
 def test_stage0_streaming_update_discards_outstanding_async_placeholder_token() -> None:

@@ -33,6 +33,19 @@ def test_default_stage_config_includes_cache_backend():
     assert engine_args["model_stage"] == "diffusion"
 
 
+def test_default_stage_config_preserves_ulysses_a2a_permute() -> None:
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "ulysses_degree": 4,
+            "ulysses_a2a_permute": True,
+        }
+    )[0]
+
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config.ulysses_degree == 4
+    assert parallel_config.ulysses_a2a_permute is True
+
+
 def test_default_stage_config_preserves_model_extras():
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg({"extras": {"ltx2_use_conv_vae": True}})[0]
 
@@ -624,6 +637,36 @@ def test_default_stage_resolves_video_output_from_checkpoint(mocker):
     )
 
     resolver.assert_called_once_with("/models/MiniMax-H3/FL2VA", "default")
+    assert captured["final_output_type"] == "video"
+
+
+def test_default_diffusers_stage_preserves_video_model_identity(mocker):
+    captured = {}
+
+    def resolve_with_default(*args, default_stage_cfg_factory, **kwargs):
+        del args, kwargs
+        captured.update(default_stage_cfg_factory()[0])
+        stage = SimpleNamespace(stage_type="diffusion", engine_args=SimpleNamespace())
+        return ("", [stage], None)
+
+    mocker.patch(
+        "vllm_omni.diffusion.utils.hf_utils.get_diffusion_model_index",
+        return_value={"_class_name": "WanImageToVideoPipeline"},
+    )
+    mocker.patch(
+        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
+        side_effect=resolve_with_default,
+    )
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+    engine._strip_single_engine_args = lambda kwargs: kwargs
+
+    engine._resolve_stage_configs(
+        "/models/Wan2.2-I2V",
+        {"diffusion_load_format": "diffusers"},
+        trust_remote_code=False,
+    )
+
+    assert captured["engine_args"]["model_class_name"] == "WanImageToVideoPipeline"
     assert captured["final_output_type"] == "video"
 
 

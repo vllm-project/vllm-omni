@@ -1,3 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+"""Pytest CLI options and the fixtures that expose them."""
+
+from __future__ import annotations
+
 import pytest
 
 

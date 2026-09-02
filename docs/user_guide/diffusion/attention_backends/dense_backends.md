@@ -1,8 +1,9 @@
 # Dense Attention Backends
 
-Use these backends when you want dense attention without backend-specific
-sparsity. Start with `TORCH_SDPA` for correctness comparisons, then benchmark
-the fastest compatible kernel for your model, shape, and hardware.
+Use these backends to run dense attention. Optional quantized or sparse modes
+remain inactive unless they are explicitly configured. Start with
+`TORCH_SDPA` for correctness comparisons, then benchmark the fastest compatible
+kernel for your model, shape, and hardware.
 
 For selection precedence and per-role configuration, see the
 [attention backend overview](../attention_backends.md).
@@ -40,6 +41,21 @@ pip install 'vllm-omni[fa4]'
 Version `4.0.0b18` is required; earlier beta wheels had known JIT failures on
 Blackwell. If the CuTe path is unavailable, the backend falls back to the
 compatible FlashAttention 3 or 2 path.
+
+## `TRTLLM_ATTN`
+
+`TRTLLM_ATTN` runs FlashInfer's trtllm-gen FMHA kernels and is the platform
+default on datacenter Blackwell for models that declare a compatible attention
+path. Selected without a `quant` or `skip_softmax` block, it runs dense BF16
+attention at FA4-level performance.
+
+```bash
+vllm serve <model> --omni \
+  --diffusion-attention-backend TRTLLM_ATTN
+```
+
+See [TRTLLM Attention](trtllm.md) for its requirements and for the optional
+SAGE quantization and Skip-Softmax modes.
 
 ## `CUDNN_ATTN`
 

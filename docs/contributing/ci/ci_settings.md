@@ -402,7 +402,7 @@ loads the model once per mode.
 Before splitting, confirm each half actually collects at least one test under the job's forwarded filters — pytest exits with code 5 ("no tests collected") if a half is empty, which the script reports as a failure, red-ing a job that used to pass as one combined invocation.
 
 Also check the tests' `num_cards` against the job's `mirror_hardwares` preset.
-`cuda_marks` turns `num_cards > 1` into `skipif(device_count() < num_cards)`, so a
+`_cuda_marks` turns `num_cards > 1` into `skipif(device_count() < num_cards)`, so a
 test asking for more GPUs than the preset provides is silently skipped and its
 coverage artifact comes back empty. Splitting such a job produces a file that
 looks fine and measures nothing — "Diffusion · Z Image Test" is the current
@@ -414,10 +414,12 @@ settings in `pyproject.toml`: online tests launch the server with
 `subprocess.Popen` and stop it with SIGTERM, and without those settings the XML
 reflects only the pytest parent process, not the server's code paths.
 
-The upload depends on `buildkite-agent` being callable inside the container. The
-`kubernetes` presets (`h100_*`, `*_npu_*`) provide it; the `docker` ones (`l4_*`)
-only do because they set `mount-buildkite-agent: true`. A new docker preset that
-runs a coverage job needs the same.
+The upload depends on `buildkite-agent` being callable inside the container.
+CUDA (`l4_*`, `h100_*`) and NPU (`*_npu_*`) presets all use the `kubernetes`
+plugin, which provides the agent. `l4_*` jobs run on the EKS `l4-k8s` queue
+(agent-stack-k8s); they no longer use the docker plugin or
+`mount-buildkite-agent`. A new **docker** preset that runs a coverage job
+still needs `mount-buildkite-agent: true`.
 
 List both `run_cov_split.sh` and `pyproject.toml` in every opted-in job's
 `source_file_dependencies` — both change what the job measures, so without them a

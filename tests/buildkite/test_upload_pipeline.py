@@ -129,8 +129,29 @@ def test_mirror_hardwares_l4_1_expands_to_agents_and_plugins() -> None:
     rendered = _render_test_pipeline(doc, changed_files=None)
     step = rendered["steps"][0]
     assert "mirror_hardwares" not in step
-    assert step["agents"]["queue"] == "gpu_1_queue"
-    assert step["plugins"][0]["docker#v5.2.0"]["image"].endswith("$BUILDKITE_COMMIT")
+    assert step["agents"]["queue"] == "l4-k8s"
+    assert step["retry"] == {
+        "automatic": [
+            {"exit_status": -1, "limit": 1},
+            {"exit_status": 128, "limit": 1},
+            {"signal_reason": "agent_stop", "limit": 1},
+            {"signal_reason": "agent_refused", "limit": 1},
+        ],
+    }
+    container = step["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]
+    assert container["image"].endswith("$BUILDKITE_COMMIT")
+    assert container["resources"]["limits"]["nvidia.com/gpu"] == 1
+
+
+def test_mirror_hardwares_l4_preserves_explicit_retry() -> None:
+    step = _expand_mirror_hardwares(
+        {
+            "label": "opt-out",
+            "mirror_hardwares": "l4_1",
+            "retry": {"automatic": [{"exit_status": 255, "limit": 2}]},
+        },
+    )
+    assert step["retry"] == {"automatic": [{"exit_status": 255, "limit": 2}]}
 
 
 def test_mirror_hardwares_conflicts_with_explicit_agents() -> None:

@@ -3,6 +3,9 @@
 
 """
 E2E offline tests for Omni model with video input and audio output.
+
+Abort / sleep-admission lives in ``test_qwen3_omni_colocate_async.py`` so it
+does not overlap this module's OmniRunners.
 """
 
 import os

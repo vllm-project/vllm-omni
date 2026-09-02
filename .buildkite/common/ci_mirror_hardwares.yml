@@ -1,19 +1,19 @@
 # Uploader-only hardware presets for CUDA / NPU test YAML.
 # Referenced as ``mirror_hardwares: l4_1`` on a step; ``upload_pipeline.py`` expands to
-# ``agents`` (+ optional top-level ``image`` for NPU) + ``plugins``, then strips
-# ``mirror_hardwares`` before Buildkite upload.
+# ``agents`` (+ optional top-level ``image`` for NPU) + ``plugins`` (+ ``retry``
+# for ``l4_*``), then strips ``mirror_hardwares`` before Buildkite upload.
 #
 # CUDA naming: {chip}_{count}
-#   l4_1, l4_4, h100_1 … h100_4
+#   l4_1, l4_2, l4_3, l4_4, h100_1 … h100_4
 # NPU naming: {queue}_{resource_class}
 #   a2b3_npu_1  — ascend-a2b3, resource_class npu-1 (A2/B3 CI image)
 #   a2b3_npu_4  — ascend-a2b3, resource_class npu-4
 #   a3_npu_2    — ascend-a3, resource_class npu-2
 #
-# The ``l4_*`` presets run under the ``docker`` plugin, which does not put
-# ``buildkite-agent`` on PATH inside the container the way the ``kubernetes``
-# presets do, so they set ``mount-buildkite-agent: true``; without it any step
-# calling ``buildkite-agent`` (artifact upload, annotate, meta-data) fails there.
+# The ``l4_*`` presets run on the EKS ``l4-k8s`` queue (agent-stack-k8s),
+# packed onto g6.12xlarge L4 nodes (``vllm.ci/gpu-pool=l4x4``). GPU / CPU /
+# memory / shm requests scale with card count (1 GPU = 10 CPU / 40Gi / 24Gi shm).
+# Retry covers lost agents / killed pods, not pytest or OOM (exit 1 / 137).
 
 x-npu-k8s-plugins: &npu_k8s_plugins
   - kubernetes:
@@ -21,39 +21,224 @@ x-npu-k8s-plugins: &npu_k8s_plugins
         imagePullSecrets:
           - name: swr-secret
 
+# Infra-only retry. Omit exit 1 (pytest failed) and 137 (cgroup OOM / SIGKILL
+# of the test process). ci-infra ``K8S_RETRY`` still retries exit 1.
+x-l4-k8s-retry: &l4_k8s_retry
+  automatic:
+    - exit_status: -1
+      limit: 1
+    - exit_status: 128
+      limit: 1
+    - signal_reason: agent_stop
+      limit: 1
+    - signal_reason: agent_refused
+      limit: 1
+
 
 mirror_hardwares:
   l4_1:
     agents:
-      queue: gpu_1_queue
+      queue: l4-k8s
+    retry: *l4_k8s_retry
     plugins:
-      - docker#v5.2.0:
-          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-          always-pull: true
-          propagate-environment: true
-          mount-buildkite-agent: true
-          shm-size: "8gb"
-          environment:
-            - HF_HOME=/fsx/hf_cache
-            - HF_TOKEN
-          volumes:
-            - /fsx/hf_cache:/fsx/hf_cache
+      - kubernetes:
+          metadata:
+            annotations:
+              cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+              karpenter.sh/do-not-disrupt: "true"
+          podSpec:
+            priorityClassName: ci
+            serviceAccountName: buildkite-gpu-jobs
+            tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+            nodeSelector:
+              vllm.ci/gpu-pool: l4x4
+            containers:
+              - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 1
+                  requests:
+                    nvidia.com/gpu: 1
+                    cpu: "10"
+                    memory: 40Gi
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /fsx/hf_cache
+                env:
+                  - name: HF_HOME
+                    value: /fsx/hf_cache
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 24Gi
+              - name: hf-cache
+                hostPath:
+                  path: /fsx/hf_cache
+                  type: DirectoryOrCreate
+
+  l4_2:
+    agents:
+      queue: l4-k8s
+    retry: *l4_k8s_retry
+    plugins:
+      - kubernetes:
+          metadata:
+            annotations:
+              cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+              karpenter.sh/do-not-disrupt: "true"
+          podSpec:
+            priorityClassName: ci
+            serviceAccountName: buildkite-gpu-jobs
+            tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+            nodeSelector:
+              vllm.ci/gpu-pool: l4x4
+            containers:
+              - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 2
+                  requests:
+                    nvidia.com/gpu: 2
+                    cpu: "20"
+                    memory: 80Gi
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /fsx/hf_cache
+                env:
+                  - name: HF_HOME
+                    value: /fsx/hf_cache
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 48Gi
+              - name: hf-cache
+                hostPath:
+                  path: /fsx/hf_cache
+                  type: DirectoryOrCreate
+
+  l4_3:
+    agents:
+      queue: l4-k8s
+    retry: *l4_k8s_retry
+    plugins:
+      - kubernetes:
+          metadata:
+            annotations:
+              cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+              karpenter.sh/do-not-disrupt: "true"
+          podSpec:
+            priorityClassName: ci
+            serviceAccountName: buildkite-gpu-jobs
+            tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+            nodeSelector:
+              vllm.ci/gpu-pool: l4x4
+            containers:
+              - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 3
+                  requests:
+                    nvidia.com/gpu: 3
+                    cpu: "30"
+                    memory: 120Gi
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /fsx/hf_cache
+                env:
+                  - name: HF_HOME
+                    value: /fsx/hf_cache
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 72Gi
+              - name: hf-cache
+                hostPath:
+                  path: /fsx/hf_cache
+                  type: DirectoryOrCreate
 
   l4_4:
     agents:
-      queue: gpu_4_queue
+      queue: l4-k8s
+    retry: *l4_k8s_retry
     plugins:
-      - docker#v5.2.0:
-          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-          always-pull: true
-          propagate-environment: true
-          mount-buildkite-agent: true
-          shm-size: "8gb"
-          environment:
-            - HF_HOME=/fsx/hf_cache
-            - HF_TOKEN
-          volumes:
-            - /fsx/hf_cache:/fsx/hf_cache
+      - kubernetes:
+          metadata:
+            annotations:
+              cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+              karpenter.sh/do-not-disrupt: "true"
+          podSpec:
+            priorityClassName: ci
+            serviceAccountName: buildkite-gpu-jobs
+            tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+            nodeSelector:
+              vllm.ci/gpu-pool: l4x4
+            containers:
+              - image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 4
+                  requests:
+                    nvidia.com/gpu: 4
+                    cpu: "40"
+                    memory: 160Gi
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /fsx/hf_cache
+                env:
+                  - name: HF_HOME
+                    value: /fsx/hf_cache
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 96Gi
+              - name: hf-cache
+                hostPath:
+                  path: /fsx/hf_cache
+                  type: DirectoryOrCreate
 
   h100_1:
     agents:

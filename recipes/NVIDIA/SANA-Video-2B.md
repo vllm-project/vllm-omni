@@ -119,6 +119,30 @@ MODEL=Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
 bash examples/online_serving/text_to_video/run_curl_sana_video.sh
 ```
 
+##### Parallel native serving
+
+The native pipelines support tensor parallelism (up to 2 GPUs) and CFG
+parallelism. Tensor parallelism on 2 GPUs:
+
+```bash
+vllm serve Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
+  --omni \
+  --model-class-name SanaVideoPipeline \
+  --tensor-parallel-size 2 \
+  --dtype bfloat16 \
+  --port 8091
+```
+
+For CFG parallelism on 2 GPUs, replace `--tensor-parallel-size 2` with
+`--cfg-parallel-size 2`; it splits the guided and unguided branches across the
+two GPUs and only helps when `guidance_scale` is above 1. Passing both flags
+combines the two on 4 GPUs.
+
+Whether tensor parallelism lowers latency depends on the interconnect. Each
+transformer block adds an all-reduce, so it speeds up generation only on fast
+GPU links such as NVLink and can be slower than a single GPU on PCIe-only
+systems. Measure on your hardware before enabling it.
+
 To run the black-box compatibility backend for T2V, replace the server script
 with `run_server_sana_video_diffusers.sh`. The same `/v1/videos` request
 works; `num_frames` is adapted to Diffusers' `frames` argument. The script
@@ -194,8 +218,9 @@ validated compatibility/reference backend.
   The denoising loop intentionally retains the checkpoint-compatible
   Diffusers `DPMSolverMultistepScheduler`.
 - Known limitations:
-    - Sequence/tensor/CFG parallelism, Cache-DiT, TeaCache, and step execution
-    are not validated for the native pipeline.
+    - Tensor parallelism (up to 2 GPUs) and CFG parallelism are supported for
+    the native pipeline. Sequence parallelism, Cache-DiT, TeaCache, and step
+    execution are not validated.
     - The Diffusers backend is a compatibility path and does not provide native
     vLLM-Omni parallelism or continuous batching.
     - Native describes pipeline and Transformer ownership, not a zero-Diffusers

@@ -230,6 +230,11 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     def _raise_unsupported_features(self) -> None:
         """Raise an error for incompatible feature switches."""
         pc = self.od_config.parallel_config
+        if pc.tensor_parallel_size > 1:
+            raise NotImplementedError(
+                "Tensor parallel is not supported with the diffusers backend. "
+                "It requires model-specific layer sharding; use a native pipeline for TP."
+            )
         if pc.cfg_parallel_size > 1:
             raise NotImplementedError(
                 "CFG parallel is not supported with the diffusers backend. "

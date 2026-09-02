@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage-1 acoustic decoder for MiniMax Music 3.
 
 Consumes the AR stage's conditioning spans and returns 32 kHz stereo audio.
@@ -235,7 +235,11 @@ class MiniMaxMusic3AcousticForConditionalGeneration(nn.Module):
         would produce audio that sounds plausible but is wrong, which is far
         worse than a startup failure.
         """
-        root = resolve_repo_root(self.model_path)
+        root = resolve_repo_root(
+            self.model_path,
+            revision=self.vllm_config.model_config.revision,
+            download_dir=self.vllm_config.load_config.download_dir,
+        )
         encoder = self.dit.condition_encoder
         encoder.load_state_dict(load_component_state(root, CONDITION_ENCODER_DIR), strict=True)
         transformer_state = remap_transformer_state(load_component_state(root, TRANSFORMER_DIR))
