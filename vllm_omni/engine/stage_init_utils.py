@@ -14,6 +14,7 @@ from __future__ import annotations
 import copy
 import fcntl
 import importlib
+import inspect
 import json
 import multiprocessing as mp
 import os
@@ -312,11 +313,27 @@ def _resolve_model_path(model: str, engine_args: dict[str, Any]) -> str:
     resolver = _resolve_omni_metadata_hook(str(resolver_path))
     if resolver is None:
         return model
+    resolver_kwargs: dict[str, Any] = {}
+    parameters: Mapping[str, inspect.Parameter]
+    try:
+        parameters = inspect.signature(resolver).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    accepts_var_kwargs = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    for field in ("model_paths", "use_hsdp", "lora_path"):
+        if field in parameters or accepts_var_kwargs:
+            value = engine_args.get(field)
+            if field == "use_hsdp" and value is None:
+                parallel_config = engine_args.get("parallel_config")
+                if isinstance(parallel_config, Mapping):
+                    value = parallel_config.get(field)
+            resolver_kwargs[field] = value
     return str(
         resolver(
             model,
             engine_args.get("revision"),
             engine_args.get("task_type"),
+            **resolver_kwargs,
         )
     )
 

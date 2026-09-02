@@ -106,6 +106,11 @@ from vllm_omni.quantization.component_config import (
 )
 
 from .batched_packing import minimax_h3_batched_forward_kwargs
+from .comfy_checkpoint import (
+    MiniMaxH3ComfyCheckpoint,
+    inspect_comfy_checkpoint,
+    resolve_comfy_checkpoint_path,
+)
 from .condition_noise import (
     minimax_h3_audio_cond_noise_aug_rows,
     minimax_h3_imgvid_cond_noise_aug_rows,
@@ -117,7 +122,7 @@ from .denoise_loop import (
     minimax_h3_publish_denoise_progress,
 )
 from .encoder import MiniMaxH3Qwen3VLEncoder
-from .fasth3 import FastH3WeightFusion, resolve_fasth3_fusion
+from .fasth3 import FastH3WeightFusion, is_fasth3_adapter, resolve_fasth3_fusion
 from .lora import load_minimax_h3_turbo_lora
 from .minimax_h3_transformer import (
     MiniMaxH3Attention,
@@ -215,6 +220,58 @@ MINIMAX_H3_DIFFUSION_DOWNLOAD_PATTERNS = {
         "Ref2VA/transformer/**",
     ],
 }
+MINIMAX_H3_OVERRIDE_DOWNLOAD_PATTERNS = {
+    "fl2va": {
+        "diffusion": [
+            "FL2VA/model_index.json",
+            "FL2VA/transformer/config.json",
+            "FL2VA/video_vae/**",
+            "FL2VA/audio_vae/**",
+        ],
+        "all": [
+            "FL2VA/model_index.json",
+            "FL2VA/tokenizer/**",
+            "FL2VA/processor/**",
+            "FL2VA/text_encoder/**",
+            "FL2VA/transformer/config.json",
+            "FL2VA/video_vae/**",
+            "FL2VA/audio_vae/**",
+        ],
+    },
+    "ref2va": {
+        "diffusion": [
+            "Ref2VA/model_index.json",
+            "Ref2VA/transformer/config.json",
+            "Ref2VA/video_vae/**",
+            "Ref2VA/audio_vae/**",
+        ],
+        "all": [
+            "Ref2VA/model_index.json",
+            "Ref2VA/tokenizer/**",
+            "Ref2VA/processor/**",
+            "Ref2VA/text_encoder/**",
+            "Ref2VA/transformer/config.json",
+            "Ref2VA/video_vae/**",
+            "Ref2VA/audio_vae/**",
+        ],
+    },
+}
+
+
+def _validate_int8_convrot_override_pair(
+    transformer_override: bool,
+    transformer_quant_config: QuantizationConfig | None,
+) -> None:
+    uses_int8_convrot = transformer_quant_config is not None and transformer_quant_config.get_name() == "int8_convrot"
+    if transformer_override and not uses_int8_convrot:
+        raise ValueError(
+            "A Comfy INT8 ConvRot transformer checkpoint requires component quantization "
+            '`{"transformer":{"method":"int8_convrot"}}`.'
+        )
+    if uses_int8_convrot and not transformer_override:
+        raise ValueError(
+            'MiniMax-H3 int8_convrot quantization requires a validated Comfy checkpoint in model_paths["transformer"].'
+        )
 
 
 def _resolve_minimax_h3_text_encoder_quant_config(
@@ -237,13 +294,19 @@ def _resolve_minimax_h3_model_root(
     partition: str,
     *,
     load_text_encoder: bool,
+    skip_transformer: bool = False,
 ) -> Path:
     path = Path(model)
     if path.is_dir():
         if path.name in {"FL2VA", "Ref2VA"}:
             return path.parent
         return path
-    if load_text_encoder:
+    if skip_transformer:
+        if partition == "combined":
+            raise ValueError("A MiniMax-H3 transformer override does not support combined mode.")
+        scope = "all" if load_text_encoder else "diffusion"
+        allow_patterns = MINIMAX_H3_OVERRIDE_DOWNLOAD_PATTERNS[partition][scope]
+    elif load_text_encoder:
         allow_patterns = (
             MINIMAX_H3_DOWNLOAD_PATTERNS if partition == "combined" else MINIMAX_H3_TASK_DOWNLOAD_PATTERNS[partition]
         )
@@ -331,6 +394,10 @@ def resolve_minimax_h3_diffusion_model_path(
     model: str,
     revision: str | None,
     task_type: str | None,
+    *,
+    model_paths: Mapping[str, str] | None = None,
+    use_hsdp: bool | None = None,
+    lora_path: str | Sequence[str] | None = None,
 ) -> str:
     """Resolve a repository root or Hub ID to its startup partition."""
     partition = (
@@ -338,11 +405,22 @@ def resolve_minimax_h3_diffusion_model_path(
         if str(task_type or "").lower() == "combined"
         else resolve_minimax_h3_partition(model, task_type, auto_partition="fl2va")
     )
+    transformer_override = bool(model_paths and model_paths.get("transformer"))
+    if transformer_override and use_hsdp:
+        raise ValueError("MiniMax-H3 INT8 ConvRot currently supports tensor parallelism, not HSDP/FSDP.")
+    if transformer_override:
+        candidates = [lora_path] if isinstance(lora_path, str) else list(lora_path or [])
+        if any(is_fasth3_adapter(candidate) for candidate in candidates):
+            raise ValueError(
+                "MiniMax-H3 INT8 ConvRot checkpoints cannot be combined with FastH3 weight fusion; "
+                "the adapter delta is not quantized in the checkpoint's rotated INT8 domain."
+            )
     model_root = _resolve_minimax_h3_model_root(
         model,
         revision,
         partition,
         load_text_encoder=False,
+        skip_transformer=transformer_override,
     )
     if partition == "combined":
         return str(model_root)
@@ -882,11 +960,15 @@ class MiniMaxH3Pipeline(
         self._turbo_lora_adapter_ids: set[int] = set()
         self._native_lora_adapter_ids: set[int] = set()
         self._lora_sigma_schedules: dict[int, DMD2SigmaSchedule] = {}
+        transformer_override = od_config.model_paths.get("transformer")
+        if transformer_override and bool(getattr(self.parallel_config, "use_hsdp", False)):
+            raise ValueError("MiniMax-H3 INT8 ConvRot currently supports tensor parallelism, not HSDP/FSDP.")
         model_root = _resolve_minimax_h3_model_root(
             str(od_config.model),
             od_config.revision,
             self.partition,
             load_text_encoder=self.load_text_encoder,
+            skip_transformer=bool(transformer_override),
         )
         model_path = model_root / ("Ref2VA" if self.partition == "ref2va" else "FL2VA")
         model_index = json.loads((model_path / "model_index.json").read_text(encoding="utf-8"))
@@ -923,15 +1005,50 @@ class MiniMaxH3Pipeline(
         if ref2va_model_path is not None:
             self._base_schedule_by_partition["ref2va"] = _read_base_schedule(ref2va_release)
 
-        self.weights_sources = [
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=str(model_path),
-                subfolder="transformer",
-                revision=od_config.revision,
-                prefix="transformer.",
-                fall_back_to_pt=False,
+        transformer_quant_config = _resolve_component_quant_config(
+            od_config.quantization_config,
+            "transformer",
+        )
+        _validate_int8_convrot_override_pair(
+            bool(transformer_override),
+            transformer_quant_config,
+        )
+        transformer_checkpoint: MiniMaxH3ComfyCheckpoint | None = None
+        if transformer_override:
+            if self.partition == "combined":
+                raise ValueError(
+                    "A Comfy MiniMax-H3 transformer override currently supports one partition at a time; "
+                    "start FL2VA or Ref2VA instead of combined mode."
+                )
+            checkpoint_path = resolve_comfy_checkpoint_path(transformer_override)
+            transformer_checkpoint = inspect_comfy_checkpoint(
+                checkpoint_path,
+                expected_partition=expected_partition,
             )
-        ]
+            configure_layers = getattr(transformer_quant_config, "configure_layers", None)
+            if configure_layers is None:
+                raise TypeError("The active int8_convrot config cannot consume checkpoint layer metadata.")
+            configure_layers(transformer_checkpoint.layer_configs)
+            self.weights_sources = [
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=str(checkpoint_path.parent),
+                    subfolder=None,
+                    revision=None,
+                    prefix="transformer.",
+                    fall_back_to_pt=False,
+                    allow_patterns_overrides=[checkpoint_path.name],
+                )
+            ]
+        else:
+            self.weights_sources = [
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=str(model_path),
+                    subfolder="transformer",
+                    revision=od_config.revision,
+                    prefix="transformer.",
+                    fall_back_to_pt=False,
+                )
+            ]
         self._dit_modules = ["transformer"]
         if ref2va_model_path is not None:
             self.weights_sources.append(
@@ -944,13 +1061,10 @@ class MiniMaxH3Pipeline(
                 )
             )
             self._dit_modules.append("transformers_ref")
-        transformer_quant_config = _resolve_component_quant_config(
-            od_config.quantization_config,
-            "transformer",
-        )
         self.transformer = MiniMaxH3DiTModel(
             od_config,
             quant_config=transformer_quant_config,
+            arch_overrides=transformer_checkpoint.arch_overrides if transformer_checkpoint is not None else None,
         )
         if ref2va_model_path is not None:
             self.transformers_ref = MiniMaxH3DiTModel(
@@ -958,7 +1072,19 @@ class MiniMaxH3Pipeline(
                 quant_config=transformer_quant_config,
             )
 
+        lora_paths = od_config.lora_path
+        lora_candidates = [lora_paths] if isinstance(lora_paths, str) else list(lora_paths or [])
+        if transformer_checkpoint is not None and any(is_fasth3_adapter(path) for path in lora_candidates):
+            raise ValueError(
+                "MiniMax-H3 INT8 ConvRot checkpoints cannot be combined with FastH3 weight fusion; "
+                "the adapter delta is not quantized in the checkpoint's rotated INT8 domain."
+            )
         self._fasth3 = resolve_fasth3_fusion(od_config, self.transformer)
+        if transformer_checkpoint is not None and self._fasth3 is not None:
+            raise ValueError(
+                "MiniMax-H3 INT8 ConvRot checkpoints cannot be combined with FastH3 weight fusion; "
+                "the adapter delta is not quantized in the checkpoint's rotated INT8 domain."
+            )
         if self._fasth3 is not None:
             self._fasth3.check_serving_contract(
                 partition=self.partition,

@@ -667,6 +667,12 @@ def _resolve_adapter_file(path: str | Path) -> Path | None:
     return None
 
 
+def is_fasth3_adapter(path: str | Path) -> bool:
+    """Return whether a local adapter carries the FastH3 release identity."""
+    weights_path = _resolve_adapter_file(path)
+    return weights_path is not None and _is_fasth3_release(_safetensors_metadata(weights_path))
+
+
 __all__ = [
     "FASTH3_BASE_MODEL",
     "FASTH3_BASE_SCHEDULE",
@@ -675,5 +681,6 @@ __all__ = [
     "FASTH3_SUPPORTED_TASKS",
     "FastH3AdapterError",
     "FastH3WeightFusion",
+    "is_fasth3_adapter",
     "resolve_fasth3_fusion",
 ]

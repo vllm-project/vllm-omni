@@ -1595,6 +1595,42 @@ def test_model_path_resolver_is_generic_and_model_owned(tmp_path):
     assert "model_path_resolver" not in engine_args
 
 
+def test_model_path_resolver_forwards_component_overrides(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3
+    from vllm_omni.engine.stage_init_utils import _resolve_model_path
+
+    calls = []
+
+    def resolver(model, revision, task_type, *, model_paths=None, use_hsdp=None, lora_path=None):
+        calls.append((model, revision, task_type, model_paths, use_hsdp, lora_path))
+        return "/resolved/FL2VA"
+
+    monkeypatch.setattr(pipeline_minimax_h3, "resolve_minimax_h3_diffusion_model_path", resolver)
+    model_paths = {"transformer": "/models/convrot.safetensors"}
+    engine_args = {
+        "model_path_resolver": (
+            "vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3.resolve_minimax_h3_diffusion_model_path"
+        ),
+        "revision": "main",
+        "task_type": "fl2va",
+        "model_paths": model_paths,
+        "parallel_config": {"use_hsdp": True},
+        "lora_path": "/models/adapter.safetensors",
+    }
+
+    assert _resolve_model_path("MiniMaxAI/MiniMax-H3", engine_args) == "/resolved/FL2VA"
+    assert calls == [
+        (
+            "MiniMaxAI/MiniMax-H3",
+            "main",
+            "fl2va",
+            model_paths,
+            True,
+            "/models/adapter.safetensors",
+        )
+    ]
+
+
 def test_build_stage0_input_processor_uses_omni_input_preprocessor(monkeypatch):
     import vllm_omni.engine.stage_init_utils as init_mod
 

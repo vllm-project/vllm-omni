@@ -104,6 +104,34 @@ def test_stage_override_preserves_model_extras_for_default_diffusion_stage(mocke
     assert stage_configs[0]["engine_args"]["extras"]["ltx2_use_conv_vae"] is True
 
 
+def test_default_diffusion_fallback_preserves_model_loading_overrides(mocker):
+    """Single-stage fallback must retain component path/load overrides."""
+
+    def resolve_with_default(*_args, default_stage_cfg_factory, **_kwargs):
+        return None, default_stage_cfg_factory(), None
+
+    mocker.patch(
+        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
+        side_effect=resolve_with_default,
+    )
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+    model_paths = {"transformer": "/models/convrot.safetensors"}
+    model_loaded = {"transformer": True, "vae": True, "text_encoder": False}
+
+    _, stage_configs = engine._resolve_stage_configs(
+        "/models/MiniMax-H3",
+        {
+            "model_paths": model_paths,
+            "model_loaded": model_loaded,
+        },
+        trust_remote_code=False,
+    )
+
+    engine_args = stage_configs[0]["engine_args"]
+    assert engine_args["model_paths"] == model_paths
+    assert engine_args["model_loaded"] == model_loaded
+
+
 def test_default_cache_config_used_when_missing():
     """Ensure default cache_config is synthesized when only backend is given."""
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
@@ -746,9 +774,13 @@ def test_resolve_stage_configs_injects_quantization_config_into_diffusion_stage(
         "dummy-model",
         {
             "deploy_config": "dummy.yaml",
-            "quantization_config": {"method": "bitsandbytes"},
+            "diffusion_quantization_config": {
+                "transformer": {"method": "int8_convrot"},
+            },
         },
         trust_remote_code=False,
     )
 
-    assert stage_configs[0].engine_args.quantization_config == {"method": "bitsandbytes"}
+    assert stage_configs[0].engine_args.quantization_config == {
+        "transformer": {"method": "int8_convrot"},
+    }

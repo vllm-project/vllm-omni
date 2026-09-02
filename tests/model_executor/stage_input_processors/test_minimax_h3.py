@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import torch
 from PIL import Image
+from safetensors.torch import save_file
 
 from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
     _load_audio,
@@ -385,3 +386,70 @@ def test_diffusion_resolver_normalizes_partial_partition_directory(tmp_path):
     (ref2va / "text_encoder").mkdir(parents=True)
 
     assert resolve_minimax_h3_diffusion_model_path(str(ref2va), None, "ref2va") == str(ref2va)
+
+
+def test_diffusion_resolver_skips_native_transformer_for_override(monkeypatch, tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
+
+    calls = []
+
+    def fake_download(**kwargs):
+        calls.append(kwargs)
+        return str(tmp_path)
+
+    monkeypatch.setattr(pipeline_module, "download_weights_from_hf_specific", fake_download)
+
+    resolved = resolve_minimax_h3_diffusion_model_path(
+        "MiniMaxAI/MiniMax-H3",
+        None,
+        "fl2va",
+        model_paths={"transformer": "/models/convrot.safetensors"},
+    )
+
+    assert resolved == str(tmp_path / "FL2VA")
+    assert len(calls) == 1
+    assert calls[0]["allow_patterns"] == pipeline_module.MINIMAX_H3_OVERRIDE_DOWNLOAD_PATTERNS["fl2va"]["diffusion"]
+    transformer_patterns = [pattern for pattern in calls[0]["allow_patterns"] if "transformer" in pattern]
+    assert transformer_patterns == ["FL2VA/transformer/config.json"]
+
+
+def test_diffusion_resolver_rejects_incompatible_convrot_modes_before_download(monkeypatch, tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
+
+    calls = []
+    monkeypatch.setattr(
+        pipeline_module,
+        "download_weights_from_hf_specific",
+        lambda **kwargs: calls.append(kwargs),
+    )
+    model_paths = {"transformer": "/models/convrot.safetensors"}
+
+    with pytest.raises(ValueError, match="not HSDP/FSDP"):
+        resolve_minimax_h3_diffusion_model_path(
+            "MiniMaxAI/MiniMax-H3",
+            None,
+            "fl2va",
+            model_paths=model_paths,
+            use_hsdp=True,
+        )
+
+    adapter = tmp_path / "fasth3.safetensors"
+    save_file(
+        {"dummy": torch.zeros(1)},
+        adapter,
+        metadata={
+            "format": "fastvideo-lora-v2",
+            "finetuned_model": "FastVideo/FastVideo-FastH3-Dense-4-step-v1",
+            "base_model": "MiniMaxAI/MiniMax-H3",
+        },
+    )
+    with pytest.raises(ValueError, match="cannot be combined with FastH3"):
+        resolve_minimax_h3_diffusion_model_path(
+            "MiniMaxAI/MiniMax-H3",
+            None,
+            "fl2va",
+            model_paths=model_paths,
+            lora_path=[str(tmp_path / "ordinary.safetensors"), str(adapter)],
+        )
+
+    assert calls == []

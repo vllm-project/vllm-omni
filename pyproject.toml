@@ -119,6 +119,13 @@ quack = [
     "quack-kernels>=0.3.11",
 ]
 
+# Native W8A8 ConvRot kernels for serialized ComfyUI diffusion checkpoints.
+# Keep this opt-in: the published CUDA wheel requires a CUDA 13 runtime and an
+# R580+ NVIDIA driver, while non-CUDA installations do not need the package.
+int8-convrot = [
+    "comfy-kitchen[cublas]==0.2.31",
+]
+
 # Optional Blackwell-native FlashAttention-4 backend. Keep this opt-in because
 # the CuTe/CUTLASS dependency is CUDA 13 and Blackwell specific.
 fa4 = [
