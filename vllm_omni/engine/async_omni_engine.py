@@ -941,6 +941,11 @@ class AsyncOmniEngine:
                 "mag_max_skip_steps": 5,
                 "mag_retention_ratio": 0.1,
             }
+        if cache_backend == "sea_cache":
+            return {
+                "sea_thresh": 0.3,
+                "sea_norm_mode": "mean",
+            }
         if cache_backend == "step_cache":
             return {
                 "step_cache_dit_enabled": True,

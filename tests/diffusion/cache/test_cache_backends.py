@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Unit tests for cache backends (cache-dit and teacache).
@@ -25,6 +25,7 @@ from vllm_omni.diffusion.cache.cachedit import (
     cache_summary,
 )
 from vllm_omni.diffusion.cache.magcache import MagCacheBackend
+from vllm_omni.diffusion.cache.seacache import SeaCacheBackend
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.cache.teacache import TeaCacheBackend
 from vllm_omni.diffusion.data import DiffusionCacheConfig
@@ -593,6 +594,15 @@ class TestCacheSelector:
         backend = get_cache_backend("tea_cache", config_dict)
         assert isinstance(backend, TeaCacheBackend)
         assert backend.config.rel_l1_thresh == 0.3
+
+    @pytest.mark.parametrize("name", ["sea_cache", "seacache"])
+    def test_get_cache_backend_sea_cache(self, name):
+        """Test getting seacache backend (and its alias)."""
+        config_dict = {"sea_thresh": 0.215, "sea_norm_mode": "mean"}
+        backend = get_cache_backend(name, config_dict)
+        assert isinstance(backend, SeaCacheBackend)
+        assert backend.config.sea_thresh == 0.215
+        assert backend.config.sea_norm_mode == "mean"
 
     def test_get_cache_backend_invalid(self):
         """Test getting invalid backend raises error."""

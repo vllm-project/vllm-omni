@@ -636,7 +636,8 @@ class OmniServeCommand(CLISubcommand):
             "--cache-backend",
             type=str,
             default="none",
-            help="Cache backend for diffusion models, options: 'tea_cache', 'cache_dit', 'mag_cache', 'step_cache'",
+            help="Cache backend for diffusion models, options: 'tea_cache', 'cache_dit', "
+            "'mag_cache', 'step_cache', 'sea_cache'",
         )
         omni_config_group.add_argument(
             "--cache-config",
@@ -645,7 +646,8 @@ class OmniServeCommand(CLISubcommand):
             help="JSON string of cache configuration. "
             "TeaCache: '{\"rel_l1_thresh\": 0.2}'. "
             'MagCache: \'{"mag_threshold": 0.24, "mag_max_skip_steps": 5, "mag_retention_ratio": 0.1}\'. '
-            "Calibration mode: add '\"mag_calibrate\": true'",
+            "Calibration mode: add '\"mag_calibrate\": true'. "
+            "SeaCache: '{\"sea_thresh\": 0.3}' (0.215 ~2x, 0.3 faster, 0.6 ~3x on FLUX.1).",
         )
         omni_config_group.add_argument(
             "--enable-cache-dit-summary",

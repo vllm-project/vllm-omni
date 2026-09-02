@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Model-specific extractors for TeaCache.
@@ -88,6 +88,16 @@ class CacheContext:
         extra_states: Optional dict for additional model-specific state.
             Use this for models that need to pass additional context beyond
             the standard fields.
+
+        sigma: Optional denoising sigma in [0, 1]; spectral caches
+            (e.g. SeaCache) build their timestep-dependent filter from it.
+
+        grid_hw: Optional (height, width) of the latent token grid, for
+            applying a 2-D filter over the latent grid.
+
+        grid_seq_len: Optional number of leading tokens forming `grid_hw`,
+            set when extra tokens follow the grid (e.g. Qwen-Image-Edit's
+            condition tokens); None means the whole sequence is the grid.
     """
 
     modulated_input: torch.Tensor
@@ -97,6 +107,9 @@ class CacheContext:
     run_transformer_blocks: Callable[[], tuple[torch.Tensor, ...]]
     postprocess: Callable[[torch.Tensor], Any]
     extra_states: dict[str, Any] | None = None
+    sigma: float | None = None
+    grid_hw: tuple[int, int] | None = None
+    grid_seq_len: int | None = None
 
     def validate(self) -> None:
         """
@@ -188,6 +201,24 @@ def extract_qwen_context(
 
     if not hasattr(module, "transformer_blocks") or len(module.transformer_blocks) == 0:
         raise ValueError("Module must have transformer_blocks")
+
+    # Qwen pipelines pass t / 1000 == the scheduler's shifted sigma
+    # (FlowMatchEuler); capture it before preprocessing mutates timestep.
+    if torch.is_tensor(timestep):
+        sigma = float(timestep.detach().to(torch.float32).reshape(-1)[0].item())
+    else:
+        sigma = float(timestep)
+
+    # img_shapes is [batch][layer] of (frame, height, width) in latent tokens.
+    # Layer 0 is the noise grid; edit pipelines append condition-image tokens
+    # after it, so the grid covers only the leading grid_seq_len tokens.
+    grid_hw = None
+    grid_seq_len = None
+    shapes = img_shapes[0] if isinstance(img_shapes, list) and img_shapes else img_shapes
+    if isinstance(shapes, (list, tuple)) and len(shapes) > 0:
+        _frame, grid_h, grid_w = shapes[0]
+        grid_hw = (int(grid_h), int(grid_w))
+        grid_seq_len = grid_hw[0] * grid_hw[1]
 
     # ============================================================================
     # PREPROCESSING (Qwen-specific)
@@ -296,6 +327,9 @@ def extract_qwen_context(
         temb=temb,
         run_transformer_blocks=run_transformer_blocks,
         postprocess=postprocess,
+        sigma=sigma,
+        grid_hw=grid_hw,
+        grid_seq_len=grid_seq_len,
     )
 
 
@@ -619,6 +653,10 @@ def extract_flux2_klein_context(
 
     num_txt_tokens = encoder_hidden_states.shape[1]
 
+    # The pipeline passes t / 1000 == the scheduler's shifted sigma
+    # (FlowMatchEuler); capture it before the * 1000 rescale below.
+    sigma = float(timestep.detach().to(torch.float32).reshape(-1)[0].item())
+
     timestep = timestep.to(dtype=dtype) * 1000
     if guidance is not None:
         guidance = guidance.to(dtype=dtype) * 1000
@@ -636,6 +674,17 @@ def extract_flux2_klein_context(
         img_ids = img_ids[0]
     if txt_ids.ndim == 3:
         txt_ids = txt_ids[0]
+
+    # img_ids rows are (T, H, W, L): the noise grid is the leading T == 0
+    # block; img2img/inpaint append condition rows with T >= 10 (see
+    # _prepare_image_ids). Expose the noise grid and its token count.
+    noise_rows = img_ids[:, 0] == 0
+    noise_ids = img_ids[noise_rows]
+    grid_hw = (
+        int(noise_ids[:, 1].to(torch.int64).max().item()) + 1,
+        int(noise_ids[:, 2].to(torch.int64).max().item()) + 1,
+    )
+    grid_seq_len = int(noise_rows.sum().item())
 
     image_rotary_emb = module.pos_embed(img_ids)
     text_rotary_emb = module.pos_embed(txt_ids)
@@ -717,6 +766,9 @@ def extract_flux2_klein_context(
         extra_states={
             "run_flux2_full_transformer_with_single": run_flux2_full_transformer_with_single,
         },
+        sigma=sigma,
+        grid_hw=grid_hw,
+        grid_seq_len=grid_seq_len,
     )
 
 
@@ -1104,6 +1156,10 @@ def extract_flux_context(
     # ============================================================================
     # PREPROCESSING (Flux1-specific)
     # ============================================================================
+    # The pipeline passes t / 1000 == the scheduler's shifted sigma
+    # (FlowMatchEuler); capture it before the * 1000 rescale below.
+    sigma = float(timestep.to(device=hidden_states.device, dtype=torch.float32).reshape(-1)[0].item())
+
     hidden_states = module.x_embedder(hidden_states)
     timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype) * 1000
 
@@ -1121,6 +1177,13 @@ def extract_flux_context(
         txt_ids = txt_ids[0]
     if img_ids.ndim == 3:
         img_ids = img_ids[0]
+
+    # img_ids columns are (axis, y, x) over the latent token grid; grid
+    # coordinates up to 256 are exact in bf16, which covers 1024px images (64x64).
+    grid_hw = (
+        int(img_ids[:, 1].to(torch.int64).max().item()) + 1,
+        int(img_ids[:, 2].to(torch.int64).max().item()) + 1,
+    )
 
     ids = torch.cat((txt_ids, img_ids), dim=0)
     if current_omni_platform.is_npu():
@@ -1184,6 +1247,8 @@ def extract_flux_context(
         temb=temb,
         run_transformer_blocks=run_transformer_blocks,
         postprocess=postprocess,
+        sigma=sigma,
+        grid_hw=grid_hw,
     )
 
 
