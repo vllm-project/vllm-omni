@@ -81,7 +81,7 @@ steps:
   - group: ":card_index_dividers: Tiny Model Tests [Single GPU]"
     depends_on: upload-ready-pipeline
     steps:
-
+      # debug for test
       - label: "Tiny Model Tests · Diffusion (base)"
         commands:
           - python -c "import os,urllib.request,json; r=urllib.request.urlopen(urllib.request.Request('https://huggingface.co/api/whoami-v2', headers={'Authorization':'Bearer '+os.environ['HF_TOKEN']})); print(json.load(r)['name'])"
