@@ -27,36 +27,52 @@ steps:
     steps:
 
       - label: "Reliability Test · qwen3-omni"
+        source_file_dependencies: omni_qwen3_omni
         timeout_in_minutes: 180
         commands:
           - pytest -s -v tests/dfx/reliability/test_reliability_qwen3_omni.py -m "slow"
         mirror_hardwares: h100_2
 
       - label: "Reliability Test · wan22"
+        source_file_dependencies: diffusion_wan22
         timeout_in_minutes: 180
         commands:
           - pytest -s -v tests/dfx/reliability/test_reliability_wan22.py -m "slow"
         mirror_hardwares: h100_2
 
       - label: "Reliability Test · hunyuan-image"
+        source_file_dependencies: diffusion_hunyuan_image3
         timeout_in_minutes: 180
         commands:
           - pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m "slow"
         mirror_hardwares: h100_4
 
       - label: "Reliability Test · Invalid parameters · H100 · Single-GPU"
+        source_file_dependencies:
+          - omni_qwen3_omni
+          - omni_minicpmo_4_5
+          - diffusion_qwen_image
+          - diffusion_wan22
         timeout_in_minutes: 90
         commands:
           - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and H100 and cards_1"
         mirror_hardwares: h100_1
 
       - label: "Reliability Test · Invalid parameters · H100 · 2-GPU"
+        source_file_dependencies:
+          - omni_qwen3_omni
+          - omni_minicpmo_4_5
+          - diffusion_qwen_image
+          - diffusion_wan22
         timeout_in_minutes: 90
         commands:
           - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and H100 and cards_2"
         mirror_hardwares: h100_2
 
       - label: "Reliability Test · Invalid parameters · L4"
+        source_file_dependencies:
+          - tts_qwen3_tts
+          - diffusion_stable_audio
         timeout_in_minutes: 120
         commands:
           - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and L4"
@@ -68,6 +84,7 @@ steps:
     steps:
 
       - label: ":full_moon: Omni · Perf Test · vLLM Text"
+        source_file_dependencies: omni_qwen3_omni
         key: weekly-omni-performance-vllm-text
         timeout_in_minutes: 180
         commands:
@@ -94,6 +111,7 @@ steps:
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Omni · Perf Test · Multi-Replica"
+        source_file_dependencies: omni_qwen3_omni
         key: weekly-omni-performance-multi-replicas
         timeout_in_minutes: 180
         commands:

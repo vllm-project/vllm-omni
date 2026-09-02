@@ -27,6 +27,7 @@ from upload_pipeline import _render_test_pipeline  # noqa: E402
 
 SKIP_FILES = {
     ".buildkite/common/ci_mirror_hardwares.yml",
+    ".buildkite/common/ci_source_file_dependencies.yml",
     ".buildkite/npu/pipeline-npu-a3.yml",
 }
 

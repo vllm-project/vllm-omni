@@ -9,28 +9,38 @@ steps:
   - group: ":card_index_dividers: Omni Model Test"
     key: nightly-omni-test-group
     depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "omni-test"
+    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     steps:
 
       - label: ":full_moon: Omni · Function Test with H100 · Single-GPU"
+        source_file_dependencies:
+          - omni_qwen3_omni
+          - omni_minicpmo_4_5
         timeout_in_minutes: 90
         commands:
           - pytest -sv tests/e2e --run-level "full_model" -m "full_model and H100 and omni and cards_1" --ignore=tests/e2e/accuracy --ignore=tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py
         mirror_hardwares: h100_1
 
       - label: ":full_moon: Omni · Function Test with H100 · 2-GPU"
+        source_file_dependencies:
+          - omni_qwen3_omni
+          - omni_minicpmo_4_5
         timeout_in_minutes: 90
         commands:
           - pytest -sv tests/e2e --run-level "full_model" -m "full_model and H100 and omni and cards_2" --ignore=tests/e2e/accuracy --ignore=tests/e2e/online_serving/test_qwen3_omni_multi_replicas.py
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Omni · MiniCPM-o 4.5 Duplex Test"
+        source_file_dependencies: omni_minicpmo_4_5_duplex
         timeout_in_minutes: 50
         commands:
           - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py -m "full_model and cuda and H100 and omni and cards_1" --run-level "full_model"
         mirror_hardwares: h100_1
 
       - label: ":full_moon: Omni · Doc Test with L4"
+        source_file_dependencies:
+          - omni_qwen3_omni
+          - omni_minicpmo_4_5
         timeout_in_minutes: 90
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
@@ -38,12 +48,16 @@ steps:
         mirror_hardwares: l4_4
 
       - label: ":full_moon: Omni · Doc Test with H100 · 2-GPU"
+        source_file_dependencies:
+          - omni_qwen3_omni
+          - omni_minicpmo_4_5
         timeout_in_minutes: 90
         commands:
           - pytest -s -v tests/examples/ -m "full_model and omni and H100 and cards_2" --run-level "full_model"
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Omni · Accuracy Test"
+        source_file_dependencies: omni_qwen3_omni
         timeout_in_minutes: 180
         commands:
           - export SEED_TTS_WER_EVAL=1
@@ -57,6 +71,7 @@ steps:
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Accuracy Test"
+        source_file_dependencies: omni_minicpmo_4_5
         timeout_in_minutes: 180
         commands:
           - export SEED_TTS_WER_EVAL=1
@@ -70,6 +85,7 @@ steps:
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Omni · Perf Test · No Async Chunk"
+        source_file_dependencies: omni_qwen3_omni
         key: nightly-omni-performance-no-async-chunk
         timeout_in_minutes: 300
         commands:
@@ -83,6 +99,7 @@ steps:
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Omni · Perf Test · Async Chunk"
+        source_file_dependencies: omni_qwen3_omni
         key: nightly-omni-performance-async-chunk
         timeout_in_minutes: 180
         commands:
@@ -96,6 +113,7 @@ steps:
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test"
+        source_file_dependencies: omni_minicpmo_4_5_perf
         key: nightly-omni-performance-minicpmo-4-5
         timeout_in_minutes: 180
         commands:
@@ -109,6 +127,7 @@ steps:
         mirror_hardwares: h100_1
 
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Duplex Seed-TTS Perf Test"
+        source_file_dependencies: omni_minicpmo_4_5_duplex
         key: nightly-omni-performance-minicpmo-4-5-duplex-seed-tts
         timeout_in_minutes: 180
         commands:
@@ -122,6 +141,7 @@ steps:
         mirror_hardwares: h100_1
 
       - label: ":full_moon: Omni · Multi-Replica Startup Test with 4x H100"
+        source_file_dependencies: omni_qwen3_omni
         timeout_in_minutes: 45
         commands:
           - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_multi_replicas.py -m "full_model" --run-level "core_model"
@@ -130,10 +150,11 @@ steps:
   - group: ":card_index_dividers: TTS Model Test"
     key: nightly-tts-test-group
     depends_on: upload-nightly-pipeline
-    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "tts-test"
+    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     steps:
 
       - label: ":full_moon: TTS · Function Test with L4"
+        source_file_dependencies: tts_qwen3_tts
         timeout_in_minutes: 120
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
@@ -143,6 +164,7 @@ steps:
         mirror_hardwares: l4_1
 
       - label: ":full_moon: TTS · Perf Test · Single-GPU"
+        source_file_dependencies: tts_qwen3_tts
         key: nightly-tts-performance-single
         timeout_in_minutes: 180
         commands:
@@ -157,6 +179,7 @@ steps:
         mirror_hardwares: h100_1
 
       - label: ":full_moon: TTS · Perf Test · 2-GPU"
+        source_file_dependencies: tts_qwen3_tts
         key: nightly-tts-performance-2gpu
         timeout_in_minutes: 180
         commands:
@@ -179,6 +202,7 @@ steps:
     steps:
 
       - label: ":full_moon: Tiny Model Tests · Diffusion (Multi-GPU accelerations)"
+        source_file_dependencies: diffusion_x2i
         timeout_in_minutes: 30
         # NOTE: Single-GPU (core_model) tiny model tests run on the ready label,
         # so nightly only adds the multi-GPU parallelism configurations.
@@ -196,11 +220,11 @@ steps:
     depends_on: upload-nightly-pipeline
     if: >-
       build.env("NIGHTLY") == "1" ||
-      build.pull_request.labels includes "nightly-test" ||
-      build.pull_request.labels includes "diffusion-x2iat-test"
+      build.pull_request.labels includes "nightly-test"
     steps:
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with H100 · Single-GPU"
+        source_file_dependencies: diffusion_qwen_image
         timeout_in_minutes: 120
         commands:
           - >-
@@ -211,6 +235,7 @@ steps:
         mirror_hardwares: h100_1
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with H100 · 2-GPU"
+        source_file_dependencies: diffusion_qwen_image
         timeout_in_minutes: 120
         commands:
           - >-
@@ -221,18 +246,21 @@ steps:
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with L4 · Multi-GPU"
+        source_file_dependencies: diffusion_x2i
         timeout_in_minutes: 120
         commands:
           - pytest -sv tests/e2e/ -k "not test_wan and not hunyuan" -m "full_model and diffusion and L4 and not cards_1" --run-level "full_model" --ignore=tests/e2e/accuracy
         mirror_hardwares: l4_4
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Doc Test"
+        source_file_dependencies: diffusion_qwen_image
         timeout_in_minutes: 60
         commands:
           - pytest -s -v tests/examples/*/test_text_to_image.py -m "full_model and example and H100" --run-level "full_model"
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Accuracy Test"
+        source_file_dependencies: diffusion_qwen_image
         timeout_in_minutes: 180
         commands:
           - export VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120
@@ -241,6 +269,7 @@ steps:
         mirror_hardwares: h100_1
 
       - label: ":full_moon: HunyuanImage3-DIT · Accuracy Test"
+        source_file_dependencies: diffusion_hunyuan_image3
         timeout_in_minutes: 180
         commands:
           - export HUNYUAN_IMAGE3_MODEL="tencent/HunyuanImage-3.0-Instruct"
@@ -249,12 +278,14 @@ steps:
         mirror_hardwares: h100_4
 
       - label: ":full_moon: HiDream-O1-Image · Accuracy Test"
+        source_file_dependencies: diffusion_hidream_o1
         timeout_in_minutes: 180
         commands:
           - pytest -s -v tests/e2e/accuracy/test_hidream_o1_image.py -m full_model --run-level full_model
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image · Single-GPU"
+        source_file_dependencies: diffusion_qwen_image
         key: nightly-diffusion-x2iat-performance-qwen-image-single
         timeout_in_minutes: 180
         commands:
@@ -271,6 +302,7 @@ steps:
         mirror_hardwares: h100_1
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image · 4-GPU"
+        source_file_dependencies: diffusion_qwen_image
         key: nightly-diffusion-x2iat-performance-qwen-image-4gpu
         timeout_in_minutes: 180
         commands:
@@ -291,53 +323,60 @@ steps:
     depends_on: upload-nightly-pipeline
     if: >-
       build.env("NIGHTLY") == "1" ||
-      build.pull_request.labels includes "nightly-test" ||
-      build.pull_request.labels includes "diffusion-x2v-test"
+      build.pull_request.labels includes "nightly-test"
     steps:
 
       - label: ":full_moon: Diffusion X2V · Wan2.2 T2V Function Test · Single-GPU"
+        source_file_dependencies: diffusion_wan22
         timeout_in_minutes: 90
         commands:
           - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py -k "t2v" -m "full_model and cuda and H100 and cards_1" --run-level "full_model"
         mirror_hardwares: h100_1
 
       - label: ":full_moon: Diffusion X2V · Wan2.2 T2V Function Test · 2-GPU"
+        source_file_dependencies: diffusion_wan22
         timeout_in_minutes: 90
         commands:
           - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py -k "t2v" -m "full_model and cuda and H100 and cards_2" --run-level "full_model"
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion X2V · Wan2.2 I2V/TI2V Function Test · Single-GPU"
+        source_file_dependencies: diffusion_wan22
         timeout_in_minutes: 90
         commands:
           - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py -k "i2v" -m "full_model and cuda and H100 and cards_1" --run-level "full_model"
         mirror_hardwares: h100_1
 
       - label: ":full_moon: Diffusion X2V · Wan2.2 I2V/TI2V Function Test · 2-GPU"
+        source_file_dependencies: diffusion_wan22
         timeout_in_minutes: 90
         commands:
           - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py -k "i2v" -m "full_model and cuda and H100 and cards_2" --run-level "full_model"
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion X2V · HunyuanVideo-1.5 Function Test"
+        source_file_dependencies: diffusion_hunyuan_video
         timeout_in_minutes: 90
         commands:
           - pytest -s -v tests/e2e/online_serving/test_hunyuan_video_15_expansion.py -m "full_model and cuda" --run-level "full_model"
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion X2V · Doc Test"
+        source_file_dependencies: diffusion_wan22
         timeout_in_minutes: 60
         commands:
           - pytest -s -v tests/examples/offline_inference/test_image_to_video.py -m "full_model and example and H100" --run-level "full_model"
         mirror_hardwares: h100_1
 
       - label: ":full_moon: Diffusion X2V · Other Function Test"
+        source_file_dependencies: diffusion_wan22
         timeout_in_minutes: 90
         commands:
           - pytest -s -v tests/e2e/offline_inference/test_wan22_autoround_w4a16_expansion.py -m "full_model and cuda" --run-level "full_model"
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion X2V · Wan2.2 Accuracy Test"
+        source_file_dependencies: diffusion_wan22
         timeout_in_minutes: 180
         commands:
           - pytest -s -v tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py -m full_model --run-level full_model
@@ -345,12 +384,14 @@ steps:
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion X2V · MiniMax H3 I2VA/Ref2VA Accuracy Test"
+        source_file_dependencies: diffusion_minimax_h3
         timeout_in_minutes: 180
         commands:
           - pytest -s -v tests/e2e/accuracy/minimax_h3/test_minimax_h3_i2va_ref2va_similarity.py -m full_model --run-level full_model
         mirror_hardwares: h100_4
 
       - label: ":full_moon: Diffusion X2V · Other Accuracy Test"
+        source_file_dependencies: diffusion_hunyuan_video
         timeout_in_minutes: 180
         commands:
           - pytest -s -v tests/e2e/accuracy/hunyuanvideo15_t2v/test_hunyuanvideo15_t2v_video_similarity.py -m full_model --run-level full_model
@@ -358,6 +399,9 @@ steps:
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion X2V · Perf Test · Single-GPU"
+        source_file_dependencies:
+          - diffusion_wan22
+          - diffusion_cosmos3
         key: nightly-diffusion-x2v-performance-single
         timeout_in_minutes: 180
         commands:
@@ -373,6 +417,9 @@ steps:
         mirror_hardwares: h100_1
 
       - label: ":full_moon: Diffusion X2V · Perf Test · 2-GPU"
+        source_file_dependencies:
+          - diffusion_wan22
+          - diffusion_cosmos3
         key: nightly-diffusion-x2v-performance-2gpu
         timeout_in_minutes: 180
         commands:
@@ -391,6 +438,7 @@ steps:
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion X2V · Perf Test · HunyuanVideo-1.5"
+        source_file_dependencies: diffusion_hunyuan_video
         key: nightly-diffusion-x2v-performance-hunyuanvideo15
         timeout_in_minutes: 180
         commands:
@@ -408,6 +456,7 @@ steps:
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion X2V · Perf Test · MiniMax-H3"
+        source_file_dependencies: diffusion_minimax_h3
         key: nightly-diffusion-x2v-performance-minimax-h3
         timeout_in_minutes: 180
         commands:
@@ -428,42 +477,49 @@ steps:
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     steps:
       - label: ":full_moon: Diffusion · Distributed Test with L4"
+        source_file_dependencies: diffusion_distributed_attention
         timeout_in_minutes: 60
         commands:
           - pytest -sv tests/diffusion/distributed/ -m 'full_model and cuda and L4' --run-level "full_model"
         mirror_hardwares: l4_4
 
       - label: ":full_moon: Diffusion · Distributed Test with H100 · 2-GPU"
+        source_file_dependencies: diffusion_distributed_attention
         timeout_in_minutes: 60
         commands:
           - pytest -sv tests/diffusion/distributed/ -m 'full_model and cuda and H100 and cards_2' --run-level "full_model"
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion · Distributed Test with H100 · 4-GPU"
+        source_file_dependencies: diffusion_distributed_attention
         timeout_in_minutes: 60
         commands:
           - pytest -sv tests/diffusion/distributed/ -m 'full_model and cuda and H100 and cards_4' --run-level "full_model"
         mirror_hardwares: h100_4
 
       - label: ":full_moon: Diffusion · Offloader Test"
+        source_file_dependencies: diffusion_offloader
         timeout_in_minutes: 60
         commands:
           - pytest -sv tests/diffusion/offloader -m "full_model and cuda"
         mirror_hardwares: l4_1
 
       - label: ":full_moon: Diffusion · Quantization Test with H100 · Single-GPU"
+        source_file_dependencies: diffusion_quantization
         timeout_in_minutes: 60
         commands:
           - pytest -sv tests/diffusion/quantization -m 'full_model and cuda and H100' --run-level "full_model"
         mirror_hardwares: h100_1
 
       - label: ":full_moon: Diffusion · MiniMax H3 FP8 Quality Test with H100 · 2-GPU"
+        source_file_dependencies: diffusion_minimax_h3
         timeout_in_minutes: 60
         commands:
           - pytest -sv tests/diffusion/models/minimax_h3/test_minimax_h3_quantization_quality.py -m 'full_model and cuda and H100' --run-level "full_model"
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Diffusion · Quantization Test with L4"
+        source_file_dependencies: diffusion_quantization
         timeout_in_minutes: 60
         commands:
           - pip install "vllm-gguf-plugin==0.0.4"
