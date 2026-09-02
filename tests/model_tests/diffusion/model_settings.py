@@ -53,6 +53,27 @@ DIFFUSION_TEST_SETTINGS = {
         model="Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
         builder=diff_model_builders.tiny_sana_video_builder,
         supported_tasks=[DiffusionTasks.TEXT_TO_VIDEO],
+        extra_test_groups=[
+            [DiffusionAccs.TENSOR_PARALLEL],
+            [DiffusionAccs.CFG_PARALLEL],
+            [DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CFG_PARALLEL],
+            [DiffusionAccs.CACHE_DIT],
+            [DiffusionAccs.CPU_OFFLOAD],
+            [DiffusionAccs.LAYERWISE_OFFLOAD],
+            [DiffusionAccs.CACHE_DIT, DiffusionAccs.CPU_OFFLOAD],
+            [DiffusionAccs.CACHE_DIT, DiffusionAccs.LAYERWISE_OFFLOAD],
+        ],
+        check_multi_output=False,
+    ),
+    "SanaImageToVideoPipeline": DiffusionModelTestOpts(
+        model="Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
+        builder=diff_model_builders.tiny_sana_video_i2v_builder,
+        supported_tasks=[DiffusionTasks.IMAGE_TO_VIDEO],
+        extra_test_groups=[
+            [DiffusionAccs.CFG_PARALLEL],
+            [DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CFG_PARALLEL],
+        ],
+        check_i2v_t2v_divergence=False,
         check_multi_output=False,
     ),
     "QwenImagePipeline": DiffusionModelTestOpts(

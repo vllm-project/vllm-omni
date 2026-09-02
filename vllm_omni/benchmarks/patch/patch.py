@@ -119,6 +119,17 @@ def should_request_stage_metrics(args: Any) -> bool:
     if backend in _IMAGE_STAGE_METRICS_BACKENDS:
         return True
 
+    percentile_metrics = getattr(args, "percentile_metrics", ()) or ()
+    if isinstance(percentile_metrics, str):
+        percentile_metrics = percentile_metrics.split(",")
+    selected_metrics = {str(metric).strip().lower() for metric in percentile_metrics}
+    if backend == "openai-chat-omni" and selected_metrics.intersection({"tpot", "itl"}):
+        # Client receive timestamps normally provide these metrics. Under
+        # enough load, however, every text token can be coalesced into one
+        # event-loop read, leaving no positive interval. Request the engine's
+        # Stage 0 timings so that path still has an authoritative measurement.
+        return True
+
     extra_body = getattr(args, "extra_body", None) or {}
     modalities = extra_body.get("modalities") if isinstance(extra_body, dict) else None
     return backend == "openai-chat-omni" and "image" in (modalities or [])
@@ -854,6 +865,33 @@ def _update_output_stage_metrics_from_payload(
         output.stage_metrics.update(stage_snapshot)
 
 
+def _apply_chat_stage0_token_timings(output: MixRequestFuncOutput) -> bool:
+    """Apply native Stage 0 timings from a chat response snapshot."""
+    stage_metrics = output.stage_metrics
+    if not isinstance(stage_metrics, dict):
+        return False
+    stage0 = stage_metrics.get("0")
+    if not isinstance(stage0, dict):
+        return False
+
+    output_tokens = coerce_positive_int_scalar(stage0.get(defs.NUM_TOKENS_OUT))
+    expected_output_tokens = coerce_positive_int_scalar(output.output_tokens)
+    if output_tokens is None or expected_output_tokens is None or output_tokens != expected_output_tokens:
+        return False
+
+    return _apply_stage0_token_timings(
+        output,
+        [
+            {
+                "output_token_count": output_tokens,
+                "itls_ms": stage0.get(defs.VLLM_ITLS_MS),
+                "tpot_ms": stage0.get(defs.VLLM_TPOT_MS),
+            }
+        ],
+        expected_output_tokens=expected_output_tokens,
+    )
+
+
 def _image_metrics_from_stage_metrics(metrics: dict[str, Any] | None) -> tuple[int, float, int, float]:
     if not isinstance(metrics, dict):
         return 0, 0.0, 0, 0.0
@@ -1121,6 +1159,14 @@ async def async_request_openai_chat_omni_completions(
 
                     output.latency = timestamp - st
                     output.generated_text = generated_text
+                    if output.output_tokens > 1 and not any(
+                        isinstance(value, int | float)
+                        and not isinstance(value, bool)
+                        and np.isfinite(value)
+                        and value > 0
+                        for value in output.itl
+                    ):
+                        _apply_chat_stage0_token_timings(output)
                     if output.itl:
                         # Align text_latency with ITL so TPOT formula and
                         # mean(ITL) are consistent.  Do NOT infer output_tokens
@@ -1492,6 +1538,72 @@ def _nonnegative_number(value: object) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool) and np.isfinite(value) and value >= 0
 
 
+def _apply_stage0_token_timings(
+    output: MixRequestFuncOutput,
+    raw_stages: list[object],
+    *,
+    expected_output_tokens: int,
+) -> bool:
+    """Populate aggregate token timing from complete per-response Stage 0 metrics."""
+    output.itl = []
+    output.text_latency = output.ttft
+    output.tpot_measured = False
+
+    stages: list[tuple[int, dict[str, object]]] = []
+    for stage in raw_stages:
+        if not isinstance(stage, dict):
+            return False
+        token_count = stage.get("output_token_count")
+        if not isinstance(token_count, int) or isinstance(token_count, bool) or token_count < 0:
+            return False
+        stages.append((token_count, stage))
+
+    if not stages or sum(count for count, _ in stages) != expected_output_tokens:
+        return False
+
+    timed = [(count - 1, stage) for count, stage in stages if count > 1]
+    if not timed:
+        return False
+
+    measured_itls: list[float] = []
+    exact_itls = True
+    for intervals, stage in timed:
+        values = stage.get("itls_ms")
+        if (
+            not isinstance(values, list)
+            or len(values) != intervals
+            or not all(_nonnegative_number(value) for value in values)
+        ):
+            exact_itls = False
+            break
+        measured_itls.extend(float(value) / 1000.0 for value in values if isinstance(value, int | float))
+    if exact_itls:
+        if sum(measured_itls) > 0:
+            output.itl = measured_itls
+            output.text_latency = output.ttft + sum(output.itl)
+            output.tpot_measured = True
+            return True
+
+    weighted_tpot_ms = 0.0
+    for intervals, stage in timed:
+        tpot_ms = stage.get("tpot_ms")
+        if not _nonnegative_number(tpot_ms) or not isinstance(tpot_ms, int | float) or tpot_ms <= 0:
+            break
+        weighted_tpot_ms += float(tpot_ms) * intervals
+    else:
+        decode_intervals = sum(intervals for intervals, _ in timed)
+        weighted_tpot = weighted_tpot_ms / decode_intervals / 1000.0
+        # ``calculate_metrics`` consumes a request-shaped latency. Preserve
+        # the weighted per-response TPOT when projecting it onto the combined
+        # output token count; gaps and TTFTs between turns are intentionally
+        # excluded.
+        output.text_latency = output.ttft + weighted_tpot * (expected_output_tokens - 1)
+        output.tpot_measured = True
+        return True
+
+    return False
+
+
 async def _async_request_omniinteract(
     request_func_input: RequestFuncInput,
     *,
@@ -1538,35 +1650,12 @@ async def _async_request_omniinteract(
         output.ttft = float(session_metrics.get("mean_ttft_ms") or 0.0) / 1000.0
         output.audio_ttfp = float(session_metrics.get("mean_ttfp_ms") or 0.0) / 1000.0
         output.audio_rtf = float(session_metrics.get("mean_rtf") or 0.0)
-        stages: list[tuple[int, dict[str, object]]] = []
-        for request_metric in case_result.duplex_request_metrics:
-            stage0 = request_metric.get("stage0_tokens")
-            if not isinstance(stage0, dict):
-                continue
-            token_count = stage0.get("output_token_count")
-            if isinstance(token_count, int) and not isinstance(token_count, bool) and token_count >= 0:
-                stages.append((token_count, stage0))
-        timed = [(count - 1, stage) for count, stage in stages if count > 1]
-        complete = (
-            len(stages) == len(case_result.duplex_request_metrics)
-            and sum(count for count, _ in stages) == output.output_tokens
+        token_timing_measured = _apply_stage0_token_timings(
+            output,
+            [request_metric.get("stage0_tokens") for request_metric in case_result.duplex_request_metrics],
+            expected_output_tokens=output.output_tokens,
         )
-        exact = complete and all(
-            isinstance(values := stage.get("itls_ms"), list)
-            and len(values) == intervals
-            and all(_nonnegative_number(value) for value in values)
-            for intervals, stage in timed
-        )
-        output.itl = [float(value) / 1000.0 for _, stage in timed for value in stage["itls_ms"]] if exact else []
-        if output.itl:
-            output.text_latency = output.ttft + sum(output.itl)
-        elif complete and timed and all(_nonnegative_number(stage.get("tpot_ms")) for _, stage in timed):
-            intervals = sum(count for count, _ in timed)
-            weighted_tpot = sum(float(stage["tpot_ms"]) * count for count, stage in timed) / intervals / 1000.0
-            output.text_latency = output.ttft + weighted_tpot * (output.output_tokens - 1)
-        else:
-            output.text_latency = output.ttft
-            output.tpot_measured = False
+        if not token_timing_measured:
             if output.output_tokens > 1 or (output.output_tokens == 0 and output.generated_text):
                 logger.warning(
                     "OmniInteract session %s omitted complete engine token timing; standard TPOT/ITL are unavailable",
@@ -1610,6 +1699,9 @@ async def async_request_openai_realtime_duplex(
     speech_extra = getattr(request_func_input, "seed_tts_speech_extra", None)
     if not isinstance(speech_extra, dict):
         speech_extra = {}
+    else:
+        speech_extra = dict(speech_extra)
+    speech_extra["return_stage_metrics"] = True
     configured_turns = getattr(request_func_input, "seed_tts_turns", ())
     turn_prompts = [
         (
@@ -1740,6 +1832,16 @@ async def async_request_openai_realtime_duplex(
                 for timing in turn_timings
                 if isinstance((stage0 := timing.get("stage0_tokens")), dict)
             )
+            token_timing_measured = _apply_stage0_token_timings(
+                output,
+                [timing.get("stage0_tokens") for timing in turn_timings],
+                expected_output_tokens=output.output_tokens,
+            )
+            if not token_timing_measured and output.output_tokens > 1:
+                logger.warning(
+                    "Realtime TTS session %s omitted complete engine token timing; standard TPOT/ITL are unavailable",
+                    session_id,
+                )
             output.success = True
     except Exception:
         output.success = False

@@ -37,6 +37,11 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import (
     DistributedAutoencoderKLLTX2Video,
 )
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin, _wrap
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_classifier_free_guidance_world_size,
+    model_parallel_is_initialized,
+)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
@@ -49,7 +54,7 @@ from vllm_omni.diffusion.request import resolve_video_num_frames
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .pipeline_output import SanaVideoPipelineOutput
-from .transformer_sana_video import SanaVideoTransformer3DModel
+from .transformer_sana_video import SanaVideoTransformer3DModel, validate_sana_video_parallel_config
 
 
 def _resolve_vae_class_and_dtype(
@@ -267,8 +272,42 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
+def _validate_cache_offload_parallelism(od_config: OmniDiffusionConfig) -> None:
+    cache_backend = od_config.cache_backend
+    if cache_backend not in ("none", "cache_dit"):
+        raise NotImplementedError(
+            f"Cache backend {cache_backend!r} is not supported by the native SANA-Video pipeline; "
+            "use 'cache_dit' or 'none'."
+        )
+    if cache_backend == "cache_dit" and od_config.enable_distributed_layerwise_offload:
+        raise NotImplementedError(
+            "SANA-Video does not support Cache-DiT with distributed layerwise offload; "
+            "per-rank cache skips desynchronize the weight AllGather."
+        )
+
+    offload_enabled = (
+        od_config.enable_cpu_offload
+        or od_config.enable_layerwise_offload
+        or od_config.enable_distributed_layerwise_offload
+    )
+    if cache_backend == "none" and not offload_enabled:
+        return
+
+    parallel_config = od_config.parallel_config
+    for name, size in (
+        ("tensor_parallel_size", parallel_config.tensor_parallel_size),
+        ("cfg_parallel_size", parallel_config.cfg_parallel_size),
+        ("sequence_parallel_size", parallel_config.sequence_parallel_size),
+    ):
+        if size > 1:
+            raise NotImplementedError(
+                f"SANA-Video cache/offload is currently supported only with TP1, CFG1, and SP1; got {name}={size}."
+            )
+
+
 class SanaVideoPipeline(
     nn.Module,
+    CFGParallelMixin,
     ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
     SupportsComponentDiscovery,
@@ -294,6 +333,7 @@ class SanaVideoPipeline(
     _encoder_modules = ["text_encoder"]
     _vae_modules = ["vae"]
     supports_step_execution = False
+    default_num_inference_steps = 50
 
     def __init__(
         self,
@@ -308,10 +348,14 @@ class SanaVideoPipeline(
     ):
         super().__init__()
 
+        if od_config is not None:
+            validate_sana_video_parallel_config(od_config.parallel_config)
+
         self.od_config = od_config
         self.device = get_local_device()
         self.weights_sources: list[DiffusersPipelineLoader.ComponentSource] = []
         if od_config is not None:
+            _validate_cache_offload_parallelism(od_config)
             tokenizer, text_encoder, vae, transformer, scheduler = self._load_components(od_config, prefix)
 
         if tokenizer is None or text_encoder is None or vae is None or transformer is None or scheduler is None:
@@ -359,7 +403,9 @@ class SanaVideoPipeline(
         model = od_config.model
         local_files_only = os.path.exists(model)
         dtype = getattr(od_config, "dtype", torch.bfloat16)
-        device = self.device
+        # The loader loads components under a default-device context that is CPU
+        # when offload is enabled; runtime placement stays with the offloader.
+        component_load_device = torch.get_default_device()
         # Transformer weights are streamed by DiffusersPipelineLoader below.
         # Prefetch only components loaded through from_pretrained here.
         component_subfolders = ["tokenizer", "text_encoder", "vae", "scheduler"]
@@ -377,7 +423,7 @@ class SanaVideoPipeline(
             prefetch_list=component_subfolders,
             local_files_only=local_files_only,
             torch_dtype=dtype,
-        ).to(device)
+        ).to(component_load_device)
 
         model_index = _load_json(model, "model_index.json", local_files_only)
         vae_class_name = model_index.get("vae", [None, "AutoencoderKLWan"])[1]
@@ -392,10 +438,13 @@ class SanaVideoPipeline(
             prefetch_list=component_subfolders,
             local_files_only=local_files_only,
             torch_dtype=vae_dtype,
-        ).to(device)
+        ).to(component_load_device)
 
         transformer_config = _load_json(model, "transformer/config.json", local_files_only)
-        transformer = SanaVideoTransformer3DModel.from_config(transformer_config).to(dtype=dtype, device=device)
+        transformer = SanaVideoTransformer3DModel.from_config(transformer_config).to(
+            dtype=dtype,
+            device=component_load_device,
+        )
         scheduler = DPMSolverMultistepScheduler.from_pretrained(
             model,
             subfolder="scheduler",
@@ -724,6 +773,105 @@ class SanaVideoPipeline(
     def interrupt(self):
         return self._interrupt
 
+    def predict_noise(self, *args, **kwargs) -> torch.Tensor:
+        # return_dict=False: the dataclass output is not subscriptable.
+        return self.transformer(*args, **kwargs, return_dict=False)[0]
+
+    def combine_cfg_noise(
+        self,
+        positive_noise_pred,
+        negative_noise_pred,
+        true_cfg_scale,
+        cfg_normalize=False,
+        kwargs=None,
+    ):
+        # fp32 combine so the bf16 all-gather path matches CFG1 bit-for-bit.
+        return super().combine_cfg_noise(
+            tuple(p.float() for p in _wrap(positive_noise_pred)),
+            tuple(n.float() for n in _wrap(negative_noise_pred)),
+            true_cfg_scale,
+            cfg_normalize,
+            kwargs,
+        )
+
+    def diffuse(
+        self,
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor | None,
+        negative_prompt_attention_mask: torch.Tensor | None,
+        guidance_scale: float,
+        extra_step_kwargs: dict,
+        dtype: torch.dtype,
+        output_slice: int | None,
+    ) -> torch.Tensor:
+        do_true_cfg = self.do_classifier_free_guidance
+        # Single-process runs never initialize the parallel groups.
+        cfg_parallel = model_parallel_is_initialized() and get_classifier_free_guidance_world_size() > 1
+        if cfg_parallel:
+            self.check_cfg_parallel_validity(guidance_scale, negative_prompt_embeds is not None)
+
+        if do_true_cfg and not cfg_parallel:
+            # Concatenate neg/pos for a single batch-2 forward.
+            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+            prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
+
+        with self.progress_bar(total=len(timesteps)) as progress_bar:
+            for t in timesteps:
+                if self.interrupt:
+                    continue
+
+                if cfg_parallel:
+                    timestep = t.expand(latents.shape[0])
+                    latent_model_input = latents.to(dtype)
+                    positive_kwargs = {
+                        "hidden_states": latent_model_input,
+                        "encoder_hidden_states": prompt_embeds.to(dtype),
+                        "encoder_attention_mask": prompt_attention_mask,
+                        "timestep": timestep,
+                    }
+                    negative_kwargs = (
+                        {
+                            "hidden_states": latent_model_input,
+                            "encoder_hidden_states": negative_prompt_embeds.to(dtype),
+                            "encoder_attention_mask": negative_prompt_attention_mask,
+                            "timestep": timestep,
+                        }
+                        if do_true_cfg
+                        else None
+                    )
+                    noise_pred = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=do_true_cfg,
+                        true_cfg_scale=guidance_scale,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=negative_kwargs,
+                        cfg_normalize=False,
+                        output_slice=output_slice,
+                    ).float()
+                else:
+                    latent_model_input = torch.cat([latents] * 2) if do_true_cfg else latents
+                    timestep = t.expand(latent_model_input.shape[0])
+                    noise_pred = self.transformer(
+                        latent_model_input.to(dtype),
+                        encoder_hidden_states=prompt_embeds.to(dtype),
+                        encoder_attention_mask=prompt_attention_mask,
+                        timestep=timestep,
+                        return_dict=False,
+                    )[0]
+                    noise_pred = noise_pred.float()
+                    if do_true_cfg:
+                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    if output_slice is not None:
+                        noise_pred = noise_pred[:, :output_slice]
+
+                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                progress_bar.update()
+
+        return latents
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         transformer_weights = (
             (name.removeprefix("transformer."), tensor) for name, tensor in weights if name.startswith("transformer.")
@@ -751,7 +899,11 @@ class SanaVideoPipeline(
             default_num_frames=81,
             is_dummy_run=req.is_dummy_run(),
         )
-        num_steps = sampling.num_inference_steps if sampling.num_inference_steps is not None else 50
+        num_steps = (
+            sampling.num_inference_steps
+            if sampling.num_inference_steps is not None
+            else self.default_num_inference_steps
+        )
         guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 6.0
         generator = sampling.generator
         if generator is None and sampling.seed is not None:
@@ -947,10 +1099,6 @@ class SanaVideoPipeline(
             max_sequence_length=max_sequence_length,
             complex_human_instruction=complex_human_instruction,
         )
-        if self.do_classifier_free_guidance:
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-            prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
-
         # 4. Prepare timesteps
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler, num_inference_steps, device, timesteps, sigmas
@@ -974,44 +1122,21 @@ class SanaVideoPipeline(
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
         # 7. Denoising loop
-        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
-
-        transformer_dtype = self.transformer.dtype
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
-                if self.interrupt:
-                    continue
-
-                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
-
-                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                timestep = t.expand(latent_model_input.shape[0])
-
-                # predict noise model_output
-                noise_pred = self.transformer(
-                    latent_model_input.to(dtype=transformer_dtype),
-                    encoder_hidden_states=prompt_embeds.to(dtype=transformer_dtype),
-                    encoder_attention_mask=prompt_attention_mask,
-                    timestep=timestep,
-                    return_dict=False,
-                )[0]
-                noise_pred = noise_pred.float()
-
-                # perform guidance
-                if self.do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-                # learned sigma
-                if self.transformer.config.out_channels // 2 == latent_channels:
-                    noise_pred = noise_pred.chunk(2, dim=1)[0]
-
-                # compute previous image: x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
-
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
+        # learned sigma: transformer predicts 2x latent channels; keep the first half.
+        output_slice = latent_channels if self.transformer.config.out_channels // 2 == latent_channels else None
+        latents = self.diffuse(
+            latents=latents,
+            timesteps=timesteps,
+            prompt_embeds=prompt_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_prompt_attention_mask=negative_prompt_attention_mask,
+            guidance_scale=guidance_scale,
+            extra_step_kwargs=extra_step_kwargs,
+            dtype=self.transformer.dtype,
+            output_slice=output_slice,
+        )
 
         if output_type == "latent":
             video = latents

@@ -34,6 +34,11 @@ def test_sync_config_is_omni():
     assert isinstance(cfg, OmniModelConfig)
 
 
+def test_session_mode_reaches_omni_model_config():
+    assert OmniEngineArgs().create_model_config().session_mode == "turn"
+    assert OmniEngineArgs(session_mode="duplex").create_model_config().session_mode == "duplex"
+
+
 def test_default_stage_id_is_concrete_int():
     """Ensure `stage_id` stays safe for downstream arithmetic/indexing."""
     engine_args = OmniEngineArgs()
@@ -279,6 +284,28 @@ def test_qwen3_tts_code2wav_injects_max_position_embeddings(monkeypatch):
             "max_position_embeddings": 65536,
         },
     }
+
+
+def test_remote_tokenizer_subfolder_download_does_not_report_failure(tmp_path, monkeypatch, mocker):
+    """A successful remote tokenizer download must not enter the error path."""
+    tokenizer_dir = tmp_path / "CosyVoice-BlankEN"
+    tokenizer_dir.mkdir()
+    baseline_config = Mock()
+    warning = mocker.patch("vllm_omni.engine.arg_utils.logger.warning")
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", lambda *args, **kwargs: str(tmp_path))
+    monkeypatch.setattr(OmniEngineArgs, "_patch_empty_hf_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(EngineArgs, "create_model_config", lambda _self: baseline_config)
+    monkeypatch.setattr(
+        OmniModelConfig,
+        "from_vllm_model_config",
+        classmethod(lambda cls, model_config, **omni_kwargs: model_config),
+    )
+
+    args = OmniEngineArgs(model="remote/cosyvoice3", model_arch="CosyVoice3Model")
+    assert args.create_model_config() is baseline_config
+    assert args.tokenizer == str(tokenizer_dir)
+    warning.assert_not_called()
 
 
 def test_patch_missing_local_hf_config(tmp_path):
