@@ -1,0 +1,134 @@
+# Grandfathered examples/ Python paths as of the ratchet introduction.
+# These paths existed before the policy was enforced.
+# This list may only SHRINK as paths are migrated or removed.
+# Do not add new paths here - use APPROVED_EXCEPTIONS in check_examples_policy.py instead.
+
+examples / offline_inference / audex / audio_qa.py
+examples / offline_inference / audex / common.py
+examples / offline_inference / audex / speech_to_speech.py
+examples / offline_inference / audex / text_to_audio.py
+examples / offline_inference / audex / text_to_speech.py
+examples / offline_inference / aura_omni / end2end.py
+examples / offline_inference / covo_audio / end2end.py
+examples / offline_inference / custom_pipeline / image_to_image / custom_pipeline.py
+examples / offline_inference / custom_pipeline / image_to_image / image_edit.py
+examples / offline_inference / diffusion / lingbot_world_v2.py
+examples / offline_inference / diffusion / lingbot_world_v2_realtime.py
+examples / offline_inference / dreamzero / client_schedule.py
+examples / offline_inference / dreamzero / export_prediction_video.py
+examples / offline_inference / dynin_omni / end2end.py
+examples / offline_inference / hunyuan_image3 / end2end.py
+examples / offline_inference / image_to_image / image_edit.py
+examples / offline_inference / image_to_image / image_to_image.py
+examples / offline_inference / image_to_video / image_to_video.py
+examples / offline_inference / internvla_a1 / end2end.py
+examples / offline_inference / internvla_a1 / internvla_a1_common.py
+examples / offline_inference / lance / end2end.py
+examples / offline_inference / lance / gradio_demo.py
+examples / offline_inference / longcat_video / end2end.py
+examples / offline_inference / mammothmodal2_preview / run_mammothmoda2_image_summarize.py
+examples / offline_inference / mimo_audio / end2end.py
+examples / offline_inference / mimo_audio / message_convert.py
+examples / offline_inference / mimo_audio / process_speechdata.py
+examples / offline_inference / ming_flash_omni / end2end.py
+examples / offline_inference / minicpmo / end2end.py
+examples / offline_inference / minimax_h3 / dlo_lifecycle.py
+examples / offline_inference / nemotron_voicechat / end2end.py
+examples / offline_inference / personaplex / personaplex_offline.py
+examples / offline_inference / qwen2_5_omni / end2end.py
+examples / offline_inference / qwen2_5_omni / extract_prompts.py
+examples / offline_inference / qwen3_omni / end2end.py
+examples / offline_inference / qwen3_omni / end2end_async_chunk.py
+examples / offline_inference / speech_to_video / speech_to_video.py
+examples / offline_inference / step_audio2 / end2end.py
+examples / offline_inference / text_to_audio / text_to_audio.py
+examples / offline_inference / text_to_image / gradio_demo.py
+examples / offline_inference / text_to_image / text_to_image.py
+examples / offline_inference / text_to_speech / cosyvoice3 / end2end.py
+examples / offline_inference / text_to_speech / dots_tts / end2end.py
+examples / offline_inference / text_to_speech / fish_speech / end2end.py
+examples / offline_inference / text_to_speech / gepard / end2end.py
+examples / offline_inference / text_to_speech / glm_tts / end2end.py
+examples / offline_inference / text_to_speech / higgs_audio_v2 / end2end.py
+examples / offline_inference / text_to_speech / higgs_audio_v3 / end2end.py
+examples / offline_inference / text_to_speech / indextts2 / end2end.py
+examples / offline_inference / text_to_speech / ming_flash_omni_tts / end2end.py
+examples / offline_inference / text_to_speech / ming_tts / end2end.py
+examples / offline_inference / text_to_speech / ming_tts / runner.py
+examples / offline_inference / text_to_speech / moss_tts / end2end.py
+examples / offline_inference / text_to_speech / moss_tts_nano / end2end.py
+examples / offline_inference / text_to_speech / omnivoice / end2end.py
+examples / offline_inference / text_to_speech / qwen3_tts / end2end.py
+examples / offline_inference / text_to_speech / qwen3_tts / word_timestamps.py
+examples / offline_inference / text_to_speech / soulxsinger / benchmark.py
+examples / offline_inference / text_to_speech / soulxsinger / end2end.py
+examples / offline_inference / text_to_speech / voxcpm2 / end2end.py
+examples / offline_inference / text_to_speech / voxtral_tts / end2end.py
+examples / offline_inference / text_to_video / text_to_video.py
+examples / offline_inference / x_to_text / x_to_text.py
+examples / offline_inference / x_to_video_audio / download_dreamid_omni.py
+examples / offline_inference / x_to_video_audio / x_to_video_audio.py
+examples / online_serving / audex / client.py
+examples / online_serving / audiox / openai_chat_client.py
+examples / online_serving / aura_omni / gradio_demo.py
+examples / online_serving / aura_omni / openai_chat_completion_client.py
+examples / online_serving / covo_audio / openai_chat_completion_client.py
+examples / online_serving / dreamzero / droid_sim_eval_client.py
+examples / online_serving / dreamzero / molmospace_dreamzero_eval_demo.py
+examples / online_serving / dreamzero / openpi_client.py
+examples / online_serving / dynin_omni / openai_chat_completion_client_for_multimodal_generation.py
+examples / online_serving / image_to_image / gradio_demo.py
+examples / online_serving / image_to_image / openai_chat_client.py
+examples / online_serving / joyvl_interaction / bridges / asr_bridge.py
+examples / online_serving / joyvl_interaction / bridges / tts_bridge.py
+examples / online_serving / joyvl_interaction / cli / run_cli_demo.py
+examples / online_serving / joyvl_interaction / cli / stream_client.py
+examples / online_serving / lance / openai_chat_client.py
+examples / online_serving / mimo_audio / openai_chat_completion_client_for_multimodal_generation.py
+examples / online_serving / minicpmo / gradio_demo.py
+examples / online_serving / minicpmo / openai_chat_completion_client_for_multimodal_generation.py
+examples / online_serving / minicpmo / realtime_duplex_demo.py
+examples / online_serving / minicpmo / realtime_web / __init__.py
+examples / online_serving / minicpmo / realtime_web / __main__.py
+examples / online_serving / minicpmo / realtime_web / server.py
+examples / online_serving / openai_chat_completion_client_for_multimodal_generation.py
+examples / online_serving / personaplex / duplex_client.py
+examples / online_serving / qwen2_5_omni / gradio_demo.py
+examples / online_serving / qwen3_omni / gradio_demo.py
+examples / online_serving / qwen3_omni / openai_realtime_client.py
+examples / online_serving / qwen3_omni / streaming_video_client.py
+examples / online_serving / replica_data_parallel / bench_replica_dp.py
+examples / online_serving / sensenova_u1 / openai_chat_client.py
+examples / online_serving / stable_audio / stable_audio_client.py
+examples / online_serving / step_audio2 / openai_chat_completion_client.py
+examples / online_serving / step_audio2 / openai_speech_client.py
+examples / online_serving / streaming_video_generation / gradio_demo.py
+examples / online_serving / streaming_video_generation / streaming_video_client.py
+examples / online_serving / text_to_image / gradio_demo.py
+examples / online_serving / text_to_image / openai_chat_client.py
+examples / online_serving / text_to_speech / cosyvoice3 / speech_client.py
+examples / online_serving / text_to_speech / fish_speech / gradio_demo.py
+examples / online_serving / text_to_speech / fish_speech / speech_client.py
+examples / online_serving / text_to_speech / glm_tts / gradio_demo.py
+examples / online_serving / text_to_speech / glm_tts / openai_speech_client.py
+examples / online_serving / text_to_speech / higgs_audio_v2 / batch_speech_client.py
+examples / online_serving / text_to_speech / higgs_audio_v3 / batch_speech_client.py
+examples / online_serving / text_to_speech / indextts2 / speech_client.py
+examples / online_serving / text_to_speech / ming_flash_omni_tts / speech_client.py
+examples / online_serving / text_to_speech / ming_tts / openai_speech_client.py
+examples / online_serving / text_to_speech / moss_tts_nano / gradio_demo.py
+examples / online_serving / text_to_speech / omnivoice / speech_client.py
+examples / online_serving / text_to_speech / qwen3_tts / batch_speech_client.py
+examples / online_serving / text_to_speech / qwen3_tts / gradio_demo.py
+examples / online_serving / text_to_speech / qwen3_tts / openai_speech_client.py
+examples / online_serving / text_to_speech / qwen3_tts / precompute_custom_voice.py
+examples / online_serving / text_to_speech / qwen3_tts / speaker_embedding_interpolation.py
+examples / online_serving / text_to_speech / qwen3_tts / streaming_speech_client.py
+examples / online_serving / text_to_speech / qwen3_tts / tts_common.py
+examples / online_serving / text_to_speech / qwen3_tts / word_timestamps_demo.py
+examples / online_serving / text_to_speech / soulxsinger / openai_chat_client.py
+examples / online_serving / text_to_speech / voxcpm2 / gradio_demo.py
+examples / online_serving / text_to_speech / voxcpm2 / openai_speech_client.py
+examples / online_serving / text_to_speech / voxcpm2 / precompute_custom_voice.py
+examples / online_serving / text_to_speech / voxtral_tts / gradio_demo.py
+examples / online_serving / text_to_speech / voxtral_tts / text_preprocess.py
