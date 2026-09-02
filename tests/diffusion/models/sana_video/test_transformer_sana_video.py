@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 
@@ -597,6 +597,39 @@ def test_native_transformer_config_filters_diffusers_metadata():
 
     with pytest.raises(ValueError, match="unsupported_field"):
         SanaVideoTransformerConfig.from_dict(_TINY_CONFIG | {"unsupported_field": True})
+
+
+def test_regional_compile_targets_glumb_with_precision_option(monkeypatch):
+    import torch.nn as nn
+
+    import vllm_omni.diffusion.compile as compile_module
+    import vllm_omni.diffusion.models.sana_video.transformer_sana_video as sana_module
+    from vllm_omni.diffusion.compile import regionally_compile
+
+    class _StubOmniAttention(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    monkeypatch.setattr(sana_module, "OmniAttention", _StubOmniAttention)
+    model = sana_module.SanaVideoTransformer3DModel(**(_TINY_CONFIG | {"num_layers": 2}))
+    compile_calls = []
+
+    def _compile(fn, *args, **kwargs):
+        compile_calls.append((fn, args, kwargs))
+        return fn
+
+    monkeypatch.setattr(compile_module.torch, "compile", _compile)
+
+    regionally_compile(model, dynamic=True)
+
+    assert sana_module.SanaVideoTransformer3DModel._repeated_blocks == ["GLUMBTempConv"]
+    assert sana_module.SanaVideoTransformer3DModel._regional_compile_inductor_options == {
+        "emulate_precision_casts": True
+    }
+    assert [fn.__self__ for fn, _, _ in compile_calls] == [block.ff for block in model.transformer_blocks]
+    assert all(
+        kwargs == {"dynamic": True, "options": {"emulate_precision_casts": True}} for _, _, kwargs in compile_calls
+    )
 
 
 def test_dual_vae_variant_resolution():

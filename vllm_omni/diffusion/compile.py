@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from typing import Any
 
 import torch
@@ -39,7 +39,10 @@ def regionally_compile(
     Args:
         model: The PyTorch model instance to compile
         *compile_args: Positional arguments forwarded to torch.compile
-        **compile_kwargs: Keyword arguments forwarded to torch.compile
+        **compile_kwargs: Keyword arguments forwarded to torch.compile. With
+            the Inductor backend and no non-default compile mode, values in an
+            explicit ``options`` mapping override model defaults from
+            ``_regional_compile_inductor_options``.
 
     Returns:
         The same model instance (modified in-place)
@@ -52,6 +55,37 @@ def regionally_compile(
         return model
 
     repeated_block_attrs = getattr(model, "_layerwise_offload_blocks_attrs", [])
+
+    # Some repeated regions require model-specific Inductor options to retain
+    # their eager numerical contract. Keep those defaults next to the model
+    # definition while allowing an explicit caller override. Other backends
+    # own their option contract. A non-default Inductor mode cannot be combined
+    # with options in torch.compile, so fail before activating a compiled model
+    # that would silently lose its eager numerical contract.
+    model_compile_options = getattr(model, "_regional_compile_inductor_options", None)
+    backend = compile_kwargs.get("backend", "inductor")
+    mode = compile_kwargs.get("mode")
+    if model_compile_options and backend == "inductor":
+        if mode not in (None, "default"):
+            raise ValueError(
+                f"Regional Inductor options required by {model.__class__.__name__} "
+                f"cannot be combined with torch.compile mode={mode!r}; pass "
+                "equivalent explicit options instead"
+            )
+        if mode == "default":
+            compile_kwargs = {key: value for key, value in compile_kwargs.items() if key != "mode"}
+        caller_compile_options = compile_kwargs.get("options")
+        if caller_compile_options is None:
+            caller_compile_options = {}
+        elif not isinstance(caller_compile_options, dict):
+            raise TypeError("torch.compile options must be a dict or None")
+        compile_kwargs = {
+            **compile_kwargs,
+            "options": {
+                **model_compile_options,
+                **caller_compile_options,
+            },
+        }
 
     # Build all compiled callables before mutating the model. This keeps setup
     # failures atomic: callers can safely continue with the uncompiled model if
@@ -74,11 +108,18 @@ def regionally_compile(
             # which torch.compile preserves.
             original_forward = getattr(submod, "_omni_original_forward", None)
             forward_to_compile = original_forward if original_forward is not None else submod.forward
+            # torch.compile removes a few special entries from ``options`` in
+            # place. Give every repeated block its own mapping so one compile
+            # call cannot change the configuration of subsequent blocks.
+            block_compile_kwargs = dict(compile_kwargs)
+            block_compile_options = block_compile_kwargs.get("options")
+            if isinstance(block_compile_options, dict):
+                block_compile_kwargs["options"] = dict(block_compile_options)
             compiled_forwards.append(
                 (
                     submod,
                     original_forward,
-                    torch.compile(forward_to_compile, *compile_args, **compile_kwargs),
+                    torch.compile(forward_to_compile, *compile_args, **block_compile_kwargs),
                 )
             )
 

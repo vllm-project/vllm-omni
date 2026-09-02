@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2025 The HuggingFace Team and SANA-Video Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +19,7 @@ import math
 import numbers
 from collections.abc import Iterable
 from dataclasses import dataclass, fields
+from typing import ClassVar
 
 import torch
 from torch import nn
@@ -962,6 +966,10 @@ class SanaVideoTransformer3DModel(nn.Module):
     """
 
     _no_split_modules = ["SanaVideoTransformerBlock", "SanaModulatedNorm"]
+    # Compile only the convolutional feed-forward region and preserve the
+    # explicit BF16 cast boundaries required to match eager numerics.
+    _repeated_blocks: ClassVar[list[str]] = ["GLUMBTempConv"]
+    _regional_compile_inductor_options: ClassVar[dict[str, bool]] = {"emulate_precision_casts": True}
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return AutoWeightsLoader(self).load_weights(weights)
