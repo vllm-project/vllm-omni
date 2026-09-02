@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The vLLM-Omni team.
 # Copyright 2024 ANT Group and the HuggingFace Inc. team.
 # Adapted from Ming repository modeling_bailingmm2.py and processing_bailingmm2.py
@@ -8,6 +9,7 @@
 
 import os
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import replace
 from typing import Annotated, Any
 
 import numpy as np
@@ -388,7 +390,10 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
             updates.append(
                 PromptReplacement(
                     modality="image",
-                    target=PLACEHOLDER_IMAGE_TOKEN_IN_TEXT,
+                    target=tokenizer.encode(
+                        PLACEHOLDER_IMAGE_TOKEN_IN_TEXT,
+                        add_special_tokens=False,
+                    ),
                     replacement=get_replacement_image,
                 )
             )
@@ -396,7 +401,10 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
             updates.append(
                 PromptReplacement(
                     modality="video",
-                    target=PLACEHOLDER_VIDEO_TOKEN_IN_TEXT,
+                    target=tokenizer.encode(
+                        PLACEHOLDER_VIDEO_TOKEN_IN_TEXT,
+                        add_special_tokens=False,
+                    ),
                     replacement=get_replacement_video,
                 )
             )
@@ -404,7 +412,10 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
             updates.append(
                 PromptReplacement(
                     modality="audio",
-                    target=PLACEHOLDER_AUDIO_TOKEN_IN_TEXT,
+                    target=tokenizer.encode(
+                        PLACEHOLDER_AUDIO_TOKEN_IN_TEXT,
+                        add_special_tokens=False,
+                    ),
                     replacement=get_replacement_audio,
                 )
             )
@@ -451,90 +462,71 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
 
         return config
 
-    def _hf_processor_applies_updates(
-        self,
-        prompt_text: str,
-        mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-    ) -> bool:
-        return False
+    def apply(self, inputs, timing_ctx):
+        """Add Ming image-generation query tokens before prompt updates."""
+        modalities = inputs.hf_processor_mm_kwargs.get("modalities") or []
+        if "image" in modalities or "img2img" in modalities:
+            from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
+                DEFAULT_NUM_QUERY_TOKENS,
+                IMAGE_PATCH_TOKEN,
+            )
+
+            tokenizer = self.info.get_tokenizer()
+            prompt_ids = list(inputs.prompt)
+            if "img2img" in modalities:
+                prompt_ids = (
+                    tokenizer.encode(
+                        PLACEHOLDER_IMAGE_TOKEN_IN_TEXT,
+                        add_special_tokens=False,
+                    )
+                    + prompt_ids
+                )
+
+            image_patch_ids = tokenizer.encode(
+                IMAGE_PATCH_TOKEN,
+                add_special_tokens=False,
+            )
+            if not image_patch_ids or not any(
+                prompt_ids[index : index + len(image_patch_ids)] == image_patch_ids
+                for index in range(len(prompt_ids) - len(image_patch_ids) + 1)
+            ):
+                image_gen_config = getattr(
+                    self.info.ctx.model_config.hf_config,
+                    "image_gen_config",
+                    None,
+                )
+                num_query_tokens = int(
+                    getattr(
+                        image_gen_config,
+                        "num_query_tokens",
+                        DEFAULT_NUM_QUERY_TOKENS,
+                    )
+                )
+                suffix = (
+                    tokenizer.encode("<image>", add_special_tokens=False)
+                    + image_patch_ids * num_query_tokens
+                    + tokenizer.encode("</image>", add_special_tokens=False)
+                )
+                prompt_ids.extend(suffix)
+
+            inputs = replace(inputs, prompt=prompt_ids)
+
+        return super().apply(inputs, timing_ctx)
 
     def _apply_hf_processor_main(
         self,
-        prompt: str | list[int],
         mm_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-        *,
-        enable_hf_prompt_update: bool,
-    ):
-        """Apply Ming-specific prompt rewrites before delegating to vllm's
-        default text / multimodal processing pipeline.
-
-        This is the single point in the base MM-processor call graph where we
-        still have BOTH the full prompt and the request-level
-        ``hf_processor_mm_kwargs`` together. Downstream, vllm's MM caching
-        design splits the work into
-        :meth:`_apply_hf_processor_text_only` (prompt, empty kwargs) and
-        :meth:`_apply_hf_processor_mm_only` (dummy text, real kwargs), so a
-        per-request flag like ``modalities`` cannot reach the real
-        tokenization from inside :meth:`_call_hf_processor`.
-
-        For Ming-flash-omni-2.0, image-generation requests carry
-        ``mm_processor_kwargs["modalities"]`` set to ``["image"]`` (t2i) or
-        ``["img2img"]`` (image edit). We expand the prompt here with the
-        ``<image><imagePatch>*N</image>`` query-token block so the expanded
-        form flows through both the tokenization and (eventual) MM paths.
-        For img2img, we also prepend ``<IMAGE>`` so the thinker-side prompt
-        replacement can locate the reference-image placeholder.
-        """
-        modalities = hf_processor_mm_kwargs.get("modalities") or []
-        is_image_gen = "image" in modalities or "img2img" in modalities
-        if isinstance(prompt, str) and is_image_gen:
-            from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
-                DEFAULT_NUM_QUERY_TOKENS,
-                maybe_expand_image_gen_prompt,
-            )
-
-            # img2img: prepend ``<IMAGE>`` so the ref-image placeholder survives
-            # MM caching (when the ref image is cache-warm, the thinker sees 0
-            # missing items and cannot inject the placeholder itself).
-            if "img2img" in modalities:
-                prompt = "<IMAGE>" + prompt
-
-            ig = getattr(self.info.ctx.model_config.hf_config, "image_gen_config", None)
-            num_query_tokens = getattr(ig, "num_query_tokens", DEFAULT_NUM_QUERY_TOKENS)
-            prompt = maybe_expand_image_gen_prompt(prompt, num_query_tokens=int(num_query_tokens))
-
-        return super()._apply_hf_processor_main(
-            prompt=prompt,
-            mm_items=mm_items,
-            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
-            tokenization_kwargs=tokenization_kwargs,
-            enable_hf_prompt_update=enable_hf_prompt_update,
-        )
-
-    def _call_hf_processor(
-        self,
-        prompt: str,
-        mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
-        """Call sub-processors for multimodal inputs and tokenize.
+        """Call Ming's modality processors without expanding prompt text.
 
         We call the image/audio sub-processors directly (instead of going
         through `MingFlashOmniProcessor.__call__`) so that the high-level
-        placeholder tokens remain **unexpanded** in the tokenized output.
-
-        NOTE: Image-gen prompt expansion is handled in
-        :meth:`_apply_hf_processor_main` — by the time we get here, vllm's
-        MM caching has already split text/mm processing and ``mm_kwargs``
-        is empty on the text-only branch.
+        placeholder tokens remain under vLLM's prompt-update control.
         """
+        valid_mm_items = mm_items.select({key for key, count in mm_items.get_all_counts().items() if count > 0})
+        mm_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
         hf_processor = self.info.get_hf_processor()
-        tokenizer = self.info.get_tokenizer()
 
         data: dict[str, object] = {}
 
@@ -577,11 +569,9 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
             )
             data.update(audio_outputs)
 
-        # Tokenize text with placeholders still intact
-        text_outputs = tokenizer(prompt, return_tensors="pt", **tok_kwargs)
-        data.update(text_outputs)
-
-        return BatchFeature(data=data)
+        processed_data = BatchFeature(data=data)
+        processed_data.update(passthrough_data)
+        return processed_data
 
 
 @MULTIMODAL_REGISTRY.register_processor(

@@ -23,7 +23,6 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 from vllm.config import VllmConfig  # type: ignore
 from vllm.logger import init_logger  # type: ignore
 from vllm.model_executor.models.utils import (  # type: ignore
-    AutoWeightsLoader,
     WeightsMapper,
 )
 
@@ -31,6 +30,7 @@ from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 from vllm_omni.model_executor.models.qwen3_omni.quantization import (
     Qwen3OmniNestedSupportsQuant,
 )
+from vllm_omni.model_executor.models.weight_loader import AutoWeightsLoader
 
 logger = init_logger(__name__)
 

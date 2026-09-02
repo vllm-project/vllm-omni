@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for MiniCPM-o 4.5 >30s audio preprocessing.
 
 Covers:
@@ -94,10 +94,10 @@ def _make_processor(
     processor.info = SimpleNamespace(audio_pattern="(<audio>./</audio>)")
     processor.data_parser = MiniCPMOMultiModalDataParser(target_sr=_SAMPLE_RATE)
 
-    def fake_base_call_hf_processor(prompts, mm_data, mm_kwargs, tok_kwargs, *, out_keys):
+    def fake_call_hf_processor_on_prompts(prompts, mm_data, mm_kwargs, *, out_keys):
         return {key: fake_hf_outputs[key] for key in out_keys}
 
-    processor._base_call_hf_processor = fake_base_call_hf_processor
+    processor._call_hf_processor_on_prompts = fake_call_hf_processor_on_prompts
     return processor
 
 
@@ -115,7 +115,7 @@ class TestProcessAudiosUnpadding:
         }
         processor = _make_processor(fake_outputs)
 
-        result = processor.process_audios({"audios": [_audio_seconds(45)]}, {}, {})
+        result = processor.process_audios({"audios": [_audio_seconds(45)]}, {})
 
         features = result["audio_features"]
         assert [feat.shape[-1] for feat in features] == chunk_lens
@@ -133,7 +133,7 @@ class TestProcessAudiosUnpadding:
         }
         processor = _make_processor(fake_outputs)
 
-        result = processor.process_audios({"audios": [_audio_seconds(42), _audio_seconds(38)]}, {}, {})
+        result = processor.process_audios({"audios": [_audio_seconds(42), _audio_seconds(38)]}, {})
 
         widths = [feat.shape[-1] for feat in result["audio_features"]]
         assert widths == [_CHUNK_FRAMES, 1200, _CHUNK_FRAMES, 800]
@@ -146,7 +146,7 @@ class TestProcessAudiosUnpadding:
         }
         processor = _make_processor(fake_outputs)
 
-        result = processor.process_audios({"audios": [_audio_seconds(9.8)]}, {}, {})
+        result = processor.process_audios({"audios": [_audio_seconds(9.8)]}, {})
 
         features = result["audio_features"]
         assert len(features) == 1

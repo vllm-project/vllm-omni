@@ -8,7 +8,6 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
@@ -17,6 +16,8 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
+
+from vllm_omni.model_executor.models.weight_loader import AutoWeightsLoader
 
 
 class Qwen2_5OmniTalkerForConditionalGeneration(

@@ -17,7 +17,7 @@ from transformers.generation.configuration_utils import GenerationConfig
 from transformers.generation.utils import ALL_CACHE_NAMES, GenerationMixin
 from transformers.utils.generic import ModelOutput
 from vllm.config.vllm import get_current_vllm_config
-from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+from vllm.model_executor.models.utils import WeightsMapper
 from vllm.transformers_utils.config import get_config
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -33,6 +33,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import Siglip2VisionTransformer
+from vllm_omni.model_executor.models.weight_loader import AutoWeightsLoader
 
 from . import request_layout as request_layout_utils
 from .hunyuan_image3_tokenizer import TokenizerEncodeOutput, TokenizerWrapper

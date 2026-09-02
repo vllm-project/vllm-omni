@@ -9,7 +9,7 @@ from collections.abc import AsyncGenerator
 from typing import Any
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
-from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.logger import init_logger
 
 from vllm_omni.experimental.fullduplex.openai.protocol import DuplexSession

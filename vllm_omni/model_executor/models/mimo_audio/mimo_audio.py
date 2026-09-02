@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2025 Xiaomi Corporation.
 import os
 from collections.abc import Iterable, Mapping, Sequence
@@ -34,7 +37,7 @@ from vllm.multimodal.processing import (
     PromptUpdate,
     PromptUpdateDetails,
 )
-from vllm.multimodal.utils import group_mm_kwargs_by_modality
+from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.sequence import IntermediateTensors
 from vllm.utils.cache import LRUCache
 from vllm.utils.collection_utils import is_list_of
@@ -395,6 +398,22 @@ class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProces
             tensor_type=None,
         )
 
+    def _apply_hf_processor_main(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        valid_mm_items = mm_items.select({key for key, count in mm_items.get_all_counts().items() if count > 0})
+        mm_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
+        processed_data = self._call_hf_processor(
+            self.dummy_inputs.get_dummy_text(mm_items.get_all_counts()),
+            dict(mm_data),
+            hf_processor_mm_kwargs,
+            {},
+        )
+        processed_data.update(passthrough_data)
+        return processed_data
+
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
@@ -484,7 +503,7 @@ class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProces
         return [
             PromptReplacement(
                 modality="audio",
-                target=audio_token,
+                target=[audio_token_id],
                 replacement=get_replacement_mimo_audio,
             )
         ]
@@ -626,7 +645,7 @@ class MiMoAudioForConditionalGeneration(
                 )
             mm_kwargs.append((mm_feature.modality, mm_item))
 
-        for modality, num_items, mm_kwargs_group in group_mm_kwargs_by_modality(
+        for modality, num_items, mm_kwargs_group in group_and_batch_mm_kwargs(
             mm_kwargs,
             device=self.device,
             pin_memory=self.pin_memory,

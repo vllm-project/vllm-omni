@@ -420,6 +420,26 @@ class MimoAudioMultiModalProcessor(BaseMultiModalProcessor[MimoAudioProcessingIn
             tok_kwargs=tok_kwargs,
         )
 
+    def _preprocess_hf_mm_data(
+        self,
+        mm_data: Mapping[str, object],
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> tuple[Mapping[str, object], Mapping[str, object]]:
+        mm_data, hf_processor_mm_kwargs = super()._preprocess_hf_mm_data(
+            mm_data,
+            hf_processor_mm_kwargs,
+        )
+        mm_data = dict(mm_data)
+        audios = mm_data.pop("audios", [])
+        if audios:
+            mm_data["audio"] = audios
+            feature_extractor = self.info.get_feature_extractor(**hf_processor_mm_kwargs)
+            hf_processor_mm_kwargs = {
+                **hf_processor_mm_kwargs,
+                "sampling_rate": feature_extractor.sampling_rate,
+            }
+        return mm_data, hf_processor_mm_kwargs
+
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
@@ -480,7 +500,7 @@ class MimoAudioMultiModalProcessor(BaseMultiModalProcessor[MimoAudioProcessingIn
         return [
             PromptReplacement(
                 modality="audio",
-                target=audio_token,
+                target=[audio_token_id],
                 replacement=get_replacement_mimo_audio,
             )
         ]

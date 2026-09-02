@@ -12,7 +12,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponseChoice,
     ChatMessage,
 )
-from vllm.entrypoints.openai.engine.protocol import ErrorResponse, UsageInfo
+from vllm.entrypoints.serve.engine.protocol import ErrorResponse, UsageInfo
 
 from vllm_omni.entrypoints.openai.batch_serving import OmniOpenAIServingChatBatch
 

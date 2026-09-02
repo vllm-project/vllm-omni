@@ -54,8 +54,17 @@ except ImportError:
     soundfile = None
 
 
+from vllm.entrypoints.generate.base.protocol import (
+    DeltaFunctionCall,
+    DeltaMessage,
+    DeltaToolCall,
+    FunctionCall,
+    FunctionDefinition,
+    RequestResponseMetadata,
+    ToolCall,
+)
 from vllm.entrypoints.generate.base.serving import clamp_prompt_logprobs
-from vllm.entrypoints.launcher import terminate_if_errored
+from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
@@ -69,22 +78,15 @@ from vllm.entrypoints.openai.chat_completion.serving import (
     _get_mm_token_counts,
     _make_prompt_tokens_details,
 )
-from vllm.entrypoints.openai.engine.protocol import (
-    DeltaFunctionCall,
-    DeltaMessage,
-    DeltaToolCall,
-    ErrorInfo,
-    ErrorResponse,
-    FunctionCall,
-    FunctionDefinition,
-    RequestResponseMetadata,
-    ToolCall,
-    UsageInfo,
-)
 from vllm.entrypoints.openai.parser.harmony_utils import (
     get_streamable_parser_for_assistant,
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+from vllm.entrypoints.serve.engine.protocol import (
+    ErrorInfo,
+    ErrorResponse,
+    UsageInfo,
+)
 from vllm.entrypoints.serve.engine.typing import ChatLikeRequest
 from vllm.entrypoints.serve.utils.api_utils import should_include_usage
 from vllm.entrypoints.serve.utils.tool_calls_utils import maybe_filter_parallel_tool_calls

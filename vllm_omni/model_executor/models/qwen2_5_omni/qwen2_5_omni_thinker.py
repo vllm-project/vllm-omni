@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Thin Omni wrapper: reuse upstream Qwen2.5-Omni thinker with minimal overrides."""
 
 import hashlib
@@ -9,6 +12,7 @@ import numpy as np
 import PIL.Image as PILImage
 import torch
 from torch import nn
+from transformers.feature_extraction_utils import BatchFeature
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
     Qwen2_5OmniThinkerConfig,
 )
@@ -59,7 +63,6 @@ from vllm.model_executor.models.qwen2_audio import (
     _get_feat_extract_output_lengths,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
@@ -84,6 +87,7 @@ from vllm.multimodal.processing.processor import (
 from vllm.sequence import IntermediateTensors
 from vllm.utils.collection_utils import is_list_of
 
+from vllm_omni.model_executor.models.weight_loader import AutoWeightsLoader
 from vllm_omni.quantization.component_config import (
     resolve_encoder_quant_config,
 )
@@ -360,25 +364,40 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
 ):
     """Override to fix use_audio_in_video detection when mm cache returns None."""
 
-    def _call_hf_processor(
+    def _apply_hf_processor_main(
         self,
-        prompt: str,
-        mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
-    ):
-        mm_kwargs = _presampled_videos_hf_kwargs(mm_data, mm_kwargs)
-        mm_kwargs = _coerce_use_audio_in_video_for_hf_processor(mm_data, mm_kwargs)
-        hf_inputs = super()._call_hf_processor(
-            prompt=prompt,
-            mm_data=mm_data,
-            mm_kwargs=mm_kwargs,
-            tok_kwargs=tok_kwargs,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        """Apply omni-specific HF kwargs before the upstream Qwen2.5-Omni
+        processor runs.
+
+        Upstream's ``_apply_hf_processor_main`` is fully custom and no longer
+        routes through the generic ``_preprocess_hf_mm_data`` /
+        ``_postprocess_hf_mm_data`` hooks, so the omni video pre-sampling and
+        per-video ``use_audio_in_video`` mask handling have to run here.
+        """
+        valid_mm_items = mm_items.select({k for k, c in mm_items.get_all_counts().items() if c > 0})
+        processor_data, _ = self._get_hf_mm_data(valid_mm_items)
+
+        hf_processor_mm_kwargs = _presampled_videos_hf_kwargs(
+            processor_data,
+            hf_processor_mm_kwargs,
         )
-        per_video_mask = mm_kwargs.get(_PER_VIDEO_USE_AUDIO_IN_VIDEO_KEY)
+        hf_processor_mm_kwargs = _coerce_use_audio_in_video_for_hf_processor(
+            processor_data,
+            hf_processor_mm_kwargs,
+        )
+
+        processed_data = super()._apply_hf_processor_main(
+            mm_items,
+            hf_processor_mm_kwargs,
+        )
+
+        per_video_mask = hf_processor_mm_kwargs.get(_PER_VIDEO_USE_AUDIO_IN_VIDEO_KEY)
         if per_video_mask is not None:
-            hf_inputs["use_audio_in_video"] = torch.tensor(per_video_mask)
-        return hf_inputs
+            processed_data["use_audio_in_video"] = torch.tensor(per_video_mask)
+        return processed_data
 
     def _get_mm_fields_config(
         self,
@@ -530,17 +549,17 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
         return [
             PromptReplacement(
                 modality="audio",
-                target=audio_token,
+                target=[audio_token_id],
                 replacement=get_replacement_qwen2_audio,
             ),
             PromptReplacement(
                 modality="image",
-                target=image_token,
+                target=[image_token_id],
                 replacement=partial(get_replacement_qwen2_vision, modality="image"),
             ),
             PromptReplacement(
                 modality="video",
-                target=video_token,
+                target=[video_token_id],
                 replacement=get_replacement_qwen2_video,
             ),
         ]
@@ -620,7 +639,7 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
         self,
         inputs: ProcessorInputs,
         timing_ctx: TimingContext,
-    ) -> tuple[list[int], MultiModalProcessingInfo, bool]:
+    ) -> MultiModalProcessingInfo:
         """Cache-aware: processes video/audio pairs as units,
         using pair-specific cache keys. Falls back to standard cache if no pairs."""
 
@@ -673,16 +692,9 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
         )
 
         with timing_ctx.record("apply_hf_processor"):
-            (
-                prompt_ids,
-                mm_missing_processed_data,
-                is_update_applied,
-            ) = self._apply_hf_processor_main(
-                prompt=inputs.prompt,
+            mm_missing_processed_data = self._apply_hf_processor_main(
                 mm_items=mm_missing_data_items,
                 hf_processor_mm_kwargs=hf_processor_mm_kwargs,
-                tokenization_kwargs=inputs.tokenization_kwargs,
-                enable_hf_prompt_update=False,
             )
 
         mm_missing_kwargs = MultiModalKwargsItems.from_hf_inputs(
@@ -714,7 +726,7 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
             prompt_updates=mm_prompt_updates,
         )
 
-        return prompt_ids, mm_info, is_update_applied
+        return mm_info
 
     def _derive_audio_from_video_placeholders(
         self,
@@ -785,7 +797,6 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
         prompt_ids: list[int],
         mm_kwargs: MultiModalKwargsItems,
         mm_prompt_updates: MultiModalPromptUpdates,
-        is_update_applied: bool,
     ) -> tuple[list[int], Mapping[str, list[PlaceholderFeaturesInfo]]]:
         mm_item_counts = mm_items.get_all_counts()
         self._validate_mm_kwargs(mm_kwargs, mm_item_counts)
@@ -794,37 +805,27 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
         video_use_audio_in_video = self._get_video_use_audio_in_video(mm_kwargs, mm_prompt_updates)
         use_audio_in_video = any(video_use_audio_in_video)
 
-        if is_update_applied:
-            mm_placeholders = self._find_mm_placeholders(
+        if use_audio_in_video and "audio" in mm_prompt_updates:
+            filtered_updates = {k: v for k, v in mm_prompt_updates.items() if k != "audio"}
+            prompt_ids, mm_placeholders = self._apply_prompt_updates(
+                prompt_ids,
+                filtered_updates,
+            )
+            mm_placeholders = self._derive_audio_from_video_placeholders(
+                mm_placeholders,
+                mm_prompt_updates,
+                video_use_audio_in_video,
+            )
+        else:
+            prompt_ids, mm_placeholders = self._apply_prompt_updates(
                 prompt_ids,
                 mm_prompt_updates,
             )
-            self._validate_mm_placeholders(
-                mm_placeholders,
-                mm_item_counts,
-            )
-        else:
-            if use_audio_in_video and "audio" in mm_prompt_updates:
-                filtered_updates = {k: v for k, v in mm_prompt_updates.items() if k != "audio"}
-                prompt_ids, mm_placeholders = self._apply_prompt_updates(
-                    prompt_ids,
-                    filtered_updates,
-                )
-                mm_placeholders = self._derive_audio_from_video_placeholders(
-                    mm_placeholders,
-                    mm_prompt_updates,
-                    video_use_audio_in_video,
-                )
-            else:
-                prompt_ids, mm_placeholders = self._apply_prompt_updates(
-                    prompt_ids,
-                    mm_prompt_updates,
-                )
 
-            self._validate_mm_placeholders(
-                mm_placeholders,
-                mm_item_counts,
-            )
+        self._validate_mm_placeholders(
+            mm_placeholders,
+            mm_item_counts,
+        )
 
         return prompt_ids, mm_placeholders
 

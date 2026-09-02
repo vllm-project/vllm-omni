@@ -22,12 +22,13 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLM
-from vllm.model_executor.models.utils import AutoWeightsLoader, maybe_prefix
+from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.gepard.configuration_gepard import GepardConfig
 from vllm_omni.model_executor.models.gepard.nanocodec import NanoCodec
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.weight_loader import AutoWeightsLoader
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)

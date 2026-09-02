@@ -25,7 +25,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from pytest_mock import MockerFixture
-from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
+from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
 
 from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.entrypoints.openai import api_server as api_server_module

@@ -92,6 +92,10 @@ RUN VLLM_WHEEL_URL=$(python3 -c "import urllib.request,re; \
 # plus `from deep_ep_cpp import EventHandle` -> ImportError, which together took
 # out 21 CI jobs on build #2947 that pass on main.
 #
+# Installing torch first means FlashInfer resolves against the final runtime.
+RUN uv pip install --system --force-reinstall \
+    "torch==2.13.0" "torchaudio==2.11.0" "torchvision==0.28.0" \
+    --torch-backend cu130
 
 # No --upgrade here: with torch already at its pinned version, --upgrade is what
 # would drag it forward again and reintroduce the mismatch this ordering fixes.

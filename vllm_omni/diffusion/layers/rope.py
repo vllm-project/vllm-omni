@@ -1,3 +1,4 @@
+from importlib import import_module
 from importlib.util import find_spec
 
 import torch
@@ -98,6 +99,7 @@ class RotaryEmbedding(CustomOp):
         self.interleaved = not is_neox_style
         self.half_head_dim = half_head_dim
         self.apply_rotary_emb_flash_attn = None
+        self.apply_rotary_emb_vllm_flash_attn = None
         self.has_mindie = False
         # ``find_spec("flash_attn")`` is True as long as *any* package publishes
         # the ``flash_attn`` namespace — including ``flash-attn-4``, which ships
@@ -109,6 +111,17 @@ class RotaryEmbedding(CustomOp):
                 from flash_attn.ops.triton.rotary import apply_rotary
 
                 self.apply_rotary_emb_flash_attn = apply_rotary
+            except ImportError:
+                pass
+        # CUDA wheels vendor this kernel under vllm_flash_attn, while source
+        # and CPU-only installations may not contain the generated package.
+        # Resolve it lazily and retain the native implementation as a portable
+        # fallback for those environments.
+        if current_omni_platform.is_cuda():
+            try:
+                self.apply_rotary_emb_vllm_flash_attn = import_module(
+                    "vllm.vllm_flash_attn.layers.rotary"
+                ).apply_rotary_emb
             except ImportError:
                 pass
         if find_spec("mindiesd") is not None:
@@ -135,12 +148,18 @@ class RotaryEmbedding(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
-
         cos, sin = self._prepare_half_head_dim_cos_sin(cos, sin)
 
+        if self.apply_rotary_emb_vllm_flash_attn is None:
+            return apply_rotary_emb_torch(
+                x,
+                cos,
+                sin,
+                interleaved=self.interleaved,
+            )
+
         x, squeezed = _ensure_batch_dim(x)
-        output = apply_rotary_emb(
+        output = self.apply_rotary_emb_vllm_flash_attn(
             x,
             cos,
             sin,
@@ -231,13 +250,14 @@ class RotaryEmbeddingWan(RotaryEmbedding):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+        if self.apply_rotary_emb_vllm_flash_attn is None:
+            return self.forward_native(x, cos, sin)
 
         if cos.dim() > 2:
             cos = cos.reshape(-1, cos.shape[-1])
             sin = sin.reshape(-1, sin.shape[-1])
 
-        return apply_rotary_emb(
+        return self.apply_rotary_emb_vllm_flash_attn(
             x,
             cos,
             sin,

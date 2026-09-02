@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Step-Audio2 Thinker - Stage 1 LLM for Audio Understanding
 
@@ -19,6 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer
+from transformers.feature_extraction_utils import BatchFeature
 from transformers.processing_utils import ProcessorMixin
 from vllm.config import VllmConfig
 from vllm.inputs import MultiModalDataDict
@@ -503,6 +507,10 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
 
         audio_token = getattr(processor, "audio_token", "<audio_patch>")
+        audio_token_ids = self.info.get_tokenizer().encode(
+            audio_token,
+            add_special_tokens=False,
+        )
 
         audio_items = mm_items.get("audio", [])
         num_audio_items = len(audio_items) if audio_items else 0
@@ -548,7 +556,7 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
         return [
             PromptReplacement(
                 modality="audio",
-                target=audio_token,
+                target=audio_token_ids,
                 replacement=get_replacement_audio,
             )
         ]
@@ -590,6 +598,43 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
             hf_inputs["audio_lens"] = torch.tensor([], dtype=torch.int32)
 
         return hf_inputs
+
+    def _preprocess_hf_mm_data(
+        self,
+        mm_data: Mapping[str, object],
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> tuple[Mapping[str, object], Mapping[str, object]]:
+        mm_data, hf_processor_mm_kwargs = super()._preprocess_hf_mm_data(
+            mm_data,
+            hf_processor_mm_kwargs,
+        )
+        mm_data = dict(mm_data)
+        audios = mm_data.pop("audios", [])
+        if audios:
+            if isinstance(audios, str):
+                mm_data["audio"] = [audios]
+            elif isinstance(audios, (list, tuple)):
+                mm_data["audio"] = audios
+            else:
+                mm_data["audio"] = [audios]
+        return mm_data, hf_processor_mm_kwargs
+
+    def _postprocess_hf_mm_data(
+        self,
+        mm_data: Mapping[str, object],
+        hf_processor_mm_kwargs: Mapping[str, object],
+        processed_data: BatchFeature,
+    ) -> BatchFeature:
+        processed_data = super()._postprocess_hf_mm_data(
+            mm_data,
+            hf_processor_mm_kwargs,
+            processed_data,
+        )
+        if "audio_mels" not in processed_data:
+            processed_data["audio_mels"] = torch.empty((0, 128, 0))
+        if "audio_lens" not in processed_data:
+            processed_data["audio_lens"] = torch.tensor([], dtype=torch.int32)
+        return processed_data
 
 
 # ============================================================================

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import math
 from collections.abc import Iterable, Mapping, Sequence
@@ -871,7 +871,7 @@ class VoxtralTTSMultiModalProcessor(BaseMultiModalProcessor[VoxtralTTSProcessing
         return [
             PromptReplacement(
                 modality="audio",
-                target="",  # Never match the prompt (see below note)
+                target=[audio_id],
                 replacement=get_replacement,
             ),
         ]
@@ -903,11 +903,27 @@ class VoxtralTTSMultiModalProcessor(BaseMultiModalProcessor[VoxtralTTSProcessing
         self,
         inputs: ProcessorInputs,
         timing_ctx: TimingContext,
-    ) -> tuple[list[int], MultiModalProcessingInfo, bool]:
-        prompt_ids, mm_info, _ = super()._cached_apply_hf_processor(inputs, timing_ctx)
+    ) -> MultiModalProcessingInfo:
+        return super()._cached_apply_hf_processor(inputs, timing_ctx)
 
-        # NOTE: The tokens are already inserted by the chat template
-        return prompt_ids, mm_info, True
+    def _maybe_apply_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        prompt_ids: list[int],
+        mm_kwargs: MultiModalKwargsItems,
+        mm_prompt_updates,
+    ):
+        # Voxtral's Mistral chat template has already inserted the complete
+        # audio-token run, so locate it without applying the replacement again.
+        mm_item_counts = mm_items.get_all_counts()
+        self._validate_mm_kwargs(mm_kwargs, mm_item_counts)
+        self._validate_mm_updates(mm_prompt_updates, mm_item_counts)
+        mm_placeholders = self._find_mm_placeholders(
+            prompt_ids,
+            mm_prompt_updates,
+        )
+        self._validate_mm_placeholders(mm_placeholders, mm_item_counts)
+        return prompt_ids, mm_placeholders
 
 
 @MULTIMODAL_REGISTRY.register_processor(

@@ -1669,7 +1669,7 @@ class _BackboneWrapper(nn.Module):
         self.config = config
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        from vllm.model_executor.models.utils import AutoWeightsLoader
+        from vllm_omni.model_executor.models.weight_loader import AutoWeightsLoader
 
         skip = ["lm_head."] if getattr(self.config, "tie_word_embeddings", False) else None
         loader = AutoWeightsLoader(self, skip_prefixes=skip)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """GLM-TTS AR Model (Stage 0): Text → Speech Tokens.
 
 Based on Llama architecture, generates speech token sequences from input text.
@@ -373,6 +373,55 @@ class GLMTTSMultiModalProcessor(BaseMultiModalProcessor[GLMTTSMultiModalProcessi
     handoff.
     """
 
+    _OMNI_PROMPT_TEXT_KEY = "_vllm_omni_original_prompt_text"
+
+    def apply(self, inputs: ProcessorInputs, timing_ctx):
+        source_tokenizer = self.info.get_tokenizer()
+        prompt_text = source_tokenizer.decode(
+            inputs.prompt,
+            skip_special_tokens=False,
+        )
+        config = self.info.ctx.get_hf_config()
+        model_dir = self.info.ctx.model_config.model
+        self._ensure_cached_runtime_components(
+            model_dir,
+            config,
+            load_voice_clone=False,
+        )
+
+        normalized_text = _normalize_glm_tts_processor_text(
+            self.text_frontend,
+            prompt_text,
+        )
+        text_ids = self._encode_text(normalized_text)
+        prompt_parts = []
+        if inputs.mm_data_items.get_all_counts().get("audio", 0):
+            reference_text = inputs.hf_processor_mm_kwargs.get("prompt_text")
+            if not isinstance(reference_text, str) or not reference_text.strip():
+                raise ValueError("GLM-TTS voice cloning requires mm_processor_kwargs['prompt_text'].")
+            normalized_reference = _normalize_glm_tts_processor_text(
+                self.text_frontend,
+                reference_text,
+                add_trailing_space=True,
+            )
+            prompt_parts.append(self._encode_text(normalized_reference))
+        prompt_parts.extend(
+            [
+                text_ids,
+                torch.tensor([[int(self.special_ids["boa"])]], dtype=torch.long),
+            ]
+        )
+        prompt_ids = torch.cat(prompt_parts, dim=1).reshape(-1).tolist()
+        inputs = replace(
+            inputs,
+            prompt=prompt_ids,
+            hf_processor_mm_kwargs={
+                **inputs.hf_processor_mm_kwargs,
+                self._OMNI_PROMPT_TEXT_KEY: prompt_text,
+            },
+        )
+        return super().apply(inputs, timing_ctx)
+
     def _ensure_cached_runtime_components(
         self,
         model_dir: str,
@@ -580,6 +629,24 @@ class GLMTTSMultiModalProcessor(BaseMultiModalProcessor[GLMTTSMultiModalProcessi
                 "glm_tts_text_token_len": [torch.tensor([int(text_ids.shape[1])], dtype=torch.long)],
             }
         )
+
+    def _apply_hf_processor_main(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        mm_kwargs = dict(hf_processor_mm_kwargs)
+        prompt_text = str(mm_kwargs.pop(self._OMNI_PROMPT_TEXT_KEY, ""))
+        valid_mm_items = mm_items.select({key for key, count in mm_items.get_all_counts().items() if count > 0})
+        mm_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
+        processed_data = self._call_hf_processor(
+            prompt_text,
+            mm_data,
+            mm_kwargs,
+            {},
+        )
+        processed_data.update(passthrough_data)
+        return processed_data
 
     def _get_mm_fields_config(
         self,

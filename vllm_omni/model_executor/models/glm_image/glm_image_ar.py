@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Adapted from
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/glm_image/modeling_glm_image.py
@@ -24,6 +24,7 @@
 import math
 import os
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from functools import lru_cache
 from typing import Annotated, Literal
 
@@ -357,6 +358,24 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         if inputs.mm_data_items.get_all_counts().get("image", 0) > 0:
             return self._apply_hf_processor(inputs, timing_ctx)
         return super()._cached_apply_hf_processor(inputs, timing_ctx)
+
+    def apply(self, inputs, timing_ctx):
+        """Ensure token prompts contain one source-image placeholder each."""
+        num_images = inputs.mm_data_items.get_all_counts().get("image", 0)
+        if num_images:
+            image_token_id = getattr(
+                self.info.get_hf_config(),
+                "image_token_id",
+                167855,
+            )
+            prompt_ids = list(inputs.prompt)
+            missing = num_images - prompt_ids.count(image_token_id)
+            if missing > 0:
+                inputs = replace(
+                    inputs,
+                    prompt=[image_token_id] * missing + prompt_ids,
+                )
+        return super().apply(inputs, timing_ctx)
 
     def _call_hf_processor(
         self,
@@ -827,6 +846,42 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         # HF processor already expanded image placeholders in input_ids.
         return prompt_ids, mm_processed_data, True
 
+    def _apply_hf_processor_main(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        """Process source images under vLLM's token-only prompt contract."""
+        mm_counts = mm_items.get_all_counts()
+        num_images = mm_counts.get("image", 0)
+        if num_images == 0:
+            return BatchFeature({"mrope_image_grid_thw": self._build_generation_grids(hf_processor_mm_kwargs)})
+
+        valid_mm_items = mm_items.select({key for key, count in mm_counts.items() if count > 0})
+        processor_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
+        images = processor_data.get("images")
+        if not images:
+            return BatchFeature(dict(passthrough_data))
+
+        processor = self.info.get_hf_processor()
+        image_inputs = processor.image_processor(
+            images=list(images),
+            return_tensors="pt",
+        )
+        image_grid_thw = image_inputs.get("image_grid_thw")
+        if image_grid_thw is not None:
+            source_grid_thw = image_grid_thw[:num_images]
+            image_inputs["image_grid_thw"] = source_grid_thw
+
+            target_grid = self._build_generation_grids(hf_processor_mm_kwargs)[:1].to(dtype=source_grid_thw.dtype)
+            image_inputs["mrope_image_grid_thw"] = torch.cat(
+                [source_grid_thw, target_grid],
+                dim=0,
+            )
+
+        image_inputs.update(passthrough_data)
+        return image_inputs
+
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
@@ -864,6 +919,13 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
                 # Register image_grid_thw - it's been sliced in _call_hf_processor
                 # to only include source image grids, so batching will work correctly
                 result["image_grid_thw"] = MultiModalFieldConfig.batched("image")
+
+                if "mrope_image_grid_thw" in hf_inputs:
+                    result["mrope_image_grid_thw"] = MultiModalFieldConfig.shared(
+                        "image",
+                        num_source_images,
+                        keep_on_cpu=True,
+                    )
 
         logger.debug(f"_get_mm_fields_config: result keys: {list(result.keys())}")
 

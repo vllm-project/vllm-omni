@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Adapted from nvidia/Nemotron-Labs-Audex-2B (Apache-2.0):
 #   inference_scripts_vllm/audioqa_scripts/audex_2b_vllm/audio_features.py
@@ -221,6 +221,22 @@ class AudexMultiModalProcessor(BaseMultiModalProcessor[AudexProcessingInfo]):
             ),
             tensor_type="pt",
         )
+
+    def _apply_hf_processor_main(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        valid_mm_items = mm_items.select({key for key, count in mm_items.get_all_counts().items() if count > 0})
+        mm_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
+        processed_data = self._call_hf_processor(
+            self.dummy_inputs.get_dummy_text(mm_items.get_all_counts()),
+            mm_data,
+            hf_processor_mm_kwargs,
+            {},
+        )
+        processed_data.update(passthrough_data)
+        return processed_data
 
     def _get_mm_fields_config(
         self,

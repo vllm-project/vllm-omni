@@ -17,12 +17,13 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.models.qwen3 import Qwen3Model
-from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, WeightsMapper, maybe_prefix
+from vllm.model_executor.models.utils import PPMissingLayer, WeightsMapper, maybe_prefix
 from vllm.multimodal.audio import AudioResampler
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.weight_loader import AutoWeightsLoader
 from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
     iter_custom_voice_profiles,

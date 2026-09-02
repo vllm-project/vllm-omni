@@ -20,7 +20,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
 )
-from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.video_frame_filter import FrameSimilarityFilter

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 OmniVoice model for vLLM-Omni two-stage TTS pipeline.
 
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -69,6 +70,32 @@ class OmniVoiceMultiModalProcessor(BaseMultiModalProcessor[OmniVoiceMultiModalPr
     For voice cloning: text + reference audio → tokenized reference
     For auto voice: text only
     """
+
+    _OMNI_PROMPT_TEXT_KEY = "_vllm_omni_original_prompt_text"
+
+    def apply(self, inputs: ProcessorInputs, timing_ctx):
+        tokenizer = self.info.get_tokenizer()
+        prompt_text = tokenizer.decode(inputs.prompt, skip_special_tokens=False)
+        prompt_inputs = self._call_hf_processor(
+            prompt_text,
+            {},
+            inputs.hf_processor_mm_kwargs,
+            {},
+        )
+        prompt_ids = prompt_inputs["input_ids"]
+        if isinstance(prompt_ids, torch.Tensor):
+            prompt_ids = prompt_ids.reshape(-1).tolist()
+        else:
+            prompt_ids = list(prompt_ids)
+        inputs = replace(
+            inputs,
+            prompt=prompt_ids,
+            hf_processor_mm_kwargs={
+                **inputs.hf_processor_mm_kwargs,
+                self._OMNI_PROMPT_TEXT_KEY: prompt_text,
+            },
+        )
+        return super().apply(inputs, timing_ctx)
 
     def _ensure_cached_runtime_components(self, model_dir: str, config: OmniVoiceConfig) -> None:
         cached_model_dir = getattr(self, "_cached_model_dir", None)
@@ -177,6 +204,24 @@ class OmniVoiceMultiModalProcessor(BaseMultiModalProcessor[OmniVoiceMultiModalPr
             }
         )
         return ft
+
+    def _apply_hf_processor_main(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        mm_kwargs = dict(hf_processor_mm_kwargs)
+        prompt_text = str(mm_kwargs.pop(self._OMNI_PROMPT_TEXT_KEY, ""))
+        valid_mm_items = mm_items.select({key for key, count in mm_items.get_all_counts().items() if count > 0})
+        mm_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
+        processed_data = self._call_hf_processor(
+            prompt_text,
+            mm_data,
+            mm_kwargs,
+            {},
+        )
+        processed_data.update(passthrough_data)
+        return processed_data
 
     def _get_mm_fields_config(
         self,

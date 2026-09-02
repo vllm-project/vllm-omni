@@ -12,6 +12,7 @@ import regex as re
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
+from vllm.inputs import mm_input
 from vllm.model_executor.models.qwen3_vl import (
     Qwen3VLDummyInputsBuilder,
     Qwen3VLForConditionalGeneration,
@@ -26,10 +27,6 @@ from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MINIMAX_H3_PRESENTATION_TASK_KEY,
 )
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
-    IMAGE_PAD,
-    VIDEO_PAD,
-    VISION_END,
-    VISION_START,
     build_minimax_h3_presentation,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -96,58 +93,57 @@ class MiniMaxH3MultiModalProcessor(Qwen3VLMultiModalProcessor):
 
     def _apply_hf_processor_main(
         self,
-        prompt: str | list[int],
         mm_items: Any,
         hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-        *,
-        enable_hf_prompt_update: bool,
     ):
-        task_value = hf_processor_mm_kwargs.get(MINIMAX_H3_PRESENTATION_TASK_KEY)
-        if task_value is None:
-            return super()._apply_hf_processor_main(
-                prompt,
-                mm_items,
-                hf_processor_mm_kwargs,
-                tokenization_kwargs,
-                enable_hf_prompt_update=enable_hf_prompt_update,
-            )
-        if not isinstance(prompt, str):
-            raise ValueError("MiniMax H3 presentation requires the original prompt text")
-
-        task = str(task_value)
-        condition_labels = self._condition_labels(hf_processor_mm_kwargs.get(MINIMAX_H3_CONDITION_LABELS_KEY))
         base_kwargs = self._base_processor_kwargs(hf_processor_mm_kwargs)
-        image_count = sum(kind == "image" for kind, _ in condition_labels)
-        video_count = sum(kind == "video" for kind, _ in condition_labels)
-        image_slot = f"{VISION_START}{IMAGE_PAD}{VISION_END}"
-        hf_processor = self.info.get_hf_processor(**base_kwargs)
-        video_slot = (
-            VIDEO_PAD if self._expands_only_video_token(hf_processor) else f"{VISION_START}{VIDEO_PAD}{VISION_END}"
-        )
-        processing_prompt = image_slot * image_count + video_slot * video_count
-        if not processing_prompt:
-            processing_prompt = prompt
-
-        _, processed_data, _ = super()._apply_hf_processor_main(
-            processing_prompt,
+        return super()._apply_hf_processor_main(
             mm_items,
             base_kwargs,
-            tokenization_kwargs,
-            enable_hf_prompt_update=enable_hf_prompt_update,
         )
+
+    def apply(self, inputs: Any, timing_ctx: Any):
+        task_value = inputs.hf_processor_mm_kwargs.get(MINIMAX_H3_PRESENTATION_TASK_KEY)
+        if task_value is None:
+            return super().apply(inputs, timing_ctx)
+
+        prompt_ids = self._postprocess_prompt(inputs.prompt)
+        mm_info = self._cached_apply_hf_processor(inputs, timing_ctx)
+        base_kwargs = self._base_processor_kwargs(inputs.hf_processor_mm_kwargs)
+        tokenizer = self.info.get_tokenizer()
+        prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=False)
+        condition_labels = self._condition_labels(inputs.hf_processor_mm_kwargs.get(MINIMAX_H3_CONDITION_LABELS_KEY))
+        out_mm_data = mm_info.kwargs.get_data()
         image_processor = self.info.get_image_processor(**base_kwargs)
         ids, _ = _build_minimax_h3_presentation(
-            self.info.get_tokenizer(),
-            prompt=prompt,
-            task=task,
+            tokenizer,
+            prompt=prompt_text,
+            task=str(task_value),
             condition_labels=condition_labels,
-            image_grid_thw=processed_data.get("image_grid_thw"),
-            video_grid_thw=processed_data.get("video_grid_thw"),
-            video_timestamps=processed_data.get("timestamps"),
+            image_grid_thw=out_mm_data.get("image_grid_thw"),
+            video_grid_thw=out_mm_data.get("video_grid_thw"),
+            video_timestamps=out_mm_data.get("timestamps"),
             merge_size=int(image_processor.merge_size),
         )
-        return ids.tolist(), processed_data, True
+        prompt_ids = ids.tolist()
+
+        mm_item_counts = inputs.mm_data_items.get_all_counts()
+        self._validate_mm_kwargs(mm_info.kwargs, mm_item_counts)
+        self._validate_mm_updates(mm_info.prompt_updates, mm_item_counts)
+        mm_placeholders = self._find_mm_placeholders(
+            prompt_ids,
+            mm_info.prompt_updates,
+        )
+        self._validate_mm_placeholders(mm_placeholders, mm_item_counts)
+        mm_placeholder_ranges = {
+            modality: [item.to_range() for item in placeholders] for modality, placeholders in mm_placeholders.items()
+        }
+        return mm_input(
+            prompt_token_ids=prompt_ids,
+            mm_kwargs=mm_info.kwargs,
+            mm_hashes=mm_info.hashes,
+            mm_placeholders=mm_placeholder_ranges,
+        )
 
     def _get_prompt_updates(
         self,

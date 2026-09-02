@@ -37,10 +37,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.qwen3 import Qwen3Model
-from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.v1.outputs import SamplerOutput
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.weight_loader import AutoWeightsLoader
 
 from .chunking import chunk_windows
 from .constants import (

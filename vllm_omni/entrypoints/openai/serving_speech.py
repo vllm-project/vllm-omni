@@ -24,12 +24,10 @@ import soundfile as sf
 import torch
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
+from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
 from vllm.entrypoints.generate.base.serving import GenerateBaseServing as OpenAIServing
-from vllm.entrypoints.launcher import terminate_if_errored
-from vllm.entrypoints.openai.engine.protocol import (
-    ErrorResponse,
-    RequestResponseMetadata,
-)
+from vllm.entrypoints.launchers.launcher import terminate_if_errored
+from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.inputs import tokens_input
 from vllm.logger import init_logger
 from vllm.multimodal.media import MediaConnector

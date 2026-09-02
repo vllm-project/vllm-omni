@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import gc
 import math
 import typing
@@ -45,13 +45,6 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from vllm.model_executor.models.hunyuan_v1 import (
-    HunYuanMLP,
-    HunYuanModel,
-    HunYuanSparseMoeBlock,
-    _get_cla_factor,
-    _is_moe,
-)
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsLoRA,
@@ -61,7 +54,6 @@ from vllm.model_executor.models.interfaces import (
     _require_is_multimodal,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     PPMissingLayer,
     _merge_multimodal_embeddings,
     is_pp_missing_parameter,
@@ -91,8 +83,16 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.model_executor.models.hunyuan_image3._hunyuan_v1_vendored import (
+    HunYuanMLP,
+    HunYuanModel,
+    HunYuanSparseMoeBlock,
+    _get_cla_factor,
+    _is_moe,
+)
 from vllm_omni.model_executor.models.hunyuan_image3.autoencoder_kl_3d import AutoencoderKLConv3D
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import LightProjector, Siglip2VisionTransformer
+from vllm_omni.model_executor.models.weight_loader import AutoWeightsLoader
 
 logger = init_logger(__name__)
 
@@ -1040,6 +1040,22 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
         if vae_generator_seed is not None and images:
             batch_feature["vae_generator_seed"] = torch.full((len(images),), int(vae_generator_seed), dtype=torch.long)
         return batch_feature
+
+    def _apply_hf_processor_main(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        valid_mm_items = mm_items.select({key for key, count in mm_items.get_all_counts().items() if count > 0})
+        mm_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
+        processed_data = self._call_hf_processor(
+            self.dummy_inputs.get_dummy_text(mm_items.get_all_counts()),
+            mm_data,
+            hf_processor_mm_kwargs,
+            {},
+        )
+        processed_data.update(passthrough_data)
+        return processed_data
 
     def _hf_processor_applies_updates(
         self,

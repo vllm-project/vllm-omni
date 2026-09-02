@@ -24,7 +24,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.batch_invariant import linear_batch_invariant
+from vllm.model_executor.determinism.batch_invariant import linear_batch_invariant
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,

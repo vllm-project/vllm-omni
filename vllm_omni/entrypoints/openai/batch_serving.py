@@ -11,7 +11,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
 )
-from vllm.entrypoints.openai.engine.protocol import (
+from vllm.entrypoints.serve.engine.protocol import (
     ErrorResponse,
     UsageInfo,
 )

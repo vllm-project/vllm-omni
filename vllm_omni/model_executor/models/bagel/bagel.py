@@ -1,4 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from math import isqrt
 from typing import Any
 
@@ -17,7 +21,6 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.bagel import BagelForConditionalGeneration
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer, Qwen2MLP
-from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
@@ -50,6 +53,7 @@ from vllm_omni.diffusion.models.bagel.bagel_transformer import (
     TimestepEmbedder,
 )
 from vllm_omni.diffusion.models.bagel.pipeline_bagel import default_ae_params
+from vllm_omni.model_executor.models.weight_loader import AutoWeightsLoader
 
 
 class OmniBagelProcessor(BagelProcessor):
@@ -218,6 +222,20 @@ class OmniBagelDataParser(MultiModalDataParser):
 class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingInfo]):
     IMG2IMG_PLACEHOLDER = "<|fim_middle|>"
 
+    def apply(self, inputs, timing_ctx):
+        num_img2img = inputs.mm_data_items.get_all_counts().get("img2img", 0)
+        if num_img2img:
+            token_id = self.info.get_tokenizer().get_vocab().get(self.IMG2IMG_PLACEHOLDER)
+            if token_id is not None:
+                prompt_ids = list(inputs.prompt)
+                missing = num_img2img - prompt_ids.count(token_id)
+                if missing > 0:
+                    inputs = replace(
+                        inputs,
+                        prompt=[token_id] * missing + prompt_ids,
+                    )
+        return super().apply(inputs, timing_ctx)
+
     @staticmethod
     def _mm_kwargs_for_bagel_img2img_hf(mm_kwargs: Mapping[str, object]) -> dict[str, object]:
         # OpenAI / GLM-style serving may pass target_h/target_w for output grid sizing.
@@ -292,6 +310,52 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
             return outputs
 
         return super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
+
+    def _apply_hf_processor_main(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        valid_mm_items = mm_items.select({key for key, count in mm_items.get_all_counts().items() if count > 0})
+        mm_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
+        prompt_text = self.dummy_inputs.get_dummy_text(mm_items.get_all_counts())
+        processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
+
+        has_image = "images" in mm_data
+        has_img2img = "pixel_values_img2img" in mm_data
+        processed_data = BatchFeature()
+
+        if has_image:
+            image_kwargs = {**hf_processor_mm_kwargs, "is_img2img": False}
+            image_outputs = self.info.ctx.call_hf_processor(
+                processor,
+                {"text": prompt_text, "images": mm_data["images"]},
+                image_kwargs,
+            )
+            processed_data.update(image_outputs)
+
+        if has_img2img:
+            img2img_kwargs = self._mm_kwargs_for_bagel_img2img_hf(hf_processor_mm_kwargs)
+            img2img_kwargs["is_img2img"] = True
+            img2img_outputs = self.info.ctx.call_hf_processor(
+                processor,
+                {
+                    "text": prompt_text,
+                    "images": mm_data["pixel_values_img2img"],
+                },
+                img2img_kwargs,
+            )
+            pixel_values = img2img_outputs.pop("pixel_values", None)
+            if pixel_values is not None:
+                processed_data["pixel_values_img2img"] = pixel_values
+            for key, value in img2img_outputs.items():
+                processed_data.setdefault(key, value)
+
+        if not has_image and not has_img2img:
+            processed_data = BatchFeature(dict(passthrough_data))
+        else:
+            processed_data.update(passthrough_data)
+        return processed_data
 
     def _hf_processor_applies_updates(
         self,

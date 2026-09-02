@@ -12,7 +12,6 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     maybe_prefix,
 )
@@ -27,6 +26,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_code_predictor_mt
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3MoeLLMForCausalLM,
 )
+from vllm_omni.model_executor.models.weight_loader import AutoWeightsLoader
 from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 
 logger = init_logger(__name__)
