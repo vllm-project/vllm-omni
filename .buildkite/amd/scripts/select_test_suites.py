@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Resolve AMD L2/L3 suites from PR labels or a debug override."""
+"""Select AMD L2/L3 suites after Buildkite has created an AMD build.
+
+This repository-side selector does not decide which GitHub label events start
+the external ``vllm-omni-amd-ci`` pipeline. Its Buildkite PR build condition
+must admit the relevant label event before this code can inspect the labels.
+"""
 
 from __future__ import annotations
 

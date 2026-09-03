@@ -163,6 +163,8 @@ Canonical layout (prefer these paths for new changes):
 
     **Test YAML (data):** `amd/test-amd-ready.yml` (L2 / `ready`), `test-amd-merge.yml` (L3 / `merge-test` and `main`). On a PR carrying both labels, AMD combines both suites behind one image build. PR builds without either tier label retain the legacy L2 fallback for compatibility with the `amd-test` trigger. `DEBUG_TEST_YAML` remains an explicit override. AMD has no L4 file yet, so `nightly-test` does not select an additional suite.
 
+    **Trigger boundary:** AMD label handling has two layers. First, the external `vllm-omni-amd-ci` Buildkite pipeline condition decides whether a GitHub label event creates a build. Only after that build starts does this repository's bootstrap inspect all current PR labels and select L2, L3, or both. Repository-side selection therefore cannot make a `merge-test` event start AMD CI by itself. The external condition must admit both `ready` and `merge-test`, while preserving the legacy `amd-test` trigger and non-PR `main` / scheduled builds. Keep `nightly-test` out of the AMD condition until an AMD L4 suite exists; otherwise it would start a build without providing nightly coverage.
+
     **Rendering:** [`test-template-amd-omni.j2`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/amd/test-template-amd-omni.j2) wraps data steps with `amd-build` image build and `amd_<agent_pool>` queues. Do **not** hand-edit generated `pipeline.yaml`.
 
     **Hardware in YAML:** `agent_pool` (for example `mi325_1`) plus `mirror_hardwares: [amdproduction]` (array—Buildkite template filter, not the CUDA/NPU uploader preset mechanism).

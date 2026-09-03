@@ -25,6 +25,8 @@ SPEC.loader.exec_module(SELECTOR)
         ("feature", ("merge-test",), ("merge",)),
         ("feature", ("merge-test", "ready"), ("ready", "merge")),
         ("feature", ("amd-test",), ("ready",)),
+        ("feature", ("amd-test", "merge-test"), ("merge",)),
+        ("feature", ("amd-test", "ready", "merge-test"), ("ready", "merge")),
         ("feature", ("nightly-test",), ("ready",)),
         ("feature", ("not-ready", "merge-test-extra"), ("ready",)),
     ],
