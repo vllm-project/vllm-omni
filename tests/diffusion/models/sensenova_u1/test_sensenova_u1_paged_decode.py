@@ -179,11 +179,13 @@ accelerator_only = pytest.mark.skipif(
     reason="torch.cuda-compatible accelerator required",
 )
 
-# PyTorch exposes ROCm devices through ``torch.cuda``. Gate on the exact paged
-# attention capability under test so unsupported CUDA builds skip as well.
+# PyTorch exposes ROCm devices through ``torch.cuda``, but the imported
+# ``vllm.vllm_flash_attn`` paged API is CUDA-only. Do not use the runtime probe
+# in this marker: a missing or incompatible extension in a CUDA build is a CI
+# configuration failure and must make these tests fail rather than skip.
 paged_decode_only = pytest.mark.skipif(
-    not torch.cuda.is_available() or not paged_decode.paged_decode_supported(torch.device("cuda"), HEAD_DIM),
-    reason="Compatible paged flash-attention kernel required",
+    not torch.cuda.is_available() or not current_omni_platform.is_cuda(),
+    reason="vLLM's paged FlashAttention API is CUDA-only",
 )
 
 
