@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for JoyAI action-to-TTS conversion."""
 
 from types import SimpleNamespace
@@ -42,7 +42,11 @@ def test_joyai_action_to_tts_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
         (
             "</response> Colored squares are visible.",
             None,
-            {"language": ["Chinese"], "speaker": ["Ryan"]},
+            {
+                "tts_task_type": "Base",
+                "language": ["Chinese"],
+                "speaker": ["Ryan"],
+            },
             ("Colored squares are visible.", "Chinese", "Ryan"),
         ),
         ("</silence>", None, {}, None),

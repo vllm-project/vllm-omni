@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Build Qwen3-TTS Talker inputs from completed JoyAI actions."""
 
 from typing import Any
@@ -35,7 +35,9 @@ def _build_tts_metadata(request_prompt: object, spoken_text: str) -> dict[str, l
     raw_additional_info = prompt_dict.get("additional_information")
     additional_info = raw_additional_info if isinstance(raw_additional_info, dict) else {}
 
-    task_type = first_value(additional_info.get("tts_task_type"), _DEFAULT_TTS_TASK_TYPE)
+    # The native pipeline loads CustomVoice checkpoints for both TTS stages.
+    # Keep client metadata from selecting an incompatible Qwen3-TTS task.
+    task_type = _DEFAULT_TTS_TASK_TYPE
     request_language = first_value(additional_info.get("language"), _DEFAULT_TTS_LANGUAGE)
     language = first_value(additional_info.get("tts_language"), request_language)
     request_speaker = first_value(additional_info.get("speaker"), _DEFAULT_TTS_SPEAKER)
