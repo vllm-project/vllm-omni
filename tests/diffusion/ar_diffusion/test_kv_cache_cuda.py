@@ -24,13 +24,25 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_real_paged_write_op_does_not_clone_the_pool_on_cuda():
-    """Same assertion as the CPU test, against the real op and CUDA codegen.
+    """Same assertion as the CPU test, against the real op's schema and CUDA codegen.
 
     The CPU test compiles a stand-in with the same ``mutates_args`` contract,
-    because the real op needs a device and an attention kernel. That leaves two
-    things unverified: whether the real op's full signature behaves the same,
-    and whether Triton codegen does, which is the path the reported regression
-    was observed on. This closes both.
+    because the real op needs a device and an attention kernel. That leaves
+    one thing unverified: whether Triton codegen reinplaces the same way,
+    which is the path the reported regression was observed on.
+
+    This does not call the real op directly: ``ar_diffusion_paged_write_attn``
+    runs FlashAttention's paged ``flash_attn_varlen_func`` internally, and
+    compiling that under ``fullgraph=True`` can fail for reasons that have
+    nothing to do with cloning (a missing kernel for this toy shape, a graph
+    break, or an autotune illegal-memory-access on the control pool). Instead
+    this registers a second stand-in that copies the real op's full argument
+    list and ``mutates_args`` declaration -- so reinplace sees the identical
+    contract the real op presents -- but skips straight to the pool writes,
+    the same way the real op's own implementation does before it calls
+    attention. That isolates "does Inductor clone this schema on CUDA" from
+    "does FlashAttention compile", which is a separate, already-covered
+    concern.
 
     Note the pools passed here are the flat views, since that is what the op
     takes -- it indexes them by slot and unflattens internally.
@@ -43,6 +55,64 @@ def test_real_paged_write_op_does_not_clone_the_pool_on_cuda():
     device = torch.device("cuda")
     num_blocks, heads, dim, num_tokens = 8, 4, 64, 8
     pool_numel = num_blocks * BLOCK * heads * dim
+    # The size a genuine clone would produce: K and V pool-sized allocations,
+    # coalesced into one buffer the way `auto_functionalized_v2` was cloning
+    # them before this PR's fix. Matching this exact size (rather than "any
+    # allocation at least as large as one pool") avoids false positives from
+    # unrelated workspace/scratch buffers Inductor may emit in that range.
+    clone_numel = 2 * pool_numel
+
+    if "write" not in dir(getattr(torch.ops, "test_kv_pool_clone_schema", object())):
+
+        @torch.library.custom_op("test_kv_pool_clone_schema::write", mutates_args=("key_pool", "value_pool"))
+        def _write(
+            query: torch.Tensor,
+            k_curr: torch.Tensor,
+            v_curr: torch.Tensor,
+            k_act: torch.Tensor | None,
+            v_act: torch.Tensor | None,
+            key_pool: torch.Tensor,
+            value_pool: torch.Tensor,
+            block_size: int,
+            video_slots: torch.Tensor,
+            action_slots: torch.Tensor,
+            block_table: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            seq_lens: torch.Tensor,
+            max_query_len: int,
+            max_seq_len: int,
+            softmax_scale: float,
+        ) -> torch.Tensor:
+            # Same pool-write side effect as `_paged_write_attn_impl`, minus
+            # the `ar_diffusion_paged_attention` call -- that is the part
+            # this test is not trying to exercise.
+            key_pool[video_slots] = k_curr.to(key_pool.dtype)
+            value_pool[video_slots] = v_curr.to(value_pool.dtype)
+            if k_act is not None and v_act is not None and k_act.shape[0] > 0:
+                key_pool[action_slots] = k_act.to(key_pool.dtype)
+                value_pool[action_slots] = v_act.to(value_pool.dtype)
+            return query * 2
+
+        @_write.register_fake
+        def _(
+            query,
+            k_curr,
+            v_curr,
+            k_act,
+            v_act,
+            key_pool,
+            value_pool,
+            block_size,
+            video_slots,
+            action_slots,
+            block_table,
+            query_start_loc,
+            seq_lens,
+            max_query_len,
+            max_seq_len,
+            softmax_scale,
+        ):
+            return torch.empty_like(query)
 
     class _Holder(torch.nn.Module):
         def __init__(self, key_flat, value_flat):
@@ -51,7 +121,7 @@ def test_real_paged_write_op_does_not_clone_the_pool_on_cuda():
             self.register_buffer("value_flat", value_flat)
 
         def forward(self, query, k_curr, v_curr, video_slots, action_slots, block_table, query_start_loc, seq_lens):
-            return torch.ops.vllm_omni.ar_diffusion_paged_write_attn(
+            return torch.ops.test_kv_pool_clone_schema.write(
                 query,
                 k_curr,
                 v_curr,
@@ -97,11 +167,14 @@ def test_real_paged_write_op_does_not_clone_the_pool_on_cuda():
                 sizes.append(numel)
         return sizes
 
-    # Positive control: one allocation, K and V as its two halves.
+    # Positive control: one allocation, K and V as its two halves. This must
+    # produce an allocation of exactly `clone_numel` -- that is the clone
+    # signature the assertion below checks for, not "no allocation this big".
     shared = torch.empty(2, num_blocks * BLOCK, heads, dim, dtype=torch.bfloat16, device=device)
     control = compiled_pool_allocations(shared[0], shared[1])
-    assert control, (
-        "the shared layout produced no pool-sized allocation, so this test can no longer tell the two layouts apart"
+    assert clone_numel in control, (
+        f"the shared layout produced no {clone_numel}-element allocation ({control}), so this test can no "
+        "longer tell the two layouts apart -- inductor's codegen or the detector changed"
     )
 
     _, k_pools, v_pools = allocate_kv_pool_with_views(
@@ -114,7 +187,7 @@ def test_real_paged_write_op_does_not_clone_the_pool_on_cuda():
         device=device,
     )
     separate = compiled_pool_allocations(k_pools[0], v_pools[0])
-    assert not separate, (
-        "the compiled graph allocates a pool-sized buffer, so the pool is being cloned "
+    assert clone_numel not in separate, (
+        f"the compiled graph allocates a {clone_numel}-element buffer, so the pool is being cloned "
         f"rather than written in place: {separate} (control saw {control})"
     )
