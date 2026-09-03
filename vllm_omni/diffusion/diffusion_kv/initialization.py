@@ -16,6 +16,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.diffusion_kv.layout import resolve_diffusion_kv_cache_layout
 from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 from vllm_omni.platforms import current_omni_platform
 
@@ -28,14 +29,35 @@ def build_native_kv_cache_configs(
     vllm_config: VllmConfig,
     worker_specs: list[dict[str, KVCacheSpec]],
     available_memory: list[int],
+    *,
+    indexes_kv_by_block_stride: bool = False,
 ) -> tuple[list[KVCacheConfig], KVCacheConfig]:
-    """Build rank-local and Scheduler-native configs using vLLM utilities."""
+    """Build rank-local and Scheduler-native configs using vLLM utilities.
+
+    ``indexes_kv_by_block_stride`` carries the native backend requirement that
+    0.29 removed from ``AttentionSpec``.  Every diffusion backend in tree
+    declares ``False``, so the default reproduces current behaviour; a caller
+    that learns otherwise from its workers passes ``True`` here and the
+    block-outermost layout propagates to every rank-local config.
+    """
 
     from vllm.v1.core import single_type_kv_cache_manager
 
+    # 0.29 sizes every KVCacheTensor region from the resolved physical layout,
+    # so it must be pinned before get_kv_cache_configs.  Idempotent, so callers
+    # that already resolved it (the control plane) are unaffected.
+    layout = resolve_diffusion_kv_cache_layout(
+        vllm_config,
+        indexes_kv_by_block_stride=indexes_kv_by_block_stride,
+    )
     single_type_kv_cache_manager.register_all_kvcache_specs(vllm_config)
     worker_configs = get_kv_cache_configs(vllm_config, worker_specs, available_memory)
-    return worker_configs, generate_scheduler_kv_cache_config(worker_configs)
+    scheduler_config = generate_scheduler_kv_cache_config(worker_configs)
+    # Workers only receive a KVCacheConfig, so the resolved layout travels on it
+    # and is adopted into each worker's own CacheConfig before allocation.
+    for config in (*worker_configs, scheduler_config):
+        config.kv_cache_layout = layout.name
+    return worker_configs, scheduler_config
 
 
 def initialize_diffusion_kv_control_plane(

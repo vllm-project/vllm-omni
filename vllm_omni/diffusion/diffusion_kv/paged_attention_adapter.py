@@ -105,10 +105,12 @@ class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
             attn_backend,
             ulysses_degree=ulysses_degree,
         )
+        # vLLM 0.29 carries the block-stride decision on the resolved physical
+        # ``CacheConfig.kv_cache_layout`` instead of the spec; the backend's
+        # requirement is enforced against that layout rather than copied here.
         canonical_spec = replace(
             spec,
             num_kv_heads=num_kv_heads,
-            indexes_kv_by_block_stride=attn_backend.indexes_kv_by_block_stride(),
         )
         self.layer_name = layer_name
         self.spec = canonical_spec

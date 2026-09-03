@@ -121,6 +121,13 @@ class AttentionBackend(ABC):
         when it unifies cache layouts across layers. Dense diffusion backends
         conservatively keep the default ``False``; a paged backend should
         override this only when its kernel actually follows that layout.
+
+        Since vLLM 0.29 this no longer rides on ``AttentionSpec``.  It selects
+        the block-outermost physical layout pinned on
+        ``CacheConfig.kv_cache_layout`` -- see
+        ``vllm_omni.diffusion.diffusion_kv.layout`` -- whose
+        ``is_block_outermost`` is what upstream reads when it sizes
+        ``KVCacheTensor`` regions.
         """
 
         return False

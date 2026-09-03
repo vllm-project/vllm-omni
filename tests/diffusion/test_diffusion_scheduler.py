@@ -10,7 +10,7 @@ import pytest
 import torch
 import vllm.v1.core.single_type_kv_cache_manager as native_kv_managers
 from pytest_mock import MockerFixture
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 
 from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
@@ -27,6 +27,7 @@ from vllm_omni.diffusion.sched import (
 from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from tests.helpers.kv_layout import build_kv_cache_tensor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -104,7 +105,7 @@ def _initialize_paged_scheduler(
     )
     config = KVCacheConfig(
         num_blocks=num_blocks,
-        kv_cache_tensors=[KVCacheTensor(size=spec.page_size_bytes * num_blocks, shared_by=["layer0"])],
+        kv_cache_tensors=[build_kv_cache_tensor(spec, num_blocks, ["layer0"])],
         kv_cache_groups=[KVCacheGroupSpec(layer_names=["layer0"], kv_cache_spec=spec)],
     )
     scheduler.initialize(

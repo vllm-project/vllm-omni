@@ -10,12 +10,13 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from vllm.config import AttentionConfig, CacheConfig, VllmConfig, set_current_vllm_config
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 from vllm.v1.worker.gpu.attn_utils import init_attn_backend, init_kv_cache
 from vllm.v1.worker.gpu.block_table import BlockTables
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
+from vllm_omni.diffusion.diffusion_kv.layout import resolve_diffusion_kv_cache_layout
 from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionAdapter,
     DiffusionPagedAttentionLayerAdapter,
@@ -23,6 +24,7 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionRowBinding,
 )
 from vllm_omni.diffusion.vllm_config import _DiffusionVllmModelConfig
+from tests.helpers.kv_layout import build_kv_cache_tensor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu]
 
@@ -89,10 +91,7 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
     kv_cache_config = KVCacheConfig(
         num_blocks=4,
         kv_cache_tensors=[
-            KVCacheTensor(
-                size=canonical_spec.page_size_bytes * 4,
-                shared_by=[_LAYER_NAME],
-            )
+            build_kv_cache_tensor(canonical_spec, 4, [_LAYER_NAME])
         ],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -101,6 +100,9 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
             )
         ],
     )
+    # 0.29 reads the resolved physical layout when allocating; the diffusion
+    # control plane pins it, so this standalone harness must too.
+    resolve_diffusion_kv_cache_layout(vllm_config)
     with set_current_vllm_config(vllm_config):
         attn_groups, _, kernel_block_sizes = init_attn_backend(
             kv_cache_config,
@@ -108,13 +110,13 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
             device,
         )
         runner_kv_caches: list[torch.Tensor | list[torch.Tensor]] = []
+        # vLLM 0.29 dropped attn_groups and cache_dtype here: the layout now
+        # comes from the resolved CacheConfig.kv_cache_layout inside the call.
         init_kv_cache(
             runner_kv_caches,
             vllm_config.compilation_config.static_forward_context,
             kv_cache_config,
-            attn_groups,
             device,
-            vllm_config.cache_config.cache_dtype,
             kernel_block_sizes,
             vllm_config,
         )

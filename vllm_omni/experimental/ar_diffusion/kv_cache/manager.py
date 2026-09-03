@@ -22,10 +22,10 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
-    KVCacheTensor,
 )
 from vllm.v1.request import RequestStatus
 
+from vllm_omni.diffusion.diffusion_kv.layout import build_kv_cache_tensor
 from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionKVBranchSpec
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
@@ -134,7 +134,7 @@ def build_kv_manager(
     """
     layer_names = list(layer_names)
     group = KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)
-    tensors = [KVCacheTensor(size=spec.page_size_bytes * num_blocks, shared_by=layer_names)]
+    tensors = [build_kv_cache_tensor(spec, num_blocks, layer_names)]
     config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=tensors,

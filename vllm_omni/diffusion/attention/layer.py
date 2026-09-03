@@ -24,6 +24,7 @@ from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.diffusion_kv.layout import assert_backend_layout_supported
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.forward_context import (
     get_forward_context,
@@ -241,15 +242,19 @@ class Attention(nn.Module):
             return None
         dtype = self.paged_kv_cache_dtype or vllm_config.model_config.dtype
         # Keep backend layout discovery under the same config context used by
-        # upstream vLLM's attention-spec collector.
+        # upstream vLLM's attention-spec collector.  vLLM 0.29 moved the
+        # block-stride decision off the spec and onto the single physical
+        # ``CacheConfig.kv_cache_layout`` resolved before the cache is built,
+        # so the backend's preference is enforced there (see
+        # ``vllm_omni.diffusion.diffusion_kv.initialization``) rather than
+        # carried per layer.
         with set_current_vllm_config(vllm_config):
-            indexes_kv_by_block_stride = self.attn_backend.indexes_kv_by_block_stride()
+            assert_backend_layout_supported(vllm_config, self.attn_backend)
         return FullAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_size,
             dtype=dtype,
-            indexes_kv_by_block_stride=indexes_kv_by_block_stride,
             non_causal=not self.causal,
         )
 

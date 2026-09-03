@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.diffusion_kv import paged_attention_adapter as adapter_module
+from tests.helpers.kv_layout import layout_for_backend
 from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionAdapter,
     DiffusionPagedAttentionMetadata,
@@ -1239,7 +1240,8 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
     assert native_layer.num_heads == 4
     assert native_layer.num_kv_heads == 2
     assert native_layer.spec.num_kv_heads == 2
-    assert native_layer.spec.indexes_kv_by_block_stride is True
+    # 0.29: the flag no longer rides on the spec, it selects the layout.
+    assert layout_for_backend(native_layer.attn_backend).is_block_outermost is True
     assert native_layer._q_scale_float == 1.0
     assert native_layer._k_scale_float == 1.0
     assert native_layer._v_scale_float == 1.0

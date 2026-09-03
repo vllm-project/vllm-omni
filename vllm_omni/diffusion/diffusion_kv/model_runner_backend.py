@@ -18,6 +18,10 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode, is_scheduler_paged_kv_mode
+from vllm_omni.diffusion.diffusion_kv.layout import (
+    adopt_kv_cache_layout,
+    assert_backend_layout_supported,
+)
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionAdapter,
@@ -285,13 +289,18 @@ class DiffusionKVModelRunnerBackend:
                     layers=self._kv_cache_layer_adapters,
                     resolve_row=self._resolve_paged_attention_row,
                 )
+                # vLLM 0.29 reads the resolved physical layout when allocating,
+                # and dropped attn_groups/cache_dtype from the signature.
+                adopt_kv_cache_layout(self.vllm_config, kv_cache_config)
+                for layer_adapter in self._kv_cache_layer_adapters.values():
+                    assert_backend_layout_supported(
+                        self.vllm_config, getattr(layer_adapter, "attn_backend", None)
+                    )
                 init_kv_cache(
                     kv_caches,
                     self.vllm_config.compilation_config.static_forward_context,
                     kv_cache_config,
-                    attn_groups,
                     self.device,
-                    self.vllm_config.cache_config.cache_dtype,
                     kernel_block_sizes,
                     self.vllm_config,
                 )
