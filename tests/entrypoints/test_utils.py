@@ -3,6 +3,7 @@
 
 """Unit tests for vllm_omni.entrypoints.utils module."""
 
+import logging
 import os
 from collections import Counter
 from dataclasses import dataclass
@@ -270,6 +271,28 @@ class TestFilterDataclassKwargs:
         assert "stage_id" in result
         assert "engine_output_type" in result
         assert "unknown_field" not in result
+
+    def test_filter_dataclass_kwargs_warns_on_unknown_drop(self, caplog):
+        """Unknown fields get a warning (not silent) so a CLI typo
+        (``--stage-overrides '{"0":{"kv_cache_dtpye":"fp8"}}'`` -> engine_args
+        typo) surfaces in the log instead of being silently misapplied. The
+        parser's shape-only contract leans on this: ``parse_stage_overrides``
+        does not preemptively reject unknown keys, but they must not vanish
+        without trace downstream.
+        """
+        @dataclass
+        class SimpleConfig:
+            name: str
+            count: int
+
+        with caplog.at_level(logging.WARNING, logger="vllm_omni.entrypoints.utils"):
+            result = filter_dataclass_kwargs(SimpleConfig, {"name": "x", "typo_field": 1})
+
+        assert result == {"name": "x"}
+        assert any(
+            "typo_field" in rec.message and "SimpleConfig" in rec.message and rec.levelno == logging.WARNING
+            for rec in caplog.records
+        ), f"expected a WARNING naming both SimpleConfig and typo_field; got {[r.message for r in caplog.records]}"
 
     def test_filters_omni_diffusion_config_union_dataclass(self):
         """Test that OmniDiffusionConfig filters nested dataclass in Union fields."""

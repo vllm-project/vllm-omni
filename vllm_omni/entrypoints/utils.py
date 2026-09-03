@@ -553,12 +553,16 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
     Field-name / type / range validation is intentionally not done at this
     layer. The downstream resolver forwards every surviving key as
     ``stage_<id>_<key>`` into ``cli_overrides`` (see
-    ``load_stage_configs_from_model``), where ``StageConfigFactory`` consumes
-    what it knows about and ignores the rest; field semantics, defaulting,
-    and unknown-field surfacing belong there. Listing an allowlist here would
-    duplicate that contract — and miss structured keys (``extras``) and
-    engine arguments (``kv_cache_dtype`` et al.) that the resolver and the
-    default-diffusion extras fallback already support.
+    ``load_stage_configs_from_model``). Field semantics live in
+    ``StageConfigFactory`` for the registered-pipeline path; the
+    default-diffusion fallback in ``async_omni_engine.py`` reads
+    ``stage_zero_overrides["extras"]`` for the unregistered path.
+    Unknown engine-arg keys that don't match ``OmniEngineArgs`` are
+    dropped with a warning at ``filter_dataclass_kwargs`` (see
+    ``stage_init_utils.py``) rather than failing at parse time, so
+    a user typo surfaces in the log instead of being silently lost.
+    Listing an allowlist here would duplicate the engine-arg contract
+    and miss new fields on day one.
 
     Raises:
         ValueError: when ``value`` is a string that is not valid JSON, or when
@@ -760,6 +764,11 @@ def filter_dataclass_kwargs(cls: Any, kwargs: dict) -> dict:
     filtered_kwargs = {}
     for k, v in kwargs.items():
         if k not in valid_fields:
+            logger.warning(
+                "Dropping unknown %s field %r (not declared on the dataclass)",
+                cls.__name__,
+                k,
+            )
             continue
         field = valid_fields[k]
         filtered_kwargs[k] = _filter_value(v, field.type)
