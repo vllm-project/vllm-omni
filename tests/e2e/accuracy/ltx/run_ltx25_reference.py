@@ -143,14 +143,34 @@ def _configure_official_sdpa(pipeline: Any) -> None:
         )
 
 
+def _connector_weight_files(model: Path) -> list[Path]:
+    connector_root = model / "connectors"
+    index_path = connector_root / "diffusion_pytorch_model.safetensors.index.json"
+    if index_path.is_file():
+        index = json.loads(index_path.read_text())
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError(f"Connector weight index has no weight_map: {index_path}")
+        if not all(isinstance(filename, str) and filename for filename in weight_map.values()):
+            raise ValueError(f"Connector weight index has invalid filenames: {index_path}")
+        filenames = sorted(set(weight_map.values()))
+        weight_files = [connector_root / filename for filename in filenames]
+        missing = [path for path in weight_files if not path.is_file()]
+        if missing:
+            raise ValueError(f"Connector weight index references missing files: {missing}")
+        return weight_files
+
+    weight_files = sorted(connector_root.glob("*.safetensors"))
+    if not weight_files:
+        raise ValueError(f"No connector safetensors found under {connector_root}")
+    return weight_files
+
+
 def _use_diffusers_connector_weights(prompt_encoder: Any, model: Path) -> None:
     """Run official connector code with the checkpoint under test."""
     from safetensors import safe_open
 
-    connector_root = model / "connectors"
-    shards = sorted(connector_root.glob("*.safetensors"))
-    if not shards:
-        raise ValueError(f"No connector safetensors found under {connector_root}")
+    weight_files = _connector_weight_files(model)
 
     original_build_embeddings_processor = prompt_encoder._build_embeddings_processor
 
@@ -160,7 +180,7 @@ def _use_diffusers_connector_weights(prompt_encoder: Any, model: Path) -> None:
         expected = {name for name in parameters if name.startswith(("video_connector.", "audio_connector."))}
         loaded: set[str] = set()
         with torch.no_grad():
-            for shard in shards:
+            for shard in weight_files:
                 with safe_open(str(shard), framework="pt", device="cpu") as weights:
                     for source_name in weights.keys():
                         if not source_name.startswith(("video_connector.", "audio_connector.")):
