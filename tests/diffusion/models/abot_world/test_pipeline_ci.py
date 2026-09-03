@@ -10,8 +10,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_omni.diffusion.models.abot_world.pipeline import ABotWorldCausalPipeline
-from vllm_omni.diffusion.models.abot_world.transformer import (
+from vllm_omni.diffusion.models.abot_world.pipeline_abot_world import ABotWorldCausalPipeline
+from vllm_omni.diffusion.models.abot_world.abot_world_transformer import (
     ABotSimpleAdapter,
     ABotWorldCausalTransformer3DModel,
 )

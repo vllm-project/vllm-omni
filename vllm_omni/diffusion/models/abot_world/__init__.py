@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from .actions import ABOT_CAMERA_ACTION_SCHEMA, ABotCameraControlReducer
-from .pipeline import (
+from .pipeline_abot_world import (
     ABotWorldCausalPipeline,
     get_abot_world_post_process_func,
     get_abot_world_pre_process_func,

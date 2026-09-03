@@ -44,7 +44,7 @@ from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionTickRequest,
 )
 
-from .transformer import (
+from .abot_world_transformer import (
     ABotAttentionCache,
     ABotTransformerCache,
     ABotWorldCausalTransformer3DModel,

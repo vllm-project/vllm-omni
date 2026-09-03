@@ -12,8 +12,8 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.models.abot_world import transformer as abot_transformer
-from vllm_omni.diffusion.models.abot_world.pipeline import (
+from vllm_omni.diffusion.models.abot_world import abot_world_transformer as abot_transformer
+from vllm_omni.diffusion.models.abot_world.pipeline_abot_world import (
     _DEFAULT_HEIGHT,
     _DEFAULT_WIDTH,
     ABOT_DMD_TIMESTEPS,
@@ -27,7 +27,7 @@ from vllm_omni.diffusion.models.abot_world.pipeline import (
     _validate_local_model_files,
     _validate_parallel_config,
 )
-from vllm_omni.diffusion.models.abot_world.transformer import (
+from vllm_omni.diffusion.models.abot_world.abot_world_transformer import (
     ABotCausalHead,
     ABotWorldCausalTransformer3DModel,
 )

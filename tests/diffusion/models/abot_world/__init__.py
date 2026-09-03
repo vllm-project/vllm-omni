@@ -24,7 +24,7 @@ def test_module_exports():
 
 def test_transformer_exports():
     """Verify the transformer module exports the expected symbols."""
-    from vllm_omni.diffusion.models.abot_world.transformer import (
+    from vllm_omni.diffusion.models.abot_world.abot_world_transformer import (
         ABotAttentionCache,
         ABotCausalAttentionBlock,
         ABotCausalCrossAttention,
