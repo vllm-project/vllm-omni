@@ -66,7 +66,7 @@ def test_cache_key_bare_cuda_resolves_to_current_device(monkeypatch):
     """A bare "cuda" shares the entry with its equivalent indexed spelling."""
     mod = _code2wav_module()
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 3)
 
     bare = mod._normalize_tokenizer_worker_cache_key(torch.device("cuda"), None, _TOK_PATH)
     indexed = mod._normalize_tokenizer_worker_cache_key(torch.device("cuda:3"), None, _TOK_PATH)

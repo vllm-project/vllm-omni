@@ -393,7 +393,8 @@ def _normalize_tokenizer_worker_cache_key(
     # current CUDA device. Resolve a bare "cuda" so it shares the cache entry
     # with the equivalent indexed spelling.
     if dev.type == "cuda" and dev.index is None and torch.cuda.is_available():
-        dev = torch.device("cuda", torch.cuda.current_device())
+        # Repo bans torch.cuda.current_device; match mimo_audio.py.
+        dev = torch.device("cuda", torch.accelerator.current_device_index())
     device_key = str(dev)
     # Use realpath so symlinks / trailing slash don't create duplicate entries
     ap = audio_tokenizer_path or ""
