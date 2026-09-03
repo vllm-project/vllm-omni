@@ -433,7 +433,8 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
                 embed_mask = [True] * num_vae_total + [False] + [True] * num_vit_total
                 return PromptUpdateDetails(
                     full=tokens,
-                    is_embed=lambda _tok, _seq, _m=embed_mask: torch.tensor(_m, dtype=torch.bool),
+                    # vLLM 0.29 calls is_embed with just the full token list.
+                    is_embed=lambda _full, _m=embed_mask: torch.tensor(_m, dtype=torch.bool),
                 )
 
             replacements.append(

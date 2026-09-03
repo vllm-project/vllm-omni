@@ -135,7 +135,9 @@ def _decode_video_bytes(
         frames_array, metadata = loader.load_bytes(
             video_bytes,
             num_frames=num_frames,
-            backend="pyav",
+            # vLLM 0.29 removed the "pyav" decoder backend; "opencv" is
+            # upstream's default and the remaining CPU-only option.
+            backend="opencv",
             keep=keep,
         )
     except Exception as exc:

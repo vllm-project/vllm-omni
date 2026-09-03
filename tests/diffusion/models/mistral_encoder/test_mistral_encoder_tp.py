@@ -64,6 +64,13 @@ def setup_tp_group(monkeypatch, mocker):
         lambda: 0,
     )
 
+    # vLLM 0.29 added a CUDA-only fused embedding kernel that engages whenever
+    # tp_size > 1; these tests drive CPU tensors, so keep the portable masked path.
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.vocab_parallel_embedding.current_platform.is_cuda",
+        lambda: False,
+    )
+
     mock_tp_group = mocker.MagicMock()
     mock_tp_group.world_size = 2
     mocker.patch("vllm.distributed.parallel_state.get_tp_group", return_value=mock_tp_group)
@@ -94,7 +101,7 @@ def setup_tp_group(monkeypatch, mocker):
 
     monkeypatch.setattr(
         "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
-        lambda: default_unquantized_gemm,
+        lambda *_args, **_kwargs: default_unquantized_gemm,
     )
 
     with set_current_vllm_config(VllmConfig(device_config=device_config)):
