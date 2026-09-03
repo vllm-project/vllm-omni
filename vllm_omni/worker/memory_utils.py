@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """GPU memory utilities for vLLM Omni workers.
 
 Includes a tolerant version of the upstream request_memory() that handles
@@ -29,25 +32,31 @@ def request_memory_tolerant(
     ``OmniGPUWorkerBase.determine_available_memory()`` already does per-process
     NVML accounting and correctly computes the KV cache budget regardless.
 
-    Logs a warning when the budget is capped so operators can detect
-    under-provisioned GPU memory.
+    A firing cap is logged at ERROR level with both the requested and the
+    granted budget: it is not a normal condition. It means the resolved
+    per-stage ``gpu_memory_utilization`` values of the stages sharing this
+    GPU do not fit (co-located stages must sum to at most 1.0 of the device),
+    or an unaccounted consumer occupies the device. The stage still starts
+    because the downstream ``OmniGPUWorkerBase.determine_available_memory()``
+    accounting sizes the KV cache from what is actually free, but the
+    operator should fix the deploy config rather than rely on the cap.
     """
     requested_memory = math.ceil(init_snapshot.total_memory * cache_config.gpu_memory_utilization)
 
     if init_snapshot.free_memory < requested_memory:
         capped = init_snapshot.free_memory
-        logger.warning(
-            "Free memory on device %s (%s/%s GiB) on startup is less than "
-            "desired GPU memory utilization (%.2f, %s GiB). "
-            "Capping requested memory to available free memory (%s GiB). "
-            "This is expected when multiple Omni stages share a GPU; "
-            "the per-process NVML accounting in determine_available_memory() "
-            "will compute the correct KV cache budget.",
+        logger.error(
+            "GPU memory budget capped on device %s: requested %s GiB "
+            "(gpu_memory_utilization=%.2f of %s GiB) but only %s GiB is free at startup; "
+            "granting %s GiB. The stages sharing this GPU over-commit it "
+            "(their resolved gpu_memory_utilization must sum to <= 1.0) or another "
+            "process holds memory here. Fix the deploy config; the KV cache is sized "
+            "from actual free memory, so this stage will run with less than configured.",
             init_snapshot.device_,
-            format_gib(init_snapshot.free_memory),
-            format_gib(init_snapshot.total_memory),
-            cache_config.gpu_memory_utilization,
             format_gib(requested_memory),
+            cache_config.gpu_memory_utilization,
+            format_gib(init_snapshot.total_memory),
+            format_gib(init_snapshot.free_memory),
             format_gib(capped),
         )
         return capped

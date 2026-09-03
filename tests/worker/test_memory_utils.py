@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Characterization tests for ``vllm_omni.worker.memory_utils``.
 
 ``request_memory_tolerant`` is still live in both workers
@@ -69,3 +69,26 @@ def test_requested_uses_ceil_of_total_times_util():
     out = request_memory_tolerant(snap, _cache_config(util))
 
     assert out == math.ceil(total * util)
+
+
+def test_cap_logs_one_error_with_both_budgets(caplog):
+    # A firing cap is a misconfiguration signal, so it must be ERROR level and name
+    # both the requested and the granted budget.
+    snap = _snapshot(total=100 * GIB, free=30 * GIB)
+    with caplog.at_level("ERROR", logger="vllm_omni.worker.memory_utils"):
+        out = request_memory_tolerant(snap, _cache_config(0.9))
+
+    assert out == 30 * GIB
+    errors = [r for r in caplog.records if r.name == "vllm_omni.worker.memory_utils" and r.levelname == "ERROR"]
+    assert len(errors) == 1
+    message = errors[0].getMessage()
+    assert "requested 90" in message and "granting 30" in message
+    assert "sum to <= 1.0" in message
+
+
+def test_no_cap_logs_nothing(caplog):
+    snap = _snapshot(total=100 * GIB, free=95 * GIB)
+    with caplog.at_level("WARNING", logger="vllm_omni.worker.memory_utils"):
+        request_memory_tolerant(snap, _cache_config(0.9))
+
+    assert not [r for r in caplog.records if r.name == "vllm_omni.worker.memory_utils"]
