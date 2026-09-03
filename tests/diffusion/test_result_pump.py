@@ -6,6 +6,7 @@ import concurrent.futures
 import queue
 import threading
 import time
+from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -30,6 +31,7 @@ def _make_executor(step_execution=False):
     executor._rpc_futures = {}
     executor._output_futures = {}
     executor._completed_outputs = {}
+    executor._dropped_output_ids = OrderedDict()
     executor._batch_split_map = {}
     executor._futures_lock = threading.RLock()
     executor._pump_running = False
@@ -285,10 +287,7 @@ class TestResultPumpDispatch:
         assert fut.done()
         assert fut.result(timeout=1.0) is output
         assert async_output_id not in executor._output_futures
-        # The resolved future is cached in _completed_outputs so a late
-        # wait_output_ready (drop → pump → wait) can still retrieve it;
-        # wait_output_ready.pop cleans it on actual consumption.
-        assert executor._completed_outputs.get(async_output_id) is fut
+        assert async_output_id not in executor._completed_outputs
 
 
 class _FakeBatchOutput:
@@ -595,12 +594,8 @@ class TestDropOutput:
         _feed_one_msg_to_pump(executor, msg)
 
         with executor._futures_lock:
-            # The resolved placeholder is now cached in _completed_outputs
-            # for a potential late wait_output_ready (drop → pump → wait);
-            # it is not in _output_futures (popped by the pump).
+            assert "aid-2" not in executor._completed_outputs
             assert "aid-2" not in executor._output_futures
-            cached = executor._completed_outputs.get("aid-2")
-            assert cached is not None and cached.done()
 
     def test_leaves_real_waiter_untouched(self):
         executor = _make_executor()
@@ -612,39 +607,131 @@ class TestDropOutput:
             # A genuine waiter still drains via the normal path.
             assert executor._output_futures.get("aid-3") is real
 
-    def test_drop_then_pump_then_wait_reuses_placeholder(self):
-        """drop_output → pump resolves placeholder → wait_output_ready must
-        return the already-resolved placeholder, not a fresh never-completed
-        Future. This is the verl-omni fully-async abort ordering that hangs
-        without the reuse fix."""
+    def test_drop_then_pump_then_late_wait_fails_fast_without_caching(self):
+        """drop_output → OUTPUT_READY → late wait_output_ready.
+
+        The aborted output's tensors must NOT be retained anywhere, and the
+        late waiter must get a completed (failed) Future rather than a fresh
+        one that never resolves — the verl-omni fully-async abort ordering.
+        """
         executor = _make_executor()
 
-        # 1. Abort registers a placeholder.
         executor.drop_output("aid-dpw")
-
-        # 2. Pump delivers OUTPUT_READY, resolving the placeholder.
-        output = DiffusionOutput(output="resolved")
         msg = AsyncDiffusionOutput(
             kind=AsyncOutputKind.OUTPUT_READY,
             async_output_id="aid-dpw",
-            output=output,
+            output=DiffusionOutput(output="discarded"),
         )
         _feed_one_msg_to_pump(executor, msg)
 
-        # 3. Late consumer waits → must get the resolved future.
-        fut = executor.wait_output_ready("aid-dpw")
-        assert fut.done(), "wait_output_ready returned a never-completed future after drop+pump"
+        with executor._futures_lock:
+            assert "aid-dpw" not in executor._completed_outputs
+            assert "aid-dpw" not in executor._output_futures
 
-    def test_drop_then_wait_share_same_future(self):
-        """drop_output → wait_output_ready (before pump) must return the same
-        placeholder so both paths agree on one future."""
+        fut = executor.wait_output_ready("aid-dpw")
+        assert fut.done(), "late wait after drop returned a never-completing future"
+        with pytest.raises(RuntimeError, match="was dropped"):
+            fut.result(timeout=0)
+        # Terminal: the dropped-id record is consumed by the wait.
+        with executor._futures_lock:
+            assert "aid-dpw" not in executor._dropped_output_ids
+
+    def test_drop_then_wait_share_placeholder_and_fail_on_delivery(self):
+        """drop_output → wait_output_ready (before pump) share one Future, and
+        delivery terminates it with the dropped error instead of the tensors."""
         executor = _make_executor()
 
         executor.drop_output("aid-dw")
         fut = executor.wait_output_ready("aid-dw")
-
         with executor._futures_lock:
             assert executor._output_futures.get("aid-dw") is fut
+        assert not fut.done()
+
+        msg = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id="aid-dw",
+            output=DiffusionOutput(output="discarded"),
+        )
+        _feed_one_msg_to_pump(executor, msg)
+
+        assert fut.done()
+        with pytest.raises(RuntimeError, match="was dropped"):
+            fut.result(timeout=0)
+        with executor._futures_lock:
+            assert "aid-dw" not in executor._completed_outputs
+            assert "aid-dw" not in executor._output_futures
+
+    def test_drop_after_cached_then_late_wait_fails_fast(self):
+        """Result already cached → drop_output → late wait must not hang."""
+        executor = _make_executor()
+        fut = concurrent.futures.Future()
+        fut.set_result(DiffusionOutput(output="cached"))
+        with executor._futures_lock:
+            executor._completed_outputs["aid-cd"] = fut
+
+        executor.drop_output("aid-cd")
+        late = executor.wait_output_ready("aid-cd")
+        assert late.done()
+        with pytest.raises(RuntimeError, match="was dropped"):
+            late.result(timeout=0)
+
+    def test_dropped_ids_memory_is_bounded(self, monkeypatch):
+        from vllm_omni.diffusion.executor import multiproc_executor as mpe
+
+        cap = 8
+        monkeypatch.setattr(mpe, "_DROPPED_OUTPUT_IDS_MAX", cap)
+        executor = _make_executor()
+        n = cap + 5
+        for i in range(n):
+            executor.drop_output(f"aid-b{i}")
+            executor._pump_stop.clear()
+            _feed_one_msg_to_pump(
+                executor,
+                AsyncDiffusionOutput(
+                    kind=AsyncOutputKind.OUTPUT_READY,
+                    async_output_id=f"aid-b{i}",
+                    output=DiffusionOutput(output=i),
+                ),
+            )
+        with executor._futures_lock:
+            assert len(executor._dropped_output_ids) == cap
+            # Oldest evicted, newest kept; no tensors retained anywhere.
+            assert "aid-b0" not in executor._dropped_output_ids
+            assert f"aid-b{n - 1}" in executor._dropped_output_ids
+            assert executor._completed_outputs == {}
+            assert executor._output_futures == {}
+
+    def test_batch_split_drop_placeholder_discards_member(self):
+        """_deliver_batch_split applies the same contract: a dropped member is
+        discarded (never cached), a live member is resolved directly."""
+        executor = _make_executor()
+        live = executor.wait_output_ready("batch-d/r-live")
+        executor.drop_output("batch-d/r-dropped")
+        with executor._futures_lock:
+            executor._batch_split_map["batch-d"] = {
+                "batch-d/r-dropped": "r-dropped",
+                "batch-d/r-live": "r-live",
+            }
+        outputs = {
+            "r-dropped": DiffusionOutput(output="discarded"),
+            "r-live": DiffusionOutput(output="ok"),
+        }
+        _feed_one_msg_to_pump(
+            executor,
+            AsyncDiffusionOutput(
+                kind=AsyncOutputKind.OUTPUT_READY,
+                async_output_id="batch-d",
+                output=_FakeBatchOutput(outputs),
+            ),
+        )
+        assert live.result(timeout=1.0) is outputs["r-live"]
+        with executor._futures_lock:
+            assert executor._completed_outputs == {}
+            assert executor._output_futures == {}
+        late = executor.wait_output_ready("batch-d/r-dropped")
+        assert late.done()
+        with pytest.raises(RuntimeError, match="was dropped"):
+            late.result(timeout=0)
 
 
 class TestShutdownClearsCompletedOutputs:

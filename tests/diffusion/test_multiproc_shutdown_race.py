@@ -18,6 +18,7 @@ after shutdown still has to be unpacked (just never cached).
 import queue
 import threading
 import time
+from collections import OrderedDict
 from unittest.mock import MagicMock
 
 import pytest
@@ -47,6 +48,7 @@ def _make_executor():
     executor._rpc_futures = {}
     executor._output_futures = {}
     executor._completed_outputs = {}
+    executor._dropped_output_ids = OrderedDict()
     executor._batch_split_map = {}
     executor._futures_lock = threading.RLock()
     executor._pump_running = False
