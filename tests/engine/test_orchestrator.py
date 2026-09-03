@@ -625,6 +625,82 @@ async def test_run_two_stage_llm(orchestrator_factory) -> None:
 
 
 @pytest.mark.asyncio
+async def test_pd_decode_replays_processed_prefill_prompt(orchestrator_factory) -> None:
+    """PD Decode must replay stage-0 processing, not the raw client prompt."""
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True)
+    orchestrator_fixture = orchestrator_factory([stage0, stage1])
+    orchestrator = orchestrator_fixture.orchestrator
+    orchestrator._pd_pair = (0, 1)
+    orchestrator._pd_bootstrap_addr = "127.0.0.1:25201"
+    orchestrator._pd_prefill_engine_id = "prefill-engine-0"
+
+    processed_info = {"meta": {"height": 512, "width": 512}}
+    processed_prompt = SimpleNamespace(
+        request_id="req-pd-replay",
+        prompt_token_ids=[101, 102, 103],
+        prompt_embeds=None,
+        prompt_is_token_ids=True,
+        mm_features=["processed-image-features"],
+        additional_information=processed_info,
+        model_intermediate_buffer={"image_span": [4, 8]},
+        cache_salt="processed-cache-salt",
+        lora_request=None,
+        data_parallel_rank=0,
+        resumable=False,
+    )
+    original_prompt = {
+        "prompt": "draw a lantern in the rain",
+        "multi_modal_data": {"image": "raw-reference-image"},
+    }
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-pd-replay",
+            prompt=processed_prompt,
+            original_prompt=original_prompt,
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+
+        req_state = orchestrator.request_states["req-pd-replay"]
+        assert req_state.prompt is original_prompt
+        assert req_state.pd_prefill_prompt is processed_prompt
+
+        # Current Mooncake routing supplies this connector metadata separately.
+        orchestrator._pd_kv_params["req-pd-replay"] = {"connector_field": "prefill-metadata"}
+        await orchestrator._forward_to_next_stage_unguarded(
+            "req-pd-replay",
+            0,
+            SimpleNamespace(request_id="req-pd-replay"),
+            req_state,
+        )
+
+        assert len(stage1.add_request_calls) == 1
+        decode_request = stage1.add_request_calls[0][0]
+        assert decode_request.prompt_token_ids == [101, 102, 103]
+        assert decode_request.mm_features == ["processed-image-features"]
+        assert decode_request.cache_salt == "processed-cache-salt"
+        assert decode_request.data_parallel_rank is None
+        assert decode_request.model_intermediate_buffer == {"image_span": [4, 8]}
+        assert decode_request.additional_information is not None
+        assert decode_request.additional_information.entries["meta.height"].scalar_data == 512
+        assert decode_request.sampling_params.extra_args["kv_transfer_params"] == {
+            "transfer_id": "xfer-req-pd-replay",
+            "remote_bootstrap_addr": "127.0.0.1:25201",
+            "remote_engine_id": "prefill-engine-0",
+            "connector_field": "prefill-metadata",
+            "do_remote_prefill": True,
+            "do_remote_decode": False,
+        }
+        assert req_state.prompt is original_prompt
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
 async def test_run_single_stage_diffusion(orchestrator_factory) -> None:
     stage0 = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
     orchestrator_fixture = orchestrator_factory([stage0])
