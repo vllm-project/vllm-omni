@@ -143,29 +143,17 @@ class OmniGPUModelRunner(GPUModelRunner):
         )
 
     def initialize_metadata_builders(self, kv_cache_config, kernel_block_sizes):
-        """Initialize metadata builders and keep FA3 graph metadata buffers sized.
+        """Initialize metadata builders and the Omni tensor prefix cache.
 
-        FlashAttentionMetadataBuilder can pre-allocate scheduler_metadata for
-        only max_num_seqs + 1 entries while FA3 with split scheduling may need
-        max_num_seqs * max_num_splits + 1 entries during CUDA graph capture.
-        This runner is shared across Omni models, so preserve the existing
-        workaround for non-Higgs models that still use FA3.
+        The FA3 ``scheduler_metadata`` buffer is left exactly as upstream sizes
+        it: ``FlashAttentionMetadataBuilder`` pre-allocates
+        ``1 + round_up(max_cudagraph_batch, 4) * 4`` entries, which is the size
+        FA3's tile scheduler emits, and that size does not grow with
+        ``max_num_splits``. The old ``max_num_seqs * max_num_splits + 1`` resize
+        (a v0.16-era workaround) was a verified over-allocation; see
+        ``tests/worker/test_fa3_scheduler_metadata_size.py``.
         """
         super().initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
-
-        for kv_cache_group in self.attn_groups:
-            for attn_group in kv_cache_group:
-                for builder in attn_group.metadata_builders:
-                    sm = getattr(builder, "scheduler_metadata", None)
-                    max_num_splits = getattr(builder, "max_num_splits", 0)
-                    if sm is not None and max_num_splits > 1:
-                        required = self.scheduler_config.max_num_seqs * max_num_splits + 1
-                        if sm.shape[0] < required:
-                            builder.scheduler_metadata = torch.zeros(
-                                required,
-                                dtype=sm.dtype,
-                                device=sm.device,
-                            )
 
         # Initialize the wrapper for both multimodal output tensors
         # and for hidden states to be passed between stages
