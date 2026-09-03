@@ -207,13 +207,42 @@ def test_parse_stage_overrides_rejects_non_integer_stage_id() -> None:
         parse_stage_overrides({1: {}})
 
 
-def test_parse_stage_overrides_rejects_unknown_field() -> None:
-    """Per-stage override keys must be a known stage config / engine field.
-    Unknown field names are rejected (with the allowed set listed) instead
-    of silently flowing downstream and being ignored or, worse, misapplied."""
-    with pytest.raises(ValueError, match="unknown fields") as excinfo:
-        parse_stage_overrides('{"0": {"bogus_field": 1}}')
-    assert "bogus_field" in str(excinfo.value)
+def test_parse_stage_overrides_accepts_stage_merge_extras_and_engine_args() -> None:
+    """Stage overrides carry two classes of keys that the parser must not
+    reject, even though they are not modeled on ``StageDeployConfig``:
+
+    - ``extras`` is the structured stage-merge contract key, read by the
+      default-diffusion fallback (``async_omni_engine.py``) and by the
+      ``StageConfigFactory`` to preserve per-stage extras across the
+      deploy / override merge. Recipes such as LTX-2.5 ship it as
+      ``--stage-overrides '{"0":{"extras":{...}}}'``.
+    - Engine arguments (``kv_cache_dtype``, ``seed``, ``swap_space``,
+      ``block_size``, ``stage_connector_spec``, ...) are forwarded verbatim
+      as ``stage_<id>_<key>`` by ``load_stage_configs_from_model`` and
+      applied to the stage's engine args. An allowlist here would duplicate
+      the vLLM ``EngineArgs`` contract and miss any new field on day one.
+
+    Field semantics / typo surfacing live in the factory; the parser only
+    validates shape, so these all parse through.
+    """
+    parsed = parse_stage_overrides(
+        '{"0": {"extras": {"ltx2_use_conv_vae": true},'
+        ' "kv_cache_dtype": "fp8", "seed": 42, "swap_space": 4,'
+        ' "block_size": 16,'
+        ' "stage_connector_spec": {"name": "SharedMemoryConnector", "extra": {}}}}'
+    )
+    assert parsed == {
+        "0": {
+            "extras": {"ltx2_use_conv_vae": True},
+            "kv_cache_dtype": "fp8",
+            "seed": 42,
+            "swap_space": 4,
+            "block_size": 16,
+            "stage_connector_spec": {"name": "SharedMemoryConnector", "extra": {}},
+        },
+    }
+    # Already-parsed mapping path carries the same trust.
+    assert parse_stage_overrides(dict(parsed)) == parsed
 
 
 def test_run_headless_parses_and_forwards_stage_overrides(mocker: MockerFixture) -> None:

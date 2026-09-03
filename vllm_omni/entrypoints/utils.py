@@ -21,11 +21,7 @@ from vllm_omni.config.config_factory import (
     with_trust_remote_code_override,
 )
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
-from vllm_omni.config.stage_config import (
-    _DEPLOY_DIR,
-    StageDeployConfig,
-    deploy_runtime_override_keys,
-)
+from vllm_omni.config.stage_config import _DEPLOY_DIR
 from vllm_omni.config.yaml_util import create_config, load_yaml_config
 from vllm_omni.diffusion.utils.hf_utils import (
     _looks_like_dreamzero,
@@ -542,24 +538,32 @@ def filter_stages(
         return stage_configs
 
 
-# Positive contract for stage override keys. Build once at import
-# so we don't re-frozenset on every parse call.
-_STAGE_OVERRIDE_ALLOWED_KEYS: frozenset[str] = (
-    frozenset(f.name for f in fields(StageDeployConfig) if f.name != "stage_id") | deploy_runtime_override_keys()
-)
-
-
 def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
     """Parse the ``--stage-overrides`` value into a per-stage override dict.
 
     ``value`` may be a raw JSON string (as supplied on the CLI) or an
     already-parsed mapping. Returns ``None`` when no overrides are given.
 
+    Only the **shape** of the override mapping is validated here:
+
+    - top-level must be a dict
+    - keys must be non-negative integer strings (stage ids)
+    - values must be dicts
+
+    Field-name / type / range validation is intentionally not done at this
+    layer. The downstream resolver forwards every surviving key as
+    ``stage_<id>_<key>`` into ``cli_overrides`` (see
+    ``load_stage_configs_from_model``), where ``StageConfigFactory`` consumes
+    what it knows about and ignores the rest; field semantics, defaulting,
+    and unknown-field surfacing belong there. Listing an allowlist here would
+    duplicate that contract — and miss structured keys (``extras``) and
+    engine arguments (``kv_cache_dtype`` et al.) that the resolver and the
+    default-diffusion extras fallback already support.
+
     Raises:
         ValueError: when ``value`` is a string that is not valid JSON, or when
-            the parsed shape/keys are not a valid per-stage override mapping
-            (e.g. non-dict top level, non-integer stage id, non-dict value,
-            or unknown field name).
+            the parsed shape is not a valid per-stage override mapping
+            (non-dict top level, non-integer stage id, non-dict value).
     """
     if not value:
         return None
@@ -587,12 +591,6 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
         if not isinstance(overrides, dict):
             raise ValueError(
                 f"--stage-overrides[{stage_id_str!r}] must be an object, got {type(overrides).__name__}: {overrides!r}"
-            )
-        unknown = set(overrides) - _STAGE_OVERRIDE_ALLOWED_KEYS
-        if unknown:
-            raise ValueError(
-                f"--stage-overrides[{stage_id_str!r}] has unknown fields: "
-                f"{sorted(unknown)}. Allowed: {sorted(_STAGE_OVERRIDE_ALLOWED_KEYS)}"
             )
 
     return parsed
