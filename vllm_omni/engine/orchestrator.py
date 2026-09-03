@@ -36,7 +36,8 @@ from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
-from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.distributed.omni_connectors.utils.initialization import connector_plan_from_model_config
+from vllm_omni.engine import ConnectorEndpoint, OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
@@ -2149,6 +2150,7 @@ class Orchestrator:
         next_input: Any,
         params: SamplingParams | PoolingParams,
         *,
+        sender_stage_id: int,
         mm_features: list | None = None,
         resumable: bool = False,
     ) -> Any:
@@ -2163,6 +2165,7 @@ class Orchestrator:
                 resumable=resumable,
             )
             request.external_req_id = request.request_id
+            request.sender_info = self._build_payload_sender_info(sender_stage_id, req_id)
             return request
 
         processor = self._get_stage_input_processor(next_stage_id)
@@ -2184,6 +2187,7 @@ class Orchestrator:
         )
         request = self._upgrade_processed_stage_request(request, next_input)
         request.external_req_id = req_id
+        request.sender_info = self._build_payload_sender_info(sender_stage_id, req_id)
         return request
 
     @staticmethod
@@ -2706,6 +2710,7 @@ class Orchestrator:
                     resumable=next_stage_resumable,
                 )
                 request.external_req_id = request.request_id
+                request.sender_info = self._build_payload_sender_info(src_stage_id, req_id)
                 if already_submitted:
                     replica_id = await next_pool.submit_update(req_id, req_state, request)
                 else:
@@ -2827,6 +2832,7 @@ class Orchestrator:
                 next_logical,
                 next_input,
                 params=params,
+                sender_stage_id=src_stage_id,
                 mm_features=mm_features,
                 resumable=next_stage_resumable,
             )
@@ -2906,13 +2912,22 @@ class Orchestrator:
                 # execute before that conditioning payload arrives.
                 continue
 
+            model_config = getattr(next_pool.stage_vllm_config, "model_config", None)
+            connector_plan = connector_plan_from_model_config(model_config) if model_config is not None else None
+            inbound = connector_plan.inbound if connector_plan is not None else None
+            if inbound is None:
+                raise RuntimeError(f"Connector-fed stage {next_stage_id} has no inbound connector edge")
+
+            sender_stage_id = inbound.from_stage
+            # Select and retain the replica that will receive this request
+            await self.stage_pools[sender_stage_id]._pick_or_select(request_id)
             req_state.stage_submit_ts[next_stage_id] = _time.time()
             _t_submit_start = _time.perf_counter()
 
             if next_pool.stage_type == "diffusion":
                 submit_kwargs = {
                     "kv_sender_info": self._build_kv_sender_info(
-                        list(getattr(next_pool.stage_client, "engine_input_source", None) or [next_stage_id - 1]),
+                        list(getattr(next_pool.stage_client, "engine_input_source", None) or [sender_stage_id]),
                         request_id=request_id,
                     )
                 }
@@ -2955,6 +2970,7 @@ class Orchestrator:
                     resumable=downstream_resumable,
                 )
                 request.external_req_id = request.request_id
+                request.sender_info = self._build_payload_sender_info(sender_stage_id, request_id)
                 submitted = await self._dispatch_or_fail_request(
                     lambda: next_pool.submit_initial(
                         request_id,
@@ -2982,13 +2998,11 @@ class Orchestrator:
                 req_state,
             )
 
-            # async_chunk pre-submit fires per stage edge (N-1 -> N). Source
-            # replica is stage 0's bound replica (single-replica thinker in
-            # all current configs); fall back to 0 if unknown.
+            # async_chunk pre-submit fires once per configured inbound edge.
             _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
-            src_replica = self.stage_pools[next_stage_id - 1].get_bound_replica_id(request_id)
+            src_replica = self.stage_pools[sender_stage_id].get_bound_replica_id(request_id)
             self._emit_tx_edge(
-                from_stage=next_stage_id - 1,
+                from_stage=sender_stage_id,
                 from_replica=src_replica if src_replica is not None else 0,
                 to_stage=next_stage_id,
                 to_pool=next_pool,
@@ -3011,9 +3025,11 @@ class Orchestrator:
                 continue
 
             sender_pool = self.stage_pools[sender_stage_id]
-            sender_stage = sender_pool.get_bound_client(request_id) if request_id is not None else None
+            sender_stage = (
+                sender_pool.get_bound_client(request_id) if request_id is not None else sender_pool.stage_client
+            )
             if sender_stage is None:
-                sender_stage = sender_pool.stage_client
+                continue
             get_sender_info = getattr(sender_stage, "get_kv_sender_info", None)
             if not callable(get_sender_info):
                 continue
@@ -3029,6 +3045,19 @@ class Orchestrator:
             sender_infos[sender_stage_id] = sender_info
 
         return sender_infos or None
+
+    def _build_payload_sender_info(
+        self,
+        sender_stage_id: int,
+        request_id: str,
+    ) -> ConnectorEndpoint | None:
+        """Resolve the endpoint of the producer replica bound to a request."""
+        sender_pool = self.stage_pools[sender_stage_id]
+        sender_stage = sender_pool.get_bound_client(request_id)
+        if sender_stage is None:
+            return None
+        get_sender_info = getattr(sender_stage, "get_payload_sender_info", None)
+        return get_sender_info() if callable(get_sender_info) else None
 
     # ---- Shutdown / lifecycle ----
 

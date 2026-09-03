@@ -214,10 +214,12 @@ class MoriTransferEngineConnector(OmniConnectorBase):
         #                upstream sender whose endpoint lives in
         #                ``sender_host`` / ``sender_zmq_port``.
         role = str(config.get("role", "sender")).lower()
-        if role not in {"sender", "receiver"}:
-            raise ValueError(f"Invalid role={role!r} for MoriTransferEngineConnector. Expected 'sender' or 'receiver'.")
+        if role not in {"sender", "receiver", "dual"}:
+            raise ValueError(
+                f"Invalid role={role!r} for MoriTransferEngineConnector. Expected 'sender', 'receiver', or 'dual'."
+            )
         self.role = role
-        self.can_put = role == "sender"
+        self.can_put = role in {"sender", "dual"}
 
         # ---- Mori IOEngine ----
         if self.device_name:
@@ -501,9 +503,9 @@ class MoriTransferEngineConnector(OmniConnectorBase):
             logger.error(f"Put failed for {put_key}: {e}", exc_info=True)
             return False, 0, None
 
-    # ------------------------------------------------ query (no-metadata get)
-    def _query_metadata_from_sender(self, get_key: str) -> dict[str, Any] | None:
-        zmq_addr = f"tcp://{self.sender_host}:{self.sender_zmq_port}"
+    # ------------------------------------------------ metadata query
+    def _query_metadata_at(self, get_key: str, host: str, port: int) -> dict[str, Any] | None:
+        zmq_addr = f"tcp://{host}:{port}"
         req_socket = self._get_req_socket(zmq_addr, timeout_ms=5000)
         try:
             q = QueryRequest(request_id=get_key)
@@ -513,8 +515,8 @@ class MoriTransferEngineConnector(OmniConnectorBase):
                 return None
             qr = msgspec.msgpack.decode(resp, type=QueryResponse)
             return {
-                "source_host": self.sender_host,
-                "source_port": self.sender_zmq_port,
+                "source_host": host,
+                "source_port": port,
                 "data_size": qr.data_size,
                 "is_fast_path": qr.is_fast_path,
             }
@@ -522,6 +524,24 @@ class MoriTransferEngineConnector(OmniConnectorBase):
             self._invalidate_req_socket(zmq_addr)
             logger.debug(f"Metadata query failed for {get_key}: {e}")
             return None
+
+    def _resolve_metadata(self, get_key: str, metadata: dict[str, Any] | None) -> dict[str, Any] | None:
+        if metadata and "data_size" in metadata:
+            return metadata
+
+        if metadata:
+            host = metadata.get("source_host")
+            port = metadata.get("source_port")
+        else:
+            host = self.sender_host
+            port = self.sender_zmq_port
+        if not host or not port or str(host).lower() == "auto":
+            raise RuntimeError(
+                f"get() requires a routable sender endpoint, but "
+                f"sender_host={host!r}, sender_zmq_port={port!r}. "
+                f"Call update_sender_info(host, port) before receiving."
+            )
+        return self._query_metadata_at(get_key, str(host), int(port))
 
     # ----------------------------------------------------------------- get()
     def get(
@@ -537,13 +557,9 @@ class MoriTransferEngineConnector(OmniConnectorBase):
         get_key = self._make_key(get_key, from_stage, to_stage)
         _t0 = _time_mod.perf_counter()
 
-        # Resolve metadata
+        metadata = self._resolve_metadata(get_key, metadata)
         if not metadata:
-            if not self.sender_host or not self.sender_zmq_port or str(self.sender_host).lower() == "auto":
-                raise RuntimeError("get(metadata=None) requires sender info. Call update_sender_info() first.")
-            metadata = self._query_metadata_from_sender(get_key)
-            if not metadata:
-                return None
+            return None
 
         _t1 = _time_mod.perf_counter()
         _query_ms = (_t1 - _t0) * 1000

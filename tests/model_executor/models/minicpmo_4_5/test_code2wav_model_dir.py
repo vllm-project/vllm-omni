@@ -67,7 +67,7 @@ def test_init_with_fake_path_does_not_resolve(monkeypatch):
     config = SimpleNamespace(
         model_config=SimpleNamespace(
             model="/fake/model",
-            stage_connector_config=None,
+            stage_input_connector_config=None,
         )
     )
     model = MiniCPMO45Code2Wav(vllm_config=config)
@@ -80,7 +80,7 @@ def test_default_prompt_wav_follows_resolved_model_path(monkeypatch):
     config = SimpleNamespace(
         model_config=SimpleNamespace(
             model="openbmb/MiniCPM-o-4_5",
-            stage_connector_config=None,
+            stage_input_connector_config=None,
         )
     )
     model = MiniCPMO45Code2Wav(vllm_config=config)

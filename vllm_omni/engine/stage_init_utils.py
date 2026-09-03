@@ -50,6 +50,7 @@ from vllm_omni.config.omni_config import (
 )
 from vllm_omni.config.stage_config import StageType
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.distributed.omni_connectors.utils.config import StageConnectorPlan
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
@@ -71,7 +72,7 @@ class ReplicaInitPlan:
     launch_mode: str
     stage_cfg: Any
     metadata: Any
-    stage_connector_spec: dict[str, Any]
+    stage_connector_plan: StageConnectorPlan
     omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None]
     stage_vllm_config: Any | None = None
     executor_class: type | None = None
@@ -1183,7 +1184,7 @@ def _finalize_engine_args_dict(
     stage_type: str | StageType,
     stage_id: int,
     model: str,
-    stage_connector_spec: dict[str, Any] | None,
+    stage_connector_plan: StageConnectorPlan | None,
     cli_tokenizer: str | None,
     has_sampling_extra_args: bool,
     sampling_extra_args_keys: tuple[str, ...] = (),
@@ -1246,8 +1247,8 @@ def _finalize_engine_args_dict(
     # Stage id must come from stage config instead of inherited CLI kwargs
     # (e.g. `--stage-id` defaulting to None).
     engine_args_dict["stage_id"] = stage_id
-    if stage_connector_spec:
-        engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
+    if stage_connector_plan is not None:
+        engine_args_dict["stage_connector_plan"] = stage_connector_plan
 
     is_diffusion = stage_type == StageType.DIFFUSION
     if is_diffusion:
@@ -1289,7 +1290,7 @@ def _finalize_engine_args_dict(
 def build_legacy_engine_args_dict(
     stage_config: Any,
     model: str,
-    stage_connector_spec: dict[str, Any] | None = None,
+    stage_connector_plan: StageConnectorPlan | None = None,
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
     """Implement engine-argument building for the legacy stage representation."""
@@ -1306,7 +1307,7 @@ def build_legacy_engine_args_dict(
         stage_type=_get_attr_or_item(stage_config, "stage_type", "llm"),
         stage_id=stage_config.stage_id,
         model=model,
-        stage_connector_spec=stage_connector_spec,
+        stage_connector_plan=stage_connector_plan,
         cli_tokenizer=cli_tokenizer,
         has_sampling_extra_args=bool(default_sp.get("extra_args")),
         sampling_extra_args_keys=_sampling_extra_args_keys(default_sp),
@@ -1316,7 +1317,7 @@ def build_legacy_engine_args_dict(
 def build_engine_args_dict(
     stage_config: Any,
     model: str,
-    stage_connector_spec: dict[str, Any] | None = None,
+    stage_connector_plan: StageConnectorPlan | None = None,
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
     """Build engine arguments through the stable production entry point.
@@ -1328,7 +1329,7 @@ def build_engine_args_dict(
     return build_legacy_engine_args_dict(
         stage_config,
         model,
-        stage_connector_spec=stage_connector_spec,
+        stage_connector_plan=stage_connector_plan,
         cli_tokenizer=cli_tokenizer,
     )
 
@@ -1336,7 +1337,7 @@ def build_engine_args_dict(
 def build_engine_args_dict_from_omni_stage_config(
     stage_config: BaseVllmOmniStageConfig,
     model: str,
-    stage_connector_spec: dict[str, Any] | None = None,
+    stage_connector_plan: StageConnectorPlan | None = None,
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
     """Project one typed stage config into backend engine arguments.
@@ -1353,7 +1354,7 @@ def build_engine_args_dict_from_omni_stage_config(
         stage_type=stage_config.stage_type,
         stage_id=stage_config.stage_id,
         model=model,
-        stage_connector_spec=stage_connector_spec,
+        stage_connector_plan=stage_connector_plan,
         cli_tokenizer=cli_tokenizer,
         has_sampling_extra_args=stage_config.model_config.has_sampling_extra_args,
         sampling_extra_args_keys=_sampling_extra_args_keys(stage_config.model_config.default_sampling_params),
@@ -1431,7 +1432,7 @@ def _check_stage_device_layout(stage_config: Any, engine_args_dict: dict[str, An
 def build_vllm_config(
     stage_config: Any,
     model: str,
-    stage_connector_spec: dict[str, Any] | None = None,
+    stage_connector_plan: StageConnectorPlan | None = None,
     engine_args_dict: dict[str, Any] | None = None,
     headless: bool = False,
 ) -> tuple[Any, type]:
@@ -1444,7 +1445,7 @@ def build_vllm_config(
         engine_args_dict = build_engine_args_dict(
             stage_config,
             model,
-            stage_connector_spec=stage_connector_spec,
+            stage_connector_plan=stage_connector_plan,
         )
 
     filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
@@ -1761,29 +1762,14 @@ def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> 
         return None
 
 
-def get_stage_connector_spec(
+def get_stage_connector_plan(
     omni_transfer_config: Any,
     stage_id: int,
-    async_chunk: bool,
-) -> dict[str, Any]:
-    """Return the first connector spec for a stage data-plane edge."""
-    from vllm_omni.distributed.omni_connectors import get_stage_connector_config
+) -> StageConnectorPlan:
+    """Resolve the stage's inbound and outbound connector edges."""
+    from vllm_omni.distributed.omni_connectors import resolve_stage_connector_plan
 
-    stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
-    for cfg in stage_connectors_cfg.values():
-        return dict(cfg.get("spec", {}))
-
-    # A producer does not consume connector data itself. Keep its connector
-    # for both async-chunk and terminal full-payload sends, but mark it
-    # sender-only so the scheduler does not park orchestrator-provided inputs
-    # waiting for an upstream payload.
-    target_stage = str(stage_id)
-    for (from_stage, _to_stage), spec in getattr(omni_transfer_config, "connectors", {}).items():
-        if from_stage == target_stage:
-            extra = dict(spec.extra or {})
-            extra.setdefault("role", "sender")
-            return {"name": spec.name, "extra": extra}
-    return {}
+    return resolve_stage_connector_plan(omni_transfer_config, stage_id)
 
 
 def build_diffusion_config(

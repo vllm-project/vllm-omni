@@ -50,6 +50,9 @@ from vllm_omni.config.stage_config import (
     merge_pipeline_deploy,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.distributed.omni_connectors.utils.initialization import (
+    default_stage_connector_plan,
+)
 from vllm_omni.engine.stage_engine_startup import _serialize_stage_config
 from vllm_omni.engine.stage_init_utils import build_legacy_engine_args_dict
 
@@ -1142,10 +1145,11 @@ def test_from_pipeline_config_matches_build_engine_args_dict_behavior_for_repres
     pipeline = _resolve_pipeline_or_skip("qwen3_tts")
     legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy(pipeline))[0]
     omega_stage = legacy_stage.to_omegaconf()
+    connector_plan = default_stage_connector_plan(legacy_stage.stage_id)
     legacy_engine_args = build_legacy_engine_args_dict(
         omega_stage,
         model="/tmp/qwen3-tts",
-        stage_connector_spec={"name": "SharedMemoryConnector", "extra": {}},
+        stage_connector_plan=connector_plan,
     )
     omni_stage = _from_pipeline_key("qwen3_tts").stage_by_id(legacy_stage.stage_id)
 
@@ -1154,7 +1158,7 @@ def test_from_pipeline_config_matches_build_engine_args_dict_behavior_for_repres
     assert legacy_engine_args["model_stage"] == omni_stage.model_stage
     assert legacy_engine_args["worker_type"] == omni_stage.worker_type
     assert legacy_engine_args["scheduler_cls"] == omni_stage.scheduler_cls
-    assert legacy_engine_args["stage_connector_spec"] == {"name": "SharedMemoryConnector", "extra": {}}
+    assert legacy_engine_args["stage_connector_plan"] == connector_plan
     assert legacy_engine_args["has_sampling_extra_args"] == bool(
         (omni_stage.model_config.default_sampling_params or {}).get("extra_args")
     )

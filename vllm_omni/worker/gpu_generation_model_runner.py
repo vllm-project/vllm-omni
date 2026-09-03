@@ -105,7 +105,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
 
-        if hasattr(self, "_omni_connector"):
+        if getattr(self, "_omni_connector_initialized", False):
             for request in getattr(scheduler_output, "pending_input_registrations", []):
                 self.register_chunk_recv(request)
             self.recv_full_payload_inputs(scheduler_output)

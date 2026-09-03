@@ -20,6 +20,11 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.serial_utils import MsgpackEncoder
 
+from vllm_omni.distributed.omni_connectors.utils.config import (
+    ConnectorSpec,
+    StageConnectorPlan,
+    StageConnectorSpec,
+)
 from vllm_omni.engine.messages import (
     AddCompanionRequestMessage,
     EngineQueueMessage,
@@ -439,7 +444,30 @@ async def test_async_chunk_prewarm_failure_reports_failing_downstream_stage(orch
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
     stage1 = FakeStageClient(stage_type="diffusion", final_output=False, final_output_type="image")
     stage2 = _UnavailableDiffusionStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
-    stage_pools = _build_stage_pools([[stage0], [stage1], [stage2]])
+    stage_vllm_configs = [
+        SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        SimpleNamespace(
+            model_config=SimpleNamespace(
+                max_model_len=64,
+                stage_connector_plan=StageConnectorPlan(
+                    inbound=StageConnectorSpec(0, 1, ConnectorSpec("SharedMemoryConnector"))
+                ),
+            )
+        ),
+        SimpleNamespace(
+            model_config=SimpleNamespace(
+                max_model_len=64,
+                stage_connector_plan=StageConnectorPlan(
+                    inbound=StageConnectorSpec(1, 2, ConnectorSpec("SharedMemoryConnector"))
+                ),
+            )
+        ),
+    ]
+    stage_pools = _build_stage_pools([[stage0], [stage1], [stage2]], stage_vllm_configs=stage_vllm_configs)
+    # Diffusion pools are built from their client directly by the test helper;
+    # attach the stage config explicitly so prewarm can resolve inbound edges.
+    stage_pools[1]._stage_vllm_config = stage_vllm_configs[1]
+    stage_pools[2]._stage_vllm_config = stage_vllm_configs[2]
     orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools, async_chunk=True)
 
     try:

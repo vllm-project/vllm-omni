@@ -21,6 +21,11 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.distributed.omni_connectors.utils.config import (
+    ConnectorSpec,
+    StageConnectorPlan,
+    StageConnectorSpec,
+)
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AbortResultMessage,
@@ -373,6 +378,7 @@ def _build_stage_pools(
     *,
     output_processors: list[FakeOutputProcessor] | None = None,
     stage_vllm_configs: list[object] | None = None,
+    async_chunk: bool = False,
 ) -> list[StagePool]:
     """Build StagePool list from per-stage replica lists.
 
@@ -382,7 +388,31 @@ def _build_stage_pools(
     if output_processors is None:
         output_processors = [FakeOutputProcessor() for _ in stage_clients]
     if stage_vllm_configs is None:
-        stage_vllm_configs = [SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)) for _ in stage_clients]
+        if async_chunk:
+            stage_vllm_configs = []
+            for stage_id in range(num_stages):
+                inbound = (
+                    StageConnectorSpec(stage_id - 1, stage_id, ConnectorSpec("SharedMemoryConnector"))
+                    if stage_id > 0
+                    else None
+                )
+                outbound = (
+                    StageConnectorSpec(stage_id, stage_id + 1, ConnectorSpec("SharedMemoryConnector"))
+                    if stage_id < num_stages - 1
+                    else None
+                )
+                stage_vllm_configs.append(
+                    SimpleNamespace(
+                        model_config=SimpleNamespace(
+                            max_model_len=64,
+                            stage_connector_plan=StageConnectorPlan(inbound=inbound, outbound=outbound),
+                        )
+                    )
+                )
+        else:
+            stage_vllm_configs = [
+                SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)) for _ in stage_clients
+            ]
 
     pools: list[StagePool] = []
     for stage_id in range(num_stages):
@@ -422,6 +452,7 @@ def _build_harness(
             nested_clients,
             output_processors=output_processors,
             stage_vllm_configs=stage_vllm_configs,
+            async_chunk=async_chunk,
         )
 
     ready_future: concurrent.futures.Future[tuple[Orchestrator, janus.Queue, janus.Queue, janus.Queue]] = (
@@ -781,6 +812,24 @@ async def test_run_async_chunk(orchestrator_factory) -> None:
         [stage0, stage1],
         output_processors=processors,
         async_chunk=True,
+        stage_vllm_configs=[
+            SimpleNamespace(
+                model_config=SimpleNamespace(
+                    max_model_len=64,
+                    stage_connector_plan=StageConnectorPlan(
+                        outbound=StageConnectorSpec(0, 1, ConnectorSpec("SharedMemoryConnector"))
+                    ),
+                )
+            ),
+            SimpleNamespace(
+                model_config=SimpleNamespace(
+                    max_model_len=64,
+                    stage_connector_plan=StageConnectorPlan(
+                        inbound=StageConnectorSpec(0, 1, ConnectorSpec("SharedMemoryConnector"))
+                    ),
+                )
+            ),
+        ],
     )
     request = SimpleNamespace(request_id="req-async", prompt_token_ids=[1, 2, 3, 4])
 

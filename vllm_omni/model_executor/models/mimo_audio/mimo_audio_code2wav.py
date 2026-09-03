@@ -482,7 +482,7 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
             * getattr(audio_tokenizer_config, "hop_length", 240)
         ) * self.config.group_size
 
-        connector_cfg = getattr(vllm_config.model_config, "stage_connector_config", None)
+        connector_cfg = getattr(vllm_config.model_config, "stage_input_connector_config", None)
         extra_cfg = (
             (
                 connector_cfg.get("extra", connector_cfg)

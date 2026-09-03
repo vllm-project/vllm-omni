@@ -1368,7 +1368,7 @@ class Qwen3OmniMoeForConditionalGeneration(
     def _get_codec_frame_config(self) -> tuple[int, int]:
         """Extract codec_chunk_frames and codec_left_context_frames from stage connector config."""
         model_cfg = getattr(self.vllm_config, "model_config", None)
-        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        connector_cfg = getattr(model_cfg, "stage_input_connector_config", None)
         if isinstance(connector_cfg, dict):
             extra = connector_cfg.get("extra", {})
         else:

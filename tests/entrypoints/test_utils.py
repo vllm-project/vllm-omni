@@ -20,7 +20,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_init_utils import (
-    get_stage_connector_spec,
+    get_stage_connector_plan,
     load_omni_transfer_config_for_model,
 )
 from vllm_omni.entrypoints.utils import (
@@ -368,21 +368,25 @@ class TestResolveModelConfigPath:
         transfer_config = load_omni_transfer_config_for_model(model, result)
         assert transfer_config is not None
 
-        sender = get_stage_connector_spec(
+        sender_plan = get_stage_connector_plan(
             omni_transfer_config=transfer_config,
             stage_id=1,
-            async_chunk=True,
         )
-        receiver = get_stage_connector_spec(
+        receiver_plan = get_stage_connector_plan(
             omni_transfer_config=transfer_config,
             stage_id=2,
-            async_chunk=True,
         )
-        assert sender["extra"]["role"] == "sender"
-        assert receiver["extra"]["role"] == "receiver"
-        assert sender["extra"]["connector_get_sleep_s"] == 0.01
-        assert sender["extra"]["connector_get_max_wait_first_chunk"] == 3000
-        assert sender["extra"]["connector_get_max_wait"] == 300
+        assert sender_plan.outbound is not None
+        assert sender_plan.outbound.from_stage == 1
+        assert sender_plan.outbound.to_stage == 2
+        assert receiver_plan.inbound is not None
+        assert receiver_plan.inbound.from_stage == 1
+        assert receiver_plan.inbound.to_stage == 2
+        assert sender_plan.outbound.spec.name == "SharedMemoryConnector"
+        assert receiver_plan.inbound.spec.name == "SharedMemoryConnector"
+        assert sender_plan.outbound.spec.extra["connector_get_sleep_s"] == 0.01
+        assert sender_plan.outbound.spec.extra["connector_get_max_wait_first_chunk"] == 3000
+        assert sender_plan.outbound.spec.extra["connector_get_max_wait"] == 300
 
     def test_object_storage_uri_resolves_via_materialized_configs(
         self,

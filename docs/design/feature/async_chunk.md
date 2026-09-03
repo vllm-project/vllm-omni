@@ -228,6 +228,9 @@ sizing.
 - `async_chunk_process_next_stage_input_func: str`: Pipeline-owned chunk processor path
 - `execution_type: StageExecutionType`: Pipeline-owned runtime family
 - `connectors: dict`: Deploy-owned connector definitions
+- `custom_process_next_stage_input_func: str`: Path to custom chunk processing function; receives `(transfer_manager, pooling_output, request)`. For qwen3-omni: `thinker2talker_async_chunk`, `talker2code2wav_async_chunk`
+- `stage_connector_plan: StageConnectorPlan`: Resolved inbound/outbound connector edges
+- `worker_type: str`: Model type, e.g. `"ar"` or `"generation"` (used by OmniChunkTransferAdapter for mode-specific payload handling)
 - `max_num_seqs: int`: Maximum number of sequences for concurrent processing in the stage
 
 ### Connector Configuration

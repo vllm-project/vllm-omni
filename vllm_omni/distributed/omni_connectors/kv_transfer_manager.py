@@ -444,6 +444,9 @@ class OmniKVTransferManager:
         if not cfg or not isinstance(cfg, dict):
             return cls(OmniKVCacheConfig(), async_prefetch=async_prefetch)
 
+        if cfg.get("need_recv_cache") and cfg.get("need_send_cache"):
+            raise ValueError("OmniKVTransferManager supports only one directional connector")
+
         rank_mapping = cfg.get("rank_mapping", {})
         if not isinstance(rank_mapping, dict):
             rank_mapping = {}

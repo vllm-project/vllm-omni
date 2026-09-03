@@ -59,6 +59,23 @@ This `metadata` must be passed through the control plane so `get()` can locate t
 
 ## Configuration Model
 
+Connector configuration has two layers:
+
+1. **Deploy configuration**: the top-level `connectors` mapping contains named
+   connector definitions. Each stage's `input_connectors` and
+   `output_connectors` reference those definitions by name and identify the
+   directed stage edge.
+2. **Runtime topology**: the configuration resolver converts those definitions
+   into a per-stage `StageConnectorPlan`. The plan contains at most one inbound
+   and one outbound `StageConnectorSpec`, including the source stage, target
+   stage, and resolved `ConnectorSpec`. It is passed to stage initialization and
+   the worker connector factory.
+
+This separation keeps deployment-owned backend settings independent from the
+runtime representation used by workers. A connector does not infer routing
+from request data, and a `StageConnectorPlan` does not replace the deploy YAML;
+it is the resolved form of that YAML.
+
 Define connectors at the top level of the deploy YAML:
 
 ```yaml

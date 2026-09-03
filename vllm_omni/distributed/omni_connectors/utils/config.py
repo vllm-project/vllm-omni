@@ -19,6 +19,16 @@ TRANSFER_ENGINE_CONNECTOR_NAMES = frozenset(
 
 def get_stage_connector_role(model_config: Any) -> str | None:
     """Return the configured stage connector direction, if explicit."""
+    plan = getattr(model_config, "stage_connector_plan", None)
+    if isinstance(plan, StageConnectorPlan):
+        if plan.inbound is not None and plan.outbound is not None:
+            return "dual"
+        if plan.inbound is not None:
+            return "receiver"
+        if plan.outbound is not None:
+            return "sender"
+        return None
+
     connector_config = getattr(model_config, "stage_connector_config", None)
     if isinstance(connector_config, dict):
         extra = connector_config.get("extra")
@@ -32,14 +42,20 @@ def get_stage_connector_role(model_config: Any) -> str | None:
 
 def stage_receives_chunks(model_config: Any) -> bool:
     """Whether connector chunks, rather than the orchestrator, feed a stage."""
+    plan = getattr(model_config, "stage_connector_plan", None)
+    if isinstance(plan, StageConnectorPlan):
+        return plan.inbound is not None
     return get_stage_connector_role(model_config) != "sender"
 
 
 def stage_sends_async_output(model_config: Any) -> bool:
     """Whether async output should be partitioned for connector transport."""
+    plan = getattr(model_config, "stage_connector_plan", None)
+    if isinstance(plan, StageConnectorPlan):
+        return plan.outbound is not None
     role = get_stage_connector_role(model_config)
     if role is not None:
-        return role == "sender"
+        return role in {"sender", "dual"}
     # Preserve legacy partitioning while keeping stage-0 orchestrator bridges
     # on the normal RequestOutput path.
     return getattr(model_config, "stage_id", None) != 0
@@ -51,6 +67,23 @@ class ConnectorSpec:
 
     name: str  # e.g., "MooncakeStoreConnector", "SharedMemoryConnector", "YuanrongConnector"
     extra: dict[str, Any] = field(default_factory=dict)  # backend-specific config
+
+
+@dataclass(frozen=True)
+class StageConnectorSpec:
+    """One connector attached to a directed stage edge."""
+
+    from_stage: int
+    to_stage: int
+    spec: ConnectorSpec
+
+
+@dataclass(frozen=True)
+class StageConnectorPlan:
+    """The optional inbound and outbound connector for one stage."""
+
+    inbound: StageConnectorSpec | None = None
+    outbound: StageConnectorSpec | None = None
 
 
 @dataclass

@@ -41,6 +41,11 @@ from vllm_omni.config.stage_config import (
     merge_pipeline_deploy,
 )
 from vllm_omni.diffusion.data import AttentionConfig, OmniDiffusionConfig
+from vllm_omni.distributed.omni_connectors.utils.config import (
+    ConnectorSpec,
+    StageConnectorPlan,
+    StageConnectorSpec,
+)
 from vllm_omni.engine import stage_init_utils
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.stage_init_utils import (
@@ -350,7 +355,13 @@ def test_typed_llm_engine_args_preserve_upstream_config_objects(tmp_path, stage_
 def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
     pipeline, deploy, model = _engine_arg_inputs(tmp_path)
     legacy_stages, omni_config = _legacy_and_typed_stages(pipeline, deploy, model)
-    connector_spec = {"name": "SharedMemoryConnector", "extra": {"mode": "test"}}
+    connector_plan = StageConnectorPlan(
+        outbound=StageConnectorSpec(
+            0,
+            1,
+            ConnectorSpec("SharedMemoryConnector", {"mode": "test"}),
+        )
+    )
     cli_tokenizer = "/external/tokenizer"
 
     typed_args_by_stage = {}
@@ -358,13 +369,13 @@ def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
         legacy_args = build_legacy_engine_args_dict(
             legacy_stages[stage_id],
             model,
-            stage_connector_spec=connector_spec,
+            stage_connector_plan=connector_plan,
             cli_tokenizer=cli_tokenizer,
         )
         typed_args = build_engine_args_dict_from_omni_stage_config(
             omni_config.stage_by_id(stage_id),
             model,
-            stage_connector_spec=connector_spec,
+            stage_connector_plan=connector_plan,
             cli_tokenizer=cli_tokenizer,
         )
         typed_args_by_stage[stage_id] = typed_args
@@ -384,7 +395,7 @@ def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
     assert thinker_args["model"] == str(tmp_path / "stage-model" / "ar-model")
     assert thinker_args["tokenizer"] == str(tmp_path / "stage-model" / "ar-tokenizer")
     assert thinker_args["stage_id"] == 0
-    assert thinker_args["stage_connector_spec"] == connector_spec
+    assert thinker_args["stage_connector_plan"] == connector_plan
     assert thinker_args["has_sampling_extra_args"] is True
     assert thinker_args["omni_kv_config"] == {"need_send_cache": True}
     assert thinker_args["worker_cls"] == "test.custom.Worker"
@@ -606,18 +617,18 @@ def test_typed_engine_args_preserve_legacy_omni_kv_precedence(tmp_path, cli_over
 def test_build_engine_args_dict_preserves_legacy_api(tmp_path):
     pipeline, deploy, model = _engine_arg_inputs(tmp_path)
     legacy_stages, _ = _legacy_and_typed_stages(pipeline, deploy, model)
-    connector_spec = {"name": "SharedMemoryConnector", "extra": {}}
+    connector_plan = StageConnectorPlan(outbound=StageConnectorSpec(0, 1, ConnectorSpec("SharedMemoryConnector")))
 
     compatibility_args = build_engine_args_dict(
         copy.deepcopy(legacy_stages[0]),
         model,
-        stage_connector_spec=connector_spec,
+        stage_connector_plan=connector_plan,
         cli_tokenizer="/external/tokenizer",
     )
     explicitly_legacy_args = build_legacy_engine_args_dict(
         copy.deepcopy(legacy_stages[0]),
         model,
-        stage_connector_spec=connector_spec,
+        stage_connector_plan=connector_plan,
         cli_tokenizer="/external/tokenizer",
     )
 

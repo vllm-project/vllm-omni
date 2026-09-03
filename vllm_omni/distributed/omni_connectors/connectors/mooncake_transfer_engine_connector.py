@@ -172,11 +172,11 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         # The orchestration layer (get_connectors_config_for_stage /
         # kv_transfer_manager) is responsible for injecting the correct role.
         role = str(config.get("role", "sender")).lower()
-        if role not in {"sender", "receiver"}:
+        if role not in {"sender", "receiver", "dual"}:
             raise ValueError(
-                f"Invalid role={role!r} for MooncakeTransferEngineConnector. Expected 'sender' or 'receiver'."
+                f"Invalid role={role!r} for MooncakeTransferEngineConnector. Expected 'sender', 'receiver', or 'dual'."
             )
-        self.can_put = role == "sender"
+        self.can_put = role in {"sender", "dual"}
 
         self.engine_id = str(uuid.uuid4())
 

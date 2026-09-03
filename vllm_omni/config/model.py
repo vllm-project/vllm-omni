@@ -1,4 +1,5 @@
-from dataclasses import MISSING, field
+from dataclasses import MISSING
+from types import SimpleNamespace
 from typing import Any
 
 from pydantic import ConfigDict, TypeAdapter
@@ -14,6 +15,7 @@ from vllm.transformers_utils.model_arch_config_convertor import (
 )
 
 import vllm_omni.model_executor.models as me_models
+from vllm_omni.distributed.omni_connectors.utils.config import StageConnectorPlan, StageConnectorSpec
 
 logger = init_logger(__name__)
 
@@ -102,11 +104,10 @@ class OmniModelConfig(ModelConfig):
          engine_output_type: Optional output type specification for the engine.
              Used to route outputs to appropriate processors (e.g., "image",
              "audio", "latents"). If None, output type is inferred.
-         stage_connector_config: Stage connector configuration dictionary.
-             Contains "name" (connector name), "extra" (extra connector config).
+         stage_connector_plan: Independent inbound and outbound stage connectors.
+         stage_connector_config: Deprecated single-connector compatibility field.
          task_type: Model-defined startup task type. Each model validates its
              supported values and applies the corresponding behavior.
-
 
     The correct way to initialize this class is via vLLM config, as most
     of the logic for handling values is in the ModelConfig's __post_init__.
@@ -136,12 +137,7 @@ class OmniModelConfig(ModelConfig):
     pooling_output_decoder: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
-    stage_connector_config: dict[str, Any] = field(
-        default_factory=lambda: {
-            "name": "SharedMemoryConnector",
-            "extra": {},
-        }
-    )
+    stage_connector_plan: StageConnectorPlan | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
     silence_ban_frames: int = 0
     omni_kv_config: dict | None = None
@@ -159,6 +155,39 @@ class OmniModelConfig(ModelConfig):
     @property
     def registry(self):
         return me_models.OmniModelRegistry
+
+    def _connector_config(self, edge: StageConnectorSpec | None) -> dict[str, Any] | None:
+        if edge is None:
+            return None
+        extra = dict(edge.spec.extra)
+        extra.update(
+            stage_id=self.stage_id,
+            from_stage=edge.from_stage,
+            to_stage=edge.to_stage,
+        )
+        return {"name": edge.spec.name, "extra": extra}
+
+    @property
+    def stage_input_connector_config(self) -> dict[str, Any] | None:
+        plan = self.stage_connector_plan
+        if plan is None:
+            return {"name": "SharedMemoryConnector", "extra": {}}
+        return self._connector_config(plan.inbound)
+
+    @property
+    def stage_output_connector_config(self) -> dict[str, Any] | None:
+        plan = self.stage_connector_plan
+        if plan is None:
+            return {"name": "SharedMemoryConnector", "extra": {}}
+        return self._connector_config(plan.outbound)
+
+    @property
+    def stage_connector_config(self) -> dict[str, Any] | None:
+        """Deprecated single-connector view; prefer ``stage_connector_plan``."""
+        plan = self.stage_connector_plan
+        if plan is None:
+            return {"name": "SharedMemoryConnector", "extra": {}}
+        return self._connector_config(plan.inbound or plan.outbound)
 
     @property
     def architectures(self) -> list[str]:
@@ -288,6 +317,22 @@ class OmniModelConfig(ModelConfig):
         faster than creating the OmniModelConfig directly from the ModelConfig,
         and saves us from having to pass all kwargs to the OmniModelConfig.
         """
+        legacy_connector_config = omni_kwargs.pop("stage_connector_config", MISSING)
+        if legacy_connector_config is not MISSING:
+            if "stage_connector_plan" in omni_kwargs:
+                raise ValueError("Cannot specify both stage_connector_config and stage_connector_plan")
+            from vllm_omni.distributed.omni_connectors.utils.initialization import (
+                connector_plan_from_model_config,
+            )
+
+            omni_kwargs["stage_connector_plan"] = connector_plan_from_model_config(
+                SimpleNamespace(
+                    stage_id=omni_kwargs.get("stage_id", 0),
+                    stage_connector_config=legacy_connector_config,
+                    stage_connector_plan=None,
+                )
+            )
+
         # Add missing defaults to the omni kwargs and ensure values are valid
         cls.add_defaults_to_omni_kwargs(omni_kwargs)
         cls._validate_omni_fields(**omni_kwargs)
