@@ -1,5 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
+import asyncio
 import queue
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -598,6 +602,43 @@ async def test_async_omni_llm_diffusion_yields_text_stream_then_image(monkeypatc
         "req-1-image-final",
     ]
     assert outputs[-1].images == ["req-1-image"]
+    assert "req-1" not in app.request_states
+
+
+@pytest.mark.asyncio
+async def test_async_omni_abort_yields_terminal_from_requested_final_stage(monkeypatch: pytest.MonkeyPatch):
+    stage_metadata = [
+        _stage_meta(stage_type="llm", final_output=False, final_output_type=None),
+        _stage_meta(stage_type="llm", final_output=True, final_output_type="audio"),
+    ]
+    engine = FakeAsyncOmniEngine(stage_metadata=stage_metadata)
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni("dummy-model")
+
+    async def collect_outputs() -> list[OmniRequestOutput]:
+        return [
+            output
+            async for output in app.generate(
+                prompt="hello",
+                request_id="req-1",
+                output_modalities=["audio"],
+            )
+        ]
+
+    try:
+        generate_task = asyncio.create_task(collect_outputs())
+        while not engine.submitted:
+            await asyncio.sleep(0)
+        await app.abort("req-1")
+        outputs = await asyncio.wait_for(generate_task, timeout=1)
+    finally:
+        app.shutdown()
+
+    assert len(outputs) == 1
+    assert outputs[0].stage_id == 1
+    assert outputs[0].final_output_type == "audio"
+    assert outputs[0].finished is True
+    assert outputs[0].outputs[0].finish_reason == "abort"
     assert "req-1" not in app.request_states
 
 

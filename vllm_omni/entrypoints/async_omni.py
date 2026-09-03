@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 AsyncOmni - Refactored async orchestrator using AsyncOmniEngine.
 
@@ -601,6 +604,7 @@ class AsyncOmni(EngineClient, OmniBase):
             req_state = ClientRequestState(
                 request_id=request_id,
                 external_request_id=external_request_id,
+                final_stage_id=final_stage_id_for_e2e,
             )
             req_state.metrics = metrics
             req_state.request_arrival_ts = wall_start_ts
@@ -1213,7 +1217,22 @@ class AsyncOmni(EngineClient, OmniBase):
             if state is not None and rid not in delivered:
                 queue = getattr(state, "queue", None)
                 if queue is not None:
-                    await state.queue.put(self._synthetic_abort_output_message(rid))
+                    final_stage_id = getattr(state, "final_stage_id", None)
+                    if final_stage_id is None:
+                        final_stage_id = 0
+                    stage_metadata = getattr(self, "_stage_meta_list", ())
+                    final_output_type = (
+                        getattr(stage_metadata[final_stage_id], "final_output_type", None)
+                        if final_stage_id < len(stage_metadata)
+                        else None
+                    ) or "text"
+                    await state.queue.put(
+                        self._synthetic_abort_output_message(
+                            rid,
+                            stage_id=final_stage_id,
+                            final_output_type=final_output_type,
+                        )
+                    )
                     delivered.add(rid)
         for rid in request_ids:
             self._record_request_failure_once(rid, reason="client_abort")
@@ -1225,13 +1244,18 @@ class AsyncOmni(EngineClient, OmniBase):
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
 
     @staticmethod
-    def _synthetic_abort_output_message(request_id: str) -> OutputMessage:
+    def _synthetic_abort_output_message(
+        request_id: str,
+        *,
+        stage_id: int,
+        final_output_type: str,
+    ) -> OutputMessage:
         """Terminal abort OutputMessage used when the engine returned none."""
         engine_output = OmniRequestOutput(
             request_id=request_id,
             finished=True,
-            stage_id=0,
-            final_output_type="text",
+            stage_id=stage_id,
+            final_output_type=final_output_type,
             outputs=[
                 CompletionOutput(
                     index=0,
@@ -1246,7 +1270,7 @@ class AsyncOmni(EngineClient, OmniBase):
         )
         return OutputMessage(
             request_id=request_id,
-            stage_id=0,
+            stage_id=stage_id,
             replica_id=None,
             engine_outputs=engine_output,
             metrics=None,
