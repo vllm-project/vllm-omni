@@ -177,6 +177,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         num_scheduled_tokens_np=np.ones(bsz, dtype=np.int32),
                         max_num_scheduled_tokens=1,
                         use_cascade_attn=False,
+                        force_uniform_decode=True,
                     )
                     n = batch_desc.num_tokens
                     ids = self.talker_mtp_input_ids.gpu[:n]
