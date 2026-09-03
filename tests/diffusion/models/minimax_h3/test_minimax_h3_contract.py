@@ -1141,6 +1141,45 @@ def test_ring_packed_attention_publishes_prefix_length_without_global_mask():
     assert metadata.extra["valid_kv_length"] == 5
 
 
+def test_ring_packed_attention_keeps_mask_when_runtime_sp_is_inactive(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer
+
+    class InactiveContext:
+        sp_active = False
+
+    attention = _fake_packed_attention("CUDNN_ATTN")
+    attention.attention.use_ring = True
+    monkeypatch.setattr(
+        minimax_h3_transformer,
+        "is_forward_context_available",
+        lambda: True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        minimax_h3_transformer,
+        "get_forward_context",
+        InactiveContext,
+        raising=False,
+    )
+    q = torch.randn(8, 2, 4)
+
+    attention._run_packed_attention(
+        q,
+        q,
+        q,
+        cu_seqlens=torch.tensor([0, 5, 8], dtype=torch.int32),
+        max_seqlen=5,
+        packed_total=8,
+    )
+
+    metadata = attention.attention.metadata
+    assert torch.equal(
+        metadata.attn_mask,
+        torch.tensor([[True, True, True, True, True, False, False, False]]),
+    )
+    assert metadata.extra["npu_attn_varlen"] is True
+
+
 def _fake_packed_attention(
     backend_name: str,
     *,
@@ -1161,6 +1200,10 @@ def _fake_packed_attention(
         @classmethod
         def supports_multi_doc_packed_varlen(cls) -> bool:
             return supports_multi_doc
+
+        @classmethod
+        def supports_packed_mask_free(cls) -> bool:
+            return False
 
     class FakeAttention(torch.nn.Module):
         attn_backend = FakeBackend
