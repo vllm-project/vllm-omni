@@ -1,12 +1,13 @@
 # Boogu-Image
 
 > Text-to-image and image-editing online serving
-(Boogu-Image-0.1-Base / -Edit / -Edit-Turbo)
+(Boogu-Image-0.1-Base / -Turbo / -Edit / -Edit-Turbo)
 
 ## Summary
 
 - Vendor: Boogu
 - Model: `Boogu/Boogu-Image-0.1-Base` (text-to-image),
+  `Boogu/Boogu-Image-0.1-Turbo` (four-step text-to-image),
   `Boogu/Boogu-Image-0.1-Edit` (image editing), and
   `Boogu/Boogu-Image-0.1-Edit-Turbo` (four-step image editing)
 - Task: Text-to-image generation and text-guided image editing (TI2I)
@@ -16,8 +17,9 @@
 ## When to use this recipe
 
 Use this recipe when you want a known-good starting point for serving
-`Boogu/Boogu-Image-0.1-Base`, `Boogu/Boogu-Image-0.1-Edit`, or
-`Boogu/Boogu-Image-0.1-Edit-Turbo` with vLLM-Omni's native pipeline (no
+`Boogu/Boogu-Image-0.1-Base`, `Boogu/Boogu-Image-0.1-Turbo`,
+`Boogu/Boogu-Image-0.1-Edit`, or `Boogu/Boogu-Image-0.1-Edit-Turbo` with
+vLLM-Omni's native pipeline (no
 `--diffusion-load-format diffusers`, and the upstream `boogu` package is not
 required).
 
@@ -25,12 +27,14 @@ Boogu-Image-0.1 is an Apache-2.0 unified image generation and editing model
 family. The Base text-to-image checkpoint pairs a Qwen3-VL multimodal encoder
 with a Diffusion Transformer (DiT) and a flow-match Euler scheduler with
 time-shift. It handles photorealistic generation and Chinese/English text
-rendering. The Edit and Edit-Turbo checkpoints use the same native
-`BooguImagePipeline` for image editing.
+rendering. The Edit checkpoint uses the native `BooguImagePipeline`, while the
+distilled Turbo and Edit-Turbo checkpoints run the four-step DMD path through
+`BooguImageTurboPipeline`.
 
 ## References
 
 - Upstream model card: <https://huggingface.co/Boogu/Boogu-Image-0.1-Base>
+- Turbo model card: <https://huggingface.co/Boogu/Boogu-Image-0.1-Turbo>
 - Edit model card: <https://huggingface.co/Boogu/Boogu-Image-0.1-Edit>
 - Edit-Turbo 1K hotfix: <https://huggingface.co/Boogu/Boogu-Image-0.1-Edit-Turbo/tree/hotfix-1k-20260708>
 - Project page: <https://boogu.org>
@@ -127,6 +131,42 @@ Use `guidance_scale > 1.0` to activate the parallel two-branch path. Requests
 with `guidance_scale=1.0` remain valid on the same server: every rank evaluates
 only the positive branch, no negative embeddings are built, and no guidance is
 applied.
+
+## Fast text-to-image (Boogu-Image-0.1-Turbo)
+
+Turbo is the distilled text-to-image checkpoint. Its `model_index.json`
+declares `BooguImageTurboPipeline`, which runs the four-step DMD path instead
+of the scheduler-driven path used by Base.
+
+### Command
+
+```bash
+vllm serve Boogu/Boogu-Image-0.1-Turbo --omni --port 8091
+```
+
+### Verification
+
+```bash
+curl -X POST http://localhost:8091/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Boogu/Boogu-Image-0.1-Turbo",
+    "prompt": "A mountain lake at sunset, photorealistic, cinematic lighting",
+    "size": "1024x1024",
+    "seed": 42
+  }' | jq -r '.data[0].b64_json' | base64 -d > output-turbo.png
+```
+
+### Notes
+
+- **Required settings:** `guidance_scale=1.0` and `guidance_scale_2=1.0`; any
+  other value is rejected. `num_inference_steps` defaults to 4. All three are
+  pipeline defaults, so the request above omits them.
+- **Resolution:** upstream constrains Turbo to 1K, so `1024x1024` is the
+  supported working resolution. The shared pipeline still clamps at 2K; larger
+  sizes are not validated for this checkpoint.
+- **Known limitations:** the same single-GPU limitations as Base apply; CPU
+  offload, Cache-DiT, and multi-GPU parallelism are not yet validated.
 
 ## Image editing (Boogu-Image-0.1-Edit)
 
@@ -251,16 +291,18 @@ curl -s http://localhost:8091/v1/chat/completions \
 ## Fast image editing (Boogu-Image-0.1-Edit-Turbo)
 
 Edit-Turbo is the distilled image-editing checkpoint. Its `model_index.json`
-declares `BooguImagePipeline`, so it uses the same native TI2I path as Edit.
-The upstream 1K hotfix is recommended for stable results and is pinned below
-to avoid silently loading the older checkpoint from the repository's default
-revision.
+declares `BooguImagePipeline`, so `--model-class-name BooguImageTurboPipeline`
+is required to reach the four-step DMD path; without it the checkpoint is
+served on the dense Edit path. The upstream 1K hotfix is recommended for
+stable results and is pinned below to avoid silently loading the older
+checkpoint from the repository's default revision.
 
 ### Command
 
 ```bash
 vllm serve Boogu/Boogu-Image-0.1-Edit-Turbo \
   --omni \
+  --model-class-name BooguImageTurboPipeline \
   --revision hotfix-1k-20260708 \
   --port 8091
 ```
@@ -304,11 +346,10 @@ curl -s http://localhost:8091/v1/chat/completions \
 
 - **Pinned revision:** use `hotfix-1k-20260708`; upstream recommends the 1K
   hotfix over the 1.5K variant for more stable results.
-- **Recommended settings:** `num_inference_steps=4` and
-  `guidance_scale=1.0`. Edit-Turbo is guidance-distilled, meaning the guidance
-  behavior is already baked into the distilled checkpoint. A scale of `1.0`
-  avoids applying additional classifier-free guidance; unlike the regular Edit
-  checkpoint, it should not be increased to `5.0`.
+- **Required settings:** `guidance_scale=1.0` and `guidance_scale_2=1.0`; the
+  Turbo pipeline rejects any other value, so the `guidance_scale_2=2.0` shown
+  for the regular Edit checkpoint does not apply here. `num_inference_steps`
+  defaults to 4.
 - **Reference images:** the same single-reference and `align_res` behavior as
   the regular Edit checkpoint applies.
 - **Known limitations:** the same single-GPU limitations as Base and Edit apply;
