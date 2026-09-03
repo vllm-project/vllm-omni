@@ -1,12 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for AR EngineCore vs diffusion worker pause/sleep routing."""
 
 from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock, call, create_autospec
 
 import pytest
+from vllm.renderers import BaseRenderer
+from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -35,6 +40,23 @@ def _make_omni(*, stage_types: list[str]) -> AsyncOmni:
     )
     omni.collective_rpc = AsyncMock(return_value=[True])
     return omni
+
+
+@pytest.mark.cpu
+def test_reset_mm_cache_clears_renderer_cache():
+    async def run() -> None:
+        omni = object.__new__(AsyncOmni)
+        renderer = create_autospec(BaseRenderer, instance=True)
+        renderer.clear_mm_cache_async = AsyncMock()
+        input_processor = create_autospec(InputProcessor, instance=True)
+        input_processor.renderer = renderer
+        omni.input_processor = input_processor
+
+        await omni.reset_mm_cache()
+
+        renderer.clear_mm_cache_async.assert_awaited_once_with()
+
+    asyncio.run(run())
 
 
 @pytest.mark.cpu
