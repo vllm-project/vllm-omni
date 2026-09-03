@@ -2409,17 +2409,10 @@ class Orchestrator:
         if sp.extra_args is None:
             sp.extra_args = {}
 
-        # Get connector metadata captured from the prefill output.
-        kv_prefill_params = self._pd_kv_params.pop(req_id, None)
-        if not kv_prefill_params:
-            raise RuntimeError(f"[Orchestrator][PD] Missing prefill kv_transfer_params for req={req_id}")
-        if "remote_request_id" not in kv_prefill_params:
-            logger.warning(
-                "[Orchestrator][PD] Prefill kv_transfer_params has no "
-                "remote_request_id for req=%s; forwarding connector metadata "
-                "without field validation",
-                req_id,
-            )
+        # Mooncake keys the transfer by transfer_id and returns no request
+        # metadata from request_finished(). Treat connector output as an
+        # optional compatibility overlay for versions that do return it.
+        kv_prefill_params = self._pd_kv_params.pop(req_id, None) or {}
 
         decode_kv_params: dict[str, Any] = {
             "transfer_id": f"xfer-{req_id}",
@@ -2439,6 +2432,14 @@ class Orchestrator:
         decode_kv_params["do_remote_decode"] = False
         if not decode_kv_params.get("transfer_id"):
             decode_kv_params["transfer_id"] = f"xfer-{req_id}"
+
+        missing = [
+            key for key in ("remote_engine_id", "remote_bootstrap_addr", "transfer_id") if not decode_kv_params.get(key)
+        ]
+        if missing:
+            raise RuntimeError(
+                f"[Orchestrator][PD] Missing decode kv_transfer_params fields for req={req_id}: {', '.join(missing)}"
+            )
 
         sp.extra_args["kv_transfer_params"] = decode_kv_params
 

@@ -669,8 +669,6 @@ async def test_pd_decode_replays_processed_prefill_prompt(orchestrator_factory) 
         assert req_state.prompt is original_prompt
         assert req_state.pd_prefill_prompt is processed_prompt
 
-        # Current Mooncake routing supplies this connector metadata separately.
-        orchestrator._pd_kv_params["req-pd-replay"] = {"connector_field": "prefill-metadata"}
         await orchestrator._forward_to_next_stage_unguarded(
             "req-pd-replay",
             0,
@@ -691,7 +689,6 @@ async def test_pd_decode_replays_processed_prefill_prompt(orchestrator_factory) 
             "transfer_id": "xfer-req-pd-replay",
             "remote_bootstrap_addr": "127.0.0.1:25201",
             "remote_engine_id": "prefill-engine-0",
-            "connector_field": "prefill-metadata",
             "do_remote_prefill": True,
             "do_remote_decode": False,
         }
