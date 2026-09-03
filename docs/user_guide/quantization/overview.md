@@ -11,7 +11,7 @@ For the internal architecture and backend extension points, see the
 ## Quantization Modes
 
 | Mode | Guide | Description | Methods |
-|------|-------|-------------|---------|
+| ------ | ------- | ------------- | --------- |
 | Online quantization | [Online Quantization](online.md) | vLLM-Omni computes quantized weights and scales while loading the model. | FP8 W8A8, Int8 W8A8, BitsAndBytes W4, MXFP8 W8A8, MXFP4 W4A4 |
 | Runtime attention quantization | [Quantized KV Cache](quantized_kvcache.md) | vLLM-Omni dynamically quantizes eligible diffusion Flash Attention tensors during inference. | FP8 FA |
 | Pre-quantized checkpoints | Method-specific guides | The checkpoint or an offline quantizer provides quantized weights and scales before serving. | ModelOpt, AutoRound, msModelSlim, serialized Int8, offline MXFP8, offline MXFP4 DualScale |
@@ -19,7 +19,7 @@ For the internal architecture and backend extension points, see the
 ## Hardware Support
 
 | Device | FP8 W8A8 | Int8 W8A8 | BitsAndBytes W4 | ModelOpt | MXFP8 W8A8 | MXFP4 W4A4 | AutoRound | msModelSlim |
-|--------|----------|-----------|------------------|----------|------------|------------|-----------|-------------|
+| -------- | ---------- | ----------- | ------------------ | ---------- | ------------ | ------------ | ----------- | ------------- |
 | NVIDIA Blackwell GPU (SM 100+) | ✅ | ✅ | ✅ | ✅ | ⭕ | ⭕ | ✅ | ❌ |
 | NVIDIA Ada/Hopper GPU (SM 89+) | ✅ | ✅ | ✅ | ✅ | ⭕ | ⭕ | ✅ | ❌ |
 | NVIDIA Ampere GPU (SM 80+) | ✅ | ✅ | ✅ | ⭕ | ⭕ | ⭕ | ✅ | ❌ |
@@ -40,7 +40,7 @@ encoder, and VAE stay on the base checkpoint unless a method guide says
 otherwise.
 
 | Method | Guide | Mode | Example models | Status |
-|--------|-------|------|----------------|--------|
+| -------- | ------- | ------ | ---------------- | -------- |
 | FP8 W8A8 | [FP8](fp8.md) | Online W8A8 or checkpoint FP8 | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image family and other DiT models |
 | Int8 W8A8 | [Int8](int8.md) | Online or serialized W8A8 | Qwen-Image; Wan2.2 is not validated | Validated for Qwen-Image and Z-Image |
 | BitsAndBytes W4 | [BitsAndBytes](bitsandbytes.md) | Online W4 weight-only | Z-Image-Turbo; Qwen-Image/Wan2.2 not validated | Validated for Z-Image-Turbo |
@@ -58,7 +58,7 @@ checkpoint contains a supported `quantization_config`; the non-AR stages stay
 in BF16 unless the model guide explicitly adds support.
 
 | Method | Guide | Scope | Example models | Status |
-|--------|-------|-------|----------------|--------|
+| -------- | ------- | ------- | ---------------- | -------- |
 | ModelOpt | [ModelOpt](modelopt.md) | Thinker or language-model checkpoint config | Qwen3-Omni thinker | ModelOpt checkpoint path |
 | Int8 | [Int8](int8.md) | Not currently validated for omni/TTS stages | Qwen3-Omni, Qwen3-TTS | Not validated |
 | BitsAndBytes | [BitsAndBytes](bitsandbytes.md) | Not currently validated for omni/TTS stages | Qwen3-Omni, Qwen3-TTS | Not validated |
@@ -73,8 +73,8 @@ These models split generation across multiple stages. Quantization must be
 attached to the intended stage rather than applied globally.
 
 | Method | Guide | Scope | Example models | Status |
-|--------|-------|-------|----------------|--------|
-| FP8 | [FP8](fp8.md) | Stage-specific DiT or transformer module | BAGEL, GLM-Image | Requires model-specific validation |
+| -------- | ------- | ------- | ---------------- | -------- |
+| FP8 | [FP8](fp8.md) | Diffusion-stage MoT / DiT module | BAGEL, GLM-Image | BAGEL online FP8 validated; GLM-Image still needs model-specific validation |
 | Int8 | [Int8](int8.md) | Stage-specific DiT or transformer module | BAGEL, GLM-Image | Requires model-specific validation |
 | BitsAndBytes | [BitsAndBytes](bitsandbytes.md) | Stage-specific transformer or DiT module | BAGEL, GLM-Image | Not validated |
 | ModelOpt | [ModelOpt](modelopt.md) | Checkpoint-defined diffusion stage | BAGEL, GLM-Image | Requires model-specific validation |
@@ -105,7 +105,7 @@ config = build_quant_config({
 ```
 
 | Component | Default quantized? | Notes |
-|-----------|--------------------|-------|
+| ----------- | -------------------- | ------- |
 | Diffusion transformer | Yes | Primary target for FP8, Int8, BitsAndBytes, ModelOpt, MXFP8, MXFP4, AutoRound, and msModelSlim |
 | Text encoder | No | Keep BF16 unless a method-specific guide documents support |
 | VAE | No | Keep BF16; storage-only paths are method-specific |
@@ -114,7 +114,7 @@ config = build_quant_config({
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 
 | Component | Default quantized? | Notes |
-|-----------|--------------------|-------|
+| ----------- | -------------------- | ------- |
 | Thinker or AR language model | Yes, when checkpoint config is supported | ModelOpt FP8/NVFP4 or AutoRound checkpoint config |
 | Audio encoder | No | BF16 |
 | Vision encoder | No | BF16 |
@@ -124,7 +124,7 @@ config = build_quant_config({
 ### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
 
 | Component | Default quantized? | Notes |
-|-----------|--------------------|-------|
+| ----------- | -------------------- | ------- |
 | Selected diffusion or transformer stage | Method-specific | Must be routed to the intended stage |
 | Other generation stages | No | Keep BF16 unless separately validated |
 | VAE, tokenizer, scheduler | No | Loaded from the base checkpoint |
@@ -204,7 +204,7 @@ The output JSON includes `output_metrics`, `reference_generation`, and
 `candidate_generation`.
 
 | Metric | Direction | Meaning |
-|--------|-----------|---------|
+| -------- | ----------- | --------- |
 | `cosine_similarity` | Higher is better | Vector direction similarity between output pixels or frames. Useful as a broad sanity check. |
 | `mae` | Lower is better | Mean absolute pixel or frame error. For decoded outputs, values are in uint8 pixel units. |
 | `mse` / `rmse` | Lower is better | Squared error and its square root. These penalize localized large differences more than `mae`. |
@@ -217,7 +217,7 @@ The output JSON includes `output_metrics`, `reference_generation`, and
 Recommended starting thresholds for same-seed diffusion comparisons:
 
 | Metric | Smoke threshold | Stricter target | Notes |
-|--------|-----------------|-----------------|-------|
+| -------- | ----------------- | ----------------- | ------- |
 | `psnr_db` | `>= 20.0` | `>= 25.0` | Good for quick image or frame regression checks. |
 | `mae` | `<= 12.0` | `<= 6.0` | Interpreted in decoded uint8 pixel units. |
 | `cosine_similarity` | `>= 0.98` | `>= 0.995` | Less sensitive to global scale than L2-style metrics. |

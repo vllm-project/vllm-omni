@@ -246,3 +246,35 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT \
 
 Use the online curl request from the `1x A100 80GB` section to verify that the
 server returns an image.
+
+## Online FP8 (diffusion stage)
+
+BAGEL online FP8 quantizes the diffusion-stage MoT transformer and connector.
+Stage-0 Thinker stays BF16. Prefer the diffusion-scoped flag:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model ByteDance-Seed/BAGEL-7B-MoT \
+  --deploy-config vllm_omni/deploy/bagel.yaml \
+  --quantization fp8 \
+  --prompt "A beautiful sunset over mountains" \
+  --height 512 \
+  --width 512 \
+  --num-inference-steps 25 \
+  --seed 42 \
+  --extra-body '{"cfg_text_scale": 4.0, "cfg_img_scale": 1.5}' \
+  --output /tmp/bagel_fp8.png
+```
+
+```python
+from vllm_omni import Omni
+
+omni = Omni(
+    model="ByteDance-Seed/BAGEL-7B-MoT",
+    diffusion_quantization_config="fp8",
+)
+```
+
+On Ampere GPUs, FP8 may use a weight-only / Marlin path that reduces memory
+without Hopper-class Tensor Core speedups. Compare quality against BF16 with
+the same prompt, seed, and step count before relying on the quantized path.

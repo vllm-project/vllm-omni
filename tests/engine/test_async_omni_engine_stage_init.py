@@ -1364,6 +1364,40 @@ def test_resolve_stage_configs_does_not_inject_diffusion_attention_into_llm_stag
     assert not hasattr(stage_configs[0].engine_args, "diffusion_attention_config")
 
 
+def test_resolve_bagel_stage_configs_isolates_fp8_to_diffusion_stage(monkeypatch):
+    import vllm_omni.engine.async_omni_engine as engine_mod
+
+    engine = object.__new__(AsyncOmniEngine)
+    thinker_stage = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args=types.SimpleNamespace(enable_sleep_mode=None),
+    )
+    dit_stage = types.SimpleNamespace(
+        stage_id=1,
+        stage_type="diffusion",
+        engine_args=types.SimpleNamespace(
+            enable_sleep_mode=None,
+            quantization_config=None,
+        ),
+    )
+
+    monkeypatch.setattr(
+        engine_mod,
+        "load_and_resolve_stage_configs",
+        lambda *args, **kwargs: ("bagel.yaml", [thinker_stage, dit_stage], None),
+    )
+
+    _config_path, stage_configs = engine._resolve_stage_configs(
+        model="ByteDance-Seed/BAGEL-7B-MoT",
+        kwargs={"diffusion_quantization_config": "fp8"},
+        trust_remote_code=True,
+    )
+
+    assert not hasattr(stage_configs[0].engine_args, "quantization_config")
+    assert stage_configs[1].engine_args.quantization_config == "fp8"
+
+
 def test_extract_legacy_stage_metadata_rocm_does_not_inject_diffusion_attention(monkeypatch):
     """ROCm default attention logic only applies to LLM stages, not diffusion."""
     from vllm_omni.engine.stage_init_utils import extract_legacy_stage_metadata
