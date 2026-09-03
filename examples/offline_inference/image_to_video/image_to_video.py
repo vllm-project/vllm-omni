@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Image-to-Video generation example using Wan2.2 I2V/TI2V models, LTX2/LTX-2.3,
@@ -109,6 +109,13 @@ def build_image_to_video_prompt(
     if negative_prompt is not None:
         result["negative_prompt"] = negative_prompt
     return result
+
+
+def _validate_video_output_type(output_type: str) -> None:
+    if output_type not in {"image", "video"}:
+        raise ValueError(
+            f"Unexpected output type '{output_type}', expected 'video' or legacy 'image' for video generation."
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -665,10 +672,7 @@ def main():
         frames = frames[0] if frames else None
 
     if isinstance(frames, OmniRequestOutput):
-        if frames.final_output_type != "image":
-            raise ValueError(
-                f"Unexpected output type '{frames.final_output_type}', expected 'image' for video generation."
-            )
+        _validate_video_output_type(frames.final_output_type)
         if frames.multimodal_output and "audio" in frames.multimodal_output:
             audio = frames.multimodal_output["audio"]
             audio_sample_rate = frames.multimodal_output.get("audio_sample_rate", audio_sample_rate)

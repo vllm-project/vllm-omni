@@ -28,6 +28,7 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.experimental.fullduplex.engine.intermediate import get_tts_handoff
+from vllm_omni.model_executor.models.minicpmo_4_5 import MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -46,7 +47,7 @@ _OFFLINE_CODEC_MAX_NEW_TOKENS = 2048
 # 25 codec frames (``codec_chunk_frames``) plus the terminating sample.
 # Without this, the single-vocab Sampler keeps the stage-1 request alive
 # until codec EOS / 4096 and Thinker never starts the next model turn.
-_DUPLEX_CODEC_TOKENS_PER_CHUNK = 26
+_DUPLEX_CODEC_TOKENS_PER_CHUNK = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
 
 
 def _native_duplex_chunk_budget(meta: Mapping[str, Any] | None) -> tuple[int, int]:
@@ -158,6 +159,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._pending_force_eos_rows: list[bool] | None = None
         self._penalty_histories: list[torch.Tensor] | None = None
         self._request_audio_states: dict[str, dict[str, Any]] = {}
+        # Mirrors upstream TTSStreamingGenerator._chunk_info: one committed
+        # condition plus, during a rollover, one immutable recompute recipe.
+        self._request_condition_states: dict[str, dict[str, Any]] = {}
         self._deferred_cleanup_ids: set[str] = set()
 
         tts_config = getattr(config, "tts_config", None)
@@ -262,6 +266,116 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             return torch.cat([condition, audio_bos], dim=0)
         return torch.cat([condition, self._boundary_embeddings()], dim=0)
 
+    def _build_streaming_recompute_embeddings(
+        self,
+        current_condition: torch.Tensor,
+        *,
+        request_id: str,
+        info_dict: Mapping[str, Any],
+        meta: Mapping[str, Any],
+    ) -> torch.Tensor:
+        """Return the official one-previous-chunk sliding-recompute window."""
+        condition_seq = meta.get("streaming_condition_seq")
+        if not isinstance(condition_seq, int) or isinstance(condition_seq, bool):
+            if meta.get("streaming_prompt_recompute") is True:
+                raise ValueError("streaming prompt recompute is missing streaming_condition_seq")
+            # Direct model tests and non-connector callers do not participate in
+            # the persistent async-chunk lifecycle, so they need no window state.
+            return current_condition
+
+        turn_start = bool(meta.get("turn_start"))
+        recompute = meta.get("streaming_prompt_recompute") is True
+        states = self._request_condition_states
+        state = states.get(request_id)
+        if turn_start:
+            if recompute:
+                raise ValueError("streaming prompt recompute cannot cross a native duplex turn boundary")
+            states[request_id] = {
+                "condition_seq": condition_seq,
+                "condition": current_condition.detach().clone(),
+                "base_recent_codes": (),
+            }
+            return current_condition
+
+        if state is None:
+            if recompute:
+                raise ValueError("streaming prompt recompute is missing the previous Talker condition")
+            states[request_id] = {
+                "condition_seq": condition_seq,
+                "condition": current_condition.detach().clone(),
+                "base_recent_codes": (),
+            }
+            return current_condition
+
+        previous_seq = state.get("condition_seq")
+        if not isinstance(previous_seq, int) or condition_seq < previous_seq:
+            raise ValueError(
+                f"stale native duplex Talker condition sequence: current={condition_seq}, previous={previous_seq}"
+            )
+        if condition_seq > previous_seq + 1:
+            raise ValueError(
+                f"native duplex Talker skipped a condition sequence: current={condition_seq}, previous={previous_seq}"
+            )
+
+        if not recompute:
+            if condition_seq > previous_seq:
+                raise ValueError(
+                    "a native duplex Talker condition advanced without its streaming recompute marker: "
+                    f"current={condition_seq}, previous={previous_seq}"
+                )
+            if "active_embeddings" in state:
+                raise ValueError("an active streaming recompute was replayed without its recompute marker")
+            return current_condition
+
+        if condition_seq == previous_seq:
+            active_embeddings = state.get("active_embeddings")
+            if not isinstance(active_embeddings, torch.Tensor):
+                raise ValueError("streaming prompt window lost its cached recompute embeddings")
+            return active_embeddings
+
+        if condition_seq != previous_seq + 1:
+            raise ValueError(
+                "streaming prompt recompute skipped a Talker condition: "
+                f"previous={previous_seq}, current={condition_seq}"
+            )
+
+        previous_condition = state.get("condition")
+        if not isinstance(previous_condition, torch.Tensor):
+            raise ValueError("streaming prompt recompute lost the previous Talker condition")
+
+        ids = info_dict.get("ids")
+        previous_codes = ids.get("streaming_prompt_previous_codes") if isinstance(ids, Mapping) else None
+        if isinstance(previous_codes, torch.Tensor):
+            code_ids = previous_codes.to(device=self.emb_code[0].weight.device, dtype=torch.long).reshape(-1)
+        elif isinstance(previous_codes, (list, tuple)):
+            code_ids = torch.as_tensor(previous_codes, device=self.emb_code[0].weight.device, dtype=torch.long)
+        else:
+            raise ValueError("streaming prompt recompute is missing confirmed codec ids")
+        if code_ids.numel() > _DUPLEX_CODEC_TOKENS_PER_CHUNK - 1:
+            raise ValueError(f"streaming prompt recompute has too many codec ids: {code_ids.numel()}")
+        if code_ids.numel() and bool(((code_ids < 0) | (code_ids >= self._codec_eos_id)).any()):
+            raise ValueError("streaming prompt recompute codec ids include an invalid or terminal token")
+
+        parts = [previous_condition]
+        if code_ids.numel():
+            parts.append(self.emb_code[0](code_ids))
+        parts.append(current_condition)
+        full_embeddings = torch.cat(parts, dim=0)
+        previous_code_ids = tuple(int(code_id) for code_id in code_ids.tolist())
+        previous_base_codes = state.get("base_recent_codes")
+        if not isinstance(previous_base_codes, tuple):
+            raise ValueError("streaming Talker condition lost its frozen codec history")
+        states[request_id] = {
+            "condition_seq": condition_seq,
+            "condition": current_condition.detach().clone(),
+            "active_embeddings": full_embeddings.detach().clone(),
+            # Official generate_with_buffer keeps all_generated_tokens across
+            # sliding recomputes, so the first sample in this chunk still sees
+            # the previous chunk's repetition-penalty window.
+            "base_recent_codes": (*previous_base_codes, *previous_code_ids)[-_CODEC_PENALTY_WINDOW:],
+        }
+        return full_embeddings
+
     def preprocess(
         self,
         input_ids: torch.Tensor,
@@ -274,6 +388,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         is_prefill = bool(info_dict.get("_omni_is_prefill", False))
         state = info_dict.get("audio_state")
         first_call = not isinstance(state, dict)
+        request_id = str(info_dict.get("request_id", "0"))
 
         if is_prefill or first_call:
             token_ids, hidden_states = get_tts_handoff(info_dict)
@@ -309,13 +424,35 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 hidden_states,
                 native_duplex=native_duplex,
             )
+            if native_duplex:
+                full_embeds = self._build_streaming_recompute_embeddings(
+                    full_embeds,
+                    request_id=request_id,
+                    info_dict=info_dict,
+                    meta=meta if isinstance(meta, Mapping) else {},
+                )
+            retained_codes: list[int] = []
+            condition_seq = meta.get("streaming_condition_seq") if isinstance(meta, Mapping) else None
+            if native_duplex and isinstance(condition_seq, int) and not isinstance(condition_seq, bool):
+                condition_state = self._request_condition_states.get(request_id)
+                base_recent_codes = (
+                    condition_state.get("base_recent_codes") if isinstance(condition_state, dict) else None
+                )
+                if not isinstance(base_recent_codes, tuple):
+                    raise ValueError("streaming Talker condition lost its frozen codec history")
+                retained_codes = list(base_recent_codes)
             offset = int(info_dict.get("_omni_num_computed_tokens", 0))
-            request_id = str(info_dict.get("request_id", "0"))
             # The handoff rebuilds only the tail-aligned Talker condition.
             # Materialize zero-token embeddings for any scheduler prompt
             # prefix so chunked prefill can slice from a non-zero offset.
             prompt_len = info_dict.get("_omni_prompt_len")
             target_len = int(prompt_len) if prompt_len is not None else offset + span_len
+            if native_duplex and isinstance(meta, Mapping) and meta.get("streaming_prompt_recompute") is True:
+                if target_len != full_embeds.shape[0]:
+                    raise ValueError(
+                        "streaming prompt recompute length mismatch: "
+                        f"scheduler={target_len}, model={full_embeds.shape[0]}"
+                    )
             prefix_len = target_len - full_embeds.shape[0]
             if prefix_len > 0:
                 placeholder_ids = torch.zeros(
@@ -348,6 +485,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 "max_tokens": max_tokens,
                 "min_tokens": min_tokens,
             }
+            if retained_codes:
+                state["recent_codes"] = retained_codes
             request_states = getattr(self, "_request_audio_states", None)
             if request_states is None:
                 request_states = {}
@@ -365,7 +504,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 },
             )
 
-        request_id = str(info_dict.get("request_id", "0"))
         stored = self._request_audio_states.get(request_id)
         if isinstance(stored, dict):
             state = stored
@@ -533,8 +671,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
     def _flush_deferred_cleanup(self) -> None:
         request_audio_states = getattr(self, "_request_audio_states", {})
+        request_condition_states = getattr(self, "_request_condition_states", {})
         for request_id in self._deferred_cleanup_ids:
             request_audio_states.pop(request_id, None)
+            request_condition_states.pop(request_id, None)
         self._deferred_cleanup_ids.clear()
 
     def _dummy_hidden_states(

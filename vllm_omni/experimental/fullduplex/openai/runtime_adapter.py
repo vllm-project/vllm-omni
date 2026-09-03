@@ -124,6 +124,7 @@ class ServingRuntimeAdapter(Protocol):
     clean_response_done_prefix: str
     interrupted_tts_prefix: str
     private_runtime_config_keys: frozenset[str]
+    collect_outputs_on_append: bool
 
     def create_session_state(self) -> ServingRuntimeSessionState: ...
 

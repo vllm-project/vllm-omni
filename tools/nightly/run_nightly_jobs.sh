@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Extract steps from .buildkite/cuda/test-nightly.yml that contain pytest, synthesize
 # small bash wrappers (exports + pytest), run them, and tee output to logs named
@@ -259,7 +259,7 @@ _nightly_log_dir_basename() {
 
 BUILDKITE_REL=".buildkite/cuda/test-nightly.yml"
 
-_find_repo_containing_nightly() {
+_find_repo_containing_yml() {
   local dir="${1:-}"
   [[ -n "$dir" ]] || return 1
   dir="$(cd "$dir" && pwd)" || return 1
@@ -307,10 +307,10 @@ else
     REPO_ROOT="$(git -C "${PWD}" rev-parse --show-toplevel 2>/dev/null || true)"
   fi
   if [[ -z "${REPO_ROOT}" ]]; then
-    REPO_ROOT="$(_find_repo_containing_nightly "${PWD}" || true)"
+    REPO_ROOT="$(_find_repo_containing_yml "${PWD}" || true)"
   fi
   if [[ -z "${REPO_ROOT}" ]]; then
-    REPO_ROOT="$(_find_repo_containing_nightly "${SCRIPT_DIR}" || true)"
+    REPO_ROOT="$(_find_repo_containing_yml "${SCRIPT_DIR}" || true)"
   fi
   if [[ -z "${REPO_ROOT}" ]]; then
     echo "Could not locate ${BUILDKITE_REL}. Set REPO_ROOT or YML, run from inside the vllm-omni clone," >&2
@@ -326,7 +326,7 @@ fi
 
 echo "Log directory: ${LOG_DIR}" >&2
 
-# Require nightly YAML only when at least one non-stability test kind needs it (validated in Python too).
+# Require test-nightly.yml only when at least one non-stability test kind needs it (validated in Python too).
 _needs_nightly_yml=0
 IFS=',' read -ra _TTOK <<< "${TEST_TYPE}"
 for _t in "${_TTOK[@]}"; do
@@ -971,7 +971,6 @@ PERF_RESULTS_SRC="${REPO_ROOT}/tests/dfx/perf/results"
 # Copy perf benchmark JSON written under tests/dfx/perf/results/ during this run into LOG_DIR.
 _collect_perf_result_jsons() {
   local since_epoch="${1:?}"
-  local dest="${LOG_DIR}/perf_results"
 
   if [[ ! -d "${PERF_RESULTS_SRC}" ]]; then
     return 0
