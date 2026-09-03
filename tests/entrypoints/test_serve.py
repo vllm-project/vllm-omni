@@ -190,14 +190,15 @@ def test_parse_stage_overrides_rejects_non_dict_top_level() -> None:
 
 
 def test_parse_stage_overrides_rejects_non_integer_stage_id() -> None:
-    """Stage-id keys must be non-negative integer strings. Letters, signs,
-    floats, and integer (non-string) keys all fail. ``str.isdigit()`` is the
-    minimal check: it rejects ``"-1"``, ``"abc"``, ``"1.5"``, and bare ``1``.
+    """Stage-id keys must be non-negative ASCII integer strings. Letters,
+    signs, floats, Unicode digit classes, and integer (non-string) keys all
+    fail. ``str.isdigit() and str.isascii()`` is the minimal check: it
+    rejects ``"-1"``, ``"abc"``, ``"1.5"``, fullwidth ``"０"``, and bare ``1``.
 
     Note: ``json.loads`` normalizes integer object keys (``{"1": {}}``) into
     the string ``"1"`` and would pass our digit check, so the integer-key case
     is exercised via the already-parsed-dict code path (``parse_stage_overrides({1: {}})``)."""
-    bad_string_keys = ('"abc"', '"-1"', '"1.5"')
+    bad_string_keys = ('"abc"', '"-1"', '"1.5"', '"\uFF10"')
     for bad_key in bad_string_keys:
         with pytest.raises(ValueError, match="non-negative integer stage ids"):
             parse_stage_overrides("{" + bad_key + ": {}}")
@@ -208,33 +209,23 @@ def test_parse_stage_overrides_rejects_non_integer_stage_id() -> None:
 
 
 def test_parse_stage_overrides_accepts_stage_merge_extras_and_engine_args() -> None:
-    """Stage overrides carry three classes of keys that the parser must not
-    reject, even though they are not all modeled on ``StageDeployConfig``:
+    """Three classes of keys pass through the shape-only parser:
 
     - ``extras`` is read by the default-diffusion fallback
-      (``async_omni_engine.py``) for the unregistered-pipeline path.
-      Recipes such as LTX-2.5 ship it as
-      ``--stage-overrides '{"0":{"extras":{...}}}'``. Registered pipelines
-      carry their ``extras`` on ``StagePipelineConfig.extras`` directly,
-      not via ``--stage-overrides``.
-    - Engine arguments (``kv_cache_dtype``, ``seed``, ``swap_space``,
-      ``block_size``, ``stage_connector_spec``, ...) are forwarded verbatim
-      as ``stage_<id>_<key>`` by ``load_stage_configs_from_model`` and
-      applied to the stage's engine args via ``OmniEngineArgs``. An
-      allowlist here would duplicate the vLLM ``EngineArgs`` contract and
-      miss any new field on day one.
-    - ``typo_field_xyz`` is intentionally NOT on ``OmniEngineArgs``. It
-      parses through here because the parser is shape-only, then gets
-      dropped with a warning at ``filter_dataclass_kwargs`` (see
-      ``tests/entrypoints/test_utils.py::test_filter_dataclass_kwargs_warns_on_unknown_drop``).
-      The trade-off: a typo at the CLI is loud (warning logged once per
-      stage init) rather than silently misapplied, but the parser does
-      not preemptively reject unknown future engine args.
+      (``async_omni_engine.py``); registered pipelines carry it on
+      ``StagePipelineConfig.extras`` directly.
+    - Engine arguments (``kv_cache_dtype``, ``stage_connector_spec``, ...)
+      are forwarded as ``stage_<id>_<key>`` and applied via
+      ``OmniEngineArgs``.
+    - Unknown keys parse through and are dropped with a warning at
+      ``filter_dataclass_kwargs`` (see
+      ``tests/entrypoints/test_utils.py::TestFilterDataclassKwargs``).
+
+    ``typo_field_xyz`` in the payload exercises the third case.
     """
     parsed = parse_stage_overrides(
         '{"0": {"extras": {"ltx2_use_conv_vae": true},'
-        ' "kv_cache_dtype": "fp8", "seed": 42, "swap_space": 4,'
-        ' "block_size": 16,'
+        ' "kv_cache_dtype": "fp8", "seed": 42,'
         ' "stage_connector_spec": {"name": "SharedMemoryConnector", "extra": {}},'
         ' "typo_field_xyz": 1}}'
     )
@@ -243,8 +234,6 @@ def test_parse_stage_overrides_accepts_stage_merge_extras_and_engine_args() -> N
             "extras": {"ltx2_use_conv_vae": True},
             "kv_cache_dtype": "fp8",
             "seed": 42,
-            "swap_space": 4,
-            "block_size": 16,
             "stage_connector_spec": {"name": "SharedMemoryConnector", "extra": {}},
             "typo_field_xyz": 1,
         },

@@ -547,27 +547,24 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
     Only the **shape** of the override mapping is validated here:
 
     - top-level must be a dict
-    - keys must be non-negative integer strings (stage ids)
+    - keys must be non-negative ASCII integer strings (stage ids)
     - values must be dicts
 
     Field-name / type / range validation is intentionally not done at this
     layer. The downstream resolver forwards every surviving key as
     ``stage_<id>_<key>`` into ``cli_overrides`` (see
-    ``load_stage_configs_from_model``). Field semantics live in
-    ``StageConfigFactory`` for the registered-pipeline path; the
+    ``load_stage_configs_from_model``); field semantics live in
+    ``StageConfigFactory`` for registered pipelines, and the
     default-diffusion fallback in ``async_omni_engine.py`` reads
-    ``stage_zero_overrides["extras"]`` for the unregistered path.
-    Unknown engine-arg keys that don't match ``OmniEngineArgs`` are
-    dropped with a warning at ``filter_dataclass_kwargs`` (see
-    ``stage_init_utils.py``) rather than failing at parse time, so
-    a user typo surfaces in the log instead of being silently lost.
-    Listing an allowlist here would duplicate the engine-arg contract
-    and miss new fields on day one.
+    ``stage_zero_overrides["extras"]`` for unregistered ones. Unknown
+    engine-arg keys that don't match ``OmniEngineArgs`` are dropped with
+    a warning at ``filter_dataclass_kwargs`` rather than failing here,
+    so a typo surfaces in the log instead of being silently lost.
 
     Raises:
-        ValueError: when ``value`` is a string that is not valid JSON, or when
-            the parsed shape is not a valid per-stage override mapping
-            (non-dict top level, non-integer stage id, non-dict value).
+        ValueError: when ``value`` is not a valid per-stage override
+            mapping (invalid JSON, non-dict top level, non-ASCII-digit
+            stage id, non-dict value).
     """
     if not value:
         return None
@@ -588,7 +585,12 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
         return None
 
     for stage_id_str, overrides in parsed.items():
-        if not isinstance(stage_id_str, str) or not stage_id_str.isdigit():
+        # ``str.isdigit()`` accepts Unicode digit classes (e.g. fullwidth
+        # ``"０"``); downstream's ``_STAGE_OVERRIDE_PATTERN`` is ASCII-only
+        # (``^stage_(\d+)_(.+)$``), so a non-ASCII-digit key would parse
+        # here and silently misroute as a global key. ``isascii()`` closes
+        # that hole.
+        if not isinstance(stage_id_str, str) or not stage_id_str.isdigit() or not stage_id_str.isascii():
             raise ValueError(
                 f"--stage-overrides keys must be non-negative integer stage ids (as strings), got {stage_id_str!r}"
             )
