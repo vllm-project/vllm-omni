@@ -198,7 +198,7 @@ def test_parse_stage_overrides_rejects_non_integer_stage_id() -> None:
     Note: ``json.loads`` normalizes integer object keys (``{"1": {}}``) into
     the string ``"1"`` and would pass our digit check, so the integer-key case
     is exercised via the already-parsed-dict code path (``parse_stage_overrides({1: {}})``)."""
-    bad_string_keys = ('"abc"', '"-1"', '"1.5"', '"\uFF10"')
+    bad_string_keys = ('"abc"', '"-1"', '"1.5"', '"\uff10"')
     for bad_key in bad_string_keys:
         with pytest.raises(ValueError, match="non-negative integer stage ids"):
             parse_stage_overrides("{" + bad_key + ": {}}")

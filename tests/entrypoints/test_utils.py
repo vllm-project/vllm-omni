@@ -276,10 +276,9 @@ class TestFilterDataclassKwargs:
         assert "stage_id" in result
         assert "engine_output_type" in result
         assert "unknown_field" not in result
-        assert any(
-            rec.levelno == logging.WARNING and "unknown_field" in rec.message
-            for rec in caplog.records
-        ), f"expected WARNING naming 'unknown_field'; got {[r.message for r in caplog.records]}"
+        assert any(rec.levelno == logging.WARNING and "unknown_field" in rec.message for rec in caplog.records), (
+            f"expected WARNING naming 'unknown_field'; got {[r.message for r in caplog.records]}"
+        )
 
     def test_filters_omni_diffusion_config_union_dataclass(self):
         """Test that OmniDiffusionConfig filters nested dataclass in Union fields."""
