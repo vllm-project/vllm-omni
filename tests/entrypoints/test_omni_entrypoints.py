@@ -21,6 +21,7 @@ from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.entrypoints.omni_base import OmniBase, OmniEngineDeadError
 from vllm_omni.errors import (
     OmniClientError,
+    OmniServerError,
     client_error_from_metadata,
     client_error_metadata,
     is_client_error_status,
@@ -964,6 +965,22 @@ def test_non_fatal_non_4xx_status_raises_runtime(status_code: int | None):
 
     assert not isinstance(exc_info.value, OmniClientError)
     assert str(exc_info.value) == "server side failure"
+
+
+def test_non_fatal_gateway_timeout_preserves_request_status():
+    base = _make_base()
+    msg = ErrorMessage(
+        error="CFG companion deadline exceeded",
+        status_code=504,
+        error_type="GatewayTimeoutError",
+    )
+
+    with pytest.raises(OmniServerError) as exc_info:
+        base._handle_output_message(msg)
+
+    assert exc_info.value.status_code == 504
+    assert exc_info.value.error_type == "GatewayTimeoutError"
+    assert str(exc_info.value) == "CFG companion deadline exceeded"
 
 
 def _make_enqueue_client_error(

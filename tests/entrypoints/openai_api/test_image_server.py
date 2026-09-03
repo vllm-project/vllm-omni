@@ -30,7 +30,7 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
     parse_size,
 )
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
-from vllm_omni.errors import GuardrailViolationError
+from vllm_omni.errors import GuardrailViolationError, OmniServerError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -625,6 +625,29 @@ def test_generate_images_guardrail_error_returns_400(test_client, mock_async_dif
     )
     assert response.status_code == 400
     assert response.json()["detail"] == "Input was blocked by Cosmos3 guardrails."
+
+
+def test_generate_images_request_timeout_returns_504(test_client, mock_async_diffusion):
+    async def timed_out_generate(**kwargs):
+        raise OmniServerError(
+            "CFG companion deadline exceeded",
+            status_code=504,
+            error_type="GatewayTimeoutError",
+        )
+        yield MockGenerationResult([])  # pragma: no cover
+
+    mock_async_diffusion.generate = timed_out_generate
+    response = test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "n": 1,
+            "size": "1024x1024",
+        },
+    )
+
+    assert response.status_code == 504
+    assert response.json()["detail"] == "CFG companion deadline exceeded"
 
 
 def test_generate_images_async_omni_sampling_params(async_omni_test_client):
