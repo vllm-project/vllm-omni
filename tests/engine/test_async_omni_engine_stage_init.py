@@ -1,13 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import concurrent.futures
 import contextlib
 import importlib
+import json
 import os
 import time
 import types
 
 import pytest
 
-from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, normalize_omni_diffusion_kwargs
 from vllm_omni.engine import async_omni_engine as async_omni_engine_module
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_init_utils import (
@@ -168,7 +172,6 @@ def _make_stage_runtime() -> StageRuntime:
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -192,7 +195,6 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_to_runtime(monkeyp
     engine.model = "dummy-model"
     engine.config_path = "dummy-config"
     engine.single_stage_mode = False
-    engine.diffusion_batch_size = 1
     engine.async_chunk = False
     engine.tokenizer = None
     engine._single_stage_id_filter = None
@@ -278,7 +280,6 @@ def test_build_logical_stage_init_plans_handles_stage_without_devices(monkeypatc
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -367,7 +368,6 @@ def test_initialize_local_diffusion_replica_restores_device_visibility_after_loc
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -395,16 +395,23 @@ def test_initialize_local_diffusion_replica_restores_device_visibility_after_loc
             os.environ[env_var] = old_env
 
 
-def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline_flag(monkeypatch):
+@pytest.mark.parametrize(
+    ("num_stages", "expected_inline"),
+    [(1, True), (2, False)],
+)
+def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline_flag(
+    monkeypatch,
+    num_stages,
+    expected_inline,
+):
     import vllm_omni.engine.stage_runtime as runtime_mod
     from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 
     runtime = StageRuntime(
-        stage_configs=[types.SimpleNamespace()],
+        stage_configs=[types.SimpleNamespace()] * num_stages,
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=4,
         async_chunk=False,
     )
 
@@ -417,7 +424,6 @@ def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline
     def _capture_launch_diffusion_stage_replica(**kwargs):
         captured["stage_id"] = kwargs["metadata"].stage_id
         captured["stage_init_timeout"] = kwargs["stage_init_timeout"]
-        captured["batch_size"] = kwargs["batch_size"]
         captured["use_inline"] = kwargs["use_inline"]
         captured["omni_master_server"] = kwargs["omni_master_server"]
         return types.SimpleNamespace(), StageReplicaResources()
@@ -429,10 +435,33 @@ def test_initialize_local_diffusion_replica_passes_stage_init_timeout_and_inline
     assert captured == {
         "stage_id": 0,
         "stage_init_timeout": 302,
-        "batch_size": 4,
-        "use_inline": True,
+        "use_inline": expected_inline,
         "omni_master_server": None,
     }
+
+
+def test_initialize_local_diffusion_replica_uses_explicit_inline_opt_in(monkeypatch):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+    from vllm_omni.engine.stage_engine_startup import StageReplicaResources
+
+    runtime = _make_stage_runtime()
+    plan = _make_diffusion_plan(0, stage_id=1).replicas[0]
+    plan.stage_cfg.engine_args["inline_diffusion"] = True
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(runtime_mod, "inject_kv_stage_info", lambda *_: None)
+    monkeypatch.setattr(
+        runtime_mod,
+        "launch_diffusion_stage_replica",
+        lambda **kwargs: (
+            captured.update(use_inline=kwargs["use_inline"]),
+            (types.SimpleNamespace(), StageReplicaResources()),
+        )[1],
+    )
+
+    runtime._initialize_local_diffusion_replica(plan, stage_init_timeout=1)
+
+    assert captured["use_inline"] is True
 
 
 def test_initialize_local_llm_replica_scopes_runtime_env(monkeypatch):
@@ -443,11 +472,16 @@ def test_initialize_local_llm_replica_scopes_runtime_env(monkeypatch):
     plan.engine_args_dict = {}
 
     runtime_env_var = "VLLM_OMNI_TEST_STAGE_RUNTIME_ENV"
+    runtime._init_visible_devices_baseline = "0"
     plan.metadata.runtime_cfg = {
         "devices": "0",
         "env": {runtime_env_var: "stage-value"},
     }
     monkeypatch.setenv(runtime_env_var, "parent-value")
+    # Pin the logical->physical device mapping so the assertion below is
+    # deterministic regardless of the ambient CUDA_VISIBLE_DEVICES (which on a
+    # rebase host can be e.g. "3,4", mapping logical device 0 -> physical 3).
+    runtime._init_visible_devices_baseline = "0"
 
     captured: dict[str, str | None] = {}
 
@@ -470,21 +504,20 @@ def test_initialize_local_llm_replica_scopes_runtime_env(monkeypatch):
     assert os.environ[runtime_env_var] == "parent-value"
 
 
-def test_initialize_diffusion_stage_applies_client_batch_size_to_engine(monkeypatch):
+def test_initialize_diffusion_stage_preserves_configured_max_num_seqs(monkeypatch):
     import vllm_omni.diffusion.stage_diffusion_client as client_mod
     import vllm_omni.engine.stage_init_utils as init_mod
 
-    od_config = types.SimpleNamespace(max_num_seqs=1)
+    od_config = types.SimpleNamespace(max_num_seqs=4)
     captured: dict[str, object] = {}
     monkeypatch.setattr(init_mod, "build_diffusion_config", lambda *args: od_config)
 
-    def _capture_client(model, config, metadata, stage_init_timeout, batch_size, use_inline):
+    def _capture_client(model, config, metadata, stage_init_timeout, use_inline):
         captured.update(
             model=model,
             config=config,
             metadata=metadata,
             stage_init_timeout=stage_init_timeout,
-            batch_size=batch_size,
             use_inline=use_inline,
         )
         return object()
@@ -498,7 +531,6 @@ def test_initialize_diffusion_stage_applies_client_batch_size_to_engine(monkeypa
         types.SimpleNamespace(),
         metadata,
         stage_init_timeout=12,
-        batch_size=4,
         use_inline=True,
     )
 
@@ -508,17 +540,16 @@ def test_initialize_diffusion_stage_applies_client_batch_size_to_engine(monkeypa
         "config": od_config,
         "metadata": metadata,
         "stage_init_timeout": 12,
-        "batch_size": 4,
         "use_inline": True,
     }
 
 
-def test_launch_diffusion_stage_replica_applies_batch_size_to_config(monkeypatch):
+def test_launch_diffusion_stage_replica_preserves_configured_max_num_seqs(monkeypatch):
     import vllm_omni.diffusion.stage_diffusion_client as client_mod
     import vllm_omni.diffusion.stage_diffusion_proc as proc_mod
     import vllm_omni.engine.stage_engine_startup as startup_mod
 
-    od_config = types.SimpleNamespace(max_num_seqs=1, parallel_config=types.SimpleNamespace(world_size=1))
+    od_config = types.SimpleNamespace(max_num_seqs=4, parallel_config=types.SimpleNamespace(world_size=1))
     monkeypatch.setattr(startup_mod, "build_diffusion_config", lambda *args: od_config)
     monkeypatch.setattr(startup_mod, "acquire_device_locks", lambda *args: [])
     monkeypatch.setattr(
@@ -555,7 +586,6 @@ def test_launch_diffusion_stage_replica_applies_batch_size_to_config(monkeypatch
         stage_config=types.SimpleNamespace(),
         metadata=types.SimpleNamespace(stage_id=0),
         stage_init_timeout=12,
-        batch_size=4,
         use_inline=False,
         omni_master_server=omni_master_server,
     )
@@ -563,6 +593,78 @@ def test_launch_diffusion_stage_replica_applies_batch_size_to_config(monkeypatch
     assert result is sentinel_client
     assert od_config.max_num_seqs == 4
     assert resources.manager is proc_manager
+
+
+def test_initialize_diffusion_stage_does_not_write_max_num_seqs(monkeypatch):
+    import vllm_omni.diffusion.stage_diffusion_client as client_mod
+    import vllm_omni.engine.stage_init_utils as init_mod
+
+    od_config = types.SimpleNamespace(max_num_seqs=8, step_execution=True)
+    monkeypatch.setattr(init_mod, "build_diffusion_config", lambda *args: od_config)
+    monkeypatch.setattr(client_mod, "create_diffusion_client", lambda *args: object())
+    metadata = _make_diffusion_metadata(0)
+
+    init_mod.initialize_diffusion_stage(
+        0,
+        "dummy-model",
+        types.SimpleNamespace(),
+        metadata,
+        stage_init_timeout=12,
+        use_inline=True,
+    )
+
+    assert od_config.max_num_seqs == 8
+
+
+def test_launch_diffusion_stage_replica_preserves_step_execution_max_num_seqs(monkeypatch):
+    import vllm_omni.diffusion.stage_diffusion_client as client_mod
+    import vllm_omni.diffusion.stage_diffusion_proc as proc_mod
+    import vllm_omni.engine.stage_engine_startup as startup_mod
+
+    od_config = types.SimpleNamespace(
+        max_num_seqs=8,
+        step_execution=True,
+        parallel_config=types.SimpleNamespace(world_size=1),
+    )
+    monkeypatch.setattr(startup_mod, "build_diffusion_config", lambda *args: od_config)
+    monkeypatch.setattr(startup_mod, "acquire_device_locks", lambda *args: [])
+    monkeypatch.setattr(
+        startup_mod,
+        "register_stage_with_omni_master",
+        lambda **kwargs: types.SimpleNamespace(
+            handshake_address="tcp://127.0.0.1:26001",
+            input_address="tcp://127.0.0.1:26002",
+            output_address="tcp://127.0.0.1:26003",
+        ),
+    )
+    omni_master_server = types.SimpleNamespace(
+        address="127.0.0.1",
+        port=25000,
+        release_route_port_reservations=lambda *args, **kwargs: None,
+    )
+    proc_manager = types.SimpleNamespace(
+        addresses=types.SimpleNamespace(
+            inputs=["tcp://127.0.0.1:26002"],
+            outputs=["tcp://127.0.0.1:26003"],
+        )
+    )
+    monkeypatch.setattr(proc_mod, "StageDiffusionProcManager", lambda **kwargs: proc_manager)
+    monkeypatch.setattr(
+        client_mod.StageDiffusionClient,
+        "from_addresses",
+        lambda metadata, **kwargs: object(),
+    )
+
+    startup_mod.launch_diffusion_stage_replica(
+        model="dummy-model",
+        stage_config=types.SimpleNamespace(),
+        metadata=types.SimpleNamespace(stage_id=0),
+        stage_init_timeout=12,
+        use_inline=False,
+        omni_master_server=omni_master_server,
+    )
+
+    assert od_config.max_num_seqs == 8
 
 
 def test_stage_runtime_initializes_stage_pools(monkeypatch):
@@ -573,7 +675,6 @@ def test_stage_runtime_initializes_stage_pools(monkeypatch):
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -639,7 +740,6 @@ def test_stage_runtime_passes_log_stats_to_llm_replica_launch(monkeypatch):
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
         log_stats=True,
     )
@@ -663,11 +763,12 @@ def test_stage_runtime_passes_log_stats_to_llm_replica_launch(monkeypatch):
 
     monkeypatch.setattr(runtime_mod, "acquire_device_locks", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(runtime_mod, "launch_stage_replica", _capture_launch_stage_replica)
-    monkeypatch.setattr(
-        runtime_mod.StageEngineCoreClientBase,
-        "make_async_mp_client",
-        lambda **kwargs: captured.__setitem__("client_log_stats", kwargs["log_stats"]) or stage_client,
-    )
+
+    def _make_async_mp_client(**kwargs):
+        captured["client_log_stats"] = kwargs["log_stats"]
+        return stage_client
+
+    monkeypatch.setattr(runtime_mod.StageEngineCoreClientBase, "make_async_mp_client", _make_async_mp_client)
 
     assert runtime._initialize_local_llm_replica(plan, stage_init_timeout=1) is stage_client
     assert captured["log_stats"] is True
@@ -682,7 +783,6 @@ def test_stage_runtime_passes_log_stats_to_output_processor(monkeypatch):
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
         log_stats=True,
     )
@@ -735,7 +835,6 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -776,7 +875,6 @@ def test_initialize_stage_replicas_collects_results_by_stage_and_replica_id(monk
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=123,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -814,7 +912,6 @@ def test_remote_replicas_use_distinct_init_group_keys():
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=123,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
     plan = _make_llm_plan(
@@ -840,7 +937,6 @@ def test_initialize_stages_cleans_up_successful_replicas_after_partial_multi_rep
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -877,7 +973,6 @@ def test_initialize_stages_cleans_up_late_successful_replicas_after_early_multi_
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
 
@@ -889,7 +984,7 @@ def test_initialize_stages_cleans_up_late_successful_replicas_after_early_multi_
 
     def _initialize_stage_replicas(_stage_plans, _stage_init_timeout):
         exc = RuntimeError("replica launch failed")
-        exc._initialized_clients_by_stage = {0: [None, initialized_client]}
+        setattr(exc, "_initialized_clients_by_stage", {0: [None, initialized_client]})
         raise exc
 
     monkeypatch.setattr(runtime, "_initialize_stage_replicas", _initialize_stage_replicas)
@@ -916,7 +1011,6 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
         model="dummy-model",
         config_path="dummy-config",
         stage_init_timeout=1,
-        diffusion_batch_size=1,
         async_chunk=False,
     )
     stage_init_timeout = 302
@@ -986,6 +1080,8 @@ def test_build_engine_args_cli_tokenizer_overrides_inferred_base_tokenizer(tmp_p
         default_sampling_params={},
     )
 
+    (tmp_path / "llm").mkdir()
+
     engine_args = build_engine_args_dict(
         stage_cfg,
         str(tmp_path),
@@ -1047,6 +1143,9 @@ def test_build_engine_args_keeps_stage_owned_tokenizer_subdir(tmp_path):
         default_sampling_params={},
     )
 
+    (tmp_path / "llm").mkdir()
+    (tmp_path / "tokenizer").mkdir()
+
     engine_args = build_engine_args_dict(
         stage_cfg,
         str(tmp_path),
@@ -1055,6 +1154,445 @@ def test_build_engine_args_keeps_stage_owned_tokenizer_subdir(tmp_path):
 
     assert engine_args["model"] == os.path.join(str(tmp_path), "llm")
     assert engine_args["tokenizer"] == os.path.join(str(tmp_path), "tokenizer")
+
+
+def test_build_engine_args_rejects_missing_subdir_in_local_model_dir(tmp_path):
+    """A local model directory without the stage subfolder must fail closed.
+
+    Forwarding the joined path as ``EngineArgs.model`` sends a non-directory
+    string to HuggingFace, which reports it as a malformed repo id.
+    """
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "language_model", "tokenizer_subdir": "tokenizer"},
+        default_sampling_params={},
+    )
+    (tmp_path / "tokenizer").mkdir()
+
+    with pytest.raises(RuntimeError, match="language_model"):
+        build_engine_args_dict(stage_cfg, str(tmp_path))
+
+
+# A real snapshot subfolder always carries artifacts; empty directories would
+# assert the broken exists-means-complete predicate this suite regresses.
+_SUBDIR_ARTIFACT = {"language_model": "model.safetensors", "tokenizer": "tokenizer.json"}
+
+
+def _make_snapshot(root, subdirs):
+    for subdir in subdirs:
+        folder = root / subdir
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / _SUBDIR_ARTIFACT.get(subdir, "data.bin")).write_text("x")
+    return str(root)
+
+
+def test_build_engine_args_pulls_stage_subdirs_missing_from_cached_snapshot(monkeypatch, tmp_path):
+    """Regression for issue #6638.
+
+    ``snapshot_download(local_files_only=True)`` hands back a snapshot root as
+    soon as the repo is partly cached, even when this stage's subfolders were
+    never materialized. Stage init must fetch exactly those subfolders instead
+    of joining onto a path that exists nowhere.
+    """
+    from huggingface_hub import HfApi
+
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    snapshot = tmp_path / "snapshots" / "deadbeef"
+    _make_snapshot(snapshot, ["tokenizer"])
+    calls = []
+
+    def fake_snapshot_download(self, repo_id, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("local_files_only"):
+            return str(snapshot)
+        _make_snapshot(snapshot, ["language_model"])
+        return str(snapshot)
+
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "language_model", "tokenizer_subdir": "tokenizer"},
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert engine_args["model"] == os.path.join(str(snapshot), "language_model")
+    assert engine_args["tokenizer"] == os.path.join(str(snapshot), "tokenizer")
+    assert os.path.isdir(engine_args["model"])
+    # Only the stage's own subfolders are pulled, not the whole repo.
+    assert calls[-1]["allow_patterns"] == ["language_model/*", "tokenizer/*"]
+
+
+def test_build_engine_args_skips_hub_call_when_cached_snapshot_is_complete(monkeypatch, tmp_path):
+    """A warm cache stays offline-friendly: no outgoing Hub request."""
+    from huggingface_hub import HfApi
+
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    snapshot = tmp_path / "snapshots" / "deadbeef"
+    _make_snapshot(snapshot, ["language_model", "tokenizer"])
+
+    def fake_snapshot_download(self, repo_id, **kwargs):
+        assert kwargs.get("local_files_only"), "warm cache must not reach the Hub"
+        return str(snapshot)
+
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "language_model", "tokenizer_subdir": "tokenizer"},
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert engine_args["model"] == os.path.join(str(snapshot), "language_model")
+
+
+def test_build_engine_args_redownloads_a_partial_subdir(monkeypatch, tmp_path):
+    """A subfolder holding only config.json is an interrupted download.
+
+    The warm-cache early return must not accept it: converting the Hub ID into
+    that local path leaves vLLM's loader without any fallback for the missing
+    weights.
+    """
+    from huggingface_hub import HfApi
+
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    snapshot = tmp_path / "snapshots" / "deadbeef"
+    partial = snapshot / "language_model"
+    partial.mkdir(parents=True)
+    (partial / "config.json").write_text("{}")
+    _make_snapshot(snapshot, ["tokenizer"])
+    calls = []
+
+    def fake_snapshot_download(self, repo_id, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("local_files_only"):
+            return str(snapshot)
+        _make_snapshot(snapshot, ["language_model"])
+        return str(snapshot)
+
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "language_model", "tokenizer_subdir": "tokenizer"},
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert any(not call.get("local_files_only") for call in calls), "a partial subdir must fall through to the Hub"
+    assert engine_args["model"] == os.path.join(str(snapshot), "language_model")
+
+
+def test_build_engine_args_redownloads_when_index_lists_missing_shards(monkeypatch, tmp_path):
+    """An index plus a subset of its shards is an interrupted download.
+
+    The index downloads early; accepting it as proof of weights converts the
+    Hub ID into a local path vLLM cannot fetch the remaining shards for.
+    """
+    from huggingface_hub import HfApi
+
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    snapshot = tmp_path / "snapshots" / "deadbeef"
+    partial = snapshot / "language_model"
+    partial.mkdir(parents=True)
+    (partial / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "a.weight": "model-00001-of-00002.safetensors",
+                    "b.weight": "model-00002-of-00002.safetensors",
+                }
+            }
+        )
+    )
+    (partial / "model-00001-of-00002.safetensors").write_text("x")
+    _make_snapshot(snapshot, ["tokenizer"])
+    calls = []
+
+    def fake_snapshot_download(self, repo_id, **kwargs):
+        calls.append(kwargs)
+        if not kwargs.get("local_files_only"):
+            (partial / "model-00002-of-00002.safetensors").write_text("x")
+        return str(snapshot)
+
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "language_model", "tokenizer_subdir": "tokenizer"},
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert any(not call.get("local_files_only") for call in calls), "missing shards must fall through to the Hub"
+    assert engine_args["model"] == os.path.join(str(snapshot), "language_model")
+
+
+def test_build_engine_args_redownloads_shards_without_their_index(monkeypatch, tmp_path):
+    """Shard-named weights always ship an index; one without it is partial."""
+    from huggingface_hub import HfApi
+
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    snapshot = tmp_path / "snapshots" / "deadbeef"
+    partial = snapshot / "language_model"
+    partial.mkdir(parents=True)
+    (partial / "model-00001-of-00004.safetensors").write_text("x")
+    _make_snapshot(snapshot, ["tokenizer"])
+    calls = []
+
+    def fake_snapshot_download(self, repo_id, **kwargs):
+        calls.append(kwargs)
+        if not kwargs.get("local_files_only"):
+            shards = {f"w{i}.weight": f"model-0000{i}-of-00004.safetensors" for i in range(1, 5)}
+            (partial / "model.safetensors.index.json").write_text(json.dumps({"weight_map": shards}))
+            for shard in shards.values():
+                (partial / shard).write_text("x")
+        return str(snapshot)
+
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "language_model", "tokenizer_subdir": "tokenizer"},
+        default_sampling_params={},
+    )
+
+    build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert any(not call.get("local_files_only") for call in calls)
+
+
+def test_build_engine_args_redownloads_a_tokenizer_folder_without_vocabulary(monkeypatch, tmp_path):
+    """Templates and configs download first; alone they are not a tokenizer."""
+    from huggingface_hub import HfApi
+
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    snapshot = tmp_path / "snapshots" / "deadbeef"
+    _make_snapshot(snapshot, ["language_model"])
+    partial = snapshot / "tokenizer"
+    partial.mkdir(parents=True)
+    (partial / "chat_template.jinja").write_text("{{ messages }}")
+    calls = []
+
+    def fake_snapshot_download(self, repo_id, **kwargs):
+        calls.append(kwargs)
+        if not kwargs.get("local_files_only"):
+            _make_snapshot(snapshot, ["tokenizer"])
+        return str(snapshot)
+
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "language_model", "tokenizer_subdir": "tokenizer"},
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert any(not call.get("local_files_only") for call in calls)
+    assert engine_args["tokenizer"] == os.path.join(str(snapshot), "tokenizer")
+
+
+def test_build_engine_args_forwards_revision_and_download_dir(monkeypatch, tmp_path):
+    """revision/download_dir must shape snapshot selection (they cannot be
+    corrected downstream once the repo ID is a local path)."""
+    from huggingface_hub import HfApi
+
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    snapshot = tmp_path / "snapshots" / "pinned"
+    _make_snapshot(snapshot, ["language_model", "tokenizer"])
+    seen = []
+
+    def fake_snapshot_download(self, repo_id, **kwargs):
+        seen.append(kwargs)
+        return str(snapshot)
+
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={
+            "model_subdir": "language_model",
+            "tokenizer_subdir": "tokenizer",
+            "revision": "v2.0",
+            "download_dir": str(tmp_path / "cache"),
+        },
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert engine_args["model"] == os.path.join(str(snapshot), "language_model")
+    assert seen, "snapshot resolution must have been consulted"
+    for call in seen:
+        assert call.get("revision") == "v2.0"
+        assert call.get("cache_dir") == str(tmp_path / "cache")
+
+
+def test_build_engine_args_resolves_tokenizer_revision_separately(monkeypatch, tmp_path):
+    """A tokenizer pinned to a different revision resolves against its own snapshot."""
+    from huggingface_hub import HfApi
+
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    model_snapshot = tmp_path / "snapshots" / "model-rev"
+    _make_snapshot(model_snapshot, ["language_model"])
+    tokenizer_snapshot = tmp_path / "snapshots" / "tok-rev"
+    _make_snapshot(tokenizer_snapshot, ["tokenizer"])
+
+    def fake_snapshot_download(self, repo_id, **kwargs):
+        if kwargs.get("revision") == "tok-rev":
+            return str(tokenizer_snapshot)
+        return str(model_snapshot)
+
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={
+            "model_subdir": "language_model",
+            "tokenizer_subdir": "tokenizer",
+            "revision": "model-rev",
+            "tokenizer_revision": "tok-rev",
+        },
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert engine_args["model"] == os.path.join(str(model_snapshot), "language_model")
+    assert engine_args["tokenizer"] == os.path.join(str(tokenizer_snapshot), "tokenizer")
+
+
+def test_build_engine_args_resolves_root_tokenizer_revision_separately(monkeypatch, tmp_path):
+    """An empty tokenizer_subdir targets the snapshot root and still honors
+    its own revision."""
+    from huggingface_hub import HfApi
+
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    model_snapshot = tmp_path / "snapshots" / "model-rev"
+    _make_snapshot(model_snapshot, ["language_model"])
+    # An empty tokenizer_subdir means the tokenizer IS the snapshot root, so
+    # the vocabulary artifact must sit at the root. Building it under
+    # ``tokenizer/`` returned a root that holds no loadable tokenizer, which
+    # the root-tokenizer validation now correctly rejects.
+    tokenizer_snapshot = tmp_path / "snapshots" / "tok-rev"
+    tokenizer_snapshot.mkdir(parents=True, exist_ok=True)
+    (tokenizer_snapshot / _SUBDIR_ARTIFACT["tokenizer"]).write_text("x")
+
+    def fake_snapshot_download(self, repo_id, **kwargs):
+        if kwargs.get("revision") == "tok-rev":
+            return str(tokenizer_snapshot)
+        return str(model_snapshot)
+
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={
+            "model_subdir": "language_model",
+            "tokenizer_subdir": "",
+            "revision": "model-rev",
+            "tokenizer_revision": "tok-rev",
+        },
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+    assert engine_args["model"] == os.path.join(str(model_snapshot), "language_model")
+    assert engine_args["tokenizer"] == str(tokenizer_snapshot)
+
+
+def test_build_engine_args_fails_closed_when_subdir_cannot_be_downloaded(monkeypatch, tmp_path):
+    """An undownloadable subfolder raises here instead of reaching HuggingFace."""
+    from huggingface_hub import HfApi
+
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    snapshot = tmp_path / "snapshots" / "deadbeef"
+    _make_snapshot(snapshot, ["tokenizer"])
+
+    def fake_snapshot_download(self, repo_id, **kwargs):
+        if kwargs.get("local_files_only"):
+            return str(snapshot)
+        raise OSError("offline")
+
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "language_model", "tokenizer_subdir": "tokenizer"},
+        default_sampling_params={},
+    )
+
+    with pytest.raises(RuntimeError, match="language_model"):
+        build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+
+def test_build_engine_args_fails_closed_on_cold_cache_instead_of_joining_repo_id(monkeypatch):
+    """With nothing cached, the stage must not join a subdir onto the repo id."""
+    from huggingface_hub import HfApi
+
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    def fake_snapshot_download(self, repo_id, **kwargs):
+        raise OSError("offline")
+
+    monkeypatch.setattr(HfApi, "snapshot_download", fake_snapshot_download)
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "language_model", "tokenizer_subdir": "tokenizer"},
+        default_sampling_params={},
+    )
+
+    with pytest.raises(RuntimeError, match="nothing is cached locally"):
+        build_engine_args_dict(stage_cfg, "MiniMaxAI/MiniMax-Music3")
+
+
+def test_model_path_resolver_is_generic_and_model_owned(tmp_path):
+    from vllm_omni.engine.stage_init_utils import _resolve_model_path
+
+    engine_args = {
+        "model_path_resolver": ("vllm_omni.model_executor.models.minimax_h3.checkpoint.resolve_minimax_h3_model_root"),
+        "revision": None,
+        "task_type": "ref2va",
+    }
+
+    resolved = _resolve_model_path(str(tmp_path), engine_args)
+
+    assert resolved == str(tmp_path / "Ref2VA" / "text_encoder")
+    assert "model_path_resolver" not in engine_args
 
 
 def test_build_stage0_input_processor_uses_omni_input_preprocessor(monkeypatch):
@@ -1255,6 +1793,41 @@ def test_resolve_stage_configs_preserves_stage_diffusion_attention(monkeypatch):
     )
 
     assert stage_configs[0].engine_args.diffusion_attention_config is existing_attention
+
+
+def test_resolve_stage_configs_does_not_inject_over_stage_diffusion_attention_backend(monkeypatch):
+    import vllm_omni.engine.async_omni_engine as engine_mod
+
+    engine = object.__new__(AsyncOmniEngine)
+    stage_cfg = types.SimpleNamespace(
+        stage_type="diffusion",
+        engine_args=types.SimpleNamespace(
+            diffusion_attention_backend="TORCH_SDPA",
+            diffusion_attention_config=None,
+            lora_path=None,
+            lora_scale=None,
+            enable_sleep_mode=None,
+            quantization_config=None,
+        ),
+    )
+
+    monkeypatch.setattr(
+        engine_mod,
+        "load_and_resolve_stage_configs",
+        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
+    )
+
+    _config_path, stage_configs = engine._resolve_stage_configs(
+        model="dummy-model",
+        kwargs={"diffusion_attention_backend": "FLASH_ATTN"},
+        trust_remote_code=False,
+    )
+
+    engine_args = stage_configs[0].engine_args
+    assert engine_args.diffusion_attention_backend == "TORCH_SDPA"
+    assert engine_args.diffusion_attention_config is None
+    normalized = normalize_omni_diffusion_kwargs(vars(engine_args))
+    assert normalized["diffusion_attention_config"].default.backend == "TORCH_SDPA"
 
 
 def test_resolve_stage_configs_does_not_inject_diffusion_attention_into_llm_stage(monkeypatch):

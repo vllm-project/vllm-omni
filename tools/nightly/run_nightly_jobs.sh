@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Extract steps from .buildkite/cuda/test-nightly.yml that contain pytest, synthesize
 # small bash wrappers (exports + pytest), run them, and tee output to logs named
@@ -20,6 +20,8 @@
 #   acc      — label contains "Accuracy Test" (incl. GEBench / GEdit-Bench style)
 #   function — label has neither "Perf Test" nor "Accuracy Test" (incl. Doc, Multi-Replica, etc.)
 #   stability— fixed dfx stability scripts under tests/dfx/stability/scripts/ (see below)
+#              Uses --pytest-mark / PYTEST_MARK for pytest -m (hardware via JSON marks).
+#              When unset, -m defaults to H800 (CUDA stability fleet; use --pytest-mark A3 on NPU).
 #   local    — pytest -sv -m "<MODEL_TYPE markers> and local_model" from repo root (no YAML step extract)
 #              When LABEL_SUBSTR is set, also runs matching tests/**/test_*.py and perf JSON configs under
 #              tests/dfx/perf/tests/*.json via run_benchmark.py / run_diffusion_benchmark.py.
@@ -42,7 +44,9 @@
 #                   whose filename contains the substring (benchmark runner chosen by JSON family).
 #
 #   stability (when included in TEST_TYPE):
-#     From repo root: pytest -s -v --run-level full_model tests/dfx/stability/scripts/test_stability_*.py
+#     From repo root: pytest -s -v --run-level full_model -m "<mark>" tests/dfx/stability/scripts/...
+#     -m comes from --pytest-mark / PYTEST_MARK when set (e.g. H800 or A3).
+#     Otherwise -m defaults to H800. PYTEST_MARK is rejected unless stability is enabled.
 #     model_type: omni → qwen3_omni; tts → qwen3_tts; diffusion → qwen_image + wan22 + hunyuan_image; all → all five
 #     LABEL_SUBSTR: if set, script path / job key / filename must contain it
 #
@@ -73,6 +77,7 @@
 #   MODEL_TYPE    - comma-separated and/or repeated flags (default: all); see above
 #   LABEL_SUBSTR  - YAML mode: substring of Buildkite step label; stability: substring of path/key/filename;
 #                   local: substring of test_*.py basename or tests/dfx/perf/tests/*.json filename
+#   PYTEST_MARK   - pytest -m expression for stability jobs only (also --pytest-mark)
 #   DRY_RUN=1     - print extracted commands only; do not write scripts or run pytest
 #   RUN_JOB_TIMEOUT_KILL_AFTER - seconds after SIGTERM before SIGKILL on inline pytest
 #                              timeout (default: 60; baked into generated job scripts)
@@ -82,6 +87,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 LABEL_SUBSTR="${LABEL_SUBSTR:-}"
+PYTEST_MARK="${PYTEST_MARK:-}"
 TEST_TYPE_ENV="${TEST_TYPE:-all}"
 MODEL_TYPE_ENV="${MODEL_TYPE:-all}"
 TEST_TYPE_CLI_PARTS=()
@@ -204,6 +210,10 @@ while [[ $# -gt 0 ]]; do
       LABEL_SUBSTR="$2"
       shift 2
       ;;
+    --pytest-mark)
+      PYTEST_MARK="$2"
+      shift 2
+      ;;
     --model-type)
       MODEL_TYPE_FROM_CLI=1
       _split_append_csv_array MODEL_TYPE_CLI_PARTS "$2"
@@ -249,7 +259,7 @@ _nightly_log_dir_basename() {
 
 BUILDKITE_REL=".buildkite/cuda/test-nightly.yml"
 
-_find_repo_containing_nightly() {
+_find_repo_containing_yml() {
   local dir="${1:-}"
   [[ -n "$dir" ]] || return 1
   dir="$(cd "$dir" && pwd)" || return 1
@@ -297,10 +307,10 @@ else
     REPO_ROOT="$(git -C "${PWD}" rev-parse --show-toplevel 2>/dev/null || true)"
   fi
   if [[ -z "${REPO_ROOT}" ]]; then
-    REPO_ROOT="$(_find_repo_containing_nightly "${PWD}" || true)"
+    REPO_ROOT="$(_find_repo_containing_yml "${PWD}" || true)"
   fi
   if [[ -z "${REPO_ROOT}" ]]; then
-    REPO_ROOT="$(_find_repo_containing_nightly "${SCRIPT_DIR}" || true)"
+    REPO_ROOT="$(_find_repo_containing_yml "${SCRIPT_DIR}" || true)"
   fi
   if [[ -z "${REPO_ROOT}" ]]; then
     echo "Could not locate ${BUILDKITE_REL}. Set REPO_ROOT or YML, run from inside the vllm-omni clone," >&2
@@ -316,7 +326,7 @@ fi
 
 echo "Log directory: ${LOG_DIR}" >&2
 
-# Require nightly YAML only when at least one non-stability test kind needs it (validated in Python too).
+# Require test-nightly.yml only when at least one non-stability test kind needs it (validated in Python too).
 _needs_nightly_yml=0
 IFS=',' read -ra _TTOK <<< "${TEST_TYPE}"
 for _t in "${_TTOK[@]}"; do
@@ -339,7 +349,7 @@ fi
 
 mkdir -p "${LOG_DIR}/jobs"
 LOG_DIR="$(cd "${LOG_DIR}" && pwd)"
-export REPO_ROOT LOG_DIR YML LABEL_SUBSTR TEST_TYPE MODEL_TYPE DRY_RUN
+export REPO_ROOT LOG_DIR YML LABEL_SUBSTR TEST_TYPE MODEL_TYPE DRY_RUN PYTEST_MARK
 
 # Drop stale wrapper scripts, old tee logs, and perf manifest so a filtered run does not
 # mix with the previous outputs.
@@ -600,6 +610,26 @@ def _stability_model_matches(model_types: list[str], families: tuple[str, ...]) 
     return bool(set(model_types) & set(families))
 
 
+STABILITY_DEFAULT_PYTEST_MARK = "H800"
+
+
+def _shell_quote_pytest_mark(marker_expr: str) -> str:
+    """Shell-safe pytest ``-m`` value for generated bash job scripts."""
+    expr = (marker_expr or "").strip()
+    if not expr:
+        raise ValueError("pytest -m expression must not be empty")
+    return shlex.quote(expr)
+
+
+def _stability_pytest_mark(model_types: list[str]) -> str:
+    """Return explicit --pytest-mark or the default CUDA stability hardware marker."""
+    del model_types  # MODEL_TYPE filters scripts; default -m is hardware-specific.
+    override = (os.environ.get("PYTEST_MARK") or "").strip()
+    if override:
+        return override
+    return STABILITY_DEFAULT_PYTEST_MARK
+
+
 def _write_job_script(key: str, script_lines: list[str], jobs_dir: Path) -> None:
     body = "\n".join(script_lines) + "\n"
     if DRY_RUN:
@@ -712,7 +742,7 @@ def run_local_mode(
 
         if rel_paths:
             paths_arg = " ".join(shlex.quote(p) for p in rel_paths)
-            pytest_line = f'pytest -sv -m "{marker_expr}" {paths_arg}'
+            pytest_line = f"pytest -sv -m {_shell_quote_pytest_mark(marker_expr)} {paths_arg}"
             slug = _local_job_slug(LABEL_SUBSTR)
             key = f"local_pytest_{slug}"
             header = (
@@ -732,7 +762,7 @@ def run_local_mode(
         for json_rel, runner_rel in perf_pairs:
             json_name = Path(json_rel).name
             pytest_line = (
-                f'pytest -s -v -m "{marker_expr}" '
+                f"pytest -s -v -m {_shell_quote_pytest_mark(marker_expr)} "
                 f"{shlex.quote(runner_rel)} "
                 f"--test-config-file {shlex.quote(json_rel)}"
             )
@@ -763,7 +793,7 @@ def run_local_mode(
             )
         return matched
 
-    pytest_line = f'pytest -sv -m "{marker_expr}"'
+    pytest_line = f"pytest -sv -m {_shell_quote_pytest_mark(marker_expr)}"
     key = "local_pytest"
     header = f"# Local marker tests — MODEL_TYPE={','.join(model_types)}"
     script_lines = [
@@ -779,6 +809,8 @@ def run_local_mode(
 
 def run_stability_mode(jobs_dir: Path, model_types: list[str]) -> int:
     matched = 0
+    marker_expr = _stability_pytest_mark(model_types)
+    mark_from_cli = bool((os.environ.get("PYTEST_MARK") or "").strip())
     for key, rel_posix, families in STABILITY_CASES:
         if not _stability_model_matches(model_types, families):
             continue
@@ -794,11 +826,17 @@ def run_stability_mode(jobs_dir: Path, model_types: list[str]) -> int:
         if not rel_path.is_file():
             print(f"# skip (missing file): {rel_path}", file=sys.stderr)
             continue
-        pytest_line = f"pytest -s -v --run-level full_model {rel_posix}"
+        pytest_line = (
+            f"pytest -s -v --run-level full_model "
+            f"-m {_shell_quote_pytest_mark(marker_expr)} "
+            f"{shlex.quote(rel_posix)}"
+        )
         matched += 1
         script_lines = [
             "#!/usr/bin/env bash",
             f"# Stability: {key} — {rel_posix}",
+            f"# pytest -m {marker_expr!r}"
+            + (" (--pytest-mark)" if mark_from_cli else f" (default {STABILITY_DEFAULT_PYTEST_MARK})"),
             "set -euo pipefail",
             f'cd "{REPO_ROOT}"',
             pytest_line,
@@ -815,6 +853,14 @@ def main() -> None:
     want_local = "local" in test_types
     yaml_test_types = [t for t in test_types if t not in ("stability", "local")]
     needs_yaml = bool(yaml_test_types)
+
+    pytest_mark = (os.environ.get("PYTEST_MARK") or "").strip()
+    if pytest_mark and not want_stability:
+        print(
+            "PYTEST_MARK / --pytest-mark is only supported when --test-type includes stability",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     jobs_dir = LOG_DIR / "jobs"
     if not DRY_RUN:
@@ -925,7 +971,6 @@ PERF_RESULTS_SRC="${REPO_ROOT}/tests/dfx/perf/results"
 # Copy perf benchmark JSON written under tests/dfx/perf/results/ during this run into LOG_DIR.
 _collect_perf_result_jsons() {
   local since_epoch="${1:?}"
-  local dest="${LOG_DIR}/perf_results"
 
   if [[ ! -d "${PERF_RESULTS_SRC}" ]]; then
     return 0

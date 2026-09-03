@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 import torch
@@ -67,6 +67,33 @@ def test_packed_attention_is_a_regional_compile_boundary():
     assert getattr(MiniMaxH3Attention._run_packed_attention, "_torchdynamo_disable", False)
 
 
+def test_denoise_branch_keeps_fast_h3_prefix_geometry_model_local():
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
+        MiniMaxH3DenoiseBranch,
+    )
+
+    packed = {
+        "seq_len": torch.tensor(9),
+        "img_pos": torch.arange(4),
+        "audio_pos": torch.empty(0, dtype=torch.long),
+        "text_pos": torch.arange(2),
+        "update_mask": torch.ones(4, dtype=torch.bool),
+        "cu_seqlens": torch.tensor([0, 9, 9], dtype=torch.int32),
+        "img_position_ids": torch.zeros(9, 3, dtype=torch.long),
+        "video_spans": ({"start": 5, "latent_grid": (1, 2, 2), "role": "target"},),
+    }
+    branch = MiniMaxH3DenoiseBranch(
+        packed=packed,
+        text_embeddings=torch.zeros(2, 4),
+        token_tags=torch.tensor([0, 0, 1, 1, 1, 2, 2, 2, 2]),
+        device=torch.device("cpu"),
+    )
+
+    layout = branch.static_kwargs["video_token_layout"]
+    assert not hasattr(layout, "prefix_segments")
+    assert branch.static_kwargs["packed_seq_params"]["vsa_prefix_segments"] == (2, 3)
+
+
 def test_h3_fused_rope_matches_reference_and_preserves_unrotated_dims():
     from vllm_omni.diffusion.layers.rope import RotaryEmbedding
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
@@ -111,6 +138,146 @@ def test_h3_rope_table_materializes_local_rows_in_fused_kernel_layout():
 
     assert actual.shape == (2, 96)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_h3_prepared_rope_table_is_rank_local_and_validated(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
+
+    class Rope(nn.Module):
+        def forward(self, position_ids):
+            freqs_half = position_ids[0].float()
+            return torch.cat((freqs_half, freqs_half), dim=-1)
+
+    model = object.__new__(h3.MiniMaxH3DiTModel)
+    nn.Module.__init__(model)
+    model.arch = h3.MiniMaxH3DiTArchConfig(rope_inv_freq_len=1)
+    model.rope = Rope()
+    model.local_sp_prepare = nn.Identity()
+    monkeypatch.setattr(h3, "_sequence_parallel_local_span", lambda *args, **kwargs: (1, 2))
+
+    position_ids = torch.arange(12, dtype=torch.long).reshape(1, 4, 3)
+    actual = model.prepare_rope_table(position_ids, seq_len=4)
+    expected = h3._build_rope_table(model.rope(position_ids[:, 1:3]))
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    model._validate_prepared_rope_table(actual, local_len=2, device=torch.device("cpu"))
+    with pytest.raises(ValueError, match="local_seq_len"):
+        model._validate_prepared_rope_table(actual[:1], local_len=2, device=torch.device("cpu"))
+
+
+def test_denoise_branch_prepares_rope_table_once_per_npu_run(monkeypatch: pytest.MonkeyPatch):
+    from vllm_omni.diffusion.models.minimax_h3 import denoise_loop
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
+        MiniMaxH3DenoiseBranch,
+        minimax_h3_denoise_loop,
+    )
+
+    monkeypatch.setattr(denoise_loop.current_omni_platform, "is_npu", lambda: True)
+
+    packed = {
+        "seq_len": torch.tensor(3),
+        "img_pos": torch.tensor([1]),
+        "audio_pos": torch.tensor([2]),
+        "text_pos": torch.tensor([0]),
+        "update_mask": torch.tensor([True]),
+        "cu_seqlens": torch.tensor([0, 3, 3], dtype=torch.int32),
+        "img_position_ids": torch.zeros(3, 3, dtype=torch.long),
+        "latent_grid": torch.tensor([1, 1, 1]),
+        "video_row_start": torch.tensor(1),
+    }
+    branch = MiniMaxH3DenoiseBranch(
+        packed=packed,
+        text_embeddings=torch.zeros(1, 2),
+        token_tags=torch.zeros(3, dtype=torch.long),
+        device=torch.device("cpu"),
+    )
+
+    class Model:
+        def __init__(self):
+            self.rope_table = torch.zeros(3, 6, dtype=torch.bfloat16)
+            self.prepare_calls = 0
+            self.forward_calls = 0
+
+        def prepare_rope_table(self, img_position_ids, *, seq_len):
+            assert img_position_ids is branch.static_kwargs["img_position_ids"]
+            assert seq_len == 3
+            self.prepare_calls += 1
+            return self.rope_table
+
+        def __call__(self, **kwargs):
+            assert kwargs["rope_table"] is self.rope_table
+            self.forward_calls += 1
+            return torch.zeros(1, 96), torch.zeros(1, 32)
+
+    model = Model()
+    minimax_h3_denoise_loop(
+        model=model,
+        positive=branch,
+        initial_video_rows=torch.zeros(1, 96),
+        initial_audio_rows=torch.zeros(1, 32),
+        keyframe_cond_rows=None,
+        sigmas_video=[1.0, 0.5, 0.0],
+        sigmas_audio=[1.0, 0.5, 0.0],
+        device=torch.device("cpu"),
+    )
+
+    assert model.prepare_calls == 1
+    assert model.forward_calls == 2
+
+
+def test_denoise_branch_keeps_rope_construction_on_the_reference_path_off_npu(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_omni.diffusion.models.minimax_h3 import denoise_loop
+    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import (
+        MiniMaxH3DenoiseBranch,
+        minimax_h3_denoise_loop,
+    )
+
+    monkeypatch.setattr(denoise_loop.current_omni_platform, "is_npu", lambda: False)
+    packed = {
+        "seq_len": torch.tensor(3),
+        "img_pos": torch.tensor([1]),
+        "audio_pos": torch.tensor([2]),
+        "text_pos": torch.tensor([0]),
+        "update_mask": torch.tensor([True]),
+        "cu_seqlens": torch.tensor([0, 3, 3], dtype=torch.int32),
+        "img_position_ids": torch.zeros(3, 3, dtype=torch.long),
+        "latent_grid": torch.tensor([1, 1, 1]),
+        "video_row_start": torch.tensor(1),
+    }
+    branch = MiniMaxH3DenoiseBranch(
+        packed=packed,
+        text_embeddings=torch.zeros(1, 2),
+        token_tags=torch.zeros(3, dtype=torch.long),
+        device=torch.device("cpu"),
+    )
+
+    class Model:
+        def __init__(self):
+            self.forward_calls = 0
+
+        def prepare_rope_table(self, *_args, **_kwargs):
+            raise AssertionError("the reference path must not pre-build a rope_table")
+
+        def __call__(self, **kwargs):
+            assert "rope_table" not in kwargs
+            self.forward_calls += 1
+            return torch.zeros(1, 96), torch.zeros(1, 32)
+
+    model = Model()
+    minimax_h3_denoise_loop(
+        model=model,
+        positive=branch,
+        initial_video_rows=torch.zeros(1, 96),
+        initial_audio_rows=torch.zeros(1, 32),
+        keyframe_cond_rows=None,
+        sigmas_video=[1.0, 0.5, 0.0],
+        sigmas_audio=[1.0, 0.5, 0.0],
+        device=torch.device("cpu"),
+    )
+
+    assert model.forward_calls == 2
 
 
 def test_strict_sp_local_span_uses_rank_owned_rows(monkeypatch):

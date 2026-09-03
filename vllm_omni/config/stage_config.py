@@ -7,7 +7,7 @@ from __future__ import annotations
 import functools
 import re
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
@@ -89,6 +89,43 @@ def build_stage_runtime_overrides(
     return result
 
 
+def normalize_pipeline_cli_overrides(
+    pipeline: PipelineConfig,
+    cli_overrides: dict[str, Any],
+) -> dict[str, Any]:
+    """Translate pipeline-owned global CLI aliases into stage-scoped overrides."""
+    normalized = dict(cli_overrides)
+    for source, (stage_id, target) in pipeline.stage_cli_aliases.items():
+        invalid_stage_keys = [
+            key
+            for key, value in normalized.items()
+            if value is not None
+            and (match := _STAGE_OVERRIDE_PATTERN.match(key)) is not None
+            and match.group(2) == source
+            and int(match.group(1)) != stage_id
+        ]
+        if invalid_stage_keys:
+            invalid = ", ".join(sorted(invalid_stage_keys))
+            raise ValueError(
+                f"{invalid} cannot be set for pipeline {pipeline.model_type!r}; "
+                f"{source} belongs to stage {stage_id} as {target}."
+            )
+        value = normalized.pop(source, None)
+        if value is None:
+            continue
+        stage_key = f"stage_{stage_id}_{target}"
+        stage_value = normalized.get(stage_key)
+        if stage_value is not None and stage_value != value:
+            warnings.warn(
+                f"Ignoring {source}={value!r} because {stage_key}={stage_value!r} takes precedence.",
+                UserWarning,
+                stacklevel=2,
+            )
+            continue
+        normalized[stage_key] = value
+    return normalized
+
+
 def _apply_diffusion_parallel_runtime_overrides(
     engine_args: dict[str, Any],
     runtime_overrides: dict[str, Any],
@@ -122,6 +159,28 @@ def _apply_diffusion_parallel_runtime_overrides(
 
     if parallel_config_dict is not None:
         engine_args["parallel_config"] = parallel_config_dict
+
+
+def reconcile_diffusion_attention_overrides(
+    engine_args: dict[str, Any],
+    runtime_overrides: Mapping[str, Any],
+) -> None:
+    """Apply CLI precedence across the two diffusion attention representations.
+
+    ``diffusion_attention_backend`` and ``diffusion_attention_config.default``
+    express the same setting and are rejected downstream when both are set, so
+    a CLI value in one form replaces the YAML value in the other.
+    """
+    if runtime_overrides.get("diffusion_attention_backend") is not None:
+        yaml_config = engine_args.get("diffusion_attention_config")
+        if isinstance(yaml_config, Mapping) and yaml_config.get("default") is not None:
+            remaining = {k: v for k, v in yaml_config.items() if k != "default"}
+            if remaining:
+                engine_args["diffusion_attention_config"] = remaining
+            else:
+                engine_args.pop("diffusion_attention_config")
+    if runtime_overrides.get("diffusion_attention_config") is not None:
+        engine_args.pop("diffusion_attention_backend", None)
 
 
 class StageType(str, Enum):
@@ -191,6 +250,10 @@ class StagePipelineConfig:
     # Alternates picked by ``merge_pipeline_deploy`` based on ``deploy.async_chunk``.
     async_chunk_process_next_stage_input_func: str | None = None
     sync_process_input_func: str | None = None
+    # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
+    # The callable receives ``(prompt, sampling_params_list)``; downstream
+    # stages continue to receive the original prompt.
+    prompt_transform_func: str | None = None
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
     omni_kv_config: dict[str, Any] | None = None
@@ -201,6 +264,16 @@ class StagePipelineConfig:
     # by ``stage_init_utils._resolve_model_tokenizer_paths``.
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
+    # Model-owned hook that resolves a pipeline root to this stage's checkpoint.
+    # Consumed and removed before backend engine args are constructed.
+    model_path_resolver: str | None = None
+    # Keep a single-replica diffusion stage in the orchestrator process.
+    # Disabled by default so existing multi-stage pipelines retain subprocess
+    # isolation unless their topology explicitly opts in.
+    inline_diffusion: bool = False
+    # Whether the non-async path waits for a complete upstream payload from
+    # the model-runner connector before scheduling this stage.
+    requires_full_payload_input: bool = False
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -248,6 +321,19 @@ class PipelineConfig:
     # Bundled deploy defaults for this concrete pipeline topology. The file is
     # loaded from vllm_omni/deploy; None uses DeployConfig defaults.
     default_deploy_config_name: str | None = None
+    # Global CLI spelling -> (stage id, stage-local spelling).
+    stage_cli_aliases: dict[str, tuple[int, str]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        errors = self.get_validation_errors()
+
+        if errors:
+            # If we have multiple errors, put them on separate indented lines for readability
+            multi_sep = "\n\t"
+            error_str = multi_sep.join(errors)
+            if len(errors) > 1:
+                error_str = f"{multi_sep}{error_str}"
+            raise ValueError(f"PipelineConfig initialization failed with the following error(s): {error_str}")
 
     def get_stage(self, stage_id: int) -> StagePipelineConfig | None:
         """Look up a stage by its ID."""
@@ -256,7 +342,7 @@ class PipelineConfig:
                 return stage
         return None
 
-    def validate(self) -> list[str]:
+    def get_validation_errors(self) -> list[str]:
         """Return list of topology errors (empty if valid)."""
         errors: list[str] = []
         if not self.stages:
@@ -274,6 +360,11 @@ class PipelineConfig:
                     errors.append(f"Stage {stage.stage_id} references itself")
         if not any(not s.input_sources for s in self.stages):
             errors.append("No entry point (stage with empty input_sources)")
+        # Request completion and client-visible output are both driven by stages
+        # that declare ``final_output`` (see ``Orchestrator._route_output``). A
+        # pipeline without one can never emit a result, so every request hangs.
+        if not any(s.final_output for s in self.stages):
+            errors.append("No terminal stage (stage with final_output=True)")
         return errors
 
 
@@ -336,6 +427,7 @@ class StageDeployConfig:
     # Diffusion parallel_config deploy/runtime override fields.
     ulysses_degree: int | None = None
     ulysses_mode: str | None = None
+    ulysses_a2a_permute: bool | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
     sequence_parallel_size: int | None = None
@@ -386,6 +478,9 @@ class StageDeployConfig:
     enable_distributed_layerwise_offload: bool | None = None
     dlo_use_allgather: bool | None = None
     dlo_resident_layers: int | None = None
+    host_weight_runtime_mode: str | None = None
+    host_weight_runtime_root: str | None = None
+    dlo_host_registration_limit_gib: float | None = None
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
 
@@ -828,6 +923,9 @@ def _build_engine_args(
         engine_args["model_subdir"] = ps.model_subdir
     if ps.tokenizer_subdir:
         engine_args["tokenizer_subdir"] = ps.tokenizer_subdir
+    if ps.model_path_resolver:
+        engine_args["model_path_resolver"] = ps.model_path_resolver
+    engine_args["inline_diffusion"] = ps.inline_diffusion
 
     # Pipeline-wide top-level DeployConfig settings, applied to every stage.
     for name in _PIPELINE_WIDE_ENGINE_FIELDS:
@@ -845,6 +943,7 @@ def _build_engine_args(
     # Materialize the resolved pipeline-wide async_chunk value into every
     # stage so explicit False overrides do not get lost downstream.
     engine_args["async_chunk"] = bool(deploy.async_chunk)
+    engine_args["session_mode"] = deploy.session_mode
     if deploy.session_mode == "duplex":
         # The engine admission limit is also the authoritative capacity for
         # model-owned streaming state. Propagate it to every stage instead of
@@ -852,6 +951,7 @@ def _build_engine_args(
         engine_args["duplex_max_sessions"] = deploy.duplex_session.max_sessions
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
+    engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
     return engine_args
 
 
@@ -873,6 +973,8 @@ def _build_extras(
         extras["output_connectors"] = dict(ds.output_connectors)
     if ds is not None and ds.input_connectors:
         extras["input_connectors"] = dict(ds.input_connectors)
+    if ps.prompt_transform_func:
+        extras["prompt_transform_func"] = ps.prompt_transform_func
     if ps.prompt_expand_func:
         extras["prompt_expand_func"] = ps.prompt_expand_func
     if ps.cfg_kv_collect_func:
@@ -1012,6 +1114,7 @@ class StageConfig:
 
         if StageType(self.stage_type) == StageType.DIFFUSION:
             _apply_diffusion_parallel_runtime_overrides(engine_args, runtime_overrides)
+            reconcile_diffusion_attention_overrides(engine_args, runtime_overrides)
 
         # CLI overrides take precedence over YAML defaults
         for key, value in runtime_overrides.items():

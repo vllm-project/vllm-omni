@@ -2,6 +2,11 @@
 
 The CLI for vLLM-Omni inherits from vllm with some additional arguments.
 
+Environment variables are process configuration rather than CLI-only options.
+See the [Environment Variables](../configuration/environment_variables.md)
+reference for ownership, precedence, evaluation time, and per-stage `env`
+scoping.
+
 ## serve
 
 Starts the vLLM-Omni OpenAI Compatible API server.
@@ -39,4 +44,5 @@ vllm bench serve --omni \
     --num-prompts  5
 ```
 
-See [vllm bench serve](./bench/serve.md) for the full reference of all available arguments.
+See [vllm bench serve](./bench/serve.md) for serving benchmark arguments and
+dataset-specific examples, including OmniInteract native-duplex sessions.

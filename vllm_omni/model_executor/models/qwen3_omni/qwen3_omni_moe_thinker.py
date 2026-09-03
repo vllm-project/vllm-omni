@@ -269,7 +269,9 @@ class Qwen3OmniMoeAudioAttention(_Qwen3OmniMoeAudioAttention):
         self.num_heads = config.encoder_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
         tp_size = get_tensor_model_parallel_world_size()
-        self.num_local_heads = self.num_heads // tp_size
+        disable_tp = self.num_heads % tp_size != 0
+        effective_tp = 1 if disable_tp else tp_size
+        self.num_local_heads = self.num_heads // effective_tp
 
         if (self.head_dim * self.num_heads) != self.embed_dim:
             raise ValueError(
@@ -285,6 +287,7 @@ class Qwen3OmniMoeAudioAttention(_Qwen3OmniMoeAudioAttention):
             total_num_heads=self.num_heads,
             total_num_kv_heads=self.num_heads,
             bias=True,
+            disable_tp=disable_tp,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv",
         )
@@ -293,6 +296,7 @@ class Qwen3OmniMoeAudioAttention(_Qwen3OmniMoeAudioAttention):
             input_size=self.embed_dim,
             output_size=self.embed_dim,
             bias=True,
+            disable_tp=disable_tp,
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
@@ -319,10 +323,13 @@ class Qwen3OmniMoeAudioEncoderLayer(_Qwen3OmniMoeAudioEncoderLayer):
         self.self_attn = Qwen3OmniMoeAudioAttention(config, quant_config=quant_config, prefix=f"{prefix}.self_attn")
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.activation_fn = _ACTIVATION_REGISTRY[config.activation_function]
+        tp_size = get_tensor_model_parallel_world_size()
+        disable_tp = config.encoder_attention_heads % tp_size != 0
         self.fc1 = ColumnParallelLinear(
             self.embed_dim,
             config.encoder_ffn_dim,
             bias=True,
+            disable_tp=disable_tp,
             quant_config=quant_config,
             prefix=f"{prefix}.fc1",
         )
@@ -330,6 +337,7 @@ class Qwen3OmniMoeAudioEncoderLayer(_Qwen3OmniMoeAudioEncoderLayer):
             config.encoder_ffn_dim,
             self.embed_dim,
             bias=True,
+            disable_tp=disable_tp,
             quant_config=quant_config,
             prefix=f"{prefix}.fc2",
         )

@@ -72,9 +72,6 @@ class _RMSNorm(CustomOp):
     def forward_cuda(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.forward_native(hidden_states)
 
-    def forward_xpu(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(hidden_states)
-
     def forward_native(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
