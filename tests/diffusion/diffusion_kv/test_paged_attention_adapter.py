@@ -15,10 +15,10 @@ import torch
 from torch import nn
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
+from tests.helpers.kv_layout import layout_for_backend
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.diffusion_kv import paged_attention_adapter as adapter_module
-from tests.helpers.kv_layout import layout_for_backend
 from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionAdapter,
     DiffusionPagedAttentionMetadata,

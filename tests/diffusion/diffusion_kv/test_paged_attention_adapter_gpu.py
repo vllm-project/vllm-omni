@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCache
 from vllm.v1.worker.gpu.attn_utils import init_attn_backend, init_kv_cache
 from vllm.v1.worker.gpu.block_table import BlockTables
 
+from tests.helpers.kv_layout import build_kv_cache_tensor
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.diffusion_kv.layout import resolve_diffusion_kv_cache_layout
@@ -24,7 +25,6 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionRowBinding,
 )
 from vllm_omni.diffusion.vllm_config import _DiffusionVllmModelConfig
-from tests.helpers.kv_layout import build_kv_cache_tensor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu]
 
@@ -90,9 +90,7 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
     canonical_spec = native_layer.spec
     kv_cache_config = KVCacheConfig(
         num_blocks=4,
-        kv_cache_tensors=[
-            build_kv_cache_tensor(canonical_spec, 4, [_LAYER_NAME])
-        ],
+        kv_cache_tensors=[build_kv_cache_tensor(canonical_spec, 4, [_LAYER_NAME])],
         kv_cache_groups=[
             KVCacheGroupSpec(
                 layer_names=[_LAYER_NAME],

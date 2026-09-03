@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Engine-level KV cache orchestration for AR-Diffusion models.
 
 This is the *body* of AR-Diffusion's KV management: it owns a vLLM ``KVCacheManager`` (a

@@ -293,9 +293,7 @@ class DiffusionKVModelRunnerBackend:
                 # and dropped attn_groups/cache_dtype from the signature.
                 adopt_kv_cache_layout(self.vllm_config, kv_cache_config)
                 for layer_adapter in self._kv_cache_layer_adapters.values():
-                    assert_backend_layout_supported(
-                        self.vllm_config, getattr(layer_adapter, "attn_backend", None)
-                    )
+                    assert_backend_layout_supported(self.vllm_config, getattr(layer_adapter, "attn_backend", None))
                 init_kv_cache(
                     kv_caches,
                     self.vllm_config.compilation_config.static_forward_context,

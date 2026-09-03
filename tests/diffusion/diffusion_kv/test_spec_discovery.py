@@ -11,11 +11,11 @@ from torch import nn
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 
 import vllm_omni.diffusion.worker.diffusion_worker as diffusion_worker_module
+from tests.helpers.kv_layout import build_kv_cache_tensor, layout_for_backend
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
-from tests.helpers.kv_layout import build_kv_cache_tensor, layout_for_backend
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 

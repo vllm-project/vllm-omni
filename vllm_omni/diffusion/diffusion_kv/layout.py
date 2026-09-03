@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Physical KV cache layout selection for the native Diffusion paged cache.
 
 vLLM 0.29 removed ``AttentionSpec.indexes_kv_by_block_stride`` and replaced it
@@ -44,8 +44,8 @@ def resolve_diffusion_kv_cache_layout(
 
     A layout already present on the config wins, mirroring upstream's
     ``resolve_kv_cache_layout``; it is validated against the requirement rather
-    than silently overwritten, because an inconsistent layout mis-addresses K/V
-    instead of raising.
+    than silently overwritten, because an inconsistent layout reads K/V
+    from the wrong offsets instead of raising.
     """
 
     required_block_outermost = bool(indexes_kv_by_block_stride)
@@ -53,11 +53,7 @@ def resolve_diffusion_kv_cache_layout(
     if cache_config is None:
         # A config double with nowhere to record the choice; report what the
         # requirement implies without pretending it was pinned.
-        return (
-            BLOCK_STRIDE_DIFFUSION_KV_CACHE_LAYOUT
-            if required_block_outermost
-            else DEFAULT_DIFFUSION_KV_CACHE_LAYOUT
-        )
+        return BLOCK_STRIDE_DIFFUSION_KV_CACHE_LAYOUT if required_block_outermost else DEFAULT_DIFFUSION_KV_CACHE_LAYOUT
 
     current = getattr(cache_config, "kv_cache_layout", None)
     if current is not None:
@@ -72,11 +68,7 @@ def resolve_diffusion_kv_cache_layout(
             )
         return layout
 
-    layout = (
-        BLOCK_STRIDE_DIFFUSION_KV_CACHE_LAYOUT
-        if required_block_outermost
-        else DEFAULT_DIFFUSION_KV_CACHE_LAYOUT
-    )
+    layout = BLOCK_STRIDE_DIFFUSION_KV_CACHE_LAYOUT if required_block_outermost else DEFAULT_DIFFUSION_KV_CACHE_LAYOUT
     cache_config.kv_cache_layout = layout.name
     return layout
 
@@ -107,8 +99,7 @@ def adopt_kv_cache_layout(vllm_config: VllmConfig, kv_cache_config) -> KVCacheLa
         cache_config.kv_cache_layout = name
     elif current != name:
         raise ValueError(
-            f"Worker KV cache layout {current!r} disagrees with the layout "
-            f"resolved by the control plane ({name!r})."
+            f"Worker KV cache layout {current!r} disagrees with the layout resolved by the control plane ({name!r})."
         )
     return KVCacheLayout[name]
 
@@ -132,7 +123,7 @@ def build_kv_cache_tensor(
 
     The strides come from upstream's own ``compute_layout_strides``, called the
     way ``vllm.v1.core.kv_cache_utils`` calls it, because hand-computed strides
-    mis-address K/V silently instead of raising.
+    read K/V from the wrong offsets silently instead of raising.
     """
 
     layout = layout or DEFAULT_DIFFUSION_KV_CACHE_LAYOUT
