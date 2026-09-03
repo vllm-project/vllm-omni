@@ -1,5 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Audio serving utility mixin.
+
+PUT HERE:
+  - AudioMixin helpers that convert audio tensors/bytes/formats for speech
+    and audio serving classes (shared by multiple serving paths).
+
+DO NOT PUT HERE:
+  - FastAPI route / form / job orchestration peeled from ``api_server.py``.
+    Put those under an audio package ``helpers.py`` (or audio serving modules)
+    when extracted.
+
+LONGEVITY:
+  - This root mixin is a **temporary shared home**.
+  - TODO(#5227, P1.1): tidy up / move with the audio/speech family split
+    in the Phase 1 audio PR; do not treat this file as the long-term owner.
+  - Endpoint-family helpers under an audio package are the longer home for
+    route-adjacent logic.
+
+See ``openai/README.md`` (utils vs helpers, no overlap).
+"""
 
 from io import BytesIO
 

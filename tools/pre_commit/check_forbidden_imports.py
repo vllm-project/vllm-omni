@@ -195,6 +195,7 @@ CHECK_IMPORTS = {
             "vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py",
             "vllm_omni/engine/arg_utils.py",
             "vllm_omni/entrypoints/openai/api_server.py",
+            "vllm_omni/entrypoints/openai/chat_template.py",
             "vllm_omni/entrypoints/openai/serving_speech.py",
             "vllm_omni/entrypoints/openai/tts_adapters/cosyvoice3.py",
             "vllm_omni/experimental/fullduplex/personaplex/runtime.py",
