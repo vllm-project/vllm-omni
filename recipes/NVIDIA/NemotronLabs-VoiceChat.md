@@ -31,7 +31,8 @@ NeMo modules (`nemo_vendored/`), so no `nemo_toolkit` install is needed.
   [`examples/offline_inference/nemotron_voicechat/end2end.py`](../../examples/offline_inference/nemotron_voicechat/end2end.py)
 - Model modules (thinker / talker / code2wav / vendored NeMo):
   [`vllm_omni/model_executor/models/nemotron_voicechat/`](../../vllm_omni/model_executor/models/nemotron_voicechat/)
-- Staged pipeline config (NeMo bit-parity path):
+- Staged pipeline config (fast default; "PARITY:" comments restore the
+  NeMo-bit-exact reference):
   [`vllm_omni/deploy/nemotron_labs_voicechat.yaml`](../../vllm_omni/deploy/nemotron_labs_voicechat.yaml)
 - Native duplex config and E2E probe:
   [`vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml`](../../vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml),
@@ -46,7 +47,7 @@ NeMo modules (`nemo_vendored/`), so no `nemo_toolkit` install is needed.
 
 | stage | arch | dtype | role |
 |---|---|---|---|
-| 0 thinker | `NemotronVoiceChatThinkerForConditionalGeneration` (LLM_AR) | fp32 | WAV + system prompt -> frame-locked text-token timeline (+ function channel) |
+| 0 thinker | `NemotronVoiceChatThinkerForConditionalGeneration` (LLM_AR) | bf16 (PARITY: fp32) | WAV + system prompt -> frame-locked text-token timeline (+ function channel) |
 | 1 talker | `NemotronVoiceChatTalker` (LLM_AR) | fp32 | text timeline -> 31-quantizer RVQ code stacks (one per 80 ms frame) |
 | 2 code2wav | `NemotronVoiceChatCode2Wav` (LLM_GENERATION) | fp32 | RVQ-VAE decode -> 22.05 kHz PCM |
 
@@ -246,8 +247,9 @@ sessions fall back to eager stepping.
   set `min_tokens` on the thinker: the tokenizer's EOS token is also the
   frame-locked PAD/silence token, so masking it forces the model to babble
   instead of pausing.
-- The talker's `max_tokens` is 16383 (its stage prompt is one placeholder
-  token, and the stage context is 16384).
+- The talker's `max_tokens` is 16347: its stage prompt is the 37-token
+  speaker-prompt prefill (`talker_init_len: 37`), and prompt + max_tokens
+  must fit the 16384 stage context.
 - The 80 ms frame period is a model/protocol contract, not a throughput
   guarantee. The default duplex profile keeps up with the frame clock on 1x
   H100; the eager fp32 PARITY execution is functionally streaming but not

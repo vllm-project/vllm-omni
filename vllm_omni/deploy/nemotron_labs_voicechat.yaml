@@ -84,11 +84,12 @@ stages:
       to_stage_2: connector_of_shared_memory
     default_sampling_params:
       # Placeholder-token loop; the stage emits stop token 1 after the last
-      # timeline position. 16383 (not 16384): the request also carries the
+      # timeline position. 16347 = max_model_len (16384) minus the native
+      # talker's 37-token speaker-prompt prefill: the request carries the
       # placeholder prompt tokens, and prompt + max_tokens must fit
       # max_model_len.
       temperature: 0.0
-      max_tokens: 16383
+      max_tokens: 16347
       stop_token_ids: [1]
       detokenize: false
       seed: 0
