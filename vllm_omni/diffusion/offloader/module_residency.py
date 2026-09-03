@@ -20,6 +20,17 @@ from .tensor_utils import is_dtensor, set_tensor_storage
 logger = init_logger(__name__)
 
 
+# Margin over the largest cached-but-unallocated value observed at a component
+# boundary. The observed peak already includes the weight-reuse payload and
+# the transient footprint of the running workload, so this only covers
+# check-to-check variation.
+_OBSERVED_PEAK_MARGIN = 1.25
+# Hard ceiling for the learned budget so a spurious observation can never
+# monopolize a small device; the #6526 L20X retention plateau (~23.8 GB on a
+# ~140 GB card) stayed well below this fraction.
+_MAX_BUDGET_CAPACITY_FRACTION = 0.25
+
+
 class BoundedAllocatorCache:
     """Retain reusable allocator blocks without monopolizing device memory.
 
@@ -28,35 +39,100 @@ class BoundedAllocatorCache:
     cached blocks are immediately reusable. This policy keeps the cache while
     both of these bounds hold:
 
-    * cached-but-unallocated memory is at most 25% of device capacity; and
+    * cached-but-unallocated memory stays within the learned budget — the
+      largest cached value observed at any component boundary times a margin,
+      capped at a quarter of device capacity; and
     * at least 5% of device capacity is physically free.
 
-    Missing memory telemetry is handled conservatively by releasing the cache.
-    Failure paths can force release; normal executor shutdown keeps its own
-    unconditional device-cache cleanup because this policy is not global.
+    The budget needs no user-chosen fraction, no multiplier constant, and no
+    warmup flag. It starts at zero, so the first boundaries of a cold start
+    release once per observation step while the peak climbs; afterwards the
+    budget tracks the observed peak and boundaries retain steadily. A
+    workload change whose cached footprint grows by more than the margin pays
+    one further release while the new peak lands. Detaching the last attached
+    ``PinnedModuleStager`` resets the observed peak, so one workload never
+    permanently influences another. Missing memory telemetry is handled
+    conservatively by releasing the cache. Failure paths can force release;
+    normal executor shutdown keeps its own unconditional device-cache cleanup
+    because this policy is not global.
     """
 
     def __init__(
         self,
         device: torch.device,
         *,
-        max_cached_fraction: float = 0.25,
         min_free_fraction: float = 0.05,
     ) -> None:
-        if not 0.0 <= max_cached_fraction <= 1.0:
-            raise ValueError(f"max_cached_fraction must be in [0, 1], got {max_cached_fraction}")
         if not 0.0 <= min_free_fraction <= 1.0:
             raise ValueError(f"min_free_fraction must be in [0, 1], got {min_free_fraction}")
         self.device = device
-        self.max_cached_fraction = max_cached_fraction
         self.min_free_fraction = min_free_fraction
+        self._staged_bytes = 0
+        self._observed_cached_peak = 0
+
+    def grow_retention_budget(self, staged_bytes: int) -> None:
+        """Record an attached stager's staged byte total."""
+        if staged_bytes < 0:
+            raise ValueError(f"staged_bytes must be >= 0, got {staged_bytes}")
+        self._staged_bytes += int(staged_bytes)
+
+    def shrink_retention_budget(self, staged_bytes: int) -> None:
+        """Record a stager detach; the last detach resets the observed peak."""
+        if staged_bytes < 0:
+            raise ValueError(f"staged_bytes must be >= 0, got {staged_bytes}")
+        self._staged_bytes = max(0, self._staged_bytes - int(staged_bytes))
+        if self._staged_bytes == 0:
+            self._observed_cached_peak = 0
+
+    @property
+    def observed_cached_peak(self) -> int:
+        """Largest cached-but-unallocated value seen at a boundary check."""
+        return self._observed_cached_peak
+
+    @property
+    def budget_bytes(self) -> int:
+        """Reusable-cache ceiling: the observed peak times its margin."""
+        return int(self._observed_cached_peak * _OBSERVED_PEAK_MARGIN)
 
     def _should_release(self) -> bool:
         reserved = int(torch.accelerator.memory_reserved(self.device))
         allocated = int(torch.accelerator.memory_allocated(self.device))
         free, total = current_omni_platform.get_device_memory(self.device)
         cached = max(0, reserved - allocated)
-        return cached > int(total * self.max_cached_fraction) or free < int(total * self.min_free_fraction)
+        capacity_cap = int(total * _MAX_BUDGET_CAPACITY_FRACTION)
+        budget = min(self.budget_bytes, capacity_cap)
+        # Decide against the pre-observation budget, then record the peak so a
+        # one-off over-budget release also teaches the budget for later checks.
+        release = cached > budget or free < int(total * self.min_free_fraction)
+        if cached > self._observed_cached_peak:
+            self._observed_cached_peak = cached
+        if release:
+            reason = "cached-over-budget" if cached > budget else "low-free-memory"
+            logger.debug(
+                "Releasing retained allocator cache (%s): cached=%d budget=%d staged=%d "
+                "observed_peak=%d capacity_cap=%d free=%d total=%d",
+                reason,
+                cached,
+                budget,
+                self._staged_bytes,
+                self._observed_cached_peak,
+                capacity_cap,
+                free,
+                total,
+            )
+            return True
+        logger.debug(
+            "Retaining allocator cache: cached=%d budget=%d staged=%d observed_peak=%d "
+            "capacity_cap=%d free=%d total=%d",
+            cached,
+            budget,
+            self._staged_bytes,
+            self._observed_cached_peak,
+            capacity_cap,
+            free,
+            total,
+        )
+        return False
 
     def release_if_needed(self, *, force: bool = False) -> bool:
         """Release cached blocks when a bound is crossed or release is forced."""
@@ -116,11 +192,12 @@ class PinnedModuleStager:
         self.device = device
         self.copy_stream = copy_stream if copy_stream is not None else current_omni_platform.Stream()
         self._ready_event = current_omni_platform.Event()
-        self.cache_retention = cache_retention
+        self.cache_retention = None
         self.loaded = False
         self._groups = self._snapshot_groups(modules, pin_memory=pin_memory)
         self._device_storages: list[torch.Tensor] = []
         self._restore_masters()
+        self.set_cache_retention(cache_retention)
 
     @staticmethod
     def _local_tensor(target: torch.Tensor) -> torch.Tensor:
@@ -198,8 +275,19 @@ class PinnedModuleStager:
     def _restore_masters(self) -> None:
         self._bind([group.master for group in self._groups])
 
+    @property
+    def staged_bytes(self) -> int:
+        """Total unique staged storage bytes (masters are uint8 byte views)."""
+        return sum(group.master.numel() for group in self._groups)
+
     def set_cache_retention(self, cache_retention: BoundedAllocatorCache | None) -> None:
+        if cache_retention is self.cache_retention:
+            return
+        if self.cache_retention is not None:
+            self.cache_retention.shrink_retention_budget(self.staged_bytes)
         self.cache_retention = cache_retention
+        if cache_retention is not None:
+            cache_retention.grow_retention_budget(self.staged_bytes)
 
     def _release_cache(self, *, force: bool = False) -> None:
         if self.cache_retention is None:
@@ -239,6 +327,10 @@ class PinnedModuleStager:
         except torch.OutOfMemoryError:
             # A retained cache is normally reusable by this process, but an
             # explicit flush gives external memory pressure one bounded retry.
+            logger.info(
+                "Staging out of memory (%d staged bytes); releasing retained cache and retrying once",
+                self.staged_bytes,
+            )
             self._cleanup_failed_load()
             try:
                 self._load_once()

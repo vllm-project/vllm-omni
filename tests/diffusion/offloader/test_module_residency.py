@@ -202,19 +202,94 @@ def test_allocator_cache_policy_enforces_cache_and_free_memory_bounds(
     expected_release,
 ):
     empty_cache, _ = patched_runtime
-    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda _device: reserved)
-    monkeypatch.setattr(torch.accelerator, "memory_allocated", lambda _device: allocated)
+    telemetry = {"reserved": 20, "allocated": 10, "free": 80}
+    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda _device: telemetry["reserved"])
+    monkeypatch.setattr(torch.accelerator, "memory_allocated", lambda _device: telemetry["allocated"])
     monkeypatch.setattr(
         residency_module.current_omni_platform,
         "get_device_memory",
-        lambda _device: (free, 100),
+        lambda _device: (telemetry["free"], 400),
     )
     retention = BoundedAllocatorCache(torch.device("cpu"))
+
+    # Prime the learned budget: the cold-start check releases (budget 0) and
+    # records cached = 10, so later checks retain at budget 12.5.
+    assert retention.release_if_needed()
+    assert retention.observed_cached_peak == 10
+    empty_cache.reset_mock()
+
+    telemetry.update(reserved=reserved, allocated=allocated, free=free)
 
     released = retention.release_if_needed()
 
     assert released is expected_release
     assert empty_cache.call_count == int(expected_release)
+
+
+def test_attached_stagers_form_a_detach_ledger_that_resets_the_observed_peak(patched_runtime):
+    left, right = _aliased_modules()
+    retention = BoundedAllocatorCache(torch.device("cpu"))
+    assert retention.budget_bytes == 0
+
+    stager = PinnedModuleStager(
+        [left, right],
+        torch.device("cpu"),
+        pin_memory=False,
+        cache_retention=retention,
+    )
+    expected_bytes = 12 * 4 + 8 * 8  # float32 parameter + int64 buffer storages
+    assert stager.staged_bytes == expected_bytes
+    assert retention._staged_bytes == expected_bytes
+
+    # Re-attaching the same cache does not double count.
+    stager.set_cache_retention(retention)
+    assert retention._staged_bytes == expected_bytes
+
+    # A second stager adds its own staged bytes to the ledger.
+    extra = PinnedModuleStager(torch.nn.Linear(2, 2), torch.device("cpu"), pin_memory=False)
+    extra.set_cache_retention(retention)
+    assert retention._staged_bytes == expected_bytes + extra.staged_bytes
+
+    # A learned peak survives a partial detach...
+    retention._observed_cached_peak = 30
+    extra.set_cache_retention(None)
+    assert retention.observed_cached_peak == 30
+    assert retention.budget_bytes == 37
+
+    # ...but the last detach resets it so one workload cannot influence the next.
+    stager.set_cache_retention(None)
+    assert retention.observed_cached_peak == 0
+    assert retention.budget_bytes == 0
+
+
+def test_allocator_cache_budget_is_capped_by_device_capacity(monkeypatch, patched_runtime):
+    empty_cache, _ = patched_runtime
+    telemetry = {"reserved": 40, "allocated": 10, "free": 80}
+    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda _device: telemetry["reserved"])
+    monkeypatch.setattr(torch.accelerator, "memory_allocated", lambda _device: telemetry["allocated"])
+    monkeypatch.setattr(
+        residency_module.current_omni_platform,
+        # Capacity 100 keeps the 25% cap at 25, below the learned budget of
+        # 30 * 1.25 = 37.5, so the cap must govern.
+        "get_device_memory",
+        lambda _device: (telemetry["free"], 100),
+    )
+    retention = BoundedAllocatorCache(torch.device("cpu"))
+
+    # Cold start: budget 0 releases and records the peak of 30.
+    assert retention.release_if_needed()
+    assert retention.observed_cached_peak == 30
+    empty_cache.reset_mock()
+
+    # The learned budget 37.5 is capped to 25, so cached 30 keeps releasing.
+    assert retention.release_if_needed()
+    assert retention.release_if_needed()
+    empty_cache.reset_mock()
+
+    # Within the cap (cached 20 <= 25) the policy retains.
+    telemetry.update(reserved=30, allocated=10)
+    assert not retention.release_if_needed()
+    assert empty_cache.call_count == 0
 
 
 def test_allocator_cache_releases_when_telemetry_is_unavailable(monkeypatch, patched_runtime):
@@ -228,3 +303,29 @@ def test_allocator_cache_releases_when_telemetry_is_unavailable(monkeypatch, pat
 
     assert retention.release_if_needed()
     empty_cache.assert_called_once_with()
+
+
+def test_allocator_cache_budget_adapts_to_observed_peak(monkeypatch, patched_runtime):
+    empty_cache, _ = patched_runtime
+    telemetry = {"reserved": 40, "allocated": 10, "free": 80}
+    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda _device: telemetry["reserved"])
+    monkeypatch.setattr(torch.accelerator, "memory_allocated", lambda _device: telemetry["allocated"])
+    monkeypatch.setattr(
+        residency_module.current_omni_platform,
+        "get_device_memory",
+        # Capacity 400 keeps the 25% cap (100) above the learned budget so
+        # this test isolates the peak-adaptation behavior from the cap.
+        lambda _device: (telemetry["free"], 400),
+    )
+    retention = BoundedAllocatorCache(torch.device("cpu"))
+
+    # Cold-start boundary: budget 0, so the policy releases and records the
+    # observed peak.
+    assert retention.release_if_needed()
+    assert retention.observed_cached_peak == 30
+
+    # The observation raises the budget to 30 * 1.25 = 37, so the same cached
+    # level is retained on every later boundary without another release.
+    assert not retention.release_if_needed()
+    assert not retention.release_if_needed()
+    assert empty_cache.call_count == 1

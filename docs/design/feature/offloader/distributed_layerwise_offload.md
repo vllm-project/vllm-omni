@@ -179,8 +179,24 @@ component can be reused by the next. The DiT prefetch path and its two shared
 device buffers are unchanged.
 
 After a component is offloaded, cached-but-unallocated memory is retained only
-while it is at most 25% of device capacity and at least 5% of device capacity
-remains physically free. Crossing either bound releases the allocator cache.
+while it stays within a budget learned from the running workload and at least
+5% of device capacity remains physically free. The budget is the largest
+cached value observed at any component boundary times a margin, so it tracks
+the weight-reuse payload plus the transient footprint whatever the
+resolution. It starts at zero: a cold start pays one release per observation
+step while the peak climbs, after which boundaries retain steadily, and a
+workload change whose cached footprint grows by more than the margin pays one
+further release while the new peak lands. Models whose request geometry opts
+out of the generic dummy run declare a feature-neutral `dummy_run_recipe`
+instead; MiniMax-H3 declares a maximum-duration t2va generation, so the
+engine's startup warmup runs it and, under DLO, the cold-start flushes land
+before real traffic. The budget is capped at a quarter
+of device capacity so a spurious observation cannot monopolize a small
+device, and detaching the last attached stager resets the learned peak so one
+workload never permanently influences another. No user-chosen fraction, no
+multiplier constant, and no warmup flag are needed. Each decision logs the
+staged byte total, observed peak, effective budget and cap,
+cached-but-unallocated bytes, and free memory.
 Missing allocator telemetry also releases it conservatively. Component or
 staging failure forces a release, and an out-of-memory allocation gets one
 retry after release. This is a component-local policy rather than a global

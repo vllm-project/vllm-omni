@@ -70,6 +70,161 @@ def test_dummy_run_image_count_resolves_hunyuan_architecture_alias() -> None:
     assert io_support.get_dummy_run_num_image_inputs("unknown") == 1
 
 
+def test_dummy_run_recipe_returns_none_without_declaration(monkeypatch: pytest.MonkeyPatch) -> None:
+    class PlainModel:
+        pass
+
+    monkeypatch.setattr(
+        io_support.DiffusionModelRegistry,
+        "_try_load_model_cls",
+        lambda model_class_name: PlainModel,
+    )
+
+    assert io_support.get_dummy_run_recipe("plain") is None
+
+
+def test_dummy_run_recipe_returns_copy_of_declaration(monkeypatch: pytest.MonkeyPatch) -> None:
+    declared = {"task": "t2va", "duration": 4.0}
+
+    class RecipeModel:
+        dummy_run_recipe = declared
+
+    monkeypatch.setattr(
+        io_support.DiffusionModelRegistry,
+        "_try_load_model_cls",
+        lambda model_class_name: RecipeModel,
+    )
+
+    recipe = io_support.get_dummy_run_recipe("recipe")
+    assert recipe == declared
+    assert recipe is not declared
+
+
+def test_minimax_h3_declares_a_valid_dlo_warmup_recipe() -> None:
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        MINIMAX_H3_MAX_OUTPUT_SECONDS,
+        MiniMaxH3Pipeline,
+    )
+
+    recipe = MiniMaxH3Pipeline.dummy_run_recipe
+    assert recipe is not None
+    assert recipe["task"] == "t2va"
+    assert recipe["aspect_ratio"] == "16:9"
+    # Maximum duration makes the learned peak dominate every production
+    # request at the fixed short edge, so no real request re-learns.
+    assert float(recipe["duration"]) == MINIMAX_H3_MAX_OUTPUT_SECONDS
+    assert MiniMaxH3Pipeline.dummy_run_num_frames == 0  # generic warmup stays opted out
+
+
+def _dlo_recipe_engine(enable_dlo: bool) -> DiffusionEngine:
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = SimpleNamespace(
+        model_class_name="RecipeModel",
+        enable_distributed_layerwise_offload=enable_dlo,
+    )
+    return engine
+
+
+def _opt_out_generic_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+    recipe: dict | None,
+    *,
+    supports_image_input: bool = False,
+) -> None:
+    """Make the generic dummy run opt out and stub the declared recipe."""
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.supports_multimodal_input",
+        lambda od_config: (supports_image_input, False),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.get_dummy_run_num_frames",
+        lambda model_class_name, supports_audio_input: 0,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.get_dummy_run_recipe",
+        lambda model_class_name: recipe,
+    )
+
+
+def test_make_dummy_request_applies_recipe_without_dlo(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The recipe is feature-neutral: a model whose geometry needs it warms up
+    # whatever features are enabled, not only under DLO.
+    _opt_out_generic_warmup(monkeypatch, {"task": "t2va", "duration": 4.0, "aspect_ratio": "16:9"})
+
+    request = _dlo_recipe_engine(enable_dlo=False)._make_dummy_request(height=512, width=512, guidance_scale=0.0)
+
+    assert request is not None
+    assert request.sampling_params.extra_args["task"] == "t2va"
+
+
+def test_make_dummy_request_builds_recipe_request_when_generic_opted_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _opt_out_generic_warmup(
+        monkeypatch,
+        {
+            "task": "t2va",
+            "duration": 4.0,
+            "aspect_ratio": "16:9",
+            "num_inference_steps": 2,
+            "guidance_scale": 1.0,
+        },
+    )
+
+    request = _dlo_recipe_engine(enable_dlo=True)._make_dummy_request(height=512, width=512, guidance_scale=0.0)
+
+    assert request is not None
+    assert request.is_dummy_run()
+    assert request.sampling_params.num_inference_steps == 2
+    assert request.sampling_params.guidance_scale == 1.0
+    extra = request.sampling_params.extra_args
+    assert extra["task"] == "t2va"
+    assert extra["duration"] == 4.0
+    assert extra["aspect_ratio"] == "16:9"
+    assert extra["cfg_text_scale"] == 1.0
+
+
+def test_make_dummy_request_recipe_stays_text_only_with_image_capable_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # H3 advertises image input for fl2va, but the warmup recipe names t2va,
+    # which rejects image conditions; the recipe request must not inherit the
+    # generic dummy run's synthetic multimodal data.
+    _opt_out_generic_warmup(
+        monkeypatch,
+        {"task": "t2va", "duration": 4.0, "aspect_ratio": "16:9"},
+        supports_image_input=True,
+    )
+
+    request = _dlo_recipe_engine(enable_dlo=True)._make_dummy_request(height=512, width=512, guidance_scale=0.0)
+
+    assert request is not None
+    assert not request.prompt.get("multi_modal_data")
+
+
+def test_dummy_run_sends_recipe_request_when_generic_opted_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    _opt_out_generic_warmup(monkeypatch, {"task": "t2va", "duration": 15.0, "aspect_ratio": "16:9"})
+    engine = _dlo_recipe_engine(enable_dlo=True)
+    engine.add_req_and_wait_for_response = Mock(return_value=SimpleNamespace(error=None, request_id="dlo-dummy"))
+
+    engine._dummy_run()
+
+    sent = engine.add_req_and_wait_for_response.call_args.args[0]
+    assert sent.is_dummy_run()
+    assert sent.sampling_params.extra_args["task"] == "t2va"
+
+
+def test_dummy_run_still_skips_without_recipe(monkeypatch: pytest.MonkeyPatch) -> None:
+    _opt_out_generic_warmup(monkeypatch, None)
+    engine = _dlo_recipe_engine(enable_dlo=True)
+    engine.add_req_and_wait_for_response = Mock()
+
+    engine._dummy_run()
+
+    engine.add_req_and_wait_for_response.assert_not_called()
+
+
 def test_dense_mode_does_not_build_kv_profile_request() -> None:
     engine = object.__new__(DiffusionEngine)
     engine.od_config = SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY)

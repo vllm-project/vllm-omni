@@ -67,6 +67,16 @@ omni = Omni(
 | `--host-weight-runtime-root PATH` | Writable node-local HWR store shared by workers in one storage domain; required for `preferred` and `required` | unset |
 | `--dlo-host-registration-limit-gib N` | Optional per-worker ceiling for registering an HWR mmap; zero adds no ceiling | `0` |
 
+## Startup warmup
+
+Models whose request geometry needs model-specific sampling arguments for a
+warmup generation (currently MiniMax-H3: `t2va`, an explicit aspect ratio)
+run one at engine startup whatever features are enabled. It runs at the
+maximum output duration so it covers every production request; under DLO
+this means the component allocator-cache retention policy learns its
+footprint during startup and no real request pays the cold-start flushes.
+The tradeoff is one maximum-length generation added to boot time.
+
 ## Host-weight loading
 
 The diffusion loader chooses host storage before DLO is enabled. It first

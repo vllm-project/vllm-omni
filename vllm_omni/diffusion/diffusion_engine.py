@@ -37,6 +37,7 @@ from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.io_support import (
     get_dummy_run_num_frames,
     get_dummy_run_num_image_inputs,
+    get_dummy_run_recipe,
     image_color_format,
     supports_audio_output,
     supports_multimodal_input,
@@ -70,6 +71,9 @@ logger = init_logger(__name__)
 
 _ASYNC_OUTPUT_TIMEOUT_ENV = "VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"
 _ASYNC_OUTPUT_TIMEOUT_DEFAULT = 600.0  # seconds
+# Warmup-recipe keys applied to the dummy request's sampling params; every
+# other recipe entry is forwarded through the request's extra_args.
+_DUMMY_RUN_RECIPE_SAMPLING_KEYS = frozenset({"height", "width", "num_inference_steps", "num_frames", "guidance_scale"})
 
 
 def _async_output_timeout() -> float:
@@ -1050,8 +1054,36 @@ class DiffusionEngine:
     ) -> OmniDiffusionRequest | None:
         """Build a one-step model request for startup profiling or warmup."""
 
-        prompt: OmniTextPrompt = {"prompt": "dummy run"}
         supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
+        num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
+        if num_frames <= 0:
+            # The model opted out of the generic dummy run; fall back to its
+            # declared warmup recipe, which supplies whatever feature-specific
+            # sampling arguments the model requires (under distributed
+            # layerwise offload the generation also primes the component
+            # allocator-cache retention policy ahead of real traffic). The
+            # recipe names its own task, so the request stays text-only even
+            # when the model's other tasks accept image or audio conditions.
+            recipe = get_dummy_run_recipe(self.od_config.model_class_name)
+            if recipe is None:
+                return None
+            extra_args: dict[str, Any] = {"cfg_text_scale": 1.0, "cfg_img_scale": 1.0}
+            extra_args.update({k: v for k, v in recipe.items() if k not in _DUMMY_RUN_RECIPE_SAMPLING_KEYS})
+            return OmniDiffusionRequest(
+                prompt={"prompt": "dummy run"},
+                request_id=DUMMY_DIFFUSION_REQUEST_ID,
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=int(recipe.get("height", height)),
+                    width=int(recipe.get("width", width)),
+                    num_inference_steps=int(recipe.get("num_inference_steps", 1)),
+                    num_frames=int(recipe.get("num_frames", 0)),
+                    guidance_scale=float(recipe.get("guidance_scale", guidance_scale)),
+                    num_outputs_per_prompt=1,
+                    extra_args=extra_args,
+                ),
+            )
+
+        prompt: OmniTextPrompt = {"prompt": "dummy run"}
         if supports_image_input:
             color_format = image_color_format(self.od_config.model_class_name)
             images = [PIL.Image.new(color_format, (width, height)) for _ in range(num_image_inputs)]
@@ -1061,9 +1093,6 @@ class DiffusionEngine:
             audio_sr = 16000
             prompt.setdefault("multi_modal_data", {})["audio"] = np.random.randn(audio_sr * 2).astype(np.float32)
 
-        num_frames = get_dummy_run_num_frames(self.od_config.model_class_name, supports_audio_input)
-        if num_frames <= 0:
-            return None
         return OmniDiffusionRequest(
             prompt=prompt,
             request_id=DUMMY_DIFFUSION_REQUEST_ID,
