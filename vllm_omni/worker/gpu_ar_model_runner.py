@@ -693,42 +693,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         keys = getattr(model, "deferred_prefix_cache_mm_keys", ())
         return set(keys or ())
 
-    def _maybe_update_prefix_cache(
-        self,
-        hidden_states: torch.Tensor,
-        hidden_states_cpu: torch.Tensor | None,
-        multimodal_outputs: dict,
-        num_tokens_unpadded: int,
-        num_tokens_padded: int,
-    ):
-        """If prefix caching is enabled and it's the last pipeline parallelism rank,
-        retrieve the hidden states & multimodal outputs from the prefix cache based
-        on our batch slot mappings.
-        """
-        # Cache hidden states if we've enabled hidden state prefix caching
-        # unless this isn't the last pipeline parallelism rank.
-        is_last_pp_rank = get_pp_group().is_last_rank
-        if hidden_states_cpu is not None and not is_last_pp_rank:
-            raise RuntimeError("hidden_states_cpu staging is only valid on the last pipeline parallel rank.")
-        if self.omni_prefix_cache is not None and is_last_pp_rank:
-            # If this happens, it generally means the model is not following the correct
-            # interface yet and is therefore currently not compatible with prefix cache.
-            hs_for_cache = hidden_states if self._model_needs_full_prefix_hidden_states() else None
-            # FIX: The .cpu attribute of slot_mapping is stale (not updated by the Triton
-            # _compute_slot_mapping_kernel which only writes to .gpu). We must use .gpu and
-            # sync back to CPU to get the correctly computed slot mapping.
-            slot_mapping_gpu = self.input_batch.block_table[0].slot_mapping.gpu
-            slot_mapping_cpu = slot_mapping_gpu[:num_tokens_padded].cpu()
-            self.omni_prefix_cache.update_omni_tensor_prefix_cache(
-                hidden_states=hs_for_cache,
-                multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
-                num_tokens_unpadded=num_tokens_unpadded,
-                slot_mapping=slot_mapping_cpu,
-                num_tokens_padded=num_tokens_padded,
-                skip_mm_cache_keys=self._deferred_prefix_cache_mm_keys(),
-                hidden_states_cpu=hidden_states_cpu,
-            )
-
     def _maybe_get_combined_prefix_cache_tensors(
         self,
         hidden_states: torch.Tensor,
@@ -1580,8 +1544,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
     def _snapshot_query_start_loc_cpu(self) -> Any:
         query_start_loc_cpu = self.query_start_loc.cpu
-        if callable(query_start_loc_cpu):
-            query_start_loc_cpu = query_start_loc_cpu()
         if isinstance(query_start_loc_cpu, torch.Tensor):
             return query_start_loc_cpu.detach().cpu().clone()
         if isinstance(query_start_loc_cpu, np.ndarray):
@@ -1609,9 +1571,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             return scheduler_output
 
     def _should_return_omni_routed_experts(self) -> bool:
-        model_config = getattr(self, "model_config", None)
-        if model_config is None:
-            model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        model_config = self.model_config
         return bool(getattr(model_config, "enable_return_routed_experts", False)) and bool(
             getattr(self, "routed_experts_initialized", False)
         )
@@ -1675,9 +1635,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if self.speculative_config is not None:
             return False
 
-        model_config = getattr(self, "model_config", None)
-        if model_config is None:
-            model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        model_config = self.model_config
         if not bool(getattr(model_config, "async_chunk", False)):
             return False
         if bool(getattr(model_config, "enable_return_routed_experts", False)):

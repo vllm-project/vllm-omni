@@ -842,8 +842,7 @@ def test_runner_assisted_full_attention_metadata_refresh_pads_buffers():
     assert block_table.commits == [4]
 
 
-@pytest.mark.parametrize("query_start_loc_attr", ["method", "tensor_attr"])
-def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monkeypatch, query_start_loc_attr):
+def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monkeypatch):
     runner = object.__new__(GPUARModelRunner)
     runner.execute_model_state = ExecuteModelState(
         SimpleNamespace(
@@ -871,12 +870,10 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
         num_tokens_no_spec=None,
     )
     query_start_loc = torch.tensor([0, 1], dtype=torch.long)
-    if query_start_loc_attr == "method":
-        runner.query_start_loc = query_start_loc
-    else:
-        runner.query_start_loc = SimpleNamespace(cpu=query_start_loc)
+    runner.query_start_loc = SimpleNamespace(cpu=query_start_loc)
     runner.omni_prefix_cache = object()
     runner.speculative_config = None
+    runner.model_config = SimpleNamespace(enable_return_routed_experts=False)
     runner.routed_experts_initialized = False
     runner.requests = {}
     runner.supports_mm_inputs = False
