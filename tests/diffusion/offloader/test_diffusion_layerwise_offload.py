@@ -236,6 +236,22 @@ def _assert_offload_state(measurement: dict[str, Any], *, expected_enabled: bool
             assert state["block_count"] == 0, f"Disabled offloader retained managed blocks: {state}"
 
 
+def _assert_audio_outputs(
+    model_name: str,
+    audio_no_offload: np.ndarray | None,
+    audio_offload: np.ndarray | None,
+) -> None:
+    if model_name not in AUDIO_MODEL:
+        return
+
+    assert audio_no_offload is not None, "Baseline Stable Audio inference returned no audio"
+    assert audio_offload is not None, "Layerwise-offloaded Stable Audio inference returned no audio"
+    # Match the sibling cpu-offload test's tolerance: layerwise offload moves
+    # blocks across the PCIe bus on a side stream, which can perturb cuBLAS
+    # algorithm selection and produce ~ULP-level drift larger than 1e-3.
+    check_audio_determinism(audio_offload, audio_no_offload, atol=1e-2)
+
+
 def _print_measurement(label: str, measurement: dict[str, Any]) -> None:
     print(
         f"{label}: initial={measurement['initial_used_mb']:.1f} MB, "
@@ -274,6 +290,22 @@ def test_measurement_order_rejects_unknown_value(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match=_MEASUREMENT_ORDER_ENV):
         _measurement_order()
+
+
+@pytest.mark.diffusion
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("audio_no_offload", "audio_offload", "message"),
+    [
+        (None, None, "Baseline Stable Audio inference returned no audio"),
+        (None, np.zeros(1), "Baseline Stable Audio inference returned no audio"),
+        (np.zeros(1), None, "Layerwise-offloaded Stable Audio inference returned no audio"),
+    ],
+)
+def test_stable_audio_requires_both_outputs(audio_no_offload, audio_offload, message) -> None:
+    with pytest.raises(AssertionError, match=message):
+        _assert_audio_outputs("stabilityai/stable-audio-open-1.0", audio_no_offload, audio_offload)
 
 
 @pytest.mark.diffusion
@@ -317,14 +349,7 @@ def test_layerwise_offload_diffusion_model(model_name: str):
 
     audio_no_offload = no_offload["audio"]
     audio_offload = layerwise_offload["audio"]
-    if audio_no_offload is not None or audio_offload is not None:
-        assert audio_no_offload is not None and audio_offload is not None, (
-            "Both isolated modes must return audio when either mode returns audio"
-        )
-        # Match the sibling cpu-offload test's tolerance: layerwise offload moves
-        # blocks across the PCIe bus on a side stream, which can perturb cuBLAS
-        # algorithm selection and produce ~ULP-level drift larger than 1e-3.
-        check_audio_determinism(audio_offload, audio_no_offload, atol=1e-2)
+    _assert_audio_outputs(model_name, audio_no_offload, audio_offload)
 
     is_rocm = torch.version.hip is not None
     platform = "rocm" if is_rocm else "cuda"
