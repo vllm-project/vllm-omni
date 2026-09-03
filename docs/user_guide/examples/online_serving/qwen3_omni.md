@@ -28,6 +28,18 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
     --deploy-config /path/to/deploy_config_file
 ```
 
+To serve **thinker-only** (text output, no talker / code2wav loaded) with Instruct
+weights, pass the bundled thinker-only deploy YAML. The `pipeline:` key
+`qwen3_omni_moe_thinker_only` overrides the HF `enable_audio_output` resolver:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --deploy-config vllm_omni/deploy/qwen3_omni_moe_thinking.yaml
+```
+
+Captioner / Thinking checkpoints (`enable_audio_output=false`) still auto-select
+the same single-stage pipeline without `--deploy-config`.
+
 ### Launch individual stages (stage-based CLI)
 
 Adopt the stage-based CLI architecture to independently instantiate execution processes per functional stage.
@@ -140,7 +152,7 @@ You can control output modalities to specify which types of output the model sho
 | Modalities | Output |
 |------------|--------|
 | `["text"]` | Text only |
-| `["audio"]` | Text + Audio |
+| `["audio"]` | Audio only |
 | `["text", "audio"]` | Text + Audio |
 | Not specified | Text + Audio (default) |
 
@@ -161,13 +173,16 @@ curl http://localhost:8091/v1/chat/completions \
 #### Text + Audio
 
 ```bash
-curl http://localhost:8091/v1/chat/completions \
+response=$(curl -s http://localhost:8091/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
     "messages": [{"role": "user", "content": "Describe vLLM in brief."}],
-    "modalities": ["audio"]
-  }'
+    "modalities": ["text", "audio"]
+  }')
+
+echo "$response" | jq -r '.choices[0].message.content'
+echo "$response" | jq -r '.choices[1].message.audio.data' | base64 -d > output.wav
 ```
 
 ### Using Python client
@@ -205,7 +220,7 @@ client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
 response = client.chat.completions.create(
     model="Qwen/Qwen3-Omni-30B-A3B-Instruct",
     messages=[{"role": "user", "content": "Describe vLLM in brief."}],
-    modalities=["audio"]
+    modalities=["text", "audio"]
 )
 # Response contains two choices: one with text, one with audio
 print(response.choices[0].message.content)  # Text response
@@ -268,7 +283,7 @@ The script supports the following arguments:
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
-If you have custom stage configs file:
+If you have a custom deploy config file:
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --deploy-config /path/to/deploy_config_file
 ```
@@ -303,7 +318,7 @@ The gradio script supports the following arguments:
     ``````
 ??? abstract "qwen3_omni_moe_thinking.yaml"
     ``````yaml
-    --8<-- "examples/online_serving/qwen3_omni/qwen3_omni_moe_thinking.yaml"
+    --8<-- "vllm_omni/deploy/qwen3_omni_moe_thinking.yaml"
     ``````
 ??? abstract "run_curl_multimodal_generation.sh"
     ``````sh

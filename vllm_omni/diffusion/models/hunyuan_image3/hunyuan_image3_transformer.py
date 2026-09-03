@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import inspect
 import logging
@@ -60,8 +60,9 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
+    get_allgather_parallel_world_size,
     get_cfg_group,
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
@@ -75,10 +76,19 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
-from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe import HunyuanFusedMoE
+
+# ResBlock is platform-dispatched in the layers package __init__: CUDA gets
+# fused GroupNorm+SiLU and AdaGN kernels, every other backend gets the plain
+# PyTorch block. UNetDown and UNetUp below instantiate whichever one this
+# resolves to.
+from vllm_omni.diffusion.models.hunyuan_image3.layers import ResBlock
+from vllm_omni.diffusion.models.hunyuan_image3.layers.common import conv_nd, normalization
+from vllm_omni.diffusion.utils.kv_utils import repeat_kv
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
+from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 
@@ -166,44 +176,6 @@ def real_batched_index_select(t, dim, idx):
     assert t.ndim >= 2 and idx.ndim >= 2, f"{t.ndim=} {idx.ndim=}"
     assert len(t) == len(idx), f"{len(t)=} != {len(idx)=}"
     return torch.stack([torch.index_select(t[i], dim - 1, idx[i]) for i in range(len(t))])
-
-
-def conv_nd(dims, *args, **kwargs):  # noqa: N802
-    """
-    Create a 1D, 2D, or 3D convolution module.
-    """
-    if dims == 1:
-        return nn.Conv1d(*args, **kwargs)
-    elif dims == 2:
-        return nn.Conv2d(*args, **kwargs)
-    elif dims == 3:
-        return nn.Conv3d(*args, **kwargs)
-    raise ValueError(f"unsupported dimensions: {dims}")
-
-
-def normalization(channels, **kwargs):
-    """
-    Make a standard normalization layer.
-    :param channels: number of input channels.
-    :return: a nn.Module for normalization.
-    """
-    return nn.GroupNorm(32, channels, **kwargs)
-
-
-def linear(*args, **kwargs):
-    """
-    Create a linear module.
-    """
-    return nn.Linear(*args, **kwargs)
-
-
-def zero_module(module):
-    """
-    Zero out the parameters of a module and return it.
-    """
-    for p in module.parameters():
-        p.detach().zero_()
-    return module
 
 
 def _to_tuple(x, dim=2):
@@ -424,22 +396,6 @@ def apply_rotary_pos_emb(
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    Equivalent to torch.repeat_interleave(x, dim=2, repeats=n_rep).
-    Input:  (batch, seqlen, num_key_value_heads, head_dim)
-    Output: (batch, seqlen, num_attention_heads, head_dim)
-    """
-    batch, slen, num_key_value_heads, head_dim = hidden_states.shape
-
-    if n_rep == 1:
-        return hidden_states
-
-    hidden_states = hidden_states[:, :, :, None, :].expand(batch, slen, num_key_value_heads, n_rep, head_dim)
-
-    return hidden_states.reshape(batch, slen, num_key_value_heads * n_rep, head_dim)
 
 
 def default(value, default_value):
@@ -674,6 +630,7 @@ class ImageInfo:
 
         self.add_timestep_token = kwargs.get("add_timestep_token", True)
         self.add_guidance_token = kwargs.get("add_guidance_token", False)
+        self.add_timestep_r_token = kwargs.get("add_timestep_r_token", False)
         self.use_front_boi_token = kwargs.get("use_front_boi_token", True)
         self.add_image_shape_token = kwargs.get("add_image_shape_token", True)
 
@@ -711,6 +668,7 @@ class ImageInfo:
                 token_length=self.image_token_length,
                 add_timestep_token=self.add_timestep_token,
                 add_guidance_token=self.add_guidance_token,
+                add_timestep_r_token=self.add_timestep_r_token,
                 use_front_boi_token=self.use_front_boi_token,
                 add_image_shape_token=self.add_image_shape_token,
                 base_size=self.base_size,
@@ -926,7 +884,7 @@ class HunYuanRotary2DEmbedder:
         return q, k
 
 
-class ImageKVCacheManager:
+class ImageKVCacheManager(nn.Module):
     """
     Manages specialized caching and updating of KV-Cache for image tokens in multimodal models.
     """
@@ -945,6 +903,7 @@ class ImageKVCacheManager:
             image_token_len: Number of tokens per image (including special placeholders),
             default 4097 (timestamp + 4096 image tokens).
         """
+        super().__init__()
         # attention related
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -957,6 +916,7 @@ class ImageKVCacheManager:
         self._injected_ar_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
 
         self.sp_size = get_sequence_parallel_world_size()
+        self.allgather_size = get_allgather_parallel_world_size()
         self.sp_rank = get_sequence_parallel_rank()
         self.attn = Attention(
             num_heads=self.num_heads,
@@ -965,6 +925,10 @@ class ImageKVCacheManager:
             softmax_scale=self.scaling,
             num_kv_heads=self.num_kv_heads,
             prefix=f"{prefix}.attn" if prefix else "",
+            paged_kv_cache_role="primary",
+            # Hunyuan image RoPE produces bfloat16 K and denoising runs under
+            # bfloat16 autocast, independent of the weight-loading dtype.
+            paged_kv_cache_dtype=torch.bfloat16,
         )
 
     @staticmethod
@@ -1099,20 +1063,106 @@ class ImageKVCacheManager:
 
         neg_kv = (key.reshape(-1, num_kv_heads, head_dim), value.reshape(-1, num_kv_heads, head_dim))
         self._injected_ar_kv = [self._injected_ar_kv[0], neg_kv]
+        logger.debug(
+            "[AR KV Reuse] neg branch: reused shared_prefix_len=%d, neg_kv_total_len=%d (q_len_actual=%d)",
+            shared_prefix_len,
+            key.shape[1],
+            q_len_actual,
+        )
         return key, value
 
-    def __call__(
+    def clear_legacy_prompt_kv_cache(self) -> None:
+        """Drop model-owned dense KV state before Scheduler-paged execution."""
+
+        self.image_kv_cache_map = None
+        self.image_kv_cache_lens = None
+
+    def _forward_paged(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        *,
+        first_step: bool,
+        query_lens: list[int],
+        seq_lens: list[int],
+        shard_image_size: int | None,
+        full_attn_spans: list[list[tuple[int, int]]],
+        uncond_cfg_prefill: bool,
+    ) -> torch.Tensor:
+        """Run Hunyuan attention against Worker-managed Scheduler pages.
+
+        This model boundary is shared by GPU and NPU: it describes Hunyuan's
+        Q/K/V layout and mixed-attention spans, while the common Attention
+        layer resolves the actual CUDA or Ascend paged kernel.
+        """
+
+        if uncond_cfg_prefill:
+            raise RuntimeError("Hunyuan negative-CFG prefill must run before paged row activation")
+        if self._injected_ar_kv is not None:
+            raise NotImplementedError("Hunyuan Scheduler-paged KV does not support imported AR KV")
+        if not query_lens or len(seq_lens) != len(query_lens):
+            raise ValueError("Hunyuan Scheduler-paged KV requires matching query and sequence lengths")
+        if len(full_attn_spans) != len(query_lens):
+            raise ValueError("Hunyuan Scheduler-paged KV requires one full-attention span row per sequence")
+
+        self.clear_legacy_prompt_kv_cache()
+        bs = len(query_lens)
+        q_len = query_lens[0]
+        seq_len = seq_lens[0]
+        assert query.shape[0] == bs * q_len, f"{query.shape[0]} != {bs * q_len}"
+
+        head_num_per_rank = query.shape[1]
+        kv_head_num_per_rank = key.shape[1]
+        head_dim = query.shape[2]
+
+        query = query.reshape(bs, q_len, head_num_per_rank, head_dim)
+        key = key.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
+        value = value.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
+
+        joint_text_query = joint_text_key = joint_text_value = None
+        if self.sp_size > 1 and first_step:
+            if shard_image_size is None or shard_image_size <= 0:
+                raise ValueError("Hunyuan paged Ulysses requires a positive local image shard size")
+            local_prompt_len = seq_len - shard_image_size
+            joint_query_len = query.shape[1] - shard_image_size
+            if local_prompt_len != joint_query_len:
+                raise ValueError(
+                    "Hunyuan paged Ulysses prompt layout mismatch: "
+                    f"key_prompt={local_prompt_len}, query_prompt={joint_query_len}"
+                )
+            joint_text_query = query[:, :joint_query_len]
+            joint_text_key = key[:, :local_prompt_len]
+            joint_text_value = value[:, :local_prompt_len]
+            query = query[:, joint_query_len:]
+            key = key[:, local_prompt_len:]
+            value = value[:, local_prompt_len:]
+
+        if joint_text_query is None:
+            attn_metadata = AttentionMetadata(full_attn_spans=full_attn_spans)
+        else:
+            attn_metadata = AttentionMetadata(
+                joint_query=joint_text_query,
+                joint_key=joint_text_key,
+                joint_value=joint_text_value,
+                joint_strategy="front",
+                full_attn_spans=full_attn_spans,
+            )
+        attn_output = self.attn(query, key, value, attn_metadata)
+        return attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+
+    def _forward_dense_legacy(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        self.image_token_len = kwargs.get("num_image_tokens")
+        """Run the device-neutral, model-owned dense prompt-KV compatibility path."""
+
         first_step = kwargs.get("first_step")
         uncond_cfg_prefill = kwargs.get("uncond_cfg_prefill", False)
-
         query_lens = kwargs.get("query_lens")
         seq_lens = kwargs.get("seq_lens")
         shard_image_size = kwargs.get("shard_image_size") if self.sp_size > 1 else None
@@ -1124,6 +1174,7 @@ class ImageKVCacheManager:
         head_num_per_rank = query.shape[1]
         kv_head_num_per_rank = key.shape[1]
         repeat_num = head_num_per_rank // kv_head_num_per_rank
+        keep_kv_compressed = self.allgather_size > 1
         head_dim = query.shape[2]
 
         query = query.reshape(bs, q_len, head_num_per_rank, head_dim)
@@ -1140,8 +1191,7 @@ class ImageKVCacheManager:
                 key = key[:, :0, :, :]
                 value = value[:, :0, :, :]
         elif first_step:
-            self.image_kv_cache_map = None  # reset first
-            self.image_kv_cache_lens = None
+            self.clear_legacy_prompt_kv_cache()
             key, value = self._cache_prompt_kv(
                 key,
                 value,
@@ -1165,11 +1215,12 @@ class ImageKVCacheManager:
                 joint_text_query = query[:, :0, :, :]
                 joint_text_key, joint_text_value = self._reuse_prompt_kv(key, value, seq_len, bs, shard_image_size)
 
-        key = repeat_kv(key, repeat_num)
-        value = repeat_kv(value, repeat_num)
-        if self.sp_size > 1:
-            joint_text_key = repeat_kv(joint_text_key, repeat_num)
-            joint_text_value = repeat_kv(joint_text_value, repeat_num)
+        if not keep_kv_compressed:
+            key = repeat_kv(key, repeat_num)
+            value = repeat_kv(value, repeat_num)
+            if self.sp_size > 1:
+                joint_text_key = repeat_kv(joint_text_key, repeat_num)
+                joint_text_value = repeat_kv(joint_text_value, repeat_num)
 
         attention_mask = attention_mask.contiguous()
 
@@ -1192,6 +1243,34 @@ class ImageKVCacheManager:
         attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
         return attn_output
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        self.image_token_len = kwargs.get("num_image_tokens")
+        if self.attn.is_paged_kv_active():
+            full_attn_spans = kwargs.get("full_attn_spans")
+            if full_attn_spans is None:
+                raise ValueError("Hunyuan Scheduler-paged KV requires full_attn_spans metadata")
+            return self._forward_paged(
+                query,
+                key,
+                value,
+                first_step=bool(kwargs.get("first_step")),
+                query_lens=kwargs.get("query_lens"),
+                seq_lens=kwargs.get("seq_lens"),
+                shard_image_size=kwargs.get("shard_image_size") if self.sp_size > 1 else None,
+                full_attn_spans=full_attn_spans,
+                uncond_cfg_prefill=kwargs.get("uncond_cfg_prefill", False),
+            )
+        if attention_mask is None:
+            raise ValueError("Hunyuan dense attention requires an attention mask")
+        return self._forward_dense_legacy(query, key, value, attention_mask, **kwargs)
 
 
 @dataclass
@@ -1365,6 +1444,9 @@ class HunyuanImage3Config(PretrainedConfig):
         vit=None,
         vit_processor=None,
         vit_aligner=None,
+        # Distillation flags
+        cfg_distilled: bool = False,
+        use_meanflow: bool = False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -1444,6 +1526,10 @@ class HunyuanImage3Config(PretrainedConfig):
         self.patch_embed_hidden_dim = patch_embed_hidden_dim
         self.image_base_size = image_base_size
 
+        # Distillation flags
+        self.cfg_distilled = cfg_distilled
+        self.use_meanflow = use_meanflow
+
         # token id
         self.eod_token_id = eod_token_id
         self.im_start_id = im_start_id
@@ -1478,7 +1564,7 @@ class HunyuanImage3ImageProcessor:
         )
         self.vision_encoder_processor = Siglip2ImageProcessorFast.from_dict(config.vit_processor)
 
-    def build_image_info(self, image_size):
+    def build_image_info(self, image_size, add_guidance_token=False, add_timestep_r_token=False):
         # parse image size (HxW, H:W, or <img_ratio_i>)
         if isinstance(image_size, str):
             if image_size.startswith("<img_ratio_"):
@@ -1515,6 +1601,8 @@ class HunyuanImage3ImageProcessor:
             token_height=token_height,
             base_size=base_size,
             ratio_index=ratio_idx,
+            add_guidance_token=add_guidance_token,
+            add_timestep_r_token=add_timestep_r_token,
         )
         return image_info
 
@@ -1625,7 +1713,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             self.shared_mlp = None
 
         enable_expert_parallel = get_current_vllm_config().parallel_config.enable_expert_parallel
-        self.experts = HunyuanFusedMoE(
+        self.experts = FusedMoE(
             shared_experts=self.shared_mlp,
             num_experts=self.n_routed_experts,
             top_k=top_k,
@@ -2105,7 +2193,7 @@ class HunyuanImage3Model(nn.Module):
         if _is_moe(self.config):
             # Params for weights, fp8 weight scales, fp8 activation scales
             # (param_name, weight_name, expert_id, shard_id)
-            fused_moe_expert_mapping = HunyuanFusedMoE.make_expert_params_mapping(
+            fused_moe_expert_mapping = FusedMoE.make_expert_params_mapping(
                 self,
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
@@ -2167,6 +2255,8 @@ class HunyuanImage3Model(nn.Module):
             "timestep_emb",
             "time_embed",
             "time_embed_2",
+            # These embeddings belong to the outer pipeline model rather than
+            # this transformer core and are loaded by the outer weight loader.
             "guidance_emb",
             "timestep_r_emb",
         ]
@@ -2386,6 +2476,8 @@ class HunyuanImage3Model(nn.Module):
         ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
     ) -> tuple | BaseModelOutputWithPast:
+        current_omni_platform.reset_diffusion_fused_moe_forward_context()
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -2723,6 +2815,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             "position_ids",
             "image_mask",
             "gen_timestep_scatter_index",
+            "guidance_scatter_index",
+            "timesteps_r_scatter_index",
             "cond_vae_image_mask",
             "cond_vit_image_mask",
             "cond_timestep_scatter_index",
@@ -2734,7 +2828,6 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         # List[List[...]] per-sample metadata indexed along the CFG batch dim
         if isinstance(model_kwargs.get("full_attn_spans"), list):
             model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"][s.start : s.stop]
-
         # custom_pos_emb: tuple of (cos, sin)
         if "custom_pos_emb" in model_kwargs and model_kwargs["custom_pos_emb"] is not None:
             cos, sin = model_kwargs["custom_pos_emb"]
@@ -2893,9 +2986,12 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         model_kwargs["attention_mask"] = model_kwargs["attention_mask"][:, :, positive_reuse_len:, :]
         model_kwargs["position_ids"] = model_kwargs["position_ids"][:, positive_reuse_len:]
 
-        # Shift image_mask and gen_timestep_scatter_index to match truncated sequence
+        # Shift generated-image placeholder indices to match the truncated sequence.
         model_kwargs["image_mask"] = model_kwargs["image_mask"][:, positive_reuse_len:]
         model_kwargs["gen_timestep_scatter_index"] = model_kwargs["gen_timestep_scatter_index"] - positive_reuse_len
+        for key in ("guidance_scatter_index", "timesteps_r_scatter_index"):
+            if model_kwargs.get(key) is not None:
+                model_kwargs[key] = model_kwargs[key] - positive_reuse_len
         model_kwargs["ar_kv_reuse_offset"] = positive_reuse_len
 
         # cond-image have computed in ar, we may skip it by index in the future.
@@ -2919,6 +3015,10 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
     ):
         ar_kv_data = model_kwargs.pop("ar_kv_data", None)
         if ar_kv_data is None:
+            logger.debug(
+                "[AR KV Reuse] cfg_rank=%s: no AR KV received, fallback to full recompute (reuse_len=0)",
+                cfg_rank,
+            )
             return input_ids, 0
 
         # 1. positive prefix len
@@ -2934,7 +3034,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         self.model.inject_ar_kv_into_layers(ar_kv_data, positive_reuse_len)
 
         # 3. negative cfg prefill
-        if self.do_classifier_free_guidance:
+        # For CFG distilled models, skip negative CFG prefill (cfg_factor=1, no negative prompt)
+        if self.do_classifier_free_guidance and not self.model.config.cfg_distilled:
             self._maybe_run_negative_cfg_prefill(
                 input_ids=input_ids,
                 model_kwargs=model_kwargs,
@@ -3042,7 +3143,12 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         self._guidance_rescale = guidance_rescale
 
         # Detect CFG parallel configuration (only 2-branch layout is supported)
-        cfg_parallel_ready = self.do_classifier_free_guidance and get_classifier_free_guidance_world_size() == 2
+        # For CFG distilled models, skip CFG parallel (cfg_factor=1, no negative branch)
+        cfg_parallel_ready = (
+            self.do_classifier_free_guidance
+            and not self.model.config.cfg_distilled
+            and get_classifier_free_guidance_world_size() == 2
+        )
 
         # Define call parameters
         device = self._execution_device
@@ -3095,7 +3201,11 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             attention_mask = attention_mask[s]
             self._split_model_kwargs_for_cfg_parallel(model_kwargs, batch_size, cfg_rank)
         else:
-            cfg_factor = 1 + self.do_classifier_free_guidance
+            # For CFG distilled models, cfg_factor is always 1 (CFG embedded in model)
+            if self.model.config.cfg_distilled:
+                cfg_factor = 1
+            else:
+                cfg_factor = 1 + self.do_classifier_free_guidance
             cfg_rank = None
 
         b, _, q_len1, seq_len = attention_mask.shape
@@ -3137,6 +3247,13 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     # Sequential CFG: double the batch
                     latent_model_input = torch.cat([latents] * cfg_factor)
 
+                if self.model.config.use_meanflow:
+                    r = self.scheduler.get_timestep_r(t)
+                    r_expand = r.repeat(latent_model_input.shape[0])
+                else:
+                    r_expand = None
+                model_kwargs["timesteps_r"] = r_expand
+
                 t_expand = t.repeat(latent_model_input.shape[0])
 
                 # ---- TeaCache: decide whether to compute or reuse ----
@@ -3158,6 +3275,13 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     tc_prev_mod = cur_mod.detach()
 
                 if should_compute:
+                    # Handle guidance for CFG distilled models
+                    if self.model.config.cfg_distilled:
+                        model_kwargs["guidance"] = torch.tensor(
+                            [1000.0 * self._guidance_scale],
+                            device=self.device,
+                            dtype=torch.bfloat16,
+                        ).repeat(latent_model_input.shape[0])
                     model_inputs = self.model.prepare_inputs_for_generation(
                         input_ids,
                         images=latent_model_input,
@@ -3177,7 +3301,12 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     pred = tc_prev_pred
 
                 # Perform guidance
-                if cfg_parallel_ready:
+                # For CFG distilled models, guidance is already embedded in the model,
+                # so we skip the explicit CFG computation
+                if self.model.config.cfg_distilled:
+                    # CFG distilled: guidance is handled internally via guidance_emb
+                    pass
+                elif cfg_parallel_ready:
                     # CFG parallel: all_gather → all ranks combine locally (no broadcast needed)
                     gathered = cfg_group.all_gather(pred, separate_tensors=True)
                     pred = self.cfg_operator(gathered[0], gathered[1], self.guidance_scale, step=i)
@@ -3231,8 +3360,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             assert image.shape[2] == 1, "image should have shape [B, C, T, H, W] and T should be 1"
             image = image.squeeze(2)
 
-        do_denormalize = [True] * image.shape[0]
-        image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
+        # Denormalize + PIL moved to engine post_process_func for overlap with next request.
 
         if not return_dict:
             return (image,)
@@ -3274,99 +3402,6 @@ class TimestepEmbedder(nn.Module):
         t_freq = timestep_embedding(t, self.frequency_embedding_size, self.max_period).type(self.mlp[0].weight.dtype)
         t_emb = self.mlp(t_freq)
         return t_emb
-
-
-class ResBlock(nn.Module):
-    r"""
-    A residual block that can optionally change the number of channels.
-
-    Args:
-        in_channels (`int`):
-            The number of input channels.
-        emb_channels (`int`):
-            The number of timestep embedding channels.
-        dropout (`float`):
-            The rate of dropout.
-        out_channels (`int`, *optional*):
-            If specified, the number of output channels.
-        use_conv (`bool`, *optional*):
-            If True and out_channels is specified, use a spatial convolution instead of a
-            smaller 1x1 convolution to change the channels in the skip connection.
-        dims (`int`, *optional*):
-            Determines if the signal is 1D, 2D, or 3D.
-        up (`bool`, *optional*):
-            If True, use this block for upsampling.
-        down (`bool`, *optional*):
-            If True, use this block for downsampling.
-
-    """
-
-    def __init__(
-        self,
-        in_channels,
-        emb_channels,
-        out_channels=None,
-        dropout=0.0,
-        use_conv=False,
-        dims=2,
-        up=False,
-        down=False,
-        device=None,
-        dtype=None,
-    ) -> None:
-        factory_kwargs = {"dtype": dtype, "device": device}
-        super().__init__()
-        self.in_channels = in_channels
-        self.dropout = dropout
-        self.out_channels = out_channels or self.in_channels
-        self.use_conv = use_conv
-
-        self.in_layers = nn.Sequential(
-            normalization(self.in_channels, **factory_kwargs),
-            nn.SiLU(),
-            conv_nd(dims, self.in_channels, self.out_channels, 3, padding=1, **factory_kwargs),  # noqa: N802
-        )
-
-        self.updown = up or down
-        self.h_upd = self.x_upd = nn.Identity()
-
-        self.emb_layers = nn.Sequential(nn.SiLU(), linear(emb_channels, 2 * self.out_channels, **factory_kwargs))
-
-        self.out_layers = nn.Sequential(
-            normalization(self.out_channels, **factory_kwargs),
-            nn.SiLU(),
-            nn.Dropout(p=dropout),
-            zero_module(conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1, **factory_kwargs)),  # noqa: N802
-        )
-
-        if self.out_channels == self.in_channels:
-            self.skip_connection = nn.Identity()
-        elif use_conv:
-            self.skip_connection = conv_nd(dims, self.in_channels, self.out_channels, 3, padding=1, **factory_kwargs)  # noqa: N802
-        else:
-            self.skip_connection = conv_nd(dims, self.in_channels, self.out_channels, 1, **factory_kwargs)  # noqa: N802
-
-    def forward(self, x, emb) -> torch.Tensor:
-        if self.updown:
-            in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
-            h = in_rest(x)
-            h = self.h_upd(h)
-            x = self.x_upd(x)
-            h = in_conv(h)
-        else:
-            h = self.in_layers(x)
-
-        emb_out = self.emb_layers(emb)
-        while len(emb_out.shape) < len(h.shape):
-            emb_out = emb_out[..., None]
-
-        # Adaptive Group Normalization
-        out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
-        scale, shift = torch.chunk(emb_out, 2, dim=1)
-        h = out_norm(h) * (1.0 + scale) + shift
-        h = out_rest(h)
-
-        return self.skip_connection(x) + h
 
 
 class UNetDown(nn.Module):

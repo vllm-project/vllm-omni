@@ -138,7 +138,16 @@ class TeaCacheHook(ModelHook):
         state = self.state_manager.get_state()
 
         # Decide whether to compute or cache based on modulated input similarity
-        should_compute = self._should_compute_full_transformer(state, ctx.modulated_input)
+        local_should_compute = self._should_compute_full_transformer(state, ctx.modulated_input)
+        sync_cache_decision = (ctx.extra_states or {}).get("synchronize_cache_decision")
+        if sync_cache_decision is not None:
+            should_compute = sync_cache_decision(local_should_compute)
+            # A rank that locally chose the cache path must reset its counter
+            # when another SP rank requires a full collective block execution.
+            if should_compute and not local_should_compute:
+                state.accumulated_rel_l1_distance = 0.0
+        else:
+            should_compute = local_should_compute
 
         if not should_compute and state.previous_residual is not None:
             # ============================================================================
@@ -231,7 +240,9 @@ class TeaCacheHook(ModelHook):
         state.accumulated_rel_l1_distance += abs(rescaled_distance)
 
         # Decision: below threshold = cache, above = compute
-        if state.accumulated_rel_l1_distance < self.config.rel_l1_thresh:
+        rel_l1_thresh = self.config.rel_l1_thresh
+        assert rel_l1_thresh is not None
+        if state.accumulated_rel_l1_distance < rel_l1_thresh:
             return False  # Use cache
         else:
             state.accumulated_rel_l1_distance = 0.0  # Reset accumulator

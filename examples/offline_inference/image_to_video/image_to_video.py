@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Image-to-Video generation example using Wan2.2 I2V/TI2V models, LTX2/LTX-2.3,
-HunyuanVideo-1.5, Cosmos3, or Wan2.1 VACE.
+HunyuanVideo-1.5, SANA-Video, Cosmos3, or Wan2.1 VACE.
 
 Supports:
 - Wan2.2-I2V-A14B-Diffusers: MoE model with CLIP image encoder
 - Wan2.2-TI2V-5B-Diffusers: Unified T2V+I2V model (dense 5B)
 - LTX2 image-to-video pipeline
 - HunyuanVideo-1.5 I2V: SigLIP + VAE dual image conditioning
+- SANA-Video 2B: first-frame latent conditioning at 480p or 720p
 - Wan2.1 VACE: first/last-frame, inpainting, and reference conditioning
 
 Usage:
@@ -23,22 +24,27 @@ Usage:
 
     # LTX2 image-to-video
     python image_to_video.py --model /path/to/LTX-2 \
-        --model-class-name LTX2ImageToVideoPipeline \
         --image input.jpg --prompt "A cinematic dolly shot of a boat" \
-        --num-frames 121 --num-inference-steps 40 --guidance-scale 4.0 \
+        --num-frames 121 --num-inference-steps 40 \
         --frame-rate 24 --fps 24 --output ltx2_i2v.mp4
 
     # LTX-2.3 image-to-video
-    python image_to_video.py --model dg845/LTX-2.3-Diffusers \
-        --model-class-name LTX23ImageToVideoPipeline \
+    python image_to_video.py --model diffusers/LTX-2.3-Diffusers \
         --image input.jpg --prompt "A cinematic dolly shot of a boat" \
-        --height 384 --width 512 --num-frames 25 --num-inference-steps 20 \
+        --height 512 --width 768 --num-frames 121 --num-inference-steps 30 \
         --frame-rate 24 --fps 24 --output ltx23_i2v.mp4
 
     # HunyuanVideo-1.5 I2V (480p)
     python image_to_video.py --model hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v \
         --image input.jpg --prompt "A cat playing with yarn" \
         --flow-shift 5.0 --guidance-scale 6.0
+
+    # SANA-Video 2B I2V (480p)
+    python image_to_video.py --model Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
+        --model-class-name SanaImageToVideoPipeline \
+        --image input.jpg --prompt "A cat turns toward the camera." \
+        --height 480 --width 832 --num-frames 81 --num-inference-steps 50 \
+        --guidance-scale 6.0
 
     # Cosmos3 I2V (image conditioning)
     python image_to_video.py --model nvidia/Cosmos3-Nano \
@@ -58,14 +64,18 @@ import numpy as np
 import PIL.Image
 import torch
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.lora.request import LoRARequest
+from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.model_extras import (
-    build_image_to_video_prompt,
+    build_image_to_video_prompt as build_model_image_to_video_prompt,
+)
+from vllm_omni.model_extras import (
     get_extra_body_params,
     get_model_class_name,
+    should_preserve_reference_image_size,
 )
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
@@ -85,22 +95,53 @@ def parse_json_object(value: str, flag_name: str = "argument") -> dict[str, Any]
 parse_profiler_config = functools.partial(parse_json_object, flag_name="--profiler-config")
 
 
+def build_image_to_video_prompt(
+    prompt: str,
+    negative_prompt: str | None,
+    media_inputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the canonical request envelope for the shared I2V example."""
+    result: dict[str, Any] = {
+        "prompt": prompt,
+        "modalities": ["video"],
+        "multi_modal_data": media_inputs,
+    }
+    if negative_prompt is not None:
+        result["negative_prompt"] = negative_prompt
+    return result
+
+
+def _validate_video_output_type(output_type: str) -> None:
+    if output_type not in {"image", "video"}:
+        raise ValueError(
+            f"Unexpected output type '{output_type}', expected 'video' or legacy 'image' for video generation."
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Generate a video from one or more images "
-            "(Wan2.2, LTX2/LTX-2.3, HunyuanVideo-1.5, Cosmos3, or Wan2.1 VACE)."
+            "(Wan2.2, LTX2/LTX-2.3, HunyuanVideo-1.5, SANA-Video, Cosmos3, or Wan2.1 VACE)."
         )
     )
     parser.add_argument(
         "--model",
         default="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        help="Diffusers I2V model ID or local path (Wan2.2, LTX2/LTX-2.3, HunyuanVideo-1.5, Cosmos3, or Wan2.1 VACE).",
+        help=(
+            "Diffusers I2V model ID or local path "
+            "(Wan2.2, LTX2/LTX-2.3, HunyuanVideo-1.5, SANA-Video, Cosmos3, or Wan2.1 VACE)."
+        ),
     )
     parser.add_argument(
         "--model-class-name",
         default=None,
-        help="Override model class name (e.g., LTX2ImageToVideoPipeline or LTX23ImageToVideoPipeline).",
+        help="Override model class name (LTX checkpoints default to LTX2Pipeline).",
+    )
+    parser.add_argument(
+        "--deploy-config",
+        default=None,
+        help="Optional deploy config YAML to use for pipeline-backed runs.",
     )
     parser.add_argument("--image", help="Path to the first-frame or source image.")
     parser.add_argument("--last-image", help="Path to a last-frame condition (used by models such as VACE).")
@@ -112,7 +153,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to a reference image. Repeat to provide multiple references.",
     )
     parser.add_argument("--prompt", default="", help="Text prompt describing the desired motion.")
-    parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
+    parser.add_argument("--negative-prompt", default=None, help="Negative prompt. Default: model-specific.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--guidance-scale", type=float, default=None, help="CFG scale. Default: model-specific.")
     parser.add_argument(
@@ -292,6 +333,30 @@ def parse_args() -> argparse.Namespace:
         help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
     )
     parser.add_argument(
+        "--lora-path",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Path to a LoRA adapter folder (PEFT format) or concrete LoRA checkpoint files. "
+        "For Wan2.2 MoE models, pass the high-noise checkpoint first and the low-noise checkpoint second.",
+    )
+    parser.add_argument(
+        "--lora-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for PEFT LoRA weights (default: 1.0).",
+    )
+    parser.add_argument(
+        "--lora-backend",
+        type=str,
+        default="peft",
+        choices=["peft", "distill"],
+        help=(
+            "LoRA backend. 'peft' loads a PEFT-format adapter for request-time activation; "
+            "'distill' fuses one or more concrete LoRA checkpoint files at initialization."
+        ),
+    )
+    parser.add_argument(
         "--extra-body",
         type=functools.partial(parse_json_object, flag_name="--extra-body"),
         default=None,
@@ -326,8 +391,13 @@ def main():
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
     model_name = str(args.model).lower() if args.model is not None else ""
     model_class_name = args.model_class_name
-    is_ltx2 = model_class_name in {"LTX2ImageToVideoPipeline", "LTX23ImageToVideoPipeline"}
+    model_class_name_lower = (model_class_name or "").lower()
+    is_ltx2_distilled = "distilled" in model_class_name_lower or "distilled" in model_name
+    is_ltx23 = "ltx23" in model_class_name_lower or "ltx-2.3" in model_name
+    is_ltx2 = is_ltx2_distilled or is_ltx23 or "ltx2" in model_class_name_lower or "ltx-2" in model_name
+    is_sana = model_class_name == "SanaImageToVideoPipeline" or "sana-video" in model_name
     is_cosmos = "cosmos" in model_name or (model_class_name is not None and "cosmos" in model_class_name.lower())
+    is_cosmos_edge = is_cosmos and ("edge" in model_name or "edge" in model_class_name_lower)
 
     image = PIL.Image.open(args.image).convert("RGB") if args.image else None
     last_image = PIL.Image.open(args.last_image).convert("RGB") if args.last_image else None
@@ -341,7 +411,19 @@ def main():
 
     # Per-model generation defaults, applied only when the matching flag is omitted.
     # Cosmos3 would otherwise silently inherit the Wan2.2 defaults (wrong size/steps/shift).
-    if is_cosmos:
+    if is_cosmos_edge:
+        # Cosmos3-Edge native defaults: 480x832, gs 5.0, flow_shift 3.0 — NOT the Nano/Super
+        # 720p / gs 6.0 / flow_shift 10.0 below, which produce degenerate output on Edge.
+        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
+            24,
+            5.0,
+            189,
+            35,
+            3.0,
+            480 * 832,
+            16,
+        )
+    elif is_cosmos:
         d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
             24,
             6.0,
@@ -351,15 +433,36 @@ def main():
             1280 * 720,
             16,
         )
+    elif is_ltx2_distilled:
+        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
+            24,
+            None,
+            121,
+            8,
+            None,
+            1024 * 1536,
+            64,
+        )
     elif is_ltx2:
         d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
             24,
-            4.0,
+            None,
             121,
-            40,
-            5.0,
+            30 if is_ltx23 else 40,
+            None,
             512 * 768,
             32,
+        )
+    elif is_sana:
+        is_720p = "720p" in model_name
+        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
+            16,
+            6.0,
+            81,
+            50,
+            5.0,
+            (704 * 1280) if is_720p else (480 * 832),
+            32 if is_720p else 16,
         )
     else:  # Wan2.2 / HunyuanVideo-1.5
         d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = 16, 5.0, 81, 50, 5.0, 480 * 832, 16
@@ -381,7 +484,13 @@ def main():
 
     media_inputs: dict[str, Any] = {}
     if image is not None:
-        media_inputs["image"] = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+        preserve_image_size = should_preserve_reference_image_size(
+            model_class_name,
+            model=args.model,
+        )
+        media_inputs["image"] = (
+            image if preserve_image_size else image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+        )
     if last_image is not None:
         media_inputs["last_image"] = last_image.resize((width, height), PIL.Image.Resampling.LANCZOS)
     if mask_image is not None:
@@ -423,7 +532,16 @@ def main():
         }
 
     profiler_enabled = args.profiler_config is not None
-    parallel_config = DiffusionParallelConfig(
+    omni_kwargs = dict(
+        model=args.model,
+        enable_layerwise_offload=args.enable_layerwise_offload,
+        vae_use_slicing=args.vae_use_slicing,
+        vae_use_tiling=args.vae_use_tiling,
+        boundary_ratio=args.boundary_ratio,
+        diffusion_kv_cache_dtype=args.diffusion_kv_cache_dtype,
+        diffusion_kv_cache_skip_steps=args.diffusion_kv_cache_skip_steps,
+        diffusion_kv_cache_skip_layers=args.diffusion_kv_cache_skip_layers,
+        enable_cpu_offload=args.enable_cpu_offload,
         ulysses_degree=args.ulysses_degree,
         ring_degree=args.ring_degree,
         cfg_parallel_size=args.cfg_parallel_size,
@@ -433,19 +551,6 @@ def main():
         hsdp_shard_size=args.hsdp_shard_size,
         hsdp_replicate_size=args.hsdp_replicate_size,
         pipeline_parallel_size=args.pipeline_parallel_size,
-    )
-    omni_kwargs = dict(
-        model=args.model,
-        enable_layerwise_offload=args.enable_layerwise_offload,
-        vae_use_slicing=args.vae_use_slicing,
-        vae_use_tiling=args.vae_use_tiling,
-        boundary_ratio=args.boundary_ratio,
-        flow_shift=flow_shift,
-        diffusion_kv_cache_dtype=args.diffusion_kv_cache_dtype,
-        diffusion_kv_cache_skip_steps=args.diffusion_kv_cache_skip_steps,
-        diffusion_kv_cache_skip_layers=args.diffusion_kv_cache_skip_layers,
-        enable_cpu_offload=args.enable_cpu_offload,
-        parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
         model_class_name=model_class_name,
         cache_backend=args.cache_backend,
@@ -453,8 +558,18 @@ def main():
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
     )
+    if args.deploy_config:
+        omni_kwargs["deploy_config"] = args.deploy_config
+    if flow_shift is not None:
+        omni_kwargs["flow_shift"] = flow_shift
     if args.quantization is not None:
         omni_kwargs["quantization"] = args.quantization
+    if args.lora_path is not None:
+        lora_path = args.lora_path
+        if len(lora_path) == 1:
+            lora_path = lora_path[0]
+        omni_kwargs["lora_path"] = lora_path
+        omni_kwargs["lora_backend"] = args.lora_backend
     # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
     # gate is an engine-level config (offline analog of the server's --no-guardrails).
     if args.extra_body and "guardrails" in args.extra_body:
@@ -485,15 +600,39 @@ def main():
     print(f"  Video size: {width}x{height}")
     print(f"{'=' * 60}\n")
 
+    lora_request = None
+    if args.lora_path and args.lora_backend == "peft":
+        if len(args.lora_path) != 1:
+            raise ValueError("Only one LoRA path is expected for PEFT backend.")
+
+        lora_path = args.lora_path[0]
+        lora_request = LoRARequest(
+            lora_name=Path(lora_path).stem,
+            lora_int_id=stable_lora_int_id(lora_path),
+            lora_path=lora_path,
+        )
+
+    negative_prompt = args.negative_prompt
+    if negative_prompt is None and not is_ltx2:
+        # Preserve the historical empty-prompt behavior for non-LTX examples.
+        negative_prompt = ""
     prompt_dict = build_image_to_video_prompt(
-        model_class_name=model_class_name,
         prompt=args.prompt,
-        negative_prompt=args.negative_prompt,
+        negative_prompt=negative_prompt,
         media_inputs=media_inputs,
+    )
+    prompt_dict = build_model_image_to_video_prompt(
+        model_class_name=model_class_name,
+        prompt=prompt_dict,
         height=height,
         width=width,
         num_frames=num_frames,
     )
+    sampling_extra_args = {"sample_solver": args.sample_solver}
+    if lora_request is not None:
+        sampling_extra_args["lora_request"] = lora_request
+        sampling_extra_args["lora_scale"] = args.lora_scale
+
     sampling_params = OmniDiffusionSamplingParams(
         height=height,
         width=width,
@@ -504,11 +643,10 @@ def main():
         num_inference_steps=num_inference_steps,
         num_frames=num_frames,
         frame_rate=frame_rate,
-        extra_args={
-            "sample_solver": args.sample_solver,
-            "flow_shift": flow_shift,
-        },
+        extra_args=sampling_extra_args,
     )
+    if flow_shift is not None:
+        sampling_params.extra_args["flow_shift"] = flow_shift
 
     # Route model-specific knobs through extra_body, filtered against the model's
     # declared extra_body_params. Models without a declaration only forward explicit
@@ -534,15 +672,12 @@ def main():
         frames = frames[0] if frames else None
 
     if isinstance(frames, OmniRequestOutput):
-        if frames.final_output_type != "image":
-            raise ValueError(
-                f"Unexpected output type '{frames.final_output_type}', expected 'image' for video generation."
-            )
+        _validate_video_output_type(frames.final_output_type)
         if frames.multimodal_output and "audio" in frames.multimodal_output:
             audio = frames.multimodal_output["audio"]
             audio_sample_rate = frames.multimodal_output.get("audio_sample_rate", audio_sample_rate)
-        if frames.is_pipeline_output and frames.request_output is not None:
-            inner_output = frames.request_output
+        if frames.is_pipeline_output and frames is not None:
+            inner_output = frames
             if isinstance(inner_output, OmniRequestOutput):
                 if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
                     audio = inner_output.multimodal_output["audio"]

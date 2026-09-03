@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Quantization quality gate for diffusion models.
 
@@ -53,6 +53,7 @@ _BENCH_MODULE_NAME = "benchmarks.diffusion.quantization_quality"
 
 if _BENCH_MODULE_NAME not in sys.modules:
     _spec = importlib.util.spec_from_file_location(_BENCH_MODULE_NAME, _BENCH_MODULE_PATH)
+    assert _spec is not None and _spec.loader is not None
     _mod = importlib.util.module_from_spec(_spec)
     sys.modules[_BENCH_MODULE_NAME] = _mod
     _spec.loader.exec_module(_mod)
@@ -80,8 +81,10 @@ class QualityTestConfig:
     num_frames: int = 5  # only for t2v
     seed: int = 42
     gpu: str = "H100"  # minimum GPU requirement
-    negative_prompt: str = ""
+    negative_prompt: str | None = ""
     guidance_scale: float | None = None
+    sigmas: list[float] | None = None
+    enable_cpu_offload: bool = False
 
     def baseline_ref(self) -> str:
         return self.baseline_model or self.model or ""
@@ -91,7 +94,7 @@ class QualityTestConfig:
             return self.quantized_model
         return self.model or ""
 
-    def quantization_ref(self) -> str | None:
+    def quantization_ref(self) -> str | dict[str, object] | None:
         if self.quantized_model is not None:
             return None
         return self.quantization
@@ -182,6 +185,18 @@ QUALITY_CONFIGS = [
         num_inference_steps=10,
     ),
     QualityTestConfig(
+        id="fp8_flux2_dev_text_encoder",
+        model="black-forest-labs/FLUX.2-dev",
+        quantization={"text_encoder": "fp8", "transformer": None, "vae": None},
+        task="t2i",
+        prompt="a cup of coffee on a wooden table, morning light",
+        max_lpips=0.15,
+        num_inference_steps=10,
+        enable_cpu_offload=True,
+        height=1024,
+        width=1024,
+    ),
+    QualityTestConfig(
         id="fp8_qwen_image",
         model="Qwen/Qwen-Image",
         quantization="fp8",
@@ -197,11 +212,14 @@ QUALITY_CONFIGS = [
         quantization="fp8",
         task="t2v",
         prompt="A serene lakeside sunrise with mist over the water",
-        max_lpips=0.10,
-        height=256,
-        width=256,
-        num_frames=25,
-        num_inference_steps=8,
+        max_lpips=0.20,
+        height=384,
+        width=512,
+        num_frames=73,
+        num_inference_steps=10,
+        # Do not override the recipe's negative conditioning, guidance, or
+        # scheduler trajectory: this gate follows the supported LTX default.
+        negative_prompt=None,
     ),
 ]
 
@@ -268,8 +286,11 @@ def _generate_image(omni, config: QualityTestConfig):
     ).manual_seed(config.seed)
     torch.accelerator.reset_peak_memory_stats()
 
+    prompt = {"prompt": config.prompt}
+    if config.negative_prompt is not None:
+        prompt["negative_prompt"] = config.negative_prompt
     outputs = omni.generate(
-        {"prompt": config.prompt, "negative_prompt": config.negative_prompt},
+        prompt,
         OmniDiffusionSamplingParams(
             height=config.height,
             width=config.width,
@@ -283,7 +304,7 @@ def _generate_image(omni, config: QualityTestConfig):
     first = outputs[0]
     if hasattr(first, "images") and first.images:
         return first.images[0], peak_mem
-    inner = first.request_output
+    inner = first
     if inner is not None and hasattr(inner, "images") and inner.images:
         return inner.images[0], peak_mem
     raise ValueError("Could not extract image from output.")
@@ -300,8 +321,11 @@ def _generate_video(omni, config: QualityTestConfig):
     ).manual_seed(config.seed)
     torch.accelerator.reset_peak_memory_stats()
 
+    prompt = {"prompt": config.prompt}
+    if config.negative_prompt is not None:
+        prompt["negative_prompt"] = config.negative_prompt
     outputs = omni.generate(
-        {"prompt": config.prompt, "negative_prompt": config.negative_prompt},
+        prompt,
         OmniDiffusionSamplingParams(
             height=config.height,
             width=config.width,
@@ -309,19 +333,20 @@ def _generate_video(omni, config: QualityTestConfig):
             num_inference_steps=config.num_inference_steps,
             num_frames=config.num_frames,
             guidance_scale=config.guidance_scale,
+            sigmas=config.sigmas,
         ),
     )
 
     peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
-    first = outputs[0]
-    if hasattr(first, "request_output") and isinstance(first.request_output, list):
-        inner = first.request_output[0]
-        if isinstance(inner, OmniRequestOutput) and hasattr(inner, "images"):
-            frames = inner.images[0] if inner.images else None
-        else:
-            frames = inner
-    elif hasattr(first, "images") and first.images:
-        frames = first.images[0]
+    if isinstance(outputs, list) and isinstance(outputs[0], OmniRequestOutput):
+        first = outputs[0]
+    elif isinstance(outputs, OmniRequestOutput):
+        first = outputs
+    else:
+        raise ValueError("Could not extract video frames from output.")
+
+    if hasattr(first, "images"):
+        frames = first.images[0] if first.images else None
     else:
         raise ValueError("Could not extract video frames from output.")
 
@@ -403,6 +428,8 @@ def _free_gpu_memory():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_benchmark_generate_image_unwraps_nested_omni_request_output(monkeypatch):
     from benchmarks.diffusion.quantization_quality import _generate_image as benchmark_generate_image
     from vllm_omni.outputs import OmniRequestOutput
@@ -414,11 +441,11 @@ def test_benchmark_generate_image_unwraps_nested_omni_request_output(monkeypatch
 
     image = Image.new("RGB", (2, 2))
     inner = OmniRequestOutput.from_diffusion(request_id="req", images=[image])
-    outer = OmniRequestOutput(
+    outer = OmniRequestOutput.from_stage_output(
+        inner,
         request_id="req",
         stage_id=0,
         final_output_type="image",
-        request_output=inner,
         finished=True,
     )
 
@@ -431,6 +458,74 @@ def test_benchmark_generate_image_unwraps_nested_omni_request_output(monkeypatch
 
     assert output is image
     assert peak_mem == 0.0
+
+
+def test_generate_video_forwards_sigmas(monkeypatch):
+    from vllm_omni.outputs import OmniRequestOutput
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "device_type", "cpu", raising=False)
+    monkeypatch.setattr(torch.accelerator, "reset_peak_memory_stats", lambda: None, raising=False)
+    monkeypatch.setattr(torch.accelerator, "max_memory_allocated", lambda: 0, raising=False)
+    captured = SimpleNamespace(sampling=None)
+
+    class DummyOmni:
+        def generate(self, _prompt, sampling):
+            captured.sampling = sampling
+            return [
+                OmniRequestOutput.from_diffusion(
+                    request_id="req",
+                    images=[np.zeros((1, 2, 2, 3), dtype=np.float32)],
+                )
+            ]
+
+    config = QualityTestConfig(
+        id="ltx-sigmas",
+        model="unused",
+        quantization="fp8",
+        task="t2v",
+        prompt="test",
+        max_lpips=0.1,
+        sigmas=[1.0, 0.5],
+    )
+    _generate_video(DummyOmni(), config)
+
+    assert captured.sampling.sigmas == [1.0, 0.5]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_ltx_quality_gate_uses_official_eager_defaults(monkeypatch):
+    from vllm_omni.outputs import OmniRequestOutput
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "device_type", "cpu", raising=False)
+    monkeypatch.setattr(torch.accelerator, "reset_peak_memory_stats", lambda: None, raising=False)
+    monkeypatch.setattr(torch.accelerator, "max_memory_allocated", lambda: 0, raising=False)
+    captured = SimpleNamespace(prompt=None, sampling=None)
+
+    class DummyOmni:
+        def generate(self, prompt, sampling):
+            captured.prompt = prompt
+            captured.sampling = sampling
+            return [
+                OmniRequestOutput.from_diffusion(
+                    request_id="req",
+                    images=[np.zeros((1, 2, 2, 3), dtype=np.float32)],
+                )
+            ]
+
+    config = next(config for config in QUALITY_CONFIGS if config.id == "fp8_ltx2")
+    _generate_video(DummyOmni(), config)
+
+    assert (config.width, config.height, config.num_frames, config.num_inference_steps) == (512, 384, 73, 10)
+    assert config.max_lpips == 0.20
+    assert config.sigmas is None
+    assert config.guidance_scale is None
+    assert config.negative_prompt is None
+    assert "negative_prompt" not in captured.prompt
+    assert captured.sampling.sigmas is None
+    assert captured.sampling.guidance_scale is None
 
 
 _marks = hardware_marks(res={"cuda": "H100"})
@@ -458,8 +553,17 @@ def test_quantization_quality(config: QualityTestConfig):
 
     generate_fn = _generate_video if config.task == "t2v" else _generate_image
 
+    # Run both arms eager: LPIPS must measure quantization only. With compile
+    # on, a compiler failure in one arm (e.g. inductor's CantSplit on fp8 FLUX)
+    # silently drops that arm to eager while the other stays compiled, and the
+    # metric then includes compile-state differences (fp8_ltx2 rose from ~0.09
+    # to 0.1291 that way in build 2954). Mirrors
+    # vllm_omni/quantization/tools/compare_diffusion_trajectory_similarity.py.
     # --- BF16 baseline ---
-    omni_bl = Omni(model=config.baseline_ref())
+    bl_kwargs: dict = {"model": config.baseline_ref(), "enforce_eager": True}
+    if config.enable_cpu_offload:
+        bl_kwargs["enable_cpu_offload"] = True
+    omni_bl = Omni(**bl_kwargs)
     baseline_out, bl_mem = generate_fn(omni_bl, config)
     omni_bl.shutdown()
     del omni_bl
@@ -468,10 +572,13 @@ def test_quantization_quality(config: QualityTestConfig):
 
     # --- Quantized ---
     quantization = config.quantization_ref()
+    qt_kwargs: dict = {"model": config.quantized_ref(), "enforce_eager": True}
+    if config.enable_cpu_offload:
+        qt_kwargs["enable_cpu_offload"] = True
     if quantization is None:
-        omni_qt = Omni(model=config.quantized_ref())
+        omni_qt = Omni(**qt_kwargs)
     else:
-        omni_qt = Omni(model=config.quantized_ref(), quantization_config=quantization)
+        omni_qt = Omni(**qt_kwargs, quantization_config=quantization)
     quant_out, qt_mem = generate_fn(omni_qt, config)
     omni_qt.shutdown()
     del omni_qt

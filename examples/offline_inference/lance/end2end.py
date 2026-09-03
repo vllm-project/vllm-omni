@@ -82,9 +82,6 @@ def parse_args():
     # ``max_num_seqs=1`` …) are passed as flat kwargs to ``Omni`` below
     # and ``create_default_diffusion`` materializes the stage config.
 
-    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
-
-    nullify_stage_engine_defaults(p)
     return p.parse_args()
 
 

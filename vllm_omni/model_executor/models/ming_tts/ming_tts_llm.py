@@ -11,15 +11,21 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.models.bailing_moe import BailingMoeModel
 from vllm.model_executor.models.qwen2 import Qwen2Model
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
+from vllm_omni.model_executor.models.common.ming.aggregator import Aggregator
+from vllm_omni.model_executor.models.common.ming.cfm_cudagraph import (
+    CFMGraphExecutor,
+    CFMSampler,
+)
+from vllm_omni.model_executor.models.common.ming.cfm_head import FlowLoss
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-from .aggregator import Aggregator
 from .config_ming_tts import (
     KEY_CFG,
     KEY_DECODE_STEP,
@@ -33,7 +39,7 @@ from .config_ming_tts import (
     KEY_TEXT_MODE,
     MingTTSConfig,
 )
-from .flowloss_head import FlowLoss
+from .constants import SPEAKER_EMBEDDING_DIM
 from .patch_emission import (
     MING_STOP_REASON_CODES,
     MING_STOP_REASON_CONTINUE,
@@ -57,10 +63,20 @@ _CFM_STEPS = 10
 
 
 class MingLLMModel(nn.Module):
+    # Drop the tensor on purpose, otherwise upstream vLLM would reject.
+    # The vendor never reaches them either (audio_gate/image_gate never fire)
+    # dropping them keeps routing identical to the reference implementation.
+    # https://github.com/inclusionAI/Ming-omni-tts/blob/main/modeling_bailingmm.py#L427-L428
+    # https://github.com/inclusionAI/Ming-omni-tts/blob/main/modeling_bailing_moe.py#L510-L520
     hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr={
+            ".mlp.audio_gate.": None,
+            ".mlp.image_gate.": None,
+        },
         orig_to_new_prefix={
+            "model.lm_head.": None,
             "model.model.": "model.",
-        }
+        },
     )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -71,8 +87,6 @@ class MingLLMModel(nn.Module):
         self.prefix = prefix
         self.fm_dtype = _resolve_ming_runtime_dtype(vllm_config)
         if self.ming_config.model_variant == "moe":
-            from vllm.model_executor.models.bailing_moe import BailingMoeModel
-
             # BailingMoeModel reads ``vllm_config.model_config.hf_config`` directly
             # (no get_text_config()), so re-wrap with the nested bailing_moe config.
             llm_config = vllm_config.model_config.hf_config.get_text_config()
@@ -91,7 +105,7 @@ class MingLLMModel(nn.Module):
             **self.ming_config.ditar_config,
         )
         self.stop_head = nn.Linear(self.ming_config.llm_hidden_size, 2, bias=True)
-        self.spk_head = nn.Linear(192, self.ming_config.llm_hidden_size, bias=True)
+        self.spk_head = nn.Linear(SPEAKER_EMBEDDING_DIM, self.ming_config.llm_hidden_size, bias=True)
         self.flowloss.to(dtype=self.fm_dtype)
         self.linear_proj_audio.to(dtype=self.fm_dtype)
         self.stop_head.to(dtype=self.fm_dtype)
@@ -324,8 +338,6 @@ class MingLLMModel(nn.Module):
         if self._cfm_graph is not None:
             return self._cfm_graph
         try:
-            from .fm.cfm_cudagraph import CFMGraphExecutor, CFMSampler
-
             # TODO(perf):
             #   (1) compile per-block (dit_model.blocks) instead of the
             #   whole forward for tighter fusion / fewer graph breaks;

@@ -71,6 +71,21 @@ plugins:
   - search
   - autorefs
   - awesome-nav
+  - redirects:
+      redirect_maps:
+        community/meetups.md: community/meetings.md
+        community/volunteers.md: community/contact_us.md
+        user_guide/diffusion/request_batching.md: user_guide/diffusion/execution_modes.md
+        user_guide/diffusion/step_execution.md: user_guide/diffusion/execution_modes.md
+        user_guide/diffusion/cpu_offload_diffusion.md: user_guide/diffusion/cpu_offload.md
+        user_guide/quantization/index.md: user_guide/quantization/overview.md
+        configuration/pd_disaggregation.md: features/pd_disaggregation.md
+        design/feature/diffusion_request_level_batching.md: design/feature/diffusion_continuous_batching.md
+        design/feature/diffusion_step_execution.md: design/feature/diffusion_continuous_batching.md
+        design/feature/cpu_offloading.md: design/feature/offloader/README.md
+        design/feature/model_level_offload.md: design/feature/offloader/cpu_offload.md
+        design/feature/layerwise_offload.md: design/feature/offloader/layerwise_offload.md
+        design/feature/distributed_layerwise_offload.md: design/feature/offloader/distributed_layerwise_offload.md
   - glightbox
   - git-revision-date-localized:
       # exclude files
@@ -103,6 +118,7 @@ plugins:
         - "vllm_omni.entrypoints.openai"  # avoid importing vllm in mkdocs building
         - "vllm_omni.entrypoints.openai.protocol"  # avoid importing vllm in mkdocs building
         - "vllm_omni.experimental"  # avoid importing optional serving deps (openai, fastapi, uvicorn, httpx) in mkdocs building
+        - "vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored"  # vendored NeMo code; upstream docstrings trip griffe strict warnings
   - mkdocstrings:
       handlers:
         python:

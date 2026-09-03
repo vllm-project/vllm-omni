@@ -22,6 +22,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.cosyvoice3"
 
 COSYVOICE3_PIPELINE = PipelineConfig(
     model_type="cosyvoice3",
+    default_deploy_config_name="cosyvoice3.yaml",
     model_arch="CosyVoice3Model",
     stages=(
         StagePipelineConfig(
@@ -47,6 +48,7 @@ COSYVOICE3_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="latent",
             sync_process_input_func=f"{_PROC}.text2flow_token_only",
+            requires_full_payload_input=True,
         ),
     ),
 )

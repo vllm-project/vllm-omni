@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Offline inference tests: text-to-image.
 See examples/offline_inference/text_to_image/README.md
@@ -26,6 +29,8 @@ EXAMPLE_OUTPUT_SUBFOLDER = "example_offline_t2i"
 def _skip_readme_snippet(language: str, code: str, h2_title: str) -> tuple[bool, str]:
     if h2_title == "Web UI Demo":
         return True, f"README section '{h2_title}' is intentionally excluded for examples tests"
+    if "krea/Krea-2-Raw" in code:
+        return True, "krea/Krea-2-Raw is gated on Hugging Face Hub; CI has no access"
     return False, ""
 
 

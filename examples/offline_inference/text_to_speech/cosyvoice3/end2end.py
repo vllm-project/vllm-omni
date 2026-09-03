@@ -168,7 +168,7 @@ def run_e2e():
     print(f"Received {len(outputs)} outputs.")
     for i, output in enumerate(outputs):
         try:
-            ro = output.request_output
+            ro = output
             if ro is None:
                 print("No request_output found.")
                 continue
@@ -182,10 +182,13 @@ def run_e2e():
                 print(f"Multimodal output keys: {mm.keys()}")
                 if "audio" in mm:
                     audio_out = mm["audio"]
+                    # The model emits its own rate (24 kHz for CosyVoice3); take
+                    # it from the payload so the file is not mislabeled.
+                    sample_rate = int(mm["sr"]) if "sr" in mm.keys() else 24000
                     print(f"Generated Audio Shape: {audio_out.shape}")
                     out_path = f"output_{i}.wav"
-                    sf.write(out_path, audio_out.cpu().numpy().squeeze(), 22050)
-                    print(f"Saved audio to {out_path}")
+                    sf.write(out_path, audio_out.cpu().numpy().squeeze(), sample_rate)
+                    print(f"Saved audio to {out_path} (sr={sample_rate})")
             else:
                 print("No multimodal output found.")
         except Exception as e:

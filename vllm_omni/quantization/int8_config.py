@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """INT8 quantization config for diffusion transformers.
 
 Supports both online (dynamic) and offline (checkpoint) INT8 quantization
@@ -26,9 +26,11 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from vllm.model_executor.layers.quantization.fp8 import CopyNumelCounter, _copy_missing_attrs
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
+)
+from vllm.model_executor.model_loader.reload.meta import (
+    CopyCounter as CopyNumelCounter,
 )
 from vllm.model_executor.model_loader.weight_utils import initialize_single_dummy_weight
 from vllm.model_executor.parameter import (
@@ -38,6 +40,9 @@ from vllm.model_executor.parameter import (
 from vllm.model_executor.utils import replace_parameter
 
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization._copy_missing_attrs import (
+    copy_missing_attrs as _copy_missing_attrs,
+)
 
 if current_omni_platform.is_npu():
     import torch_npu
@@ -50,7 +55,53 @@ if TYPE_CHECKING:
 # Dynamic quantization is supported first.
 ACTIVATION_SCHEMES = ["dynamic"]
 
+# Ascend's npu_quant_matmul (QuantBatchMatmulV3) refuses a weight whose last
+# dimension exceeds this, and it fails at the first forward rather than at load
+# time. Layers still wider than the limit after TP sharding stay unquantized.
+NPU_QUANT_MATMUL_MAX_OUT_FEATURES = 65535
+
 logger = init_logger(__name__)
+
+
+def _fell_back_to_unquantized_npu(
+    layer: torch.nn.Module,
+    input_size_per_partition: int,
+    output_partition_sizes: list[int],
+    input_size: int,
+    output_size: int,
+    params_dtype: torch.dtype,
+    **extra_weight_attrs,
+) -> bool:
+    """Swap a layer to unquantized weights when npu_quant_matmul cannot run its shape.
+
+    The check uses the per-partition output size because that is what the kernel
+    actually sees; a layer over the limit on one rank can be within it at a
+    higher TP degree. Returns True when the layer was swapped and its weights
+    created, in which case the caller must not create its own.
+    """
+    output_size_per_partition = sum(output_partition_sizes)
+    if output_size_per_partition <= NPU_QUANT_MATMUL_MAX_OUT_FEATURES:
+        return False
+
+    logger.warning_once(
+        "Keeping a %d-wide linear unquantized: npu_quant_matmul rejects an output dimension past "
+        "%d. Tensor parallelism shrinks this per-rank dimension, so a higher TP degree brings such "
+        "layers back into range.",
+        output_size_per_partition,
+        NPU_QUANT_MATMUL_MAX_OUT_FEATURES,
+    )
+    fallback = UnquantizedLinearMethod()
+    layer.quant_method = fallback
+    fallback.create_weights(
+        layer,
+        input_size_per_partition,
+        output_partition_sizes,
+        input_size,
+        output_size,
+        params_dtype,
+        **extra_weight_attrs,
+    )
+    return True
 
 
 def create_weight_parameter(
@@ -231,6 +282,21 @@ class LazyWeightMixin:
 
     uses_meta_device: bool = True
 
+    # This mixin knows when a layer's weight is final, so it can hand the layer
+    # back to the host right there. Loaders that intend to offload the whole
+    # model after loading opt in per layer via ``enable_offload_after_quant``.
+    supports_offload_after_quant: bool = True
+    _offload_after_quant: bool = False
+
+    def enable_offload_after_quant(self) -> None:
+        """Return each layer to host memory as soon as it has been quantized.
+
+        Caps the load-time device footprint at one layer instead of the whole
+        model. A quant method instance belongs to a single layer, so this is not
+        a global switch.
+        """
+        self._offload_after_quant = True
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -286,6 +352,11 @@ class LazyWeightMixin:
                 # Prevent the usual `process_weights_after_loading` call from doing
                 # anything
                 layer._already_called_process_weights_after_loading = True
+
+                # This layer's weight is final, so nothing needs it on the
+                # accelerator until inference.
+                if self._offload_after_quant:
+                    layer.to("cpu")
 
                 # Note that we keep `layer._loaded_numel` around just in case
                 # there is logic added to vllm in the future which calls a
@@ -353,6 +424,11 @@ class NPUInt8LinearMethod(BaseInt8LinearMethod):
 
     def __init__(self, quant_config: DiffusionInt8Config):
         super().__init__(quant_config)
+
+    def create_weights(self, layer: torch.nn.Module, *args, **kwargs) -> None:
+        if _fell_back_to_unquantized_npu(layer, *args, **kwargs):
+            return
+        super().create_weights(layer, *args, **kwargs)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         layer.weight.data = layer.weight.data.t().contiguous()
@@ -423,6 +499,13 @@ class NPUInt8OnlineLinearMethod(LazyWeightMixin, NPUInt8LinearMethod):
     NPU Online version of Int8LinearMethod, loads the fp16/bf16 checkpoint
     and quantized the weights during loading.
     """
+
+    def create_weights(self, layer: torch.nn.Module, *args, **kwargs) -> None:
+        # NPUInt8LinearMethod's override is unreachable from here: LazyWeightMixin
+        # comes first in the MRO and does not call super().
+        if _fell_back_to_unquantized_npu(layer, *args, **kwargs):
+            return
+        super().create_weights(layer, *args, **kwargs)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):

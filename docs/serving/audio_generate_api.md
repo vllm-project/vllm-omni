@@ -4,14 +4,14 @@ vLLM-Omni provides an API for text-to-audio generation using diffusion-based mod
 
 Unlike the [Speech API](speech_api.md) which targets text-to-speech synthesis, the Audio Generate API is designed for general-purpose audio generation from text descriptions (sound effects, music, ambient soundscapes, etc.).
 
-Each server instance runs a single model (specified at startup via `vllm-omni serve <model> --omni`).
+Each server instance runs a single model (specified at startup via `vllm serve <model> --omni`).
 
 ## Quick Start
 
 ### Start the Server
 
 ```bash
-vllm-omni serve stabilityai/stable-audio-open-1.0 \
+vllm serve stabilityai/stable-audio-open-1.0 \
     --host 0.0.0.0 \
     --port 8091 \
     --gpu-memory-utilization 0.9 \
@@ -66,7 +66,7 @@ Content-Type: application/json
 |-----------|------|---------|-------------|
 | `input` | string | **required** | Text prompt describing the audio to generate |
 | `model` | string | server's model | Model to use (optional, should match server if specified) |
-| `response_format` | string | "wav" | Audio format: wav, mp3, flac, pcm, aac, opus |
+| `response_format` | string | "wav" | Audio format: wav, mp3, flac, pcm, opus |
 | `speed` | float | 1.0 | Playback speed (0.25 - 4.0) |
 
 #### Diffusion Parameters
@@ -90,7 +90,6 @@ Returns binary audio data with the appropriate `Content-Type` header:
 | `mp3` | `audio/mpeg` |
 | `flac` | `audio/flac` |
 | `pcm` | `audio/pcm` |
-| `aac` | `audio/aac` |
 | `opus` | `audio/opus` |
 
 ## Examples
@@ -285,7 +284,7 @@ Pydantic validation failure (e.g. invalid `response_format`, `speed` out of rang
     "detail": [
         {
             "type": "literal_error",
-            "msg": "Input should be 'wav', 'pcm', 'flac', 'mp3', 'aac' or 'opus'",
+            "msg": "Input should be 'wav', 'pcm', 'flac', 'mp3' or 'opus'",
             ...
         }
     ]
@@ -327,7 +326,7 @@ curl http://localhost:8091/health
 Enable debug logging:
 
 ```bash
-vllm-omni serve stabilityai/stable-audio-open-1.0 \
+vllm serve stabilityai/stable-audio-open-1.0 \
     --host 0.0.0.0 \
     --port 8091 \
     --gpu-memory-utilization 0.9 \

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Integration tests for diffusion pipeline streaming output mode.
 
 Covers:
@@ -273,7 +273,7 @@ class TestPipelineStreamingOutputToEntrypoint:
             await _wait_for(lambda: len(pipeline.requests) == 1)
             assert pipeline.requests[0].request_id.startswith("req-omni-")
             assert [output.multimodal_output["metadata"]["stream"]["chunk"] for output in outputs] == [0, 1]
-            assert [getattr(output.request_output, "finished", output.finished) for output in outputs] == [False, True]
+            assert [output.finished for output in outputs] == [False, True]
         finally:
             await self._shutdown_pipeline_omni_harness(omni, fixture, inline_client)
 
@@ -311,8 +311,8 @@ class TestPipelineStreamingOutputToEntrypoint:
             lambda *, output_format, fps, video_codec_options=None: FakeStreamingVideoEncoder(),
         )
         mocker.patch(
-            "vllm_omni.entrypoints.openai.serving_video_output_stream.get_stage_type",
-            return_value="diffusion",
+            "vllm_omni.entrypoints.openai.serving_video_output_stream.is_video_generation_pipeline",
+            return_value=True,
         )
         mocker.patch(
             "vllm_omni.entrypoints.openai.serving_video_output_stream.build_stage_sampling_params_list",
@@ -341,7 +341,9 @@ class TestPipelineStreamingOutputToEntrypoint:
                 with client.websocket_connect("/v1/realtime/video") as ws:
                     ws.send_json({"type": "session.start", "prompt": "integration test"})
                     assert ws.receive_json()["type"] == "video.start"
+                    assert ws.receive_json()["type"] == "video.chunk_metadata"
                     assert ws.receive_bytes() == b"pipeline-fmp4-0"
+                    assert ws.receive_json()["type"] == "video.chunk_metadata"
                     assert ws.receive_bytes() == b"pipeline-fmp4-1"
                     done = ws.receive_json()
                     assert done["type"] == "session.done"
@@ -439,7 +441,6 @@ class TestPipelineStreamingOutputToEntrypoint:
                     model="test_model",
                     od_config=od_config,
                     metadata=metadata,
-                    batch_size=1,
                 )
 
     @staticmethod
@@ -453,7 +454,6 @@ class TestPipelineStreamingOutputToEntrypoint:
         omni.final_output_task = None
         omni.event_resolver = AsyncEventResolver()
         omni._enable_ar_profiler = False
-        omni._is_sleeping = False
         omni.prom_metrics = MagicMock()
         omni.mod_metrics = MagicMock()
         omni.resolve_sampling_params_list = lambda params, allow_delta_coercion: params
@@ -525,6 +525,7 @@ class TestSupportedPipelines:
         runner = object.__new__(DiffusionModelRunner)
         runner.vllm_config = _make_vllm_config()
         runner.od_config = SimpleNamespace(
+            max_num_seqs=1,
             enable_cpu_offload=False,
             enable_layerwise_offload=False,
             enforce_eager=True,
@@ -543,7 +544,11 @@ class TestSupportedPipelines:
 
         monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _FakeDiffusersPipelineLoader)
         monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _FakeDeviceMemoryProfiler)
-        monkeypatch.setattr(model_runner_module, "get_offload_backend", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            model_runner_module,
+            "enable_offload_backend",
+            lambda _config, pipeline, **_kwargs: (pipeline, None),
+        )
         monkeypatch.setattr(model_runner_module, "get_cache_backend", lambda *args, **kwargs: None)
 
         with pytest.raises(ValueError, match="NoStepPipeline"):
