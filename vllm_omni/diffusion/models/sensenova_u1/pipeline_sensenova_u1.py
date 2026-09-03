@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """SenseNova-U1 Pipeline for vLLM-Omni.
 
 SenseNova-U1 is a unified Qwen3-based model that uses Mixture-of-Tokenizers
@@ -17,7 +17,6 @@ Key integration points:
 
 from __future__ import annotations
 
-import json
 import math
 import os
 from collections.abc import Iterable
@@ -35,13 +34,30 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.lora.loader import (
+    LoraLoaderMixin,
+    _apply_diffusers_lora_alpha_scaling,
+    _load_lora_state_dict,
+    _prepare_lora_delta,
+    _remap_state_dict_keys,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.transformers_utils.configs.sensenova_u1 import (
+    SenseNovaU1Config,
+)
 
+from .paged_decode import (
+    DecodeGraphRunner,
+    PagedDecodeCache,
+    dynamic_lora_wrappers_present,
+    paged_decode_supported,
+)
 from .sensenova_u1_transformer import (
+    SenseNovaU1CausalLMOutput,
     SenseNovaU1ForCausalLM,
     clear_flash_kv_cache,
     create_block_causal_mask,
@@ -86,10 +102,8 @@ SYSTEM_MESSAGE_FOR_GEN = (
 
 
 # ---------------------------------------------------------------------------
-# Config parsed from config.json
+# Config
 # ---------------------------------------------------------------------------
-
-
 def _resolve_model_path(model_path: str) -> str:
     """Resolve a HuggingFace model ID or local path to a local directory."""
     if os.path.isdir(model_path):
@@ -180,73 +194,6 @@ def _load_image_native(
     )
     grid_hw = torch.tensor([[grid_h, grid_w]])
     return flatten_pv, grid_hw
-
-
-def _load_sensenova_u1_config(model_path: str):
-    """Parse config.json and return (top_config, llm_config, vision_config) namespaces."""
-    local_path = _resolve_model_path(model_path)
-    cfg_path = os.path.join(local_path, "config.json")
-    with open(cfg_path, encoding="utf-8") as f:
-        raw = json.load(f)
-
-    llm_raw = raw.get("llm_config", {})
-    vis_raw = raw.get("vision_config", {})
-
-    # LLM config needs these extra fields for 3D RoPE
-    llm_cfg = SimpleNamespace(
-        hidden_size=llm_raw.get("hidden_size", 4096),
-        intermediate_size=llm_raw.get("intermediate_size", 11008),
-        num_hidden_layers=llm_raw.get("num_hidden_layers", 32),
-        num_attention_heads=llm_raw.get("num_attention_heads", 32),
-        num_key_value_heads=llm_raw.get("num_key_value_heads", llm_raw.get("num_attention_heads", 32)),
-        head_dim=llm_raw.get("head_dim", llm_raw.get("hidden_size", 4096) // llm_raw.get("num_attention_heads", 32)),
-        hidden_act=llm_raw.get("hidden_act", "silu"),
-        rms_norm_eps=llm_raw.get("rms_norm_eps", 1e-6),
-        vocab_size=llm_raw.get("vocab_size", 152064),
-        rope_theta=llm_raw.get("rope_theta", 1000000.0),
-        rope_theta_hw=llm_raw.get("rope_theta_hw", 10000.0),
-        max_position_embeddings=llm_raw.get("max_position_embeddings", 40960),
-        max_position_embeddings_hw=llm_raw.get("max_position_embeddings_hw", 10000),
-        attention_bias=llm_raw.get("attention_bias", True),
-        layer_types=llm_raw.get("layer_types", ["full_attention"] * llm_raw.get("num_hidden_layers", 32)),
-        tie_word_embeddings=llm_raw.get("tie_word_embeddings", False),
-    )
-
-    vis_cfg = SimpleNamespace(
-        num_channels=vis_raw.get("num_channels", 3),
-        patch_size=vis_raw.get("patch_size", 16),
-        hidden_size=vis_raw.get("hidden_size", 1024),
-        llm_hidden_size=vis_raw.get("llm_hidden_size", [llm_cfg.hidden_size]),
-        downsample_ratio=vis_raw.get("downsample_ratio", [0.5]),
-        rope_theta_vision=vis_raw.get("rope_theta_vision", 10000.0),
-        max_position_embeddings_vision=vis_raw.get("max_position_embeddings_vision", 10000),
-        output_hidden_states=vis_raw.get("output_hidden_states", False),
-        use_return_dict=vis_raw.get("use_return_dict", True),
-    )
-
-    top_cfg = SimpleNamespace(
-        downsample_ratio=raw.get("downsample_ratio", 0.5),
-        template=raw.get("template", "neo1_0"),
-        fm_head_layers=raw.get("fm_head_layers", 2),
-        fm_head_dim=raw.get("fm_head_dim", 4096),
-        fm_head_mlp_ratio=raw.get("fm_head_mlp_ratio", 1.0),
-        use_pixel_head=raw.get("use_pixel_head", False),
-        noise_scale=raw.get("noise_scale", 1.0),
-        noise_scale_mode=raw.get("noise_scale_mode", "none"),
-        noise_scale_base_image_seq_len=raw.get("noise_scale_base_image_seq_len", 256),
-        noise_scale_max_value=raw.get("noise_scale_max_value", 10.0),
-        add_noise_scale_embedding=raw.get("add_noise_scale_embedding", False),
-        time_schedule=raw.get("time_schedule", "standard"),
-        time_shift_type=raw.get("time_shift_type", "exponential"),
-        base_shift=raw.get("base_shift", 0.5),
-        max_shift=raw.get("max_shift", 1.15),
-        base_image_seq_len=raw.get("base_image_seq_len", 256),
-        max_image_seq_len=raw.get("max_image_seq_len", 4096),
-        concat_time_token_num=raw.get("concat_time_token_num", 0),
-        t_eps=raw.get("t_eps", 0.02),
-    )
-
-    return top_cfg, llm_cfg, vis_cfg
 
 
 # ---------------------------------------------------------------------------
@@ -514,7 +461,13 @@ class SenseNovaU1DenoisingAdapter(nn.Module):
         return self.language_model(*args, **kwargs)
 
 
-class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin, CFGParallelMixin):
+class SenseNovaU1Pipeline(
+    nn.Module,
+    SupportsComponentDiscovery,
+    DiffusionPipelineProfilerMixin,
+    CFGParallelMixin,
+    LoraLoaderMixin,
+):
     """SenseNova-U1 text-to-image and image-to-image pipeline for vllm-omni.
 
     Builds the full model graph internally:
@@ -549,7 +502,9 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         model_path = od_config.model
         self.local_model_path = _resolve_model_path(model_path)
 
-        self.top_cfg, self.llm_cfg, self.vis_cfg = _load_sensenova_u1_config(model_path)
+        self.model_cfg = SenseNovaU1Config.from_pretrained(self.local_model_path)
+        self.llm_cfg = self.model_cfg.llm_config
+        self.vis_cfg = self.model_cfg.vision_config
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.local_model_path)
         self.img_context_token_id = self.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
@@ -573,13 +528,13 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         # FM modules
         llm_hidden_size = self.llm_cfg.hidden_size
         patch_size = self.vis_cfg.patch_size
-        merge_size = int(1 / self.top_cfg.downsample_ratio)
+        merge_size = int(1 / self.model_cfg.downsample_ratio)
         output_dim = 3 * (patch_size * merge_size) ** 2
 
         vision_model_mot_gen = NEOVisionModel(self.vis_cfg)
         timestep_embedder = TimestepEmbedder(llm_hidden_size)
 
-        if self.top_cfg.use_pixel_head:
+        if self.model_cfg.use_pixel_head:
             fm_head = ConvDecoder(llm_hidden_size)
         else:
             # The reference implementation uses a fixed 2-layer GELU MLP with a 4096-d
@@ -601,13 +556,13 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             }
         )
 
-        if self.top_cfg.add_noise_scale_embedding:
+        if self.model_cfg.add_noise_scale_embedding:
             self.fm_modules["noise_scale_embedder"] = TimestepEmbedder(llm_hidden_size)
 
         # Config shortcuts
         self.patch_size = patch_size
         self.merge_size = merge_size
-        self.downsample_ratio = self.top_cfg.downsample_ratio
+        self.downsample_ratio = self.model_cfg.downsample_ratio
 
         # Weight sources for diffusers_loader
         self.weights_sources = [
@@ -727,6 +682,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         t,
         z,
         image_token_num,
+        t_eps: float,
         image_size=None,
         cache_dit_skip=False,
         **_kw,
@@ -748,7 +704,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         )
         last_hidden_state = outputs.hidden_states
 
-        if self.top_cfg.use_pixel_head:
+        if self.model_cfg.use_pixel_head:
             merge_size = self.merge_size
             token_h = image_size[1] // (self.patch_size * merge_size)
             token_w = image_size[0] // (self.patch_size * merge_size)
@@ -765,7 +721,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         else:
             x_pred = self.fm_modules["fm_head"](last_hidden_state[:, -image_token_num:].view(B, L, -1)).view(B, L, -1)
 
-        v_pred = (x_pred - z) / (1 - t).clamp_min(self.top_cfg.t_eps)
+        v_pred = (x_pred - z) / (1 - t).clamp_min(t_eps)
         return v_pred
 
     def _apply_time_schedule(self, t, image_seq_len, timestep_shift):
@@ -774,8 +730,71 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         sigma = shift * sigma / (1 + (shift - 1) * sigma)
         return 1 - sigma
 
-    def _ar_step(self, next_token, t_idx, past_key_values):
+    def _decode_context(self, past_key_values):
+        """Paged cache plus a captured graph for the AR loop, or ``None``.
+
+        Decode is where a think request spends most of its time, and every step
+        issues the same work at the same shapes, so it is worth capturing. The
+        cache has to be paged for that: it keeps the buffers a fixed size while
+        the kernel reads only ``seqused_k`` of them, which is what lets one
+        capture serve every step until the next bucket.
+
+        Both live on the pipeline and are reused across requests unless a LoRA
+        adapter is being served dynamically. A capture binds the addresses it
+        recorded, so a cache built per request forces a capture per request:
+        measured, that left about 40 MiB of device memory behind on every
+        request and re-captured every time. Reuse rests on the same thing the
+        paged path already rests on -- one sequence in flight per pipeline
+        forward.
+        """
+        if os.environ.get("VLLM_OMNI_SENSENOVA_PAGED_DECODE", "1") != "1":
+            return None
+        head_dim = self.language_model.model.layers[0].self_attn.head_dim
+        if not paged_decode_supported(torch.device(self.device), head_dim):
+            return None
+        if past_key_values is None or not past_key_values.layers:
+            return None
+        layer0 = past_key_values.layers[0]
+        if layer0.keys is None:
+            return None
+        _, kv_heads, prefix, kv_head_dim = layer0.keys.shape
+        device = torch.device(self.device)
+        num_layers = len(self.language_model.model.layers)
+        # Reuse is off once the LoRA manager holds the decode path: the test
+        # below sees shape, dtype and bucket, none of which move when an adapter
+        # is bound, rescaled or reset between requests.
+        reuse = not dynamic_lora_wrappers_present(self.language_model)
+        decode = getattr(self, "_paged_decode", None) if reuse else None
+        if decode is None or not decode[0].reusable_for(
+            num_layers, kv_heads, kv_head_dim, layer0.keys.dtype, prefix + 1
+        ):
+            cache = PagedDecodeCache(num_layers, kv_heads, kv_head_dim, prefix + 1, device, layer0.keys.dtype)
+            decode = (cache, DecodeGraphRunner(self.language_model, cache, device))
+            self._paged_decode = decode if reuse else None
+        if not decode[0].load_prefix(past_key_values):
+            return None
+        return decode
+
+    def release_captured_graphs(self) -> None:
+        """Drop the reused paged cache and the graphs captured against it.
+
+        Sleep level 2 discards the memory a capture recorded, so anything held
+        across requests has to go with it. The next request rebuilds both.
+        """
+        self._paged_decode = None
+
+    def _ar_step(self, next_token, t_idx, past_key_values, decode=None):
         """One autoregressive token step. Constructs single-token `indexes` explicitly."""
+        if decode is not None:
+            cache, runner = decode
+            if cache.length + 1 > cache.bucket:
+                cache.grow(cache.length + 1)
+            cache.set_length(cache.length + 1)
+            logits = runner.step(int(next_token), t_idx + 1)
+            # The caller reassigns its cache handle from this field; the paged
+            # tokens are merged into it once, at the hand-off below.
+            return SenseNovaU1CausalLMOutput(logits=logits, past_key_values=past_key_values)
+
         indexes = torch.tensor([[t_idx + 1], [0], [0]], dtype=torch.long, device=self.device)
         outputs = self.language_model(
             input_ids=next_token.unsqueeze(0),
@@ -790,23 +809,27 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         think_end_token_id = self.tokenizer.convert_tokens_to_ids("</think>")
         think_token_ids = []
         next_token = torch.argmax(prefix_outputs.logits[:, -1, :], dim=-1)
+        decode = self._decode_context(past_key_values)
 
         for _ in range(max_think_tokens):
             token_item = next_token.item()
             if token_item == eos_token_id:
                 break
             if token_item == think_end_token_id:
-                outputs = self._ar_step(next_token, t_idx, past_key_values)
+                outputs = self._ar_step(next_token, t_idx, past_key_values, decode)
                 past_key_values = outputs.past_key_values
                 t_idx += 1
                 think_token_ids.append(token_item)
                 break
 
             think_token_ids.append(token_item)
-            outputs = self._ar_step(next_token, t_idx, past_key_values)
+            outputs = self._ar_step(next_token, t_idx, past_key_values, decode)
             past_key_values = outputs.past_key_values
             t_idx += 1
             next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1)
+
+        if decode is not None:
+            decode[0].to_dynamic_cache(past_key_values)
 
         # Append "\n\n<img>" tokens to cache
         append_ids = self.tokenizer(
@@ -862,6 +885,10 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         """Autoregressive text decoding seeded from prefix logits."""
         eos_token_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
         generated_ids: list[int] = []
+        # Same paged decode as the think loop. No write-back at the end: the
+        # caller returns the decoded string and never reads the cache again,
+        # unlike the think path, which hands it to the generation stage.
+        decode = self._decode_context(past_key_values)
 
         logits = prefix_logits[:, -1, :]
         for _ in range(max_tokens):
@@ -875,7 +902,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             if token_id == eos_token_id:
                 break
             generated_ids.append(token_id)
-            outputs = self._ar_step(next_token, t_idx, past_key_values)
+            outputs = self._ar_step(next_token, t_idx, past_key_values, decode)
             past_key_values = outputs.past_key_values
             logits = outputs.logits[:, -1, :]
             t_idx += 1
@@ -1055,14 +1082,14 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         token_w = p.image_size[0] // (self.patch_size * merge_size)
         grid_hw = torch.tensor([[grid_h, grid_w]] * p.batch_size, device=self.device)
 
-        noise_scale = self.top_cfg.noise_scale
-        if self.top_cfg.noise_scale_mode in ("resolution", "dynamic", "dynamic_sqrt"):
-            base = float(self.top_cfg.noise_scale_base_image_seq_len)
+        noise_scale = self.model_cfg.noise_scale
+        if self.model_cfg.noise_scale_mode in ("resolution", "dynamic", "dynamic_sqrt"):
+            base = float(self.model_cfg.noise_scale_base_image_seq_len)
             scale = math.sqrt((grid_h * grid_w) / (merge_size**2) / base)
-            noise_scale = scale * float(self.top_cfg.noise_scale)
-            if self.top_cfg.noise_scale_mode == "dynamic_sqrt":
+            noise_scale = scale * float(self.model_cfg.noise_scale)
+            if self.model_cfg.noise_scale_mode == "dynamic_sqrt":
                 noise_scale = math.sqrt(noise_scale)
-        noise_scale = min(noise_scale, self.top_cfg.noise_scale_max_value)
+        noise_scale = min(noise_scale, self.model_cfg.noise_scale_max_value)
 
         generator = torch.Generator(self.device).manual_seed(p.seed)
         image_prediction = noise_scale * torch.randn(
@@ -1101,6 +1128,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             z=z,
             image_token_num=ns.token_h * ns.token_w,
             image_size=p.image_size,
+            t_eps=p.t_eps,
         )
         if cache_dit_skip:
             kwargs["cache_dit_skip"] = True
@@ -1238,10 +1266,38 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             layer.values = layer.values.expand(batch_size, *layer.values.shape[1:])
         prepare_flash_kv_cache(kv, current_len=token_hw, batch_size=batch_size)
 
+    @staticmethod
+    def _is_warmup_request(req) -> bool:
+        is_dummy_run = getattr(req, "is_dummy_run", None)
+        if callable(is_dummy_run):
+            return bool(is_dummy_run())
+        return OmniDiffusionRequest.is_dummy_run_request_id(getattr(req, "request_id", None))
+
+    def _warm_ar_decode(self) -> None:
+        """Run one single-token decode at startup so its compiled region is built.
+
+        The engine's dummy request is a text-to-image run with think off. It
+        exercises the prefill shape but never the decode one, so whatever the
+        deploy config compiles for decode lands on the first real request
+        instead of on readiness. Warmup is best effort and must not fail startup.
+        """
+        try:
+            lm = self.language_model
+            device = torch.device(self.device)
+            ids = torch.zeros(1, 2, dtype=torch.long, device=device)
+            idx = torch.zeros(3, 2, dtype=torch.long, device=device)
+            prefill = lm(input_ids=ids, indexes=idx, use_cache=True)
+            nxt = torch.zeros(1, 1, dtype=torch.long, device=device)
+            nidx = torch.tensor([[2], [0], [0]], dtype=torch.long, device=device)
+            lm(input_ids=nxt, indexes=nidx, past_key_values=prefill.past_key_values, use_cache=True)
+        except Exception as exc:  # pragma: no cover - warmup is best effort
+            logger.warning("Autoregressive decode warmup skipped: %s", exc)
+
     @torch.inference_mode()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+        if self._is_warmup_request(req):
+            self._warm_ar_decode()
         p = self._parse_request(req)
-        self.top_cfg.t_eps = p.t_eps
 
         input_images = self._extract_input_images(p.first_prompt)
         modalities = p.first_prompt.get("modalities", []) if isinstance(p.first_prompt, dict) else []
@@ -1438,8 +1494,8 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
                 ns.token_h * ns.token_w,
                 -1,
             )
-            if self.top_cfg.add_noise_scale_embedding:
-                ns_tensor = torch.full_like(t_expanded, ns.noise_scale / self.top_cfg.noise_scale_max_value)
+            if self.model_cfg.add_noise_scale_embedding:
+                ns_tensor = torch.full_like(t_expanded, ns.noise_scale / self.model_cfg.noise_scale_max_value)
                 ns_emb = self.fm_modules["noise_scale_embedder"](ns_tensor).view(
                     p.batch_size,
                     ns.token_h * ns.token_w,
@@ -1473,21 +1529,129 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
     # Weight loading
     # -----------------------------------------------------------------------
 
+    # Shard name -> fused parameter, used by weight loading and LoRA loading.
+    # More specific _mot_gen patterns FIRST to avoid substring ambiguity
+    # (e.g. `.q_proj` is a substring of `.q_proj_mot_gen`).
+    stacked_params_mapping: ClassVar[list[tuple[str, str, str | int]]] = [
+        (".qkv_proj_mot_gen", ".q_proj_mot_gen", "q"),
+        (".qkv_proj_mot_gen", ".k_proj_mot_gen", "k"),
+        (".qkv_proj_mot_gen", ".v_proj_mot_gen", "v"),
+        (".qkv_proj", ".q_proj", "q"),
+        (".qkv_proj", ".k_proj", "k"),
+        (".qkv_proj", ".v_proj", "v"),
+        # MLP gate/up fused into MergedColumnParallelLinear
+        (".gate_up_proj", ".gate_proj", 0),
+        (".gate_up_proj", ".up_proj", 1),
+    ]
+
+    def load_lora_weights(
+        self,
+        pretrained_model_name_or_path: str | list[str],
+        adapter_name: str | None = None,
+    ) -> None:
+        """Fuse a distilled few-step LoRA into the weights.
+
+        The checkpoints ship kohya `lora_down`/`lora_up`/`alpha` names, renamed
+        here to the Diffusers names before `load_lora_into_module` routes each
+        delta into its slice of the fused projections.
+        """
+        if adapter_name in self.lora_loaded:
+            return
+
+        paths = (
+            [pretrained_model_name_or_path]
+            if isinstance(pretrained_model_name_or_path, str)
+            else list(pretrained_model_name_or_path)
+        )
+        if len(paths) != 1:
+            raise ValueError(f"Expected exactly one distilled LoRA file, got {len(paths)}: {paths}")
+
+        state_dict = _load_lora_state_dict(paths[0])
+        state_dict = _remap_state_dict_keys(
+            state_dict,
+            [(".lora_down.weight", ".lora_A.weight"), (".lora_up.weight", ".lora_B.weight")],
+        )
+        # Fold alpha and the low-rank product in fp32; scaling B in bf16 would
+        # round once before the matmul and once after.
+        state_dict = {k: v.to(torch.float32) for k, v in state_dict.items()}
+        state_dict = _apply_diffusers_lora_alpha_scaling(state_dict)
+
+        applied = self._add_lora_deltas(state_dict)
+        if not applied:
+            raise ValueError(f"Distilled LoRA {paths[0]} matched no parameter of this pipeline.")
+        logger.info("Fused distilled LoRA %s into %d parameters", paths[0], applied)
+        # Fusion is one-way and there is no unload path, so keep only a sentinel;
+        # the fp32 state dict is ~1.5 GiB and would stay resident for the process.
+        self.lora_loaded[adapter_name] = paths[0]
+
+    def _fused_shards(self, base_key: str) -> list[tuple[str, str | int]] | None:
+        """Unfused source names and shard ids for a fused parameter, else None."""
+        for param_name, weight_name, shard_id in self.stacked_params_mapping:
+            if base_key.endswith(param_name):
+                return [
+                    (base_key[: -len(param_name)] + w, sid)
+                    for p, w, sid in self.stacked_params_mapping
+                    if p == param_name
+                ]
+        return None
+
+    def _add_lora_deltas(self, state_dict: dict[str, torch.Tensor]) -> int:
+        """Add every matching delta into its parameter, sharding through vLLM.
+
+        The delta read from the checkpoint spans the whole layer. A parameter of
+        a parallel layer only holds this rank's slice of it, so the delta goes
+        through the layer's own weight loader -- into a zeroed copy of the
+        parameter, which is then added -- instead of being added directly.
+
+        Each parameter is fused in place as it is reached, so a failure part way
+        through leaves the earlier ones fused and the pipeline has to be
+        reloaded. Deferring the writes would mean holding every delta at once,
+        and the deltas are full rank: 15.09 GiB for the 8B checkpoint, against
+        the 192 MiB one parameter costs here. Fusion runs at load time, before
+        the pipeline serves anything, so a partially fused model is never
+        reachable from a request.
+        """
+        applied = 0
+        for name, param in self.named_parameters():
+            if not name.endswith(".weight"):
+                continue
+            base_key = name[: -len(".weight")]
+            shards = self._fused_shards(base_key)
+
+            deltas: list[tuple[torch.Tensor, str | int | None]] = []
+            for src, shard_id in shards or [(base_key, None)]:
+                delta, _ = _prepare_lora_delta(state_dict, src, None)
+                if delta is None:
+                    deltas = []
+                    break
+                deltas.append((delta, shard_id))
+            if not deltas:
+                continue
+
+            weight_loader = getattr(param, "weight_loader", None)
+            buffer = torch.zeros_like(param.data)
+            if weight_loader is None:
+                # Not a parallel layer: the delta is already rank-local.
+                buffer = torch.cat([d for d, _ in deltas]).to(device=param.device, dtype=param.dtype)
+            else:
+                saved = param.data
+                try:
+                    param.data = buffer
+                    for delta, shard_id in deltas:
+                        delta = delta.to(device=param.device, dtype=param.dtype)
+                        if shard_id is None:
+                            weight_loader(param, delta)
+                        else:
+                            weight_loader(param, delta, shard_id)
+                finally:
+                    param.data = saved
+            with torch.no_grad():
+                param.data.add_(buffer)
+            applied += 1
+        return applied
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # More specific _mot_gen patterns FIRST to avoid substring
-            # ambiguity (e.g. `.q_proj` is a substring of `.q_proj_mot_gen`).
-            (".qkv_proj_mot_gen", ".q_proj_mot_gen", "q"),
-            (".qkv_proj_mot_gen", ".k_proj_mot_gen", "k"),
-            (".qkv_proj_mot_gen", ".v_proj_mot_gen", "v"),
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            # MLP gate/up fused into MergedColumnParallelLinear
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-        self.stacked_params_mapping = stacked_params_mapping
+        stacked_params_mapping = self.stacked_params_mapping
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()

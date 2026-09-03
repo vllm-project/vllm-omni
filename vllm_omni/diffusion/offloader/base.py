@@ -1,17 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
+from typing import Protocol, runtime_checkable
 
 import torch
 from torch import nn
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig, validate_dlo_host_registration_options
 
 logger = init_logger(__name__)
+
+
+@runtime_checkable
+class SupportsModelCpuOffload(Protocol):
+    """Pipeline-owned lifecycle for model-level CPU offload.
+
+    Pipelines with non-forward component entry points (for example VAE
+    ``decode_latent`` methods) need to activate those stages explicitly, so
+    generic forward-hook discovery cannot manage their full lifecycle.
+    """
+
+    def enable_omni_model_cpu_offload(
+        self,
+        *,
+        device: torch.device,
+        pin_memory: bool,
+        use_hsdp: bool,
+    ) -> None: ...
+
+    def disable_omni_model_cpu_offload(self) -> None: ...
 
 
 class OffloadStrategy(Enum):
@@ -27,11 +48,13 @@ class OffloadConfig:
     pin_cpu_memory: bool = True
     use_hsdp: bool = False
     dp_size: int = 1  # derived from parallel_config, not user-configurable
-    # True: add DP sharding + AllGather. False: stream the standard loader's
-    # rank-local tensors (including TP-local shards) with H2D only.
+    # True: add DP sharding + AllGather. False: stream complete rank-local
+    # blocks from the loader-selected host backing with H2D only.
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = 0  # leading DiT layers kept on device
-    model_path: str | None = None  # checkpoint path for mmap weight loading
+    # Optional per-worker ceiling for registering an HWR mmap. Zero means no
+    # additional ceiling; pin_cpu_memory controls whether registration is tried.
+    dlo_host_registration_limit_gib: float = 0.0
 
     @classmethod
     def from_od_config(cls, od_config: OmniDiffusionConfig) -> "OffloadConfig":
@@ -58,13 +81,12 @@ class OffloadConfig:
 
         parallel_config = getattr(od_config, "parallel_config", None)
         use_hsdp = getattr(parallel_config, "use_hsdp", False) if parallel_config else False
-
         # Derive dp_size from parallel_config — not user-configurable.
         # The offload adapts to whatever DP/SP is already configured.
         dp_size = 1
         if parallel_config is not None:
             dp_size = getattr(parallel_config, "data_parallel_size", 1)
-            # HSDP's fully_shard_degree also contributes to effective DP
+            # HSDP shard and replica sizes determine the effective group size.
             hsdp_shard_size = getattr(parallel_config, "hsdp_shard_size", -1) if use_hsdp else -1
             hsdp_replicate_size = getattr(parallel_config, "hsdp_replicate_size", 1) if use_hsdp else 1
             if use_hsdp and hsdp_shard_size > 0:
@@ -103,6 +125,12 @@ class OffloadConfig:
         # requirements (concurrent requests, dummy run skip).
         dlo_use_allgather = getattr(od_config, "dlo_use_allgather", True)
         dlo_resident_layers = int(getattr(od_config, "dlo_resident_layers", 0))
+        dlo_host_registration_limit_gib = validate_dlo_host_registration_options(
+            limit_gib=getattr(od_config, "dlo_host_registration_limit_gib", 0.0),
+            enable_dlo=enable_distributed_layerwise_offload,
+            use_allgather=dlo_use_allgather,
+            hwr_mode=getattr(od_config, "host_weight_runtime_mode", "disabled"),
+        )
         if dlo_resident_layers < 0:
             raise ValueError(f"dlo_resident_layers must be >= 0, got {dlo_resident_layers}")
         if dlo_resident_layers and dlo_use_allgather:
@@ -116,7 +144,8 @@ class OffloadConfig:
             dp_size = 1
             logger.info(
                 "Distributed layerwise offload: dlo_use_allgather=False, "
-                "streaming standard-loader rank-local weights (no DP shard or AllGather)"
+                "streaming complete rank-local blocks (no DLO shard or AllGather); "
+                "the backend will select mmap or standard-loader host storage"
             )
 
         # HSDP already shards parameters into DTensors.  Running distributed
@@ -137,7 +166,7 @@ class OffloadConfig:
             dp_size=dp_size,
             dlo_use_allgather=dlo_use_allgather,
             dlo_resident_layers=dlo_resident_layers,
-            model_path=getattr(od_config, "model", None),
+            dlo_host_registration_limit_gib=dlo_host_registration_limit_gib,
         )
 
 

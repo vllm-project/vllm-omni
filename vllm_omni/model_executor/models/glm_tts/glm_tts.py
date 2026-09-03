@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """GLM-TTS AR Model (Stage 0): Text → Speech Tokens.
 
 Based on Llama architecture, generates speech token sequences from input text.

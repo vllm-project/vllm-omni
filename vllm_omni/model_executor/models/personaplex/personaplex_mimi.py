@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Streaming Mimi codec for PersonaPlex (moshi-free).
 
 Frame-clocked duplex needs a codec that encodes/decodes exactly one 80 ms frame

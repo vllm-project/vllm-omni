@@ -121,8 +121,19 @@ def _pack_tensor_if_large(
     val: torch.Tensor,
     d2h_stream: torch.Stream | None = None,
 ) -> torch.Tensor | dict:
-    """Replace a tensor with an SHM handle if it exceeds the threshold."""
-    if val.nelement() * val.element_size() > _SHM_TENSOR_THRESHOLD:
+    """Replace a tensor with an SHM handle if it exceeds the threshold.
+
+    Batch outputs are split into per-request views that share one storage.
+    Pickle serializes a view's whole storage, so a batch of small views costs
+    the full batch tensor once per request. Size the decision on the storage
+    to keep those views off the wire; packing copies just the view.
+    """
+    view_bytes = val.nelement() * val.element_size()
+    try:
+        storage_bytes = val.untyped_storage().nbytes()
+    except Exception:
+        storage_bytes = view_bytes
+    if max(view_bytes, storage_bytes) > _SHM_TENSOR_THRESHOLD:
         return _tensor_to_shm(val, d2h_stream=d2h_stream)
     return val
 
@@ -147,7 +158,7 @@ def _pack_value_if_large(
 
     Walks the container shapes pipelines return as ``DiffusionOutput.output``:
     bare tensors, dicts (e.g. Cosmos3 ``{"image"/"video": ...}``), and
-    tuples/lists (e.g. LTX2 and DreamID ``(video, audio)``). Other values pass
+    tuples/lists (e.g. LTX2 ``(video, audio)``). Other values pass
     through unchanged. ``_unpack_if_shm_handle`` must mirror these shapes — keep
     the two in sync.
     """

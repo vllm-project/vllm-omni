@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Shared recipe-driven runtime for LTX pipeline variants."""
 
@@ -29,6 +29,7 @@ from vllm_omni.platforms import current_omni_platform
 from . import ltx2_latents as latent_ops
 from .ltx2_components import (
     LTXComponentProfile,
+    _ltx2_use_diffusion_decoder,
     detect_ltx_model_version,
     initialize_pipeline_components,
     resolve_ltx_component_profile,
@@ -47,6 +48,7 @@ from .ltx2_guidance import (
     LTXGuidanceExecutor,
     LTXGuidancePlan,
 )
+from .ltx2_phase_adapter import LTXPhaseAdapterRuntime, build_ltx_phase_adapter
 from .ltx2_recipes import (
     LTXPhaseRecipe,
     LTXPipelineRecipe,
@@ -57,6 +59,29 @@ from .ltx2_request import (
     LTXRequestMixin,
     validate_pipeline_request,
 )
+
+
+def _run_ltx_vocoder(vocoder: nn.Module, generated_mel: torch.Tensor) -> torch.Tensor:
+    """Run the BWE vocoder in FP32, matching the official LTX pipeline."""
+    if not hasattr(vocoder, "bwe_generator"):
+        return vocoder(generated_mel)
+
+    input_dtype = generated_mel.dtype
+    device_type = generated_mel.device.type
+    module_dtype = next(vocoder.parameters()).dtype
+    if device_type == "mps":
+        if module_dtype != torch.float32:
+            vocoder.float()
+        try:
+            return vocoder(generated_mel.float()).to(input_dtype)
+        finally:
+            if module_dtype != torch.float32:
+                vocoder.to(module_dtype)
+
+    # BF16 errors compound through the BWE model's long convolution stack.
+    # FP32 autocast upcasts each op without materializing a second FP32 model.
+    with torch.autocast(device_type=device_type, dtype=torch.float32):
+        return vocoder(generated_mel.float()).to(input_dtype)
 
 
 def _expand_per_prompt_decode_value(
@@ -137,19 +162,34 @@ class LTXRuntime(
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         del prefix
-        self.model_version = detect_ltx_model_version(od_config.model)
+        parallel_config = getattr(od_config, "parallel_config", None)
+        if getattr(parallel_config, "ulysses_mode", "strict") == "advanced_uaa":
+            raise ValueError(
+                f"{self.__class__.__name__} does not support ulysses_mode='advanced_uaa'. "
+                "Use the default ulysses_mode='strict' for LTX sequence parallelism."
+            )
+        self.model_version = detect_ltx_model_version(od_config.model, revision=getattr(od_config, "revision", None))
+        self.use_diffusion_decoder = _ltx2_use_diffusion_decoder(od_config, self.model_version)
         self.component_profile = resolve_ltx_component_profile(self.pipeline_kind, self.model_version)
         self.pipeline_recipe = resolve_ltx_pipeline_recipe(self.pipeline_kind, self.model_version)
+        if getattr(od_config, "cache_backend", "none") == "cache_dit" and not self.pipeline_recipe.supports_cache_dit:
+            raise ValueError(
+                f"{self.__class__.__name__} does not support cache_backend='cache_dit'. "
+                "Cache-DiT is not qualified for this LTX recipe."
+            )
         self._dit_modules = list(self.component_profile.dit_modules)
         self._encoder_modules = list(self.component_profile.encoder_modules)
         self._vae_modules = list(self.component_profile.vae_modules)
+        if self.use_diffusion_decoder:
+            self._vae_modules.append("diffusion_decoder")
         self._resident_modules = list(self.component_profile.resident_modules)
-        if self.model_version == "2.3":
+        if self.model_version in ("2.3", "2.5"):
             self.preserve_sp_padded_audio_duration = True
             self.reports_stage_durations = True
         super().__init__()
         self._guidance_plan = LTXGuidancePlan.build(self.pipeline_recipe.request_guidance)
         initialize_pipeline_components(self, od_config)
+        self._phase_adapter: LTXPhaseAdapterRuntime | None = build_ltx_phase_adapter(self)
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
@@ -159,6 +199,7 @@ class LTXRuntime(
         req: DiffusionRequestBatch,
         *,
         image: Any | None = None,
+        image_crf: int | None = None,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         height: int | None = None,
@@ -167,6 +208,8 @@ class LTXRuntime(
         frame_rate: float | None = None,
         num_inference_steps: int | None = None,
         sigmas: list[float] | None = None,
+        stage_1_sigmas: list[float] | None = None,
+        stage_2_sigmas: list[float] | None = None,
         guidance_scale: float | None = None,
         num_videos_per_prompt: int | None = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
@@ -203,18 +246,41 @@ class LTXRuntime(
             decode_noise_scale=decode_noise_scale,
             output_type=output_type,
             max_sequence_length=max_sequence_length,
+            image_crf=image_crf,
         )
         image = self._resolve_request_image(req, image, request_inputs)
+        if image is not None and not self.support_image_input:
+            raise ValueError(f"{self.__class__.__name__} does not support `image` input.")
         request_sigmas = self._resolve_request_sigmas(req, sigmas)
+        request_phase_sigmas = self._resolve_request_phase_sigmas(req, stage_1_sigmas, stage_2_sigmas)
+        min_video_latent_spatial_size = None
+        if getattr(self, "use_diffusion_decoder", False):
+            first_stage_kernel = self.diffusion_decoder.config.decoder_stage_kernels[0]
+            min_video_latent_spatial_size = (int(first_stage_kernel[-2]), int(first_stage_kernel[-1]))
         validate_pipeline_request(
             request_inputs,
             pipeline_recipe=self.pipeline_recipe,
             vae_spatial_compression_ratio=self.vae_spatial_compression_ratio,
             vae_temporal_compression_ratio=self.vae_temporal_compression_ratio,
             pipeline_name=self.__class__.__name__,
+            min_video_latent_spatial_size=min_video_latent_spatial_size,
             request_sigmas=request_sigmas,
+            request_phase_sigmas=request_phase_sigmas,
         )
-        return self._run_recipe(req, request_inputs, request_sigmas=request_sigmas, image=image)
+        phase_adapter = getattr(self, "_phase_adapter", None)
+        if phase_adapter is not None and any(
+            getattr(sampling, "lora_request", None) is not None for sampling in req.sampling_params_list
+        ):
+            raise ValueError(
+                f"{self.__class__.__name__} cannot compose a request LoRA with its internal phase adapter."
+            )
+        return self._run_recipe(
+            req,
+            request_inputs,
+            request_sigmas=request_sigmas,
+            request_phase_sigmas=request_phase_sigmas,
+            image=image,
+        )
 
     def _run_recipe(
         self,
@@ -222,24 +288,39 @@ class LTXRuntime(
         request_inputs: LTXRequestInputs,
         *,
         request_sigmas: list[float] | None,
+        request_phase_sigmas: tuple[list[float] | None, ...] | None = None,
         image: Any | None = None,
     ) -> DiffusionOutput | list[DiffusionOutput]:
         """Execute one- and multi-phase recipes through the same control flow."""
         phase_results: list[LTXPhaseResult] = []
         prompt_context = None
-
-        for phase_recipe in self.pipeline_recipe.phases:
+        for phase_index, phase_recipe in enumerate(self.pipeline_recipe.phases):
+            override_sigmas = None if request_phase_sigmas is None else request_phase_sigmas[phase_index]
+            phase_sigmas = (
+                override_sigmas
+                if override_sigmas is not None
+                else (
+                    request_sigmas
+                    if request_sigmas is not None
+                    else (list(phase_recipe.sigmas) if phase_recipe.sigmas is not None else None)
+                )
+            )
             self._enter_phase(phase_recipe)
             phase_inputs = self._build_phase_inputs(
                 request_inputs,
                 phase_recipe,
                 phase_results[-1] if phase_results else None,
             )
+            if phase_sigmas is not None:
+                phase_inputs = replace(phase_inputs, num_inference_steps=len(phase_sigmas) - 1)
+            noise_scale = phase_recipe.noise_scale
+            if override_sigmas is not None and phase_recipe.input_transform == "spatial_upsample":
+                noise_scale = float(override_sigmas[0])
             phase_result = self.run_phase(
                 req,
                 phase_inputs,
-                noise_scale=phase_recipe.noise_scale,
-                sigmas=list(phase_recipe.sigmas) if phase_recipe.sigmas is not None else request_sigmas,
+                noise_scale=noise_scale,
+                sigmas=phase_sigmas,
                 timesteps=None,
                 attention_kwargs=None,
                 phase_recipe=phase_recipe,
@@ -258,8 +339,21 @@ class LTXRuntime(
         return self.decode_phase(output_phase)
 
     def _enter_phase(self, phase: LTXPhaseRecipe) -> None:
-        """Hook for a future phase-weight strategy."""
         self._active_phase_name = phase.name
+        self._guidance_plan = LTXGuidancePlan.build(phase.guidance)
+        phase_adapter = getattr(self, "_phase_adapter", None)
+        if phase_adapter is None:
+            if phase.adapter_slot is not None:
+                raise RuntimeError(f"LTX phase {phase.name!r} requires adapter slot {phase.adapter_slot!r}.")
+            return
+        phase_adapter.activate(phase.adapter_slot)
+
+    def eval(self):
+        result = super().eval()
+        phase_adapter = getattr(self, "_phase_adapter", None)
+        if phase_adapter is not None:
+            phase_adapter.finalize()
+        return result
 
     def prepare_latents(
         self,
@@ -457,7 +551,10 @@ class LTXRuntime(
             return self._make_output((latents, audio_latents))
 
         latents = latents.to(connector_prompt_embeds.dtype)
-        if not self.vae.config.timestep_conditioning:
+        use_diffusion_decoder = getattr(self, "use_diffusion_decoder", False)
+        if use_diffusion_decoder:
+            timestep_decode = None
+        elif not self.vae.config.timestep_conditioning:
             timestep_decode = None
         else:
             noise = randn_tensor(latents.shape, generator=generator, device=device, dtype=latents.dtype)
@@ -474,14 +571,22 @@ class LTXRuntime(
         dist_initialized = torch.distributed.is_initialized()
         is_output_rank = not dist_initialized or torch.distributed.get_rank() == 0
         vae_decode_needs_all_ranks = False
-        is_distributed_vae_enabled = getattr(self.vae, "is_distributed_enabled", None)
+        video_decoder = self.diffusion_decoder if use_diffusion_decoder else self.vae
+        is_distributed_vae_enabled = getattr(video_decoder, "is_distributed_enabled", None)
         if self.distributed_video_decode and dist_initialized and callable(is_distributed_vae_enabled):
             # Distributed tiled decode is collective, so every rank must enter it.
             vae_decode_needs_all_ranks = bool(is_distributed_vae_enabled())
 
         should_decode_video = not self.distributed_video_decode or is_output_rank or vae_decode_needs_all_ranks
         if should_decode_video:
-            video = self.vae.decode(latents.to(self.vae.dtype), timestep_decode, return_dict=False)[0]
+            if use_diffusion_decoder:
+                video = self.diffusion_decoder.decode(
+                    latents.to(self.diffusion_decoder.dtype),
+                    generator=generator,
+                    return_dict=False,
+                )[0]
+            else:
+                video = self.vae.decode(latents.to(self.vae.dtype), timestep_decode, return_dict=False)[0]
         else:
             video = torch.empty(0, device=latents.device, dtype=latents.dtype)
 
@@ -496,7 +601,7 @@ class LTXRuntime(
         if video.numel() > 0:
             video = self.video_processor.postprocess_video(video, output_type=output_type)
         generated_mel = self.audio_vae.decode(audio_latents.to(self.audio_vae.dtype), return_dict=False)[0]
-        audio = self.vocoder(generated_mel)
+        audio = _run_ltx_vocoder(self.vocoder, generated_mel)
         return self._make_output((video, audio))
 
     def _prepare_video_latents_stage(
@@ -610,7 +715,12 @@ class LTXRuntime(
         audio_token_count: int,
     ) -> dict[str, torch.Tensor]:
         del forward_ctx, denoise_ctx
-        return self.guidance_executor.timestep_kwargs(ts, video_token_count, audio_token_count)
+        return self.guidance_executor.timestep_kwargs(
+            ts,
+            video_token_count,
+            audio_token_count,
+            expand_for_sequence_parallel=True,
+        )
 
     def _video_guidance_model_sigma(
         self,
@@ -665,6 +775,7 @@ class LTXRuntime(
             state,
             forward_ctx,
             denoise_ctx,
+            preserve_positive_velocity=forward_ctx.sampler == "euler_ancestral",
         )
 
     def _denoise_step(
@@ -692,6 +803,7 @@ class LTXRuntime(
             noise_pred_audio,
             timestep,
         )
+        audio = latent_ops.clear_audio_padding(audio, forward_ctx.original_audio_num_frames)
         return latent_ops.LTXAVState(video=video, audio=audio)
 
     def _unpack_and_denormalize_stage(
@@ -708,11 +820,12 @@ class LTXRuntime(
             self.transformer_spatial_patch_size,
             self.transformer_temporal_patch_size,
         )
+        latents_mean, latents_std, scaling_factor = latent_ops.resolve_video_latent_statistics(self)
         latents = latent_ops.denormalize_latents(
             latents,
-            self.vae.latents_mean,
-            self.vae.latents_std,
-            self.vae.config.scaling_factor,
+            latents_mean,
+            latents_std,
+            scaling_factor,
         )
 
         audio_latents = latent_ops.unpad_audio_latents(audio_latents, forward_ctx.original_audio_num_frames)

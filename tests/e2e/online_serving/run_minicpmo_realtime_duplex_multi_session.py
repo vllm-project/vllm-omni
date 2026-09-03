@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Concurrent MiniCPM-o Realtime duplex and resumable-session E2E driver."""
 
 from __future__ import annotations
@@ -8,22 +11,100 @@ import hashlib
 import json
 import sys
 import uuid
+from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import websockets
+from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+REPO_ROOT = SCRIPT_DIR.parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from minicpmo_realtime_duplex_scenarios import (  # noqa: E402
-    _ref_audio_data_url,
-    _url_with_model,
-    run_demo,
-)
+
+@lru_cache(maxsize=1)
+def _scenario_module():
+    """Delay heavyweight vLLM imports so ``--help`` remains directly executable."""
+    from tests.e2e.online_serving.helpers import minicpmo_realtime_duplex_scenarios
+
+    return minicpmo_realtime_duplex_scenarios
+
+
+def _ref_audio_data_url(path: str) -> str:
+    return _scenario_module()._ref_audio_data_url(path)
+
+
+def _url_with_model(*args, **kwargs) -> str:
+    return _scenario_module()._url_with_model(*args, **kwargs)
+
+
+async def run_demo(args):
+    return await _scenario_module().run_demo(args)
+
+
+class _SynchronizedStartGate:
+    """One-shot, failure-propagating start gate for Python 3.10+."""
+
+    def __init__(self, parties: int, *, timeout_s: float):
+        if parties < 1:
+            raise ValueError("synchronized start parties must be positive")
+        if timeout_s <= 0:
+            raise ValueError("synchronized start timeout must be positive")
+        self._parties = parties
+        self._timeout_s = timeout_s
+        self._arrived = 0
+        self._released = False
+        self._failure: BaseException | None = None
+        self._event = asyncio.Event()
+        self._lock = asyncio.Lock()
+
+    async def wait(self) -> None:
+        async with self._lock:
+            if self._failure is not None:
+                raise RuntimeError(f"synchronized start aborted: {self._failure!r}") from self._failure
+            if self._released:
+                return
+            self._arrived += 1
+            if self._arrived == self._parties:
+                self._released = True
+                self._event.set()
+                return
+
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout=self._timeout_s)
+        except asyncio.TimeoutError as exc:
+            failure = TimeoutError(
+                f"synchronized start timed out after {self._timeout_s:.1f}s "
+                f"({self._arrived}/{self._parties} sessions ready)"
+            )
+            await self.abort(failure)
+            if self._released and self._failure is None:
+                return
+            raise failure from exc
+
+        if self._failure is not None:
+            raise RuntimeError(f"synchronized start aborted: {self._failure!r}") from self._failure
+
+    async def abort(self, failure: BaseException) -> None:
+        async with self._lock:
+            if self._released or self._failure is not None:
+                return
+            self._failure = failure
+            self._event.set()
+
+
+async def _run_demo_with_start_gate(args: SimpleNamespace):
+    start_gate = getattr(args, "start_barrier", None)
+    try:
+        return await run_demo(args)
+    except BaseException as exc:
+        if start_gate is not None:
+            await start_gate.abort(exc)
+        raise
 
 
 def _with_resume_mode(url: str) -> str:
@@ -85,14 +166,24 @@ def _validate_semantic_isolation(
         return True
     if len(expected_tokens) != len(results):
         return False
-    for result, expected_token in zip(results, expected_tokens, strict=True):
+    normalized_expected_tokens = [token.strip().casefold() for token in expected_tokens]
+    if any(not token for token in normalized_expected_tokens):
+        return False
+    for result_index, (result, expected_token) in enumerate(zip(results, normalized_expected_tokens, strict=True)):
         details = result.get("transcript_integrity")
         transcripts = (
             [str(item.get("transcript", "")) for item in details if isinstance(item, dict)]
             if isinstance(details, list)
             else []
         )
-        if expected_token not in "".join(transcripts):
+        joined_transcripts = "".join(transcripts).casefold()
+        if expected_token not in joined_transcripts:
+            return False
+        if any(
+            other_token in joined_transcripts
+            for other_index, other_token in enumerate(normalized_expected_tokens)
+            if other_index != result_index
+        ):
             return False
     return True
 
@@ -114,10 +205,14 @@ async def _receive_until(ws, event_type: str, *, timeout_s: float) -> tuple[dict
     return await asyncio.wait_for(receive(), timeout=timeout_s)
 
 
+def _server_event_sequences(events: list[dict[str, object]]) -> list[int]:
+    return [sequence for event in events if isinstance(sequence := event.get("server_event_seq"), int)]
+
+
 async def _open_admission_session(
     args: argparse.Namespace,
     session_id: str,
-) -> tuple[object, dict[str, object]]:
+) -> tuple[ClientConnection, dict[str, object]]:
     url = _url_with_model(
         args.url,
         args.model,
@@ -143,7 +238,7 @@ async def _open_admission_session(
     return ws, created
 
 
-async def _close_admission_session(ws, *, timeout_s: float) -> None:
+async def _close_admission_session(ws: ClientConnection, *, timeout_s: float) -> None:
     await ws.send(json.dumps({"type": "session.close"}))
     await _receive_until(ws, "session.closed", timeout_s=timeout_s)
     await ws.close()
@@ -153,8 +248,8 @@ async def _admission_probe(args: argparse.Namespace, *, limit: int) -> dict[str,
     if limit < 1:
         raise ValueError("admission limit must be positive")
     prefix = f"admission-{uuid.uuid4().hex}"
-    accepted: list[tuple[object, dict[str, object]]] = []
-    replacement: tuple[object, dict[str, object]] | None = None
+    accepted: list[tuple[ClientConnection, dict[str, object]]] = []
+    replacement: tuple[ClientConnection, dict[str, object]] | None = None
     overflow_code = None
     try:
         for index in range(limit):
@@ -258,14 +353,7 @@ async def _resume_probe(
         generation = created.get("attachment_generation")
         if not isinstance(token, str) or not isinstance(incarnation, int):
             raise RuntimeError("session.created omitted resumable credentials")
-        last_seq = max(
-            (
-                event.get("server_event_seq", 0)
-                for event in first_events
-                if isinstance(event.get("server_event_seq"), int)
-            ),
-            default=0,
-        )
+        last_seq = max(_server_event_sequences(first_events), default=0)
 
     delay_s = args.expire_after_s if expect_expired else args.resume_after_ms / 1000
     if delay_s > 0:
@@ -308,7 +396,7 @@ async def _resume_probe(
         await second.send(json.dumps({"type": "session.close"}))
         closed, close_events = await _receive_until(second, "session.closed", timeout_s=args.timeout_s)
 
-    replay_sequences = [event["server_event_seq"] for event in replay if isinstance(event.get("server_event_seq"), int)]
+    replay_sequences = _server_event_sequences(replay)
     return {
         "ok": (
             resumed.get("session_id") == session_id
@@ -370,14 +458,7 @@ async def _takeover_probe(
         generation = created.get("attachment_generation")
         if not isinstance(token, str) or not isinstance(incarnation, int) or not isinstance(generation, int):
             raise RuntimeError("session.created omitted takeover credentials")
-        last_seq = max(
-            (
-                event.get("server_event_seq", 0)
-                for event in first_events
-                if isinstance(event.get("server_event_seq"), int)
-            ),
-            default=0,
-        )
+        last_seq = max(_server_event_sequences(first_events), default=0)
 
         second = await websockets.connect(_with_resume_mode(url), max_size=64 * 1024 * 1024)
         await second.send(
@@ -441,7 +522,9 @@ async def _takeover_probe(
         await first.close()
 
 
-def _demo_args(args: argparse.Namespace, index: int) -> SimpleNamespace:
+def _demo_args(
+    args: argparse.Namespace, index: int, start_barrier: _SynchronizedStartGate | None = None
+) -> SimpleNamespace:
     validation_mode = "response-required" if args.response_required else "model-policy"
     input_wav = args.session_input_wav[index] if args.session_input_wav else args.input_wav
     return SimpleNamespace(
@@ -461,14 +544,16 @@ def _demo_args(args: argparse.Namespace, index: int) -> SimpleNamespace:
         omit_transcript_hints=True,
         validation_mode=validation_mode,
         temperature=args.temperature,
-        scenario="sequential",
+        scenario=getattr(args, "scenario", "sequential"),
+        silence_ms=getattr(args, "silence_ms", 500),
         require_audio=args.response_required,
         require_distinct_inputs=False,
-        expect_empty_turn=[],
+        expect_empty_turn=list(getattr(args, "expect_empty_turn", []) or []),
         short_ack_ms=350,
         turns=args.turns,
         timeout_s=args.timeout_s,
         model_policy_settle_ms=args.model_policy_settle_ms,
+        start_barrier=start_barrier,
     )
 
 
@@ -495,8 +580,16 @@ async def run_multi_session(args: argparse.Namespace) -> dict[str, object]:
         )
     lifecycle_result = await run_lifecycle_probes(args)
 
+    start_barrier = (
+        _SynchronizedStartGate(
+            args.sessions,
+            timeout_s=min(float(args.timeout_s), 30.0),
+        )
+        if getattr(args, "synchronized_start", False)
+        else None
+    )
     session_results = await asyncio.gather(
-        *(run_demo(_demo_args(args, index)) for index in range(args.sessions)),
+        *(_run_demo_with_start_gate(_demo_args(args, index, start_barrier)) for index in range(args.sessions)),
         return_exceptions=True,
     )
     failures = [repr(result) for result in session_results if isinstance(result, BaseException)]
@@ -580,7 +673,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--turns", type=int, default=1)
     parser.add_argument("--first-turn-ms", type=int, default=1400)
     parser.add_argument("--turn-duration-ms", type=int, action="append", default=[])
+    parser.add_argument("--expect-empty-turn", type=int, action="append", default=[])
     parser.add_argument("--response-required", action="store_true")
+    parser.add_argument(
+        "--scenario",
+        choices=["sequential", "listen-only-overlap"],
+        default="sequential",
+    )
+    parser.add_argument("--silence-ms", type=int, default=500)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--disconnect-session-index", type=int)
     parser.add_argument("--takeover-session-index", type=int)
@@ -588,6 +688,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expire-session-index", type=int)
     parser.add_argument("--expire-after-s", type=float, default=6.0)
     parser.add_argument("--verify-admission-limit", type=int)
+    parser.add_argument(
+        "--synchronized-start",
+        action="store_true",
+        help="Wait until every session is created before starting input.",
+    )
     parser.add_argument("--model-policy-settle-ms", type=int, default=600)
     parser.add_argument("--timeout-s", type=float, default=120.0)
     args = parser.parse_args()
@@ -599,6 +704,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("provide exactly one --session-expected-token per session")
     if args.session_expected_token and not args.session_input_wav:
         parser.error("--session-expected-token requires --session-input-wav")
+    normalized_expected_tokens = [token.strip().casefold() for token in args.session_expected_token]
+    for token_index, token in enumerate(normalized_expected_tokens):
+        if any(
+            token in other_token or other_token in token
+            for other_token in normalized_expected_tokens[token_index + 1 :]
+        ):
+            parser.error("--session-expected-token values must not overlap after normalization")
     return args
 
 

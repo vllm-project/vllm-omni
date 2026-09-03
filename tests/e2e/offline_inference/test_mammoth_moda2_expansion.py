@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 End-to-end test for MammothModa2 text-to-image generation.
 
@@ -38,7 +41,7 @@ _AR_PATCH_SIZE = 16
 MODEL_PATH = "bytedance-research/MammothModa2-Preview"
 T2I_DEPLOY_CONFIG = get_deploy_config_path("mammoth_moda2.yaml")
 
-_OMNI_RUNNER_PARAM = (MODEL_PATH, None, {"deploy_config": T2I_DEPLOY_CONFIG})
+_OMNI_RUNNER_PARAM = (MODEL_PATH, T2I_DEPLOY_CONFIG)
 
 # Golden pixel reference file.  Set UPDATE_GOLDEN=1 to regenerate.
 _GOLDEN_T2I_PATH = Path(__file__).parent / "fixtures" / "mammoth_moda2_t2i_golden.json"
@@ -172,7 +175,7 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
 
     found_image = False
     for out in outputs:
-        ro_list = getattr(out, "request_output", out)
+        ro_list = out
         if not isinstance(ro_list, list):
             ro_list = [ro_list]
         for ro in ro_list:

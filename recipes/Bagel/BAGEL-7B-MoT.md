@@ -57,14 +57,14 @@ move the diffusion stage to a second GPU in a custom deploy config.
 #### Offline Commands
 
 Run text-to-image with the shared offline example from the repository root.
-Pick the topology with `--stage-configs-path` and forward BAGEL-specific
+Pick the topology with `--deploy-config` and forward BAGEL-specific
 generation parameters as a JSON object through `--extra-body`:
 
 ```bash
 # Two-stage (Thinker + DiT), shares one GPU by default
 python examples/offline_inference/text_to_image/text_to_image.py \
   --model ByteDance-Seed/BAGEL-7B-MoT \
-  --stage-configs-path vllm_omni/deploy/bagel.yaml \
+  --deploy-config vllm_omni/deploy/bagel.yaml \
   --prompt "A beautiful sunset over mountains" \
   --height 1024 \
   --width 1024 \
@@ -79,7 +79,7 @@ python examples/offline_inference/text_to_image/text_to_image.py \
 # Single-stage (DiT only, with internal LLM/ViT/VAE)
 python examples/offline_inference/text_to_image/text_to_image.py \
   --model ByteDance-Seed/BAGEL-7B-MoT \
-  --stage-configs-path vllm_omni/deploy/bagel_single_stage.yaml \
+  --deploy-config vllm_omni/deploy/bagel_single_stage.yaml \
   --prompt "A beautiful sunset over mountains" \
   --height 1024 \
   --width 1024 \

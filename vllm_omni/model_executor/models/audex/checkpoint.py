@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Audex checkpoint layout preparation.
 
 The nvidia/Nemotron-Labs-Audex-2B repo deduplicates weights: the

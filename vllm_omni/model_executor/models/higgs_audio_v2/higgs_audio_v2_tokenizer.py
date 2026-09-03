@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """TTS prompt builder + scope validators for higgs-audio v2.
 
 vllm-omni's higgs path supports two request shapes:

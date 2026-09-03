@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from pathlib import Path
 
@@ -142,12 +142,6 @@ def _generate_joint_output(omni, config: QualityTestConfig):
 
     first = outputs[0]
     worker_peak_memory_mb = float(getattr(first, "peak_memory_mb", 0.0) or 0.0)
-    if hasattr(first, "request_output") and isinstance(first.request_output, list):
-        first = first.request_output[0]
-        worker_peak_memory_mb = max(
-            worker_peak_memory_mb,
-            float(getattr(first, "peak_memory_mb", 0.0) or 0.0),
-        )
     if not hasattr(first, "images") or not first.images:
         raise ValueError("Could not extract video frames from H3 output")
     frames = first.images[0]
@@ -193,6 +187,7 @@ def test_minimax_h3_quantization_quality(config: QualityTestConfig):
         "model": model_ref,
         "enforce_eager": True,
         "tensor_parallel_size": 2,
+        # The fused BF16 baseline only fits on H100-80GB with encoder TP.
         "text_encoder_tp_size": 2,
         "vae_use_tiling": True,
     }

@@ -23,10 +23,8 @@ from typing import Any
 
 import torch
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -251,17 +249,6 @@ def main():
             "scm_steps_policy": "dynamic",
         }
 
-    parallel_config = DiffusionParallelConfig(
-        tensor_parallel_size=args.tensor_parallel_size,
-        cfg_parallel_size=args.cfg_parallel_size,
-        vae_patch_parallel_size=args.vae_patch_parallel_size,
-        ring_degree=args.ring_degree,
-        ulysses_degree=args.ulysses_degree,
-        use_hsdp=args.use_hsdp,
-        hsdp_shard_size=args.hsdp_shard_size,
-        hsdp_replicate_size=args.hsdp_replicate_size,
-    )
-
     profiler_enabled = args.profiler_config is not None
 
     omni_kwargs = dict(
@@ -272,7 +259,14 @@ def main():
         vae_use_tiling=args.vae_use_tiling,
         enable_cpu_offload=args.enable_cpu_offload,
         enable_layerwise_offload=args.enable_layerwise_offload,
-        parallel_config=parallel_config,
+        tensor_parallel_size=args.tensor_parallel_size,
+        cfg_parallel_size=args.cfg_parallel_size,
+        vae_patch_parallel_size=args.vae_patch_parallel_size,
+        ring_degree=args.ring_degree,
+        ulysses_degree=args.ulysses_degree,
+        use_hsdp=args.use_hsdp,
+        hsdp_shard_size=args.hsdp_shard_size,
+        hsdp_replicate_size=args.hsdp_replicate_size,
         enforce_eager=args.enforce_eager,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         cache_backend=args.cache_backend,
@@ -352,8 +346,8 @@ def main():
         else:
             print("[Profiler] No valid profiling data returned.")
 
-    # Extract output from result
-    output = OmniRequestOutput.unwrap_result(result)
+    # omni.generate() returns a list for sync calls; unwrap single-result list.
+    output = result[0] if isinstance(result, list) else result
 
     if not output.images:
         raise ValueError("No video frames found in OmniRequestOutput.")

@@ -35,7 +35,6 @@ MIN_AUDIO_SAMPLES = 1000
 pytestmark = [
     pytest.mark.slow,
     pytest.mark.tts,
-    pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4704"),
 ]
 
 
@@ -137,14 +136,11 @@ def _extract_final_audio_outputs(outputs):
         if getattr(item, "final_output_type", None) == "audio":
             final_outputs.append(item)
             continue
-        request_output = getattr(item, "request_output", None)
-        if request_output is None:
-            continue
-        multimodal_output = getattr(request_output, "multimodal_output", None)
+        multimodal_output = getattr(item, "multimodal_output", None)
         if isinstance(multimodal_output, Mapping):
             final_outputs.append(item)
             continue
-        completions = getattr(request_output, "outputs", None) or []
+        completions = getattr(item, "outputs", None) or []
         if any(isinstance(getattr(completion, "multimodal_output", None), Mapping) for completion in completions):
             final_outputs.append(item)
     return final_outputs
@@ -155,16 +151,11 @@ def _extract_multimodal_output(output) -> Mapping[str, Any]:
     if isinstance(multimodal_output, Mapping):
         return multimodal_output
 
-    request_output = getattr(output, "request_output", None)
-    if request_output is not None:
-        multimodal_output = getattr(request_output, "multimodal_output", None)
+    completions = getattr(output, "outputs", None) or []
+    for completion in completions:
+        multimodal_output = getattr(completion, "multimodal_output", None)
         if isinstance(multimodal_output, Mapping):
             return multimodal_output
-        completions = getattr(request_output, "outputs", None) or []
-        for completion in completions:
-            multimodal_output = getattr(completion, "multimodal_output", None)
-            if isinstance(multimodal_output, Mapping):
-                return multimodal_output
 
     raise AssertionError("No multimodal audio output found in Ming generate results")
 
