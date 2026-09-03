@@ -229,6 +229,17 @@ steps:
             --run-level "full_model"
         mirror_hardwares: h100_2
 
+      - label: ":full_moon: Diffusion X2I(&A&T) · Boogu Edit CFG · 3-GPU"
+        timeout_in_minutes: 120
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_boogu_image_edit_expansion.py
+            -k "test_double_guidance_cfg_parallel and cfg_parallel_3_full"
+            -m "slow and diffusion and cuda and H100 and cards_3"
+            --run-level "full_model"
+        mirror_hardwares: h100_3
+
       - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with L4 · 4-GPU"
         timeout_in_minutes: 120
         commands:
