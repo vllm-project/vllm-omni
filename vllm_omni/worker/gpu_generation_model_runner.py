@@ -541,13 +541,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             sampler=self.sampler,
         )
 
-        if hasattr(self.model, "forward"):
-            return self._model_forward(**kwargs)
-
-        raise RuntimeError(
-            "The loaded model does not expose diffusion interfaces 'sample', "
-            "'forward', or 'diffuse'. Please implement one of them or adapt the runner."
-        )
+        return self._model_forward(**kwargs)
 
     @torch.inference_mode()
     def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -975,7 +969,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
         # Add `is_profile` here to pre-allocate communication buffers
         hidden_states, _ = self._dummy_run(self.max_num_tokens, is_profile=True)
-        output = None
         self._sync_device()
         del hidden_states
         self.encoder_cache.clear()
