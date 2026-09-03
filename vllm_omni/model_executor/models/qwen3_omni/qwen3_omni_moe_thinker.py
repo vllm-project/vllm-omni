@@ -278,7 +278,12 @@ class Qwen3OmniMoeAudioAttention(_Qwen3OmniMoeAudioAttention):
 
         self.scaling = self.head_dim**-0.5
 
-        self.qkv = QKVParallelLinear(
+        # vLLM 0.29 renamed the audio attention projection to ``qkv_proj`` and
+        # its stacked mapping rewrites checkpoint ``q_proj``/``k_proj``/
+        # ``v_proj`` onto that name, so the module must match or weight loading
+        # fails with "no module or parameter named ...self_attn.qkv_proj".
+        # The inherited forward also calls ``self.qkv_proj``.
+        self.qkv_proj = QKVParallelLinear(
             hidden_size=self.embed_dim,
             head_size=self.head_dim,
             total_num_heads=self.num_heads,
@@ -286,7 +291,7 @@ class Qwen3OmniMoeAudioAttention(_Qwen3OmniMoeAudioAttention):
             bias=True,
             disable_tp=disable_tp,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv",
+            prefix=f"{prefix}.qkv_proj",
         )
 
         self.out_proj = RowParallelLinear(
