@@ -473,6 +473,16 @@ _OMNI_MODELS = {
         "acoustic",
         "MiniMaxMusic3AcousticForConditionalGeneration",
     ),
+    "BreezeForConditionalGeneration": (
+        "breeze_tts_2",
+        "modeling_breeze_tts_2_talker",
+        "BreezeTTS2TalkerForGeneration",
+    ),
+    "BreezeTTS2MimiCodec": (
+        "breeze_tts_2",
+        "modeling_breeze_tts_2_codec",
+        "BreezeTTS2MimiCodec",
+    ),
 }
 
 

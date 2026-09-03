@@ -1,0 +1,35 @@
+# Breeze-TTS-2: talker -> audio codec decoder, synchronous full-payload mode.
+# Chunk streaming and CFG are intentionally disabled in this first adapter.
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.80
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      min_tokens: 1
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.15
+    enforce_eager: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
