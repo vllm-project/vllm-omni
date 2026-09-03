@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import contextlib
 from types import SimpleNamespace
 
@@ -90,6 +93,27 @@ def test_sample_tokens_dict_output():
     assert "audio" in output.multimodal_outputs[0]
     assert "unused" not in output.multimodal_outputs[0]
     assert output.multimodal_outputs[0]["audio"].shape == (1, 4)
+
+
+def test_sample_tokens_dict_output_tensorizes_scalars():
+    # IndexTTS2 legitimately emits a batch-wide sample rate next to its tensors.
+    multimodal_outputs = {"audio": torch.randn(1, 4), "sr": 22050}
+    runner = _make_runner(multimodal_outputs)
+
+    output = GPUGenerationModelRunner.sample_tokens(runner)
+
+    sr = output.multimodal_outputs[0]["sr"]
+    assert isinstance(sr, torch.Tensor)
+    assert sr.item() == 22050
+
+
+def test_sample_tokens_dict_output_rejects_unconvertible_values():
+    # Previously a warning and a silently dropped key; now a loud contract error.
+    multimodal_outputs = {"audio": torch.randn(1, 4), "meta": "not-a-tensor"}
+    runner = _make_runner(multimodal_outputs)
+
+    with pytest.raises(TypeError, match="Unsupported multimodal output type for key 'meta'"):
+        GPUGenerationModelRunner.sample_tokens(runner)
 
 
 class _StubSchedulerOutput:

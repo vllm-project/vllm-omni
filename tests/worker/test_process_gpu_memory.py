@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Tests for process-scoped GPU memory accounting."""
 
 import os
@@ -79,6 +82,60 @@ class TestGetProcessGpuMemory:
 
         with pytest.raises(RuntimeError, match="Invalid GPU device"):
             get_process_gpu_memory(5)
+
+    def test_raises_when_local_rank_outside_visible_mask(self, mocker: MockerFixture):
+        from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
+
+        mocker.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "2,5"})
+        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlInit")
+        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlShutdown")
+        by_index = mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetHandleByIndex")
+
+        # Previously fell through to physical index 3, silently measuring a device
+        # outside the mask; now it is a configuration error, not a fallback.
+        with pytest.raises(ValueError, match="not a valid index into CUDA_VISIBLE_DEVICES"):
+            get_process_gpu_memory(3)
+        by_index.assert_not_called()
+
+    def test_raises_on_negative_local_rank_inside_mask(self, mocker: MockerFixture):
+        from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
+
+        mocker.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "2,5"})
+        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlInit")
+        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlShutdown")
+        by_index = mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetHandleByIndex")
+
+        # -1 must not wrap around to the last masked device.
+        with pytest.raises(ValueError, match="not a valid index into CUDA_VISIBLE_DEVICES"):
+            get_process_gpu_memory(-1)
+        by_index.assert_not_called()
+
+    def test_raises_when_visible_mask_is_empty(self, mocker: MockerFixture):
+        from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
+
+        # Set-but-empty hides every device under CUDA semantics; it is not "no mask".
+        mocker.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": ""})
+        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlInit")
+        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlShutdown")
+        count = mocker.patch("vllm.third_party.pynvml.nvmlDeviceGetCount", return_value=8)
+        by_index = mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetHandleByIndex")
+
+        with pytest.raises(ValueError, match="0 visible device"):
+            get_process_gpu_memory(0)
+        count.assert_not_called()
+        by_index.assert_not_called()
+
+    def test_raises_on_negative_local_rank_without_mask(self, mocker: MockerFixture):
+        from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
+
+        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlInit")
+        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlShutdown")
+        mocker.patch("vllm.third_party.pynvml.nvmlDeviceGetCount", return_value=8)
+        by_index = mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetHandleByIndex")
+
+        with pytest.raises(RuntimeError, match="Invalid GPU device"):
+            get_process_gpu_memory(-1)
+        by_index.assert_not_called()
 
     def test_returns_zero_when_process_not_found(self, mocker: MockerFixture):
         from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory

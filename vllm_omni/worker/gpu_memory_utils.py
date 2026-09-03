@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """NVML-based per-process GPU memory utilities.
 
 Shared across worker types (OmniGPUWorkerBase, DiffusionWorker, etc.)
@@ -75,11 +78,17 @@ def get_process_gpu_memory(local_rank: int) -> int | None:
         Memory in bytes used by this process, or None if NVML unavailable.
 
     Raises:
+        ValueError: If ``CUDA_VISIBLE_DEVICES`` is set (even to the empty
+            string, which hides every device) but ``local_rank`` is not a
+            valid index into it, i.e. a misconfigured deploy ``devices``
+            setting.
         RuntimeError: If device validation fails (invalid index or UUID).
     """
     from vllm.third_party.pynvml import nvmlDeviceGetCount
 
     my_pid = os.getpid()
+    # An empty CUDA_VISIBLE_DEVICES is a mask too: CUDA hides every device.
+    mask_set = "CUDA_VISIBLE_DEVICES" in os.environ
     visible_devices = parse_cuda_visible_devices()
 
     try:
@@ -89,7 +98,13 @@ def get_process_gpu_memory(local_rank: int) -> int | None:
         return None
 
     try:
-        if visible_devices and local_rank < len(visible_devices):
+        if mask_set:
+            if not 0 <= local_rank < len(visible_devices):
+                raise ValueError(
+                    f"local_rank {local_rank} is not a valid index into CUDA_VISIBLE_DEVICES="
+                    f"{os.environ['CUDA_VISIBLE_DEVICES']!r} ({len(visible_devices)} visible device(s)). "
+                    "Check the deploy config `devices` setting."
+                )
             device_id = visible_devices[local_rank]
             try:
                 handle = get_device_handle(device_id)
@@ -99,9 +114,9 @@ def get_process_gpu_memory(local_rank: int) -> int | None:
                     f"Check CUDA_VISIBLE_DEVICES or the deploy config `devices` setting."
                 ) from e
         else:
-            # No CUDA_VISIBLE_DEVICES or local_rank out of range: use index directly
+            # No CUDA_VISIBLE_DEVICES mask: local_rank is a physical index
             device_count = nvmlDeviceGetCount()
-            if local_rank >= device_count:
+            if not 0 <= local_rank < device_count:
                 raise RuntimeError(
                     f"Invalid GPU device {local_rank}. Only {device_count} GPU(s) available. "
                     f"Check CUDA_VISIBLE_DEVICES or the deploy config `devices` setting."
@@ -112,7 +127,7 @@ def get_process_gpu_memory(local_rank: int) -> int | None:
             if proc.pid == my_pid:
                 return proc.usedGpuMemory
         return 0
-    except RuntimeError:
+    except (RuntimeError, ValueError):
         raise
     except Exception as e:
         logger.warning("NVML query failed, will use profiling fallback: %s", e)

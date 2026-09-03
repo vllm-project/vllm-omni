@@ -456,8 +456,18 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                         mm_payload[key] = out[i].detach().to("cpu").contiguous()
                     elif isinstance(out, torch.Tensor):
                         mm_payload[key] = out.detach().to("cpu").contiguous()
+                    elif isinstance(out, (int, float, bool)):
+                        # Batch-wide scalars (e.g. IndexTTS2's {"sr": 22050})
+                        # get the same tensorization _ensure_tensor_values applies.
+                        mm_payload[key] = torch.tensor(out)
+                    elif out is None:
+                        # An absent output for this key, not an error.
+                        continue
                     else:
-                        logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
+                        raise TypeError(
+                            f"Unsupported multimodal output type for key '{key}': "
+                            f"{type(out).__name__} (expected Tensor, per-request list, or scalar)"
+                        )
                 per_req_payloads.append(_ensure_tensor_values(mm_payload))
         else:
             raise RuntimeError("Unsupported diffusion output type")

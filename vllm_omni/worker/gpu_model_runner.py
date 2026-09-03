@@ -589,10 +589,15 @@ class OmniGPUModelRunner(GPUModelRunner):
                     setattr(self.requests[req_id], "prompt_embeds_cpu", pe_cpu)
                     try:
                         new_req_data.prompt_embeds = pe_cpu  # type: ignore[assignment]
-                    except Exception:
+                    except (AttributeError, TypeError):
+                        # Frozen/typed request structs reject the write; the
+                        # decoded tensor already lives on the request state.
                         pass
-            except Exception as e:
-                logger.error(f"Error decoding prompt embeds: {e}")
+            except (AttributeError, TypeError, ValueError):
+                # Malformed payload (unknown dtype, bad shape, wrong field
+                # types): keep the request alive without prompt embeddings
+                # and record why. Anything else propagates.
+                logger.exception("Error decoding prompt embeds for request %s", req_id)
             # Direct runner data-plane payloads populate
             # model_intermediate_buffer without going through the deprecated
             # additional_information request transport.
@@ -1346,11 +1351,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             model_kwargs_extra["model_intermediate_buffer"] = buffer_map
             # Backward compatible: also emit old name
             model_kwargs_extra["runtime_additional_information"] = buffer_map
-        except Exception as e:
-            logger.error(f"[OMNI DEBUG] Error building model_kwargs_extra: {e}")
-            import traceback
-
-            traceback.print_exc()
+        except Exception:
+            logger.exception("Error building model_kwargs_extra")
 
         # Per-request (start, end) hidden-row spans so make_omni_output can map
         # flat hidden rows to the right request in mixed prefill+decode steps,
@@ -1452,11 +1454,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                         **postprocess_kwargs,
                     )
                     self._update_intermediate_buffer(req_id, update_dict)
-        except Exception as e:
-            logger.error(f"Error merging for requests:{req_ids} additional information update: {e}")
-            import traceback
-
-            traceback.print_exc()
+        except Exception:
+            logger.exception("Error merging additional-information update for requests %s", req_ids)
 
     def _collect_additional_information_for_prefill(
         self,
