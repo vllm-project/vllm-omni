@@ -1167,6 +1167,7 @@ class AsyncOmniEngine:
             "enable_prompt_embed_cache": kwargs.get("enable_prompt_embed_cache", False),
             "prompt_embed_cache_size": kwargs.get("prompt_embed_cache_size", 32),
             "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
+            "enable_broadcast_weight_load": kwargs.get("enable_broadcast_weight_load", True),
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
             "quantization": kwargs.get("quantization", None),
             "quantization_config": kwargs.get("quantization_config", None),

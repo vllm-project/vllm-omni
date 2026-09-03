@@ -163,6 +163,7 @@ class _ModelEngineOverrides(TypedDict, total=False):
     max_cudagraph_capture_size: int
     enable_flashinfer_autotune: bool
     enable_multithread_weight_load: bool
+    enable_broadcast_weight_load: bool
     num_weight_load_threads: int
     disable_autocast: bool
 
@@ -401,6 +402,7 @@ class OmniStageModelConfig:
     max_cudagraph_capture_size: int | None = Field(default=None, ge=0)
     enable_flashinfer_autotune: bool | None = None
     enable_multithread_weight_load: bool = True
+    enable_broadcast_weight_load: bool = True
     num_weight_load_threads: int = Field(default=4, ge=1)
     disable_autocast: bool = False
     # Per-stage checkpoint/tokenizer subdirectories under the model root
@@ -968,6 +970,7 @@ _DIFFUSION_MOVED_SHARED_FIELDS = frozenset(
         "enable_sleep_mode",
         "enforce_eager",
         "enable_multithread_weight_load",
+        "enable_broadcast_weight_load",
         "num_weight_load_threads",
         "disable_autocast",
     }

@@ -567,6 +567,7 @@ class OrchestratorArgs:
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     enable_multithread_weight_load: bool = True
+    enable_broadcast_weight_load: bool = True
     num_weight_load_threads: int = 4
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False

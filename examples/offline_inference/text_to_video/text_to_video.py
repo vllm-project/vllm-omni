@@ -428,7 +428,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hsdp-shard-size",
         type=int,
-        default=1,
+        default=-1,
         help="Number of GPUs to shard weights across for HSDP.",
     )
     parser.add_argument(
@@ -528,6 +528,10 @@ def main():
             lora_path = lora_path[0]
         omni_kwargs["lora_path"] = lora_path
         omni_kwargs["lora_backend"] = args.lora_backend
+    if args.use_hsdp:
+        omni_kwargs["use_hsdp"] = args.use_hsdp
+        omni_kwargs["hsdp_shard_size"] = args.hsdp_shard_size
+        omni_kwargs["hsdp_replicate_size"] = args.hsdp_replicate_size
 
     # Cosmos3 loads its (gated) guardrail models at build time, so the guardrails
     # gate is an engine-level config (offline analog of the server's --no-guardrails).

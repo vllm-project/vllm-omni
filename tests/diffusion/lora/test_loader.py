@@ -490,3 +490,27 @@ def test_prepare_lora_delta_unchanged_for_existing_fused_layouts(fused, shards):
     delta, used_keys = _prepare_lora_delta(state_dict, base_key, param_to_weight_names)
     assert delta.shape == (len(shards) * HEAD_DIM, HEAD_DIM)
     assert len(used_keys) == 2 * len(shards)
+
+
+def test_lora_loader_mixin_lora_is_fused_property():
+    pipe = DummyPipeline(num_layers=2, d_model=HEAD_DIM)
+    assert not pipe.lora_is_fused
+    pipe.lora_is_fused = True
+    assert pipe.lora_is_fused
+
+    pipe2 = DummyPipeline(num_layers=2, d_model=HEAD_DIM)
+    assert not pipe2.lora_is_fused
+    pipe2.lora_loaded = {"default": {"some_key": torch.zeros(1)}}
+    assert pipe2.lora_is_fused
+
+
+def test_prepare_lora_delta_with_compute_device():
+    base_key = "blocks.0.attn.to_q"
+    state_dict = {
+        f"{base_key}.lora_A.weight": torch.ones(RANK, HEAD_DIM),
+        f"{base_key}.lora_B.weight": torch.ones(HEAD_DIM, RANK),
+    }
+    delta, used_keys = _prepare_lora_delta(state_dict, base_key, compute_device=torch.device("cpu"))
+    assert delta is not None
+    assert delta.shape == (HEAD_DIM, HEAD_DIM)
+    assert len(used_keys) == 2

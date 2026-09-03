@@ -471,6 +471,7 @@ class StageDeployConfig:
 
     # Runtime optimizations used by diffusion loading/execution.
     enable_multithread_weight_load: bool | None = None
+    enable_broadcast_weight_load: bool | None = None
     num_weight_load_threads: int | None = None
     enable_cpu_offload: bool | None = None
     enable_layerwise_offload: bool | None = None

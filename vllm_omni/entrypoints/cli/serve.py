@@ -696,6 +696,13 @@ class OmniServeCommand(CLISubcommand):
             help="Disable multi-threaded safetensors loading (default: enabled with 4 threads).",
         )
         omni_config_group.add_argument(
+            "--disable-broadcast-weight-load",
+            action="store_false",
+            dest="enable_broadcast_weight_load",
+            default=True,
+            help="Disable Rank-0 shared weight broadcast across workers (default: enabled).",
+        )
+        omni_config_group.add_argument(
             "--num-weight-load-threads",
             type=int,
             default=4,
