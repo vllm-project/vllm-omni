@@ -117,6 +117,16 @@ class SupportsStreamingDecode(Protocol):
         """Upper bound on resident decoder bytes per session at this shape."""
         ...
 
+    def release(self, state: StreamingDecodeState) -> None:
+        """Drop ``state``'s cache and return it to its pre-stream state.
+
+        Declared here, not just implemented on :class:`WanStreamingDecoder`,
+        so a caller programming against this protocol -- a session runtime
+        releasing decoder state alongside KV state on close or failure -- can
+        rely on it being present without depending on the concrete class.
+        """
+        ...
+
 
 class WanStreamingDecoder:
     """Streaming decode over a Wan-family causal autoencoder.
