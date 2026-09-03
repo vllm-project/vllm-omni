@@ -264,6 +264,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         remove_route_from_app(app, "/v1/chat/completions", {"POST"})
         remove_route_from_app(app, "/v1/chat/completions/batch", {"POST"})
         remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
+        remove_route_from_app(app, "/health", {"GET"})
         app.include_router(router)
 
         # OMNI: Override upstream exception handlers with Omni-aware versions
@@ -1488,11 +1489,6 @@ async def duplex_websocket(websocket: WebSocket):
 
 
 # Health and Model endpoints for diffusion mode
-
-
-# Remove existing health endpoint if present (from vllm imports)
-# to ensure our handler takes precedence
-_remove_route_from_router(router, "/health")
 
 
 @router.get("/health")
