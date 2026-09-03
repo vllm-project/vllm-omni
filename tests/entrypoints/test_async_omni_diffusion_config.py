@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from pydantic import ValidationError
 
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.resolver import OmniConfigResolution
@@ -91,7 +92,14 @@ def test_default_stage_config_preserves_and_overrides_promoted_extras():
     assert extras["default_llama_model_id"] == "top-level/default-llama"
 
 
-def test_stage_override_preserves_model_extras_for_default_diffusion_stage(mocker):
+@pytest.mark.parametrize(
+    "stage_overrides",
+    [
+        {"0": {"extras": {"ltx2_use_conv_vae": True}}},
+        '{"0":{"extras":{"ltx2_use_conv_vae":true}}}',
+    ],
+)
+def test_stage_override_preserves_model_extras_for_default_diffusion_stage(mocker, stage_overrides):
     """Local/unregistered Diffusers checkpoints still honor stage-0 extras."""
     mocker.patch(
         "vllm_omni.config.resolver.StageConfigFactory.create_from_model",
@@ -105,11 +113,19 @@ def test_stage_override_preserves_model_extras_for_default_diffusion_stage(mocke
 
     _, stage_configs = engine._resolve_stage_configs(
         "/models/LTX-2.5-Diffusers",
-        {"stage_overrides": {"0": {"extras": {"ltx2_use_conv_vae": True}}}},
+        {"stage_overrides": stage_overrides},
         trust_remote_code=False,
     )
 
     assert stage_configs[0]["engine_args"]["extras"]["ltx2_use_conv_vae"] is True
+
+
+def test_default_stage_rejects_unknown_nested_parallel_config_key():
+    unknown_key = "unknown_parallel_field"
+    with pytest.raises(ValidationError, match=unknown_key):
+        StageConfigFactory.create_default_diffusion(
+            {"parallel_config": {unknown_key: 2}},
+        )
 
 
 def test_default_cache_config_used_when_missing():

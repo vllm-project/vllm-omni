@@ -278,9 +278,8 @@ def test_parse_stage_overrides_accepts_empty_inner_dict() -> None:
     assert parsed == {"0": {}, "1": {}}
 
 
-def test_run_headless_parses_and_forwards_stage_overrides(mocker: MockerFixture) -> None:
-    """Regression: the headless path must parse ``--stage-overrides`` (a JSON
-    string) through the same resolver inputs as the standard engine path."""
+def test_run_headless_forwards_parsed_stage_overrides(mocker: MockerFixture) -> None:
+    """The headless resolver receives the mapping parsed by argparse."""
     captured: dict = {}
 
     def _fake_resolve(*args, **kwargs):
@@ -313,7 +312,7 @@ def test_run_headless_parses_and_forwards_stage_overrides(mocker: MockerFixture)
 def test_parse_stage_overrides_rejects_non_mapping_values() -> None:
     with pytest.raises(argparse.ArgumentTypeError, match="JSON object"):
         _parse_stage_overrides('["not", "a", "mapping"]')
-    with pytest.raises(argparse.ArgumentTypeError, match="override objects"):
+    with pytest.raises(argparse.ArgumentTypeError, match="must be an object"):
         _parse_stage_overrides('{"0": "not a mapping"}')
 
 

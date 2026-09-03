@@ -72,13 +72,11 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
     for stage_id, overrides in parsed.items():
         if not isinstance(stage_id, str) or not stage_id.isascii() or not stage_id.isdigit():
             raise ValueError(
-                "--stage-overrides keys must be non-negative integer stage ids "
-                f"(as strings), got {stage_id!r}"
+                f"--stage-overrides keys must be non-negative integer stage ids (as strings), got {stage_id!r}"
             )
         if not isinstance(overrides, dict):
             raise ValueError(
-                f"--stage-overrides[{stage_id!r}] must be an object, "
-                f"got {type(overrides).__name__}: {overrides!r}"
+                f"--stage-overrides[{stage_id!r}] must be an object, got {type(overrides).__name__}: {overrides!r}"
             )
 
     return parsed
@@ -254,7 +252,7 @@ def detect_pid_host() -> bool:
     if not ic:
         return True
 
-    return has_pid_host()
+    return has_pid_host() is True
 
 
 ### Helpers for handling delta messages

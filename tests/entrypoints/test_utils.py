@@ -4,7 +4,6 @@
 """Unit tests for vllm_omni.entrypoints.utils module."""
 
 import logging
-import os
 from collections import Counter
 from dataclasses import dataclass
 from types import SimpleNamespace

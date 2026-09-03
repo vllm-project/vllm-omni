@@ -468,9 +468,9 @@ class DiffusionParallelConfig:
 
         valid_fields = {item.name for item in fields(cls) if item.init}
         if isinstance(parallel_config, Mapping):
-            values = {key: value for key, value in parallel_config.items() if key in valid_fields}
+            return cls.from_dict(dict(parallel_config))
         elif parallel_config is not None and hasattr(parallel_config, "__dict__"):
-            values = {key: value for key, value in vars(parallel_config).items() if key in valid_fields}
+            return cls.from_dict(dict(vars(parallel_config)))
         elif parallel_config is not None:
             raise TypeError(
                 f"parallel_config must be a mapping or DiffusionParallelConfig, got {type(parallel_config).__name__}"

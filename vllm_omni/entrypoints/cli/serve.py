@@ -14,7 +14,7 @@ import math
 import os
 import signal
 from types import FrameType
-from typing import Any
+from typing import Any, cast
 
 import uvloop
 from vllm.entrypoints.cli.types import CLISubcommand
@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import omni_run_server
+from vllm_omni.entrypoints.utils import parse_stage_overrides
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 logger = init_logger(__name__)
@@ -49,13 +50,12 @@ Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
 
 
 def _parse_stage_overrides(value: str) -> dict[str, dict[str, Any]]:
-    """Parse and validate ``--stage-overrides`` at the CLI boundary."""
+    """Adapt shared stage-override validation to argparse's error type."""
     try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError as exc:
-        raise argparse.ArgumentTypeError(f"--stage-overrides is not valid JSON: {exc}. Got: {value!r}") from exc
-    if not isinstance(parsed, dict) or any(not isinstance(overrides, dict) for overrides in parsed.values()):
-        raise argparse.ArgumentTypeError("--stage-overrides must be a JSON object of stage-id to override objects")
+        parsed = parse_stage_overrides(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    assert parsed is not None
     return parsed
 
 
@@ -1044,7 +1044,7 @@ def run_headless(args: TrackingNamespace) -> None:
             omni_master_port=omni_master_port,
             omni_dp_size_local=omni_dp_size_local,
             per_replica_devices=per_replica_devices,
-            config_path=config_path,
+            config_path=cast(str, config_path),
             replica_bind_address=omni_replica_address,
         )
         return

@@ -78,6 +78,7 @@ from vllm_omni.engine.stage_runtime import (
     create_stage_runtime,
 )
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
+from vllm_omni.entrypoints.utils import parse_stage_overrides
 from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 
@@ -963,7 +964,9 @@ class AsyncOmniEngine:
 
         deploy_config_path = kwargs.pop("deploy_config", None)
         strategy_config_path = kwargs.pop("strategy_config", None)
-        stage_overrides = kwargs.pop("stage_overrides", None)
+        # CLI callers arrive pre-parsed; offline Python callers may use the
+        # JSON-string form documented in recipes.
+        stage_overrides = parse_stage_overrides(kwargs.pop("stage_overrides", None))
 
         resolved = resolve_omni_config(
             model,
@@ -994,7 +997,7 @@ class AsyncOmniEngine:
         # rather than as a per-stage config field.
         self._apply_strategy_lb_policy(strategy_lb_policy, kwargs)
 
-        return config_path, stage_configs
+        return cast(str, config_path), stage_configs
 
     # ==================== Public API ====================
 
@@ -1520,7 +1523,7 @@ class AsyncOmniEngine:
             tokens generated before abort (empty for diffusion / no OP state).
         """
         if not request_ids or getattr(self, "_shutdown_called", False):
-            return
+            return []
         if self.request_queue is None:
             raise RuntimeError("request_queue is not initialized")
         transport = self._correlated_rpc_client
@@ -1547,7 +1550,7 @@ class AsyncOmniEngine:
             result_msg = await loop.run_in_executor(None, _wait)
         except Exception as exc:
             if getattr(self, "_shutdown_called", False) and is_abort_transport_shutdown(exc):
-                return
+                return []
             raise
         if not result_msg.success:
             raise RuntimeError(result_msg.error or "abort failed")
