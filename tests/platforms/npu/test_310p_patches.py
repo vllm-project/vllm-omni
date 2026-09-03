@@ -431,9 +431,17 @@ def test_310p_attention_forward_runs_fused_qkv_runtime(monkeypatch: pytest.Monke
         trans_calls.append(weight.detach().clone())
         return weight + 1.0
 
-    def npu_rotary_mul(hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        rotary_calls.append((hidden_states.detach().clone(), cos.detach().clone(), sin.detach().clone()))
-        return hidden_states + cos - sin
+    def npu_apply_rotary_pos_emb(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        *,
+        layout: str = "BSND",
+        rotary_mode: str = "half",
+    ):
+        rotary_calls.append((query.detach().clone(), key.detach().clone(), cos.detach().clone(), sin.detach().clone()))
+        return query + cos - sin, key + cos - sin
 
     def npu_flash_attention(**kwargs) -> None:
         flash_calls.append(
@@ -443,7 +451,7 @@ def test_310p_attention_forward_runs_fused_qkv_runtime(monkeypatch: pytest.Monke
 
     monkeypatch.setattr(module, "maybe_trans_nz", maybe_trans_nz)
     monkeypatch.setattr(module, "aligned_16", lambda tensor: tensor)
-    monkeypatch.setattr(module.torch_npu, "npu_rotary_mul", npu_rotary_mul, raising=False)
+    monkeypatch.setattr(module.torch_npu, "npu_apply_rotary_pos_emb", npu_apply_rotary_pos_emb, raising=False)
     monkeypatch.setattr(module.torch_npu, "_npu_flash_attention", npu_flash_attention, raising=False)
 
     config = SimpleNamespace(
@@ -503,7 +511,12 @@ def test_310p_attention_forward_runs_fused_qkv_runtime(monkeypatch: pytest.Monke
     expected_v_f = expected_v.transpose(1, 2).reshape(3, attention.num_kv_heads, attention.head_dim)
     expected_flash = (expected_q_f + expected_k_f + expected_v_f).to(torch.float16).to(torch.float32)
 
-    assert len(rotary_calls) == 2
+    # One fused aclnn rope call covers q and k in the 4D BSND layout.
+    assert len(rotary_calls) == 1
+    assert rotary_calls[0][0].shape == (1, 3, attention.num_heads, attention.head_dim)
+    assert rotary_calls[0][1].shape == (1, 3, attention.num_kv_heads, attention.head_dim)
+    assert rotary_calls[0][2].shape == (1, 3, 1, attention.head_dim)
+    assert rotary_calls[0][3].shape == (1, 3, 1, attention.head_dim)
     assert len(flash_calls) == 1
     torch.testing.assert_close(flash_calls[0]["query"], expected_q_f)
     torch.testing.assert_close(flash_calls[0]["key"], expected_k_f)

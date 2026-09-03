@@ -166,10 +166,15 @@ class _Qwen3CodePredictorAttention310P(qwen3_code_predictor.CodePredictorAttenti
         cos, sin = position_embeddings
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
-        # Use the fused Ascend RoPE op instead of expanding RoPE into
-        # elementwise mul/add/rotate-half kernels.
-        q = torch_npu.npu_rotary_mul(q, cos, sin)
-        k = torch_npu.npu_rotary_mul(k, cos, sin)
+        # Use the fused aclnn rope op, which is NPUGraph-capturable; it
+        # requires the 4D BSND layout with head_dim 128 or 64.
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        cos = cos.transpose(1, 2).contiguous()
+        sin = sin.transpose(1, 2).contiguous()
+        q, k = torch_npu.npu_apply_rotary_pos_emb(q, k, cos, sin, rotary_mode="half")
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
 
         real_tokens = int(bsz) * int(seq_len)
         output_dtype = q.dtype
