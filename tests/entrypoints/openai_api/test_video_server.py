@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Unit tests for OpenAI-compatible video generation endpoints.
 """
@@ -75,6 +75,7 @@ class FakeAsyncOmni:
         self.model_class_name = "WanPipeline"
         self.captured_prompt = None
         self.captured_reference_video_bytes = None
+        self.captured_control_reference_bytes = {}
         self.captured_sampling_params_list = None
 
     def get_diffusion_od_config(self):
@@ -83,6 +84,10 @@ class FakeAsyncOmni:
     async def generate(self, prompt, request_id, sampling_params_list):
         self.captured_prompt = prompt
         self.captured_sampling_params_list = sampling_params_list
+        for control_type in ("edge", "blur", "depth", "seg", "wsm"):
+            control_params = sampling_params_list[0].extra_args.get(control_type)
+            if isinstance(control_params, dict) and isinstance(control_params.get("control_path"), str):
+                self.captured_control_reference_bytes[control_type] = Path(control_params["control_path"]).read_bytes()
         reference_videos = prompt.get("multi_modal_data", {}).get("video")
         if (
             isinstance(reference_videos, list)
@@ -846,6 +851,17 @@ def test_mixed_reference_capability_uses_model_metadata_when_config_defaults_fal
     handler._stage_configs = handler._engine_client.stage_configs
 
     assert handler.supports_mixed_reference_inputs
+
+
+@pytest.mark.parametrize("model_class_name", ["Cosmos3OmniDiffusersPipeline", "Cosmos3OmniPipeline"])
+def test_control_upload_capability_is_declared_only_by_cosmos3(test_client, model_class_name):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = model_class_name
+
+    assert handler.supported_control_upload_types == frozenset({"edge", "blur", "depth", "seg", "wsm"})
+
+    handler._engine_client.model_class_name = "WanPipeline"
+    assert handler.supported_control_upload_types == frozenset()
 
 
 def test_decode_video_bytes_can_keep_first_frames():
@@ -2140,6 +2156,136 @@ def test_sync_v2v_returns_video_bytes(test_client, mocker: MockerFixture):
     input_video = engine.captured_prompt["multi_modal_data"]["video"]
     assert len(input_video) == 3
     assert input_video[0].size == (32, 24)
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("control_type", ["wsm", "depth"])
+def test_cosmos3_accepts_optional_uploaded_control(
+    endpoint,
+    control_type,
+    test_client,
+    mocker: MockerFixture,
+):
+    control_bytes = f"{control_type}-control".encode()
+    _mock_encode_video_bytes(mocker, b"controlled-video")
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "Cosmos3OmniDiffusersPipeline"
+
+    response = test_client.post(
+        endpoint,
+        data={
+            "prompt": "Follow the uploaded control.",
+            "control_type": control_type,
+            "extra_params": json.dumps({control_type: {"control_weight": 0.75}}),
+        },
+        files=[
+            ("input_reference", ("input.mp4", _make_test_video_bytes(), "video/mp4")),
+            ("control_reference", (f"{control_type}.mp4", control_bytes, "video/mp4")),
+        ],
+    )
+
+    assert response.status_code == 200
+    if endpoint.endswith("/sync"):
+        assert response.content == b"controlled-video"
+    else:
+        video_id = response.json()["id"]
+        _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    captured = engine.captured_sampling_params_list[0].extra_args[control_type]
+    assert captured["control_weight"] == 0.75
+    assert engine.captured_control_reference_bytes[control_type] == control_bytes
+    assert len(engine.captured_prompt["multi_modal_data"]["video"]) == 3
+    assert not Path(captured["control_path"]).exists()
+
+
+def test_cosmos3_control_upload_is_optional(test_client, mocker: MockerFixture):
+    _mock_encode_video_bytes(mocker)
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "Cosmos3OmniDiffusersPipeline"
+
+    response = test_client.post("/v1/videos/sync", data={"prompt": "No control for this request."})
+
+    assert response.status_code == 200
+    assert "wsm" not in engine.captured_sampling_params_list[0].extra_args
+
+
+def test_control_upload_does_not_affect_models_without_capability(test_client):
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "Unsupported control.", "control_type": "wsm"},
+        files={"control_reference": ("wsm.mp4", b"control", "video/mp4")},
+    )
+
+    assert response.status_code == 400
+    assert "not supported by this model" in response.json()["detail"]
+    assert test_client.app.state.openai_serving_video._engine_client.captured_prompt is None
+
+
+@pytest.mark.parametrize(
+    ("data", "files", "message"),
+    [
+        (
+            {"prompt": "Missing type."},
+            {"control_reference": ("wsm.mp4", b"control", "video/mp4")},
+            "requires control_type",
+        ),
+        (
+            {"prompt": "Missing file.", "control_type": "wsm"},
+            None,
+            "requires a control_reference",
+        ),
+        (
+            {"prompt": "Unknown type.", "control_type": "unknown"},
+            {"control_reference": ("control.mp4", b"control", "video/mp4")},
+            "not supported by this model",
+        ),
+    ],
+)
+def test_cosmos3_control_upload_validates_contract(data, files, message, test_client):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "Cosmos3OmniDiffusersPipeline"
+
+    response = test_client.post("/v1/videos/sync", data=data, files=files)
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+
+
+def test_cosmos3_control_upload_rejects_existing_control_source(test_client):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "Cosmos3OmniDiffusersPipeline"
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "Ambiguous control.",
+            "control_type": "wsm",
+            "extra_params": json.dumps({"wsm": {"control_path": "/already/present.mp4"}}),
+        },
+        files={"control_reference": ("wsm.mp4", b"control", "video/mp4")},
+    )
+
+    assert response.status_code == 400
+    assert "not both" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("control_bytes", "message"),
+    [
+        (b"", "must not be empty"),
+        (b"control", "size limit"),
+    ],
+)
+def test_cosmos3_control_upload_rejects_invalid_size(control_bytes, message, test_client, monkeypatch):
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "Cosmos3OmniDiffusersPipeline"
+    monkeypatch.setattr(api_server, "CONTROL_REFERENCE_MAX_BYTES", 3)
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "Invalid control.", "control_type": "wsm"},
+        files={"control_reference": ("wsm.mp4", control_bytes, "video/mp4")},
+    )
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+    assert test_client.app.state.openai_serving_video._engine_client.captured_prompt is None
 
 
 def test_sync_missing_handler_returns_503():

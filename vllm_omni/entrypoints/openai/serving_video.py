@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -164,6 +164,35 @@ class OmniOpenAIServingVideo:
             get_diffusion_model_metadata(model_arch).supports_mixed_reference_inputs for model_arch in model_archs
         )
         return capability is True or metadata_capability
+
+    @property
+    def supported_control_upload_types(self) -> frozenset[str]:
+        """Return multipart control types accepted by the active pipeline.
+
+        Unknown pipelines deliberately return an empty set.  This keeps the
+        generic video API isolated from model-specific controls unless a model
+        explicitly opts into the ``control_path`` contract in metadata.
+        """
+        od_config = self._resolve_diffusion_od_config()
+        model_archs = [None if od_config is None else getattr(od_config, "model_class_name", None)]
+        for stage_config in self.stage_configs or ():
+            stage_get = (
+                stage_config.get if isinstance(stage_config, Mapping) else lambda key: getattr(stage_config, key, None)
+            )
+            engine_args = stage_get("engine_args") or {}
+            model_archs.extend(
+                (
+                    stage_get("model_arch"),
+                    engine_args.get("model_class_name")
+                    if isinstance(engine_args, Mapping)
+                    else getattr(engine_args, "model_class_name", None),
+                )
+            )
+
+        supported: set[str] = set()
+        for model_arch in model_archs:
+            supported.update(get_diffusion_model_metadata(model_arch).supported_control_upload_types)
+        return frozenset(supported)
 
     @classmethod
     def for_diffusion(

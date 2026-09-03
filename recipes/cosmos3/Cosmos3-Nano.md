@@ -32,13 +32,13 @@ mode is selected per request:
   T2V/I2V `/v1/videos/sync` request to also generate synchronized audio, muxed into
   the mp4 as AAC 48 kHz stereo. See the official model card's "Video + Audio" examples.
 - **Action** — pass `extra_params={"action_mode": ...}` to drive Physical-AI tasks:
-  - `forward_dynamics` — given a first frame or video **and** an action trajectory,
+    - `forward_dynamics` — given a first frame or video **and** an action trajectory,
     roll out the resulting video. Synchronous: `POST /v1/videos/sync`.
-  - `policy` — given a first frame or video and a language instruction,
+    - `policy` — given a first frame or video and a language instruction,
     **predict** the action trajectory (and a rollout video). Use the async
     `POST /v1/videos` endpoint and read the predicted action from the top-level
     `action` field.
-  - `inverse_dynamics` — given a video, **recover** the action trajectory. Use
+    - `inverse_dynamics` — given a video, **recover** the action trajectory. Use
     the async `POST /v1/videos` endpoint and read the recovered action from
     the top-level `action` field
     (`{data, shape, dtype, raw_action_dim, domain_id}`).
@@ -207,6 +207,18 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
   -F 'extra_params={"depth":{"control_path":"/path/to/depth_control.mp4"},"max_frames":121,"resolution":"720","num_video_frames_per_chunk":121}' \
   -o cosmos3_transfer_depth.mp4
 
+# The same transfer control can be uploaded by a remote client instead of
+# being placed on the server filesystem. Uploads are limited to 512 MiB.
+curl -sS -X POST http://localhost:8000/v1/videos/sync \
+  -H "Accept: video/mp4" \
+  -F "model=nvidia/Cosmos3-Nano" \
+  -F "prompt=Generate a realistic scene following the provided world-state control." \
+  -F "input_reference=@/path/to/input.mp4;type=video/mp4" \
+  -F "control_reference=@/path/to/wsm.mp4;type=video/mp4" \
+  -F "control_type=wsm" \
+  -F 'extra_params={"wsm":{"control_weight":1.0},"max_frames":121,"resolution":"720","num_video_frames_per_chunk":121}' \
+  -o cosmos3_transfer_wsm.mp4
+
 # Text-to-video-with-sound
 curl -sS -X POST http://localhost:8000/v1/videos/sync \
   -H "Accept: video/mp4" \
@@ -307,11 +319,11 @@ vllm serve nvidia/Cosmos3-Nano-Policy-DROID \
 #### Notes
 
 - **Measured latency (1x B300, bf16, guardrails off):**
-  - T2I 1024² — 10 / 25 / 50 steps → ~0.4 / 0.7 / **1.3 s**
-  - T2V 1280×720 @ 35 steps — 25 / 49 / 93 / **189** frames → ~7 / 15 / 33 / **~93 s**
-  - I2V 1280×720, 189 frames @ 35 steps → ~**99 s**
-  - Action 640×480 @ 30 steps — forward-dynamics 61f ~**4 s**, policy 17f ~**1–3 s**.
-  - Guardrails-on overhead: ~8% on T2I, negligible on video.
+    - T2I 1024² — 10 / 25 / 50 steps → ~0.4 / 0.7 / **1.3 s**
+    - T2V 1280×720 @ 35 steps — 25 / 49 / 93 / **189** frames → ~7 / 15 / 33 / **~93 s**
+    - I2V 1280×720, 189 frames @ 35 steps → ~**99 s**
+    - Action 640×480 @ 30 steps — forward-dynamics 61f ~**4 s**, policy 17f ~**1–3 s**.
+    - Guardrails-on overhead: ~8% on T2I, negligible on video.
 - **Memory:** transformer ~17 GiB (bf16); peak ~46 GiB for 720p video on 1 GPU;
   full repo (transformer + Wan VAE + Qwen3-VL vision encoder + audio tokenizer)
   ~33 GB on disk.
@@ -367,12 +379,12 @@ vllm serve nvidia/Cosmos3-Nano-Policy-DROID \
   `conditioning_fps`, `action_chunk_size`, `raw_action_dim`, `deterministic_seed`,
   and `session_id`.
 - **Known limitations:**
-  - Guardrails-on requires `cosmos-guardrail` **and** access to the gated
+    - Guardrails-on requires `cosmos-guardrail` **and** access to the gated
     `nvidia/Cosmos-1.0-Guardrail` repo (accept license + `HF_TOKEN`); otherwise
     the server fails at pipeline build with a gated-repo / safety-checker error.
-  - A guardrail-blocked prompt currently returns HTTP 500
+    - A guardrail-blocked prompt currently returns HTTP 500
     (`"Guardrail blocked prompt"`).
-  - Action `forward_dynamics`, `policy`, and `inverse_dynamics` are supported
+    - Action `forward_dynamics`, `policy`, and `inverse_dynamics` are supported
     online. Use async `POST /v1/videos` when you need the predicted/recovered
     action payload under the top-level `action` field; sync `/v1/videos/sync`
     returns raw MP4 bytes and does not expose action metadata in the response body.
@@ -510,7 +522,7 @@ so an md5 comparison across two runs also works as a smoke check.
   are therefore complementary rather than redundant:
 
   | Flag | Latency | Peak reserved | Peak allocated | Acts on |
-  |---|---|---|---|---|
+  | --- | --- | --- | --- | --- |
   | *(none)* | 161 s | 120 GiB | 95 GiB | — |
   | `--vae-use-tiling` | 183 s (+13.5%) | **38 GiB** (−68%) | **36 GiB** (−62%) | decode activations |
   | `--enable-layerwise-offload` | 162 s (+0.8%) | 84 GiB (−30%) | 69 GiB (−27%) | weights |
@@ -693,10 +705,10 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
 #### Notes
 
 - **Measured latency (1x Ascend 910B / 910C, bf16, guardrails off):**
-  - T2I 1024² — 10 steps → ~8 s
-  - T2V 1280×720 @ 20 steps — 49 frames → ~55 s
-  - I2V 1280×720 @ 10 steps — 25 frames → ~25 s
-  - V2V 480×320 @ 10 steps — 17 frames → ~12 s
+    - T2I 1024² — 10 steps → ~8 s
+    - T2V 1280×720 @ 20 steps — 49 frames → ~55 s
+    - I2V 1280×720 @ 10 steps — 25 frames → ~25 s
+    - V2V 480×320 @ 10 steps — 17 frames → ~12 s
 - **Memory:** transformer ~17 GiB (bf16); peak ~46 GiB for 720p video on 1 NPU;
   full repo (transformer + Wan VAE + Qwen3-VL vision encoder + audio tokenizer)
   ~33 GB on disk.
@@ -709,9 +721,9 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
   (for model loading), `--tensor-parallel-size 8` for multi-NPU, and
   `--model-class-name Cosmos3OmniDiffusersPipeline` to force the pipeline class.
 - **Known limitations:**
-  - Transfer V2V with `extra_params` (`edge`/`blur`/`depth`/`seg`/`wsm`) hits a
+    - Transfer V2V with `extra_params` (`edge`/`blur`/`depth`/`seg`/`wsm`) hits a
     resolution-parsing bug; basic V2V without transfer hints works.
-  - FP8 online quantization and layerwise offload are not supported on NPU.
+    - FP8 online quantization and layerwise offload are not supported on NPU.
 
 ### 1x Ascend 910B / 910C (Atlas A2 / A3) — Offline generation
 
