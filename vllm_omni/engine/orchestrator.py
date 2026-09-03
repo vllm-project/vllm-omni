@@ -191,11 +191,8 @@ def build_engine_core_request_from_tokens(
     prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
     raw_additional_information = prompt.get("additional_information")
     model_intermediate_buffer = prompt.get("model_intermediate_buffer")
-    wire_payload: dict[str, Any] | None = None
-    if isinstance(raw_additional_information, dict):
-        wire_payload = dict(raw_additional_information)
     additional_info_payload = serialize_additional_information(
-        wire_payload,
+        raw_additional_information,
         log_prefix=f"build_engine_core_request_from_tokens req={request_id}",
     )
 
@@ -206,10 +203,11 @@ def build_engine_core_request_from_tokens(
         sampling_params=sampling_params,
         pooling_params=pooling_params,
         arrival_time=arrival_time,
-        lora_request=getattr(params, "lora_request", None),
+        lora_request=prompt.get("lora_request", getattr(params, "lora_request", None)),
         cache_salt=prompt.get("cache_salt"),
         data_parallel_rank=None,
         prompt_embeds=prompt_embeds,
+        prompt_is_token_ids=prompt.get("prompt_is_token_ids"),
         resumable=resumable,
         additional_information=additional_info_payload,
         model_intermediate_buffer=model_intermediate_buffer if isinstance(model_intermediate_buffer, dict) else None,
@@ -266,6 +264,30 @@ def _update_stale_request_metadata(
         # Written raw so the request's other tensors are not decoded.
         request.additional_information.entries[RETURN_STAGE_PAYLOAD_KEY] = return_stage_payload_entry
 
+def _pd_decode_input_from_prefill_prompt(prefill_prompt: Any) -> tuple[dict[str, Any], list | None]:
+    """Extract the processed stage-0 request fields needed by a PD decode."""
+    if isinstance(prefill_prompt, dict):
+        get_field = prefill_prompt.get
+    else:
+
+        def get_field(key: str, default: Any = None) -> Any:
+            return getattr(prefill_prompt, key, default)
+
+    prompt_token_ids = get_field("prompt_token_ids")
+    if prompt_token_ids is None:
+        raise RuntimeError("[Orchestrator][PD] Prefill request has no prompt_token_ids")
+
+    decode_input = {
+        "prompt_token_ids": list(prompt_token_ids),
+        "prompt_embeds": get_field("prompt_embeds"),
+        "prompt_is_token_ids": get_field("prompt_is_token_ids"),
+        "additional_information": get_field("additional_information"),
+        "model_intermediate_buffer": get_field("model_intermediate_buffer"),
+        "cache_salt": get_field("cache_salt"),
+        "lora_request": get_field("lora_request"),
+    }
+    return decode_input, get_field("mm_features")
+
 
 @dataclass
 class OrchestratorRequestState:
@@ -291,6 +313,10 @@ class OrchestratorRequestState:
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
     mm_processor_kwargs: dict | None = None
     mm_features: list | None = None
+    # The processed stage-0 request is retained only for the P->D handoff.
+    # ``prompt`` deliberately remains the original user input for downstream
+    # bridges such as HunyuanImage3 AR->DiT.
+    pd_prefill_prompt: Any | None = None
     pd_prefill_multimodal_output: dict[str, Any] | None = None
 
     streaming: StreamingInputState = field(default_factory=lambda: StreamingInputState())
@@ -2988,50 +3014,41 @@ class OrchestratorBase:
             )
             return
 
-        # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
+        # PD disaggregation: rebuild decode from the processed prefill request.
         if self._pd_pair is not None and (src_stage_id, next_logical) == self._pd_pair:
             params = self._build_pd_decode_params(req_id, params)
 
-            # Use the original user prompt for the decode stage (not processed embeddings)
-            original_prompt = req_state.prompt
-            raw_decode_inputs = [original_prompt] if not isinstance(original_prompt, list) else original_prompt
-
-            decode_inputs: list[dict[str, Any]] = []
-            for decode_input in raw_decode_inputs:
-                if isinstance(decode_input, dict):
-                    decode_inputs.append(decode_input)
-                    continue
-                prompt_token_ids = getattr(decode_input, "prompt_token_ids", None)
-                if prompt_token_ids is None:
-                    raise TypeError(
-                        "[Orchestrator][PD] decode input must be dict or have prompt_token_ids, "
-                        f"got {type(decode_input).__name__} for req={req_id}"
-                    )
-                decode_inputs.append({"prompt_token_ids": list(prompt_token_ids)})
-
-            decode_requests: list[EngineCoreRequest] = []
-            for decode_input in decode_inputs:
-                request = build_engine_core_request_from_tokens(
-                    request_id=req_id,
-                    prompt=decode_input,
-                    params=params,
-                    model_config=next_pool.stage_vllm_config.model_config,
-                    mm_features=req_state.mm_features,
-                    resumable=next_stage_resumable,
-                )
-                request.external_req_id = request.request_id
-                decode_requests.append(request)
-
-            await self._submit_to_stage(
+            if req_state.pd_prefill_prompt is None:
+                raise RuntimeError(f"[Orchestrator][PD] Missing processed prefill prompt for req={req_id}")
+            pd_decode_prompt, pd_decode_mm_features = _pd_decode_input_from_prefill_prompt(req_state.pd_prefill_prompt)
+            request = build_engine_core_request_from_tokens(
+                request_id=req_id,
+                prompt=pd_decode_prompt,
+                params=params,
+                model_config=next_pool.stage_vllm_config.model_config,
+                mm_features=pd_decode_mm_features,
+                resumable=next_stage_resumable,
+            )
+            request.external_req_id = request.request_id
+            if already_submitted:
+                replica_id = await next_pool.submit_update(req_id, req_state, request, **route_kwargs)
+            else:
+                replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None, **route_kwargs)
+            self._on_stage_submitted(
+                next_logical,
                 req_id,
+                replica_id,
                 req_state,
-                decode_requests,
-                source_stage_id=src_stage_id,
-                source_replica_id=src_replica_id,
-                receiver_stage_id=next_logical,
-                already_submitted=already_submitted,
-                t_submit_start=_t_submit_start,
-                pinned_replica_id=pinned_replica_id,
+            )
+            req_state.stage_submit_ts[next_logical] = _time.time()
+            _tx_ms = (_time.perf_counter() - _t_submit_start) * 1000.0
+            self._emit_tx_edge(
+                from_stage=src_stage_id,
+                from_replica=src_replica_id if src_replica_id is not None else 0,
+                to_stage=next_logical,
+                to_pool=next_pool,
+                request_id=req_id,
+                tx_ms=_tx_ms,
             )
             return
 
@@ -3830,6 +3847,7 @@ class Orchestrator(OrchestratorBase):
             yield_stage_id=msg.yield_stage_id,
             request_timestamp=float(msg.request_timestamp or _time.time()),
             mm_features=getattr(prompt, "mm_features", None),
+            pd_prefill_prompt=(prompt if self._pd_pair is not None and self._pd_pair[0] == stage_id else None),
             request_artifact_dirs=set(msg.request_artifact_dirs or ()),
             trace=RequestTrace(self.tracer, request_id, msg.trace_headers) if self.tracer is not None else None,
         )
