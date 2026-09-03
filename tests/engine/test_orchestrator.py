@@ -142,6 +142,7 @@ class FakeStageClient:
         self.custom_process_input_func = None
         self._kv_sender_info = dict(kv_sender_info) if kv_sender_info is not None else None
         self.add_request_calls: list[tuple] = []
+        self.add_request_kwargs: list[dict[str, Any]] = []
         self.abort_calls: list[list[str]] = []
         self.collective_rpc_calls: list[tuple[str, float | None, tuple[Any, ...], dict[str, Any]]] = []
         self.shutdown_calls = 0
@@ -151,6 +152,7 @@ class FakeStageClient:
     # Orchestrator-facing interface.
     async def add_request_async(self, *args, **kwargs) -> None:
         self.add_request_calls.append(args)
+        self.add_request_kwargs.append(dict(kwargs))
 
     async def get_output_async(self):
         try:
@@ -409,6 +411,7 @@ def _build_harness(
     async_chunk: bool = False,
     log_stats: bool = False,
     stage_pools: list[StagePool] | None = None,
+    pd_config: dict[str, Any] | None = None,
 ) -> OrchestratorFixture:
     """Build an Orchestrator test harness.
 
@@ -443,6 +446,7 @@ def _build_harness(
                 rpc_async_queue=rpc_queue.async_q,
                 stage_pools=stage_pools,
                 async_chunk=async_chunk,
+                pd_config=pd_config,
                 log_stats=log_stats,
             )
             ready_future.set_result((orchestrator, request_queue, output_queue, rpc_queue))
@@ -693,6 +697,146 @@ async def test_pd_decode_replays_processed_prefill_prompt(orchestrator_factory) 
             "do_remote_decode": False,
         }
         assert req_state.prompt is original_prompt
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_run_hunyuan_image3_pd_prefill_decode_to_diffusion(orchestrator_factory) -> None:
+    """Exercise the complete 1P1D orchestrator route through the DiT submit."""
+    prefill_sender_info = {"engine_id": "prefill-omni-sender"}
+    decode_sender_info = {
+        "engine_id": "decode-omni-sender",
+        "host": "127.0.0.1",
+        "port": 50051,
+    }
+    stage0 = FakeStageClient(
+        stage_type="llm",
+        final_output=False,
+        kv_sender_info=prefill_sender_info,
+    )
+    stage1 = FakeStageClient(
+        stage_type="llm",
+        final_output=True,
+        kv_sender_info=decode_sender_info,
+    )
+    stage2 = FakeStageClient(
+        stage_type="diffusion",
+        final_output=True,
+        final_output_type="image",
+        engine_input_source=[1],
+    )
+    stage2.requires_multimodal_data = True
+
+    bridge_calls: list[tuple[list[Any], Any, bool]] = []
+
+    def ar2diffusion_bridge(source_outputs, prompt, requires_multimodal_data):
+        bridge_calls.append((source_outputs, prompt, requires_multimodal_data))
+        return {
+            "prompt": prompt["prompt"],
+            "height": 512,
+            "width": 512,
+            "extra": {"ar_generated_text": "decoded recaption"},
+        }
+
+    stage2.custom_process_input_func = ar2diffusion_bridge
+    processors = [
+        # MooncakeConnector.request_finished() currently returns no metadata.
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-hy-pd", token_ids=[1], finished=True)]),
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-hy-pd", token_ids=[201, 202], finished=True)]),
+        FakeOutputProcessor(),
+    ]
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1, stage2],
+        output_processors=processors,
+        pd_config={
+            "pd_pair": (0, 1),
+            "bootstrap_addr": "127.0.0.1:25201",
+            "prefill_engine_id": "prefill-engine-0",
+        },
+    )
+
+    processed_prompt = SimpleNamespace(
+        request_id="req-hy-pd",
+        prompt_token_ids=[101, 102, 103],
+        prompt_embeds=None,
+        prompt_is_token_ids=True,
+        mm_features=["processed-image-features"],
+        additional_information={"image_span": [4, 8]},
+        model_intermediate_buffer={"mrope_position_delta": 7},
+        cache_salt="processed-cache-salt",
+        lora_request=None,
+        data_parallel_rank=0,
+        resumable=False,
+    )
+    original_prompt = {
+        "prompt": "draw a lantern in the rain",
+        "multi_modal_data": {"image": "raw-reference-image"},
+    }
+    diffusion_params = OmniDiffusionSamplingParams()
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-hy-pd",
+            prompt=processed_prompt,
+            original_prompt=original_prompt,
+            sampling_params_list=[_sampling_params(1), _sampling_params(), diffusion_params],
+            final_stage_id=2,
+        )
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+
+        stage0.push_engine_core_outputs(_engine_core_outputs("prefill-finished", 1.0))
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+
+        decode_request = stage1.add_request_calls[0][0]
+        assert decode_request.prompt_token_ids == [101, 102, 103]
+        assert decode_request.mm_features == ["processed-image-features"]
+        assert decode_request.model_intermediate_buffer == {"mrope_position_delta": 7}
+        assert decode_request.sampling_params.extra_args["kv_transfer_params"] == {
+            "transfer_id": "xfer-req-hy-pd",
+            "remote_bootstrap_addr": "127.0.0.1:25201",
+            "remote_engine_id": "prefill-engine-0",
+            "do_remote_prefill": True,
+            "do_remote_decode": False,
+        }
+
+        stage1.push_engine_core_outputs(_engine_core_outputs("decode-finished", 2.0))
+        await _wait_for(lambda: len(stage2.add_request_calls) == 1)
+
+        assert len(bridge_calls) == 1
+        bridge_outputs, bridge_prompt, bridge_requires_mm = bridge_calls[0]
+        assert bridge_outputs[0].outputs[0].token_ids == [201, 202]
+        assert bridge_prompt is original_prompt
+        assert bridge_requires_mm is True
+
+        assert stage2.add_request_calls[0] == (
+            "req-hy-pd",
+            {
+                "prompt": "draw a lantern in the rain",
+                "height": 512,
+                "width": 512,
+                "extra": {"ar_generated_text": "decoded recaption"},
+            },
+            diffusion_params,
+        )
+        assert stage2.add_request_kwargs[0] == {
+            "kv_sender_info": {1: decode_sender_info},
+        }
+
+        stage2.push_diffusion_output(
+            OmniRequestOutput.from_diffusion(
+                request_id="req-hy-pd",
+                images=[],
+                final_output_type="image",
+            )
+        )
+
+        decode_output = await _get_output_message(orchestrator_fixture)
+        image_output = await _get_output_message(orchestrator_fixture)
+        assert (decode_output.stage_id, decode_output.finished) == (1, False)
+        assert (image_output.stage_id, image_output.finished) == (2, True)
+        await _wait_for(lambda: "req-hy-pd" not in orchestrator_fixture.orchestrator.request_states)
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 

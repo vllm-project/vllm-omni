@@ -768,6 +768,7 @@ def test_sub_config_fields_match_structured_scopes():
     assert {f.name for f in fields(OmniStageConnectorConfig)} == {
         "async_chunk",
         "omni_kv_config",
+        "kv_transfer_config",
         "stage_connector",
         "output_connectors",
         "input_connectors",
