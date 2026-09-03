@@ -1,0 +1,56 @@
+# AMD CI L4 (`full_model`): experimental nightly coverage during burn-in.
+# All jobs are non-blocking until the lane has stable runtime evidence.
+
+env:
+  VLLM_WORKER_MULTIPROC_METHOD: spawn
+  HF_HUB_DOWNLOAD_TIMEOUT: 300
+  HF_HUB_ETAG_TIMEOUT: 60
+
+steps:
+  # MI325 is the repository's legacy ROCm pytest marker. The AMD template maps
+  # agent_pool to the current MI300 Buildkite queues independently of that mark.
+  - group: ":full_moon: Qwen3-Omni L4"
+    steps:
+      - label: "Qwen3-Omni Function Expansion"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
+
+      - label: "Qwen3-Omni Accuracy"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        artifact_paths:
+          - tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json
+        commands:
+          - export SEED_TTS_WER_EVAL=1
+          # PyTorch ROCm uses the torch.cuda device namespace.
+          - export SEED_TTS_EVAL_DEVICE=cuda:1
+          - pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
+
+      - label: "Qwen3-Omni Documentation Examples"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 120
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - pytest -s -v tests/examples/online_serving/test_qwen3_omni.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
+
+      - label: "Qwen3-Omni AITER-on Smoke"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 90
+        commands:
+          - export VLLM_ROCM_USE_AITER=1
+          - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py::test_text_to_text_audio_001 -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"

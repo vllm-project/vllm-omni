@@ -59,7 +59,8 @@ resolve_test_specs() {
     if ! selected_specs=$(python3 "$AMD_SUITE_SELECTOR" \
         --branch "$BUILDKITE_BRANCH" \
         --labels "$PR_LABELS" \
-        --debug-test-yaml "${DEBUG_TEST_YAML:-}"); then
+        --debug-test-yaml "${DEBUG_TEST_YAML:-}" \
+        --nightly "$NIGHTLY"); then
         exit 1
     fi
 
@@ -79,6 +80,12 @@ filter_test_specs_by_skip_ci() {
         case "$suite_spec" in
             READY_TESTS:*) level="l2" ;;
             MERGE_TESTS:*) level="l3" ;;
+            NIGHTLY_TESTS:*)
+                # Explicit PR and scheduled nightly selections must survive
+                # L2/L3 diff gating, including docs-only main commits.
+                runnable_specs+=("$suite_spec")
+                continue
+                ;;
             *)
                 echo "ERROR: unknown AMD test suite spec '$suite_spec'" >&2
                 exit 1
@@ -100,7 +107,7 @@ filter_test_specs_by_skip_ci() {
                 ":memo: CI skipped — docs or pytest skip-mark changes only" \
                 --style "info" 2>/dev/null || true
         fi
-        echo "No AMD L2/L3 suites remain after skip-ci filtering."
+        echo "No AMD suites remain after skip-ci filtering."
         exit 0
     fi
 }
@@ -218,8 +225,8 @@ if [[ $BUILDKITE_BRANCH == "main" ]]; then
     file_diff=$(get_diff_main)
 fi
 
-# Resolve PR tier labels before skip-ci so ready and merge suites can be
-# filtered independently for CI-YAML-only changes.
+# Resolve PR tier labels before skip-ci so L2/L3 suites can be filtered
+# independently while an explicitly selected L4 suite passes through.
 resolve_test_specs
 filter_test_specs_by_skip_ci
 
