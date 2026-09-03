@@ -196,7 +196,11 @@ class SanaImageToVideoPipeline(SanaVideoPipeline, SupportImageInput):
             default_num_frames=81,
             is_dummy_run=req.is_dummy_run(),
         )
-        num_steps = sampling.num_inference_steps if sampling.num_inference_steps is not None else 50
+        num_steps = (
+            sampling.num_inference_steps
+            if sampling.num_inference_steps is not None
+            else self.default_num_inference_steps
+        )
         guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 6.0
         generator = sampling.generator
         if generator is None and sampling.seed is not None:

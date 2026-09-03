@@ -202,6 +202,75 @@ Use the native `SanaVideoPipeline` and `SanaImageToVideoPipeline` for the
 primary SANA execution paths. The Diffusers adapter is retained as a
 validated compatibility/reference backend.
 
+#### Native Cache-DiT and CPU offload
+
+The native T2V and I2V pipelines support Cache-DiT, model-level CPU offload,
+and layerwise CPU offload through the common diffusion flags. Layerwise mode
+keeps non-block transformer modules, the text encoder, and the VAE on the
+runtime device while prefetching DiT blocks in order.
+
+Add one of the following flag sets to either native offline command above:
+
+```bash
+# Cache-DiT
+--cache-backend cache_dit
+
+# Model-level CPU offload
+--enable-cpu-offload
+
+# Layerwise CPU offload
+--enable-layerwise-offload
+
+# Cache-DiT plus model-level offload
+--cache-backend cache_dit --enable-cpu-offload
+
+# Cache-DiT plus layerwise offload
+--cache-backend cache_dit --enable-layerwise-offload
+
+# Distributed layerwise offload (weights sharded across the DP group)
+--enable-distributed-layerwise-offload
+```
+
+If both CPU offload flags are supplied, the common offloader keeps its existing
+layerwise precedence. Cache-DiT refreshes each request from the explicit
+`num_inference_steps`; when that field is omitted, both native SANA pipelines
+default to 50 inference steps.
+
+Cache-DiT and CPU offload require TP1, CFG1, and SP1. Combining them with
+tensor, CFG, or sequence parallelism raises before checkpoint components are
+loaded, as do other cache backends such as TeaCache. Cache-DiT cannot be
+combined with distributed layerwise offload: per-rank cache skips would
+desynchronize the weight AllGather.
+
+Measured on one A800-SXM4-80GB (driver 580.126.09, CUDA 13.0, PyTorch
+2.11.0+cu130, Diffusers 0.38.0) with `DIFFUSION_ATTENTION_BACKEND=CUDNN_ATTN`,
+81 frames, 50 steps, seed 42, each configuration in its own process:
+
+| Configuration | 480p T2V latency | 480p T2V generation peak |
+|---|---:|---:|
+| Baseline | 120.19 s | 24.07 GiB |
+| Cache-DiT | 77.11 s (1.56x) | 24.07 GiB |
+| Model CPU offload | 121.15 s | 16.81 GiB (-7.26 GiB) |
+| Layerwise offload | 118.63 s | 20.75 GiB (-3.32 GiB) |
+
+Cache-DiT gives 1.54x on 720p I2V (37.0 s to 24.1 s). Latency is the median of
+three measured runs after one warmup. Offload trades startup peak too: 14.28
+GiB baseline against 6.14 GiB for model-level and 6.80 GiB for layerwise.
+
+Cache-DiT is approximate: it skips block computations, so its output differs
+from an uncached run. Similarity against a reference run is not used as a gate
+here because this pipeline does not reproduce its own trajectory on this
+hardware -- two runs of identical code differ by SSIM 0.9712 / rel_l2 8.7e-2 at
+50 steps. Cache-DiT output was checked frame by frame against the uncached run
+on 480p T2V and 720p I2V instead, and matches it in subject, composition,
+sharpness, and lighting.
+
+The numbers above use the offline example's default cache configuration.
+Lowering `residual_diff_threshold` in `cache_config` caches fewer steps,
+trading speed for a trajectory closer to the uncached run; see the
+[Cache-DiT guide](../../docs/user_guide/diffusion/cache_acceleration/cache_dit.md)
+for the tuning knobs.
+
 #### Notes
 
 - Key flags: select I2V explicitly with `--model-class-name
@@ -219,8 +288,13 @@ validated compatibility/reference backend.
   Diffusers `DPMSolverMultistepScheduler`.
 - Known limitations:
     - Tensor parallelism (up to 2 GPUs) and CFG parallelism are supported for
-    the native pipeline. Sequence parallelism, Cache-DiT, TeaCache, and step
-    execution are not validated.
+    the native pipeline. Sequence parallelism, TeaCache, and step execution
+    are not validated.
+    - Cache-DiT and CPU offload are limited to TP1/CFG1/SP1. Cache-DiT with
+    distributed layerwise offload is not supported by the native pipeline.
+    - Cache-DiT speedup and offload memory numbers above are single-GPU A800
+    measurements; other hardware will differ. Distributed layerwise offload is
+    only exercised single-rank here.
     - The Diffusers backend is a compatibility path and does not provide native
     vLLM-Omni parallelism or continuous batching.
     - Native describes pipeline and Transformer ownership, not a zero-Diffusers

@@ -7,7 +7,7 @@ import os
 import random
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
-from enum import Enum, StrEnum
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import diffusers
@@ -121,6 +121,8 @@ def validate_dlo_host_registration_options(
     hwr_mode: object,
 ) -> float:
     """Validate the optional transport budget without probing CUDA or HWR."""
+    if not isinstance(limit_gib, (int, float, str)):
+        raise TypeError(f"dlo_host_registration_limit_gib must be a number; got {type(limit_gib).__name__}")
     value = float(limit_gib)
     if not math.isfinite(value) or value < 0:
         raise ValueError("dlo_host_registration_limit_gib must be finite and >= 0")
@@ -1682,7 +1684,8 @@ class AttnQuantSpec:
 
     @property
     def enabled(self) -> bool:
-        return self.dtype_qk is not None or self.dtype_vo is not None
+        # Include flashinfer_backend so a variant pin without dtypes is serialized.
+        return self.dtype_qk is not None or self.dtype_vo is not None or self.flashinfer_backend is not None
 
 
 # Backends that select key blocks instead of attending densely, and so accept
@@ -1690,7 +1693,7 @@ class AttnQuantSpec:
 BLOCK_SPARSE_BACKENDS = frozenset({"RAINFUSION_ATTN"})
 
 
-class RainFusionPrecision(StrEnum):
+class RainFusionPrecision(str, Enum):
     """Execution precision for block-sparse RainFusion (rf_v3) attention.
 
     ``bf16``: no quantization, pure BF16 sparse attention (official baseline).
@@ -1728,11 +1731,11 @@ class BlockSparseSpec:
             raise ValueError(f"block_sparse.start_step must be >= 0; got {self.start_step!r}.")
         if self.end_step < 0:
             raise ValueError(f"block_sparse.end_step must be >= 0; got {self.end_step!r}.")
-        if self.precision not in {p.value for p in RainFusionPrecision}:
-            raise ValueError(
-                f"block_sparse.precision must be one of {sorted(p.value for p in RainFusionPrecision)}; "
-                f"got {self.precision!r}."
-            )
+        precision = self.precision.value if isinstance(self.precision, RainFusionPrecision) else self.precision
+        valid = {member.value for member in RainFusionPrecision}
+        if precision not in valid:
+            raise ValueError(f"block_sparse.precision must be one of {sorted(valid)}; got {self.precision!r}.")
+        self.precision = precision
         self.skip_layer_indices = parse_kv_cache_skip_selector(self.skip_layers)
 
 
@@ -1797,18 +1800,19 @@ class AttentionSpec:
                 kw["target_sparsity"] = ss.target_sparsity
             if ss.disabled_until_timestep:
                 kw["disabled_until_timestep"] = ss.disabled_until_timestep
-        if self.quant is not None and self.quant.enabled:
+        if self.quant is not None:
             q = self.quant
-            quant_kw: dict[str, Any] = {
-                "dtype_qk": q.dtype_qk,
-                "q_block_size": q.q_block_size,
-                "k_block_size": q.k_block_size,
-            }
-            if q.dtype_vo is not None:
-                quant_kw["dtype_vo"] = q.dtype_vo
+            quant_kw: dict[str, Any] = {}
+            if q.dtype_qk is not None or q.dtype_vo is not None:
+                quant_kw["dtype_qk"] = q.dtype_qk
+                quant_kw["q_block_size"] = q.q_block_size
+                quant_kw["k_block_size"] = q.k_block_size
+                if q.dtype_vo is not None:
+                    quant_kw["dtype_vo"] = q.dtype_vo
             if q.flashinfer_backend is not None:
                 quant_kw["flashinfer_backend"] = q.flashinfer_backend
-            kw["quant"] = quant_kw
+            if quant_kw:
+                kw["quant"] = quant_kw
         if self.fastvideo_vsa_topk is not None:
             kw["topk"] = self.fastvideo_vsa_topk
         if self.block_sparse is not None:
