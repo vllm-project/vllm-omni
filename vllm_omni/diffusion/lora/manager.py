@@ -27,6 +27,8 @@ from vllm_omni.diffusion.lora.utils import (
     _expand_expected_modules_for_packed_layers,
     _match_target_modules,
     from_layer_diffusion,
+    read_peft_rank_alpha_patterns,
+    validate_generic_peft_ranks,
 )
 from vllm_omni.lora.utils import stable_lora_int_id
 
@@ -315,6 +317,20 @@ class DiffusionLoRAManager:
                 model_vocab_size=None,
                 tensorizer_config_dict=lora_request.tensorizer_config_dict,
                 weights_mapper=None,
+            )
+
+            # The generic PEFT fallback applies a single global rank/scale
+            # (peft_helper.r / lora_alpha) to every module and never re-checks
+            # the per-module rank from the A/B tensors. Reject adapters that
+            # break that assumption (mixed/fused ranks or a declared
+            # rank_pattern/alpha_pattern) instead of silently scaling them incorrectly;
+            # model-specific formats are handled by the branch above.
+            rank_pattern, alpha_pattern = read_peft_rank_alpha_patterns(lora_path)
+            validate_generic_peft_ranks(
+                lora_model.loras,
+                peft_helper.r,
+                rank_pattern=rank_pattern,
+                alpha_pattern=alpha_pattern,
             )
         else:
             lora_model, peft_helper = loaded
