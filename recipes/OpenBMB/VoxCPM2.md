@@ -85,6 +85,10 @@ The deploy config at
 is loaded automatically by the model registry (HF `model_type=voxcpm2`).
 Pass `--deploy-config <path>` to override.
 
+The `engine_extras.hf_overrides.voxcpm2_runtime_config` section controls
+LocDiT CFM generation. `inference_timesteps`, `cfg_value`, and
+`cfg_cutoff_ratio` default to `10`, `2.0`, and `1.0`, respectively.
+
 #### Verification
 
 **Server cold-start**: ~60 s from `vllm serve` to `Application startup
