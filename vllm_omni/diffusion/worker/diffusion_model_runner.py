@@ -519,6 +519,23 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if self.prompt_embed_cache is not None:
             self.prompt_embed_cache.clear()
 
+    def release_captured_graphs(self) -> None:
+        """Drop every CUDA graph held for this model, wherever it is kept.
+
+        Sleep level 2 discards the memory a capture was recorded against, so a
+        graph that outlives it replays over freed storage. The runner owns
+        compilation and execution resources, so it owns the release: a pipeline
+        that captures graphs of its own implements ``release_captured_graphs``
+        and is collected here, instead of every caller having to know which
+        pipelines have one.
+        """
+        runners = getattr(self, "graph_runners", None)
+        if runners is not None:
+            runners.clear()
+        release = getattr(self.pipeline, "release_captured_graphs", None)
+        if callable(release):
+            release()
+
     def get_prompt_embed_cache_stats(self) -> dict | None:
         """Return hit/miss statistics for the prompt-embedding cache, if enabled.
 
@@ -614,6 +631,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # RequestBatchSamplingParamsKey, so the first request's num_inference_steps applies
         # to the whole runner batch.
         num_inference_steps = first_req.sampling_params.num_inference_steps
+        if num_inference_steps is None and first_req.sampling_params.timesteps is not None:
+            num_inference_steps = len(first_req.sampling_params.timesteps)
+        if num_inference_steps is None and first_req.sampling_params.sigmas is not None:
+            num_inference_steps = len(first_req.sampling_params.sigmas)
+        if num_inference_steps is None:
+            num_inference_steps = getattr(self.pipeline, "default_num_inference_steps", None)
         if num_inference_steps is None and od_config.cache_backend in (
             "tea_cache",
             "step_cache",

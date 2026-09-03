@@ -11,7 +11,7 @@ import types
 
 import pytest
 
-from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, normalize_omni_diffusion_kwargs
 from vllm_omni.engine import async_omni_engine as async_omni_engine_module
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_init_utils import (
@@ -1793,6 +1793,41 @@ def test_resolve_stage_configs_preserves_stage_diffusion_attention(monkeypatch):
     )
 
     assert stage_configs[0].engine_args.diffusion_attention_config is existing_attention
+
+
+def test_resolve_stage_configs_does_not_inject_over_stage_diffusion_attention_backend(monkeypatch):
+    import vllm_omni.engine.async_omni_engine as engine_mod
+
+    engine = object.__new__(AsyncOmniEngine)
+    stage_cfg = types.SimpleNamespace(
+        stage_type="diffusion",
+        engine_args=types.SimpleNamespace(
+            diffusion_attention_backend="TORCH_SDPA",
+            diffusion_attention_config=None,
+            lora_path=None,
+            lora_scale=None,
+            enable_sleep_mode=None,
+            quantization_config=None,
+        ),
+    )
+
+    monkeypatch.setattr(
+        engine_mod,
+        "load_and_resolve_stage_configs",
+        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
+    )
+
+    _config_path, stage_configs = engine._resolve_stage_configs(
+        model="dummy-model",
+        kwargs={"diffusion_attention_backend": "FLASH_ATTN"},
+        trust_remote_code=False,
+    )
+
+    engine_args = stage_configs[0].engine_args
+    assert engine_args.diffusion_attention_backend == "TORCH_SDPA"
+    assert engine_args.diffusion_attention_config is None
+    normalized = normalize_omni_diffusion_kwargs(vars(engine_args))
+    assert normalized["diffusion_attention_config"].default.backend == "TORCH_SDPA"
 
 
 def test_resolve_stage_configs_does_not_inject_diffusion_attention_into_llm_stage(monkeypatch):

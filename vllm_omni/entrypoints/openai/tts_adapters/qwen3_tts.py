@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import regex as re
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
@@ -42,6 +43,39 @@ class Qwen3TTSAdapter(ARTTSAdapter):
     validates_generation = True
     stage_keys = frozenset({"qwen3_tts"})
     name = "qwen3_tts"
+    supported_output_sample_rates = frozenset({8000, 24000})
+
+    def _get_model_variant(self) -> str | None:
+        """Return the task supported by the loaded Qwen3-TTS checkpoint.
+
+        Checkpoint metadata is authoritative. Metadata-less re-exports may be
+        served from dated snapshot directories, so only when metadata is
+        absent or unrecognized do we inspect path components from the leaf
+        upwards. A marker must end a component to avoid inferring ``Base`` from
+        names such as ``base_models`` or ``database``.
+        """
+        model_config = self.ctx.server.engine_client.model_config
+        hf_config = getattr(model_config, "hf_config", None)
+        configured_variant = getattr(hf_config, "tts_model_type", None)
+        variants = {
+            "customvoice": "CustomVoice",
+            "voicedesign": "VoiceDesign",
+            "base": "Base",
+        }
+
+        if isinstance(configured_variant, str):
+            normalized = re.sub(r"[^a-z]", "", configured_variant.lower())
+            if (variant := variants.get(normalized)) is not None:
+                return variant
+
+        model_path = getattr(model_config, "model", None)
+        if not isinstance(model_path, str):
+            return None
+        for component in reversed(re.split(r"[\\/]+", model_path.rstrip("/\\"))):
+            match = re.search(r"(?:^|[-_.])(custom[-_.]?voice|voice[-_.]?design|base)$", component.lower())
+            if match is not None:
+                return variants[re.sub(r"[-_.]", "", match.group(1))]
+        return None
 
     def normalize(self, request: "OpenAICreateSpeechRequest") -> None:
         """Qwen3-TTS normalization (Base-task inference, voice lowercasing) is
@@ -58,9 +92,22 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         # Normalize voice to lowercase for case-insensitive matching
         if request.voice is not None:
             request.voice = request.voice.lower()
-            if request.task_type is None and request.voice in self.capabilities.precomputed_speakers:
+            stored_voice = (
+                request.voice in server.uploaded_speakers or request.voice in self.capabilities.precomputed_speakers
+            )
+            # _build_tts_params dispatches stored voices as Base. Normalize to
+            # that effective task before model-variant validation so the
+            # admission gate and builder cannot disagree.
+            if stored_voice:
                 request.task_type = "Base"
         task_type = request.task_type or "CustomVoice"
+
+        model_variant = self._get_model_variant()
+        if model_variant is not None and task_type != model_variant:
+            return (
+                f"Qwen3-TTS {model_variant} checkpoint does not support task_type='{task_type}'. "
+                f"Use task_type='{model_variant}' or load the matching {task_type} checkpoint."
+            )
 
         # Validate input is not empty
         if not request.input or not request.input.strip():
@@ -194,13 +241,13 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         talker codec embeddings, so the real compatibility requirement is the
         talker hidden size.
         """
-        hf_config = self.ctx.engine_client.model_config.hf_config
+        hf_config = self.ctx.server.engine_client.model_config.hf_config
         talker_config = hf_config.talker_config
         return int(talker_config.hidden_size)
 
     def _load_precomputed_speakers(self) -> dict[str, dict]:
         return load_precomputed_speakers(
-            self.ctx.engine_client,
+            self.ctx.server.engine_client,
             expected_model_type=self.name,
             validate_profile=lambda profile, tensors: validate_qwen3_tts_profile(
                 profile,
@@ -211,7 +258,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
 
     def _load_supported_languages(self) -> frozenset[str]:
         try:
-            config = self.ctx.engine_client.model_config.hf_config.talker_config
+            config = self.ctx.server.engine_client.model_config.hf_config.talker_config
 
             if isinstance(config, dict):
                 codec_language_id = config.get("codec_language_id")

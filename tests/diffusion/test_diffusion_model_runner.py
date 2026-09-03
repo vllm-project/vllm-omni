@@ -14,6 +14,7 @@ from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion]
 
@@ -133,12 +134,7 @@ class _CompileTrackingModel:
 
 
 def _make_request():
-    sampling_params = SimpleNamespace(
-        generator=None,
-        seed=None,
-        generator_device=None,
-        num_inference_steps=4,
-    )
+    sampling_params = OmniDiffusionSamplingParams(num_inference_steps=4)
     return SimpleNamespace(
         request_id="req-test",
         prompt="a prompt",
@@ -177,6 +173,30 @@ def test_request_scoped_cache_dit_lifecycle_is_pipeline_opt_in():
     assert model_runner_module.adopt_request_scoped_cache_dit(request_scoped_pipeline, backend)
     assert model_runner_module.is_request_scoped_cache_dit_enabled(request_scoped_pipeline)
     assert events == [backend]
+
+
+def test_release_captured_graphs_clears_runners_and_delegates_to_the_pipeline():
+    """Both halves in one place, so a pipeline that keeps captures is collected
+    without the caller knowing which pipelines have one."""
+    released = []
+    runner = object.__new__(DiffusionModelRunner)
+    runner.graph_runners = {"decode": object()}
+    runner.pipeline = SimpleNamespace(release_captured_graphs=lambda: released.append(True))
+
+    runner.release_captured_graphs()
+
+    assert runner.graph_runners == {}
+    assert released == [True]
+
+
+def test_release_captured_graphs_tolerates_a_pipeline_without_captures():
+    """Most pipelines keep none, and the runner may not carry `graph_runners`."""
+    runner = object.__new__(DiffusionModelRunner)
+    runner.pipeline = object()
+
+    runner.release_captured_graphs()
+
+    assert not hasattr(runner, "graph_runners")
 
 
 def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summary: bool = True):
@@ -223,6 +243,58 @@ def _make_compile_runner(
         parallel_config=SimpleNamespace(use_hsdp=use_hsdp),
     )
     return runner
+
+
+class _EnabledCacheBackend:
+    def __init__(self):
+        self.refresh_calls = []
+
+    def is_enabled(self):
+        return True
+
+    def refresh(self, pipeline, num_inference_steps, verbose=True):
+        self.refresh_calls.append((pipeline, num_inference_steps, verbose))
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_refresh_cache_prefers_request_steps_then_schedule_then_pipeline_default():
+    cache_backend = _EnabledCacheBackend()
+    runner = _make_runner(cache_backend=cache_backend, cache_backend_name="cache_dit")
+    runner.pipeline.default_num_inference_steps = 50
+    req = _make_request()
+
+    custom_timesteps = torch.linspace(999.0, 0.0, 8)
+    custom_sigmas = [0.9, 0.5, 0.1]
+    cases = [
+        (20, None, None),
+        (30, custom_timesteps, custom_sigmas),
+        (None, custom_timesteps, None),
+        (None, custom_timesteps, custom_sigmas),
+        (None, None, custom_sigmas),
+        (None, None, None),
+    ]
+    for num_inference_steps, timesteps, sigmas in cases:
+        req.sampling_params.num_inference_steps = num_inference_steps
+        req.sampling_params.timesteps = timesteps
+        req.sampling_params.sigmas = sigmas
+        DiffusionModelRunner._refresh_cache_for_requests(runner, [req], od_config=runner.od_config)
+
+    assert [steps for _, steps, _ in cache_backend.refresh_calls] == [20, 30, 8, 8, 3, 50]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_refresh_cache_without_request_or_pipeline_default_warns(caplog):
+    cache_backend = _EnabledCacheBackend()
+    runner = _make_runner(cache_backend=cache_backend, cache_backend_name="cache_dit")
+    req = _make_request()
+    req.sampling_params.num_inference_steps = None
+
+    DiffusionModelRunner._refresh_cache_for_requests(runner, [req], od_config=runner.od_config)
+
+    assert cache_backend.refresh_calls == []
+    assert "requires num_inference_steps to be passed explicitly" in caplog.text
 
 
 @pytest.mark.core_model
@@ -427,16 +499,6 @@ def test_execute_model_skips_cache_summary_without_active_cache_backend(monkeypa
 @pytest.mark.core_model
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeypatch):
-    class _EnabledCacheBackend:
-        def __init__(self):
-            self.refresh_calls = []
-
-        def is_enabled(self):
-            return True
-
-        def refresh(self, pipeline, num_inference_steps, verbose=True):
-            self.refresh_calls.append((pipeline, num_inference_steps, verbose))
-
     cache_backend = _EnabledCacheBackend()
     runner = _make_runner(cache_backend=cache_backend, cache_backend_name="cache_dit")
     req = _make_request()
