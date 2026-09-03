@@ -55,7 +55,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
     - Reuses GPUModelRunner preparation, multimodal handling, and TP/PP/DP glue.
     - Does not compute logits or perform token sampling.
-    - Executes generation process and returns tensors via `pooler_output`.
+    - Executes the generation pass and returns tensors via `multimodal_outputs`.
     """
 
     def __init__(self, *args, **kwargs):
@@ -533,8 +533,12 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         """Run generation from codec codes to waveforms.
 
         Args:
-            scheduler_output: Contains codec codes in input_ids or additional info
-            intermediate_tensors: PP intermediate tensors if applicable
+            input_ids: Codec codes (or None when ``inputs_embeds`` carries the input).
+            positions: Position ids for the batch.
+            intermediate_tensors: PP intermediate tensors if applicable.
+            inputs_embeds: Precomputed input embeddings, if any.
+            model_kwargs: Extra model keyword arguments for this step.
+            logits_indices: Row indices the model treats as logits positions.
 
         Returns:
             Audio waveforms: [batch, 1, waveform_len] or list of tensors

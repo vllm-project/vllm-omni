@@ -878,3 +878,91 @@ def test_maybe_attach_mimo_audio_req_infos_no_req_state_returns_input():
 
     # When no req_state, helper should be a no-op.
     assert result is req_infos
+
+
+def test_load_model_mirrors_upstream_signature():
+    import inspect
+
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+    from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+
+    # eval_str resolves the string annotations `from __future__ import annotations` produces.
+    upstream = inspect.signature(GPUModelRunner.load_model, eval_str=True)
+    assert inspect.signature(OmniGPUModelRunner.load_model, eval_str=True) == upstream
+    assert inspect.signature(GPUARModelRunner.load_model, eval_str=True) == upstream
+
+
+class _RawMRoPEModel:
+    """Raw model behind a CUDA-graph wrapper: declares SupportsMRoPE, accepts a kwarg subset."""
+
+    supports_mrope = True
+
+    def __init__(self):
+        self.calls = []
+
+    def get_mrope_input_positions(self, prompt_token_ids, *, hf_config, image_grid_thw, video_grid_thw):
+        self.calls.append((list(prompt_token_ids), hf_config, image_grid_thw, video_grid_thw))
+        return torch.zeros(3, len(prompt_token_ids), dtype=torch.long), 0
+
+
+def test_init_mrope_positions_dispatches_to_raw_model_not_wrapper():
+    # `runner.model` stands in for the CUDA-graph wrapper, which exposes none of the
+    # model's M-RoPE surface; `get_model()` is the only way to the raw model.
+    raw = _RawMRoPEModel()
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace()
+    runner.get_model = lambda: raw
+    hf_config = object()
+    runner.model_config = SimpleNamespace(hf_config=hf_config)
+    req_state = SimpleNamespace(mm_features=[], sampling_params=None, prompt_token_ids=[7, 8, 9])
+
+    OmniGPUModelRunner._init_mrope_positions(runner, req_state)
+
+    assert raw.calls == [([7, 8, 9], hf_config, [], [])]
+    assert req_state.mrope_positions.shape == (3, 3)
+    assert req_state.mrope_position_delta == 0
+
+
+class _RawPostprocessModel:
+    """Raw model declaring the postprocess protocol; the wrapper in front declares nothing."""
+
+    has_postprocess = True
+    postprocess_uses_hidden_states = True
+    postprocess_uses_multimodal_outputs = False
+    postprocess_uses_req_infos = False
+
+    def __init__(self):
+        self.calls = []
+
+    def postprocess(self, hidden_states, *, multimodal_outputs):
+        self.calls.append((hidden_states.clone(), multimodal_outputs))
+        return {"rows": torch.tensor(hidden_states.shape[0])}
+
+
+def test_process_additional_information_updates_reads_flags_from_raw_model():
+    import numpy as np
+
+    raw = _RawPostprocessModel()
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace()
+    runner.get_model = lambda: raw
+    runner.model_intermediate_buffer = {}
+    updates = []
+    runner._update_intermediate_buffer = lambda req_id, update: updates.append((req_id, update))
+    hidden_states = torch.arange(6.0).view(3, 2)
+
+    OmniGPUModelRunner._process_additional_information_updates(
+        runner,
+        hidden_states,
+        {"unused": torch.zeros(1)},
+        np.array([2, 1]),
+        None,
+        req_ids=["r1", "r2"],
+        query_start_loc_cpu=torch.tensor([0, 2, 3]),
+    )
+
+    assert [c[0].tolist() for c in raw.calls] == [[[0.0, 1.0], [2.0, 3.0]], [[4.0, 5.0]]]
+    assert all(c[1] is None for c in raw.calls)  # postprocess_uses_multimodal_outputs=False honoured
+    assert [(rid, int(u["rows"])) for rid, u in updates] == [("r1", 2), ("r2", 1)]

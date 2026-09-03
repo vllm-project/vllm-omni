@@ -28,7 +28,13 @@ from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    AsyncModelRunnerOutput,
+    LogprobsTensors,
+    RoutedExpertsTensors,
+    make_empty_encoder_model_runner_output,
+)
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -45,6 +51,7 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
+from vllm_omni.distributed.ray_utils.utils import calculate_total_bytes, maybe_disable_pin_memory_for_ray
 from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import (
@@ -163,23 +170,22 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         self,
         *,
         model_runner_output_builder: Callable[[], OmniModelRunnerOutput],
+        sampled_token_ids: torch.Tensor,
+        logprobs_tensors: LogprobsTensors | None,
+        invalid_req_indices: list[int],
+        async_output_copy_stream: torch.cuda.Stream,
+        vocab_size: int,
         cuda_device: torch.device | int | str | None = None,
-        **kwargs: Any,
+        routed_experts: RoutedExpertsTensors | None = None,
+        check_ep_fault: bool = False,
+        num_nans: torch.Tensor | None = None,
     ) -> None:
-        sampled_token_ids = kwargs.pop("sampled_token_ids")
-        logprobs_tensors = kwargs.pop("logprobs_tensors")
-        invalid_req_indices = kwargs.pop("invalid_req_indices")
-        async_output_copy_stream = kwargs.pop("async_output_copy_stream")
-        vocab_size = kwargs.pop("vocab_size")
-        routed_experts = kwargs.pop("routed_experts", None)
-        num_nans = kwargs.pop("num_nans", None)
-        # Upstream AsyncGPUModelRunnerOutput added check_ep_fault / _has_fault
-        # for EP all2all fault tolerance (PR #43637). Omni doesn't use this
-        # feature but must consume the kwarg to prevent TypeError from stray
-        # kwargs and initialize the attribute so super().get_output() works.
-        kwargs.pop("check_ep_fault", False)
-        if kwargs:
-            raise TypeError(f"Unexpected OmniAsyncGPUModelRunnerOutput kwargs: {sorted(kwargs)}")
+        # Mirrors upstream AsyncGPUModelRunnerOutput.__init__ minus
+        # model_runner_output (built asynchronously here) plus the builder and
+        # device. ``check_ep_fault`` (EP all2all fault tolerance, upstream
+        # PR #43637) is accepted for signature parity; Omni does not use it
+        # but initializes ``_has_fault`` so super().get_output() works.
+        del check_ep_fault
 
         self._model_runner_output = None
         self._invalid_req_indices = invalid_req_indices
@@ -353,17 +359,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         self._downstream_payload_cache: dict[str, bool] = {}
         self._init_duplex_sampling_state()
 
-    def load_model(self, *args, **kwargs) -> None:
-        super().load_model(*args, **kwargs)
+    def load_model(self, load_dummy_weights: bool = False) -> None:
+        super().load_model(load_dummy_weights=load_dummy_weights)
         self._resolve_duplex_sampling_hook(force=True)
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
-        from vllm_omni.distributed.ray_utils.utils import (
-            calculate_total_bytes,
-            maybe_disable_pin_memory_for_ray,
-        )
-
         total_bytes = calculate_total_bytes(size, dtype)
 
         # Use the context manager to temporarily disable pinning if needed
@@ -522,6 +523,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # 5. Release all CUDA graphs unconditionally (upstream only does this
         #    on ROCm; on CUDA the graphs are only freed by Python GC during
         #    interpreter shutdown, which is too late to prevent memory spikes).
+        # lazy: teardown-only; keeps the vllm.compilation wrappers off the runner's import path
         from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
         from vllm.compilation.cuda_graph import CUDAGraphWrapper
 

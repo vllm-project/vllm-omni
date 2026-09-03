@@ -20,6 +20,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.tracing import instrument
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv
+from vllm.v1.outputs import RoutedExpertsLists
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -34,6 +35,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
+from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -41,7 +43,6 @@ from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
-    from vllm.v1.outputs import RoutedExpertsLists
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
     xgr_torch_compile = LazyLoader(
@@ -130,8 +131,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         Returns RoutedExpertsLists (batch-level, with slot_mapping) so that
         downstream schedulers can use slot_mapping to map back to requests.
         """
-        from vllm.v1.outputs import RoutedExpertsLists
-
         if not self.routed_experts_initialized:
             return None
         total = scheduler_output.total_num_scheduled_tokens
@@ -166,8 +165,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             )
 
     @instrument(span_name="Loading (GPU)")
-    def load_model(self, *args, **kwargs) -> None:
-        super().load_model(*args, **kwargs)
+    def load_model(self, load_dummy_weights: bool = False) -> None:
+        super().load_model(load_dummy_weights=load_dummy_weights)
         model = getattr(self, "model", None)
         override_fn = None
         if bool(getattr(model, "supports_sampled_token_ids_cpu_override", False)):
@@ -218,6 +217,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         capture_sizes = getattr(self.compilation_config, "cudagraph_capture_sizes", None)
         if not capture_sizes:
             return
+        # lazy: pulls in the fish attention backend; only needed once a fish model is loaded
         from vllm_omni.attention.fish_kvcache_backend import prewarm_fish_kvcache_attn_capture_workspaces
 
         prewarm_fish_kvcache_attn_capture_workspaces(
@@ -238,6 +238,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         for_cudagraph_capture: bool = False,
         num_scheduled_tokens_np: np.ndarray | None = None,
     ) -> None:
+        # lazy: pulls in the fish attention backend; only needed once a fish model is loaded
         from vllm_omni.attention.fish_kvcache_backend import maybe_attach_fish_kvcache_seq_lens_upper_bound
 
         maybe_attach_fish_kvcache_seq_lens_upper_bound(
@@ -343,7 +344,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             if use_audio_in_video_value is not None:
                 use_audio_in_video = bool(use_audio_in_video_value.item())
 
-        if supports_mrope(self.get_model()):
+        model = self.get_model()
+        if supports_mrope(model):
             # Model implements SupportsMRoPE interface
             # Pass all extracted metadata; models use what they need via **kwargs
             sp_extra_args = getattr(req_state.sampling_params, "extra_args", {}) if req_state.sampling_params else {}
@@ -362,9 +364,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                 kwargs["target_h"] = target_h
             if target_w is not None:
                 kwargs["target_w"] = target_w
-            req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
+            req_state.mrope_positions, req_state.mrope_position_delta = model.get_mrope_input_positions(
                 req_state.prompt_token_ids,
-                **_filter_mrope_kwargs_for_model(self.model, kwargs),
+                **_filter_mrope_kwargs_for_model(model, kwargs),
             )
         else:
             req_state.mrope_positions, req_state.mrope_position_delta = MRotaryEmbedding.get_input_positions_tensor(
@@ -834,7 +836,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             return None
 
     @torch.inference_mode()
-    def extract_multimodal_outputs(self, hidden_states: torch.Tensor | list[torch.Tensor] | OmniOutput) -> dict:
+    def extract_multimodal_outputs(
+        self, hidden_states: torch.Tensor | list[torch.Tensor] | OmniOutput
+    ) -> tuple[torch.Tensor, OmniPayload | dict | None]:
         if (
             hasattr(self.model, "have_multimodal_outputs")
             and self.model.have_multimodal_outputs
@@ -1403,7 +1407,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         combined_multimodal_outputs: dict[str, object] | None = None,
         req_ids_filter: set[str] | None = None,
         req_ids: list[str] | None = None,
-        query_start_loc_cpu: object | None = None,
+        query_start_loc_cpu: torch.Tensor | None = None,
     ) -> None:
         """Process model-provided per-request updates and merge into model_intermediate_buffer."""
         req_ids = req_ids if req_ids is not None else self.input_batch.req_ids
@@ -1412,10 +1416,11 @@ class OmniGPUModelRunner(GPUModelRunner):
         try:
             # execute the custom postprocess function
             # TODO(Peiqi): do we have a more elegant way to do this?
-            if hasattr(self.model, "has_postprocess") and self.model.has_postprocess:
-                postprocess_uses_hidden_states = getattr(self.model, "postprocess_uses_hidden_states", True)
-                postprocess_uses_multimodal_outputs = getattr(self.model, "postprocess_uses_multimodal_outputs", True)
-                postprocess_uses_req_infos = getattr(self.model, "postprocess_uses_req_infos", True)
+            model = self.get_model()
+            if getattr(model, "has_postprocess", False):
+                postprocess_uses_hidden_states = getattr(model, "postprocess_uses_hidden_states", True)
+                postprocess_uses_multimodal_outputs = getattr(model, "postprocess_uses_multimodal_outputs", True)
+                postprocess_uses_req_infos = getattr(model, "postprocess_uses_req_infos", True)
                 for req_index, req_id in enumerate(req_ids):
                     if req_ids_filter is not None and req_id not in req_ids_filter:
                         continue
@@ -1448,7 +1453,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     # TODO: pass req_infos as a single payload arg instead of **unpacking
                     # to avoid key collisions with positional args.
                     postprocess_kwargs = {k: v for k, v in req_infos.items() if k != "hidden_states"}
-                    update_dict = self.model.postprocess(
+                    update_dict = model.postprocess(
                         hidden_states_slice,
                         multimodal_outputs=mm_out,
                         **postprocess_kwargs,
@@ -1460,9 +1465,8 @@ class OmniGPUModelRunner(GPUModelRunner):
     def _collect_additional_information_for_prefill(
         self,
         num_scheduled_tokens_np: np.ndarray,
-    ) -> dict[str, dict]:
-        """Overlay per-request prompt_embeds for the prefill portion and collect
-        additional_information slices for this step. Returns a map req_id -> dict."""
+    ) -> None:
+        """Overlay each request's prompt_embeds onto its prefill rows for this step, in place."""
         for req_index, req_id in enumerate(self.input_batch.req_ids):
             req_state = self.requests[req_id]
             pe_cpu = getattr(req_state, "prompt_embeds_cpu", None)
@@ -1547,7 +1551,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         num_input_tokens: int,
         intermediate_tensors: IntermediateTensors | None = None,
     ):
-        """Align with v0.14.0 preprocess and omni's additional information handling.
+        """Omni override of upstream ``_preprocess``: model preprocess hook + additional-information handling.
 
         Note:
             Upstream vLLM (commit c621af169) added a conditional in the
