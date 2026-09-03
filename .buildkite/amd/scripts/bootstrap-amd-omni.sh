@@ -37,34 +37,14 @@ if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]]; then
     if ! PR_LABELS=$(curl -fsSL \
         "https://api.github.com/repos/vllm-project/vllm-omni/pulls/$BUILDKITE_PULL_REQUEST" \
         | jq -r '.labels[].name'); then
-        echo "WARNING: Could not read PR labels; preserving the legacy AMD ready-suite fallback." >&2
-        PR_LABELS=""
+        echo "ERROR: Could not read PR labels; refusing to select an incorrect AMD test tier." >&2
+        exit 1
     fi
 fi
 
-has_pr_label() {
-    grep -Fqx -- "$1" <<< "$PR_LABELS"
-}
-
 fail_fast() {
     if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]]; then
-        if has_pr_label "ci-no-fail-fast"; then
-            echo false
-        else
-            echo true
-        fi
-    else
-        echo false  # not a PR or BUILDKITE_PULL_REQUEST not set
-    fi
-}
-
-check_run_all_label() {
-    if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]]; then
-        if has_pr_label "ready-run-all-tests"; then
-            echo true
-        else
-            echo false
-        fi
+        echo true
     else
         echo false  # not a PR or BUILDKITE_PULL_REQUEST not set
     fi
@@ -290,14 +270,6 @@ for file in $file_diff; do
         fi
     fi
 done
-
-# Check for ready-run-all-tests label
-LABEL_RUN_ALL=$(check_run_all_label)
-if [[ $LABEL_RUN_ALL == true ]]; then
-    RUN_ALL=1
-    NIGHTLY=1
-    echo "Found 'ready-run-all-tests' label. Running all tests including optional tests."
-fi
 
 # Decide whether to use precompiled wheels
 # Relies on existing patterns array as a basis.
