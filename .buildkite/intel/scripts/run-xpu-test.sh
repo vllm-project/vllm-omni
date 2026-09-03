@@ -5,7 +5,12 @@ set -ex
 
 omni_source_dir=$(git rev-parse --show-toplevel)
 
-base_image_name="xpu/vllm-omni-ci-base:${VLLM_VERSION:?VLLM_VERSION must be set}"
+: "${VLLM_VERSION:?VLLM_VERSION must be set}"
+# Official upstream XPU image. It is published from vllm's own
+# docker/Dockerfile.xpu, which is exactly what build_vllm_base() clones and
+# builds below, so pulling it is equivalent to building the fallback base.
+upstream_base_image="vllm/vllm-openai-xpu:${VLLM_VERSION}"
+local_base_image="xpu/vllm-omni-ci-base:${VLLM_VERSION}"
 image_name="xpu/vllm-omni-ci:${BUILDKITE_COMMIT:?BUILDKITE_COMMIT must be set}"
 container_name="xpu_${BUILDKITE_COMMIT}_$(
     tr -dc A-Za-z0-9 </dev/urandom | head -c 10
@@ -34,9 +39,51 @@ docker_build() {
     docker build "${out[@]}" "$@" -f docker/Dockerfile.xpu .
 }
 
-if [ -z "$(docker images -q "${base_image_name}")" ]; then
-    docker_build "${base_image_name}" --target vllm-base --build-arg "VLLM_VERSION=${VLLM_VERSION}"
-fi
+build_vllm_base() (
+    local vllm_source_dir
+    vllm_source_dir=$(mktemp -d)
+    trap 'rm -rf "${vllm_source_dir}"' EXIT
+
+    git clone --depth 1 --branch "${VLLM_VERSION}" \
+        https://github.com/vllm-project/vllm "${vllm_source_dir}"
+
+    local out=("${export_args[@]/'{{IMAGE}}'/${base_image_name}}")
+    docker build "${out[@]}" \
+        --target vllm-openai \
+        -f "${vllm_source_dir}/docker/Dockerfile.xpu" \
+        "${vllm_source_dir}"
+)
+
+# Resolve the vLLM base image, in priority order:
+#   1. the published upstream image for VLLM_VERSION, pulled fresh (so moving
+#      tags like nightly are refreshed rather than served stale from disk);
+#   2. a local copy of that same image, when the registry is unreachable;
+#   3. VLLM_BASE, if that image is already on disk;
+#   4. otherwise build VLLM_BASE from the matching vLLM source tag (~30min).
+# VLLM_BASE names the fallback base and defaults to ${local_base_image}; set it
+# to reuse or produce a base under a different tag.
+resolve_vllm_base() {
+    if docker pull "${upstream_base_image}"; then
+        base_image_name="${upstream_base_image}"
+        return
+    fi
+
+    # Registry unreachable, but a previous run may have left the image behind.
+    if [ -n "$(docker images -q "${upstream_base_image}")" ]; then
+        echo "WARNING: could not pull ${upstream_base_image}; using local copy" >&2
+        base_image_name="${upstream_base_image}"
+        return
+    fi
+
+    echo "WARNING: ${upstream_base_image} unavailable remotely and locally" >&2
+    base_image_name="${VLLM_BASE:-${local_base_image}}"
+    if [ -z "$(docker images -q "${base_image_name}")" ]; then
+        echo "WARNING: building ${base_image_name} from vLLM ${VLLM_VERSION} source" >&2
+        build_vllm_base
+    fi
+}
+
+resolve_vllm_base
 
 # Try building the docker image
 docker_build "${image_name}" --build-arg "VLLM_BASE=${base_image_name}" --build-arg "VLLM_VERSION=${VLLM_VERSION}"
@@ -72,8 +119,9 @@ time timeout -k 30 30m docker run \
     echo $ZE_AFFINITY_MASK
     pip install tblib==3.1.0
     cd /workspace/vllm-omni
-    pytest -v -s -m "core_model and xpu and B60"
+    XPU_TEST_PATHS="tests/diffusion tests/dfx tests/e2e"
+    pytest -v -s $XPU_TEST_PATHS -m "core_model and xpu and B60"
     pytest -v -s tests/diffusion/quantization/test_mxfp8_config.py
-    pytest -v -s -m "advanced_model and xpu and B60"
-    pytest -v -s -m "omni and xpu and B60"
+    pytest -v -s $XPU_TEST_PATHS -m "advanced_model and xpu and B60"
+    pytest -v -s $XPU_TEST_PATHS -m "omni and xpu and B60"
 '

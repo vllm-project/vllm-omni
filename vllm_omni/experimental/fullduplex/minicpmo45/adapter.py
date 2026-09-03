@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import base64
@@ -11,6 +14,7 @@ from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45Duplex
 from vllm_omni.experimental.fullduplex.openai.protocol import DuplexSessionConfig
 from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
     ServingRuntimeConfigError,
+    reject_changed_runtime_value,
 )
 
 
@@ -37,6 +41,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
             "ref_audio_data",
             "ref_audio_format",
             "ref_audio_sample_rate_hz",
+            "initial_user_text",
         }
     )
 
@@ -65,7 +70,13 @@ class MiniCPMO45NativeDuplexServingAdapter:
         current: object,
     ) -> dict[str, object]:
         runtime_config = deepcopy(dict(current)) if isinstance(current, dict) else {}
-        runtime_config["instructions"] = config.instructions
+        reject_changed_runtime_value(
+            config.instructions,
+            runtime_config.get("instructions"),
+            message="instructions cannot be changed after the session is created",
+            code="instructions_update_unsupported",
+            error_cls=MiniCPMO45ClientRuntimeConfigError,
+        )
         stage_max_tokens = runtime_config.get("duplex_stage_max_tokens")
         stage_max_tokens = deepcopy(stage_max_tokens) if isinstance(stage_max_tokens, dict) else {}
         stage_max_tokens["0"] = (
@@ -90,13 +101,20 @@ class MiniCPMO45NativeDuplexServingAdapter:
             raise ValueError("ref_audio_path is not accepted by native duplex; use ref_audio URI instead")
         cls.validate_client_config(config)
         runtime_config: dict[str, object] = {"instructions": config.instructions}
+        initial_user_text = extra_body.pop("duplex_initial_user_text", None)
+        if isinstance(initial_user_text, str) and initial_user_text:
+            runtime_config["initial_user_text"] = initial_user_text
         cls._apply_default_scheduler_policy(runtime_config, config=config, model_config=model_config)
 
         ref_audio = config.ref_audio
-        if ref_audio is None and isinstance(extra_body.get("ref_audio"), str):
-            ref_audio = extra_body.pop("ref_audio")
-        if ref_audio is None and isinstance(extra_body.get("tts_ref_audio"), str):
-            ref_audio = extra_body.pop("tts_ref_audio")
+        extra_ref_audio = extra_body.get("ref_audio")
+        if ref_audio is None and isinstance(extra_ref_audio, str):
+            extra_body.pop("ref_audio")
+            ref_audio = extra_ref_audio
+        extra_tts_ref_audio = extra_body.get("tts_ref_audio")
+        if ref_audio is None and isinstance(extra_tts_ref_audio, str):
+            extra_body.pop("tts_ref_audio")
+            ref_audio = extra_tts_ref_audio
 
         if ref_audio is None:
             if any(str(modality).lower() == "audio" for modality in config.modalities):
@@ -108,6 +126,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
                 runtime_config,
                 model_config=model_config,
                 instructions=config.instructions,
+                initial_user_text=initial_user_text,
                 ref_sample_count=None,
             )
             config.extra_body = extra_body
@@ -130,6 +149,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
             runtime_config,
             model_config=model_config,
             instructions=config.instructions,
+            initial_user_text=initial_user_text,
             ref_sample_count=len(wav_np),
         )
         config.extra_body = extra_body
@@ -155,7 +175,11 @@ class MiniCPMO45NativeDuplexServingAdapter:
         stop_token_ids = cls._native_stage0_stop_token_ids(model_config)
         if stop_token_ids:
             stage0_params["stop_token_ids"] = stop_token_ids
-        runtime_config["duplex_stage_sampling_params"] = {"0": stage0_params}
+        # Stage 1 keeps the deploy YAML's codec knobs, minus upstream's
+        # min_new_token=50: that floor is for whole-utterance chat TTS, while a
+        # duplex chunk is 26 codec samples, so check_stop would never release
+        # the Talker and Thinker would stall on the next model turn.
+        runtime_config["duplex_stage_sampling_params"] = {"0": stage0_params, "1": {"min_tokens": 0}}
         scheduler_token_id = cls._native_scheduler_token_id(model_config)
         if scheduler_token_id is not None:
             runtime_config["duplex_scheduler_token_id"] = scheduler_token_id
@@ -167,6 +191,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
         *,
         model_config: Any,
         instructions: object,
+        initial_user_text: object,
         ref_sample_count: int | None,
     ) -> None:
         """Precompute the exact session-context token count for the engine.
@@ -186,6 +211,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
         prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
             instructions,
             ref_sample_count is not None,
+            initial_user_text,
         )
         try:
             prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
@@ -228,6 +254,8 @@ class MiniCPMO45NativeDuplexServingAdapter:
             if token_id is not None:
                 return token_id
         eos_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_id is None:
+            return None
         try:
             return int(eos_id)
         except (TypeError, ValueError):
@@ -257,10 +285,13 @@ class MiniCPMO45NativeDuplexServingAdapter:
             value = convert(token)
             if isinstance(value, list):
                 value = value[0] if len(value) == 1 else None
-        try:
-            token_id = int(value)
-        except (TypeError, ValueError):
+        if value is None:
             token_id = -1
+        else:
+            try:
+                token_id = int(value)
+            except (TypeError, ValueError):
+                token_id = -1
         unk_token_id = getattr(tokenizer, "unk_token_id", None)
         if token_id >= 0 and token_id != unk_token_id:
             return token_id

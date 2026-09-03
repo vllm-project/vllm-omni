@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """DiT tensor-parallel parity and perf checks for diffusion models.
 
@@ -9,6 +9,7 @@ Uses ``Tongyi-MAI/Z-Image-Turbo`` as the parity model.
 
 from __future__ import annotations
 
+import gc
 import os
 import time
 from pathlib import Path
@@ -18,8 +19,8 @@ import pytest
 import torch
 from PIL import Image
 
-from tests.helpers.env import DeviceMemoryMonitor
 from tests.helpers.mark import hardware_test
+from tests.helpers.monitor import DeviceMemoryMonitor
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -49,10 +50,10 @@ def _diff_metrics(a: Image.Image, b: Image.Image) -> tuple[float, float]:
 def _extract_single_image(outputs) -> Image.Image:
     first_output = outputs[0]
     assert first_output.final_output_type == "image"
-    if not hasattr(first_output, "request_output") or not first_output.request_output:
+    if not isinstance(first_output, OmniRequestOutput) or not first_output:
         raise ValueError("No request_output found in OmniRequestOutput")
 
-    req_out = first_output.request_output
+    req_out = first_output
     if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
         raise ValueError("Invalid request_output structure or missing 'images' key")
 
@@ -75,8 +76,13 @@ def _run_generate(
     if num_requests < 2:
         raise ValueError("num_requests must be >= 2 (1 warmup + >=1 timed)")
 
+    gc.collect()
     current_omni_platform.empty_cache()
     device_index = current_omni_platform.current_device()
+    with current_omni_platform.device(device_index):
+        free_bytes, total_bytes = current_omni_platform.mem_get_info()
+    initial_used_mb = (total_bytes - free_bytes) / (1024**2)
+
     monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
     monitor.start()
     try:
@@ -113,7 +119,10 @@ def _run_generate(
                 pass
 
             median_time_s = float(np.median(per_request_times_s))
-            peak_memory_mb = monitor.peak_used_mb
+            # DeviceMemoryMonitor samples absolute device usage. Normalize by
+            # this run's starting usage so compiler and allocator caches retained
+            # by the preceding TP=1 run are not charged to the TP=2 run.
+            peak_memory_mb = max(0.0, monitor.peak_used_mb - initial_used_mb)
             return _extract_single_image([last_output]), median_time_s, peak_memory_mb
     finally:
         monitor.stop()

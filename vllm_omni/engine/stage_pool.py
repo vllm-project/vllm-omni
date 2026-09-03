@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unified stage-local runtime abstraction for vLLM-Omni."""
 
 from __future__ import annotations
@@ -44,6 +47,19 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class StageUnavailableError(RuntimeError):
+    """Raised when dispatch cannot reach a live replica of a stage.
+
+    Deliberately a ``RuntimeError`` subclass (not ``EngineDeadError``): no
+    engine died at the raise site — the stage's replica set is empty or the
+    chosen slot was evicted, which is a routing/capacity condition and, in
+    distributed mode, recoverable. Dispatch guards catch exactly this type so
+    unrelated ``RuntimeError``s keep failing fast, and existing
+    ``EngineDeadError`` handlers (teardown-on-dead, poll-path eviction) are
+    not silently enrolled.
+    """
+
+
 @dataclass
 class _ReplicaMetrics:
     """Per-replica metrics accumulators owned by a stage pool."""
@@ -81,6 +97,16 @@ class StagePool:
 
     DISPATCH_WAIT_TIMEOUT_S: float = 10.0
     DISPATCH_RETRY_INTERVAL_S: float = 0.1
+    # Only these EngineCore helpers may skip collective_rpc_async. A generic
+    # ``{method}_async`` on AsyncMPClient must not silently drop timeout.
+    _ENGINE_CORE_CONTROL_ASYNC_METHODS = frozenset(
+        {
+            "pause_scheduler",
+            "resume_scheduler",
+            "sleep",
+            "wake_up",
+        }
+    )
 
     def __init__(
         self,
@@ -329,7 +355,9 @@ class StagePool:
 
             now = _time.monotonic()
             if now >= deadline:
-                raise RuntimeError(f"no UP replica for stage {self.stage_id} after {self.DISPATCH_WAIT_TIMEOUT_S:.1f}s")
+                raise StageUnavailableError(
+                    f"no UP replica for stage {self.stage_id} after {self.DISPATCH_WAIT_TIMEOUT_S:.1f}s"
+                )
             await asyncio.sleep(min(self.DISPATCH_RETRY_INTERVAL_S, deadline - now))
 
     def preselect_replica_id(
@@ -555,7 +583,7 @@ class StagePool:
             # Prefer replicas that are both live (client up) and available.
             live = [r for r in self.live_replica_ids() if self.is_replica_available(r)]
             if not live:
-                raise RuntimeError(f"stage {self.stage_id} has no live replicas")
+                raise StageUnavailableError(f"stage {self.stage_id} has no live replicas")
             if len(live) == 1:
                 chosen = live[0]
             else:
@@ -570,13 +598,13 @@ class StagePool:
     def _llm_client(self, replica_id: int) -> StagePoolLLMClient:
         client = self.clients[replica_id]
         if client is None:
-            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
         return cast(StagePoolLLMClient, client)
 
     def _diffusion_client(self, replica_id: int) -> StagePoolDiffusionClient:
         client = self.clients[replica_id]
         if client is None:
-            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
         return cast(StagePoolDiffusionClient, client)
 
     # ---- Metrics ----
@@ -605,6 +633,15 @@ class StagePool:
             if callable(pop_native_text_metrics):
                 native_text_metrics = pop_native_text_metrics(request_id)
         native_generation_tokens = native_text_metrics.get("num_generation_tokens")
+        finish_reason = next(
+            (
+                str(reason)
+                for request_output in reversed(request_outputs)
+                for completion in reversed(getattr(request_output, "outputs", []) or [])
+                if (reason := getattr(completion, "finish_reason", None)) is not None
+            ),
+            None,
+        )
         num_tokens_out = (
             max(int(native_generation_tokens), 0)
             if isinstance(native_generation_tokens, int) and not isinstance(native_generation_tokens, bool)
@@ -628,16 +665,16 @@ class StagePool:
         )
         image_pixels = self._count_image_pixels(request_outputs) if output_unit_type == "image" else 0
         num_inference_steps = coerce_positive_int_scalar(getattr(sampling_params, "num_inference_steps", None)) or 0
-        denoise_step_latency_ms = (
-            defs.compute_denoise_step_latency(stage_gen_time_ms, num_inference_steps)
-            if output_unit_type == "image"
-            else 0.0
-        )
         has_output_timestamps = bool(output_timestamps)
         first_ts = output_timestamps[0] if has_output_timestamps else now
         serving_time_to_first_output_ms = (
             max((non_empty_first_output_ts - request_timestamp) * 1000.0, 0.0)
             if non_empty_first_output_ts is not None
+            else 0.0
+        )
+        image_time_to_first_output_ms = (
+            max((non_empty_first_output_ts - submit_ts) * 1000.0, 0.0)
+            if non_empty_first_output_ts is not None and output_unit_type == "image"
             else 0.0
         )
         remaining_ms = max((now - first_ts) * 1000.0, 0.0)
@@ -673,6 +710,7 @@ class StagePool:
             # happens inside the model runner and is not observable here.
             batch_size=1,
             replica_id=replica_id,
+            finish_reason=finish_reason,
             rx_decode_time_ms=0.0,
             rx_transfer_bytes=0,
             rx_in_flight_time_ms=0.0,
@@ -684,10 +722,11 @@ class StagePool:
             audio_sample_rate=audio_sample_rate,
             audio_duration_s=audio_duration_s,
             image_pixels=image_pixels,
-            denoise_step_latency_ms=denoise_step_latency_ms,
+            num_inference_steps=num_inference_steps,
             output_unit_type=output_unit_type,
             output_unit_count=output_unit_count,
             serving_time_to_first_output_ms=serving_time_to_first_output_ms,
+            image_time_to_first_output_ms=image_time_to_first_output_ms,
             time_per_output_unit_ms=time_per_output_unit_ms,
             inter_output_latency_ms=inter_output_latency_ms,
             inter_output_latencies_ms=inter_output_latencies_ms,
@@ -961,7 +1000,7 @@ class StagePool:
         )
         client = self.clients[replica_id]
         if client is None:
-            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
         try:
             self.output_processor.add_request(
                 request=request,
@@ -1010,7 +1049,7 @@ class StagePool:
 
         client = self.clients[replica_id]
         if client is None:
-            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
+            raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
 
         if self.stage_type == "diffusion":
             if isinstance(request, list):
@@ -1160,14 +1199,19 @@ class StagePool:
 
     # ---- Stage-local control plane ----
 
-    async def abort_requests(self, request_ids: list[str]) -> None:
+    async def abort_requests(self, request_ids: list[str]) -> list[tuple[str, Any]]:
         """Abort the given requests in this stage pool.
 
         Request-bound abort routing stays inside the pool because route affinity
         (``request_id -> replica_id``) is pool-owned.
+
+        For AR stages, collect terminal abort ``RequestOutput`` objects from
+        output-processor state *before* EngineCore abort so partial tokens
+        generated so far are preserved. Diffusion stages return no abort
+        outputs (whole-sample retry remains the recovery path).
         """
         if not request_ids:
-            return
+            return []
 
         request_ids_by_replica: dict[int, list[str]] = {}
         for request_id in request_ids:
@@ -1177,18 +1221,45 @@ class StagePool:
                 continue
             request_ids_by_replica.setdefault(replica_id, []).append(request_id)
 
+        abort_outputs: list[tuple[str, Any]] = []
+        is_diffusion = self.stage_type == "diffusion"
         for replica_id, replica_request_ids in request_ids_by_replica.items():
+            # Orchestrator ids are OP external ids; EngineCore may use a
+            # different internal request_id assigned by InputProcessor.
+            # Always key collected outputs by the orchestrator id we passed
+            # (internal=False), never by RequestOutput.request_id — some stages
+            # still surface EngineCore/internal ids and would drop the prefix.
+            engine_abort_ids = list(replica_request_ids)
+            if not is_diffusion and self._output_processor is not None:
+                collect = getattr(self._output_processor, "abort_requests_collecting_outputs", None)
+                if collect is not None:
+                    engine_abort_ids = []
+                    for orch_req_id in replica_request_ids:
+                        collected_ids, stage_outputs = collect(
+                            [orch_req_id],
+                            internal=False,
+                            commit_state=False,
+                        )
+                        for req_out in stage_outputs:
+                            abort_outputs.append((orch_req_id, req_out))
+                        if collected_ids:
+                            engine_abort_ids.extend(collected_ids)
+                        else:
+                            engine_abort_ids.append(orch_req_id)
+                else:
+                    aborted = self._output_processor.abort_requests(replica_request_ids, internal=False)
+                    if aborted:
+                        engine_abort_ids = list(aborted)
             client = self.clients[replica_id]
             if client is None:
                 continue
-            await client.abort_requests_async(replica_request_ids)
+            await client.abort_requests_async(engine_abort_ids)
+            if not is_diffusion and self._output_processor is not None:
+                commit = getattr(self._output_processor, "commit_aborted_request_state", None)
+                if callable(commit):
+                    commit(replica_request_ids, internal=False)
 
-        # Clean up OutputProcessor state (e.g. mm_accumulated tensors) that
-        # would otherwise leak — aborted requests never produce a final
-        # EngineCoreOutput, so process_outputs() never fires its cleanup path.
-        all_aborted = [rid for ids in request_ids_by_replica.values() for rid in ids]
-        if all_aborted and self._output_processor is not None:
-            self._output_processor.abort_requests(all_aborted, internal=True)
+        return abort_outputs
 
     async def collective_rpc(
         self,
@@ -1198,7 +1269,13 @@ class StagePool:
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any] | Any:
-        """Dispatch a stage-scoped control-plane RPC to one physical route."""
+        """Dispatch a stage-scoped control-plane RPC to one physical route.
+
+        EngineCore control methods (``pause_scheduler``, ``resume_scheduler``,
+        ``sleep``, ``wake_up``) propagate worker exceptions. Capability probes
+        and other RPCs still return ``{"supported": False, "error": ...}``.
+        """
+        args = tuple(args or ())
         kwargs = dict(kwargs or {})
         client = self.clients[replica_id]
         if client is None:
@@ -1207,6 +1284,14 @@ class StagePool:
                 "error": f"stage {self.stage_id} replica {replica_id} is not attached",
             }
         try:
+            if self.stage_type != "diffusion" and method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS:
+                client_method = getattr(client, f"{method}_async", None)
+                if callable(client_method):
+                    result = client_method(*args, **kwargs)
+                    if timeout is not None:
+                        return await asyncio.wait_for(result, timeout=timeout)
+                    return await result
+
             return await client.collective_rpc_async(
                 method=method,
                 timeout=timeout,
@@ -1220,9 +1305,15 @@ class StagePool:
                 replica_id,
                 method,
             )
+            if method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS:
+                raise
+            if isinstance(exc, TimeoutError):
+                error = f"{type(exc).__name__}: {method} timed out after {timeout}s"
+            else:
+                error = str(exc) or repr(exc)
             return {
                 "supported": False,
-                "error": str(exc),
+                "error": error,
             }
 
     def shutdown_replica(self, replica_id: int) -> None:
@@ -1246,3 +1337,21 @@ class StagePool:
                 replica_id,
                 e,
             )
+
+    def evict_replica(self, replica_id: int) -> None:
+        """Shut down a replica and remove it from the live set.
+
+        After eviction ``live_replica_ids`` / ``live_num_replicas`` no longer
+        include this slot, so the orchestrator stops polling and dispatching to
+        it (per-replica fault isolation). The slot is left as a ``None`` hole,
+        consistent with ``num_replicas``.
+        """
+        # replica_id should always come from live_replica_ids() (a valid, live
+        # index). Fail loud on an out-of-range id rather than letting a negative
+        # index wrap or IndexError on the next line; an ``assert`` would be
+        # stripped under ``python -O``, silently leaving a dead replica in the
+        # live set and breaking isolation.
+        if not 0 <= replica_id < len(self.clients):
+            raise ValueError(f"evict_replica: replica_id {replica_id} out of range (num_replicas={len(self.clients)})")
+        self.shutdown_replica(replica_id)
+        self.clients[replica_id] = None

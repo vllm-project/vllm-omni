@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Structured vLLM-Omni configuration classes.
 
 This module is additive for Phase 2 of RFC #4021.
@@ -12,12 +12,22 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import InitVar, dataclass, field, fields
+from functools import wraps
+from inspect import Parameter, signature
 from pathlib import Path
 from typing import Any, Literal, TypeAlias, TypedDict, cast
 
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, model_validator
+from typing_extensions import Self
+from vllm.config import CacheConfig as VllmCacheConfig
+from vllm.config import CompilationConfig as VllmCompilationConfig
+from vllm.config import LoadConfig as VllmLoadConfig
+from vllm.config import ParallelConfig as VllmParallelConfig
+from vllm.config import ProfilerConfig as VllmProfilerConfig
+from vllm.config import SchedulerConfig as VllmSchedulerConfig
 from vllm.config.utils import config
+from vllm.engine.arg_utils import EngineArgs as VllmEngineArgs
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.config.stage_config import (
@@ -36,6 +46,8 @@ from vllm_omni.config.stage_config import (
     _select_processor_funcs,
     build_stage_runtime_overrides,
     load_deploy_config,
+    normalize_pipeline_cli_overrides,
+    reconcile_diffusion_attention_overrides,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 
@@ -53,7 +65,6 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
         "model",
         "omni",
         "output_modalities",
-        "stage_configs_path",
         "stage_id",
         "tokenizer",
     }
@@ -78,6 +89,49 @@ class _QuantizationEngineOverrides(TypedDict, total=False):
     quantization: str
 
 
+class _TrackExplicitConfigFields:
+    """Record constructor inputs without adding a serialized config field."""
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _record_explicit_config_fields(cls, value: Any, handler: Any) -> Any:
+        result = handler(value)
+        kwargs = getattr(value, "kwargs", None)
+        if kwargs is not None:
+            explicit_fields = frozenset(kwargs)
+        elif isinstance(value, cls):
+            explicit_fields = getattr(value, "_omni_explicit_fields", frozenset())
+        else:
+            explicit_fields = frozenset()
+        object.__setattr__(result, "_omni_explicit_fields", explicit_fields)
+        return result
+
+
+def _enforce_keyword_only_init(cls: type[Any]) -> type[Any]:
+    """Make inherited Pydantic dataclass fields keyword-only as well."""
+    generated_init = cls.__init__
+    generated_signature = signature(cls)
+    keyword_only_signature = generated_signature.replace(
+        parameters=[
+            parameter.replace(kind=Parameter.KEYWORD_ONLY)
+            if parameter.kind in {Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD}
+            else parameter
+            for parameter in generated_signature.parameters.values()
+        ]
+    )
+
+    @wraps(generated_init)
+    def keyword_only_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        if args:
+            raise TypeError(f"{cls.__name__}() accepts keyword arguments only; got {len(args)} positional argument(s)")
+        generated_init(self, **kwargs)
+
+    cls.__init__ = keyword_only_init
+    cls.__signature__ = keyword_only_signature
+    setattr(cls, "__match_args__", ())
+    return cls
+
+
 class _ModelEngineOverrides(TypedDict, total=False):
     model: str
     model_arch: str
@@ -91,12 +145,16 @@ class _ModelEngineOverrides(TypedDict, total=False):
     trust_remote_code: bool
     dtype: Any
     attention_backend: Any
+    attention_config: Any
     moe_backend: str
     hf_overrides: Any
     limit_mm_per_prompt: dict[str, Any]
+    interleave_mm_strings: bool
+    media_io_kwargs: dict[str, Any]
     active_stream_window: int
     enable_sleep_mode: bool
     subtalker_sampling_params: dict[str, Any]
+    silence_ban_frames: int
     has_sampling_extra_args: bool
     custom_voice_dir: str
     task_type: str
@@ -104,7 +162,6 @@ class _ModelEngineOverrides(TypedDict, total=False):
     enforce_eager: bool
     max_cudagraph_capture_size: int
     enable_flashinfer_autotune: bool
-    compilation_config: dict[str, Any]
     enable_multithread_weight_load: bool
     num_weight_load_threads: int
     disable_autocast: bool
@@ -126,6 +183,7 @@ class _CacheEngineOverrides(TypedDict, total=False):
     enable_prefix_caching: bool
     disable_hybrid_kv_cache_manager: bool
     mm_processor_cache_gb: float
+    mamba_ssm_cache_dtype: str
 
 
 class _SchedulerEngineOverrides(TypedDict, total=False):
@@ -145,7 +203,6 @@ class _RuntimeEngineOverrides(TypedDict, total=False):
     num_gpus: int
     log_level: str
     log_stats: bool
-    profiler_config: dict[str, Any]
 
 
 class _ParallelConfigEngineOverrides(TypedDict, total=False):
@@ -157,6 +214,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     ring_degree: int
     allgather_degree: int
     ulysses_mode: str
+    ulysses_a2a_permute: bool
     cfg_parallel_size: int
     vae_patch_parallel_size: int
     vae_parallel_mode: str
@@ -189,6 +247,8 @@ class _StageEngineValues:
     runtime: _RuntimeEngineOverrides
     parallel: _ParallelEngineOverrides
     diffusion: _DiffusionEngineOverrides
+    compilation_config: Mapping[str, Any] | VllmCompilationConfig | None
+    profiler_config: Mapping[str, Any] | VllmProfilerConfig | None
 
 
 @dataclass(frozen=True)
@@ -319,14 +379,20 @@ class OmniStageModelConfig:
     trust_remote_code: bool = False
     dtype: Any = "auto"
     attention_backend: Any = None
+    attention_config: Any = None
     moe_backend: str = "auto"
     hf_overrides: Any = None
     limit_mm_per_prompt: dict[str, Any] | None = None
+    # MiniCPM interleaved AV packing and media decode knobs (Daily-Omni).
+    interleave_mm_strings: bool | None = None
+    media_io_kwargs: dict[str, Any] | None = None
     active_stream_window: int = Field(default=0, ge=0)
+    session_mode: str = "turn"
     duplex_max_sessions: int = Field(default=1, ge=1)
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
+    silence_ban_frames: int = 0
     has_sampling_extra_args: bool = False
     custom_voice_dir: str | None = None
     task_type: str | None = None
@@ -334,7 +400,6 @@ class OmniStageModelConfig:
     enforce_eager: bool = False
     max_cudagraph_capture_size: int | None = Field(default=None, ge=0)
     enable_flashinfer_autotune: bool | None = None
-    compilation_config: dict[str, Any] | None = None
     enable_multithread_weight_load: bool = True
     num_weight_load_threads: int = Field(default=4, ge=1)
     disable_autocast: bool = False
@@ -343,23 +408,24 @@ class OmniStageModelConfig:
     # StagePipelineConfig.model_subdir/tokenizer_subdir on the legacy path.
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
+    requires_full_payload_input: bool = False
 
 
-@config
-class OmniStageLoadConfig:
-    """Per-stage loading behavior and resolved tokenizer input."""
+@_enforce_keyword_only_init
+@config(kw_only=True)
+class OmniStageLoadConfig(_TrackExplicitConfigFields, VllmLoadConfig):
+    """vLLM loading behavior plus Omni stage-specific tokenizer inputs."""
 
     tokenizer: str | None = None
-    download_dir: str | None = None
     skip_tokenizer_init: bool = False
-    load_format: str = "auto"
     tokenizer_mode: str = "auto"
     config_format: str | None = None
     skip_mm_profiling: bool | None = None
 
 
-@config
-class OmniStageCacheConfig:
+@_enforce_keyword_only_init
+@config(kw_only=True)
+class OmniStageCacheConfig(_TrackExplicitConfigFields, VllmCacheConfig):
     """Per-stage engine cache and memory behavior.
 
     This is separate from ``_DiffusionConfigProjection.cache_config``, which configures
@@ -372,19 +438,30 @@ class OmniStageCacheConfig:
     enable_prefix_caching: bool | None = None
     disable_hybrid_kv_cache_manager: bool | None = None
     mm_processor_cache_gb: float | None = Field(default=None, ge=0.0)
+    # Hybrid-mamba SSM state dtype ("auto"/"float32"); vLLM CacheConfig field.
+    mamba_ssm_cache_dtype: str | None = None
 
 
-@config
-class OmniStageSchedulerConfig:
+@_enforce_keyword_only_init
+@config(kw_only=True)
+class OmniStageSchedulerConfig(_TrackExplicitConfigFields, VllmSchedulerConfig):
     """Per-stage request scheduling behavior."""
 
+    # Upstream receives max_model_len only while materializing SchedulerConfig.
+    # Omni retains it as unresolved stage input until the owning engine process.
     max_num_seqs: int | None = Field(default=None, ge=1)
     max_num_batched_tokens: int | None = Field(default=None, ge=1)
     max_model_len: int | None = Field(default=None, ge=-1)
+    is_encoder_decoder: InitVar[bool] = False  # type: ignore[assignment]
     enable_chunked_prefill: bool | None = None
     async_scheduling: bool | None = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, is_encoder_decoder: bool = False) -> None:
+        # Upstream initializes these derived fields in its terminal post-init.
+        # Keep them serializable here without running model-dependent checks.
+        self.max_num_encoder_input_tokens = self.max_num_batched_tokens
+        self.encoder_cache_size = self.max_num_batched_tokens
+
         if (
             self.max_num_batched_tokens is not None
             and self.max_num_seqs is not None
@@ -423,24 +500,73 @@ class OmniStageRuntimeConfig:
     num_gpus: int = Field(default=1, ge=1)
     log_level: str = "info"
     log_stats: bool = False
-    profiler_config: dict[str, Any] | None = None
 
 
-@config
-class OmniStageParallelConfig:
+@_enforce_keyword_only_init
+@config(kw_only=True)
+class OmniStageParallelConfig(_TrackExplicitConfigFields, VllmParallelConfig):
     """Common per-stage distributed parallelism behavior."""
 
-    pipeline_parallel_size: int = Field(default=1, ge=1)
-    data_parallel_size: int = Field(default=1, ge=1)
-    tensor_parallel_size: int = Field(default=1, ge=1)
-    enable_expert_parallel: bool = False
-    world_size: int = Field(default=1, ge=1, init=False)
+    # EngineArgs intentionally leaves these unresolved. The upstream terminal
+    # ParallelConfig defaults (rank 0, local size 1, port 29550, worker
+    # ``"auto"``) must not turn into explicit engine inputs in the head
+    # process merely because this transport class inherits ParallelConfig.
+    data_parallel_size_local: int | None = Field(default=None, ge=0)
+    data_parallel_rank: int | None = Field(default=None, ge=0)
+    data_parallel_rpc_port: int | None = None
+    worker_cls: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_parallel_config(self) -> Self:
+        """Run upstream validation without resolving deferred engine inputs."""
+        deferred_values = (
+            self.data_parallel_size_local,
+            self.data_parallel_rank,
+            self.data_parallel_rpc_port,
+            self.worker_cls,
+            getattr(self, "all2all_backend", None),
+            getattr(self, "disable_custom_all_reduce", None),
+        )
+        if self.data_parallel_size_local is not None and self.data_parallel_size_local > self.data_parallel_size:
+            raise ValueError(
+                f"data_parallel_size_local ({self.data_parallel_size_local}) "
+                f"must be <= data_parallel_size ({self.data_parallel_size})"
+            )
+        if self.data_parallel_rank is not None and not 0 <= self.data_parallel_rank < self.data_parallel_size:
+            raise ValueError(
+                f"data_parallel_rank ({self.data_parallel_rank}) must be in the range [0, {self.data_parallel_size})"
+            )
+        self.data_parallel_size_local = self.data_parallel_size
+        self.data_parallel_rank = 0
+        self.data_parallel_rpc_port = VllmParallelConfig.data_parallel_rpc_port
+        self.worker_cls = VllmParallelConfig.worker_cls
+        try:
+            VllmParallelConfig._validate_parallel_config(self)
+        finally:
+            (
+                self.data_parallel_size_local,
+                self.data_parallel_rank,
+                self.data_parallel_rpc_port,
+                self.worker_cls,
+                self.all2all_backend,
+                self.disable_custom_all_reduce,
+            ) = deferred_values
+        return self
 
     def __post_init__(self) -> None:
+        # Keep config construction transport-safe. Upstream runtime backend,
+        # rank, port, and platform resolution happens in the owning process.
+        self.data_parallel_index = self.data_parallel_rank
         self.world_size = self.pipeline_parallel_size * self.data_parallel_size * self.tensor_parallel_size
 
+    @property
+    def world_size_across_dp(self) -> int:
+        # Omni's public world_size has historically included DP.
+        return self.world_size
 
-@config
+
+@_enforce_keyword_only_init
+@config(kw_only=True)
 class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     """Diffusion-stage distributed parallelism behavior."""
 
@@ -449,6 +575,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     ring_degree: int = Field(default=1, ge=1)
     allgather_degree: int = Field(default=1, ge=1)
     ulysses_mode: str = "strict"
+    ulysses_a2a_permute: bool = False
     cfg_parallel_size: int = Field(default=1, ge=1)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
     text_encoder_tp_size: int = Field(default=1, ge=1)
@@ -459,6 +586,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     hsdp_replicate_size: int = Field(default=1, ge=1)
 
     def __post_init__(self) -> None:
+        self.data_parallel_index = self.data_parallel_rank
         self.sequence_parallel_size = (
             self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
         )
@@ -480,12 +608,17 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
             * self.cfg_parallel_size
         )
         if self.use_hsdp:
-            if self.tensor_parallel_size > 1 or self.data_parallel_size > 1:
-                raise ValueError(
-                    "HSDP (use_hsdp=True) cannot be used with TP or DP "
-                    f"(tensor_parallel_size={self.tensor_parallel_size}, "
-                    f"data_parallel_size={self.data_parallel_size})"
-                )
+            incompatible = []
+            if self.tensor_parallel_size > 1:
+                incompatible.append("TP")
+            if self.data_parallel_size > 1:
+                incompatible.append("DP")
+            if self.pipeline_parallel_size > 1:
+                incompatible.append("PP")
+            if self.enable_expert_parallel:
+                incompatible.append("EP")
+            if incompatible:
+                raise ValueError("HSDP (FSDP2) is not compatible with " + ", ".join(incompatible))
             if self.hsdp_shard_size == -1:
                 if other_parallel_world_size == 1:
                     raise ValueError("Cannot auto-calculate hsdp_shard_size when other parallelism is all 1")
@@ -536,7 +669,7 @@ class _DiffusionConfigProjection:
     dtype: Any = "auto"
     trust_remote_code: bool = False
     revision: str | None = None
-    distributed_executor_backend: str = "mp"
+    distributed_executor_backend: str | None = None
     dist_timeout: int | None = None
     nccl_port: int | None = None
     master_port: int | None = None
@@ -551,6 +684,7 @@ class _DiffusionConfigProjection:
     cache_config: Any = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
     diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
+    diffusion_kv_max_rows_per_request: int | None = Field(default=None, ge=1, strict=True)
     enable_prompt_embed_cache: bool = False
     prompt_embed_cache_size: int = Field(default=32, ge=1)
     enable_session_state_manager: bool = False
@@ -558,8 +692,9 @@ class _DiffusionConfigProjection:
     diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_pipeline_cls: Any = None
-    lora_path: str | None = None
+    lora_path: str | list[str] | None = None
     lora_scale: float = 1.0
+    lora_backend: str = "peft"
     max_cpu_loras: int | None = None
     output_type: str = "pil"
     enable_cpu_offload: bool = False
@@ -567,6 +702,9 @@ class _DiffusionConfigProjection:
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = Field(default=0, ge=0)
+    host_weight_runtime_mode: Literal["disabled", "preferred", "required"] = "disabled"
+    host_weight_runtime_root: str | None = None
+    dlo_host_registration_limit_gib: float = Field(default=0.0, ge=0)
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
     diffusion_compile_dynamic: bool = Field(default=True, strict=True)
@@ -596,6 +734,7 @@ class _DiffusionConfigProjection:
         default_factory=lambda: {
             "transformer": True,
             "vae": True,
+            "text_encoder": True,
         }
     )
     override_transformer_cls_name: str | None = None
@@ -612,7 +751,7 @@ class _DiffusionConfigProjection:
         from vllm_omni.diffusion.data import normalize_omni_diffusion_kwargs
 
         normalized_kwargs = normalize_omni_diffusion_kwargs(kwargs)
-        valid_fields = {f.name for f in fields(cls)}
+        valid_fields = {f.name for f in fields(cast(Any, cls))}
         return cls(**{k: v for k, v in normalized_kwargs.items() if k in valid_fields})
 
     def __post_init__(self) -> None:
@@ -624,6 +763,8 @@ class _DiffusionConfigProjection:
             TransformerConfig,
             build_attention_config,
             parse_kv_cache_skip_selector,
+            validate_dlo_host_registration_options,
+            validate_host_weight_runtime_options,
         )
         from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
         from vllm_omni.quantization import build_quant_config
@@ -688,6 +829,11 @@ class _DiffusionConfigProjection:
             )
 
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
+        if (
+            self.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+            and self.diffusion_kv_max_rows_per_request is None
+        ):
+            raise ValueError("paged_scheduler requires diffusion_kv_max_rows_per_request to be set")
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
@@ -695,6 +841,17 @@ class _DiffusionConfigProjection:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+
+        validate_host_weight_runtime_options(
+            mode=self.host_weight_runtime_mode,
+            root=self.host_weight_runtime_root,
+        )
+        self.dlo_host_registration_limit_gib = validate_dlo_host_registration_options(
+            limit_gib=self.dlo_host_registration_limit_gib,
+            enable_dlo=self.enable_distributed_layerwise_offload,
+            use_allgather=self.dlo_use_allgather,
+            hwr_mode=self.host_weight_runtime_mode,
+        )
 
         if self.diffusion_load_format != "diffusers" and (self.diffusers_load_kwargs or self.diffusers_call_kwargs):
             raise ValueError(
@@ -759,7 +916,7 @@ class _DiffusionConfigProjection:
                 setattr(self, name, _copy_value(getattr(omni_diffusion_config, name)))
 
 
-_DIFFUSION_CONFIG_FIELDS = frozenset(f.name for f in fields(_DiffusionConfigProjection))
+_DIFFUSION_CONFIG_FIELDS = frozenset(f.name for f in fields(cast(Any, _DiffusionConfigProjection)))
 
 # Current OmniDiffusionConfig still contains a flat mix of shared engine,
 # runtime, parallel, and diffusion-specific knobs. Keep this classification
@@ -804,6 +961,10 @@ _DIFFUSION_MOVED_SHARED_FIELDS = frozenset(
         "omni_kv_config",
         "cfg_kv_collect_func",
         "max_num_seqs",
+        "kv_cache_memory_bytes",
+        "gpu_memory_utilization",
+        "max_num_batched_tokens",
+        "max_model_len",
         "enable_sleep_mode",
         "enforce_eager",
         "enable_multithread_weight_load",
@@ -818,6 +979,7 @@ _STAGE_DEPLOY_ENGINE_FIELDS: tuple[str, ...] = tuple(_STAGE_DEPLOY_FIELDS)
 _DIFFUSION_BACKCOMPAT_ENGINE_FIELDS = frozenset(
     {
         "diffusion_attention_backend",
+        "fastvideo_vsa_topk",
         "kv_cache_dtype",
         "kv_cache_skip_layers",
         "kv_cache_skip_steps",
@@ -829,6 +991,58 @@ _DIFFUSION_STAGE_ENGINE_FIELDS = (_DIFFUSION_CONFIG_FIELDS | _DIFFUSION_BACKCOMP
     "stage_id",
 }
 
+
+def _upstream_engine_field_map(
+    config_cls: type[Any],
+    *,
+    aliases: Mapping[str, str] = {},
+    exclude: frozenset[str] = frozenset(),
+) -> dict[str, str]:
+    """Map reusable upstream config fields to their EngineArgs inputs."""
+    engine_fields = frozenset(config_field.name for config_field in fields(VllmEngineArgs))
+    return {
+        config_field.name: engine_name
+        for config_field in fields(config_cls)
+        if config_field.init
+        and config_field.name not in exclude
+        and (engine_name := aliases.get(config_field.name, config_field.name)) in engine_fields
+    }
+
+
+_LOAD_CONFIG_ENGINE_FIELD_MAP = _upstream_engine_field_map(VllmLoadConfig)
+_CACHE_CONFIG_ENGINE_FIELD_MAP = _upstream_engine_field_map(
+    VllmCacheConfig,
+    aliases={"cache_dtype": "kv_cache_dtype"},
+)
+_SCHEDULER_CONFIG_ENGINE_FIELD_MAP = _upstream_engine_field_map(
+    VllmSchedulerConfig,
+    aliases={"policy": "scheduling_policy"},
+    # ``scheduler_cls`` is selected by the immutable stage topology, while
+    # ``disable_hybrid_kv_cache_manager`` belongs to the cache concern in the
+    # Omni schema.  Keep both out of the dynamic SchedulerConfig projection so
+    # one input cannot acquire two owners.
+    exclude=frozenset(
+        {
+            "scheduler_cls",
+            "disable_hybrid_kv_cache_manager",
+        }
+    ),
+)
+_PARALLEL_CONFIG_ENGINE_FIELD_MAP = _upstream_engine_field_map(
+    VllmParallelConfig,
+    aliases={"data_parallel_master_ip": "data_parallel_address"},
+    # Runtime owns worker selection. The private API-process fields are
+    # terminal vLLM internals rather than per-stage user inputs.
+    exclude=frozenset(
+        {
+            "distributed_executor_backend",
+            "worker_cls",
+            "_api_process_count",
+            "_api_process_rank",
+        }
+    ),
+)
+
 _QUANTIZATION_ENGINE_FIELDS = frozenset(_QuantizationEngineOverrides.__annotations__)
 _MODEL_ENGINE_FIELDS = frozenset(_ModelEngineOverrides.__annotations__)
 _LOAD_ENGINE_FIELDS = frozenset(_LoadEngineOverrides.__annotations__)
@@ -836,7 +1050,17 @@ _CACHE_ENGINE_FIELDS = frozenset(_CacheEngineOverrides.__annotations__)
 _SCHEDULER_ENGINE_FIELDS = frozenset(_SchedulerEngineOverrides.__annotations__)
 _CONNECTOR_ENGINE_FIELDS = frozenset(_ConnectorEngineOverrides.__annotations__)
 _RUNTIME_ENGINE_FIELDS = frozenset(_RuntimeEngineOverrides.__annotations__)
-_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(_ParallelConfigEngineOverrides.__annotations__)
+_DIRECT_VLLM_CONFIG_ENGINE_FIELDS = frozenset({"compilation_config", "profiler_config"})
+_LLM_LOAD_ENGINE_FIELDS = _LOAD_ENGINE_FIELDS | frozenset(_LOAD_CONFIG_ENGINE_FIELD_MAP.values())
+_LLM_CACHE_ENGINE_FIELDS = _CACHE_ENGINE_FIELDS | frozenset(_CACHE_CONFIG_ENGINE_FIELD_MAP.values())
+_LLM_SCHEDULER_ENGINE_FIELDS = _SCHEDULER_ENGINE_FIELDS | frozenset(_SCHEDULER_CONFIG_ENGINE_FIELD_MAP.values())
+_LLM_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(_PARALLEL_CONFIG_ENGINE_FIELD_MAP.values())
+_DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(
+    f.name for f in fields(OmniStageDiffusionParallelConfig)
+) & frozenset(_ParallelConfigEngineOverrides.__annotations__)
+_DIFFUSION_PARALLEL_CONFIG_FIELD_MAP = {name: name for name in _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS}
+_LLM_PARALLEL_CONFIG_FIELDS = frozenset(_PARALLEL_CONFIG_ENGINE_FIELD_MAP)
+_PARALLEL_CONFIG_ENGINE_FIELDS = _LLM_PARALLEL_CONFIG_ENGINE_FIELDS | _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS
 _PARALLEL_ENGINE_FIELDS = _PARALLEL_CONFIG_ENGINE_FIELDS | {"parallel_config"}
 _COMMON_STAGE_ENGINE_FIELDS = (
     _QUANTIZATION_ENGINE_FIELDS
@@ -846,12 +1070,16 @@ _COMMON_STAGE_ENGINE_FIELDS = (
     | _SCHEDULER_ENGINE_FIELDS
     | _CONNECTOR_ENGINE_FIELDS
     | _RUNTIME_ENGINE_FIELDS
+    | _DIRECT_VLLM_CONFIG_ENGINE_FIELDS
 )
-_LLM_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(f.name for f in fields(OmniStageParallelConfig)) - {"world_size"}
-_DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(f.name for f in fields(OmniStageDiffusionParallelConfig)) - {
-    "world_size"
-}
-_LLM_STAGE_ENGINE_FIELDS = _COMMON_STAGE_ENGINE_FIELDS | _LLM_PARALLEL_CONFIG_ENGINE_FIELDS | {"parallel_config"}
+_LLM_STAGE_ENGINE_FIELDS = (
+    _COMMON_STAGE_ENGINE_FIELDS
+    | _LLM_LOAD_ENGINE_FIELDS
+    | _LLM_CACHE_ENGINE_FIELDS
+    | _LLM_SCHEDULER_ENGINE_FIELDS
+    | _LLM_PARALLEL_CONFIG_ENGINE_FIELDS
+    | {"parallel_config"}
+)
 _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS = (
     _COMMON_STAGE_ENGINE_FIELDS
     | _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS
@@ -872,6 +1100,27 @@ _PARALLEL_CONFIG_ENGINE_FIELDS_BY_EXECUTION_TYPE = {
     StageExecutionType.LLM_GENERATION: _LLM_PARALLEL_CONFIG_ENGINE_FIELDS,
     StageExecutionType.DIFFUSION: _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS,
 }
+_PARALLEL_CONFIG_FIELDS_BY_EXECUTION_TYPE = {
+    StageExecutionType.LLM_AR: _LLM_PARALLEL_CONFIG_FIELDS,
+    StageExecutionType.LLM_GENERATION: _LLM_PARALLEL_CONFIG_FIELDS,
+    StageExecutionType.DIFFUSION: frozenset(_DIFFUSION_PARALLEL_CONFIG_FIELD_MAP),
+}
+
+_LOAD_STAGE_ENGINE_FIELD_MAP = {
+    **{name: name for name in _LOAD_ENGINE_FIELDS},
+    **_LOAD_CONFIG_ENGINE_FIELD_MAP,
+}
+_CACHE_STAGE_ENGINE_FIELD_MAP = {
+    **{name: name for name in _CACHE_ENGINE_FIELDS},
+    **_CACHE_CONFIG_ENGINE_FIELD_MAP,
+}
+_SCHEDULER_STAGE_ENGINE_FIELD_MAP = {
+    **{name: name for name in _SCHEDULER_ENGINE_FIELDS},
+    **_SCHEDULER_CONFIG_ENGINE_FIELD_MAP,
+}
+_DIFFUSION_LOAD_STAGE_ENGINE_FIELD_MAP = {name: name for name in _LOAD_ENGINE_FIELDS}
+_DIFFUSION_CACHE_STAGE_ENGINE_FIELD_MAP = {name: name for name in _CACHE_ENGINE_FIELDS}
+_DIFFUSION_SCHEDULER_STAGE_ENGINE_FIELD_MAP = {name: name for name in _SCHEDULER_ENGINE_FIELDS}
 
 
 def _validate_stage_engine_override_ownership(
@@ -882,13 +1131,19 @@ def _validate_stage_engine_override_ownership(
     try:
         owner_fields = _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
         parallel_owner_fields = _PARALLEL_CONFIG_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
+        parallel_config_fields = _PARALLEL_CONFIG_FIELDS_BY_EXECUTION_TYPE[execution_type]
     except KeyError as exc:
         raise ValueError(f"Unsupported stage execution type: {execution_type!r}") from exc
 
     unowned_fields = set(overrides) - owner_fields
     parallel_config = overrides.get("parallel_config")
     if isinstance(parallel_config, Mapping):
-        unowned_fields.update(f"parallel_config.{name}" for name in set(parallel_config) - parallel_owner_fields)
+        # Nested values traditionally use upstream config names, while flat
+        # EngineArgs uses aliases such as ``data_parallel_address``.  Accept
+        # either spelling at the boundary; the builder canonicalizes aliases
+        # before instantiating the inherited config.
+        accepted_parallel_names = parallel_config_fields | parallel_owner_fields
+        unowned_fields.update(f"parallel_config.{name}" for name in set(parallel_config) - accepted_parallel_names)
     if unowned_fields:
         names = ", ".join(sorted(unowned_fields))
         raise ValueError(
@@ -909,7 +1164,7 @@ def _global_stage_cli_fields() -> frozenset[str]:
     )
     externally_consumed = (
         _NON_STAGE_ENGINE_CLI_FIELDS
-        | frozenset(f.name for f in fields(VllmOmniOrchestratorConfig))
+        | frozenset(f.name for f in fields(cast(Any, VllmOmniOrchestratorConfig)))
         | (orchestrator_field_names() - _STAGE_ENGINE_FIELDS)
     )
     return candidates - externally_consumed
@@ -953,23 +1208,37 @@ def _stage_engine_values(
     if topology.omni_kv_config:
         engine["omni_kv_config"] = _copy_value(topology.omni_kv_config)
     if stage_cli_overrides:
+        if topology.execution_type == StageExecutionType.DIFFUSION:
+            # Mirror StageConfig.to_omegaconf so both projections resolve alike.
+            reconcile_diffusion_attention_overrides(engine, stage_cli_overrides)
         engine.update(_copy_value(stage_cli_overrides))
     _validate_stage_engine_override_ownership(
         topology.stage_id,
         topology.execution_type,
         engine,
     )
+    if topology.execution_type in {
+        StageExecutionType.LLM_AR,
+        StageExecutionType.LLM_GENERATION,
+    }:
+        load_engine_fields = _LLM_LOAD_ENGINE_FIELDS
+        cache_engine_fields = _LLM_CACHE_ENGINE_FIELDS
+        scheduler_engine_fields = _LLM_SCHEDULER_ENGINE_FIELDS
+    else:
+        load_engine_fields = _LOAD_ENGINE_FIELDS
+        cache_engine_fields = _CACHE_ENGINE_FIELDS
+        scheduler_engine_fields = _SCHEDULER_ENGINE_FIELDS
     return _StageEngineValues(
         quantization=cast(
             _QuantizationEngineOverrides,
             _select_engine_overrides(engine, _QUANTIZATION_ENGINE_FIELDS),
         ),
         model=cast(_ModelEngineOverrides, _select_engine_overrides(engine, _MODEL_ENGINE_FIELDS)),
-        load=cast(_LoadEngineOverrides, _select_engine_overrides(engine, _LOAD_ENGINE_FIELDS)),
-        cache=cast(_CacheEngineOverrides, _select_engine_overrides(engine, _CACHE_ENGINE_FIELDS)),
+        load=cast(_LoadEngineOverrides, _select_engine_overrides(engine, load_engine_fields)),
+        cache=cast(_CacheEngineOverrides, _select_engine_overrides(engine, cache_engine_fields)),
         scheduler=cast(
             _SchedulerEngineOverrides,
-            _select_engine_overrides(engine, _SCHEDULER_ENGINE_FIELDS),
+            _select_engine_overrides(engine, scheduler_engine_fields),
         ),
         connector=cast(
             _ConnectorEngineOverrides,
@@ -978,6 +1247,8 @@ def _stage_engine_values(
         runtime=cast(_RuntimeEngineOverrides, _select_engine_overrides(engine, _RUNTIME_ENGINE_FIELDS)),
         parallel=cast(_ParallelEngineOverrides, _select_engine_overrides(engine, _PARALLEL_ENGINE_FIELDS)),
         diffusion=_DiffusionEngineOverrides.from_engine(engine),
+        compilation_config=_copy_value(engine.get("compilation_config")),
+        profiler_config=_copy_value(engine.get("profiler_config")),
     )
 
 
@@ -994,7 +1265,7 @@ def _stage_sampling_params(
 
 def _orchestrator_cli_overrides(cli_overrides: Mapping[str, Any]) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
-    for config_field in fields(VllmOmniOrchestratorConfig):
+    for config_field in fields(cast(Any, VllmOmniOrchestratorConfig)):
         name = config_field.name
         if name == "deploy_config_path":
             continue
@@ -1032,6 +1303,8 @@ class BaseVllmOmniStageConfig:
     connector_config: OmniStageConnectorConfig = field(default_factory=OmniStageConnectorConfig)
     runtime_config: OmniStageRuntimeConfig = field(default_factory=OmniStageRuntimeConfig)
     parallel_config: OmniStageParallelConfig = field(default_factory=OmniStageParallelConfig)
+    compilation_config: VllmCompilationConfig | None = None
+    profiler_config: VllmProfilerConfig | None = None
     quantization_config: _QuantizationConfigType = None
 
     @property
@@ -1109,6 +1382,10 @@ class BaseVllmOmniStageConfig:
         return self.stage_pipeline_config.prompt_expand_func
 
     @property
+    def prompt_transform_func(self) -> str | None:
+        return self.stage_pipeline_config.prompt_transform_func
+
+    @property
     def cfg_kv_collect_func(self) -> str | None:
         return self.stage_pipeline_config.cfg_kv_collect_func
 
@@ -1183,6 +1460,8 @@ def _build_common_stage_config_kwargs(
                 parallel_config,
             ),
             "parallel_config": parallel_config,
+            "compilation_config": _copy_value(engine.compilation_config),
+            "profiler_config": _copy_value(engine.profiler_config),
             "quantization_config": _copy_value(quantization_config),
         },
         input_proc,
@@ -1195,8 +1474,8 @@ def _with_resolved_processors(
     input_proc: str | None,
     next_stage_proc: str | None,
 ) -> StageConfigType:
-    stage_config._resolved_custom_process_input_func = input_proc
-    stage_config._resolved_custom_process_next_stage_input_func = next_stage_proc
+    setattr(stage_config, "_resolved_custom_process_input_func", input_proc)
+    setattr(stage_config, "_resolved_custom_process_next_stage_input_func", next_stage_proc)
     return stage_config
 
 
@@ -1310,13 +1589,16 @@ def _build_stage_config(
         builder = _STAGE_CONFIG_BUILDERS[topology.execution_type]
     except KeyError as exc:
         raise ValueError(f"Unsupported stage execution type: {topology.execution_type!r}") from exc
-    return builder(
-        pipeline,
-        deploy,
-        topology,
-        stage_deploy,
-        engine,
-        model=model,
+    return cast(
+        StageConfigType,
+        builder(
+            pipeline,
+            deploy,
+            topology,
+            stage_deploy,
+            engine,
+            model=model,
+        ),
     )
 
 
@@ -1343,6 +1625,7 @@ def _build_model_config(
 ) -> OmniStageModelConfig:
     default_sampling_params = _stage_sampling_params(stage_deploy, topology)
     kwargs = _config_kwargs(engine)
+    kwargs["requires_full_payload_input"] = topology.requires_full_payload_input
     kwargs["model"] = _first_defined(kwargs.get("model"), model)
     if "model_arch" not in kwargs:
         kwargs["model_arch"] = topology.model_arch or pipeline.model_arch or None
@@ -1360,8 +1643,9 @@ def _build_model_config(
         kwargs["model_subdir"] = topology.model_subdir
     if "tokenizer_subdir" not in kwargs and topology.tokenizer_subdir is not None:
         kwargs["tokenizer_subdir"] = topology.tokenizer_subdir
-    return OmniStageModelConfig(
+    return cast(Any, OmniStageModelConfig)(
         default_sampling_params=default_sampling_params,
+        session_mode=deploy.session_mode,
         duplex_max_sessions=duplex_max_sessions,
         **kwargs,
     )
@@ -1377,12 +1661,51 @@ def _build_load_config(
     return OmniStageLoadConfig(**kwargs)
 
 
+def _config_kwargs_from_engine_args(
+    engine: Mapping[str, Any],
+    field_map: Mapping[str, str],
+) -> dict[str, Any]:
+    """Convert EngineArgs names back to their upstream config field names."""
+    return {
+        config_name: _copy_value(engine[engine_name])
+        for config_name, engine_name in field_map.items()
+        if engine_name in engine and engine[engine_name] is not None
+    }
+
+
+def _normalize_config_mapping(
+    values: Mapping[str, Any],
+    field_map: Mapping[str, str],
+) -> dict[str, Any]:
+    """Canonicalize config and EngineArgs spellings to config field names."""
+    engine_to_config = {engine_name: config_name for config_name, engine_name in field_map.items()}
+    normalized: dict[str, Any] = {}
+    source_names: dict[str, str] = {}
+    for name, value in values.items():
+        if value is None:
+            continue
+        config_name = name if name in field_map else engine_to_config.get(name, name)
+        if config_name in normalized:
+            raise ValueError(
+                f"Config mapping specifies both {source_names[config_name]!r} and {name!r} "
+                f"for upstream field {config_name!r}"
+            )
+        normalized[config_name] = _copy_value(value)
+        source_names[config_name] = name
+    return normalized
+
+
+def _omni_config_kwargs(engine: Mapping[str, Any], fields_: frozenset[str]) -> dict[str, Any]:
+    return {name: _copy_value(engine[name]) for name in fields_ if name in engine and engine[name] is not None}
+
+
 def _build_cache_config(
     deploy: DeployConfig,
     engine: _CacheEngineOverrides,
     execution_type: StageExecutionType,
 ) -> OmniStageCacheConfig:
-    kwargs = _config_kwargs(engine)
+    kwargs = _config_kwargs_from_engine_args(engine, _CACHE_CONFIG_ENGINE_FIELD_MAP)
+    kwargs.update(_omni_config_kwargs(engine, _CACHE_ENGINE_FIELDS))
     if "enable_prefix_caching" not in kwargs and deploy.enable_prefix_caching is not None:
         kwargs["enable_prefix_caching"] = _copy_value(deploy.enable_prefix_caching)
     if "disable_hybrid_kv_cache_manager" not in kwargs and execution_type == StageExecutionType.LLM_GENERATION:
@@ -1396,7 +1719,8 @@ def _build_scheduler_config(
     engine: _SchedulerEngineOverrides,
     execution_type: StageExecutionType,
 ) -> OmniStageSchedulerConfig:
-    kwargs = _config_kwargs(engine)
+    kwargs = _config_kwargs_from_engine_args(engine, _SCHEDULER_CONFIG_ENGINE_FIELD_MAP)
+    kwargs.update(_omni_config_kwargs(engine, _SCHEDULER_ENGINE_FIELDS))
     if "enable_chunked_prefill" not in kwargs and deploy.enable_chunked_prefill is not None:
         kwargs["enable_chunked_prefill"] = _copy_value(deploy.enable_chunked_prefill)
     if "async_scheduling" not in kwargs and execution_type == StageExecutionType.LLM_AR:
@@ -1411,7 +1735,7 @@ def _build_connector_config(
 ) -> OmniStageConnectorConfig:
     output_connectors = stage_deploy.output_connectors if stage_deploy is not None else None
     input_connectors = stage_deploy.input_connectors if stage_deploy is not None else None
-    return OmniStageConnectorConfig(
+    return cast(Any, OmniStageConnectorConfig)(
         async_chunk=bool(deploy.async_chunk),
         omni_kv_config=_copy_value(engine.get("omni_kv_config")),
         output_connectors=_copy_value(output_connectors) if output_connectors else None,
@@ -1444,16 +1768,21 @@ def _build_parallel_config(
     config_cls: type[OmniStageParallelConfig] = OmniStageParallelConfig,
 ) -> OmniStageParallelConfig:
     parallel_config = _mapping_or_empty(engine.get("parallel_config"))
-    config_fields = {
-        config_field.name
-        for config_field in fields(config_cls)
-        if getattr(config_field.default, "init", None) is not False
-    }
-    kwargs = {
-        name: _copy_value(value) for name in _PARALLEL_CONFIG_ENGINE_FIELDS if (value := engine.get(name)) is not None
-    }
+    config_fields = frozenset(signature(config_cls).parameters)
+    is_diffusion = issubclass(config_cls, OmniStageDiffusionParallelConfig)
+    field_map = _DIFFUSION_PARALLEL_CONFIG_FIELD_MAP if is_diffusion else _PARALLEL_CONFIG_ENGINE_FIELD_MAP
+    owned_parallel_fields = frozenset(field_map)
+    kwargs = _config_kwargs(engine) if is_diffusion else _config_kwargs_from_engine_args(engine, field_map)
+    kwargs = {name: value for name, value in kwargs.items() if name in owned_parallel_fields}
     kwargs = {name: value for name, value in kwargs.items() if name in config_fields}
-    kwargs.update({name: value for name, value in _config_kwargs(parallel_config).items() if name in config_fields})
+    nested_kwargs = _normalize_config_mapping(parallel_config, field_map)
+    kwargs.update(
+        {
+            name: value
+            for name, value in nested_kwargs.items()
+            if name in owned_parallel_fields and name in config_fields
+        }
+    )
     if "pipeline_parallel_size" not in kwargs and deploy.pipeline_parallel_size is not None:
         kwargs["pipeline_parallel_size"] = _copy_value(deploy.pipeline_parallel_size)
     if "data_parallel_size" not in kwargs and deploy.data_parallel_size is not None:
@@ -1519,6 +1848,7 @@ class VllmOmniConfig:
         """Create a structured config from a resolved pipeline and deploy YAML."""
         if cli_overrides is None:
             cli_overrides = {}
+        cli_overrides = normalize_pipeline_cli_overrides(pipeline_cfg, cli_overrides)
 
         deploy, loaded_deploy_config_path = _get_deploy_config(
             pipeline_cfg,
@@ -1555,11 +1885,11 @@ class VllmOmniConfig:
             for topology in pipeline_cfg.stages
         )
 
-        orchestrator_config = VllmOmniOrchestratorConfig(
+        orchestrator_config = cast(Any, VllmOmniOrchestratorConfig)(
             deploy_config_path=loaded_deploy_config_path,
             **_orchestrator_cli_overrides(cli_overrides),
         )
-        return cls(
+        return cast(Any, cls)(
             pipeline_config=pipeline_cfg,
             stage_configs=stage_configs,
             orchestrator_config=orchestrator_config,

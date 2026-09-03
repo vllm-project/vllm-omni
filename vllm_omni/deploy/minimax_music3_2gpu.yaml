@@ -1,0 +1,97 @@
+# MiniMax-Music3 two-GPU layout: AR talker on device 0, acoustic decoder on
+# device 1.
+#
+# Splitting the stages removes the memory-budget compromise of the single-card
+# file: the talker's CFG-doubled KV no longer competes with the DiT and DAV
+# weights, and the flow-matching solver no longer competes with AR decode for
+# SMs. Everything else (window geometry, CFG contract, sampling defaults)
+# matches minimax_music3.yaml, so the two files stay behaviorally identical.
+pipeline: minimax_music3
+async_chunk: true
+
+# The repo-root config.json reports model_type=minimax_music3, which upstream
+# transformers does not ship a config class for.
+trust_remote_code: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      # Stream stereo PCM back to the client as stage 1 finishes each window.
+      codec_streaming: true
+      # Window geometry is fixed by the checkpoint (200-frame windows on a
+      # 100-frame hop, models/minimax_music3/constants.py), so there are no
+      # codec_chunk_frames knobs here: changing the window changes the audio.
+      shm_threshold_bytes: 65536
+      connector_get_sleep_s: 0.01
+      # One window is 200 AR frames = 8 s of music, so stage 1 waits far longer
+      # for a chunk than a per-step codec stage would. First chunk additionally
+      # covers stage-0 prefill of both CFG rows.
+      connector_get_max_wait_first_chunk: 30000
+      connector_get_max_wait: 10000
+
+stages:
+  - stage_id: 0
+    # 32 rows = 16 concurrent guided requests, since CFG doubles every request.
+    # Twice the single-card figure: this stage now owns its whole device.
+    max_num_seqs: 32
+    gpu_memory_utilization: 0.85
+    dtype: bfloat16
+    # The checkpoint's max_position_embeddings is 10240 and the whole song is
+    # decoded in-context. Note this cannot hold a max-length prompt AND a
+    # max-length song at the same time: the prompt cap is 5000 tokens and the
+    # frame budget is 9000, which overruns 10240. That is a property of the
+    # checkpoint, not of this file; long captions shorten the maximum song.
+    max_model_len: 10240
+    # One scheduler step must be able to prefill both rows of a pair
+    # (2 x 5000 prompt tokens) so the cond/uncond pair stays step-locked.
+    max_num_batched_tokens: 10240
+    # The talker owns its sampler and drives a depth decoder per AR step;
+    # leave graph capture off until that path is verified graph-safe.
+    enforce_eager: true
+    # A CFG pair must be sampled inside one engine step for the logits blend
+    # and the cond->uncond token copy to line up.
+    async_scheduling: false
+    # Off during bring-up: the uncond row is a long run of identical
+    # <|audio_cfg|> tokens and would take a much larger prefix-cache hit than
+    # its cond partner, which is exactly the num_computed_tokens skew the CFG
+    # pair patches then have to undo.
+    enable_prefix_caching: false
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 1.0
+      # The frame budget is enforced by the model. This ceiling only has to
+      # leave room for the extra step that delivers the final window.
+      max_tokens: 9002
+      extra_args:
+        cfg_role: cond
+        cfg_scale: 1.5
+
+  - stage_id: 1
+    # One row per user request: the uncond companion is stage-0-final and
+    # never reaches the acoustic stage.
+    max_num_seqs: 16
+    # No KV cache on this stage, but it now has a device to itself, so the
+    # solver can hold more windows in flight than the shared-card profile.
+    gpu_memory_utilization: 0.6
+    # The flow-matching solver degrades measurably in bfloat16
+    # (SUPPORTED_ACOUSTIC_DTYPES in models/minimax_music3/constants.py).
+    dtype: float32
+    enforce_eager: true
+    # Async scheduling builds per-request payloads against the NEXT step's
+    # input batch, which breaks when chunk arrival staggers requests.
+    async_scheduling: false
+    enable_prefix_caching: false
+    # One placeholder prompt token per arriving window, so a six-minute song
+    # (90 windows) needs a tiny context.
+    max_model_len: 4096
+    max_num_batched_tokens: 4096
+    devices: "1"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 4096
+      seed: 0

@@ -18,8 +18,8 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni --port 8000
 ```
 
 The server auto-loads its Deploy YAML from `vllm_omni/deploy/qwen3_tts.yaml`
-(Pipeline + Deploy schema introduced in #2383). No `--stage-configs-path` or
-`--deploy-config` flag is needed for any registered model.
+(Pipeline + Deploy schema introduced in #2383). No explicit `--deploy-config`
+flag is needed for a registered model.
 
 ### 2. Run the benchmark (`vllm bench serve --omni`)
 
@@ -138,6 +138,34 @@ python benchmarks/tts/bench_tts.py \
     --concurrency 4 --num-prompts 200 \
     --output-dir ./results
 ```
+
+#### Fixed IndexTTS 2.5 performance sweep
+
+IndexTTS 2.5 is registered in `model_configs.yaml` like the other TTS models.
+Use `--served-model-name` when the server was launched from a local native
+bundle instead of the registry key. The command below reproduces the acceptance
+workload: Seed-TTS Eval EN, `n=500`, concurrency `4/8/16/32`, five warmups, and
+dataset seed 0.
+
+```bash
+python benchmarks/tts/bench_tts.py \
+    --model IndexTeam/IndexTTS-2.5 \
+    --served-model-name /path/to/indextts-2.5 \
+    --task voice_clone --locale en \
+    --dataset-path /path/to/seedtts_testset \
+    --host 127.0.0.1 --port 8092 \
+    --concurrency 4 8 16 32 \
+    --num-prompts 500 --num-warmups 5 \
+    --output-dir ./results/indextts2_5 \
+    -- \
+    --tokenizer /path/to/indextts-2.5/qwen0.6bemo4-merge \
+    --seed 0 --metric-percentiles 50,95,99 --disable-tqdm --save-detailed
+```
+
+The wrapper benchmarks an already-running server. For reproducible quality
+comparisons, add `--request-seed 42`; production-performance runs should omit
+it. The trailing `--seed 0` controls Seed-TTS row selection rather than model
+sampling.
 
 ### 4. Plot a sweep
 

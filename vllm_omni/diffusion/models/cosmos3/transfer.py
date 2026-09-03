@@ -14,6 +14,7 @@ generation, or action generation.
 from __future__ import annotations
 
 import importlib
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,6 +26,14 @@ import torch
 import torch.nn.functional as F
 
 TRANSFER_HINT_KEYS: tuple[str, ...] = ("edge", "blur", "depth", "seg", "wsm")
+_TRANSFER_HINT_COMMON_FIELDS = frozenset({"control_path", "control", "control_weight"})
+_TRANSFER_HINT_FIELDS: dict[str, frozenset[str]] = {
+    "edge": _TRANSFER_HINT_COMMON_FIELDS | {"preset_edge_threshold"},
+    "blur": _TRANSFER_HINT_COMMON_FIELDS | {"preset_blur_strength"},
+    "depth": _TRANSFER_HINT_COMMON_FIELDS,
+    "seg": _TRANSFER_HINT_COMMON_FIELDS,
+    "wsm": _TRANSFER_HINT_COMMON_FIELDS,
+}
 TRANSFER_SAMPLE_DEFAULTS: dict[str, Any] = {
     "num_video_frames_per_chunk": 93,
     "num_conditional_frames": 1,
@@ -33,6 +42,7 @@ TRANSFER_SAMPLE_DEFAULTS: dict[str, Any] = {
     "show_input": False,
     "num_first_chunk_conditional_frames": 0,
     "share_vision_temporal_positions": True,
+    "emphasize_control_in_prompt": True,
 }
 TRANSFER_DEFAULTS: dict[str, dict[str, Any]] = {
     "edge": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
@@ -85,6 +95,7 @@ class Cosmos3TransferHint:
     key: str
     control_path: str | None = None
     control: Any | None = None
+    control_weight: float = 1.0
     preset_edge_threshold: str = "medium"
     preset_blur_strength: str = "medium"
 
@@ -103,12 +114,23 @@ class Cosmos3TransferConfig:
     show_input: bool = False
     num_first_chunk_conditional_frames: int = 0
     share_vision_temporal_positions: bool = True
+    emphasize_control_in_prompt: bool = True
     num_frames: int | None = None
     fps: float | None = None
 
     @property
     def ordered_hints(self) -> list[Cosmos3TransferHint]:
         return [self.hints[key] for key in TRANSFER_HINT_KEYS if key in self.hints]
+
+    @property
+    def normalized_control_weights(self) -> list[float]:
+        weights = [hint.control_weight for hint in self.ordered_hints]
+        if any(not math.isfinite(weight) or weight < 0.0 for weight in weights):
+            raise ValueError(f"Cosmos3 transfer control_weight values must be finite and non-negative, got {weights}.")
+        total = sum(weights)
+        if total <= 0.0:
+            raise ValueError("Cosmos3 transfer control_weight values must have a positive sum.")
+        return [weight / total for weight in weights]
 
 
 def _extra_args(sp: Any) -> Mapping[str, Any]:
@@ -184,7 +206,7 @@ def _as_interval(value: Any) -> tuple[float, float] | None:
         return None
     if isinstance(value, str):
         value = [item.strip() for item in value.split(",") if item.strip()]
-    if not isinstance(value, (list, tuple)) or len(value) != 2:
+    if not isinstance(value, list | tuple) or len(value) != 2:
         raise ValueError("Cosmos3 transfer control_guidance_interval must contain exactly two values.")
     lo, hi = float(value[0]), float(value[1])
     if lo > hi:
@@ -220,10 +242,27 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
             raise TypeError(
                 f"Cosmos3 transfer hint '{key}' must be an object, path string, or true; got {type(raw)!r}."
             )
+        unknown_fields = set(raw) - _TRANSFER_HINT_FIELDS[key]
+        if unknown_fields:
+            raise ValueError(
+                f"Unsupported Cosmos3 transfer hint '{key}' fields: {sorted(unknown_fields)}. "
+                f"Supported fields are: {sorted(_TRANSFER_HINT_FIELDS[key])}."
+            )
+        try:
+            control_weight = float(raw.get("control_weight", 1.0))
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"Cosmos3 transfer hint '{key}' control_weight must be a finite non-negative number."
+            ) from exc
+        if not math.isfinite(control_weight) or control_weight < 0.0:
+            raise ValueError(
+                f"Cosmos3 transfer hint '{key}' control_weight must be finite and non-negative, got {control_weight!r}."
+            )
         hints[key] = Cosmos3TransferHint(
             key=key,
             control_path=str(raw["control_path"]) if raw.get("control_path") is not None else None,
             control=raw.get("control"),
+            control_weight=control_weight,
             preset_edge_threshold=str(raw.get("preset_edge_threshold") or "medium").lower(),
             preset_blur_strength=str(raw.get("preset_blur_strength") or "medium").lower(),
         )
@@ -239,6 +278,7 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
             "show_input",
             "num_first_chunk_conditional_frames",
             "share_vision_temporal_positions",
+            "emphasize_control_in_prompt",
         )
         if any(_is_user_field(extra, sp, prompt_data, key) for key in transfer_only):
             raise ValueError("Cosmos3 transfer options were provided, but no transfer hint was selected.")
@@ -293,6 +333,10 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
             _param(extra, sp, prompt_data, "share_vision_temporal_positions", None),
             bool(TRANSFER_SAMPLE_DEFAULTS["share_vision_temporal_positions"]),
         ),
+        emphasize_control_in_prompt=_as_bool(
+            _param(extra, sp, prompt_data, "emphasize_control_in_prompt", None),
+            bool(TRANSFER_SAMPLE_DEFAULTS["emphasize_control_in_prompt"]),
+        ),
         num_frames=(
             int(_param(extra, sp, prompt_data, "num_frames"))
             if _param(extra, sp, prompt_data, "num_frames", None) is not None
@@ -328,6 +372,7 @@ def resolve_transfer_config(sp: Any, prompt_data: Any = None) -> Cosmos3Transfer
             raise ValueError(f"Unsupported Cosmos3 edge preset: {hint.preset_edge_threshold!r}.")
         if hint.key == "blur" and hint.preset_blur_strength not in BLUR_DOWNUP_PRESETS:
             raise ValueError(f"Unsupported Cosmos3 blur preset: {hint.preset_blur_strength!r}.")
+    _ = config.normalized_control_weights
     return config
 
 

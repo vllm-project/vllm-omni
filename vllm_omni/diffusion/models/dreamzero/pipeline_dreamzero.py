@@ -70,6 +70,9 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 logger = logging.getLogger(__name__)
 MAX_DREAMZERO_SESSIONS = 64
+# Shipped DreamZero geometry retains 24 Wan VAE causal-convolution cache
+# entries. This is the measured persistent CUDA upper bound per live session.
+DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION = 603 * 1024 * 1024
 
 # The pipeline's per-session state is a bespoke ``DreamZeroState`` by default, or
 # a ``DreamZeroStateAdapter`` view when the opt-in session manager is enabled.
@@ -149,6 +152,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             session_capacity=MAX_DREAMZERO_SESSIONS,
             cross_attention=tuple(cross_attention),
             max_scratch_tokens_per_branch=int(transformer.num_action_per_block + transformer.num_state_per_block),
+            model_owned_state_bytes_per_session=DREAMZERO_MODEL_OWNED_STATE_BYTES_PER_SESSION,
         )
 
     @contextmanager

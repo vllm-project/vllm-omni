@@ -1,0 +1,81 @@
+# NemotronVoiceChat-11B offline speech-to-speech deployment.
+# 3 stages on one GPU: thinker (NemotronH AR) -> talker (EAR-TTS AR) -> code2wav
+# (RVQ-VAE decode). thinker->talker is token-path only; talker->code2wav ships
+# the [frames, 31] code stack via the shared-memory connector.
+pipeline: nemotron_voicechat
+async_chunk: false
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+
+stages:
+  - stage_id: 0  # thinker: speech -> frame-locked text (final text output)
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.62
+    enforce_eager: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 8192
+    max_model_len: 8192
+    # fp32 matches the NeMo reference exactly (196/196 token parity on the
+    # acceptance fixture). bf16 is ~2x faster and measured within one word of
+    # the reference on the same fixture — flip to bfloat16 if you prefer speed
+    # over exact parity.
+    dtype: float32
+    # NemotronH mamba SSM state in fp32 (matches NVIDIA's own vLLM deployment
+    # of this model; bf16 SSM state accumulates drift over long sequences).
+    mamba_ssm_cache_dtype: float32
+    devices: "0"
+    default_sampling_params:
+      # Greedy, frame-locked: the example sets max_tokens to the
+      # exact acoustic frame count per request; text EOS never stops generation.
+      temperature: 0.0
+      ignore_eos: true
+      seed: 0
+
+  - stage_id: 1  # talker: text timeline -> 31-quantizer code stacks
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.12
+    enforce_eager: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    skip_tokenizer_init: true
+    max_num_batched_tokens: 4096
+    max_model_len: 16384
+    # fp32 like the NeMo reference: the EAR-TTS MoG/codec-embedding path mixes
+    # fp32 buffers into the forward, and 1B params in fp32 are cheap.
+    dtype: float32
+    devices: "0"
+    output_connectors:
+      to_stage_2: connector_of_shared_memory
+    default_sampling_params:
+      # Placeholder-token loop; the stage emits stop token 1 after the last
+      # timeline position. 16383 (not 16384): the request also carries one
+      # placeholder prompt token, and prompt + max_tokens must fit
+      # max_model_len.
+      temperature: 0.0
+      max_tokens: 16383
+      stop_token_ids: [1]
+      detokenize: false
+      seed: 0
+
+  - stage_id: 2  # code2wav: codes -> 22.05 kHz PCM (fp32 codec)
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.06
+    enforce_eager: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    skip_tokenizer_init: true
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1
+      detokenize: false
+      seed: 0

@@ -193,7 +193,16 @@ class RotaryEmbedding(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        return self.forward_native(x, cos, sin)
+        # Keep the full-dimension NeoX form inline for MUSA compilation.
+        # Other layouts use the shared native implementation.
+        if self.half_head_dim or self.interleaved:
+            return self.forward_native(x, cos, sin)
+        if cos.dim() == 3:
+            cos, sin = cos[0], sin[0]
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
+        x1, x2 = x.chunk(2, dim=-1)
+        return x * cos + torch.cat((-x2, x1), dim=-1) * sin
 
     def forward_native(
         self,
@@ -414,16 +423,16 @@ class WanS2VRotaryPosEmbed(torch.nn.Module):
                         h_sam = torch.linspace(int(h_o), int(t_h + h_o) - 1, seq_h_int, device=device).long()
                         w_sam = torch.linspace(int(w_o), int(t_w + w_o) - 1, seq_w_int, device=device).long()
 
-                        freqs_0 = freqs_split[0][f_sam] if f_o >= 0 else freqs_split[0][f_sam].conj()
+                        freqs_0 = torch.index_select(freqs_split[0] if f_o >= 0 else freqs_split[0].conj(), 0, f_sam)
                         freqs_0 = freqs_0.view(seq_f_int, 1, 1, -1)
 
                         freqs_i = torch.cat(
                             [
                                 freqs_0.expand(seq_f_int, seq_h_int, seq_w_int, -1),
-                                freqs_split[1][h_sam]
+                                torch.index_select(freqs_split[1], 0, h_sam)
                                 .view(1, seq_h_int, 1, -1)
                                 .expand(seq_f_int, seq_h_int, seq_w_int, -1),
-                                freqs_split[2][w_sam]
+                                torch.index_select(freqs_split[2], 0, w_sam)
                                 .view(1, 1, seq_w_int, -1)
                                 .expand(seq_f_int, seq_h_int, seq_w_int, -1),
                             ],
@@ -514,14 +523,18 @@ class RotaryEmbeddingS2VGrid(torch.nn.Module):
                         h_sam = torch.linspace(int(h_o), int(t_h + h_o) - 1, seq_h_int, device=device).long()
                         w_sam = torch.linspace(int(w_o), int(t_w + w_o) - 1, seq_w_int, device=device).long()
 
-                        freqs_0 = freqs[0][f_sam] if f_o >= 0 else freqs[0][f_sam].conj()
+                        freqs_0 = torch.index_select(freqs[0] if f_o >= 0 else freqs[0].conj(), 0, f_sam)
                         freqs_0 = freqs_0.view(seq_f_int, 1, 1, -1)
 
                         freqs_i = torch.cat(
                             [
                                 freqs_0.expand(seq_f_int, seq_h_int, seq_w_int, -1),
-                                freqs[1][h_sam].view(1, seq_h_int, 1, -1).expand(seq_f_int, seq_h_int, seq_w_int, -1),
-                                freqs[2][w_sam].view(1, 1, seq_w_int, -1).expand(seq_f_int, seq_h_int, seq_w_int, -1),
+                                torch.index_select(freqs[1], 0, h_sam)
+                                .view(1, seq_h_int, 1, -1)
+                                .expand(seq_f_int, seq_h_int, seq_w_int, -1),
+                                torch.index_select(freqs[2], 0, w_sam)
+                                .view(1, 1, seq_w_int, -1)
+                                .expand(seq_f_int, seq_h_int, seq_w_int, -1),
                             ],
                             dim=-1,
                         ).reshape(seg_len, 1, -1)

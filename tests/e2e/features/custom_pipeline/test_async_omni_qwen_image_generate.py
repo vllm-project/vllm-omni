@@ -17,9 +17,12 @@ from functools import lru_cache
 
 import numpy as np
 import pytest
+import torch.distributed as dist
 from transformers import AutoTokenizer
 
 from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.executor.uniproc_executor import UniProcDiffusionExecutor
+from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -131,6 +134,19 @@ async def _generate_once(
     return last_output
 
 
+def _assert_live_uniproc_worker(engine: AsyncOmni) -> None:
+    """Default single-GPU path must use the in-process executor, not mp IPC."""
+    clients = engine.engine.stage_clients
+    assert len(clients) == 1
+    client = clients[0]
+    assert isinstance(client, InlineStageDiffusionClient)
+    executor = client._engine.executor
+    assert isinstance(executor, UniProcDiffusionExecutor)
+    assert executor.driver_worker is not None
+    assert dist.is_initialized()
+    assert dist.get_world_size() == 1
+
+
 def _assert_valid_image_output(output: OmniRequestOutput) -> None:
     assert output.final_output_type == "image"
     assert output.images, "Expected at least one generated image"
@@ -158,6 +174,7 @@ async def test_async_omni_generate():
         )
         after.callback(engine.shutdown)
 
+        _assert_live_uniproc_worker(engine)
         output = await _generate_once(
             engine,
             "a beautiful sunset over the ocean with vibrant orange and purple clouds "

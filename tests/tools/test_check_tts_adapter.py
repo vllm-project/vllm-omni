@@ -17,9 +17,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools" / "pre_commit"))
 
 from check_tts_adapter import (  # noqa: E402
-    MAX_LEGACY_DETECTORS,
     MAX_MODEL_TYPE_BRANCHES,
-    _legacy_detectors,
     _model_type_branches,
     main,
 )
@@ -60,12 +58,6 @@ def test_dict_dispatch_is_a_known_gap():
     assert _count('TABLE = {"foo": 1}\nvalue = TABLE[self._tts_model_type]') == 0
 
 
-def test_legacy_detector_counting():
-    src = 'X = (LegacyDetector(name="a", stage_keys=frozenset({"s"})), LegacyDetector(name="b"))'
-    found = _legacy_detectors(ast.parse(src))
-    assert [name for _, name in found] == ["a", "b"]
-
-
 def test_gate_passes_on_current_tree():
     """The recorded budgets must match reality, or the ratchet is decorative."""
     assert main([]) == 0
@@ -74,6 +66,4 @@ def test_gate_passes_on_current_tree():
 def test_budgets_are_the_real_counts():
     root = Path(__file__).resolve().parents[2]
     serving = root / "vllm_omni" / "entrypoints" / "openai" / "serving_speech.py"
-    adapters = root / "vllm_omni" / "entrypoints" / "openai" / "tts_adapters" / "__init__.py"
     assert len(_model_type_branches(ast.parse(serving.read_text()))) == MAX_MODEL_TYPE_BRANCHES
-    assert len(_legacy_detectors(ast.parse(adapters.read_text()))) == MAX_LEGACY_DETECTORS

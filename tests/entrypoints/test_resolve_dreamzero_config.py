@@ -49,7 +49,9 @@ def test_dreamzero_config_sets_model_class_and_policy_config(monkeypatch):
 def test_dreamzero_enrich_config_preserves_explicit_model_class_name(monkeypatch):
     monkeypatch.setattr(
         "vllm.transformers_utils.config.get_hf_file_to_dict",
-        lambda path, _model: None if path == "model_index.json" else {"model_type": "vla", "architectures": ["VLA"]},
+        lambda path, _model, **_kwargs: (
+            None if path == "model_index.json" else {"model_type": "vla", "architectures": ["VLA"]}
+        ),
     )
 
     od_config = OmniDiffusionConfig(

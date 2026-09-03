@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for the Omni serve CLI helpers."""
 
 from __future__ import annotations
@@ -74,6 +77,17 @@ def test_serve_parser_accepts_four_way_cfg_parallelism() -> None:
     args = parser.parse_args(["serve", "fake-model", "--omni", "--cfg-parallel-size", "4"])
 
     assert args.cfg_parallel_size == 4
+
+
+def test_serve_parser_accepts_ulysses_a2a_permute() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--ulysses-a2a-permute"])
+
+    assert args.ulysses_a2a_permute is True
+    assert args.get_explicit_kwargs_dict()["ulysses_a2a_permute"] is True
 
 
 def _make_headless_args(**kwargs) -> TrackingNamespace:
@@ -193,7 +207,7 @@ def test_run_headless_parses_and_forwards_stage_overrides(mocker: MockerFixture)
     with pytest.raises(ValueError, match="No stage config found for stage_id=0"):
         run_headless(args)
 
-    assert captured["args"][1] is None
+    assert len(captured["args"]) == 2
     assert captured["deploy_config_path"] == "/tmp/deploy.yaml"
     assert captured["stage_overrides"] == {"0": {"devices": "0,1"}, "1": {"devices": "2"}}
     assert captured["strategy_config_path"] == "/tmp/strategy.yaml"
