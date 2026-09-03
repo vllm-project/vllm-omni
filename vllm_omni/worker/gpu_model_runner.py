@@ -82,7 +82,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         super().__init__(*args, **kwargs)
         self.model_intermediate_buffer: dict[str, dict[str, Any]] = {}
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
-        self._omni_last_model_output: object | None = None
         # The Omni tensor prefix cache will be allocated
         # when we initialize the metadata builders if enabled
         self.omni_prefix_cache = None
@@ -1420,8 +1419,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         req_ids = req_ids if req_ids is not None else self.input_batch.req_ids
         if query_start_loc_cpu is None:
             query_start_loc_cpu = self.query_start_loc.cpu
-            if callable(query_start_loc_cpu):
-                query_start_loc_cpu = query_start_loc_cpu()
         try:
             # execute the custom postprocess function
             # TODO(Peiqi): do we have a more elegant way to do this?
@@ -2004,8 +2001,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         )
         if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
             model_output = self.model.make_omni_output(model_output, **model_kwargs, **model_kwargs_extra)
-        # Cache model output so later sample_tokens can consume multimodal results.
-        self._omni_last_model_output = model_output
         return model_output
 
     def _store_value(self, dest: dict, key: str, value: Any, gpu_keys: set) -> None:
