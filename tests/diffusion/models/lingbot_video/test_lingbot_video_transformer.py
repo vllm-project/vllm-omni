@@ -1,10 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import contextmanager
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@contextmanager
+def _force_torch_sdpa():
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.data import AttentionConfig
+
+    with set_current_diffusion_config(
+        SimpleNamespace(
+            diffusion_attention_config=AttentionConfig(default="TORCH_SDPA"),
+            parallel_config=SimpleNamespace(ring_degree=1),
+        )
+    ):
+        yield
 
 
 def _tiny_transformer(**overrides):
@@ -25,6 +42,82 @@ def _tiny_transformer(**overrides):
     }
     config.update(overrides)
     return LingBotVideoTransformer3DModel(**config)
+
+
+@pytest.mark.cache
+def test_cache_dit_pattern_3_skips_both_cfg_branches():
+    import cache_dit
+    from cache_dit import ForwardPattern
+
+    from vllm_omni.diffusion.cache.cachedit import (
+        CacheDiTAdapterConfig,
+        CacheDiTBackend,
+    )
+    from vllm_omni.diffusion.data import DiffusionCacheConfig
+
+    with _force_torch_sdpa():
+        model = _tiny_transformer(depth=3)
+    adapter_config = model._cache_dit_adapter_config
+    assert isinstance(adapter_config, CacheDiTAdapterConfig)
+    assert adapter_config.block_forward_patterns == {"blocks": ForwardPattern.Pattern_3}
+    assert adapter_config.has_separate_cfg is True
+
+    pipeline = SimpleNamespace(
+        transformer=model,
+        _dit_modules=["transformer"],
+    )
+    block_calls = [0] * len(model.blocks)
+    hooks = [
+        block.register_forward_hook(
+            lambda _module, _args, _output, index=index: block_calls.__setitem__(index, block_calls[index] + 1)
+        )
+        for index, block in enumerate(model.blocks)
+    ]
+    backend = CacheDiTBackend(
+        DiffusionCacheConfig(
+            max_warmup_steps=1,
+            residual_diff_threshold=1_000_000.0,
+            max_continuous_cached_steps=8,
+        )
+    )
+
+    try:
+        backend.enable(pipeline)
+        backend.refresh(pipeline, num_inference_steps=6, verbose=False)
+        hidden_states = torch.randn(
+            1,
+            2,
+            1,
+            2,
+            2,
+            generator=torch.Generator().manual_seed(0),
+        )
+        timestep = torch.tensor([300.0])
+        attention_mask = torch.ones(1, 3, dtype=torch.long)
+        branch_embeds = (
+            torch.ones(1, 3, 8),
+            -torch.ones(1, 3, 8),
+        )
+
+        with torch.no_grad():
+            for _ in range(6):
+                for encoder_hidden_states in branch_embeds:
+                    model(
+                        hidden_states,
+                        timestep,
+                        encoder_hidden_states,
+                        encoder_attention_mask=attention_mask,
+                        return_dict=False,
+                    )
+
+        [block_stats, *_] = cache_dit.summary(model, logging=False)
+        assert block_stats.cached_steps
+        assert block_stats.cfg_cached_steps
+        assert sum(block_calls) < 6 * len(branch_embeds) * len(block_calls)
+    finally:
+        for hook in hooks:
+            hook.remove()
+        backend.disable(pipeline)
 
 
 def test_joint_position_ids_video_then_text_order():
