@@ -5,11 +5,14 @@
 from __future__ import annotations
 
 import math
+import warnings
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.models.abot_world import transformer as abot_transformer
 from vllm_omni.diffusion.models.abot_world.pipeline import (
     _DEFAULT_HEIGHT,
     _DEFAULT_WIDTH,
@@ -22,6 +25,7 @@ from vllm_omni.diffusion.models.abot_world.pipeline import (
     _resolve_local_model_path,
     _validate_latent_channel_contract,
     _validate_local_model_files,
+    _validate_parallel_config,
 )
 from vllm_omni.diffusion.models.abot_world.transformer import (
     ABotCausalHead,
@@ -29,6 +33,31 @@ from vllm_omni.diffusion.models.abot_world.transformer import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.mark.parametrize("enforce_eager", [False, True])
+def test_parallel_config_warns_when_eager_execution_is_disabled(enforce_eager: bool) -> None:
+    config = SimpleNamespace(enforce_eager=enforce_eager, quantization_config=None, parallel_config=None)
+
+    if enforce_eager:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _validate_parallel_config(config)
+    else:
+        with pytest.warns(UserWarning, match=r"NaNs or black frames.*--enforce-eager"):
+            _validate_parallel_config(config)
+
+
+def test_parallel_config_still_rejects_quantization() -> None:
+    config = SimpleNamespace(enforce_eager=True, quantization_config=object(), parallel_config=None)
+
+    with pytest.raises(NotImplementedError, match="does not support quantization"):
+        _validate_parallel_config(config)
+
+
+def test_abot_world_packed_modules_constant_is_model_prefixed() -> None:
+    assert abot_transformer.ABOT_WORLD_WAN_PACKED_MODULES == {"qkv": ["q", "k", "v"]}
+    assert not hasattr(abot_transformer, "_WAN_PACKED_MODULES")
 
 
 def test_default_resolution_is_flash_attention_page_aligned() -> None:

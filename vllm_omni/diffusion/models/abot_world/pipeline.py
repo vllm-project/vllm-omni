@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import os
+import warnings
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -281,6 +282,14 @@ def _build_shifted_flow_schedule(*, flow_shift: float) -> tuple[tuple[float, flo
 
 
 def _validate_parallel_config(od_config: OmniDiffusionConfig) -> None:
+    if not getattr(od_config, "enforce_eager", False):
+        warnings.warn(
+            "ABot-World realtime requires enforce_eager=True; enforce_eager=False enters the "
+            "torch.compiler.cudagraph_mark_step_begin() path and may produce NaNs or black frames. "
+            "Enable --enforce-eager.",
+            UserWarning,
+            stacklevel=2,
+        )
     if getattr(od_config, "quantization_config", None) is not None:
         raise NotImplementedError("ABot-World does not support quantization.")
     parallel_config = getattr(od_config, "parallel_config", None)

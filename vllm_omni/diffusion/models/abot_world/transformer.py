@@ -34,7 +34,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
 )
 
 # Re-export these symbols so registry detection works correctly.
-_WAN_PACKED_MODULES = {"qkv": ["q", "k", "v"]}
+ABOT_WORLD_WAN_PACKED_MODULES = {"qkv": ["q", "k", "v"]}
 
 
 # ── Inline helpers (avoid importing private symbols from wan2_2_transformer) ──
@@ -677,7 +677,7 @@ class ABotWorldCausalTransformer3DModel(nn.Module):
     """
 
     _repeated_blocks = ["ABotCausalAttentionBlock"]
-    packed_modules_mapping = _WAN_PACKED_MODULES
+    packed_modules_mapping = ABOT_WORLD_WAN_PACKED_MODULES
     _layerwise_offload_blocks_attrs = ["blocks"]
 
     def __init__(
