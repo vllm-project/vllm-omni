@@ -763,7 +763,7 @@ class Orchestrator:
                     self._shutdown_event.wait(),
                     timeout=self._cfg_companion_reaper_interval_s,
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 # Unlike the duplex reaper, expired parents are claimed before
                 # cleanup. Propagate failures so run() tears the orchestrator
                 # down instead of losing the only retry owner silently.
@@ -791,6 +791,7 @@ class Orchestrator:
                     request_id=parent_id,
                     stage_id=deferred["stage_id"],
                     status_code=HTTPStatus.GATEWAY_TIMEOUT.value,
+                    error_type="GatewayTimeoutError",
                     error=(
                         "CFG companion deadline exceeded after "
                         f"{self._cfg_companion_timeout_s:g}s while waiting for "

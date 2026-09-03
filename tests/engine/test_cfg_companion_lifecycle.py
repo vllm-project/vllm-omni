@@ -247,6 +247,27 @@ async def test_expired_companion_wait_fails_parent_and_cleans_bundle():
 
 
 @pytest.mark.asyncio
+async def test_cfg_companion_reaper_continues_after_poll_timeout(monkeypatch):
+    """The periodic poll timeout must be handled on every supported Python."""
+    orch = _make_orchestrator()
+    orch._shutdown_event = asyncio.Event()
+    orch._cfg_companion_reaper_interval_s = 0.001
+    reap_count = 0
+
+    async def reap_once() -> int:
+        nonlocal reap_count
+        reap_count += 1
+        orch._shutdown_event.set()
+        return 0
+
+    monkeypatch.setattr(orch, "_reap_expired_cfg_parents", reap_once)
+
+    await asyncio.wait_for(orch._cfg_companion_reaper_loop(), timeout=1)
+
+    assert reap_count == 1
+
+
+@pytest.mark.asyncio
 async def test_companion_abort_after_completion_does_not_fail_parent():
     """A late/duplicate abort of a companion whose output is already stashed
     must not cancel the (possibly already dispatched) parent."""
