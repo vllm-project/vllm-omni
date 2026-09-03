@@ -227,3 +227,23 @@ def test_omits_cache_misses_when_payload_object_is_replaced():
     request.additional_information = {"omni_final_stage_id": 1}
 
     assert not scheduler._request_omits_chunk_transfer_to_next_stage(request)
+
+
+def test_decode_to_dit_transfer_keeps_prefill_and_decode_blocks():
+    """The DiT export must include blocks allocated for the imported prefix."""
+    scheduler = OmniARScheduler.__new__(OmniARScheduler)
+    scheduler.requests_needing_kv_transfer = {}
+    scheduler._should_transfer_kv_for_request = lambda _request_id: True
+    scheduler.kv_cache_manager = SimpleNamespace(
+        # Blocks 10 and 11 represent the imported Prefill prefix; block 12
+        # contains locally generated Decode tokens. Block 13 is unused tail.
+        get_block_ids=lambda _request_id: ([10, 11, 12, 13],),
+    )
+    scheduler.cache_config = SimpleNamespace(block_size=4)
+
+    scheduler._mark_request_for_kv_transfer("req", seq_len=10)
+
+    assert scheduler.requests_needing_kv_transfer["req"] == {
+        "seq_len": 10,
+        "block_ids": [10, 11, 12],
+    }
