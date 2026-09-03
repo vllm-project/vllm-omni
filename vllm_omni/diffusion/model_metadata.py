@@ -88,6 +88,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "Cosmos3OmniDiffusersPipeline": DiffusionModelMetadata(final_output_type="video"),
     "Cosmos3OmniPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SanaVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "SanaImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SanaWmPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,
@@ -98,6 +99,7 @@ _DIFFUSION_MODEL_METADATA_ALIASES = {
     "WanDMDPipeline": "WanPipeline",
     "LTX2TwoStagePipeline": "LTX2Pipeline",
     "LTX2DistilledOneStagePipeline": "LTX2DistilledPipeline",
+    "LTX2DistilledTwoStagePipeline": "LTX2DistilledPipeline",
     "LingBotWorldCausalDMDPipeline": "LingBotVideoPipeline",
 }
 

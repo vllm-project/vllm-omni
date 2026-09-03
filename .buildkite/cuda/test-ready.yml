@@ -1,3 +1,6 @@
+# CUDA CI L2 (`core_model` e2e) plus L1 CPU Simple Test (`core_model and cpu`).
+# Uploaded by Upload Ready Pipeline: PR label `ready`, or main+WEEKLY=1 with --e2e.
+
 env:
   VLLM_WORKER_MULTIPROC_METHOD: spawn
   VLLM_USE_FLASHINFER_MOE_FP16: 0
@@ -51,17 +54,20 @@ steps:
           - timeout 15m pytest -sv tests/diffusion/batching -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_1
 
-      - label: "Diffusion · Distributed & Attention Test"
-        source_file_dependencies:
-          - tests/diffusion/distributed/
-          - tests/diffusion/attention/test_attention_sp.py
-          - vllm_omni/diffusion/distributed/
-          - vllm_omni/diffusion/attention/
-          - vllm_omni/diffusion/data.py
-          - vllm_omni/diffusion/models/
+      - label: "Diffusion · Distributed Test · Single-GPU"
         commands:
-          - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda' --run-level "core_model"
-          - timeout 20m pytest -sv tests/diffusion/attention/test_attention_sp.py -m 'core_model and cuda' --run-level "core_model"
+          - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda and L4 and cards_1' --run-level "core_model"
+        mirror_hardwares: l4_1
+
+      - label: "Diffusion · Distributed Test · 2-GPU"
+        commands:
+          - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
+        mirror_hardwares: l4_2
+
+      - label: "Diffusion · Distributed & Attention Test · 4-GPU"
+        commands:
+          - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda and L4 and cards_4' --run-level "core_model"
+          - timeout 20m pytest -sv tests/diffusion/attention/test_attention_sp.py -m 'core_model and cuda and L4 and cards_4' --run-level "core_model"
         mirror_hardwares: l4_4
 
       - label: "Diffusion · Model Test"

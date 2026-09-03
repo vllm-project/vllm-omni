@@ -220,16 +220,20 @@ def run_and_validate_text_to_video_request(omni: Omni):
     _validate_video(_run_offline_t2v(omni))
 
 
-def run_and_validate_image_to_video_request(omni: Omni):
+def run_and_validate_image_to_video_request(omni: Omni, check_t2v_divergence: bool = True):
     """Run and validate an image to video request.
 
     LTX2Pipeline uses a unified text/image entry and can fall back to T2V if
     the image never reaches conditioning, so also run T2V with the same seed
     and prompt and assert the outputs differ; a regression that silently
     drops the input image would otherwise still pass a "did we get a valid
-    video back" check alone.
+    video back" check alone. Pipelines that mandate an image and fail closed
+    without one (SANA-Video I2V) pass check_t2v_divergence=False: a dropped
+    image raises instead of silently degrading, so the T2V comparison is moot.
     """
     i2v_video = _validate_video_frames(_get_offline_videos(_run_offline_i2v(omni)))[0]
+    if not check_t2v_divergence:
+        return
     t2v_video = _validate_video_frames(_get_offline_videos(_run_offline_t2v(omni)))[0]
     assert not np.array_equal(i2v_video, t2v_video), (
         "I2V output is identical to T2V output with the same seed and prompt; "

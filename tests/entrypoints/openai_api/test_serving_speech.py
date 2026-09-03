@@ -174,7 +174,7 @@ def create_mock_audio_output_for_test(
         def __init__(self, index: int = 0):
             self.index = index
             self.text = ""
-            self.token_ids = []
+            self.token_ids: list[int] = []
             self.finish_reason = "stop"
             self.stop_reason = None
             self.logprobs = None
@@ -236,7 +236,8 @@ def test_app(mocker: MockerFixture, tmp_path, monkeypatch):
     mock_engine_client.errored = False
 
     async def mock_generate_fn(*args, **kwargs):
-        yield create_mock_audio_output_for_test(request_id=kwargs.get("request_id"))
+        request_id = kwargs.get("request_id") or "speech-mock-123"
+        yield create_mock_audio_output_for_test(request_id=request_id)
 
     mock_engine_client.generate = mocker.MagicMock(side_effect=mock_generate_fn)
     mock_engine_client.default_sampling_params_list = [{}]
@@ -276,7 +277,7 @@ def test_app(mocker: MockerFixture, tmp_path, monkeypatch):
     async def awaitable_patched_create_speech(*args, **kwargs):
         return await original_create_speech(*args, **kwargs)
 
-    awaitable_patched_create_speech.__signature__ = new_sig
+    awaitable_patched_create_speech.__signature__ = new_sig  # type: ignore[attr-defined]
     speech_server.create_speech = awaitable_patched_create_speech
 
     app = FastAPI()
@@ -1100,6 +1101,207 @@ class TestTTSMethods:
         emb = [0.1] * 2048
         req = OpenAICreateSpeechRequest(input="Hello", task_type="Base", speaker_embedding=emb, x_vector_only_mode=True)
         assert speech_server._validate_tts_request(req) is None
+
+    @pytest.mark.parametrize(
+        ("configured_variant", "requested_task"),
+        [
+            ("custom_voice", "Base"),
+            ("voice_design", "CustomVoice"),
+            ("base", "VoiceDesign"),
+        ],
+    )
+    def test_task_type_must_match_loaded_qwen3_tts_variant(self, speech_server, configured_variant, requested_task):
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            # Deliberately make the path uninformative so this test proves that
+            # the checkpoint config field is authoritative.
+            model="/mnt/base_models/qwen3-tts-1.7b-ckpt",
+            hf_config=SimpleNamespace(
+                tts_model_type=configured_variant,
+                talker_config=SimpleNamespace(hidden_size=2048),
+            ),
+        )
+
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type=requested_task,
+            ref_audio="data:audio/wav;base64,abc" if requested_task == "Base" else None,
+            x_vector_only_mode=True if requested_task == "Base" else None,
+            instructions="Warm voice" if requested_task == "VoiceDesign" else None,
+        )
+        result = speech_server._validate_tts_request(req)
+
+        assert result is not None
+        expected_variant = {
+            "custom_voice": "CustomVoice",
+            "voice_design": "VoiceDesign",
+            "base": "Base",
+        }[configured_variant]
+        assert f"{expected_variant} checkpoint does not support task_type='{requested_task}'" in result
+
+    @pytest.mark.parametrize(
+        "model_path",
+        [
+            "/models/base_models/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            "/models/base_models/Qwen3-TTS-12Hz-1.7B-custom_voice",
+        ],
+    )
+    def test_task_type_variant_falls_back_to_model_path(self, speech_server, model_path):
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            model=model_path,
+            hf_config=SimpleNamespace(
+                talker_config=SimpleNamespace(hidden_size=2048),
+            ),
+        )
+
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            x_vector_only_mode=True,
+        )
+        result = speech_server._validate_tts_request(req)
+
+        assert result is not None
+        assert "CustomVoice checkpoint does not support task_type='Base'" in result
+
+    def test_task_type_variant_falls_back_to_dated_snapshot_directory(self, speech_server):
+        """Metadata-less dated exports use the nearest matching path component."""
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            model="/models/Qwen3-TTS-12Hz-1.7B-CustomVoice/20260623_01",
+            hf_config=SimpleNamespace(
+                talker_config=SimpleNamespace(hidden_size=2048),
+            ),
+        )
+
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            x_vector_only_mode=True,
+        )
+        result = speech_server._validate_tts_request(req)
+
+        assert result is not None
+        assert "CustomVoice checkpoint does not support task_type='Base'" in result
+
+    def test_task_type_variant_unknown_config_falls_back_to_model_path(self, speech_server):
+        """An unrecognized metadata value should not discard a useful path signal."""
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            model="/models/Qwen3-TTS-12Hz-1.7B-Base",
+            hf_config=SimpleNamespace(
+                tts_model_type="future_variant",
+                talker_config=SimpleNamespace(hidden_size=2048),
+            ),
+        )
+
+        req = OpenAICreateSpeechRequest(input="Hello", task_type="CustomVoice")
+        result = speech_server._validate_tts_request(req)
+
+        assert result is not None
+        assert "Base checkpoint does not support task_type='CustomVoice'" in result
+
+    def test_task_type_variant_path_does_not_match_nonvariant_parent_components(self, speech_server):
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            model="/mnt/base_models/qwen3-tts-1.7b-ckpt",
+            hf_config=SimpleNamespace(
+                talker_config=SimpleNamespace(hidden_size=2048),
+            ),
+        )
+
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            x_vector_only_mode=True,
+        )
+
+        # Path fallback walks ancestors for dated snapshots, but base_models
+        # is not a delimited variant marker and must not imply Base.
+        assert speech_server._validate_tts_request(req) is None
+
+    def test_task_type_variant_config_wins_over_conflicting_path(self, speech_server):
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            model="/mnt/base_models/qwen3-tts-1.7b-ckpt",
+            hf_config=SimpleNamespace(
+                tts_model_type="custom_voice",
+                talker_config=SimpleNamespace(hidden_size=2048),
+            ),
+        )
+
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            x_vector_only_mode=True,
+        )
+        result = speech_server._validate_tts_request(req)
+
+        assert result is not None
+        assert "CustomVoice checkpoint does not support task_type='Base'" in result
+
+    def test_matching_task_type_and_model_variant_is_accepted(self, speech_server):
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            model="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+            hf_config=SimpleNamespace(
+                tts_model_type="Base",
+                talker_config=SimpleNamespace(hidden_size=2048),
+            ),
+        )
+
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            task_type="Base",
+            ref_audio="data:audio/wav;base64,abc",
+            x_vector_only_mode=True,
+        )
+
+        assert speech_server._validate_tts_request(req) is None
+
+    def test_stored_voice_uses_base_then_checks_model_variant(self, speech_server):
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            model="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            hf_config=SimpleNamespace(
+                tts_model_type="custom_voice",
+                talker_config=SimpleNamespace(hidden_size=2048),
+            ),
+        )
+        speech_server.uploaded_speakers = {
+            "alice": {
+                "file_path": "/tmp/alice.safetensors",
+                "embedding_source": "audio",
+            }
+        }
+
+        # Explicit CustomVoice must not pass validation and then be silently
+        # rewritten to Base by _build_tts_params.
+        req = OpenAICreateSpeechRequest(input="Hello", voice="alice", task_type="CustomVoice")
+        result = speech_server._validate_tts_request(req)
+
+        assert req.task_type == "Base"
+        assert result is not None
+        assert "CustomVoice checkpoint does not support task_type='Base'" in result
+
+    def test_precomputed_voice_infers_base_without_server_attribute(self, speech_server):
+        """Cover the non-uploaded side of stored_voice's ``or`` expression."""
+        speech_server._tts_model_type = "qwen3_tts"
+        adapter = speech_server._get_tts_adapter()
+        adapter.capabilities = replace(
+            adapter.capabilities,
+            precomputed_speakers={"precomputed-alice": {"mode": "xvec"}},
+        )
+
+        req = OpenAICreateSpeechRequest(input="Hello", voice="precomputed-alice")
+
+        assert speech_server._validate_tts_request(req) is None
+        assert req.task_type == "Base"
 
     def test_upload_voice_embedding_wrong_dims_rejected(self, speech_server):
         """Embedding uploads must match the loaded Qwen3-TTS model before being stored."""
@@ -2836,7 +3038,7 @@ class TestStreamingResponse:
                 def __init__(self, index: int = 0):
                     self.index = index
                     self.text = ""
-                    self.token_ids = []
+                    self.token_ids: list[int] = []
                     self.finish_reason = "stop"
                     self.stop_reason = None
                     self.logprobs = None
@@ -2895,7 +3097,7 @@ class TestStreamingResponse:
         async def awaitable_create_speech(*args, **kwargs):
             return await original_create_speech(*args, **kwargs)
 
-        awaitable_create_speech.__signature__ = new_sig
+        awaitable_create_speech.__signature__ = new_sig  # type: ignore[attr-defined]
         speech_server.create_speech = awaitable_create_speech
 
         app = FastAPI()
@@ -3108,7 +3310,7 @@ class TestStreamingResponse:
         async def awaitable_create_speech(*args, **kwargs):
             return await original_create_speech(*args, **kwargs)
 
-        awaitable_create_speech.__signature__ = new_sig
+        awaitable_create_speech.__signature__ = new_sig  # type: ignore[attr-defined]
         speech_server.create_speech = awaitable_create_speech
 
         app = FastAPI()
@@ -4110,7 +4312,7 @@ class TestWAVStreaming:
                 def __init__(self, index: int = 0):
                     self.index = index
                     self.text = ""
-                    self.token_ids = []
+                    self.token_ids: list[int] = []
                     self.finish_reason = "stop"
                     self.stop_reason = None
                     self.logprobs = None
@@ -4157,7 +4359,7 @@ class TestWAVStreaming:
         async def awaitable_create_speech(*args, **kwargs):
             return await original_create_speech(*args, **kwargs)
 
-        awaitable_create_speech.__signature__ = new_sig
+        awaitable_create_speech.__signature__ = new_sig  # type: ignore[attr-defined]
         speech_server.create_speech = awaitable_create_speech
 
         app = FastAPI()

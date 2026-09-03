@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.e2e.accuracy.helpers import SimilarityThresholds
+
 RABBIT_IMAGE_URL = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/rabbit.png"
 MODEL_NAME = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
 SIZE = "832x480"
@@ -13,8 +15,16 @@ FLOW_SHIFT = 5.0
 NUM_INFERENCE_STEPS = 50
 SEED = 42
 BOUNDARY_RATIO = 0.875
-SSIM_THRESHOLD = 0.94
-PSNR_THRESHOLD = 28.0
+
+
+# Per-device overrides for online-vs-diffusers video similarity.
+# Only listed profiles are matched against ``get_device_name()``; everything
+# else (including H100/L4) uses ``default``.
+SIMILARITY_THRESHOLDS_BY_DEVICE: dict[str, SimilarityThresholds] = {
+    "B200": SimilarityThresholds(ssim=0.93, psnr=28.0),
+    "default": SimilarityThresholds(ssim=0.94, psnr=28.0),
+}
+
 
 PROMPT = """一只棕色野兔的正面特写镜头，采用低角度仰拍视角，营造亲密而庄严的视觉冲击。兔子一双圆润漆黑的大眼睛直视镜头深处，眼神中交织着野生动物的警觉与一丝难以言喻的温柔好奇，仿佛在与观者建立跨越物种的静默对话。它毛色呈现层次丰富的棕褐渐变，从浅奶油色腹部过渡到深棕背部，每根毛发纹理清晰可辨，在侧光下泛着丝绸般的光泽。细长洁白的胡须共有三对，随呼吸节奏微微颤动，偶尔因捕捉气流信息而轻轻摇摆。
 两只标志性的长耳完全竖立，耳廓外侧覆盖短密棕毛，内侧则露出粉嫩的血管网络，薄如蝉翼的皮肤下血液流动隐约可见，耳朵以细微幅度不时转动，精准定位声源方向。背景是一片澄澈的蔚蓝天空，形态蓬松的白色积云以缓慢速度横向漂移，云影在兔子头顶交替变化，光线随之明暗流转。晴朗天气的明媚阳光从画面左上方45度角倾泻而下，在兔脸右侧形成柔和的伦勃朗式阴影，强化了面部立体感和皮毛质感。

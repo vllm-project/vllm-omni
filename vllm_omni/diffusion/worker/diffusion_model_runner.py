@@ -631,6 +631,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # RequestBatchSamplingParamsKey, so the first request's num_inference_steps applies
         # to the whole runner batch.
         num_inference_steps = first_req.sampling_params.num_inference_steps
+        if num_inference_steps is None and first_req.sampling_params.timesteps is not None:
+            num_inference_steps = len(first_req.sampling_params.timesteps)
+        if num_inference_steps is None and first_req.sampling_params.sigmas is not None:
+            num_inference_steps = len(first_req.sampling_params.sigmas)
+        if num_inference_steps is None:
+            num_inference_steps = getattr(self.pipeline, "default_num_inference_steps", None)
         if num_inference_steps is None and od_config.cache_backend in (
             "tea_cache",
             "step_cache",

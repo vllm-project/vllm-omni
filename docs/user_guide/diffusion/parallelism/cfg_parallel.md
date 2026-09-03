@@ -94,7 +94,7 @@ In `DiffusionParallelConfig`
 
 
 !!! info
-    Most models support `cfg_parallel_size=2` (positive branch on rank 0, negative branch on rank 1). **Bagel** is an exception: it supports `cfg_parallel_size=3`, which adds a third branch on rank 2 for full three-way CFG parallelism.
+    Most models support `cfg_parallel_size=2` (positive branch on rank 0, negative branch on rank 1). **Bagel** and **Boogu-Image-Edit double guidance** also support `cfg_parallel_size=3` for full three-way branch execution. Boogu double guidance additionally supports size 2 via round-robin assignment of its three branches.
 
 
 ---

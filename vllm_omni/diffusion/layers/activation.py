@@ -35,6 +35,3 @@ class SiluAndMul(CustomOp):
         import torch_npu
 
         return torch_npu.npu_swiglu(x, dim=-1)
-
-    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)
