@@ -383,12 +383,18 @@ def extract_audio_code_tensor(
 
 
 def _normalize_tokenizer_worker_cache_key(
-    device: torch.device,
+    device: torch.device | str,
     config_path: str | None,
     audio_tokenizer_path: str,
 ) -> tuple[str, str, str]:
     """Normalize cache key so that same tokenizer always hits the same cache entry."""
-    device_type = device.type if isinstance(device, torch.device) else str(device).split(":")[0]
+    dev = device if isinstance(device, torch.device) else torch.device(str(device))
+    # Keep the index: an explicit "cuda:1" must not collapse onto the process's
+    # current CUDA device. Resolve a bare "cuda" so it shares the cache entry
+    # with the equivalent indexed spelling.
+    if dev.type == "cuda" and dev.index is None and torch.cuda.is_available():
+        dev = torch.device("cuda", torch.cuda.current_device())
+    device_key = str(dev)
     # Use realpath so symlinks / trailing slash don't create duplicate entries
     ap = audio_tokenizer_path or ""
     if ap and os.path.exists(ap):
@@ -399,22 +405,21 @@ def _normalize_tokenizer_worker_cache_key(
 
     if not cp and ap:
         cp = os.path.dirname(ap)
-    return (device_type, cp, ap)
+    return (device_key, cp, ap)
 
 
 _TOKENIZER_WORKER_CACHE: dict[tuple[str, str, str], MiMoAudioTokenizerWorker] = {}
 
 
 def get_tokenizer_worker(
-    device: torch.device,
-    config_path: str,
+    device: torch.device | str,
+    config_path: str | None,
     audio_tokenizer_path: str,
 ) -> MiMoAudioTokenizerWorker:
     key = _normalize_tokenizer_worker_cache_key(device, config_path, audio_tokenizer_path)
     if key not in _TOKENIZER_WORKER_CACHE:
-        device_type = key[0]
         _TOKENIZER_WORKER_CACHE[key] = MiMoAudioTokenizerWorker(
-            device_str=device_type,
+            device_str=key[0],
             config_path=config_path,
             audio_tokenizer_path=audio_tokenizer_path,
         )
