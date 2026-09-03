@@ -1084,7 +1084,10 @@ class Qwen3OmniMoeConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMix
         audio_input: Qwen2_5OmniAudioFeatureInputs,
     ) -> tuple[torch.Tensor, ...]:
         input_features = audio_input["input_features"]
-        audio_feature_lengths = audio_input["audio_feature_lengths"]
+        # vLLM 0.29 marks audio_feature_lengths keep_on_cpu, and the audio tower
+        # derives device placement from feature_lens, so move it explicitly.
+        # Mirrors upstream Qwen3OmniMoeThinker._process_audio_input.
+        audio_feature_lengths = audio_input["audio_feature_lengths"].to(input_features.device, non_blocking=True)
 
         audio_output_lengths = _get_feat_extract_output_lengths(audio_feature_lengths)
 

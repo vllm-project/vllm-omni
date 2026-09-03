@@ -3640,6 +3640,17 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
                 additional_placeholders.append((modality, sub_pattern))
         placeholders += additional_placeholders
 
+        # vLLM 0.29 removed PromptUpdateDetails.select_text: prompt updates are
+        # token oriented now, so encode the replacement text and select the unk
+        # placeholder positions by token id instead of by text.
+        unk_token_id = tokenizer.convert_tokens_to_ids("<unk>")
+
+        def _select_unk_positions(text: str) -> PromptUpdateDetails:
+            return PromptUpdateDetails.select_token_id(
+                tokenizer.encode(text, add_special_tokens=False),
+                unk_token_id,
+            )
+
         image_max_slice_nums = hf_processor_mm_kwargs.get("max_slice_nums")
         image_use_image_id = hf_processor_mm_kwargs.get("use_image_id")
 
@@ -3648,14 +3659,13 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
 
             image_size = images.get_image_size(item_idx)
 
-            return PromptUpdateDetails.select_text(
+            return _select_unk_positions(
                 self.get_image_prompt_texts(
                     image_size,
                     item_idx,
                     max_slice_nums=None if image_max_slice_nums is None else int(image_max_slice_nums),  # type: ignore[arg-type]
                     use_image_id=None if image_use_image_id is None else bool(image_use_image_id),
-                ),
-                "<unk>",
+                )
             )
 
         def get_video_replacement(item_idx: int):
@@ -3664,10 +3674,7 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
             frame_size = videos.get_frame_size(item_idx)
             num_frames = videos.get_num_frames(item_idx)
 
-            return PromptUpdateDetails.select_text(
-                self.get_video_prompt_texts(frame_size, num_frames),
-                "<unk>",
-            )
+            return _select_unk_positions(self.get_video_prompt_texts(frame_size, num_frames))
 
         get_replacement = {
             "image": get_image_replacement,
@@ -3693,10 +3700,7 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
             else:
                 audio_len = audios.get_audio_length(item_idx)
 
-            return PromptUpdateDetails.select_text(
-                self.get_audio_prompt_texts(audio_len),
-                "<unk>",
-            )
+            return _select_unk_positions(self.get_audio_prompt_texts(audio_len))
 
         return [
             *base_updates,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for component routing for quantization."""
 
 from unittest.mock import MagicMock
@@ -372,7 +372,8 @@ class TestComponentApplyVllmMapper:
                 "thinker.model": "thinker.language_model.model",
                 "talker.model": "talker.language_model.model",
             }
-        ).get_unstacked_mapper()
+            # vLLM 0.29 renamed get_unstacked_mapper to get_rename_mapper.
+        ).get_rename_mapper()
 
         config.apply_vllm_mapper(mapper)
 

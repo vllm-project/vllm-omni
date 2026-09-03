@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Process manager for omni stage engine subprocesses.
 
@@ -81,6 +81,12 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
         # while reusing the parent's instance methods (shutdown, monitor).
         if local_engine_count <= 0:
             raise ValueError(f"local_engine_count must be > 0, got {local_engine_count}")
+
+        # Mirrors the vLLM 0.29 parent __init__: the inherited shutdown() reads
+        # this to bound how long in-flight requests may drain. Omitting it makes
+        # shutdown raise AttributeError, which leaves the engine core
+        # subprocesses alive and hangs interpreter exit until the job timeout.
+        self._request_shutdown_timeout = vllm_config.shutdown_timeout
 
         context = get_mp_context()
         common_kwargs: dict[str, object] = {
