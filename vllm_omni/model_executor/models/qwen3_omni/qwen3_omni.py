@@ -59,6 +59,16 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerProcessingInfo,
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
+
+# Codec token ids are single-sourced in the stage input processor
+# (``_QWEN3_CODEC_*``); the model keeps the ``TALKER_CODEC_*`` aliases for
+# backwards compatibility.  At runtime the talker actually reads them from
+# ``config.talker_config.codec_{pad,bos,eos}``.
+from vllm_omni.model_executor.stage_input_processors.qwen3_omni import (
+    _QWEN3_CODEC_BOS_TOKEN_ID,
+    _QWEN3_CODEC_EOS_TOKEN_ID,
+    _QWEN3_CODEC_PAD_TOKEN_ID,
+)
 from vllm_omni.platforms import current_omni_platform
 
 # Special token IDs for Qwen3 Omni MoE
@@ -75,10 +85,13 @@ TTS_BOS_TOKEN_ID = 151672  # <tts_text_bos>
 TTS_EOS_TOKEN_ID = 151673  # <tts_text_eod> (end of dialogue)
 TTS_BOS_SINGLE_TOKEN_ID = 151674  # <tts_text_bos_single>
 
-# Talker codec tokens (talker vocabulary, used for RVQ code generation)
-TALKER_CODEC_PAD_TOKEN_ID = 4196  # Padding token
-TALKER_CODEC_BOS_TOKEN_ID = 4197  # Beginning of speech
-TALKER_CODEC_EOS_TOKEN_ID = 4198  # End of speech
+# Talker codec tokens (talker vocabulary, used for RVQ code generation).
+# Single-sourced from ``stage_input_processors.qwen3_omni``
+# (``_QWEN3_CODEC_*``); at runtime the talker reads these ids from
+# ``config.talker_config.codec_{pad,bos,eos}`` instead.
+TALKER_CODEC_PAD_TOKEN_ID = _QWEN3_CODEC_PAD_TOKEN_ID  # Padding token
+TALKER_CODEC_BOS_TOKEN_ID = _QWEN3_CODEC_BOS_TOKEN_ID  # Beginning of speech
+TALKER_CODEC_EOS_TOKEN_ID = _QWEN3_CODEC_EOS_TOKEN_ID  # End of speech
 TALKER_CODEC_NOTHINK_ID = 4203  # No-think mode
 TALKER_CODEC_THINK_BOS_ID = 4204  # Think mode start
 TALKER_CODEC_THINK_EOS_ID = 4205  # Think mode end

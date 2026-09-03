@@ -21,6 +21,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors import _common
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 
 logger = init_logger(__name__)
@@ -44,11 +45,8 @@ _STATE_KEY = "_audex_async_state"
 
 
 def _ensure_list(value: Any) -> list[int]:
-    if value is None:
-        return []
-    if isinstance(value, torch.Tensor):
-        return value.reshape(-1).tolist()
-    return list(value)
+    """Delegate to the canonical ``_common.ensure_list_flatten``."""
+    return _common.ensure_list_flatten(value)
 
 
 def _connector_extra(transfer_manager: Any) -> dict[str, Any]:

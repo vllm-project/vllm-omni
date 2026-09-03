@@ -8,6 +8,7 @@ from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors import _common
 
 logger = init_logger(__name__)
 
@@ -19,22 +20,8 @@ def _to_prompt_dict(prompt_item: OmniTokensPrompt | TextPrompt | str | None) -> 
 
 
 def _to_token_id_list(value: Any) -> list[int]:
-    if isinstance(value, torch.Tensor):
-        value = value.detach().to("cpu")
-        if value.ndim == 0:
-            return [int(value.item())]
-        if value.ndim > 1:
-            value = value[0]
-        return [int(x) for x in value.tolist()]
-    if isinstance(value, list):
-        if not value:
-            return []
-        if isinstance(value[0], list):
-            return [int(x) for x in value[0]]
-        return [int(x) for x in value]
-    if value is None:
-        return []
-    return [int(value)]
+    """Delegate to the canonical ``_common.to_token_id_list``."""
+    return _common.to_token_id_list(value)
 
 
 def _to_int(value: Any, default: int = 0) -> int:

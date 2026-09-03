@@ -20,6 +20,7 @@ implementation contract; it is not, by itself, a general support claim.
 - [Disaggregated Inference](feature/disaggregated_inference.md)
 - [Host Weight Runtime](feature/host_weight_runtime.md)
 - [Async Chunk](feature/async_chunk.md)
+- [Stage Input Processor Contract](feature/async_chunk.md#stage-input-processor-contract) — RFC #4872 `stage_input_processors` refactor
 - [Async Diffusion Output](feature/async_diffusion_output.md)
 - [Async Omni Output Materialization](feature/omni_async_output_materialization.md)
 - [Automatic Prefix Caching in Omni Models](feature/prefix_caching.md)

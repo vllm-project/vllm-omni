@@ -1057,6 +1057,7 @@ def merge_pipeline_deploy(
                 stage_type=stage_type,
                 input_sources=list(ps.input_sources),
                 custom_process_input_func=input_proc,
+                sync_process_input_func=ps.sync_process_input_func,
                 final_output=ps.final_output,
                 final_output_type=ps.final_output_type,
                 worker_type=worker_type,
@@ -1085,6 +1086,7 @@ class StageConfig:
     stage_type: StageType = StageType.LLM
     input_sources: list[int] = field(default_factory=list)
     custom_process_input_func: str | None = None
+    sync_process_input_func: str | None = None
     final_output: bool = False
     final_output_type: str | None = None
     worker_type: str | None = None
@@ -1158,6 +1160,11 @@ class StageConfig:
 
         if self.custom_process_input_func:
             config_dict["custom_process_input_func"] = self.custom_process_input_func
+        # Carry the raw ``sync_process_input_func`` path to the orchestrator so
+        # async-chunk prewarm can resolve the registered placeholder builder
+        # (``*_token_only``) without re-reading the YAML.
+        if self.sync_process_input_func:
+            config_dict["sync_process_input_func"] = self.sync_process_input_func
 
         # Pass through extra YAML fields (default_sampling_params,
         # output_connectors, input_connectors, tts_args, etc.)

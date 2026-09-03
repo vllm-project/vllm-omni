@@ -1431,22 +1431,22 @@ class TestAdaptiveAccumulationPath:
                 tm.ramp_chunk_count[rid] += 1
             return p
 
-        # Phase 1 (t=0.0): chunk 0, IC=2
+        # t=0.0: chunk 0, IC=2.
         for i in range(2):
             append_and_emit(i)
 
-        # Phase 2 (t=0.05): build EWMA, emit target=4 at length=6
+        # t=0.05: build EWMA, emit target=4 at length=6.
         clock[0] = 0.05
         for i in range(2, 6):
             append_and_emit(i)
 
-        # Phase 3 (t=0.05): greedy target=18 (large buffer), accumulate
-        # 17 frames while holding (new_frames 1..17 < 18)
+        # t=0.05: greedy target=18 (large buffer), accumulate 17 frames while
+        # holding (new_frames 1..17 < 18).
         for i in range(6, 23):
             append_and_emit(i)
 
-        # Phase 4 (t=100.0): clock jumps, greedy collapses, target drops
-        # to ramp_floor=6. new_frames=18 > 6 -> bug trigger point.
+        # t=100.0: clock jumps, greedy collapses, target drops to ramp_floor=6.
+        # new_frames=18 > 6 -> bug trigger point.
         clock[0] = 100.0
         for i in range(23, total_frames):
             append_and_emit(i, finished=(i == total_frames - 1))

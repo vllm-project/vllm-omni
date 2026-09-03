@@ -18,6 +18,7 @@ from vllm_omni.data_entry_keys import (
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.cosyvoice3.utils import unpad_prompt_conditioning
+from vllm_omni.model_executor.stage_input_processors import _common
 
 logger = init_logger(__name__)
 
@@ -37,35 +38,13 @@ def _build_prompt_embed_struct(prompt_payload: dict[str, Any]) -> EmbeddingsStru
 
 
 def _ensure_list(x: Any) -> list[Any]:
-    if hasattr(x, "_x"):
-        return list(x._x)
-    if isinstance(x, list):
-        return list(x)
-    if isinstance(x, tuple):
-        return list(x)
-    if x is None:
-        return []
-    try:
-        return list(x)
-    except TypeError:
-        return [x]
+    """Delegate to the canonical shared helper."""
+    return _common.ensure_list(x)
 
 
 def _to_token_id_list(value: Any) -> list[int]:
-    if value is None:
-        return []
-    if isinstance(value, torch.Tensor):
-        value = value.detach().to("cpu").reshape(-1).tolist()
-    token_ids: list[int] = []
-    for item in _ensure_list(value):
-        if isinstance(item, torch.Tensor):
-            token_ids.extend(_to_token_id_list(item))
-            continue
-        if isinstance(item, (list, tuple)):
-            token_ids.extend(_to_token_id_list(item))
-            continue
-        token_ids.append(int(item))
-    return token_ids
+    """Recursive token-id flattening (cosyvoice3 golden semantics)."""
+    return _common.to_token_id_list(value, recursive=True)
 
 
 def _strip_prompt_prefix(output_ids: list[Any], prefix_ids: list[Any]) -> list[Any]:
@@ -84,13 +63,8 @@ def _prompt_speech_token_ids(multi_modal_data: dict[str, Any]) -> list[int]:
 
 
 def _to_cpu_tensor(x: Any) -> torch.Tensor | None:
-    if isinstance(x, list):
-        if not x:
-            return None
-        x = x[0]
-    if isinstance(x, torch.Tensor):
-        return x.detach().cpu()
-    return None
+    """Delegate to the canonical shared helper."""
+    return _common.to_cpu_tensor(x)
 
 
 def talker2code2wav_async_chunk(

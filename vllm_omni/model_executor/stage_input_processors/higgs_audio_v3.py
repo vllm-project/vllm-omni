@@ -33,6 +33,7 @@ from vllm_omni.data_entry_keys import (
     OmniPayloadStruct,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors import _common
 
 __all__ = ["talker2code2wav", "talker2code2wav_async_chunk"]
 
@@ -59,40 +60,25 @@ def _empty_code2wav_prompt() -> Any:
 
 
 def _revert_delay_pattern(audio_codes_qt: torch.Tensor) -> torch.Tensor:
-    """Reverse the MusicGen-style delay pattern.
+    """Reverse the MusicGen-style delay pattern (higgs-v3 strict variant).
 
-    Input shape: [num_codebooks, seq_len + num_codebooks - 1].
-    Output shape: [num_codebooks, seq_len].
-
-    For each codebook i, extract delayed[i, i : i + seq_len] to remove
-    the i leading BOC pads and Q-1-i trailing EOC entries.
+    Delegates to the canonical ``_common.revert_delay_pattern`` with the
+    strict codebook-count and short-input checks.
     """
-    if audio_codes_qt.ndim != 2:
-        raise ValueError(f"_revert_delay_pattern expects [Q, T] input; got {tuple(audio_codes_qt.shape)}")
-    q, t = audio_codes_qt.shape
-    if q != _NUM_CODEBOOKS:
-        raise ValueError(f"Expected exactly {_NUM_CODEBOOKS} codebook rows, got {q}. Input shape: [{q}, {t}]")
-    if t < q:
-        raise ValueError(f"Not enough frames to revert delay pattern: T={t} < Q={q}")
-    seq_len = t - q + 1
-    out_l = []
-    for i in range(q):
-        out_l.append(audio_codes_qt[i : i + 1, i : seq_len + i])
-    return torch.cat(out_l, dim=0)
+    return _common.revert_delay_pattern(
+        audio_codes_qt,
+        expected_codebooks=_NUM_CODEBOOKS,
+        allow_short=False,
+    )
 
 
 def _filter_real_code_frames(audio_codes_qt: torch.Tensor) -> torch.Tensor:
     """Keep only frames where ALL codebook values are in [0, 1023].
 
-    Input shape: [num_codebooks, num_frames].
-    Called AFTER delay pattern reversal.
+    Delegates to the canonical ``_common.filter_real_code_frames`` with the
+    higgs-v3 ``[num_codebooks, num_frames]`` layout.
     """
-    if audio_codes_qt.numel() == 0:
-        return audio_codes_qt
-    # Transpose to [num_frames, num_codebooks] for per-frame filtering
-    frames = audio_codes_qt.t()
-    valid = (frames >= 0).all(dim=1) & (frames < _NUM_REAL_CODES).all(dim=1)
-    return frames[valid].t().contiguous()
+    return _common.filter_real_code_frames(audio_codes_qt, num_real_codes=_NUM_REAL_CODES, layout="codebooks_first")
 
 
 def talker2code2wav(

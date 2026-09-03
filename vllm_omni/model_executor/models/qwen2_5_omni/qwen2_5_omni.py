@@ -44,6 +44,10 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerProcessingInfo,
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, split_list_into_ranges
+
+# RFC #4872 P6: the talker codec end token id is single-sourced in the stage
+# input processor (``TALKER_CODEC_END_TOKEN_ID``).
+from vllm_omni.model_executor.stage_input_processors.qwen2_5_omni import TALKER_CODEC_END_TOKEN_ID
 from vllm_omni.platforms import current_omni_platform
 
 # `get_llm_pos_ids_for_vision` was removed from upstream vLLM (commit
@@ -51,7 +55,9 @@ from vllm_omni.platforms import current_omni_platform
 # OmniMRotaryEmbedding. Bind it at module level to keep call sites unchanged.
 get_llm_pos_ids_for_vision = OmniMRotaryEmbedding._get_llm_pos_ids_for_vision
 
-TALKER_CODEC_EOS_TOKEN_ID = 8294
+# RFC #4872 P6: alias kept for backwards compatibility; the single source is
+# ``TALKER_CODEC_END_TOKEN_ID`` in ``stage_input_processors.qwen2_5_omni``.
+TALKER_CODEC_EOS_TOKEN_ID = TALKER_CODEC_END_TOKEN_ID
 TALKER_CODEC_BOS_TOKEN_ID = 8293
 
 

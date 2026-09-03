@@ -74,11 +74,8 @@ The thinker stage handles multimodal understanding. Key features:
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeForCausalLM
 
-class Qwen3OmniMoeThinkerForConditionalGeneration(
-    Qwen3MoeForCausalLM,
-    SupportsMultiModal,
-    SupportsPP
-):
+
+class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3MoeForCausalLM, SupportsMultiModal, SupportsPP):
     """Thinker stage: multimodal understanding → text generation."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -93,10 +90,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 The talker stage converts text embeddings to codec codes:
 
 ```python
-class Qwen3OmniMoeTalkerForConditionalGeneration(
-    Qwen3MoeForCausalLM,
-    SupportsPP
-):
+class Qwen3OmniMoeTalkerForConditionalGeneration(Qwen3MoeForCausalLM, SupportsPP):
     """Talker stage: text embeddings → RVQ codec codes."""
 
     def __init__(self, vllm_config, talker_config, prefix):
@@ -156,8 +150,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         if self.model_stage == "thinker":
             # Initialize thinker model
             thinker_vllm_config = vllm_config.with_hf_config(
-                config.thinker_config,
-                architectures=["Qwen3OmniMoeThinkerForConditionalGeneration"]
+                config.thinker_config, architectures=["Qwen3OmniMoeThinkerForConditionalGeneration"]
             )
             self.thinker = init_vllm_registered_model(
                 vllm_config=thinker_vllm_config,
@@ -170,8 +163,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         elif self.model_stage == "talker":
             # Initialize talker model
             talker_vllm_config = vllm_config.with_hf_config(
-                config.talker_config,
-                architectures=["Qwen3OmniMoeTalkerForConditionalGeneration"]
+                config.talker_config, architectures=["Qwen3OmniMoeTalkerForConditionalGeneration"]
             )
             self.talker = init_vllm_registered_model(
                 vllm_config=talker_vllm_config,
@@ -184,8 +176,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         elif self.model_stage == "code2wav":
             # Initialize code2wav model
             code2wav_vllm_config = vllm_config.with_hf_config(
-                config.code2wav_config,
-                architectures=["Qwen3OmniMoeCode2Wav"]
+                config.code2wav_config, architectures=["Qwen3OmniMoeCode2Wav"]
             )
             self.code2wav = init_vllm_registered_model(
                 vllm_config=code2wav_vllm_config,
@@ -196,8 +187,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             self.model = self.code2wav
         else:
             raise ValueError(
-                f"Invalid model_stage: {self.model_stage}. "
-                f"Must be one of: 'thinker', 'talker', 'code2wav'"
+                f"Invalid model_stage: {self.model_stage}. Must be one of: 'thinker', 'talker', 'code2wav'"
             )
 ```
 
@@ -298,11 +288,10 @@ Register your model in `vllm_omni/model_executor/models/registry.py`:
 ```python
 _OMNI_MODELS = {
     # ... existing models ...
-
     # Your new model
     "YourModelForConditionalGeneration": (
-        "your_model_name",        # Module folder name
-        "your_model",             # Module file name (without .py)
+        "your_model_name",  # Module folder name
+        "your_model",  # Module file name (without .py)
         "YourModelForConditionalGeneration",  # Class name
     ),
     "YourModelThinkerForConditionalGeneration": (
@@ -400,10 +389,7 @@ The stage transition process follows these steps:
        else:
            # Custom transition function (YOUR CODE HERE)
            return self.custom_process_input_func(
-               stage_list,
-               self.engine_input_source,
-               prompt,
-               self.requires_multimodal_data
+               stage_list, self.engine_input_source, prompt, self.requires_multimodal_data
            )
    ```
    - If `custom_process_input_func` is configured, it calls that function
@@ -492,14 +478,27 @@ thinker_hidden_states = output.multimodal_output["24"]
 
 Create stage transition processors in `vllm_omni/model_executor/stage_input_processors/your_model_name.py`. Each inter-stage edge should provide a **coherent processor set** rather than a single monolithic function:
 
-| Suffix | Role | Runs when |
-|--------|------|-----------|
-| `*_full_payload` | Worker-side payload producer | `async_chunk=false`; accumulates tensors and ships via connector |
-| `*_async_chunk` | Scheduler-side streaming producer | `async_chunk=true`; emits per-chunk payloads |
-| `*_token_only` | Orchestrator placeholder builder | `async_chunk=false`; allocates downstream prompt slots only |
+| Suffix | Registry kind | Runs where | Role |
+|--------|---------------|------------|------|
+| `*_full_payload` | `producer_full_payload` | Worker (producer-side) | `async_chunk=false`; accumulates tensors and ships via connector |
+| `*_async_chunk` | `producer_async_chunk` | Scheduler (producer-side) | `async_chunk=true`; emits per-chunk payloads |
+| `*_token_only` | `placeholder_prompt_builder` | Orchestrator (consumer-side) | Allocates downstream prompt slots only (both modes) |
+
+A model that supports **both** `async_chunk=false` and `async_chunk=true` must
+implement all three processors for every inter-stage edge — `*_full_payload`,
+`*_async_chunk` and `*_token_only`. The `*_token_only` placeholder builder is
+required in both modes: in non-async mode it builds the forward placeholder, in
+async mode the orchestrator reuses it to prewarm the downstream stage.
+
+Orchestrator-facing builders are normalized to the C1 contract
+`(source_outputs, ctx: OrchestratorInputContext)` by
+`wrap_orchestrator_processor`. The legacy `*_token_only` shell keeps its
+positional signature for call-site compatibility; the actual C1 entry point is
+the `build_forward_placeholder` / `build_prewarm_placeholder` pair attached to
+the shell (RFC #4872 P8b dual-entry design):
 
 ```python
-# qwen3_omni.py (Thinker → Talker, non-async path)
+# qwen3_omni.py (Thinker → Talker)
 
 def thinker2talker_token_only(
     source_outputs: list[Any],
@@ -507,20 +506,33 @@ def thinker2talker_token_only(
     requires_multimodal_data: bool = False,
     streaming_context: Any | None = None,
 ) -> list[OmniTokensPrompt]:
-    """Allocate talker prefill slots; bulk tensors arrive via the connector."""
+    """Allocate talker prefill slots; bulk tensors arrive via the connector.
+
+    Legacy positional shell (C2). The orchestrator wraps it once via
+    ``wrap_orchestrator_processor``, which forwards the C1
+    ``OrchestratorInputContext`` fields back into the positional arguments.
+    """
     ...
 
 
+# Attached C1 dual-entry builders (RFC #4872 P8b):
+#   thinker2talker_token_only.build_forward_placeholder(source_outputs, ctx)
+#   thinker2talker_token_only.build_prewarm_placeholder(*, stage0_prompt, ctx, ...)
+
+
 def thinker2talker_full_payload(
+    *,
     transfer_manager: Any,
     pooling_output: dict[str, Any],
     request: OmniEngineCoreRequest,
+    is_finished: bool = ...,  # optional: the worker retries without it
 ) -> dict[str, Any] | None:
     """Pack accumulated thinker hidden states into OmniPayload for stage-1."""
     ...
 
 
 def thinker2talker_async_chunk(
+    *,
     transfer_manager: Any,
     multimodal_output: OmniPayload | dict[str, Any],
     request: OmniEngineCoreRequest,
@@ -529,6 +541,13 @@ def thinker2talker_async_chunk(
     """Stream thinker rows to talker while async_chunk is enabled."""
     ...
 ```
+
+The `OrchestratorInputContext` carried by the C1 contract has `prompt`,
+`requires_multimodal_data`, `streaming_context` and `sampling_params` (and
+deliberately has no `model_config` field). The producer-side builders
+(`*_full_payload`, `*_async_chunk`) are keyword-only and never receive an
+`OrchestratorInputContext`; `pooling_output` / `multimodal_output` are
+load-bearing keyword names of the connector data plane.
 
 Wire these in `pipeline.py`:
 
@@ -546,7 +565,34 @@ StagePipelineConfig(
 ),
 ```
 
-Do **not** add a no-suffix `thinker2talker` when a `sync_process_input_func` is already declared — `_select_processor_funcs()` always prefers the `*_token_only` hook in non-async mode, so the bare function would never run. See `docs/design/rfc_stage_input_processors_refactor.md` for the full contract.
+### Registry registration and validation
+
+The processor registry infers a processor's kind from its name suffix and
+structurally validates the signature at startup (it never executes processor
+logic). Names that do not follow the suffix convention can register an explicit
+kind override once, e.g. at module import time:
+
+```python
+from vllm_omni.model_executor.stage_input_processors import register_processor
+
+register_processor(f"{_PROC}.thinker2talker_token_only", "placeholder_prompt_builder")
+```
+
+At startup the runtime resolves each processor through
+`resolve_processor(path, expected_kind=...)` — import -> `infer_kind` ->
+`validate_processor` -> expected-kind check — and returns a `ProcessorSpec`
+whose `fn` is the same callable a legacy `getattr(importlib.import_module(...),
+...)` lookup would produce. Hard contract violations raise
+`ProcessorValidationError`; soft mismatches (e.g. a `*_full_payload` builder
+declaring `multimodal_output` instead of `pooling_output`) emit a
+`RuntimeWarning`. New model processors should therefore match the suffix
+convention and the corresponding signature exactly.
+
+Do **not** add a no-suffix `thinker2talker` when a `sync_process_input_func` is
+already declared — `_select_processor_funcs()` always prefers the `*_token_only`
+hook in non-async mode, so the bare function would never run. See the
+[Stage Input Processor Contract](../../design/feature/async_chunk.md#stage-input-processor-contract)
+section of the async chunk design document for the full contract.
 
 ## Testing
 

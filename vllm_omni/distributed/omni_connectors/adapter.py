@@ -188,34 +188,27 @@ def try_recv_via_connector(
 def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
     """Compute the length of the talker prompt ids.
 
+    Delegates to the canonical ``_common.compute_placeholder_prompt_len(mode="full")``
+    so the streaming fixup path (``construct_next_stage_streaming_input_prompt``)
+    and the forward placeholder builder (``build_forward_placeholder``) share one
+    length helper.  Behaviour is golden-locked (``test_common_helpers_golden.py``
+    reproduces the 15-token chat-template result for the canonical prompt).
+
     Args:
         prompt_ids: The prompt ids tensor.
 
     Returns:
         The length of the talker prompt ids.
     """
-    im_start_token_id = 151644
-    system_token_id = 8948
-    user_token_id = 872
-    assistant_token_id = 77091
-    im_start_indexes = [i for i in range(len(prompt_ids)) if prompt_ids[i] == im_start_token_id]
-    im_start_indexes.append(len(prompt_ids))
-    sum_user_len = 0
-    assistant_len = 0
-    for i in range(len(im_start_indexes) - 1):
-        s = im_start_indexes[i]
-        e = im_start_indexes[i + 1]
-        role = prompt_ids[s + 1]
-        if role == system_token_id:
-            continue
-        elif role == user_token_id:
-            sum_user_len += e - s
-        elif role == assistant_token_id and i == len(im_start_indexes) - 2:
-            assistant_len += 9  # 3 + 4 + 1 + 1
-        else:
-            pass
+    from vllm_omni.model_executor.stage_input_processors import _common
 
-    return sum_user_len + assistant_len
+    # A flat prompt list has no ``all``/``prompt`` split, so feed the same list
+    # to both roles; ``_common``'s terminal index then equals ``len(prompt_ids)``
+    # exactly as the legacy inline scan did.
+    return _common.compute_placeholder_prompt_len(
+        ids_or_prompt={"ids": {"all": prompt_ids, "prompt": prompt_ids}},
+        mode="full",
+    )
 
 
 def construct_next_stage_streaming_input_prompt(

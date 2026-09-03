@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import copy
-import importlib
 import inspect
 import threading
 import time
@@ -16,6 +15,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import ConstantList
 
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
+from vllm_omni.model_executor.stage_input_processors import resolve_processor
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..factory import OmniConnectorFactory
@@ -138,9 +138,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.custom_process_next_stage_input_func: Callable[..., OmniPayloadStruct | None] | None = None
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
         if custom_process_next_stage_input_func:
-            module_path, func_name = custom_process_next_stage_input_func.rsplit(".", 1)
-            module = importlib.import_module(module_path)
-            self.custom_process_next_stage_input_func = getattr(module, func_name)
+            # Resolve through the registry with the async-chunk producer
+            # contract.  ``_select_processor_funcs`` already merged the
+            # async_chunk field into this path, so it must be a real
+            # ``*_async_chunk`` producer; ``is_finished`` is required (the
+            # scheduler always passes it below) — a missing/positional-only
+            # declaration is a hard configuration error (ProcessorValidationError).
+            spec = resolve_processor(custom_process_next_stage_input_func, expected_kind="producer_async_chunk")
+            self.custom_process_next_stage_input_func = spec.fn
         self._processor_accepts_step_tokens: dict[Callable[..., Any], bool] = {}
         # mapping for request id and chunk id
         self.put_req_chunk: dict[str, int] = defaultdict(int)

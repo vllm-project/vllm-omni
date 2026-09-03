@@ -6,7 +6,6 @@ Directly inherits from vLLM's AsyncMPClient to reuse EngineCore architecture.
 
 from __future__ import annotations
 
-import inspect
 import os
 import socket
 from typing import TYPE_CHECKING, Any
@@ -146,6 +145,10 @@ class StageEngineCoreClientBase(StageClientBase):
             self.prompt_transform_func = metadata.prompt_transform_func
             self.prompt_expand_func = metadata.prompt_expand_func
             self.custom_process_input_func = metadata.custom_process_input_func
+            # Raw ``sync_process_input_func`` path so the orchestrator can
+            # resolve the async-chunk prewarm placeholder builder
+            # (``build_prewarm_placeholder``) at prewarm time.
+            self.sync_process_input_func = metadata.sync_process_input_func
 
         self.engine_outputs: Any = None
         self.client_addresses = dict(client_addresses or {})
@@ -395,22 +398,28 @@ class StageEngineCoreClientBase(StageClientBase):
         and the original prompt.
         """
         if self.custom_process_input_func is not None:
-            signature = inspect.signature(self.custom_process_input_func)
-            if len(signature.parameters) >= 4:
-                return self.custom_process_input_func(
-                    source_outputs,
-                    prompt,
-                    self.requires_multimodal_data,
-                    streaming_context,
-                )
-            return self.custom_process_input_func(
+            # Dispatch through the shared contract layer, replacing the ad-hoc
+            # arity probe (`len(signature.parameters) >= 4`).
+            from vllm_omni.model_executor.stage_input_processors._dispatch import (
+                OrchestratorInputContext,
+                invoke_orchestrator_processor,
+            )
+
+            ctx = OrchestratorInputContext(
+                prompt=prompt,
+                requires_multimodal_data=self.requires_multimodal_data,
+                streaming_context=streaming_context,
+            )
+            return invoke_orchestrator_processor(
+                self.custom_process_input_func,
                 source_outputs,
-                prompt,
-                self.requires_multimodal_data,
+                ctx,
             )
 
         if not self.engine_input_source:
             raise ValueError(f"engine_input_source empty for stage {self.stage_id}")
+        # The default path below is itself a C0-shape processor; it is kept out of
+        # the contract dispatch to preserve its exact fallback semantics unchanged.
         return _default_process_engine_inputs(source_outputs, prompt, self.requires_multimodal_data)
 
     async def collective_rpc_async(

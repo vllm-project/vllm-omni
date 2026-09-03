@@ -6,7 +6,8 @@
 2. [Performance](#performance)
 3. [Architecture](#architecture)
 4. [Configuration](#configuration)
-5. [Related Files](#related-files)
+5. [Stage Input Processor Contract](#stage-input-processor-contract)
+6. [Related Files](#related-files)
 
 ## Overview
 
@@ -256,6 +257,174 @@ stages:
     devices: "1"
     max_num_seqs: 64  # Enables batched audio generation
 ```
+
+## Stage Input Processor Contract
+
+RFC #4872 standardized the per-model builders that convert one stage's outputs
+into the next stage's inputs. Each builder belongs to exactly one *role*
+(consumer-side vs producer-side) and is dispatched by the runtime according to
+the `async_chunk` mode. The naming convention and the validation rules below
+are load-bearing: the processor registry infers a builder's kind from its name
+suffix and enforces the matching signature at startup.
+
+### Naming convention and roles
+
+| Suffix | Registry kind | Runs where | Role |
+|--------|---------------|------------|------|
+| `*_full_payload` | `producer_full_payload` | Worker (producer-side) | Packs the accumulated stage output into an `OmniPayload` and ships it through the connector (`FullPayloadProducer`) |
+| `*_async_chunk` | `producer_async_chunk` | Scheduler (producer-side) | Streams one chunk per call while `async_chunk` is enabled (`AsyncChunkProducer`) |
+| `*_token_only` | `placeholder_prompt_builder` | Orchestrator (consumer-side) | Allocates downstream KV slots only; bulk tensors arrive via the connector (`PlaceholderPromptBuilder`) |
+| (no suffix, legacy) | `legacy_orchestrator_builder` | Orchestrator (consumer-side) | Legacy sync builder — a placeholder or diffusion input builder, adapted through `wrap_orchestrator_processor` |
+
+Diffusion-stage edges use dedicated suffixes
+(`ar2diffusion` / `ar2dit` / `thinker2imagegen` / ...) mapped to
+`diffusion_input_builder`, and `moss_tts.talker2codec` keeps the legacy
+`legacy_multi_source` shape. The canonical naming documentation lives in the
+`vllm_omni/model_executor/stage_input_processors/__init__.py` module docstring.
+
+### Minimal processor set per edge
+
+A new model that must work in **both** modes implements, for each inter-stage
+edge, the three processors below:
+
+| Mode | Producer-side | Consumer-side (orchestrator) |
+|------|---------------|------------------------------|
+| `async_chunk=false` | `*_full_payload` (`FullPayloadProducer`) | `*_token_only` (`PlaceholderPromptBuilder`) |
+| `async_chunk=true` | `*_async_chunk` (`AsyncChunkProducer`) | `*_token_only` (prewarm via `build_prewarm_placeholder`) |
+
+The minimal union set is `*_full_payload`, `*_async_chunk` and `*_token_only`.
+The `*_token_only` placeholder builder is required in both modes: in non-async
+mode it builds the forward placeholder, and in async mode the orchestrator
+reuses it to prewarm the downstream stage.
+
+### OrchestratorInputContext and the C1 contract
+
+Every orchestrator-facing builder is invoked under the fixed C1 contract
+`(source_outputs, ctx)`:
+
+```python
+from vllm_omni.model_executor.stage_input_processors import OrchestratorInputContext
+
+
+def my_token_only(
+    source_outputs: list[Any],
+    ctx: OrchestratorInputContext,
+) -> list[OmniTokensPrompt]:
+    """Upstream outputs -> next-stage token prompts (C1 contract)."""
+    ...
+```
+
+`OrchestratorInputContext` carries the transition metadata and deliberately has
+no `model_config` field (a processor that needs the model config reads it
+through the upstream stage closure, never through this context):
+
+```python
+@dataclass(frozen=True)
+class OrchestratorInputContext:
+    prompt: Any | None = None
+    requires_multimodal_data: bool = False
+    streaming_context: Any | None = None
+    sampling_params: Any | None = None
+```
+
+Processors that already accept `ctx` are used unchanged. Legacy positional
+shapes (C0 3-arg, C2 placeholder with `streaming_context`, C3 diffusion with
+`sampling_params`, C4 `moss_tts.talker2codec` multi-source) are adapted by
+`wrap_orchestrator_processor` / `invoke_orchestrator_processor` and emit a
+`DeprecationWarning`.
+
+### Registry and startup validation
+
+The registry performs **signature-level structural checks only** — it never
+executes processor logic and never loads model weights. Kind inference is
+name-driven (suffix-based):
+
+- `register_processor(path, kind)` — manual kind override for names that do not
+  follow the suffix convention (escape hatch; overrides are validated eagerly).
+- `infer_kind(fn, *, path)` — suffix rules: `_token_only` ->
+  `placeholder_prompt_builder`, `_full_payload` / `_batch` ->
+  `producer_full_payload`, `_async_chunk` -> `producer_async_chunk`, diffusion
+  suffixes -> `diffusion_input_builder`, no suffix ->
+  `legacy_orchestrator_builder`, `moss_tts.talker2codec` ->
+  `legacy_multi_source`.
+- `validate_processor(fn, *, kind, path, stage_config=None)` — hard contract
+  violations raise `ProcessorValidationError`; soft mismatches emit a
+  `RuntimeWarning`.
+- `resolve_processor(path, *, expected_kind=None, stage_config=None)` — the
+  drop-in replacement for the legacy `getattr(importlib.import_module(...), ...)`
+  lookups: imports, infers, validates, optionally checks `expected_kind`, and
+  returns a `ProcessorSpec` whose `fn` is the same callable the legacy lookup
+  produced.
+
+### P8b dual entry: forward and prewarm placeholders
+
+The `*_token_only` placeholder builder is exposed through two entry points so
+the sync forward path and the async-chunk prewarm path share the same `_common`
+length / packing helpers:
+
+- `build_forward_placeholder(source_outputs, ctx)` — the non-async forward
+  path. One placeholder `OmniTokensPrompt` per upstream output, sized by
+  `_common.compute_placeholder_prompt_len(mode="full")`.
+- `build_prewarm_placeholder(*, stage0_prompt, ctx, downstream_stage_id)` —
+  async-chunk mode has no upstream `source_outputs` yet at prewarm time, so the
+  length is a best-effort estimate from the stage-0 input prompt
+  (`mode="stage0_only"`, i.e. `len(stage0_prompt)`). The connector fixup path
+  (`adapter.construct_next_stage_streaming_input_prompt`) replaces the estimate
+  with the real length once the upstream chunk arrives.
+
+The orchestrator routes prewarm through `_prewarm_async_chunk_stages`, which
+reads `build_prewarm_placeholder` off the resolved `*_token_only` function
+object (both builders are attached as attributes on the exported function).
+
+### Three-state async gate
+
+The orchestrator only forwards via `process_engine_inputs` when the transition
+is not served by the async-chunk data plane:
+
+```python
+if (
+    (finished or segment_finished)
+    and stage_id < req_state.final_stage_id
+    and (not self.async_chunk or not self._stage_receives_async_chunks(stage_id + 1))
+    and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
+):
+```
+
+`_stage_receives_async_chunks(stage_id)` reports whether a stage's connector
+supplies its runtime inputs. When `async_chunk=true` and the downstream stage
+receives async chunks, the orchestrator skips `process_engine_inputs` for that
+transition, so the corresponding input processor may be dead for the duration
+of the request. `dead_processor_hint` is a pure decision helper (for warnings
+and tests only); the runtime is warn-first in the M0 phase.
+
+### Producer keyword contract
+
+Producer-side builders never receive an `OrchestratorInputContext`; their
+keyword-only parameters are load-bearing parts of the connector data plane and
+must not be renamed or made positional:
+
+```python
+def my_full_payload(
+    *,
+    transfer_manager: Any,
+    pooling_output: Any,
+    request: Any,
+    is_finished: bool = ...,  # optional: the worker retries without it
+) -> Any: ...
+
+
+def my_async_chunk(
+    *,
+    transfer_manager: Any,
+    multimodal_output: Any,
+    request: Any,
+    is_finished: bool = False,  # required: the scheduler always passes it
+) -> Any: ...
+```
+
+`pooling_output` (full payload) and `multimodal_output` (async chunk) are
+cross-checked by `validate_processor`; using the wrong keyword name for a kind
+is flagged as a structural warning.
 
 ## Related Files
 

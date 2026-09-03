@@ -13,6 +13,7 @@ import torch
 from vllm.inputs import TextPrompt
 
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors import _common
 
 logger = logging.getLogger(__name__)
 
@@ -204,14 +205,11 @@ def _resolve_image_patch_token_id(stage: Any) -> int:
 
 
 def _ensure_list(x) -> list[int]:
-    """Convert ConstantList / tensor-like to plain list."""
-    if hasattr(x, "_x"):
-        return list(x._x)
-    if isinstance(x, list):
-        return x
-    if hasattr(x, "tolist"):
-        return x.tolist()
-    return list(x)
+    """Convert ConstantList / tensor-like to plain list.
+
+    Delegates to the canonical ``_common.ensure_list_strict``.
+    """
+    return _common.ensure_list_strict(x)
 
 
 def _slice_patch_hidden(

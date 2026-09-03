@@ -29,6 +29,7 @@ from vllm_omni.data_entry_keys import (
     OmniPayload,
     OmniPayloadStruct,
 )
+from vllm_omni.model_executor.stage_input_processors import _common
 
 __all__ = ["talker2code2wav", "talker2code2wav_async_chunk"]
 
@@ -52,40 +53,19 @@ _NUM_REAL_CODES = _AUDIO_STREAM_BOS_ID  # codes in [0, 1023] are real
 def _filter_real_code_frames(audio_codes: torch.Tensor) -> torch.Tensor:
     """Keep only frames whose codes are entirely in [0, 1023].
 
-    ``audio_codes`` has shape ``[num_frames, num_codebooks]`` after the
-    standard Stage-0 transpose. We drop frames containing stream specials
-    or anything padded outside the real-code range.
+    Delegates to the canonical ``_common.filter_real_code_frames`` with the
+    higgs-v2 ``[num_frames, num_codebooks]`` layout.
     """
-    if audio_codes.numel() == 0:
-        return audio_codes
-    if audio_codes.ndim != 2:
-        raise ValueError(f"expected [num_frames, num_codebooks] audio_codes; got shape {tuple(audio_codes.shape)}")
-    valid = (audio_codes >= 0).all(dim=1) & (audio_codes < _NUM_REAL_CODES).all(dim=1)
-    return audio_codes[valid]
+    return _common.filter_real_code_frames(audio_codes, num_real_codes=_NUM_REAL_CODES, layout="frames_first")
 
 
 def _revert_delay_pattern(audio_codes_qt: torch.Tensor) -> torch.Tensor:
-    """Reverse the delay-pattern shift, mirroring upstream's
-    ``boson_multimodal.model.higgs_audio.utils.revert_delay_pattern``.
+    """Reverse the delay-pattern shift (higgs-v2 lenient variant).
 
-    Input shape: ``[num_codebooks, seq_len + num_codebooks - 1]``.
-    Output shape: ``[num_codebooks, seq_len]``.
-
-    For each codebook ``i``, slice rows ``[i:i+1]`` from columns
-    ``[i : seq_len + i]`` to remove ``i`` leading BOS pads and ``Q-1-i``
-    trailing PAD entries.
+    Delegates to the canonical ``_common.revert_delay_pattern`` with
+    ``allow_short=True`` (T < Q returns the input unchanged).
     """
-    if audio_codes_qt.ndim != 2:
-        raise ValueError(f"_revert_delay_pattern expects [Q, T] input; got {tuple(audio_codes_qt.shape)}")
-    q, t = audio_codes_qt.shape
-    if t < q:
-        # Not enough frames to revert delay pattern; return as-is.
-        return audio_codes_qt
-    seq_len = t - q + 1
-    out_l = []
-    for i in range(q):
-        out_l.append(audio_codes_qt[i : i + 1, i : seq_len + i])
-    return torch.cat(out_l, dim=0)
+    return _common.revert_delay_pattern(audio_codes_qt, allow_short=True)
 
 
 def talker2code2wav(

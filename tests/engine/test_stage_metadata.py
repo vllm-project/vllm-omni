@@ -1,5 +1,6 @@
 import copy
 import operator
+from typing import Any
 
 import pytest
 from vllm.sampling_params import SamplingParams
@@ -19,6 +20,7 @@ from vllm_omni.engine.stage_init_utils import (
     extract_stage_metadata_from_omni_stage_config,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_executor.stage_input_processors import ProcessorValidationError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -171,3 +173,45 @@ def test_extract_stage_metadata_defaults_missing_engine_input_source():
     metadata = extract_stage_metadata(legacy_config)
 
     assert metadata.engine_input_source == []
+
+
+# ---------------------------------------------------------------------------
+# A bad custom_process_input_func must FAIL FAST.  The config-hook resolution
+# path no longer swallows resolve_processor failures and continues with
+# custom_process_input_func=None (which silently fell back to
+# _default_process_engine_inputs).  The worker mixin candidate chain keeps its
+# own skip-on-mismatch tolerance; this is the config-hook resolution path.
+# ---------------------------------------------------------------------------
+
+
+def _legacy_stage0_config() -> Any:
+    pipeline, deploy = _metadata_inputs()
+    return merge_pipeline_deploy(
+        pipeline,
+        copy.deepcopy(deploy),
+    )[0].to_omegaconf()
+
+
+def test_extract_stage_metadata_fails_fast_on_bad_processor_module():
+    legacy_config = _legacy_stage0_config()
+    legacy_config["custom_process_input_func"] = "nonexistent.module.does_not_exist"
+    with pytest.raises(ImportError):
+        extract_legacy_stage_metadata(legacy_config)
+
+
+def test_extract_stage_metadata_fails_fast_on_missing_processor_attr():
+    legacy_config = _legacy_stage0_config()
+    legacy_config["custom_process_input_func"] = "operator.does_not_exist"
+    with pytest.raises(AttributeError):
+        extract_legacy_stage_metadata(legacy_config)
+
+
+def test_extract_stage_metadata_fails_fast_on_invalid_processor():
+    # Resolves to a non-callable symbol -> ProcessorValidationError (rule
+    # "callable") instead of silently dropping the configured hook.
+    legacy_config = _legacy_stage0_config()
+    legacy_config["custom_process_input_func"] = (
+        "vllm_omni.model_executor.stage_input_processors._common._IM_START_TOKEN_ID"
+    )
+    with pytest.raises(ProcessorValidationError):
+        extract_legacy_stage_metadata(legacy_config)

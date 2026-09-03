@@ -78,6 +78,15 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         talker_config: Qwen3OmniMoeTalkerConfig = vllm_config.model_config.hf_config
+        # The codec token-id consistency guard is deliberately not run at module
+        # import (it pulls in transformers / the qwen3-tts config).  Invoke it
+        # explicitly at model-load startup so the processor constants stay in
+        # sync with the HF configs this model actually runs with.
+        from vllm_omni.model_executor.stage_input_processors.qwen3_omni import (
+            _assert_codec_token_ids_consistent,
+        )
+
+        _assert_codec_token_ids_consistent()
         rope_params = getattr(talker_config.text_config, "rope_scaling", None)
         if rope_params is None:
             rope_params = getattr(talker_config.text_config, "rope_parameters", None) or {}

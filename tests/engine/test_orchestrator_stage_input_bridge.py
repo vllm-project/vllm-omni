@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import asyncio
 import queue
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import ANY, AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import janus
 import pytest
@@ -51,7 +51,7 @@ class FakeStageClient:
         self.next_inputs = list(next_inputs or [])
         self.add_request_calls: list[tuple[Any, ...]] = []
         self.decoded_source_tokens: str | None = None
-        self._engine_core_outputs = queue.Queue()
+        self._engine_core_outputs: queue.Queue[Any] = queue.Queue()
 
     async def add_request_async(self, *args, **_kwargs) -> None:
         self.add_request_calls.append(args)
@@ -297,6 +297,56 @@ async def test_async_prewarm_skips_outgoing_only_stage() -> None:
 
 
 @pytest.mark.asyncio
+async def test_prewarm_uses_registered_build_prewarm_placeholder() -> None:
+    """Async-chunk prewarm resolves ``sync_process_input_func`` (the
+    ``*_token_only`` path) to ``build_prewarm_placeholder`` and uses its estimate.
+
+    The placeholder length is ``stage0_only`` = the Qwen chat-template scan on
+    the stage-0 prompt.  The synthetic ``[1, 2]`` prompt has no chat-template
+    marker, so the scan yields 0 and the builder floors it to a 1-token
+    placeholder (best-effort; the connector fixup path replaces it later).
+    """
+    orchestrator = object.__new__(Orchestrator)
+    stage0 = FakePrewarmPool("sender")
+    stage1 = FakePrewarmPool("receiver")
+    # The real qwen3_omni sync placeholder builder exposes build_prewarm_placeholder
+    # off the resolved fn (see test_placeholder_parity.py).
+    stage1.stage_client = SimpleNamespace(  # type: ignore[attr-defined]
+        sync_process_input_func=(
+            "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_token_only"
+        ),
+    )
+    orchestrator.stage_pools = [stage0, stage1]
+    orchestrator._emit_tx_edge = lambda **_kwargs: None
+    orchestrator._record_duplex_stage_submission = MagicMock()
+    req_state = OrchestratorRequestState(
+        request_id="req-prewarm-resolved",
+        prompt={"prompt_token_ids": [1, 2]},
+        sampling_params_list=[SamplingParams(max_tokens=1), SamplingParams(max_tokens=1)],
+        final_stage_id=1,
+    )
+
+    prewarmed = await orchestrator._prewarm_async_chunk_stages(
+        "req-prewarm-resolved",
+        SimpleNamespace(prompt_token_ids=[1, 2], resumable=True),
+        req_state,
+    )
+
+    assert prewarmed is True
+    assert len(stage1.submitted) == 1
+    # build_prewarm_placeholder uses stage0_only = the chat-template scan on the
+    # stage-0 prompt.  The synthetic [1, 2] prompt has no chat-template marker,
+    # so the scan yields 0 and the builder floors it to a 1-token placeholder.
+    assert stage1.submitted[0].prompt_token_ids == [0]
+    orchestrator._record_duplex_stage_submission.assert_called_once_with(
+        1,
+        "req-prewarm-resolved",
+        0,
+        req_state,
+    )
+
+
+@pytest.mark.asyncio
 async def test_duplex_prewarm_runs_after_first_stage0_submission() -> None:
     port, stage_pools, request_states, prewarm, submission = _duplex_stage_port_submission()
     prewarm.return_value = True
@@ -391,3 +441,145 @@ async def test_streaming_segment_does_not_complete_final_output_stage() -> None:
     orchestrator._cleanup_request_ids.assert_not_awaited()
     routed = orchestrator.output_async_queue.get_nowait()
     assert routed.finished is False
+
+
+# ---------------------------------------------------------------------------
+# P2 deep-dive: dead-processor hint must not flag the selected sync hook.
+# ---------------------------------------------------------------------------
+
+
+def _prewarm_orchestrator_with_client(client: Any) -> Orchestrator:
+    orch = object.__new__(Orchestrator)
+    orch.stage_pools = [
+        SimpleNamespace(
+            stage_client=client,
+            stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        )
+    ]
+    return orch
+
+
+def test_warn_dead_input_processors_skips_selected_sync_hook() -> None:
+    """The selected sync hook used as the custom hook is NOT dead.
+
+    In non-async mode a stage wiring the same ``*_token_only`` processor as
+    both ``custom_process_input_func`` and ``sync_process_input_func`` must not
+    be reported as never-invoked (it is the active forward processor).
+    """
+    from vllm_omni.engine import orchestrator as orch_module
+
+    def _sync_hook(source_outputs, prompt=None, requires_multimodal_data=False):  # type: ignore[no-untyped-def]
+        return []
+
+    path = f"{_sync_hook.__module__}.{_sync_hook.__qualname__}"
+
+    class _Client:
+        custom_process_input_func = _sync_hook
+        sync_process_input_func = path
+
+    orch = _prewarm_orchestrator_with_client(_Client())
+    orch.async_chunk = False
+    with patch.object(orch_module.logger, "warning") as mock_warn:
+        orch._warn_dead_input_processors()
+    dead_warnings = [call for call in mock_warn.call_args_list if call.args and "never invoked" in call.args[0]]
+    assert dead_warnings == []
+
+
+def test_warn_dead_input_processors_flags_distinct_sync_hook() -> None:
+    """A custom hook overridden by a *different* sync hook is still reported dead."""
+    from vllm_omni.engine import orchestrator as orch_module
+
+    def _custom_hook(source_outputs, prompt=None, requires_multimodal_data=False):  # type: ignore[no-untyped-def]
+        return []
+
+    def _sync_hook(source_outputs, prompt=None, requires_multimodal_data=False):  # type: ignore[no-untyped-def]
+        return []
+
+    path = f"{_sync_hook.__module__}.{_sync_hook.__qualname__}"
+
+    class _Client:
+        custom_process_input_func = _custom_hook
+        sync_process_input_func = path
+
+    orch = _prewarm_orchestrator_with_client(_Client())
+    orch.async_chunk = False
+    with patch.object(orch_module.logger, "warning") as mock_warn:
+        orch._warn_dead_input_processors()
+    dead_warnings = [call for call in mock_warn.call_args_list if call.args and "never invoked" in call.args[0]]
+    assert len(dead_warnings) == 1
+
+
+# ---------------------------------------------------------------------------
+# P3 deep-dive: prewarm placeholder builder resolution is cached per stage.
+# ---------------------------------------------------------------------------
+
+
+class _FakeProcessorSpec:
+    """Minimal stand-in for ``ProcessorSpec`` with a controllable ``fn``."""
+
+    def __init__(self, fn: Any) -> None:
+        self.path = "fake"
+        self.kind = "placeholder_prompt_builder"
+        self.fn = fn
+
+
+def test_prewarm_builder_resolved_once_and_cached() -> None:
+    """A stage with a builder resolves it once and caches it.
+
+    Repeated async requests must not re-run the importlib resolution or the
+    registry validation.
+    """
+    from vllm_omni.model_executor import stage_input_processors as sip
+
+    def _build_prewarm_placeholder(**kwargs):  # type: ignore[no-untyped-def]
+        return {"prompt_token_ids": [0]}
+
+    def _sync_hook(source_outputs, prompt=None, requires_multimodal_data=False):  # type: ignore[no-untyped-def]
+        return []
+
+    _sync_hook.build_prewarm_placeholder = _build_prewarm_placeholder  # type: ignore[attr-defined]
+
+    class _Client:
+        sync_process_input_func = "pkg.mod.fake_token_only"
+
+    orch = _prewarm_orchestrator_with_client(_Client())
+    with patch.object(sip, "resolve_processor", return_value=_FakeProcessorSpec(_sync_hook)) as mock_resolve:
+        first = orch._get_prewarm_placeholder_builder(0)
+        second = orch._get_prewarm_placeholder_builder(0)
+    assert first is _build_prewarm_placeholder
+    assert second is _build_prewarm_placeholder
+    assert mock_resolve.call_count == 1
+
+
+def test_prewarm_builder_miss_warns_once_and_caches() -> None:
+    """A stage WITHOUT a builder resolves once, warns once, then caches a miss.
+
+    Qwen3-TTS and other models have no ``build_prewarm_placeholder``; without
+    per-stage caching every async request re-resolved and re-warned.
+    """
+    from vllm_omni.engine import orchestrator as orch_module
+    from vllm_omni.model_executor import stage_input_processors as sip
+
+    def _sync_hook(source_outputs, prompt=None, requires_multimodal_data=False):  # type: ignore[no-untyped-def]
+        return []
+
+    class _Client:
+        sync_process_input_func = "pkg.mod.fake_token_only"
+
+    orch = _prewarm_orchestrator_with_client(_Client())
+    fake_module = SimpleNamespace()
+    with (
+        patch.object(sip, "resolve_processor", return_value=_FakeProcessorSpec(_sync_hook)) as mock_resolve,
+        patch("importlib.import_module", return_value=fake_module) as mock_import,
+        patch.object(orch_module.logger, "warning") as mock_warn,
+    ):
+        first = orch._get_prewarm_placeholder_builder(0)
+        second = orch._get_prewarm_placeholder_builder(0)
+        third = orch._get_prewarm_placeholder_builder(0)
+    assert first is None
+    assert second is None
+    assert third is None
+    assert mock_resolve.call_count == 1
+    assert mock_import.call_count == 1
+    inline_estimates = [call for call in mock_warn.call_args_list if call.args and "inline estimate" in call.args[0]]
+    assert len(inline_estimates) == 1

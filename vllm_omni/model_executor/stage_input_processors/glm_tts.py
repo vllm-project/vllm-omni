@@ -18,6 +18,7 @@ from vllm_omni.data_entry_keys import (
     OmniPayloadStruct,
 )
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.model_executor.stage_input_processors import _common
 
 logger = init_logger(__name__)
 
@@ -170,15 +171,11 @@ def _extract_last_speech_token(pooling_output: dict[str, Any]) -> int | None:
 
 
 def _to_cpu_tensor(value: Any) -> torch.Tensor | None:
-    """Convert value to CPU tensor if possible."""
-    if isinstance(value, torch.Tensor):
-        return value.detach().cpu()
-    if isinstance(value, list):
-        if not value:
-            return None
-        if isinstance(value[0], torch.Tensor):
-            return value[0].detach().cpu()
-    return None
+    """Convert value to CPU tensor if possible.
+
+    Delegates to the canonical ``_common.to_cpu_tensor``.
+    """
+    return _common.to_cpu_tensor(value)
 
 
 # ---------------------------------------------------------------------------
