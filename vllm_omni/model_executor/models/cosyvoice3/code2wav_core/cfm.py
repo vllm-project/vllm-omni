@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from https://github.com/FunAudioLLM/CosyVoice/tree/main/cosyvoice/flow
 """Conditional Flow Matching (CFM) classes for audio generation."""
 

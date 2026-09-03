@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for CosyVoice3 components."""
 
-from contextlib import contextmanager
 import types
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from https://github.com/FunAudioLLM/CosyVoice/tree/main/cosyvoice/flow/DiT
 # Refactored to use vllm_omni diffusion infrastructure for optimized attention backends
 
