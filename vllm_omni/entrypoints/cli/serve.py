@@ -116,14 +116,25 @@ class OmniServeCommand(CLISubcommand):
             if explicit_keys is not None:
                 args.explicit_keys = explicit_keys | {"model_config"}
 
-        if args.headless:
+        if args.standalone:
+            uvloop.run(run_standalone(args))
+        elif args.headless:
             run_headless(args)
         else:
             uvloop.run(omni_run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
-        if args.stage_id is not None and (args.omni_master_address is None or args.omni_master_port is None):
-            raise ValueError("--stage-id requires both --omni-master-address and --omni-master-port to be set")
+        standalone = args.standalone
+        if standalone and args.stage_id is None:
+            raise ValueError("--standalone requires --stage-id")
+        if standalone and args.headless:
+            raise ValueError("--standalone and --headless are mutually exclusive")
+        if (
+            args.stage_id is not None
+            and not standalone
+            and (args.omni_master_address is None or args.omni_master_port is None)
+        ):
+            raise ValueError("--stage-id requires --omni-master-address and --omni-master-port (or use --standalone)")
 
         # --omni-replica-address is only consulted in run_headless(); reject it
         # on the head so a misconfigured launch fails loudly instead of being
@@ -302,6 +313,13 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=None,
             help="Select and launch a single stage by stage_id.",
+        )
+        omni_config_group.add_argument(
+            "--standalone",
+            action="store_true",
+            default=False,
+            help="Run a single stage as a standalone HTTP server. "
+            "Requires --stage-id. Mutually exclusive with --headless.",
         )
         omni_config_group.add_argument(
             "--replica-id",
@@ -920,6 +938,55 @@ class OmniServeCommand(CLISubcommand):
         type(self)._parser = serve_parser
 
         return serve_parser
+
+
+async def run_standalone(args: TrackingNamespace) -> None:
+    """Run a single stage as a standalone HTTP server."""
+    from vllm_omni.entrypoints.utils import (
+        extract_standalone_stage_config,
+        load_and_resolve_stage_configs,
+        parse_stage_overrides,
+    )
+
+    model = args.model
+    stage_id: int = args.stage_id
+
+    if not model:
+        raise ValueError("--model is required")
+
+    if args.async_chunk:
+        logger.warning(
+            "[Standalone] async_chunk is not supported in standalone mode and will be disabled. "
+            "Standalone stages use full-payload transfer."
+        )
+
+    args_dict = args.get_explicit_kwargs_dict()
+    stage_overrides = parse_stage_overrides(args_dict.get("stage_overrides"))
+
+    config_path, stage_configs, _ = load_and_resolve_stage_configs(
+        model,
+        dict(args_dict),
+        trust_remote_code=args.trust_remote_code,
+        deploy_config_path=args_dict.get("deploy_config"),
+        stage_overrides=stage_overrides,
+        strategy_config_path=args_dict.get("strategy_config"),
+    )
+
+    standalone_configs = extract_standalone_stage_config(stage_configs, stage_id)
+
+    stage_cfg = standalone_configs[0]
+    model_stage = stage_cfg.get("engine_args", {}).get("model_stage", f"stage-{stage_id}")
+    logger.info("[Standalone] Booting stage %d (%s) as independent server", stage_id, model_stage)
+
+    args.async_chunk = False
+    args._standalone_stage_configs = standalone_configs
+    args._standalone = True
+    args.explicit_keys = (args.explicit_keys | {"_standalone_stage_configs", "_standalone", "async_chunk"}) - {
+        "stage_id",
+        "standalone",
+    }
+
+    await omni_run_server(args)
 
 
 def run_headless(args: TrackingNamespace) -> None:

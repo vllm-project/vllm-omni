@@ -121,6 +121,7 @@ class AsyncOmniEngine:
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _enable_orch_monitor: bool = False
+    _standalone: bool = False
     # Lazily created by get_output_blocking_async().
     _output_drain_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
@@ -154,6 +155,7 @@ class AsyncOmniEngine:
         # --log-stats CLI flag set by the user via OmniBase.
         self._log_stats = log_stats
         self._enable_orch_monitor = bool(kwargs.pop("enable_orch_monitor", False))
+        self._standalone = bool(kwargs.pop("_standalone", False))
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
 
@@ -369,6 +371,12 @@ class AsyncOmniEngine:
             supported_tasks.add("generate")
         if any(meta.final_output_type == "audio" for meta in self.stage_metadata):
             supported_tasks.add("speech")
+        # Standalone downstream stages (e.g., code2wav) lack a tokenizer and
+        # are not detected as comprehension models, so "generate" is not added
+        # by the check above. They still must accept generate requests with
+        # pre-tokenized prompt_token_ids from the upstream stage.
+        if self._standalone:
+            supported_tasks.add("generate")
         self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
 
     def _bootstrap_orchestrator(
@@ -1256,6 +1264,13 @@ class AsyncOmniEngine:
         trust_remote_code: bool | None,
     ) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
+
+        standalone_configs = kwargs.pop("_standalone_stage_configs", None)
+        if standalone_configs is not None:
+            config_path = kwargs.pop("deploy_config", None) or model
+            for key in ("strategy_config", "stage_overrides", "stage_configs_path", "stage_configs"):
+                kwargs.pop(key, None)
+            return config_path, standalone_configs
 
         for legacy_arg in ("stage_configs_path", "stage_configs"):
             if legacy_arg in kwargs:
