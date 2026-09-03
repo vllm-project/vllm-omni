@@ -245,10 +245,9 @@ class LTXAudioRuntime(
     support_audio_output = True
     support_image_input = False
     supports_request_batch = False
-    # The generic diffusion warmup uses this class-level value when the
-    # pipeline is registered by name.  LTX's causal audio clock requires
-    # ``8 * k + 1`` frames; 9 is the smallest valid warmup shape.
-    dummy_run_num_frames: ClassVar[int] = 9
+    # CUDA Graphs are captured lazily from the first real request, so a full
+    # startup request only shifts capture latency and needlessly runs decoding.
+    dummy_run_num_frames: ClassVar[int] = 0
     connector_batches_cfg = False
     preserve_sp_padded_audio_duration = True
     _default_audio_resource_limits: ClassVar[LTX2AudioResourceLimits] = LTX2AudioResourceLimits()
@@ -277,7 +276,6 @@ class LTXAudioRuntime(
 
         self.component_profile = resolve_ltx_component_profile(self.pipeline_kind, self.model_version)
         self.pipeline_recipe = resolve_ltx_pipeline_recipe(self.pipeline_kind, self.model_version)
-        self._validate_audio_cuda_graph_buckets()
         if cache_backend == "cache_dit" and not self.pipeline_recipe.supports_cache_dit:
             raise ValueError(
                 f"{type(self).__name__} does not support cache_backend='cache_dit'. "
@@ -302,21 +300,6 @@ class LTXAudioRuntime(
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=getattr(od_config, "enable_diffusion_pipeline_profiler", False)
         )
-
-    def _validate_audio_cuda_graph_buckets(self) -> None:
-        for bucket_seconds in self._audio_cuda_graph_config.audio_length_buckets:
-            self._audio_resource_limits.validate_requested_duration(bucket_seconds)
-            bucket_num_frames = resolve_ltx_audio_num_frames(
-                audio_length=bucket_seconds,
-                num_frames=None,
-                frame_rate=self.pipeline_recipe.frame_rate,
-                default_num_frames=self.pipeline_recipe.num_frames,
-            )
-            self._audio_resource_limits.validate_resolved_duration(
-                num_frames=bucket_num_frames,
-                frame_rate=self.pipeline_recipe.frame_rate,
-                expected_frame_rate=self.pipeline_recipe.frame_rate,
-            )
 
     @staticmethod
     def _validate_audio_cuda_graph_support(od_config: OmniDiffusionConfig, device: torch.device) -> None:
@@ -425,12 +408,6 @@ class LTXAudioRuntime(
             exact_num_frames = sampling.num_frames
         requested_frame_rate = sampling.resolved_frame_rate
         frame_rate = float(self.pipeline_recipe.frame_rate if requested_frame_rate is None else requested_frame_rate)
-        if req.is_dummy_run() and self._audio_cuda_graph_config.audio_length_buckets:
-            # Warm the first configured graph shape directly.  Padding the
-            # minimal dummy shape would capture the attention-mask branch,
-            # while an exact-length request normally uses the unmasked branch.
-            audio_length = self._audio_cuda_graph_config.audio_length_buckets[0]
-            exact_num_frames = None
         limits = getattr(self, "_audio_resource_limits", self._default_audio_resource_limits)
         if audio_length is not None:
             audio_length = float(audio_length)
@@ -535,27 +512,6 @@ class LTXAudioRuntime(
         parallel_config = getattr(getattr(self, "od_config", None), "parallel_config", None)
         sp_size = int(getattr(parallel_config, "sequence_parallel_size", 1) or 1)
         limits.validate_latent_frames(latent_ops.get_sp_padded_audio_latent_length(requested_frames, sp_size))
-        bucket_audio_frames_list = []
-        for bucket_seconds in self._audio_cuda_graph_config.audio_length_buckets:
-            bucket_num_frames = resolve_ltx_audio_num_frames(
-                audio_length=bucket_seconds,
-                num_frames=None,
-                frame_rate=inputs.frame_rate,
-                default_num_frames=self.pipeline_recipe.num_frames,
-            )
-            bucket_duration_s = bucket_num_frames / inputs.frame_rate
-            bucket_audio_frames_float = bucket_duration_s * latent_rate
-            if not math.isfinite(bucket_audio_frames_float):
-                raise ValueError("LTX text-to-audio bucket latent frame count must be finite.")
-            bucket_audio_frames = round(bucket_audio_frames_float)
-            # Keep configured buckets on the same structural shape used by
-            # ``prepare_audio_latents``.  Without this normalization, dummy
-            # warmup captures the SP-padded bucket while a shorter real
-            # request is padded back to the raw (possibly non-divisible)
-            # bucket, so it misses the warmed graph and may not shard evenly.
-            bucket_audio_frames = latent_ops.get_sp_padded_audio_latent_length(bucket_audio_frames, sp_size)
-            limits.validate_latent_frames(bucket_audio_frames)
-            bucket_audio_frames_list.append(bucket_audio_frames)
         num_mel_bins = self.audio_vae.config.mel_bins
         latent_mel_bins = num_mel_bins // self.audio_vae_mel_compression_ratio
         audio_latents, original_frames, padded_frames = self.prepare_audio_latents(
@@ -569,18 +525,6 @@ class LTXAudioRuntime(
             generator=inputs.generator,
             latents=inputs.audio_latents,
         )
-        for bucket_audio_frames in bucket_audio_frames_list:
-            if bucket_audio_frames < original_frames:
-                continue
-            if bucket_audio_frames > padded_frames:
-                padding = audio_latents.new_zeros(
-                    audio_latents.shape[0],
-                    bucket_audio_frames - padded_frames,
-                    audio_latents.shape[2],
-                )
-                audio_latents = torch.cat([audio_latents, padding], dim=1)
-                padded_frames = bucket_audio_frames
-            break
         return audio_latents, original_frames, padded_frames, latent_mel_bins
 
     @staticmethod
@@ -692,12 +636,21 @@ class LTXAudioRuntime(
             for index, timestep in enumerate(timesteps):
                 if self.interrupt:
                     continue
-                model_input = _repeat_batch(audio_latents, model_pass_count).to(model_dtype)
-                expanded_timestep = timestep.expand(model_input.shape[0])
+                if audio_graph_runner is None:
+                    model_input = _repeat_batch(audio_latents, model_pass_count).to(model_dtype)
+                    model_input_repeats = 1
+                else:
+                    # Broadcast directly into the graph's CFG-sized static
+                    # input buffer instead of materializing a repeated tensor.
+                    model_input = audio_latents.to(model_dtype)
+                    model_input_repeats = model_pass_count
+                model_batch_size = encoder_hidden_states.shape[0]
+                expanded_timestep = timestep.expand(model_batch_size)
                 model_timestep = expanded_timestep[:, None].expand(-1, model_input.shape[1])
-                model_sigma = audio_scheduler.sigmas[index].expand(model_input.shape[0])
+                model_sigma = audio_scheduler.sigmas[index].expand(model_batch_size)
                 velocity = self._run_audio_transformer(
                     audio_hidden_states=model_input,
+                    audio_hidden_states_repeats=model_input_repeats,
                     audio_encoder_hidden_states=encoder_hidden_states,
                     audio_timestep=model_timestep,
                     audio_sigma=model_sigma,
@@ -708,6 +661,11 @@ class LTXAudioRuntime(
                     audio_static_conditioning=audio_static_conditioning,
                 )
                 if guidance_parallel_ready:
+                    # Guidance collectives may consume their inputs on a
+                    # communication stream after this Python call returns. Do
+                    # not expose graph-owned output storage across that stream.
+                    if audio_graph_runner is not None:
+                        velocity = velocity.clone()
                     local_slots = velocity.chunk(model_pass_count)
                     group = get_guidance_parallel_group()
                     gathered_slots = [group.all_gather(value, separate_tensors=True) for value in local_slots]
@@ -733,7 +691,7 @@ class LTXAudioRuntime(
                     audio_scheduler.sigmas,
                     index,
                 )
-                audio_latents = latent_ops.clear_audio_padding(audio_latents, original_num_frames)
+                audio_latents = latent_ops.clear_audio_padding_(audio_latents, original_num_frames)
                 progress_bar.update()
         return audio_latents
 
@@ -741,6 +699,7 @@ class LTXAudioRuntime(
         self,
         *,
         audio_hidden_states: torch.Tensor,
+        audio_hidden_states_repeats: int = 1,
         audio_encoder_hidden_states: torch.Tensor,
         audio_timestep: torch.Tensor,
         audio_sigma: torch.Tensor,
@@ -755,6 +714,7 @@ class LTXAudioRuntime(
         if audio_graph_runner is not None:
             return audio_graph_runner(
                 audio_hidden_states=audio_hidden_states,
+                audio_hidden_states_repeats=audio_hidden_states_repeats,
                 audio_encoder_hidden_states=audio_encoder_hidden_states,
                 audio_timestep=audio_timestep,
                 audio_sigma=audio_sigma,
@@ -774,8 +734,13 @@ class LTXAudioRuntime(
         transformer_kwargs = {}
         if audio_static_conditioning is not None:
             transformer_kwargs["audio_static_conditioning"] = audio_static_conditioning
+        eager_hidden_states = (
+            audio_hidden_states
+            if audio_hidden_states_repeats == 1
+            else _repeat_batch(audio_hidden_states, audio_hidden_states_repeats)
+        )
         return self.transformer(
-            audio_hidden_states=audio_hidden_states,
+            audio_hidden_states=eager_hidden_states,
             audio_encoder_hidden_states=audio_encoder_hidden_states,
             audio_timestep=audio_timestep,
             audio_sigma=audio_sigma,

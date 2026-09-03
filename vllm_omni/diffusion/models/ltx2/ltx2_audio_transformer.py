@@ -17,7 +17,7 @@ from torch import nn
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig, LTX2AudioCachedAdapter
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 
@@ -188,6 +188,7 @@ class LTX2AudioTransformerModel(nn.Module):
         # Guidance passes are fused into one batch and produce one Transformer
         # forward per denoising step.
         has_separate_cfg=False,
+        cached_adapter_cls=LTX2AudioCachedAdapter,
         check_forward_pattern=False,
     )
 
@@ -427,7 +428,8 @@ class LTX2AudioTransformerModel(nn.Module):
         for index, block in enumerate(self.transformer_blocks):
             perturbation_mask = perturbation_kwargs.get("audio_self_attention_mask")
             blocks = perturbation_kwargs.get("audio_self_attention_blocks")
-            if blocks is not None and index not in blocks:
+            routes_perturbation = getattr(block, "_routes_ltx2_audio_perturbation", False)
+            if not routes_perturbation and blocks is not None and index not in blocks:
                 perturbation_mask = None
             kwargs = {
                 "temb_audio": temb_audio,
@@ -437,6 +439,8 @@ class LTX2AudioTransformerModel(nn.Module):
                 "audio_self_attention_mask": audio_attention_mask,
                 "audio_self_attention_perturbation_mask": perturbation_mask,
             }
+            if routes_perturbation:
+                kwargs["audio_self_attention_perturbation_blocks"] = blocks
             audio_hidden_states = block(audio_hidden_states, audio_encoder_hidden_states, **kwargs)
 
         values = self.audio_scale_shift_table[None, None] + embedded_timestep[:, :, None]

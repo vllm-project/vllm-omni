@@ -8,6 +8,8 @@ import torch
 from cache_dit import ForwardPattern
 from torch import nn
 
+from vllm_omni.diffusion.cache.cachedit import LTX2AudioCachedAdapter
+from vllm_omni.diffusion.cache.cachedit.model_specific import LTX2AudioCachedBlocks
 from vllm_omni.diffusion.models.ltx2 import ltx2_audio_transformer
 from vllm_omni.diffusion.models.ltx2.ltx2_audio_transformer import (
     LTX2AudioStaticConditioning,
@@ -89,7 +91,71 @@ def test_ltx_audio_transformer_declares_single_stream_cache_dit_pattern():
 
     assert config.block_forward_patterns == {"transformer_blocks": ForwardPattern.Pattern_2}
     assert config.has_separate_cfg is False
+    assert config.cached_adapter_cls is LTX2AudioCachedAdapter
     assert config.check_forward_pattern is False
+
+
+def test_ltx_audio_cached_blocks_route_stg_mask_by_original_layer():
+    perturbation_mask = torch.tensor([1.0, 0.0])
+    kwargs = {
+        "audio_self_attention_perturbation_mask": perturbation_mask,
+        "audio_self_attention_perturbation_blocks": (28,),
+    }
+
+    assert LTX2AudioCachedBlocks._block_kwargs(0, kwargs)["audio_self_attention_perturbation_mask"] is None
+    assert (
+        LTX2AudioCachedBlocks._block_kwargs(28, kwargs)["audio_self_attention_perturbation_mask"] is perturbation_mask
+    )
+    assert "audio_self_attention_perturbation_blocks" not in LTX2AudioCachedBlocks._block_kwargs(28, kwargs)
+
+
+def test_ltx_audio_cached_block_segments_keep_global_layer_ids():
+    calls = []
+
+    class FakeContextManager:
+        name = "test"
+
+        @staticmethod
+        def Fn_compute_blocks():
+            return 1
+
+        @staticmethod
+        def Bn_compute_blocks():
+            return 1
+
+    class FakeBlock(nn.Module):
+        def __init__(self, block_id):
+            super().__init__()
+            self.block_id = block_id
+
+        def forward(self, hidden_states, _encoder_hidden_states, **kwargs):
+            calls.append((self.block_id, kwargs["audio_self_attention_perturbation_mask"]))
+            return hidden_states + 1
+
+    wrapper = LTX2AudioCachedBlocks(
+        nn.ModuleList([FakeBlock(index) for index in range(3)]),
+        forward_pattern=ForwardPattern.Pattern_2,
+        check_forward_pattern=False,
+        cache_prefix="blocks",
+        cache_context="blocks",
+        context_manager=FakeContextManager(),
+    )
+    hidden_states = torch.zeros(1)
+    encoder_hidden_states = torch.zeros(1)
+    perturbation_mask = torch.ones(1)
+    kwargs = {
+        "audio_self_attention_perturbation_mask": perturbation_mask,
+        "audio_self_attention_perturbation_blocks": (1,),
+    }
+
+    wrapper.call_Fn_blocks(hidden_states, encoder_hidden_states, **kwargs)
+    wrapper.call_Mn_blocks(hidden_states, encoder_hidden_states, **kwargs)
+    wrapper.call_Bn_blocks(hidden_states, encoder_hidden_states, **kwargs)
+
+    assert [block_id for block_id, _mask in calls] == [0, 1, 2]
+    assert calls[0][1] is None
+    assert calls[1][1] is perturbation_mask
+    assert calls[2][1] is None
 
 
 def test_ltx_audio_transformer_exposes_hsdp_blocks(monkeypatch):

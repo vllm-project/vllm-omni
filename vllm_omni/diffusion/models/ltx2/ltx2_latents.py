@@ -173,6 +173,15 @@ def clear_audio_padding(latents: torch.Tensor, num_frames: int) -> torch.Tensor:
     return torch.cat([latents[:, :num_frames], padding], dim=1)
 
 
+def clear_audio_padding_(latents: torch.Tensor, num_frames: int) -> torch.Tensor:
+    """Zero audio padding in place without allocating a new sampler state."""
+    if not 0 < num_frames <= latents.shape[1]:
+        raise ValueError(f"Audio frame count must be in [1, {latents.shape[1]}], got {num_frames}.")
+    if num_frames < latents.shape[1]:
+        latents[:, num_frames:].zero_()
+    return latents
+
+
 def get_sp_padded_audio_latent_length(audio_latent_length: int, sp_size: int) -> int:
     if sp_size > 1:
         audio_latent_length += (sp_size - (audio_latent_length % sp_size)) % sp_size

@@ -15,6 +15,7 @@ from torch import nn
 from vllm_omni.diffusion.models.ltx2.ltx2_audio_cuda_graph import (
     LTX2AudioCUDAGraphConfig,
     LTX2AudioCUDAGraphRunner,
+    _copy_repeated_batch_,
     make_ltx2_audio_graph_key,
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_audio_transformer import LTX2AudioStaticConditioning
@@ -33,20 +34,6 @@ def test_config_defaults_and_preserves_unrelated_additional_config():
     ) == LTX2AudioCUDAGraphConfig(enabled=True, max_entries=8)
 
 
-def test_config_accepts_strictly_increasing_audio_length_buckets():
-    config = LTX2AudioCUDAGraphConfig.from_additional_config(
-        {
-            "ltx2_audio_cuda_graph": {
-                "enabled": True,
-                "max_entries": 4,
-                "audio_length_buckets": [1, 5.0, 10],
-            }
-        }
-    )
-
-    assert config.audio_length_buckets == (1.0, 5.0, 10.0)
-
-
 @pytest.mark.parametrize(
     ("additional_config", "error", "message"),
     [
@@ -58,26 +45,7 @@ def test_config_accepts_strictly_increasing_audio_length_buckets():
         ({"ltx2_audio_cuda_graph": {"max_entries": True}}, ValueError, "positive integer"),
         ({"ltx2_audio_cuda_graph": {"max_entries": 0}}, ValueError, "positive integer"),
         ({"ltx2_audio_cuda_graph": {"max_entries": "4"}}, ValueError, "positive integer"),
-        (
-            {"ltx2_audio_cuda_graph": {"enabled": True, "audio_length_buckets": "1,5"}},
-            TypeError,
-            "list or tuple",
-        ),
-        (
-            {"ltx2_audio_cuda_graph": {"enabled": True, "audio_length_buckets": [1.0, 1.0]}},
-            ValueError,
-            "strictly increasing",
-        ),
-        (
-            {"ltx2_audio_cuda_graph": {"enabled": True, "audio_length_buckets": [0.0]}},
-            ValueError,
-            "finite and positive",
-        ),
-        (
-            {"ltx2_audio_cuda_graph": {"enabled": False, "audio_length_buckets": [1.0]}},
-            ValueError,
-            "enabled=true",
-        ),
+        ({"ltx2_audio_cuda_graph": {"audio_length_buckets": [1.0]}}, ValueError, "Unknown"),
     ],
 )
 def test_config_rejects_invalid_model_options(additional_config, error, message):
@@ -141,6 +109,25 @@ def test_graph_key_canonicalizes_stg_blocks():
     assert first.stg_blocks == (4, 28)
 
 
+def test_graph_key_and_static_copy_expand_hidden_batch_without_repeat_tensor():
+    inputs = _cpu_inputs()
+    source = inputs["audio_hidden_states"]
+    destination = torch.empty(6, *source.shape[1:], dtype=source.dtype)
+
+    _copy_repeated_batch_(destination, source, 3)
+    key = make_ltx2_audio_graph_key(
+        source,
+        torch.empty(6, *inputs["audio_encoder_hidden_states"].shape[1:]),
+        None,
+        None,
+        None,
+        hidden_batch_repeats=3,
+    )
+
+    torch.testing.assert_close(destination, source.repeat(3, 1, 1))
+    assert key.hidden_shape == (6, 3, 4)
+
+
 class _EagerTransformer:
     def __call__(self, **kwargs):
         return kwargs["audio_hidden_states"] + 1
@@ -156,6 +143,26 @@ def test_incompatible_inputs_fall_back_without_failed_key():
     assert runner.stats_snapshot()["eager"] == 1
     assert runner.stats_snapshot()["eager_incompatible_inputs"] == 1
     assert runner.stats_snapshot()["failed_key_count"] == 0
+
+
+def test_incompatible_inputs_expand_hidden_batch_for_eager_fallback():
+    runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cpu")
+    inputs = _cpu_inputs()
+    repeats = 3
+    for name in (
+        "audio_encoder_hidden_states",
+        "audio_timestep",
+        "audio_sigma",
+        "audio_coords",
+    ):
+        value = inputs[name]
+        inputs[name] = value.repeat((repeats,) + (1,) * (value.ndim - 1))
+
+    output = runner(**inputs, audio_hidden_states_repeats=repeats)
+
+    torch.testing.assert_close(output, inputs["audio_hidden_states"].repeat(repeats, 1, 1) + 1)
+    assert output.shape == (6, 3, 4)
+    assert runner.last_call_info["reason"] == "incompatible_inputs"
 
 
 def test_tp_capture_scope_uses_dedicated_stream(monkeypatch):
@@ -275,7 +282,7 @@ def test_cache_miss_returns_warmup_output_without_replay(monkeypatch):
 
     replay.assert_not_called()
     torch.testing.assert_close(output, captured_output)
-    assert output.data_ptr() != captured_output.data_ptr()
+    assert output.data_ptr() == captured_output.data_ptr()
     assert runner.last_call_info["mode"] == "capture"
 
     runner(**inputs)
@@ -446,7 +453,7 @@ def _cuda_inputs(*, tokens=3, value=1.0, mask=True, perturb=True):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_cuda_graph_matches_eager_replays_values_and_owns_output():
+def test_cuda_graph_matches_eager_and_replay_uses_static_output():
     torch.manual_seed(7)
     transformer = _TinyAudioTransformer().eval()
     runner = LTX2AudioCUDAGraphRunner(transformer, max_graphs=2)
@@ -481,6 +488,7 @@ def test_cuda_graph_matches_eager_replays_values_and_owns_output():
     torch.testing.assert_close(second_graph, second_eager, rtol=0, atol=0)
     torch.testing.assert_close(first_graph, preserved, rtol=0, atol=0)
     assert first_graph.data_ptr() != runner._cache[_key(first_inputs)].static_output.data_ptr()
+    assert second_graph.data_ptr() == runner._cache[_key(second_inputs)].static_output.data_ptr()
     assert runner.stats_snapshot()["captures"] == 1
     assert runner.stats_snapshot()["hits"] == 1
 
@@ -535,6 +543,36 @@ def test_cuda_graph_replays_request_scoped_static_conditioning():
     torch.testing.assert_close(second_actual, second_expected, rtol=0.0, atol=0.0)
     assert runner.stats_snapshot()["captures"] == 1
     assert runner.stats_snapshot()["hits"] == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_graph_expands_cfg_hidden_batch_inside_static_buffer():
+    transformer = _TinyAudioTransformer().eval()
+    runner = LTX2AudioCUDAGraphRunner(transformer, max_graphs=1)
+    inputs = _cuda_inputs(value=1)
+    inputs["audio_hidden_states"] = inputs["audio_hidden_states"][:1]
+    repeated_hidden_states = inputs["audio_hidden_states"].repeat(2, 1, 1)
+
+    with torch.inference_mode():
+        expected = runner._call_transformer(
+            hidden_states=repeated_hidden_states,
+            context=inputs["audio_encoder_hidden_states"],
+            timestep=inputs["audio_timestep"],
+            sigma=inputs["audio_sigma"],
+            coords=inputs["audio_coords"],
+            attention_mask=inputs["audio_attention_mask"],
+            perturbation_mask=inputs["perturbation_mask"],
+            stg_blocks=(28,),
+        ).clone()
+        first = runner(**inputs, audio_hidden_states_repeats=2)
+        second = runner(**inputs, audio_hidden_states_repeats=2)
+    torch.accelerator.synchronize("cuda")
+
+    torch.testing.assert_close(first, expected, rtol=0, atol=0)
+    torch.testing.assert_close(second, expected, rtol=0, atol=0)
+    entry = next(iter(runner._cache.values()))
+    torch.testing.assert_close(entry.static_hidden_states, repeated_hidden_states, rtol=0, atol=0)
+    assert second.data_ptr() == entry.static_output.data_ptr()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

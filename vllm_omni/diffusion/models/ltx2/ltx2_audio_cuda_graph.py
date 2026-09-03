@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import math
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
@@ -27,7 +26,6 @@ class LTX2AudioCUDAGraphConfig:
 
     enabled: bool = False
     max_entries: int = 4
-    audio_length_buckets: tuple[float, ...] = ()
 
     @classmethod
     def from_additional_config(cls, additional_config: Mapping[str, Any] | None) -> LTX2AudioCUDAGraphConfig:
@@ -42,33 +40,18 @@ class LTX2AudioCUDAGraphConfig:
         if not isinstance(raw, Mapping):
             raise TypeError("additional_config.ltx2_audio_cuda_graph must be a mapping")
 
-        unknown = set(raw) - {"enabled", "max_entries", "audio_length_buckets"}
+        unknown = set(raw) - {"enabled", "max_entries"}
         if unknown:
             names = ", ".join(sorted(str(name) for name in unknown))
             raise ValueError(f"Unknown LTX2 audio CUDA Graph option(s): {names}")
 
         enabled = raw.get("enabled", False)
         max_entries = raw.get("max_entries", 4)
-        raw_buckets = raw.get("audio_length_buckets", ())
         if type(enabled) is not bool:
             raise TypeError("additional_config.ltx2_audio_cuda_graph.enabled must be a bool")
         if type(max_entries) is not int or max_entries < 1:
             raise ValueError("additional_config.ltx2_audio_cuda_graph.max_entries must be a positive integer")
-        if not isinstance(raw_buckets, (list, tuple)):
-            raise TypeError("additional_config.ltx2_audio_cuda_graph.audio_length_buckets must be a list or tuple")
-        buckets: list[float] = []
-        for value in raw_buckets:
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise TypeError("LTX2 audio CUDA Graph length buckets must contain only numbers")
-            bucket = float(value)
-            if not math.isfinite(bucket) or bucket <= 0:
-                raise ValueError("LTX2 audio CUDA Graph length buckets must be finite and positive")
-            buckets.append(bucket)
-        if any(right <= left for left, right in zip(buckets, buckets[1:], strict=False)):
-            raise ValueError("LTX2 audio CUDA Graph length buckets must be strictly increasing")
-        if buckets and not enabled:
-            raise ValueError("LTX2 audio CUDA Graph length buckets require enabled=true")
-        return cls(enabled=enabled, max_entries=max_entries, audio_length_buckets=tuple(buckets))
+        return cls(enabled=enabled, max_entries=max_entries)
 
 
 @dataclass(frozen=True)
@@ -114,13 +97,14 @@ def make_ltx2_audio_graph_key(
     perturbation_mask: torch.Tensor | None,
     stg_blocks: Sequence[int] | None,
     static_conditioning: LTX2AudioStaticConditioning | None = None,
+    hidden_batch_repeats: int = 1,
 ) -> LTX2AudioGraphKey:
     blocks = None if stg_blocks is None else tuple(sorted(set(int(block) for block in stg_blocks)))
     rotary_shapes = (
         None if static_conditioning is None else tuple(tuple(value.shape) for value in static_conditioning.rotary_emb)
     )
     return LTX2AudioGraphKey(
-        hidden_shape=tuple(hidden_states.shape),
+        hidden_shape=(hidden_states.shape[0] * hidden_batch_repeats, *hidden_states.shape[1:]),
         context_shape=tuple(
             context.shape if static_conditioning is None else static_conditioning.encoder_hidden_states.shape
         ),
@@ -135,6 +119,13 @@ def _static_copy(value: torch.Tensor) -> torch.Tensor:
     static = torch.empty_like(value, memory_format=torch.contiguous_format)
     static.copy_(value)
     return static
+
+
+def _copy_repeated_batch_(destination: torch.Tensor, source: torch.Tensor, repeats: int) -> None:
+    if repeats == 1:
+        destination.copy_(source)
+        return
+    destination.unflatten(0, (repeats, source.shape[0])).copy_(source.unsqueeze(0))
 
 
 def _has_tensor_metadata(
@@ -162,9 +153,9 @@ class LTX2AudioCUDAGraphRunner:
 
     A runner is owned by one diffusion worker and is accessed serially by that
     worker. Captures and replays use a runner-private shared graph pool.
-    Returned outputs are cloned so callers never retain graph storage.
-    Concurrent calls are unsupported because entries reuse mutable static
-    buffers across the complete copy, replay, and output-clone lifecycle.
+    Replay returns the graph's static output. Downstream consumers must enqueue
+    their work on the same CUDA stream before the next replay overwrites it.
+    Concurrent calls are unsupported because entries reuse mutable buffers.
     """
 
     def __init__(
@@ -254,6 +245,7 @@ class LTX2AudioCUDAGraphRunner:
         rotary_sin: torch.Tensor | None,
         attention_mask: torch.Tensor | None,
         perturbation_mask: torch.Tensor | None,
+        hidden_batch_repeats: int = 1,
     ) -> bool:
         expected_device = self.device
         if expected_device.type != "cuda" or not torch.cuda.is_available():
@@ -266,7 +258,10 @@ class LTX2AudioCUDAGraphRunner:
         ):
             return False
 
-        batch, audio_tokens, _ = hidden_states.shape
+        if type(hidden_batch_repeats) is not int or hidden_batch_repeats < 1:
+            return False
+        source_batch, audio_tokens, _ = hidden_states.shape
+        batch = source_batch * hidden_batch_repeats
         if context.ndim != 3 or context.shape[0] != batch:
             return False
 
@@ -322,9 +317,17 @@ class LTX2AudioCUDAGraphRunner:
         rotary_sin: torch.Tensor | None,
         attention_mask: torch.Tensor | None,
         perturbation_mask: torch.Tensor | None,
+        hidden_batch_repeats: int = 1,
     ) -> bool:
+        expected_hidden_shape = (hidden_states.shape[0] * hidden_batch_repeats, *hidden_states.shape[1:])
+        if not _has_tensor_metadata(
+            entry.static_hidden_states,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+            shape=expected_hidden_shape,
+        ):
+            return False
         pairs = (
-            (entry.static_hidden_states, hidden_states),
             (entry.static_context, context),
             (entry.static_timestep, timestep),
             (entry.static_sigma, sigma),
@@ -380,11 +383,14 @@ class LTX2AudioCUDAGraphRunner:
             **transformer_kwargs,
         )
 
-    def _eager_forward(self, reason: str, **kwargs: Any) -> torch.Tensor:
+    def _eager_forward(self, reason: str, *, hidden_batch_repeats: int = 1, **kwargs: Any) -> torch.Tensor:
         self._stats["eager"] += 1
         reason_counter = f"eager_{reason}"
         if reason_counter in self._stats:
             self._stats[reason_counter] += 1
+        if hidden_batch_repeats != 1:
+            hidden_states = kwargs["hidden_states"]
+            kwargs["hidden_states"] = hidden_states.repeat((hidden_batch_repeats,) + (1,) * (hidden_states.ndim - 1))
         return self._call_transformer(**kwargs)
 
     @contextmanager
@@ -410,10 +416,19 @@ class LTX2AudioCUDAGraphRunner:
         with torch.cuda.stream(capture_stream):
             yield
 
-    def _capture(self, **inputs: Any) -> tuple[LTX2AudioGraphEntry, torch.Tensor]:
+    def _capture(self, *, hidden_batch_repeats: int = 1, **inputs: Any) -> tuple[LTX2AudioGraphEntry, torch.Tensor]:
         static_inputs = {
             name: _static_copy(value) if isinstance(value, torch.Tensor) else value for name, value in inputs.items()
         }
+        hidden_states = inputs["hidden_states"]
+        if hidden_batch_repeats != 1:
+            static_hidden_states = torch.empty(
+                (hidden_states.shape[0] * hidden_batch_repeats, *hidden_states.shape[1:]),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            _copy_repeated_batch_(static_hidden_states, hidden_states, hidden_batch_repeats)
+            static_inputs["hidden_states"] = static_hidden_states
         with self._tensor_parallel_capture_scope():
             current_stream = torch.cuda.current_stream(self.device)
             warmup_stream = torch.cuda.Stream(device=self.device)
@@ -468,9 +483,10 @@ class LTX2AudioCUDAGraphRunner:
         attention_mask: torch.Tensor | None,
         perturbation_mask: torch.Tensor | None,
         stg_blocks: tuple[int, ...] | None,
+        hidden_batch_repeats: int = 1,
     ) -> torch.Tensor:
         del stg_blocks
-        entry.static_hidden_states.copy_(hidden_states)
+        _copy_repeated_batch_(entry.static_hidden_states, hidden_states, hidden_batch_repeats)
         entry.static_timestep.copy_(timestep)
         entry.static_sigma.copy_(sigma)
         copy_request_inputs = (
@@ -495,12 +511,13 @@ class LTX2AudioCUDAGraphRunner:
                 entry.static_perturbation_mask.copy_(perturbation_mask)
             entry.request_generation = self._active_request_generation
         entry.graph.replay()
-        return entry.static_output.detach().clone()
+        return entry.static_output
 
     def __call__(
         self,
         *,
         audio_hidden_states: torch.Tensor,
+        audio_hidden_states_repeats: int = 1,
         audio_encoder_hidden_states: torch.Tensor,
         audio_timestep: torch.Tensor,
         audio_sigma: torch.Tensor,
@@ -532,13 +549,25 @@ class LTX2AudioCUDAGraphRunner:
             "perturbation_mask": perturbation_mask,
             "stg_blocks": blocks,
         }
-        if not self._inputs_are_compatible(**{k: v for k, v in inputs.items() if k != "stg_blocks"}):
+        tensor_inputs = {k: v for k, v in inputs.items() if k != "stg_blocks"}
+        if not self._inputs_are_compatible(
+            **tensor_inputs,
+            hidden_batch_repeats=audio_hidden_states_repeats,
+        ):
             self.last_call_info = {"mode": "eager", "reason": "incompatible_inputs"}
-            return self._eager_forward("incompatible_inputs", **inputs)
+            return self._eager_forward(
+                "incompatible_inputs",
+                **inputs,
+                hidden_batch_repeats=audio_hidden_states_repeats,
+            )
 
         if torch.cuda.is_current_stream_capturing():
             self.last_call_info = {"mode": "eager", "reason": "active_capture"}
-            return self._eager_forward("active_capture", **inputs)
+            return self._eager_forward(
+                "active_capture",
+                **inputs,
+                hidden_batch_repeats=audio_hidden_states_repeats,
+            )
 
         key = make_ltx2_audio_graph_key(
             audio_hidden_states,
@@ -547,24 +576,44 @@ class LTX2AudioCUDAGraphRunner:
             perturbation_mask,
             blocks,
             audio_static_conditioning,
+            audio_hidden_states_repeats,
         )
         entry = self._cache.get(key)
         if entry is not None:
-            if not self._entry_matches(entry, **{k: v for k, v in inputs.items() if k != "stg_blocks"}):
+            if not self._entry_matches(
+                entry,
+                **tensor_inputs,
+                hidden_batch_repeats=audio_hidden_states_repeats,
+            ):
                 self.last_call_info = {"mode": "eager", "reason": "incompatible_inputs", "key": key}
-                return self._eager_forward("incompatible_inputs", **inputs)
+                return self._eager_forward(
+                    "incompatible_inputs",
+                    **inputs,
+                    hidden_batch_repeats=audio_hidden_states_repeats,
+                )
             self._cache.move_to_end(key)
             self._stats["hits"] += 1
             self.last_call_info = {"mode": "replay", "reason": "cache_hit", "key": key}
-            return self._copy_and_replay(entry, **inputs)
+            return self._copy_and_replay(
+                entry,
+                **inputs,
+                hidden_batch_repeats=audio_hidden_states_repeats,
+            )
 
         if key in self._failed_keys:
             self._failed_keys.move_to_end(key)
             self.last_call_info = {"mode": "eager", "reason": "previous_capture_failure", "key": key}
-            return self._eager_forward("previous_capture_failure", **inputs)
+            return self._eager_forward(
+                "previous_capture_failure",
+                **inputs,
+                hidden_batch_repeats=audio_hidden_states_repeats,
+            )
 
         try:
-            entry, initial_output = self._capture(**inputs)
+            entry, initial_output = self._capture(
+                **inputs,
+                hidden_batch_repeats=audio_hidden_states_repeats,
+            )
             entry.request_generation = self._active_request_generation
             self._stats["captures"] += 1
             self._cache[key] = entry
@@ -576,7 +625,7 @@ class LTX2AudioCUDAGraphRunner:
             # The warmup already produced the result for these inputs.
             # Captured graph outputs are not populated until their first
             # replay, so use the warmup result to avoid that redundant replay.
-            return initial_output.detach().clone()
+            return initial_output
         except Exception:
             self._stats["capture_failures"] += 1
             self._failed_keys[key] = None
@@ -588,7 +637,11 @@ class LTX2AudioCUDAGraphRunner:
                 "LTX2 audio CUDA Graph capture failed; using eager execution for this signature",
                 exc_info=True,
             )
-            return self._eager_forward("capture_failure", **inputs)
+            return self._eager_forward(
+                "capture_failure",
+                **inputs,
+                hidden_batch_repeats=audio_hidden_states_repeats,
+            )
 
     def clear(self) -> None:
         """Synchronously release captured graphs and reset the lifecycle."""
