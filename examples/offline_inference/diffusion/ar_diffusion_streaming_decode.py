@@ -29,7 +29,13 @@ import math
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    # Only for type hints -- the real import stays deferred inside run() so
+    # --help and the offline validation helpers don't require a CUDA-enabled
+    # vLLM install.
+    import torch
 
 _MODEL = "robbyant/lingbot-world-v2-14b-causal-fast-diffusers"
 _CAMERA_ACTION_SCHEMA = "lingbot.camera_actions.v1"
@@ -41,6 +47,20 @@ _MAX_REALTIME_TICKS = 10
 def _camera_event_data(frames: list[list[str]]) -> dict[str, Any]:
     """Build the event-side script consumed by LingBotCameraControlReducer."""
     return {"mode": "script", "frames": frames}
+
+
+def _to_vae_latent_space(latent: torch.Tensor, *, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    """Invert the checkpoint's latent normalization: model space -> VAE latent space.
+
+    The realtime tick path always uses ``output_type="latent"`` and returns raw
+    model-space latents; the pipeline's own non-tick decode path applies this
+    same inversion (``LingBotWorldCausalDMDPipeline._vae_latent_stats``) before
+    calling ``vae.decode``. ``WanStreamingDecoder.decode_chunk`` documents its
+    input as already carrying that inversion -- skip this and every chunk
+    decodes to a valid-looking but wrong video while latency/finite checks
+    stay green, because nothing downstream can detect a global mis-scale.
+    """
+    return latent * std + mean
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -170,9 +190,8 @@ async def run(argv: Sequence[str] | None = None) -> Path:
         parameter.requires_grad_(False)
     decoder = WanStreamingDecoder(vae)
     decode_state = decoder.new_decode_state(args.session_id)
-    # Same per-channel rescale the pipeline applies before its own vae.decode()
-    # call (LingBotWorldCausalDMDPipeline._vae_latent_stats) -- the tick path's
-    # raw output is in model space, decode_chunk expects VAE latent space.
+    # Same per-channel statistics the pipeline uses in _vae_latent_stats; see
+    # _to_vae_latent_space for why this rescale has to happen before decode.
     latent_mean = torch.as_tensor(vae.config.latents_mean, device=args.vae_device, dtype=vae_dtype).view(1, -1, 1, 1, 1)
     latent_std = torch.as_tensor(vae.config.latents_std, device=args.vae_device, dtype=vae_dtype).view(1, -1, 1, 1, 1)
 
@@ -245,15 +264,8 @@ async def run(argv: Sequence[str] | None = None) -> Path:
             gen_elapsed = time.perf_counter() - gen_started
             if len(output.images) != 1 or not isinstance(output.images[0], torch.Tensor):
                 raise RuntimeError("Expected one latent tensor from each realtime LingBot chunk.")
-            # The realtime tick path always uses output_type="latent" and returns
-            # raw model-space latents -- the pipeline's own non-tick decode path
-            # inverts this same normalization (lingbot_world/pipeline.py) before
-            # calling vae.decode. decode_chunk's contract assumes latent-space
-            # input already carries that inversion; skipping it decodes valid
-            # tensors that are quietly the wrong video (latency/finite checks
-            # would stay green throughout).
             latent = output.images[0].detach().to(device=args.vae_device, dtype=vae_dtype)
-            latent = latent * latent_std + latent_mean
+            latent = _to_vae_latent_space(latent, mean=latent_mean, std=latent_std)
             metadata = consumer.chunk_metadata(output).to_dict()
 
             decode_started = time.perf_counter()
