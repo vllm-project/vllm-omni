@@ -69,7 +69,8 @@ stages:
     # condition advance, forcing a per-second full re-prefill that pushed
     # duplex RTF from ~1.0 to ~1.85. Full attention keeps the whole context
     # resident (bounded by tts max_model_len 4096 below) and restores
-    # real-time pacing.
+    # real-time pacing. Until #6799 adds capacity-triggered rollover, a
+    # session that accumulates past that 4096 bound can still fail.
     hf_overrides:
       tts_config:
         attention_type: full_attention
