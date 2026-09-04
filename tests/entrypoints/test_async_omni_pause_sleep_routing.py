@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, call, create_autospec
+from unittest.mock import AsyncMock, call
 
 import pytest
 from vllm.renderers import BaseRenderer
@@ -43,12 +43,11 @@ def _make_omni(*, stage_types: list[str]) -> AsyncOmni:
 
 
 @pytest.mark.cpu
-def test_reset_mm_cache_clears_renderer_cache():
+def test_reset_mm_cache_routes_through_renderer(mocker):
     async def run() -> None:
         omni = object.__new__(AsyncOmni)
-        renderer = create_autospec(BaseRenderer, instance=True)
-        renderer.clear_mm_cache_async = AsyncMock()
-        input_processor = create_autospec(InputProcessor, instance=True)
+        renderer = mocker.create_autospec(BaseRenderer, instance=True)
+        input_processor = mocker.create_autospec(InputProcessor, instance=True)
         input_processor.renderer = renderer
         omni.input_processor = input_processor
 
