@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import logging
 import os
@@ -23,9 +23,13 @@ NORM_EPS = 1e-5
 
 
 @pytest.fixture(autouse=True)
-def _init_distributed():
+def _init_distributed(request):
     """Initialize the minimal single-rank distributed environment required by
     the vLLM parallel linear layers (tensor-parallel group must exist)."""
+    if request.node.name.startswith("test_real_rotary_"):
+        yield
+        return
+
     from vllm.distributed.parallel_state import (
         cleanup_dist_env_and_memory,
         init_distributed_environment,
@@ -59,6 +63,20 @@ def _force_default_gemm(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _force_torch_sdpa():
+    """Pin TORCH_SDPA so CPU shape tests do not pick CUDA-only backends (FA3)."""
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.data import AttentionConfig
+
+    od_config = SimpleNamespace(
+        diffusion_attention_config=AttentionConfig(default="TORCH_SDPA"),
+        parallel_config=SimpleNamespace(ring_degree=1),
+    )
+    with set_current_diffusion_config(od_config):
+        yield
+
+
 def _randomize_parameters(module: torch.nn.Module) -> None:
     """Fill parameters with small random values.
 
@@ -70,11 +88,11 @@ def _randomize_parameters(module: torch.nn.Module) -> None:
             param.uniform_(-0.02, 0.02)
 
 
-def _identity_rotary_emb(batch_size: int, seq_len: int) -> torch.Tensor:
-    """Complex rotary frequencies encoding a zero rotation."""
-    return torch.polar(
-        torch.ones(batch_size, seq_len, HEAD_DIM // 2),
-        torch.zeros(batch_size, seq_len, HEAD_DIM // 2),
+def _identity_rotary_emb(batch_size: int, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Real-valued rotary frequencies encoding a zero rotation."""
+    return (
+        torch.ones(batch_size, seq_len, HEAD_DIM),
+        torch.zeros(batch_size, seq_len, HEAD_DIM),
     )
 
 
@@ -117,6 +135,72 @@ def test_boogu_image_transformer_import():
     from vllm_omni.diffusion.models.boogu_image import BooguImageTransformer2DModel
 
     assert BooguImageTransformer2DModel is not None
+
+
+def test_real_rotary_emb_matches_complex_reference():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import apply_rotary_emb
+
+    torch.manual_seed(0)
+    x = torch.randn(2, 7, NUM_HEADS, HEAD_DIM)
+    angles = torch.randn(2, 7, HEAD_DIM // 2)
+    rotary_emb = (
+        angles.cos().repeat_interleave(2, dim=-1),
+        angles.sin().repeat_interleave(2, dim=-1),
+    )
+
+    actual = apply_rotary_emb(x, rotary_emb)
+    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], HEAD_DIM // 2, 2))
+    freqs_cis = torch.polar(torch.ones_like(angles), angles).unsqueeze(2)
+    expected = torch.view_as_real(x_complex * freqs_cis).flatten(3).type_as(x)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_real_rotary_frequency_tables_are_real_and_repeated():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageDoubleStreamRotaryPosEmbed,
+    )
+
+    freqs_real = BooguImageDoubleStreamRotaryPosEmbed.get_freqs_real(AXES_DIM_ROPE, AXES_LENS, theta=10000)
+
+    assert len(freqs_real) == len(AXES_DIM_ROPE)
+    for (freqs_cos, freqs_sin), axis_dim, axis_len in zip(freqs_real, AXES_DIM_ROPE, AXES_LENS):
+        assert freqs_cos.shape == (axis_len, axis_dim)
+        assert freqs_sin.shape == (axis_len, axis_dim)
+        assert not freqs_cos.is_complex()
+        assert not freqs_sin.is_complex()
+        torch.testing.assert_close(freqs_cos[..., ::2], freqs_cos[..., 1::2])
+        torch.testing.assert_close(freqs_sin[..., ::2], freqs_sin[..., 1::2])
+
+
+def test_real_rotary_frequency_tables_use_float32_on_npu(monkeypatch):
+    from vllm_omni.diffusion.models.boogu_image import boogu_image_transformer
+
+    npu_platform = SimpleNamespace(is_npu=lambda: True, supports_float64=lambda: True)
+    monkeypatch.setattr(boogu_image_transformer, "current_omni_platform", npu_platform)
+
+    freqs_real = boogu_image_transformer.BooguImageDoubleStreamRotaryPosEmbed.get_freqs_real(
+        AXES_DIM_ROPE, AXES_LENS, theta=10000
+    )
+
+    assert all(freqs.dtype == torch.float32 for pair in freqs_real for freqs in pair)
+
+
+def test_real_rotary_frequency_tables_use_float32_on_mps(monkeypatch):
+    from vllm_omni.diffusion.models.boogu_image import boogu_image_transformer
+
+    platform = SimpleNamespace(
+        is_npu=lambda: False,
+        supports_float64=lambda: True,
+    )
+    monkeypatch.setattr(boogu_image_transformer, "current_omni_platform", platform)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+
+    freqs_real = boogu_image_transformer.BooguImageDoubleStreamRotaryPosEmbed.get_freqs_real(
+        AXES_DIM_ROPE, AXES_LENS, theta=10000
+    )
+
+    assert all(freqs.dtype == torch.float32 for pair in freqs_real for freqs in pair)
 
 
 def test_single_stream_block_shape():
@@ -398,10 +482,10 @@ def test_transformer_forward_t2i_shape():
     timestep = torch.full((batch_size,), 0.5)
     instruction_hidden_states = torch.randn(batch_size, instruct_len, instruction_feat_dim)
     instruction_attention_mask = torch.ones(batch_size, instruct_len, dtype=torch.bool)
-    freqs_cis = BooguImageDoubleStreamRotaryPosEmbed.get_freqs_cis(model.axes_dim_rope, model.axes_lens, theta=10000)
+    freqs_real = BooguImageDoubleStreamRotaryPosEmbed.get_freqs_real(model.axes_dim_rope, model.axes_lens, theta=10000)
 
     with torch.no_grad():
-        out = model(latents, timestep, instruction_hidden_states, freqs_cis, instruction_attention_mask)
+        out = model(latents, timestep, instruction_hidden_states, freqs_real, instruction_attention_mask)
 
     assert out.shape == (batch_size, model.out_channels, latent_h, latent_w)
     assert torch.isfinite(out).all()
@@ -431,7 +515,7 @@ def test_transformer_forward_ti2i_shape():
     timestep = torch.full((batch_size,), 0.5)
     instruction_hidden_states = torch.randn(batch_size, instruct_len, instruction_feat_dim)
     instruction_attention_mask = torch.ones(batch_size, instruct_len, dtype=torch.bool)
-    freqs_cis = BooguImageDoubleStreamRotaryPosEmbed.get_freqs_cis(model.axes_dim_rope, model.axes_lens, theta=10000)
+    freqs_real = BooguImageDoubleStreamRotaryPosEmbed.get_freqs_real(model.axes_dim_rope, model.axes_lens, theta=10000)
 
     # One sample, one reference image (Boogu editing supports a single ref).
     ref_image_hidden_states = [[torch.randn(in_channels, ref_h, ref_w)]]
@@ -441,7 +525,7 @@ def test_transformer_forward_ti2i_shape():
             latents,
             timestep,
             instruction_hidden_states,
-            freqs_cis,
+            freqs_real,
             instruction_attention_mask,
             ref_image_hidden_states=ref_image_hidden_states,
         )

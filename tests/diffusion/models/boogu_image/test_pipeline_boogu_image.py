@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """L1 unit tests for the native Boogu-Image pipeline.
 
@@ -133,6 +133,51 @@ def test_constructor_strips_mllm_lm_head(boogu_pipeline, mock_dependencies):
     assert boogu_pipeline.mllm is mock_dependencies["inner_encoder"]
 
 
+def test_constructor_forwards_revision_to_all_component_loaders(mock_dependencies, mocker):
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        BooguImagePipeline,
+    )
+
+    revision = "hotfix-1k-20260708"
+    prefetch = mocker.patch(f"{_MODULE}.prefetch_subfolders")
+    scheduler_loader = mocker.patch(
+        f"{_MODULE}.FlowMatchEulerDiscreteScheduler.from_pretrained",
+        return_value=mock_dependencies["scheduler"],
+    )
+    mllm_loader = mocker.patch(
+        f"{_MODULE}.Qwen3VLForConditionalGeneration.from_pretrained",
+        return_value=mock_dependencies["mllm_wrapper"],
+    )
+    processor_loader = mocker.patch(
+        f"{_MODULE}.Qwen3VLProcessor.from_pretrained",
+        return_value=mock_dependencies["processor"],
+    )
+    vae_loader = mocker.patch(
+        f"{_MODULE}.AutoencoderKL.from_pretrained",
+        return_value=mock_dependencies["vae"],
+    )
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        revision=revision,
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.float32,
+        num_gpus=1,
+    )
+
+    pipeline = BooguImagePipeline(od_config=od_config)
+
+    (source,) = pipeline.weights_sources
+    assert source.revision == revision
+    prefetch.assert_called_once_with(
+        "dummy-boogu",
+        ["scheduler", "vae", "mllm", "processor"],
+        local_files_only=True,
+        revision=revision,
+    )
+    for loader in (scheduler_loader, mllm_loader, processor_loader, vae_loader):
+        assert loader.call_args.kwargs["revision"] == revision
+
+
 def test_constructor_weights_sources(boogu_pipeline):
     (source,) = boogu_pipeline.weights_sources
     assert source.model_or_path == "dummy-boogu"
@@ -147,7 +192,6 @@ def test_constructor_weights_sources(boogu_pipeline):
         (DiffusionParallelConfig(tensor_parallel_size=2), "none", "Tensor parallelism"),
         (DiffusionParallelConfig(ulysses_degree=2), "none", "Sequence parallelism"),
         (DiffusionParallelConfig(ring_degree=2), "none", "Sequence parallelism"),
-        (DiffusionParallelConfig(cfg_parallel_size=2), "none", "CFG parallelism"),
         (
             DiffusionParallelConfig(use_hsdp=True, hsdp_shard_size=2),
             "none",
@@ -180,6 +224,26 @@ def test_constructor_rejects_unsupported_execution_modes(
 
     # Validation happens before any checkpoint component is constructed.
     mock_dependencies["mllm_wrapper"].model.to.assert_not_called()
+
+
+@pytest.mark.parametrize("cfg_parallel_size", [2, 3])
+def test_constructor_accepts_cfg_parallel(mock_dependencies, cfg_parallel_size):
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        BooguImagePipeline,
+    )
+
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.float32,
+        parallel_config=DiffusionParallelConfig(cfg_parallel_size=cfg_parallel_size),
+    )
+
+    pipeline = BooguImagePipeline(od_config=od_config)
+
+    assert pipeline.od_config.parallel_config.cfg_parallel_size == cfg_parallel_size
+    assert hasattr(pipeline, "predict_noise_maybe_with_cfg")
+    assert hasattr(pipeline, "predict_noise_with_multi_branch_cfg")
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +486,8 @@ class _FakeTransformer:
         "reduce_type": "mean",
     }
 
-    def __call__(self, latents, timestep, instruction_embeds, freqs_cis, instruction_attention_mask, **kwargs):
+    def __call__(self, latents, timestep, instruction_embeds, freqs_real, instruction_attention_mask, **kwargs):
+        assert all(not freqs.is_complex() for pair in freqs_real for freqs in pair)
         return torch.zeros_like(latents)
 
 
@@ -480,6 +545,14 @@ def test_forward_returns_diffusion_output():
 
 def test_forward_cfg_off_when_guidance_one():
     pipeline = _make_forward_pipeline()
+    cfg_calls = []
+    original_predict_noise_maybe_with_cfg = pipeline.predict_noise_maybe_with_cfg
+
+    def record_cfg_call(**kwargs):
+        cfg_calls.append(kwargs)
+        return original_predict_noise_maybe_with_cfg(**kwargs)
+
+    pipeline.predict_noise_maybe_with_cfg = record_cfg_call
     req = _make_request_batch("a cat", height=64, width=64, num_inference_steps=2, guidance_scale=1.0)
     # guidance_scale=1.0 is falsy-adjacent but explicitly disables CFG; the
     # request layer would set guidance_scale_provided, so emulate that here.
@@ -489,6 +562,30 @@ def test_forward_cfg_off_when_guidance_one():
 
     # Only the positive prompt is encoded when CFG is off.
     assert len(pipeline.processor.calls) == 1
+    assert len(cfg_calls) == 2
+    assert all(call["do_true_cfg"] is False for call in cfg_calls)
+    assert all(call["negative_kwargs"] is None for call in cfg_calls)
+
+
+def test_double_guidance_combine_matches_legacy_formula():
+    pipeline = _make_forward_pipeline()
+    positive_with_reference = torch.randn(2, 4, 8, 8)
+    negative_with_reference = torch.randn(2, 4, 8, 8)
+    uncond = torch.randn(2, 4, 8, 8)
+    text_scale = 5.0
+    image_scale = 2.0
+
+    actual = pipeline.combine_multi_branch_cfg_noise(
+        [positive_with_reference, negative_with_reference, uncond],
+        {"text": text_scale, "image": image_scale},
+    )
+    legacy = (
+        positive_with_reference
+        + (text_scale - 1.0) * (positive_with_reference - negative_with_reference)
+        + (image_scale - 1.0) * (negative_with_reference - uncond)
+    )
+
+    torch.testing.assert_close(actual, legacy, rtol=0, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -756,6 +853,39 @@ def test_build_ref_latents_expands_per_output_and_handles_none():
     assert ref_latents[2] is None and ref_latents[3] is None
 
 
+def test_vae_attention_context_is_noop_on_cpu():
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        BooguImagePipeline,
+    )
+
+    with BooguImagePipeline._vae_attention_context(torch.device("cpu")):
+        pass
+
+
+def test_vae_attention_context_prioritizes_efficient_cuda(monkeypatch):
+    from vllm_omni.diffusion.models.boogu_image import pipeline_boogu_image
+
+    recorded = {}
+
+    def fake_sdpa_kernel(backends, *, set_priority):
+        recorded["backends"] = backends
+        recorded["set_priority"] = set_priority
+        return pipeline_boogu_image.nullcontext()
+
+    monkeypatch.setattr(pipeline_boogu_image, "sdpa_kernel", fake_sdpa_kernel)
+
+    with pipeline_boogu_image.BooguImagePipeline._vae_attention_context(torch.device("cuda")):
+        pass
+
+    assert recorded == {
+        "backends": [
+            pipeline_boogu_image.SDPBackend.EFFICIENT_ATTENTION,
+            pipeline_boogu_image.SDPBackend.MATH,
+        ],
+        "set_priority": True,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Editing / TI2I: forward CFG branch selection
 # ---------------------------------------------------------------------------
@@ -766,9 +896,11 @@ class _RecordingRefTransformer(_FakeTransformer):
 
     def __init__(self):
         self.calls = []
+        self.instruction_embed_calls = []
 
-    def __call__(self, latents, timestep, instruction_embeds, freqs_cis, instruction_attention_mask, **kwargs):
+    def __call__(self, latents, timestep, instruction_embeds, freqs_real, instruction_attention_mask, **kwargs):
         self.calls.append(kwargs.get("ref_image_hidden_states"))
+        self.instruction_embed_calls.append(instruction_embeds)
         return torch.zeros_like(latents)
 
 
@@ -830,6 +962,9 @@ def test_forward_ti2i_text_only_two_predictions_with_ref():
     # Text-only ti2i: cond+ref and neg+ref -> 2 predictions/step, both carry ref.
     assert _count_per_step(pipeline.transformer.calls, num_steps) == 2
     assert all(ref is not None for ref in pipeline.transformer.calls)
+    for i in range(0, len(pipeline.transformer.instruction_embed_calls), 2):
+        positive, negative = pipeline.transformer.instruction_embed_calls[i : i + 2]
+        assert positive is not negative
 
 
 def test_forward_ti2i_double_guidance_three_predictions():
@@ -849,6 +984,11 @@ def test_forward_ti2i_double_guidance_three_predictions():
     per_step = [pipeline.transformer.calls[i : i + 3] for i in range(0, len(pipeline.transformer.calls), 3)]
     for step_calls in per_step:
         assert sum(ref is None for ref in step_calls) == 1
+    embed_calls = pipeline.transformer.instruction_embed_calls
+    for i in range(0, len(embed_calls), 3):
+        positive, negative_with_reference, uncond = embed_calls[i : i + 3]
+        assert positive is not negative_with_reference
+        assert negative_with_reference is uncond
 
 
 def test_forward_ti2i_image_only_two_predictions_drop_ref():
@@ -868,6 +1008,10 @@ def test_forward_ti2i_image_only_two_predictions_drop_ref():
     per_step = [pipeline.transformer.calls[i : i + 2] for i in range(0, len(pipeline.transformer.calls), 2)]
     for step_calls in per_step:
         assert sum(ref is None for ref in step_calls) == 1
+    embed_calls = pipeline.transformer.instruction_embed_calls
+    for i in range(0, len(embed_calls), 2):
+        positive_with_reference, positive_without_reference = embed_calls[i : i + 2]
+        assert positive_with_reference is positive_without_reference
 
 
 def test_forward_ti2i_no_guidance_single_prediction_with_ref():

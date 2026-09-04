@@ -60,6 +60,50 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
 
 See [`bagel_single_stage.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/deploy/bagel_single_stage.yaml) for configuration. The `pipeline: bagel_single_stage` field selects the single-stage topology from the pipeline registry.
 
+### Step Execution and Continuous Batching
+
+Image generation supports step execution with all three BAGEL deploy configs.
+The global flag is applied only to diffusion stages:
+
+- With `bagel.yaml` or `bagel_think.yaml`, Stage 1 uses step execution and the
+  Stage 0 Thinker remains autoregressive.
+- With `bagel_single_stage.yaml`, image requests use step execution in Stage 0.
+  Explicit `text2text` and `img2text` requests use the same complete-request
+  text path as they do without `--step-execution`.
+
+Start with the deploy file's default diffusion capacity of one:
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
+    --deploy-config vllm_omni/deploy/bagel.yaml \
+    --step-execution
+```
+
+To enable step-wise continuous batching, override `max_num_seqs` on the
+diffusion stage. Use Stage 1 for either two-stage config:
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
+    --deploy-config vllm_omni/deploy/bagel.yaml \
+    --step-execution \
+    --stage-overrides '{"1":{"max_num_seqs":4}}'
+```
+
+Use Stage 0 for the single-stage config:
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
+    --deploy-config vllm_omni/deploy/bagel_single_stage.yaml \
+    --step-execution \
+    --stage-overrides '{"0":{"max_num_seqs":4}}'
+```
+
+BAGEL image requests use exactly `num_inference_steps` denoising updates,
+including one-step requests. The scheduler batches only requests with
+compatible effective image sizes and BAGEL CFG/renormalization settings.
+Sequence parallelism and diffusion cache backends such as TeaCache or
+Cache-DiT are not currently supported together with BAGEL step execution.
+
 ### Tensor Parallelism (TP)
 
 For larger models or multi-GPU environments, enable TP via CLI:
@@ -203,6 +247,13 @@ curl http://localhost:8091/v1/chat/completions \
   -d @payload.json
 ```
 
+BAGEL img2img derives its generated image size from the input image. It
+preserves the input aspect ratio, aligns dimensions to the latent stride, and
+applies the checkpoint size limit; explicit `height` and `width` values do not
+override this model-specific resize policy. In step mode, the effective size is
+resolved before scheduler admission so requests with different resulting
+shapes are not combined.
+
 ### Image to Text (img2text)
 
 **Python client:**
@@ -267,8 +318,8 @@ curl http://localhost:8091/v1/chat/completions \
 | `--server` / `-s` | `http://localhost:8091` | Server URL |
 | `--image-url` / `-i` | `None` | Input image URL or local path (img2img/img2text) |
 | `--modality` / `-m` | `text2img` | `text2img`, `img2img`, `img2text`, `text2text` |
-| `--height` | `512` | Image height in pixels |
-| `--width` | `512` | Image width in pixels |
+| `--height` | `512` | Text-to-image output height; BAGEL img2img derives its size from the input image |
+| `--width` | `512` | Text-to-image output width; BAGEL img2img derives its size from the input image |
 | `--steps` | `25` | Number of inference steps |
 | `--seed` | `42` | Random seed |
 | `--negative` | `None` | Negative prompt for CFG |
@@ -293,6 +344,7 @@ python openai_chat_client.py \
 | File | Description |
 | :--- | :---------- |
 | [`bagel.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/deploy/bagel.yaml) | Two-stage default (Thinker + DiT on GPU 0) |
+| [`bagel_think.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/deploy/bagel_think.yaml) | Two-stage think mode (Thinker + DiT) |
 | [`bagel_single_stage.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/deploy/bagel_single_stage.yaml) | Single-stage (DiT only) |
 
 ### Key Deploy YAML Fields

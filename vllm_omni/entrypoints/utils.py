@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import json
 import os
 import types
@@ -541,17 +544,62 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
     ``value`` may be a raw JSON string (as supplied on the CLI) or an
     already-parsed mapping. Returns ``None`` when no overrides are given.
 
+    Only the **shape** of the override mapping is validated here:
+
+    - top-level must be a dict
+    - keys must be non-negative ASCII integer strings (stage ids)
+    - values must be dicts
+
+    Field-name / type / range validation is intentionally not done at this
+    layer. The downstream resolver forwards every surviving key as
+    ``stage_<id>_<key>`` into ``cli_overrides`` (see
+    ``load_stage_configs_from_model``); field semantics live in
+    ``StageConfigFactory`` for registered pipelines, and the
+    default-diffusion fallback in ``async_omni_engine.py`` reads
+    ``stage_zero_overrides["extras"]`` for unregistered ones. Unknown
+    engine-arg keys that don't match ``OmniEngineArgs`` are dropped with
+    a warning at ``filter_dataclass_kwargs`` rather than failing here,
+    so a typo surfaces in the log instead of being silently lost.
+
     Raises:
-        ValueError: when ``value`` is a string that is not valid JSON.
+        ValueError: when ``value`` is not a valid per-stage override
+            mapping (invalid JSON, non-dict top level, non-ASCII-digit
+            stage id, non-dict value).
     """
     if not value:
         return None
     if isinstance(value, str):
         try:
-            return json.loads(value)
+            parsed = json.loads(value)
         except json.JSONDecodeError as exc:
             raise ValueError(f"--stage-overrides is not valid JSON: {exc}. Got: {value!r}") from exc
-    return value
+    else:
+        parsed = value
+
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"--stage-overrides must be a JSON object mapping stage_id -> overrides, "
+            f"got {type(parsed).__name__}: {parsed!r}"
+        )
+    if not parsed:
+        return None
+
+    for stage_id_str, overrides in parsed.items():
+        # ``str.isdigit()`` accepts Unicode digit classes (e.g. fullwidth
+        # ``"０"``); downstream's ``_STAGE_OVERRIDE_PATTERN`` is ASCII-only
+        # (``^stage_(\d+)_(.+)$``), so a non-ASCII-digit key would parse
+        # here and silently misroute as a global key. ``isascii()`` closes
+        # that hole.
+        if not isinstance(stage_id_str, str) or not stage_id_str.isdigit() or not stage_id_str.isascii():
+            raise ValueError(
+                f"--stage-overrides keys must be non-negative integer stage ids (as strings), got {stage_id_str!r}"
+            )
+        if not isinstance(overrides, dict):
+            raise ValueError(
+                f"--stage-overrides[{stage_id_str!r}] must be an object, got {type(overrides).__name__}: {overrides!r}"
+            )
+
+    return parsed
 
 
 def load_and_resolve_stage_configs(
@@ -600,6 +648,18 @@ def load_and_resolve_stage_configs(
             stage_configs = []
 
     stage_configs = filter_stages(config_path, stage_configs, kwargs)
+
+    # ``revision`` selects the model source for every stage. Keep the global
+    # CLI pin on each stage's engine args so diffusion config construction can
+    # pass it through to all component loaders. The registry-to-legacy-stage
+    # conversion currently drops this inherited vLLM EngineArgs field.
+    revision = (kwargs or {}).get("revision")
+    if revision is not None:
+        for stage_config in stage_configs:
+            engine_args = stage_config.get("engine_args") if hasattr(stage_config, "get") else None
+            if engine_args is not None and engine_args.get("revision") is None:
+                engine_args["revision"] = revision
+
     logger.debug(f"stage_configs: {stage_configs}")
 
     return config_path, stage_configs, omni_lb_policy
@@ -706,6 +766,11 @@ def filter_dataclass_kwargs(cls: Any, kwargs: dict) -> dict:
     filtered_kwargs = {}
     for k, v in kwargs.items():
         if k not in valid_fields:
+            logger.warning(
+                "Dropping unknown %s field %r (not declared on the dataclass)",
+                cls.__name__,
+                k,
+            )
             continue
         field = valid_fields[k]
         filtered_kwargs[k] = _filter_value(v, field.type)

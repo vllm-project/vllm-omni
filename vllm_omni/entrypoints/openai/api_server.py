@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import asyncio
 import base64
 import dataclasses
@@ -13,6 +13,7 @@ import os
 import random
 import tempfile
 import time
+import uuid
 from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -29,7 +30,6 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from PIL import Image
 from pydantic import BaseModel, Field
 from starlette.datastructures import State
-from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
@@ -65,6 +65,14 @@ from vllm.entrypoints.pooling.pooling.serving import ServingPooling
 from vllm.entrypoints.pooling.scoring.serving import ServingScores
 from vllm.entrypoints.scale_out.token_in_token_out.serving import ServingTokens
 
+# vLLM < 0.28 keeps create_error_response under serve.utils (it is not
+# re-exported from vllm.entrypoints.serve); 0.28+ moved it under
+# serve.exception_handling and re-exports it from the package root.
+try:
+    from vllm.entrypoints.serve import create_error_response
+except ImportError:
+    from vllm.entrypoints.serve.utils.error_response import create_error_response
+
 # vLLM moved `base` from openai.basic.api_router to serve.instrumentator.basic.
 # Keep a fallback for older/newer upstream layouts during rebase windows.
 from vllm.entrypoints.serve.instrumentator.basic import base
@@ -75,7 +83,6 @@ from vllm.entrypoints.serve.utils.api_utils import (
     validate_json_request,
     with_cancellation,
 )
-from vllm.entrypoints.serve.utils.error_response import create_error_response
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.serve.utils.server_utils import get_uvicorn_log_config
@@ -94,7 +101,10 @@ from vllm.utils import random_uuid
 from vllm.utils.system_utils import decorate_logs
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
-from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
+from vllm_omni.config.endpoint_policy import (
+    remove_route_from_app,
+    shutdown_unsupported_routes,
+)
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.batch_serving import OmniOpenAIServingChatBatch
@@ -276,21 +286,6 @@ async def _get_vllm_config(engine_client: EngineClient) -> Any:
     return getattr(engine_client, "vllm_config", None)
 
 
-def _remove_route_from_app(app, path: str, methods: frozenset[str] | None = None):
-    """Remove a route from the app by path and optionally by methods.
-
-    OMNI: used to override upstream /v1/chat/completions with omni behavior.
-    """
-    routes_to_remove = []
-    for route in app.routes:
-        if isinstance(route, Route) and route.path == path:
-            if methods is None or (hasattr(route, "methods") and route.methods & methods):
-                routes_to_remove.append(route)
-
-    for route in routes_to_remove:
-        app.routes.remove(route)
-
-
 def _register_omni_exception_handlers(app) -> None:
     """Override upstream vLLM exception handlers with Omni-aware versions.
 
@@ -451,6 +446,116 @@ class _DiffusionServingModels:
 # Server entry points
 
 
+async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
+    """Run silent frames through a throwaway realtime session at startup.
+
+    Self-connects over the server's own websocket endpoint so the warmup
+    exercises the exact production path (serving adapter, duplex control
+    plane, every pipeline stage). One-time costs — kernel JIT compilation,
+    first prefill/decode paths, codec caches — are paid here instead of by
+    the first real client; ``/v1/realtime`` holds other connections until
+    the warmup finishes (see ``duplex_warmup_done``).
+    """
+    import base64
+
+    warmup_done = getattr(app.state, "duplex_warmup_done", None)
+    try:
+        try:
+            import websockets
+        except ImportError:
+            logger.warning("Duplex warmup skipped: the 'websockets' package is not installed.")
+            return
+        served = getattr(args, "served_model_name", None)
+        if isinstance(served, list | tuple) and served:
+            model_name = served[0]
+        elif isinstance(served, str) and served:
+            model_name = served
+        else:
+            model_name = args.model
+        adapter = getattr(getattr(app.state, "openai_serving_duplex", None), "_serving_runtime_adapter", None)
+        frame_samples = int(getattr(adapter, "silence_continuation_samples", 16000))
+        silence = base64.b64encode(bytes(frame_samples * 4)).decode("ascii")
+        from vllm_omni.experimental.fullduplex.client import build_realtime_url
+
+        url = (
+            build_realtime_url(f"ws://127.0.0.1:{args.port}/v1/realtime", model_name, autostart=False)
+            + "&vllm_omni_warmup=1"
+        )
+        logger.info("Duplex warmup starting: %d silent frames of %d samples.", warmup_frames, frame_samples)
+        start = time.time()
+        # The socket is bound before uvicorn finishes starting, so a plain
+        # connect can be accepted and then reset. Wait for /health first.
+        async with httpx.AsyncClient() as http:
+            for _ in range(120):
+                try:
+                    if (await http.get(f"http://127.0.0.1:{args.port}/health", timeout=2)).status_code == 200:
+                        break
+                except httpx.HTTPError:
+                    pass
+                await asyncio.sleep(1)
+            else:
+                logger.warning("Duplex warmup: /health never became ready; skipping warmup.")
+                return
+        async with websockets.connect(url, max_size=64 * 1024 * 1024, open_timeout=10) as ws:
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "session_id": f"warmup-{uuid.uuid4().hex[:8]}",
+                            "model": model_name,
+                            "modalities": ["audio", "text"],
+                            "input_audio_format": "pcm_f32le",
+                            "output_audio_format": "pcm16",
+                            "idle_timeout_s": 60,
+                            "turn_detection": None,
+                            "extra_body": {"auto_response": True},
+                        },
+                    }
+                )
+            )
+            saw_audio = False
+            sent = 0
+
+            async def _recv_until(predicate, timeout_s: float) -> bool:
+                deadline = time.monotonic() + timeout_s
+                while time.monotonic() < deadline:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=max(0.05, deadline - time.monotonic()))
+                    except (TimeoutError, asyncio.TimeoutError):
+                        return False
+                    event = json.loads(raw)
+                    if predicate(event):
+                        return True
+                return False
+
+            if not await _recv_until(lambda e: e.get("type") == "session.created", 30):
+                logger.warning("Duplex warmup: no session.created within 30 s; aborting warmup.")
+                return
+            while sent < warmup_frames:
+                await ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": silence}))
+                sent += 1
+                await asyncio.sleep(0.08)
+            # Wait for the pipeline's first audio output so every stage ran.
+            saw_audio = await _recv_until(lambda e: e.get("type") == "response.audio.delta", 30)
+            # Close the session EXPLICITLY: a bare websocket close parks the
+            # session in its disconnect grace window, where it would keep
+            # occupying the max_sessions=1 slot and block the first client.
+            await ws.send(json.dumps({"type": "session.close"}))
+            await _recv_until(lambda e: e.get("type") == "session.closed", 10)
+        logger.info(
+            "Duplex warmup finished in %.1f s (%d silent frames, first audio %s).",
+            time.time() - start,
+            sent,
+            "received" if saw_audio else "NOT received",
+        )
+    except Exception:
+        logger.exception("Duplex warmup failed; continuing to serve (first session pays cold-start costs).")
+    finally:
+        if warmup_done is not None:
+            warmup_done.set()
+
+
 async def omni_run_server(args, **uvicorn_kwargs) -> None:
     """Run a single-worker API server.
 
@@ -516,9 +621,10 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         app = build_openai_app(args, supported_tasks)
 
         # OMNI: Remove upstream routes that we override with omni-specific handlers
-        _remove_route_from_app(app, "/v1/chat/completions", {"POST"})
-        _remove_route_from_app(app, "/v1/chat/completions/batch", {"POST"})
-        _remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
+        remove_route_from_app(app, "/v1/chat/completions", {"POST"})
+        remove_route_from_app(app, "/v1/chat/completions/batch", {"POST"})
+        remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
+        remove_route_from_app(app, "/health", {"GET"})
         app.include_router(router)
 
         # OMNI: Override upstream exception handlers with Omni-aware versions
@@ -540,6 +646,8 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
         if _should_enable_profiler_endpoints(stage_configs):
             logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
+            remove_route_from_app(app, "/start_profile", frozenset({"POST"}))
+            remove_route_from_app(app, "/stop_profile", frozenset({"POST"}))
             app.include_router(profiler_router)
 
         vllm_config = await _get_vllm_config(engine_client)
@@ -588,6 +696,21 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                     scope["state"]["request_timestamp"] = time.time()
                 await self._inner(scope, receive, send)
 
+        # Startup duplex warmup (duplex_session.warmup_frames in the deploy
+        # yaml): real /v1/realtime connections wait on this event so the
+        # first client never pays cold-start costs.
+        duplex_warmup_frames = 0
+        if getattr(app.state, "openai_serving_duplex", None) is not None:
+            duplex_cfg = getattr(engine_client, "duplex_session_config", None)
+            duplex_warmup_frames = int(getattr(duplex_cfg, "warmup_frames", 0) or 0)
+        app.state.duplex_warmup_done = asyncio.Event() if duplex_warmup_frames > 0 else None
+        warmup_task: asyncio.Task | None = None
+        if duplex_warmup_frames > 0:
+            # Scheduled before serve_http (which may not return until
+            # shutdown); the coroutine retries its self-connect until the
+            # server socket is accepting.
+            warmup_task = asyncio.create_task(_warmup_duplex_realtime(app, args, duplex_warmup_frames))
+
         shutdown_task = await serve_http(
             _TimestampMiddleware(app),
             sock=sock,
@@ -612,7 +735,12 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         try:
             await shutdown_task
         finally:
+            if warmup_task is not None:
+                warmup_task.cancel()
             state = getattr(app, "state", None)
+            serving_video = getattr(state, "openai_serving_video", None) if state is not None else None
+            if serving_video is not None:
+                serving_video.shutdown()
             serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
             if serving_speech is not None:
                 serving_speech.shutdown()
@@ -823,6 +951,8 @@ async def omni_init_app_state(
             diffusion_engine=engine_client,
             model_name=model_name,
             stage_configs=diffusion_stage_configs,
+            allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
+            allowed_media_domains=getattr(args, "allowed_media_domains", None),
         )
         state.openai_serving_duplex = None
         state.openai_streaming_speech = None
@@ -997,11 +1127,9 @@ async def omni_init_app_state(
     )
 
     # Warm up chat template processing to avoid first-request latency
-    # Upstream f5ffc59b6a moved warmup onto OnlineRenderer. Accelerator
-    # images can temporarily lag that renderer API, where warmup is optional.
-    renderer_warmup = getattr(state.online_renderer, "warmup", None)
-    if renderer_warmup is not None:
-        renderer_warmup()
+    # Upstream f5ffc59b6a removed OpenAIServingChat.warmup() and moved the
+    # warmup onto the renderer (OnlineRenderer.warmup()); mirror upstream.
+    state.online_renderer.warmup()
 
     state.openai_serving_completion = (
         OpenAIServingCompletion(
@@ -1709,6 +1837,14 @@ async def streaming_video_output(websocket: WebSocket):
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
     """WebSocket endpoint for OpenAI-style realtime interactions."""
+    # Hold real clients until the startup duplex warmup finishes (the warmup
+    # connection marks itself with vllm_omni_warmup=1 and passes through).
+    warmup_done = getattr(websocket.app.state, "duplex_warmup_done", None)
+    if warmup_done is not None and not warmup_done.is_set() and websocket.query_params.get("vllm_omni_warmup") != "1":
+        try:
+            await asyncio.wait_for(warmup_done.wait(), timeout=120)
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.warning("Duplex warmup still running after 120 s; admitting the client anyway.")
     duplex_handler = getattr(websocket.app.state, "openai_serving_duplex", None)
     duplex_query = websocket.query_params.get("duplex")
     use_duplex_realtime = (
@@ -1758,11 +1894,6 @@ async def duplex_websocket(websocket: WebSocket):
 
 
 # Health and Model endpoints for diffusion mode
-
-
-# Remove existing health endpoint if present (from vllm imports)
-# to ensure our handler takes precedence
-_remove_route_from_router(router, "/health")
 
 
 @router.get("/health")

@@ -1,14 +1,15 @@
 When you want to add L4-level ***performance test*** cases, add entries to JSON files under `tests/dfx/perf/tests/` and run them via `tests/dfx/perf/scripts/run_benchmark.py` (omni / TTS) or `run_diffusion_benchmark.py` (diffusion).
 
-**Config file layout (in-tree examples)**
+#### Config file layout (in-tree examples)
 
 | Model type | Runner | Example JSON files |
 | ---------- | ------ | ------------------ |
-| Omni | `run_benchmark.py` | `test_qwen3_omni_no_async_chunk.json`, `test_qwen3_omni_async_chunk.json`, `test_qwen3_omni_vllm_text.json`, `test_qwen3_omni_multi_replicas.json` |
+| Omni (nightly) | `run_benchmark.py` | `test_qwen3_omni_no_async_chunk.json`, `test_qwen3_omni_async_chunk.json` (`full_model` without `slow` in `mark`) |
+| Omni (weekly) | `run_benchmark.py` | `test_qwen3_omni_async_chunk.json` (CUDA only), `test_qwen3_omni_vllm_text.json`, `test_qwen3_omni_multi_replicas.json` (`slow` in `mark`; **Perf Test** in `test-weekly.yml`) |
 | TTS | `run_benchmark.py` | `test_tts.json`, `test_voxcpm2.json`, `test_higgs_audio_v3.json` |
 | Diffusion | `run_diffusion_benchmark.py` | `test_qwen_image_vllm_omni.json`, `test_bagel_vllm_omni.json`, `test_wan22_i2v_vllm_omni.json`, `test_cosmos3_vllm_omni.json`, … |
 
-**How runners pick cases**
+#### How runners pick cases
 
 Without **`--test-config-file`**, each runner scans all `*.json` under `tests/dfx/perf/tests/` but only keeps its own model type:
 
@@ -17,9 +18,9 @@ Without **`--test-config-file`**, each runner scans all `*.json` under `tests/df
 
 Diffusion cases are detected when the JSON has `server_type` (typically `"vllm-omni"`) or `"diffusion"` in the `mark` array. Omni / TTS JSON has neither.
 
-**Running perf cases**
+#### Running perf cases
 
-Pass **`--test-config-file`** to run one JSON file as-is, or omit it for the bulk scan above and filter with pytest **`-m`** on each case's JSON `mark` (for example `pytest … run_benchmark.py -m "full_model and tts and H100"`).
+Pass **`--test-config-file`** to load one JSON file, or omit it for the bulk scan above. In either mode, pytest **`-m`** filters each case using its JSON `mark`. A single file can contain nightly, weekly, and platform-specific case objects. For example, the nightly object in `test_qwen3_omni_async_chunk.json` declares both H100 and A3, while its `slow` weekly object is CUDA-only; there is no NPU weekly counterpart. Use `-m "H100 and full_model and not slow"`, `-m "H100 and full_model and slow"`, or `-m "npu"` to select the intended schedule and platform.
 
 ```JSON
 {
@@ -55,31 +56,33 @@ Pass **`--test-config-file`** to run one JSON file as-is, or omit it for the bul
 }
 ```
 
-**Parameter Explanation**
+#### Parameter Explanation
 
-*Overview*
+##### Overview
 
-| Field            | Required | Description                                                     |
-| ---------------- | -------- | --------------------------------------------------------------- |
-| test_name        | Yes      | Unique identifier for the test case                             |
-| mark             | No       | Pytest marks for this case (see **`mark` field** below). Omit only for configs not meant to be filtered by `-m`. |
-| server_params    | Yes      | Server-side configuration parameters                            |
-| benchmark_params | Yes      | Benchmark running parameters (supports multiple configurations) |
-| server_type      | Diffusion only | When set (e.g. `"vllm-omni"`), routes the case to `run_diffusion_benchmark.py`. |
-| benchmark_endpoint | Diffusion only | API path for the benchmark client (e.g. `/v1/videos`, `/v1/images/generations`). |
+| Field              | Required       | Description                                  |
+| ------------------ | -------------- | -------------------------------------------- |
+| test_name          | Yes            | Unique identifier for the test case          |
+| mark               | No             | Pytest marks; see **`mark` field** below     |
+| server_params      | Yes            | Server-side configuration parameters         |
+| benchmark_params   | Yes            | Benchmark running parameters                 |
+| server_type        | Diffusion only | Routes case to run_diffusion_benchmark.py    |
+| benchmark_endpoint | Diffusion only | Benchmark API path                           |
 
-**`mark` field**
+Omit `mark` only for configs not meant to be filtered by `-m`. `server_type` is typically `"vllm-omni"`. `benchmark_endpoint` examples: `/v1/videos`, `/v1/images/generations`.
+
+#### `mark` field
 
 Optional top-level field on each perf JSON **case object** (one per `test_name`). `run_benchmark.py` and `run_diffusion_benchmark.py` read it via `tests.dfx.conftest.resolve_pytest_marks` and attach the marks to the corresponding `pytest.param`, so you can filter locally with `-m`.
 
-When `mark` is present, it must be an **array** with exactly one ``hardware_marks`` object (same shape as `@hardware_test` / `hardware_marks()` in `tests/helpers/mark.py`), followed by registered pytest marker name strings such as `full_model`, `omni`, `tts`, `diffusion`, or `local_model`.
+When `mark` is present, it must be an **array** with exactly one ``hardware_marks`` object (same shape as `@hardware_test` / `hardware_marks()` in `tests/helpers/mark.py`), followed by registered pytest marker name strings such as `full_model`, `slow`, `omni`, `tts`, `diffusion`, or `local_model`.
 
 Supported form:
 
 | Form | Example | Effect |
 | ---- | ------- | ------ |
-| Array (single platform) | `"mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2}}, "full_model", "diffusion"]` | Hardware marks from `hardware_marks(...)`; `num_cards` > 1 adds `distributed_*` (+ CUDA `skipif_cuda` when applicable). String entries become extra pytest marks. |
-| Array (multi-platform) | `"mark": [{"hardware_marks": {"res": {"cuda": "H100", "rocm": "MI325", "npu": "A2"}, "num_cards": {"cuda": 2, "rocm": 2, "npu": 1}}}, "full_model", "omni"]` | Same as above, but declares **multiple platforms** in one case. Filter examples: `-m "full_model and H100 and cuda"`, `-m "full_model and MI325 and rocm"`. |
+| Array (single platform) | `"mark": [{"hardware_marks": {"res": {"cuda": "H100"}, "num_cards": 2}}, "full_model", "diffusion"]` | Hardware marks from `hardware_marks(...)`; `num_cards` adds `cards_{n}` (including `cards_1` when omitted). String entries become extra pytest marks. |
+| Array (multi-platform) | `"mark": [{"hardware_marks": {"res": {"cuda": "H100", "rocm": "MI325"}, "num_cards": 2}}, "full_model", "omni"]` | Same as above, but declares **multiple platforms** on one item. All platforms must share the same `num_cards` (int or identical dict values). Different counts need `@hardware_test` or one `hardware_marks()` per `pytest.param`. Filter examples: `-m "full_model and H100 and cards_2 and cuda"`, `-m "full_model and MI325 and cards_2 and rocm"`. |
 
 Recommended for L4 perf cases:
 
@@ -119,11 +122,11 @@ Multi-GPU diffusion (example: Cosmos3 with `cfg-parallel-size=2`):
 - Diffusion perf: include `"diffusion"` in the `mark` array
 - HunyuanImage local-weight cases: add `"local_model"` to the `mark` array
 
-**Parametrization IDs**
+#### Parametrization IDs
 
 Each `(server, benchmark index)` pair becomes one `pytest.param` with id `{test_name}-{suffix}`. The suffix comes from `benchmark_params[].name` when set (for example `test_tts-p0`, `test_omni-p1`); otherwise it is derived from fields like `task` / `eval_phase`.
 
-**Benchmark result filenames**
+#### Benchmark result filenames
 
 Result files use the **runtime** hardware label from `get_runtime_resource_label()` (detected GPU/NPU name on the machine that ran the job), **not** `mark.hardware_marks.res`. On the default H100 CI pool, `H100` is **omitted** from filenames (`resource_label_for_filename`).
 
@@ -132,32 +135,40 @@ Examples:
 - Omni/TTS: `result_{test_name}_{optional_hw}_{dataset}_....json` under `BENCHMARK_DIR`
 - Diffusion: one aggregate `diffusion_result_{config_stem}_{optional_hw}_{timestamp}.json` per source JSON file (array of all runs from that file)
 
-**Local commands**
+#### Local commands
 
 ```bash
 # Bulk load + filter by JSON mark
 pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and H100 and diffusion"
 pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "full_model and omni and H100"
 
-# Single file (same as nightly CI Perf steps)
+# Single file (same selectors as the CI Perf steps)
 pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py \
   --test-config-file tests/dfx/perf/tests/test_bagel_vllm_omni.json
 pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
-  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
+  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json \
+  -m "H100 and full_model and not slow"
+pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json \
+  -m "H100 and full_model and slow"
+pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json \
+  -m "npu"
 ```
 
-See also [Markers for Tests](#markers-for-tests) for registered hardware markers (`H100`, `L4`, `cuda`, `distributed_cuda`, …).
+<!-- markdownlint-disable-next-line MD051 -->
+See also [Markers for Tests](#markers-for-tests) for registered hardware markers (`H100`, `L4`, `cuda`, `cards_1`, …).
 
-**`server_params` Configuration**
+#### `server_params` Configuration
 
-*Basic Parameters*
+##### Basic Parameters
 
-| Parameter         | Required | Example                            | Description                   |
-| ----------------- | -------- | ---------------------------------- | ----------------------------- |
-| model             | Yes      | "Qwen/Qwen3-Omni-30B-A3B-Instruct" | Model name or path            |
-| stage_config_name | Yes      | "qwen3_omni_moe.yaml"              | Deploy configuration file name |
+| Parameter         | Required | Example                   | Description                    |
+| ----------------- | -------- | ------------------------- | ------------------------------ |
+| model             | Yes      | Qwen/Qwen3-Omni-30B-A3B…  | Model name or path             |
+| stage_config_name | Yes      | qwen3_omni_moe.yaml       | Deploy configuration file name |
 
-*Dynamic Configuration (update/delete)*
+##### Dynamic Configuration (update/delete)
 
 Supports incremental modifications based on the basic configuration:
 
@@ -166,9 +177,9 @@ Supports incremental modifications based on the basic configuration:
 | update    | Update or add configuration items    |
 | delete    | Delete specified configuration items |
 
-**Example**:
+##### Example
 
-```
+```json
 "update": {
     "async_chunk": true,  // Enable asynchronous chunk processing
     "stages": {
@@ -184,20 +195,22 @@ Supports incremental modifications based on the basic configuration:
 }
 ```
 
-**`benchmark_params` Configuration**
+#### `benchmark_params` Configuration
 
 You can add any benchmark running parameters you need here. For all optional parameters, refer to the [benchmark documentation](https://github.com/vllm-project/vllm-omni/blob/main/docs/cli/bench/serve.md). General modifications are as follows:
 
-1.  Change the --xxx-xx-xx running parameters to xxx_xx_xx format and fill them as keys in the JSON file.
-2.  For boolean variables in the running parameters, modify them to forms such as ignore_eos: true/false and fill them into the JSON file.
-3.  Optionally add a `baseline` object (see **Baseline thresholds** below). If you omit `baseline` or leave it empty, the performance test still runs but does not assert metric thresholds from this field.
-4.  Set `"name"` on each `benchmark_params` entry for stable pytest ids and readable result keys.
-5.  The qps and concurrency modes are recommended to be mutually exclusive. For detailed explanations, see the table below:
+1. Change the --xxx-xx-xx running parameters to xxx_xx_xx format and fill them as keys in the JSON file.
+2. For boolean variables in the running parameters, modify them to forms such as ignore_eos: true/false and fill them into the JSON file.
+3. Optionally add a `baseline` object (see **Baseline thresholds** below). If you omit `baseline` or leave it empty, the performance test still runs but does not assert metric thresholds from this field.
+4. Set `"name"` on each `benchmark_params` entry for stable pytest ids and readable result keys.
+5. The qps and concurrency modes are recommended to be mutually exclusive. For detailed explanations, see the table below:
 
-| Parameter       | Type        | Required | Example/Values  | Description                                                                                                                                                                                                                                                          |
-| --------------- | ----------- | -------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| name            | string      | No       | `"1024x1024_steps4"` | Stable suffix for pytest param id and logs. |
-| num_prompts     | int / array | Yes      | 10,[10, 20, 30] | Number of requests. Supports single values or arrays. If a single value is used, it will be automatically expanded to match the number of qps or max_concurrency, e.g., [10,10,10]. If an array is used, its length must match the number of qps or max_concurrency. |
-| request_rate    | float / array | No  | 0.5, [0.5, 1, inf] | Queries per second. Supports single values or arrays. If a single value is used, it will be automatically expanded to match the number of num_prompts, e.g., [1,1,1]. If an array is used, its length must match the number of num_prompts.                          |
-| max_concurrency | int / array | No       | 1, [1, 2, 3]    | Maximum concurrent in-flight requests. Same array / expansion rules as `request_rate` (mutually exclusive with QPS mode).                                                                                                                                                                                                             |
-| baseline        | object      | No       | see below       | Optional thresholds. **Hardware-nested only**: top-level keys must be `[hardware-resource]` pytest markers from `pyproject.toml` (`get_hardware_mark_list()`). Under each hardware key, metric names are free-form; values are scalars or sweep-aligned lists. Example: `{"H100": {"throughput_qps": […], "custom_stage_ms": 1.0}, "A3": {…}}`. Runtime filename aliases (`_RUNTIME_DEVICE_ALIASES`) are separate and do not expand this allowlist. |
+| Parameter       | Type          | Required | Example/Values       | Description                          |
+| --------------- | ------------- | -------- | -------------------- | ------------------------------------ |
+| name            | string        | No       | `"1024x1024_steps4"` | Stable suffix for pytest param id    |
+| num_prompts     | int / array   | Yes      | 10, [10, 20, 30]     | Number of requests (scalar or sweep) |
+| request_rate    | float / array | No       | 0.5, [0.5, 1, inf]   | Queries per second (QPS mode)        |
+| max_concurrency | int / array   | No       | 1, [1, 2, 3]         | Max in-flight requests               |
+| baseline        | object        | No       | see below            | Optional hardware-nested thresholds  |
+
+`num_prompts`, `request_rate`, and `max_concurrency` accept scalars or arrays; single values expand to match sweep length. QPS and concurrency modes are mutually exclusive. `baseline` top-level keys must be hardware pytest markers from `pyproject.toml`; metric names and values are free-form (scalars or sweep-aligned lists). Omit `baseline` to run without threshold assertions.

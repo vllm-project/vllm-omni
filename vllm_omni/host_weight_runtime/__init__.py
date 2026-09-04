@@ -35,7 +35,7 @@ from .inspection import (
     DomainInspection,
     HostWeightInspector,
 )
-from .lease import HostWeightLease, LeaseProvenance, MappedHostRegion
+from .lease import HostWeightLease, HostWeightLeaseCarrier, LeaseProvenance, MappedHostRegion
 from .manifest import (
     FileManifestEntry,
     ManifestValidationError,
@@ -47,6 +47,8 @@ from .manifest import (
 from .outcomes import (
     AttemptResult,
     HostWeightResolution,
+    PostLoadPublicationOutcome,
+    PostLoadPublicationReport,
     ResolutionAttempt,
     ResolutionOutcome,
     ResolutionReport,
@@ -90,6 +92,7 @@ __all__ = [
     "HostWeightError",
     "HostWeightFailure",
     "HostWeightLease",
+    "HostWeightLeaseCarrier",
     "HostWeightResolution",
     "HostWeightInspector",
     "HostWeightRuntime",
@@ -102,6 +105,8 @@ __all__ = [
     "ManifestValidationError",
     "MappedHostRegion",
     "ProducerIdentity",
+    "PostLoadPublicationOutcome",
+    "PostLoadPublicationReport",
     "ProductionMetadata",
     "ProductionPolicy",
     "ProductionSourceMode",

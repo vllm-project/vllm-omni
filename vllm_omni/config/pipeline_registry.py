@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Pipeline registry and factory for vllm-omni.
 
 ``OMNI_PIPELINES`` maps each ``model_type`` to either a ``PipelineConfig``
@@ -85,6 +85,7 @@ from vllm_omni.model_executor.models.ming_tts.pipeline import (
     MING_TTS_PIPELINE,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
+from vllm_omni.model_executor.models.minimax_h3.pipeline import MINIMAX_H3_PIPELINE
 from vllm_omni.model_executor.models.minimax_music3.pipeline import MINIMAX_MUSIC3_PIPELINE
 from vllm_omni.model_executor.models.moss_tts.pipeline import (
     MOSS_TTS_LOCAL_PIPELINE,
@@ -101,12 +102,11 @@ from vllm_omni.model_executor.models.qwen2_5_omni.pipeline import (
     QWEN2_5_OMNI_PIPELINE,
     QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
 )
-from vllm_omni.model_executor.models.qwen3_omni.pipeline import resolve_qwen3_omni_pipeline
-from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_PIPELINE
-from vllm_omni.model_executor.models.soulx_singer.pipeline import (
-    SOULXSINGER_SVC_PIPELINE,
-    SOULXSINGER_SVS_PIPELINE,
+from vllm_omni.model_executor.models.qwen3_omni.pipeline import (
+    QWEN3_OMNI_THINKER_ONLY_PIPELINE,
+    resolve_qwen3_omni_pipeline,
 )
+from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_PIPELINE
 from vllm_omni.model_executor.models.step_audio2.pipeline import (
     STEP_AUDIO2_ASR_PIPELINE,
     STEP_AUDIO2_PIPELINE,
@@ -131,6 +131,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     # has no model_type key).
     "nemotron_labs_voicechat": NEMOTRON_VOICECHAT_PIPELINE,
     "qwen3_omni_moe": resolve_qwen3_omni_pipeline,
+    "qwen3_omni_moe_thinker_only": QWEN3_OMNI_THINKER_ONLY_PIPELINE,
     "qwen3_tts": QWEN3_TTS_PIPELINE,
     "step_audio_2": STEP_AUDIO2_PIPELINE,
     "step_audio_2_asr": STEP_AUDIO2_ASR_PIPELINE,
@@ -171,6 +172,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "ming_flash_omni_thinker_only": MING_FLASH_OMNI_THINKER_ONLY_PIPELINE,
     "ming_flash_omni_image": MING_FLASH_OMNI_IMAGE_PIPELINE,
     "moss_tts_nano": MOSS_TTS_NANO_PIPELINE,
+    "minimax_h3_disaggregated": MINIMAX_H3_PIPELINE,
     "omnivoice": OMNIVOICE_PIPELINE,
     "mammoth_moda2": MAMMOTH_MODA2_PIPELINE,
     "mammoth_moda2_ar": MAMMOTH_MODA2_AR_PIPELINE,
@@ -184,8 +186,6 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "dynin_omni": DYNIN_OMNI_PIPELINE,
     "indextts2": INDEXTTS2_PIPELINE,
     "indextts2_5": INDEXTTS25_PIPELINE,
-    "soulxsinger_svc": SOULXSINGER_SVC_PIPELINE,
-    "soulxsinger_svs": SOULXSINGER_SVS_PIPELINE,
 }
 
 
@@ -196,18 +196,13 @@ def register_pipeline(pipeline: PipelineConfig | PipelineResolverFunc, model_typ
     since resolvers can return multiple different PipelineConfigs depending on the
     consumed config.
     """
-    errors: list[str] = []
     if isinstance(pipeline, PipelineConfig):
-        errors = pipeline.validate()
         model_type = model_type if model_type is not None else pipeline.model_type
-    else:
-        if model_type is None:
-            raise ValueError("Model type must be explicitly provided when registering a pipeline resolver")
+    elif model_type is None:
+        raise ValueError("Model type must be explicitly provided when registering a pipeline resolver")
 
     if model_type in OMNI_PIPELINES:
-        errors.append(f"Model type {model_type} is already registered; the old mapping will be clobbered")
-    if errors:
-        logger.warning("Registration for pipeline of type %s produced the following issues: %s", model_type, errors)
+        logger.warning(f"Model type {model_type} is already registered; the old mapping will be clobbered")
     OMNI_PIPELINES[model_type] = pipeline
 
 

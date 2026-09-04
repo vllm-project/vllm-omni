@@ -8,10 +8,6 @@ from typing import Any, Literal, Protocol
 
 from PIL import Image
 
-from vllm_omni.model_extras.audiox import (
-    AUDIOX_EXTRA_BODY_PARAMS,
-    AUDIOX_EXTRA_OUTPUT_PARAMS,
-)
 from vllm_omni.model_extras.bagel import (
     BAGEL_EXTRA_BODY_PARAMS,
     BAGEL_EXTRA_OUTPUT_PARAMS,
@@ -40,10 +36,6 @@ from vllm_omni.model_extras.ltx2 import (
     ltx_preserves_reference_image_size,
     ltx_transformer_config_subfolder,
 )
-from vllm_omni.model_extras.magi_human import (
-    MAGI_HUMAN_EXTRA_BODY_PARAMS,
-    MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
-)
 from vllm_omni.model_extras.mammothmodal2_preview import (
     MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS,
     MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS,
@@ -66,6 +58,7 @@ from vllm_omni.model_extras.ming_flash_omni import (
 from vllm_omni.model_extras.ming_flash_omni import (
     build_text_to_image_prompt as build_ming_flash_omni_text_to_image_prompt,
 )
+from vllm_omni.model_extras.sana_video import SANA_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.sensenova_u1 import (
     SENSENOVA_U1_EXTRA_BODY_PARAMS,
     SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
@@ -179,10 +172,6 @@ def default_image_to_image_prompt(
 
 
 _EXTRA_SPECS: dict[str, dict[str, Any]] = {
-    "AudioXPipeline": {
-        "extra_body_params": AUDIOX_EXTRA_BODY_PARAMS,
-        "extra_output_params": AUDIOX_EXTRA_OUTPUT_PARAMS,
-    },
     "BagelPipeline": {
         "extra_body_params": BAGEL_EXTRA_BODY_PARAMS,
         "extra_output_params": BAGEL_EXTRA_OUTPUT_PARAMS,
@@ -202,10 +191,6 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "Cosmos3OmniPipeline": {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
-    },
-    "MagiHumanPipeline": {
-        "extra_body_params": MAGI_HUMAN_EXTRA_BODY_PARAMS,
-        "extra_output_params": MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
     },
     "HeliosPipeline": {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
@@ -234,6 +219,12 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
             "LTX2DistilledPipeline",
             "LTX2DistilledTwoStagePipeline",
         )
+    },
+    "SanaVideoPipeline": {
+        "extra_body_params": SANA_VIDEO_EXTRA_BODY_PARAMS,
+    },
+    "SanaImageToVideoPipeline": {
+        "extra_body_params": SANA_VIDEO_EXTRA_BODY_PARAMS,
     },
     "WanVACEPipeline": {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,

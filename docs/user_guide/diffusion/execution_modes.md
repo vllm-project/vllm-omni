@@ -94,15 +94,31 @@ validating a model or debugging correctness, then increase it for
 multi-request throughput.
 
 Step execution is capability-based, not a generic switch for every diffusion
-model. Qwen-Image supports step-wise continuous batching. HunyuanImage3 also
-supports it, but only when its resolved self-attention backend is `TORCH_SDPA`;
+model. Qwen-Image supports step-wise continuous batching. BAGEL supports
+step-wise continuous batching for image generation with `bagel.yaml`,
+`bagel_think.yaml`, and `bagel_single_stage.yaml`. In the two-stage topologies,
+only the diffusion stage uses step execution; the autoregressive Thinker is
+unchanged. Explicit text-output requests in the single-stage topology retain
+the complete-request path. BAGEL schedules exactly `num_inference_steps`
+denoising updates, so one-step image requests are supported. BAGEL step
+execution does not currently support sequence parallelism or a diffusion cache
+backend. HunyuanImage3 also supports step execution, but only
+when its resolved self-attention backend is `TORCH_SDPA`;
 set `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA` or configure
 `diffusion_attention_config.default.backend=TORCH_SDPA` before using
 `--max-num-seqs >1`. See the
 [HunyuanImage-3.0 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/HunyuanImage-3.0-Instruct.md)
 for its validated configuration. Helios supports single-request step execution only: use
-`--step-execution --max-num-seqs 1` for Helios. Consult the selected pipeline's
-documentation and source for the latest support status.
+`--step-execution --max-num-seqs 1` for Helios. MiniMax H3 supports step-wise
+continuous batching by packing co-batched requests into one sequence that keeps
+a separate attention document per request; that layout needs a backend which
+honors the packed `cu_seqlens` metadata, so run it with
+`--diffusion-attention-backend FLASH_ATTN` (other backends stay correct but
+fall back to one transformer forward per request). Batching H3 does not improve
+its throughput — see the measured numbers in the
+[MiniMax-H3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md)
+— so keep `--max-num-seqs 1` unless you need step-level scheduling. Consult the
+selected pipeline's documentation and source for the latest support status.
 
 ## Streaming Output
 
