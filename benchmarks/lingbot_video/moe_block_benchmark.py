@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Benchmark one LingBot-Video MoE block at the measured production shape."""
 
@@ -148,7 +148,6 @@ def main() -> int:
 
     device = torch.device("cuda")
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
     vllm_config = VllmConfig(device_config=DeviceConfig(device="cuda"))
 
     with _single_rank_runtime(vllm_config):
