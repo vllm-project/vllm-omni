@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Seed-TTS WER aligned with Bytedance ``seed-tts-eval`` / ``run_wer.py``.
 
 Matches the published protocol (see Hugging Face dataset card and
@@ -329,7 +332,8 @@ def _ensure_utmos_jit_model() -> Any | None:
             return _utmos_jit_model
         try:
             import torch
-            from huggingface_hub import hf_hub_download
+
+            from vllm_omni.transformers_utils.repo_utils import hf_api
 
             repo = os.environ.get("SEED_TTS_UTMOS_HF_REPO", "balacoon/utmos").strip() or "balacoon/utmos"
             fname = os.environ.get("SEED_TTS_UTMOS_JIT_FILE", "utmos.jit").strip() or "utmos.jit"
@@ -338,7 +342,7 @@ def _ensure_utmos_jit_model() -> Any | None:
                 repo,
                 fname,
             )
-            path = hf_hub_download(repo_id=repo, filename=fname, repo_type="model")
+            path = hf_api().hf_hub_download(repo_id=repo, filename=fname, repo_type="model")
 
             # TODO The model weights in UTMOS must be loaded in cuda:0; otherwise, the model execution will fail.
             want = "cuda:0"

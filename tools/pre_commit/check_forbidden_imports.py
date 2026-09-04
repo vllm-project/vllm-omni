@@ -17,7 +17,7 @@ import regex as re
 _HF_NAMES = (
     r"HfApi|HfFileSystem|hf_hub_download|snapshot_download"
     r"|list_repo_files|file_exists|try_to_load_from_cache"
-    r"|list_repo_refs|repo_exists"
+    r"|list_repo_refs|repo_exists|get_safetensors_metadata"
 )
 
 # Non-library trees: examples, tests, and tooling may keep stdlib imports.
@@ -169,58 +169,20 @@ CHECK_IMPORTS = {
             r"^\s*from\s+huggingface_hub\s+import\b[^\n]*\b(?:" + _HF_NAMES + r")\b"
         ),
         tip=(
-            "Use the shared, vLLM-tagged helpers from "
-            "vllm.transformers_utils.repo_utils (e.g. hf_api(), hf_fs(), "
-            "list_repo_files, file_exists) instead of calling "
-            "huggingface_hub directly."
+            "Use 'hf_api()' from 'vllm_omni.transformers_utils.repo_utils' (or "
+            "add a tagged helper there) instead, so requests are tagged with "
+            "vLLM-Omni's library info."
         ),
         allowed_dirs=_NON_LIBRARY_DIRS,
         allowed_files={
-            "vllm_omni/benchmarks/data_modules/daily_omni_dataset.py",
-            "vllm_omni/benchmarks/data_modules/seed_tts_dataset.py",
-            "vllm_omni/benchmarks/data_modules/seed_tts_eval.py",
-            "vllm_omni/diffusion/lora/loader.py",
-            "vllm_omni/diffusion/model_loader/hub_prefetch.py",
-            "vllm_omni/diffusion/models/cosmos3/sound_tokenizer.py",
-            "vllm_omni/diffusion/models/dreamzero/pipeline_dreamzero.py",
-            "vllm_omni/diffusion/models/helios/pipeline_helios.py",
-            "vllm_omni/diffusion/models/longcat_video/pipeline_longcat_video_avatar.py",
-            "vllm_omni/diffusion/models/ltx2/ltx2_components.py",
-            "vllm_omni/diffusion/models/magi_human/pipeline_magi_human.py",
-            "vllm_omni/diffusion/models/omnivoice/pipeline_omnivoice.py",
-            "vllm_omni/diffusion/models/pi0/pipeline_pi0.py",
-            "vllm_omni/diffusion/models/sensenova_u1/pipeline_sensenova_u1.py",
-            "vllm_omni/diffusion/models/soulx_singer/utils.py",
-            "vllm_omni/diffusion/models/utils.py",
-            "vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py",
-            "vllm_omni/engine/arg_utils.py",
-            "vllm_omni/entrypoints/openai/api_server.py",
-            "vllm_omni/entrypoints/openai/serving_speech.py",
-            "vllm_omni/entrypoints/openai/tts_adapters/cosyvoice3.py",
-            "vllm_omni/experimental/fullduplex/personaplex/runtime.py",
-            "vllm_omni/experimental/fullduplex/personaplex/serving/server.py",
-            "vllm_omni/model_executor/model_loader/weight_utils.py",
-            "vllm_omni/model_executor/models/audex/checkpoint.py",
-            "vllm_omni/model_executor/models/bagel/bagel.py",
-            "vllm_omni/model_executor/models/cosyvoice3/cosyvoice3.py",
-            "vllm_omni/model_executor/models/covo_audio/covo_audio_code2wav.py",
-            "vllm_omni/model_executor/models/dots_tts/dots_tts_talker.py",
-            "vllm_omni/model_executor/models/dynin_omni/dynin_omni_common.py",
-            "vllm_omni/model_executor/models/dynin_omni/dynin_omni_token2audio.py",
-            "vllm_omni/model_executor/models/glm_tts/glm_tts.py",
+            # ``try_to_load_from_cache`` is a local cache lookup that issues no
+            # Hub request, so there is nothing for ``hf_api()`` to tag.
             "vllm_omni/model_executor/models/higgs_audio_v2/higgs_audio_v2_code2wav.py",
             "vllm_omni/model_executor/models/higgs_audio_v2/higgs_audio_v2_tokenizer.py",
             "vllm_omni/model_executor/models/higgs_audio_v3/higgs_audio_v3_code2wav.py",
-            "vllm_omni/model_executor/models/indextts2/preprocess_utils.py",
-            "vllm_omni/model_executor/models/indextts2/s2mel/modules/bigvgan.py",
-            "vllm_omni/model_executor/models/indextts2/tokenizer_v2_5.py",
-            "vllm_omni/model_executor/models/ming_tts/speaker_extractor.py",
-            "vllm_omni/model_executor/models/minicpmo_4_5/minicpmo_4_5_code2wav.py",
-            "vllm_omni/model_executor/models/omnivoice/omnivoice.py",
-            "vllm_omni/model_executor/models/personaplex/personaplex_mimi.py",
-            "vllm_omni/model_executor/models/step_audio2/step_audio2_token2wav.py",
-            "vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py",
             "vllm_omni/transformers_utils/configs/higgs_audio_v3.py",
+            # Defines the tagged helper itself.
+            "vllm_omni/transformers_utils/repo_utils.py",
         },
     ),
 }
@@ -332,6 +294,7 @@ def test_regex():
         ("from huggingface_hub import HfFileSystem", True),
         ("from huggingface_hub import list_repo_files", True),
         ("from huggingface_hub import try_to_load_from_cache", True),
+        ("from huggingface_hub import get_safetensors_metadata", True),
         ("    from huggingface_hub import snapshot_download", True),
         ("from huggingface_hub import PyTorchModelHubMixin, hf_hub_download", True),
         ("from huggingface_hub import (snapshot_download)", True),
@@ -348,6 +311,7 @@ def test_regex():
         ("from huggingface_hub.constants import HF_HUB_CACHE", False),
         ("from huggingface_hub.utils import EntryNotFoundError", False),
         ("from vllm.transformers_utils.repo_utils import hf_api", False),
+        ("from vllm_omni.transformers_utils.repo_utils import hf_api", False),
         ("from huggingface_hub import (\n    PyTorchModelHubMixin,\n)", False),
         ("# from huggingface_hub import snapshot_download", False),
     ]

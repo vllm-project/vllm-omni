@@ -10,11 +10,11 @@ from diffusers.loaders.lora_conversion_utils import (
     _convert_non_diffusers_qwen_lora_to_diffusers,
     _convert_non_diffusers_wan_lora_to_diffusers,
 )
-from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_from_pipeline
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 logger = init_logger(__name__)
 
@@ -131,7 +131,7 @@ def _load_lora_state_dict(
 
     # finally, we try to load it from the internet
     try:
-        model_file = hf_hub_download(
+        model_file = hf_api().hf_hub_download(
             pretrained_model_name_or_path,
             filename=weights_name,
             subfolder=subfolder,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E offline inference tests for MOSS-TTS-Realtime (MossTTSRealtime, 1.7B).
 
 Uses the standard omni_runner + pytestmark pattern (one module-scoped engine
@@ -160,12 +160,13 @@ def _build_request(ref_audio_path: str, text: str) -> dict:
     Frees the codec model before returning to avoid competing with the
     running vllm engine for GPU/CPU memory.
     """
-    from huggingface_hub import snapshot_download
     from transformers import AutoModel, AutoTokenizer
+
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
     # Step 1: locate the realtime processor module in the snapshot.
     try:
-        snap_dir = Path(snapshot_download(repo_id=MODEL))
+        snap_dir = Path(hf_api().snapshot_download(repo_id=MODEL))
     except Exception as exc:
         msg = f"Cannot locate snapshot for {MODEL}: {exc}"
         if os.environ.get("MOSS_TTS_SKIP_ON_NET_FAIL"):

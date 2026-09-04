@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """PersonaPlex full-duplex server, compatible with the OFFICIAL Moshi web client.
 
 Serves the official PersonaPlex web UI (``dist.tgz`` from ``nvidia/personaplex-7b-v1``,
@@ -41,7 +41,6 @@ from pathlib import Path
 import numpy as np
 import sphn
 from aiohttp import WSMsgType, web
-from huggingface_hub import hf_hub_download
 
 from vllm_omni.experimental.fullduplex.personaplex.config import PersonaPlexConfig
 from vllm_omni.experimental.fullduplex.personaplex.engine import PersonaPlexEngine
@@ -51,6 +50,7 @@ from vllm_omni.experimental.fullduplex.personaplex.session import (
     PersonaPlexSession,
     offer_realtime,
 )
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 logger = logging.getLogger(__name__)
 _HF_REPO = "nvidia/personaplex-7b-v1"
@@ -81,7 +81,7 @@ def _opus_decode(reader: sphn.OpusStreamReader, data: bytes) -> np.ndarray | Non
 def _official_web_dir() -> Path | None:
     """Download + extract the official PersonaPlex web client (dist.tgz)."""
     try:
-        tgz = Path(hf_hub_download(_HF_REPO, "dist.tgz"))
+        tgz = Path(hf_api().hf_hub_download(_HF_REPO, "dist.tgz"))
         dist = tgz.parent / "dist"
         if not dist.exists():
             with tarfile.open(tgz, "r:gz") as tar:

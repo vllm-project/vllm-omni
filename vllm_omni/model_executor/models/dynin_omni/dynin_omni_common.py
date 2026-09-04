@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import hashlib
@@ -20,9 +23,9 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 try:
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 except Exception:  # pragma: no cover
-    snapshot_download = None
+    hf_api = None
 
 
 class DetokTarget(IntEnum):
@@ -397,13 +400,13 @@ def _find_dynin_config_under_root(root: Path) -> Path | None:
 
 @lru_cache(maxsize=16)
 def _resolve_dynin_config_from_hf_repo(repo_id: str) -> str | None:
-    if not _looks_like_hf_repo_id(repo_id) or snapshot_download is None:
+    if not _looks_like_hf_repo_id(repo_id) or hf_api is None:
         return None
 
     try:
         snapshot_dir = (
             Path(
-                snapshot_download(
+                hf_api().snapshot_download(
                     repo_id=repo_id,
                     repo_type="model",
                     allow_patterns=list(_DYNIN_CONFIG_CANDIDATE_RELPATHS),
@@ -719,7 +722,7 @@ def _resolve_remote_snapshot_dir(
     if source_path.is_dir():
         return str(source_path.resolve())
 
-    if snapshot_download is None:
+    if hf_api is None:
         raise RuntimeError("huggingface_hub is required to load remote code.")
 
     kwargs: dict[str, Any] = {
@@ -732,10 +735,10 @@ def _resolve_remote_snapshot_dir(
         kwargs["revision"] = revision
 
     try:
-        return str(snapshot_download(**kwargs))
+        return str(hf_api().snapshot_download(**kwargs))
     except TypeError:
         kwargs.pop("local_files_only", None)
-        return str(snapshot_download(**kwargs))
+        return str(hf_api().snapshot_download(**kwargs))
 
 
 def _ensure_remote_package(snapshot_dir: str) -> str:

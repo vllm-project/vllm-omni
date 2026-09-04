@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -140,8 +140,8 @@ def _load_json(model_path: str, filename: str, local_files_only: bool = True) ->
         with open(path) as f:
             return json.load(f)
     else:
-        from huggingface_hub import hf_hub_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
-        cached = hf_hub_download(repo_id=model_path, filename=filename)
+        cached = hf_api().hf_hub_download(repo_id=model_path, filename=filename)
         with open(cached) as f:
             return json.load(f)
