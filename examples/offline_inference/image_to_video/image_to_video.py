@@ -58,7 +58,7 @@ import functools
 import json
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import PIL.Image
@@ -386,11 +386,38 @@ def calculate_dimensions(
     return height, width
 
 
-def main():
-    args = parse_args()
-    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
-    model_name = str(args.model).lower() if args.model is not None else ""
-    model_class_name = args.model_class_name
+class ModelGenerationDefaults(NamedTuple):
+    """Model-aware generation defaults for the shared I2V example.
+
+    The CLI flags are shared across model families, but each family has
+    different defaults for frame rate, CFG scale, frame count, sampling steps,
+    flow shift, and output resolution. These values apply only when the
+    matching flag is omitted on the command line.
+    """
+
+    fps: float
+    guidance_scale: float | None
+    num_frames: int
+    num_inference_steps: int
+    flow_shift: float | None
+    max_area: int
+    mod_value: int
+    is_ltx2: bool
+
+
+def resolve_model_generation_defaults(
+    model_name: str,
+    model_class_name: str | None,
+) -> ModelGenerationDefaults:
+    """Resolve per-model generation defaults for ``image_to_video.py``.
+
+    ``model_name`` is the ``--model`` value and ``model_class_name`` is the
+    optional ``--model-class-name`` override. Matching is case-insensitive.
+    The returned defaults match the model families advertised in the module
+    docstring (LTX2 / LTX-2.3, SANA-Video, Cosmos3 / Cosmos3-Edge, and
+    Wan2.2 / HunyuanVideo).
+    """
+    model_name = model_name.lower()
     model_class_name_lower = (model_class_name or "").lower()
     is_ltx2_distilled = "distilled" in model_class_name_lower or "distilled" in model_name
     is_ltx23 = "ltx23" in model_class_name_lower or "ltx-2.3" in model_name
@@ -398,6 +425,32 @@ def main():
     is_sana = model_class_name == "SanaImageToVideoPipeline" or "sana-video" in model_name
     is_cosmos = "cosmos" in model_name or (model_class_name is not None and "cosmos" in model_class_name.lower())
     is_cosmos_edge = is_cosmos and ("edge" in model_name or "edge" in model_class_name_lower)
+
+    if is_cosmos_edge:
+        # Cosmos3-Edge native defaults: 480x832, gs 5.0, flow_shift 3.0 — NOT the
+        # Nano/Super 720p / gs 6.0 / flow_shift 10.0 values, which produce
+        # degenerate output on Edge.
+        return ModelGenerationDefaults(24, 5.0, 189, 35, 3.0, 480 * 832, 16, False)
+    if is_cosmos:
+        return ModelGenerationDefaults(24, 6.0, 189, 35, 10.0, 1280 * 720, 16, False)
+    if is_ltx2_distilled:
+        return ModelGenerationDefaults(24, None, 121, 8, None, 1024 * 1536, 64, True)
+    if is_ltx2:
+        return ModelGenerationDefaults(24, None, 121, 30 if is_ltx23 else 40, None, 512 * 768, 32, True)
+    if is_sana:
+        is_720p = "720p" in model_name
+        return ModelGenerationDefaults(
+            16, 6.0, 81, 50, 5.0, (704 * 1280) if is_720p else (480 * 832), 32 if is_720p else 16, False
+        )
+    # Wan2.2 / HunyuanVideo-1.5
+    return ModelGenerationDefaults(16, 5.0, 81, 50, 5.0, 480 * 832, 16, False)
+
+
+def main():
+    args = parse_args()
+    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+    model_name = str(args.model).lower() if args.model is not None else ""
+    model_class_name = args.model_class_name
 
     image = PIL.Image.open(args.image).convert("RGB") if args.image else None
     last_image = PIL.Image.open(args.last_image).convert("RGB") if args.last_image else None
@@ -411,61 +464,9 @@ def main():
 
     # Per-model generation defaults, applied only when the matching flag is omitted.
     # Cosmos3 would otherwise silently inherit the Wan2.2 defaults (wrong size/steps/shift).
-    if is_cosmos_edge:
-        # Cosmos3-Edge native defaults: 480x832, gs 5.0, flow_shift 3.0 — NOT the Nano/Super
-        # 720p / gs 6.0 / flow_shift 10.0 below, which produce degenerate output on Edge.
-        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
-            24,
-            5.0,
-            189,
-            35,
-            3.0,
-            480 * 832,
-            16,
-        )
-    elif is_cosmos:
-        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
-            24,
-            6.0,
-            189,
-            35,
-            10.0,
-            1280 * 720,
-            16,
-        )
-    elif is_ltx2_distilled:
-        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
-            24,
-            None,
-            121,
-            8,
-            None,
-            1024 * 1536,
-            64,
-        )
-    elif is_ltx2:
-        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
-            24,
-            None,
-            121,
-            30 if is_ltx23 else 40,
-            None,
-            512 * 768,
-            32,
-        )
-    elif is_sana:
-        is_720p = "720p" in model_name
-        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = (
-            16,
-            6.0,
-            81,
-            50,
-            5.0,
-            (704 * 1280) if is_720p else (480 * 832),
-            32 if is_720p else 16,
-        )
-    else:  # Wan2.2 / HunyuanVideo-1.5
-        d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod = 16, 5.0, 81, 50, 5.0, 480 * 832, 16
+    d_fps, d_guidance, d_num_frames, d_steps, d_flow_shift, d_max_area, d_mod, is_ltx2 = (
+        resolve_model_generation_defaults(model_name, model_class_name)
+    )
 
     fps = args.fps if args.fps is not None else d_fps
     frame_rate = args.frame_rate if args.frame_rate is not None else float(fps)
