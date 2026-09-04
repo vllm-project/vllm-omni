@@ -46,42 +46,42 @@ More failure modes (for example, network jitter and network interruption) will b
 ## Fault Injection Scenario Matrix
 
 | Scenario | Fault Type | System Behavior | Current Status |
-|------|----------------------------|----------|----------|
-| No load | Send `SIGKILL` to Worker | Worker process is killed immediately; main service detects child-process loss and turns unavailable; API enters stable 5xx |  |
-| No load | Send `SIGTERM` to Worker | Worker exits after receiving termination signal; main service is marked unavailable; API enters stable 5xx |  |
+| ------ | ---------------------------- | ---------- | ---------- |
+| No load | Send `SIGKILL` to Worker | Worker process is killed immediately; main service detects child-process loss and turns unavailable; API enters stable 5xx | |
+| No load | Send `SIGTERM` to Worker | Worker exits after receiving termination signal; main service is marked unavailable; API enters stable 5xx | |
 | No load | Send `SIGKILL` to serve main process | serve main process exits instantly; request connections are interrupted; related child processes are cleaned up with no residue; GPU memory is released quickly | [#3725](https://github.com/vllm-project/vllm-omni/issues/3725) <br>[#43060](https://github.com/vllm-project/vllm/issues/43060) |
-| No load | Send `SIGTERM` to serve main process | serve enters graceful shutdown and stops serving; then exits and completes cleanup; GPU memory is released |  |
-| No load | Send `SIGINT` to serve main process (equivalent to `Ctrl+C`) | Triggers serve shutdown path; service stops responding and becomes unavailable; related child processes exit and resources are released |  |
-| No load | Send `SIGKILL` to all related processes | All related processes terminate immediately; service becomes unavailable at once; no residual processes remain; GPU memory is released quickly |  |
-| No load | Send `SIGTERM` to all related processes | All processes enter exit flow and complete shutdown; service becomes unavailable; resource release is completed |  |
+| No load | Send `SIGTERM` to serve main process | serve enters graceful shutdown and stops serving; then exits and completes cleanup; GPU memory is released | |
+| No load | Send `SIGINT` to serve main process (equivalent to `Ctrl+C`) | Triggers serve shutdown path; service stops responding and becomes unavailable; related child processes exit and resources are released | |
+| No load | Send `SIGKILL` to all related processes | All related processes terminate immediately; service becomes unavailable at once; no residual processes remain; GPU memory is released quickly | |
+| No load | Send `SIGTERM` to all related processes | All processes enter exit flow and complete shutdown; service becomes unavailable; resource release is completed | |
 | Under load | Send `SIGKILL` to Worker | In-flight requests are hard interrupted (5xx/connection drop); main service becomes unavailable | [#3683](https://github.com/vllm-project/vllm-omni/issues/3683) |
-| Under load | Send `SIGTERM` to Worker | In-flight requests are canceled or fail fast; main service becomes unavailable |  |
+| Under load | Send `SIGTERM` to Worker | In-flight requests are canceled or fail fast; main service becomes unavailable | |
 | Under load | Send `SIGKILL` to serve main process | serve is hard-killed and current connections are interrupted; in-flight requests fail; after cleanup there are no residual processes and GPU memory is released | [#3683](https://github.com/vllm-project/vllm-omni/issues/3683) |
 | Under load | Send `SIGTERM` to serve main process | serve stops accepting new requests and executes shutdown flow; in-flight requests fail; no residue remains and GPU memory is released | [#3683](https://github.com/vllm-project/vllm-omni/issues/3683) |
 | Under load | Send `SIGINT` to serve main process (equivalent to `Ctrl+C`) | `Ctrl+C`-style serve shutdown; in-flight requests fail (5xx/connection interruption); service unavailable; after exit there is no residue and GPU memory is released | [#3683](https://github.com/vllm-project/vllm-omni/issues/3683) |
-| Under load | Send `SIGKILL` to all related processes | All processes terminate instantly; all in-flight requests fail; service becomes unavailable immediately; GPU memory is released quickly |  |
+| Under load | Send `SIGKILL` to all related processes | All processes terminate instantly; all in-flight requests fail; service becomes unavailable immediately; GPU memory is released quickly | |
 | Under load | Send `SIGTERM` to all related processes | All processes exit gracefully; in-flight requests fail; service unavailable; GPU memory is released | [#3683](https://github.com/vllm-project/vllm-omni/issues/3683) |
 | OOM | Occupy all free GPU memory via an extra process | After OOM injection process starts, GPU memory is continuously saturated; service enters unavailable/degraded state and health check drops to 503; different request types (chat/speech, etc.) fail fast within a fixed time and return 500 (no hanging) | [#4285](https://github.com/vllm-project/vllm-omni/issues/4285) |
 
 ## Source of Conclusions
 
-The behaviors and conclusions above are summarized from current fault injection validation results on **`Qwen3-Omni`**, **`Wan2.2`**, **`HunyuanImage-3.0-Instruct`** (DiT-only, `/v1/images/generations`), and **`VoxCPM2`** (`/v1/audio/speech`). Automated coverage lives under `tests/dfx/reliability/` (`test_reliability_qwen3_omni.py`, `test_reliability_wan22.py`, `test_reliability_hunyuan_image.py`, `test_reliability_voxcpm2.py`) and runs weekly via `.buildkite/cuda/test-weekly.yml`.
+The behaviors and conclusions above are summarized from current fault injection validation results on **`Qwen3-Omni`**, **`Wan2.2`**, and **`HunyuanImage-3.0-Instruct`** (DiT-only, `/v1/images/generations`). Automated coverage lives under `tests/dfx/reliability/` (`test_reliability_qwen3_omni.py`, `test_reliability_wan22.py`, `test_reliability_hunyuan_image.py`) and runs weekly via `.buildkite/cuda/test-weekly.yml`.
 
 ### Example: `SIGTERM` fault injection log (Qwen3-Omni)
 
-The following full log is from a real run where a `SIGTERM` signal was sent to the serve root process.
+The following log is based on a real run where a `SIGTERM` signal was sent to the serve root process. Its command line has been normalized to the current `--deploy-config` option.
 
 ```text
-Launching OmniServer with: /workspace/.venv/bin/python3 -m vllm_omni.entrypoints.cli.main serve Qwen/Qwen3-Omni-30B-A3B-Instruct --host 127.0.0.1 --port 60675 --omni --async-chunk --stage-init-timeout 600 --init-timeout 900 --log-stats --stage-configs-path vllm-omni/vllm_omni/deploy/qwen3_omni_moe.yaml
+Launching OmniServer with: /workspace/.venv/bin/python3 -m vllm_omni.entrypoints.cli.main serve Qwen/Qwen3-Omni-30B-A3B-Instruct --host 127.0.0.1 --port 60675 --omni --async-chunk --stage-init-timeout 600 --init-timeout 900 --log-stats --deploy-config vllm-omni/vllm_omni/deploy/qwen3_omni_moe.yaml
 Server ready on 127.0.0.1:60675 (OmniServer startup took 206.023s)
 OmniServer started successfully
-[reliability][process-kill] current_server_proc pid=556855 name=python3 cmdline=/workspace/.venv/bin/python3 -m vllm_omni.entrypoints.cli.main serve Qwen/Qwen3-Omni-30B-A3B-Instruct --host 127.0.0.1 --port 60675 --omni --async-chunk --stage-init-timeout 600 --init-timeout 900 --log-stats --stage-configs-path vllm-omni/vllm_omni/deploy/qwen3_omni_moe.yaml
+[reliability][process-kill] current_server_proc pid=556855 name=python3 cmdline=/workspace/.venv/bin/python3 -m vllm_omni.entrypoints.cli.main serve Qwen/Qwen3-Omni-30B-A3B-Instruct --host 127.0.0.1 --port 60675 --omni --async-chunk --stage-init-timeout 600 --init-timeout 900 --log-stats --deploy-config vllm-omni/vllm_omni/deploy/qwen3_omni_moe.yaml
 [reliability][process-kill] current_server_proc pid=557118 name=python3 cmdline=/workspace/.venv/bin/python3 -c from multiprocessing.resource_tracker import main;main(57)
 [reliability][process-kill] current_server_proc pid=557119 name=VLLM::StageEngineCoreProc_noid_replica0_DP0 cmdline=VLLM::StageEngineCoreProc_noid_replica0_DP0
 [reliability][process-kill] current_server_proc pid=557122 name=VLLM::StageEngineCoreProc_noid_replica0_DP0 cmdline=VLLM::StageEngineCoreProc_noid_replica0_DP0
 [reliability][process-kill] current_server_proc pid=558201 name=VLLM::StageEngineCoreProc_noid_replica0_DP0 cmdline=VLLM::StageEngineCoreProc_noid_replica0_DP0
 
-[reliability][process-kill] root-kill pid=556855 name=python3 signal=SIGTERM cmdline=/workspace/.venv/bin/python3 -m vllm_omni.entrypoints.cli.main serve Qwen/Qwen3-Omni-30B-A3B-Instruct --host 127.0.0.1 --port 60675 --omni --async-chunk --stage-init-timeout 600 --init-timeout 900 --log-stats --stage-configs-path vllm-omni/vllm_omni/deploy/qwen3_omni_moe.yaml
+[reliability][process-kill] root-kill pid=556855 name=python3 signal=SIGTERM cmdline=/workspace/.venv/bin/python3 -m vllm_omni.entrypoints.cli.main serve Qwen/Qwen3-Omni-30B-A3B-Instruct --host 127.0.0.1 --port 60675 --omni --async-chunk --stage-init-timeout 600 --init-timeout 900 --log-stats --deploy-config vllm-omni/vllm_omni/deploy/qwen3_omni_moe.yaml
 [0;36m(APIServer pid=556855)[0;0m INFO 05-19 12:24:51 [omni_base.py:463] [AsyncOmni] Shutting down
 [0;36m(APIServer pid=556855)[0;0m INFO 05-19 12:24:51 [async_omni_engine.py:2397] [AsyncOmniEngine] Shutting down Orchestrator
 [0;36m(APIServer pid=556855)[0;0m INFO 05-19 12:24:51 [orchestrator.py:351] [Orchestrator] Received shutdown signal

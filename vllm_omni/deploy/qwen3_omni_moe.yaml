@@ -69,6 +69,27 @@ stages:
       repetition_penalty: 1.1
 
 platforms:
+  # vLLM 0.27's compiled native MRoPE path can vertically fuse the thinker's
+  # Q/K RMSNorm reductions into the rotary operations and materially change
+  # Qwen3-Omni audio output (#6090). Keep MRoPE on its CUDA path instead.
+  cuda:
+    stages:
+      - stage_id: 0
+        compilation_config:
+          custom_ops: ["+rotary_embedding"]
+
+  # The supported Qwen3-Omni ModelOpt checkpoint quantizes the thinker only. Clear the
+  # checkpoint-level metadata for the BF16 audio stages on the verified MUSA
+  # profile before vLLM performs its normal quantization auto-detection.
+  musa:
+    stages:
+      - stage_id: 1
+        hf_overrides:
+          quantization_config: null
+      - stage_id: 2
+        hf_overrides:
+          quantization_config: null
+
   npu:
     stages:
       - stage_id: 0

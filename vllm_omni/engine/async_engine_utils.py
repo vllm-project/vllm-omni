@@ -24,6 +24,24 @@ logger = init_logger(__name__)
 SHUTDOWN_ENQUEUE_TIMEOUT_S = 1.0
 SHUTDOWN_JOIN_TIMEOUT_S = 30.0
 _WEAK_SHUTDOWN_JOIN_TIMEOUT_S = 1.0
+_JANUS_SYNC_QUEUE_SHUTDOWN = getattr(janus, "SyncQueueShutDown", None)
+_LEGACY_JANUS_QUEUE_CLOSED_MESSAGE = "Operation on the closed queue is forbidden"
+_RPC_RESULT_ROUTER_CLOSED_MESSAGES = {
+    "RPC result router closed",
+    "RPC result router is closed",
+}
+
+
+def is_janus_sync_queue_shutdown(exc: Exception) -> bool:
+    if _JANUS_SYNC_QUEUE_SHUTDOWN is not None:
+        return isinstance(exc, _JANUS_SYNC_QUEUE_SHUTDOWN)
+    return isinstance(exc, RuntimeError) and str(exc) == _LEGACY_JANUS_QUEUE_CLOSED_MESSAGE
+
+
+def is_abort_transport_shutdown(exc: Exception) -> bool:
+    return is_janus_sync_queue_shutdown(exc) or (
+        isinstance(exc, RuntimeError) and str(exc) in _RPC_RESULT_ROUTER_CLOSED_MESSAGES
+    )
 
 
 def inject_global_id(target: Any, request_id: str) -> None:
@@ -77,12 +95,17 @@ def upgrade_to_omni_request(
 def apply_omni_final_stage_metadata(
     request: EngineCoreRequest,
     final_stage_id: int,
+    *,
+    force_kv_transfer: bool = False,
 ) -> EngineCoreRequest:
-    """Tag a request so the AR scheduler can skip DiT KV for stage zero."""
+    """Tag a request with its final stage and optional KV-transfer override."""
     merged: dict[str, Any] = {}
     if isinstance(request, OmniEngineCoreRequest) and request.additional_information is not None:
         merged = deserialize_additional_information(request.additional_information)
     merged["omni_final_stage_id"] = final_stage_id
+    merged.pop("omni_force_kv_transfer", None)
+    if force_kv_transfer:
+        merged["omni_force_kv_transfer"] = True
     payload = serialize_additional_information(merged)
     return OmniEngineCoreRequest.from_request(
         request,

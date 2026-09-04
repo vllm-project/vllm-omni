@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Model-specific extractors for TeaCache.
@@ -13,6 +13,7 @@ all model-specific information needed for generic caching, including preprocessi
 transformer execution, and postprocessing logic.
 """
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -723,11 +724,11 @@ def extract_flux2_klein_context(
 def extract_longcat_context(
     module: nn.Module,  # LongCatImageTransformer2DModel
     hidden_states,
-    timestep,
-    guidance,
-    encoder_hidden_states,
-    txt_ids,
-    img_ids,
+    encoder_hidden_states=None,
+    timestep=None,
+    img_ids=None,
+    txt_ids=None,
+    guidance=None,
     **kwargs,
 ) -> CacheContext:
     """Extract the cache context for LongCat Image.
@@ -1249,6 +1250,222 @@ def extract_sensenova_u1_context(
     )
 
 
+def extract_minimax_h3_context(
+    module: nn.Module,
+    **kwargs: Any,
+) -> CacheContext:
+    """Extract cache context for MiniMaxH3DiTModel.
+
+    Mirrors the packed multimodal forward in ``MiniMaxH3DiTModel.forward``:
+    preprocessing via ``_embed``, cacheable ``blocks`` loop, and
+    ``final_layer`` postprocessing with row selection and update masks.
+    """
+    from vllm_omni.diffusion.attention.ops.minimax_h3_modulation import indexed_scale_shift_
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        _FORWARD_SUPPORTED_KWARGS,
+        MINIMAX_H3_ADALN_MODALITY_NUM,
+        _required_kwarg,
+    )
+
+    if not hasattr(module, "blocks") or len(module.blocks) == 0:
+        raise ValueError("Module must have blocks")
+
+    unexpected = sorted(set(kwargs) - _FORWARD_SUPPORTED_KWARGS)
+    if unexpected:
+        raise TypeError(
+            "MiniMaxH3DiTModel.forward received unexpected kwargs: "
+            f"{unexpected}; supported kwargs: "
+            f"{sorted(_FORWARD_SUPPORTED_KWARGS)}"
+        )
+
+    x = _required_kwarg(kwargs, "x")
+    audio_x = _required_kwarg(kwargs, "audio_x")
+    img_position_ids = _required_kwarg(kwargs, "img_position_ids")
+    unique_timesteps = _required_kwarg(kwargs, "unique_timesteps")
+    inverse_indices = _required_kwarg(kwargs, "inverse_indices").view(-1).to(torch.long)
+    update_mask = _required_kwarg(kwargs, "update_mask")
+    token_tags = _required_kwarg(kwargs, "token_tags").view(-1).to(torch.long)
+    skip_mask_out_condition = bool(kwargs.get("skip_mask_out_condition", False))
+    update_audio_mask = kwargs.get("update_audio_mask")
+
+    text_selected = _required_kwarg(kwargs, "prompt_embeds")
+
+    img_pos = module._pos_ids(_required_kwarg(kwargs, "img_pos_info"), "img_pos_info")
+    audio_pos = module._pos_ids(_required_kwarg(kwargs, "audio_pos_info"), "audio_pos_info")
+    text_pos = module._pos_ids(
+        _required_kwarg(kwargs, "text_pos_info"),
+        "text_pos_info",
+    )
+    infer_out_pos = module._pos_ids(
+        _required_kwarg(kwargs, "img_pos_for_infer_output_info"),
+        "img_pos_for_infer_output_info",
+    )
+
+    psp = _required_kwarg(kwargs, "packed_seq_params")
+    cu_seqlens = module._psp_field(psp, "packed_seq_params", "cu_seqlens_q").to(torch.int32)
+    max_seqlen = int(module._psp_field(psp, "packed_seq_params", "max_seqlen_q"))
+    # Mirror forward()'s host-side scalar so the refiner sees the number of
+    # packed requests without reading cu_seqlens off-device.
+    num_requests = int(module._psp_optional(psp, "num_requests", 1))
+    refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
+    refiner_cu = module._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
+    refiner_max = int(module._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
+    video_layout = kwargs.get("video_token_layout")
+
+    if x.dim() != 3 or x.shape[0] != 1:
+        raise ValueError(f"x must be [1, S, C], got {list(x.shape)}")
+    seq_len = int(x.shape[1])
+    if token_tags.shape[0] != seq_len:
+        raise ValueError(f"token_tags must cover the full packed sequence ({seq_len}), got {token_tags.shape[0]}.")
+    if inverse_indices.shape[0] != seq_len:
+        raise ValueError(f"inverse_indices must be [{seq_len}], got {list(inverse_indices.shape)}")
+    device = x.device
+    local_span = module._rope_local_span(seq_len)
+    local_start, local_len = local_span
+    rope_table = kwargs.get("rope_table")
+    if rope_table is None:
+        rope_table = module.prepare_rope_table(
+            img_position_ids,
+            seq_len=seq_len,
+        )
+    else:
+        module._validate_prepared_rope_table(
+            rope_table,
+            local_len=local_len,
+            device=device,
+        )
+
+    decoder_input, t_emb = module._embed(
+        x=x,
+        audio_x=audio_x,
+        text_embeddings_selected=text_selected,
+        unique_timesteps=unique_timesteps.view(-1).to(device),
+        img_pos=img_pos.to(device),
+        audio_pos=audio_pos.to(device),
+        text_pos=text_pos.to(device),
+        refiner_cu_seqlens=refiner_cu.to(device),
+        refiner_max_seqlen=refiner_max,
+        num_requests=num_requests,
+        seq_len=seq_len,
+        device=device,
+        local_span=local_span,
+    )
+
+    combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
+    inverse_indices = inverse_indices.to(device)
+    cu_seqlens = cu_seqlens.to(device)
+
+    # In strict SP, _embed already returns this rank's packed rows while
+    # combined_indices still describes the full packed sequence. TeaCache uses
+    # the first block's modulation as part of its rank-local cache state, so
+    # the modulation indices must be sliced to the same local layout. Keep the
+    # full indices below: local_sp_prepare owns the global-to-local conversion
+    # for transformer-block inputs.
+    state_combined_indices = combined_indices.narrow(0, local_start, local_len)
+    if local_len == seq_len:
+        state_combined_indices = combined_indices
+
+    shift_msa, scale_msa, *_ = module.blocks[0].adaln_proj(t_emb)
+    modulated_input = module.blocks[0].norm1(decoder_input)
+    modulated_input = indexed_scale_shift_(
+        modulated_input,
+        shift_msa,
+        scale_msa,
+        state_combined_indices,
+    )
+
+    def synchronize_cache_decision(local_should_compute: bool) -> bool:
+        if local_len == seq_len:
+            return local_should_compute
+
+        from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+
+        decision = torch.tensor(
+            int(local_should_compute),
+            dtype=torch.int32,
+            device=device,
+        )
+        get_sp_group().all_reduce(decision, op=torch.distributed.ReduceOp.MAX)
+        return bool(decision.item())
+
+    def run_transformer_blocks() -> tuple[torch.Tensor, ...]:
+        if local_len == seq_len:
+            hidden, block_rope, block_combined = module.sp_prepare(
+                decoder_input,
+                rope_table,
+                combined_indices,
+            )
+        else:
+            hidden, block_rope, block_combined = module.local_sp_prepare(
+                decoder_input,
+                rope_table,
+                combined_indices,
+            )
+        for block in module.blocks:
+            hidden = block(
+                hidden,
+                t_emb=t_emb,
+                combined_indices=block_combined,
+                rope_table=block_rope,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                packed_total=seq_len,
+                video_layout=video_layout,
+            )
+        # TeaCache stores residuals as block_output - decoder_input. Strict SP
+        # must keep both tensors rank-local until postprocess projects local
+        # rows to compact logits and gathers them exactly once.
+        if local_len == seq_len:
+            hidden = module.sp_gather(hidden)
+        return (hidden,)
+
+    def postprocess(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if local_len == seq_len:
+            video_logits, audio_logits = module.final_layer(
+                hidden,
+                t_emb=t_emb,
+                inverse_indices=inverse_indices,
+            )
+        else:
+            local_inverse_indices = inverse_indices.narrow(
+                0,
+                local_start,
+                local_len,
+            )
+            video_logits, audio_logits = module.final_layer(
+                hidden,
+                t_emb=t_emb,
+                inverse_indices=local_inverse_indices,
+            )
+            compact_logits = torch.cat((video_logits, audio_logits), dim=-1)
+            compact_logits = module.sp_gather(compact_logits)
+            video_width = module.arch.latents_dim * math.prod(module.arch.patch_size)
+            video_logits = compact_logits[..., :video_width]
+            audio_logits = compact_logits[..., video_width:]
+        video_logits = video_logits.index_select(0, infer_out_pos.to(device))
+        audio_logits = audio_logits.index_select(0, audio_pos.to(device))
+        if not skip_mask_out_condition:
+            mask = update_mask.view(-1).to(device)
+            if mask.shape[0] != video_logits.shape[0]:
+                raise ValueError(f"update_mask length mismatch: {mask.shape[0]} != {video_logits.shape[0]}")
+            video_logits = video_logits * mask.unsqueeze(-1)
+            if update_audio_mask is not None:
+                audio_logits = audio_logits * update_audio_mask.view(-1).unsqueeze(-1)
+        return video_logits, audio_logits
+
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=decoder_input,
+        encoder_hidden_states=None,
+        temb=t_emb,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+        extra_states={
+            "synchronize_cache_decision": synchronize_cache_decision,
+        },
+    )
+
+
 # Registry for model-specific extractors
 # Key: Transformer class name
 # Value: extractor function with signature (module, *args, **kwargs) -> CacheContext
@@ -1265,6 +1482,7 @@ EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "LongCatImageTransformer2DModel": extract_longcat_context,
     "FluxTransformer2DModel": extract_flux_context,
     "SenseNovaU1ForCausalLM": extract_sensenova_u1_context,
+    "MiniMaxH3DiTModel": extract_minimax_h3_context,
     # Future models:
     # "CogVideoXTransformer3DModel": extract_cogvideox_context,
 }

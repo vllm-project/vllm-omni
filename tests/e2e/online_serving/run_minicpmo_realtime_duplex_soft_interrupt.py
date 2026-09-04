@@ -252,6 +252,19 @@ def summarize_artifacts(
         (summary["done_indices"][0] for summary in reversed(response_summaries) if summary.get("done_indices")),
         None,
     )
+    # A soft interrupt's follow-up response can drain past the commit (residual
+    # model unit), so its response.done lands after input_audio_buffer.committed.
+    # Anchor the "listen after last done, before commit" sandwich on the last
+    # turn that closed its floor strictly before the commit, not the
+    # globally-last done (which may sit after the commit and leave the interval empty).
+    last_done_before_commit_index = next(
+        (
+            summary["done_indices"][0]
+            for summary in reversed(response_summaries)
+            if summary.get("done_indices") and commit_index is not None and summary["done_indices"][0] < commit_index
+        ),
+        None,
+    )
     listen_indices = [index for index, event in enumerate(events) if event.get("type") == "response.listen"]
     effective_min_responses = min_responses if validation_mode == "response-required" else 1
     enough_responses = len(response_summaries) >= effective_min_responses
@@ -279,9 +292,9 @@ def summarize_artifacts(
     )
     listen_after_last_done = last_done_index is not None and any(index > last_done_index for index in listen_indices)
     listen_after_response_before_commit = (
-        last_done_index is not None
+        last_done_before_commit_index is not None
         and commit_index is not None
-        and any(last_done_index < index < commit_index for index in listen_indices)
+        and any(last_done_before_commit_index < index < commit_index for index in listen_indices)
     )
     final_listen_after_commit = commit_index is not None and any(index > commit_index for index in listen_indices)
     transcript = "".join(str(summary.get("transcript") or "") for summary in response_summaries)
@@ -314,6 +327,14 @@ def summarize_artifacts(
         and event["response"].get("status") == "cancelled"
     )
     result_ok = result.get("ok") is True
+    # response-required keeps the full listen sandwich around commit. model-policy
+    # only requires a completed audio response that started before final commit:
+    # single-GPU co-location often still drains speak after the WAV ends.
+    commit_listen_contract_ok = (
+        listen_after_response_before_commit and final_listen_after_commit
+        if validation_mode == "response-required"
+        else response_before_final_commit
+    )
     common_contract_ok = bool(
         result_ok
         and not error_events
@@ -323,8 +344,7 @@ def summarize_artifacts(
         and multi_delta_ok
         and response_audio_contract_ok
         and response_before_final_commit
-        and listen_after_response_before_commit
-        and final_listen_after_commit
+        and commit_listen_contract_ok
     )
     mode_contract_ok = validation_mode == "model-policy" or (
         second_response_before_final_commit
@@ -393,6 +413,11 @@ async def run_soft_interrupt(args: argparse.Namespace) -> dict[str, object]:
         f"duplex-soft-interrupt-{uuid.uuid4().hex}",
     ]
     command.extend(["--ref-audio", str(_canonical_path(args.ref_audio))])
+    temperature = getattr(args, "temperature", None)
+    if temperature is None and args.validation_mode == "response-required":
+        temperature = 0.0
+    if temperature is not None:
+        command.extend(["--temperature", str(temperature)])
     if args.require_audio:
         command.append("--require-audio")
     if args.no_realtime_pacing:
@@ -453,6 +478,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary-output")
     parser.add_argument("--chunk-ms", type=int, default=200)
     parser.add_argument("--timeout-s", type=float, default=120.0)
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Stage0 sampling temperature; response-required defaults to 0.0.",
+    )
     parser.add_argument("--require-audio", action="store_true")
     parser.add_argument("--no-realtime-pacing", action="store_true")
     parser.add_argument(

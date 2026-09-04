@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import nullcontext
 from enum import Enum
@@ -128,9 +128,43 @@ class OmniPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    def validate_diffusion_attn_backend(cls, selected_backend: str) -> None:
+        """Reject an explicitly selected backend this platform cannot run.
+
+        Platforms call this from ``get_diffusion_attn_backend_cls`` so that a
+        backend restricted to other hardware, or one whose kernel package is
+        missing, fails during resolution rather than at the first forward.
+        """
+        from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+
+        backend_upper = selected_backend.upper()
+        backend_cls = DiffusionAttentionBackendEnum[backend_upper].get_class()
+
+        supported = backend_cls.supported_platforms
+        platform = cls._omni_enum.value
+        if supported is not None and platform not in supported:
+            raise ValueError(
+                f"The {backend_upper} diffusion attention backend runs on {', '.join(supported)} only, "
+                f"but the current platform is {platform}. Select a backend supported here, "
+                "such as FLASH_ATTN or TORCH_SDPA."
+            )
+        backend_cls.validate_available()
+
+    @classmethod
+    def supports_diffusion_dense_flash_attention(cls) -> bool:
+        """Whether the platform's dense ``FLASH_ATTN`` dependencies exist."""
+
+        return True
+
+    @classmethod
     def supports_torch_inductor(cls) -> bool:
         """Check if the platform supports torch.compile with inductor backend."""
         raise NotImplementedError
+
+    @classmethod
+    def supports_talker_mtp_graph_capture(cls) -> bool:
+        """Whether a model may capture its dedicated talker MTP graph."""
+        return True
 
     @classmethod
     def has_flash_attn_package(cls) -> bool:
@@ -157,11 +191,61 @@ class OmniPlatform(Platform):
         return "vllm_omni.diffusion.worker.diffusion_model_runner.DiffusionModelRunner"
 
     @classmethod
+    def get_diffusion_kv_block_tables_cls(cls) -> type:
+        """Return the platform's native paged-KV BlockTables implementation."""
+        from vllm.v1.worker.gpu.block_table import BlockTables
+
+        return BlockTables
+
+    @classmethod
+    def build_diffusion_kv_attn_metadata(cls, **kwargs: Any) -> dict[str, Any]:
+        """Build native attention metadata for the diffusion paged path.
+
+        This default is the GPU/common path and uses vLLM's builder. NPU
+        overrides it to build Ascend attention metadata without making the
+        shared diffusion adapter import ``vllm_ascend``. ``seq_lens_cpu`` is an
+        adapter-only convenience value and is removed before calling the
+        upstream builder.
+        """
+        from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
+
+        kwargs.pop("seq_lens_cpu", None)
+        return build_attn_metadata(**kwargs)
+
+    @classmethod
+    def get_diffusion_paged_kv_attn_backend(cls, attn_backend: type, *, ulysses_degree: int) -> type:
+        """Specialize a native paged backend for diffusion execution."""
+
+        del ulysses_degree
+        return attn_backend
+
+    @classmethod
+    def requires_diffusion_paged_kv_prewrite(cls) -> bool:
+        """Whether paged attention must write K/V before native execution.
+
+        The default GPU path keeps cache-update ownership in its native
+        attention call. Ascend overrides this because piecewise FIA should
+        write the complete K/V span once, then read it from cache for every
+        segment.
+        """
+
+        return False
+
+    @classmethod
     def init_diffusion_worker_vllm_config(
         cls,
         vllm_config: Any,
     ) -> None:
         """Initialize platform-specific state for diffusion worker VllmConfig."""
+        return None
+
+    @classmethod
+    def configure_diffusion_vllm_config(
+        cls,
+        vllm_config: Any,
+        od_config: Any,
+    ) -> None:
+        """Apply platform-specific native cache geometry for diffusion."""
         return None
 
     @classmethod

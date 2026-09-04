@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # ruff: noqa: N803, E741
 """Layer-level correctness & performance test for MoT parallel linear layers.
 
@@ -237,6 +240,53 @@ def _reference_forward(x, text_indices, vae_indices, text_linear, vae_linear):
     return output
 
 
+def _assert_gen_expert_parallel_metadata(layer):
+    """The secondary expert must satisfy vLLM's parallel-linear contract."""
+    for attr in (
+        "tp_rank",
+        "tp_size",
+        "input_size",
+        "input_size_per_partition",
+        "output_size",
+        "output_size_per_partition",
+    ):
+        assert getattr(layer.gen_exp, attr) == getattr(layer, attr)
+
+
+def test_mot_gen_expert_parallel_metadata():
+    """Keep secondary experts compatible with vLLM online quantizers."""
+    from vllm.model_executor.layers.quantization.online.fp8 import (
+        _is_tp_sharded,
+    )
+
+    with set_current_vllm_config(VllmConfig()):
+        layers = (
+            MoTQKVParallelLinear(
+                hidden_size=16,
+                head_size=4,
+                total_num_heads=4,
+                total_num_kv_heads=2,
+                bias=False,
+                vae_bias=False,
+                params_dtype=torch.bfloat16,
+                disable_tp=True,
+            ),
+            MoTRowParallelLinear(
+                16,
+                8,
+                bias=False,
+                vae_bias=False,
+                input_is_parallel=True,
+                params_dtype=torch.bfloat16,
+                disable_tp=True,
+            ),
+        )
+
+    for layer in layers:
+        _assert_gen_expert_parallel_metadata(layer)
+        assert _is_tp_sharded(layer.gen_exp) is False
+
+
 def _check_and_report(ref: torch.Tensor, mot: torch.Tensor, tag: str):
     """Compare outputs, print metrics, and assert correctness.
 
@@ -335,6 +385,8 @@ def test_mot_qkv_parallel(image_num: int, K: int, N: int, dtype: str, bias: bool
             disable_tp=True,
         ).cuda()
 
+        _assert_gen_expert_parallel_metadata(mot_linear)
+
         assert text_linear.output_size_per_partition == N, (
             f"Expected output_size_per_partition={N}, "
             f"got {text_linear.output_size_per_partition}. "
@@ -423,6 +475,8 @@ def test_mot_o_proj(
             disable_tp=True,
         ).cuda()
 
+        _assert_gen_expert_parallel_metadata(mot_linear)
+
         _sync_weights(text_linear, vae_linear, mot_linear)
 
         text_idx, vae_idx, M = _make_indices(image_num, _VAE_CHUNK_SIZE)
@@ -501,6 +555,13 @@ def test_mot_qkv_und_mode(K: int, N: int, dtype: str, bias: bool):
         ).cuda()
 
         with torch.no_grad():
+            # vLLM linear layers leave weights uninitialized (torch.empty), so
+            # a freshly zeroed GPU page would make both outputs zero and the
+            # cosine-similarity gate degenerate. Seed deterministic values so
+            # und-mode is compared against a meaningful reference.
+            ref_linear.weight.normal_(mean=0.0, std=0.02)
+            if ref_linear.bias is not None:
+                ref_linear.bias.normal_(mean=0.0, std=0.02)
             mot_linear.weight.copy_(ref_linear.weight)
             if bias and ref_linear.bias is not None:
                 mot_linear.bias.copy_(ref_linear.bias)
@@ -549,6 +610,13 @@ def test_mot_row_und_mode(K: int, N: int, dtype: str, bias: bool):
         ).cuda()
 
         with torch.no_grad():
+            # vLLM linear layers leave weights uninitialized (torch.empty), so
+            # a freshly zeroed GPU page would make both outputs zero and the
+            # cosine-similarity gate degenerate. Seed deterministic values so
+            # und-mode is compared against a meaningful reference.
+            ref_linear.weight.normal_(mean=0.0, std=0.02)
+            if ref_linear.bias is not None:
+                ref_linear.bias.normal_(mean=0.0, std=0.02)
             mot_linear.weight.copy_(ref_linear.weight)
             if bias and ref_linear.bias is not None:
                 mot_linear.bias.copy_(ref_linear.bias)

@@ -46,6 +46,16 @@ class TestOmniBaseProfiler:
             stage_ids=None,
         )
 
+    def test_removed_diffusion_batch_size_fails_loudly(self, mock_engine, mocker: MockerFixture):
+        """Legacy diffusion_batch_size callers receive an actionable error."""
+        mocker.patch("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", return_value=mock_engine)
+        mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", side_effect=lambda x: x)
+        mocker.patch("vllm_omni.entrypoints.omni_base.weakref.finalize")
+        from vllm_omni.entrypoints.omni_base import OmniBase
+
+        with pytest.raises(TypeError, match="diffusion_batch_size.*max_num_seqs"):
+            OmniBase(model="test-model", diffusion_batch_size=8)
+
     def test_start_profile_with_prefix(self, omni_base_instance, mock_engine):
         """Test that start_profile passes profile_prefix to collective_rpc."""
         omni_base_instance.start_profile(profile_prefix="test_trace")

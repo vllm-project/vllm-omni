@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 OpenAI-compatible protocol definitions for image generation.
 
@@ -20,6 +20,17 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
+
+# Bound int request fields to avoid overflow issues.
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+
+_IMAGE_FILE_METADATA = {
+    "jpg": ("jpg", "image/jpeg"),
+    "jpeg": ("jpeg", "image/jpeg"),
+    "png": ("png", "image/png"),
+    "webp": ("webp", "image/webp"),
+}
 
 
 class ResponseFormat(str, Enum):
@@ -137,7 +148,7 @@ class ImageGenerationRequest(BaseModel):
         default=None,
         description="Optional model-specific parameters passed directly to the model's extra_args.",
     )
-    seed: int | None = Field(default=None, description="Random seed for reproducibility")
+    seed: int | None = Field(default=None, ge=_INT64_MIN, le=_INT64_MAX, description="Random seed for reproducibility")
     generator_device: str | None = Field(
         default=None,
         description="Device for the seeded torch.Generator (e.g. 'cpu', 'cuda'). Defaults to the runner's device.",
@@ -183,7 +194,7 @@ class ImageGenerationResponse(BaseModel):
 
     created: int = Field(..., description="Unix timestamp of when the generation completed")
     data: list[ImageData] = Field(..., description="Array of generated images")
-    output_format: str = Field(None, description="The output format of the image generation")
+    output_format: str | None = Field(None, description="The output format of the image generation")
     size: str = Field(None, description="The size of the image generated")
     cot_output: str | None = Field(
         None,
@@ -201,12 +212,16 @@ class ImageGenerationResponse(BaseModel):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
                 detail="No image data available for file response.",
             )
+        extension, media_type = _IMAGE_FILE_METADATA.get(
+            (self.output_format or "png").lower(),
+            _IMAGE_FILE_METADATA["png"],
+        )
         if len(self.data) == 1:
             image_bytes = base64.b64decode(self.data[0].b64_json)
-            filename = f"image_{uuid.uuid4().hex[:8]}.png"
+            filename = f"image_{uuid.uuid4().hex[:8]}.{extension}"
             return StreamingResponse(
                 io.BytesIO(image_bytes),
-                media_type="image/png",
+                media_type=media_type,
                 headers={
                     "Content-Disposition": f'attachment; filename="{filename}"',
                     "Content-Length": str(len(image_bytes)),
@@ -217,7 +232,7 @@ class ImageGenerationResponse(BaseModel):
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
                 for idx, item in enumerate(self.data):
                     if item.b64_json:
-                        zf.writestr(f"image_{idx}.png", base64.b64decode(item.b64_json))
+                        zf.writestr(f"image_{idx}.{extension}", base64.b64decode(item.b64_json))
             zip_bytes = zip_buffer.getvalue()
             filename = f"images_{uuid.uuid4().hex[:8]}.zip"
             return StreamingResponse(

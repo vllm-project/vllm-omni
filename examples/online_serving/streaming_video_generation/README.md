@@ -37,7 +37,7 @@ During generation the client normally sends only `session.start` and then receiv
 ## Install Client Dependency
 
 ```bash
-pip install websockets
+pip install av websockets
 # For the Gradio demo:
 pip install 'vllm-omni[demo]' websockets
 ```

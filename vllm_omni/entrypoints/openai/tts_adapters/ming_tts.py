@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Ming-TTS (dense) serving adapter."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 
@@ -17,8 +17,16 @@ logger = init_logger(__name__)
 
 @register_tts_adapter
 class MingTTSAdapter(ARTTSAdapter):
-    # Detected by model_arch (MingTTSForConditionalGeneration), not stage key.
+    # Ming dense has no dedicated model_stage value, so both stage discovery and
+    # model-type detection go through the architecture. ``ming_flash_omni_tts``
+    # is the model that owns the ``ming_tts`` *stage key*, and is matched first.
     name = "ming_tts"
+    model_archs = frozenset({"MingTTSForConditionalGeneration"})
+    arch_identifies_entry_stage = True
+    # Ming dense deploys its AR stage as the generic ``model_stage="llm"``, so
+    # this is an architecture *fallback*: it must run after every adapter that
+    # owns a real stage key, or it would claim stages those adapters own.
+    detect_priority = 200
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         """Validate Ming TTS request parameters. Returns error message or None."""
@@ -56,7 +64,7 @@ class MingTTSAdapter(ARTTSAdapter):
         if isinstance(ref_audio_source, list):
             ref_audio_data = await server._resolve_ref_audio_many(ref_audio_source)
         elif ref_audio_source is not None and isinstance(ref_audio_source, str):
-            wav_list, sr = await server._resolve_ref_audio(ref_audio_source)
+            wav_list, sr, _ = await server._resolve_ref_audio(ref_audio_source)
             ref_audio_data = (wav_list, sr)
         prompt = server._build_ming_dense_prompt(
             request,
@@ -65,8 +73,35 @@ class MingTTSAdapter(ARTTSAdapter):
             voice_created_at=uploaded_audio_created_at,
         )
         tts_params = prompt.get("additional_information", {})
-        # Ming stop-token / max_tokens sampling stays in the orchestrator tail.
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type="ming_tts")
+
+    def apply_sampling_overrides(
+        self,
+        sampling_params_list: list,
+        request: "OpenAICreateSpeechRequest",
+        prompt: dict[str, Any] | None = None,
+        request_id: str | None = None,
+    ) -> list:
+        import copy
+
+        server = self.ctx.server
+
+        from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
+            MOE_TEXT_EOS_TOKEN_ID,
+            TEXT_EOS_TOKEN_ID,
+        )
+
+        hf_config = server.engine_client.model_config.hf_config
+        is_moe = getattr(hf_config, "model_type", "") == "bailingmm"
+        stop_token_id = MOE_TEXT_EOS_TOKEN_ID if is_moe else TEXT_EOS_TOKEN_ID
+
+        sampling_params_list = copy.deepcopy(sampling_params_list)
+        sampling_params_list[0].stop_token_ids = [int(stop_token_id)]
+        if request.max_new_tokens is not None:
+            # Ming emits TEXT_EOS after the latent decode budget is exhausted, so
+            # Stage-0 needs one extra token beyond ming_max_decode_steps.
+            sampling_params_list[0].max_tokens = int(request.max_new_tokens) + 1
+        return sampling_params_list
 
     def _validate_ming_tts_single_speaker_request(self, request: "OpenAICreateSpeechRequest") -> str | None:
         server = self.ctx.server
@@ -149,3 +184,44 @@ class MingTTSAdapter(ARTTSAdapter):
                 return f"max_new_tokens cannot exceed {self.max_new_tokens_max}"
 
         return None
+
+    def validate_tts_embedding_dim(self, emb_dim: int) -> str | None:
+        if emb_dim != SPEAKER_EMBEDDING_DIM:
+            return f"Ming speaker embedding must have {SPEAKER_EMBEDDING_DIM} dims, got {emb_dim}"
+        return None
+
+    def _load_ming_tts_codec_frame_rate(self) -> float | None:
+        server = self.ctx.server
+        try:
+            from vllm_omni.model_executor.models.ming_tts.config_ming_tts import MingTTSConfig
+
+            hf_config = server.engine_client.model_config.hf_config
+            ming_cfg = MingTTSConfig.from_hf_config(hf_config)
+            patch_size = int(ming_cfg.patch_size)
+            audio_frame_hop = int(ming_cfg.audio_frame_hop)
+            sample_rate = int(ming_cfg.sample_rate)
+            if patch_size <= 0 or audio_frame_hop <= 0 or sample_rate <= 0:
+                raise ValueError(
+                    "Ming config has invalid tokenizer timing values: "
+                    f"patch_size={patch_size}, audio_frame_hop={audio_frame_hop}, sample_rate={sample_rate}"
+                )
+            rate = float(sample_rate) / float(audio_frame_hop * patch_size)
+            logger.info(
+                "Derived Ming codec frame rate: %.1f Hz (sample_rate=%s, audio_frame_hop=%s, patch_size=%s)",
+                rate,
+                sample_rate,
+                audio_frame_hop,
+                patch_size,
+            )
+            return rate
+        except Exception as e:
+            logger.warning(f"Failed to derive Ming codec frame rate from hf_config: {e}")
+
+    def _load_supported_speakers(self) -> set[str]:
+        return set()
+
+    def _load_codec_frame_rate(self) -> float | None:
+        codec_frame_rate = self._load_ming_tts_codec_frame_rate()
+        if codec_frame_rate is None:
+            codec_frame_rate = super()._load_codec_frame_rate()
+        return codec_frame_rate

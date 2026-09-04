@@ -3,10 +3,8 @@
 
 """E2E accuracy guard against a pinned Lightricks LTX pipeline revision.
 
-The comparison runs both runtimes through PyTorch SDPA and uses
-``max_batch_size=4`` in the official reference to match Omni's fused guidance
-batch. Video and audio guidance use the official non-HQ one-stage defaults;
-only the generation shape and step count are reduced for CI runtime.
+Four complementary default-shape cases cover both model versions, both
+two-stage weight families, and T2V/I2V without duplicating one-stage coverage.
 """
 
 from __future__ import annotations
@@ -17,8 +15,9 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pytest
@@ -53,72 +52,197 @@ NEGATIVE_PROMPT = (
 
 # Both runtimes use PyTorch SDPA with the current Torch dispatch defaults.
 ATTENTION_BACKEND = "torch_sdpa"
-VIDEO_SSIM_MEAN_THRESHOLD = 0.95
-VIDEO_SSIM_MIN_THRESHOLD = 0.90
-VIDEO_PSNR_MEAN_THRESHOLD = 30.0
-AUDIO_RELATIVE_L2_THRESHOLD = 0.2
-AUDIO_COSINE_THRESHOLD = 0.95
+
+
+@dataclass(frozen=True)
+class LTXArtifact:
+    repo_id: str
+    filename: str
+    revision: str
+    env: str
+    repo_type: Literal["model", "dataset"] = "model"
+
+
+@dataclass(frozen=True)
+class LTXAccuracyThresholds:
+    video_ssim_mean: float
+    video_ssim_min: float
+    video_psnr_mean_db: float
+    audio_relative_l2: float
+    audio_cosine_similarity: float
+
+
+STRICT_THRESHOLDS = LTXAccuracyThresholds(
+    video_ssim_mean=0.99,
+    video_ssim_min=0.99,
+    video_psnr_mean_db=40.0,
+    audio_relative_l2=0.10,
+    audio_cosine_similarity=0.99,
+)
 
 
 @dataclass(frozen=True)
 class LTXAccuracyCase:
     name: str
+    pipeline_kind: Literal["distilled", "two_stage"]
     model_id: str
     model_revision: str
     model_env: str
     model_class_name: str
-    checkpoint_repo: str
-    checkpoint_filename: str
-    checkpoint_revision: str
-    checkpoint_env: str
-    stg_block: int
-    prompt: str = PROMPT
-    image_repo: str | None = None
-    image_filename: str | None = None
-    image_revision: str | None = None
+    checkpoint: LTXArtifact
+    width: int
+    height: int
+    num_frames: int
+    num_inference_steps: int
+    seed: int
+    stg_block: int | None
+    gemma_model_id: str | None = None
+    gemma_model_revision: str | None = None
+    gemma_model_env: str | None = None
+    image: LTXArtifact | None = None
+    spatial_upsampler: LTXArtifact | None = None
+    distilled_lora: LTXArtifact | None = None
+    # Official uses block streaming; Omni uses layerwise offload. Both preserve
+    # bf16 arithmetic while keeping full-resolution two-stage cases on one H100.
+    enable_layerwise_offload: bool = False
 
 
-CASES = (
+LTX2_REVISION = "47da56e2ad66ce4125a9922b4a8826bf407f9d0a"
+LTX23_REVISION = "4229404625088d21c4f112eb640fb04a0900ee25"
+LTX2_CHECKPOINT = LTXArtifact(
+    repo_id="Lightricks/LTX-2",
+    filename="ltx-2-19b-dev.safetensors",
+    revision=LTX2_REVISION,
+    env="VLLM_TEST_LTX2_OFFICIAL_CHECKPOINT",
+)
+LTX2_DISTILLED_CHECKPOINT = replace(
+    LTX2_CHECKPOINT,
+    filename="ltx-2-19b-distilled.safetensors",
+    env="VLLM_TEST_LTX2_DISTILLED_OFFICIAL_CHECKPOINT",
+)
+LTX2_UPSAMPLER = replace(
+    LTX2_CHECKPOINT,
+    filename="ltx-2-spatial-upscaler-x2-1.0.safetensors",
+    env="VLLM_TEST_LTX2_UPSAMPLER",
+)
+LTX2_DISTILLED_LORA = replace(
+    LTX2_CHECKPOINT,
+    filename="ltx-2-19b-distilled-lora-384.safetensors",
+    env="VLLM_TEST_LTX2_DISTILLED_LORA",
+)
+LTX23_CHECKPOINT = LTXArtifact(
+    repo_id="Lightricks/LTX-2.3",
+    filename="ltx-2.3-22b-dev.safetensors",
+    revision=LTX23_REVISION,
+    env="VLLM_TEST_LTX23_OFFICIAL_CHECKPOINT",
+)
+LTX23_DISTILLED_CHECKPOINT = replace(
+    LTX23_CHECKPOINT,
+    # The pinned Diffusers checkpoint contains the original merged distilled
+    # Transformer. Keep the reference Transformer on the same version; the
+    # spatial upsampler is versioned independently and remains on 1.1 below.
+    filename="ltx-2.3-22b-distilled.safetensors",
+    env="VLLM_TEST_LTX23_DISTILLED_OFFICIAL_CHECKPOINT",
+)
+LTX23_UPSAMPLER = replace(
+    LTX23_CHECKPOINT,
+    filename="ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+    env="VLLM_TEST_LTX23_UPSAMPLER",
+)
+LTX23_DISTILLED_LORA = replace(
+    LTX23_CHECKPOINT,
+    filename="ltx-2.3-22b-distilled-lora-384-1.1.safetensors",
+    env="VLLM_TEST_LTX23_DISTILLED_LORA",
+)
+I2V_IMAGE = LTXArtifact(
+    repo_id="huggingface/documentation-images",
+    filename="diffusers/svd/rocket.png",
+    revision="645d8364f0c7a101180b364811b5a11a362e4010",
+    env="VLLM_TEST_LTX_I2V_IMAGE",
+    repo_type="dataset",
+)
+
+
+TWO_STAGE_CASES = (
     LTXAccuracyCase(
-        name="ltx2",
+        name="ltx2_distilled_t2v",
+        pipeline_kind="distilled",
+        model_id="rootonchair/LTX-2-19b-distilled",
+        model_revision="388e2846f54aae51687498ffb6b27c7c2c9ce9e5",
+        model_env="VLLM_TEST_LTX2_DISTILLED_MODEL",
+        model_class_name="LTX2DistilledPipeline",
+        checkpoint=LTX2_DISTILLED_CHECKPOINT,
+        spatial_upsampler=LTX2_UPSAMPLER,
+        width=1536,
+        height=1024,
+        num_frames=121,
+        num_inference_steps=8,
+        seed=10,
+        stg_block=None,
+        gemma_model_id="Lightricks/LTX-2",
+        gemma_model_revision=LTX2_REVISION,
+        gemma_model_env="VLLM_TEST_LTX2_MODEL",
+    ),
+    LTXAccuracyCase(
+        name="ltx23_distilled_i2v",
+        pipeline_kind="distilled",
+        model_id="diffusers/LTX-2.3-Distilled-Diffusers",
+        model_revision="432e0d3c2d1769aaa4d295f9243f7062bf6b47ee",
+        model_env="VLLM_TEST_LTX23_DISTILLED_MODEL",
+        model_class_name="LTX2DistilledPipeline",
+        checkpoint=LTX23_DISTILLED_CHECKPOINT,
+        spatial_upsampler=LTX23_UPSAMPLER,
+        width=1536,
+        height=1024,
+        num_frames=121,
+        num_inference_steps=8,
+        seed=10,
+        stg_block=None,
+        gemma_model_id="diffusers/LTX-2.3-Diffusers",
+        gemma_model_revision="8eee8edcf067e838b843f926ec4d4cc9b2be1aaf",
+        gemma_model_env="VLLM_TEST_LTX23_MODEL",
+        image=I2V_IMAGE,
+    ),
+    LTXAccuracyCase(
+        name="ltx2_two_stage_layer_fused_t2v",
+        pipeline_kind="two_stage",
         model_id="Lightricks/LTX-2",
-        model_revision="47da56e2ad66ce4125a9922b4a8826bf407f9d0a",
+        model_revision=LTX2_REVISION,
         model_env="VLLM_TEST_LTX2_MODEL",
-        model_class_name="LTX2Pipeline",
-        checkpoint_repo="Lightricks/LTX-2",
-        checkpoint_filename="ltx-2-19b-dev.safetensors",
-        checkpoint_revision="47da56e2ad66ce4125a9922b4a8826bf407f9d0a",
-        checkpoint_env="VLLM_TEST_LTX2_OFFICIAL_CHECKPOINT",
+        model_class_name="LTX2TwoStagePipeline",
+        checkpoint=LTX2_CHECKPOINT,
+        spatial_upsampler=LTX2_UPSAMPLER,
+        distilled_lora=LTX2_DISTILLED_LORA,
+        width=1536,
+        height=1024,
+        num_frames=121,
+        num_inference_steps=40,
+        seed=10,
         stg_block=29,
+        enable_layerwise_offload=True,
     ),
     LTXAccuracyCase(
-        name="ltx2_3",
+        name="ltx23_two_stage_layer_fused_i2v",
+        pipeline_kind="two_stage",
         model_id="diffusers/LTX-2.3-Diffusers",
         model_revision="8eee8edcf067e838b843f926ec4d4cc9b2be1aaf",
         model_env="VLLM_TEST_LTX23_MODEL",
-        model_class_name="LTX2Pipeline",
-        checkpoint_repo="Lightricks/LTX-2.3",
-        checkpoint_filename="ltx-2.3-22b-dev.safetensors",
-        checkpoint_revision="4229404625088d21c4f112eb640fb04a0900ee25",
-        checkpoint_env="VLLM_TEST_LTX23_OFFICIAL_CHECKPOINT",
+        model_class_name="LTX2TwoStagePipeline",
+        checkpoint=LTX23_CHECKPOINT,
+        spatial_upsampler=LTX23_UPSAMPLER,
+        distilled_lora=LTX23_DISTILLED_LORA,
+        width=1536,
+        height=1024,
+        num_frames=121,
+        num_inference_steps=30,
+        seed=10,
         stg_block=28,
-    ),
-    LTXAccuracyCase(
-        name="ltx2_3_i2v",
-        model_id="diffusers/LTX-2.3-Diffusers",
-        model_revision="8eee8edcf067e838b843f926ec4d4cc9b2be1aaf",
-        model_env="VLLM_TEST_LTX23_MODEL",
-        model_class_name="LTX2Pipeline",
-        checkpoint_repo="Lightricks/LTX-2.3",
-        checkpoint_filename="ltx-2.3-22b-dev.safetensors",
-        checkpoint_revision="4229404625088d21c4f112eb640fb04a0900ee25",
-        checkpoint_env="VLLM_TEST_LTX23_OFFICIAL_CHECKPOINT",
-        stg_block=28,
-        image_repo="huggingface/documentation-images",
-        image_filename="diffusers/svd/rocket.png",
-        image_revision="645d8364f0c7a101180b364811b5a11a362e4010",
+        enable_layerwise_offload=True,
+        image=I2V_IMAGE,
     ),
 )
+
+WEEKLY_CASES = TWO_STAGE_CASES
 
 
 def _run(command: list[str], *, env: dict[str, str], timeout: int = 1800) -> None:
@@ -209,6 +333,7 @@ def _resolve_model(case: LTXAccuracyCase) -> Path:
                 "model_index.json",
                 "audio_vae/*",
                 "connectors/*",
+                "latent_upsampler/*",
                 "processor/*",
                 "scheduler/*",
                 "text_encoder/config.json",
@@ -223,74 +348,124 @@ def _resolve_model(case: LTXAccuracyCase) -> Path:
     )
 
 
-def _resolve_gemma_root(model: Path) -> Path:
+def _resolve_gemma_root(case: LTXAccuracyCase, model: Path) -> Path:
     configured_root = os.environ.get("VLLM_TEST_LTX_GEMMA_ROOT")
     if configured_root:
         root = Path(configured_root)
         assert root.is_dir(), f"Gemma root not found: {root}"
         return root
+    if case.gemma_model_id is not None:
+        configured_model = os.environ.get(case.gemma_model_env or "")
+        if configured_model and Path(configured_model).is_dir():
+            return Path(configured_model)
+        return Path(
+            snapshot_download(
+                repo_id=case.gemma_model_id,
+                revision=case.gemma_model_revision,
+                allow_patterns=[
+                    "processor/*",
+                    "text_encoder/*",
+                    "tokenizer/*",
+                ],
+            )
+        )
     return model
 
 
-def _resolve_checkpoint(case: LTXAccuracyCase, model: Path) -> Path:
-    configured_checkpoint = os.environ.get(case.checkpoint_env)
-    if configured_checkpoint:
-        checkpoint = Path(configured_checkpoint)
-        assert checkpoint.is_file(), f"Official checkpoint not found: {checkpoint}"
-        return checkpoint
-    model_checkpoint = model / case.checkpoint_filename
-    if model_checkpoint.is_file():
-        return model_checkpoint
+def _resolve_artifact(artifact: LTXArtifact, model: Path | None = None) -> Path:
+    configured_path = os.environ.get(artifact.env)
+    if configured_path:
+        path = Path(configured_path)
+        assert path.is_file(), f"Configured LTX artifact not found: {path}"
+        return path
+    if model is not None:
+        model_path = model / artifact.filename
+        if model_path.is_file():
+            return model_path
     return Path(
         hf_hub_download(
-            repo_id=case.checkpoint_repo,
-            filename=case.checkpoint_filename,
-            revision=case.checkpoint_revision,
+            repo_id=artifact.repo_id,
+            repo_type=None if artifact.repo_type == "model" else artifact.repo_type,
+            filename=artifact.filename,
+            revision=artifact.revision,
         )
     )
 
 
 def _resolve_image(case: LTXAccuracyCase) -> Path | None:
-    if case.image_filename is None:
+    if case.image is None:
         return None
-    if case.image_repo is None or case.image_revision is None:
-        raise ValueError(f"Incomplete image source for LTX accuracy case {case.name!r}.")
-    configured_image = os.environ.get("VLLM_TEST_LTX_I2V_IMAGE")
-    if configured_image:
-        image = Path(configured_image)
-        assert image.is_file(), f"LTX I2V conditioning image not found: {image}"
-        return image
-    return Path(
-        hf_hub_download(
-            repo_id=case.image_repo,
-            repo_type="dataset",
-            filename=case.image_filename,
-            revision=case.image_revision,
-        )
-    )
+    return _resolve_artifact(case.image)
+
+
+def _omni_model_with_pinned_artifacts(
+    model: Path,
+    output_root: Path,
+    artifacts: tuple[Path | None, ...],
+) -> Path:
+    """Expose the already-resolved sidecars to Omni without copying the model."""
+    resolved_artifacts = tuple(artifact for artifact in artifacts if artifact is not None)
+    if not resolved_artifacts:
+        return model
+
+    overlay = output_root / "omni-model"
+    overlay.mkdir()
+    for source in model.iterdir():
+        (overlay / source.name).symlink_to(source.resolve(), target_is_directory=source.is_dir())
+    for artifact in resolved_artifacts:
+        target = overlay / artifact.name
+        if target.exists():
+            assert target.samefile(artifact), f"Model sidecar does not match pinned artifact: {target} != {artifact}"
+        else:
+            target.symlink_to(artifact.resolve())
+    return overlay
+
+
+def test_omni_model_overlay_pins_artifacts(tmp_path: Path) -> None:
+    model = tmp_path / "model"
+    model.mkdir()
+    component = model / "model_index.json"
+    component.write_text("{}\n")
+    artifact = tmp_path / "sidecar.safetensors"
+    artifact.write_bytes(b"pinned")
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+
+    overlay = _omni_model_with_pinned_artifacts(model, output_root, (artifact,))
+
+    assert (overlay / component.name).samefile(component)
+    assert (overlay / artifact.name).samefile(artifact)
 
 
 def _request(case: LTXAccuracyCase, image: Path | None) -> dict[str, object]:
     request: dict[str, object] = {
-        "prompt": case.prompt,
-        "negative_prompt": NEGATIVE_PROMPT,
-        "width": 512,
-        "height": 384,
-        "num_frames": 25,
+        "pipeline_kind": case.pipeline_kind,
+        "prompt": PROMPT,
+        "negative_prompt": "" if case.pipeline_kind == "distilled" else NEGATIVE_PROMPT,
+        "width": case.width,
+        "height": case.height,
+        "num_frames": case.num_frames,
         "fps": 24,
-        "num_inference_steps": 20,
-        "seed": 42,
-        "video_cfg_scale": 3.0,
-        "audio_cfg_scale": 7.0,
-        "video_stg_scale": 1.0,
-        "audio_stg_scale": 1.0,
-        "video_modality_scale": 3.0,
-        "audio_modality_scale": 3.0,
-        "video_rescale_scale": 0.7,
-        "audio_rescale_scale": 0.7,
-        "video_stg_blocks": [case.stg_block],
-        "audio_stg_blocks": [case.stg_block],
+        "num_inference_steps": case.num_inference_steps,
+        "seed": case.seed,
     }
+    if case.pipeline_kind != "distilled":
+        request.update(
+            video_cfg_scale=3.0,
+            audio_cfg_scale=7.0,
+            video_modality_scale=3.0,
+            audio_modality_scale=3.0,
+        )
+    if case.pipeline_kind == "two_stage":
+        assert case.stg_block is not None
+        request.update(
+            video_stg_scale=1.0,
+            audio_stg_scale=1.0,
+            video_rescale_scale=0.7,
+            audio_rescale_scale=0.7,
+            video_stg_blocks=[case.stg_block],
+            audio_stg_blocks=[case.stg_block],
+        )
     if image is not None:
         request["image"] = str(image.resolve())
     return request
@@ -299,20 +474,30 @@ def _request(case: LTXAccuracyCase, image: Path | None) -> dict[str, object]:
 def _video_metrics(reference: np.ndarray, prediction: np.ndarray) -> dict[str, float]:
     assert reference.shape == prediction.shape
     assert reference.ndim == 4 and reference.shape[-1] == 3
+    device = torch.device("cpu")
+    ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+    psnr = PeakSignalNoiseRatio(data_range=1.0).to(device)
     ssim_scores: list[float] = []
     psnr_scores: list[float] = []
-    for reference_frame, prediction_frame in zip(reference, prediction, strict=True):
-        reference_tensor = torch.from_numpy(reference_frame).permute(2, 0, 1).unsqueeze(0)
-        prediction_tensor = torch.from_numpy(prediction_frame).permute(2, 0, 1).unsqueeze(0)
-        ssim_scores.append(float(StructuralSimilarityIndexMeasure(data_range=1.0)(prediction_tensor, reference_tensor)))
-        psnr_scores.append(float(PeakSignalNoiseRatio(data_range=1.0)(prediction_tensor, reference_tensor)))
-    difference = np.abs(reference.astype(np.float64) - prediction.astype(np.float64))
+    max_abs = 0.0
+    absolute_error_sum = 0.0
+    with torch.inference_mode():
+        for reference_frame, prediction_frame in zip(reference, prediction, strict=True):
+            reference_tensor = torch.from_numpy(reference_frame).permute(2, 0, 1).unsqueeze(0).to(device)
+            prediction_tensor = torch.from_numpy(prediction_frame).permute(2, 0, 1).unsqueeze(0).to(device)
+            ssim_scores.append(float(ssim(prediction_tensor, reference_tensor)))
+            psnr_scores.append(float(psnr(prediction_tensor, reference_tensor)))
+            ssim.reset()
+            psnr.reset()
+            difference = np.abs(reference_frame.astype(np.float64) - prediction_frame.astype(np.float64))
+            max_abs = max(max_abs, float(difference.max()))
+            absolute_error_sum += float(difference.sum())
     return {
         "ssim_mean": float(np.mean(ssim_scores)),
         "ssim_min": float(np.min(ssim_scores)),
         "psnr_mean_db": float(np.mean(psnr_scores)),
-        "max_abs": float(difference.max()),
-        "mean_abs": float(difference.mean()),
+        "max_abs": max_abs,
+        "mean_abs": absolute_error_sum / reference.size,
     }
 
 
@@ -338,29 +523,42 @@ def _audio_metrics(reference: np.ndarray, prediction: np.ndarray) -> dict[str, f
     }
 
 
-@pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
-@pytest.mark.full_model
+@pytest.mark.parametrize("case", WEEKLY_CASES, ids=lambda case: case.name)
+@pytest.mark.slow
 @pytest.mark.benchmark
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-def test_ltx_one_stage_matches_official(case: LTXAccuracyCase, accuracy_artifact_root: Path) -> None:
-    """Compare official and Omni raw AV outputs from the same E2E request."""
+def test_ltx_matches_official(case: LTXAccuracyCase, accuracy_artifact_root: Path) -> None:
+    """Compare official and Omni raw AV outputs from the same single-H100 request."""
+    configured_artifact_root = os.environ.get("VLLM_TEST_LTX_ARTIFACT_ROOT")
+    if configured_artifact_root:
+        accuracy_artifact_root = Path(configured_artifact_root)
+        accuracy_artifact_root.mkdir(parents=True, exist_ok=True)
     output_root = reset_artifact_dir(accuracy_artifact_root / "ltx_official" / case.name)
     official_root, official_revision = _official_source(accuracy_artifact_root / "ltx_official")
     model = _resolve_model(case)
-    gemma_root = _resolve_gemma_root(model)
-    checkpoint = _resolve_checkpoint(case, model)
+    gemma_root = _resolve_gemma_root(case, model)
+    checkpoint = _resolve_artifact(case.checkpoint, model)
+    spatial_upsampler = _resolve_artifact(case.spatial_upsampler, model) if case.spatial_upsampler is not None else None
+    distilled_lora = _resolve_artifact(case.distilled_lora, model) if case.distilled_lora is not None else None
+    omni_model = _omni_model_with_pinned_artifacts(model, output_root, (spatial_upsampler, distilled_lora))
     image = _resolve_image(case)
+    request = _request(case, image)
     request_path = output_root / "request.json"
-    request_path.write_text(json.dumps(_request(case, image), indent=2) + "\n")
+    request_path.write_text(json.dumps(request, indent=2) + "\n")
 
     runner = Path(__file__).with_name("run_ltx_reference.py")
     runner_args = [
         str(runner),
         "--request",
         str(request_path),
+        "--pipeline-kind",
+        case.pipeline_kind,
     ]
-    if os.environ.get("VLLM_TEST_LTX_ENABLE_LAYERWISE_OFFLOAD", "").lower() in {"1", "true", "yes", "on"}:
+    enable_layerwise_offload = case.enable_layerwise_offload or os.environ.get(
+        "VLLM_TEST_LTX_ENABLE_LAYERWISE_OFFLOAD", ""
+    ).lower() in {"1", "true", "yes", "on"}
+    if enable_layerwise_offload:
         runner_args.append("--enable-layerwise-offload")
     env = os.environ.copy()
     env["VLLM_TEST_LTX_OFFICIAL_REVISION"] = official_revision
@@ -372,10 +570,9 @@ def test_ltx_one_stage_matches_official(case: LTXAccuracyCase, accuracy_artifact
     )
 
     official_output = output_root / "official"
-    _run(
-        _official_runner_prefix()
-        + runner_args
-        + [
+    official_args = _official_runner_prefix() + runner_args
+    official_args.extend(
+        [
             "--backend",
             "official",
             "--output-dir",
@@ -386,12 +583,16 @@ def test_ltx_one_stage_matches_official(case: LTXAccuracyCase, accuracy_artifact
             str(checkpoint),
             "--gemma-root",
             str(gemma_root),
-        ],
-        env=env,
+        ]
     )
+    if spatial_upsampler is not None:
+        official_args.extend(["--spatial-upsampler", str(spatial_upsampler)])
+    if distilled_lora is not None:
+        official_args.extend(["--distilled-lora", str(distilled_lora)])
+    _run(official_args, env=env)
 
     omni_output = output_root / "omni"
-    _run(
+    omni_args = (
         [sys.executable]
         + runner_args
         + [
@@ -400,12 +601,12 @@ def test_ltx_one_stage_matches_official(case: LTXAccuracyCase, accuracy_artifact
             "--output-dir",
             str(omni_output),
             "--model",
-            str(model),
+            str(omni_model),
             "--model-class-name",
             case.model_class_name,
-        ],
-        env=env,
+        ]
     )
+    _run(omni_args, env=env)
 
     official_metadata = json.loads((official_output / "metadata.json").read_text())
     omni_metadata = json.loads((omni_output / "metadata.json").read_text())
@@ -423,18 +624,25 @@ def test_ltx_one_stage_matches_official(case: LTXAccuracyCase, accuracy_artifact
     result = {
         "case": case.name,
         "task": "i2v" if image is not None else "t2v",
+        "pipeline_kind": case.pipeline_kind,
+        "model_class_name": case.model_class_name,
         "attention_backend": ATTENTION_BACKEND,
         "official_revision": official_revision,
         "model_revision": case.model_revision,
-        "checkpoint_revision": case.checkpoint_revision,
+        "checkpoint_revision": case.checkpoint.revision,
+        "spatial_upsampler_revision": (case.spatial_upsampler.revision if case.spatial_upsampler is not None else None),
+        "distilled_lora_revision": case.distilled_lora.revision if case.distilled_lora is not None else None,
+        "enable_layerwise_offload": enable_layerwise_offload,
+        "thresholds": asdict(STRICT_THRESHOLDS),
+        "request": request,
         "video": video_metrics,
         "audio": audio_metrics,
     }
     (output_root / "metrics.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))
 
-    assert video_metrics["ssim_mean"] >= VIDEO_SSIM_MEAN_THRESHOLD
-    assert video_metrics["ssim_min"] >= VIDEO_SSIM_MIN_THRESHOLD
-    assert video_metrics["psnr_mean_db"] >= VIDEO_PSNR_MEAN_THRESHOLD
-    assert audio_metrics["relative_l2"] <= AUDIO_RELATIVE_L2_THRESHOLD
-    assert audio_metrics["cosine_similarity"] >= AUDIO_COSINE_THRESHOLD
+    assert video_metrics["ssim_mean"] >= STRICT_THRESHOLDS.video_ssim_mean
+    assert video_metrics["ssim_min"] >= STRICT_THRESHOLDS.video_ssim_min
+    assert video_metrics["psnr_mean_db"] >= STRICT_THRESHOLDS.video_psnr_mean_db
+    assert audio_metrics["relative_l2"] <= STRICT_THRESHOLDS.audio_relative_l2
+    assert audio_metrics["cosine_similarity"] >= STRICT_THRESHOLDS.audio_cosine_similarity

@@ -300,7 +300,16 @@ def apply_rope(
     max_period: float = 10_000,
     time_before_heads: bool = False,
 ):
-    """Apply rotary position embedding."""
+    """Apply rotary position embedding (GPT-J interleaved convention).
+
+    On NPU, uses ``torch_npu.npu_rotary_mul`` (a single fused rotation kernel)
+    instead of the manual 14-op eager rotation. The codec's GPT-J convention
+    (even/odd index pairs) is mathematically identical to the neox convention
+    after a layout conversion: interleaved ``[r0 i0 r1 i1 ...]`` -> neox
+    ``[r0 r1 ... i0 i1 ...]``, apply ``npu_rotary_mul``, convert back. This
+    fuses the 6 mul/add ops into 1 kernel. Result is bf16-identical
+    (max_abs_diff = 1 ULP). Falls back to the eager path on non-NPU.
+    """
     if time_before_heads:
         B, T, H, D = q.shape
     else:
@@ -319,6 +328,29 @@ def apply_rope(
     else:
         ts = ts.view(B, 1, -1, 1)
 
+    # Fast path: npu_rotary_mul (fused rotation kernel) on NPU.
+    if q.device.type == "npu":
+        import torch_npu
+
+        cos_d2 = torch.cos(freqs * ts)  # (..., 1, T, D//2)
+        sin_d2 = torch.sin(freqs * ts)
+        # neox cos/sin: cat([first_half, second_half]) -- each freq once per half.
+        cos = torch.cat([cos_d2, cos_d2], dim=-1)  # (..., 1, T, D)
+        sin = torch.cat([sin_d2, sin_d2], dim=-1)
+        dims = q.shape[:-1]
+        # interleaved -> neox: [r0 i0 r1 i1 ...] -> [r0 r1 ... i0 i1 ...]
+        q_neox = q.view(*dims, D // 2, 2).transpose(-1, -2).reshape(*dims, D).contiguous()
+        k_neox = k.view(*dims, D // 2, 2).transpose(-1, -2).reshape(*dims, D).contiguous()
+        # npu_rotary_mul: q_out = q * cos + rotate_half(q) * sin (neox rotation
+        # = GPT-J rotation after the layout conversion -- verified bf16-identical).
+        qo = torch_npu.npu_rotary_mul(q_neox, cos, sin)
+        ko = torch_npu.npu_rotary_mul(k_neox, cos, sin)
+        # neox -> interleaved (back)
+        qo = qo.view(*dims, 2, D // 2).transpose(-1, -2).reshape(*dims, D).contiguous()
+        ko = ko.view(*dims, 2, D // 2).transpose(-1, -2).reshape(*dims, D).contiguous()
+        return qo, ko
+
+    # Eager fallback (non-NPU): original 14-op GPT-J rotation in fp32.
     dims = q.shape[:-1]
     q = q.view(*dims, D // 2, 2)
     k = k.view(*dims, D // 2, 2)
@@ -2000,8 +2032,12 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         if codes_lengths is None:
             codes_lengths = torch.full((B,), T, device=device, dtype=torch.long)
 
-        # Keep eager execution and CUDA Graph capture on the same BF16 path.
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+        # Keep eager execution and CUDA/NPU Graph capture on the same BF16 path.
+        # Autocast is required on NPU because #5235's decode-LUT uses .float()
+        # for precision, producing float32 embeddings.  Without autocast, these
+        # float32 tensors flow into bf16 LayerNorm weights and NPU's aclnnLayerNorm
+        # rejects the mixed dtype (CUDA auto-casts; NPU does not).
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type != "cpu"):
             quantizer = cast(MossAudioTokenizerResidualVQ | MossAudioTokenizerResidualLFQ, self.quantizer)
             zq = quantizer.decode_codes(codes)
 
