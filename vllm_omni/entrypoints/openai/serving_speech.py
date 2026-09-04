@@ -24,6 +24,8 @@ import soundfile as sf
 import torch
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
+from transformers import AutoModel, AutoTokenizer
+from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from vllm.entrypoints.generate.base.serving import GenerateBaseServing as OpenAIServing
 from vllm.entrypoints.launcher import terminate_if_errored
 from vllm.entrypoints.openai.engine.protocol import (
@@ -74,6 +76,8 @@ from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
 from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
     create_instruction as ming_create_instruction,
 )
+from vllm_omni.model_executor.models.moss_tts.realtime_prompt import build_realtime_prompt
+from vllm_omni.model_executor.models.moss_tts.reference_encoder import encode_realtime_reference_codes
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
@@ -1403,6 +1407,44 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._moss_processor_cache = proc
         return proc
 
+    def _get_moss_realtime_components(self):
+        cached = getattr(self, "_moss_realtime_components", None)
+        if cached is not None:
+            return cached
+
+        model_id = self.engine_client.model_config.model
+        processor_cls = get_class_from_dynamic_module(
+            "processing_mossttsrealtime.MossTTSRealtimeProcessor",
+            model_id,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        processor = processor_cls(tokenizer=tokenizer)
+        hf_config = self.engine_client.model_config.hf_config
+        codec_path = str(
+            getattr(
+                hf_config,
+                "codec_model_name_or_path",
+                getattr(
+                    hf_config,
+                    "audio_tokenizer_name_or_path",
+                    "OpenMOSS-Team/MOSS-Audio-Tokenizer",
+                ),
+            )
+        )
+        codec = (
+            AutoModel.from_pretrained(
+                codec_path,
+                trust_remote_code=True,
+            )
+            # Reference encoding runs in the API process. Keep the codec on CPU
+            # so it does not reserve accelerator memory outside the model workers.
+            .to("cpu")
+            .eval()
+        )
+        cached = (tokenizer, processor, codec)
+        self._moss_realtime_components = cached
+        return cached
+
     async def _build_moss_tts_params(
         self,
         request: OpenAICreateSpeechRequest,
@@ -1424,42 +1466,57 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         max_new_frames, ...}``. The caller treats ``prompt_token_ids`` as the
         prompt and forwards the rest as ``additional_information``.
         """
-        import torch  # local to avoid pulling torch at module import time
-
         v = self._moss_variant
 
         # ---- Legacy nano path (unchanged) ----
         if v is None:  # moss_tts_nano
-            params: dict[str, Any] = {
+            ref_audio = request.ref_audio
+            assert isinstance(ref_audio, str)
+            nano_params: dict[str, Any] = {
                 "text": [request.input or ""],
                 "mode": ["voice_clone"],
             }
             if request.max_new_tokens is not None:
-                params["max_new_frames"] = [request.max_new_tokens]
-            wav_list, sr, cache_key = await self._resolve_ref_audio(request.ref_audio)
-            params["prompt_audio_array"] = [[wav_list, sr]]
-            params["ref_audio_cache_key"] = cache_key
-            return params
+                nano_params["max_new_frames"] = [request.max_new_tokens]
+            wav_list, sr, cache_key = await self._resolve_ref_audio(ref_audio)
+            nano_params["prompt_audio_array"] = [[wav_list, sr]]
+            nano_params["ref_audio_cache_key"] = cache_key
+            return nano_params
 
-        # ---- MOSS-TTS-Realtime: keep the old prompt_audio_array path ----
-        # ``AutoProcessor.from_pretrained`` doesn't auto-discover
-        # ``MossTTSRealtimeProcessor`` (no ``processor_config.json`` in the
-        # snapshot), and Realtime's prompt format diverges from MossTTSDelay
-        # (16-channel grid, separate per-step text feed). The
-        # ``prompt_audio_array`` shape lines up well enough with what the
-        # talker reads for short prompts; full Realtime support needs a
-        # separate processor.from_module path which we don't wire here.
         if v == "realtime":
-            params: dict[str, Any] = {
-                "text": [request.input or ""],
-                "mode": ["voice_clone"],
-            }
+            ref_audio = request.ref_audio
+            assert isinstance(ref_audio, str)
+            tokenizer, processor, codec = self._get_moss_realtime_components()
+            raw_voice = request.voice.strip() if isinstance(request.voice, str) else ""
+            voice_lower = raw_voice.lower() if raw_voice else ""
+            use_named_voice = bool(voice_lower) and voice_lower in self.uploaded_speakers and not has_inline_ref_audio
+            voice = voice_lower if use_named_voice else ""
+            resolve_keys: list[str] = []
+
+            async def tracked_resolve(ref_str: str) -> tuple[list, int, str]:
+                wav_list, sr, cache_key = await self._resolve_ref_audio(ref_str)
+                resolve_keys.append(cache_key)
+                return wav_list, sr, cache_key
+
+            reference_codes = await encode_realtime_reference_codes(
+                ref_audio,
+                codec=codec,
+                resolve_ref_audio=tracked_resolve,
+                speaker_cache=self._speaker_cache,
+                voice_name=voice or None,
+                voice_created_at=self._voice_created_at(voice) if voice else 0,
+            )
+            realtime_params = build_realtime_prompt(
+                tokenizer,
+                processor,
+                request.input or "",
+                reference_codes,
+            )
             if request.max_new_tokens is not None:
-                params["max_new_frames"] = [request.max_new_tokens]
-            wav_list, sr, cache_key = await self._resolve_ref_audio(request.ref_audio)
-            params["prompt_audio_array"] = [[wav_list, sr]]
-            params["ref_audio_cache_key"] = cache_key
-            return params
+                realtime_params["max_new_frames"] = [request.max_new_tokens]
+            if resolve_keys:
+                realtime_params["ref_audio_cache_key"] = resolve_keys[0]
+            return realtime_params
 
         # ---- MossTTSDelay family (tts/ttsd/sound_effect/voice_generator)
         # and MOSS-TTS-Local-Transformer-v1.5: call the upstream processor
@@ -1482,11 +1539,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # output rate (48000), the wrong value to resample the reference into.
         sr_target = 24000 if v == "local" else int(getattr(proc.model_config, "sampling_rate", 24000))
 
-        # Reference-audio encoding + speaker caching lives in the model package
-        # (moss_tts.reference_encoder), mirroring Fish Speech / CosyVoice3 /
-        # Qwen3-TTS which keep reference handling with the model rather than in
-        # this shared serving file. Imported lazily so the API-server process
-        # only pulls it on the delay-family path (alongside the upstream proc).
+        # Keep the model-specific encoder on the delay-family request path.
         from vllm_omni.model_executor.models.moss_tts.reference_encoder import encode_reference_codes
 
         # Named-voice speaker cache is only valid for uploaded speakers
@@ -1525,11 +1578,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         user_kwargs: dict[str, Any] = {"text": request.input or ""}
         if v in ("tts", "local"):
-            user_kwargs["reference"] = [await _encode_ref(request.ref_audio, named_voice=True)]
+            ref_audio = request.ref_audio
+            assert isinstance(ref_audio, str)
+            user_kwargs["reference"] = [await _encode_ref(ref_audio, named_voice=True)]
         elif v == "ttsd":
-            refs = [await _encode_ref(request.ref_audio, named_voice=True)]
+            ref_audio = request.ref_audio
+            assert isinstance(ref_audio, str)
+            refs = [await _encode_ref(ref_audio, named_voice=True)]
             if request.ref_audio_2:
-                refs.append(await _encode_ref(request.ref_audio_2, named_voice=False))
+                ref_audio_2 = request.ref_audio_2
+                assert isinstance(ref_audio_2, str)
+                refs.append(await _encode_ref(ref_audio_2, named_voice=False))
             user_kwargs["reference"] = refs
         elif v == "sound_effect":
             user_kwargs["text"] = request.input or ""  # may be empty

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E offline inference tests for MOSS-TTS-Realtime (MossTTSRealtime, 1.7B).
 
 Uses the standard omni_runner + pytestmark pattern (one module-scoped engine
@@ -95,7 +95,6 @@ def _get_test_config() -> str:
 # ---------------------------------------------------------------------------
 
 pytestmark = [
-    pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4700"),
     pytest.mark.slow,
     pytest.mark.tts,
     pytest.mark.parametrize(
@@ -271,7 +270,7 @@ def _collect_audio(omni_runner: OmniRunner, request: dict) -> tuple[torch.Tensor
 # ---------------------------------------------------------------------------
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_moss_tts_realtime_english(omni_runner: OmniRunner, ref_audio_path: str) -> None:
     """MossTTSRealtime: English voice_clone produces non-empty 24 kHz audio."""
     req = _build_request(ref_audio_path, "This is a real-time TTS streaming test.")
@@ -282,7 +281,7 @@ def test_moss_tts_realtime_english(omni_runner: OmniRunner, ref_audio_path: str)
     assert not torch.all(audio == 0), "Audio is silence"
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_moss_tts_realtime_chinese(omni_runner: OmniRunner, ref_audio_path: str) -> None:
     """MossTTSRealtime: Chinese input produces non-empty audio."""
     req = _build_request(ref_audio_path, "你好，这是语音合成测试。")

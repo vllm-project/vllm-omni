@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Reference-audio encoding + speaker cache for the MOSS-TTS-family talker.
 
 This lives in the model package (not the shared serving layer) so all
@@ -8,8 +11,8 @@ in ``serving_speech.py``. The serving layer just calls
 :func:`encode_reference_codes` with its generic helpers (the audio resolver and
 the process-wide speaker cache).
 
-Kept import-light (only ``asyncio`` / ``torch`` plus the logger)
-so importing it from the API-server process does not pull the talker/codec.
+Kept separate from the talker and codec modules so importing it from the
+API-server process does not load either model implementation.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import torch
+import torchaudio
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -30,12 +34,65 @@ def _encode_wav_sync(processor: Any, wav_list: list, sr: int, sr_target: int, n_
     if wav.dim() == 1:
         wav = wav.unsqueeze(0)
     if sr != sr_target:
-        import torchaudio
-
         wav = torchaudio.functional.resample(wav, sr, sr_target)
     with torch.no_grad():
         codes_list = processor.encode_audios_from_wav([wav], sampling_rate=sr_target, n_vq=n_vq)
     return codes_list[0]
+
+
+def _encode_realtime_wav_sync(codec: Any, wav_list: list, sr: int) -> torch.Tensor:
+    wav = torch.tensor(wav_list, dtype=torch.float32)
+    if wav.dim() == 1:
+        wav = wav.unsqueeze(0)
+    if sr != 24000:
+        wav = torchaudio.functional.resample(wav, sr, 24000)
+
+    with torch.no_grad():
+        encoded = codec.batch_encode([wav.squeeze(0)], num_quantizers=16)
+    codes = encoded.audio_codes[:, 0, : int(encoded.audio_codes_lengths[0].item())]
+    return codes.transpose(0, 1).contiguous().to(dtype=torch.int64, device="cpu")
+
+
+async def encode_realtime_reference_codes(
+    ref_str: str,
+    *,
+    codec: Any,
+    resolve_ref_audio: Callable[[str], Awaitable[tuple[list, int, str]]],
+    speaker_cache: Any,
+    voice_name: str | None = None,
+    voice_created_at: int = 0,
+) -> torch.Tensor:
+    """Encode and cache the 16-channel reference grid for Realtime."""
+    model_type = "moss_tts_realtime_nq16"
+
+    if voice_name:
+        speaker_name = voice_name
+        created_at = int(voice_created_at)
+        cache_key = speaker_cache.make_cache_key(
+            speaker_name,
+            model_type=model_type,
+            created_at=created_at,
+        )
+        cached = speaker_cache.get(cache_key)
+        if cached is not None:
+            return cached["codes"].clone()
+        wav_list, sr, _ = await resolve_ref_audio(ref_str)
+    else:
+        wav_list, sr, resolve_cache_key = await resolve_ref_audio(ref_str)
+        speaker_name = "ref:" + resolve_cache_key
+        created_at = 0
+        cache_key = speaker_cache.make_cache_key(
+            speaker_name,
+            model_type=model_type,
+            created_at=created_at,
+        )
+        cached = speaker_cache.get(cache_key)
+        if cached is not None:
+            return cached["codes"].clone()
+
+    codes = await asyncio.to_thread(_encode_realtime_wav_sync, codec, wav_list, sr)
+    speaker_cache.put(cache_key, {"codes": codes.detach().cpu()})
+    return codes
 
 
 async def encode_reference_codes(

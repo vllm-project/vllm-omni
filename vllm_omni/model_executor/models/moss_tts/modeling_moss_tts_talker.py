@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 OpenMOSS and the vLLM-Omni team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
@@ -41,10 +44,10 @@ def _maybe_prefix(prefix: str, name: str) -> str:
 
 
 def _iter_state_row_spans(
-    states: Sequence[dict[str, Any]],
+    states: Sequence[dict[str, Any] | None],
     spans: Sequence[tuple[int, int]] | None,
     num_rows: int,
-) -> Iterable[tuple[dict[str, Any], int, int]]:
+) -> Iterable[tuple[dict[str, Any] | None, int, int]]:
     """Yield state/logit-row ranges without assuming equal request row counts."""
     if num_rows <= 0 or not states:
         return
@@ -795,6 +798,9 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
     have_multimodal_outputs: bool = True
     has_preprocess: bool = True
     has_postprocess: bool = True
+    # Intermediate prefill chunks reach make_omni_output but must not produce
+    # audio until the scheduler has completed the prompt.
+    requires_request_sample_eligibility: bool = True
 
     AUDIO_BOS = 1025
     AUDIO_EOS = 1026
@@ -855,7 +861,7 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         # We still need a logits_processor so vLLM downstream stays happy with
         # something callable; a minimal pass-through suffices.
         self.logits_processor = LogitsProcessor(self.text_vocab_size)
-        self._batch_state: list[dict[str, Any]] | None = None
+        self._batch_state: list[dict[str, Any] | None] | None = None
 
         # Stacked weight cache built after load_weights().
         # shape: (n_vq, audio_vocab_size, hidden_size)
@@ -969,13 +975,14 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         span_len = int(input_ids.shape[0])
         audio_state = info_dict.get("audio_state")
         is_first_call = not isinstance(audio_state, dict)
+        is_prefill = bool(info_dict.get("_omni_is_prefill", span_len > 1))
 
-        if span_len > 1 or is_first_call:
+        if is_prefill or is_first_call:
             # Prefill: read the full reference-audio code grid (channels x T)
             # from ``info_dict["codes"]["ref"]``; slice the chunk that aligns
             # with this prefill window.
             ref_codes = (info_dict.get("codes", {}) or {}).get("ref")
-            ref_offset = int(info_dict.get("ref_offset", 0))
+            ref_offset = int(info_dict.get("_omni_num_computed_tokens", info_dict.get("ref_offset", 0)))
             chunk_audio = None
             if isinstance(ref_codes, torch.Tensor) and ref_codes.numel() > 0:
                 if ref_codes.dim() == 1 and ref_codes.numel() % self.n_vq == 0:
@@ -991,22 +998,24 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                 if chunk_audio is not None
                 else torch.full((self.n_vq,), self.audio_pad_token, dtype=torch.long, device=device)
             )
-            # Capture the streaming-text list from the request (set by the
-            # realtime end2end builder; empty for the delay variants which
-            # don't take this code path anyway).
-            remaining = (info_dict.get("ids", {}) or {}).get("all")
-            if not isinstance(remaining, list):
-                remaining = []
             info_update: dict[str, Any] = {
-                "audio_state": {
+                "audio_codes": {"current": current_codes},
+                "ref_offset": ref_offset + span_len,
+            }
+            if is_first_call:
+                remaining = (info_dict.get("ids", {}) or {}).get("all")
+                if not isinstance(remaining, list):
+                    remaining = []
+                max_new_frames = info_dict.get("max_new_frames")
+                if isinstance(max_new_frames, (list, tuple)):
+                    max_new_frames = max_new_frames[0] if max_new_frames else None
+                info_update["audio_state"] = {
                     "is_stopping": False,
                     "step": 0,
                     "text_cursor": 0,
                     "remaining_text": list(remaining),
-                },
-                "audio_codes": {"current": current_codes},
-                "ref_offset": ref_offset + span_len,
-            }
+                    "max_new_frames": int(max_new_frames) if max_new_frames is not None else -1,
+                }
             return input_ids, embeds, info_update
 
         # Decode step: text_token from the just-sampled vLLM logit, plus the
@@ -1043,13 +1052,21 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         info_dicts: list[dict[str, Any]] = (
             kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or []
         )
+        sample_eligible = kwargs.get("request_sample_eligible")
+        eligible = [
+            sample_eligible is None or i >= len(sample_eligible) or bool(sample_eligible[i])
+            for i in range(len(info_dicts))
+        ]
 
         # Defensive state init.
         for info in info_dicts:
             if isinstance(info, dict) and not isinstance(info.get("audio_state"), dict):
                 info["audio_state"] = {"is_stopping": False, "step": 0}
 
-        self._batch_state = [(info["audio_state"] if isinstance(info, dict) else {}) for info in info_dicts]
+        self._batch_state = [
+            (info["audio_state"] if isinstance(info, dict) and eligible[i] else None)
+            for i, info in enumerate(info_dicts)
+        ]
         self._batch_state_spans = kwargs.get("request_token_spans")
 
         # See delay talker: real per-request row spans from the runner are
@@ -1070,6 +1087,8 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                 )
             for i, info in enumerate(info_dicts):
                 if not isinstance(info, dict):
+                    continue
+                if not eligible[i]:
                     continue
                 row_start, row_end = spans[i]
                 row_end = min(int(row_end), num_rows)
@@ -1112,10 +1131,13 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                     )
 
                 ch0 = int(new_codes[0].item())
+                state["step"] = int(state.get("step", 0)) + 1
+                max_new_frames = int(state.get("max_new_frames", -1))
+                if max_new_frames > 0 and state["step"] >= max_new_frames:
+                    state["is_stopping"] = True
                 # Stop condition mirrors upstream: codebook 0 == eos_audio_id.
                 if ch0 == self.AUDIO_EOS:
                     state["is_stopping"] = True
-                    state["step"] = int(state.get("step", 0)) + 1
                     info["audio_codes"] = {
                         "current": new_codes,
                         "accumulated": (info.get("audio_codes", {}) or {}).get("accumulated"),
@@ -1124,7 +1146,6 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
 
                 if ch0 in (self.AUDIO_BOS, self.audio_pad_token):
                     # Skip the bos / pad frames — they don't decode to real audio.
-                    state["step"] = int(state.get("step", 0)) + 1
                     info["audio_codes"] = {
                         "current": new_codes,
                         "accumulated": (info.get("audio_codes", {}) or {}).get("accumulated"),
@@ -1138,7 +1159,6 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                     updated_acc = new_codes.unsqueeze(0)
 
                 info["audio_codes"] = {"current": new_codes, "accumulated": updated_acc}
-                state["step"] = int(state.get("step", 0)) + 1
                 per_req_codes[i] = new_codes.unsqueeze(0)
                 have_codes = True
 
