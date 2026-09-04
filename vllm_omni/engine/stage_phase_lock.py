@@ -37,7 +37,11 @@ from collections.abc import Iterator
 
 from vllm.logger import init_logger
 
-from vllm_omni.engine.stage_init_utils import device_init_lock_path
+from vllm_omni.engine.stage_init_utils import (
+    device_init_lock_path,
+    open_device_lock_file,
+    record_lock_holder_pid,
+)
 
 logger = init_logger(__name__)
 
@@ -142,7 +146,7 @@ class DevicePhaseLock:
         deadline = time.monotonic() + self._timeout_s
         try:
             for device_id in self._device_ids:
-                fd = os.open(device_init_lock_path(device_id, self._lock_dir), os.O_CREAT | os.O_RDWR, 0o644)
+                fd, writable = open_device_lock_file(device_init_lock_path(device_id, self._lock_dir))
                 while True:
                     try:
                         fcntl.flock(fd, mode | fcntl.LOCK_NB)
@@ -155,11 +159,7 @@ class DevicePhaseLock:
                                 f"{'EX' if mode == fcntl.LOCK_EX else 'SH'} lock on device {device_id}"
                             )
                         time.sleep(0.01)
-                try:
-                    os.ftruncate(fd, 0)
-                    os.write(fd, f"{os.getpid()}\n".encode())
-                except OSError:
-                    pass
+                record_lock_holder_pid(fd, writable)
                 acquired.append(fd)
             return acquired
         except BaseException:
@@ -205,8 +205,16 @@ def wrap_executor_with_phase_locks(executor_class, locker: DevicePhaseLock):
 
     * ``__init__`` (executor construction → weight load) under ``shared()``.
     * ``determine_available_memory`` (profiling) under ``exclusive()``.
-    * ``initialize_from_config`` (KV allocation + CUDA-graph capture, fused
-      upstream) under ``shared()``.
+    * ``initialize_from_config`` (KV cache allocation) under ``shared()``.
+    * ``compile_or_warm_up_model`` (kernel warmup + CUDA-graph capture) under
+      ``shared()``.
+
+    ``compile_or_warm_up_model`` needs its own bracket: upstream used to fuse it
+    into ``Executor.initialize_from_config``, but since vLLM v0.20.0 (vllm#39240)
+    ``EngineCore._initialize_kv_caches`` calls the two separately. Leaving it
+    unwrapped would let one stage capture graphs — mutating device memory — while
+    a peer holds the exclusive lock for its profiling measurement, which is
+    exactly the interference this protocol exists to prevent.
 
     Works uniformly for any executor (UniProc/MultiProc): the lock is taken in
     the driver process that instantiates the executor and issues its collectives.
@@ -224,6 +232,10 @@ def wrap_executor_with_phase_locks(executor_class, locker: DevicePhaseLock):
         def initialize_from_config(self, kv_cache_configs):
             with locker.shared():
                 return super().initialize_from_config(kv_cache_configs)
+
+        def compile_or_warm_up_model(self):
+            with locker.shared():
+                return super().compile_or_warm_up_model()
 
     _PhaseLockedExecutor.__name__ = f"PhaseLocked{executor_class.__name__}"
     _PhaseLockedExecutor.__qualname__ = _PhaseLockedExecutor.__name__

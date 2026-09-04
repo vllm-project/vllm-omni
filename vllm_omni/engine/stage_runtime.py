@@ -461,8 +461,10 @@ class StageRuntime:
         self._init_visible_devices_baseline = os.environ.get(current_omni_platform.device_control_env_var)
 
         if self._parallel_stage_init:
-            # Prove every physical device's summed budget fits BEFORE any stage
-            # spawns. Fail fast here rather than OOM at allocation time.
+            # Refuse executor backends the phase locks cannot cover, then prove
+            # every physical device's summed budget fits BEFORE any stage spawns.
+            # Both fail fast here rather than OOM at allocation time.
+            self._reject_unguardable_executors(stage_plans)
             self._run_stage_admission(stage_plans)
 
         init_groups: dict[str, list[tuple[int, ReplicaInitPlan]]] = {}
@@ -521,11 +523,49 @@ class StageRuntime:
 
         return initialized_clients_by_stage
 
+    def _reject_unguardable_executors(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
+        """Fail closed for executors the SH/EX phase locks cannot actually guard.
+
+        ``DevicePhaseLock`` is a node-local ``flock`` over files on the engine-core
+        driver's host, and the admission ledger is built only from this host's
+        devices. A Ray executor may place the workers that load weights, profile,
+        allocate KV cache and capture graphs on **other** nodes, which participate
+        in neither mechanism. Running there would take the parallel path — the
+        parent skips its own device lock when ``parallel_stage_init`` is on —
+        while only advertising the protection, so refuse before anything spawns.
+
+        Detection uses the ``uses_ray`` class attribute vLLM sets on
+        ``RayDistributedExecutor`` / ``RayExecutorV2`` (and that custom executors
+        are expected to set), rather than matching backend strings.
+
+        Remote replicas are skipped: they are launched by the runtime owning their
+        node and are already ``ADMISSION_EXEMPT`` in this host's ledger.
+        """
+        offenders: list[str] = []
+        for plan in stage_plans:
+            for replica in plan.replicas:
+                if replica.launch_mode == "remote":
+                    continue
+                executor_class = replica.executor_class
+                if executor_class is not None and getattr(executor_class, "uses_ray", False):
+                    offenders.append(
+                        f"stage{replica.metadata.stage_id}/replica{replica.replica_id} ({executor_class.__name__})"
+                    )
+        if offenders:
+            raise RuntimeError(
+                "parallel_stage_init cannot guard a Ray-backed executor: the SH/EX phase locks "
+                "are node-local file locks and the admission ledger only accounts for this "
+                "host's devices, so workers placed on other nodes would initialize unprotected. "
+                f"Offending replicas: {', '.join(offenders)}. Disable parallel_stage_init for "
+                "this deployment, or use a non-Ray executor backend."
+            )
+
     def _run_stage_admission(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
         """Pre-launch per-device admission for parallel stage init (fail-fast)."""
         from vllm_omni.engine.stage_admission import (
             ADMISSION_EXEMPT,
             AdmissionExempt,
+            StageAdmissionError,
             check_admission,
         )
 
@@ -553,16 +593,54 @@ class StageRuntime:
                     return None
             return ids or None
 
-        def _total_memory(device_id: int) -> int:
+        def _visible_ordinal(physical_id: int) -> int:
+            """Translate a physical device id to this process's visible ordinal.
+
+            The ledger is keyed by *physical* id (resolved against the visibility
+            baseline captured before any stage narrowed the env), but
+            ``get_device_total_memory`` and ``torch.cuda.get_device_properties``
+            interpret their argument as an ordinal in the **current** process's
+            visible-device namespace. Passing the physical id straight through
+            raises an invalid-ordinal error under a restricted
+            ``CUDA_VISIBLE_DEVICES`` and, when visibility is reordered, silently
+            reads a different GPU — which yields a wrong capacity, and therefore
+            an unsafe admission result, on heterogeneous devices.
+            """
+            baseline = self._init_visible_devices_baseline
+            if not baseline:
+                # No device-control env captured: ordinals are physical ids.
+                return physical_id
+            visible: list[int] = []
+            for tok in baseline.split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                try:
+                    visible.append(int(tok))
+                except ValueError:
+                    # Non-integer visibility (UUID / MIG) has no ordinal mapping;
+                    # such stages already fail to resolve to integer ids above.
+                    return physical_id
             try:
-                mem = current_omni_platform.get_device_total_memory(device_id)
+                return visible.index(physical_id)
+            except ValueError:
+                raise StageAdmissionError(
+                    f"Physical device {physical_id} is not in the visibility baseline "
+                    f"{baseline!r} captured at init, so its capacity cannot be measured "
+                    "from this process. Refusing to admit against an unknown device."
+                ) from None
+
+        def _total_memory(device_id: int) -> int:
+            ordinal = _visible_ordinal(device_id)
+            try:
+                mem = current_omni_platform.get_device_total_memory(ordinal)
                 if mem:
                     return int(mem)
             except (NotImplementedError, AttributeError, TypeError):
                 pass
             import torch
 
-            return int(torch.cuda.get_device_properties(device_id).total_memory)
+            return int(torch.cuda.get_device_properties(ordinal).total_memory)
 
         check_admission(
             stage_plans,

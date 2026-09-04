@@ -14,6 +14,10 @@ hardware soak and is out of scope for these unit tests.
 from __future__ import annotations
 
 import contextlib
+import inspect
+import os
+import subprocess
+import threading
 import types
 from pathlib import Path
 
@@ -29,7 +33,12 @@ from vllm_omni.engine.stage_admission import (
     graph_reserve_bytes,
 )
 from vllm_omni.engine.stage_engine_core_proc import _install_phase_locks
-from vllm_omni.engine.stage_init_utils import LogicalStageInitPlan, ReplicaInitPlan
+from vllm_omni.engine.stage_init_utils import (
+    LogicalStageInitPlan,
+    ReplicaInitPlan,
+    device_init_lock_path,
+    open_device_lock_file,
+)
 from vllm_omni.engine.stage_phase_lock import (
     DeviceLockTimeoutError,
     DevicePhaseLock,
@@ -310,6 +319,142 @@ def test_run_stage_admission_excludes_remote_replicas(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# B1b: admission capacity is queried in the visible-ordinal namespace
+# --------------------------------------------------------------------------- #
+def _capture_admission(monkeypatch, runtime, replicas):
+    """Run _run_stage_admission with check_admission stubbed; return its callables."""
+    import vllm_omni.engine.stage_admission as admission_mod
+
+    captured: dict = {}
+
+    def _fake_check_admission(stage_plans, *, resolve_physical_devices, device_total_memory, **kw):
+        captured["resolve"] = resolve_physical_devices
+        captured["capacity"] = device_total_memory
+        return {}
+
+    monkeypatch.setattr(admission_mod, "check_admission", _fake_check_admission)
+    runtime._run_stage_admission([LogicalStageInitPlan(stage_idx=0, stage_id=0, replicas=replicas)])
+    return captured
+
+
+def _stub_platform(monkeypatch, seen: list[int], total: int = 80 * 1024**3):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    monkeypatch.setattr(
+        runtime_mod,
+        "current_omni_platform",
+        types.SimpleNamespace(
+            device_control_env_var="CUDA_VISIBLE_DEVICES",
+            get_device_total_memory=lambda d: (seen.append(d), total)[1],
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("baseline", "devices", "physical", "ordinal"),
+    [
+        ("3,4,5", "1", 4, 1),  # restricted visibility
+        ("1,0", "0", 1, 0),  # reordered visibility
+        ("0,1,2,3", "2", 2, 2),  # identity
+    ],
+    ids=["restricted", "reordered", "identity"],
+)
+def test_admission_capacity_uses_visible_ordinal(monkeypatch, baseline, devices, physical, ordinal):
+    """The ledger stays keyed by physical id, but the capacity query is translated.
+
+    ``get_device_total_memory``/``torch.cuda.get_device_properties`` read their
+    argument as an ordinal in the *current* process's visible-device namespace.
+    With CUDA_VISIBLE_DEVICES=3,4,5 the orchestrator only has ordinals 0..2, so
+    passing physical id 4 straight through would raise — or, when visibility is
+    reordered, silently measure a different GPU.
+    """
+    runtime = _runtime(parallel_stage_init=True)
+    runtime._init_visible_devices_baseline = baseline
+    replica = _llm_replica(0, 0, devices, vllm_config=_fake_vllm_config(0.4, cudagraph_mode="NONE"))
+
+    seen: list[int] = []
+    _stub_platform(monkeypatch, seen)
+    captured = _capture_admission(monkeypatch, runtime, [replica])
+
+    assert captured["resolve"](replica) == [physical], "ledger key must stay physical"
+    assert captured["capacity"](physical) == 80 * 1024**3
+    assert seen == [ordinal], f"expected the capacity query on ordinal {ordinal}, got {seen}"
+
+
+def test_admission_capacity_rejects_device_outside_baseline(monkeypatch):
+    """A physical id absent from the captured baseline cannot be measured here."""
+    runtime = _runtime(parallel_stage_init=True)
+    runtime._init_visible_devices_baseline = "3,4,5"
+    replica = _llm_replica(0, 0, "0", vllm_config=_fake_vllm_config(0.4, cudagraph_mode="NONE"))
+
+    seen: list[int] = []
+    _stub_platform(monkeypatch, seen)
+    captured = _capture_admission(monkeypatch, runtime, [replica])
+
+    with pytest.raises(StageAdmissionError, match="not in the visibility baseline"):
+        captured["capacity"](7)
+    assert seen == [], "must not query the platform with an unmappable id"
+
+
+def test_admission_capacity_identity_when_no_baseline(monkeypatch):
+    """With no device-control env captured, ordinals and physical ids coincide."""
+    runtime = _runtime(parallel_stage_init=True)
+    runtime._init_visible_devices_baseline = None
+    replica = _llm_replica(0, 0, "2", vllm_config=_fake_vllm_config(0.4, cudagraph_mode="NONE"))
+
+    seen: list[int] = []
+    _stub_platform(monkeypatch, seen)
+    captured = _capture_admission(monkeypatch, runtime, [replica])
+
+    assert captured["capacity"](2) == 80 * 1024**3
+    assert seen == [2]
+
+
+# --------------------------------------------------------------------------- #
+# B1c: fail closed for executors the phase locks cannot guard
+# --------------------------------------------------------------------------- #
+class _RayBackedExecutor:
+    uses_ray = True
+
+
+class _LocalExecutor:
+    uses_ray = False
+
+
+def test_parallel_init_refuses_ray_backed_executor():
+    """Phase locks are node-local flocks and the ledger only sees this host.
+
+    A Ray executor may place the workers that load weights, profile, allocate KV
+    and capture graphs on other nodes, which participate in neither mechanism —
+    and the parent skips its own device lock when parallel_stage_init is on.
+    """
+    runtime = _runtime(parallel_stage_init=True)
+    replica = _llm_replica(0, 0, "0")
+    replica.executor_class = _RayBackedExecutor
+    plans = [LogicalStageInitPlan(stage_idx=0, stage_id=0, replicas=[replica])]
+
+    with pytest.raises(RuntimeError, match="cannot guard a Ray-backed executor"):
+        runtime._reject_unguardable_executors(plans)
+
+
+def test_parallel_init_allows_non_ray_executor():
+    runtime = _runtime(parallel_stage_init=True)
+    replicas = [_llm_replica(0, 0, "0"), _llm_replica(1, 0, "1")]
+    replicas[0].executor_class = _LocalExecutor
+    replicas[1].executor_class = object  # no uses_ray attribute at all
+    runtime._reject_unguardable_executors([LogicalStageInitPlan(stage_idx=0, stage_id=0, replicas=replicas)])
+
+
+def test_parallel_init_ignores_remote_ray_replicas():
+    """Remote replicas are launched by the runtime owning their node."""
+    runtime = _runtime(parallel_stage_init=True)
+    replica = _llm_replica(0, 0, "0")
+    replica.executor_class = _RayBackedExecutor
+    replica.launch_mode = "remote"
+    runtime._reject_unguardable_executors([LogicalStageInitPlan(stage_idx=0, stage_id=0, replicas=[replica])])
+
+
+# --------------------------------------------------------------------------- #
 # B2: SH/EX device phase locks (real flock)
 # --------------------------------------------------------------------------- #
 def _lock(tmp: Path, **kw) -> DevicePhaseLock:
@@ -345,6 +490,172 @@ def test_empty_device_set_is_noop(tmp_path):
         pass
     with lock.exclusive():
         pass
+
+
+def _dead_pid() -> int:
+    """A PID that has certainly exited and been reaped."""
+    proc = subprocess.Popen(["/bin/true"])
+    proc.wait()
+    return proc.pid
+
+
+def test_legacy_device_lock_never_unlinks_the_path():
+    """The stale-PID unlink path is gone from the legacy acquirer.
+
+    ``flock`` is released by the kernel when the holder exits (SIGKILL included),
+    so a dead holder never keeps the lock and unlink-based cleanup is never
+    needed. It was also unsafe: the cleanup only ran on ``BlockingIOError``, i.e.
+    only while the lock *was* held, so every case it fired in was a case where
+    unlinking broke a live holder.
+    """
+    import vllm_omni.engine.stage_init_utils as siu
+
+    assert not hasattr(siu, "_cleanup_stale_lock_if_dead")
+    assert "unlink" not in inspect.getsource(siu.acquire_device_locks)
+
+
+def test_legacy_lock_cannot_break_a_live_shared_holder(tmp_path, monkeypatch):
+    """A live LOCK_SH holder must keep excluding the legacy LOCK_EX acquirer
+    even when the PID recorded in the lock file belongs to a dead process.
+
+    Several LOCK_SH holders overwrite that PID, so the recorded value can name a
+    process that has exited while another holder still owns the inode. Unlinking
+    on that signal let the legacy acquirer create a fresh file under the same
+    name and take LOCK_EX on a *different* inode — conflicting with nobody.
+    """
+    import vllm_omni.engine.stage_init_utils as siu
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setattr(
+        siu,
+        "device_init_lock_path",
+        lambda device_id, lock_dir="/tmp": device_init_lock_path(device_id, str(tmp_path)),
+    )
+
+    path = Path(device_init_lock_path(0, str(tmp_path)))
+    holder = DevicePhaseLock([0], lock_dir=str(tmp_path), timeout_s=5)
+
+    with holder.shared():
+        path.write_text(f"{_dead_pid()}\n")  # peer SH holder exited after recording its PID
+        inode_before = path.stat().st_ino
+
+        lock_fds = siu.acquire_device_locks(0, {"tensor_parallel_size": 1}, stage_init_timeout=1)
+
+        assert lock_fds == [], "legacy LOCK_EX must not be granted while a shared holder is live"
+        assert path.exists(), "the lock path must never be unlinked"
+        assert path.stat().st_ino == inode_before, "the lock inode must stay stable"
+
+    siu.release_device_locks(lock_fds)
+
+
+def test_phase_lock_reuses_the_existing_lock_inode(tmp_path):
+    """Repeated acquisitions coordinate on one stable inode per device."""
+    path = Path(device_init_lock_path(0, str(tmp_path)))
+    lock = DevicePhaseLock([0], lock_dir=str(tmp_path), timeout_s=1)
+
+    with lock.shared():
+        first = path.stat().st_ino
+    with lock.exclusive():
+        assert path.stat().st_ino == first
+    assert os.path.exists(path)
+
+
+def test_device_lock_file_never_visible_at_restrictive_mode(tmp_path):
+    """Concurrent creators must never observe the lock at a umask-filtered mode.
+
+    Creating in place with O_EXCL and widening afterwards publishes the file at
+    0600 under a restrictive umask; a second user opening it in that window is
+    locked out and parallel init aborts. Publishing atomically closes the window,
+    so every concurrent creator either wins the link or opens a readable file.
+    """
+    path = device_init_lock_path(0, str(tmp_path))
+    results: list[tuple[int, bool]] = []
+    errors: list[BaseException] = []
+    modes: list[int] = []
+    barrier = threading.Barrier(8)
+
+    def _worker() -> None:
+        barrier.wait()
+        try:
+            fd, writable = open_device_lock_file(path)
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the assert below
+            errors.append(exc)
+            return
+        try:
+            modes.append(os.stat(path).st_mode & 0o777)
+            results.append((fd, writable))
+        finally:
+            os.close(fd)
+
+    previous = os.umask(0o077)
+    try:
+        threads = [threading.Thread(target=_worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        os.umask(previous)
+
+    assert not errors, f"concurrent creators were locked out: {errors!r}"
+    assert len(results) == 8
+    assert all(m & 0o044 == 0o044 for m in modes), f"lock was visible at {[oct(m) for m in modes]}"
+    assert len({os.stat(path).st_ino}) == 1
+
+
+@pytest.mark.parametrize("umask_value", [0o022, 0o027, 0o077], ids=["022", "027", "077"])
+def test_device_lock_file_is_readable_by_other_users(tmp_path, umask_value):
+    """The lock file must stay group/other readable whatever the creator's umask.
+
+    These files coordinate GPU init *across* users, so a second user has to be
+    able to open the first user's file. The mode passed to ``os.open`` is filtered
+    by umask, so a restrictive umask (0027, 0077) would produce 0640 or 0600 and
+    lock every other user out -- fatal for parallel_stage_init, and a silent loss
+    of serialization in the legacy path.
+    """
+    path = device_init_lock_path(0, str(tmp_path))
+    previous = os.umask(umask_value)
+    try:
+        fd, writable = open_device_lock_file(path)
+    finally:
+        os.umask(previous)
+    try:
+        assert writable is True
+        mode = os.stat(path).st_mode & 0o777
+        assert mode & 0o044 == 0o044, f"lock file mode {mode:04o} is not readable by other users"
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file permission bits")
+def test_phase_lock_tolerates_lock_file_owned_by_another_user(tmp_path):
+    """A lock file created by a different user must not break locking.
+
+    These files coordinate *across* users -- two people on the same physical GPU
+    must contend on the same path -- so whoever creates one owns it at 0644 and
+    every later user's O_RDWR open fails with EACCES. That made parallel_stage_init
+    die at startup on any shared machine. flock attaches to the open file
+    description and needs no write access, so the read-only fallback keeps full
+    mutual exclusion and only forfeits the diagnostic PID write.
+    """
+    path = Path(device_init_lock_path(0, str(tmp_path)))
+    path.write_text("999999\n")
+    path.chmod(0o444)
+
+    fd, writable = open_device_lock_file(str(path))
+    try:
+        assert writable is False, "expected the read-only fallback on an unwritable file"
+    finally:
+        os.close(fd)
+
+    holder = DevicePhaseLock([0], lock_dir=str(tmp_path), timeout_s=0.3)
+    contender = DevicePhaseLock([0], lock_dir=str(tmp_path), timeout_s=0.2)
+    with holder.exclusive():
+        with pytest.raises(DeviceLockTimeoutError):
+            with contender.shared():
+                pass
+
+    assert path.read_text() == "999999\n", "must not clobber a file it cannot own"
 
 
 def test_resolve_driver_device_ids_dp_slice(monkeypatch):
@@ -403,6 +714,9 @@ class _FakeExecutor:
     def initialize_from_config(self, kv_cache_configs):
         return "ok"
 
+    def compile_or_warm_up_model(self):
+        return "warm"
+
 
 def test_wrapper_phase_ordering():
     locker = _RecordingLocker()
@@ -410,14 +724,39 @@ def test_wrapper_phase_ordering():
     exec_ = wrapped_cls(vllm_config=object())
     assert exec_.determine_available_memory() == 123
     assert exec_.initialize_from_config([]) == "ok"
+    assert exec_.compile_or_warm_up_model() == "warm"
     assert locker.events == [
         "SH-enter",
         "SH-exit",  # load
         "EX-enter",
         "EX-exit",  # profile
         "SH-enter",
-        "SH-exit",  # KV alloc + capture
+        "SH-exit",  # KV cache allocation
+        "SH-enter",
+        "SH-exit",  # kernel warmup + CUDA-graph capture
     ]
+
+
+def test_wrapper_locks_warmup_and_capture_separately():
+    """Regression guard for the upstream split.
+
+    ``Executor.initialize_from_config`` used to fuse ``compile_or_warm_up_model``
+    into itself; since vLLM v0.20.0 ``EngineCore._initialize_kv_caches`` calls the
+    two separately. If the wrapper only brackets ``initialize_from_config``, one
+    stage captures CUDA graphs — mutating device memory — while a peer holds the
+    exclusive lock for its profiling measurement.
+    """
+    locker = _RecordingLocker()
+    wrapped_cls = wrap_executor_with_phase_locks(_FakeExecutor, locker)
+    exec_ = wrapped_cls(vllm_config=object())
+    locker.events.clear()
+
+    assert exec_.compile_or_warm_up_model() == "warm"
+
+    assert locker.events == ["SH-enter", "SH-exit"], "compile_or_warm_up_model must run under the shared device lock"
+    assert "compile_or_warm_up_model" in vars(wrapped_cls), (
+        "the wrapper must override compile_or_warm_up_model, not inherit it unguarded"
+    )
 
 
 @pytest.mark.parametrize(
