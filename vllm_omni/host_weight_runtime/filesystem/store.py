@@ -12,6 +12,7 @@ import logging
 import os
 import shutil
 import stat
+import tempfile
 import time
 import uuid
 from collections import defaultdict
@@ -298,25 +299,15 @@ def _move_artifact_locked(source: Path, destination: Path) -> None:
 
 def _write_atomic_json(path: Path, value: object, *, mode: int = 0o444) -> None:
     data = canonical_json(value)
-    temporary = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_CLOEXEC, 0o600)
+    handle = tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False)
+    temporary = Path(handle.name)
     try:
-        try:
-            offset = 0
-            while offset < len(data):
-                count = os.write(fd, data[offset:])
-                if count <= 0:
-                    raise OSError(errno.EIO, f"short write for {temporary}")
-                offset += count
-            os.fsync(fd)
-            os.fchmod(fd, mode)
-            os.fsync(fd)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.close(fd)
-            raise
-        else:
-            os.close(fd)
+        with handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+            os.fchmod(handle.fileno(), mode)
+            os.fsync(handle.fileno())
         os.replace(temporary, path)
     except BaseException:
         with contextlib.suppress(OSError):
