@@ -598,6 +598,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             logger.warning("Stage payload connector unavailable: %s", exc)
             return None
 
+    def _stage_payload_broadcast_group(self) -> Any | None:
+        """Return the group whose ranks share one stage payload."""
+        tp_group = self._get_local_tp_group()
+        if tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
+            return tp_group
+        try:
+            from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+
+            sp_group = get_sp_group()
+        except (AssertionError, ImportError):
+            return None
+        return sp_group if getattr(sp_group, "world_size", 1) > 1 else None
+
     def _stage_input_payload_keys(self) -> tuple[str, ...]:
         """Payload keys this stage expects to receive from the previous stage.
 
@@ -632,16 +645,20 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             return
 
         from_stage, to_stage = self.kv_transfer_manager.recv_stages
-        tp_group = self._get_local_tp_group()
-        tp_active = tp_group is not None and getattr(tp_group, "world_size", 1) > 1
-        is_transfer_rank = not tp_active or self.is_data_transfer_rank()
+        broadcast_group = self._stage_payload_broadcast_group()
+        group_active = broadcast_group is not None
+        is_transfer_rank = not group_active or getattr(broadcast_group, "rank_in_group", 0) == 0
 
         connector = None
         if is_transfer_rank:
             # Ordinary stage payloads are TP-identical and published once by
             # the producer's transfer rank. Only the matching receiver rank
             # may consume the NIXL key; the payload is broadcast below.
-            sender_info = getattr(req, "kv_sender_info", None)
+            # Full payloads use the request-forwarding endpoint, which is
+            # distinct from the KV-transfer endpoint carried in kv_sender_info.
+            sender_info = getattr(req, "payload_sender_info", None)
+            if not sender_info:
+                sender_info = getattr(req, "kv_sender_info", None)
             if sender_info:
                 self.kv_transfer_manager.update_sender_info(sender_info, sender_stage_id=from_stage)
             connector = self._stage_payload_connector()
@@ -675,10 +692,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 logger.warning("Stage payload get failed for %s: %s", get_key, exc)
 
         payload = result[0] if result else None
-        if tp_active:
-            delivered = tp_group.broadcast_object(isinstance(payload, dict) if is_transfer_rank else None, src=0)
+        if broadcast_group is not None:
+            delivered = broadcast_group.broadcast_object(isinstance(payload, dict) if is_transfer_rank else None, src=0)
             if delivered:
-                payload = tp_group.broadcast_tensor_dict(payload if is_transfer_rank else None, src=0)
+                payload = broadcast_group.broadcast_tensor_dict(payload if is_transfer_rank else None, src=0)
 
         if payload is None:
             if is_transfer_rank:

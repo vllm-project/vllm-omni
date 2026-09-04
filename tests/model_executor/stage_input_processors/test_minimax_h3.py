@@ -407,6 +407,19 @@ def test_full_payload_hook_emits_the_diffusion_ready_structure():
     assert conditioning["token_tags"].shape == (4,)
 
 
+def test_full_payload_hook_accepts_flattened_runner_payload():
+    payload = _stage0_payload()
+    flattened = {
+        "hidden_states.output": payload["hidden_states"]["output"],
+        "meta.token_role_ids": payload["meta"]["token_role_ids"],
+    }
+
+    result = text_encoder2diffusion_full_payload(pooling_output=flattened)
+
+    assert torch.equal(result["text_encoder_output"]["hidden_states"], flattened["hidden_states.output"])
+    assert result["text_encoder_output"]["token_tags"].shape == (4,)
+
+
 def test_full_payload_hook_tolerates_a_connector_less_stage():
     assert text_encoder2diffusion_full_payload(pooling_output=None) is None
     assert text_encoder2diffusion_full_payload(pooling_output={"hidden_states": None}) is None

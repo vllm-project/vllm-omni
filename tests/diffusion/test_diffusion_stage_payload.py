@@ -70,8 +70,13 @@ def _make_output(**custom):
     return SimpleNamespace(custom_output=dict(custom))
 
 
-def _make_request(prompt, *, request_id="req-7", kv_sender_info=None):
-    return SimpleNamespace(prompt=prompt, request_id=request_id, kv_sender_info=kv_sender_info)
+def _make_request(prompt, *, request_id="req-7", kv_sender_info=None, payload_sender_info=None):
+    return SimpleNamespace(
+        prompt=prompt,
+        request_id=request_id,
+        kv_sender_info=kv_sender_info,
+        payload_sender_info=payload_sender_info,
+    )
 
 
 def _conditioning():
@@ -162,6 +167,20 @@ def test_sender_info_is_applied_before_the_connector_is_used():
     assert runner.kv_transfer_manager.sender_info_calls == [({0: {"host": "10.0.0.1", "zmq_port": 50171}}, "0")]
 
 
+def test_payload_sender_info_overrides_kv_sender_info_for_full_payloads():
+    connector = _FakeConnector(_conditioning())
+    runner = _make_runner(connector)
+    req = _make_request(
+        {"prompt": "a cat"},
+        kv_sender_info={0: {"host": "10.0.0.1", "zmq_port": 50171}},
+        payload_sender_info={"host": "10.0.0.1", "zmq_port": 50071},
+    )
+
+    runner._maybe_recv_stage_payload(req)
+
+    assert runner.kv_transfer_manager.sender_info_calls == [({"host": "10.0.0.1", "zmq_port": 50071}, "0")]
+
+
 def test_tp_payload_is_fetched_once_by_leader_and_broadcast_to_followers():
     connector = _FakeConnector(_conditioning())
     state = {}
@@ -230,6 +249,45 @@ def test_tp_payload_miss_is_broadcast_without_follower_connector_access():
     assert len(connector.calls) == 1
 
 
+def test_sp_payload_is_fetched_once_by_leader_and_broadcast_to_followers():
+    connector = _FakeConnector(_conditioning())
+    state = {}
+
+    class _FakeSPGroup:
+        world_size = 4
+
+        def __init__(self, rank):
+            self.rank_in_group = rank
+
+        def broadcast_object(self, value, src=0):
+            if self.rank_in_group == src:
+                state["delivered"] = value
+            return state["delivered"]
+
+        def broadcast_tensor_dict(self, value, src=0):
+            if self.rank_in_group == src:
+                state["payload"] = value
+            return state["payload"]
+
+    leader = _make_runner(connector)
+    leader._get_local_tp_group = lambda: None
+    leader._stage_payload_broadcast_group = lambda: _FakeSPGroup(0)
+    follower = _make_runner(connector)
+    follower._local_rank = 1
+    follower._get_local_tp_group = lambda: None
+    follower._stage_payload_broadcast_group = lambda: _FakeSPGroup(1)
+
+    leader_req = _make_request({"prompt": "a cat"})
+    follower_req = _make_request({"prompt": "a cat"})
+    leader._maybe_recv_stage_payload(leader_req)
+    follower._maybe_recv_stage_payload(follower_req)
+
+    assert len(connector.calls) == 1
+    leader_output = leader_req.prompt["additional_information"]["text_encoder_output"]["hidden_states"]
+    follower_output = follower_req.prompt["additional_information"]["text_encoder_output"]["hidden_states"]
+    assert torch.equal(leader_output, follower_output)
+
+
 def test_missing_incoming_edge_is_reported_not_fetched():
     connector = _FakeConnector(_conditioning())
     runner = _make_runner(connector, recv_stages=(None, None))
@@ -263,6 +321,7 @@ def test_send_puts_declared_keys_and_attaches_a_handle():
     from_stage, to_stage, put_key, data = connector.put_calls[0]
     assert (from_stage, to_stage, put_key) == ("0", "1", "req-7_0_0")
     # Only declared keys travel over the connector.
+    assert isinstance(data, dict)
     assert set(data) == {"prompt_embeds"}
     handle = output.custom_output[HANDLE_KEY]
     assert handle["key"] == "req-7_0_0"

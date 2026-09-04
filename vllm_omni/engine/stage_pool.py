@@ -986,6 +986,9 @@ class StagePool:
                     "Diffusion list-prompt batch requests are no longer supported. "
                     "Submit multiple independent requests to use scheduler batching."
                 )
+            payload_sender_info = getattr(request, "payload_sender_info", None)
+            if payload_sender_info is not None:
+                submit_kwargs.setdefault("payload_sender_info", payload_sender_info)
             replica_id = await self._pick_or_select(
                 request_id,
                 affinity_request_id=affinity_request_id,

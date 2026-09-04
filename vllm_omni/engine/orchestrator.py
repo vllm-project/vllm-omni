@@ -2648,16 +2648,20 @@ class Orchestrator:
             if already_submitted:
                 replica_id = await next_pool.submit_update(req_id, req_state, diffusion_prompt)
             else:
+                submit_kwargs = {
+                    "kv_sender_info": self._build_kv_sender_info(
+                        list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
+                        request_id=req_id,
+                    )
+                }
+                payload_sender_info = self._build_payload_sender_info(src_stage_id, request_id=req_id)
+                if payload_sender_info is not None:
+                    submit_kwargs["payload_sender_info"] = payload_sender_info
                 replica_id = await next_pool.submit_initial(
                     req_id,
                     req_state,
                     diffusion_prompt,
-                    submit_kwargs={
-                        "kv_sender_info": self._build_kv_sender_info(
-                            list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
-                            request_id=req_id,
-                        )
-                    },
+                    submit_kwargs=submit_kwargs,
                     params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
                 )
             self._record_duplex_stage_submission(

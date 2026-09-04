@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import asyncio
@@ -78,6 +81,33 @@ async def test_inline_dispatch_request_success(client, mock_engine):
 
     assert output is not None
     assert output.request_id == "req-1"
+
+
+def test_inline_dispatch_preserves_payload_sender_info(client, mock_engine):
+    async def _run_test():
+        requests = []
+
+        async def _step_streaming(request):
+            requests.append(request)
+            yield [OmniRequestOutput.from_diffusion(request_id=request.request_id, images=[MagicMock()])]
+
+        mock_engine.step_streaming = _step_streaming
+        payload_sender_info = {"host": "10.0.0.1", "zmq_port": 50071}
+        await client.add_request_async(
+            "req-payload",
+            "A test prompt",
+            OmniDiffusionSamplingParams(),
+            payload_sender_info=payload_sender_info,
+        )
+
+        for _ in range(10):
+            if requests:
+                break
+            await asyncio.sleep(0.01)
+
+        assert requests[0].payload_sender_info == payload_sender_info
+
+    asyncio.run(_run_test())
 
 
 @pytest.mark.asyncio
