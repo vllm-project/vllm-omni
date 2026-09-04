@@ -205,6 +205,10 @@ def test_hunyuan_image3_pd_structured_config_projects_vllm_kv_transfer() -> None
 
     prefill = omni_config.stage_by_id(0)
     decode = omni_config.stage_by_id(1)
+    assert prefill.scheduler_config.enable_chunked_prefill is True
+    assert decode.scheduler_config.enable_chunked_prefill is True
+    assert prefill.cache_config.enable_prefix_caching is False
+    assert decode.cache_config.enable_prefix_caching is False
     for stage, role, rank, port in [
         (prefill, "kv_producer", 0, 25201),
         (decode, "kv_consumer", 1, 25202),

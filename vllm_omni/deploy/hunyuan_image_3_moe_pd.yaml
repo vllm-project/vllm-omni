@@ -6,7 +6,7 @@ pipeline: hunyuan_image3_pd
 async_chunk: false
 trust_remote_code: true
 enable_prefix_caching: false
-enable_chunked_prefill: false
+enable_chunked_prefill: true
 
 connectors:
   rdma_connector:
@@ -114,3 +114,28 @@ edges:
     to: 2
     window_size: -1
     max_inflight: 1
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        devices: "0,1,2,3"
+        tensor_parallel_size: 4
+        gpu_memory_utilization: 0.8
+        max_num_batched_tokens: 8192
+
+      - stage_id: 1
+        devices: "4,5,6,7"
+        tensor_parallel_size: 4
+        gpu_memory_utilization: 0.8
+        max_num_batched_tokens: 8192
+
+      - stage_id: 2
+        devices: "8,9,10,11"
+        gpu_memory_utilization: 0.65
+        max_num_batched_tokens: 8192
+        parallel_config:
+          tensor_parallel_size: 4
+          enable_expert_parallel: false
+          sequence_parallel_size: 1
+          ulysses_degree: 1
