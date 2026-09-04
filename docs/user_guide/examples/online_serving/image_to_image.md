@@ -7,6 +7,26 @@ This example demonstrates how to deploy Qwen-Image-Edit model for online image e
 
 For **multi-image** input editing, use **Qwen-Image-Edit-2509** (QwenImageEditPlusPipeline) and send multiple images in the user message content.
 
+### Mage-Flow Edit
+
+Mage-Flow Edit supports one to three ordered reference images on a single CUDA
+GPU using BF16 and request-level padded batching:
+
+```bash
+vllm serve microsoft/Mage-Flow-Edit-Turbo --omni --port 8092 --dtype bfloat16 \
+  --max-num-seqs 2 --request-batch-max-wait-ms 20
+```
+
+The same batch may contain different reference counts; output resolution is
+part of the batch key, so requests that differ there are served separately.
+CFG positive and negative branches are packed into one transformer forward.
+
+Use `microsoft/Mage-Flow-Edit-Base`, `microsoft/Mage-Flow-Edit`, or
+`microsoft/Mage-Flow-Edit-Turbo`. Their default denoising steps are 30, 30, and
+4; default CFG values are 5.0, 5.0, and 1.0. The `mage_vision_long_edge`
+request parameter defaults to 384 and affects only the Qwen3-VL semantic path;
+VAE reference conditioning keeps the requested output resolution.
+
 ## Start Server
 
 ### Basic Start
@@ -118,6 +138,13 @@ python openai_chat_client.py --input input.png --prompt "Convert to oil painting
 
 # Multi-image editing (Qwen-Image-Edit-2509 server required)
 python openai_chat_client.py --input input1.png input2.png --prompt "Combine these images into a single scene" --output output.png
+
+# One to three Mage-Flow Edit references
+python openai_chat_client.py \
+  --model microsoft/Mage-Flow-Edit-Turbo \
+  --input input1.png input2.png input3.png \
+  --prompt "Combine the subject, setting, and palette" \
+  --output mage_edit.png
 ```
 
 ### Method 4: Using Gradio Demo

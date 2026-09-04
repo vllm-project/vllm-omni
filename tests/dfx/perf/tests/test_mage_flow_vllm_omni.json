@@ -1,0 +1,69 @@
+[
+    {
+        "test_name": "test_mage_flow_turbo_single_device",
+        "description": "Single-device BF16 baseline collection for Mage-Flow Turbo (no parallelism)",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "microsoft/Mage-Flow-Turbo",
+            "serve_args": {
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "1024x1024_steps4",
+                "dataset": "random",
+                "task": "t2i",
+                "width": 1024,
+                "height": 1024,
+                "num-inference-steps": 4,
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "enable-negative-prompt": false,
+                "skip-performance-assertion": true
+            },
+            {
+                "name": "512x2048_steps4",
+                "dataset": "random",
+                "task": "t2i",
+                "width": 2048,
+                "height": 512,
+                "num-inference-steps": 4,
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "enable-negative-prompt": false,
+                "skip-performance-assertion": true
+            }
+        ]
+    },
+    {
+        "test_name": "test_mage_flow_turbo_request_batch_2",
+        "description": "Single-device BF16 padded request batch throughput collection",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "microsoft/Mage-Flow-Turbo",
+            "serve_args": {
+                "enable-diffusion-pipeline-profiler": true,
+                "max-num-seqs": 2,
+                "request-batch-max-wait-ms": 20
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "512x512_steps4_concurrency2",
+                "dataset": "random",
+                "task": "t2i",
+                "width": 512,
+                "height": 512,
+                "num-inference-steps": 4,
+                "guidance-scale": 5.0,
+                "num-prompts": 20,
+                "max-concurrency": 2,
+                "warmup-requests": 2,
+                "warmup-concurrency": 2,
+                "enable-negative-prompt": true,
+                "skip-performance-assertion": true
+            }
+        ]
+    }
+]

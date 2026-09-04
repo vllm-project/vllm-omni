@@ -16,13 +16,25 @@ class DiffusionModelMetadata:
 
 
 QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
+MAGE_FLOW_MAX_INPUT_IMAGES = 3
 # Upstream HunyuanImage-3.0 "Multi-Image Fusion" caps reference images at 3.
 HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
 # Boogu-Image editing (TI2I) supports a single reference image for now.
 BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
 
+# Request-scoped controls MageFlowPipeline accepts through
+# OmniDiffusionSamplingParams.extra_args. This lives here rather than in
+# model_extras so that the entrypoint layer (which advertises the keys) and the
+# pipeline (which rejects everything else) cannot drift apart; a drift would let
+# a key pass request validation and then fail mid-request.
+MAGE_FLOW_EXTRA_BODY_PARAMS = frozenset({"mage_vision_long_edge"})
+
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
+    "MageFlowPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=MAGE_FLOW_MAX_INPUT_IMAGES,
+    ),
     "QwenImageEditPlusPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES,

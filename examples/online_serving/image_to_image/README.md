@@ -2,9 +2,28 @@
 
 This example demonstrates how to deploy image-to-image models for online image editing service using vLLM-Omni.
 
-Supported models include Qwen-Image-Edit, BAGEL, and other image-to-image pipelines.
+Supported models include Qwen-Image-Edit, Mage-Flow Edit, BAGEL, and other
+image-to-image pipelines.
 
 For **multi-image** input editing, use **Qwen-Image-Edit-2509** (QwenImageEditPlusPipeline) and send multiple images in the user message content.
+
+### Mage-Flow Edit
+
+Mage-Flow Edit supports one to three ordered reference images on a single CUDA
+GPU using BF16 and request-level padded batching:
+
+```bash
+vllm serve microsoft/Mage-Flow-Edit-Turbo --omni --port 8092 --dtype bfloat16 \
+  --max-num-seqs 2 --request-batch-max-wait-ms 20
+```
+
+The same batch may contain different reference counts; output resolution is
+part of the batch key, so requests that differ there are served separately.
+CFG positive and negative branches are packed into one transformer forward.
+
+Base/RL/Turbo default to 30/30/4 steps and CFG 5.0/5.0/1.0. Set
+`mage_vision_long_edge` in the request body to change the Qwen3-VL visual
+conditioning size (default 384).
 
 ## Start Server
 

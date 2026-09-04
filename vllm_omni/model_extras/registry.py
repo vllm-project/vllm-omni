@@ -36,6 +36,7 @@ from vllm_omni.model_extras.ltx2 import (
     ltx_preserves_reference_image_size,
     ltx_transformer_config_subfolder,
 )
+from vllm_omni.model_extras.mage_flow import MAGE_FLOW_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.mammothmodal2_preview import (
     MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS,
     MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS,
@@ -172,6 +173,9 @@ def default_image_to_image_prompt(
 
 
 _EXTRA_SPECS: dict[str, dict[str, Any]] = {
+    "MageFlowPipeline": {
+        "extra_body_params": MAGE_FLOW_EXTRA_BODY_PARAMS,
+    },
     "BagelPipeline": {
         "extra_body_params": BAGEL_EXTRA_BODY_PARAMS,
         "extra_output_params": BAGEL_EXTRA_OUTPUT_PARAMS,

@@ -215,6 +215,8 @@ steps:
           - >-
             pytest -sv
             tests/e2e/online_serving/test_qwen_image_expansion.py
+            tests/e2e/online_serving/test_mage_flow_expansion.py
+            tests/e2e/online_serving/test_mage_flow_edit_expansion.py
             -m "full_model and diffusion and H100 and cards_1"
             --run-level "full_model"
         mirror_hardwares: h100_1

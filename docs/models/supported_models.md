@@ -26,6 +26,7 @@ th {
 | `InternVLAA1Pipeline` | InternVLA-A1 | `InternRobotics/InternVLA-A1-3B` | ✅︎ | ✅︎ | | | — |
 | `Gr00tN1d7Pipeline` | GR00T N1.7 | `nvidia/GR00T-N1.7-3B` | ✅︎ | | | | — |
 | `HunyuanImage3ForCausalMM` | HunyuanImage3.0 (DiT-only) | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
+| `MageFlowPipeline` | Mage-Flow (T2I and Edit, Base / RL / Turbo)<sup>2</sup> | `microsoft/Mage-Flow-Base`, `microsoft/Mage-Flow`, `microsoft/Mage-Flow-Turbo`, `microsoft/Mage-Flow-Edit-Base`, `microsoft/Mage-Flow-Edit`, `microsoft/Mage-Flow-Edit-Turbo` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/microsoft/Mage-Flow.md) |
 | `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` | ✅︎ | | | ✅︎ | [Published](https://recipes.vllm.ai/Qwen/Qwen-Image) |
 | `QwenImagePipeline` | Qwen-Image-2512 | `Qwen/Qwen-Image-2512` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen-Image-2512.md) |
 | `QwenImageEditPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
@@ -118,6 +119,25 @@ explicitly documented in that recipe. Other rows retain the implementation
 support metadata until their recipe is audited.
 
 ✅︎ indicates the model is supported on that backend. Empty cells mean not listed as supported on that backend.
+
+<sup>2</sup> Mage-Flow currently supports CUDA BF16, request-level padded
+batching, packed CFG, and one output per request. A batch may contain different
+prompt lengths and a mix of T2I and Edit requests, but not differing output
+resolutions; Edit accepts one to three PIL, NumPy, or Tensor reference images. Multi-GPU execution supports
+tensor parallelism, CFG parallelism (degree 2), and Ulysses sequence
+parallelism; see the [Mage-Flow recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/microsoft/Mage-Flow.md)
+for tested configurations. Sequence parallelism requires uniform token counts
+across the batch, so it is refused at startup unless `--max-num-seqs 1`; under
+it a guided request runs the two guidance branches as sequential forwards, and
+`--cfg-parallel-size 2` is the faster pairing because it splits them by rank. Quantization, LoRA, pipeline parallelism, HSDP, VAE parallel, step
+execution, and diffusion cache are not yet supported. The upstream reference
+implementation additionally runs a mandatory, fail-closed content-policy gate
+on its text encoder and embeds a Gaussian-Shading provenance watermark in the
+initial noise; this integration provides neither, so deployments are
+responsible for their own content moderation and provenance marking. The
+upstream checkpoints are released for research purposes and are not intended
+for product or service deployment; the weight repositories are gated, so accept
+their access terms before serving.
 
 See the [LingBot-World 2.0 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Robbyant/LingBot-World-2.0.md)
 for offline and experimental realtime usage, supported controls, validation,
