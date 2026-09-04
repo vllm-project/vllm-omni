@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from datetime import timedelta
 from types import SimpleNamespace
 
 import numpy as np
@@ -25,7 +26,7 @@ def _make_pipeline():
     pipeline.default_negative_prompt = "default negative"
     pipeline.default_image_negative_prompt = "default image negative"
     pipeline.img_prompt_template = "<image>"
-    pipeline.od_config = SimpleNamespace(flow_shift=None)
+    pipeline.od_config = SimpleNamespace(flow_shift=None, parallel_config=SimpleNamespace(cfg_parallel_size=1))
     return pipeline
 
 
@@ -97,7 +98,7 @@ def test_component_discovery_declarations():
         ({"tensor_parallel_size": 2}, {}, "tensor parallelism"),
         ({"enable_expert_parallel": True}, {}, "expert parallelism"),
         ({"ulysses_degree": 2}, {}, "sequence parallelism"),
-        ({"cfg_parallel_size": 2}, {}, "CFG parallelism"),
+        ({"vae_patch_parallel_size": 2}, {}, "VAE patch parallelism"),
         ({"use_hsdp": True, "hsdp_shard_size": 2}, {}, "HSDP"),
         ({}, {"enable_cpu_offload": True}, "CPU offload"),
         ({}, {"enable_layerwise_offload": True}, "layerwise offload"),
@@ -706,3 +707,266 @@ def test_load_weights_rejects_external_weight_stream():
     assert pipeline.load_weights([]) == set()
     with pytest.raises(RuntimeError, match="components are loaded directly"):
         pipeline.load_weights([("transformer.weight", torch.zeros(1))])
+
+
+@pytest.mark.parallel
+@pytest.mark.parametrize("cache_backend", ["none", "cache_dit"])
+@pytest.mark.parametrize(
+    ("parallel_kwargs", "config_overrides", "message"),
+    [
+        ({"cfg_parallel_size": 3}, {}, "cfg_parallel_size"),
+        ({"tensor_parallel_size": 2}, {}, "tensor parallelism"),
+        ({"ulysses_degree": 2}, {}, "sequence parallelism"),
+        ({"ring_degree": 2}, {}, "sequence parallelism"),
+        ({"pipeline_parallel_size": 2}, {}, "pipeline parallelism"),
+        ({"enable_expert_parallel": True}, {}, "expert parallelism"),
+        ({"use_hsdp": True, "hsdp_shard_size": 2}, {}, "HSDP"),
+        ({"vae_patch_parallel_size": 2}, {}, "VAE patch parallelism"),
+        ({}, {"enable_cpu_offload": True}, "CPU offload"),
+        ({}, {"enable_layerwise_offload": True}, "layerwise offload"),
+        ({}, {"enable_distributed_layerwise_offload": True}, "distributed layerwise offload"),
+        ({}, {"cache_backend": "tea_cache"}, "cache_backend"),
+    ],
+)
+def test_cfg_parallel_rejects_unsupported_config_before_loading(
+    monkeypatch, cache_backend, parallel_kwargs, config_overrides, message
+):
+    test_cache_dit_rejects_unvalidated_configuration_before_loading(
+        monkeypatch,
+        {"cfg_parallel_size": 2, **parallel_kwargs},
+        {"cache_backend": cache_backend, **config_overrides},
+        message,
+    )
+
+
+@pytest.mark.parallel
+@pytest.mark.parametrize("cache_backend", ["none", "cache_dit"])
+@pytest.mark.parametrize(
+    ("sampling_overrides", "message"),
+    [
+        ({"guidance_scale": 1.0}, "guidance_scale"),
+        ({"extra_args": {"batch_cfg": True}}, "batch_cfg"),
+        ({"extra_args": {"null_cond_clone_zero": True}}, "null_cond_clone_zero"),
+        ({"extra_args": {"offload_vae_during_denoise": True}}, "offload_vae_during_denoise"),
+        ({"extra_args": {"t_thresh": 0.2}}, "t_thresh"),
+    ],
+)
+def test_cfg_parallel_rejects_request_before_collectives(cache_backend, sampling_overrides, message):
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = _make_pipeline()
+    pipeline.od_config.parallel_config.cfg_parallel_size = 2
+    pipeline.od_config.cache_backend = cache_backend
+    pipeline._generate = lambda **kwargs: pytest.fail("invalid request reached generation")
+    with pytest.raises(OmniClientError, match=message):
+        pipeline.forward(_make_request_batch("positive", guidance_scale_provided=True, **sampling_overrides))
+
+
+def _make_tiny_cfg_pipeline(monkeypatch, cfg_size, cache_backend):
+    from tests.diffusion.models.lingbot_video.test_lingbot_video_transformer import (
+        _force_torch_sdpa,
+        _tiny_transformer,
+    )
+    from vllm_omni.diffusion.attention import selector
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+    from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module
+    from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+
+    # Spawned workers do not inherit pytest fixtures or selector caches. Use
+    # real CPU attention without probing a CUDA platform detected through NVML.
+    monkeypatch.setattr(selector, "_cached_get_backend_cls", lambda *a, **k: SDPABackend)
+
+    with torch.random.fork_rng(devices=[]), _force_torch_sdpa():
+        torch.random.default_generator.manual_seed(1234)
+        model = _tiny_transformer(depth=3)
+    monkeypatch.setattr(module, "get_local_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(module.LingBotVideoTransformer3DModel, "from_pretrained", lambda *a, **k: model)
+    monkeypatch.setattr(module.Qwen3VLForConditionalGeneration, "from_pretrained", lambda *a, **k: nn.Identity())
+    monkeypatch.setattr(module.Qwen3VLProcessor, "from_pretrained", lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(module.AutoencoderKLWan, "from_pretrained", lambda *a, **k: nn.Identity())
+    monkeypatch.setattr(
+        module.FlowUniPCMultistepScheduler, "from_pretrained", lambda *a, **k: FlowUniPCMultistepScheduler()
+    )
+    pipeline = module.LingBotVideoPipeline(
+        od_config=_make_cache_config(
+            parallel_kwargs={"cfg_parallel_size": cfg_size}, cache_backend=cache_backend, dtype=torch.float32
+        )
+    )
+    pipeline.encoded_prompts = []
+    pipeline.decoded_latents = []
+    pipeline.scheduler_calls = []
+    pipeline.final_latents = []
+
+    def encode(prompt, **kwargs):
+        pipeline.encoded_prompts.append(prompt)
+        # Different lengths exercise independent branch ownership without padding.
+        length, value = (3, 1.0) if prompt == "positive" else (2, -1.0)
+        return torch.full((1, length, 8), value), torch.ones(1, length, dtype=torch.long)
+
+    def decode(latents):
+        pipeline.decoded_latents.append(latents.clone())
+        return latents
+
+    original_step = pipeline.scheduler.step
+    original_generate = pipeline._generate
+
+    def step(*args, **kwargs):
+        pipeline.scheduler_calls.append(1)
+        return original_step(*args, **kwargs)
+
+    def generate(**kwargs):
+        result = original_generate(**kwargs)
+        if isinstance(result, torch.Tensor):
+            pipeline.final_latents.append(result.clone())
+        return result
+
+    pipeline.encode_prompt = encode
+    pipeline._decode_latents = decode
+    pipeline.scheduler.step = step
+    pipeline._generate = generate
+    return pipeline
+
+
+def _cfg_cpu_worker(rank, rendezvous, cache_backend):
+    import cache_dit
+    import torch.distributed as dist
+
+    from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend
+    from vllm_omni.diffusion.data import DiffusionCacheConfig
+    from vllm_omni.diffusion.distributed import parallel_state
+    from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+    from vllm_omni.errors import OmniClientError
+
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=45))
+    try:
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(
+                parallel_state, "_CFG", SimpleNamespace(world_size=2, rank_in_group=rank, device_group=dist.group.WORLD)
+            )
+            pipeline = _make_tiny_cfg_pipeline(monkeypatch, 2, cache_backend)
+            assert pipeline.transformer._cache_dit_adapter_config.has_separate_cfg is False
+            runner = object.__new__(DiffusionModelRunner)
+            runner.pipeline = pipeline
+            runner.cache_backend = None
+            if cache_backend == "cache_dit":
+                runner.cache_backend = CacheDiTBackend(
+                    DiffusionCacheConfig(max_warmup_steps=1, residual_diff_threshold=1e6, max_continuous_cached_steps=8)
+                )
+                runner.cache_backend.enable(pipeline)
+            block_calls = [0, 0, 0]
+            hooks = [
+                block.register_forward_hook(lambda _m, _a, _o, i=i: block_calls.__setitem__(i, block_calls[i] + 1))
+                for i, block in enumerate(pipeline.transformer.blocks)
+            ]
+            try:
+                # Invalid request on both ranks must leave the group usable.
+                with pytest.raises(OmniClientError, match="batch_cfg"):
+                    pipeline.forward(_make_request_batch("positive", extra_args={"batch_cfg": True}))
+                outputs = []
+                for steps, seed, output_type in [
+                    (6, 42, "latent"),
+                    (4, None, "latent"),
+                    (6, 42, "latent"),
+                    (4, 42, "pt"),
+                ]:
+                    sampling = dict(
+                        height=16,
+                        width=16,
+                        num_frames=5,
+                        num_inference_steps=steps,
+                        guidance_scale=3.0,
+                        guidance_scale_provided=True,
+                        output_type=output_type,
+                        seed=seed if rank == 0 or seed is None else 99,
+                    )
+                    # Unseeded, explicit initial latents intentionally disagree across ranks.
+                    if seed is None:
+                        sampling["latents"] = torch.full((1, 2, 2, 2, 2), 0.5 + rank)
+                    request = _make_request_batch({"prompt": "positive", "negative_prompt": "negative"}, **sampling)
+                    runner._refresh_cache_for_requests(request.requests, od_config=pipeline.od_config)
+                    before = sum(block_calls)
+                    result = pipeline.forward(request)
+                    if output_type == "latent":
+                        peers = [torch.empty_like(pipeline.final_latents[-1]) for _ in range(2)]
+                        dist.all_gather(peers, pipeline.final_latents[-1])
+                        torch.testing.assert_close(peers[0], peers[1], rtol=0, atol=0)
+                        assert torch.isfinite(peers[0]).all()
+                        outputs.append(peers[0])
+                    if rank == 0:
+                        assert result.output["video"] is not None
+                        # Compare against the same tiny model's actual sequential CFG + UniPC path.
+                        with pytest.MonkeyPatch.context() as ref_patch:
+                            reference = _make_tiny_cfg_pipeline(ref_patch, 1, cache_backend)
+                            assert reference.transformer._cache_dit_adapter_config.has_separate_cfg is True
+                            ref_backend = None
+                            if cache_backend == "cache_dit":
+                                ref_backend = CacheDiTBackend(runner.cache_backend.config)
+                                ref_backend.enable(reference)
+                                ref_backend.refresh(reference, steps, verbose=False)
+                            try:
+                                expected = reference.forward(
+                                    _make_request_batch(
+                                        {"prompt": "positive", "negative_prompt": "negative"}, **sampling
+                                    )
+                                ).output["video"]
+                                torch.testing.assert_close(result.output["video"], expected, rtol=0, atol=0)
+                            finally:
+                                if ref_backend is not None:
+                                    ref_backend.disable(reference)
+                    else:
+                        assert result.output is None
+                    if cache_backend == "cache_dit":
+                        [stats, *_] = cache_dit.summary(pipeline.transformer, logging=False)
+                        assert stats.cached_steps
+                        assert not stats.cfg_cached_steps
+                        assert max(stats.cached_steps) < steps
+                        assert sum(block_calls) - before < steps * 3
+                    else:
+                        assert sum(block_calls) - before == steps * 3
+                    dist.barrier()
+                torch.testing.assert_close(outputs[0], outputs[2], rtol=0, atol=0)
+                assert pipeline.encoded_prompts == ["positive" if rank == 0 else "negative"] * 4
+                assert len(pipeline.scheduler_calls) == (20 if rank == 0 else 0)
+                assert len(pipeline.decoded_latents) == (1 if rank == 0 else 0)
+            finally:
+                for hook in hooks:
+                    hook.remove()
+                if runner.cache_backend is not None:
+                    runner.cache_backend.disable(pipeline)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parallel
+@pytest.mark.parametrize("cache_backend", ["none", pytest.param("cache_dit", marks=pytest.mark.cache)])
+def test_cfg_parallel_two_process_parity_and_request_isolation(tmp_path, cache_backend):
+    import torch.distributed as dist
+    import torch.multiprocessing as mp
+
+    if not dist.is_gloo_available():
+        pytest.skip("CPU distributed test requires Gloo")
+    mp.spawn(_cfg_cpu_worker, args=((tmp_path / "gloo_init").as_uri(), cache_backend), nprocs=2, join=True)
+
+
+@pytest.mark.parallel
+@pytest.mark.parametrize("rank", [0, 1])
+def test_cfg_parallel_allows_guidance_disabled_dummy_warmup(monkeypatch, rank):
+    from vllm_omni.diffusion.models.lingbot_video import pipeline_lingbot_video as module
+
+    pipeline = _make_pipeline()
+    pipeline.od_config.parallel_config.cfg_parallel_size = 2
+    pipeline.od_config.cache_backend = "cache_dit"
+    monkeypatch.setattr(module, "get_cfg_group", lambda: SimpleNamespace(world_size=2, rank_in_group=rank))
+    calls = []
+
+    def generate(**kwargs):
+        calls.append(kwargs)
+        return torch.ones(1)
+
+    pipeline._generate = generate
+    request = _make_request_batch("positive", guidance_scale=1.0, guidance_scale_provided=True)
+    request.requests[0].request_id = DUMMY_DIFFUSION_REQUEST_ID
+    output = pipeline.forward(request)
+    assert calls[0]["cfg_parallel_group"] is None
+    assert (output.output is None) == (rank == 1)

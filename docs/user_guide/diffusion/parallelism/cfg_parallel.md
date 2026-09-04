@@ -54,6 +54,34 @@ outputs = omni.generate(
 
 ---
 
+### LingBot-Video
+
+For dense and MoE LingBot-Video checkpoints, use two resident DiT replicas:
+
+```bash
+vllm serve robbyant/lingbot-video-moe-30b-a3b --omni \
+  --model-class-name LingBotVideoPipeline --cfg-parallel-size 2
+```
+
+Requests must use `guidance_scale > 1`. CFG rank 0 computes the positive branch,
+advances the scheduler, and decodes the output; rank 1 computes the negative
+branch. Rank 0 broadcasts latents at every step and after the last update, so
+both branches use the same noise even for unseeded requests. Each rank holds a
+full transformer; CFG parallel does not shard model weights.
+
+Add `--cache-backend cache_dit` to enable Cache-DiT. Sequential CFG maintains two
+cache contexts in one process; CFG2 maintains one branch context per process.
+The runner refreshes both processes' caches before each request. Measure cache
+quality and speed separately for CFG1 and CFG2.
+
+CFG2 supports the base transformer with cache disabled or Cache-DiT. It rejects
+TP, SP (including Ring), PP, EP, HSDP, VAE patch parallelism, and CPU/layerwise
+offload combinations before loading weights. Requests using `batch_cfg`,
+`null_cond_clone_zero`, `offload_vae_during_denoise`, or `t_thresh` are rejected
+before generation. Internal guidance-disabled warmup runs locally on each rank.
+
+---
+
 ## Example Script
 
 ### Offline Inference
