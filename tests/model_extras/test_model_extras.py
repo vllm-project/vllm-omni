@@ -196,6 +196,25 @@ def test_cosmos3_extra_registry_declares_request_and_response_params(pipeline_na
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_cosmos3_multiview_extra_registry() -> None:
+    assert get_extra_body_params("Cosmos3MultiviewPipeline") == frozenset(
+        {
+            "multiview",
+            "wsm",
+            "flow_shift",
+            "max_sequence_length",
+            "negative_prompt",
+            "resolution",
+            "fps",
+            "frame_rate",
+            "resolved_frame_rate",
+        }
+    )
+    assert get_extra_output_params("Cosmos3MultiviewPipeline") == frozenset()
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_ltx_extra_registry_declares_official_guidance_params() -> None:
     expected = frozenset(
         {

@@ -166,6 +166,37 @@ def test_edge_config_resolves_nemotron_defaults() -> None:
     assert model.temporal_compression_factor == 4
 
 
+def test_multiview_transformer_installs_sparse_cross_attention_and_clears_mask_cache() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_multiview import (
+        COSMOS3_MULTIVIEW_BACKBONE_TYPE,
+        Cosmos3MultiviewCrossAttention,
+        Cosmos3MultiviewVFMTransformer,
+    )
+
+    model = Cosmos3MultiviewVFMTransformer(
+        SimpleNamespace(
+            tf_model_config=_tiny_cosmos3_config(
+                num_hidden_layers=1,
+                backbone_type=COSMOS3_MULTIVIEW_BACKBONE_TYPE,
+            ),
+            dtype=torch.float32,
+        )
+    )
+
+    assert isinstance(model.gen_layers[0].cross_attention, Cosmos3MultiviewCrossAttention)
+    model._multiview_mask_cache[("fixture",)] = object()
+    model._multiview_buffer_cache[("fixture",)] = torch.empty(0)
+    model.cached_kv = []
+    model.cached_freqs_gen = (torch.empty(0), torch.empty(0))
+    model.reset_cache()
+    # Both request-local caches must go: the masks are keyed on request
+    # geometry, and the packing buffers hold gigabytes between requests.
+    assert model._multiview_mask_cache == {}
+    assert model._multiview_buffer_cache == {}
+    assert model.cached_kv is None
+    assert model.cached_freqs_gen is None
+
+
 def test_edge_config_requires_backbone_type() -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import (
         Cosmos3EdgeVFMTransformer,

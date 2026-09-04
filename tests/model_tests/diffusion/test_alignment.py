@@ -68,6 +68,9 @@ EXCLUDED_MODELS = [
     "OmniVoice",
     "Cosmos3OmniDiffusersPipeline",
     "Cosmos3OmniPipeline",
+    # Requires a CUDA FlexAttention kernel plus a fixed camera/control asset
+    # bundle; covered by dedicated mask/pipeline tests and checkpoint E2E.
+    "Cosmos3MultiviewPipeline",
     "DiffusersAdapterPipeline",
     "HiDreamImagePipeline",
     "HiDreamO1ImagePipeline",

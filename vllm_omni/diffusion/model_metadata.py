@@ -87,6 +87,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "DreamIDOmniPipeline": DiffusionModelMetadata(final_output_type="video"),
     "Cosmos3OmniDiffusersPipeline": DiffusionModelMetadata(final_output_type="video"),
     "Cosmos3OmniPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "Cosmos3MultiviewPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SanaVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SanaImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SanaWmPipeline": DiffusionModelMetadata(

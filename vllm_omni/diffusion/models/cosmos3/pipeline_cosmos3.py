@@ -108,7 +108,12 @@ from .transfer import (
     transfer_max_frames_from_extra_args,
     uint8_cthw_to_normalized_5d,
 )
-from .transformer_cosmos3 import Cosmos3VFMTransformer, _tf_config_get, resolve_sound_gen
+from .transformer_cosmos3 import (
+    COSMOS3_MULTIVIEW_BACKBONE_TYPE,
+    Cosmos3VFMTransformer,
+    _tf_config_get,
+    resolve_sound_gen,
+)
 from .transformer_cosmos3_edge import COSMOS3_EDGE_BACKBONE_TYPE, Cosmos3EdgeVFMTransformer
 from .utils import (
     COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION,
@@ -296,6 +301,10 @@ def resolve_cosmos3_transformer_cls(model_config: Any) -> type[Cosmos3VFMTransfo
         return Cosmos3VFMTransformer
     if backbone_type == COSMOS3_EDGE_BACKBONE_TYPE:
         return Cosmos3EdgeVFMTransformer
+    if backbone_type == COSMOS3_MULTIVIEW_BACKBONE_TYPE:
+        from .transformer_cosmos3_multiview import Cosmos3MultiviewVFMTransformer
+
+        return Cosmos3MultiviewVFMTransformer
     raise ValueError(f"Unsupported Cosmos3 transformer backbone_type={backbone_type!r}.")
 
 

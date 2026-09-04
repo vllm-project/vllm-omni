@@ -316,6 +316,11 @@ _DIFFUSION_MODELS = {
         "pipeline_cosmos3",
         "Cosmos3OmniDiffusersPipeline",
     ),
+    "Cosmos3MultiviewPipeline": (
+        "cosmos3",
+        "pipeline_cosmos3_multiview",
+        "Cosmos3MultiviewPipeline",
+    ),
     "DiffusersAdapterPipeline": (
         "diffusers_adapter",
         "pipeline_diffusers_adapter",
@@ -368,6 +373,8 @@ _NO_CACHE_ACCELERATION = {
     # instead of erroring.
     "Pi0Pipeline",
     "LingBotWorldCausalDMDPipeline",
+    # Cache-DiT has not been validated with the model-local FlexAttention mask.
+    "Cosmos3MultiviewPipeline",
 }
 
 
@@ -592,6 +599,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
+    "Cosmos3MultiviewPipeline": "get_cosmos3_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
@@ -605,6 +613,7 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
     # where mod_folder and mod_relname are defined and mapped using `_DIFFUSION_MODELS` via the `arch` key.
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_ir_op_priority_func",
     "Cosmos3OmniPipeline": "get_cosmos3_ir_op_priority_func",
+    "Cosmos3MultiviewPipeline": "get_cosmos3_ir_op_priority_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {

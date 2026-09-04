@@ -49,3 +49,17 @@ COSMOS3_EXTRA_OUTPUT_PARAMS = frozenset(
         "action_mode",
     }
 )
+
+COSMOS3_MULTIVIEW_EXTRA_BODY_PARAMS = frozenset(
+    {
+        "multiview",
+        "wsm",
+        "flow_shift",
+        "max_sequence_length",
+        "negative_prompt",
+        "resolution",
+        "fps",
+        "frame_rate",
+        "resolved_frame_rate",
+    }
+)

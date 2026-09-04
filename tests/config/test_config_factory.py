@@ -442,6 +442,7 @@ class TestStageConfigFactory:
             "WanPipeline",
             "LTX2Pipeline",
             "Cosmos3OmniDiffusersPipeline",
+            "Cosmos3MultiviewPipeline",
         ],
     )
     def test_default_video_diffusion_output_type(self, model_class_name):
