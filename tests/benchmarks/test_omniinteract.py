@@ -203,18 +203,19 @@ def test_archive_is_safe_and_atomically_shared(tmp_path: Path, monkeypatch: pyte
     assert not list(target.glob(".tmp-*"))
 
 
-def test_hub_archive_uses_vllm_filesystem(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("dataset_repo", ["org/repo", "org/repo@revision"])
+def test_hub_archive_uses_vllm_filesystem(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dataset_repo: str):
     source = tmp_path / "source.tar"
     _archive(source, "data/1q1a/video_json_map.json")
 
     class FS:
         def get_file(self, remote: str, local: str) -> None:
-            assert remote == "datasets/org/repo/data.tar.gz"
+            assert remote == f"datasets/{dataset_repo}/data.tar.gz"
             Path(local).write_bytes(source.read_bytes())
 
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
     monkeypatch.setattr(data, "hf_fs", lambda: FS())
-    assert (data.resolve_omniinteract_root(None, "org/repo") / "1q1a").is_dir()
+    assert (data.resolve_omniinteract_root(None, dataset_repo) / "1q1a").is_dir()
 
 
 def test_media_commands_are_bounded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

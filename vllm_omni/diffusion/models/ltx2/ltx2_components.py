@@ -550,6 +550,13 @@ def get_ltx2_post_process_func(od_config: Any):
         if not (isinstance(output, tuple) and len(output) == 2):
             return output
         video, audio = output
+        if isinstance(video, torch.Tensor) and video.dtype == torch.uint8:
+            if video.ndim != 5 or video.shape[-1] != 3 or not video.is_contiguous():
+                raise ValueError(
+                    "LTX uint8 video output must be contiguous BTHWC RGB, "
+                    f"got shape={tuple(video.shape)} stride={video.stride()}"
+                )
+            video = video.detach().cpu().numpy()
         if isinstance(audio, torch.Tensor):
             audio = audio.detach().cpu()
         result: dict[str, Any] = {"video": video, "audio": audio}
