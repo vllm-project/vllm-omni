@@ -61,22 +61,30 @@ configurations.
 
 ## Automatic Safetensors Startup Staging
 
-Eligible CUDA safetensors loads automatically use bounded pinned-memory staging
-(typically 1–3 GiB of pinned host memory per rank). Floating-point weights are
+Eligible CUDA safetensors loads automatically use bounded pinned-memory staging:
+the cooperative path keeps up to 4 GiB of that buffer per rank in flight, while
+the single-rank pinned path uses a smaller pool. Floating-point weights are
 converted to their destination dtype while copied into the staging pool,
 avoiding a pageable or dtype-converting H2D transfer. The pinned staging path
 is automatically skipped for quantized weights using torchao strategies,
 non-floating tensors, CPU destination offload, layerwise-offload backends,
 request-scoped pipelines, DeepSpeed CPU offload, and non-quantized HSDP with
-CPU destinations. All excluded paths fall back silently to the existing loader
-without affecting correctness.
+CPU destinations. It is also skipped when the whole checkpoint is already in
+the page cache: nothing is left for staging to win once the pages are warm, so
+the existing multi-thread loader runs instead. All excluded paths fall back
+silently to the existing loader without affecting correctness.
 
 With the multiprocessing executor, the parent process also prewarms checkpoint
-pages while GPU workers spawn and import modules. It reads pipeline components
-first, then transformer shards. Before worker model initialization starts, all
-workers wait for the parent readers to stop and join; foreground component
-loading therefore never competes with speculative I/O. The exact model revision
-is resolved from the same local Hugging Face cache used by demand loading.
+pages while GPU workers spawn and import modules. Daemon threads issue chunked
+``readahead`` / ``posix_fadvise`` hints (falling back to a copy) with the
+transformer shards first, because the weight loader consumes those while
+pipeline construction is already opening the text encoder and VAE. Demand
+loading yields individual safetensors and pauses the speculative copies while
+a demanded file still needs the disk, so foreground component loading is not
+fighting the prewarm for I/O. The parent stops the readers once the workers
+report ready.
+The exact model revision is resolved from the same local Hugging Face cache
+used by demand loading.
 Resident files, insufficient host or cgroup memory, and unavailable local
 snapshots degrade to no-op behavior without error.
 

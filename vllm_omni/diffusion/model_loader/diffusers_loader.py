@@ -393,9 +393,86 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         """Hand page-cache ownership from speculative prewarm to the loader."""
         handle = getattr(self, "_weights_prewarm_handle", None)
         if handle is not None:
-            handle.stop()
-            handle.join()
+            stop_weights_prewarm(handle)
             self._weights_prewarm_handle = None
+
+    def _resident_cast_gate_across_tp(self, files: list[str], local_eligible: bool) -> bool:
+        """Group-agreed residency gate for the fast path.
+
+        A fully page-cache-resident checkpoint has no disk pressure left, so
+        cooperation's only remaining win is halving H2D bytes - and the
+        per-rank local multithread iterator is faster than a bucket schedule
+        once the pages are warm: the pinned pool plus one broadcast per bucket
+        buys nothing when the H2D it removes is ~1.3 s per component. Measured
+        on g7e.12xlarge (vLLM 0.32, TP=2, hot cache): HunyuanImage-3.0 BF16
+        15.2 s cooperative vs 13.7 s local, MiniMax-H3 BF16 19.2 s vs 10.9 s.
+
+        Every rank of the TP group must enter this vote. ``local_eligible`` is
+        per rank (CUDA visibility, pinned-memory availability under Ray), so it
+        is folded into the voted value rather than guarding the call: a
+        rank-local guard would send one rank into this collective while a peer
+        enters the preflight collective instead, and the two would never meet.
+        The MIN-reduce is what makes the branch safe."""
+        if not files:
+            return False
+        local = 1 if (local_eligible and checkpoint_fully_resident(files)) else 0
+        try:
+            import torch.distributed as dist
+
+            if not (dist.is_available() and dist.is_initialized()):
+                return bool(local)
+            from vllm.distributed.parallel_state import get_tp_group
+
+            group = get_tp_group()
+            if group.world_size <= 1:
+                return bool(local)
+            device = (
+                torch.device("cuda", torch.accelerator.current_device_index())
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
+            flag = torch.tensor([local], dtype=torch.int32, device=device)
+            dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group.device_group)
+            return bool(flag.item())
+        except (ImportError, AttributeError, AssertionError, RuntimeError, ValueError):
+            return False
+
+    def _yield_prewarm_file(self, path: str) -> None:
+        yield_parent_prewarm_file(path)
+        handle = getattr(self, "_weights_prewarm_handle", None)
+        if handle is not None:
+            handle.yield_file(path)
+
+    def _pause_prewarm_copy(self) -> None:
+        pause_parent_prewarm_copy()
+        handle = getattr(self, "_weights_prewarm_handle", None)
+        if handle is not None:
+            handle.pause_copy()
+
+    def _resume_prewarm_copy(self) -> None:
+        resume_parent_prewarm_copy()
+        handle = getattr(self, "_weights_prewarm_handle", None)
+        if handle is not None:
+            handle.resume_copy()
+
+    def _iter_safetensors(self, files: list[str], *, use_tqdm: bool, strategy: str):
+        """Yield tensors file-by-file; pause remaining copies only while this
+        component's staging actually needs the disk."""
+        paused_here = False
+        try:
+            for index, path in enumerate(files):
+                self._yield_prewarm_file(path)
+                if index == 0 and should_pause_for_demand(path):
+                    self._pause_prewarm_copy()
+                    paused_here = True
+                yield from safetensors_weights_iterator(
+                    [path],
+                    use_tqdm and index == 0,
+                    strategy,
+                )
+        finally:
+            if paused_here:
+                self._resume_prewarm_copy()
 
     def _get_weights_iterator(
         self,
@@ -415,6 +492,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # pipeline construction. Stop those broad readers before demand
         # loading so they cannot compete with targeted staging faults.
         self._stop_weights_prewarm()
+
 
         # Decide the static gate before choosing the source iterator. Excluded
         # paths must retain their existing multi-thread loader rather than pay
@@ -448,7 +526,16 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
         cooperative_context = None
         if use_pinned_staging and tp_cooperative:
-            cooperative_context = prepare_cooperative_staging(local_eligible)
+            if self._resident_cast_gate_across_tp(hf_weights_files, local_eligible):
+                # Fully page-cache resident: skip the cooperative group AND the
+                # pinned-staging wrapper, loading per rank through the
+                # multithread iterator exactly like the pre-staging loader (the
+                # executor restores OMP threads so any fp32->bf16 cast the
+                # consumer still does is parallel). Nothing is left for
+                # cooperation to win once the pages are warm.
+                use_pinned_staging = False
+            else:
+                cooperative_context = prepare_cooperative_staging(local_eligible)
         cooperation_enabled = cooperative_context is not None and cooperative_context.comm is not None
         use_multithread = (
             use_safetensors
@@ -466,13 +553,28 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         )
         if use_multithread:
             num_threads = getattr(self.od_config, "num_weight_load_threads", 4)
-            # Keep deterministic shard order before passing to vLLM helper.
+            # Concurrent opens cannot yield per file; stop those shards first.
             sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
-            weights_iterator = multi_thread_safetensors_weights_iterator(
-                sorted_hf_weights_files,
-                self.load_config.use_tqdm_on_load,
-                max_workers=num_threads,
-            )
+            for path in sorted_hf_weights_files:
+                self._yield_prewarm_file(path)
+
+            def _multithread_iter():
+                # Concurrent opens cannot yield per file; pause remaining
+                # copies only if these shards still need the disk.
+                paused_here = not checkpoint_fully_resident(sorted_hf_weights_files)
+                if paused_here:
+                    self._pause_prewarm_copy()
+                try:
+                    yield from multi_thread_safetensors_weights_iterator(
+                        sorted_hf_weights_files,
+                        self.load_config.use_tqdm_on_load,
+                        max_workers=num_threads,
+                    )
+                finally:
+                    if paused_here:
+                        self._resume_prewarm_copy()
+
+            weights_iterator = _multithread_iter()
         elif use_torchao:
             sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
             weights_iterator = pt_weights_iterator(
@@ -501,11 +603,18 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 # Glob order is not contractual; the cooperative plan needs
                 # an identical file order on every rank.
                 hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
-            weights_iterator = safetensors_weights_iterator(
-                hf_weights_files,
-                self.load_config.use_tqdm_on_load,
-                self.load_config.safetensors_load_strategy,
-            )
+            if use_safetensors:
+                weights_iterator = self._iter_safetensors(
+                    hf_weights_files,
+                    use_tqdm=self.load_config.use_tqdm_on_load,
+                    strategy=self.load_config.safetensors_load_strategy,
+                )
+            else:
+                weights_iterator = safetensors_weights_iterator(
+                    hf_weights_files,
+                    self.load_config.use_tqdm_on_load,
+                    self.load_config.safetensors_load_strategy,
+                )
 
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()

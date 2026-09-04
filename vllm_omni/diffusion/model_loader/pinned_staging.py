@@ -15,18 +15,12 @@ dtype-converting H2D ``copy_`` falls off the pinned fast path entirely
 staging buys nothing for mismatched checkpoints. Casting while staging also
 halves the staged bytes and H2D traffic for fp32->bf16.
 
-Pinned buffers come from an internal power-of-two size pool and are recycled
-once the consumer moves past a tensor, so each size class pays ``cudaHostAlloc``
-only a handful of times per load rather than once per tensor — host allocation
-can cost >100 ms per 100 MiB, far more than the copy. The in-flight byte budget
-bounds read-ahead.
-
-Consumer contract: a yielded tensor is only valid until the next item is
-requested from the iterator — its backing buffer is then recycled. This
-matches ``load_weights`` implementations that copy each tensor into model
-parameters before advancing (the standard vLLM weight-loader pattern).
-Consumers that stash raw checkpoint tensors across iterations must not
-enable pinned staging.
+Pinned buffers come from an internal power-of-two size pool and are leased
+to the consumer. A buffer returns to the pool only after the consumer has
+advanced past that item and dropped every reference to the yielded tensor.
+Reuse also waits for a CUDA event recorded on the default stream after the
+consumer returned, so a non-blocking H2D issued during that iteration
+finishes before the same storage is staged again.
 
 Falls back to passing tensors through unpinned on the first allocation
 failure (e.g. ``RLIMIT_MEMLOCK`` in containers); loading then behaves as
@@ -39,6 +33,7 @@ import queue
 import sys
 import threading
 import time
+import weakref
 from collections.abc import Generator, Iterator, Mapping
 from types import TracebackType
 
@@ -189,7 +184,7 @@ class _PinnedBufferPool:
 
     def __init__(self, max_cached_bytes: int):
         self._max_cached_bytes = max_cached_bytes
-        self._free: dict[int, list[torch.Tensor]] = {}
+        self._free: dict[int, list[tuple[torch.Tensor, object | None]]] = {}
         self._lock = threading.Lock()
         self.cached_bytes = 0
         self.reserved_bytes = 0
@@ -205,7 +200,13 @@ class _PinnedBufferPool:
             if free:
                 self.reuses += 1
                 self.cached_bytes -= bucket
-                return free.pop()
+                buf, event = free.pop()
+            else:
+                buf, event = None, None
+        if buf is not None:
+            if event is not None:
+                event.synchronize()
+            return buf
         buf = _alloc_pinned(bucket)
         with self._lock:
             self.allocs += 1
@@ -213,7 +214,7 @@ class _PinnedBufferPool:
             self.peak_reserved_bytes = max(self.peak_reserved_bytes, self.reserved_bytes)
         return buf
 
-    def put(self, buf: torch.Tensor) -> None:
+    def put(self, buf: torch.Tensor, event: object | None = None) -> None:
         size = buf.numel()
         with self._lock:
             # The read-ahead budget may be smaller than the 1 MiB pool floor,
@@ -221,11 +222,13 @@ class _PinnedBufferPool:
             # one such buffer; otherwise every item reallocates it forever.
             effective_cap = max(self._max_cached_bytes, size)
             if self.cached_bytes + size <= effective_cap:
-                self._free.setdefault(size, []).append(buf)
+                self._free.setdefault(size, []).append((buf, event))
                 self.cached_bytes += size
                 return
             self.reserved_bytes -= size
             self.drops += 1
+        if event is not None:
+            event.synchronize()
 
 
 def pinned_staging_weights_iterator(
@@ -240,7 +243,7 @@ def pinned_staging_weights_iterator(
     Yields the same ``(name, tensor)`` pairs as ``weights_iter`` (order may
     interleave across staging threads); tensors stay on CPU so downstream
     ``load_weights`` semantics (TP narrowing, QKV fusion) are unchanged.
-    See the module docstring for the buffer-recycling consumer contract.
+    See the module docstring for the buffer-lease consumer contract.
 
     Mismatched float checkpoints are cast during the staging copy (see the
     module docstring): ``target_dtypes`` (param name -> dtype) by exact name,
@@ -370,6 +373,32 @@ def pinned_staging_weights_iterator(
     for t in threads:
         t.start()
 
+    def _copy_done_event() -> object | None:
+        if not torch.cuda.is_available():
+            return None
+        try:
+            event = torch.cuda.Event()
+            event.record()
+            return event
+        except (RuntimeError, AssertionError):
+            return None
+
+    def _release_lease(
+        leased_ref: weakref.ReferenceType[torch.Tensor] | None,
+        leased_buf: torch.Tensor | None,
+        leased_event: object | None,
+    ) -> None:
+        if leased_buf is None:
+            return
+        # A live weakref means the consumer still holds the tensor. Leave the
+        # buffer out of the pool so a later stage cannot mutate that storage.
+        if leased_ref is not None and leased_ref() is not None:
+            return
+        pool.put(leased_buf, leased_event)
+
+    prev_ref: weakref.ReferenceType[torch.Tensor] | None = None
+    prev_buf: torch.Tensor | None = None
+    prev_event: object | None = None
     try:
         while True:
             item = out_q.get()
@@ -380,18 +409,21 @@ def pinned_staging_weights_iterator(
             name, tensor, buf, nbytes = item
             consumer_t0 = time.perf_counter()
             yield name, tensor
-            # Control returned: the consumer has finished with `tensor`
-            # (normally its blocking H2D/weight_loader copy), so its buffer can
-            # be reused. Return it before releasing the read-ahead budget: a
-            # woken producer can then reuse this buffer instead of racing its
-            # return and issuing another cudaHostAlloc.
+            # Consumer returned from this next(), so any default-stream copy
+            # (including non_blocking H2D) is already queued. Release the
+            # previous lease now that the loop variable has been rebound.
             stats["consumer_s"] += time.perf_counter() - consumer_t0
-            if buf is not None:
-                pool.put(buf)
+            _release_lease(prev_ref, prev_buf, prev_event)
+            prev_ref = weakref.ref(tensor)
+            prev_buf = buf
+            prev_event = _copy_done_event() if buf is not None else None
             with lock:
                 state["inflight"] -= nbytes
                 lock.notify_all()
+        _release_lease(prev_ref, prev_buf, prev_event)
+        prev_ref, prev_buf, prev_event = None, None, None
     finally:
+        _release_lease(prev_ref, prev_buf, prev_event)
         with lock:
             state["stopped"] = True
             lock.notify_all()

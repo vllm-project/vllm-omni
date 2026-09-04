@@ -18,11 +18,14 @@ GPU-resident tensors in the original checkpoint order, and the layer
 ``weight_loader`` narrows on the GPU — cheap, and the strided-pinned problem
 disappears. Per-rank disk faults, pin, cast and H2D all drop to ~1/N.
 
-Buckets are processed in pipeline windows: transfers issue back-to-back on
-a dedicated CUDA stream and the consumer gates on per-bucket events, so
-window N's transfers overlap window N-1's weight_loader copies and window
-N+1's staging (measured: Wan2.2 cold 20.6s -> 15.4s over the serialized
-form — the apparent "disk floor" had serialized transfer time hidden in it).
+Buckets are processed in pipeline windows. Owner H2D finishes and is voted
+across the group before any rank enters broadcast, so a transfer failure
+cannot strand peers in the collective. After that schedule vote, staging for
+the next window starts while the current window transfers, so pin+cast overlap
+H2D/broadcast/apply. Each packed window still stays inside the byte budget; the
+pinned pool holds two windows so overlap does not churn ``cudaHostAlloc``.
+A single tensor larger than that budget is still staged cooperatively as a
+singleton window — falling back would make every rank copy it.
 
 Lockstep: all ranks walk identical (name, shape, dtype) streams (the local
 safetensors headers), so the bucket plan and ownership are computed
@@ -39,8 +42,8 @@ per-rank pinned staging. Checkpoint source errors are coordinated separately
 and raised on every rank. The load never fails because of staging — same
 contract as ``pinned_staging``.
 
-Consumer contract: identical to pinned staging — a yielded tensor is valid
-only until the next item is requested.
+Consumer contract: identical to pinned staging — GPU views stay valid while
+the consumer holds them; pinned host buffers are leased until unreferenced.
 """
 
 import threading
@@ -74,10 +77,20 @@ logger = init_logger(__name__)
 _DEFAULT_BUCKET_BYTES = 256 << 20
 # Offsets inside a bucket are aligned so a uint8 slice can be viewed as any
 # dtype (largest element size is 8 bytes; 16 also keeps copies SIMD-friendly).
+# The default inflight budget (4 GiB) sizes buckets at _DEFAULT_BUCKET_BYTES
+# while the pinned free-list and per-window GPU payload stay bounded by it;
+# measured on HunyuanImage TP=2 cold, 512 MiB inflight packed 128 MiB buckets
+# whose per-bucket broadcast + per-window vote collectives cost ~20 s of GPU
+# time (Nsight: 9.4 s broadcast + ~11 s votes across 1441 buckets).
 _ALIGN = 16
 # Buckets per pipeline window; also the stagers' plan-ahead depth.
 _WINDOW_BUCKETS = 4
 _STAGE_WORKERS = 4  # concurrent bucket stagings per rank
+# Windows of buckets staged ahead of the forming window. Depth 2 keeps the
+# stagers busy across the schedule vote and the current window's apply, which
+# measured as the exposed stage tail on HunyuanImage TP=2 resident (Nsight:
+# ~60 ms/window of pin+cast vs ~33 ms/window of transfer+apply).
+_PIPELINE_DEPTH = 2
 _COLLECTIVE_ERRORS = (OSError, RuntimeError, TypeError, ValueError)
 
 
@@ -225,16 +238,19 @@ class _BucketPlanner:
 
 
 class _PinnedPool:
-    """Free list of pinned bucket buffers, shared between the consumer loop
-    and the stager threads (hence the lock).
+    """Byte-bounded free list shared by the consumer and stager threads.
 
-    A buffer may be repooled while its H2D copy is still in flight; the
-    associated event is waited only when the buffer is REUSED (in get, on a
-    stager thread) so the wait stays off the per-bucket consumer path."""
+    A buffer may be repooled while its H2D copy is still in flight; the event
+    is waited before reuse or release so page-locked storage is never recycled
+    while DMA still references it.
+    """
 
-    def __init__(self):
+    def __init__(self, max_cached_bytes: int):
+        self._max_cached_bytes = max(0, max_cached_bytes)
         self._free: list[tuple[torch.Tensor, object | None]] = []
         self._lock = threading.Lock()
+        self.cached_bytes = 0
+        self.drops = 0
 
     def get(self, nbytes: int, floor: int) -> torch.Tensor:
         need = _bucket_bytes(max(nbytes, 1))
@@ -243,6 +259,7 @@ class _PinnedPool:
             for i, (free, event) in enumerate(self._free):
                 if free.numel() >= need:
                     found = self._free.pop(i)
+                    self.cached_bytes -= free.numel()
                     break
         if found is not None:
             buf, event = found
@@ -252,8 +269,16 @@ class _PinnedPool:
         return _alloc_pinned(max(need, _bucket_bytes(floor)))
 
     def put(self, buf: torch.Tensor, event=None) -> None:
+        size = buf.numel()
         with self._lock:
-            self._free.append((buf, event))
+            keep = self.cached_bytes + size <= self._max_cached_bytes
+            if keep:
+                self._free.append((buf, event))
+                self.cached_bytes += size
+                return
+            self.drops += 1
+        if event is not None:
+            event.synchronize()
 
 
 @dataclass
@@ -263,18 +288,29 @@ class CooperativeStagingContext:
     comm: object | None
     pool: _PinnedPool
     bucket_bytes: int
+    max_inflight_bytes: int
+    window_buckets: int
+
+
+def _memory_plan(max_inflight_bytes: int, requested_bucket_bytes: int) -> tuple[int, int, int]:
+    """Return a byte cap, bucket size, and count whose product stays capped."""
+    cap = max(1, max_inflight_bytes)
+    bucket_bytes = min(requested_bucket_bytes, max(1, cap // _WINDOW_BUCKETS))
+    window_buckets = max(1, min(_WINDOW_BUCKETS, cap // bucket_bytes))
+    return cap, bucket_bytes, window_buckets
 
 
 def prepare_cooperative_staging(
     local_eligible: bool,
-    max_inflight_bytes: int = 512 << 20,
+    max_inflight_bytes: int = 4 << 30,
+    requested_bucket_bytes: int = _DEFAULT_BUCKET_BYTES,
 ) -> CooperativeStagingContext:
     """Vote on cooperation before choosing a deterministic source iterator."""
     comm = _tp_comm()
-    pool = _PinnedPool()
-    bucket_bytes = min(_DEFAULT_BUCKET_BYTES, max(1 << 20, max_inflight_bytes))
+    max_inflight_bytes, bucket_bytes, window_buckets = _memory_plan(max_inflight_bytes, requested_bucket_bytes)
+    pool = _PinnedPool(2 * max_inflight_bytes)
     if comm is None:
-        return CooperativeStagingContext(None, pool, bucket_bytes)
+        return CooperativeStagingContext(None, pool, bucket_bytes, max_inflight_bytes, window_buckets)
 
     eligible = 0
     if local_eligible:
@@ -289,7 +325,7 @@ def prepare_cooperative_staging(
     except _COLLECTIVE_ERRORS as exc:
         logger.warning("Cooperative staging: preflight collective failed (%s); falling back locally.", exc)
         comm = None
-    return CooperativeStagingContext(comm, pool, bucket_bytes)
+    return CooperativeStagingContext(comm, pool, bucket_bytes, max_inflight_bytes, window_buckets)
 
 
 def _stage_bucket(bucket: _Bucket, pool: _PinnedPool, cap: int) -> None:
@@ -303,11 +339,25 @@ def _stage_bucket(bucket: _Bucket, pool: _PinnedPool, cap: int) -> None:
     bucket.stage_s = time.perf_counter() - started
 
 
+def _alloc_device_payload(nbytes: int, device: torch.device) -> torch.Tensor:
+    return torch.empty(nbytes, dtype=torch.uint8, device=device)
+
+
+def _copy_bucket_to_device(bucket: _Bucket, stream) -> None:
+    if stream is not None:
+        bucket.h2d_start = torch.cuda.Event(enable_timing=True)
+        bucket.h2d_start.record()
+    bucket.gpu.copy_(bucket.pinned[: bucket.total], non_blocking=True)
+    if stream is not None:
+        bucket.h2d_done = torch.cuda.Event(enable_timing=True)
+        bucket.h2d_done.record()
+
+
 def cooperative_staging_weights_iterator(
     weights_iter: Iterator[tuple[str, torch.Tensor]],
     comm=None,
     bucket_bytes: int = _DEFAULT_BUCKET_BYTES,
-    max_inflight_bytes: int = 512 << 20,
+    max_inflight_bytes: int = 4 << 30,
     target_dtypes: Mapping[str, torch.dtype] | None = None,
     default_dtype: torch.dtype | None = None,
     local_eligible: bool = True,
@@ -336,16 +386,26 @@ def cooperative_staging_weights_iterator(
         comm = context.comm
         pool = context.pool
         bucket_bytes = context.bucket_bytes
+        max_inflight_bytes = context.max_inflight_bytes
+        window_buckets = context.window_buckets
     else:
         # Backward-compatible lazy preflight for direct callers. The loader
         # prepares a context eagerly so it can retain multithread loading when
         # the group vetoes cooperation.
+        max_inflight_bytes, bucket_bytes, window_buckets = _memory_plan(max_inflight_bytes, bucket_bytes)
         if comm is None:
-            context = prepare_cooperative_staging(local_eligible, bucket_bytes)
+            context = prepare_cooperative_staging(
+                local_eligible,
+                max_inflight_bytes=max_inflight_bytes,
+                requested_bucket_bytes=bucket_bytes,
+            )
             comm = context.comm
             pool = context.pool
+            bucket_bytes = context.bucket_bytes
+            max_inflight_bytes = context.max_inflight_bytes
+            window_buckets = context.window_buckets
         else:
-            pool = _PinnedPool()
+            pool = _PinnedPool(2 * max_inflight_bytes)
             eligible = 0
             if local_eligible:
                 try:
@@ -375,18 +435,37 @@ def cooperative_staging_weights_iterator(
 
     planner = _BucketPlanner(comm.world_size, bucket_bytes, target_dtypes, default_dtype)
     pending: list[_Bucket] = []
+    staged: list[_Bucket] = []
+    deferred: list[_Bucket] = []
     stager = ThreadPoolExecutor(max_workers=_STAGE_WORKERS, thread_name_prefix="coop-staging")
     stats = {"own_bytes": 0, "source_s": 0.0, "stage_s": 0.0, "buckets": 0, "aborted": False}
     h2d_events: list[tuple[object, object]] = []
     exhausted = False
     source_error: BaseException | None = None
 
-    def _admit(bucket: _Bucket) -> None:
+    def _pending_bytes() -> int:
+        return sum(bucket.total for bucket in pending)
+
+    def _staged_bytes() -> int:
+        return sum(bucket.total for bucket in staged)
+
+    def _window_room(bucket: _Bucket) -> bool:
+        """Whether ``bucket`` may join the forming window."""
+        if not pending:
+            return True
+        if bucket.total > max_inflight_bytes:
+            return False
+        return len(pending) < window_buckets and _pending_bytes() + bucket.total <= max_inflight_bytes
+
+    def _admit(bucket: _Bucket, sink: list[_Bucket]) -> None:
+        # Oversized singleton tensors still cooperate: the pipelining budget
+        # is not a max-tensor-size. Falling back here made Hunyuan TP=2 stage
+        # the full 154 GiB stream on every rank.
         if bucket.owner == comm.rank:
             for e in bucket.entries:
                 _prefault(e.src)
             bucket.future = stager.submit(_stage_bucket, bucket, pool, bucket_bytes)
-        pending.append(bucket)
+        sink.append(bucket)
 
     def _local_fallback(unyielded: list[_Bucket]) -> Iterator[tuple[str, torch.Tensor]]:
         # Group-wide degrade: wait out in-flight stagings, then hand every
@@ -398,6 +477,13 @@ def cooperative_staging_weights_iterator(
         tail = planner.flush()
         if tail is not None:
             unyielded.append(tail)
+        seen = {id(bucket) for bucket in unyielded}
+        for bucket in chain(pending, staged, deferred):
+            if id(bucket) not in seen:
+                unyielded.append(bucket)
+        pending.clear()
+        staged.clear()
+        deferred.clear()
         for b in unyielded:
             if b.pinned is not None:
                 pool.put(b.pinned, b.h2d_done)
@@ -410,13 +496,22 @@ def cooperative_staging_weights_iterator(
             default_dtype=default_dtype,
         )
 
-    def _fill_pending() -> None:
-        # Plan ahead so owned buckets stage while transfers and consumer
-        # copies of the current window are still in flight. Fill depth is a
-        # pure function of the stream (never of timing): the window
-        # composition must be identical on every rank.
+    def _fill_staged(depth: int) -> None:
+        # Read up to ``depth`` windows of buckets ahead so owner-side pin+cast
+        # overlaps two windows of transfers and consumer copies, not one.
+        # Fill depth is a pure function of the stream (never of timing) so
+        # every rank stages the same buckets.
         nonlocal exhausted, source_error
-        while not exhausted and len(pending) < _WINDOW_BUCKETS:
+        limit_buckets = depth * window_buckets
+        limit_bytes = depth * max_inflight_bytes
+        while deferred and len(staged) < limit_buckets:
+            bucket = deferred.pop(0)
+            _admit(bucket, staged)
+            if bucket.total > max_inflight_bytes:
+                return
+        while not exhausted and len(staged) < limit_buckets:
+            if staged and _staged_bytes() >= limit_bytes:
+                return
             source_t0 = time.perf_counter()
             captured = _CapturedFailure()
             item = None
@@ -427,7 +522,10 @@ def cooperative_staging_weights_iterator(
                 exhausted = True
                 tail = planner.flush()
                 if tail is not None:
-                    _admit(tail)
+                    if (staged or pending) and tail.total > max_inflight_bytes:
+                        deferred.append(tail)
+                    else:
+                        _admit(tail, staged)
                 break
             if captured.error is not None:
                 source_error = captured.error
@@ -435,7 +533,22 @@ def cooperative_staging_weights_iterator(
                 break
             assert item is not None
             for closed in planner.add(*item):
-                _admit(closed)
+                # An oversized bucket must own its window: defer it when
+                # anything is already staged or forming.
+                if closed.total > max_inflight_bytes and (staged or pending):
+                    deferred.append(closed)
+                    return
+                _admit(closed, staged)
+                if closed.total > max_inflight_bytes:
+                    return
+
+    def _drain_window() -> None:
+        # Move staged buckets into the forming window (deterministic order:
+        # staged items precede deferred ones in the stream).
+        while staged and _window_room(staged[0]):
+            _admit(staged.pop(0), pending)
+        while deferred and _window_room(deferred[0]):
+            _admit(deferred.pop(0), pending)
 
     def _plan_signature(window: list[_Bucket]) -> tuple[int, int]:
         """Hash the exact collective schedule and tensor views for a window."""
@@ -458,17 +571,14 @@ def cooperative_staging_weights_iterator(
     xfer = torch.cuda.Stream(device=comm.device) if comm.device.type == "cuda" else None
 
     try:
-        _fill_pending()
         while True:
+            _fill_staged(_PIPELINE_DEPTH)
+            _drain_window()
             # Every rank enters one agreement for every window, including an
             # empty terminal window. This keeps an early-EOF rank in lockstep
             # long enough to detect a peer with additional buckets.
             window = list(pending)
             pending.clear()
-            if window:
-                # Refill immediately so stagers keep working while this window
-                # transfers and the previous one is consumed.
-                _fill_pending()
 
             stage_err = 0
             for bucket in window:
@@ -477,11 +587,12 @@ def cooperative_staging_weights_iterator(
                     if future_error is not None:
                         bucket.error = future_error
                     bucket.future = None
-                    if bucket.error is not None:
-                        logger.warning("Cooperative staging: local stage failed (%s)", bucket.error)
-                        stage_err = 1
+                if bucket.error is not None:
+                    logger.warning("Cooperative staging: local stage failed (%s)", bucket.error)
+                    stage_err = 1
+                    continue
                 try:
-                    bucket.gpu = torch.empty(bucket.total, dtype=torch.uint8, device=comm.device)
+                    bucket.gpu = _alloc_device_payload(bucket.total, comm.device)
                 except (OSError, RuntimeError, TypeError, ValueError) as exc:
                     logger.warning("Cooperative staging: payload alloc failed (%s)", exc)
                     stage_err = 1
@@ -510,7 +621,7 @@ def cooperative_staging_weights_iterator(
                     exc,
                 )
                 stats["aborted"] = True
-                yield from _local_fallback(window + list(pending))
+                yield from _local_fallback(window + list(pending) + list(staged))
                 return
             diverged = agreed[2] != -agreed[5] or agreed[3] != -agreed[6] or agreed[4] != -agreed[7]
             if agreed[1] != 0:
@@ -526,24 +637,58 @@ def cooperative_staging_weights_iterator(
                 )
             if agreed[0] != 0 or diverged:
                 stats["aborted"] = True
-                yield from _local_fallback(window + list(pending))
+                yield from _local_fallback(window + list(pending) + list(staged))
                 return
             if not window:
                 return
 
-            # Issue the whole window's transfers back-to-back on the
-            # transfer stream; consumers gate on per-bucket events only.
+            # Top up the staged-ahead buffer so the stagers keep working
+            # through this window's H2D/broadcast and the consumer's apply —
+            # transfer time to hide the pin+cast of the window after next.
+            # The H2D vote below still runs before any broadcast. Fallback
+            # drains `pending` and `staged`.
+            _fill_staged(_PIPELINE_DEPTH)
+
+            # Complete owner H2D first, then vote before any rank enters a
+            # broadcast. Without this rendezvous an owner exception would
+            # unwind while peers block forever in the collective.
+            h2d_error = None
+            with torch.cuda.stream(xfer) if xfer is not None else nullcontext():
+                for bucket in window:
+                    if bucket.owner != comm.rank:
+                        continue
+                    try:
+                        _copy_bucket_to_device(bucket, xfer)
+                    except _COLLECTIVE_ERRORS as exc:
+                        h2d_error = exc
+                        break
+            if xfer is not None and h2d_error is None:
+                try:
+                    xfer.synchronize()
+                except _COLLECTIVE_ERRORS as exc:
+                    h2d_error = exc
+            try:
+                h2d_agreed = comm.all_reduce_max([int(h2d_error is not None)])
+            except _COLLECTIVE_ERRORS as exc:
+                logger.warning(
+                    "Cooperative staging: H2D agreement failed (%s); all ranks falling back locally.",
+                    exc,
+                )
+                stats["aborted"] = True
+                yield from _local_fallback(window + list(staged))
+                return
+            if h2d_agreed[0] != 0:
+                logger.warning(
+                    "Cooperative staging: owner H2D failed (%s); all ranks falling back locally.",
+                    h2d_error,
+                )
+                stats["aborted"] = True
+                yield from _local_fallback(window + list(staged))
+                return
+
             collective_error = None
             with torch.cuda.stream(xfer) if xfer is not None else nullcontext():
                 for bucket in window:
-                    if bucket.owner == comm.rank:
-                        if xfer is not None:
-                            bucket.h2d_start = torch.cuda.Event(enable_timing=True)
-                            bucket.h2d_start.record()
-                        bucket.gpu.copy_(bucket.pinned[: bucket.total], non_blocking=True)
-                        if xfer is not None:
-                            bucket.h2d_done = torch.cuda.Event(enable_timing=True)
-                            bucket.h2d_done.record()
                     try:
                         comm.broadcast(bucket.gpu, src=bucket.owner)
                     except _COLLECTIVE_ERRORS as exc:
@@ -564,7 +709,7 @@ def cooperative_staging_weights_iterator(
                     collective_error,
                 )
                 stats["aborted"] = True
-                yield from _local_fallback(window + list(pending))
+                yield from _local_fallback(window + list(pending) + list(staged))
                 return
 
             for bucket in window:

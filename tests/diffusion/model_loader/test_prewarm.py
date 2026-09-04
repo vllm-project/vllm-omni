@@ -59,7 +59,9 @@ def test_read_order_and_ram_budget(tmp_path, monkeypatch):
         key=lambda p: prewarm._parent_read_order_key(os.path.relpath(p, d)),
     )
     parent_subdirs = [os.path.basename(os.path.dirname(f)) for f in parent_files]
-    assert parent_subdirs == ["text_encoder", "vae", "transformer", "transformer_2"]
+    # Parent prewarm runs through pipeline construction, so it must not race
+    # the text encoder the build is already opening: DiT shards first.
+    assert parent_subdirs == ["transformer", "transformer_2", "text_encoder", "vae"]
 
     # shared budget: takes succeed until exhausted, crossing zero is admitted once
     budget = prewarm._Budget(10)
@@ -192,6 +194,9 @@ def test_gating_and_loader_hook(tmp_path, monkeypatch):
             assert self.stopped
             self.joined = True
 
+        def is_alive(self):
+            return not self.joined
+
     handle = _Handle()
     calls = []
 
@@ -239,6 +244,9 @@ def test_parent_prewarm_hands_off_before_worker_model_init(monkeypatch):
             assert self.stopped.is_set()
             self.joined = True
 
+        def is_alive(self):
+            return not self.joined
+
     handle = _Handle()
     calls = []
 
@@ -256,12 +264,14 @@ def test_parent_prewarm_hands_off_before_worker_model_init(monkeypatch):
         assert handoff is not None
         assert not handle.stopped.is_set()
         with prewarm.use_parent_weights_prewarm(handoff):
-            assert handle.stopped.is_set()
-            assert handle.joined
-            # The worker's DiffusersPipelineLoader still calls this interface,
-            # but the parent handoff suppresses a duplicate speculative reader.
+            assert not handle.stopped.is_set()
+            assert not handle.joined
+            # Duplicate worker-local scans stay suppressed while parent readers
+            # keep running until this context exits.
             assert prewarm.start_weights_prewarm("org/model") is None
+        assert not handle.stopped.is_set()
 
+    assert handle.stopped.is_set() and handle.joined
     assert calls == [
         ("org/model", "fixed-revision", "/model-cache", prewarm._parent_read_order_key),
     ]
@@ -281,6 +291,9 @@ def test_worker_proc_hands_off_parent_prewarm_before_worker_creation(monkeypatch
         def join(self, timeout=None):
             assert self.stopped.is_set()
             self.joined = True
+
+        def is_alive(self):
+            return not self.joined
 
     handle = _Handle()
     monkeypatch.setattr(prewarm, "_start_weights_prewarm", lambda *args, **kwargs: handle)
@@ -302,8 +315,8 @@ def test_worker_proc_hands_off_parent_prewarm_before_worker_creation(monkeypatch
     created_worker = object()
 
     def _create_worker(self, *args, **kwargs):
-        assert handle.stopped.is_set()
-        assert handle.joined
+        assert not handle.stopped.is_set()
+        assert not handle.joined
         assert prewarm.start_weights_prewarm("org/model") is None
         return created_worker
 
@@ -320,6 +333,39 @@ def test_worker_proc_hands_off_parent_prewarm_before_worker_creation(monkeypatch
         )
 
     assert worker_proc.worker is created_worker
+    assert handle.stopped.is_set() and handle.joined
+
+
+def test_parent_prewarm_terminates_stalled_reader_before_releasing_workers(monkeypatch):
+    class _StalledWorker:
+        def __init__(self):
+            self.alive = True
+            self.join_timeouts = []
+            self.terminated = False
+
+        def start(self):
+            pass
+
+        def join(self, timeout=None):
+            self.join_timeouts.append(timeout)
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.terminated = True
+            self.alive = False
+
+    worker = _StalledWorker()
+    handle = prewarm.WeightsPrewarmHandle(worker, prewarm.threading.Event())
+    monkeypatch.setattr(prewarm, "_start_weights_prewarm", lambda *args, **kwargs: handle)
+    monkeypatch.setattr(prewarm, "_PREWARM_STOP_TIMEOUT_S", 0.01)
+
+    with prewarm.parent_weights_prewarm("org/model") as handoff:
+        with prewarm.use_parent_weights_prewarm(handoff):
+            assert not worker.terminated
+    assert worker.terminated
+    assert worker.join_timeouts == [0.01, 0.01]
 
 
 def test_parent_prewarm_suppresses_duplicate_worker_scan_when_no_reads_start(monkeypatch):
@@ -384,3 +430,104 @@ def test_diffusers_load_hands_off_prewarm_before_demand_loading(monkeypatch):
 
     assert loader.load_model(load_device="cpu", load_format="diffusers") is model
     assert loader._weights_prewarm_handle is None
+
+
+def test_yield_file_skips_one_file_and_keeps_reading_others(tmp_path, monkeypatch):
+    monkeypatch.setattr(prewarm, "_advise_range", lambda *args, **kwargs: False)
+    monkeypatch.setattr(prewarm, "_is_file_fully_resident", lambda path: False)
+    model_dir = _make_model_dir(
+        tmp_path,
+        [("text_encoder", 1 << 20), ("transformer", 1 << 20)],
+    )
+    files = sorted(
+        (
+            os.path.join(root, name)
+            for root, _, names in os.walk(model_dir)
+            for name in names
+            if name.endswith(".safetensors")
+        ),
+        key=lambda path: prewarm._parent_read_order_key(os.path.relpath(path, model_dir)),
+    )
+    assert len(files) == 2
+    handle = prewarm.WeightsPrewarmHandle(None, prewarm.threading.Event())
+    handle.yield_file(files[0])
+    done_bytes, done_files = prewarm._read_files(files, prewarm._Budget(4 << 20), handle)
+    assert done_bytes == os.path.getsize(files[1])
+    assert done_files == 1
+
+
+def test_residency_helpers(tmp_path, monkeypatch):
+    """Pause only when the demanded file still needs the disk; the group
+    residency helper requires every file to be resident."""
+    model_dir = _make_model_dir(
+        tmp_path,
+        [("transformer", 1 << 20), ("transformer_2", 1 << 20)],
+    )
+    files = sorted(
+        (
+            os.path.join(root, name)
+            for root, _, names in os.walk(model_dir)
+            for name in names
+            if name.endswith(".safetensors")
+        ),
+        key=lambda path: prewarm._parent_read_order_key(os.path.relpath(path, model_dir)),
+    )
+    assert len(files) == 2
+
+    monkeypatch.setattr(prewarm, "_is_file_fully_resident", lambda p: p == files[0])
+    assert prewarm.should_pause_for_demand(files[0]) is False
+    assert prewarm.should_pause_for_demand(files[1]) is True
+    assert prewarm.checkpoint_fully_resident(files) is False
+
+    monkeypatch.setattr(prewarm, "_is_file_fully_resident", lambda p: True)
+    assert prewarm.should_pause_for_demand(files[0]) is False
+    assert prewarm.checkpoint_fully_resident(files) is True
+    assert prewarm.checkpoint_fully_resident([]) is False
+
+
+def test_pause_copy_hints_without_force_read(tmp_path, monkeypatch):
+    advised = []
+    forced = []
+    monkeypatch.setattr(prewarm, "_advise_range", lambda fd, offset, length: advised.append((offset, length)) or True)
+    monkeypatch.setattr(prewarm, "_range_resident", lambda mapping, offset, length: False)
+    monkeypatch.setattr(
+        prewarm,
+        "_force_read_range",
+        lambda handle, offset, length, buf, stop: forced.append(length) or length,
+    )
+    path = _make_model_dir(tmp_path, [("transformer", 3 << 20)]) / "transformer" / "model-00000.safetensors"
+    handle = prewarm.WeightsPrewarmHandle(None, prewarm.threading.Event())
+    handle.pause_copy()
+    done_bytes, done_files = prewarm._read_files([str(path)], prewarm._Budget(4 << 20), handle)
+    assert done_bytes == 0 and done_files == 0
+    assert advised == [(0, 3 << 20)] and forced == []
+
+    handle.resume_copy()
+    advised.clear()
+    done_bytes, done_files = prewarm._read_files([str(path)], prewarm._Budget(4 << 20), handle)
+    assert done_bytes == 3 << 20 and done_files == 1
+    assert forced == [3 << 20]
+
+
+def test_chunked_advise_skips_copy_when_resident(tmp_path, monkeypatch):
+    """Hint the current and next chunk; copy only when mincore is negative."""
+    advised = []
+    forced = []
+
+    monkeypatch.setattr(prewarm, "_advise_range", lambda fd, offset, length: advised.append((offset, length)) or True)
+    monkeypatch.setattr(prewarm, "_range_resident", lambda mapping, offset, length: True)
+    monkeypatch.setattr(
+        prewarm,
+        "_force_read_range",
+        lambda handle, offset, length, buf, stop: forced.append(length) or length,
+    )
+    path = _make_model_dir(tmp_path, [("transformer", 3 << 20)]) / "transformer" / "model-00000.safetensors"
+    done_bytes, done_files = prewarm._read_files([str(path)], prewarm._Budget(4 << 20))
+    assert done_bytes == 3 << 20 and done_files == 1
+    assert advised == [(0, 3 << 20)] and forced == []
+
+    advised.clear()
+    monkeypatch.setattr(prewarm, "_range_resident", lambda mapping, offset, length: False)
+    done_bytes, done_files = prewarm._read_files([str(path)], prewarm._Budget(4 << 20))
+    assert done_bytes == 3 << 20 and done_files == 1
+    assert advised == [(0, 3 << 20)] and forced == [3 << 20]

@@ -1384,9 +1384,9 @@ class WorkerProc:
 
         assert od_config.master_port is not None
 
-        # Parent prewarm overlaps process spawn/import only. All ranks wait for
-        # its readers to stop before any worker starts model initialization,
-        # and the context suppresses the old per-worker speculative readers.
+        # Parent prewarm keeps reading during model init. This context only
+        # suppresses a duplicate worker-local scan; demand loading yields
+        # individual files so speculative I/O gets out of the way per shard.
         with use_parent_weights_prewarm(weights_prewarm_handoff):
             self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
         self._running = True

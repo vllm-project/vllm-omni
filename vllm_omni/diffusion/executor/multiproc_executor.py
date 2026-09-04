@@ -380,6 +380,15 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # N-GPU run oversubscribes the host by N x core_count. Honours a
         # user-provided OMP_NUM_THREADS.
         set_multiprocessing_worker_envs()
+        # Diffusion weight loading casts fp32 checkpoints to bf16 on the CPU
+        # during pageable H2D copies; with vllm's default OMP_NUM_THREADS=1
+        # that cast is single-threaded and measured 3x slower on g7e.12xlarge
+        # (18.8s vs 5.8s resident, Wan TP=2). Restore one thread pool per
+        # worker sized to the host: workers x threads ~= core count, so the
+        # cap still bounds contention without serializing the casts.
+        workers = max(1, int(getattr(od_config, "num_gpus", 1) or 1))
+        if "OMP_NUM_THREADS" not in os.environ:
+            os.environ["OMP_NUM_THREADS"] = str(max(2, (os.cpu_count() or 8) // workers))
         mp.set_start_method("spawn", force=True)
 
         model_ref = getattr(od_config, "model", None)

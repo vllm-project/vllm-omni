@@ -68,6 +68,16 @@ def test_stream_contract_and_producer_lifecycle():
     out = list(pinned_staging_weights_iterator(iter([("big", torch.zeros(1 << 16))]), max_inflight_bytes=16))
     assert len(out) == 1
 
+    # lease: retaining a yielded tensor keeps its bytes stable after later
+    # items reuse the pool (same-shape tensors would otherwise overwrite it).
+    it = pinned_staging_weights_iterator(_weights(n=4), num_staging_threads=1)
+    _, first = next(it)
+    first_value = first.clone()
+    held = first
+    for _name, _tensor in it:
+        pass
+    assert torch.equal(held, first_value)
+
     # early close leaves no producer threads behind
     before = {t.ident for t in threading.enumerate()}
     gen = pinned_staging_weights_iterator(_weights(n=64), max_inflight_bytes=64)
@@ -278,6 +288,9 @@ def test_loader_gate_and_dtype_wiring(monkeypatch):
             "joined": False,
             "stop": lambda self: setattr(self, "stopped", True),
             "join": lambda self, timeout=None: setattr(self, "joined", True),
+            # stop_weights_prewarm returns early only when the reader is gone.
+            "is_alive": lambda self: False,
+            "terminate": lambda self: True,
         },
     )()
     loader._weights_prewarm_handle = handoff

@@ -164,6 +164,120 @@ def test_cooperative_stream_contract(monkeypatch):
     for (_, _, _, v0), (_, _, _, v1) in zip(results[0], results[1]):
         assert torch.equal(v0, v1)
 
+    # Tight budget forces several windows; next-window staging overlaps H2D.
+    results = _run_ranks(
+        2,
+        lambda rank: _stream(n=20),
+        bucket_bytes=200 << 10,
+        max_inflight_bytes=400 << 10,
+        default_dtype=torch.bfloat16,
+    )
+    for rank_out in results:
+        _assert_complete_bf16(rank_out, 20)
+
+
+def test_owner_h2d_failure_rendezvouses_before_broadcast(monkeypatch):
+    """An owner-side H2D failure must be voted across the group before any
+    peer enters broadcast; every rank can then replay the unyielded window
+    locally instead of leaving peers blocked in the collective."""
+    monkeypatch.setattr(cooperative_staging, "_alloc_pinned", lambda n: torch.empty(n, dtype=torch.uint8))
+    monkeypatch.setattr(pinned_staging, "_alloc_pinned", lambda n: torch.empty(n, dtype=torch.uint8))
+    real_copy = cooperative_staging._copy_bucket_to_device
+    tripped = threading.Event()
+
+    def _fail_one_owner(bucket, stream):
+        if bucket.owner == 0 and not tripped.is_set():
+            tripped.set()
+            raise RuntimeError("injected H2D failure")
+        return real_copy(bucket, stream)
+
+    monkeypatch.setattr(cooperative_staging, "_copy_bucket_to_device", _fail_one_owner)
+    results = _run_ranks(
+        2,
+        lambda rank: _stream(n=12),
+        bucket_bytes=200 << 10,
+        default_dtype=torch.bfloat16,
+    )
+
+    assert tripped.is_set()
+    for rank_out in results:
+        _assert_complete_bf16(rank_out, 12, ordered=False)
+
+
+def test_cooperative_memory_budget_and_oversized_fallback(monkeypatch):
+    """The configured budget caps packed collective windows and the pinned
+    free list. A single tensor larger than the budget still cooperates as a
+    singleton window (fallback would make every rank stage it). Payload OOM
+    still falls back before any broadcast."""
+    monkeypatch.setattr(cooperative_staging, "_alloc_pinned", lambda n: torch.empty(n, dtype=torch.uint8))
+    monkeypatch.setattr(pinned_staging, "_alloc_pinned", lambda n: torch.empty(n, dtype=torch.uint8))
+
+    class _BudgetComm(_FakeComm):
+        max_window_bytes = 0
+        broadcasts = 0
+
+        def all_reduce_max(self, values):
+            if len(values) == 8:
+                type(self).max_window_bytes = max(type(self).max_window_bytes, values[3])
+            return super().all_reduce_max(values)
+
+        def broadcast(self, tensor, src):
+            type(self).broadcasts += 1
+            return super().broadcast(tensor, src)
+
+    budget = 400 << 10
+    results = _run_ranks(
+        2,
+        lambda rank: _stream(n=20),
+        comm_factory=_BudgetComm,
+        bucket_bytes=200 << 10,
+        max_inflight_bytes=budget,
+    )
+    assert all(len(rank_out) == 20 for rank_out in results)
+    assert _BudgetComm.max_window_bytes <= budget
+
+    _BudgetComm.broadcasts = 0
+    oversized = 200_000  # fp32 = 800 KiB, larger than the 400 KiB group budget
+    results = _run_ranks(
+        2,
+        lambda rank: _stream(n=1, numel=oversized),
+        comm_factory=_BudgetComm,
+        bucket_bytes=200 << 10,
+        max_inflight_bytes=budget,
+    )
+    assert all(len(rank_out) == 1 for rank_out in results)
+    name, dtype, _, value = results[0][0]
+    assert name == "layer.0.weight" and dtype is torch.float32
+    assert torch.equal(value, torch.zeros(oversized, dtype=torch.float32))
+    assert _BudgetComm.broadcasts >= 2
+
+    real_alloc_payload = cooperative_staging._alloc_device_payload
+    failed = threading.Event()
+
+    def _oom_once(nbytes, device):
+        if not failed.is_set():
+            failed.set()
+            raise torch.cuda.OutOfMemoryError("injected payload OOM")
+        return real_alloc_payload(nbytes, device)
+
+    monkeypatch.setattr(cooperative_staging, "_alloc_device_payload", _oom_once)
+    _BudgetComm.broadcasts = 0
+    results = _run_ranks(
+        2,
+        lambda rank: _stream(n=8),
+        comm_factory=_BudgetComm,
+        bucket_bytes=200 << 10,
+        max_inflight_bytes=budget,
+    )
+    assert failed.is_set() and all(len(rank_out) == 8 for rank_out in results)
+    assert _BudgetComm.broadcasts == 0
+
+    pool = cooperative_staging._PinnedPool(max_cached_bytes=budget)
+    pool.put(torch.empty(256 << 10, dtype=torch.uint8))
+    pool.put(torch.empty(256 << 10, dtype=torch.uint8))
+    assert pool.cached_bytes <= budget
+    assert pool.drops == 1
+
 
 def test_group_degradation_paths(monkeypatch):
     """Degradation paths preserve each local stream without deadlocking;
