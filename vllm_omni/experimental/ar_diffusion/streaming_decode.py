@@ -136,11 +136,17 @@ class WanStreamingDecoder:
     so a module shared by several sessions stays stateless between calls.
     """
 
-    def __init__(self, vae: Any) -> None:
+    def __init__(self, vae: Any, *, bytes_per_pixel_fp32: float | None = None) -> None:
         for attribute in ("decoder", "post_quant_conv"):
             if not hasattr(vae, attribute):
                 raise TypeError(f"Streaming decode requires a Wan-family autoencoder exposing {attribute!r}.")
         self._vae = vae
+        # A one-off measured constant for this checkpoint; see declared_state_bytes.
+        # Optional at construction because most callers never need admission
+        # accounting, but a constructor argument (rather than requiring an
+        # external attribute assignment after the fact) means the value can't
+        # be silently unset for a caller that does.
+        self._bytes_per_pixel_fp32 = bytes_per_pixel_fp32
 
     @property
     def num_causal_convs(self) -> int:
@@ -212,14 +218,15 @@ class WanStreamingDecoder:
         Every cached tensor is ``[B, C_l, <= CACHE_T, H_l, W_l]`` with ``H_l``
         and ``W_l`` fixed fractions of the output, so the total scales exactly
         with ``height * width``. Callers that need the constant should measure
-        it once for their checkpoint; this helper scales a measured constant so
-        admission does not have to re-measure per resolution.
+        it once for their checkpoint and pass it as ``bytes_per_pixel_fp32`` to
+        the constructor; this helper scales that measured constant so admission
+        does not have to re-measure per resolution.
         """
-        constant = getattr(self, "_bytes_per_pixel_fp32", None)
+        constant = self._bytes_per_pixel_fp32
         if constant is None:
             raise RuntimeError(
                 "declared_state_bytes needs a measured bytes-per-pixel constant for this checkpoint; "
-                "set _bytes_per_pixel_fp32 from a one-off measurement."
+                "pass bytes_per_pixel_fp32= to WanStreamingDecoder() from a one-off measurement."
             )
         element_ratio = torch.empty((), dtype=dtype).element_size() / 4
         return int(constant * height * width * element_ratio)

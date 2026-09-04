@@ -170,6 +170,15 @@ async def run(argv: Sequence[str] | None = None) -> Path:
         parameter.requires_grad_(False)
     decoder = WanStreamingDecoder(vae)
     decode_state = decoder.new_decode_state(args.session_id)
+    # Same per-channel rescale the pipeline applies before its own vae.decode()
+    # call (LingBotWorldCausalDMDPipeline._vae_latent_stats) -- the tick path's
+    # raw output is in model space, decode_chunk expects VAE latent space.
+    latent_mean = torch.as_tensor(vae.config.latents_mean, device=args.vae_device, dtype=vae_dtype).view(
+        1, -1, 1, 1, 1
+    )
+    latent_std = torch.as_tensor(vae.config.latents_std, device=args.vae_device, dtype=vae_dtype).view(
+        1, -1, 1, 1, 1
+    )
 
     engine = AsyncOmni(
         model=args.model,
@@ -240,7 +249,15 @@ async def run(argv: Sequence[str] | None = None) -> Path:
             gen_elapsed = time.perf_counter() - gen_started
             if len(output.images) != 1 or not isinstance(output.images[0], torch.Tensor):
                 raise RuntimeError("Expected one latent tensor from each realtime LingBot chunk.")
+            # The realtime tick path always uses output_type="latent" and returns
+            # raw model-space latents -- the pipeline's own non-tick decode path
+            # inverts this same normalization (lingbot_world/pipeline.py) before
+            # calling vae.decode. decode_chunk's contract assumes latent-space
+            # input already carries that inversion; skipping it decodes valid
+            # tensors that are quietly the wrong video (latency/finite checks
+            # would stay green throughout).
             latent = output.images[0].detach().to(device=args.vae_device, dtype=vae_dtype)
+            latent = latent * latent_std + latent_mean
             metadata = consumer.chunk_metadata(output).to_dict()
 
             decode_started = time.perf_counter()
@@ -267,9 +284,12 @@ async def run(argv: Sequence[str] | None = None) -> Path:
             print(json.dumps(measurements[-1], sort_keys=True), flush=True)
     finally:
         try:
-            await manager.close_session(args.session_id)
+            decoder.release(decode_state)
         finally:
-            engine.shutdown()
+            try:
+                await manager.close_session(args.session_id)
+            finally:
+                engine.shutdown()
 
     summary_path = output_dir / "summary.json"
     summary_path.write_text(
