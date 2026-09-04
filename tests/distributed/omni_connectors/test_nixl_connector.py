@@ -15,6 +15,9 @@ import types
 import msgspec
 import pytest
 import torch
+import zmq
+
+from vllm_omni.data_entry_keys import HiddenStatesStruct, MetaStruct, OmniPayloadStruct
 
 pytestmark = [pytest.mark.cpu, pytest.mark.parallel, pytest.mark.core_model]
 
@@ -24,6 +27,7 @@ PORT = 47431
 class _FakeNixlAgent:
     def __init__(self, name, config=None):
         self.name = name
+        self.config = config
         self.registered = []
 
     def get_reg_descs(self, regions, memory_type):
@@ -45,8 +49,22 @@ def nixl_connector_cls(monkeypatch):
     """Import NixlConnector with vLLM's optional NIXL dependency stubbed out."""
     stub = types.ModuleType("vllm.distributed.nixl_utils")
     stub.NixlWrapper = _FakeNixlAgent  # type: ignore[attr-defined]
-    stub.nixl_agent_config = None  # type: ignore[attr-defined]
+    config_module = types.ModuleType("test_nixl_config_api")
+    config_sync_type = types.SimpleNamespace(NIXL_THREAD_SYNC_STRICT="strict")
+    config_module.nixl_thread_sync_t = config_sync_type  # type: ignore[attr-defined]
+
+    def agent_config(**kwargs):
+        return kwargs
+
+    agent_config.__module__ = config_module.__name__
+    config_module.nixl_agent_config = agent_config  # type: ignore[attr-defined]
+    stub.nixl_agent_config = agent_config  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "vllm.distributed.nixl_utils", stub)
+    monkeypatch.setitem(sys.modules, config_module.__name__, config_module)
+    sync_type = types.SimpleNamespace(NIXL_THREAD_SYNC_STRICT="wrong-public-enum")
+    nixl_module = types.ModuleType("nixl")
+    nixl_module.nixl_thread_sync_t = sync_type  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "nixl", nixl_module)
 
     from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import NixlConnector
 
@@ -74,6 +92,10 @@ def test_put_publishes_its_handshake_endpoint(producer):
     assert size == 32
     assert metadata["sender_host"] == "127.0.0.1"
     assert metadata["sender_zmq_port"] == PORT
+
+
+def test_agent_uses_strict_thread_synchronization(producer):
+    assert producer._agent.config["sync_mode"] == "strict"
 
 
 def test_handshake_serves_metadata_when_caller_has_none(producer, consumer):
@@ -115,10 +137,21 @@ def test_source_endpoint_metadata_overrides_configured_sender(consumer, monkeypa
     assert queried == [("req-tp4-rank3", "10.0.0.3", PORT + 3 * 16)]
 
 
-def test_unknown_key_is_retried_then_reported(producer, consumer):
-    consumer._handshake_max_wait_s = 0.2
+def test_unknown_key_is_queried_once(producer, consumer, monkeypatch):
+    socket = consumer._get_req_socket(f"tcp://127.0.0.1:{PORT}")
+    send_count = 0
+    original_send = socket.send
+
+    def count_send(message):
+        nonlocal send_count
+        send_count += 1
+        return original_send(message)
+
+    monkeypatch.setattr(socket, "send", count_send)
 
     assert consumer._resolve_metadata("never-published", None) is None
+    assert send_count == 1
+    assert socket.getsockopt(zmq.RCVTIMEO) == 10
 
 
 def test_transfer_done_releases_the_producer_buffer(producer, consumer):
@@ -234,6 +267,60 @@ def test_deferred_transfer_releases_exactly_once_after_done(nixl_connector_cls):
         connector.close()
 
 
+def test_active_sibling_transfer_requires_deferred_ownership(nixl_connector_cls):
+    connector = nixl_connector_cls({"role": "receiver"})
+    connector._agent.check_xfer_state = lambda handle: {"failed": "ERR", "active": "PROC"}[handle]
+    try:
+        assert connector._transfers_may_be_active(["failed", "active"]) is True
+        assert connector._transfers_may_be_active(["failed"]) is False
+    finally:
+        connector.close()
+
+
+def test_get_defers_complete_ownership_when_sibling_transfer_is_active(nixl_connector_cls):
+    connector = nixl_connector_cls({"role": "receiver"})
+    connector._agent.add_remote_agent = lambda metadata: "producer"
+    connector._agent.get_xfer_descs = lambda regions, memory_type: (regions, memory_type)
+    connector._agent.prep_xfer_dlist = lambda agent, descs: (agent, tuple(descs[0]))
+    handles = iter(["failed", "active"])
+    connector._agent.make_prepped_xfer = lambda *_args: next(handles)
+    connector._agent.transfer = lambda handle: None
+    connector._agent.check_xfer_state = lambda handle: {"failed": "ERR", "active": "PROC"}[handle]
+    released = []
+    connector._agent.release_xfer_handle = lambda handle: released.append(("handle", handle))
+    connector._agent.release_dlist_handle = lambda handle: released.append(("dlist", handle))
+    connector._agent.remove_remote_agent = lambda agent: released.append(("agent", agent))
+    connector._agent.deregister_memory = lambda descs: released.append(("registration", descs))
+    metadata = {
+        "schema_version": 1,
+        "kind": "tensors",
+        "agent_metadata": b"producer-metadata",
+        "tensor_specs": [
+            {"shape": [1], "dtype": "torch.float32", "device": "cpu", "size": 4},
+            {"shape": [1], "dtype": "torch.float32", "device": "cpu", "size": 4},
+        ],
+        "descriptor_groups": [
+            {"memory_type": "DRAM", "tensor_indices": [0], "regions": [(1, 4, 0, "")]},
+            {"memory_type": "DRAM", "tensor_indices": [1], "regions": [(2, 4, 0, "")]},
+        ],
+        "size": 8,
+    }
+
+    try:
+        assert connector.get("0", "1", "req-active-sibling", metadata) is None
+        assert released == []
+        assert len(connector._deferred_transfers) == 1
+        deferred = connector._deferred_transfers[0]
+        assert deferred.handles == ["failed", "active"]
+        assert len(deferred.registrations) == 2
+        assert len(deferred.dlists) == 4
+        assert deferred.remote_agent == "producer"
+        assert len(deferred.tensors) == 2
+    finally:
+        connector._agent.check_xfer_state = lambda handle: "DONE"
+        connector.close()
+
+
 @pytest.mark.parametrize(
     "payload,expected_kind",
     [
@@ -281,6 +368,21 @@ def test_structured_payload_groups_descriptors_by_memory_type(producer, monkeypa
         },
     ]
     assert len(producer._agent.registered) == 2
+
+
+def test_omni_payload_struct_uses_structured_tensor_path(producer):
+    payload = OmniPayloadStruct(
+        hidden_states=HiddenStatesStruct(output=torch.ones(4, dtype=torch.float32)),
+        meta=MetaStruct(left_context_size=2),
+    )
+
+    _, _, metadata = producer.put("0", "1", "req-struct", payload)
+    skeleton, tensors = producer._extract_tensor_leaves(payload)
+
+    assert metadata["kind"] == "structured"
+    assert len(tensors) == 1
+    assert torch.equal(tensors[0], payload.hidden_states.output)
+    assert skeleton["meta"]["left_context_size"] == 2
 
 
 def test_partial_group_registration_failure_rolls_back(producer, monkeypatch):

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
 import os
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -100,12 +101,25 @@ class NixlConnector(OmniConnectorBase):
         if nixl_agent_config is None:
             agent_config = None
         else:
+            from nixl import nixl_thread_sync_t
+
+            config_module = sys.modules.get(nixl_agent_config.__module__)
+            sync_type = getattr(config_module, "nixl_thread_sync_t", nixl_thread_sync_t)
+            sync_mode = sync_type.NIXL_THREAD_SYNC_STRICT
             non_ucx_backends = [backend for backend in self._backends if backend != "UCX"]
             if non_ucx_backends:
-                agent_config = nixl_agent_config(backends=self._backends, capture_telemetry=False)
+                agent_config = nixl_agent_config(
+                    backends=self._backends,
+                    capture_telemetry=False,
+                    sync_mode=sync_mode,
+                )
             else:
                 num_threads = int(self.config.get("num_threads", 4))
-                agent_config = nixl_agent_config(num_threads=num_threads, capture_telemetry=False)
+                agent_config = nixl_agent_config(
+                    num_threads=num_threads,
+                    capture_telemetry=False,
+                    sync_mode=sync_mode,
+                )
 
         self._agent = NixlWrapper(str(self.config.get("agent_name", uuid.uuid4())), agent_config)
         self._receive_device = self._parse_device(self.config.get("receive_device"))
@@ -159,6 +173,9 @@ class NixlConnector(OmniConnectorBase):
         self._sender_host = self.config.get("sender_host")
         self._sender_zmq_port = self.config.get("sender_zmq_port")
         self._handshake_timeout_ms = int(self.config.get("handshake_timeout_ms", 5000))
+        self._metadata_query_timeout_ms = int(
+            self.config.get("metadata_query_timeout_ms", min(self._handshake_timeout_ms, 10))
+        )
         self._handshake_max_wait_s = float(self.config.get("handshake_max_wait_s", 60.0))
         self._handshake_retry_s = float(self.config.get("handshake_retry_s", 0.05))
         self._zmq_ctx: zmq.Context | None = None
@@ -352,24 +369,7 @@ class NixlConnector(OmniConnectorBase):
                     self._agent.transfer(xfer_handle)
 
             for xfer_handle in xfer_handles:
-                try:
-                    self._wait_for_transfer(xfer_handle, get_key)
-                except TimeoutError:
-                    self._defer_transfer(
-                        _DeferredTransfer(
-                            tensors=local_tensors,
-                            registrations=local_reg_descs_list,
-                            dlists=dlist_handles,
-                            handles=xfer_handles,
-                            remote_agent=remote_agent,
-                        )
-                    )
-                    local_tensors = []
-                    local_reg_descs_list = []
-                    dlist_handles = []
-                    xfer_handles = []
-                    remote_agent = None
-                    raise
+                self._wait_for_transfer(xfer_handle, get_key)
             for xfer_handle in xfer_handles:
                 self._agent.release_xfer_handle(xfer_handle)
             xfer_handles.clear()
@@ -390,6 +390,21 @@ class NixlConnector(OmniConnectorBase):
             logger.debug("NixlConnector get %s->%s key=%s size=%d", from_stage, to_stage, get_key, size)
             return payload, size
         except Exception:
+            if xfer_handles and self._transfers_may_be_active(xfer_handles):
+                self._defer_transfer(
+                    _DeferredTransfer(
+                        tensors=local_tensors,
+                        registrations=local_reg_descs_list,
+                        dlists=dlist_handles,
+                        handles=xfer_handles,
+                        remote_agent=remote_agent,
+                    )
+                )
+                local_tensors = []
+                local_reg_descs_list = []
+                dlist_handles = []
+                xfer_handles = []
+                remote_agent = None
             self._metrics["errors"] += 1
             logger.error("NixlConnector get failed for %s", get_key, exc_info=True)
             return None
@@ -535,33 +550,22 @@ class NixlConnector(OmniConnectorBase):
     def _query_metadata_at(self, get_key: str, host: str, port: int) -> dict[str, Any] | None:
         """Fetch transfer metadata for ``get_key`` from a producer's ROUTER socket.
 
-        A consumer can outrun its producer, so a missing key is retried until
-        ``handshake_max_wait_s`` instead of failing the request immediately.
+        Each call performs one bounded query so a missing key cannot starve
+        other requests in the shared receive loop. The caller retries later.
         """
         zmq_addr = f"tcp://{host}:{port}"
-        deadline = time.monotonic() + self._handshake_max_wait_s
         request = _GET_META_MSG + msgspec.msgpack.encode({"key": get_key})
-        while not self._stop_event.is_set():
-            sock = self._get_req_socket(zmq_addr)
-            try:
-                sock.send(request)
-                reply = sock.recv()
-            except Exception:
-                self._invalidate_req_socket(zmq_addr)
-                logger.debug("NixlConnector handshake query to %s failed for %s", zmq_addr, get_key, exc_info=True)
-                reply = _META_NOT_FOUND
-            if reply != _META_NOT_FOUND:
-                return msgspec.msgpack.decode(reply)
-            if time.monotonic() >= deadline:
-                logger.error(
-                    "NixlConnector handshake timed out after %.0fs waiting for key %s at %s",
-                    self._handshake_max_wait_s,
-                    get_key,
-                    zmq_addr,
-                )
-                return None
-            time.sleep(self._handshake_retry_s)
-        return None
+        sock = self._get_req_socket(zmq_addr, self._metadata_query_timeout_ms)
+        try:
+            sock.send(request)
+            reply = sock.recv()
+        except Exception:
+            self._invalidate_req_socket(zmq_addr)
+            logger.debug("NixlConnector handshake query to %s failed for %s", zmq_addr, get_key, exc_info=True)
+            return None
+        if reply == _META_NOT_FOUND:
+            return None
+        return msgspec.msgpack.decode(reply)
 
     def _notify_transfer_done(self, get_key: str, metadata: dict[str, Any]) -> None:
         """Tell the producer its buffer is drained so it can deregister now.
@@ -624,7 +628,7 @@ class NixlConnector(OmniConnectorBase):
         logger.warning("NixlConnector handshake received an unknown message")
         return _META_NOT_FOUND
 
-    def _get_req_socket(self, zmq_addr: str) -> zmq.Socket:
+    def _get_req_socket(self, zmq_addr: str, timeout_ms: int | None = None) -> zmq.Socket:
         """Return a thread-local REQ socket so concurrent calls never interleave."""
         cache: dict[str, zmq.Socket] | None = getattr(self._req_local, "cache", None)
         if cache is None:
@@ -635,8 +639,9 @@ class NixlConnector(OmniConnectorBase):
             sock = self._zmq_ctx.socket(zmq.REQ)
             sock.connect(zmq_addr)
             cache[zmq_addr] = sock
-        sock.setsockopt(zmq.SNDTIMEO, self._handshake_timeout_ms)
-        sock.setsockopt(zmq.RCVTIMEO, self._handshake_timeout_ms)
+        timeout_ms = self._handshake_timeout_ms if timeout_ms is None else timeout_ms
+        sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
+        sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
         return sock
 
     def _invalidate_req_socket(self, zmq_addr: str) -> None:
@@ -672,6 +677,12 @@ class NixlConnector(OmniConnectorBase):
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"NIXL transfer for {request_id} timed out")
             time.sleep(self._poll_interval_s)
+
+    def _transfers_may_be_active(self, handles: list[Any]) -> bool:
+        try:
+            return any(self._agent.check_xfer_state(handle) == "PROC" for handle in handles)
+        except Exception:
+            return True
 
     def _cleanup_expired_pending(self) -> None:
         now = time.monotonic()
@@ -814,6 +825,8 @@ class NixlConnector(OmniConnectorBase):
     def _contains_tensor(cls, payload: Any) -> bool:
         if isinstance(payload, torch.Tensor):
             return True
+        if isinstance(payload, msgspec.Struct):
+            payload = msgspec.structs.asdict(payload)
         if isinstance(payload, dict):
             return any(cls._contains_tensor(value) for value in payload.values())
         if isinstance(payload, (list, tuple)):
@@ -829,6 +842,8 @@ class NixlConnector(OmniConnectorBase):
                 index = len(tensors)
                 tensors.append(value)
                 return {_TENSOR_MARKER: index}
+            if isinstance(value, msgspec.Struct):
+                value = msgspec.structs.asdict(value)
             if isinstance(value, dict):
                 return {key: visit(item) for key, item in value.items()}
             if isinstance(value, list):

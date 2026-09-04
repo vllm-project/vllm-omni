@@ -39,10 +39,20 @@ class _SenderGeneration:
 class _LoadEntry:
     """Identify one receiver registration across queue and I/O boundaries."""
 
-    __slots__ = ("request",)
+    __slots__ = ("request", "source_metadata")
 
     def __init__(self, request: Request) -> None:
         self.request = request
+        sender_info = getattr(request, "payload_sender_info", None)
+        self.source_metadata = None
+        if isinstance(sender_info, dict):
+            host = sender_info.get("host")
+            port = sender_info.get("zmq_port")
+            if host and port:
+                self.source_metadata = {
+                    "source_host": str(host),
+                    "source_port": int(port),
+                }
 
     @property
     def request_id(self) -> str:
@@ -447,6 +457,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 str(target_stage_id),
                 str(stage_id),
                 connector_get_key,
+                entry.source_metadata,
             )
         except Exception as e:
             logger.error(f"SharedMemoryConnector get failed for req {connector_get_key}: {e}")

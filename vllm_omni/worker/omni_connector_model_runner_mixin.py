@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unified data-plane communication mixin for Model Runners.
 
 All connector.put()/get() calls are consolidated here. Background I/O
@@ -155,7 +155,11 @@ class OmniConnectorModelRunnerMixin:
                 getattr(topology, "target_tp_size", None),
                 getattr(topology, "local_rank", None),
             )
-            if all(isinstance(value, int) for value in effective_mapping):
+            if (
+                isinstance(effective_mapping[0], int)
+                and isinstance(effective_mapping[1], int)
+                and isinstance(effective_mapping[2], int)
+            ):
                 rank_cfg = {
                     "from_tp": effective_mapping[0],
                     "to_tp": effective_mapping[1],
@@ -604,14 +608,19 @@ class OmniConnectorModelRunnerMixin:
         from_stage: str,
         to_stage: str,
         connector_get_key: str,
+        metadata: dict[str, Any] | None = None,
     ) -> Any:
         """Receive one ordinary non-KV stage payload on the local leader rank only."""
         tp_group = self._get_local_tp_group()
         if tp_group is None or getattr(tp_group, "world_size", 1) <= 1:
-            return connector.get(from_stage, to_stage, connector_get_key)
+            if metadata is None:
+                return connector.get(from_stage, to_stage, connector_get_key)
+            return connector.get(from_stage, to_stage, connector_get_key, metadata)
         if not self.is_data_transfer_rank():
             return None
-        return connector.get(from_stage, to_stage, connector_get_key)
+        if metadata is None:
+            return connector.get(from_stage, to_stage, connector_get_key)
+        return connector.get(from_stage, to_stage, connector_get_key, metadata)
 
     def _recv_full_payload_result(
         self,
@@ -619,6 +628,7 @@ class OmniConnectorModelRunnerMixin:
         from_stage: str,
         to_stage: str,
         connector_get_key: str,
+        metadata: dict[str, Any] | None = None,
     ) -> Any:
         """Receive one full-payload transfer on the local leader rank only."""
         return self._recv_ordinary_stage_result(
@@ -626,6 +636,7 @@ class OmniConnectorModelRunnerMixin:
             from_stage,
             to_stage,
             connector_get_key,
+            metadata,
         )
 
     def _recv_async_chunk_result(
@@ -634,6 +645,7 @@ class OmniConnectorModelRunnerMixin:
         from_stage: str,
         to_stage: str,
         connector_get_key: str,
+        metadata: dict[str, Any] | None = None,
     ) -> Any:
         """Receive one ordinary async chunk on the local leader rank only."""
         return self._recv_ordinary_stage_result(
@@ -641,6 +653,7 @@ class OmniConnectorModelRunnerMixin:
             from_stage,
             to_stage,
             connector_get_key,
+            metadata,
         )
 
     @staticmethod
@@ -1091,13 +1104,6 @@ class OmniConnectorModelRunnerMixin:
         # across requests.
         ext = getattr(request, "external_req_id", None)
         self._request_ids_mapping[request_id] = ext if ext is not None else request_id
-        sender_info = getattr(request, "payload_sender_info", None)
-        if isinstance(sender_info, dict) and self._omni_connector is not None:
-            host = sender_info.get("host")
-            port = sender_info.get("zmq_port")
-            update_sender_info = getattr(self._omni_connector, "update_sender_info", None)
-            if host and port and callable(update_sender_info):
-                update_sender_info(str(host), int(port))
         with self._lock:
             if request_id in self._stage_recv_req_ids:
                 return
@@ -1792,6 +1798,14 @@ class OmniConnectorModelRunnerMixin:
         chunk_id = self._get_req_chunk[req_id]
         external_req_id = self._request_ids_mapping.get(req_id, req_id)
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
+        request = self._pending_load_reqs.get(req_id)
+        sender_info = getattr(request, "payload_sender_info", None)
+        metadata = None
+        if isinstance(sender_info, dict):
+            host = sender_info.get("host")
+            port = sender_info.get("zmq_port")
+            if host and port:
+                metadata = {"source_host": str(host), "source_port": int(port)}
 
         if self._async_chunk:
             result = self._recv_async_chunk_result(
@@ -1799,6 +1813,7 @@ class OmniConnectorModelRunnerMixin:
                 str(target_stage_id),
                 str(self._stage_id),
                 connector_get_key,
+                metadata,
             )
         else:
             result = self._recv_full_payload_result(
@@ -1806,6 +1821,7 @@ class OmniConnectorModelRunnerMixin:
                 str(target_stage_id),
                 str(self._stage_id),
                 connector_get_key,
+                metadata,
             )
 
         if result is None:

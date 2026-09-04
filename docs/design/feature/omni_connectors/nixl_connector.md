@@ -23,7 +23,14 @@ tensor index so mixed CPU/accelerator payloads can be reconstructed in order.
 Payloads are not restricted to tensors. A single tensor or a list of tensors is
 transferred as-is; a nested structure has its tensor leaves extracted and shipped
 alongside a msgpack-encoded skeleton; anything else is msgpack-encoded into one
-uint8 tensor. The consumer reassembles the original object.
+uint8 tensor. Mapping and sequence structure is preserved. `msgspec.Struct` values,
+including `OmniPayloadStruct`, are normalised to mappings so their tensor leaves use
+the direct NIXL path rather than CPU object serialisation.
+
+Each NIXL agent uses strict thread synchronization. A consumer performs one short
+metadata query per scheduler poll (10ms by default), which prevents an unavailable
+producer from blocking unrelated requests. The regular transfer-completion handshake
+keeps the configured transfer timeout.
 
 ## Installation
 
@@ -67,6 +74,8 @@ Parameters:
   without one config entry per rank.
 - `sender_host` / `sender_zmq_port`: consumer-side override naming the producer's
   handshake endpoint. Only needed when the consumer cannot learn it from metadata.
+  In replicated deployments, the producer endpoint is carried with each request and
+  selected at `get()` time; it is not mutable connector-wide state.
 - `backends`: NIXL backends to register memory with. Defaults to `["UCX"]`.
 - `receive_device`: forces where received tensors land. By default the consumer
   keeps the producer's device *type* but uses its own current device of that type.
@@ -81,5 +90,21 @@ Parameters:
   buffers and registrations remain owned by the connector until NIXL reports a
   terminal state; `close()` waits for that state before releasing them.
   `VLLM_OMNI_NIXL_XFER_TIMEOUT_S` overrides it.
+
+## Validation
+
+The native CUDA smoke test requires NIXL and at least two visible CUDA devices:
+
+```bash
+UCX_RCACHE_MAX_UNRELEASED=1024 pytest -o addopts='' -q -s \
+  tests/distributed/omni_connectors/test_nixl_connector_native.py
+```
+
+It starts independent producer and consumer processes, loads the real UCX backend,
+performs the ZMQ `GET_META` handshake and a native NIXL `READ` from GPU 0 to GPU 1,
+checks mixed CPU/GPU tensor leaves from an `OmniPayloadStruct`, sends `XFER_DONE`,
+and verifies that producer registrations are released. This validates same-host,
+cross-GPU operation. Inter-node UCX transport is supported by the design but was not
+validated by this test.
 
 For more details, refer to the [NIXL repository](https://github.com/ai-dynamo/nixl).

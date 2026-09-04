@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for OmniConnectorModelRunnerMixin.
 
 These tests use a mock connector (in-memory dict store) and do not require
@@ -555,15 +555,53 @@ class TestChunkStreamCompletedGuard(unittest.TestCase):
 
         host.shutdown_omni_connectors()
 
-    def test_register_updates_payload_sender_endpoint(self):
+    def test_poll_uses_request_scoped_payload_sender_endpoint(self):
         host = self._make_host(stage_id=1)
-        host._omni_connector.update_sender_info = MagicMock()
+        host._omni_connector.get = MagicMock(return_value=None)
         req = _make_request("req-1", "ext-req-1")
         req.payload_sender_info = {"host": "10.0.0.1", "zmq_port": 50051}
 
         host.register_chunk_recv(req)
+        host._poll_single_request("req-1")
 
-        host._omni_connector.update_sender_info.assert_called_once_with("10.0.0.1", 50051)
+        host._omni_connector.get.assert_called_once_with(
+            "0",
+            "1",
+            "ext-req-1_0_0",
+            {"source_host": "10.0.0.1", "source_port": 50051},
+        )
+        host.shutdown_omni_connectors()
+
+    def test_concurrent_requests_keep_distinct_payload_sender_endpoints(self):
+        host = self._make_host(stage_id=1)
+        host._omni_connector.get = MagicMock(return_value=None)
+        first = _make_request("req-1", "ext-req-1")
+        first.payload_sender_info = {"host": "10.0.0.1", "zmq_port": 50051}
+        second = _make_request("req-2", "ext-req-2")
+        second.payload_sender_info = {"host": "10.0.0.2", "zmq_port": 51051}
+
+        host.register_chunk_recv(first)
+        host.register_chunk_recv(second)
+        host._poll_single_request("req-2")
+        host._poll_single_request("req-1")
+
+        self.assertEqual(
+            host._omni_connector.get.call_args_list,
+            [
+                unittest.mock.call(
+                    "0",
+                    "1",
+                    "ext-req-2_0_0",
+                    {"source_host": "10.0.0.2", "source_port": 51051},
+                ),
+                unittest.mock.call(
+                    "0",
+                    "1",
+                    "ext-req-1_0_0",
+                    {"source_host": "10.0.0.1", "source_port": 50051},
+                ),
+            ],
+        )
         host.shutdown_omni_connectors()
 
     def test_finish_sentinel_populates_completed_set(self):

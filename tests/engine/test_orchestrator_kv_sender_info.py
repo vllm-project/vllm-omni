@@ -1,13 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
+from collections.abc import Callable
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from vllm import SamplingParams
+from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
 
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.messages import OutputMessage
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
-from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
+from vllm_omni.engine.stage_engine_core_client import (
+    DPLBStageEngineCoreClient,
+    StageEngineCoreClient,
+)
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -28,7 +37,7 @@ class _DummySenderStage:
 class _DummyDiffusionStage:
     stage_type = "diffusion"
     final_output = True
-    custom_process_input_func = None
+    custom_process_input_func: Callable[..., Any] | None = None
 
     def __init__(self, engine_input_source=None):
         self.engine_input_source = engine_input_source or [0]
@@ -52,6 +61,51 @@ def _build_sender_pool(stage_id: int, sender_info: dict[str, object]) -> StagePo
         output_processor=object(),
         stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
     )
+
+
+@pytest.mark.parametrize(
+    ("client_class", "base_client_class"),
+    [
+        (StageEngineCoreClient, AsyncMPClient),
+        (DPLBStageEngineCoreClient, DPLBAsyncMPClient),
+    ],
+)
+def test_stage_engine_core_client_builds_payload_sender_info_after_base_init(
+    monkeypatch, client_class, base_client_class
+):
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            omni_kv_config=None,
+            hf_config=None,
+            stage_connector_config=None,
+        )
+    )
+    metadata = SimpleNamespace(
+        stage_id=0,
+        replica_id=0,
+        stage_type="llm",
+        model_stage="main",
+        is_comprehension=False,
+        requires_multimodal_data=False,
+        engine_input_source=[],
+        final_output=False,
+        final_output_type=None,
+        default_sampling_params=None,
+        prompt_transform_func=None,
+        prompt_expand_func=None,
+        custom_process_input_func=None,
+    )
+
+    def fake_base_init(self, config, *_args, **_kwargs):
+        self.vllm_config = config
+        self.resources = SimpleNamespace(engine_dead=False)
+
+    monkeypatch.setattr(base_client_class, "__init__", fake_base_init)
+
+    client = client_class(vllm_config, object, metadata=metadata)
+
+    assert client.vllm_config is vllm_config
+    assert client.get_payload_sender_info() is None
 
 
 def test_stage_engine_core_client_builds_kv_sender_info_from_tcp_address():

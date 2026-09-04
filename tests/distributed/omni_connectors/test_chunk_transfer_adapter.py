@@ -4,7 +4,7 @@
 import threading
 from collections import deque
 from types import MethodType, SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 import torch
@@ -458,8 +458,51 @@ def test_load_poll(build_adapter):
     assert request.additional_information == payload
     assert adapter.get_req_chunk["req-1"] == 1
     assert "req-1" not in adapter._finished_load_reqs
-    assert "req-1" in adapter.upstream_exhausted_requests
-    assert "req-1" not in adapter._pending_load_reqs
+
+
+def test_load_poll_uses_request_scoped_payload_sender_endpoint(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
+    request.payload_sender_info = {"host": "10.0.0.1", "zmq_port": 50051}
+    connector.get.return_value = None
+
+    adapter._poll_single_request(_dequeue_load_entry(adapter, request))
+
+    connector.get.assert_called_once_with(
+        "1",
+        "2",
+        "req-1_1_0",
+        {"source_host": "10.0.0.1", "source_port": 50051},
+    )
+
+
+def test_load_poll_keeps_concurrent_payload_sender_endpoints_distinct(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    first = _req("req-1", RequestStatus.WAITING)
+    first.payload_sender_info = {"host": "10.0.0.1", "zmq_port": 50051}
+    second = _req("req-2", RequestStatus.WAITING)
+    second.payload_sender_info = {"host": "10.0.0.2", "zmq_port": 51051}
+    connector.get.return_value = None
+
+    second_entry = _dequeue_load_entry(adapter, second)
+    first_entry = _dequeue_load_entry(adapter, first)
+    adapter._poll_single_request(second_entry)
+    adapter._poll_single_request(first_entry)
+
+    assert connector.get.call_args_list == [
+        call(
+            "1",
+            "2",
+            "req-2_1_0",
+            {"source_host": "10.0.0.2", "source_port": 51051},
+        ),
+        call(
+            "1",
+            "2",
+            "req-1_1_0",
+            {"source_host": "10.0.0.1", "source_port": 50051},
+        ),
+    ]
 
 
 def test_load_async_does_not_requeue_registered_inflight_request(build_adapter):

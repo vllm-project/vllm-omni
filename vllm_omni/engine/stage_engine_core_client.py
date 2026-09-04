@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Stage Engine Core Client for vLLM-Omni multi-stage runtime.
 
@@ -154,7 +157,6 @@ class StageEngineCoreClientBase(StageClientBase):
         self._kv_sender_host = self._resolve_contact_host()
         self._kv_sender_info: dict[str, Any] | None = None
         self._kv_sender_initialized = False
-        self._payload_sender_info = self._build_payload_sender_info()
 
         client_name = self.__class__.__name__
         logger.info(
@@ -211,6 +213,7 @@ class StageEngineCoreClientBase(StageClientBase):
                 )
             raise
 
+        self._payload_sender_info = self._build_payload_sender_info()
         self._initialize_kv_sender_endpoint()
 
         logger.info(
