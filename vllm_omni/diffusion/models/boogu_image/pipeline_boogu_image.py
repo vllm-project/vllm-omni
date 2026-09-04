@@ -54,6 +54,7 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.quantization.component_config import resolve_component_quant_config
 
 logger = init_logger(__name__)
 
@@ -235,6 +236,7 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         super().__init__()
         self.od_config = od_config
         self._raise_unsupported_features()
+        transformer_quant_config = resolve_component_quant_config(od_config.quantization_config, "transformer")
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -298,7 +300,11 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
             revision=od_config.revision,
         ).to(self._execution_device)
 
-        self.transformer = BooguImageTransformer2DModel(od_config=od_config)
+        self.transformer = BooguImageTransformer2DModel(
+            od_config=od_config,
+            quant_config=transformer_quant_config,
+            prefix="transformer",
+        )
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.default_sample_size = 128

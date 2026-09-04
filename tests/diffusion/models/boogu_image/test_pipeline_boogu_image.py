@@ -83,6 +83,7 @@ def mock_dependencies(mocker, monkeypatch):
         "processor": mock_processor,
         "vae": mock_vae,
         "scheduler": mock_scheduler,
+        "transformer_cls": mock_transformer_cls,
         "transformer": mock_transformer_instance,
     }
 
@@ -184,6 +185,28 @@ def test_constructor_weights_sources(boogu_pipeline):
     assert source.subfolder == "transformer"
     assert source.prefix == "transformer."
     assert source.fall_back_to_pt is True
+
+
+def test_constructor_routes_only_transformer_config(mock_dependencies, mocker):
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
+    from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+
+    transformer_config = mocker.MagicMock(spec=QuantizationConfig)
+    encoder_config = mocker.MagicMock(spec=QuantizationConfig)
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.bfloat16,
+        quantization_config=ComponentQuantizationConfig(
+            {"transformer": transformer_config, "mllm": encoder_config, "vae": None}
+        ),
+    )
+    BooguImagePipeline(od_config=od_config)
+    kwargs = mock_dependencies["transformer_cls"].call_args.kwargs
+    assert kwargs["quant_config"] is transformer_config
+    assert kwargs["prefix"] == "transformer"
 
 
 @pytest.mark.parametrize(

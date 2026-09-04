@@ -16,6 +16,7 @@ from huggingface_hub import snapshot_download
 from safetensors.torch import save_file
 from vllm.config.load import LoadConfig
 
+import vllm_omni.diffusion.model_loader.diffusers_loader as loader_module
 from vllm_omni.diffusion.config import get_current_diffusion_config, get_current_diffusion_config_or_none
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -28,6 +29,7 @@ from vllm_omni.diffusion.model_loader.host_weights import source_identity as sou
 from vllm_omni.diffusion.models.helios import HeliosPipeline
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
 from vllm_omni.diffusion.registry import initialize_model
+from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -161,6 +163,43 @@ def _make_loader_with_weights(weight_names: list[str]) -> DiffusersPipelineLoade
 
     loader.get_all_weights = _iter_weights  # type: ignore[assignment]
     return loader
+
+
+def test_serialized_torchao_component_uses_pytorch_iterator(mocker):
+    torchao_config = SimpleNamespace(
+        get_name=lambda: "torchao",
+        is_checkpoint_torchao_serialized=True,
+    )
+    loader = _make_loader_with_weights([])
+    loader.quant_config = ComponentQuantizationConfig({"transformer": torchao_config})
+    loader.load_config.pt_load_map_location = "cpu"
+    files = ["/weights/model-10.bin", "/weights/model-2.bin"]
+    mocker.patch.object(loader, "_prepare_weights", return_value=("/weights", files, False))
+    pt_iterator = mocker.patch.object(
+        loader_module,
+        "pt_weights_iterator",
+        return_value=iter([("block.weight", torch.ones(1))]),
+    )
+    safetensors_iterator = mocker.patch.object(loader_module, "safetensors_weights_iterator")
+    multithread_iterator = mocker.patch.object(loader_module, "multi_thread_safetensors_weights_iterator")
+    source = DiffusersPipelineLoader.ComponentSource(
+        model_or_path="/weights",
+        subfolder=None,
+        revision=None,
+        prefix="transformer.",
+    )
+
+    weights = list(loader._get_weights_iterator(source))
+
+    pt_iterator.assert_called_once_with(
+        ["/weights/model-2.bin", "/weights/model-10.bin"],
+        loader.load_config.use_tqdm_on_load,
+        "cpu",
+    )
+    safetensors_iterator.assert_not_called()
+    multithread_iterator.assert_not_called()
+    assert weights[0][0] == "transformer.block.weight"
+    assert torch.equal(weights[0][1], torch.ones(1))
 
 
 def test_hwr_cold_publication_and_warm_restore_skip_ordinary_dit_loading(
@@ -390,7 +429,7 @@ def test_prepare_weights_honors_component_index_and_explicit_override(tmp_path, 
     assert folder == str(transformer)
     assert [str(transformer / filename) for filename in indexed_files] == files
     assert use_safetensors
-    assert hub_api.hf_hub_download.call_count == 2
+    assert hub_api.hf_hub_download.call_count == len(loader_mod.SAFETENSORS_INDEX_FILES)
     hub_api.hf_hub_download.assert_any_call(
         repo_id="org/model",
         filename="transformer/diffusion_pytorch_model.safetensors.index.json",
@@ -449,6 +488,45 @@ def test_prepare_local_weights_honors_component_index(tmp_path):
     assert use_safetensors
 
 
+def test_prepare_local_bin_index_is_authoritative_and_safetensors_remains_preferred(tmp_path):
+    transformer = tmp_path / "transformer"
+    transformer.mkdir()
+    indexed_files = [f"diffusion_pytorch_model-{index:05d}-of-00002.bin" for index in (1, 2)]
+    stale_file = "diffusion_pytorch_model-00001-of-00008.bin"
+    (transformer / "diffusion_pytorch_model.bin.index.json").write_text(
+        json.dumps({"weight_map": {f"weight.{index}": filename for index, filename in enumerate(indexed_files)}})
+    )
+    for filename in (*indexed_files, stale_file):
+        (transformer / filename).touch()
+
+    _, files, use_safetensors = _make_loader_with_weights([])._prepare_weights(
+        tmp_path,
+        subfolder="transformer",
+        revision=None,
+        fall_back_to_pt=True,
+        allow_patterns_overrides=None,
+    )
+
+    assert files == [str(transformer / filename) for filename in indexed_files]
+    assert not use_safetensors
+
+    safetensors_file = "diffusion_pytorch_model.safetensors"
+    (transformer / "diffusion_pytorch_model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"weight": safetensors_file}})
+    )
+    (transformer / safetensors_file).touch()
+    _, files, use_safetensors = _make_loader_with_weights([])._prepare_weights(
+        tmp_path,
+        subfolder="transformer",
+        revision=None,
+        fall_back_to_pt=True,
+        allow_patterns_overrides=None,
+    )
+
+    assert files == [str(transformer / safetensors_file)]
+    assert use_safetensors
+
+
 def test_prepare_weights_rejects_polluted_offline_cache_without_index(tmp_path, mocker):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
 
@@ -475,7 +553,9 @@ def test_prepare_weights_rejects_polluted_offline_cache_without_index(tmp_path, 
             allow_patterns_overrides=None,
         )
 
-    assert hub_api.hf_hub_download.call_count == 2
+    assert hub_api.hf_hub_download.call_count == len(loader_mod.SAFETENSORS_INDEX_FILES) + len(
+        loader_mod.PT_INDEX_FILES
+    )
     assert all(call.kwargs["local_files_only"] for call in hub_api.hf_hub_download.call_args_list)
 
 

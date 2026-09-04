@@ -90,6 +90,26 @@ def test_serve_parser_accepts_ulysses_a2a_permute() -> None:
     assert args.get_explicit_kwargs_dict()["ulysses_a2a_permute"] is True
 
 
+def test_serve_parser_accepts_diffusion_quantization_config() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+    expected = {"transformer": {"method": "torchao_float8_weight_only"}}
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Boogu/Boogu-Image-0.1-Base-fp8",
+            "--omni",
+            "--diffusion-quantization-config",
+            '{"transformer":{"method":"torchao_float8_weight_only"}}',
+        ]
+    )
+
+    assert args.diffusion_quantization_config == expected
+    assert args.get_explicit_kwargs_dict()["diffusion_quantization_config"] == expected
+
+
 def _make_headless_args(**kwargs) -> TrackingNamespace:
     defaults = {
         "model": "fake-model",

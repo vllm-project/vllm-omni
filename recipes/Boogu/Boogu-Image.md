@@ -128,6 +128,73 @@ with `guidance_scale=1.0` remain valid on the same server: every rank evaluates
 only the positive branch, no negative embeddings are built, and no guidance is
 applied.
 
+### 1x RTX 4090 48GB (Loading FP8-Quantized Weights)
+
+#### Environment
+
+The following configuration was validated:
+
+- OS: Linux
+- Python: 3.12
+- Driver / runtime: NVIDIA CUDA environment with one RTX 4090 48 GB GPU
+- vLLM version: Match the vLLM-Omni checkout used for deployment
+- vLLM-Omni version or commit: Use the commit that contains TorchAO FP8
+  checkpoint loading for diffusion models
+- TorchAO version: 0.17.0
+- `kernels` / `kernels-data`: 0.15.2 / 0.16.1
+
+#### Command
+
+Serve the official Base FP8 checkpoint using its pre-quantized TorchAO FP8
+weight-only transformer weights:
+
+```bash
+vllm serve Boogu/Boogu-Image-0.1-Base-fp8 \
+  --omni \
+  --port 8091 \
+  --diffusion-quantization-config \
+  '{"transformer":{"method":"torchao_float8_weight_only"}}'
+```
+
+For image editing, replace the model ID with
+`Boogu/Boogu-Image-0.1-Edit-fp8` and keep the same quantization configuration.
+
+#### Verification
+
+After the server is ready, test the Base FP8 checkpoint with a simple request:
+
+```bash
+curl -X POST http://localhost:8091/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Boogu/Boogu-Image-0.1-Base-fp8",
+    "prompt": "A mountain lake at sunset, photorealistic, cinematic lighting",
+    "size": "1024x1024",
+    "num_inference_steps": 28,
+    "guidance_scale": 4.0,
+    "seed": 42
+  }' | jq -r '.data[0].b64_json' | base64 -d > output_fp8.png
+```
+
+Test the Edit FP8 checkpoint with a reference image:
+
+```bash
+curl -X POST http://localhost:8091/v1/images/edits \
+  -F model="Boogu/Boogu-Image-0.1-Edit-fp8" \
+  -F image="@input.png" \
+  -F prompt="Change the style to a colored pencil drawing." \
+  -F num_inference_steps=28 \
+  -F guidance_scale=4.0 \
+  -F guidance_scale_2=1.0 \
+  -F seed=42 \
+  | jq -r '.data[0].b64_json' | base64 -d > edited_fp8.png
+```
+
+#### Notes
+
+- **Memory usage:** E2E generation uses approximately 21.1 GiB at 512x512 and 24.2-24.6 GiB at 1024x1024.
+- **Quantization scope:** TorchAO loading applies only to the diffusion transformer. The MLLM retains its checkpoint-declared configuration; the VAE and scheduler are outside this TorchAO routing.
+
 ## Image editing (Boogu-Image-0.1-Edit)
 
 The Edit checkpoint is served by the same native pipeline (`BooguImagePipeline`);
