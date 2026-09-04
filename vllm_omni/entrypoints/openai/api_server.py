@@ -2941,7 +2941,7 @@ async def _cleanup_video(video_id: str):
 def _cleanup_video_references(
     reference_video: ReferenceVideo | None,
     reference_audio: ReferenceAudio | None,
-    request_cleanup_paths: tuple[str, ...] = (),
+    control_path: str | None = None,
 ) -> None:
     if reference_video is not None:
         for path in reference_video.cleanup_paths:
@@ -2952,9 +2952,8 @@ def _cleanup_video_references(
         for path in cleanup_paths:
             if os.path.exists(path):
                 os.unlink(path)
-    for path in request_cleanup_paths:
-        if os.path.exists(path):
-            os.unlink(path)
+    if control_path is not None and os.path.exists(control_path):
+        os.unlink(control_path)
 
 
 async def _run_video_generation_job(
@@ -2964,13 +2963,13 @@ async def _run_video_generation_job(
     reference_image: ReferenceImage | None = None,
     reference_video: ReferenceVideo | None = None,
     reference_audio: ReferenceAudio | None = None,
-    request_cleanup_paths: tuple[str, ...] = (),
+    control_path: str | None = None,
     app_state: Any | None = None,
 ) -> None:
     job = await VIDEO_STORE.get(video_id)
     if job is None:
         logger.warning("Video job %s missing before generation task started; skipping", video_id)
-        _cleanup_video_references(reference_video, reference_audio, request_cleanup_paths)
+        _cleanup_video_references(reference_video, reference_audio, control_path)
         return
 
     await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
@@ -3039,7 +3038,7 @@ async def _run_video_generation_job(
         await VIDEO_STORE.pop(video_id)
         raise
     finally:
-        _cleanup_video_references(reference_video, reference_audio, request_cleanup_paths)
+        _cleanup_video_references(reference_video, reference_audio, control_path)
 
 
 VIDEO_SYNC_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", 600.0))
@@ -3362,7 +3361,7 @@ async def _parse_video_form(
     ReferenceImage | None,
     ReferenceVideo | None,
     ReferenceAudio | None,
-    tuple[str, ...],
+    str | None,
 ]:
     """FastAPI dependency that parses video form data, validates inputs,
     resolves the handler, and decodes any reference image.
@@ -3581,19 +3580,16 @@ async def _parse_video_form(
             cleanup_paths=cleanup_paths,
         )
 
-    request_cleanup_paths: tuple[str, ...] = ()
+    control_path: str | None = None
     if control_reference is not None and normalized_control_type is not None:
-        control_path: str | None = None
         try:
             control_path = await _persist_uploaded_control_reference(
                 control_reference,
                 max_bytes=CONTROL_REFERENCE_MAX_BYTES,
             )
-            request_cleanup_paths = (control_path,)
             _attach_control_upload(request, normalized_control_type, control_path)
         except (asyncio.CancelledError, HTTPException, OSError, TypeError, ValueError):
-            control_cleanup_paths = () if control_path is None else (control_path,)
-            _cleanup_video_references(reference_video, reference_audio, control_cleanup_paths)
+            _cleanup_video_references(reference_video, reference_audio, control_path)
             raise
 
     return (
@@ -3603,7 +3599,7 @@ async def _parse_video_form(
         reference_image,
         reference_video,
         reference_audio,
-        request_cleanup_paths,
+        control_path,
     )
 
 
@@ -3625,7 +3621,7 @@ async def create_video(
         ReferenceImage | None,
         ReferenceVideo | None,
         ReferenceAudio | None,
-        tuple[str, ...],
+        str | None,
     ] = Depends(_parse_video_form),
 ) -> VideoResponse:
     """Create an asynchronous video generation job.
@@ -3640,7 +3636,7 @@ async def create_video(
         reference_image,
         reference_video,
         reference_audio,
-        request_cleanup_paths,
+        control_path,
     ) = ctx
     ref = video_response_from_request(effective_model_name, request)
     await VIDEO_STORE.upsert(ref.id, ref)
@@ -3652,7 +3648,7 @@ async def create_video(
             reference_image,
             reference_video,
             reference_audio,
-            request_cleanup_paths,
+            control_path,
             app_state=raw_request.app.state,
         )
     )
@@ -3678,7 +3674,7 @@ async def create_video_sync(
         ReferenceImage | None,
         ReferenceVideo | None,
         ReferenceAudio | None,
-        tuple[str, ...],
+        str | None,
     ] = Depends(_parse_video_form),
 ) -> Response:
     """Synchronous video generation endpoint.
@@ -3697,7 +3693,7 @@ async def create_video_sync(
         reference_image,
         reference_video,
         reference_audio,
-        request_cleanup_paths,
+        control_path,
     ) = ctx
     request_id = f"video_sync-{random_uuid()}"
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
@@ -3732,7 +3728,7 @@ async def create_video_sync(
             detail=f"Video generation failed: {str(exc)}",
         ) from exc
     finally:
-        _cleanup_video_references(reference_video, reference_audio, request_cleanup_paths)
+        _cleanup_video_references(reference_video, reference_audio, control_path)
     inference_time_s = time.perf_counter() - started_at
 
     return Response(
