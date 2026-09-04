@@ -21,7 +21,9 @@ remote stages, intra-stage data parallelism, Ray, fault tolerance, elastic
 expert parallelism, sleep mode, or runtime LoRA updating. Runtime voice upload
 and deletion are also disabled because those mutations are process-local;
 built-in voices, inline reference audio, and voices restored at startup remain
-available.
+available. The `/v1/omni/sleep` and `/v1/omni/wakeup` control routes return HTTP
+409 for the same reason: their bookkeeping is process-local while stage engines
+are shared.
 
 ## Stage-based CLI quickstart
 

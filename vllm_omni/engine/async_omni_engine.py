@@ -33,7 +33,7 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
-from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
+from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.stage_config import (
     DuplexSessionRuntimeConfig,
     load_deploy_config,
@@ -77,13 +77,14 @@ from vllm_omni.engine.stage_client import StageClient
 from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.engine.stage_runtime import (
+    OmniClientConfig,
     StageRuntimeInfo,
     create_stage_runtime,
 )
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import (
     load_and_resolve_stage_configs,
-    parse_stage_overrides,
+    prepare_stage_config_inputs,
 )
 from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
@@ -121,7 +122,7 @@ class AsyncOmniEngine:
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _enable_orch_monitor: bool = False
-    _client_config: dict[str, Any] | None = None
+    _client_config: OmniClientConfig | None = None
     # Lazily created by get_output_blocking_async().
     _output_drain_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
@@ -136,7 +137,7 @@ class AsyncOmniEngine:
         log_stats: bool = False,
         tokenizer: str | None = None,
         trust_remote_code: bool | None = None,
-        client_config: dict[str, Any] | None = None,
+        client_config: OmniClientConfig | None = None,
         **kwargs: Any,
     ) -> None:
         self.model = model
@@ -222,11 +223,8 @@ class AsyncOmniEngine:
         if deploy_config_path is not None:
             self.duplex_session_config = load_deploy_config(deploy_config_path).duplex_session
 
-        # Tri-state: None means "not specified" — the deploy yaml's per-stage
-        # trust_remote_code stays in effect. An explicit True/False here is a
-        # global override (precedence: caller > deploy yaml > default False);
-        # the merge rule lives in with_trust_remote_code_override.
-        kwargs = with_trust_remote_code_override(kwargs, trust_remote_code)
+        # Tri-state trust_remote_code precedence is normalized together with
+        # deploy/strategy/override extraction in _resolve_stage_configs().
         self.config_path, self.stage_configs = self._resolve_stage_configs(
             model,
             kwargs,
@@ -1263,16 +1261,15 @@ class AsyncOmniEngine:
     ) -> tuple[str, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
-        for legacy_arg in ("stage_configs_path", "stage_configs"):
-            if legacy_arg in kwargs:
-                raise ValueError(f"`{legacy_arg}` is no longer supported; use `deploy_config` instead.")
-
-        deploy_config_path = kwargs.pop("deploy_config", None)
-        strategy_config_path = kwargs.pop("strategy_config", None)
-        stage_overrides_json = kwargs.pop("stage_overrides", None)
-
-        # Parse --stage-overrides JSON string if provided
-        stage_overrides = parse_stage_overrides(stage_overrides_json)
+        config_inputs = prepare_stage_config_inputs(
+            model,
+            kwargs,
+            trust_remote_code=trust_remote_code,
+        )
+        kwargs = config_inputs.kwargs
+        deploy_config_path = config_inputs.deploy_config_path
+        strategy_config_path = config_inputs.strategy_config_path
+        stage_overrides = config_inputs.stage_overrides
 
         # Unregistered diffusion checkpoints use the single-stage fallback
         # below instead of StageConfigFactory, so fold stage-0 model extras

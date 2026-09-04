@@ -5,7 +5,8 @@ import json
 import os
 import types
 from collections import Counter
-from dataclasses import fields, is_dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any, get_args, get_origin
 
@@ -555,6 +556,60 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
         except json.JSONDecodeError as exc:
             raise ValueError(f"--stage-overrides is not valid JSON: {exc}. Got: {value!r}") from exc
     return value
+
+
+@dataclass(frozen=True)
+class StageConfigInputs:
+    """Normalized inputs shared by all stage-config loading paths."""
+
+    model: str
+    kwargs: dict[str, Any]
+    trust_remote_code: bool | None
+    deploy_config_path: str | None
+    stage_overrides: dict[str, dict[str, Any]] | None
+    strategy_config_path: str | None
+
+
+def prepare_stage_config_inputs(
+    model: str,
+    kwargs: Mapping[str, Any],
+    *,
+    trust_remote_code: bool | None,
+    snapshot_model: bool = False,
+) -> StageConfigInputs:
+    """Normalize model/config arguments before resolving stage configs.
+
+    The standard API worker, multi-API parent, and headless entrypoint must
+    apply the same legacy-key filtering, trust-remote-code precedence, and
+    config-file extraction before calling :func:`load_and_resolve_stage_configs`.
+    """
+    resolved_model = model
+    if snapshot_model:
+        # Keep model materialization at the CLI boundary for the parent-owned
+        # launch path. The API worker's OmniBase has already done this work.
+        from vllm_omni.entrypoints.omni_base import omni_snapshot_download
+
+        resolved_model = omni_snapshot_download(model)
+
+    resolved_kwargs = dict(kwargs)
+    for legacy_arg in ("stage_configs_path", "stage_configs"):
+        if legacy_arg in resolved_kwargs:
+            raise ValueError(f"`{legacy_arg}` is no longer supported; use `deploy_config` instead.")
+    resolved_kwargs.pop("api_server_count", None)
+    resolved_kwargs.pop("model_tag", None)
+
+    resolved_kwargs = with_trust_remote_code_override(resolved_kwargs, trust_remote_code)
+    deploy_config_path = resolved_kwargs.pop("deploy_config", None)
+    strategy_config_path = resolved_kwargs.pop("strategy_config", None)
+    stage_overrides = parse_stage_overrides(resolved_kwargs.pop("stage_overrides", None))
+    return StageConfigInputs(
+        model=resolved_model,
+        kwargs=resolved_kwargs,
+        trust_remote_code=trust_remote_code,
+        deploy_config_path=deploy_config_path,
+        stage_overrides=stage_overrides,
+        strategy_config_path=strategy_config_path,
+    )
 
 
 def load_and_resolve_stage_configs(

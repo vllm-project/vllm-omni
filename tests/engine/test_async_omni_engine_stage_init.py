@@ -32,6 +32,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @dataclass
 class _FakeParallelConfig:
     enable_fault_tolerance: bool = False
+    enable_elastic_ep: bool = False
     data_parallel_size: int = 1
     use_ray: bool = False
 
@@ -945,6 +946,21 @@ def test_stage_runtime_multi_api_maps_stage_devices_from_launcher_visibility(mon
 
     assert captured_devices == ["5"]
     assert os.environ[device_env] == "5"
+
+
+def test_stage_runtime_multi_api_rejects_elastic_ep(monkeypatch):
+    runtime = _make_stage_runtime()
+    stage_plan = _make_llm_plan(
+        0,
+        stage_id=0,
+        vllm_config=_FakeVllmConfig(parallel_config=_FakeParallelConfig(enable_elastic_ep=True)),
+    )
+    stage_plan.replicas[0].engine_args_dict = {}
+    monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: [stage_plan])
+
+    with pytest.raises(ValueError, match="enable-elastic-ep"):
+        with runtime.launch_stage_engines(2):
+            pass
 
 
 def test_stage_runtime_multi_api_failure_shuts_down_before_exceptional_context_exit(monkeypatch):

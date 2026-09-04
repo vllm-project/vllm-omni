@@ -166,8 +166,8 @@ def test_build_multi_api_stage_runtime_matches_current_constructor(mocker: Mocke
 
     runtime = serve_module._build_multi_api_stage_runtime(args, 2)
 
-    assert runtime._client_count == 2
-    assert runtime._client_index == -1
+    assert runtime._client_count == 1
+    assert runtime._client_index == 0
 
 
 def test_build_multi_api_stage_runtime_rejects_sleep_enabled_in_stage_config(mocker: MockerFixture) -> None:

@@ -14,7 +14,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from multiprocessing.process import BaseProcess
-from typing import Any, cast
+from typing import Any, TypedDict, cast
 
 import janus
 from omegaconf import OmegaConf
@@ -91,11 +91,24 @@ class StageRemoteFactoryContext:
     executor_class: type | None = None
 
 
+class OmniClientConfig(TypedDict, total=False):
+    """Per-frontend transport/configuration passed across process boundaries."""
+
+    client_count: int
+    client_index: int
+    stage_addresses: dict[int | str, dict[int | str, dict[str, Any]]]
+    input_address: str
+    output_address: str
+    stats_update_address: str
+    actual_address_pipe: Any
+    tensor_queue: Any
+
+
 @dataclass
 class MultiApiStageEngineLaunch:
     """Parent-owned stage engines shared by multiple API processes."""
 
-    client_configs: list[dict[str, Any]]
+    client_configs: list[OmniClientConfig]
     resources: list[StageReplicaResources]
     watched_frontend_processes: list[BaseProcess] = field(default_factory=list)
 
@@ -149,9 +162,7 @@ class StageRuntime:
         async_chunk: bool,
         tokenizer: str | None = None,
         log_stats: bool = False,
-        client_config: dict[str, Any] | None = None,
-        client_count: int = 1,
-        client_index: int = 0,
+        client_config: OmniClientConfig | None = None,
     ) -> None:
         self._stage_configs = stage_configs
         self._model = model
@@ -161,8 +172,8 @@ class StageRuntime:
         self._tokenizer = tokenizer
         self._log_stats = log_stats
         self._num_stages = len(stage_configs)
-        self._client_count = int((client_config or {}).get("client_count", client_count))
-        self._client_index = int((client_config or {}).get("client_index", client_index))
+        self._client_count = int((client_config or {}).get("client_count", 1))
+        self._client_index = int((client_config or {}).get("client_index", 0))
         if self._client_count < 1:
             raise ValueError(f"client_count must be >= 1, got {self._client_count}")
         if self._client_index != -1 and not 0 <= self._client_index < self._client_count:
@@ -332,6 +343,8 @@ class StageRuntime:
                 parallel_configs.append(replica.stage_vllm_config.parallel_config)
         if any(getattr(parallel_config, "enable_fault_tolerance", False) for parallel_config in parallel_configs):
             raise ValueError("--api-server-count > 1 cannot be combined with --enable-fault-tolerance")
+        if any(getattr(parallel_config, "enable_elastic_ep", False) for parallel_config in parallel_configs):
+            raise ValueError("--api-server-count > 1 cannot be combined with --enable-elastic-ep")
         if any(
             getattr(parallel_config, "data_parallel_size", 1) != 1 or getattr(parallel_config, "use_ray", False)
             for parallel_config in parallel_configs
@@ -341,7 +354,7 @@ class StageRuntime:
                 "intra-replica data parallelism and Ray backends are not supported"
             )
 
-        client_configs: list[dict[str, Any]] = [
+        client_configs: list[OmniClientConfig] = [
             {
                 "client_count": num_api_servers,
                 "client_index": client_index,
@@ -352,6 +365,9 @@ class StageRuntime:
         entered_contexts: list[AbstractContextManager[StageReplicaResources]] = []
         resources: list[StageReplicaResources] = []
         watched_frontend_processes: list[BaseProcess] = []
+        # launch_stage_replica performs its readiness handshake in __exit__,
+        # after API workers are started, so initialization locks must remain
+        # held until all launch contexts have exited.
         lock_fds: list[int] = []
         locked_device_groups: set[str | None] = set()
         launch: MultiApiStageEngineLaunch | None = None
@@ -1346,7 +1362,7 @@ def create_stage_runtime(
     omni_lb_policy: str = "random",
     request_queue: janus.Queue[EngineQueueMessage] | None = None,
     log_stats: bool = False,
-    client_config: dict[str, Any] | None = None,
+    client_config: OmniClientConfig | None = None,
 ) -> StageRuntime:
     """Factory: select StageRuntime or DistStageRuntime."""
     if single_stage_mode:

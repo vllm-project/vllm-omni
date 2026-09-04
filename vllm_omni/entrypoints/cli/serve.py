@@ -972,34 +972,33 @@ class OmniServeCommand(CLISubcommand):
 
 def _build_multi_api_stage_runtime(args: TrackingNamespace, num_api_servers: int) -> StageRuntime:
     """Resolve the local EngineCore stages that the parent process owns."""
-    from vllm_omni.config.config_factory import with_trust_remote_code_override
     from vllm_omni.engine.stage_runtime import StageRuntime
-    from vllm_omni.entrypoints.omni_base import omni_snapshot_download
     from vllm_omni.entrypoints.utils import (
         load_and_resolve_stage_configs,
-        parse_stage_overrides,
+        prepare_stage_config_inputs,
     )
 
     kwargs = args.get_explicit_kwargs_dict()
-    kwargs.pop("api_server_count", None)
-    kwargs.pop("model_tag", None)
     model = kwargs.pop("model", None) or args.model
-    model = omni_snapshot_download(model)
 
     trust_remote_code = kwargs.get("trust_remote_code")
     if trust_remote_code is False:
         trust_remote_code = None
-    kwargs = with_trust_remote_code_override(kwargs, trust_remote_code)
-    deploy_config_path = kwargs.pop("deploy_config", None)
-    strategy_config_path = kwargs.pop("strategy_config", None)
-    stage_overrides = parse_stage_overrides(kwargs.pop("stage_overrides", None))
-    config_path, stage_configs, _ = load_and_resolve_stage_configs(
+    config_inputs = prepare_stage_config_inputs(
         model,
         kwargs,
         trust_remote_code=trust_remote_code,
-        deploy_config_path=deploy_config_path,
-        stage_overrides=stage_overrides,
-        strategy_config_path=strategy_config_path,
+        snapshot_model=True,
+    )
+    model = config_inputs.model
+    kwargs = config_inputs.kwargs
+    config_path, stage_configs, _ = load_and_resolve_stage_configs(
+        model,
+        kwargs,
+        trust_remote_code=config_inputs.trust_remote_code,
+        deploy_config_path=config_inputs.deploy_config_path,
+        stage_overrides=config_inputs.stage_overrides,
+        strategy_config_path=config_inputs.strategy_config_path,
     )
 
     sleep_stages = [
@@ -1023,8 +1022,6 @@ def _build_multi_api_stage_runtime(args: TrackingNamespace, num_api_servers: int
         async_chunk=async_chunk,
         tokenizer=getattr(args, "tokenizer", None),
         log_stats=not bool(getattr(args, "disable_log_stats", False)),
-        client_count=num_api_servers,
-        client_index=-1,
     )
 
 
@@ -1185,10 +1182,7 @@ def run_headless(args: TrackingNamespace) -> None:
         load_omni_transfer_config_for_model,
         prepare_engine_environment,
     )
-    from vllm_omni.entrypoints.utils import (
-        load_and_resolve_stage_configs,
-        parse_stage_overrides,
-    )
+    from vllm_omni.entrypoints.utils import load_and_resolve_stage_configs, prepare_stage_config_inputs
 
     model = args.model
     stage_id: int | None = args.stage_id
@@ -1223,20 +1217,21 @@ def run_headless(args: TrackingNamespace) -> None:
             args.replica_id,
         )
 
-    # Parse --stage-overrides (raw JSON string) exactly like the standard
-    # engine path (AsyncOmniEngine._resolve_stage_configs) so headless and
-    # standard launches resolve to the same per-stage device layout.
-    stage_overrides = parse_stage_overrides(args_dict.get("stage_overrides"))
+    config_inputs = prepare_stage_config_inputs(
+        model,
+        args_dict,
+        trust_remote_code=getattr(args, "trust_remote_code", None) or None,
+    )
+    model = config_inputs.model
+    args_dict = config_inputs.kwargs
 
     config_path, stage_configs, _ = load_and_resolve_stage_configs(
         model,
         args_dict,
-        # store_true cannot express an explicit False: absent maps to None
-        # ("not specified") so the deploy yaml's per-stage value applies.
-        trust_remote_code=getattr(args, "trust_remote_code", None) or None,
-        deploy_config_path=args_dict.get("deploy_config"),
-        stage_overrides=stage_overrides,
-        strategy_config_path=args_dict.get("strategy_config"),
+        trust_remote_code=config_inputs.trust_remote_code,
+        deploy_config_path=config_inputs.deploy_config_path,
+        stage_overrides=config_inputs.stage_overrides,
+        strategy_config_path=config_inputs.strategy_config_path,
     )
 
     # Locate the stage config that matches stage_id.
