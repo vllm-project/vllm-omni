@@ -20,6 +20,12 @@ _HF_NAMES = (
     r"|list_repo_refs|repo_exists"
 )
 
+# Indentation on the import's own line. A plain ``\s*`` also matches newlines,
+# so a match could start on a preceding blank line and the line number reported
+# below -- the only pointer a contributor gets -- would point at that blank line
+# instead of at the import.
+_INDENT = r"[^\S\r\n]*"
+
 # Non-library trees: examples, tests, and tooling may keep stdlib imports.
 _NON_LIBRARY_DIRS = {
     "examples/",
@@ -46,7 +52,7 @@ class ForbiddenImport:
 CHECK_IMPORTS = {
     "pickle/cloudpickle": ForbiddenImport(
         pattern=(
-            r"^\s*(import\s+(?:[\w.]+\s*(?:as\s+\w+)?\s*,\s*)*(pickle|cloudpickle)\b"
+            r"^" + _INDENT + r"(import\s+(?:[\w.]+\s*(?:as\s+\w+)?\s*,\s*)*(pickle|cloudpickle)\b"
             r"|from\s+(pickle|cloudpickle)\s+import\b)"
         ),
         tip=("Avoid using pickle or cloudpickle or add this file to tools/pre_commit/check_forbidden_imports.py."),
@@ -59,7 +65,7 @@ CHECK_IMPORTS = {
         },
     ),
     "base64": ForbiddenImport(
-        pattern=r"^\s*(?:import\s+base64(?:$|\s|,)|from\s+base64\s+import)",
+        pattern=r"^" + _INDENT + r"(?:import\s+base64(?:$|\s|,)|from\s+base64\s+import)",
         tip=("Replace 'import base64' with 'import pybase64' or 'import pybase64 as base64'."),
         allowed_pattern=re.compile(r"^\s*import\s+pybase64(\s*|\s+as\s+base64\s*)$"),
         allowed_dirs=_NON_LIBRARY_DIRS,
@@ -100,7 +106,7 @@ CHECK_IMPORTS = {
         },
     ),
     "re": ForbiddenImport(
-        pattern=r"^\s*(?:import\s+re(?:$|\s|,)|from\s+re\s+import)",
+        pattern=r"^" + _INDENT + r"(?:import\s+re(?:$|\s|,)|from\s+re\s+import)",
         tip="Replace 'import re' with 'import regex as re' or 'import regex'.",
         allowed_pattern=re.compile(r"^\s*import\s+regex(\s*|\s+as\s+re\s*)$"),
         allowed_dirs=_NON_LIBRARY_DIRS,
@@ -164,9 +170,9 @@ CHECK_IMPORTS = {
         # Catch `from huggingface_hub import `, including parenthesized,
         # multi-line imports.
         pattern=(
-            r"^\s*from\s+huggingface_hub\s+import\s*\([^)]*\b(?:" + _HF_NAMES + r")\b"
+            r"^" + _INDENT + r"from\s+huggingface_hub\s+import\s*\([^)]*\b(?:" + _HF_NAMES + r")\b"
             r"|"
-            r"^\s*from\s+huggingface_hub\s+import\b[^\n]*\b(?:" + _HF_NAMES + r")\b"
+            r"^" + _INDENT + r"from\s+huggingface_hub\s+import\b[^\n]*\b(?:" + _HF_NAMES + r")\b"
         ),
         tip=(
             "Use the shared, vLLM-tagged helpers from "
