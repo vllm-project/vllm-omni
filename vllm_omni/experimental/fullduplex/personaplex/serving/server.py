@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """PersonaPlex full-duplex server, compatible with the OFFICIAL Moshi web client.
 
 Serves the official PersonaPlex web UI (``dist.tgz`` from ``nvidia/personaplex-7b-v1``,
@@ -525,11 +525,17 @@ def main() -> None:
         default=1,
         help="Concurrent conversation slots on one engine (elastic batching when > 1).",
     )
+    ap.add_argument(
+        "--cuda-graphs",
+        action="store_true",
+        help="Capture the per-frame model steps into CUDA graphs (closes the eager realtime deficit on H100).",
+    )
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO)
     cfg = PersonaPlexConfig(
         voice_prompt=args.voice,
         batch_size=args.batch_size,
+        cuda_graphs=args.cuda_graphs,
         **({"persona": args.persona} if args.persona else {}),
     )
     web.run_app(create_app(cfg), host=args.host, port=args.port)

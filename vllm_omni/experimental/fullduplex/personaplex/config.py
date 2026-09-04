@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Configuration for the PersonaPlex full-duplex backend.
 
 PersonaPlex (``nvidia/personaplex-7b-v1``) is a Moshi finetune: a pure-lockstep
@@ -40,6 +40,11 @@ class PersonaPlexConfig:
         batch_size: Concurrent conversation slots sharing one engine. ``1`` is
             the single-session path; ``> 1`` enables elastic batching with
             per-slot recycle for new callers.
+        cuda_graphs: Capture the per-frame model steps into CUDA graphs at load
+            time, before any caller connects (see ``cuda_graphs.py``). Off by
+            default; capture failure falls back to eager.
+        graph_temporal: With ``cuda_graphs``, also graph the 7B temporal step
+            (not just the depformer). Ignored when ``cuda_graphs`` is off.
 
     Note: the native stepper decodes greedily (argmax) for both the text head
     and the depformer, so there are no sampling knobs here yet. Temperature /
@@ -54,6 +59,9 @@ class PersonaPlexConfig:
     cpu_offload: bool = False
 
     batch_size: int = 1
+
+    cuda_graphs: bool = False
+    graph_temporal: bool = True
 
     @property
     def sample_rate(self) -> int:

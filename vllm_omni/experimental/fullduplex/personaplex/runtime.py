@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Moshi-free PersonaPlex lockstep engine (native temporal + depformer + Mimi).
 
 This is the real-time duplex backend built entirely from vllm-omni-native
@@ -165,6 +165,8 @@ class PersonaPlexEngine:
 
         self._load_voice(cfg.voice_prompt)
         self._loaded = True
+        if cfg.cuda_graphs:
+            self.warmup_and_capture()
         return self
 
     def _load_voice(self, voice: str) -> None:
@@ -389,6 +391,86 @@ class PersonaPlexEngine:
         codes run-order dependent (valid but not reproducible token-for-token).
         """
         return self._step_from_codes(user_codes.to(self.config.device).long(), prefill)
+
+    # Throwaway frames driven before any caller connects: enough to clear the
+    # cold-start tick and the delay-line warmup gates, so the recorded example
+    # call has steady-state shapes and JIT/autotune have already fired.
+    _GRAPH_WARMUP_TICKS = 8
+
+    def _pplex_record_calls(self):
+        """Wrap the hot per-frame modules so the latest call's arguments are kept."""
+        import torch
+
+        state = self._pplex_graphs = {"rec": {}, "orig": {}}
+        orig_dep, orig_step = self._dep, self._temporal.step
+        state["orig"] = {"dep": orig_dep, "step": orig_step}
+
+        def rec_dep(*a, **k):
+            state["rec"]["dep"] = (
+                tuple(x.clone() if torch.is_tensor(x) else x for x in a),
+                {kk: (v.clone() if torch.is_tensor(v) else v) for kk, v in k.items()},
+            )
+            return orig_dep(*a, **k)
+
+        def rec_step(*a, **k):
+            state["rec"]["step"] = (
+                tuple(x.clone() if torch.is_tensor(x) else x for x in a),
+                {kk: (v.clone() if torch.is_tensor(v) else v) for kk, v in k.items()},
+            )
+            return orig_step(*a, **k)
+
+        self._dep, self._temporal.step = rec_dep, rec_step
+
+    def _pplex_restore_eager(self):
+        state = getattr(self, "_pplex_graphs", None)
+        if state and state.get("orig"):
+            self._dep = state["orig"]["dep"]
+            self._temporal.step = state["orig"]["step"]
+
+    def _pplex_capture_graphs(self):
+        """Swap the hot per-frame modules for CUDA-graph replays (see cuda_graphs.py)."""
+        from vllm_omni.experimental.fullduplex.personaplex.cuda_graphs import graph_capture
+
+        state = self._pplex_graphs
+        if "dep" not in state["rec"]:
+            logger.warning("[cudagraph] warmup recorded no depformer call; staying eager")
+            self._pplex_restore_eager()
+            return
+
+        # Capture in replay order (temporal step runs before the depformer in
+        # every tick); both graphs share the platform-global memory pool.
+        if self.config.graph_temporal and "step" in state["rec"]:
+            a, k = state["rec"]["step"]
+            self._temporal.step = graph_capture(state["orig"]["step"], a, k, label="temporal")
+        else:
+            self._temporal.step = state["orig"]["step"]
+        a, k = state["rec"]["dep"]
+        self._dep = graph_capture(state["orig"]["dep"], a, k, label="depformer")
+
+    def warmup_and_capture(self) -> None:
+        """Capture the per-frame CUDA graphs at load, before any caller connects.
+
+        Drives throwaway silence frames through the real serving path so the
+        recorded example call is steady-state shaped, then captures and wipes
+        every streaming buffer. The wipe is in place, so the captured graphs
+        stay welded to buffers the sessions that follow will use.
+        """
+        B = self.config.batch_size
+        silence = self._silence.view(1, 8).expand(B, 8)
+        try:
+            self._reset_all_streaming()
+            self._pplex_record_calls()
+            for _ in range(self._GRAPH_WARMUP_TICKS):
+                self._step_from_codes(silence.clone(), None)
+            self._pplex_capture_graphs()
+        except Exception:
+            logger.exception("[cudagraph] boot capture failed; serving eager", stack_info=True)
+            self._pplex_restore_eager()
+        finally:
+            # Whatever happened above, no fabricated frame may survive into a
+            # real session: rewind every offset and refill the staging ring.
+            self._reset_all_streaming()
+            self.last_out_tokens = None
 
     def _step_from_codes(self, codes, prefill):
         import torch
