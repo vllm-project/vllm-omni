@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """OmniModalityMetrics — per-modality Prometheus families (audio path only).
 
 7 audio business-semantic metric families. Text-path metrics (TTFT / ITL /
@@ -335,6 +338,7 @@ def observe_audio_streaming_finalize(
     chunk_arrival_times_s: list[float],
     chunk_bytes: list[int],
     sample_rate: int,
+    channels: int = defs.DEFAULT_AUDIO_CHANNELS,
     threshold_s: float = defs.AUDIO_CONTINUITY_DEFAULT_THRESHOLD_S,
 ) -> None:
     """Emit audio_underrun_s + audio_continuity_ok_total at request end.
@@ -353,6 +357,7 @@ def observe_audio_streaming_finalize(
         chunk_arrival_times_s=chunk_arrival_times_s,
         chunk_bytes=chunk_bytes,
         sample_rate=sample_rate,
+        channels=channels,
         threshold_s=threshold_s,
     )
     stage_label = str(stage_id)

@@ -53,6 +53,7 @@ Protocol:
 import asyncio
 import base64
 import json
+import time
 from contextlib import aclosing
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -271,6 +272,8 @@ class OmniStreamingSpeechHandler:
         ``utterance_index`` identifies the flush this sentence belongs to and
         ``sentence_index`` its position inside that flush.
         """
+        request_arrival_ts = time.time()
+        request_start_s = time.perf_counter()
         response_format = config.response_format or "wav"
 
         # Reject unmet word-timestamps preconditions early with a clear reason.
@@ -332,7 +335,10 @@ class OmniStreamingSpeechHandler:
         request_id = None
         try:
             if config.stream_audio:
-                request_id, generator, tts_params = await self._speech_service._prepare_speech_generation(request)
+                request_id, generator, tts_params = await self._speech_service._prepare_speech_generation(
+                    request,
+                    arrival_time=request_arrival_ts,
+                )
                 if config.word_timestamps:
                     total_bytes = await self._stream_audio_with_alignments(
                         websocket=websocket,
@@ -342,6 +348,8 @@ class OmniStreamingSpeechHandler:
                         utterance_index=utterance_index,
                         sentence_index=sentence_index,
                         language=config.language,
+                        request_start_s=request_start_s,
+                        request_arrival_ts=request_arrival_ts,
                         tts_params=tts_params,
                     )
                 else:
@@ -349,6 +357,8 @@ class OmniStreamingSpeechHandler:
                         self._speech_service._generate_pcm_chunks(
                             generator,
                             request_id,
+                            request_start_s=request_start_s,
+                            request_arrival_ts=request_arrival_ts,
                             tts_params=tts_params,
                         )
                     ) as stream:
@@ -356,7 +366,10 @@ class OmniStreamingSpeechHandler:
                             total_bytes += len(chunk)
                             await websocket.send_bytes(chunk)
             else:
-                audio_bytes, _ = await self._speech_service._generate_audio_bytes(request)
+                audio_bytes, _ = await self._speech_service._generate_audio_bytes(
+                    request,
+                    request_arrival_ts=request_arrival_ts,
+                )
                 total_bytes = len(audio_bytes)
                 await websocket.send_bytes(audio_bytes)
         except WebSocketDisconnect:
@@ -402,6 +415,8 @@ class OmniStreamingSpeechHandler:
         sentence_text: str,
         utterance_index: int,
         sentence_index: int,
+        request_start_s: float,
+        request_arrival_ts: float,
         language: str | None = None,
         tts_params: dict | None = None,
     ) -> int:
@@ -449,6 +464,8 @@ class OmniStreamingSpeechHandler:
             self._speech_service._generate_pcm_chunks(
                 generator,
                 request_id,
+                request_start_s=request_start_s,
+                request_arrival_ts=request_arrival_ts,
                 include_sample_rate=True,
                 tts_params=tts_params,
                 collect=collect,

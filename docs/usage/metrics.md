@@ -12,7 +12,7 @@ curl http://localhost:8000/metrics
 ## Metric Namespaces
 
 | Prefix | Source | Present when |
-|--------|--------|--------------|
+| -------- | -------- | -------------- |
 | `vllm_omni:` | vLLM-Omni orchestrator / audio modality / cross-stage transfer | Pipeline-dependent |
 | `vllm:` | Upstream vLLM engine, wrapped by `OmniPrometheusStatLogger` to expose `{stage, replica}` | Pipeline includes an LLM (AR) stage |
 | `http_` / `process_` | Uvicorn / Python runtime | Always |
@@ -24,7 +24,7 @@ Defined in `vllm_omni/metrics/prometheus.py`. Track request lifecycle across the
 ### Request counts
 
 | Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
+| -------- | ------ | -------- | ------------- |
 | `vllm_omni:num_requests_running` | Gauge | `model_name` | Pipeline-global in-flight requests (dispatched to engine, not yet finalized) |
 | `vllm_omni:num_requests_waiting` | Gauge | `model_name` | Requests waiting in the Orchestrator queue |
 | `vllm_omni:requests_success_total` | Counter | `model_name`, `finished_reason` | Total requests by completion reason. `finished_reason` ∈ {`stop`, `length`, `abort`, ...} mirroring upstream `vllm:request_success_total`; aborts cover client disconnect / cancellation paths in addition to upstream `FinishReason.ABORT` |
@@ -32,15 +32,15 @@ Defined in `vllm_omni/metrics/prometheus.py`. Track request lifecycle across the
 ### Latency
 
 | Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
+| -------- | ------ | -------- | ------------- |
 | `vllm_omni:e2e_request_latency_s` | Histogram | `model_name` | Pipeline-global end-to-end request latency in seconds |
 
 ## Audio Modality Metrics (`vllm_omni:`)
 
-Emitted at request finalize, except for `audio_ttfp_s` (streaming-hook at the first audio packet) and `audio_underrun_s` / `audio_continuity_ok_total` (streaming finalize, after the chunk stream is exhausted). All carry `{model_name, stage, replica}` plus the listed extra label.
+Emitted at request finalize, except for `audio_ttfp_s` (the first audio packet/frame from streaming Chat or Speech APIs) and `audio_underrun_s` / `audio_continuity_ok_total` (Chat or Speech streaming finalize, after the chunk stream is exhausted). Non-streaming Speech latency is represented by `e2e_request_latency_s`, not TTFP. All audio metrics carry `{model_name, stage, replica}` plus the listed extra label.
 
 | Metric | Type | Extra label | Description |
-|--------|------|-------------|-------------|
+| -------- | ------ | ------------- | ------------- |
 | `vllm_omni:audio_ttfp_s` | Histogram | — | Time from request arrival to first audio packet/frame |
 | `vllm_omni:audio_duration_s` | Histogram | — | Audio content duration (`audio_frames / sample_rate`) |
 | `vllm_omni:audio_rtf` | Histogram | — | Real-time factor (`stage_gen_time_s / audio_duration_s`); streaming TTS SLO red line `< 1`; uses `RTF_BUCKETS` |
@@ -50,13 +50,22 @@ Emitted at request finalize, except for `audio_ttfp_s` (streaming-hook at the fi
 | `vllm_omni:audio_skipped_requests_total` | Counter | `reason` | Silent-loss counter — code2wav rejected malformed codec input and returned `200 OK` with empty audio |
 
 The continuity math comes from `vllm_omni/benchmarks/audio_continuity.py::compute_continuity_stats` so the server-side observation aligns with the bench-side definition.
+For Speech, continuity applies to raw audio, SSE, and WebSocket streaming. WAV headers and empty chunks are excluded; non-streaming Speech requests do not emit continuity samples.
+
+Continuity rate for the default 100 ms threshold can be derived from the successful-continuity counter and the underrun Histogram's request count:
+
+```promql
+sum by (model_name, stage, replica) (rate(vllm_omni:audio_continuity_ok_total{threshold_ms="100"}[5m]))
+/
+sum by (model_name, stage, replica) (rate(vllm_omni:audio_underrun_s_count[5m]))
+```
 
 ## Diffusion Metrics (`vllm_omni:`)
 
 Per-request timing breakdowns for diffusion (image/video) stages. Emitted at request finalize when `stage_metrics.diffusion_metrics` is present. All carry `{model_name, stage, replica}`.
 
 | Metric | Type | Description |
-|--------|------|-------------|
+| -------- | ------ | ------------- |
 | `vllm_omni:diffusion_exec_s` | Histogram | DiT forward pass execution time per request in seconds |
 | `vllm_omni:diffusion_exec_per_step_s` | Histogram | DiT forward pass execution time per denoising step in seconds (`exec_s / num_inference_steps`) |
 | `vllm_omni:diffusion_preprocess_s` | Histogram | Diffusion input preprocessing time per request in seconds |
@@ -80,7 +89,7 @@ rate(vllm_omni:diffusion_preprocess_s_sum[5m])
 Per-physical-transfer histograms tracking the data hop between adjacent stages. Labels `{model_name, from_stage, from_replica, to_stage, to_replica}` let dashboards attribute latency to specific replica edges. `from_replica` / `to_replica` are resolved from the orchestrator's sticky-routing binding (`stage_pool.get_bound_replica_id(request_id)`), so no extra plumbing through `TransferEdgeStats` is needed.
 
 | Metric | Type | Description |
-|--------|------|-------------|
+| -------- | ------ | ------------- |
 | `vllm_omni:transfer_size_bytes` | Histogram | Per-transfer payload size in bytes |
 | `vllm_omni:transfer_tx_s` | Histogram | Sender-side time (serialize + submit to connector) |
 | `vllm_omni:transfer_rx_s` | Histogram | Receiver-side time (recv + deserialize) |
@@ -106,7 +115,7 @@ For the full list of upstream metrics, see [the vLLM docs](https://github.com/vl
 ## Metric Availability by Pipeline Type
 
 | Metric group | Multi-stage LLM (Qwen3-Omni) |
-|---|---|
+| --- | --- |
 | `vllm_omni:` request tracking + latency | With `--log-stats` |
 | `vllm_omni:` audio modality | With `--log-stats`, if pipeline has a talker stage |
 | `vllm_omni:` transfer | With `--log-stats`, if pipeline has ≥ 2 stages |
