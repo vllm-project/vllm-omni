@@ -1704,7 +1704,7 @@ class TestTTSMethods:
         speech_server._resolve_ref_audio = mocker.AsyncMock(return_value=([0.9] * 48000, 24000, "key_bbb"))
         prompt_b = await speech_server._build_higgs_audio_v3_params(req)
 
-        assert prompt_a["prompt_token_ids"] == [1, 151702, 151702, 2]
+        assert prompt_a["prompt_token_ids"] == [1, 151700, 151700, 2]
         assert prompt_a["prompt_token_ids"] == prompt_b["prompt_token_ids"]
         assert prompt_a["additional_information"]["audio_placeholder_positions"].tolist() == [1, 2]
         assert prompt_a["cache_salt"] != prompt_b["cache_salt"]

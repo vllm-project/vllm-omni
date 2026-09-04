@@ -109,7 +109,11 @@ class HiggsAudioV3TokenizerAdapter:
             [index for index, token_id in enumerate(prompt_ids) if token_id == AUDIO_PLACEHOLDER_ID],
             dtype=torch.long,
         )
-        engine_prompt_ids = [self.audio_id if token_id == AUDIO_PLACEHOLDER_ID else token_id for token_id in prompt_ids]
+        # The embedding at every marked position is replaced before the
+        # transformer layers run. Use <|tts|> as the valid filler so the
+        # placeholders cannot be mistaken for <|audio|> continuation tokens by
+        # the model's sampler state machine.
+        engine_prompt_ids = [self.tts_id if token_id == AUDIO_PLACEHOLDER_ID else token_id for token_id in prompt_ids]
         return engine_prompt_ids, placeholder_positions
 
     def build_prompt(

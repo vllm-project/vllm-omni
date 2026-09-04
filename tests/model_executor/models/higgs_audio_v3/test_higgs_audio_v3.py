@@ -1633,7 +1633,9 @@ class TestPromptBuilder:
         assert min(prompt_ids) < 0
         assert min(engine_prompt_ids) >= 0
         assert placeholder_positions.tolist() == [2, 3]
-        assert [engine_prompt_ids[index] for index in placeholder_positions.tolist()] == [adapter.audio_id] * 2
+        filler_ids = [engine_prompt_ids[index] for index in placeholder_positions.tolist()]
+        assert filler_ids == [adapter.tts_id] * 2
+        assert adapter.audio_id not in filler_ids
 
 
 class TestVoiceCloneReferenceCache:
