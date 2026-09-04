@@ -198,10 +198,41 @@ def _check_devices(runtime: dict[str, Any], cfg: OmniParallelConfig, *, role: Ro
 
 
 def _apply_to_stage(stage: Any, cfg: OmniParallelConfig, *, role: RoleKey) -> None:
+    declared = set(cfg.l1_owners.keys())
+    if hasattr(stage, "parallel_config") and hasattr(stage, "runtime_config"):
+        parallel = stage.parallel_config
+        for kind, field_name in _ENGINE_FIELD_BY_KIND.items():
+            if kind in declared:
+                existing = getattr(parallel, field_name, None)
+                value = getattr(cfg, field_name)
+                if existing not in (None, 1, value):
+                    _fail(
+                        f"role {role!r}: strategy derives {field_name}={value} "
+                        f"but structured config already set {existing}"
+                    )
+                setattr(parallel, field_name, value)
+        if "ep" in declared and cfg.enable_expert_parallel:
+            setattr(parallel, "enable_expert_parallel", True)
+        if "stage_replica" in declared:
+            existing = stage.runtime_config.num_replicas
+            if existing not in (None, 1, cfg.stage_replica_size):
+                _fail(
+                    f"role {role!r}: strategy derives "
+                    f"num_replicas={cfg.stage_replica_size} but structured config already set {existing}"
+                )
+            stage.runtime_config.num_replicas = cfg.stage_replica_size
+        check_device_layout(
+            stage.runtime_config.devices,
+            tensor_parallel_size=cfg.tensor_parallel_size,
+            data_parallel_size=cfg.data_parallel_size,
+            pipeline_parallel_size=cfg.pipeline_parallel_size,
+            num_replicas=int(stage.runtime_config.num_replicas or 1),
+            role=role,
+        )
+        return
+
     engine_args = stage.yaml_engine_args
     runtime = stage.yaml_runtime
-
-    declared = set(cfg.l1_owners.keys())
     for kind, field_name in _ENGINE_FIELD_BY_KIND.items():
         if kind in declared:
             _set_explicit(engine_args, field_name, getattr(cfg, field_name), role=role)
@@ -209,7 +240,6 @@ def _apply_to_stage(stage: Any, cfg: OmniParallelConfig, *, role: RoleKey) -> No
         _set_explicit(engine_args, "enable_expert_parallel", True, role=role)
     if "stage_replica" in declared:
         _set_num_replicas(runtime, cfg.stage_replica_size, role=role)
-
     _check_devices(runtime, cfg, role=role)
 
 

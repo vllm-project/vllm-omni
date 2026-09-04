@@ -15,9 +15,9 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import janus
-from omegaconf import OmegaConf
 from vllm.logger import init_logger
 
+from vllm_omni.config.omni_config import BaseVllmOmniStageConfig
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     resolve_omni_kv_config_for_stage,
 )
@@ -48,10 +48,12 @@ from vllm_omni.engine.stage_init_utils import (
     _inject_inferred_kv_tp_topology,
     acquire_device_locks,
     build_engine_args_dict,
+    build_engine_args_dict_from_omni_stage_config,
     build_llm_stage_output_processor,
     build_vllm_config,
     compute_replica_layout,
     extract_legacy_stage_metadata,
+    extract_stage_metadata_from_omni_stage_config,
     get_stage_connector_spec,
     inject_kv_stage_info,
     inject_omni_kv_connector_config,
@@ -122,19 +124,38 @@ class StageRuntime:
         model: str,
         config_path: str,
         *,
+        typed_stage_configs: list[BaseVllmOmniStageConfig] | None = None,
         stage_init_timeout: int,
         async_chunk: bool,
         tokenizer: str | None = None,
         log_stats: bool = False,
     ) -> None:
+        if typed_stage_configs is not None:
+            if len(typed_stage_configs) != len(stage_configs):
+                raise ValueError(
+                    "Typed and legacy stage configs must contain the same number of stages "
+                    f"(got {len(typed_stage_configs)} typed and {len(stage_configs)} legacy)."
+                )
+            for stage_idx, (typed_stage_cfg, legacy_stage_cfg) in enumerate(
+                zip(typed_stage_configs, stage_configs, strict=True)
+            ):
+                typed_stage_id = int(typed_stage_cfg.stage_id)
+                legacy_stage_id = int(getattr(legacy_stage_cfg, "stage_id", stage_idx))
+                if typed_stage_id != legacy_stage_id:
+                    raise ValueError(
+                        "Typed and legacy stage configs must be ordered by the same stage ID "
+                        f"(index {stage_idx}: {typed_stage_id} != {legacy_stage_id})."
+                    )
         self._stage_configs = stage_configs
+        self._typed_stage_configs = typed_stage_configs
+        self._planning_stage_configs = typed_stage_configs if typed_stage_configs is not None else stage_configs
         self._model = model
         self._config_path = config_path
         self._stage_init_timeout = stage_init_timeout
         self._async_chunk = async_chunk
         self._tokenizer = tokenizer
         self._log_stats = log_stats
-        self._num_stages = len(stage_configs)
+        self._num_stages = len(self._planning_stage_configs)
 
         # Populated by initialize()
         self.stage_pools: list[StagePool] = []
@@ -274,7 +295,7 @@ class StageRuntime:
 
     def _prepare_stage_plans(self) -> list[LogicalStageInitPlan]:
         """Build logical stage plans and cache prompt expansion metadata."""
-        replicas_per_stage, replica_devices_map = compute_replica_layout(self._stage_configs)
+        replicas_per_stage, replica_devices_map = compute_replica_layout(self._planning_stage_configs)
         prepare_engine_environment()
         omni_transfer_config = load_omni_transfer_config_for_model(self._model, self._config_path)
         stage_plans = self._build_logical_stage_init_plans(
@@ -339,12 +360,13 @@ class StageRuntime:
         """Build startup plans for every logical stage and replica."""
         stage_plans: list[LogicalStageInitPlan] = []
 
-        # RFC #4021 transition boundary: stage planning still relies on legacy
-        # StageConfig.runtime and StageConfig.engine_args for replica and engine
-        # setup. Keep metadata extraction on the legacy path until the
-        # coordinated stage-init cutover.
-        for stage_idx, stage_cfg in enumerate(self._stage_configs):
-            base_metadata = extract_legacy_stage_metadata(stage_cfg)
+        for stage_idx, stage_cfg in enumerate(self._planning_stage_configs):
+            legacy_stage_cfg = self._stage_configs[stage_idx]
+            base_metadata = (
+                extract_stage_metadata_from_omni_stage_config(stage_cfg)
+                if isinstance(stage_cfg, BaseVllmOmniStageConfig)
+                else extract_legacy_stage_metadata(stage_cfg)
+            )
             stage_id = int(base_metadata.stage_id)
             if stage_id != stage_idx:
                 raise ValueError(
@@ -368,14 +390,23 @@ class StageRuntime:
             executor_class = None
             engine_args_dict = None
             if base_metadata.stage_type != "diffusion":
-                # The stable adapter entry point still receives the same
-                # legacy stage object as replica planning. Its implementation
-                # switches only at the coordinated RFC #4021 cutover.
-                engine_args_dict = build_engine_args_dict(
-                    stage_cfg,
-                    self._model,
-                    stage_connector_spec=stage_connector_spec,
-                    cli_tokenizer=self._tokenizer,
+                # Engine construction is the next RFC #4021 slice. Until then,
+                # the stable adapter receives the paired legacy launch payload;
+                # planning and metadata above remain fully typed.
+                engine_args_dict = (
+                    build_engine_args_dict_from_omni_stage_config(
+                        stage_cfg,
+                        self._model,
+                        stage_connector_spec=stage_connector_spec,
+                        cli_tokenizer=self._tokenizer,
+                    )
+                    if isinstance(stage_cfg, BaseVllmOmniStageConfig)
+                    else build_engine_args_dict(
+                        legacy_stage_cfg,
+                        self._model,
+                        stage_connector_spec=stage_connector_spec,
+                        cli_tokenizer=self._tokenizer,
+                    )
                 )
                 inject_omni_kv_connector_config(
                     engine_args_dict,
@@ -385,7 +416,7 @@ class StageRuntime:
                 _inject_inferred_kv_tp_topology(
                     engine_args_dict.get("omni_kv_config"),
                     stage_id,
-                    self._stage_configs,
+                    self._planning_stage_configs,
                 )
                 stage_vllm_config, executor_class = build_vllm_config(
                     stage_cfg,
@@ -396,10 +427,20 @@ class StageRuntime:
 
             for replica_id in range(num_replicas):
                 replica_cfg = copy.deepcopy(stage_cfg) if replica_id > 0 else stage_cfg
+                legacy_replica_cfg = copy.deepcopy(legacy_stage_cfg) if replica_id > 0 else legacy_stage_cfg
                 if stage_idx in replica_devices_map:
-                    replica_cfg.runtime.devices = replica_devices_map[stage_idx][replica_id]
+                    devices = replica_devices_map[stage_idx][replica_id]
+                    runtime_cfg = getattr(replica_cfg, "runtime_config", getattr(replica_cfg, "runtime", None))
+                    if runtime_cfg is not None:
+                        runtime_cfg.devices = devices
+                    if not isinstance(legacy_replica_cfg, BaseVllmOmniStageConfig):
+                        legacy_replica_cfg.runtime.devices = devices
 
-                replica_metadata = extract_legacy_stage_metadata(replica_cfg)
+                replica_metadata = (
+                    extract_stage_metadata_from_omni_stage_config(replica_cfg)
+                    if isinstance(replica_cfg, BaseVllmOmniStageConfig)
+                    else extract_legacy_stage_metadata(replica_cfg)
+                )
                 replica_metadata.replica_id = replica_id
                 if launch_mode == "remote" and replica_metadata.stage_type != "diffusion":
                     replica_metadata.runtime_cfg = None
@@ -409,6 +450,7 @@ class StageRuntime:
                         num_replicas=num_replicas,
                         launch_mode=launch_mode,
                         stage_cfg=replica_cfg,
+                        legacy_stage_cfg=legacy_replica_cfg,
                         metadata=replica_metadata,
                         stage_connector_spec=stage_connector_spec,
                         omni_kv_connector=omni_kv_connector,
@@ -651,22 +693,30 @@ class StageRuntime:
                 if omni_conn_cfg:
                     if omni_from is None or omni_to is None:
                         raise RuntimeError("Omni KV connector requires source and destination stages")
-                    inject_omni_kv_config(plan.stage_cfg, omni_conn_cfg, omni_from, omni_to)
-                inject_kv_stage_info(plan.stage_cfg, plan.metadata.stage_id, self._stage_configs)
-                engine_args = getattr(plan.stage_cfg, "engine_args", {})
-                inline_diffusion = (
-                    engine_args.get("inline_diffusion", False)
-                    if hasattr(engine_args, "get")
-                    else getattr(engine_args, "inline_diffusion", False)
-                )
-                custom_pipeline_args = (
-                    engine_args.get("custom_pipeline_args")
-                    if hasattr(engine_args, "get")
-                    else getattr(engine_args, "custom_pipeline_args", None)
-                )
+                    inject_omni_kv_config(plan.runtime_stage_cfg, omni_conn_cfg, omni_from, omni_to)
+                inject_kv_stage_info(plan.runtime_stage_cfg, plan.metadata.stage_id, self._stage_configs)
+                if isinstance(plan.runtime_stage_cfg, BaseVllmOmniStageConfig):
+                    inline_diffusion = plan.runtime_stage_cfg.stage_pipeline_config.inline_diffusion
+                    custom_pipeline_args = getattr(
+                        getattr(plan.runtime_stage_cfg, "diffusion_config", None),
+                        "custom_pipeline_args",
+                        None,
+                    )
+                else:
+                    engine_args = getattr(plan.runtime_stage_cfg, "engine_args", {})
+                    inline_diffusion = (
+                        engine_args.get("inline_diffusion", False)
+                        if hasattr(engine_args, "get")
+                        else getattr(engine_args, "inline_diffusion", False)
+                    )
+                    custom_pipeline_args = (
+                        engine_args.get("custom_pipeline_args")
+                        if hasattr(engine_args, "get")
+                        else getattr(engine_args, "custom_pipeline_args", None)
+                    )
                 client, resources = launch_diffusion_stage_replica(
                     model=self._model,
-                    stage_config=plan.stage_cfg,
+                    stage_config=plan.runtime_stage_cfg,
                     metadata=plan.metadata,
                     stage_init_timeout=stage_init_timeout,
                     use_inline=plan.num_replicas == 1
@@ -762,6 +812,7 @@ class DistStageRuntime(StageRuntime):
         model: str,
         config_path: str,
         *,
+        typed_stage_configs: list[BaseVllmOmniStageConfig] | None = None,
         stage_init_timeout: int,
         async_chunk: bool,
         single_stage_id_filter: int | None,
@@ -778,6 +829,7 @@ class DistStageRuntime(StageRuntime):
             stage_configs=stage_configs,
             model=model,
             config_path=config_path,
+            typed_stage_configs=typed_stage_configs,
             stage_init_timeout=stage_init_timeout,
             async_chunk=async_chunk,
             tokenizer=tokenizer,
@@ -820,10 +872,11 @@ class DistStageRuntime(StageRuntime):
 
         for idx, stage_cfg in enumerate(self._stage_configs):
             stage_id = int(getattr(stage_cfg, "stage_id", idx))
-            runtime_cfg = getattr(stage_cfg, "runtime", None)
+            runtime_cfg = getattr(stage_cfg, "runtime_config", getattr(stage_cfg, "runtime", None))
             if runtime_cfg is None:
                 continue
             if stage_id == target_stage_id:
+                typed_runtime_cfg = None
                 try:
                     runtime_cfg.num_replicas = self._omni_dp_size_local
                 except (AttributeError, TypeError):
@@ -835,6 +888,22 @@ class DistStageRuntime(StageRuntime):
                         self._omni_dp_size_local,
                         stage_id,
                     )
+                if self._typed_stage_configs is not None:
+                    typed_stage_cfg = self._typed_stage_configs[idx]
+                    typed_runtime_cfg = getattr(typed_stage_cfg, "runtime_config", None)
+                if typed_runtime_cfg is not None:
+                    try:
+                        typed_runtime_cfg.num_replicas = self._omni_dp_size_local
+                    except (AttributeError, TypeError):
+                        if hasattr(typed_runtime_cfg, "__setitem__"):
+                            typed_runtime_cfg["num_replicas"] = self._omni_dp_size_local
+                        else:
+                            logger.warning(
+                                "[DistStageRuntime] Failed to apply omni_dp_size_local=%s "
+                                "to typed stage %s runtime config",
+                                self._omni_dp_size_local,
+                                stage_id,
+                            )
 
     def _before_initialize_stage_replicas(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
         self._start_omni_master_server(stage_plans)
@@ -892,13 +961,9 @@ class DistStageRuntime(StageRuntime):
         if registered_stage_cfg is None:
             raise ValueError(f"Remote stage {plan.metadata.stage_id} registered without stage config")
 
-        # Remote diffusion registration still transports the legacy mapping
-        # shape. Reconstruct and project that shape until its RFC #4021 cutover.
-        metadata = (
-            extract_legacy_stage_metadata(OmegaConf.create(registered_stage_cfg))
-            if plan.metadata.stage_type == "diffusion"
-            else copy.deepcopy(plan.metadata)
-        )
+        # Registration is transport-only: the head-side typed plan remains
+        # authoritative for metadata and topology.
+        metadata = extract_stage_metadata_from_omni_stage_config(plan.stage_cfg)
         metadata.replica_id = plan.replica_id
         ctx = StageRemoteFactoryContext(
             stage_id=plan.metadata.stage_id,
@@ -1097,6 +1162,7 @@ def create_stage_runtime(
     model: str,
     config_path: str,
     *,
+    typed_stage_configs: list[BaseVllmOmniStageConfig] | None = None,
     single_stage_mode: bool,
     stage_init_timeout: int,
     async_chunk: bool,
@@ -1119,6 +1185,7 @@ def create_stage_runtime(
             stage_configs=stage_configs,
             model=model,
             config_path=config_path,
+            typed_stage_configs=typed_stage_configs,
             stage_init_timeout=stage_init_timeout,
             async_chunk=async_chunk,
             tokenizer=tokenizer,
@@ -1135,6 +1202,7 @@ def create_stage_runtime(
         stage_configs=stage_configs,
         model=model,
         config_path=config_path,
+        typed_stage_configs=typed_stage_configs,
         stage_init_timeout=stage_init_timeout,
         async_chunk=async_chunk,
         tokenizer=tokenizer,

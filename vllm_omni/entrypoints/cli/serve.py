@@ -14,6 +14,7 @@ import math
 import os
 import signal
 from types import FrameType
+from typing import Any
 
 import uvloop
 from vllm.entrypoints.cli.types import CLISubcommand
@@ -45,6 +46,24 @@ Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
 --help=OmniConfig)
   Use `--help=all` to show all available flags at once.
 """
+
+
+def _parse_stage_overrides(value: str) -> dict[str, dict[str, Any]]:
+    """Parse and validate ``--stage-overrides`` at the CLI boundary."""
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"--stage-overrides is not valid JSON: {exc}. Got: {value!r}") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("--stage-overrides must be a JSON object of stage-id to override objects")
+    for stage_id, overrides in parsed.items():
+        if not isinstance(stage_id, str) or not stage_id.isascii() or not stage_id.isdigit():
+            raise argparse.ArgumentTypeError(
+                "--stage-overrides keys must be non-negative integer stage ids (as strings)"
+            )
+        if not isinstance(overrides, dict):
+            raise argparse.ArgumentTypeError("--stage-overrides values must be override objects")
+    return parsed
 
 
 def _nonneg_finite_float(value: str) -> float:
@@ -286,7 +305,7 @@ class OmniServeCommand(CLISubcommand):
         )
         omni_config_group.add_argument(
             "--stage-overrides",
-            type=str,
+            type=_parse_stage_overrides,
             default=None,
             help="Per-stage JSON overrides. Example: "
             '\'{"0": {"gpu_memory_utilization": 0.8}, "2": {"enforce_eager": true}}\'',
@@ -934,6 +953,7 @@ def run_headless(args: TrackingNamespace) -> None:
     from vllm.v1.executor.multiproc_executor import MultiprocExecutor
     from vllm.version import __version__ as VLLM_VERSION
 
+    from vllm_omni.config.resolver import resolve_omni_config
     from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_omni_kv_config_for_stage
     from vllm_omni.engine.stage_engine_startup import (
         get_headless_replica_devices,
@@ -942,15 +962,12 @@ def run_headless(args: TrackingNamespace) -> None:
     )
     from vllm_omni.engine.stage_init_utils import (
         build_engine_args_dict,
+        build_engine_args_dict_from_omni_stage_config,
         build_vllm_config,
         get_stage_connector_spec,
         inject_omni_kv_connector_config,
         load_omni_transfer_config_for_model,
         prepare_engine_environment,
-    )
-    from vllm_omni.entrypoints.utils import (
-        load_and_resolve_stage_configs,
-        parse_stage_overrides,
     )
 
     model = args.model
@@ -973,6 +990,10 @@ def run_headless(args: TrackingNamespace) -> None:
     # Filter down to a dict of things explicitly requested by the user
     args_dict = args.get_explicit_kwargs_dict()
 
+    deploy_config_path = args_dict.pop("deploy_config", None)
+    strategy_config_path = args_dict.pop("strategy_config", None)
+    stage_overrides = args_dict.pop("stage_overrides", None)
+
     # ``--replica-id`` is deprecated and ignored — replica ids are
     # auto-assigned by ``OmniMasterServer`` so headless processes carry
     # no knowledge of their per-replica id at launch time. Warn (don't
@@ -985,33 +1006,27 @@ def run_headless(args: TrackingNamespace) -> None:
             "master server.",
             args.replica_id,
         )
+        args_dict.pop("replica_id")
 
-    # Parse --stage-overrides (raw JSON string) exactly like the standard
-    # engine path (AsyncOmniEngine._resolve_stage_configs) so headless and
-    # standard launches resolve to the same per-stage device layout.
-    stage_overrides = parse_stage_overrides(args_dict.get("stage_overrides"))
-
-    config_path, stage_configs, _ = load_and_resolve_stage_configs(
+    resolved = resolve_omni_config(
         model,
-        args_dict,
         # store_true cannot express an explicit False: absent maps to None
         # ("not specified") so the deploy yaml's per-stage value applies.
         trust_remote_code=getattr(args, "trust_remote_code", None) or None,
-        deploy_config_path=args_dict.get("deploy_config"),
+        cli_overrides=args_dict,
+        deploy_config_path=deploy_config_path,
         stage_overrides=stage_overrides,
-        strategy_config_path=args_dict.get("strategy_config"),
+        strategy_config_path=strategy_config_path,
     )
+    config_path = resolved.config_path
+    stage_configs = list(resolved.stage_configs)
 
-    # Locate the stage config that matches stage_id.
-    stage_cfg = None
-    for cfg in stage_configs:
-        if cfg.stage_id == stage_id:
-            stage_cfg = cfg
-            break
-    if stage_cfg is None:
+    try:
+        stage_cfg = resolved.stage_by_id(stage_id)
+    except KeyError:
         raise ValueError(
             f"No stage config found for stage_id={stage_id}. Available stage ids: {[c.stage_id for c in stage_configs]}"
-        )
+        ) from None
 
     prepare_engine_environment()
     per_replica_devices = get_headless_replica_devices(stage_cfg, stage_id, omni_dp_size_local)
@@ -1036,21 +1051,21 @@ def run_headless(args: TrackingNamespace) -> None:
     stage_connector_spec = get_stage_connector_spec(
         omni_transfer_config=omni_transfer_config,
         stage_id=stage_id,
-        async_chunk=bool(stage_cfg.engine_args.get("async_chunk", False)),
+        async_chunk=bool(
+            getattr(getattr(stage_cfg, "connector_config", None), "async_chunk", None)
+            if hasattr(stage_cfg, "connector_config")
+            else stage_cfg.engine_args.get("async_chunk", False)
+        ),
     )
 
-    # ``runtime_cfg`` is mostly inherited from the parent's
-    # CUDA_VISIBLE_DEVICES; when ``--omni-dp-size-local > 1`` we additionally
-    # bracket each replica's spawn below with setup_stage_devices so they
-    # don't all stack on cuda:0 (see ``per_replica_devices`` above).
-    # Headless startup still supplies the legacy OmegaConf stage shape through
-    # the stable adapter entry point. The implementation switches only when
-    # RFC #4021 threads structured stage configs through the launch plan.
-    engine_args_dict = build_engine_args_dict(
-        stage_cfg,
-        model,
-        stage_connector_spec=stage_connector_spec,
-        cli_tokenizer=getattr(args, "tokenizer", None),
+    engine_args_dict = (
+        build_engine_args_dict_from_omni_stage_config(
+            stage_cfg, model, stage_connector_spec=stage_connector_spec, cli_tokenizer=getattr(args, "tokenizer", None)
+        )
+        if hasattr(stage_cfg, "connector_config")
+        else build_engine_args_dict(
+            stage_cfg, model, stage_connector_spec=stage_connector_spec, cli_tokenizer=getattr(args, "tokenizer", None)
+        )
     )
 
     inject_omni_kv_connector_config(engine_args_dict, omni_kv_connector, stage_id)

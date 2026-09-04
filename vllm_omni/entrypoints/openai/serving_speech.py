@@ -37,6 +37,7 @@ from vllm.utils import random_uuid
 from vllm.utils.async_utils import make_async
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.config.stage_config import StagePipelineConfig
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin, StreamingAudioResampler
 from vllm_omni.entrypoints.openai.protocol.audio import (
     AudioResponse,
@@ -85,6 +86,24 @@ _SPEECH_USAGE_OUTPUT_TOKENS_HEADER = "X-VLLM-OMNI-OUTPUT-TOKENS"
 _SPEECH_USAGE_TOTAL_TOKENS_HEADER = "X-VLLM-OMNI-TOTAL-TOKENS"
 _SPEECH_USAGE_INPUT_TEXT_TOKENS_HEADER = "X-VLLM-OMNI-INPUT-TEXT-TOKENS"
 _SPEECH_USAGE_INPUT_AUDIO_TOKENS_HEADER = "X-VLLM-OMNI-INPUT-AUDIO-TOKENS"
+
+
+def _stage_speech_metadata(stage: Any) -> tuple[str | None, str | None, str | None]:
+    """Return speech routing metadata from typed or legacy stage configs."""
+    topology = getattr(stage, "stage_pipeline_config", None)
+    if isinstance(topology, StagePipelineConfig):
+        return (
+            getattr(topology, "model_stage", None),
+            getattr(getattr(stage, "model_config", None), "model_arch", None),
+            getattr(stage, "worker_type", None),
+        )
+    engine_args = getattr(stage, "engine_args", None)
+    return (
+        getattr(engine_args, "model_stage", None),
+        getattr(engine_args, "model_arch", None),
+        getattr(engine_args, "worker_type", None),
+    )
+
 
 # TTS Configuration
 #
@@ -564,13 +583,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         tts_stage_keys = all_tts_stage_keys()
         entry_stage_archs = tts_entry_stage_archs()
         all_stages = frozenset(
-            getattr(stage.engine_args, "model_stage", None) for stage in self.engine_client.stage_configs
+            model_stage
+            for stage in self.engine_client.stage_configs
+            if (model_stage := _stage_speech_metadata(stage)[0]) is not None
         )
         for stage in self.engine_client.stage_configs:
-            engine_args = stage.engine_args
-            model_stage = engine_args.model_stage
-            model_arch = getattr(engine_args, "model_arch", None)
-            worker_type = getattr(engine_args, "worker_type", None)
+            model_stage, model_arch, worker_type = _stage_speech_metadata(stage)
             if model_stage in tts_stage_keys:
                 # Owning the stage key is not always enough: a model may be
                 # speech-capable only in some deployment topologies. Ask the
@@ -594,10 +612,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """
         if self._tts_stage is None:
             return None
-        return detect_tts_model_type(
-            getattr(self._tts_stage.engine_args, "model_stage", None),
-            getattr(self._tts_stage.engine_args, "model_arch", None),
-        )
+        return detect_tts_model_type(*_stage_speech_metadata(self._tts_stage)[:2])
 
     def _compute_max_instructions_length(self) -> int:
         """Compute max instructions length with precedence: CLI > stage config > default.
@@ -611,7 +626,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # 2. Try to get from TTS stage config
         if self._tts_stage is not None:
-            tts_args = getattr(self._tts_stage, "tts_args", {})
+            topology = getattr(self._tts_stage, "stage_pipeline_config", None)
+            tts_args = (
+                getattr(topology, "extras", {}).get("tts_args", {})
+                if isinstance(topology, StagePipelineConfig)
+                else getattr(self._tts_stage, "tts_args", {})
+            )
             if "max_instructions_length" in tts_args:
                 return tts_args["max_instructions_length"]
 
@@ -2867,7 +2887,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
 
-            stage = getattr(getattr(self._tts_stage, "engine_args", None), "model_stage", None)
+            stage = _stage_speech_metadata(self._tts_stage)[0]
             if stage == "audex_omni":
                 profile, folder = "full", "checkpoint_folder_full"
             elif stage == "audex_tta_thinker":
@@ -3116,9 +3136,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # chat-template markers (im_start_token_id 151644).  A raw-text
             # prompt produces a 1-token placeholder that crashes the talker's
             # prefill/decode handoff.  Reject early with an actionable message.
-            stage_names = {
-                getattr(getattr(s, "engine_args", None), "model_stage", None) for s in self.engine_client.stage_configs
-            }
+            stage_names = {_stage_speech_metadata(s)[0] for s in self.engine_client.stage_configs}
             if "talker" in stage_names:
                 raise ValueError(
                     "The /v1/audio/speech endpoint is only supported for "

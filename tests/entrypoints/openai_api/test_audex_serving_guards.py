@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Serving-layer regressions for the Audex zero-codec-token contract.
 
 A zero-codec-token (or phase-invalid TTA) request reaches the serving layer
@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.config.stage_config import StagePipelineConfig
 from vllm_omni.entrypoints.openai.serving_speech import (
     _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES,
     OmniOpenAIServingSpeech,
@@ -251,9 +252,28 @@ class TestAudexStageDetection:
         stage = serving._find_tts_stage()
         assert stage is not None and stage.engine_args.model_stage == "audex_thinker"
 
+    def test_typed_pipeline_detected_without_legacy_engine_args(self):
+        serving = OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
+        stages = [
+            SimpleNamespace(
+                stage_pipeline_config=StagePipelineConfig(stage_id=index, model_stage=model_stage),
+                model_config=SimpleNamespace(model_arch=None),
+                worker_type="generation",
+            )
+            for index, model_stage in enumerate(("audex_thinker", "audex_code2wav"))
+        ]
+        serving.engine_client = SimpleNamespace(stage_configs=stages)
+
+        stage = serving._find_tts_stage()
+        serving._tts_stage = stage
+
+        assert stage is stages[0]
+        assert serving._detect_tts_model_type() == "audex"
+
 
 def test_guided_injection_sets_guided_temperature():
     """Guided requests decode at the measured CFG temperature (0.05)."""
+
     serving = TestAudexCfgInjection()._serving_with_fake_tokenizer()
     cond = TestAudexCfgInjection()._cond_prompt()
     params = SimpleNamespace(extra_args={"cfg_scale": 1.5}, temperature=0.1)
@@ -263,6 +283,29 @@ def test_guided_injection_sets_guided_temperature():
     unguided = SimpleNamespace(extra_args={"cfg_scale": 1.0}, temperature=0.1)
     out = serving._adapter._inject_audex_cfg_pair_args("req-2", {"prompt": cond}, unguided)
     assert out.temperature == 0.1
+
+
+def test_typed_full_pipeline_uses_full_checkpoint_tokenizer(mocker):
+    serving = OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
+    serving._audex_tokenizer = None
+    serving._tts_stage = SimpleNamespace(
+        stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="audex_omni"),
+        model_config=SimpleNamespace(model_arch=None),
+        worker_type="ar",
+    )
+    serving.engine_client = SimpleNamespace(
+        model_config=SimpleNamespace(model="/models/audex"),
+    )
+    ensure_snapshot = mocker.patch(
+        "vllm_omni.model_executor.models.audex.checkpoint.ensure_audex_snapshot",
+        return_value="/snapshots/audex",
+    )
+    from_pretrained = mocker.patch("transformers.AutoTokenizer.from_pretrained", return_value=object())
+
+    serving._get_audex_tokenizer()
+
+    ensure_snapshot.assert_called_once_with("/models/audex", profile="full")
+    from_pretrained.assert_called_once_with("/snapshots/audex/checkpoint_folder_full")
 
 
 # ---------------------------------------------------------------- TTA serving surface

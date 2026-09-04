@@ -27,6 +27,7 @@ from pydantic import ValidationError
 from pytest_mock import MockerFixture
 from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
 
+from vllm_omni.config.stage_config import StagePipelineConfig
 from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.entrypoints.openai import api_server as api_server_module
 from vllm_omni.entrypoints.openai import serving_speech as serving_speech_module
@@ -921,6 +922,38 @@ class TestTTSMethods:
         )
         assert server._is_tts is False
 
+        request = OpenAICreateSpeechRequest(input="Hello world")
+        with pytest.raises(ValueError, match="only supported for dedicated TTS models"):
+            asyncio.run(server._prepare_speech_generation(request))
+        server.shutdown()
+
+    def test_prepare_speech_rejects_typed_non_tts_omni_model(self, mocker: MockerFixture):
+        """Typed Qwen3-Omni stages must hit the same talker guard as legacy stages."""
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.tts_max_instructions_length = None
+        mock_engine_client.stage_configs = [
+            SimpleNamespace(
+                stage_pipeline_config=StagePipelineConfig(stage_id=index, model_stage=model_stage),
+                model_config=SimpleNamespace(model_arch=None),
+                worker_type=worker_type,
+            )
+            for index, (model_stage, worker_type) in enumerate(
+                (
+                    ("thinker", "ar"),
+                    ("talker", "ar"),
+                    ("code2wav", "generation"),
+                )
+            )
+        ]
+
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
         request = OpenAICreateSpeechRequest(input="Hello world")
         with pytest.raises(ValueError, match="only supported for dedicated TTS models"):
             asyncio.run(server._prepare_speech_generation(request))

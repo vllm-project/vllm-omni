@@ -52,7 +52,7 @@ from vllm_omni.config.stage_config import StageType
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
-from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
+from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
@@ -73,9 +73,14 @@ class ReplicaInitPlan:
     metadata: Any
     stage_connector_spec: dict[str, Any]
     omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None]
+    legacy_stage_cfg: Any | None = None
     stage_vllm_config: Any | None = None
     executor_class: type | None = None
     engine_args_dict: dict[str, Any] | None = None
+
+    @property
+    def runtime_stage_cfg(self) -> Any:
+        return self.legacy_stage_cfg if self.legacy_stage_cfg is not None else self.stage_cfg
 
 
 @dataclass
@@ -398,6 +403,11 @@ def _tp_size_for_stage(stage_configs: Sequence[Any], stage_id: Any) -> int | Non
     for stage_cfg in stage_configs:
         if str(getattr(stage_cfg, "stage_id", None)) not in id_strs:
             continue
+        if isinstance(stage_cfg, BaseVllmOmniStageConfig):
+            try:
+                return max(1, int(stage_cfg.parallel_config.tensor_parallel_size))
+            except (TypeError, ValueError):
+                return 1
         engine_args = getattr(stage_cfg, "engine_args", None)
         if engine_args is None:
             return 1
@@ -485,11 +495,15 @@ def inject_kv_stage_info(stage_cfg: Any, stage_id: int, stage_configs: Sequence[
     rank mappings automatically.
     """
     try:
-        engine_args = stage_cfg.engine_args
-        if hasattr(engine_args, "get"):
-            omni_kv = engine_args.get("omni_kv_config", None)
+        connector_config = getattr(stage_cfg, "connector_config", None)
+        if connector_config is not None:
+            omni_kv = connector_config.omni_kv_config
         else:
-            omni_kv = getattr(engine_args, "omni_kv_config", None)
+            engine_args = stage_cfg.engine_args
+            if hasattr(engine_args, "get"):
+                omni_kv = engine_args.get("omni_kv_config", None)
+            else:
+                omni_kv = getattr(engine_args, "omni_kv_config", None)
 
         if omni_kv is None:
             return
@@ -500,7 +514,11 @@ def inject_kv_stage_info(stage_cfg: Any, stage_id: int, stage_configs: Sequence[
             if "stage_id" not in omni_kv:
                 omni_kv["stage_id"] = stage_id
 
-        engine_input_source = getattr(stage_cfg, "engine_input_source", None)
+        engine_input_source = (
+            getattr(stage_cfg, "input_sources", None)
+            if connector_config is not None
+            else getattr(stage_cfg, "engine_input_source", None)
+        )
         if engine_input_source is not None:
             if hasattr(omni_kv, "setdefault"):
                 omni_kv.setdefault("engine_input_source", list(engine_input_source))
@@ -706,10 +724,14 @@ def extract_stage_metadata_from_omni_stage_config(
     require the legacy StageConfig/OmegaConf shape.
     """
     stage_type: Literal["llm", "diffusion"] = "diffusion" if stage_config.stage_type == StageType.DIFFUSION else "llm"
-    sampling_params_cls = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
-    sampling_params: OmniSamplingParams = sampling_params_cls(
-        **(stage_config.model_config.default_sampling_params or {})
-    )
+    pooling_config = stage_config.pooling_config
+    if stage_type == "llm" and (pooling_config.runner or "").lower() == "pooling":
+        sampling_params: OmniSamplingParams | PoolingParams = (
+            copy.deepcopy(pooling_config.default_pooling_params) or PoolingParams()
+        )
+    else:
+        sampling_params_cls = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
+        sampling_params = sampling_params_cls(**(stage_config.model_config.default_sampling_params or {}))
     custom_process_input_func = _resolve_omni_metadata_hook(stage_config.custom_process_input_func)
 
     if stage_type == "diffusion":
@@ -882,6 +904,9 @@ def _get_local_llm_parallel_sizes(
 
 def get_stage_devices_per_replica(stage_cfg: Any, engine_args: Any | None = None) -> int:
     """Return the number of devices consumed by one replica of *stage_cfg*."""
+    typed_parallel_config = getattr(stage_cfg, "parallel_config", None)
+    if typed_parallel_config is not None:
+        return max(1, int(getattr(typed_parallel_config, "world_size", 1)))
     if engine_args is None:
         engine_args = getattr(stage_cfg, "engine_args", {})
     if getattr(stage_cfg, "stage_type", "llm") == "diffusion":
@@ -926,7 +951,7 @@ def compute_replica_layout(
     """
     replicas_per_stage: list[int] = []
     for stage_cfg in stage_configs:
-        runtime_cfg = getattr(stage_cfg, "runtime", {})
+        runtime_cfg = getattr(stage_cfg, "runtime_config", getattr(stage_cfg, "runtime", {}))
         num_replicas = int(
             runtime_cfg.get("num_replicas", 1)
             if hasattr(runtime_cfg, "get")
@@ -941,7 +966,7 @@ def compute_replica_layout(
         num_replicas = replicas_per_stage[stage_id]
         if num_replicas <= 1:
             continue
-        runtime_cfg = getattr(stage_cfg, "runtime", {})
+        runtime_cfg = getattr(stage_cfg, "runtime_config", getattr(stage_cfg, "runtime", {}))
         devices_str = (
             runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
         )
@@ -1095,6 +1120,11 @@ def _project_omni_stage_engine_args(
                 exclude=excluded_fields,
             )
         )
+    pooling_config = stage_config.pooling_config
+    if pooling_config.runner is not None:
+        engine_args["runner"] = pooling_config.runner
+    if pooling_config.pooling_output_decoder is not None:
+        engine_args["pooling_output_decoder"] = pooling_config.pooling_output_decoder
 
     if is_diffusion:
         for config, field_map in (
@@ -1380,7 +1410,7 @@ def _check_stage_device_layout(stage_config: Any, engine_args_dict: dict[str, An
     """
     from vllm_omni.config.composable_parallel import StrategyApplyError, check_device_layout
 
-    runtime = getattr(stage_config, "runtime", None)
+    runtime = getattr(stage_config, "runtime_config", getattr(stage_config, "runtime", None))
     devices = _get_attr_or_item(runtime, "devices", None) if runtime is not None else None
     if devices is None:
         # No explicit placement -> vLLM assigns devices itself; nothing to check.
@@ -1441,10 +1471,12 @@ def build_vllm_config(
         (vllm_config, executor_class)
     """
     if engine_args_dict is None:
-        engine_args_dict = build_engine_args_dict(
-            stage_config,
-            model,
-            stage_connector_spec=stage_connector_spec,
+        engine_args_dict = (
+            build_engine_args_dict_from_omni_stage_config(
+                stage_config, model, stage_connector_spec=stage_connector_spec
+            )
+            if isinstance(stage_config, BaseVllmOmniStageConfig)
+            else build_engine_args_dict(stage_config, model, stage_connector_spec=stage_connector_spec)
         )
 
     filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
@@ -1740,7 +1772,7 @@ def release_device_locks(lock_fds: list[int]) -> None:
 
 
 def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> Any:
-    """Load omni transfer config from an explicit path or resolved model config.
+    """Load omni transfer config from the resolver-selected deploy config.
 
     Resolves ``base_config`` inheritance (CI overlay → base deploy YAML) so
     that connectors defined in the base config are visible to the transfer
@@ -1749,12 +1781,11 @@ def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> 
     from vllm_omni.distributed.omni_connectors import load_omni_transfer_config
 
     try:
-        resolved_config_path = config_path or resolve_model_config_path(model)
-        if resolved_config_path is None:
+        if config_path is None:
             return None
         from vllm_omni.config.stage_config import resolve_deploy_yaml
 
-        resolved_dict = resolve_deploy_yaml(resolved_config_path)
+        resolved_dict = resolve_deploy_yaml(config_path)
         return load_omni_transfer_config(config_dict=resolved_dict)
     except Exception as e:
         logger.warning("[stage_init] Failed to load transfer config: %s", e)
@@ -1793,7 +1824,11 @@ def build_diffusion_config(
 ) -> Any:
     """Build diffusion config for a stage."""
 
-    engine_args_dict = build_engine_args_dict(stage_cfg, model)
+    engine_args_dict = (
+        build_engine_args_dict_from_omni_stage_config(stage_cfg, model)
+        if isinstance(stage_cfg, BaseVllmOmniStageConfig)
+        else build_engine_args_dict(stage_cfg, model)
+    )
     od_config = OmniDiffusionConfig.from_kwargs(**engine_args_dict)
 
     num_devices_per_stage = od_config.parallel_config.world_size

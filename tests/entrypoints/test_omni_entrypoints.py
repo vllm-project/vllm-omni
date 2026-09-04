@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import queue
@@ -12,6 +15,8 @@ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import StageConfig
 from vllm_omni.engine.async_omni_engine import StageRuntimeInfo
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
@@ -220,6 +225,14 @@ def test_resolve_sampling_params_list_preserves_stage_constraints():
     assert 42 in resolved[0]._all_stop_token_ids
     assert caller_params.detokenize is True
     assert caller_params.stop_token_ids == [7]
+
+
+def test_sampling_constraints_are_forwarded_by_typed_stage_configs():
+    config = VllmOmniConfig.from_pipeline_config(OMNI_PIPELINES["qwen3_tts"])
+
+    constraints = OmniBase._get_sampling_constraints_list(config.stage_configs)
+
+    assert constraints == [dict(stage.stage_pipeline_config.sampling_constraints) for stage in config.stage_configs]
 
 
 def _stage_spec(

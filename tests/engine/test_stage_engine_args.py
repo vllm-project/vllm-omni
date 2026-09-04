@@ -92,6 +92,7 @@ _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
         "num_weight_load_threads",
         "omni_kv_config",
         "parallel_config",
+        "pooling_output_decoder",
         "silence_ban_frames",
         "subtalker_sampling_params",
         "task_type",

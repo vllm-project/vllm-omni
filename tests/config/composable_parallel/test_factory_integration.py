@@ -20,6 +20,7 @@ from vllm_omni.config.composable_parallel import (
     apply_strategy_specs,
 )
 from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
 
@@ -137,3 +138,17 @@ def test_cli_overrides_strategy_with_warning():
     assert _resolved(stages, "talker").runtime.num_replicas == 3
     # ...and the override was warned about, naming the conflicting field.
     assert any("num_replicas" in m and "overrides the strategy-derived" in m for m in messages)
+
+
+def test_typed_cli_overrides_strategy():
+    pipeline = OMNI_PIPELINES["qwen2_5_omni"]
+    config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=load_deploy_config(_DEPLOY),
+        cli_overrides={"stage_1_num_replicas": 3},
+        strategy_specs={"talker": [_stage_replica(2, "round_robin")]},
+    )
+
+    talker = next(stage for stage in config.stage_configs if stage.model_stage == "talker")
+    assert talker.runtime_config.num_replicas == 3
+    assert config.orchestrator_config.omni_lb_policy == "round-robin"

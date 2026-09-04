@@ -514,7 +514,7 @@ class OrchestratorArgs:
 
     # === Config Files ===
     deploy_config: str | None = None
-    stage_overrides: str | None = None  # raw JSON string; parsed downstream
+    stage_overrides: dict[str, dict[str, Any]] | None = None
     # Optional composable-parallel strategy.yaml; orchestrator reads it, overlays
     # derived sizing onto merged stages, then drops it before per-stage engine args.
     strategy_config: str | None = None

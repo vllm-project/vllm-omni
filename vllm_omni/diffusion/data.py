@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import copy
+import json
 import math
 import os
 import random
@@ -42,45 +43,57 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+def normalize_omni_diffusion_kwargs(raw_kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize legacy diffusion kwargs before config construction."""
-    normalized = dict(kwargs)
+    config_kwargs = dict(raw_kwargs)
+
+    dtype = config_kwargs.get("dtype")
+    if dtype is None:
+        config_kwargs["dtype"] = "auto"
+    elif isinstance(dtype, torch.dtype):
+        config_kwargs["dtype"] = str(dtype).removeprefix("torch.")
+    elif not isinstance(dtype, str):
+        raise TypeError(f"Provided dtype must be a string or torch.dtype, got {type(dtype).__name__}")
 
     # Backwards-compatibility: older callers may use a diffusion-specific
     # "static_lora_scale" kwarg. Normalize it to the canonical "lora_scale".
-    if "static_lora_scale" in normalized:
-        if "lora_scale" not in normalized:
-            normalized["lora_scale"] = normalized["static_lora_scale"]
-        normalized.pop("static_lora_scale", None)
+    if "static_lora_scale" in config_kwargs:
+        if "lora_scale" not in config_kwargs:
+            config_kwargs["lora_scale"] = config_kwargs["static_lora_scale"]
+        config_kwargs.pop("static_lora_scale", None)
+
+    diffusion_quantization = config_kwargs.pop("diffusion_quantization_config", None)
+    if config_kwargs.get("quantization_config") is None and diffusion_quantization is not None:
+        config_kwargs["quantization_config"] = diffusion_quantization
 
     # Backwards-compatibility: map "quantization" to "quantization_config"
     # so callers using the old field name still work.
-    if "quantization" in normalized and normalized.get("quantization_config", None) is None:
-        normalized["quantization_config"] = normalized.pop("quantization")
+    if "quantization" in config_kwargs and config_kwargs.get("quantization_config", None) is None:
+        config_kwargs["quantization_config"] = config_kwargs.pop("quantization")
     else:
-        normalized.pop("quantization", None)
+        config_kwargs.pop("quantization", None)
 
     # Renamed from kv_cache_* to avoid clashing with vLLM's --kv-cache-dtype.
-    if normalized.get("diffusion_kv_cache_dtype") is None and "kv_cache_dtype" in normalized:
-        normalized["diffusion_kv_cache_dtype"] = normalized.pop("kv_cache_dtype")
+    if config_kwargs.get("diffusion_kv_cache_dtype") is None and "kv_cache_dtype" in config_kwargs:
+        config_kwargs["diffusion_kv_cache_dtype"] = config_kwargs.pop("kv_cache_dtype")
     else:
-        normalized.pop("kv_cache_dtype", None)
-    if normalized.get("diffusion_kv_cache_skip_steps") is None and "kv_cache_skip_steps" in normalized:
-        normalized["diffusion_kv_cache_skip_steps"] = normalized.pop("kv_cache_skip_steps")
+        config_kwargs.pop("kv_cache_dtype", None)
+    if config_kwargs.get("diffusion_kv_cache_skip_steps") is None and "kv_cache_skip_steps" in config_kwargs:
+        config_kwargs["diffusion_kv_cache_skip_steps"] = config_kwargs.pop("kv_cache_skip_steps")
     else:
-        normalized.pop("kv_cache_skip_steps", None)
-    if normalized.get("diffusion_kv_cache_skip_layers") is None and "kv_cache_skip_layers" in normalized:
-        normalized["diffusion_kv_cache_skip_layers"] = normalized.pop("kv_cache_skip_layers")
+        config_kwargs.pop("kv_cache_skip_steps", None)
+    if config_kwargs.get("diffusion_kv_cache_skip_layers") is None and "kv_cache_skip_layers" in config_kwargs:
+        config_kwargs["diffusion_kv_cache_skip_layers"] = config_kwargs.pop("kv_cache_skip_layers")
     else:
-        normalized.pop("kv_cache_skip_layers", None)
+        config_kwargs.pop("kv_cache_skip_layers", None)
 
     # Handle "diffusion_attention_backend" shorthand: merge into
     # diffusion_attention_config before field filtering.
-    diffusion_attn_backend = normalized.pop("diffusion_attention_backend", None)
-    fastvideo_vsa_topk = normalized.pop("fastvideo_vsa_topk", None)
+    diffusion_attn_backend = config_kwargs.pop("diffusion_attention_backend", None)
+    fastvideo_vsa_topk = config_kwargs.pop("fastvideo_vsa_topk", None)
     if diffusion_attn_backend is not None or fastvideo_vsa_topk is not None:
-        existing = normalized.get("diffusion_attention_config")
-        normalized["diffusion_attention_config"] = parse_attention_config(
+        existing = config_kwargs.get("diffusion_attention_config")
+        config_kwargs["diffusion_attention_config"] = parse_attention_config(
             existing,
             attention_backend=diffusion_attn_backend,
             fastvideo_vsa_topk=fastvideo_vsa_topk,
@@ -88,16 +101,28 @@ def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]
 
     # Check environment variable as fallback for cache_backend.
     # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND.
-    if "cache_backend" not in normalized:
+    if "cache_backend" not in config_kwargs:
         cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
-        normalized["cache_backend"] = cache_backend.lower() if cache_backend else "none"
+        config_kwargs["cache_backend"] = cache_backend.lower() if cache_backend else "none"
+
+    cache_config = config_kwargs.get("cache_config")
+    if isinstance(cache_config, str):
+        try:
+            config_kwargs["cache_config"] = json.loads(cache_config)
+        except json.JSONDecodeError:
+            logger.warning("Invalid cache_config JSON, using backend defaults.")
+            config_kwargs.pop("cache_config", None)
+
+    if config_kwargs.get("streaming_output") is None and config_kwargs.get("diffusion_streaming_output") is not None:
+        config_kwargs["streaming_output"] = config_kwargs["diffusion_streaming_output"]
+    config_kwargs.pop("diffusion_streaming_output", None)
 
     # Convert optional YAML null values to empty containers.
     for key in ("diffusers_load_kwargs", "diffusers_call_kwargs"):
-        if key in normalized and normalized[key] is None:
-            normalized[key] = {}
+        if key in config_kwargs and config_kwargs[key] is None:
+            config_kwargs[key] = {}
 
-    return normalized
+    return config_kwargs
 
 
 def validate_host_weight_runtime_options(*, mode: object, root: object) -> None:
@@ -433,6 +458,27 @@ class DiffusionParallelConfig:
         if not isinstance(data, dict):
             raise TypeError(f"Expected parallel config dict, got {type(data)!r}")
         return cls(**data)
+
+    @classmethod
+    def from_stage_overrides(cls, kwargs: Mapping[str, Any]) -> "DiffusionParallelConfig":
+        """Resolve nested or flat stage inputs through the config's own defaults."""
+        parallel_config = kwargs.get("parallel_config")
+        if isinstance(parallel_config, cls):
+            return parallel_config
+
+        valid_fields = {item.name for item in fields(cls) if item.init}
+        if isinstance(parallel_config, Mapping):
+            values = {key: value for key, value in parallel_config.items() if key in valid_fields}
+        elif parallel_config is not None and hasattr(parallel_config, "__dict__"):
+            values = {key: value for key, value in vars(parallel_config).items() if key in valid_fields}
+        elif parallel_config is not None:
+            raise TypeError(
+                f"parallel_config must be a mapping or DiffusionParallelConfig, got {type(parallel_config).__name__}"
+            )
+        else:
+            values = {key: value for key, value in kwargs.items() if key in valid_fields}
+
+        return cls(**{key: value for key, value in values.items() if value is not None})
 
 
 @dataclass
@@ -1499,15 +1545,18 @@ class OmniDiffusionConfig:
                     raise
 
     @classmethod
-    def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
-        kwargs = normalize_omni_diffusion_kwargs(kwargs)
-
-        # Filter kwargs to only include valid fields
+    def normalize_init_kwargs(cls, raw_kwargs: Mapping[str, Any]) -> dict[str, Any]:
+        config_kwargs = normalize_omni_diffusion_kwargs(raw_kwargs)
         valid_fields = {f.name for f in fields(cls)}
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
+        # Remaining ``None`` values mean "unset" at the CLI/deploy boundary.
+        # Drop them so non-optional dataclass defaults are not overwritten.
+        # Fields where ``None`` has normalization semantics (for example dtype
+        # and nullable container inputs) are handled above before this filter.
+        return {key: value for key, value in config_kwargs.items() if key in valid_fields and value is not None}
 
-        instance = cls(**filtered_kwargs)
-        return instance
+    @classmethod
+    def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
+        return cls(**cls.normalize_init_kwargs(kwargs))
 
 
 @dataclass
