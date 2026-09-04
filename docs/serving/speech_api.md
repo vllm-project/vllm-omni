@@ -319,8 +319,9 @@ upstream LLM) pays the WebSocket handshake once instead of once per utterance.
 
 - The session config is sticky. Send `input.text` again straight after
   `session.done` to reuse it, or send another `session.config` first to change
-  voice, format, or reference audio. A `session.config` sent while text is
-  still buffered is rejected so no pending input is silently dropped.
+  voice, format, or reference audio. A `session.config` sent in the middle of
+  an utterance is rejected so no pending input is silently dropped and so a
+  split utterance cannot end up half in one voice and half in another.
 - An utterance is the flush unit, not a linguistic one: it is one `input.done`
   cycle. `utterance_index` counts those flushes across the connection, so it
   tells you which `input.done` a frame belongs to. `sentence_index` counts the
@@ -341,6 +342,12 @@ All REST API parameters are supported, plus:
 | `stream_audio` | bool | false | Stream one or more PCM chunks for each TTS request over WebSocket |
 | `split_granularity` | string | `"none"` | `"none"`: one request per `input.done`. `"sentence"`: split on `.!?` plus CJK `。！？…`, Indic danda `।॥`, and Arabic `؟`. `"clause"`: also split on `,;，；،`. |
 | `seed` | integer | null | Forwarded to the speech engine for this session |
+
+ASCII punctuation only ends a unit when whitespace or `input.done` follows it,
+and decimals (`3.14`), thousands separators (`1,000`), abbreviations (`Dr.`,
+`e.g.`) and initials (`J. R.`) are not treated as boundaries. A punctuation run
+and any closing quote or bracket stay with the unit they close, so `Wait...`
+and `He said "Hello."` are one request each.
 
 ```bash
 DELETE /v1/audio/voices/{name}

@@ -117,6 +117,10 @@ class OmniStreamingSpeechHandler:
         splitter = SpeechTextSplitter("none")
         utterance_index = 0
         sentence_index = 0
+        # An utterance is in progress from the first input.text until the next
+        # input.done. Buffered text is not enough to detect it: sentence/clause
+        # splitting can leave the buffer empty after emitting a unit.
+        utterance_open = False
 
         try:
             while True:
@@ -141,10 +145,10 @@ class OmniStreamingSpeechHandler:
                 msg_type = msg.get("type")
 
                 if msg_type == "session.config":
-                    if splitter.has_buffered_text():
+                    if utterance_open:
                         await self._send_error(
                             websocket,
-                            "session.config cannot be applied while input is buffered; send input.done first",
+                            "session.config cannot be applied while an utterance is in progress; send input.done first",
                         )
                         continue
                     new_config = await self._build_config(websocket, msg)
@@ -167,6 +171,8 @@ class OmniStreamingSpeechHandler:
                     if not isinstance(text, str):
                         await self._send_error(websocket, "input.text requires a string value")
                         continue
+                    if text:
+                        utterance_open = True
                     for unit in splitter.feed(text):
                         await self._generate_and_send(
                             websocket,
@@ -197,6 +203,7 @@ class OmniStreamingSpeechHandler:
                     )
                     utterance_index += 1
                     sentence_index = 0
+                    utterance_open = False
 
                 elif msg_type == "session.close":
                     await websocket.close()

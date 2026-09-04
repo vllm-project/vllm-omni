@@ -197,7 +197,7 @@ class TestStreamingSpeechWebSocket:
 
                 error = ws.receive_json()
                 assert error["type"] == "error"
-                assert "while input is buffered" in error["message"]
+                assert "while an utterance is in progress" in error["message"]
 
                 # The buffered text survives the rejected reconfiguration.
                 ws.send_json({"type": "input.done"})
@@ -853,6 +853,53 @@ class TestWebSocketSentenceSplitting:
                 ws.receive_bytes()
                 assert ws.receive_json()["type"] == "audio.done"
                 assert ws.receive_json()["total_sentences"] == 2
+
+    def test_session_config_rejected_after_a_split_unit_was_emitted(self, mocker: MockerFixture):
+        """The splitter buffer is empty here, but the utterance is still open."""
+        app, speech_service = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "split_granularity": "sentence",
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "First sentence. "})
+                ws.receive_json()
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+
+                ws.send_json({"type": "session.config", "voice": "Serena"})
+                error = ws.receive_json()
+                assert error["type"] == "error"
+                assert "while an utterance is in progress" in error["message"]
+
+                ws.send_json({"type": "input.text", "text": "Second sentence. "})
+                assert ws.receive_json()["sentence_index"] == 1
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+
+                ws.send_json({"type": "input.done"})
+                assert ws.receive_json() == {
+                    "type": "session.done",
+                    "utterance_index": 0,
+                    "total_sentences": 2,
+                }
+
+                # Reconfiguration is allowed again once the utterance closed.
+                ws.send_json({"type": "session.config", "voice": "Serena"})
+                ws.send_json({"type": "input.text", "text": "Third."})
+                ws.send_json({"type": "input.done"})
+                ws.receive_json()
+                ws.receive_bytes()
+                ws.receive_json()
+                ws.receive_json()
+
+        voices = [call.args[0].voice for call in speech_service._generate_audio_bytes.await_args_list]
+        assert voices == ["Vivian", "Vivian", "Serena"]
 
     def test_seed_is_forwarded_to_speech_request(self, mocker: MockerFixture):
         app, speech_service = _build_test_app(mocker=mocker)
