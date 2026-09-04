@@ -324,10 +324,14 @@ def text_encoder2diffusion_full_payload(
     del kwargs
     if not isinstance(pooling_output, Mapping):
         return None
-    hidden_states = pooling_output.get("hidden_states")
-    hidden_states = hidden_states.get("output") if isinstance(hidden_states, Mapping) else None
-    meta = pooling_output.get("meta")
-    token_tags = meta.get("token_role_ids") if isinstance(meta, Mapping) else None
+    hidden_states = pooling_output.get("hidden_states.output")
+    if hidden_states is None:
+        hidden_states_group = pooling_output.get("hidden_states")
+        hidden_states = hidden_states_group.get("output") if isinstance(hidden_states_group, Mapping) else None
+    token_tags = pooling_output.get("meta.token_role_ids")
+    if token_tags is None:
+        meta = pooling_output.get("meta")
+        token_tags = meta.get("token_role_ids") if isinstance(meta, Mapping) else None
     if not isinstance(hidden_states, torch.Tensor) or not isinstance(token_tags, torch.Tensor):
         return None
     return {"text_encoder_output": _build_conditioning(hidden_states, token_tags).to_payload()}

@@ -470,7 +470,7 @@ def test_diffusion_resolver_normalizes_partial_partition_directory(tmp_path):
 
 
 def _stage0_payload(tokens=4):
-    hidden = torch.randn(tokens, MINIMAX_H3_TEXT_HIDDEN_SIZE)
+    hidden = torch.randn(tokens, MINIMAX_H3_TEXT_HIDDEN_SIZE, dtype=torch.bfloat16)
     token_role_ids = torch.zeros(tokens, 1, dtype=torch.long)
     return {"hidden_states": {"output": hidden}, "meta": {"token_role_ids": token_role_ids}}
 
@@ -484,6 +484,19 @@ def test_full_payload_hook_emits_the_diffusion_ready_structure():
     conditioning = result["text_encoder_output"]
     assert torch.equal(conditioning["hidden_states"], payload["hidden_states"]["output"])
     assert conditioning["token_tags"].shape == (4,)
+
+
+def test_full_payload_hook_accepts_flattened_runner_payload():
+    payload = _stage0_payload()
+    flattened = {
+        "hidden_states.output": payload["hidden_states"]["output"],
+        "meta.token_role_ids": payload["meta"]["token_role_ids"],
+    }
+
+    result = text_encoder2diffusion_full_payload(pooling_output=flattened)
+
+    assert torch.equal(result["text_encoder_output"]["hidden_states"], flattened["hidden_states.output"])
+    assert result["text_encoder_output"]["token_tags"].shape == (4,)
 
 
 def test_full_payload_hook_tolerates_a_connector_less_stage():
