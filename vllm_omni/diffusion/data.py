@@ -91,6 +91,11 @@ def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]
     if "cache_backend" not in normalized:
         cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
         normalized["cache_backend"] = cache_backend.lower() if cache_backend else "none"
+    elif normalized["cache_backend"] is None:
+        # Callers (e.g. example CLIs with `default=None`) pass an explicit
+        # None for "no cache"; canonicalize it so every consumer sees the
+        # declared `str` value instead of relying on per-model None handling.
+        normalized["cache_backend"] = "none"
 
     # Convert optional YAML null values to empty containers.
     for key in ("diffusers_load_kwargs", "diffusers_call_kwargs"):
