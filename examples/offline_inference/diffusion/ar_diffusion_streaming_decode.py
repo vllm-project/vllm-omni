@@ -58,7 +58,7 @@ def _to_vae_latent_space(latent: torch.Tensor, *, mean: torch.Tensor, std: torch
     calling ``vae.decode``. ``WanStreamingDecoder.decode_chunk`` documents its
     input as already carrying that inversion -- skip this and every chunk
     decodes to a valid-looking but wrong video while latency/finite checks
-    stay green, because nothing downstream can detect a global mis-scale.
+    stay green, because nothing downstream can detect the wrong scale.
     """
     return latent * std + mean
 
