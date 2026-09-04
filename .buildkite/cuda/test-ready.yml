@@ -67,7 +67,7 @@ steps:
 
       - label: "Diffusion · Other Test"
         commands:
-          - timeout 15m pytest -sv tests/diffusion/*.py -m 'core_model and cuda' --run-level "core_model"
+          - timeout 15m pytest -sv tests/diffusion/*.py tests/diffusion/ar_diffusion -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_1
 
   - group: ":card_index_dividers: Tiny Model Tests [Single GPU]"
