@@ -39,6 +39,10 @@ from vllm.v1.sample.ops.topk_topp_sampler import random_sample
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
+from vllm_omni.model_executor.models.cosyvoice3.runtime import (
+    cosyvoice3_batch_flow_debug,
+    cosyvoice3_batch_flow_enabled,
+)
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
 from vllm_omni.model_executor.models.cosyvoice3.utils import (
     concat_text_with_prompt_ids,
@@ -1040,12 +1044,21 @@ class CosyVoice3Model(
             request_ids_list = self._split_request_ids(flat_ids, seq_token_counts)
 
             num_reqs = max(1, len(request_ids_list))
+            debug_batch_flow = cosyvoice3_batch_flow_debug()
+            if debug_batch_flow:
+                logger.info(
+                    "CosyVoice3 code2wav debug: forward num_reqs=%d seq_token_counts=%s flat_ids=%d",
+                    num_reqs,
+                    seq_token_counts,
+                    int(flat_ids.numel()),
+                )
             sample_rate = torch.tensor(int(self.config.sample_rate), dtype=torch.int32)
             empty_audio = torch.zeros((0,), dtype=torch.float32, device=input_ids.device)
             audios: list[torch.Tensor] = [empty_audio] * num_reqs
             srs: list[torch.Tensor] = [sample_rate] * num_reqs
             if not isinstance(runtime_info, list):
                 runtime_info = []
+            streaming_flow_items: list[dict[str, object]] = []
 
             for idx, req_ids in enumerate(request_ids_list):
                 raw = runtime_info[idx] if idx < len(runtime_info) and isinstance(runtime_info[idx], dict) else {}
@@ -1112,23 +1125,21 @@ class CosyVoice3Model(
                         with self._stream_audio_cache_lock:
                             cache_state = self._stream_vocoder_cache_by_req.get(req_id)
 
-                    tts_speech, new_cache_state = self.code2wav.forward_streaming(
-                        token=token.unsqueeze(0),
-                        prompt_token=speech_token[:1],
-                        prompt_feat=speech_feat[:1],
-                        embedding=embedding[:1],
-                        cache_state=cache_state,
-                        n_timesteps=10,
-                        token_offset_tokens=token_offset,
-                        finalize=stream_finished,
+                    streaming_flow_items.append(
+                        {
+                            "index": idx,
+                            "req_id": req_id,
+                            "stream_finished": stream_finished,
+                            "token": token.unsqueeze(0),
+                            "prompt_token": speech_token[:1],
+                            "prompt_feat": speech_feat[:1],
+                            "embedding": embedding[:1],
+                            "cache_state": cache_state,
+                            "token_offset_tokens": token_offset,
+                            "finalize": stream_finished,
+                        }
                     )
-
-                    if req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
-                        with self._stream_audio_cache_lock:
-                            if new_cache_state is None or stream_finished:
-                                self._stream_vocoder_cache_by_req.pop(req_id, None)
-                            else:
-                                self._stream_vocoder_cache_by_req[req_id] = new_cache_state
+                    continue
                 else:
                     token_offset = max(0, meta.talker_prefill_offset or 0) if meta else 0
                     tts_speech = self.code2wav.forward(
@@ -1143,6 +1154,60 @@ class CosyVoice3Model(
                 audio = tts_speech.reshape(-1).to(dtype=torch.float32)
 
                 audios[idx] = self._stitch_stream_audio(req_id, audio, stream_finished)
+
+            if streaming_flow_items:
+                if debug_batch_flow:
+                    item_shapes = [
+                        (
+                            tuple(item["token"].shape),  # type: ignore[union-attr]
+                            tuple(item["prompt_token"].shape),  # type: ignore[union-attr]
+                            tuple(item["prompt_feat"].shape),  # type: ignore[union-attr]
+                            bool(item.get("finalize", False)),
+                        )
+                        for item in streaming_flow_items
+                    ]
+                    logger.info(
+                        "CosyVoice3 code2wav debug: streaming_items=%d item_shapes=%s",
+                        len(streaming_flow_items),
+                        item_shapes,
+                    )
+                if (
+                    len(streaming_flow_items) > 1
+                    and cosyvoice3_batch_flow_enabled()
+                    and hasattr(self.code2wav, "forward_streaming_batch")
+                ):
+                    streaming_results = self.code2wav.forward_streaming_batch(
+                        streaming_flow_items,
+                        n_timesteps=10,
+                    )
+                else:
+                    streaming_results = [
+                        self.code2wav.forward_streaming(
+                            token=item["token"],  # type: ignore[arg-type]
+                            prompt_token=item["prompt_token"],  # type: ignore[arg-type]
+                            prompt_feat=item["prompt_feat"],  # type: ignore[arg-type]
+                            embedding=item["embedding"],  # type: ignore[arg-type]
+                            cache_state=item.get("cache_state"),  # type: ignore[arg-type]
+                            n_timesteps=10,
+                            token_offset_tokens=int(item.get("token_offset_tokens", 0)),
+                            finalize=bool(item.get("finalize", False)),
+                        )
+                        for item in streaming_flow_items
+                    ]
+
+                for item, (tts_speech, new_cache_state) in zip(streaming_flow_items, streaming_results):
+                    idx = int(item["index"])
+                    req_id = item.get("req_id")
+                    stream_finished = bool(item.get("stream_finished", False))
+                    if req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
+                        with self._stream_audio_cache_lock:
+                            if new_cache_state is None or stream_finished:
+                                self._stream_vocoder_cache_by_req.pop(req_id, None)
+                            else:
+                                self._stream_vocoder_cache_by_req[req_id] = new_cache_state
+
+                    audio = tts_speech.reshape(-1).to(dtype=torch.float32)
+                    audios[idx] = self._stitch_stream_audio(req_id, audio, stream_finished)
 
             return OmniOutput(text_hidden_states=None, multimodal_outputs={"audio": audios, "sr": srs})
         else:

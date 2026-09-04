@@ -167,7 +167,7 @@ def test_inventory_matches_reviewed_snapshot_counts():
         EnvironmentVariableCategory.PUBLIC_OMNI: 24,
         EnvironmentVariableCategory.INHERITED_VLLM: 20,
         EnvironmentVariableCategory.PLATFORM_EXTERNAL: 27,
-        EnvironmentVariableCategory.MODEL_SPECIFIC: 58,
+        EnvironmentVariableCategory.MODEL_SPECIFIC: 60,
         EnvironmentVariableCategory.BENCHMARK_TRANSITIONAL: 20,
         EnvironmentVariableCategory.INTERNAL: 2,
     }
@@ -178,10 +178,10 @@ def test_inventory_matches_reviewed_snapshot_counts():
         if item.category is EnvironmentVariableCategory.MODEL_SPECIFIC
     )
     assert {disposition: disposition_counts[disposition] for disposition in ModelEnvironmentVariableDisposition} == {
-        ModelEnvironmentVariableDisposition.PROMOTE: 35,
+        ModelEnvironmentVariableDisposition.PROMOTE: 36,
         ModelEnvironmentVariableDisposition.REQUEST_SCOPE: 6,
         ModelEnvironmentVariableDisposition.EXTERNAL: 0,
-        ModelEnvironmentVariableDisposition.INTERNALIZE: 11,
+        ModelEnvironmentVariableDisposition.INTERNALIZE: 12,
         ModelEnvironmentVariableDisposition.DEPRECATE_REMOVE: 6,
     }
 
