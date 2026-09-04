@@ -682,7 +682,7 @@ def test_code2wav_streaming_batch_matches_ragged_flow_numerics(monkeypatch):
             pre_lookahead_layer=PreLookaheadLayer(in_channels=80, channels=80, pre_lookahead_len=1),
             decoder=decoder,
         )
-        .cuda()
+        .to(device="cuda", dtype=torch.bfloat16)
         .eval()
     )
 
