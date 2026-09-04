@@ -278,9 +278,9 @@ class LanceBagel(Bagel):
     ``forward_cache_update_vae`` — is reused unchanged.
     """
 
-    # Upstream Lance samples ``num_timesteps + 1`` schedule points (one extra
-    # over official BAGEL) so the denoise loop runs exactly ``num_timesteps``
-    # Euler steps. See Bagel.generate_image and issue #4470.
+    # Upstream Lance uses the same ``num_timesteps + 1`` schedule-point
+    # convention as BAGEL, so the denoise loop runs exactly ``num_timesteps``
+    # Euler steps.
     _denoise_schedule_extra_step: bool = True
 
     @staticmethod

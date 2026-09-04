@@ -16,6 +16,43 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+@pytest.mark.parametrize(("step_execution", "expected_steps"), [(False, 1), (True, 1)])
+def test_dummy_run_uses_enough_steps_for_execution_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    step_execution: bool,
+    expected_steps: int,
+) -> None:
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = type(
+        "Config",
+        (),
+        {"model_class_name": "mock_model", "diffusion_load_format": "default"},
+    )()
+    engine.step_execution = step_execution
+    engine.pre_process_func = None
+    captured_requests = []
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.supports_multimodal_input",
+        lambda od_config: (False, False),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.get_dummy_run_num_frames",
+        lambda model_class_name, supports_audio_input: 1,
+    )
+
+    def run_request(request):
+        captured_requests.append(request)
+        return type("Output", (), {"error": None})()
+
+    engine.add_req_and_wait_for_response = run_request
+
+    engine._dummy_run()
+
+    assert len(captured_requests) == 1
+    assert captured_requests[0].sampling_params.num_inference_steps == expected_steps
+
+
 def test_dummy_run_num_frames_uses_explicit_model_setting(monkeypatch: pytest.MonkeyPatch) -> None:
     class JointAudioVideoModel:
         dummy_run_num_frames = 2
