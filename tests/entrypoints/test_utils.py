@@ -1,5 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for vllm_omni.entrypoints.utils module."""
 
+import logging
 import os
 from collections import Counter
 from dataclasses import dataclass
@@ -252,8 +256,12 @@ class TestFilterDataclassKwargs:
         with pytest.raises(ValueError, match="kwargs must be a dictionary"):
             filter_dataclass_kwargs(SimpleConfig, "invalid")
 
-    def test_filters_omni_engine_args_unknown_fields(self):
-        """Test that OmniEngineArgs kwargs are filtered to valid fields only."""
+    def test_filters_omni_engine_args_unknown_fields(self, caplog):
+        """Test that OmniEngineArgs kwargs are filtered to valid fields only,
+        and that the WARNING contract fires for every drop — the affordance
+        that lets a ``--stage-overrides`` typo (``{"0":{"kv_cache_dtpye":...}}``)
+        surface in the log rather than being silently misapplied downstream.
+        """
         kwargs = {
             "model": "dummy",
             "stage_id": 1,
@@ -261,12 +269,16 @@ class TestFilterDataclassKwargs:
             "unknown_field": "drop_me",
         }
 
-        result = filter_dataclass_kwargs(OmniEngineArgs, kwargs)
+        with caplog.at_level(logging.WARNING, logger="vllm_omni.entrypoints.utils"):
+            result = filter_dataclass_kwargs(OmniEngineArgs, kwargs)
 
         assert "model" in result
         assert "stage_id" in result
         assert "engine_output_type" in result
         assert "unknown_field" not in result
+        assert any(rec.levelno == logging.WARNING and "unknown_field" in rec.message for rec in caplog.records), (
+            f"expected WARNING naming 'unknown_field'; got {[r.message for r in caplog.records]}"
+        )
 
     def test_filters_omni_diffusion_config_union_dataclass(self):
         """Test that OmniDiffusionConfig filters nested dataclass in Union fields."""
@@ -420,6 +432,7 @@ class TestLoadAndResolveStageConfigs:
         """Ensure that kwargs survive default stage creation."""
         engine_backend = "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine"
         kwargs = {"dtype": torch.float32, "engine_backend": engine_backend}
+        kwargs["revision"] = "pinned-revision"
         mocker.patch("vllm_omni.entrypoints.utils.resolve_model_config_path", return_value=None)
         mocker.patch("vllm_omni.entrypoints.utils.load_stage_configs_from_model", return_value=([], None))
 
@@ -433,6 +446,7 @@ class TestLoadAndResolveStageConfigs:
         assert len(stage_configs) == 1
         assert "dtype" in stage_configs[0]["engine_args"]
         assert stage_configs[0]["engine_args"]["engine_backend"] == engine_backend
+        assert stage_configs[0]["engine_args"]["revision"] == "pinned-revision"
 
     def test_deploy_config_preserves_cli_overrides_and_replicas(self, tmp_path, mocker: MockerFixture):
         deploy_path = tmp_path / "qwen3_multi.yaml"

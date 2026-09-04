@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Quantization quality gate for diffusion models.
 
@@ -53,6 +53,7 @@ _BENCH_MODULE_NAME = "benchmarks.diffusion.quantization_quality"
 
 if _BENCH_MODULE_NAME not in sys.modules:
     _spec = importlib.util.spec_from_file_location(_BENCH_MODULE_NAME, _BENCH_MODULE_PATH)
+    assert _spec is not None and _spec.loader is not None
     _mod = importlib.util.module_from_spec(_spec)
     sys.modules[_BENCH_MODULE_NAME] = _mod
     _spec.loader.exec_module(_mod)
@@ -80,7 +81,7 @@ class QualityTestConfig:
     num_frames: int = 5  # only for t2v
     seed: int = 42
     gpu: str = "H100"  # minimum GPU requirement
-    negative_prompt: str = ""
+    negative_prompt: str | None = ""
     guidance_scale: float | None = None
     sigmas: list[float] | None = None
     enable_cpu_offload: bool = False
@@ -93,7 +94,7 @@ class QualityTestConfig:
             return self.quantized_model
         return self.model or ""
 
-    def quantization_ref(self) -> str | None:
+    def quantization_ref(self) -> str | dict[str, object] | None:
         if self.quantized_model is not None:
             return None
         return self.quantization
@@ -211,24 +212,14 @@ QUALITY_CONFIGS = [
         quantization="fp8",
         task="t2v",
         prompt="A serene lakeside sunrise with mist over the water",
-        max_lpips=0.10,
-        height=256,
-        width=256,
-        num_frames=25,
-        num_inference_steps=8,
-        # Preserve the final scheduler trajectory used when this FP8 quality
-        # gate was established. Explicit LTX sigmas bypass dynamic shifting.
-        sigmas=[
-            1.0,
-            0.92185378074646,
-            0.8327768445014954,
-            0.7303033471107483,
-            0.6111654043197632,
-            0.4709382653236389,
-            0.30347853899002075,
-            0.10000002384185791,
-            0.0,
-        ],
+        max_lpips=0.20,
+        height=384,
+        width=512,
+        num_frames=73,
+        num_inference_steps=10,
+        # Do not override the recipe's negative conditioning, guidance, or
+        # scheduler trajectory: this gate follows the supported LTX default.
+        negative_prompt=None,
     ),
 ]
 
@@ -295,8 +286,11 @@ def _generate_image(omni, config: QualityTestConfig):
     ).manual_seed(config.seed)
     torch.accelerator.reset_peak_memory_stats()
 
+    prompt = {"prompt": config.prompt}
+    if config.negative_prompt is not None:
+        prompt["negative_prompt"] = config.negative_prompt
     outputs = omni.generate(
-        {"prompt": config.prompt, "negative_prompt": config.negative_prompt},
+        prompt,
         OmniDiffusionSamplingParams(
             height=config.height,
             width=config.width,
@@ -327,8 +321,11 @@ def _generate_video(omni, config: QualityTestConfig):
     ).manual_seed(config.seed)
     torch.accelerator.reset_peak_memory_stats()
 
+    prompt = {"prompt": config.prompt}
+    if config.negative_prompt is not None:
+        prompt["negative_prompt"] = config.negative_prompt
     outputs = omni.generate(
-        {"prompt": config.prompt, "negative_prompt": config.negative_prompt},
+        prompt,
         OmniDiffusionSamplingParams(
             height=config.height,
             width=config.width,
@@ -464,6 +461,7 @@ def test_benchmark_generate_image_unwraps_nested_omni_request_output(monkeypatch
 
 
 def test_generate_video_forwards_sigmas(monkeypatch):
+    from vllm_omni.outputs import OmniRequestOutput
     from vllm_omni.platforms import current_omni_platform
 
     monkeypatch.setattr(current_omni_platform, "device_type", "cpu", raising=False)
@@ -474,7 +472,12 @@ def test_generate_video_forwards_sigmas(monkeypatch):
     class DummyOmni:
         def generate(self, _prompt, sampling):
             captured.sampling = sampling
-            return [SimpleNamespace(images=[np.zeros((1, 2, 2, 3), dtype=np.float32)])]
+            return [
+                OmniRequestOutput.from_diffusion(
+                    request_id="req",
+                    images=[np.zeros((1, 2, 2, 3), dtype=np.float32)],
+                )
+            ]
 
     config = QualityTestConfig(
         id="ltx-sigmas",
@@ -488,6 +491,41 @@ def test_generate_video_forwards_sigmas(monkeypatch):
     _generate_video(DummyOmni(), config)
 
     assert captured.sampling.sigmas == [1.0, 0.5]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_ltx_quality_gate_uses_official_eager_defaults(monkeypatch):
+    from vllm_omni.outputs import OmniRequestOutput
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "device_type", "cpu", raising=False)
+    monkeypatch.setattr(torch.accelerator, "reset_peak_memory_stats", lambda: None, raising=False)
+    monkeypatch.setattr(torch.accelerator, "max_memory_allocated", lambda: 0, raising=False)
+    captured = SimpleNamespace(prompt=None, sampling=None)
+
+    class DummyOmni:
+        def generate(self, prompt, sampling):
+            captured.prompt = prompt
+            captured.sampling = sampling
+            return [
+                OmniRequestOutput.from_diffusion(
+                    request_id="req",
+                    images=[np.zeros((1, 2, 2, 3), dtype=np.float32)],
+                )
+            ]
+
+    config = next(config for config in QUALITY_CONFIGS if config.id == "fp8_ltx2")
+    _generate_video(DummyOmni(), config)
+
+    assert (config.width, config.height, config.num_frames, config.num_inference_steps) == (512, 384, 73, 10)
+    assert config.max_lpips == 0.20
+    assert config.sigmas is None
+    assert config.guidance_scale is None
+    assert config.negative_prompt is None
+    assert "negative_prompt" not in captured.prompt
+    assert captured.sampling.sigmas is None
+    assert captured.sampling.guidance_scale is None
 
 
 _marks = hardware_marks(res={"cuda": "H100"})

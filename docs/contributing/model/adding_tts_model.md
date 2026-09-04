@@ -438,7 +438,7 @@ selects the scheduler and worker family:
 Key topology fields belong to `StagePipelineConfig`:
 
 | Field | Description |
-|-------|-------------|
+| ------- | ------------- |
 | `model_stage` | Logical stage name (`ar_stage`, `decoder`, etc.). |
 | `execution_type` | Runtime family for this stage. |
 | `input_sources` | Upstream stage IDs that provide input. |
@@ -960,7 +960,7 @@ Common failures and fixes:
 | `check-forbidden-imports` | Stdlib `re`/`base64`, pickle, Hugging Face Hub API, or direct Triton/TileLang | `import regex as re` and `pybase64`; do not grow the allowlist without review |
 | `check-torch-cuda-call` | New `torch.cuda.*` call site | Use `current_omni_platform`; do not grow `ALLOWED_FILES` without review |
 | `check-tts-adapter-migration` | New `_tts_model_type` branch in `serving_speech.py` | Put logic in `tts_adapters/`; lower `MAX_MODEL_TYPE_BRANCHES` when removing branches |
-| `check-test-ci-coverage` | Test file missing level or hardware mark | Add `core_model`/… plus `cpu`/`cuda`/`hardware_test(` |
+| `check-mark` | Test file missing level/hardware mark, or direct `pytest.mark.H100` | Add `core_model`/… plus `cpu`/`cuda`/`hardware_test(`; SKU marks only via helpers |
 | `shellcheck` | Native `shellcheck` missing, or script warning | Install via apt/dnf/brew (or `shellcheck.exe` on Windows). See [Linting](../README.md#linting) |
 | `mypy-3.10` / `markdownlint-cli2` / `check-buildkite` | Types, docs markdown, or Buildkite YAML | See [Linting](../README.md#linting) |
 

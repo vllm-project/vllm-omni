@@ -71,9 +71,11 @@ dev = [
     "voxcpm==2.0.3", # for VoxCPM2 path-locating in tests
     "torchdiffeq==0.2.5", # for covo_audio Test
     "FlagEmbedding==1.4.0", # for hunyuan_image3 tests
-    "kernels==0.14.1", # for accuracy tests comparison with diffusers output (0.15.0 incompatible with diffusers 0.38.0)
     "s3tokenizer==0.3.0", # for tts test
+    # Provides top-level cosyvoice2; do not co-install stepaudio2-minicpmo,
+    # whose top-level stepaudio2 package conflicts with this distribution.
     "step-audio2==1.0.0", # Step-Audio2 / MiniCPM-o 4.5 Token2Wav (flashcosyvoice / hyperpyyaml)
+    "silero-vad==6.1", # Realtime server-VAD duplex E2E
 ]
 
 demo = [
@@ -81,6 +83,10 @@ demo = [
     "opencv-python>=4.12.0.88",  # cli/stream_client frame reading
     "requests>=2.28.0",  # cli/stream_client HTTP
     "cn2an>=0.5.22",  # Chinese number normalization for TTS (e.g. "1次" -> "一次")
+]
+
+server-vad = [
+    "silero-vad==6.1",
 ]
 
 forced-aligner = [
@@ -133,13 +139,6 @@ docs = [
     "regex",
     "ruff",
     "pydantic",
-]
-
-soulx-svs = [
-    "funasr>=1.0.0",
-    "g2pM>=0.1.2.5",
-    "g2p-en>=2.1.0",
-    "ToJyutping>=3.2.0",
 ]
 
 [project.urls]
@@ -249,11 +248,11 @@ addopts = [
     "--dist=loadgroup"
 ]
 markers = [
-    # ci/cd required
-    "core_model: L1&L2 tests (run in each PR)",
-    "advanced_model: L3 level tests (run on each merge)",
-    "full_model: L4 level tests (run nightly)",
-    "local_model: tests (run locally)",
+    # ci/cd required — tag with [ci-level] for tests.helpers.mark.get_level_markers().
+    "core_model: [ci-level] L1&L2 tests (run in each PR)",
+    "advanced_model: [ci-level] L3 level tests (run on each merge)",
+    "full_model: [ci-level] L4 level tests (run nightly)",
+    "local_model: [ci-level] tests (run locally)",
     # function module markers
     "diffusion: Diffusion model tests",
     "omni: Omni model tests",
@@ -263,37 +262,41 @@ markers = [
     "sp: Sequence parallelism tests",
     "example: Doc example code tests",
     # platform markers
-    "cpu: Tests that run on CPU",
-    "gpu: Tests that run on GPU (auto-added)",
-    "cuda: Tests that run on CUDA (auto-added)",
-    "rocm: Tests that run on AMD/ROCm (auto-added)",
-    "xpu: Tests that run on XPU (auto-added)",
-    "npu: Tests that run on NPU/Ascend (auto-added)",
-    "musa: Tests that run on MUSA/Moore Threads (auto-added)",
+    # Tag with [hardware-platform] for tests.helpers.mark.get_supported_platforms().
+    # Add [gpu] on accelerator platforms that should also get pytest.mark.gpu.
+    # cpu/gpu are pytest marks; hardware_test(res=...) rejects them as keys.
+    "cpu: [hardware-platform] Tests that run on CPU",
+    "gpu: [hardware-platform] Tests that run on GPU (auto-added)",
+    "cuda: [hardware-platform] [gpu] Tests that run on CUDA (auto-added)",
+    "rocm: [hardware-platform] [gpu] Tests that run on AMD/ROCm (auto-added)",
+    "xpu: [hardware-platform] [gpu] Tests that run on XPU (auto-added)",
+    "npu: [hardware-platform] Tests that run on NPU/Ascend (auto-added)",
+    "musa: [hardware-platform] [gpu] Tests that run on MUSA/Moore Threads (auto-added)",
     # specified computation resources marks (auto-added)
-    # Tag with [hardware-resource] for tests.helpers.mark.get_hardware_mark_list().
-    "H100: [hardware-resource] Tests that require H100 GPU",
-    "H200: [hardware-resource] Tests that require H200 GPU",
-    "L4: [hardware-resource] Tests that require L4 GPU",
-    "B200: [hardware-resource] Tests that require B200 GPU",
-    "MI325: [hardware-resource] Tests that require MI325 GPU (AMD/ROCm)",
-    "B60: [hardware-resource] Tests that require Intel Arc Pro B60 XPU",
-    "S5000: [hardware-resource] Tests that require S5000 GPU (Moore Threads/MUSA)",
-    "A2: [hardware-resource] Tests that require A2 NPU",
-    "A3: [hardware-resource] Tests that require A3 NPU",
-    "distributed_cuda: Tests that require multi cards on CUDA platform",
-    "distributed_rocm: Tests that require multi cards on ROCm platform",
-    "distributed_xpu: Tests that require multi cards on XPU platform",
-    "distributed_npu: Tests that require multi cards on NPU platform",
-    "distributed_musa: Tests that require multi cards on MUSA platform",
-    "skipif_cuda: Skip if the num of CUDA cards is less than the required",
-    "skipif_rocm: Skip if the num of ROCm cards is less than the required",
-    "skipif_xpu: Skip if the num of XPU cards is less than the required",
-    "skipif_npu: Skip if the num of NPU cards is less than the required",
-    "skipif_musa: Skip if the num of MUSA cards is less than the required",
+    # [hardware-resource] + [cuda]/[rocm]/[xpu]/[npu]/[musa] for hardware_test(res=...).
+    # Do not put [gpu] on SKU lines: that would make gpu a res key.
+    "H100: [hardware-resource] [cuda] Tests that require H100 GPU",
+    "H800: [hardware-resource] [cuda] Tests that require H800 GPU",
+    "H200: [hardware-resource] [cuda] Tests that require H200 GPU",
+    "L4: [hardware-resource] [cuda] Tests that require L4 GPU",
+    "B200: [hardware-resource] [cuda] Tests that require B200 GPU",
+    "MI325: [hardware-resource] [rocm] Tests that require MI325 GPU (AMD/ROCm)",
+    "B60: [hardware-resource] [xpu] Tests that require Intel Arc Pro B60 XPU",
+    "S5000: [hardware-resource] [musa] Tests that require S5000 GPU (Moore Threads/MUSA)",
+    "A2: [hardware-resource] [npu] Tests that require A2 NPU",
+    "A3: [hardware-resource] [npu] Tests that require A3 NPU",
+    # Tag with [hardware-cards] for tests.helpers.mark.get_supported_card_counts().
+    "cards_1: [hardware-cards] Tests that require 1 accelerator card",
+    "cards_2: [hardware-cards] Tests that require 2 accelerator cards",
+    "cards_3: [hardware-cards] Tests that require 3 accelerator cards",
+    "cards_4: [hardware-cards] Tests that require 4 accelerator cards",
+    "cards_5: [hardware-cards] Tests that require 5 accelerator cards",
+    "cards_6: [hardware-cards] Tests that require 6 accelerator cards",
+    "cards_7: [hardware-cards] Tests that require 7 accelerator cards",
+    "cards_8: [hardware-cards] Tests that require 8 accelerator cards",
     # more detailed markers
     "sp: Sequence parallelism tests (multi-GPU)",
-    "slow: Slow tests (may skip in quick CI)",
+    "slow: [ci-level] Slow tests (may skip in quick CI)",
     "benchmark: Benchmark tests",
     "xdist: xdist-parallelizable tests",
 ]

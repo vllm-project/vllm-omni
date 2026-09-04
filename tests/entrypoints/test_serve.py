@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for the Omni serve CLI helpers."""
 
 from __future__ import annotations
@@ -74,6 +77,17 @@ def test_serve_parser_accepts_four_way_cfg_parallelism() -> None:
     args = parser.parse_args(["serve", "fake-model", "--omni", "--cfg-parallel-size", "4"])
 
     assert args.cfg_parallel_size == 4
+
+
+def test_serve_parser_accepts_ulysses_a2a_permute() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--ulysses-a2a-permute"])
+
+    assert args.ulysses_a2a_permute is True
+    assert args.get_explicit_kwargs_dict()["ulysses_a2a_permute"] is True
 
 
 def _make_headless_args(**kwargs) -> TrackingNamespace:
@@ -163,6 +177,78 @@ def test_parse_stage_overrides_invalid_json_raises() -> None:
     message = str(excinfo.value)
     assert message.startswith("--stage-overrides is not valid JSON:")
     assert f"Got: {bad!r}" in message
+
+
+def test_parse_stage_overrides_rejects_non_dict_top_level() -> None:
+    """Top-level must be a JSON object (dict). A list, scalar, or non-dict
+    mapping is rejected with a ValueError naming ``--stage-overrides`` and
+    pointing at the bad shape. Without this guard, ``json.loads`` happily
+    returns a list/scalar and the override silently never applies."""
+    for bad in ("[1, 2, 3]", '"oops"', "42"):
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            parse_stage_overrides(bad)
+
+
+def test_parse_stage_overrides_rejects_non_integer_stage_id() -> None:
+    """Stage-id keys must be non-negative ASCII integer strings. Letters,
+    signs, floats, Unicode digit classes, and integer (non-string) keys all
+    fail. ``str.isdigit() and str.isascii()`` is the minimal check: it
+    rejects ``"-1"``, ``"abc"``, ``"1.5"``, fullwidth ``"０"``, and bare ``1``.
+
+    Note: ``json.loads`` normalizes integer object keys (``{"1": {}}``) into
+    the string ``"1"`` and would pass our digit check, so the integer-key case
+    is exercised via the already-parsed-dict code path (``parse_stage_overrides({1: {}})``)."""
+    bad_string_keys = ('"abc"', '"-1"', '"1.5"', '"\uff10"')
+    for bad_key in bad_string_keys:
+        with pytest.raises(ValueError, match="non-negative integer stage ids"):
+            parse_stage_overrides("{" + bad_key + ": {}}")
+    # Integer (non-string) key: must reach the structural check, not the JSON
+    # parser, so pass an already-parsed mapping directly.
+    with pytest.raises(ValueError, match="non-negative integer stage ids"):
+        parse_stage_overrides({1: {}})
+
+
+def test_parse_stage_overrides_accepts_stage_merge_extras_and_engine_args() -> None:
+    """Three classes of keys pass through the shape-only parser:
+
+    - ``extras`` is read by the default-diffusion fallback
+      (``async_omni_engine.py``); registered pipelines carry it on
+      ``StagePipelineConfig.extras`` directly.
+    - Engine arguments (``kv_cache_dtype``, ``stage_connector_spec``, ...)
+      are forwarded as ``stage_<id>_<key>`` and applied via
+      ``OmniEngineArgs``.
+    - Unknown keys parse through and are dropped with a warning at
+      ``filter_dataclass_kwargs`` (see
+      ``tests/entrypoints/test_utils.py::TestFilterDataclassKwargs``).
+
+    ``typo_field_xyz`` in the payload exercises the third case.
+    """
+    parsed = parse_stage_overrides(
+        '{"0": {"extras": {"ltx2_use_conv_vae": true},'
+        ' "kv_cache_dtype": "fp8", "seed": 42,'
+        ' "stage_connector_spec": {"name": "SharedMemoryConnector", "extra": {}},'
+        ' "typo_field_xyz": 1}}'
+    )
+    assert parsed == {
+        "0": {
+            "extras": {"ltx2_use_conv_vae": True},
+            "kv_cache_dtype": "fp8",
+            "seed": 42,
+            "stage_connector_spec": {"name": "SharedMemoryConnector", "extra": {}},
+            "typo_field_xyz": 1,
+        },
+    }
+    # Already-parsed mapping path carries the same trust.
+    assert parse_stage_overrides(dict(parsed)) == parsed
+
+
+def test_parse_stage_overrides_accepts_empty_inner_dict() -> None:
+    """Per-stage overrides may be empty (``{}``): shape stays valid, every
+    stage simply receives no per-stage tweaks. Locks in the
+    ``not parsed`` -> ``None`` short-circuit's twin: an outer
+    non-empty dict with empty inner dicts is a valid no-op pass-through."""
+    parsed = parse_stage_overrides('{"0": {}, "1": {}}')
+    assert parsed == {"0": {}, "1": {}}
 
 
 def test_run_headless_parses_and_forwards_stage_overrides(mocker: MockerFixture) -> None:

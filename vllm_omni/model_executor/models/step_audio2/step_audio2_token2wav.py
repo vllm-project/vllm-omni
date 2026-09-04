@@ -44,6 +44,14 @@ from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
 logger = init_logger(__name__)
 
 
+def _get_left_context_size(info: dict[str, Any]) -> Any | None:
+    """Return the async-chunk marker from a nested metadata payload."""
+    meta = info.get("meta")
+    if not isinstance(meta, dict):
+        return None
+    return meta.get("left_context_size")
+
+
 def fade_in_out(
     fade_in_mel: torch.Tensor,
     fade_out_mel: torch.Tensor,
@@ -540,7 +548,8 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
             additional: Additional information dict (deprecated)
             runtime_additional_information: Per-request dicts from the
                 async_chunk processor.  Each dict contains ``audio_tokens``
-                (list[int]) and ``last_chunk`` (bool).
+                (list[int]) and ``meta.left_context_size`` as the
+                last-chunk marker (0 = non-final, 1 = final).
             **kwargs: Other kwargs
 
         Returns:
@@ -553,7 +562,7 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         # [{}]), so a bare truthiness check would incorrectly enter this
         # branch in synchronous mode.
         if runtime_additional_information and any(
-            "left_context_size" in info for info in runtime_additional_information
+            _get_left_context_size(info) is not None for info in runtime_additional_information
         ):
             return self._forward_async_chunk(input_ids, runtime_additional_information, **kwargs)
 
@@ -622,15 +631,15 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         async_chunk payload to ``request.additional_information``).
         """
         # --- batch=1 guard ---
-        batch_size = sum(1 for info in runtime_additional_information if "left_context_size" in info)
+        batch_size = sum(1 for info in runtime_additional_information if _get_left_context_size(info) is not None)
         if batch_size != 1:
             raise RuntimeError(
                 f"Token2Wav async_chunk only supports batch=1, got {batch_size}. "
                 "Batch>1 requires framework support for batch_req_ids."
             )
 
-        info = next(info for info in runtime_additional_information if "left_context_size" in info)
-        last_chunk = info.get("left_context_size", 0) == 1
+        info = next(info for info in runtime_additional_information if _get_left_context_size(info) is not None)
+        last_chunk = _get_left_context_size(info) == 1
 
         # --- Manage single stream state ---
         # If the previous request was preempted (setup_done but not finished),

@@ -48,6 +48,7 @@ from vllm_omni.engine.stage_init_utils import (
     build_engine_args_dict_from_omni_stage_config,
     build_legacy_engine_args_dict,
 )
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -71,6 +72,7 @@ def _effective_backend_values(config_cls: type, engine_args: dict) -> dict[str, 
 
 _LLM_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniEngineArgs))
 _DIFFUSION_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniDiffusionConfig))
+_TOPOLOGY_ONLY_ENGINE_ARGS = frozenset({"inline_diffusion"})
 _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
     {
         "active_stream_window",
@@ -122,6 +124,17 @@ def _stable_engine_arg_environment(monkeypatch, tmp_path):
             engine_args["worker_cls"] = f"test.{worker_type}.Worker"
 
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", _resolve_test_worker)
+
+    class _TestConnectorRunner(OmniConnectorModelRunnerMixin):
+        pass
+
+    class _TestWorker:
+        model_runner_cls = _TestConnectorRunner
+
+    for worker_type in ("ar", "generation"):
+        worker_module = types.ModuleType(f"test.{worker_type}")
+        setattr(worker_module, "Worker", _TestWorker)
+        monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
 
 
 def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, str]:
@@ -356,7 +369,9 @@ def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
         )
         typed_args_by_stage[stage_id] = typed_args
 
-        assert {name: typed_args[name] for name in legacy_args} == legacy_args
+        expected_args = {name: value for name, value in legacy_args.items() if name not in _TOPOLOGY_ONLY_ENGINE_ARGS}
+        assert {name: typed_args[name] for name in expected_args} == expected_args
+        assert _TOPOLOGY_ONLY_ENGINE_ARGS.isdisjoint(typed_args)
 
     thinker_args = typed_args_by_stage[0]
     inherited_vllm_fields = {
@@ -417,6 +432,63 @@ def test_typed_diffusion_engine_args_use_structured_diffusion_config(tmp_path):
     assert isinstance(typed_args["diffusion_attention_config"], AttentionConfig)
     assert typed_args["diffusion_attention_config"].default.backend == "FLASH_ATTN"
     assert typed_args["diffusion_attention_config"].per_role["cross"].backend == "TORCH_SDPA"
+
+
+def test_engine_args_consume_stage_diffusion_attention_shorthand(tmp_path):
+    """A stage-level ``diffusion_attention_backend`` shorthand is folded into the structured config."""
+    pipeline, deploy, model = _engine_arg_inputs(tmp_path)
+    deploy.stages[2] = replace(
+        deploy.stages[2],
+        diffusion_attention_config=None,
+        diffusion_attention_backend="TORCH_SDPA",
+    )
+    legacy_stages, omni_config = _legacy_and_typed_stages(pipeline, deploy, model)
+
+    legacy_args = build_legacy_engine_args_dict(legacy_stages[2], model)
+    typed_args = build_engine_args_dict_from_omni_stage_config(
+        omni_config.stage_by_id(2),
+        model,
+    )
+
+    for engine_args in (legacy_args, typed_args):
+        assert engine_args.get("diffusion_attention_backend") is None
+        assert isinstance(engine_args["diffusion_attention_config"], AttentionConfig)
+        assert engine_args["diffusion_attention_config"].default.backend == "TORCH_SDPA"
+        od_config = OmniDiffusionConfig.from_kwargs(**engine_args)
+        assert od_config.diffusion_attention_config.default.backend == "TORCH_SDPA"
+
+
+@pytest.mark.parametrize(
+    "yaml_attention_config",
+    [
+        {"default": {"backend": "FLASH_ATTN"}, "per_role": {"cross": {"backend": "SAGE_ATTN"}}},
+        {"per_role": {"cross": {"backend": "SAGE_ATTN"}}},
+    ],
+    ids=["yaml-default", "yaml-per-role-only"],
+)
+def test_engine_args_apply_cli_attention_shorthand_over_yaml_config(tmp_path, yaml_attention_config):
+    pipeline, deploy, model = _engine_arg_inputs(tmp_path)
+    deploy.stages[2] = replace(deploy.stages[2], diffusion_attention_config=yaml_attention_config)
+    legacy_stages, omni_config = _legacy_and_typed_stages(
+        pipeline,
+        deploy,
+        model,
+        cli_overrides={"stage_2_diffusion_attention_backend": "TORCH_SDPA"},
+    )
+
+    legacy_args = build_legacy_engine_args_dict(legacy_stages[2], model)
+    typed_args = build_engine_args_dict_from_omni_stage_config(
+        omni_config.stage_by_id(2),
+        model,
+    )
+
+    for engine_args in (legacy_args, typed_args):
+        assert engine_args.get("diffusion_attention_backend") is None
+        attention_config = engine_args["diffusion_attention_config"]
+        assert attention_config.default.backend == "TORCH_SDPA"
+        assert attention_config.per_role["cross"].backend == "SAGE_ATTN"
+        od_config = OmniDiffusionConfig.from_kwargs(**engine_args)
+        assert od_config.diffusion_attention_config.default.backend == "TORCH_SDPA"
 
 
 def test_typed_engine_args_preserve_explicit_backend_default_overrides(tmp_path):
@@ -615,8 +687,24 @@ def test_typed_ming_image_engine_args_defer_diffusion_batch_default():
     assert OmniDiffusionConfig(**typed_backend_args).max_num_seqs == 1
 
 
+def _fake_model_root(pipeline, tmp_path):
+    """A model directory carrying every subfolder the pipeline's stages declare.
+
+    Stage init fails closed when a declared ``model_subdir``/``tokenizer_subdir``
+    is not a real directory, because the joined path would otherwise reach
+    HuggingFace as a malformed repo id (issue #6638).
+    """
+    root = tmp_path / "model"
+    root.mkdir(exist_ok=True)
+    for stage in pipeline.stages:
+        for subdir in (stage.model_subdir, stage.tokenizer_subdir):
+            if subdir:
+                (root / subdir).mkdir(parents=True, exist_ok=True)
+    return str(root)
+
+
 @pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
-def test_typed_engine_args_match_current_registry_backend_semantics(model_type):
+def test_typed_engine_args_match_current_registry_backend_semantics(model_type, tmp_path):
     pipeline = resolve_pipeline_config(model_type)
     if pipeline is None:
         pytest.skip(f"Pipeline {model_type!r} requires an HF config to resolve")
@@ -626,18 +714,19 @@ def test_typed_engine_args_match_current_registry_backend_semantics(model_type):
         if pipeline.default_deploy_config_name is not None
         else DeployConfig()
     )
+    model = _fake_model_root(pipeline, tmp_path)
     legacy_stages, omni_config = _legacy_and_typed_stages(
         pipeline,
         deploy,
-        model="/tmp",
+        model=model,
     )
 
     for legacy_stage in legacy_stages:
         stage_id = legacy_stage.stage_id
-        legacy_args = build_legacy_engine_args_dict(legacy_stage, model="/tmp")
+        legacy_args = build_legacy_engine_args_dict(legacy_stage, model=model)
         typed_args = build_engine_args_dict_from_omni_stage_config(
             omni_config.stage_by_id(stage_id),
-            model="/tmp",
+            model=model,
         )
         if legacy_stage.stage_type == StageType.DIFFUSION:
             backend_fields = _DIFFUSION_BACKEND_FIELDS
@@ -646,6 +735,7 @@ def test_typed_engine_args_match_current_registry_backend_semantics(model_type):
             backend_fields = _LLM_BACKEND_FIELDS
             backend_config_cls = OmniEngineArgs
 
+        backend_fields -= _TOPOLOGY_ONLY_ENGINE_ARGS
         missing_fields = (legacy_args.keys() & backend_fields) - typed_args.keys()
         assert not missing_fields, f"{model_type} stage {stage_id} lost backend fields: {sorted(missing_fields)}"
 

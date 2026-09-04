@@ -1,7 +1,17 @@
+import json
 from functools import partial
 from pathlib import Path
 
-from tests.helpers.tiny_model import build_tiny_from_configs
+import torch
+from diffusers import (
+    AutoencoderKLWan,
+    DPMSolverMultistepScheduler,
+    SanaVideoPipeline,
+    SanaVideoTransformer3DModel,
+)
+from transformers import Gemma2Config, Gemma2Model, GemmaTokenizerFast
+
+from tests.helpers.tiny_model import _get_tiny_model_path, build_tiny_from_configs
 
 TINY_CONFIGS_DIR = Path(__file__).parent / "tiny_configs"
 
@@ -38,6 +48,87 @@ def tiny_flux2_klein_builder() -> str:
 def tiny_ltx2_builder() -> str:
     """Build a tiny LTX2 model from vendored configs."""
     return build_tiny_from_configs("LTX2Pipeline", "Lightricks/LTX-2", TINY_CONFIGS_DIR / "LTX2Pipeline")
+
+
+def _build_tiny_sana_video(pipeline_name: str) -> str:
+    """Build a tiny 480p SANA-Video model without downloading model weights.
+
+    The tokenizer is the only component loaded from the upstream repository.
+    All modules with weights are initialized locally from intentionally small
+    configs, and the scheduler is constructed from its weight-free config. The
+    I2V pipeline shares this diffusers layout, so it reuses the same components
+    and only rewrites model_index.json's ``_class_name`` to its own class.
+    """
+    model_id = "Efficient-Large-Model/SANA-Video_2B_480p_diffusers"
+    model_dir = _get_tiny_model_path(pipeline_name)
+
+    tokenizer = GemmaTokenizerFast.from_pretrained(model_id, subfolder="tokenizer")
+    scheduler = DPMSolverMultistepScheduler(
+        algorithm_type="dpmsolver++",
+        flow_shift=8.0,
+        prediction_type="flow_prediction",
+        use_flow_sigmas=True,
+    )
+    text_encoder = Gemma2Model(
+        Gemma2Config(
+            vocab_size=256000,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=512,
+            sliding_window=256,
+            layer_types=["sliding_attention"],
+        )
+    )
+    transformer = SanaVideoTransformer3DModel(
+        in_channels=16,
+        out_channels=16,
+        num_attention_heads=2,
+        attention_head_dim=16,
+        num_layers=2,
+        num_cross_attention_heads=2,
+        cross_attention_head_dim=16,
+        cross_attention_dim=32,
+        caption_channels=32,
+        mlp_ratio=2.0,
+        sample_size=30,
+        patch_size=(1, 2, 2),
+    )
+    vae = AutoencoderKLWan(
+        base_dim=8,
+        decoder_base_dim=8,
+        z_dim=16,
+        dim_mult=[1, 1, 1, 1],
+        num_res_blocks=1,
+        temperal_downsample=[False, True, True],
+        latents_mean=[0.0] * 16,
+        latents_std=[1.0] * 16,
+    )
+    pipeline = SanaVideoPipeline(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        vae=vae,
+        transformer=transformer,
+        scheduler=scheduler,
+    )
+    pipeline.to(dtype=torch.bfloat16).save_pretrained(model_dir)
+    if pipeline_name != "SanaVideoPipeline":
+        index_path = Path(model_dir) / "model_index.json"
+        index = json.loads(index_path.read_text())
+        index["_class_name"] = pipeline_name
+        index_path.write_text(json.dumps(index, indent=2))
+    return model_dir
+
+
+def tiny_sana_video_builder() -> str:
+    return _build_tiny_sana_video("SanaVideoPipeline")
+
+
+def tiny_sana_video_i2v_builder() -> str:
+    return _build_tiny_sana_video("SanaImageToVideoPipeline")
 
 
 def _shrink_flux_clip_text_encoder(config: dict) -> dict:
@@ -125,6 +216,22 @@ def tiny_longcat_image_builder() -> str:
     )
 
 
+def tiny_longcat_image_edit_builder() -> str:
+    return build_tiny_from_configs(
+        "LongCatImageEditPipeline",
+        "meituan-longcat/LongCat-Image-Edit",
+        transform={
+            "text_encoder": _shrink_qwen_text_encoder_config,
+            "transformer": partial(
+                _shrink_dit_rope_config,
+                num_single_layers=2,
+                default_axes_dims_rope=[16, 56, 56],
+                joint_attention_dim=64,
+            ),
+        },
+    )
+
+
 def tiny_flux_builder() -> str:
     return build_tiny_from_configs(
         "FluxPipeline",
@@ -151,19 +258,18 @@ def tiny_flux_kontext_builder() -> str:
 
 def tiny_flux2_builder() -> str:
     def shrink_text_encoder(config: dict) -> dict:
-        # The real checkpoint ships language_model.lm_head.weight as its own
-        # tensor even though tie_word_embeddings defaults to True; keep it
-        # untied here too so transformers doesn't drop it on save.
         config["tie_word_embeddings"] = False
-        config["text_config"]["num_hidden_layers"] = 31
+        config["text_config"]["num_hidden_layers"] = 3
+        config["text_config"]["hidden_size"] = 32
         config["text_config"]["intermediate_size"] = 64
-        config["text_config"]["num_attention_heads"] = 4
-        config["text_config"]["head_dim"] = 32
+        config["text_config"]["num_attention_heads"] = 2
+        config["text_config"]["head_dim"] = 16
         config["text_config"]["num_key_value_heads"] = 2
+        config["text_config"]["text_encoder_out_layers"] = [0, 1, 2]
         config["vision_config"]["num_hidden_layers"] = 2
         config["vision_config"]["intermediate_size"] = 64
-        config["vision_config"]["num_attention_heads"] = 4
-        config["vision_config"]["head_dim"] = 32
+        config["vision_config"]["num_attention_heads"] = 2
+        config["vision_config"]["head_dim"] = 16
         return config
 
     return build_tiny_from_configs(
@@ -171,6 +277,6 @@ def tiny_flux2_builder() -> str:
         "black-forest-labs/FLUX.2-dev",
         transform={
             "text_encoder": shrink_text_encoder,
-            "transformer": partial(_shrink_dit_rope_config, num_single_layers=2),
+            "transformer": partial(_shrink_dit_rope_config, num_single_layers=2, joint_attention_dim=96),
         },
     )

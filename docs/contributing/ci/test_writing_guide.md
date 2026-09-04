@@ -48,17 +48,12 @@ Defined in `pyproject.toml`:
 | `MI325`            | Tests that require MI325 GPU (AMD/ROCm) *                                                               |
 | `A2`               | Tests that require A2 NPU *                                                                             |
 | `A3`               | Tests that require A3 NPU *                                                                             |
-| `distributed_cuda` | Tests that require multi cards on CUDA platform *                                                       |
-| `distributed_rocm` | Tests that require multi cards on ROCm platform  *                                                      |
-| `distributed_npu`  | Tests that require multi cards on NPU platform  *                                                       |
-| `skipif_cuda`      | Skip if the num of CUDA cards is less than the required *                                               |
-| `skipif_rocm`      | Skip if the num of ROCm cards is less than the required *                                               |
-| `skipif_npu`       | Skip if the num of NPU cards is less than the required *                                                |
+| `cards_{n}`        | Tests that require *n* accelerator cards (`cards_1` … `cards_8`); auto-added from `num_cards` *         |
 | `slow`             | Slow tests (may skip in quick CI)                                                                       |
 | `benchmark`        | Benchmark tests (decorator on runner test functions; perf JSON uses `full_model` + type marker instead) |
 | `local_model`      | Tests requiring local / non-HF-hub model weights                                                        |
 
-\* Means those markers are auto-added by `@hardware_test` (parametrization decorator) or `hardware_marks` (only returning the list of marks for flexibility).
+\* Means those markers are auto-added by `@hardware_test` (parametrization decorator) or `hardware_marks` (only returning the list of marks for flexibility). Do **not** write `pytest.mark.H100` / `pytest.mark.L4` (or other SKU names) by hand: `check-mark` rejects that so `cards_{n}` cannot be skipped.
 
 #### Example usage for markers
 
@@ -81,25 +76,23 @@ def test_video_to_audio()
 This decorator is intended to make hardware-aware, cross-platform test authoring easier and more robust for CI/CD environments. The `hardware_test` decorator in `vllm-omni/tests/helpers/mark.py` performs the following actions:
 
 1. **Applies platform and resource markers**  
-   Adds the appropriate pytest markers for each specified hardware platform (e.g., `cuda`, `rocm`, `xpu`, `npu`) and resource type (e.g., `L4`, `H100`, `MI325`, `B60`, `A2`, `A3`).
+   Adds the appropriate pytest markers for each specified hardware platform (e.g., `cuda`, `rocm`, `xpu`, `npu`) and resource type (e.g., `L4`, `H100`, `H200`, `B200`, `MI325`, `B60`, `A2`, `A3`).
    ```python
    @pytest.mark.cuda
    @pytest.mark.L4
    ```
-2. **Handles multi-card (distributed) scenarios**  
-   For tests requiring multiple cards, it automatically adds distributed markers such as `distributed_cuda`, `distributed_rocm`, or `distributed_npu`.
-   ```python
-   @pytest.mark.distributed_cuda(num_cards=num_cards)
-   ```
+2. **Handles card-count filtering**  
+   Adds a filterable marker `cards_{n}` (including `cards_1` when `num_cards` is omitted / 1). Use this with the SKU and platform, e.g. `-m "H100 and cards_4 and cuda"` vs `-m "H100 and cards_2 and cuda"`. Any multi-card CUDA test is `-m "cuda and not cards_1"`.
+
+   When `res` lists more than one platform **and** `num_cards` differs by platform, `@hardware_test` collects **one variant per platform** so those `cards_{n}` marks do not stack. `-m "H100 and cards_4 and cuda"` then selects only the CUDA/H100 4-card variant, not a ROCm 2-card sibling. The same count on every platform stays a single item.
 3. **Supports flexible card requirements**  
    Accepts `num_cards` as either a single integer for all platforms or as a dictionary with per-platform values. If not specified, defaults to 1 card per platform.
 
 4. **Integrates resource validation**  
-   On CUDA, adds a skip marker (`skipif_cuda`) if the system does not have the required number of devices.
-   Support for `skipif_rocm` and `skipif_npu` will be implemented later.
+   On CUDA and XPU, when `num_cards > 1`, attaches pytest's built-in `skipif` if the machine has fewer devices than requested. This is not a named `skipif_*` marker and is not used for `-m` filtering.
 
 5. **Works with pytest filtering**  
-   Allows tests to be filtered and selected at runtime using standard pytest marker expressions (e.g., `-m "distributed_cuda and L4"`).
+   Allows tests to be filtered and selected at runtime using standard pytest marker expressions (e.g., `-m "H100 and cards_2"`, `-m "L4 and not cards_1"`).
 
 ##### Example usage for decorator
 
@@ -117,13 +110,14 @@ This decorator is intended to make hardware-aware, cross-platform test authoring
         num_cards=2,
     )
     ```
-- `res` must be a dict; supported resources: CUDA (L4/H100), ROCm (MI325), XPU (B60), MUSA (S5000), NPU (A2/A3)
+- `res` must be a dict. SKU values come from `pyproject.toml` markers tagged `[hardware-resource]` plus the platform key (`[cuda]`, `[rocm]`, `[xpu]`, `[npu]`, `[musa]`).
 - `num_cards` can be int (all platforms) or dict (per platform); defaults to 1 when missing
-- Distributed markers (`distributed_cuda`, `distributed_rocm`, `distributed_npu`) are auto-added for multi-card cases
 - Filtering examples:
-    - CUDA only: `pytest -m "distributed_cuda and L4"`
-    - ROCm only: `pytest -m "distributed_rocm and MI325"`
-    - NPU only: `pytest -m "distributed_npu"`
+    - CUDA H100 4-card: `pytest -m "H100 and cards_4 and cuda"`
+    - CUDA H100 2-card: `pytest -m "H100 and cards_2 and cuda"`
+    - CUDA multi-card (any count): `pytest -m "L4 and not cards_1"`
+    - ROCm multi-card: `pytest -m "MI325 and not cards_1"`
+    - NPU multi-card: `pytest -m "npu and not cards_1"`
 
 #### Function: `hardware_marks`
 
@@ -179,37 +173,30 @@ If you want to add support for a new platform (e.g., "tpu" for a new accelerator
    [tool.pytest.ini_options]
    markers = [
        # ... existing markers ...
-       "tpu: Tests that require TPU device",
-       "TPU_V3: Tests that require TPU v3 hardware",
-       "distributed_tpu: Tests that require multiple TPU devices",
+       "tpu: [hardware-platform] Tests that require TPU device",
+       # Add [gpu] next to [hardware-platform] if this platform should also get pytest.mark.gpu.
+       "TPU_V3: [hardware-resource] [tpu] Tests that require TPU v3 hardware",
+       "cards_1: [hardware-cards] Tests that require 1 accelerator card",
+       "cards_2: [hardware-cards] Tests that require 2 accelerator cards",
    ]
    ```
+   `check-mark` treats `[hardware-platform]` names (including `cpu`/`gpu`) as allowed `pytest.mark.<name>` values. `hardware_test(res=...)` still rejects `cpu`/`gpu` as `res` keys.
 2. **Implement a marker construction function for your platform** in `vllm-omni/tests/helpers/mark.py`:
    ```python
    # In vllm-omni/tests/helpers/mark.py
 
-   def tpu_marks(*, res: str, num_cards: int):
-       test_platform = pytest.mark.tpu
-       if res == "TPU_V3":
-           test_resource = pytest.mark.TPU_V3
-       else:
-           raise ValueError(
-               f"Invalid TPU resource type: {res}. Supported: TPU_V3")
-
-       if num_cards == 1:
-           return [test_platform, test_resource]
-       else:
-           test_distributed = pytest.mark.distributed_tpu(num_cards=num_cards)
-           # Optionally: add skipif_tpu when implemented
-           return [test_platform, test_resource, test_distributed]
+   def _tpu_marks(*, res: str, num_cards: int):
+       _require_sku("tpu", res)
+       return [pytest.mark.tpu, getattr(pytest.mark, res), _cards_mark(num_cards)]
    ```
-3. **Update `hardware_marks` to recognize your new platform**:
-    In the relevant place (see the `hardware_marks` implementation), add:
+3. **Register the builder** in `_marks_for_platform`:
     ```python
-    if platform == "tpu":
-        marks = tpu_marks(res=resource, num_cards=cards)
+    builders = {
+        # ... existing platforms ...
+        "tpu": _tpu_marks,
+    }
     ```
-    (`hardware_test` calls `hardware_marks` internally, so both will pick up the change.)
+    (`hardware_test` / `hardware_marks` both go through `_marks_for_platform`.)
 4. **(Recommended) Add a test using your new markers**:
    ```python
    @hardware_test(
@@ -223,11 +210,11 @@ If you want to add support for a new platform (e.g., "tpu" for a new accelerator
 **Summary**:  
 
 - Add pytest markers for your new platform/resources  
-- Implement a marker function (`xxx_marks`)  
-- Plug into `hardware_marks`  
-- You're done: tests using `@hardware_test` or `hardware_marks` with your platform now automatically get the correct markers, distribution, and isolation!
+- Implement a private marker function (`_xxx_marks`)
+- Register it in `_marks_for_platform`
+- You're done: tests using `@hardware_test` or `hardware_marks` with your platform now automatically get the correct markers and `cards_{n}` filtering.
 
-See code in `vllm-omni/tests/helpers/mark.py` for existing examples (`cuda_marks`, `rocm_marks`, `npu_marks`).
+See code in `vllm-omni/tests/helpers/mark.py` for existing examples (`_cuda_marks`, `_rocm_marks`, `_npu_marks`).
 
 ## Test case style
 
@@ -509,7 +496,7 @@ L4 level testing is a comprehensive quality audit before a version release. It e
 #### 3.2 Testing Content and Scope
 
 - ***Full Functionality Testing***: Executes all test cases defined in `test_{model_name}_expansion.py`, covering all implemented features, positive flows, boundary conditions, and exception handling.
-- ***Performance Testing***: Uses `tests/dfx/perf/tests/test_qwen3_omni_*.json` (Omni), `test_tts.json` / `test_voxcpm2.json` / `test_higgs_audio_v3.json` (TTS), and diffusion configs `tests/dfx/perf/tests/test_*_vllm_omni.json` (passed to `run_benchmark.py` or `run_diffusion_benchmark.py` via `--test-config-file` in nightly **Perf Test** steps) to drive throughput, latency, and memory benchmarks. Each JSON **case** may declare an optional top-level **`mark`** array: exactly one ``hardware_marks`` object plus pytest marker name strings (`full_model`, `omni` / `tts` / `diffusion`, …). Runners attach those marks to each parametrized `(server, benchmark index)` pair so **local** bulk runs can filter with `-m` (for example `-m "full_model and H100 and diffusion"`). Nightly CI perf jobs select workloads by **`--test-config-file`**, not `-m`. Details are in the Performance Tests example below.
+- ***Performance Testing***: JSON configs under `tests/dfx/perf/tests/` drive Omni, TTS, and diffusion serving benchmarks via `run_benchmark.py` or `run_diffusion_benchmark.py`, measuring throughput, latency, and related metrics under configured workloads.
 - ***Documentation Testing***: Verifies whether the example code provided to users is runnable and its results match the description.
 
 #### 3.3 Test Directory and Execution Files
@@ -567,7 +554,7 @@ L5 level testing focuses on the performance of model services under ***long-runn
 - ***Trigger Timing***: **`Weekly`** (weekly) or **`Days before Release`** (several days before a major release). Due to long execution times, the frequency is lower.
 - ***Run Command***:
     - ***Stability***: `pytest -s -v tests/dfx/stability/scripts/test_stability_qwen3_omni.py` or `pytest -s -v tests/dfx/stability/scripts/test_stability_wan22.py` (or add `test_stability_<model>.py` alongside a matching JSON config)
-    - ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`). Weekly CI (`.buildkite/cuda/test-weekly.yml`) runs one step per suite (`WEEKLY=1` or PR label `weekly-test`)
+    - ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`).
 - ***Script Example***:
 
 <details>

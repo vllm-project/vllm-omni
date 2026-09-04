@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -196,6 +196,7 @@ def test_code2wav_patch_reads_stage_additional_config(
 
     model = SimpleNamespace(
         backend=None,
+        _extra_config=lambda: {},
         vllm_config=SimpleNamespace(
             additional_config={
                 "code2wav_enable_npu_graph": enabled,
@@ -222,6 +223,47 @@ def test_code2wav_patch_reads_stage_additional_config(
         assert graph_runner.max_graphs == max_graphs
     else:
         assert model.backend not in code2wav_patch._backend_graph_runners
+
+
+@pytest.mark.parametrize("value", [True, "true", "false", "0", "off"])
+def test_code2wav_patch_rejects_bfloat16_attention_cache(monkeypatch, value):
+    built = False
+
+    model = SimpleNamespace(
+        backend=None,
+        _extra_config=lambda: {"code2wav_bfloat16_attention_cache": value},
+    )
+
+    def build_backend(_instance):
+        nonlocal built
+        built = True
+
+    monkeypatch.setattr(code2wav_patch, "_original_build_backend", build_backend)
+
+    with pytest.raises(ValueError, match="currently supported only on CUDA"):
+        code2wav_patch._patched_build_backend(model)
+
+    assert not built
+
+
+@pytest.mark.parametrize("value", [False, None, 0, ""])
+def test_code2wav_patch_allows_disabled_bfloat16_attention_cache(monkeypatch, value):
+    built = False
+
+    model = SimpleNamespace(
+        backend=None,
+        _extra_config=lambda: {"code2wav_bfloat16_attention_cache": value},
+    )
+
+    def build_backend(instance):
+        nonlocal built
+        built = True
+        instance.backend = object()
+
+    monkeypatch.setattr(code2wav_patch, "_original_build_backend", build_backend)
+    code2wav_patch._patched_build_backend(model)
+
+    assert built
 
 
 @pytest.mark.parametrize("with_cache", [False, True])

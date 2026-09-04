@@ -33,5 +33,49 @@
                 }
             }
         ]
+    },
+    {
+        "test_name": "test_boogu_image_cfg_parallel_2",
+        "mark": [
+            {
+                "hardware_marks": {
+                    "res": {
+                        "cuda": "H100"
+                    },
+                    "num_cards": 2
+                }
+            },
+            "full_model",
+            "diffusion"
+        ],
+        "description": "Two-device CFG-parallel Base T2I measurement row. Run beside test_boogu_image_single_device on the same H100 revision and populate latency, throughput, speedup, and per-GPU peak-memory baselines from the resulting report.",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "Boogu/Boogu-Image-0.1-Base",
+            "serve_args": {
+                "cfg-parallel-size": 2,
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "512x512_steps28_cfg2",
+                "dataset": "random",
+                "task": "t2i",
+                "width": 512,
+                "height": 512,
+                "num-inference-steps": 28,
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "warmup-requests": 4,
+                "warmup-concurrency": 1,
+                "warmup-num-inference-steps": 28,
+                "enable-negative-prompt": true,
+                "extra-body": {
+                    "guidance_scale": 4.0,
+                    "seed": 42
+                }
+            }
+        ]
     }
 ]

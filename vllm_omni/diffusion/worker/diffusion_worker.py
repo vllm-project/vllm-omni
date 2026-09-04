@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Diffusion Worker for vLLM-Omni.
@@ -13,6 +13,7 @@ import multiprocessing as mp
 import os
 import queue
 import signal
+import sys
 import threading
 import traceback
 import uuid
@@ -25,10 +26,12 @@ import torch.distributed as dist
 import zmq
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
+from vllm.distributed.parallel_state import get_ep_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.profiler.wrapper import CudaProfilerWrapper, WorkerProfiler
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.mem_utils import GiB_bytes, MemorySnapshot, format_gib, memory_profiling
+from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.worker.utils import request_memory
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -46,8 +49,15 @@ from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
+    get_cfg_group,
+    get_dp_group,
+    get_fs_group,
+    get_hsdp_replicate_group,
+    get_pp_group,
+    get_sp_group,
     init_distributed_environment,
     initialize_model_parallel,
+    model_parallel_is_initialized,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, pack_diffusion_output_shm
@@ -84,6 +94,16 @@ _ASYNC_OUTPUT_DRAIN_TIMEOUT_S = 10.0
 _MEMORY_RELEASING_METHODS = frozenset({"sleep", "handle_sleep_task"})
 
 
+def _cleanup_after_execution_error(exc: Exception) -> None:
+    """Release device tensors retained by a failed execution traceback."""
+    exc.__traceback__ = None
+    try:
+        gc.collect()
+        current_omni_platform.empty_cache()
+    except Exception:
+        logger.warning("Failed to release device memory after an execution error", exc_info=True)
+
+
 def _all_gather_rank_values(value: Any) -> list[Any]:
     if not dist.is_available() or not dist.is_initialized():
         return [value]
@@ -106,6 +126,47 @@ def _run_and_gather_rank_values(operation: str, func: Callable[[], Any]) -> list
     if failures:
         raise RuntimeError(f"{operation} failed on " + "; ".join(failures))
     return [result for _, result in rank_results]
+
+
+def _setup_diffusion_worker_proc_title_and_log_prefix(
+    enable_ep: bool,
+    use_hsdp: bool,
+    hsdp_replicate_size: int = 1,
+) -> None:
+    """Set the worker process title and log prefix from initialized groups."""
+    process_name = "DiffusionWorker"
+    if model_parallel_is_initialized():
+        dp_group = get_dp_group()
+        pp_group = get_pp_group()
+        sp_group = get_sp_group()
+        cfg_group = get_cfg_group()
+        tp_group = get_tp_group()
+
+        if dp_group.world_size > 1:
+            process_name += f"_DP{dp_group.rank_in_group}"
+        if pp_group.world_size > 1:
+            process_name += f"_PP{pp_group.rank_in_group}"
+        if sp_group.world_size > 1:
+            process_name += f"_SP{sp_group.rank_in_group}"
+        if cfg_group.world_size > 1:
+            process_name += f"_CFG{cfg_group.rank_in_group}"
+        if tp_group.world_size > 1:
+            process_name += f"_TP{tp_group.rank_in_group}"
+        if use_hsdp:
+            fs_group = get_fs_group()
+            if fs_group.world_size > 1:
+                process_name += f"_FS{fs_group.rank_in_group}"
+            if hsdp_replicate_size > 1:
+                replicate_group = get_hsdp_replicate_group()
+                if replicate_group.world_size > 1:
+                    process_name += f"_RP{replicate_group.rank_in_group}"
+        if enable_ep:
+            ep_group = get_ep_group()
+            if ep_group.world_size > 1:
+                process_name += f"_EP{ep_group.rank_in_group}"
+
+    set_process_title(name=process_name, prefix="vLLM-Omni")
+    decorate_logs(process_name)
 
 
 @contextmanager
@@ -188,11 +249,6 @@ class DiffusionWorker:
         # requests, which only carry their request_id in subsequent ticks.
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
-        if self.od_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER:
-            logger.warning_once(
-                "paged_scheduler initializes native paged KV storage, but no production diffusion model uses the "
-                "paged-attention adapter yet; model attention remains on the dense path."
-            )
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
         #   1. explicit od_config.diffusion_model_runner_cls (user override),
@@ -284,8 +340,14 @@ class DiffusionWorker:
                 allgather_degree=parallel_config.allgather_degree,
                 tensor_parallel_size=parallel_config.tensor_parallel_size,
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+                fully_shard_degree=parallel_config.hsdp_shard_size if parallel_config.use_hsdp else 1,
                 enable_expert_parallel=parallel_config.enable_expert_parallel,
                 use_hsdp=parallel_config.use_hsdp,
+            )
+            _setup_diffusion_worker_proc_title_and_log_prefix(
+                enable_ep=parallel_config.enable_expert_parallel,
+                use_hsdp=parallel_config.use_hsdp,
+                hsdp_replicate_size=parallel_config.hsdp_replicate_size,
             )
             if (
                 getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
@@ -471,7 +533,16 @@ class DiffusionWorker:
 
     def init_lora_manager(self) -> None:
         """Initialize the LoRA manager for this worker."""
-        if self.model_runner.pipeline is None:
+        pipeline = self.model_runner.pipeline
+        if pipeline is None:
+            return
+
+        # A release whose weights cannot be expressed as switchable LoRA layers
+        # is fused into the checkpoint while the pipeline loads. There is then
+        # no adapter left to register, and handing the same path to the manager
+        # would only fail on a format it does not accept.
+        if getattr(pipeline, "lora_is_fused", False):
+            logger.info("LoRA was fused into the checkpoint at load time; skipping the dynamic LoRA manager.")
             return
 
         lora_path = self.od_config.lora_path
@@ -672,11 +743,15 @@ class DiffusionWorker:
             logger.warning("LoRA activation skipped: %s", exc)
 
     def remove_lora(self, adapter_id: int) -> bool:
+        if self.lora_manager is None:
+            return False
         return self.lora_manager.remove_adapter(adapter_id)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         # NOTE (Alex): We have not implemented the API routing
         # for the frontend server yet.
+        if self.lora_manager is None:
+            return False
         return self.lora_manager.add_adapter(lora_request)
 
     def submit_interaction(
@@ -689,9 +764,13 @@ class DiffusionWorker:
         self.model_runner.submit_interaction(request_id, interaction)
 
     def list_loras(self) -> list[int]:
+        if self.lora_manager is None:
+            return []
         return self.lora_manager.list_adapters()
 
     def pin_lora(self, adapter_id: int) -> bool:
+        if self.lora_manager is None:
+            return False
         return self.lora_manager.pin_adapter(adapter_id)
 
     def sleep(self, level: int = 1) -> int:
@@ -707,9 +786,8 @@ class DiffusionWorker:
         usage_before = allocator.get_current_usage()
 
         if level == 2 and self.model_runner is not None:
-            if hasattr(self.model_runner, "graph_runners"):
-                self.model_runner.graph_runners.clear()
-                logger.info(f"[Worker {self.rank}] CUDA Graphs cleared.")
+            self.model_runner.release_captured_graphs()
+            logger.info(f"[Worker {self.rank}] CUDA Graphs cleared.")
             model = self.model_runner.pipeline
             self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
 
@@ -887,11 +965,25 @@ class DiffusionWorker:
 
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup distributed environment."""
-        if self.model_runner is not None:
-            mgr = getattr(self.model_runner, "kv_transfer_manager", None)
-            if mgr is not None:
-                mgr.shutdown_prefetch()
-        destroy_distributed_env()
+        try:
+            if self.model_runner is not None:
+                mgr = getattr(self.model_runner, "kv_transfer_manager", None)
+                try:
+                    offload_backend = getattr(self.model_runner, "offload_backend", None)
+                    if offload_backend is not None:
+                        offload_backend.disable()
+                finally:
+                    if mgr is not None:
+                        mgr.shutdown_prefetch()
+        finally:
+            try:
+                a2a_permute = sys.modules.get("vllm_omni.diffusion.distributed.a2a_permute")
+                if a2a_permute is not None:
+                    a2a_permute.clear_a2a_permute_workspaces()
+            except Exception:
+                logger.exception("Failed to release fused Ulysses symmetric-memory workspaces")
+            finally:
+                destroy_distributed_env()
 
 
 class CustomPipelineWorkerExtension:
@@ -1187,7 +1279,6 @@ class WorkerProc:
             return None, False
 
         result = None
-        rpc_exception: Exception | None = None
         status: dict[str, Any] = {
             "rank": self.gpu_id,
             "ok": True,
@@ -1204,7 +1295,6 @@ class WorkerProc:
             result = self.worker.execute_method(method, *args, **kwargs)
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
-            rpc_exception = e
             status.update(
                 {
                     "ok": False,
@@ -1213,6 +1303,9 @@ class WorkerProc:
                     "traceback": traceback.format_exc(),
                 }
             )
+            if not collect_rank_status:
+                raise
+            _cleanup_after_execution_error(e)
 
         if isinstance(result, bool):
             status["bool_result"] = result
@@ -1232,8 +1325,6 @@ class WorkerProc:
                 )
             return None, False
 
-        if rpc_exception is not None:
-            raise rpc_exception
         if isinstance(result, dict) and wave_id is not None:
             result["wave_id"] = wave_id
         return result, should_reply
@@ -1282,6 +1373,8 @@ class WorkerProc:
                         self._return_result(result, rpc_id=rpc_id)
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
+                    error = str(e)
+                    _cleanup_after_execution_error(e)
                     # Apply the same reply gate as the success path so
                     # non-output ranks don't enqueue stale error replies
                     # that compete with the expected responder's message.
@@ -1296,7 +1389,7 @@ class WorkerProc:
                                 AsyncDiffusionOutput(
                                     kind=AsyncOutputKind.RPC_RESULT,
                                     rpc_id=rpc_id,
-                                    error=str(e),
+                                    error=error,
                                 )
                             )
                         elif output_rank is None and exec_all_ranks:
@@ -1324,11 +1417,11 @@ class WorkerProc:
                                 except Exception:
                                     dp_rank = self.gpu_id
                                 self._return_result(
-                                    {"status": "error", "error": str(e), "dp_rank": dp_rank, "wave_id": wave_id}
+                                    {"status": "error", "error": error, "dp_rank": dp_rank, "wave_id": wave_id}
                                 )
                         elif output_rank is None or output_rank == self.gpu_id:
                             # Normal RPC: only the expected rank replies
-                            self._return_result({"status": "error", "error": str(e), "wave_id": wave_id})
+                            self._return_result({"status": "error", "error": error, "wave_id": wave_id})
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)
@@ -1345,6 +1438,7 @@ class WorkerProc:
                         exc_info=True,
                     )
                     output = DiffusionOutput.from_exception(e)
+                    _cleanup_after_execution_error(e)
 
                 try:
                     self._return_result(output)
@@ -1380,13 +1474,11 @@ class WorkerProc:
 
         set_death_signal(signal.SIGTERM)
 
-        # Set process title for visibility in nvidia-smi / htop (optional, non-fatal)
-        try:
-            import setproctitle
-
-            setproctitle.setproctitle(f"vLLM-Omni::DiffusionWorker-{rank}")
-        except ImportError:
-            pass  # setproctitle not installed, skip process title setting
+        _setup_diffusion_worker_proc_title_and_log_prefix(
+            enable_ep=od_config.parallel_config.enable_expert_parallel,
+            use_hsdp=od_config.parallel_config.use_hsdp,
+            hsdp_replicate_size=od_config.parallel_config.hsdp_replicate_size,
+        )
 
         load_omni_general_plugins()
         worker_proc = None

@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for HSDP (Hybrid Sharded Data Parallel) configuration and utilities."""
 
 import gc
-import os
-import socket
 
 import pytest
 import torch
@@ -12,6 +10,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.tensor import DeviceMesh, DTensor
 
+from tests.helpers.runtime import get_distributed_init_method
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.distributed.hsdp import (
     HSDPInferenceConfig,
@@ -37,35 +36,17 @@ class _PackedModel(nn.Module):
         self.root_weight = nn.Parameter(torch.ones(2))
 
 
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 @pytest.fixture(scope="module")
 def cpu_process_group():
     if dist.is_initialized():
         yield
         return
 
-    master_port = _find_free_port()
-    os.environ.update(
-        {
-            "RANK": "0",
-            "LOCAL_RANK": "0",
-            "WORLD_SIZE": "1",
-            "MASTER_ADDR": "127.0.0.1",
-            "MASTER_PORT": str(master_port),
-        }
-    )
-    dist.init_process_group("gloo", rank=0, world_size=1)
+    dist.init_process_group("gloo", rank=0, world_size=1, init_method=get_distributed_init_method())
     try:
         yield
     finally:
         dist.destroy_process_group()
-        for key in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK"):
-            os.environ.pop(key, None)
         gc.collect()
 
 

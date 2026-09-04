@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """INT8 quantization config for diffusion transformers.
 
 Supports both online (dynamic) and offline (checkpoint) INT8 quantization
@@ -26,9 +26,11 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from vllm.model_executor.layers.quantization.fp8 import CopyNumelCounter
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
+)
+from vllm.model_executor.model_loader.reload.meta import (
+    CopyCounter as CopyNumelCounter,
 )
 from vllm.model_executor.model_loader.weight_utils import initialize_single_dummy_weight
 from vllm.model_executor.parameter import (
