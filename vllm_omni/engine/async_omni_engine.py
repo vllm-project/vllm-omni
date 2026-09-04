@@ -29,9 +29,11 @@ from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
-from vllm_omni.config.resolver import resolve_omni_config
+from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.resolver import OmniConfigResolution, resolve_omni_config
 from vllm_omni.config.stage_config import (
     DuplexSessionRuntimeConfig,
+    PipelineConfig,
     load_deploy_config,
 )
 from vllm_omni.data_entry_keys import REQUEST_ARTIFACT_DIRS_KEY, TRANSFORM_OWNED_META_KEYS
@@ -185,11 +187,28 @@ class AsyncOmniEngine:
                 self._omni_master_port,
             )
 
+        # Keep the historical tuple return from _resolve_stage_configs while
+        # retaining the richer resolver result for pipeline-wide settings.
+        # Overrides of that private seam fall back to the factory below.
+        deploy_config_path = kwargs.get("deploy_config")
+        self._config_resolution: OmniConfigResolution | None = None
         self.config_path, self.stage_configs = self._resolve_stage_configs(
             model,
             kwargs,
             trust_remote_code=trust_remote_code,
         )
+        if self._config_resolution is None:
+            pipeline_config = StageConfigFactory.get_pipeline_config(
+                model=model,
+                trust_remote_code=bool(trust_remote_code),
+                deploy_config_path=deploy_config_path,
+            )
+            self._set_pipeline_runtime_config(pipeline_config, deploy_config_path)
+        else:
+            self._set_pipeline_runtime_config(
+                self._config_resolution.pipeline_config,
+                self._config_resolution.config_path,
+            )
 
         self.num_stages = len(self.stage_configs)
         stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
@@ -949,6 +968,24 @@ class AsyncOmniEngine:
             )
             self._omni_lb_policy = str(derived)
 
+    def _set_pipeline_runtime_config(
+        self,
+        pipeline_config: PipelineConfig | None,
+        config_path: str | None,
+    ) -> None:
+        """Initialize engine-wide settings resolved from pipeline metadata."""
+        self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()
+        self._duplex_runtime_extension_path = (
+            pipeline_config.duplex_runtime_extension if pipeline_config is not None else None
+        )
+        self.duplex_serving_adapter_path = (
+            pipeline_config.duplex_serving_adapter if pipeline_config is not None else None
+        )
+        self._duplex_control_enabled = bool(pipeline_config and pipeline_config.duplex_control_enabled)
+        self.duplex_session_config = DuplexSessionRuntimeConfig()
+        if config_path is not None:
+            self.duplex_session_config = load_deploy_config(config_path).duplex_session
+
     def _resolve_stage_configs(
         self,
         model: str,
@@ -976,21 +1013,10 @@ class AsyncOmniEngine:
             stage_overrides=stage_overrides,
             strategy_config_path=strategy_config_path,
         )
+        self._config_resolution = resolved
         config_path = resolved.config_path
         stage_configs = list(resolved.stage_configs)
         strategy_lb_policy = resolved.omni_lb_policy
-        self.endpoint_restrictions = resolved.endpoint_restrictions
-        pipeline_config = resolved.pipeline_config
-        self._duplex_runtime_extension_path = (
-            pipeline_config.duplex_runtime_extension if pipeline_config is not None else None
-        )
-        self.duplex_serving_adapter_path = (
-            pipeline_config.duplex_serving_adapter if pipeline_config is not None else None
-        )
-        self._duplex_control_enabled = bool(pipeline_config and pipeline_config.duplex_control_enabled)
-        self.duplex_session_config = DuplexSessionRuntimeConfig()
-        if pipeline_config is not None and config_path is not None:
-            self.duplex_session_config = load_deploy_config(config_path).duplex_session
 
         # A strategy.yaml may derive a pipeline-wide load-balancer policy. It is
         # an orchestrator-level knob (read once at construction), so apply it here
