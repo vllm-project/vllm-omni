@@ -14,6 +14,7 @@ from __future__ import annotations
 import inspect
 import os
 from collections.abc import Collection, Iterable, Sequence
+from dataclasses import dataclass
 
 import torch
 from vllm.logger import init_logger
@@ -26,7 +27,11 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import RequestStatus
 
-from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionKVBranchSpec
+from vllm_omni.experimental.ar_diffusion.capability import (
+    ARDiffusionCrossAttentionKVSpec,
+    ARDiffusionKVBranchSpec,
+    ARDiffusionKVCacheSpec,
+)
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
     ChunkWindowSpec,
@@ -115,6 +120,104 @@ def compute_num_blocks(
     return max(0, budget // page_size_bytes)
 
 
+@dataclass(frozen=True)
+class ARDiffusionKVCacheMemoryEstimate:
+    """Side-effect-free memory accounting for one prospective KV pool."""
+
+    page_size_bytes: int
+    scratch_blocks_per_local_branch: int
+    scratch_num_blocks: int
+    scratch_reserved_bytes: int
+    managed_num_blocks: int
+    cross_attention_bytes_per_session: int
+    cross_attention_reserved_bytes: int
+    model_owned_state_reserved_bytes: int
+    required_bytes: int
+
+
+def ar_diffusion_scratch_blocks_override() -> int:
+    """Read and validate the optional process-wide scratch-block floor."""
+
+    raw = os.environ.get("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH")
+    try:
+        value = int(raw) if raw is not None else 0
+    except ValueError as exc:
+        raise ValueError("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH must be an integer") from exc
+    if value < 0:
+        raise ValueError("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH must be non-negative")
+    return value
+
+
+def estimate_ar_diffusion_kv_cache_memory(
+    config: ARDiffusionKVConfig,
+    spec: ARDiffusionKVCacheSpec,
+    dtype: torch.dtype,
+    *,
+    session_capacity: int = 1,
+    scratch_blocks_override: int = 0,
+) -> ARDiffusionKVCacheMemoryEstimate:
+    """Estimate all pool allocations without constructing managers or tensors."""
+
+    if session_capacity <= 0:
+        raise ValueError(f"session_capacity must be positive, got {session_capacity}")
+    if scratch_blocks_override < 0:
+        raise ValueError("scratch_blocks_override must be non-negative")
+    if config.window_chunks is None:
+        raise ValueError("AR-Diffusion memory estimation requires a bounded window")
+    if config.chunk_size != spec.tokens_per_frame:
+        raise ValueError(
+            "AR-Diffusion effective config chunk_size must equal tokens_per_frame: "
+            f"{config.chunk_size} != {spec.tokens_per_frame}"
+        )
+
+    page_size_bytes = int(
+        2 * spec.tokens_per_frame * spec.num_kv_heads * spec.head_size * dtype.itemsize * spec.num_layers
+    )
+    scratch_frames = spec.frames_per_block
+    if spec.max_scratch_frames_per_branch is not None:
+        scratch_frames = spec.max_scratch_frames_per_branch
+    extra_scratch_blocks = (spec.max_scratch_tokens_per_branch + spec.tokens_per_frame - 1) // spec.tokens_per_frame
+    scratch_blocks_per_local_branch = max(
+        scratch_frames + extra_scratch_blocks,
+        scratch_blocks_override,
+    )
+    scratch_num_blocks = spec.num_local_kv_branches * scratch_blocks_per_local_branch
+    scratch_reserved_bytes = scratch_num_blocks * page_size_bytes
+    managed_num_blocks = (
+        spec.num_local_kv_branches
+        * (session_capacity * (spec.sink_frames + spec.window_frames) + spec.frames_per_block)
+        + 2
+    )
+    cross_attention_bytes_per_session = int(
+        2
+        * len(spec.kv_branches)
+        * sum(spec.cross_attention_lengths.values())
+        * spec.num_kv_heads
+        * spec.head_size
+        * dtype.itemsize
+        * spec.num_layers
+    )
+    cross_attention_reserved_bytes = session_capacity * cross_attention_bytes_per_session
+    model_owned_state_reserved_bytes = session_capacity * spec.model_owned_state_bytes_per_session
+    required_bytes = (
+        scratch_reserved_bytes
+        + managed_num_blocks * page_size_bytes
+        + cross_attention_reserved_bytes
+        + model_owned_state_reserved_bytes
+    )
+    return ARDiffusionKVCacheMemoryEstimate(
+        page_size_bytes=page_size_bytes,
+        scratch_blocks_per_local_branch=scratch_blocks_per_local_branch,
+        scratch_num_blocks=scratch_num_blocks,
+        scratch_reserved_bytes=scratch_reserved_bytes,
+        managed_num_blocks=managed_num_blocks,
+        cross_attention_bytes_per_session=cross_attention_bytes_per_session,
+        cross_attention_reserved_bytes=cross_attention_reserved_bytes,
+        model_owned_state_reserved_bytes=model_owned_state_reserved_bytes,
+        required_bytes=required_bytes,
+    )
+
+
 def build_kv_manager(
     spec: KVCacheSpec,
     layer_names: Sequence[str],
@@ -173,6 +276,7 @@ class ARDiffusionKVCache:
         cross_attention_lengths: dict[str, int] | None = None,
         device: torch.device | None = None,
         frames_per_block: int = 1,
+        max_scratch_frames_per_branch: int | None = None,
         max_scratch_tokens_per_branch: int = 0,
         model_owned_state_bytes_per_session: int = 0,
     ) -> None:
@@ -203,6 +307,8 @@ class ARDiffusionKVCache:
         self.num_local_kv_branches = max(local_indices) + 1
         if frames_per_block <= 0:
             raise ValueError(f"frames_per_block must be positive, got {frames_per_block}")
+        if max_scratch_frames_per_branch is not None and max_scratch_frames_per_branch < 0:
+            raise ValueError(f"max_scratch_frames_per_branch must be non-negative, got {max_scratch_frames_per_branch}")
         if max_scratch_tokens_per_branch < 0:
             raise ValueError(f"max_scratch_tokens_per_branch must be non-negative, got {max_scratch_tokens_per_branch}")
         if model_owned_state_bytes_per_session < 0:
@@ -210,7 +316,12 @@ class ARDiffusionKVCache:
                 f"model_owned_state_bytes_per_session must be non-negative, got {model_owned_state_bytes_per_session}"
             )
         self.frames_per_block = int(frames_per_block)
+        self.max_scratch_frames_per_branch = int(
+            frames_per_block if max_scratch_frames_per_branch is None else max_scratch_frames_per_branch
+        )
+        self.max_scratch_tokens_per_branch = int(max_scratch_tokens_per_branch)
         self.block_size = block_size
+        self.max_model_len = max_model_len
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
@@ -239,52 +350,51 @@ class ARDiffusionKVCache:
             reset_at_boundary=config.reset_at_boundary,
         )
 
-        # Scratch blocks are outside KVCacheManager ownership. A non-committing
-        # forward needs one block per current frame plus space for any
-        # model-declared action/state tokens that coexist with video KV.
-        declared_scratch_blocks = (max_scratch_tokens_per_branch + block_size - 1) // block_size
-        minimum_scratch_blocks = self.frames_per_block + declared_scratch_blocks
-        override = os.environ.get("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH")
-        override_blocks = int(override) if override is not None else 0
-        if override_blocks < 0:
-            raise ValueError("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH must be non-negative")
-        scratch_per_kv_branch = max(minimum_scratch_blocks, override_blocks)
-        self.scratch_blocks_per_kv_branch = scratch_per_kv_branch
-        self.scratch_num_blocks = self.num_local_kv_branches * scratch_per_kv_branch
+        override_blocks = ar_diffusion_scratch_blocks_override()
+
+        effective_spec = ARDiffusionKVCacheSpec(
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            tokens_per_frame=block_size,
+            frames_per_block=frames_per_block,
+            window_frames=config.window_chunks,
+            sink_frames=config.sink_chunks,
+            reset_at_boundary=config.reset_at_boundary,
+            kv_branches=kv_branches,
+            session_capacity=session_capacity,
+            cross_attention=tuple(
+                ARDiffusionCrossAttentionKVSpec(name, length) for name, length in self.cross_attention_lengths.items()
+            ),
+            max_model_len=max_model_len,
+            max_scratch_frames_per_branch=max_scratch_frames_per_branch,
+            max_scratch_tokens_per_branch=max_scratch_tokens_per_branch,
+            model_owned_state_bytes_per_session=model_owned_state_bytes_per_session,
+        )
+        one_session = estimate_ar_diffusion_kv_cache_memory(
+            config,
+            effective_spec,
+            dtype,
+            scratch_blocks_override=override_blocks,
+        )
+        self.scratch_blocks_per_kv_branch = one_session.scratch_blocks_per_local_branch
+        self.scratch_num_blocks = one_session.scratch_num_blocks
 
         # The self-attention pool, scratch pool, and lazily materialized
         # cross-attention caches share one hard memory budget. Select the largest
         # feasible resident-session count rather than raising a block-count floor
         # past that budget. All resident sessions need a complete sink + window;
         # only one request can be in flight, so frames_per_block is counted once.
-        page_size_bytes = self.spec.page_size_bytes * num_layers
+        page_size_bytes = one_session.page_size_bytes
         self.available_memory_bytes = available_bytes
         self.configured_memory_budget_bytes = int(available_bytes * config.gpu_memory_fraction)
         # Reuse the public helper's validation for the memory fraction/page size.
         compute_num_blocks(available_bytes, config.gpu_memory_fraction, page_size_bytes)
-        self.scratch_reserved_bytes = self.scratch_num_blocks * page_size_bytes
+        self.scratch_reserved_bytes = one_session.scratch_reserved_bytes
         self.model_owned_state_bytes_per_session = model_owned_state_bytes_per_session
+        self.cross_attention_bytes_per_session = one_session.cross_attention_bytes_per_session
 
-        def _cross_pool_bytes(length: int) -> int:
-            return int(2 * len(self.kv_branches) * length * num_kv_heads * head_size * dtype.itemsize * num_layers)
-
-        self.cross_attention_bytes_per_session = sum(
-            _cross_pool_bytes(length) for length in self.cross_attention_lengths.values()
-        )
-
-        def _required_managed_blocks(capacity: int) -> int:
-            resident_per_session = config.sink_chunks + config.window_chunks
-            return self.num_local_kv_branches * (capacity * resident_per_session + self.frames_per_block) + 2
-
-        def _required_bytes(capacity: int) -> int:
-            return (
-                self.scratch_reserved_bytes
-                + capacity * self.cross_attention_bytes_per_session
-                + capacity * self.model_owned_state_bytes_per_session
-                + _required_managed_blocks(capacity) * page_size_bytes
-            )
-
-        one_session_bytes = _required_bytes(1)
+        one_session_bytes = one_session.required_bytes
         if one_session_bytes > available_bytes:
             raise ValueError(
                 "AR-Diffusion available device memory cannot fit one session: "
@@ -303,10 +413,16 @@ class ARDiffusionKVCache:
         effective_capacity = 0
         required_managed_blocks = 0
         for candidate in range(session_capacity, 0, -1):
-            candidate_managed_blocks = _required_managed_blocks(candidate)
-            if _required_bytes(candidate) <= self.memory_budget_bytes:
+            candidate_estimate = estimate_ar_diffusion_kv_cache_memory(
+                config,
+                effective_spec,
+                dtype,
+                session_capacity=candidate,
+                scratch_blocks_override=override_blocks,
+            )
+            if candidate_estimate.required_bytes <= self.memory_budget_bytes:
                 effective_capacity = candidate
-                required_managed_blocks = candidate_managed_blocks
+                required_managed_blocks = candidate_estimate.managed_num_blocks
                 break
         assert effective_capacity > 0
 

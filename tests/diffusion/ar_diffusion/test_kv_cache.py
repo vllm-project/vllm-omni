@@ -352,6 +352,7 @@ def _make_kv(
     local_branches,
     num_frame_per_block=2,
     window_chunks=9,
+    max_scratch_frames_per_branch=None,
     max_scratch_tokens_per_branch=0,
 ):
     kv_branches = (
@@ -360,8 +361,9 @@ def _make_kv(
         else (ARDiffusionKVBranchSpec("positive", 0), ARDiffusionKVBranchSpec("negative", 1))
     )
     page_bytes = 2 * BLOCK * 4 * 64 * torch.float32.itemsize
+    scratch_frames = num_frame_per_block if max_scratch_frames_per_branch is None else max_scratch_frames_per_branch
     declared_scratch_blocks = (max_scratch_tokens_per_branch + BLOCK - 1) // BLOCK
-    scratch_blocks = local_branches * (num_frame_per_block + declared_scratch_blocks)
+    scratch_blocks = local_branches * (scratch_frames + declared_scratch_blocks)
     managed_blocks = local_branches * (window_chunks + num_frame_per_block) + 2
     return ARDiffusionKVCache(
         ARDiffusionKVConfig(
@@ -381,6 +383,7 @@ def _make_kv(
         kv_branches=kv_branches,
         session_capacity=1,
         frames_per_block=num_frame_per_block,
+        max_scratch_frames_per_branch=max_scratch_frames_per_branch,
         max_scratch_tokens_per_branch=max_scratch_tokens_per_branch,
     )
 
@@ -407,6 +410,21 @@ def test_scratch_capacity_is_derived_from_declared_geometry(monkeypatch):
         max_scratch_tokens_per_branch=BLOCK + 1,
     )
     assert kv.scratch_blocks_per_kv_branch == 8  # six video blocks + two auxiliary blocks
+
+
+def test_scratch_video_span_is_independent_of_managed_inflight_span(monkeypatch):
+    monkeypatch.delenv("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH", raising=False)
+    kv = _make_kv(
+        local_branches=1,
+        num_frame_per_block=1,
+        max_scratch_frames_per_branch=4,
+        max_scratch_tokens_per_branch=BLOCK + 1,
+    )
+
+    assert kv.frames_per_block == 1
+    assert kv.max_scratch_frames_per_branch == 4
+    assert kv.managed_num_blocks == 12  # nine window + one managed in-flight + two sentinels
+    assert kv.scratch_blocks_per_kv_branch == 6  # four current-video + two auxiliary
 
 
 def test_scratch_env_override_cannot_reduce_declared_minimum(monkeypatch):

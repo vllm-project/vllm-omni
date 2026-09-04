@@ -182,7 +182,8 @@ def test_paged_attention_matches_dense_reference_cpu(history_chunks, action_len,
         history_k_parts.append(k)
         history_v_parts.append(v)
 
-    ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=commit_current)[0].forward_ctx
+    layer_ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=commit_current)[0]
+    ctx = layer_ctx.forward_ctx
     ctx.ensure_video_slots(device)
     current_k = torch.randn(1, BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
     current_v = torch.randn(1, BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
@@ -231,9 +232,65 @@ def test_paged_attention_matches_dense_reference_cpu(history_chunks, action_len,
 
     torch.testing.assert_close(paged, ref, rtol=1e-5, atol=1e-5)
 
+    ctx.prepare(device=device, action_len=action_len, query_len=query.shape[1])
+    fused = paged_write_attn(
+        layer_ctx.to_layer_inputs(),
+        query[0],
+        current_k[0],
+        current_v[0],
+        action_k[0] if action_len else None,
+        action_v[0] if action_len else None,
+        HEAD_DIM**-0.5,
+    ).unsqueeze(0)
+    torch.testing.assert_close(fused, ref, rtol=1e-5, atol=1e-5)
+
     before = st.adapter(POS).completed_chunks
     st.commit_paged_context(POS)
     assert st.adapter(POS).completed_chunks == before + (1 if commit_current else 0)
+
+
+def test_extra_visible_tokens_keeps_the_history_window_in_addition_to_current():
+    torch.manual_seed(0)
+    device = torch.device("cpu")
+    kv, st = make_state(window_chunks=2, device=device)
+    committed = [
+        _commit_video_span(
+            kv,
+            st,
+            kv_branch=POS,
+            n_chunks=1,
+            dtype=torch.float32,
+            device=device,
+        )
+        for _ in range(3)
+    ]
+
+    layer_ctx = st.get_kv_caches(
+        POS,
+        seq_len=BLOCK,
+        commit_current=False,
+        extra_visible_tokens=BLOCK,
+    )[0]
+    current_k = torch.randn(BLOCK, N_HEADS, HEAD_DIM)
+    current_v = torch.randn_like(current_k)
+    text_k = torch.randn(3, N_HEADS, HEAD_DIM)
+    text_v = torch.randn_like(text_k)
+    query = torch.randn(BLOCK, N_HEADS, HEAD_DIM)
+    layer_ctx.forward_ctx.prepare(device=device, action_len=text_k.shape[0], query_len=query.shape[0])
+
+    paged = paged_write_attn(
+        layer_ctx.to_layer_inputs(),
+        query,
+        current_k,
+        current_v,
+        text_k,
+        text_v,
+        HEAD_DIM**-0.5,
+    ).unsqueeze(0)
+    dense_k = torch.cat([committed[-2][0], committed[-1][0], current_k.unsqueeze(0), text_k.unsqueeze(0)], dim=1)
+    dense_v = torch.cat([committed[-2][1], committed[-1][1], current_v.unsqueeze(0), text_v.unsqueeze(0)], dim=1)
+
+    torch.testing.assert_close(paged, _dense_attention(query.unsqueeze(0), dense_k, dense_v))
 
 
 @pytest.mark.skipif(not _gpu_flash_attn_usable(), reason="usable GPU FlashAttention is required")

@@ -1,0 +1,24 @@
+# Cosmos-Dreams / Cosmos3-Interactive distilled forward-dynamics deployment.
+
+pipeline: cosmos_dreams
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+default_resolution: [720, 1280]
+max_pixels: 921600
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: CosmosDreamsPipeline
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    model_config:
+      action_gen: true
+      action_dim: 64
+      num_embodiment_domains: 32
+      default_fps: 15.0
+      ar_diffusion_kv_config:
+        gpu_memory_fraction: 0.35
+        warmup_cudagraph: false

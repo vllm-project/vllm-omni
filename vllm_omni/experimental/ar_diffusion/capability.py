@@ -8,9 +8,28 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from vllm_omni.errors import OmniClientError
+
 if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+
+AR_DIFFUSION_REQUEST_REJECTED_ERROR_TYPE = "ARDiffusionRequestRejectedError"
+
+
+class ARDiffusionRequestRejectedError(OmniClientError):
+    """A request failed admission validation before any state was touched.
+
+    Pipelines raise this for fail-closed rejections (session-fingerprint
+    mismatch, out-of-order chunk index, over-long prompt, wrong resolution,
+    malformed inputs). The contract: no session state, KV pool content, or
+    accounting was modified, so the runner must surface the error WITHOUT
+    releasing the session — the client keeps its paid-for KV history and can
+    retry a corrected request or explicitly reset.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, error_type=AR_DIFFUSION_REQUEST_REJECTED_ERROR_TYPE)
 
 
 @dataclass(frozen=True)
@@ -56,8 +75,11 @@ class ARDiffusionKVCacheSpec:
     recent sliding tail and ``sink_frames`` is the separately retained prefix;
     both are expressed in the same frame/block unit.
 
-    ``max_scratch_tokens_per_branch`` is the maximum non-video KV (for example,
-    action/state registers) that must coexist with an uncommitted video block.
+    ``max_scratch_frames_per_branch`` is the maximum current-video span that a
+    non-committing forward writes to scratch. It defaults to
+    ``frames_per_block``. ``max_scratch_tokens_per_branch`` is the maximum
+    additional non-video KV (for example, action/state registers) that must
+    coexist with that video span.
     ``model_owned_state_bytes_per_session`` is a conservative upper bound for
     persistent per-session CUDA state outside runner-owned self/cross-attention
     KV and scratch pools.
@@ -83,6 +105,7 @@ class ARDiffusionKVCacheSpec:
     max_model_len: int = 1 << 20
     max_scratch_tokens_per_branch: int = 0
     model_owned_state_bytes_per_session: int = 0
+    max_scratch_frames_per_branch: int | None = None
 
     def __post_init__(self) -> None:
         positive_fields = {
@@ -100,6 +123,11 @@ class ARDiffusionKVCacheSpec:
                 raise ValueError(f"AR-Diffusion {name} must be positive, got {value}")
         if self.sink_frames < 0:
             raise ValueError(f"AR-Diffusion sink_frames must be non-negative, got {self.sink_frames}")
+        if self.max_scratch_frames_per_branch is not None and self.max_scratch_frames_per_branch < 0:
+            raise ValueError(
+                "AR-Diffusion max_scratch_frames_per_branch must be non-negative, "
+                f"got {self.max_scratch_frames_per_branch}"
+            )
         if self.max_scratch_tokens_per_branch < 0:
             raise ValueError(
                 "AR-Diffusion max_scratch_tokens_per_branch must be non-negative, "
@@ -132,6 +160,41 @@ class ARDiffusionKVCacheSpec:
     @property
     def cross_attention_lengths(self) -> dict[str, int]:
         return {cache.name: cache.num_tokens for cache in self.cross_attention}
+
+
+@dataclass(frozen=True)
+class ARDiffusionRequestKVSpec:
+    """Request-specific KV requirements plus an opaque session geometry key."""
+
+    kv_spec: ARDiffusionKVCacheSpec
+    geometry_key: object
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kv_spec, ARDiffusionKVCacheSpec):
+            raise TypeError(
+                f"AR-Diffusion request kv_spec must be ARDiffusionKVCacheSpec, got {type(self.kv_spec).__name__}"
+            )
+
+
+@runtime_checkable
+class SupportsDynamicARDiffusion(Protocol):
+    """Optional capability for pipelines whose KV geometry varies per request."""
+
+    def ar_diffusion_default_request_spec(self) -> ARDiffusionRequestKVSpec:
+        """Return the request spec used for initial pool allocation."""
+        ...
+
+    def ar_diffusion_request_spec(self, request: OmniDiffusionRequest) -> ARDiffusionRequestKVSpec:
+        """Resolve one serialized request before runner session admission."""
+        ...
+
+    def ar_diffusion_worst_case_request_specs(self) -> Iterable[ARDiffusionRequestKVSpec]:
+        """Yield model-computed worst-case specs for startup capacity validation."""
+        ...
+
+    def validate_ar_diffusion_effective_spec(self, spec: ARDiffusionKVCacheSpec) -> None:
+        """Validate the runner's effective structure after deployment overrides."""
+        ...
 
 
 @runtime_checkable

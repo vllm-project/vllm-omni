@@ -214,6 +214,7 @@ def test_lingbot_like_single_branch_session_reuse_reset_and_close():
     assert kv is not None
     assert kv.num_local_kv_branches == 1
     assert kv.frames_per_block == 3
+    assert kv.max_scratch_frames_per_branch == 3
     assert kv.spec.window_chunks == 5
     assert kv.spec.sink_chunks == 1
     assert kv.cross_attention_lengths == {"text": 8}

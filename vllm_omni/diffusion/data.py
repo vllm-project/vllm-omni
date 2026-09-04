@@ -721,6 +721,11 @@ class OmniDiffusionConfig:
     model_config: dict[str, Any] = field(default_factory=dict)
     tf_model_config: TransformerConfig = field(default_factory=TransformerConfig)
 
+    # Optional request-geometry policy. Model-specific pipelines decide
+    # whether and how these deployment values apply.
+    default_resolution: list[int] | tuple[int, int] | None = None
+    max_pixels: int | None = None
+
     # Attention
     diffusion_attention_config: "AttentionConfig" = field(default_factory=lambda: AttentionConfig())
     fa_deterministic: bool = False
