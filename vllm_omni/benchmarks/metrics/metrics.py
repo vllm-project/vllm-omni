@@ -196,6 +196,22 @@ def has_metric_samples(metrics: object, metric_name: str) -> bool:
     return sample_count_attr is None or getattr(metrics, sample_count_attr, 0) > 0
 
 
+def _produced_no_output(output: RequestFuncOutput) -> bool:
+    """A successful request must produce measurable output in some modality.
+
+    A 200 response whose stream closes without any text tokens, audio frames,
+    or images carries no benchmark signal; counting it as completed lets a
+    degraded run pass gates that only check request counts.
+    """
+    has_text = bool(getattr(output, "output_tokens", 0)) or bool(getattr(output, "generated_text", ""))
+    has_audio = (
+        float(getattr(output, defs.AUDIO_FRAMES, 0.0) or 0.0) > 0
+        or float(getattr(output, defs.AUDIO_DURATION, 0.0) or 0.0) > 0
+    )
+    has_images = int(getattr(output, defs.IMAGE_COUNT, 0) or 0) > 0
+    return not (has_text or has_audio or has_images)
+
+
 def print_metrics(
     task_type,
     selected_percentile_metrics,
@@ -738,6 +754,7 @@ def calculate_metrics(
     actual_output_lens: list[int] = []
     total_input = 0
     completed = 0
+    degraded_outputs = 0
     good_completed = 0
     itls: list[float] = []
     tpots: list[float] = []
@@ -771,6 +788,14 @@ def calculate_metrics(
                     # bundled together
                     # Note : this may inflate the output token count slightly
                     output_len = len(tokenizer(outputs[i].generated_text, add_special_tokens=False).input_ids)
+            if _produced_no_output(outputs[i]):
+                # HTTP-level success but nothing measurable was generated (e.g.
+                # the engine died after the response stream opened). Count as
+                # failed so baseline gates trip loudly instead of publishing
+                # silently degraded metrics.
+                degraded_outputs += 1
+                actual_output_lens.append(0)
+                continue
             actual_output_lens.append(output_len)
             total_input += outputs[i].prompt_len
             tpot: float | None = None
@@ -866,6 +891,16 @@ def calculate_metrics(
             stacklevel=2,
         )
 
+    if degraded_outputs:
+        warnings.formatwarning = lambda msg, category, filename, lineno, line=None: (
+            f"{filename}:{lineno}: {category.__name__}: {msg}\n"
+        )
+        warnings.warn(
+            f"{degraded_outputs} request(s) returned HTTP success but produced no measurable "
+            "output (no text tokens, audio, or images); counted as failed.",
+            stacklevel=2,
+        )
+
     # Calculate max output tokens per second metric
     max_output_tokens_per_s = 0.0
     max_concurrent_requests = 0
@@ -946,7 +981,7 @@ def calculate_metrics(
     missing_duplex_value = float("nan") if duplex_metrics_present else 0
     metrics = MultiModalsBenchmarkMetrics(
         completed=completed,
-        failed=len(failed_outputs),
+        failed=len(failed_outputs) + degraded_outputs,
         total_input=total_input,
         total_output=sum(actual_output_lens),
         request_throughput=completed / dur_s,
