@@ -49,6 +49,8 @@ def mock_dependencies(mocker, monkeypatch):
     mock_vae = mocker.MagicMock(name="vae")
     mock_vae.config.block_out_channels = [128, 256, 512, 512]  # scale factor 8
     mock_vae.to.return_value = mock_vae
+    # __init__ arms the GroupNorm+SiLU fusion and logs the site count with %d.
+    mock_vae.set_group_norm_silu_fusion.return_value = 29
 
     mock_scheduler = mocker.MagicMock(name="scheduler")
 
@@ -65,7 +67,7 @@ def mock_dependencies(mocker, monkeypatch):
         lambda *a, **k: mock_processor,
     )
     monkeypatch.setattr(
-        f"{_MODULE}.AutoencoderKL.from_pretrained",
+        f"{_MODULE}.BooguAutoencoderKL.from_pretrained",
         lambda *a, **k: mock_vae,
     )
 
@@ -153,7 +155,7 @@ def test_constructor_forwards_revision_to_all_component_loaders(mock_dependencie
         return_value=mock_dependencies["processor"],
     )
     vae_loader = mocker.patch(
-        f"{_MODULE}.AutoencoderKL.from_pretrained",
+        f"{_MODULE}.BooguAutoencoderKL.from_pretrained",
         return_value=mock_dependencies["vae"],
     )
     od_config = OmniDiffusionConfig(
@@ -1042,3 +1044,42 @@ def test_forward_image_guidance_ignored_without_reference():
     # t2i text CFG: cond + uncond -> 2 predictions/step, no ref anywhere.
     assert _count_per_step(pipeline.transformer.calls, num_steps) == 2
     assert all(ref is None for ref in pipeline.transformer.calls)
+
+
+def test_vae_loader_falls_back_to_diffusers(monkeypatch):
+    """On any in-repo VAE load failure the pipeline must serve diffusers'
+    AutoencoderKL (correct but unfused) — and must not crash by calling the
+    fusion-arm method on the fallback object (which does not have one)."""
+    from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
+
+    from vllm_omni.diffusion.models.boogu_image import pipeline_boogu_image as M
+    from vllm_omni.diffusion.models.boogu_image.vae import BooguVaeStrictLoadError
+
+    # Build the fallback instance BEFORE patching from_pretrained.
+    tiny_diffusers = AutoencoderKL(
+        block_out_channels=(8,),
+        down_block_types=("DownEncoderBlock2D",),
+        up_block_types=("UpDecoderBlock2D",),
+        layers_per_block=1,
+        latent_channels=4,
+        norm_num_groups=4,
+    )
+
+    def _raise(cls, *a, **k):
+        raise BooguVaeStrictLoadError("boom")
+
+    monkeypatch.setattr(M, "from_pretrained_with_prefetch", lambda fn, model, **kw: fn(model))
+    monkeypatch.setattr(M.BooguAutoencoderKL, "from_pretrained", classmethod(_raise))
+    monkeypatch.setattr(M.AutoencoderKL, "from_pretrained", classmethod(lambda cls, *a, **k: tiny_diffusers))
+
+    vae = M._load_boogu_vae(
+        "dummy-model",
+        SimpleNamespace(additional_config=None),
+        subfolder="vae",
+        prefetch_list=[],
+        local_files_only=True,
+        revision=None,
+        device=torch.device("cpu"),
+    )
+    assert isinstance(vae, AutoencoderKL)
+    assert not hasattr(vae, "set_group_norm_silu_fusion")

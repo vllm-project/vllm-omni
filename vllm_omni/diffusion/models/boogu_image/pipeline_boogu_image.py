@@ -49,6 +49,10 @@ from vllm_omni.diffusion.models.boogu_image.image_processor import BooguImagePro
 from vllm_omni.diffusion.models.boogu_image.scheduling_flow_match_euler_discrete_time_shifting import (
     FlowMatchEulerDiscreteScheduler,
 )
+from vllm_omni.diffusion.models.boogu_image.vae import (
+    BooguAutoencoderKL,
+    vae_group_norm_silu_fusion_enabled,
+)
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -56,6 +60,45 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = init_logger(__name__)
+
+
+def _load_boogu_vae(model, od_config, *, subfolder, prefetch_list, local_files_only, revision, device):
+    """Load the in-repo BooguAutoencoderKL (strict) with a diffusers fallback.
+
+    The in-repo class refuses any checkpoint it cannot match key-for-key
+    (BooguVaeStrictLoadError); on any failure of the primary path the stock
+    diffusers AutoencoderKL is served instead — correct but UNFUSED. The
+    fusion arming happens inside the try, so a fallback object (which has no
+    such method) can never be handed a fusion call.
+    """
+    try:
+        vae = from_pretrained_with_prefetch(
+            BooguAutoencoderKL.from_pretrained,
+            model,
+            subfolder=subfolder,
+            prefetch_list=prefetch_list,
+            local_files_only=local_files_only,
+            revision=revision,
+        ).to(device)
+        fused_sites = vae.set_group_norm_silu_fusion(vae_group_norm_silu_fusion_enabled(od_config))
+        logger.info(
+            "Boogu VAE: in-repo impl (strict load OK); GroupNorm+SiLU fusion @ %d site(s)", fused_sites
+        )
+        return vae
+    except Exception:
+        logger.exception(
+            "Boogu VAE: in-repo BooguAutoencoderKL failed to load; falling back to "
+            "diffusers AutoencoderKL (correct but UNFUSED)"
+        )
+        return from_pretrained_with_prefetch(
+            AutoencoderKL.from_pretrained,
+            model,
+            subfolder=subfolder,
+            prefetch_list=prefetch_list,
+            local_files_only=local_files_only,
+            revision=revision,
+        ).to(device)
+
 
 # Reference-image preprocessing limits (upstream ``BooguImagePipeline.__call__``
 # defaults). The VLM copy is aggressively downscaled for the Qwen3VL encoder;
@@ -272,14 +315,18 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
             revision=od_config.revision,
         )
 
-        self.vae = from_pretrained_with_prefetch(
-            AutoencoderKL.from_pretrained,
+        # Boogu-private VAE: diffusers-faithful copy with GroupNorm+SiLU fused
+        # in its own decoder forward (#6686, D-15). Same checkpoint, zero key
+        # remap; strict load with a diffusers fallback.
+        self.vae = _load_boogu_vae(
             model,
+            od_config,
             subfolder="vae",
             prefetch_list=boogu_subfolders,
             local_files_only=local_files_only,
             revision=od_config.revision,
-        ).to(self._execution_device)
+            device=self._execution_device,
+        )
 
         self.transformer = BooguImageTransformer2DModel(od_config=od_config)
 
