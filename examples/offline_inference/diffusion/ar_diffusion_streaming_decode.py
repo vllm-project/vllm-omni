@@ -173,12 +173,8 @@ async def run(argv: Sequence[str] | None = None) -> Path:
     # Same per-channel rescale the pipeline applies before its own vae.decode()
     # call (LingBotWorldCausalDMDPipeline._vae_latent_stats) -- the tick path's
     # raw output is in model space, decode_chunk expects VAE latent space.
-    latent_mean = torch.as_tensor(vae.config.latents_mean, device=args.vae_device, dtype=vae_dtype).view(
-        1, -1, 1, 1, 1
-    )
-    latent_std = torch.as_tensor(vae.config.latents_std, device=args.vae_device, dtype=vae_dtype).view(
-        1, -1, 1, 1, 1
-    )
+    latent_mean = torch.as_tensor(vae.config.latents_mean, device=args.vae_device, dtype=vae_dtype).view(1, -1, 1, 1, 1)
+    latent_std = torch.as_tensor(vae.config.latents_std, device=args.vae_device, dtype=vae_dtype).view(1, -1, 1, 1, 1)
 
     engine = AsyncOmni(
         model=args.model,
