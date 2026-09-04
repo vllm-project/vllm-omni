@@ -18,7 +18,7 @@ pytestmark = [
     pytest.mark.usefixtures("clean_gpu_memory_between_tests"),
     pytest.mark.full_model,
     pytest.mark.example,
-    *hardware_marks(res={"cuda": "H100"}),
+    *hardware_marks(res={"cuda": ["H100", "B200"]}),
 ]
 
 T2I_SCRIPT = EXAMPLES / "offline_inference" / "text_to_image" / "text_to_image.py"

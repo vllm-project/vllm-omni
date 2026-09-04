@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 L4 expansion coverage for ``robbyant/lingbot-video-dense-1.3b``.
@@ -26,7 +26,7 @@ MODEL = "robbyant/lingbot-video-dense-1.3b"
 PROMPT = "a robotic arm picks up a red block"
 NEGATIVE_PROMPT = "low quality, blurry, watermark, text"
 
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": ["H100", "B200"]})
 
 
 def _get_diffusion_feature_cases(model: str):

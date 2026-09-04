@@ -34,7 +34,7 @@ from tests.helpers.mark import hardware_test
 pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_duplex_admission_and_expiry_reaper(omni_server, tmp_path: Path) -> None:
     args = multi_session_args(
@@ -62,7 +62,7 @@ def test_duplex_admission_and_expiry_reaper(omni_server, tmp_path: Path) -> None
 # still talking, which only holds when the duplex pipeline sustains real-time
 # throughput. The current NPU stack runs several times slower than real time,
 # so it never reaches a mid-stream decision point.
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_duplex_soft_interrupt(omni_server, tmp_path: Path) -> None:
     input_wav = validated_soft_interrupt_wav()
@@ -95,7 +95,7 @@ def test_duplex_soft_interrupt(omni_server, tmp_path: Path) -> None:
     assert result["followup_response_transcript_ok"] is True
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_duplex_server_vad_hard_interrupt(omni_server) -> None:
     result = asyncio.run(

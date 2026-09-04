@@ -296,7 +296,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.parametrize("model_id", ["Qwen/Qwen-Image"])
 def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifact_root: Path) -> None:
     output_dir = model_output_dir(accuracy_artifact_root, model_id + "-diffusers-backend")
@@ -335,7 +335,7 @@ def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifac
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.parametrize(
     "model_id",
     [

@@ -246,7 +246,7 @@ def _transcribe_for(wav: torch.Tensor, tmp_dir: str, name: str, accepts) -> str:
         pytest.param(
             "The quick brown fox jumps over the lazy dog.",
             None,
-            marks=pytest.mark.full_model,
+            marks=pytest.mark.slow,
             id="second_text",
         ),
     ],
@@ -274,7 +274,7 @@ def test_gepard_offline_zero_shot(omni_runner, run_level: str, text: str, keywor
     assert keyword in transcript, f"expected {keyword!r} in transcript, got {transcript!r}"
 
 
-@pytest.mark.full_model
+@pytest.mark.slow
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_gepard_offline_long_text_skips_repetition(omni_runner, run_level: str) -> None:
     """The other branch of the prompt layout, end to end.

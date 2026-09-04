@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ SSIM_THRESHOLDS = {
 }
 
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.diffusion,
     pytest.mark.skipif(
         not GOLDEN_BASE_URL,
@@ -169,6 +169,7 @@ def _validate_metadata(payload: Any, manifest: dict[str, Any], variant: str, tas
 
 def _download_case(variant: str, task: str, output_dir: Path, filenames: set[str]) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    assert GOLDEN_BASE_URL is not None
     base_url = f"{GOLDEN_BASE_URL.rstrip('/')}/{variant}/{task}"
     response = requests.get(f"{base_url}/manifest.json", timeout=60)
     response.raise_for_status()

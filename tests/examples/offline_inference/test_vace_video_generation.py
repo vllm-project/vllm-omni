@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """VACE coverage through the shared text-to-video and image-to-video examples."""
 
 from pathlib import Path
@@ -14,7 +17,7 @@ pytestmark = [
     pytest.mark.full_model,
     pytest.mark.diffusion,
     pytest.mark.example,
-    *hardware_marks(res={"cuda": "H100"}),
+    *hardware_marks(res={"cuda": ["H100", "B200"]}),
 ]
 
 TEXT_TO_VIDEO_README = EXAMPLES / "offline_inference" / "text_to_video" / "text_to_video.md"

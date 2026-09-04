@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 End-to-end tests for the unified quantization framework (PR #1764).
 
@@ -270,7 +270,7 @@ def _generate_bagel_image(
 # ─── Single-stage diffusion model tests ──────────────────────────────────────
 
 
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": ["L4", "B200"]})
 def test_single_stage_zimage_fp8():
     """Z-Image-Turbo with FP8 generates valid images."""
     images, _ = _generate_single_stage_image(
@@ -281,7 +281,7 @@ def test_single_stage_zimage_fp8():
     images[0].save("test_zimage_fp8.png")
 
 
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": ["L4", "B200"]})
 def test_single_stage_zimage_fp8_uses_less_memory():
     """FP8 should use less peak memory than BF16 for Z-Image-Turbo."""
     _, mem_bf16 = _generate_single_stage_image(
@@ -300,7 +300,7 @@ def test_single_stage_zimage_fp8_uses_less_memory():
     assert mem_fp8 < mem_bf16, f"FP8 ({mem_fp8:.2f} GiB) should use less memory than BF16 ({mem_bf16:.2f} GiB)"
 
 
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": ["L4", "B200"]})
 def test_single_stage_qwen_image_fp8():
     """Qwen-Image (random weights) with FP8 generates valid images."""
     model = "riverclouds/qwen_image_random"
@@ -315,7 +315,7 @@ def test_single_stage_qwen_image_fp8():
     images[0].save("test_qwen_image_fp8.png")
 
 
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": ["H100", "B200"]})
 @pytest.mark.skip(reason="This model is not authorized on Hugging Face Hub yet")
 def test_single_stage_flux_fp8():
     """FLUX.1-dev with FP8 generates valid images."""
@@ -330,7 +330,7 @@ def test_single_stage_flux_fp8():
     images[0].save("test_flux_fp8.png")
 
 
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": ["H100", "B200"]})
 @pytest.mark.skip(reason="This model is not authorized on Hugging Face Hub yet")
 def test_single_stage_flux_fp8_uses_less_memory():
     """FP8 should use less peak memory than BF16 for FLUX.1-dev."""
@@ -356,7 +356,7 @@ def test_single_stage_flux_fp8_uses_less_memory():
     assert mem_fp8 < mem_bf16, f"FP8 ({mem_fp8:.2f} GiB) should use less memory than BF16 ({mem_bf16:.2f} GiB)"
 
 
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": ["H100", "B200"]})
 def test_single_stage_ltx2_fp8_uses_less_memory():
     """FP8 should use less peak memory than BF16 for LTX-2."""
     _, mem_bf16 = _generate_single_stage_video(
@@ -378,7 +378,7 @@ def test_single_stage_ltx2_fp8_uses_less_memory():
 # ─── Multi-stage model tests (BAGEL) ─────────────────────────────────────────
 
 
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": ["H100", "B200"]})
 def test_bagel_fp8_generates_image():
     """BAGEL with diffusion-stage FP8 generates a valid image.
 
@@ -391,7 +391,7 @@ def test_bagel_fp8_generates_image():
     image.save("test_bagel_fp8.png")
 
 
-@hardware_test(res={"cuda": "H100"})
+@hardware_test(res={"cuda": ["H100", "B200"]})
 def test_bagel_bf16_generates_image():
     """BAGEL without quantization generates a valid image (baseline)."""
     image, _ = _generate_bagel_image(diffusion_quantization_config=None)
@@ -401,7 +401,7 @@ def test_bagel_bf16_generates_image():
 # ─── Quantization config routing tests ────────────────────────────────────────
 
 
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": ["L4", "B200"]})
 def test_quantization_key_maps_to_quantization_config():
     """The old 'quantization' kwarg should map to 'quantization_config'
     in OmniDiffusionConfig.from_kwargs for backwards compatibility."""
@@ -412,7 +412,7 @@ def test_quantization_key_maps_to_quantization_config():
     assert config.quantization_config.get_name() == "fp8"
 
 
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": ["L4", "B200"]})
 def test_quantization_config_key_takes_priority():
     """When both 'quantization' and 'quantization_config' are set,
     'quantization_config' takes priority."""
@@ -427,7 +427,7 @@ def test_quantization_config_key_takes_priority():
     assert config.quantization_config.activation_scheme == "static"
 
 
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": ["L4", "B200"]})
 def test_single_stage_quantization_config_key():
     """Single-stage model using quantization_config (dict) key generates images."""
     images, _ = _generate_single_stage_image(
