@@ -1267,10 +1267,13 @@ class OmniDuplexSessionHandler(
             if not rid or not response_id:
                 return
             turn_id = sess.active_response_turn_id
+            mark_arrival = getattr(engine_client, "mark_duplex_turn_arrival", None)
+            arrival_ts = mark_arrival(rid) if callable(mark_arrival) else None
             begin(
                 rid,
                 response_id=response_id,
                 turn_id=turn_id if turn_id is not None else sess.turn_id,
+                arrival_ts=arrival_ts,
             )
 
         def on_end(

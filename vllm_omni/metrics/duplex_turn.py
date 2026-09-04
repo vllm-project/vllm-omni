@@ -146,7 +146,7 @@ def queue_turn_stage_metrics(
     final_output_type: str | None = None,
     stage_submit_ts: float | None = None,
 ) -> None:
-    """Accumulate into the open turn, or buffer until ``begin_response``."""
+    """Accumulate into the open turn, or buffer until begin_response."""
     if metrics is None:
         return
     turn = req_state.duplex_turn
@@ -289,6 +289,7 @@ def finalize_duplex_turn_metrics(turn: DuplexTurnMetrics, *, reason: str) -> boo
                 "turn": turn.turn_id,
                 "reason": turn.finished_reason,
             }
+            aggregator.omit_serving_time_to_first_output = True
             aggregator.build_and_log_summary()
     except Exception:
         logger.exception(

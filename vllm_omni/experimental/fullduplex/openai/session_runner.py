@@ -337,6 +337,10 @@ class DuplexSessionRunnerMixin:
             if append_turn_id is None:
                 append_turn_id = session.turn_id
             request_id = self._native_stage0_request_id(session, append_epoch)
+            engine_client = getattr(self._chat_service, "engine_client", None)
+            mark_arrival = getattr(engine_client, "mark_duplex_turn_arrival", None)
+            if callable(mark_arrival):
+                mark_arrival(request_id)
             if final or precreate_response:
                 session.bind_request(request_id)
             if precreate_response:

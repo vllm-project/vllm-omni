@@ -172,6 +172,8 @@ def test_finalize_logs_once_with_identity_line(mocker) -> None:
     assert "response=resp-turn" in identity
     assert "turn=3" in identity
     assert "reason=stop" in identity
+    assert "total=" not in identity
+    assert "engine=" not in identity
     assert "resp-turn" in aggregator.e2e_done
     assert turn.finished_reason == "stop"
 
@@ -564,7 +566,7 @@ async def test_abort_emits_table_once_then_close_is_noop(mocker) -> None:
     obj.engine = SimpleNamespace(
         num_stages=2,
         get_stage_metadata=lambda stage_id: SimpleNamespace(final_output_type="text"),
-        abort_async=mocker.AsyncMock(),
+        abort_async=mocker.AsyncMock(return_value=[]),
         _running_counter=None,
     )
     logged = []
@@ -583,7 +585,8 @@ async def test_abort_emits_table_once_then_close_is_noop(mocker) -> None:
 
     await obj._abort([request_id])
     assert len(logged) == 1
-    assert request_id not in obj.request_states
+    assert request_id in obj.request_states
+    assert obj.request_states[request_id].duplex_turn is None
     assert obj.finalize_duplex_turn_metrics(request_id, reason="abort") is False
 
 
@@ -624,6 +627,75 @@ def test_duplex_direct_output_does_not_double_count_stage0() -> None:
     assert events[0].num_tokens_in == 10
     assert events[0].num_tokens_out == 4
     assert events[0].stage_gen_time_ms == 15.0
+
+
+def test_chat_request_does_not_buffer_duplex_pending() -> None:
+    obj = _omni_base()
+    req_state = ClientRequestState("chatcmpl-1")
+    obj.request_states["chatcmpl-1"] = req_state
+    obj._handle_output_message(
+        StageMetricsMessage(
+            request_id="chatcmpl-1",
+            stage_id=0,
+            metrics=_stage_stats(num_tokens_out=2, stage_gen_time_ms=8.0),
+        )
+    )
+    assert req_state.duplex_turn_pending == []
+    assert req_state.duplex_turn_arrival_ts is None
+
+
+def test_mark_turn_arrival_stamps_before_begin(mocker) -> None:
+    mocker.patch("vllm_omni.experimental.fullduplex.request_client.time.time", return_value=42.0)
+    client = _client()
+    request_id = _request_id()
+    ts = client.mark_turn_arrival(request_id)
+    assert ts == 42.0
+    mocker.patch("vllm_omni.experimental.fullduplex.request_client.time.time", return_value=99.0)
+    assert client.mark_turn_arrival(request_id) == 42.0
+    turn = client.begin_turn_metrics(request_id, response_id="resp-arr")
+    assert turn is not None
+    assert turn.arrival_ts == 42.0
+    assert client.mark_turn_arrival("chatcmpl-1") is None
+
+
+def test_duplex_dump_titles_hide_ttfo_and_skip_total_engine(mocker) -> None:
+    logged = mocker.patch("vllm_omni.metrics.stats.logger.info")
+    request_id = _request_id()
+    turn = DuplexTurnMetrics(
+        request_id=request_id,
+        response_id="resp-dump",
+        turn_id=4,
+        arrival_ts=1.0,
+        aggregator=make_turn_aggregator(num_stages=2, log_stats=True, wall_start_ts=1.0),
+    )
+    accumulate_turn_stage_metrics(
+        turn,
+        0,
+        _stage_stats(
+            num_tokens_out=3,
+            stage_gen_time_ms=11.0,
+            serving_time_to_first_output_ms=1_757_000_000.0,
+        ),
+    )
+    assert finalize_duplex_turn_metrics(turn, reason="stop") is True
+    blobs = []
+    for call in logged.call_args_list:
+        if not call.args:
+            continue
+        if call.args[0] == "[OmniTiming] %s":
+            blobs.append(call.args[1])
+        elif call.args[0] == "\n%s":
+            blobs.append(call.args[1])
+    joined = "\n".join(blobs)
+    assert f"request_id={request_id}" in joined
+    assert "response=resp-dump" in joined
+    assert "turn=4" in joined
+    assert "reason=stop" in joined
+    assert "StageRequestStats" in joined
+    assert "serving_time_to_first_output_ms" not in joined
+    timing = next(text for text in blobs if text.startswith("req="))
+    assert "total=" not in timing
+    assert "engine=" not in timing
 
 
 def test_response_hooks_do_not_raise_into_begin_end() -> None:

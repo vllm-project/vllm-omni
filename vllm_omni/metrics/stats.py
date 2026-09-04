@@ -174,8 +174,8 @@ class OrchestratorAggregator:
         # by the orchestrator's cleanup path (e.g. final-stage cleanup races
         # the omni_base finalize emit).
         self._replica_cache: dict[tuple[int, str], int] = {}
-        # Optional identity fields merged into the single [OmniTiming] row.
         self.timing_identity: dict[str, Any] | None = None
+        self.omit_serving_time_to_first_output: bool = False
 
     def init_run_state(self, wall_start_ts: float) -> None:
         # Per-run aggregates and timing state
@@ -789,6 +789,19 @@ class OrchestratorAggregator:
             for cached_key in [k for k in self._replica_cache if k[1] == rid_key]:
                 self._replica_cache.pop(cached_key, None)
 
+    def _format_request_table_title(self, kind: str, rid: str) -> str:
+        identity = self.timing_identity
+        if not identity:
+            return f"{kind} [request_id={rid}]"
+        parts = [f"request_id={identity.get('req') or rid}"]
+        if identity.get("response") is not None:
+            parts.append(f"response={identity['response']}")
+        if identity.get("turn") is not None:
+            parts.append(f"turn={identity['turn']}")
+        if identity.get("reason") is not None:
+            parts.append(f"reason={identity['reason']}")
+        return f"{kind} [{' '.join(parts)}]"
+
     def build_and_log_summary(self) -> dict[str, Any]:
         if not self.log_stats:
             return {}
@@ -865,7 +878,7 @@ class OrchestratorAggregator:
                     logger.info(
                         "\n%s",
                         _format_table(
-                            f"RequestE2EStats [request_id={rid}]",
+                            self._format_request_table_title("RequestE2EStats", rid),
                             e2e_data,
                             value_fields=value_fields_e2e,
                         ),
@@ -894,11 +907,13 @@ class OrchestratorAggregator:
                     if identity.get("reason") is not None:
                         extra_parts.append(f"reason={identity['reason']}")
                 parts = [f"req={req_label}", *extra_parts]
-                if e2e_evt:
+                has_preprocess = "preprocess_ms" in pt
+                skip_total_engine = bool(identity) and not has_preprocess
+                if e2e_evt and not skip_total_engine:
                     parts.append(f"total={e2e_evt.e2e_total_ms / 1000.0:.2f}s")
-                if "preprocess_ms" in pt:
+                if has_preprocess:
                     parts.append(f"preprocess={pt['preprocess_ms'] / 1000.0:.2f}s")
-                if e2e_evt:
+                if e2e_evt and not skip_total_engine:
                     engine_ms = e2e_evt.e2e_total_ms - pt.get("preprocess_ms", 0.0)
                     parts.append(f"engine={engine_ms / 1000.0:.2f}s")
                 stage_parts = []
@@ -925,6 +940,8 @@ class OrchestratorAggregator:
             has_diffusion_metrics = any(getattr(evt, "diffusion_metrics", None) for evt in stage_evts)
             if has_diffusion_metrics:
                 local_exclude.add("postprocess_time_ms")
+            if self.omit_serving_time_to_first_output:
+                local_exclude.add("serving_time_to_first_output_ms")
             local_stage_fields = _build_field_defs(StageRequestStats, local_exclude, FIELD_TRANSFORMS)
 
             # if diffusion_metrics is present, expand it into multiple columns
@@ -961,7 +978,7 @@ class OrchestratorAggregator:
                     logger.info(
                         "\n%s",
                         _format_table(
-                            f"StageRequestStats [request_id={rid}]",
+                            self._format_request_table_title("StageRequestStats", rid),
                             stage_rows,
                             column_key="stage_id",
                             value_fields=value_fields_list,
@@ -1001,7 +1018,7 @@ class OrchestratorAggregator:
                     logger.info(
                         "\n%s",
                         _format_table(
-                            f"TransferEdgeStats [request_id={rid}]",
+                            self._format_request_table_title("TransferEdgeStats", rid),
                             transfer_rows,
                             column_key="edge",
                             value_fields=value_fields_list,

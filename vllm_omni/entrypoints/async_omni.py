@@ -434,6 +434,9 @@ class AsyncOmni(EngineClient, OmniBase):
             self._duplex_request_client = client
         return client
 
+    def mark_duplex_turn_arrival(self, request_id: str, arrival_ts: float | None = None) -> float | None:
+        return self._get_duplex_request_client().mark_turn_arrival(request_id, arrival_ts=arrival_ts)
+
     def begin_duplex_turn_metrics(
         self,
         request_id: str,

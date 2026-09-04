@@ -278,6 +278,18 @@ class DuplexRequestClient:
             timeout=timeout,
         )
 
+    def mark_turn_arrival(self, request_id: str, arrival_ts: float | None = None) -> float | None:
+        """Stamp t0 for the next assistant turn; keep the first stamp."""
+        if not is_duplex_resource_request_id(request_id):
+            return None
+        req_state = self.output_port.request_states.get(request_id)
+        if req_state is None:
+            req_state = ClientRequestState(request_id)
+            self.output_port.request_states[request_id] = req_state
+        if req_state.duplex_turn_arrival_ts is None:
+            req_state.duplex_turn_arrival_ts = float(arrival_ts) if arrival_ts is not None else time.time()
+        return float(req_state.duplex_turn_arrival_ts)
+
     def begin_turn_metrics(
         self,
         request_id: str,
@@ -285,12 +297,10 @@ class DuplexRequestClient:
         response_id: str,
         turn_id: int | None = None,
         arrival_ts: float | None = None,
-    ):
-        """Open a turn-scoped aggregator keyed by response_id.
+    ) -> DuplexTurnMetrics | None:
+        """Open a turn aggregator keyed by response_id and flush buffered snapshots.
 
-        Stage snapshots that arrived before begin (auto_response) are replayed
-        into the new aggregator. ``arrival_ts`` prefers the caller, then the
-        commit/first-append stamp, then now.
+        arrival_ts prefers the caller, then the commit/first-append stamp, then now.
         """
         if not response_id or not is_duplex_resource_request_id(request_id):
             return None

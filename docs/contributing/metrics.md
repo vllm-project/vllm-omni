@@ -86,9 +86,11 @@ For **offline inference** (batch mode), the summary includes both system-level m
 
 For **online inference** (serving mode), the summary is always per-request. `e2e_requests` is always 1, and only request-level metrics are reported for each completion.
 
-For native full-duplex (`/v1/realtime?duplex=1`), `--log-stats` emits the same tables once per assistant turn. The table `request_id` is that turn's `response_id`. The long-lived stage-0 session request is not finalized as a chat completion.
+For native full-duplex (`/v1/realtime?duplex=1`), `--log-stats` emits the same tables once per assistant turn. The Stage/E2E/Transfer titles include the engine resource `request_id` plus `response=`, `turn=`, and `reason=`. Table row keys still use that turn's `response_id`. The long-lived stage-0 session request is not finalized as a chat completion.
 
-Duplex `stage_gen_time_ms` is the **turn-accumulated** compute time (every decode/TTS segment in that assistant response), not a single chat decode step. Collapsed `vllm_tpot_ms` is token-weighted across those segments, matching the websocket sidecar (`weight = max(num_tokens_out - 1, 1)`). One `[OmniTiming]` row is logged per turn and includes `reason`: `stop`, `barge_in`, `cancel`, `close`, `abort`, or `error`.
+Duplex `stage_gen_time_ms` is the **turn-accumulated** compute time (every decode/TTS segment in that assistant response), not a single chat decode step. `e2e_stage_{i}_wall_time_ms` is first-submit through last-receipt for that stage in the turn (**idle between segments is included**). Collapsed `vllm_tpot_ms` is token-weighted across those segments, matching the websocket sidecar (`weight = max(num_tokens_out - 1, 1)`). One `[OmniTiming]` row is logged per turn and includes `reason`: `stop`, `barge_in`, `cancel`, `close`, `abort`, or `error`. When the turn has no `preprocess_ms` (typical duplex), `[OmniTiming]` omits `total=` / `engine=`. `serving_time_to_first_output_ms` is hidden on duplex dumps (it is still an epoch-ms clock; Prometheus audio TTFP is a later PR).
+
+`auto_response` stage-0 snapshots that arrive before `begin_response` are buffered and attributed to the first speak table. A listen-only session that never speaks still emits no table.
 
 ---
 
