@@ -1649,8 +1649,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Build prompt_token_ids for higgs_audio_v3.
 
         Plain-text path: builds ``[tts, text, tokens, audio]``.
-        Voice-clone path: encodes reference audio, applies delay pattern,
-        builds ``[tts, (ref_text, tokens,) ref_audio, -100xN, text, tokens, audio]``.
+        Voice-clone path: encodes reference audio, applies delay pattern, and
+        records reference-audio prompt positions while submitting valid token IDs.
         """
         adapter = await self._resolve_higgs_audio_v3_adapter()
 
@@ -1681,12 +1681,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             num_ref_tokens=int(ref_codes_delayed.shape[0]),
             reference_text=request.ref_text or None,
         )
+        prompt_ids, audio_placeholder_positions = adapter.prepare_prompt_for_engine(prompt_ids)
         prompt = tokens_input(prompt_token_ids=prompt_ids)
         import torch
 
         prompt["additional_information"] = {
             "audio_input_ids": ref_codes_delayed.to(torch.long),
             "audio_input_ids_mask": torch.ones(ref_codes_delayed.shape[0], dtype=torch.bool),
+            "audio_placeholder_positions": audio_placeholder_positions,
             "ref_audio_cache_key": cache_key,
         }
         # Placeholder prompt ids do not change when a same-path file is
