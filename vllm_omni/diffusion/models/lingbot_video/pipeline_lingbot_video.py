@@ -439,9 +439,9 @@ class LingBotVideoPipeline(
         null_cond_clone_zero: bool,
         offload_vae_during_denoise: bool,
         is_dummy_run: bool,
+        cfg_parallel: bool,
     ) -> None:
         cache_backend = str(getattr(self.od_config, "cache_backend", "none") or "none").lower()
-        cfg_parallel = self.od_config.parallel_config.cfg_parallel_size == 2
         if is_dummy_run or (cache_backend != "cache_dit" and not cfg_parallel):
             return
 
@@ -674,16 +674,19 @@ class LingBotVideoPipeline(
         if cfg_parallel:
             if not dist.is_available() or not dist.is_initialized():
                 raise ValueError("`cfg_parallel_group` requires an initialized process group.")
-            if effective_batch_cfg:
-                raise ValueError("`cfg_parallel_group` and `batch_cfg` are mutually exclusive.")
-            if not do_cfg:
-                raise ValueError("CFG parallel requires `guidance_scale > 1.0`.")
+            self._validate_acceleration_request(
+                guidance_scale=guidance_scale,
+                batch_cfg=effective_batch_cfg,
+                t_thresh=t_thresh,
+                null_cond_clone_zero=null_cond_clone_zero,
+                offload_vae_during_denoise=offload_vae_during_denoise,
+                is_dummy_run=False,
+                cfg_parallel=True,
+            )
             cfg_parallel_rank = dist.get_rank(cfg_parallel_group)
             cfg_parallel_world_size = dist.get_world_size(cfg_parallel_group)
             if cfg_parallel_world_size != 2:
                 raise ValueError(f"CFG parallel currently requires exactly 2 ranks, got {cfg_parallel_world_size}.")
-            if null_cond_clone_zero or offload_vae_during_denoise or t_thresh is not None:
-                raise ValueError("CFG parallel does not support null_cond_clone_zero, VAE offload, or t_thresh.")
         image_condition = None
         prompt_images = None
         # Public image/mode combinations are validated by resolve_lingbot_mode.
@@ -918,6 +921,7 @@ class LingBotVideoPipeline(
                 null_cond_clone_zero=bool(extra_args.get("null_cond_clone_zero", False)),
                 offload_vae_during_denoise=bool(extra_args.get("offload_vae_during_denoise", False)),
                 is_dummy_run=request.is_dummy_run(),
+                cfg_parallel=self.od_config.parallel_config.cfg_parallel_size == 2,
             )
         except (TypeError, ValueError) as exc:
             raise OmniClientError(str(exc)) from exc
@@ -925,8 +929,6 @@ class LingBotVideoPipeline(
         cfg_group = None
         if self.od_config.parallel_config.cfg_parallel_size == 2:
             cfg_group = get_cfg_group()
-            if cfg_group.world_size != 2:
-                raise RuntimeError("LingBot CFG parallel requires an initialized two-rank CFG group.")
 
         generator = sampling.generator
         if isinstance(generator, list):

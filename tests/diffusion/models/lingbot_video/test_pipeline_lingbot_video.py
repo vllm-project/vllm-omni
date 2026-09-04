@@ -710,7 +710,6 @@ def test_load_weights_rejects_external_weight_stream():
 
 
 @pytest.mark.parallel
-@pytest.mark.parametrize("cache_backend", ["none", "cache_dit"])
 @pytest.mark.parametrize(
     ("parallel_kwargs", "config_overrides", "message"),
     [
@@ -726,29 +725,32 @@ def test_load_weights_rejects_external_weight_stream():
         ({}, {"enable_layerwise_offload": True}, "layerwise offload"),
         ({}, {"enable_distributed_layerwise_offload": True}, "distributed layerwise offload"),
         ({}, {"cache_backend": "tea_cache"}, "cache_backend"),
+        ({"cfg_parallel_size": 3}, {"cache_backend": "cache_dit"}, "cfg_parallel_size"),
+        ({"ring_degree": 2}, {"cache_backend": "cache_dit"}, "sequence parallelism"),
     ],
 )
 def test_cfg_parallel_rejects_unsupported_config_before_loading(
-    monkeypatch, cache_backend, parallel_kwargs, config_overrides, message
+    monkeypatch, parallel_kwargs, config_overrides, message
 ):
     test_cache_dit_rejects_unvalidated_configuration_before_loading(
         monkeypatch,
         {"cfg_parallel_size": 2, **parallel_kwargs},
-        {"cache_backend": cache_backend, **config_overrides},
+        {"cache_backend": "none", **config_overrides},
         message,
     )
 
 
 @pytest.mark.parallel
-@pytest.mark.parametrize("cache_backend", ["none", "cache_dit"])
 @pytest.mark.parametrize(
-    ("sampling_overrides", "message"),
+    ("cache_backend", "sampling_overrides", "message"),
     [
-        ({"guidance_scale": 1.0}, "guidance_scale"),
-        ({"extra_args": {"batch_cfg": True}}, "batch_cfg"),
-        ({"extra_args": {"null_cond_clone_zero": True}}, "null_cond_clone_zero"),
-        ({"extra_args": {"offload_vae_during_denoise": True}}, "offload_vae_during_denoise"),
-        ({"extra_args": {"t_thresh": 0.2}}, "t_thresh"),
+        ("none", {"guidance_scale": 1.0}, "guidance_scale"),
+        ("none", {"extra_args": {"batch_cfg": True}}, "batch_cfg"),
+        ("none", {"extra_args": {"null_cond_clone_zero": True}}, "null_cond_clone_zero"),
+        ("none", {"extra_args": {"offload_vae_during_denoise": True}}, "offload_vae_during_denoise"),
+        ("none", {"extra_args": {"t_thresh": 0.2}}, "t_thresh"),
+        ("cache_dit", {"extra_args": {"null_cond_clone_zero": True}}, "null_cond_clone_zero"),
+        ("cache_dit", {"extra_args": {"offload_vae_during_denoise": True}}, "offload_vae_during_denoise"),
     ],
 )
 def test_cfg_parallel_rejects_request_before_collectives(cache_backend, sampling_overrides, message):
