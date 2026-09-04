@@ -437,6 +437,83 @@ def test_adopting_the_contract_refuses_a_vsa_variant_and_ref2va(tmp_path):
         _fusion(tmp_path).check_serving_contract(partition="ref2va", **contract)
 
 
+def test_a_vsa_variant_accepts_pure_ulysses_and_refuses_ring(tmp_path):
+    sparse = tmp_path / "vsa" / "adapter_model.safetensors"
+    _write_adapter(sparse, tensors={"transformer_blocks.0.attn.to_gate_compress.set_weight": torch.ones((2, 2))})
+    od_config = SimpleNamespace(
+        diffusion_attention_backend="FASTVIDEO_VSA",
+        parallel_config=SimpleNamespace(sequence_parallel_size=8, ulysses_degree=8, ring_degree=1),
+    )
+    fusion = _load(sparse.parent)
+    fusion.check_serving_contract(partition="fl2va", od_config=od_config, video_shift=12.0, audio_shift=3.0)
+
+    od_config.parallel_config.ring_degree = 2
+    with pytest.raises(ValueError, match="pure Ulysses"):
+        fusion.check_serving_contract(partition="fl2va", od_config=od_config, video_shift=12.0, audio_shift=3.0)
+
+
+def test_a_vsa_variant_accepts_normalized_attention_config(tmp_path):
+    sparse = tmp_path / "vsa" / "adapter_model.safetensors"
+    _write_adapter(sparse, tensors={"transformer_blocks.0.attn.to_gate_compress.set_weight": torch.ones((2, 2))})
+    od_config = SimpleNamespace(
+        diffusion_attention_config=SimpleNamespace(default=SimpleNamespace(backend="FASTVIDEO_VSA")),
+        parallel_config=SimpleNamespace(sequence_parallel_size=1),
+    )
+    _load(sparse.parent).check_serving_contract(
+        partition="fl2va", od_config=od_config, video_shift=12.0, audio_shift=3.0
+    )
+
+
+def test_a_vsa_variant_reads_the_backend_the_dit_will_actually_resolve(tmp_path):
+    # The 50 DiT blocks carry attention role "self", so a per_role entry - not
+    # the default - decides whether the compression gates ever reach a sparse
+    # kernel.
+    sparse = tmp_path / "vsa" / "adapter_model.safetensors"
+    _write_adapter(sparse, tensors={"transformer_blocks.0.attn.to_gate_compress.set_weight": torch.ones((2, 2))})
+    fusion = _load(sparse.parent)
+    contract = {"partition": "fl2va", "video_shift": 12.0, "audio_shift": 3.0}
+
+    dense_dit = SimpleNamespace(
+        diffusion_attention_config=SimpleNamespace(
+            default=SimpleNamespace(backend="FASTVIDEO_VSA"),
+            per_role={"self": SimpleNamespace(backend="TRTLLM_ATTN")},
+        ),
+        parallel_config=SimpleNamespace(sequence_parallel_size=1),
+    )
+    with pytest.raises(ValueError, match="TRTLLM_ATTN"):
+        fusion.check_serving_contract(od_config=dense_dit, **contract)
+
+    sparse_dit = SimpleNamespace(
+        diffusion_attention_config=SimpleNamespace(
+            default=None,
+            per_role={"self": SimpleNamespace(backend="FASTVIDEO_VSA")},
+        ),
+        parallel_config=SimpleNamespace(sequence_parallel_size=1),
+    )
+    fusion.check_serving_contract(od_config=sparse_dit, **contract)
+
+
+def test_a_gate_that_never_reached_the_model_is_refused(tmp_path):
+    # load_weights only logs a skip for a parameter the model does not have, so
+    # yielding the gate is not evidence it arrived.
+    sparse = tmp_path / "vsa" / "adapter_model.safetensors"
+    _write_adapter(sparse, tensors={"transformer_blocks.0.attn.to_gate_compress.set_weight": torch.ones((2, 2))})
+    fusion = _load(sparse.parent)
+    checkpoint = [
+        ("blocks.0.attn.qkv_proj.weight", torch.zeros((3 * _INNER, _HIDDEN))),
+        ("blocks.0.attn.out_proj.weight", torch.zeros((_HIDDEN, _INNER))),
+        ("blocks.0.mlp.fc1.weight", torch.zeros((2 * _FFN, _HIDDEN))),
+        ("blocks.0.mlp.fc2.weight", torch.zeros((_HIDDEN, _FFN))),
+    ]
+    gate = "blocks.0.attn.to_gate_compress.weight"
+    streamed = {name for name, _ in fusion.apply(checkpoint)}
+    assert gate in streamed
+
+    with pytest.raises(FastH3AdapterError, match="never reached the model"):
+        fusion.validate_fully_applied(streamed - {gate})
+    fusion.validate_fully_applied(streamed)
+
+
 def test_a_full_rank_delta_on_a_fused_parameter_is_refused(tmp_path):
     # Only low-rank factors are placed into H3's fused QKV and gate/up layouts,
     # so a .diff aimed at one would otherwise be added transposed.

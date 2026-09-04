@@ -212,13 +212,20 @@ def _maybe_build_block_adapter(
     if missing_attributes:
         raise AttributeError(f"Missing Cache-DiT block attributes: {missing_attributes}")
 
-    return BlockAdapter(
+    block_adapter = BlockAdapter(
         transformer=transformer,
         blocks=[getattr(transformer, block_attribute) for block_attribute in block_attributes],
         forward_pattern=list(forward_patterns),
         has_separate_cfg=adapter_config.has_separate_cfg,
         check_forward_pattern=adapter_config.check_forward_pattern,
     )
+    # cache_dit marks the wrapper pipe's class as cached, and for bare-transformer
+    # adapters that class is shared process-wide; a marker left by a previous
+    # engine would make this enable skip cache-context installation.
+    pipe_cls = type(block_adapter.pipe)
+    if "_is_cached" in vars(pipe_cls):
+        del pipe_cls._is_cached
+    return block_adapter
 
 
 def _maybe_get_cached_adapter_cls(
