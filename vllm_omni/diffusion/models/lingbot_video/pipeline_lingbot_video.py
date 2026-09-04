@@ -287,13 +287,13 @@ def get_lingbot_video_post_process_func(od_config: OmniDiffusionConfig):
             output_key = output_keys[0]
             frames = frames[output_key]
         output_type = getattr(sampling_params, "output_type", None) or "pt"
-        # The image serving path currently accepts PIL images or NumPy arrays,
-        # while LingBot decodes T2I outputs to tensors. Keep that compatibility
-        # conversion without discarding the model's image/video payload key.
+        # Decoded LingBot pixels are already in [0, 1]. The video API treats
+        # floating tensors as [-1, 1], so use its NumPy path to avoid normalizing
+        # twice. Images also need NumPy for serving; keep latent tensors intact.
         if (
             isinstance(frames, torch.Tensor)
             and output_type != "latent"
-            and (output_type == "np" or output_key == "image")
+            and (output_type == "np" or output_key in {"image", "video"})
         ):
             frames = frames.float().cpu().numpy()
         return {output_key: frames} if output_key is not None else frames
