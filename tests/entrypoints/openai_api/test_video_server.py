@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Unit tests for OpenAI-compatible video generation endpoints.
 """
@@ -37,6 +37,12 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
 from vllm_omni.entrypoints.openai.storage import LocalStorageManager
 from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
+from vllm_omni.entrypoints.openai.video.generation import helpers as video_generation_helpers
+from vllm_omni.entrypoints.openai.video.generation.helpers import (
+    MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES,
+    _read_upload_limited,
+    _reference_video_decode_spec,
+)
 from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -187,6 +193,8 @@ def isolated_video_backends(tmp_path, monkeypatch):
     monkeypatch.setattr(api_server, "VIDEO_STORE", store)
     monkeypatch.setattr(api_server, "VIDEO_TASKS", tasks)
     monkeypatch.setattr(api_server, "STORAGE_MANAGER", storage)
+    monkeypatch.setattr(video_generation_helpers, "VIDEO_STORE", store)
+    monkeypatch.setattr(video_generation_helpers, "STORAGE_MANAGER", storage)
     return store, tasks, storage
 
 
@@ -240,7 +248,7 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
     monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: FastAPI())
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
     monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
-    monkeypatch.setattr(api_server, "_get_vllm_config", fake_get_vllm_config)
+    monkeypatch.setattr(api_server.openai_app_state, "_get_vllm_config", fake_get_vllm_config)
     monkeypatch.setattr(api_server, "omni_init_app_state", fake_init_app_state)
     monkeypatch.setattr(api_server, "get_uvicorn_log_config", lambda args: None)
 
@@ -889,7 +897,7 @@ def test_cosmos3_reference_video_limit_uses_v2v_condition_frames():
         extra_params={"condition_frame_indexes_vision": [0, 2]},
     )
 
-    spec = api_server._reference_video_decode_spec(request, _cosmos3_stage_configs())
+    spec = _reference_video_decode_spec(request, _cosmos3_stage_configs())
     assert spec.max_frames == 9
     assert spec.keep == "first"
 
@@ -901,7 +909,7 @@ def test_cosmos3_reference_video_limit_preserves_action_frames():
         extra_params={"action_mode": "inverse_dynamics", "action_chunk_size": 16},
     )
 
-    assert api_server._reference_video_decode_spec(request, _cosmos3_stage_configs()).max_frames == 17
+    assert _reference_video_decode_spec(request, _cosmos3_stage_configs()).max_frames == 17
 
 
 def test_cosmos3_reference_video_limit_caps_condition_frames_to_output_frames():
@@ -911,7 +919,7 @@ def test_cosmos3_reference_video_limit_caps_condition_frames_to_output_frames():
         extra_params={"condition_frame_indexes_vision": [0, 20]},
     )
 
-    assert api_server._reference_video_decode_spec(request, _cosmos3_stage_configs()).max_frames == 5
+    assert _reference_video_decode_spec(request, _cosmos3_stage_configs()).max_frames == 5
 
 
 def test_s2v_video_generation_with_audio_reference_form(test_client, mocker: MockerFixture):
@@ -1560,15 +1568,15 @@ def test_h3_multipart_rejects_bmp_image_reference(test_client):
 @pytest.mark.asyncio
 async def test_h3_upload_limit_checks_declared_size_before_read():
     class OversizedUpload:
-        size = api_server.MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES + 1
+        size = MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES + 1
 
         async def read(self, _size):
             raise AssertionError("the oversized upload must be rejected before reading")
 
     with pytest.raises(HTTPException, match="size limit"):
-        await api_server._read_upload_limited(
+        await _read_upload_limited(
             OversizedUpload(),
-            max_bytes=api_server.MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES,
+            max_bytes=MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES,
         )
 
 

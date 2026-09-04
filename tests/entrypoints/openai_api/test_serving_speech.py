@@ -29,6 +29,7 @@ from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
 
 from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.entrypoints.openai import api_server as api_server_module
+from vllm_omni.entrypoints.openai import errors as openai_errors
 from vllm_omni.entrypoints.openai import serving_speech as serving_speech_module
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol.audio import (
@@ -55,6 +56,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_supporte
 from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import MingTTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import Qwen3TTSCodecLimitError
 from vllm_omni.entrypoints.openai.tts_adapters.voxtral import VoxtralTTSAdapter
+from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     FISH_TEXT_ONLY_SYSTEM_PROMPT,
     build_fish_voice_clone_prompt_ids,
@@ -3640,7 +3642,7 @@ def _patch_api_server_base(mocker: MockerFixture):
 
     fake_base = mocker.MagicMock()
     fake_base.create_error_response.side_effect = _fake_create_error_response
-    mocker.patch.object(api_server_module, "base", return_value=fake_base)
+    mocker.patch.object(openai_errors, "base", return_value=fake_base)
     return fake_base
 
 
@@ -3955,7 +3957,7 @@ def test_api_server_create_speech_engine_error_response_includes_request_and_sta
         )
     )
 
-    terminate_mock = mocker.patch.object(api_server_module, "terminate_if_errored")
+    terminate_mock = mocker.patch.object(serve_errors, "terminate_if_errored")
 
     raw_request = _make_api_server_request(handler, path="/v1/audio/speech")
     raw_request.app.state.args = SimpleNamespace(log_error_stack=False)
@@ -3987,8 +3989,8 @@ def test_omni_engine_error_handler_includes_request_and_stage_id(mocker: MockerF
     )
     app.state.server = SimpleNamespace()
 
-    terminate_mock = mocker.patch.object(api_server_module, "terminate_if_errored")
-    api_server_module._register_omni_exception_handlers(app)
+    terminate_mock = mocker.patch.object(serve_errors, "terminate_if_errored")
+    serve_errors._register_omni_exception_handlers(app)
 
     @app.get("/boom")
     async def boom(request: Request):

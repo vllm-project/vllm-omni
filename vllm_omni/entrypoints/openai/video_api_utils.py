@@ -1,7 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
-Shared helper utilities for OpenAI-compatible video generation API.
+Shared media utilities for OpenAI-compatible video APIs.
+
+PUT HERE:
+  - Shared media backends reused by generation and streaming serving:
+    decode/encode of image/video/audio references and frames, streaming
+    encoders, frame/audio coercion. No FastAPI Request / job-store orchestration.
+
+DO NOT PUT HERE:
+  - ``/v1/videos*`` multipart form parsing, upload limits, job runners,
+    cleanup, or response factories — those go in ``video.generation.helpers``.
+
+LONGEVITY:
+  - This root utils file is a **temporary shared home**.
+  - TODO(#5227, P1.3): tidy up / move into the video family (e.g.
+    ``video/generation/media.py``) in the P1.3 video modality PR; do not treat this
+    file as the long-term owner.
+  - ``video.generation.helpers`` is the longer home for ``/v1/videos*``
+    endpoint logic through P0.2/P0.3 until P1.3 further splits it.
+
+See ``openai/README.md`` and ``video/README.md`` (utils vs helpers, no overlap).
 """
 
 from __future__ import annotations
