@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -182,7 +182,8 @@ def _fake_ltx_parallel_attention():
             return "FLASH_ATTN"
 
         @staticmethod
-        def supports_attention_mask():
+        def supports_attention_mask(attention_spec=None):
+            del attention_spec
             return True
 
     def run(name):

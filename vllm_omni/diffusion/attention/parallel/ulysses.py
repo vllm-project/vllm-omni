@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -8,12 +8,67 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
 from vllm_omni.diffusion.forward_context import get_ulysses_mode
+
+logger = init_logger(__name__)
+
+# When advanced_uaa pads Q by the GQA ratio, MQA/very-uneven-GQA shapes can
+# inflate the query-head count substantially (worst case: MQA @ U=N pads Q from
+# H to N*H, an N x blow-up in Q attention work and temporary VRAM). Warn once
+# per (Q, KV, world_size) tuple when the ratio crosses this threshold so users
+# can pick a friendlier ulysses_degree if the overhead is unacceptable.
+_UAA_PAD_RATIO_WARN_THRESHOLD = 1.5
+_uaa_pad_ratio_warned: set[tuple[int, int, int, str]] = set()
+
+
+def _maybe_warn_uaa_pad_ratio(
+    query_head_cnt: int,
+    kv_head_cnt: int,
+    padded_query_head_cnt: int,
+    ulysses_world_size: int,
+    tensor_label: str,
+) -> None:
+    """Emit a one-shot warning when advanced_uaa padding materially inflates Q.
+
+    The padding itself is mandatory for correctness (Ulysses splits along the
+    head dim, so KV must be a multiple of ulysses_world_size and Q must stay a
+    multiple of KV to remain a valid GQA shape). There is no cheap fallback,
+    but the caller may want to know when the inflation is large enough to
+    justify picking a different ulysses_degree.
+    """
+    if query_head_cnt <= 0 or padded_query_head_cnt <= query_head_cnt:
+        return
+    ratio = padded_query_head_cnt / query_head_cnt
+    if ratio < _UAA_PAD_RATIO_WARN_THRESHOLD:
+        return
+    key = (query_head_cnt, kv_head_cnt, ulysses_world_size, tensor_label)
+    if key in _uaa_pad_ratio_warned:
+        return
+    _uaa_pad_ratio_warned.add(key)
+    logger.warning(
+        "Ulysses advanced_uaa GQA padding inflates %s heads %.2fx "
+        "(Q=%d, KV=%d, ulysses_degree=%d -> padded Q=%d). "
+        "Attention FLOPs and temporary VRAM for this tensor grow by the same "
+        "factor. If this is unacceptable, choose a ulysses_degree that divides "
+        "KV_heads (or the GCD of Q/KV) to reduce or eliminate padding.",
+        tensor_label,
+        ratio,
+        query_head_cnt,
+        kv_head_cnt,
+        ulysses_world_size,
+        padded_query_head_cnt,
+    )
+
+
+def _a2a_permute_enabled(enabled: bool, scatter_idx: int, gather_idx: int, world_size: int) -> bool:
+    """Whether the fused permute-free all-to-all applies (strict layout only)."""
+    return enabled and world_size > 1 and scatter_idx == 2 and gather_idx == 1
 
 
 def _ceil_div(n: int, d: int) -> int:
@@ -55,6 +110,7 @@ def _ulysses_all_to_all_any_qkv(
     *,
     seq_lens: list[int],
     use_sync: bool,
+    padded_head_cnt: int | None = None,
 ) -> tuple[torch.Tensor, int]:
     """UAA forward all-to-all: (B, S_local, H, D) -> (B, S_global, H_local, D).
 
@@ -67,7 +123,12 @@ def _ulysses_all_to_all_any_qkv(
 
     bsz, s_local, head_cnt, head_dim = x.shape
     orig_head_cnt = int(head_cnt)
-    padded_head_cnt = _ceil_div(orig_head_cnt, world_size) * world_size
+    if padded_head_cnt is None:
+        padded_head_cnt = _ceil_div(orig_head_cnt, world_size) * world_size
+    if padded_head_cnt < orig_head_cnt or padded_head_cnt % world_size != 0:
+        raise ValueError(
+            f"Invalid padded head count {padded_head_cnt} for original heads={orig_head_cnt}, world_size={world_size}."
+        )
     head_pad = padded_head_cnt - orig_head_cnt
     if head_pad:
         x = F.pad(x, (0, 0, 0, head_pad))
@@ -181,12 +242,23 @@ class UlyssesParallelAttention:
         scatter_idx: int,
         gather_idx: int,
         use_sync: bool,
+        ulysses_a2a_permute: bool = False,
     ) -> None:
         self._sp_group = sp_group
         self._ulysses_pg = sp_group.ulysses_group
         self._scatter_idx = scatter_idx
         self._gather_idx = gather_idx
         self._use_sync = use_sync
+        self._ulysses_a2a_permute = ulysses_a2a_permute
+        if _a2a_permute_enabled(
+            ulysses_a2a_permute,
+            scatter_idx,
+            gather_idx,
+            sp_group.ulysses_world_size,
+        ):
+            from vllm_omni.diffusion.distributed.a2a_permute import ensure_a2a_permute_available
+
+            ensure_a2a_permute_available()
 
     @property
     def enabled(self) -> bool:
@@ -205,23 +277,20 @@ class UlyssesParallelAttention:
     ):
         mode = get_ulysses_mode(default="strict")
         ulysses_world_size = self._sp_group.ulysses_world_size
+        gate_compress = None
+        if attn_metadata is not None:
+            candidate = attn_metadata.extra.get("gate_compress")
+            if isinstance(candidate, torch.Tensor):
+                if candidate.shape != query.shape:
+                    raise ValueError(
+                        f"gate_compress must match pre-Ulysses query shape, got {candidate.shape} vs {query.shape}"
+                    )
+                gate_compress = candidate
 
         # advanced_uaa pads non-divisible head counts before the Ulysses
-        # all-to-all. Padding K/V is not valid in hybrid Ulysses+Ring: the Ring
-        # GQA/MQA path would repeat the padded zero heads as real K/V heads.
-        # Reject this layout until K/V replication is performed before Ulysses.
-        if mode == "advanced_uaa" and self._sp_group.ring_world_size > 1:
-            for name, tensor in (("key", key), ("value", value)):
-                kv_head_cnt = int(tensor.shape[2])
-                if kv_head_cnt % ulysses_world_size != 0:
-                    raise ValueError(
-                        "ulysses_mode='advanced_uaa' with hybrid Ulysses+Ring "
-                        "does not support K/V head padding. "
-                        f"{name}_head_cnt={kv_head_cnt}, "
-                        f"ulysses_degree={ulysses_world_size}. "
-                        "Use ring_degree=1, choose a compatible ulysses_degree, "
-                        "or replicate K/V heads before Ulysses."
-                    )
+        # all-to-all. This also holds in hybrid Ulysses+Ring: Q is derived
+        # from the padded K/V count by the GQA ratio (see below), so padded
+        # heads pair with padded heads; non-GQA layouts are rejected below.
 
         joint_tensor_query = joint_tensor_key = joint_tensor_value = None
         joint_strategy = "front"
@@ -246,32 +315,61 @@ class UlyssesParallelAttention:
             # Slice joint_query for this Ulysses rank
             # joint_query is (B, S, H, D). We split H (dim 2).
             ulysses_rank = self._sp_group.ulysses_rank
-            joint_head_cnt = int(joint_tensor_query.shape[-2])
-            joint_orig_head_cnt = joint_head_cnt
+            joint_q_head_cnt = int(joint_tensor_query.shape[-2])
+            joint_k_head_cnt = int(joint_tensor_key.shape[-2])
+            joint_v_head_cnt = int(joint_tensor_value.shape[-2])
+            joint_orig_head_cnt = joint_q_head_cnt
+
+            if joint_k_head_cnt != joint_v_head_cnt or joint_q_head_cnt % joint_k_head_cnt != 0:
+                raise ValueError(
+                    "Ulysses joint attention requires equal K/V head counts and joint query "
+                    "heads to be a multiple of joint KV heads, got "
+                    f"joint_Q={joint_q_head_cnt}, joint_K={joint_k_head_cnt}, joint_V={joint_v_head_cnt}."
+                )
 
             if mode == "advanced_uaa":
-                padded_joint_head_cnt = _ceil_div(joint_head_cnt, ulysses_world_size) * ulysses_world_size
-                joint_head_pad = padded_joint_head_cnt - joint_head_cnt
-                if joint_head_pad:
-                    joint_tensor_query = F.pad(joint_tensor_query, (0, 0, 0, joint_head_pad))
-                    joint_tensor_key = F.pad(joint_tensor_key, (0, 0, 0, joint_head_pad))
-                    joint_tensor_value = F.pad(joint_tensor_value, (0, 0, 0, joint_head_pad))
-                joint_head_cnt = padded_joint_head_cnt
+                # Pad joint KV to a world_size multiple, then derive joint Q by the
+                # GQA ratio so the ratio survives the head-dim split (mirrors the
+                # main-tensor path below; e.g. 28Q/7KV at SP2 becomes 32/8).
+                padded_joint_kv_head_cnt = _ceil_div(joint_k_head_cnt, ulysses_world_size) * ulysses_world_size
+                gqa_ratio = joint_q_head_cnt // joint_k_head_cnt
+                padded_joint_q_head_cnt = padded_joint_kv_head_cnt * gqa_ratio
+                _maybe_warn_uaa_pad_ratio(
+                    joint_q_head_cnt,
+                    joint_k_head_cnt,
+                    padded_joint_q_head_cnt,
+                    ulysses_world_size,
+                    "joint_query",
+                )
+
+                joint_q_pad = padded_joint_q_head_cnt - joint_q_head_cnt
+                joint_kv_pad = padded_joint_kv_head_cnt - joint_k_head_cnt
+                if joint_q_pad:
+                    joint_tensor_query = F.pad(joint_tensor_query, (0, 0, 0, joint_q_pad))
+                if joint_kv_pad:
+                    joint_tensor_key = F.pad(joint_tensor_key, (0, 0, 0, joint_kv_pad))
+                    joint_tensor_value = F.pad(joint_tensor_value, (0, 0, 0, joint_kv_pad))
+                joint_q_head_cnt = padded_joint_q_head_cnt
+                joint_k_head_cnt = padded_joint_kv_head_cnt
             else:
-                if joint_head_cnt % ulysses_world_size != 0:
-                    supported = _positive_divisors(joint_head_cnt)
-                    raise ValueError(
-                        "Ulysses-SP strict mode requires joint head_cnt divisible by ulysses_degree. "
-                        f"joint_head_cnt={joint_head_cnt}, ulysses_degree={ulysses_world_size}. "
-                        f"Try ulysses_degree in {supported}, or set ulysses_mode='advanced_uaa'."
-                    )
+                for name, cnt in (
+                    ("joint_query", joint_q_head_cnt),
+                    ("joint_key", joint_k_head_cnt),
+                    ("joint_value", joint_v_head_cnt),
+                ):
+                    if cnt % ulysses_world_size != 0:
+                        supported = _positive_divisors(cnt)
+                        raise ValueError(
+                            "Ulysses-SP strict mode requires joint head_cnt divisible by ulysses_degree. "
+                            f"{name}_head_cnt={cnt}, ulysses_degree={ulysses_world_size}. "
+                            f"Try ulysses_degree in {supported}, or set ulysses_mode='advanced_uaa'."
+                        )
 
-            attn_heads_per_ulysses_rank = joint_head_cnt // ulysses_world_size
+            attn_heads_per_ulysses_rank_q = joint_q_head_cnt // ulysses_world_size
 
-            # Note: We use the same heads for Q/K/V
             joint_tensor_query = joint_tensor_query[
                 ...,
-                attn_heads_per_ulysses_rank * ulysses_rank : attn_heads_per_ulysses_rank * (ulysses_rank + 1),
+                attn_heads_per_ulysses_rank_q * ulysses_rank : attn_heads_per_ulysses_rank_q * (ulysses_rank + 1),
                 :,
             ]
 
@@ -285,8 +383,9 @@ class UlyssesParallelAttention:
 
         if is_joint:
             # Slice joint key/value heads for this ulysses rank.
-            # Using same slicing logic as query
-            attn_heads_per_ulysses_rank_kv = joint_tensor_key.shape[-2] // ulysses_world_size
+            # Using the KV head count (post-pad in advanced_uaa) so the per-rank
+            # KV shape matches the main K/V slice and preserves the GQA ratio.
+            attn_heads_per_ulysses_rank_kv = joint_k_head_cnt // ulysses_world_size
 
             joint_tensor_key = joint_tensor_key[
                 ...,
@@ -329,11 +428,68 @@ class UlyssesParallelAttention:
                         "This typically means the input sequence was not evenly shardable across the ring. "
                         "Try setting ring_degree=1, or choose a sequence length divisible by ring_degree."
                     )
-            query, orig_head_cnt = _ulysses_all_to_all_any_qkv(
-                self._ulysses_pg, query, seq_lens=seq_lens, use_sync=self._use_sync
+
+            # Pad KV to a world_size multiple, then scale Q by the GQA ratio so
+            # the ratio survives the head-dim split (e.g. 28Q/7KV at SP2 becomes
+            # 32/8, i.e. 16/4 per rank -- padding each independently would give
+            # 14/4, which is not a valid GQA shape).
+            #
+            # Overhead: padded_Q = ceil(KV/U)*U * (Q/KV). This is exact for
+            # well-aligned shapes (0% overhead when U divides KV) but can be
+            # substantial for uneven GQA/MQA: 28Q/7KV @ U=2 pads to 32Q (+14%),
+            # 32Q/1KV @ U=8 pads to 256Q (8x). _maybe_warn_uaa_pad_ratio()
+            # surfaces a one-shot warning once the blow-up crosses
+            # _UAA_PAD_RATIO_WARN_THRESHOLD so callers can adjust
+            # ulysses_degree if the extra work / VRAM is unacceptable.
+            query_head_cnt = int(query.shape[2])
+            kv_head_cnt = int(key.shape[2])
+            if key.shape[2] != value.shape[2] or query_head_cnt % kv_head_cnt != 0:
+                raise ValueError(
+                    "Ulysses GQA requires equal K/V head counts and query heads "
+                    f"to be a multiple of KV heads, got Q={query_head_cnt}, "
+                    f"K={kv_head_cnt}, V={int(value.shape[2])}."
+                )
+            padded_kv_head_cnt = _ceil_div(kv_head_cnt, ulysses_world_size) * ulysses_world_size
+            padded_query_head_cnt = padded_kv_head_cnt * (query_head_cnt // kv_head_cnt)
+            _maybe_warn_uaa_pad_ratio(
+                query_head_cnt,
+                kv_head_cnt,
+                padded_query_head_cnt,
+                ulysses_world_size,
+                "query",
             )
-            key, _ = _ulysses_all_to_all_any_qkv(self._ulysses_pg, key, seq_lens=seq_lens, use_sync=self._use_sync)
-            value, _ = _ulysses_all_to_all_any_qkv(self._ulysses_pg, value, seq_lens=seq_lens, use_sync=self._use_sync)
+
+            query, orig_head_cnt = _ulysses_all_to_all_any_qkv(
+                self._ulysses_pg,
+                query,
+                seq_lens=seq_lens,
+                use_sync=self._use_sync,
+                padded_head_cnt=padded_query_head_cnt,
+            )
+            key, _ = _ulysses_all_to_all_any_qkv(
+                self._ulysses_pg,
+                key,
+                seq_lens=seq_lens,
+                use_sync=self._use_sync,
+                padded_head_cnt=padded_kv_head_cnt,
+            )
+            value, _ = _ulysses_all_to_all_any_qkv(
+                self._ulysses_pg,
+                value,
+                seq_lens=seq_lens,
+                use_sync=self._use_sync,
+                padded_head_cnt=padded_kv_head_cnt,
+            )
+            if gate_compress is not None:
+                # gate_compress mirrors the query layout, so it must follow the
+                # same GQA-derived head padding as the query all-to-all.
+                gate_compress, _ = _ulysses_all_to_all_any_qkv(
+                    self._ulysses_pg,
+                    gate_compress,
+                    seq_lens=seq_lens,
+                    use_sync=self._use_sync,
+                    padded_head_cnt=padded_query_head_cnt,
+                )
         else:
             # Strict mode: fail fast with actionable errors for head divisibility.
             for name, t in (("query", query), ("key", key), ("value", value)):
@@ -347,9 +503,32 @@ class UlyssesParallelAttention:
                     )
 
             # (bs, seq_len/P, head_cnt, head_size) -> (bs, seq_len, head_cnt/P, head_size)
-            query = SeqAllToAll4D.apply(self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync)
-            key = SeqAllToAll4D.apply(self._ulysses_pg, key, self._scatter_idx, self._gather_idx, self._use_sync)
-            value = SeqAllToAll4D.apply(self._ulysses_pg, value, self._scatter_idx, self._gather_idx, self._use_sync)
+            if _a2a_permute_enabled(
+                self._ulysses_a2a_permute,
+                self._scatter_idx,
+                self._gather_idx,
+                ulysses_world_size,
+            ):
+                from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd
+
+                group_name = self._ulysses_pg.group_name
+                query = ulysses_qkv_fwd(query, group_name, ulysses_world_size)
+                key = ulysses_qkv_fwd(key, group_name, ulysses_world_size)
+                value = ulysses_qkv_fwd(value, group_name, ulysses_world_size)
+                if gate_compress is not None:
+                    gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
+            else:
+                query = SeqAllToAll4D.apply(
+                    self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync
+                )
+                key = SeqAllToAll4D.apply(self._ulysses_pg, key, self._scatter_idx, self._gather_idx, self._use_sync)
+                value = SeqAllToAll4D.apply(
+                    self._ulysses_pg, value, self._scatter_idx, self._gather_idx, self._use_sync
+                )
+                if gate_compress is not None:
+                    gate_compress = SeqAllToAll4D.apply(
+                        self._ulysses_pg, gate_compress, self._scatter_idx, self._gather_idx, self._use_sync
+                    )
             seq_lens = []
             local_seq_len = 0
             orig_head_cnt = 0
@@ -376,6 +555,12 @@ class UlyssesParallelAttention:
             else:  # "rear"
                 key = torch.cat([key, joint_tensor_key], dim=1)
                 value = torch.cat([value, joint_tensor_value], dim=1)
+
+        if gate_compress is not None and attn_metadata is not None:
+            # The VSA compression gate follows the same S<->H all-to-all as
+            # Q/K/V so every rank sees the full packed sequence for its local
+            # head shard, matching FastVideo's DistributedAttention_VSA.
+            attn_metadata.extra["gate_compress"] = gate_compress
 
         ctx = _UlyssesCtx(
             name=self.name,
@@ -404,6 +589,7 @@ class UlyssesParallelAttention:
                     attn_metadata.attn_mask = None
                 else:
                     if attn_metadata.attn_mask is None:
+                        assert attn_metadata.joint_attn_mask is not None
                         attn_metadata.attn_mask = torch.ones(
                             [query.shape[0], query.shape[1] - attn_metadata.joint_attn_mask.shape[1]],
                             dtype=torch.bool,
@@ -456,6 +642,19 @@ class UlyssesParallelAttention:
                     orig_head_cnt=ctx.orig_head_cnt,
                     use_sync=ctx.use_sync,
                 )
+            elif _a2a_permute_enabled(
+                self._ulysses_a2a_permute,
+                ctx.scatter_idx,
+                ctx.gather_idx,
+                dist.get_world_size(ctx.ulysses_pg),
+            ):
+                from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
+
+                output_img = ulysses_o_rev(
+                    output_img,
+                    ctx.ulysses_pg.group_name,
+                    dist.get_world_size(ctx.ulysses_pg),
+                )
             else:
                 output_img = SeqAllToAll4D.apply(
                     ctx.ulysses_pg, output_img, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync
@@ -487,5 +686,18 @@ class UlyssesParallelAttention:
                 local_seq_len=ctx.uaa_local_seq_len,
                 orig_head_cnt=ctx.orig_head_cnt,
                 use_sync=ctx.use_sync,
+            )
+        if _a2a_permute_enabled(
+            self._ulysses_a2a_permute,
+            ctx.scatter_idx,
+            ctx.gather_idx,
+            dist.get_world_size(ctx.ulysses_pg),
+        ):
+            from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
+
+            return ulysses_o_rev(
+                attn_output,
+                ctx.ulysses_pg.group_name,
+                dist.get_world_size(ctx.ulysses_pg),
             )
         return SeqAllToAll4D.apply(ctx.ulysses_pg, attn_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync)

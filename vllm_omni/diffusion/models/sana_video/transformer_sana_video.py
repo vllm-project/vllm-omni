@@ -18,11 +18,49 @@ from collections.abc import Iterable
 from dataclasses import dataclass, fields
 
 import torch
+from cache_dit import ForwardPattern
 from torch import nn
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
+from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
+
+
+def validate_sana_video_parallel_config(parallel_config) -> None:
+    """Reject unsupported SANA-Video parallel topologies before weights load."""
+    tp_size = parallel_config.tensor_parallel_size
+    if tp_size not in (1, 2):
+        raise NotImplementedError(
+            f"SANA-Video supports tensor_parallel_size 1 or 2, got {tp_size}. Set --tensor-parallel-size to 1 or 2."
+        )
+    cfg_size = parallel_config.cfg_parallel_size
+    if cfg_size not in (1, 2):
+        raise NotImplementedError(
+            f"SANA-Video supports cfg_parallel_size 1 or 2, got {cfg_size}. Set --cfg-parallel-size to 1 or 2."
+        )
+    sp_size = parallel_config.sequence_parallel_size
+    if sp_size is not None and sp_size > 1:
+        raise NotImplementedError(
+            "Sequence parallel is not supported for SANA-Video: its linear attention and "
+            "GLUMB temporal conv have no SANA-specific SP implementation. Use tensor and/or "
+            "CFG parallel instead."
+        )
+    if parallel_config.pipeline_parallel_size > 1:
+        raise NotImplementedError("SANA-Video does not support pipeline parallel. Set --pipeline-parallel-size to 1.")
+    if parallel_config.use_hsdp:
+        raise NotImplementedError("SANA-Video does not support HSDP. Remove --use-hsdp.")
+    if parallel_config.text_encoder_tp_size > 1:
+        raise NotImplementedError(
+            "SANA-Video does not support text encoder tensor parallel. Set text_encoder_tp_size to 1."
+        )
 
 
 @dataclass
@@ -107,6 +145,54 @@ class SanaRMSNorm(nn.Module):
             hidden_states = hidden_states.to(input_dtype)
 
         return hidden_states
+
+
+class SanaDistributedRMSNorm(nn.Module):
+    """RMSNorm that computes global RMS across tensor parallel ranks."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        set_weight_attrs(self.weight, {"weight_loader": self.weight_loader})
+
+    def weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        if param.shape == loaded_weight.shape:
+            param.data.copy_(loaded_weight)
+            return
+
+        tp_size = get_tensor_model_parallel_world_size()
+        if loaded_weight.shape[0] % tp_size != 0:
+            raise ValueError(
+                f"Cannot shard RMSNorm weight of shape {tuple(loaded_weight.shape)} across tp_size={tp_size}."
+            )
+
+        shard_size = loaded_weight.shape[0] // tp_size
+        start_idx = get_tensor_model_parallel_rank() * shard_size
+        shard = loaded_weight.narrow(0, start_idx, shard_size)
+        if param.shape != shard.shape:
+            raise ValueError(f"RMSNorm shard shape mismatch: param={tuple(param.shape)}, shard={tuple(shard.shape)}.")
+        param.data.copy_(shard)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        tp_size = get_tensor_model_parallel_world_size()
+        x_float = x.float()
+        sum_sq = x_float.pow(2).sum(dim=-1, keepdim=True)
+        count = x.shape[-1]
+
+        if tp_size > 1:
+            # Use vLLM's collective (custom all-reduce / symmetric-mem fast path
+            # for small tensors) instead of raw torch.distributed.all_reduce, and
+            # take the return value so the custom-AR path (which may return a new
+            # buffer) is handled correctly. No .clone() needed.
+            sum_sq = tensor_model_parallel_all_reduce(sum_sq)
+            count = count * tp_size
+
+        hidden_states = x_float * torch.rsqrt(sum_sq / count + self.eps)
+        # Only cast to the weight dtype for fp16/bf16 weights; keep fp32 otherwise.
+        if self.weight.dtype in (torch.float16, torch.bfloat16):
+            hidden_states = hidden_states.to(self.weight.dtype)
+        return hidden_states * self.weight
 
 
 def _get_timestep_embedding(
@@ -378,17 +464,41 @@ class GLUMBTempConv(nn.Module):
         hidden_channels = int(expand_ratio * in_channels)
         self.norm_type = norm_type
         self.residual_connection = residual_connection
+        self.hidden_channels = hidden_channels
+
+        tp_size = get_tensor_model_parallel_world_size()
+        local_hidden_channels = hidden_channels // tp_size
 
         self.nonlinearity = nn.SiLU()
-        self.conv_inverted = nn.Conv2d(in_channels, hidden_channels * 2, 1, 1, 0)
-        self.conv_depth = nn.Conv2d(hidden_channels * 2, hidden_channels * 2, 3, 1, 1, groups=hidden_channels * 2)
-        self.conv_point = nn.Conv2d(hidden_channels, out_channels, 1, 1, 0, bias=False)
+        self.conv_inverted = nn.Conv2d(in_channels, 2 * local_hidden_channels, 1, 1, 0)
+        self.conv_depth = nn.Conv2d(
+            2 * local_hidden_channels, 2 * local_hidden_channels, 3, 1, 1, groups=2 * local_hidden_channels
+        )
+        self.conv_point = nn.Conv2d(local_hidden_channels, out_channels, 1, 1, 0, bias=False)
+        # conv_inverted/conv_depth carry [value(h), gate(h)]; each rank must hold a
+        # slice of both segments so the local chunk(2) still splits value from gate.
+        for param in (self.conv_inverted.weight, self.conv_inverted.bias, self.conv_depth.weight, self.conv_depth.bias):
+            set_weight_attrs(param, {"weight_loader": self._segment_weight_loader})
+        set_weight_attrs(self.conv_point.weight, {"weight_loader": self._point_weight_loader})
 
         self.norm = None
         if norm_type == "rms_norm":
             self.norm = SanaRMSNorm(out_channels, eps=1e-5, elementwise_affine=True, bias=True)
 
         self.conv_temp = nn.Conv2d(out_channels, out_channels, kernel_size=(3, 1), stride=1, padding=(1, 0), bias=False)
+
+    def _segment_weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        h = self.hidden_channels
+        local = h // get_tensor_model_parallel_world_size()
+        start = get_tensor_model_parallel_rank() * local
+        value = loaded_weight.narrow(0, start, local)
+        gate = loaded_weight.narrow(0, h + start, local)
+        param.data.copy_(torch.cat([value, gate], dim=0))
+
+    def _point_weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        local = self.hidden_channels // get_tensor_model_parallel_world_size()
+        start = get_tensor_model_parallel_rank() * local
+        param.data.copy_(loaded_weight.narrow(1, start, local))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.residual_connection:
@@ -404,6 +514,8 @@ class GLUMBTempConv(nn.Module):
         hidden_states = hidden_states * self.nonlinearity(gate)
 
         hidden_states = self.conv_point(hidden_states)
+        if get_tensor_model_parallel_world_size() > 1:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
         # Temporal aggregation
         hidden_states_temporal = hidden_states.view(batch_size, num_frames, num_channels, height * width).permute(
@@ -440,13 +552,20 @@ class SanaLinearAttention(nn.Module):
     ) -> None:
         super().__init__()
         inner_dim = num_heads * head_dim
-        self.heads = num_heads
-        self.to_q = nn.Linear(dim, inner_dim, bias=bias)
-        self.to_k = nn.Linear(dim, inner_dim, bias=bias)
-        self.to_v = nn.Linear(dim, inner_dim, bias=bias)
-        self.norm_q = SanaRMSNorm(inner_dim, eps=1e-5, elementwise_affine=True) if qk_norm is not None else None
-        self.norm_k = SanaRMSNorm(inner_dim, eps=1e-5, elementwise_affine=True) if qk_norm is not None else None
-        self.to_out = nn.ModuleList([nn.Linear(inner_dim, dim, bias=True), nn.Dropout(dropout)])
+        tp_size = get_tensor_model_parallel_world_size()
+        self.heads = num_heads // tp_size
+        local_inner_dim = inner_dim // tp_size
+        self.to_q = ColumnParallelLinear(dim, inner_dim, bias=bias, gather_output=False, return_bias=False)
+        self.to_k = ColumnParallelLinear(dim, inner_dim, bias=bias, gather_output=False, return_bias=False)
+        self.to_v = ColumnParallelLinear(dim, inner_dim, bias=bias, gather_output=False, return_bias=False)
+        self.norm_q = SanaDistributedRMSNorm(local_inner_dim, eps=1e-5) if qk_norm is not None else None
+        self.norm_k = SanaDistributedRMSNorm(local_inner_dim, eps=1e-5) if qk_norm is not None else None
+        self.to_out = nn.ModuleList(
+            [
+                RowParallelLinear(inner_dim, dim, bias=True, input_is_parallel=True, return_bias=False),
+                nn.Dropout(dropout),
+            ]
+        )
 
     def forward(
         self,
@@ -632,18 +751,29 @@ class SanaCrossAttention(nn.Module):
     ) -> None:
         super().__init__()
         inner_dim = num_heads * head_dim
-        self.heads = num_heads
+        tp_size = get_tensor_model_parallel_world_size()
+        self.heads = num_heads // tp_size
         self.head_dim = head_dim
-        self.to_q = nn.Linear(dim, inner_dim, bias=bias)
-        self.to_k = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
-        self.to_v = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
-        self.norm_q = SanaRMSNorm(inner_dim, eps=1e-5, elementwise_affine=True) if qk_norm is not None else None
-        self.norm_k = SanaRMSNorm(inner_dim, eps=1e-5, elementwise_affine=True) if qk_norm is not None else None
-        self.to_out = nn.ModuleList([nn.Linear(inner_dim, dim, bias=out_bias), nn.Dropout(dropout)])
+        local_inner_dim = inner_dim // tp_size
+        self.to_q = ColumnParallelLinear(dim, inner_dim, bias=bias, gather_output=False, return_bias=False)
+        self.to_k = ColumnParallelLinear(
+            cross_attention_dim, inner_dim, bias=bias, gather_output=False, return_bias=False
+        )
+        self.to_v = ColumnParallelLinear(
+            cross_attention_dim, inner_dim, bias=bias, gather_output=False, return_bias=False
+        )
+        self.norm_q = SanaDistributedRMSNorm(local_inner_dim, eps=1e-5) if qk_norm is not None else None
+        self.norm_k = SanaDistributedRMSNorm(local_inner_dim, eps=1e-5) if qk_norm is not None else None
+        self.to_out = nn.ModuleList(
+            [
+                RowParallelLinear(inner_dim, dim, bias=out_bias, input_is_parallel=True, return_bias=False),
+                nn.Dropout(dropout),
+            ]
+        )
         self.attn = OmniAttention(
-            num_heads=num_heads,
+            num_heads=self.heads,
             head_size=head_dim,
-            num_kv_heads=num_heads,
+            num_kv_heads=self.heads,
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
             role="cross",
@@ -834,6 +964,12 @@ class SanaVideoTransformer3DModel(nn.Module):
     """
 
     _no_split_modules = ["SanaVideoTransformerBlock", "SanaModulatedNorm"]
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "transformer_blocks": ForwardPattern.Pattern_3,
+        },
+    )
+    _layerwise_offload_blocks_attrs = ["transformer_blocks"]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return AutoWeightsLoader(self).load_weights(weights)

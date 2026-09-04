@@ -33,6 +33,77 @@ def test_default_stage_config_includes_cache_backend():
     assert engine_args["model_stage"] == "diffusion"
 
 
+def test_default_stage_config_preserves_ulysses_a2a_permute() -> None:
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "ulysses_degree": 4,
+            "ulysses_a2a_permute": True,
+        }
+    )[0]
+
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config.ulysses_degree == 4
+    assert parallel_config.ulysses_a2a_permute is True
+
+
+def test_default_stage_config_preserves_model_extras():
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg({"extras": {"ltx2_use_conv_vae": True}})[0]
+
+    assert stage_cfg["engine_args"]["extras"]["ltx2_use_conv_vae"] is True
+
+
+def test_default_stage_config_preserves_and_overrides_promoted_extras():
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "extras": {
+                "auxiliary_text_encoder": "/models/extras-llama",
+                "default_llama_model_id": "extras/default-llama",
+            },
+            "auxiliary_text_encoder": None,
+        }
+    )[0]
+
+    extras = stage_cfg["engine_args"]["extras"]
+    assert extras["auxiliary_text_encoder"] == "/models/extras-llama"
+    assert extras["default_llama_model_id"] == "extras/default-llama"
+
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "extras": {
+                "auxiliary_text_encoder": "/models/extras-llama",
+                "default_llama_model_id": "extras/default-llama",
+            },
+            "auxiliary_text_encoder": "/models/top-level-llama",
+            "default_llama_model_id": "top-level/default-llama",
+        }
+    )[0]
+
+    extras = stage_cfg["engine_args"]["extras"]
+    assert extras["auxiliary_text_encoder"] == "/models/top-level-llama"
+    assert extras["default_llama_model_id"] == "top-level/default-llama"
+
+
+def test_stage_override_preserves_model_extras_for_default_diffusion_stage(mocker):
+    """Local/unregistered Diffusers checkpoints still honor stage-0 extras."""
+
+    def resolve_with_default(*_args, default_stage_cfg_factory, **_kwargs):
+        return None, default_stage_cfg_factory(), None
+
+    mocker.patch(
+        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
+        side_effect=resolve_with_default,
+    )
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+
+    _, stage_configs = engine._resolve_stage_configs(
+        "/models/LTX-2.5-Diffusers",
+        {"stage_overrides": '{"0":{"extras":{"ltx2_use_conv_vae":true}}}'},
+        trust_remote_code=False,
+    )
+
+    assert stage_configs[0]["engine_args"]["extras"]["ltx2_use_conv_vae"] is True
+
+
 def test_default_cache_config_used_when_missing():
     """Ensure default cache_config is synthesized when only backend is given."""
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
@@ -255,6 +326,29 @@ def test_serve_cli_accepts_ulysses_mode():
     assert args.ulysses_mode == "advanced_uaa"
     assert parallel_config.ulysses_degree == 4
     assert parallel_config.ulysses_mode == "advanced_uaa"
+
+
+def test_serve_cli_accepts_text_encoder_tp_size():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--text-encoder-tp-size",
+            "4",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+
+    assert args.text_encoder_tp_size == 4
+    assert parallel_config.text_encoder_tp_size == 4
 
 
 def test_serve_cli_forwards_model_defined_task_type_to_diffusion_stage():
@@ -514,6 +608,66 @@ def test_serve_cli_accepts_additional_config():
 
     assert args.additional_config == {"torchair_graph_config": {"enabled": True}}
     assert engine_args["additional_config"] == {"torchair_graph_config": {"enabled": True}}
+
+
+def test_default_stage_resolves_video_output_from_checkpoint(mocker):
+    captured = {}
+
+    def resolve_with_default(*args, default_stage_cfg_factory, **kwargs):
+        del args, kwargs
+        captured.update(default_stage_cfg_factory()[0])
+        stage = SimpleNamespace(stage_type="diffusion", engine_args=SimpleNamespace())
+        return ("", [stage], None)
+
+    resolver = mocker.patch(
+        "vllm_omni.engine.async_omni_engine.resolve_model_class_name",
+        return_value="MiniMaxH3Pipeline",
+    )
+    mocker.patch(
+        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
+        side_effect=resolve_with_default,
+    )
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+    engine._strip_single_engine_args = lambda kwargs: kwargs
+
+    engine._resolve_stage_configs(
+        "/models/MiniMax-H3/FL2VA",
+        {},
+        trust_remote_code=False,
+    )
+
+    resolver.assert_called_once_with("/models/MiniMax-H3/FL2VA", "default")
+    assert captured["final_output_type"] == "video"
+
+
+def test_default_diffusers_stage_preserves_video_model_identity(mocker):
+    captured = {}
+
+    def resolve_with_default(*args, default_stage_cfg_factory, **kwargs):
+        del args, kwargs
+        captured.update(default_stage_cfg_factory()[0])
+        stage = SimpleNamespace(stage_type="diffusion", engine_args=SimpleNamespace())
+        return ("", [stage], None)
+
+    mocker.patch(
+        "vllm_omni.diffusion.utils.hf_utils.get_diffusion_model_index",
+        return_value={"_class_name": "WanImageToVideoPipeline"},
+    )
+    mocker.patch(
+        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
+        side_effect=resolve_with_default,
+    )
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+    engine._strip_single_engine_args = lambda kwargs: kwargs
+
+    engine._resolve_stage_configs(
+        "/models/Wan2.2-I2V",
+        {"diffusion_load_format": "diffusers"},
+        trust_remote_code=False,
+    )
+
+    assert captured["engine_args"]["model_class_name"] == "WanImageToVideoPipeline"
+    assert captured["final_output_type"] == "video"
 
 
 def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mocker):

@@ -12,15 +12,17 @@ LoRA adapters are lightweight, model-specific fine-tuning weights that can be ap
 ## LoRA Adapter Format
 
 ### PEFT (Parameter-Efficient Fine-Tuning) format (default)
+
 A typical PEFT-format LoRA adapter directory structure:
 
-```
+```text
 lora_adapter/
 ├── adapter_config.json
 └── adapter_model.safetensors
 ```
 
 The `adapter_config.json` file contains metadata about the LoRA adapter, including:
+
 - `r`: LoRA rank
 - `lora_alpha`: LoRA alpha scaling factor
 - `target_modules`: List of module names to apply LoRA to
@@ -67,7 +69,7 @@ For distilled few-step LoRAs, pass `lora_backend="distill"` together with one or
 For Qwen-Image and Wan pipelines, the distill backend calls `pipeline.load_lora_weights(...)` during worker initialization.
 
 | Pipeline | Supported distilled LoRA repo | Notes |
-|----------|--------------------------------|-------|
+| ---------- | -------------------------------- | ------- |
 | `QwenImagePipeline` | `lightx2v/Qwen-Image-2512-Lightning` | Used with Qwen-Image-2512 Lightning-style few-step inference. |
 | `Wan22Pipeline` | `lightx2v/Wan2.1-Distill-Loras`, `lightx2v/Wan2.2-Distill-Loras` | Wan2.1 uses one LoRA file. For dual-transformer Wan2.2 MoE, pass high-noise then low-noise LoRA files. |
 | `Wan22I2VPipeline` | `lightx2v/Wan2.2-Distill-Loras` | For dual-transformer Wan2.2 MoE, pass high-noise then low-noise LoRA files. |
@@ -240,6 +242,37 @@ Notes:
 - Output quality and speed depend on the replacement checkpoints and sampling params you choose.
 - If you only need to fuse distilled LoRAs into a Wan2.2 checkpoint at load time (without the full LightX2V convert + assemble pipeline), you can instead pass them directly via `--lora-backend distill --lora-path <high>.safetensors <low>.safetensors`. See the [Distill backend](#distill-backend-fuse-distilled-lora-at-init) section above.
 
+## MiniMax-H3 adapter-declared schedules
+
+MiniMax-H3 supports two few-step mechanisms that must not be conflated:
+
+- **Checkpoint-pinned schedule**: a merged release writes `base_schedule` into
+  `model_index.json`. Requests must pass `num_inference_steps` as the interval
+  count (for example `4` for `[1.0, 0.7, 0.4, 0.15, 0.0]`).
+- **Runtime Turbo LoRA**: LightX2V Turbo artifacts request five sigma points and
+  enforce `flow_shift=6`, `audio_flow_shift=3`.
+- **Runtime native LoRA**: FlashGen-style artifacts declare
+  `key_format=minimax-h3-native` and embed `base_schedule` in safetensors
+  metadata. When active, the adapter schedule overrides the base checkpoint and
+  requests must use the interval-count contract (`num_inference_steps=4`).
+  Request-mode generation may omit the field and take the count from the adapter
+  schedule; step execution requires it explicitly, because the step scheduler
+  derives the total step count from the request before the adapter schedule is
+  known.
+
+Native artifacts also declare `qkv_layout=grouped`. The H3 loader reorders fused
+`qkv_proj` LoRA rows with the same `_reorder_grouped_qkv_to_qkv` helper used for
+base-weight loading, then binds the packed Q/K/V slices through the legacy PEFT
+manager without modifying `DiffusionLoRAManager`.
+
+Both runtime adapters run with distributed layerwise offload in request-mode
+generation, where the manager keeps the LoRA A/B buffers resident on the compute
+device while DLO streams the base blocks. MiniMax-H3 step execution still
+rejects DLO, so `--step-execution` cannot be combined with
+`--enable-distributed-layerwise-offload`. Model-level CPU offload and standard
+layerwise offload are rejected in every mode, because the dynamic LoRA tensors
+are neither parameters nor registered buffers and therefore do not participate
+in those weight lifecycles.
 
 ## See Also
 

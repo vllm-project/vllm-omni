@@ -1,3 +1,6 @@
+# CUDA CI L3 (`advanced_model` e2e) plus L1 CPU Simple Test (`core_model and cpu`).
+# Uploaded by Upload Merge Pipeline: PR label `merge-test`, or post-merge on main.
+
 env:
   VLLM_WORKER_MULTIPROC_METHOD: spawn
   VLLM_USE_FLASHINFER_MOE_FP16: 0
@@ -85,6 +88,9 @@ steps:
           - vllm_omni/model_executor/models/common/alias_free_activation.py
           - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
           - vllm_omni/deploy/qwen3_tts.yaml
+          - vllm_omni/entrypoints/openai/serving_speech.py
+          - vllm_omni/entrypoints/openai/tts_adapters/
+          - vllm_omni/engine/stage_pool.py
         commands:
           - |
             timeout 40m bash -c "
@@ -104,6 +110,9 @@ steps:
           - vllm_omni/model_executor/models/common/alias_free_activation.py
           - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
           - vllm_omni/deploy/qwen3_tts.yaml
+          - vllm_omni/entrypoints/openai/serving_speech.py
+          - vllm_omni/entrypoints/openai/tts_adapters/
+          - vllm_omni/engine/stage_pool.py
           - .buildkite/common/scripts/run_cov_split.sh
           - pyproject.toml
         # 40 -> 60: the coverage split runs the model twice.
@@ -122,6 +131,7 @@ steps:
       - label: "Omni · Qwen3-Omni Test"
         source_file_dependencies:
           - tests/e2e/offline_inference/test_qwen3_omni.py
+          - tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py
           - tests/e2e/online_serving/test_qwen3_omni.py
           - tests/helpers/runtime.py
           - vllm_omni/entrypoints/openai/serving_chat.py
@@ -132,9 +142,10 @@ steps:
           - vllm_omni/model_executor/models/qwen3_tts/cuda_graph_decoder_wrapper.py
           - vllm_omni/model_executor/stage_input_processors/qwen3_omni.py
           - vllm_omni/deploy/qwen3_omni_moe.yaml
+          - vllm_omni/deploy/qwen3_omni_moe_thinking.yaml
         timeout_in_minutes: 50
         commands:
-          - pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py tests/e2e/online_serving/test_qwen3_omni.py -m 'advanced_model and cuda' --run-level 'advanced_model'
+          - pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py tests/e2e/online_serving/test_qwen3_omni.py tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py -m 'advanced_model and cuda' --run-level 'advanced_model'
         mirror_hardwares: h100_2
 
       - label: "Omni · MiniCPM-o 4.5 Test"
@@ -166,10 +177,10 @@ steps:
           - tests/e2e/online_serving/test_minicpmo_realtime_duplex_drivers.py
           - tests/e2e/online_serving/helpers/minicpmo_realtime_duplex_scenarios.py
           - tests/e2e/online_serving/run_minicpmo_realtime_duplex_multi_session.py
+          - tests/e2e/online_serving/run_minicpmo_realtime_duplex_server_vad.py
           - tests/e2e/online_serving/run_minicpmo_realtime_duplex_soft_interrupt.py
           - vllm_omni/deploy/minicpmo_4_5.yaml
           - tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py
-          - vllm_omni/deploy/minicpmo_4_5_duplex.yaml
           - vllm_omni/experimental/fullduplex/
           - vllm_omni/model_executor/models/minicpmo_4_5/
           - vllm_omni/model_executor/models/step_audio2/
@@ -217,3 +228,50 @@ steps:
               pytest -s -v tests/e2e/offline_inference/test_wan22_t2v.py tests/e2e/online_serving/test_wan22_t2v.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
             "
         mirror_hardwares: h100_1
+
+      - label: "Diffusion · HunyuanVideo-1.5 Test"
+        source_file_dependencies:
+          - tests/e2e/online_serving/test_hunyuan_video_15_expansion.py
+          - vllm_omni/diffusion/models/hunyuan_video/
+        commands:
+          - |
+            timeout 40m bash -c "
+              export VLLM_IMAGE_FETCH_TIMEOUT=60
+              pytest -s -v tests/e2e/online_serving/test_hunyuan_video_15_expansion.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
+            "
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · MiniMax-H3 L3 DLO DP2 and FastH3"
+        source_file_dependencies:
+          - tests/e2e/online_serving/minimax_h3/
+          - tests/helpers/assertions.py
+          - tests/helpers/mark.py
+          - tests/helpers/media.py
+          - tests/helpers/runtime.py
+          - vllm_omni/diffusion/models/minimax_h3/
+          - vllm_omni/diffusion/lora/
+          - vllm_omni/diffusion/offloader/
+          - vllm_omni/diffusion/distributed/
+          - vllm_omni/entrypoints/openai/
+        # Keep four server lifecycles in one Buildkite job, but never in one
+        # pytest process. DLO uses multiprocessing shared-memory queues; the
+        # parent's resource_tracker can retain a stale /psm_* entry during
+        # teardown and strand the next Ref2VA collective.
+        # A per-file process plus a hard timeout also makes a regression fail
+        # instead of leaving the merge queue stuck indefinitely.
+        timeout_in_minutes: 150
+        commands:
+          - |
+            set -eu
+            export VLLM_IMAGE_FETCH_TIMEOUT=60
+            if [ -f vllm_omni/diffusion/models/minimax_h3/lora.py ]; then
+              export VLLM_TEST_MINIMAX_H3_TURBO_LORA=$(python3 -c 'from huggingface_hub import hf_hub_download; print(hf_hub_download(repo_id="lightx2v/Minimax-h3-Turbo", filename="minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"))')
+            fi
+            if [ -f vllm_omni/diffusion/models/minimax_h3/fasth3.py ]; then
+              export VLLM_TEST_MINIMAX_H3_FASTH3_LORA=$(python3 -c 'from huggingface_hub import hf_hub_download; print(hf_hub_download(repo_id="FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA", filename="dense-datafree/adapter_model.safetensors"))')
+            fi
+            timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_dlo_dp2_fl2va.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
+            timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_dlo_dp2_ref2va.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
+            timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_turbo_lora.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
+            timeout 35m pytest -s -v tests/e2e/online_serving/minimax_h3/test_minimax_h3_fasth3_lora.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
+        mirror_hardwares: h100_2
