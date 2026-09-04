@@ -9,11 +9,13 @@ Coverage:
 - Weight / scale shape-transform arithmetic from process_weights_after_loading (CPU)
 - build_quant_config integration
 - MXFP8_QUANT_CONFIG structure as the auto-detection contract
+- Offload-after-quant capability of the shared online-method mixin (CPU)
 """
 
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from torch.nn import Module
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
 from vllm_omni.platforms import current_omni_platform
@@ -335,3 +337,89 @@ def test_supported_methods_include_mxfp8():
     from vllm_omni.quantization import SUPPORTED_QUANTIZATION_METHODS
 
     assert "mxfp8" in SUPPORTED_QUANTIZATION_METHODS
+
+
+# ---------------------------------------------------------------------------
+# Offload-after-quant capability (CPU, no NPU ops)
+# ---------------------------------------------------------------------------
+
+
+class TestOffloadAfterQuant:
+    """Online MXFP methods advertise ``supports_offload_after_quant`` so the
+    diffusion loader can stream each layer back to host memory right after it
+    is quantized, instead of accumulating the whole model on the accelerator
+    until the final ``model.to("cpu")``.
+
+    The capability lives on ``_LazyWeightMixin``, which is shared by all
+    online MXFP8/MXFP4 methods, so pinning it here covers mxfp4 too.
+    """
+
+    def _make_method(self):
+        from vllm_omni.quantization.mxfp8_config import (
+            DiffusionMXFP8Config,
+            NPUMxfp8OnlineLinearMethod,
+        )
+
+        return NPUMxfp8OnlineLinearMethod(DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=False))
+
+    def test_only_methods_advertising_the_capability_are_asked(self):
+        from vllm_omni.diffusion.model_loader.diffusers_loader import (
+            DiffusersPipelineLoader,
+        )
+
+        class MetaDeviceOnlyMethod:
+            """Stands in for upstream online FP8: lazy, but no offload hook."""
+
+            uses_meta_device = True
+
+        model = torch.nn.Sequential(Module(), Module())
+        lazy_mxfp8 = self._make_method()
+        model[0].quant_method = lazy_mxfp8
+        model[1].quant_method = MetaDeviceOnlyMethod()
+
+        marked = DiffusersPipelineLoader._request_offload_after_quant(model)
+
+        assert marked == 1
+        assert lazy_mxfp8._offload_after_quant
+
+    def _load_layer_in_one_chunk(self, method, layer):
+        method.create_weights(
+            layer,
+            input_size_per_partition=8,
+            output_partition_sizes=[4],
+            input_size=8,
+            output_size=4,
+            params_dtype=torch.bfloat16,
+            weight_loader=lambda param, loaded_weight, *args, **kwargs: param.copy_(loaded_weight),
+        )
+        full_weight = torch.randn(4, 8, dtype=torch.bfloat16)
+        layer.weight.weight_loader(layer.weight, full_weight)
+
+    def test_finished_layer_returns_to_cpu_when_enabled(self, mocker: MockerFixture):
+        method = self._make_method()
+        method.enable_offload_after_quant()
+        mocker.patch.object(method, "process_weights_after_loading")
+
+        layer = Module()
+        moved_to = []
+        layer.to = lambda device, *args, **kwargs: moved_to.append(device)  # type: ignore[method-assign]
+
+        self._load_layer_in_one_chunk(method, layer)
+
+        method.process_weights_after_loading.assert_called_once_with(layer)
+        assert layer._already_called_process_weights_after_loading
+        assert moved_to == ["cpu"]
+
+    def test_finished_layer_stays_put_by_default(self, mocker: MockerFixture):
+        method = self._make_method()
+        mocker.patch.object(method, "process_weights_after_loading")
+
+        layer = Module()
+        moved_to = []
+        layer.to = lambda device, *args, **kwargs: moved_to.append(device)  # type: ignore[method-assign]
+
+        self._load_layer_in_one_chunk(method, layer)
+
+        method.process_weights_after_loading.assert_called_once_with(layer)
+        assert layer._already_called_process_weights_after_loading
+        assert moved_to == []

@@ -941,6 +941,19 @@ def test_dlo_allgather_rejects_unvalidated_online_quant_method(monkeypatch):
         loader.load_model(load_device="cpu")
 
 
+def test_dlo_allgather_allows_unquantized_host_fallback():
+    """Host-loaded unquantized fallback layers are plain contiguous bf16 —
+    the same runtime layout DLO already shards on the ordinary path — so the
+    allowlist must not reject them."""
+    from vllm_omni.quantization.int8_config import UnquantizedHostLinearMethod
+
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    model.transformer.quant_method = object.__new__(UnquantizedHostLinearMethod)
+
+    assert DiffusersPipelineLoader._unsupported_dlo_allgather_online_quant_methods(model) == ()
+
+
 def test_dlo_allgather_online_mxfp8_uses_ordinary_loader(monkeypatch):
     mxfp8_config = pytest.importorskip("vllm_omni.quantization.mxfp8_config")
     NPUMxfp8OnlineLinearMethod = mxfp8_config.NPUMxfp8OnlineLinearMethod

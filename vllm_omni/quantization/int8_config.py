@@ -7,6 +7,8 @@ on CUDA and NPU platforms.
 """
 
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -62,6 +64,32 @@ NPU_QUANT_MATMUL_MAX_OUT_FEATURES = 65535
 
 logger = init_logger(__name__)
 
+# Set by the diffusion loader while it constructs a model whose weights will be
+# offloaded back to host memory after online quantization (DLO). Over-wide
+# layers that npu_quant_matmul cannot run then load straight into host memory
+# instead of being built on the accelerator and moved off at the end of
+# loading — on MiniMax H3 the 50 fallback adaln layers are ~24 GiB of bf16,
+# which is the dominant startup memory peak.
+_LOAD_UNQUANTIZABLE_FALLBACK_ON_CPU: ContextVar[bool] = ContextVar(
+    "int8_load_unquantizable_fallback_on_cpu", default=False
+)
+
+
+@contextmanager
+def load_unquantizable_fallback_on_cpu():
+    """Create npu_quant_matmul-incompatible fallback weights on meta and load
+    them straight into host memory.
+
+    Only valid when the whole model returns to the host after loading (the
+    loader's offload-after-quant path); otherwise the fallback weights would
+    stay on CPU while the rest of the model runs on the accelerator.
+    """
+    token = _LOAD_UNQUANTIZABLE_FALLBACK_ON_CPU.set(True)
+    try:
+        yield
+    finally:
+        _LOAD_UNQUANTIZABLE_FALLBACK_ON_CPU.reset(token)
+
 
 def _fell_back_to_unquantized_npu(
     layer: torch.nn.Module,
@@ -90,7 +118,15 @@ def _fell_back_to_unquantized_npu(
         output_size_per_partition,
         NPU_QUANT_MATMUL_MAX_OUT_FEATURES,
     )
-    fallback = UnquantizedLinearMethod()
+    if _LOAD_UNQUANTIZABLE_FALLBACK_ON_CPU.get():
+        logger.info_once(
+            "Loading over-wide unquantized fallback weights straight into host memory "
+            "(offload-after-quant is active); they only reach the accelerator via "
+            "the offload backend's runtime prefetch."
+        )
+        fallback: LinearMethodBase = UnquantizedHostLinearMethod()
+    else:
+        fallback = UnquantizedLinearMethod()
     layer.quant_method = fallback
     fallback.create_weights(
         layer,
@@ -379,6 +415,85 @@ class LazyWeightMixin:
         )
         # stash the correct device for `patched_weight_loader`
         layer._load_device = torch.get_default_device()
+        layer.register_parameter("weight", weight)
+
+
+class UnquantizedHostLinearMethod(UnquantizedLinearMethod):
+    """Unquantized linear method whose weight loads straight into host memory.
+
+    Layers wider than ``NPU_QUANT_MATMUL_MAX_OUT_FEATURES`` cannot be quantized,
+    so under the ordinary path their bf16 weights materialize on the accelerator
+    at construction time and stay there until the whole model is moved off after
+    loading. When the loader has entered ``load_unquantizable_fallback_on_cpu()``
+    (offload-after-quant, i.e. DLO), that round trip is pure startup peak — the
+    weights end up pinned on the host either way and only visit the accelerator
+    through the offload backend's runtime prefetch.
+
+    This method mirrors ``LazyWeightMixin``'s meta + just-in-time materialize
+    pattern, but materializes on CPU and skips quantization entirely.
+    """
+
+    # The weight really is deferred on meta until loading, like the online
+    # quant methods, so the loader's meta-aware bookkeeping treats the layer
+    # correctly. Offload-after-quant marking is deliberately not advertised:
+    # the weight never visits the accelerator, so there is nothing to return.
+    uses_meta_device: bool = True
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        def patched_weight_loader(param, loaded_weight, *args, **kwargs):
+            # Materialize on host just-in-time: checkpoint chunks are CPU
+            # tensors, so loading stays CPU->CPU with no accelerator round trip.
+            if layer.weight.device.type == "meta":
+                weight = ModelWeightParameter(
+                    data=torch.empty_like(layer.weight, device="cpu"),
+                    input_dim=1,
+                    output_dim=0,
+                    weight_loader=patched_weight_loader,
+                )
+                _copy_missing_attrs(layer.weight, weight)
+                layer.register_parameter("weight", weight)
+
+            # refresh the reference to `param` to reflect just-in-time
+            # materialization
+            param = layer.weight
+
+            copy_numel_counter = CopyNumelCounter()
+            with copy_numel_counter:
+                res = weight_loader(param, loaded_weight, *args, **kwargs)  # type: ignore[misc]
+            layer._loaded_numel = getattr(layer, "_loaded_numel", 0) + copy_numel_counter.copied_numel
+
+            if layer._loaded_numel == layer.weight.numel():
+                # process_weights_after_loading is a no-op for unquantized
+                # weights; the flag keeps the post-load sweep from bouncing the
+                # host tensor to the accelerator and back just to call it.
+                layer._already_called_process_weights_after_loading = True
+
+            return res
+
+        weight = ModelWeightParameter(
+            data=torch.empty(
+                output_size_per_partition,
+                input_size_per_partition,
+                # materialized just-in-time in `patched_weight_loader`
+                device="meta",
+                dtype=params_dtype,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=patched_weight_loader,
+        )
         layer.register_parameter("weight", weight)
 
 

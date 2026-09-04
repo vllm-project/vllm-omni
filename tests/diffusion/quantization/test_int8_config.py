@@ -248,6 +248,128 @@ class TestNPUQuantMatmulShapeFallback:
         assert layer.quant_method is method
 
 
+class TestHostFallbackLoading:
+    """Over-wide fallback layers load straight into host memory when the loader
+    will offload the model back to CPU after online quantization (DLO).
+
+    Without the context the eager path is preserved: the fallback weight is a
+    real tensor created at construction time.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _mock_tp(self, mocker):
+        # Same stand-in as TestNPUQuantMatmulShapeFallback: the eager fallback
+        # delegates to UnquantizedLinearMethod, which reads the TP group.
+        mock_group = mocker.Mock()
+        mock_group.rank_in_group = 0
+        mocker.patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", return_value=1)
+        mocker.patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_rank", return_value=0)
+        mocker.patch("vllm.distributed.parallel_state.get_tp_group", return_value=mock_group)
+
+    @pytest.fixture
+    def quant_config(self):
+        from vllm_omni.quantization.int8_config import DiffusionInt8Config
+
+        return DiffusionInt8Config(is_checkpoint_int8_serialized=False, activation_scheme="dynamic")
+
+    def _make_over_wide_layer(self, quant_config, weight_loader):
+        from vllm_omni.quantization.int8_config import (
+            NPU_QUANT_MATMUL_MAX_OUT_FEATURES,
+            NPUInt8OnlineLinearMethod,
+        )
+
+        out_features = NPU_QUANT_MATMUL_MAX_OUT_FEATURES + 1
+        method = NPUInt8OnlineLinearMethod(quant_config)
+        layer = Module()
+        layer.quant_method = method
+        method.create_weights(
+            layer,
+            input_size_per_partition=8,
+            output_partition_sizes=[out_features],
+            input_size=8,
+            output_size=out_features,
+            params_dtype=torch.bfloat16,
+            weight_loader=weight_loader,
+        )
+        return layer, out_features
+
+    @staticmethod
+    def _loaded_values(out_features):
+        return (
+            torch.arange(out_features * 8, dtype=torch.float32)
+            .reshape(out_features, 8)
+            .to(torch.bfloat16)
+        )
+
+    def test_fallback_without_context_keeps_eager_weights(self, quant_config):
+        layer, _ = self._make_over_wide_layer(quant_config, lambda param, loaded_weight, *a, **k: None)
+
+        assert type(layer.quant_method) is UnquantizedLinearMethod
+        assert layer.weight.device.type != "meta"
+
+    def test_fallback_under_context_defers_weight_to_meta(self, quant_config):
+        from vllm_omni.quantization.int8_config import (
+            UnquantizedHostLinearMethod,
+            load_unquantizable_fallback_on_cpu,
+        )
+
+        with load_unquantizable_fallback_on_cpu():
+            layer, _ = self._make_over_wide_layer(quant_config, lambda param, loaded_weight, *a, **k: None)
+
+        assert isinstance(layer.quant_method, UnquantizedHostLinearMethod)
+        assert layer.quant_method.uses_meta_device
+        assert layer.weight.device.type == "meta"
+
+    def test_fallback_weight_loads_straight_to_cpu(self, quant_config):
+        from vllm_omni.quantization.int8_config import load_unquantizable_fallback_on_cpu
+
+        def copy_loader(param, loaded_weight, *args, **kwargs):
+            param.data.copy_(loaded_weight)
+
+        with load_unquantizable_fallback_on_cpu():
+            layer, out_features = self._make_over_wide_layer(quant_config, copy_loader)
+
+        loaded = self._loaded_values(out_features)
+        layer.weight.weight_loader(layer.weight, loaded)
+
+        assert layer.weight.device.type == "cpu"
+        assert torch.equal(layer.weight, loaded)
+        # Marks the post-load sweep to skip the layer instead of bouncing the
+        # host tensor to the accelerator and back for a no-op process call.
+        assert layer._already_called_process_weights_after_loading
+
+    def test_chunked_load_marks_completion_only_when_full(self, quant_config):
+        from vllm_omni.quantization.int8_config import load_unquantizable_fallback_on_cpu
+
+        state = {"offset": 0}
+
+        def half_loader(param, loaded_weight, *args, **kwargs):
+            start = state["offset"]
+            param.data[start : start + loaded_weight.shape[0]].copy_(loaded_weight)
+            state["offset"] += loaded_weight.shape[0]
+
+        with load_unquantizable_fallback_on_cpu():
+            layer, out_features = self._make_over_wide_layer(quant_config, half_loader)
+
+        loaded = self._loaded_values(out_features)
+        halves = loaded.chunk(2, dim=0)
+        layer.weight.weight_loader(layer.weight, halves[0])
+        assert not getattr(layer, "_already_called_process_weights_after_loading", False)
+
+        layer.weight.weight_loader(layer.weight, halves[1])
+        assert layer._already_called_process_weights_after_loading
+        assert torch.equal(layer.weight, loaded)
+
+    def test_context_does_not_leak(self, quant_config):
+        from vllm_omni.quantization.int8_config import load_unquantizable_fallback_on_cpu
+
+        with load_unquantizable_fallback_on_cpu():
+            pass
+        layer, _ = self._make_over_wide_layer(quant_config, lambda param, loaded_weight, *a, **k: None)
+
+        assert type(layer.quant_method) is UnquantizedLinearMethod
+
+
 class TestOffloadAfterQuant:
     def test_only_methods_advertising_the_capability_are_asked(self):
         from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
