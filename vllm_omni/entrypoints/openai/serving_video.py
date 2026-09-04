@@ -7,7 +7,6 @@ import copy
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from functools import cached_property
 from http import HTTPStatus
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -36,7 +35,7 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
     encode_video_base64,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
-from vllm_omni.model_extras import should_preserve_reference_image_size
+from vllm_omni.model_extras import resize_reference_images
 from vllm_omni.outputs.output_metadata import (
     DiffusionMetadataMapping,
     DiffusionMultimodalOutput,
@@ -123,16 +122,24 @@ class OmniOpenAIServingVideo:
         if self._stage_configs is None and stage_configs is not None:
             self._stage_configs = stage_configs
 
-    @cached_property
-    def preserves_reference_image_size(self) -> bool:
-        """Return whether the active pipeline owns reference-image resizing."""
+    def _resize_reference_images(
+        self,
+        images: Image.Image | list[Image.Image],
+        *,
+        width: int,
+        height: int,
+    ) -> Image.Image | list[Image.Image]:
+        """Prepare reference images using the active pipeline's resize policy."""
         od_config = self._resolve_diffusion_od_config()
         model_class_name = None if od_config is None else getattr(od_config, "model_class_name", None)
         model = getattr(od_config, "model", None) if od_config is not None else None
         model = model or self.model_name
         revision = getattr(od_config, "revision", None) if od_config is not None else None
-        return should_preserve_reference_image_size(
+        return resize_reference_images(
             model_class_name,
+            images,
+            width=width,
+            height=height,
             model=None if model is None else str(model),
             revision=revision,
         )
@@ -207,19 +214,12 @@ class OmniOpenAIServingVideo:
         provided_fields = request.model_fields_set
         fps_provided = self._request_fps_provided(request)
         vp = request.resolve_video_params()
-        if (
-            input_image is not None
-            and vp.width is not None
-            and vp.height is not None
-            and not self.preserves_reference_image_size
-        ):
-            target_size = (vp.width, vp.height)
-            image_items = input_image if isinstance(input_image, list) else [input_image]
-            resized_images = [
-                image.resize(target_size, Image.Resampling.LANCZOS) if image.size != target_size else image
-                for image in image_items
-            ]
-            input_image = resized_images if isinstance(input_image, list) else resized_images[0]
+        if input_image is not None and vp.width is not None and vp.height is not None:
+            input_image = self._resize_reference_images(
+                input_image,
+                width=vp.width,
+                height=vp.height,
+            )
         multi_modal_data: dict[str, Any] = {}
         if input_image is not None:
             multi_modal_data["image"] = input_image

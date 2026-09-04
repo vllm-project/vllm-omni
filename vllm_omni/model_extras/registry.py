@@ -103,6 +103,18 @@ class ReferenceImageSizeResolver(Protocol):
     ) -> bool: ...
 
 
+class ReferenceImageResizer(Protocol):
+    def __call__(
+        self,
+        images: Image.Image | list[Image.Image],
+        *,
+        width: int,
+        height: int,
+        model: str | None = None,
+        revision: str | None = None,
+    ) -> Image.Image | list[Image.Image]: ...
+
+
 class TransformerConfigSubfolderResolver(Protocol):
     def __call__(
         self,
@@ -171,6 +183,49 @@ def default_image_to_image_prompt(
     return result
 
 
+def default_reference_image_resizer(
+    images: Image.Image | list[Image.Image],
+    *,
+    width: int,
+    height: int,
+    model: str | None = None,
+    revision: str | None = None,
+) -> Image.Image | list[Image.Image]:
+    """Resize reference images to exactly ``width`` x ``height``.
+
+    This is the historical shared-layer behaviour: a straight Lanczos resample
+    to the requested box, applied only when the source geometry differs. It is
+    correct for pipelines that consume the reference image at the output
+    resolution without any aspect-ratio handling of their own.
+    """
+    del model, revision
+    target_size = (width, height)
+    items = images if isinstance(images, list) else [images]
+    resized = [
+        image.resize(target_size, Image.Resampling.LANCZOS) if image.size != target_size else image for image in items
+    ]
+    return resized if isinstance(images, list) else resized[0]
+
+
+def passthrough_reference_image_resizer(
+    images: Image.Image | list[Image.Image],
+    *,
+    width: int,
+    height: int,
+    model: str | None = None,
+    revision: str | None = None,
+) -> Image.Image | list[Image.Image]:
+    """Return reference images untouched for pipelines that own their geometry.
+
+    Models whose pipeline applies its own aspect-preserving resize and crop
+    (e.g. LingBot-Video) must receive the raw image; a shared pre-resize would
+    distort the crop whenever the requested aspect ratio differs from the
+    reference image's.
+    """
+    del width, height, model, revision
+    return images
+
+
 _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "BagelPipeline": {
         "extra_body_params": BAGEL_EXTRA_BODY_PARAMS,
@@ -204,7 +259,10 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": LINGBOT_VIDEO_EXTRA_BODY_PARAMS,
         "output_tensor_range": "zero_to_one",
         # Shared T2I/I2V envelopes select the output modality. LingBot's
-        # pipeline owns model-specific validation and normalization.
+        # pipeline owns model-specific validation and normalization, including
+        # its official aspect-preserving resize + center crop, so the shared
+        # layer must hand it the raw reference image.
+        "reference_image_resizer": passthrough_reference_image_resizer,
     },
     **{
         model_class_name: {
@@ -326,6 +384,42 @@ def should_preserve_reference_image_size(
     spec = _get_spec(model_class_name)
     resolver: ReferenceImageSizeResolver | None = spec.get("reference_image_size_resolver") if spec else None
     return bool(resolver and resolver(model=model, revision=revision))
+
+
+def resize_reference_images(
+    model_class_name: str | None,
+    images: Image.Image | list[Image.Image],
+    *,
+    width: int,
+    height: int,
+    model: str | None,
+    revision: str | None = None,
+) -> Image.Image | list[Image.Image]:
+    """Resize reference images using the model-declared policy.
+
+    Resolution order:
+
+    1. A model-declared ``reference_image_resizer`` hook, when registered.
+    2. The legacy ``reference_image_size_resolver`` boolean: models that opt in
+       receive the raw images untouched (equivalent to a passthrough resizer).
+    3. The default exact-size Lanczos resample.
+
+    This keeps the dimension input path uniform -- every request still carries
+    the standard ``width``/``height`` -- while letting models with custom
+    geometry declare how the shared layer should prepare the reference image.
+    """
+    if model_class_name is None and model is not None:
+        from vllm_omni.diffusion.data import resolve_model_class_name
+
+        model_class_name = resolve_model_class_name(model, revision=revision)
+    spec = _get_spec(model_class_name)
+    resizer: ReferenceImageResizer | None = spec.get("reference_image_resizer") if spec else None
+    if resizer is None:
+        if should_preserve_reference_image_size(model_class_name, model=model, revision=revision):
+            resizer = passthrough_reference_image_resizer
+        else:
+            resizer = default_reference_image_resizer
+    return resizer(images, width=width, height=height, model=model, revision=revision)
 
 
 def should_init_extra_args_for_non_diffusion_stages(model_class_name: str | None) -> bool:
