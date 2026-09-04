@@ -60,6 +60,9 @@ def test_video_pipeline_rejects_non_video_final_outputs(stage_configs):
         "WanDMDPipeline",
         "LingBotWorldCausalDMDPipeline",
         "LongCatVideoAvatarPipeline",
+        "SanaVideoPipeline",
+        "SanaImageToVideoPipeline",
+        "SanaWmPipeline",
     ],
 )
 def test_registered_video_aliases_declare_video_output(model_class_name):
