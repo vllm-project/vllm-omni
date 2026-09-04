@@ -374,3 +374,6 @@ ba = "ba"
 SER = "SER"
 # NumPy ndarray.flags.writeable (canonical flag name, not "writable").
 writeable = "writeable"
+# ARPAbet phoneme symbol (Fish Speech phoneme-control token example, e.g.
+# "IY0"), not a typo of "IT".
+IY = "IY"
