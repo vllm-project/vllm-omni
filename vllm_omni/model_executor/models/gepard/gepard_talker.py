@@ -361,20 +361,6 @@ class GepardTalkerForConditionalGeneration(nn.Module):
                         req_id,
                         undelivered,
                     )
-            elif state.frame_count:
-                # Not a resubmit, so this is a preemption recompute, and it
-                # cannot be recovered: a frame's 31 side-channel codes are not
-                # in the token stream, so the replayed prompt cannot rebuild the
-                # KV that produced the audio already delivered. Generation
-                # restarts from frame 0 and the caller gets two unrelated halves.
-                logger.warning(
-                    "Gepard request %s was preempted after %d frame(s) and is being recomputed; "
-                    "its audio will not continue from where it stopped. Raise the stage's "
-                    "gpu_memory_utilization or lower max_num_seqs to keep requests from being "
-                    "preempted.",
-                    req_id,
-                    state.frame_count,
-                )
             state.curr_embed_for_next = None
             state.frames.clear()
             state.emitted_frames = 0

@@ -48,6 +48,7 @@ MIMO_AUDIO_PIPELINE = PipelineConfig(
                 # the text stream can continue after audio has already ended.
                 "stop_token_ids": [NO_INTERLEAVE_NEXT_TOKEN_ID, _IM_END_TOKEN_ID],
             },
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,

@@ -291,6 +291,43 @@ def test_from_pipeline_config_rejects_full_payload_input_capability_overrides(
 
 
 @pytest.mark.parametrize(
+    ("engine_extras", "cli_overrides"),
+    [
+        ({"recompute_preemption": "allow"}, {}),
+        ({}, {"stage_0_recompute_preemption": "allow"}),
+    ],
+    ids=["deploy", "stage-cli"],
+)
+def test_from_pipeline_config_rejects_recompute_preemption_capability_overrides(
+    engine_extras,
+    cli_overrides,
+):
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    deploy = DeployConfig(
+        stages=[
+            StageDeployConfig(
+                stage_id=0,
+                engine_extras=engine_extras,
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match=r"no structured config owner: recompute_preemption"):
+        VllmOmniConfig.from_pipeline_config(
+            pipeline,
+            user_deploy_config=deploy,
+            cli_overrides=cli_overrides,
+        )
+
+
+def test_from_pipeline_config_projects_topology_recompute_preemption() -> None:
+    omni_config = _from_pipeline_key("qwen3_tts")
+
+    assert omni_config.stage_by_id(0).model_config.recompute_preemption == "fail"
+    assert omni_config.stage_by_id(1).model_config.recompute_preemption == "allow"
+
+
+@pytest.mark.parametrize(
     ("cli_overrides", "stage_id"),
     [
         ({"kv_cache_dtype": "fp8"}, 0),
@@ -648,6 +685,7 @@ def test_sub_config_fields_match_structured_scopes():
         "model_subdir",
         "tokenizer_subdir",
         "requires_full_payload_input",
+        "recompute_preemption",
     }
     vllm_load_fields = {f.name for f in fields(VllmLoadConfig)}
     assert issubclass(OmniStageLoadConfig, VllmLoadConfig)

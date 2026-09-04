@@ -1130,6 +1130,7 @@ def _project_omni_stage_engine_args(
         "custom_process_next_stage_input_func": stage_config.custom_process_next_stage_input_func,
         "model_path_resolver": topology.model_path_resolver,
         "retains_state_across_chunks": topology.retains_state_across_chunks,
+        "recompute_preemption": topology.recompute_preemption,
     }
     engine_args.update(
         {name: copy.deepcopy(value) for name, value in topology_engine_args.items() if value is not None}

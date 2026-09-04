@@ -36,6 +36,7 @@ MOSS_TTS_NANO_PIPELINE = PipelineConfig(
                 # streaming chunk is yielded; keep a hard backstop here.
                 "stop_token_ids": [2],
             },
+            recompute_preemption="fail",
         ),
     ),
 )

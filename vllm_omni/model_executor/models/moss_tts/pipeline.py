@@ -36,6 +36,7 @@ MOSS_TTS_PIPELINE = PipelineConfig(
             sampling_constraints={
                 "detokenize": False,
             },
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,
@@ -67,6 +68,7 @@ MOSS_TTS_REALTIME_PIPELINE = PipelineConfig(
             engine_output_type="latent",
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2codec_raw_async_chunk"),
             sampling_constraints={"detokenize": False},
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,
@@ -101,6 +103,7 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
                 "detokenize": False,
                 "stop_token_ids": [151645],
             },
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,

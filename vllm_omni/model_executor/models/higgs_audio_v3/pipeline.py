@@ -44,6 +44,7 @@ HIGGS_AUDIO_V3_PIPELINE = PipelineConfig(
                 "stop_token_ids": [151643, 151671],
             },
             async_chunk_process_next_stage_input_func=f"{_PROC}.talker2code2wav_async_chunk",
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,

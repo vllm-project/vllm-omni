@@ -41,6 +41,7 @@ DOTS_TTS_PIPELINE = PipelineConfig(
                 # 2-slot continue/stop softmax our compute_logits builds.
                 "stop_token_ids": [1],
             },
+            recompute_preemption="fail",
         ),
     ),
 )

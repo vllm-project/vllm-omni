@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 from pydantic.fields import FieldInfo
+from transformers import Qwen3OmniMoeConfig
 from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
 from vllm.config import LoadConfig as VllmLoadConfig
@@ -48,6 +49,7 @@ from vllm_omni.engine.stage_init_utils import (
     build_engine_args_dict_from_omni_stage_config,
     build_legacy_engine_args_dict,
 )
+from vllm_omni.model_executor.models.gepard.pipeline import GEPARD_PIPELINE
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -764,3 +766,75 @@ def test_typed_engine_args_match_current_registry_backend_semantics(model_type, 
         assert typed_effective_args == legacy_effective_args, (
             f"{model_type} stage {stage_id} changed effective backend arguments"
         )
+
+
+def test_stage_pipeline_config_defaults_recompute_preemption_to_allow() -> None:
+    stage = StagePipelineConfig(stage_id=0, model_stage="test")
+    assert stage.recompute_preemption == "allow"
+
+
+@pytest.mark.parametrize(
+    ("model_type", "stage_ids"),
+    [
+        ("gepard", (0,)),
+        ("voxcpm2", (0,)),
+        ("dots_tts", (0,)),
+        ("moss_tts_nano", (0,)),
+        ("qwen3_tts", (0,)),
+        ("aura_omni", (2,)),
+        ("minimax_music3", (0,)),
+        ("fish_qwen3_omni", (0,)),
+        ("personaplex", (0,)),
+        ("moss_tts_delay", (0,)),
+        ("moss_tts_realtime", (0,)),
+        ("moss_tts_local", (0,)),
+        ("nemotron_voicechat", (1,)),
+        ("voxtral_tts", (0,)),
+        ("higgs_audio_v2", (0,)),
+        ("higgs_multimodal_qwen3", (0,)),
+        ("ming_tts", (0,)),
+        ("ming_tts_moe", (0,)),
+        ("mimo_audio", (0,)),
+        ("qwen3_omni_moe", (1,)),
+        ("qwen2_5_omni", (1,)),
+    ],
+)
+def test_native_ar_tts_pipelines_declare_fail_recompute_preemption(model_type, stage_ids) -> None:
+    # qwen3_omni_moe is a resolver: without HF config it returns None.
+    hf_config = Qwen3OmniMoeConfig(enable_audio_output=True) if model_type == "qwen3_omni_moe" else None
+    pipeline = resolve_pipeline_config(model_type, hf_config)
+    assert pipeline is not None
+    for stage_id in stage_ids:
+        stage = pipeline.get_stage(stage_id)
+        assert stage is not None
+        assert stage.recompute_preemption == "fail"
+
+
+def test_gepard_deploy_merge_projects_fail_recompute_preemption() -> None:
+    deploy = load_deploy_config(_DEPLOY_DIR / "gepard.yaml")
+    merged = merge_pipeline_deploy(GEPARD_PIPELINE, deploy)
+    assert merged[0].yaml_engine_args["recompute_preemption"] == "fail"
+
+
+def test_deploy_engine_extras_cannot_override_recompute_preemption() -> None:
+    gepard_deploy = load_deploy_config(_DEPLOY_DIR / "gepard.yaml")
+    gepard_deploy.stages[0].engine_extras["recompute_preemption"] = "allow"
+    merged_gepard = merge_pipeline_deploy(GEPARD_PIPELINE, gepard_deploy)
+    assert merged_gepard[0].yaml_engine_args["recompute_preemption"] == "fail"
+
+
+@pytest.mark.parametrize("source", ["direct", "stage-overrides"])
+def test_stage_runtime_overrides_cannot_override_recompute_preemption(source: str) -> None:
+    """``--stage-overrides '{"0": {"recompute_preemption": "allow"}}'`` becomes
+    ``stage_0_recompute_preemption`` and is applied in ``to_omegaconf()`` after
+    topology projection. The fail declaration must still win.
+    """
+    gepard_deploy = load_deploy_config(_DEPLOY_DIR / "gepard.yaml")
+    merged = merge_pipeline_deploy(GEPARD_PIPELINE, gepard_deploy)
+    if source == "direct":
+        runtime_overrides = {"recompute_preemption": "allow"}
+    else:
+        runtime_overrides = build_stage_runtime_overrides(0, {"stage_0_recompute_preemption": "allow"})
+    merged[0].runtime_overrides = runtime_overrides
+    cfg = merged[0].to_omegaconf()
+    assert cfg.engine_args.recompute_preemption == "fail"

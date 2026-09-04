@@ -36,6 +36,7 @@ FISH_SPEECH_PIPELINE = PipelineConfig(
                 # <|im_end|> — stop when the model emits end-of-turn.
                 "stop_token_ids": [151645],
             },
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,

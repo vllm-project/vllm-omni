@@ -74,6 +74,7 @@ NEMOTRON_VOICECHAT_PIPELINE = PipelineConfig(
             async_chunk_process_next_stage_input_func=f"{_PROC}.talker2code2wav_async_chunk",
             sync_process_input_func=f"{_PROC}.thinker2talker_token_only",
             sampling_constraints={"detokenize": False},
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=2,
