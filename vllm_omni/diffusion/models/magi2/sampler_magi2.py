@@ -25,7 +25,7 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 
-from .preview_data_proxy import Magi2DataProxy, ModelInput
+from .preview_data_proxy import Magi2DataProxy, Magi2PackedLayout, ModelInput
 
 
 def _pad_or_trim(
@@ -167,6 +167,9 @@ class Magi2PreviewSampler(CFGParallelMixin):
         )
         latent = sampler_input.latent.clone()
         audio_latent = sampler_input.audio_latent.clone()
+        cfg_parallel = get_classifier_free_guidance_world_size() > 1
+        layout = Magi2PackedLayout()
+        branch_layouts = (Magi2PackedLayout(), Magi2PackedLayout())
 
         for timestep, video_cfg, audio_cfg in zip(
             video_timesteps,
@@ -186,9 +189,10 @@ class Magi2PreviewSampler(CFGParallelMixin):
                 ref_image_special_token_embedding=(sampler_input.ref_image_special_token_embedding),
                 t=timestep,
                 cfg_config=sampler_input.cfg_config,
+                layout=None if cfg_parallel else layout,
             )
-            if get_classifier_free_guidance_world_size() > 1:
-                positive_input, negative_input = self._split_cfg_model_input(model_input)
+            if cfg_parallel:
+                positive_input, negative_input = self._split_cfg_model_input(model_input, branch_layouts)
                 guided = self.predict_noise_maybe_with_cfg(
                     do_true_cfg=True,
                     true_cfg_scale=1.0,
@@ -257,6 +261,7 @@ class Magi2PreviewSampler(CFGParallelMixin):
         ref_image_special_token_embedding: torch.Tensor | None = None,
         t: torch.Tensor | float | None = None,
         cfg_config: CFGConfig | None = None,
+        layout: Magi2PackedLayout | None = None,
     ) -> ModelInput:
         self._validate_prepare_inputs(latent, audio_latent, txt_feat, null_txt_feat)
         batch_size = latent.shape[0]
@@ -330,10 +335,14 @@ class Magi2PreviewSampler(CFGParallelMixin):
             ref_image_feat=ref_image_feat_cfg,
             ref_image_feat_len=ref_image_feat_len_cfg,
             ref_image_special_token_embedding=ref_image_special_tokens_cfg,
+            layout=layout,
         )
 
     @staticmethod
-    def _split_cfg_model_input(model_input: ModelInput) -> tuple[ModelInput, ModelInput]:
+    def _split_cfg_model_input(
+        model_input: ModelInput,
+        layouts: tuple[Magi2PackedLayout, Magi2PackedLayout] | None = None,
+    ) -> tuple[ModelInput, ModelInput]:
         """Split the packed positive/negative batch for CFG rank dispatch."""
 
         batch = model_input.x_t.shape[0]
@@ -374,7 +383,10 @@ class Magi2PreviewSampler(CFGParallelMixin):
         }
         branches = []
         for branch in range(2):
-            branches.append(ModelInput(**{name: pair[branch] for name, pair in field_pairs.items()}))
+            branch_layout = None if layouts is None else layouts[branch]
+            branches.append(
+                ModelInput(**{name: pair[branch] for name, pair in field_pairs.items()}, layout=branch_layout)
+            )
         return branches[0], branches[1]
 
     @staticmethod

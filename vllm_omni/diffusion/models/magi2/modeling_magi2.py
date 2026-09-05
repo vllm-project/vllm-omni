@@ -35,6 +35,7 @@ from .layers import (
 )
 from .mh_moe import Magi2MultiHeadMoE, Magi2MultiHeadMoEConfig
 from .parallel import Magi2SequenceDispatcher
+from .preview_data_proxy import Magi2PackedLayout
 
 
 class Modality(IntEnum):
@@ -339,12 +340,10 @@ class Magi2PreAdapter(nn.Module):
     def forward(
         self,
         packed: torch.Tensor,
-        coords_mapping: torch.Tensor,
         video_indices: torch.Tensor,
         audio_indices: torch.Tensor,
         text_indices: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        rope = self.rope(coords_mapping)
+    ) -> torch.Tensor:
         output = torch.zeros(
             packed.shape[0],
             self.adapter_dim,
@@ -369,7 +368,7 @@ class Magi2PreAdapter(nn.Module):
                 video_indices,
                 self.video_embedder(packed.index_select(0, video_indices)[:, : self.config.video_in_channels].float()),
             )
-        return output, rope
+        return output
 
 
 class Magi2PostAdapter(nn.Module):
@@ -637,40 +636,39 @@ class Magi2PreviewTransformer(nn.Module):
         modality_mapping: torch.Tensor,
         varlen_handler: VarlenHandler,
         time_token_sequence: torch.Tensor | None = None,
+        layout: Magi2PackedLayout | None = None,
     ) -> torch.Tensor:
         dispatcher = Magi2SequenceDispatcher()
         x = dispatcher.dispatch(x)
-        coords_mapping = dispatcher.dispatch(coords_mapping)
-        modality_mapping = dispatcher.dispatch(modality_mapping)
         if time_token_sequence is not None:
             time_token_sequence = dispatcher.dispatch(time_token_sequence)
+        if layout is None:
+            layout = Magi2PackedLayout()
+        tokens = layout.tokens
+        if tokens is None:
+            tokens = layout.resolve_tokens(
+                dispatcher.dispatch(modality_mapping),
+                self.pre_adapter.rope(dispatcher.dispatch(coords_mapping)),
+            )
         assert dispatcher.split_sizes is not None
         cp_split_sizes = dispatcher.split_sizes
 
-        time_mask = modality_mapping == int(Modality.TIME)
-        modality_mapping = torch.where(time_mask, int(Modality.TEXT), modality_mapping)
-        modality_dispatcher = ModalityDispatcher(modality_mapping, 3)
-        video_indices = torch.nonzero(modality_mapping == int(Modality.VIDEO)).flatten()
-        audio_indices = torch.nonzero(modality_mapping == int(Modality.AUDIO)).flatten()
-        text_indices = torch.nonzero(modality_mapping == int(Modality.TEXT)).flatten()
-
-        hidden_states, rope = self.pre_adapter(
+        hidden_states = self.pre_adapter(
             x,
-            coords_mapping,
-            video_indices,
-            audio_indices,
-            text_indices,
+            tokens.video_indices,
+            tokens.audio_indices,
+            tokens.text_indices,
         )
         if time_token_sequence is not None and time_token_sequence.shape[-1] > 0:
             hidden_states[:, : time_token_sequence.shape[-1]] = time_token_sequence.to(hidden_states.dtype)
         hidden_states = self.block(
             hidden_states,
-            rope,
+            tokens.rope,
             varlen_handler,
-            modality_dispatcher,
+            tokens.dispatcher,
             cp_split_sizes,
         )
-        output = self.post_adapter(hidden_states, video_indices, audio_indices)
+        output = self.post_adapter(hidden_states, tokens.video_indices, tokens.audio_indices)
         return dispatcher.undispatch(output)
 
     def _moe_for_weight(self, name: str) -> Magi2MultiHeadMoE | None:
