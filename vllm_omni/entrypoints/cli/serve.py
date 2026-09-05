@@ -779,6 +779,18 @@ class OmniServeCommand(CLISubcommand):
                 "under the existing pinned-memory policy and fall back to bounded staging when unavailable."
             ),
         )
+        omni_config_group.add_argument(
+            "--dlo-offload-components",
+            type=json.loads,
+            default=None,
+            metavar="JSON",
+            help=(
+                "Per auxiliary encoder/VAE DLO policy as a JSON object, for example "
+                "'{\"text_encoder\": false}'. False keeps the whole component "
+                "resident; true permits the model's existing offload behavior. "
+                "DiT offload is not controlled by this map."
+            ),
+        )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
             "--boundary-ratio",

@@ -1582,7 +1582,7 @@ class MiniMaxH3Pipeline(
             with sequential_offload_component(component):
                 yield
             return
-        staged = self._uses_manual_component_offload()
+        staged = self._uses_manual_component_offload() and getattr(component, "_omni_dlo_offload_enabled", True)
         try:
             if staged:
                 component.load_to_device()

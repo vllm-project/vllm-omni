@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
@@ -52,6 +53,9 @@ class OffloadConfig:
     # blocks from the loader-selected host backing with H2D only.
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = 0  # leading DiT layers kept on device
+    # Per auxiliary component: True permits model-declared DLO offload;
+    # False keeps the whole component resident. "default" is the fallback.
+    dlo_offload_components: dict[str, bool] = field(default_factory=dict)
     # Optional per-worker ceiling for registering an HWR mmap. Zero means no
     # additional ceiling; pin_cpu_memory controls whether registration is tried.
     dlo_host_registration_limit_gib: float = 0.0
@@ -125,6 +129,25 @@ class OffloadConfig:
         # requirements (concurrent requests, dummy run skip).
         dlo_use_allgather = getattr(od_config, "dlo_use_allgather", True)
         dlo_resident_layers = int(getattr(od_config, "dlo_resident_layers", 0))
+        raw_component_policy = getattr(od_config, "dlo_offload_components", {})
+        if raw_component_policy is None:
+            raw_component_policy = {}
+        if not isinstance(raw_component_policy, Mapping):
+            raise TypeError(
+                "dlo_offload_components must be a mapping of component names to booleans, "
+                f"got {type(raw_component_policy).__name__}"
+            )
+        dlo_offload_components: dict[str, bool] = {}
+        for component, enabled in raw_component_policy.items():
+            if not isinstance(component, str) or not component:
+                raise TypeError("dlo_offload_components keys must be non-empty strings")
+            if not isinstance(enabled, bool):
+                raise TypeError(
+                    f"dlo_offload_components[{component!r}] must be a boolean, got {type(enabled).__name__}"
+                )
+            dlo_offload_components[component] = enabled
+        if dlo_offload_components and not enable_distributed_layerwise_offload:
+            raise ValueError("dlo_offload_components requires distributed layerwise offload")
         dlo_host_registration_limit_gib = validate_dlo_host_registration_options(
             limit_gib=getattr(od_config, "dlo_host_registration_limit_gib", 0.0),
             enable_dlo=enable_distributed_layerwise_offload,
@@ -166,6 +189,7 @@ class OffloadConfig:
             dp_size=dp_size,
             dlo_use_allgather=dlo_use_allgather,
             dlo_resident_layers=dlo_resident_layers,
+            dlo_offload_components=dlo_offload_components,
             dlo_host_registration_limit_gib=dlo_host_registration_limit_gib,
         )
 

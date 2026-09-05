@@ -817,6 +817,9 @@ class OmniDiffusionConfig:
     dlo_use_allgather: bool = True
     # Leading main-DiT blocks kept resident by distributed layerwise offload.
     dlo_resident_layers: int = 0
+    # Auxiliary encoder/VAE policy. False keeps the whole component resident;
+    # DiT offload remains owned by DLO.
+    dlo_offload_components: dict[str, bool] = field(default_factory=dict)
     # Final-layout Host Weight Runtime policy. The loader only activates this
     # for eligible no-AllGather DLO; all other configurations preserve their
     # existing loader/storage path.

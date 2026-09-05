@@ -712,6 +712,7 @@ class _DiffusionConfigProjection:
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = Field(default=0, ge=0)
+    dlo_offload_components: dict[str, bool] = Field(default_factory=dict)
     host_weight_runtime_mode: Literal["disabled", "preferred", "required"] = "disabled"
     host_weight_runtime_root: str | None = None
     dlo_host_registration_limit_gib: float = Field(default=0.0, ge=0)

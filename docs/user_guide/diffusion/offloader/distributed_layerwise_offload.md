@@ -36,7 +36,8 @@ vllm serve /path/to/model --omni \
 vllm serve /path/to/model --omni \
   --enable-distributed-layerwise-offload \
   --data-parallel-size 4 \
-  --dlo-no-use-allgather
+  --dlo-no-use-allgather \
+  --dlo-offload-components '{"text_encoder": false}'
 
 # Sequence parallel deployment
 vllm serve /path/to/model --omni \
@@ -51,6 +52,7 @@ omni = Omni(
     model="/path/to/model",
     enable_distributed_layerwise_offload=True,
     dlo_use_allgather=True,
+    dlo_offload_components={"text_encoder": False},
 )
 ```
 
@@ -63,6 +65,7 @@ omni = Omni(
 | `--dlo-use-allgather` | Shard host weights and reconstruct with AllGather | `true` |
 | `--dlo-no-use-allgather` | Stream complete rank-local blocks without a DLO weight collective | `false` |
 | `--dlo-resident-layers N` | Keep N leading main-DiT blocks on device; requires no-AllGather and model-declared resident paths | `0` |
+| `--dlo-offload-components JSON` | Permit or disable offload for discovered encoder/VAE components | `{}` |
 | `--host-weight-runtime-mode {disabled,preferred,required}` | HWR policy: no interaction, populate on a miss, or require an exact hit | `disabled` |
 | `--host-weight-runtime-root PATH` | Writable node-local HWR store shared by workers in one storage domain; required for `preferred` and `required` | unset |
 | `--dlo-host-registration-limit-gib N` | Optional per-worker ceiling for registering an HWR mmap; zero adds no ceiling | `0` |
@@ -250,6 +253,25 @@ class MyPipeline(nn.Module):
 When no plan exists, discovery falls back to
 `_layerwise_offload_blocks_attrs` and then heuristic attribute lookup.
 
+## Auxiliary component policy
+
+`dlo_offload_components` follows the same component-map style as diffusion
+quantization. Keys are discovered encoder or VAE paths, values are booleans,
+and `default` is the optional fallback:
+
+```python
+dlo_offload_components = {
+    "text_encoder": False,
+    "default": True,
+}
+```
+
+`True` permits the model's existing DLO behavior for that component. `False`
+keeps the whole component resident, including its child blocks and non-block
+modules. An empty map preserves current behavior. Unknown keys are rejected;
+the map does not control DiT blocks because enabling DLO gives the backend
+ownership of DiT streaming.
+
 ## Data-parallel concurrency
 
 With `data_parallel_size > 1` and AllGather enabled, the scheduler can process
@@ -274,6 +296,13 @@ must enter each collective.
   are validated.
 - Resident leading layers require `--dlo-no-use-allgather` and a model
   `OffloadPlan` that declares eligible `resident_dit_paths`.
+- Component policy applies only to discovered auxiliary encoders and VAEs;
+  it cannot disable DLO for a DiT.
+- MiniMax-H3's encoder TP group is global rather than DP-replica-local. An
+  encoder TP size that spans multiple DP replicas (for example TP4 with
+  DP2/TP2 or DP2/SP2 on four ranks) is not supported for independent-prompt
+  AllGather waves: the current pipeline broadcasts rank 0's conditioning to
+  both replicas. This limitation is independent of the component policy.
 - DP concurrency requires an explicit, identical inference-step count.
 
 Sharing quantized or otherwise unvalidated transformed layouts through a

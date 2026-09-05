@@ -99,3 +99,22 @@ def test_manual_component_offload_failure_forces_retained_cache_release(mocker):
     assert component.load_to_device.call_count == 2
     assert component.offload_to_cpu.call_count == 2
     pipeline._dlo_component_cache.release_if_needed.assert_called_once_with(force=True)
+
+
+def test_resident_component_skips_manual_dlo_lifecycle(mocker):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = mocker.Mock()
+    pipeline.od_config.enable_layerwise_offload = False
+    pipeline.od_config.enable_distributed_layerwise_offload = True
+    pipeline._model_cpu_offload_modules = []
+    component = mocker.Mock()
+    component._omni_dlo_offload_enabled = False
+
+    with pipeline._component_on_device(component):
+        pass
+
+    component.load_to_device.assert_not_called()
+    component.offload_to_cpu.assert_not_called()

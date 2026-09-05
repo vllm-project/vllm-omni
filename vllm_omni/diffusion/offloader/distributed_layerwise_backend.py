@@ -43,7 +43,7 @@ from .host_registration import (
     HostRegistrationError,
     register_host_mappings,
 )
-from .module_collector import ModuleDiscovery
+from .module_collector import ModuleDiscovery, PipelineModules
 from .offload_plan import (
     OffloadPlan,
     get_offload_plan,
@@ -1400,6 +1400,39 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         module.to(self.device)
         logger.info("Moved %s (%s) to GPU (resident)", label, module.__class__.__name__)
 
+    def _component_offload_enabled(self, name: str) -> bool:
+        policy = self.config.dlo_offload_components
+        return policy.get(name, policy.get("default", True))
+
+    def _validate_component_offload_policy(self, modules: PipelineModules) -> None:
+        known_components = {"default", *modules.encoder_names, *modules.vae_names}
+        unknown = sorted(self.config.dlo_offload_components.keys() - known_components)
+        if unknown:
+            raise ValueError(
+                f"dlo_offload_components contains unknown auxiliary components: {unknown}. DLO always owns DiT offload."
+            )
+
+    def _prepare_auxiliary_components(self, modules: PipelineModules, plan: OffloadPlan | None) -> None:
+        for encoder, name in zip(modules.encoders, modules.encoder_names, strict=True):
+            offload = self._component_offload_enabled(name)
+            encoder._omni_dlo_offload_enabled = offload
+            if offload:
+                self._try_layerwise_offload_encoder(encoder, name, plan)
+            self._register_on_demand_hook(
+                encoder,
+                name,
+                stage_on_demand=(offload and plan is not None and name in plan.on_demand_component_paths),
+            )
+
+        for vae, name in zip(modules.vaes, modules.vae_names, strict=True):
+            offload = self._component_offload_enabled(name)
+            vae._omni_dlo_offload_enabled = offload
+            self._register_on_demand_hook(
+                vae,
+                name,
+                stage_on_demand=(offload and plan is not None and name in plan.on_demand_component_paths),
+            )
+
     def _try_layerwise_offload_encoder(self, module: nn.Module, name: str, plan: OffloadPlan | None) -> bool:
         """Stream plan-declared encoder blocks on each rank without AllGather."""
         if plan is None or name not in plan.encoder_block_attrs:
@@ -1668,6 +1701,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # Retrieve optional declarative OffloadPlan from the pipeline.
         # When present, replaces heuristic block discovery.
         plan = get_offload_plan(pipeline)
+        self._validate_component_offload_policy(modules)
 
         if self.config.dlo_resident_layers and (plan is None or not plan.resident_dit_paths):
             logger.warning(
@@ -1728,21 +1762,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 )
             logger.info("DLO is using host tensors materialized by the ordinary loader")
 
-        # Keep VAE/encoders on CPU; move to GPU on-demand via hooks.
-        # This saves ~4.3 GB HBM per card (VAE 1.3 + encoder 1.1 + sound 1.9)
-        # during the DiT forward pass.  They are only needed briefly for
-        # text-encoding (before DiT) and VAE-decode (after DiT).
-        for enc, enc_name in zip(modules.encoders, modules.encoder_names):
-            self._try_layerwise_offload_encoder(enc, enc_name, plan)
-            self._register_on_demand_hook(
-                enc, "encoder", stage_on_demand=plan is not None and enc_name in plan.on_demand_component_paths
-            )
-        for vae, vae_name in zip(modules.vaes, modules.vae_names):
-            self._register_on_demand_hook(
-                vae,
-                "vae",
-                stage_on_demand=(plan is not None and vae_name in plan.on_demand_component_paths),
-            )
+        # Apply the user policy to discovered auxiliary components. The default
+        # keeps the model-declared staged lifecycle; False leaves a component
+        # resident for repeated requests.
+        self._prepare_auxiliary_components(modules, plan)
 
         # Move resident modules to GPU (small modules needed every forward)
         for name, module in zip(modules.resident_names, modules.resident_modules):

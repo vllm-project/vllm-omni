@@ -426,7 +426,7 @@ def test_serve_cli_forwards_distilled_lora_to_diffusion_stage():
     ]
 
 
-def test_serve_cli_forwards_distributed_offload_residency():
+def test_serve_cli_forwards_distributed_offload_options():
     """Ensure the two-GPU DLO placement controls reach the diffusion stage."""
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
@@ -441,6 +441,8 @@ def test_serve_cli_forwards_distributed_offload_residency():
             "--dlo-no-use-allgather",
             "--dlo-resident-layers",
             "20",
+            "--dlo-offload-components",
+            '{"text_encoder": false, "default": true}',
         ]
     )
 
@@ -451,9 +453,14 @@ def test_serve_cli_forwards_distributed_offload_residency():
     assert args.enable_distributed_layerwise_offload is True
     assert args.dlo_use_allgather is False
     assert args.dlo_resident_layers == 20
+    assert args.dlo_offload_components == {"text_encoder": False, "default": True}
     assert engine_args["enable_distributed_layerwise_offload"] is True
     assert engine_args["dlo_use_allgather"] is False
     assert engine_args["dlo_resident_layers"] == 20
+    assert engine_args["dlo_offload_components"] == {
+        "text_encoder": False,
+        "default": True,
+    }
 
 
 def test_serve_cli_forwards_hwr_policy_for_no_allgather_dlo():

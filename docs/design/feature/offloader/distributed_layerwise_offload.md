@@ -31,6 +31,7 @@ Legend: ✅ supported, ⚠️ compatibility path or limited validation, ❌ unsu
 | **Other online quantization methods** | ❌ Rejected until runtime packing and scale layouts are validated. | ⚠️ Allowed through the ordinary loader; validation is method-specific. |
 | **Model-level or standard layerwise CPU offload** | ❌ Disabled because DLO takes priority. | ❌ Disabled because DLO takes priority. |
 | **Resident leading layers** | ❌ Rejected. | ✅ Requires eligible resident paths in the model's `OffloadPlan`. |
+| **Auxiliary component policy** | ✅ Encoders/VAEs may remain resident. | ✅ Encoders/VAEs may remain resident. |
 
 See [Parallelism compatibility](#parallelism-compatibility) and
 [Request and loading constraints](#request-and-loading-constraints) for the
@@ -427,6 +428,22 @@ failure.
 - **HSDP + DP or TP:** rejected independently by the diffusion parallel
   configuration.
 
+### Auxiliary component policy
+
+`dlo_offload_components` maps discovered encoder/VAE paths to booleans. A
+component set to `False` is materialized on the target device once and is not
+entered through the model's manual offload lifecycle. A `True` value permits
+the existing `OffloadPlan.on_demand_component_paths` and encoder block-hook
+behavior; it does not add support where the model declares none. The optional
+`default` key handles unmatched auxiliary components, and an empty map
+preserves the current policy.
+
+The policy is resolved after component discovery and before DLO mutates DiT
+storage. Unknown names, including DiT paths, are rejected. DLO continues to
+own DiT streaming regardless of this map, which avoids an invalid state where
+the loader has skipped ordinary DiT materialization but the backend is asked
+to keep that DiT resident.
+
 ## Request and loading constraints
 
 AllGather DP multi-concurrency requires:
@@ -437,6 +454,15 @@ AllGather DP multi-concurrency requires:
 
 The no-AllGather path does not impose these DLO-specific synchronized-wave
 requirements.
+
+MiniMax-H3 currently builds one global encoder TP group and broadcasts the
+resulting conditioning from global rank 0. Therefore an encoder TP group that
+spans multiple DP replicas is not valid for independent-prompt AllGather
+waves. Exact-recipe DP2/TP2 and DP2/SP2 experiments with encoder TP4 completed
+the collective schedule, but two distinct prompts with the same seed produced
+byte-identical video and audio in every measured wave. Enabling or disabling
+encoder offload produced paired-identical results, so this is a pre-existing
+model topology limitation rather than component-policy behavior.
 
 Direct checkpoint mmap can back either transfer path. It is currently limited
 to proven TP1, non-HSDP, non-online-quantized layouts. Other layouts use the
@@ -505,6 +531,9 @@ ordinary loader as designed; no-AllGather PSS was 314.01 GiB, about 48% above
 AllGather, because DP replicas did not share checkpoint-backed runtime
 weights. This is a functional and memory smoke test, not a production-quality
 performance or output-quality benchmark.
+
+These B300 DP waves intentionally reused the same prompt and seed, so they do
+not establish independent-prompt isolation across DP replicas.
 
 ### Host-memory measurement
 

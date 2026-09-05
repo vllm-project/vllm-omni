@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Validate MiniMax-H3 request-mode and DLO lifecycle behavior.
 
 The DLO modes accept any positive data-parallel size.  With AllGather enabled,
@@ -85,12 +85,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=768)
     parser.add_argument("--batch-wait-ms", type=float, default=500.0)
     parser.add_argument("--init-timeout", type=float, default=1800.0)
+    parser.add_argument(
+        "--dlo-offload-components",
+        type=json.loads,
+        default=None,
+        help="Component policy JSON, e.g. '{\"text_encoder\": false}'",
+    )
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
 
 def engine_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     is_dlo = args.mode in {"dlo", "dlo-no-allgather"}
+    if args.dlo_offload_components and not is_dlo:
+        raise ValueError("--dlo-offload-components requires a DLO mode")
     common: dict[str, Any] = {
         "model": args.model,
         "trust_remote_code": True,
@@ -114,6 +122,7 @@ def engine_kwargs(args: argparse.Namespace) -> dict[str, Any]:
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=args.mode == "dlo",
             dlo_resident_layers=0,
+            dlo_offload_components=({} if args.dlo_offload_components is None else args.dlo_offload_components),
         )
     else:
         common.update(
