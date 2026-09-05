@@ -255,6 +255,11 @@ def test_arch_matching_is_a_fallback_not_an_override():
     assert detect_tts_model_type("ming_tts", "MingTTSForConditionalGeneration") == "ming_flash_omni_tts"
 
 
+def test_shared_latent_generator_resolves_by_architecture_priority():
+    assert detect_tts_model_type("latent_generator", "VoxCPM2TalkerForConditionalGeneration") == "voxcpm2"
+    assert detect_tts_model_type("latent_generator", "DotsTTSForConditionalGeneration") == "dots_tts"
+
+
 def test_stage_keys_cover_legacy_stage_set():
     """No stage key was dropped when the module constants were deleted."""
     assert _LEGACY_TTS_MODEL_STAGES <= all_tts_stage_keys()

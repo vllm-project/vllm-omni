@@ -7,15 +7,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_omni.engine.duplex.contracts import duplex_resource_request_id
+from vllm_omni.engine.duplex.messages import DuplexFence
 from vllm_omni.engine.messages import OutputMessage, StageMetricsMessage
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
+from vllm_omni.entrypoints.duplex.protocol import DuplexSession, DuplexSessionConfig, DuplexTurnState
+from vllm_omni.entrypoints.duplex_request_client import DuplexRequestClient, DuplexRequestOutputPort
 from vllm_omni.entrypoints.omni_base import OmniBase
-from vllm_omni.experimental.fullduplex.engine.contracts import duplex_resource_request_id
-from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
-from vllm_omni.experimental.fullduplex.openai.protocol import DuplexSession, DuplexSessionConfig, DuplexTurnState
-from vllm_omni.experimental.fullduplex.output import attach_duplex_output_decision
-from vllm_omni.experimental.fullduplex.request_client import DuplexRequestClient, DuplexRequestOutputPort
 from vllm_omni.metrics.duplex_turn import (
     DuplexTurnMetrics,
     accumulate_turn_stage_metrics,
@@ -26,6 +25,7 @@ from vllm_omni.metrics.duplex_turn import (
 )
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats, StageStats
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.duplex import attach_duplex_output_decision
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -429,7 +429,7 @@ async def test_signal_barge_in_finalizes_before_pop(mocker) -> None:
         reasons.append(captured_turn.finished_reason or "")
         return emitted
 
-    mocker.patch("vllm_omni.experimental.fullduplex.request_client.finalize_duplex_turn_metrics", capture_finalize)
+    mocker.patch("vllm_omni.entrypoints.duplex_request_client.finalize_duplex_turn_metrics", capture_finalize)
 
     async def signal_duplex_turn_async(session_id, **kwargs):
         return {"ok": True}
@@ -480,7 +480,7 @@ async def test_close_open_turn_emits_close(mocker) -> None:
         reasons.append(captured_turn.finished_reason or "")
         return emitted
 
-    mocker.patch("vllm_omni.experimental.fullduplex.request_client.finalize_duplex_turn_metrics", capture_finalize)
+    mocker.patch("vllm_omni.entrypoints.duplex_request_client.finalize_duplex_turn_metrics", capture_finalize)
     client = _client()
     turn = client.begin_turn_metrics(request_id, response_id="resp-close", turn_id=1, arrival_ts=1.0)
     accumulate_turn_stage_metrics(turn, 0, _stage_stats(num_tokens_out=1, stage_gen_time_ms=4.0))
@@ -645,12 +645,12 @@ def test_chat_request_does_not_buffer_duplex_pending() -> None:
 
 
 def test_mark_turn_arrival_stamps_before_begin(mocker) -> None:
-    mocker.patch("vllm_omni.experimental.fullduplex.request_client.time.time", return_value=42.0)
+    mocker.patch("vllm_omni.entrypoints.duplex_request_client.time.time", return_value=42.0)
     client = _client()
     request_id = _request_id()
     ts = client.mark_turn_arrival(request_id)
     assert ts == 42.0
-    mocker.patch("vllm_omni.experimental.fullduplex.request_client.time.time", return_value=99.0)
+    mocker.patch("vllm_omni.entrypoints.duplex_request_client.time.time", return_value=99.0)
     assert client.mark_turn_arrival(request_id) == 42.0
     turn = client.begin_turn_metrics(request_id, response_id="resp-arr")
     assert turn is not None

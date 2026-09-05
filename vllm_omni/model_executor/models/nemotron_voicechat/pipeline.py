@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """NemotronVoiceChat pipeline: thinker (speech -> frame-locked text) -> talker
 (text timeline -> 31-quantizer RVQ code stacks) -> code2wav (codes -> 22.05 kHz PCM).
 
@@ -32,10 +32,10 @@ NEMOTRON_VOICECHAT_PIPELINE = PipelineConfig(
     model_type="nemotron_voicechat",
     model_arch="NemotronVoiceChatThinkerForConditionalGeneration",
     duplex_runtime_extension=(
-        "vllm_omni.experimental.fullduplex.nemotron_voicechat.runtime.NemotronVoiceChatDuplexRuntimeExtension"
+        "vllm_omni.model_executor.models.nemotron_voicechat.duplex.runtime.NemotronVoiceChatDuplexRuntimeExtension"
     ),
     duplex_serving_adapter=(
-        "vllm_omni.experimental.fullduplex.nemotron_voicechat.serving_adapter.NemotronVoiceChatServingRuntimeAdapter"
+        "vllm_omni.model_executor.models.nemotron_voicechat.duplex.serving_adapter.NemotronVoiceChatServingRuntimeAdapter"
     ),
     duplex_control_enabled=True,
     # Named after the alias key so the deploy-yaml stem substring-matches the

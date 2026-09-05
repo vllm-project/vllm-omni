@@ -320,13 +320,23 @@ def _resolve_scheduler_path(execution_type: StageExecutionType, async_scheduling
     return _scheduler_path(_resolve_scheduler(execution_type, async_scheduling))
 
 
-def _stage_cli_overrides(stage_id: int, cli_overrides: Mapping[str, Any]) -> dict[str, Any]:
+def _stage_cli_overrides(
+    stage_id: int,
+    cli_overrides: Mapping[str, Any],
+    *,
+    execution_type: StageExecutionType | None = None,
+) -> dict[str, Any]:
     runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
     global_stage_fields = _global_stage_cli_fields()
     result: dict[str, Any] = {}
     for key, value in runtime_overrides.items():
         if key in global_stage_fields or f"stage_{stage_id}_{key}" in cli_overrides:
             result[key] = _copy_value(value)
+
+    # step_execution is a diffusion execution protocol, not an LLM engine
+    # argument. Keep global and stage-scoped CLI values off AR/generation stages.
+    if execution_type is not None and execution_type is not StageExecutionType.DIFFUSION:
+        result.pop("step_execution", None)
     return result
 
 
@@ -1878,7 +1888,11 @@ class VllmOmniConfig:
                 _stage_engine_values(
                     deploy_by_id.get(topology.stage_id),
                     topology,
-                    _stage_cli_overrides(topology.stage_id, cli_overrides),
+                    _stage_cli_overrides(
+                        topology.stage_id,
+                        cli_overrides,
+                        execution_type=topology.execution_type,
+                    ),
                 ),
                 model=model,
             )

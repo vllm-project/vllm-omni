@@ -22,7 +22,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urljoin, urlsplit
 
 import pybase64 as base64
@@ -33,24 +33,27 @@ from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
     OmniInteractPreparedInput,
     case_manifest,
 )
-from vllm_omni.experimental.fullduplex.client import (
-    PCM16_BYTES_PER_SAMPLE,
-    PCM16_SAMPLE_RATE,
-    RealtimeDuplexClient,
-    RealtimeEventCollector,
-    build_realtime_url,
-    chunk_period_ms,
-    has_residual_model_unit,
-    reference_audio_data_url,
-    summarize_session_request_metrics,
-    write_pcm16_wav,
-)
 
+# The duplex client library (vllm_omni.clients) is imported lazily inside the
+# functions that need it: this module reaches the CLI import graph through the
+# benchmark patch package (`vllm-omni serve` included), and the client package
+# must stay out of that graph
+# (tests/engine/test_duplex_import_boundary.py enforces the boundary).
+if TYPE_CHECKING:
+    from vllm_omni.clients.duplex import EventCollector, WebSocketTransport
+
+# The duplex input wire format (16 kHz mono PCM16); mirrors
+# vllm_omni.clients.duplex without importing it at module scope.
+PCM16_SAMPLE_RATE = 16_000
+PCM16_BYTES_PER_SAMPLE = 2
 OUTPUT_SAMPLE_RATE = 24_000
 SUCCESS_ARTIFACTS = (".done", "output.wav", "wav_transcript.json", "events.json", "result.json")
 BATCH_ARTIFACTS = ("batch_summary.json", "official_eval_manifest.jsonl")
 ARTIFACT_LOCK_FILE = ".omniinteract.lock"
 _INPUT_CHUNK_MS = 200
+# Minimum new played audio between two incremental playback.ack sends for one
+# response; completion acks always flush regardless of the step.
+_ACK_STEP_MS = 200
 VIDEO_FPS = 1.0
 _COMPLETION_SETTLE_S = 2.0
 logger = logging.getLogger(__name__)
@@ -215,12 +218,13 @@ class _Playback:
         self.warnings: list[str] = []
         self._total_samples: dict[str, int] = {}
         self._response_end_s: dict[str, float] = {}
+        self._acked_ms: dict[str, int] = {}
 
     def _warn_once(self, warning: str) -> None:
         if warning not in self.warnings:
             self.warnings.append(warning)
 
-    def ingest(self, events: RealtimeEventCollector) -> None:
+    def ingest(self, events: EventCollector) -> None:
         while self.cursor < len(events.events):
             index, self.cursor = self.cursor, self.cursor + 1
             event = events.events[index]
@@ -260,21 +264,52 @@ class _Playback:
             self._total_samples[response_id] = self._total_samples.get(response_id, 0) + samples
             self._response_end_s[response_id] = segment.end_s
 
-    async def acknowledge(self, client: RealtimeDuplexClient, now: float | None = None) -> None:
+    async def acknowledge(self, client: _RealtimeSession, now: float | None = None) -> None:
+        """Ack playback progress incrementally along the serialized clock.
+
+        A real listener reports cumulative played audio while it plays, not
+        once after the fact. The first ack for a response goes out as soon as
+        its audio starts arriving, whatever the played amount: it checkpoints
+        the response's history position on the server, so a user input
+        committed later updates that slot in place instead of displacing it.
+        Later acks follow ``_ACK_STEP_MS``, with the exact total at drain.
+        """
         events = client.events
         self.ingest(events)
         now = time.monotonic() if now is None else now
-        for response_id in self.completed - self.completion_acked:
-            total_samples = self._total_samples.get(response_id, 0)
-            if not total_samples or now < self._response_end_s[response_id]:
+        for response_id, total_samples in self._total_samples.items():
+            if response_id in self.completion_acked:
                 continue
-            played_ms = total_samples * 1000 // OUTPUT_SAMPLE_RATE
+            acked_ms = self._acked_ms.get(response_id)
+            if response_id in self.completed and now >= self._response_end_s[response_id]:
+                played_ms = total_samples * 1000 // OUTPUT_SAMPLE_RATE
+                if acked_ms is None or played_ms > acked_ms:
+                    await client.send_playback_ack(response_id, played_ms)
+                    self._acked_ms[response_id] = played_ms
+                self.completion_acked.add(response_id)
+                continue
+            played_ms = self._played_ms(response_id, now)
+            if acked_ms is not None and played_ms - acked_ms < _ACK_STEP_MS:
+                continue
             await client.send_playback_ack(response_id, played_ms)
-            self.completion_acked.add(response_id)
+            self._acked_ms[response_id] = played_ms
+
+    def _played_ms(self, response_id: str, now: float) -> int:
+        """Cumulative audio of one response played by ``now`` on the serial clock."""
+        played_samples = 0
+        for segment in self.segments:
+            if segment.response_id != response_id or now <= segment.start_s:
+                continue
+            samples = len(segment.pcm16) // PCM16_BYTES_PER_SAMPLE
+            if now >= segment.end_s:
+                played_samples += samples
+            else:
+                played_samples += min(samples, int((now - segment.start_s) * OUTPUT_SAMPLE_RATE + 0.5))
+        return played_samples * 1000 // OUTPUT_SAMPLE_RATE
 
 
 async def stream_inputs(
-    client: RealtimeDuplexClient,
+    client: _RealtimeSession,
     pcm: bytes,
     frames: Sequence[str | None],
     playback: _Playback,
@@ -319,7 +354,7 @@ def _response_status(event: dict[str, object]) -> str | None:
 
 
 def response_ledger(
-    collector: RealtimeEventCollector,
+    collector: EventCollector,
     *,
     end: int | None = None,
 ) -> tuple[set[str], set[str]]:
@@ -357,7 +392,7 @@ def _is_model_listen_decision(event: dict[str, object]) -> bool:
 
 
 def _has_post_commit_decision(
-    collector: RealtimeEventCollector,
+    collector: EventCollector,
     events: list[dict[str, object]],
     *,
     prior_response_ids: set[str],
@@ -377,15 +412,34 @@ def _has_post_commit_decision(
     return False
 
 
+# An ack computed just before a commit event was delivered can still lose the
+# race server-side; the response it acks was already superseded, so the
+# refusal is harmless — record it instead of failing the case.
+_TOLERATED_ERROR_CODES = frozenset({"playback_ack_too_late"})
+
+
+def _error_code(event: dict[str, object]) -> str | None:
+    error = event.get("error")
+    code = error.get("code") if isinstance(error, dict) else event.get("code")
+    return code if isinstance(code, str) else None
+
+
 def _raise_if_session_terminated(
-    collector: RealtimeEventCollector,
+    collector: EventCollector,
     from_index: int,
     *,
     explicit_close_from: int | None = None,
+    warnings: list[str] | None = None,
 ) -> None:
     errors = collector.errors()
-    if errors:
-        raise RuntimeError(str(errors[-1]))
+    fatal = [event for event in errors if _error_code(event) not in _TOLERATED_ERROR_CODES]
+    if fatal:
+        raise RuntimeError(str(fatal[-1]))
+    if warnings is not None:
+        for event in errors:
+            warning = f"tolerated in-flight server rejection: {_error_code(event)}"
+            if warning not in warnings:
+                warnings.append(warning)
     for index, event in enumerate(collector.events[from_index:], start=from_index):
         event_type = event.get("type")
         if event_type not in {"session.expired", "session.closed"}:
@@ -416,6 +470,8 @@ def _ensure_final_commit_tail(pcm: bytes, events: list[dict[str, object]]) -> by
     that correlation; the server pads the missing sample back to a full unit.
     """
 
+    from vllm_omni.clients.duplex import chunk_period_ms, has_residual_model_unit
+
     period_ms = chunk_period_ms(events)
     if len(pcm) >= PCM16_BYTES_PER_SAMPLE and not has_residual_model_unit(pcm, chunk_period_ms=period_ms):
         return pcm[:-PCM16_BYTES_PER_SAMPLE]
@@ -423,7 +479,7 @@ def _ensure_final_commit_tail(pcm: bytes, events: list[dict[str, object]]) -> by
 
 
 async def wait_for_session_completion(
-    client: RealtimeDuplexClient,
+    client: _RealtimeSession,
     playback: _Playback,
     *,
     commit_from: int,
@@ -438,7 +494,11 @@ async def wait_for_session_completion(
     stable_since = time.monotonic()
     while time.monotonic() < deadline:
         client.raise_if_reader_stopped()
-        _raise_if_session_terminated(client.events, commit_from if session_from is None else session_from)
+        _raise_if_session_terminated(
+            client.events,
+            commit_from if session_from is None else session_from,
+            warnings=playback.warnings,
+        )
         await playback.acknowledge(client)
         if len(client.events.events) != last_event_count:
             last_event_count = len(client.events.events)
@@ -522,6 +582,8 @@ def _atomic_write_json(path: Path, value: object) -> None:
 
 
 def _atomic_write_wav(path: Path, pcm: bytes | bytearray, rate: int) -> None:
+    from vllm_omni.clients.duplex import write_pcm16_wav
+
     _atomic_replace(
         path,
         lambda temporary: write_pcm16_wav(
@@ -578,7 +640,7 @@ def _publish_success_artifacts(
 
 
 def _collect_output(
-    collector: RealtimeEventCollector,
+    collector: EventCollector,
     playback: _Playback,
     *,
     stream_start: float,
@@ -677,7 +739,7 @@ def _collect_output(
 def prepare_success_artifacts(
     root: Path,
     case: OmniInteractCase,
-    collector: RealtimeEventCollector,
+    collector: EventCollector,
     *,
     playback: _Playback | None = None,
     stream_start: float,
@@ -770,6 +832,8 @@ def _websocket_url(config: OmniInteractBenchmarkConfig, session_id: str) -> str:
         if urlsplit(config.endpoint).scheme
         else urljoin(config.base_url.rstrip("/") + "/", config.endpoint.lstrip("/"))
     )
+    from vllm_omni.clients.duplex import build_realtime_url
+
     return build_realtime_url(
         endpoint,
         config.model,
@@ -779,9 +843,121 @@ def _websocket_url(config: OmniInteractBenchmarkConfig, session_id: str) -> str:
     )
 
 
+class _RealtimeSession:
+    """The public :class:`DuplexClient` behind the benchmark's session surface.
+
+    The case runner works in event-cursor style over one growing collector,
+    so this wrapper pairs a ``DuplexClient`` with an :class:`EventCollector`
+    fed by a background consumer task and exposes the few calls the runner
+    needs: raw sends, the final commit, cumulative playback acks, reader
+    liveness checks, and a confirmed close.
+    """
+
+    _MAX_FRAME_BYTES = 64 * 1024 * 1024
+
+    def __init__(self, config: OmniInteractBenchmarkConfig, session_id: str, reference_audio: str) -> None:
+        from vllm_omni.clients.duplex import DuplexClient, EventCollector, SessionConfig
+
+        self.session_config = SessionConfig(
+            ref_audio=reference_audio,
+            overlap_policy="listen_only",
+            playback_commit_policy="ack_only",
+            idle_timeout_s=float(config.timeout_s),
+            extra_body={
+                "native_duplex": True,
+                "force_listen_count": 0,
+                **(config.extra_body or {}),
+            },
+        )
+        self.url = _websocket_url(config, session_id)
+        headers = dict(config.extra_headers or {})
+
+        async def connect(url: str) -> WebSocketTransport:
+            import websockets
+
+            return await websockets.connect(
+                url,
+                max_size=self._MAX_FRAME_BYTES,
+                additional_headers=headers or None,
+            )
+
+        self.events = EventCollector()
+        self._client = DuplexClient(
+            self.url,
+            model=config.model,
+            config=self.session_config,
+            session_id=session_id,
+            reconnect=None,
+            heartbeat_interval_s=None,
+            handshake_timeout_s=min(config.timeout_s, 20.0),
+            connect=connect,
+        )
+        self._consume_task: asyncio.Task[None] | None = None
+
+    async def __aenter__(self) -> _RealtimeSession:
+        await self._client.__aenter__()
+        self._consume_task = asyncio.create_task(self.events.consume(self._client))
+        # The handshake consumed session.created before the collector
+        # subscribed; seed it so capability lookups and cursors still work.
+        self.events.add({"type": "session.created", "session": dict(self._client.session_info)})
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        try:
+            await self._client.__aexit__(exc_type, exc, traceback)
+        finally:
+            if self._consume_task is not None:
+                self._consume_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._consume_task
+
+    async def send(self, event: dict[str, object]) -> None:
+        await self._client.send(event)
+
+    async def commit(self) -> None:
+        await self._client.commit()
+
+    async def send_playback_ack(self, response_id: str, played_ms: int) -> None:
+        await self._client.ack_playback(
+            played_ms,
+            response_id=response_id,
+            item_id=f"item_{response_id}",
+        )
+
+    def raise_if_reader_stopped(self) -> None:
+        """Fail a caller waiting on events after the event consumer exits."""
+        task = self._consume_task
+        if task is None or not task.done():
+            return
+        if task.cancelled():
+            raise ConnectionError("Realtime event consumer was cancelled")
+        error = task.exception()
+        if error is not None:
+            raise ConnectionError("Realtime session failed") from error
+        raise ConnectionError("Realtime session closed before the requested event arrived")
+
+    async def close_session(self, *, timeout_s: float = 20.0) -> None:
+        await self._client.close(timeout_s=timeout_s)
+        if self._consume_task is not None:
+            # Let the collector drain session.closed before callers check it.
+            with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(self._consume_task), timeout=5.0)
+
+
+def _audio_rtf_from_raw_metric(raw_metric: dict[str, object]) -> float | None:
+    """Derive the audio RTF from a client-reported raw request metric."""
+    from vllm_omni.metrics.definitions import compute_audio_rtf
+
+    generation_ms = raw_metric.get("audio_generation_ms")
+    duration_ms = raw_metric.get("audio_duration_ms")
+    if not isinstance(generation_ms, int | float) or not isinstance(duration_ms, int | float) or duration_ms <= 0:
+        return None
+    return round(compute_audio_rtf(float(generation_ms) / 1000.0, float(duration_ms) / 1000.0), 6)
+
+
 def _populate_response_metrics(
     result: OmniInteractCaseResult,
-    collector: RealtimeEventCollector,
+    collector: EventCollector,
     *,
     stream_start: float,
 ) -> None:
@@ -807,6 +983,10 @@ def _populate_response_metrics(
             "response_id": response_id,
             **(raw_metric if isinstance(raw_metric, dict) else {}),
         }
+        if isinstance(raw_metric, dict):
+            # The client reports raw data only; the RTF is derived here with
+            # the canonical server-side metric definition.
+            metric["rtf"] = _audio_rtf_from_raw_metric(raw_metric)
         if isinstance(stage0, dict):
             metric["stage0_tokens"] = dict(stage0)
             output_tokens += int(stage0.get("output_token_count") or 0)
@@ -814,6 +994,8 @@ def _populate_response_metrics(
             request_metrics.append(metric)
     result.output_tokens = output_tokens
     result.duplex_request_metrics = request_metrics
+    from vllm_omni.clients.duplex import summarize_session_request_metrics
+
     result.duplex_session_metrics = summarize_session_request_metrics(
         request_metrics,
         session_id=result.session_id,
@@ -847,6 +1029,8 @@ async def run_omniinteract_case(
     started_at = time.monotonic()
     try:
         if prepared_input is None:
+            from vllm_omni.clients.duplex import reference_audio_data_url
+
             reference_audio = reference_audio_data_url(config.ref_audio)
             duration, pcm, frames = await asyncio.to_thread(
                 prepare_media,
@@ -862,18 +1046,8 @@ async def run_omniinteract_case(
             frames = prepared_input.video_frames
         if not any(frames):
             raise ValueError(f"No video frames were decoded from {case.video_path}")
-        async with RealtimeDuplexClient(
-            _websocket_url(config, session_id), additional_headers=config.extra_headers
-        ) as client:
-            session_from = len(client.events.events)
-            await client.configure(
-                config.model,
-                ref_audio=reference_audio,
-                session_id=session_id,
-                extra_body=config.extra_body,
-                idle_timeout_s=config.timeout_s,
-                timeout_s=min(config.timeout_s, 20.0),
-            )
+        async with _RealtimeSession(config, session_id, reference_audio) as client:
+            session_from = 0  # the collector holds only this session's events
             pcm = _ensure_final_commit_tail(pcm, client.events.events)
             playback = _Playback()
             stream_start = time.monotonic()
@@ -897,17 +1071,19 @@ async def run_omniinteract_case(
                     settle_s=_COMPLETION_SETTLE_S,
                 )
                 await playback.acknowledge(client, playback.end_s)
-                _raise_if_session_terminated(client.events, session_from)
+                _raise_if_session_terminated(client.events, session_from, warnings=playback.warnings)
                 close_from = len(client.events.events)
                 await client.close_session(timeout_s=min(config.timeout_s, 20.0))
             except Exception:
                 with contextlib.suppress(Exception):
                     await client.close_session(timeout_s=min(config.timeout_s, 20.0))
                 raise
-            errors = client.events.errors()
-            if errors:
-                raise RuntimeError(str(errors[-1]))
-            _raise_if_session_terminated(client.events, session_from, explicit_close_from=close_from)
+            _raise_if_session_terminated(
+                client.events,
+                session_from,
+                explicit_close_from=close_from,
+                warnings=playback.warnings,
+            )
             result.latency_s = time.monotonic() - started_at
             result.input_audio_chunks, result.input_video_frames = chunks, frame_count
             result.pacing_mean_lag_s, result.pacing_max_lag_s = mean_lag, max_lag

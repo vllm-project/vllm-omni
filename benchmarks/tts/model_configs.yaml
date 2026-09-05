@@ -132,3 +132,14 @@ models:
     endpoint: /v1/audio/speech
     task_extra_body:
       voice_design: {}
+
+  # OmniVoice serves plain text-to-speech over /v1/audio/speech; voice cloning
+  # and voice design are offline-only for this model, so default_voice is the
+  # only task the server can answer.
+  k2-fsa/OmniVoice:
+    supported_tasks: [default_voice]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: true
+    task_extra_body:
+      default_voice: {}

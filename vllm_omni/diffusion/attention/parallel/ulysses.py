@@ -277,6 +277,15 @@ class UlyssesParallelAttention:
     ):
         mode = get_ulysses_mode(default="strict")
         ulysses_world_size = self._sp_group.ulysses_world_size
+        gate_compress = None
+        if attn_metadata is not None:
+            candidate = attn_metadata.extra.get("gate_compress")
+            if isinstance(candidate, torch.Tensor):
+                if candidate.shape != query.shape:
+                    raise ValueError(
+                        f"gate_compress must match pre-Ulysses query shape, got {candidate.shape} vs {query.shape}"
+                    )
+                gate_compress = candidate
 
         # advanced_uaa pads non-divisible head counts before the Ulysses
         # all-to-all. This also holds in hybrid Ulysses+Ring: Q is derived
@@ -471,6 +480,16 @@ class UlyssesParallelAttention:
                 use_sync=self._use_sync,
                 padded_head_cnt=padded_kv_head_cnt,
             )
+            if gate_compress is not None:
+                # gate_compress mirrors the query layout, so it must follow the
+                # same GQA-derived head padding as the query all-to-all.
+                gate_compress, _ = _ulysses_all_to_all_any_qkv(
+                    self._ulysses_pg,
+                    gate_compress,
+                    seq_lens=seq_lens,
+                    use_sync=self._use_sync,
+                    padded_head_cnt=padded_query_head_cnt,
+                )
         else:
             # Strict mode: fail fast with actionable errors for head divisibility.
             for name, t in (("query", query), ("key", key), ("value", value)):
@@ -496,6 +515,8 @@ class UlyssesParallelAttention:
                 query = ulysses_qkv_fwd(query, group_name, ulysses_world_size)
                 key = ulysses_qkv_fwd(key, group_name, ulysses_world_size)
                 value = ulysses_qkv_fwd(value, group_name, ulysses_world_size)
+                if gate_compress is not None:
+                    gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
             else:
                 query = SeqAllToAll4D.apply(
                     self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync
@@ -504,6 +525,10 @@ class UlyssesParallelAttention:
                 value = SeqAllToAll4D.apply(
                     self._ulysses_pg, value, self._scatter_idx, self._gather_idx, self._use_sync
                 )
+                if gate_compress is not None:
+                    gate_compress = SeqAllToAll4D.apply(
+                        self._ulysses_pg, gate_compress, self._scatter_idx, self._gather_idx, self._use_sync
+                    )
             seq_lens = []
             local_seq_len = 0
             orig_head_cnt = 0
@@ -530,6 +555,12 @@ class UlyssesParallelAttention:
             else:  # "rear"
                 key = torch.cat([key, joint_tensor_key], dim=1)
                 value = torch.cat([value, joint_tensor_value], dim=1)
+
+        if gate_compress is not None and attn_metadata is not None:
+            # The VSA compression gate follows the same S<->H all-to-all as
+            # Q/K/V so every rank sees the full packed sequence for its local
+            # head shard, matching FastVideo's DistributedAttention_VSA.
+            attn_metadata.extra["gate_compress"] = gate_compress
 
         ctx = _UlyssesCtx(
             name=self.name,
@@ -558,6 +589,7 @@ class UlyssesParallelAttention:
                     attn_metadata.attn_mask = None
                 else:
                     if attn_metadata.attn_mask is None:
+                        assert attn_metadata.joint_attn_mask is not None
                         attn_metadata.attn_mask = torch.ones(
                             [query.shape[0], query.shape[1] - attn_metadata.joint_attn_mask.shape[1]],
                             dtype=torch.bool,

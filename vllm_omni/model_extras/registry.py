@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -36,6 +36,12 @@ from vllm_omni.model_extras.ltx2 import (
     ltx_preserves_reference_image_size,
     ltx_transformer_config_subfolder,
 )
+from vllm_omni.model_extras.magi2 import (
+    MAGI2_EXTRA_BODY_PARAMS,
+    MAGI2_EXTRA_OUTPUT_PARAMS,
+    get_magi2_video_generation_defaults,
+    magi2_preserves_reference_image_size,
+)
 from vllm_omni.model_extras.mammothmodal2_preview import (
     MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS,
     MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS,
@@ -70,6 +76,7 @@ from vllm_omni.model_extras.vace import (
 from vllm_omni.model_extras.vace import (
     build_image_to_video_prompt as build_vace_image_to_video_prompt,
 )
+from vllm_omni.model_extras.video_generation import VideoGenerationDefaults
 
 TextToImagePromptBuilder = Callable[
     [str, str | None, int | None, int | None],
@@ -192,6 +199,12 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
     },
+    "Magi2Pipeline": {
+        "extra_body_params": MAGI2_EXTRA_BODY_PARAMS,
+        "extra_output_params": MAGI2_EXTRA_OUTPUT_PARAMS,
+        "video_generation_defaults_builder": get_magi2_video_generation_defaults,
+        "reference_image_size_resolver": magi2_preserves_reference_image_size,
+    },
     "HeliosPipeline": {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
         "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,
@@ -284,6 +297,18 @@ def get_extra_body_params(model_class_name: str | None) -> frozenset[str]:
 def get_extra_output_params(model_class_name: str | None) -> frozenset[str]:
     spec = _get_spec(model_class_name)
     return spec.get("extra_output_params", frozenset()) if spec is not None else frozenset()
+
+
+def get_video_generation_defaults(
+    model_class_name: str | None,
+    extra_body: Mapping[str, Any] | None = None,
+) -> VideoGenerationDefaults | None:
+    """Return model-owned defaults for the shared video examples, if declared."""
+    spec = _get_spec(model_class_name)
+    if spec is None:
+        return None
+    builder = spec.get("video_generation_defaults_builder")
+    return builder(extra_body) if builder is not None else None
 
 
 def get_output_tensor_range(model_class_name: str | None) -> OutputTensorRange:

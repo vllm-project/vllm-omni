@@ -298,7 +298,7 @@ def _create_ltx25_natten_processor() -> LTX2VideoVaeNeighborhoodNattenProcessor:
     except (ImportError, OSError, RuntimeError, ValueError) as exc:
         raise RuntimeError(
             "LTX-2.5 DiffVAE requires the shi-labs/natten Hub kernel. "
-            "Install kernels==0.14.1, use a supported GPU, leave "
+            "Install kernels==0.15.2, use a supported GPU, leave "
             "DIFFUSERS_DISABLE_REMOTE_CODE unset, and allow Hub access during kernel initialization."
         ) from exc
 
@@ -550,6 +550,13 @@ def get_ltx2_post_process_func(od_config: Any):
         if not (isinstance(output, tuple) and len(output) == 2):
             return output
         video, audio = output
+        if isinstance(video, torch.Tensor) and video.dtype == torch.uint8:
+            if video.ndim != 5 or video.shape[-1] != 3 or not video.is_contiguous():
+                raise ValueError(
+                    "LTX uint8 video output must be contiguous BTHWC RGB, "
+                    f"got shape={tuple(video.shape)} stride={video.stride()}"
+                )
+            video = video.detach().cpu().numpy()
         if isinstance(audio, torch.Tensor):
             audio = audio.detach().cpu()
         result: dict[str, Any] = {"video": video, "audio": audio}

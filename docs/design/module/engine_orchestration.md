@@ -28,6 +28,9 @@ related_code_paths:
   - vllm_omni/engine/stage_pool.py
   - vllm_omni/outputs/output_processor.py
   - vllm_omni/distributed/omni_coordinator/**
+  # Duplex kernel design is owned by ../fullduplex.md; listed here because the
+  # orchestrator hosts the duplex control plane.
+  - vllm_omni/engine/duplex/**
 depends_on:
   - input_output_modality_contracts.md
   - error_contracts.md
@@ -44,7 +47,8 @@ validation_paths:
   - tests/engine/test_orchestrator_stage_input_bridge.py
   - tests/engine/test_cfg_companion_lifecycle.py
   - tests/engine/test_rpc_result_router.py
-  - tests/e2e/features/fullduplex/engine/**
+  - tests/engine/duplex/**
+  - tests/engine/test_duplex_import_boundary.py
 upstream_refs:
   - vllm.v1.engine.EngineCoreRequest
   - vllm.v1.engine.EngineCoreOutputs

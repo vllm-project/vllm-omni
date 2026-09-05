@@ -567,7 +567,7 @@ class OmniBase(PDDisaggregationMixin):
                 consumed.add(msg_id)
 
         if msg.metrics is not None:
-            from vllm_omni.experimental.fullduplex.output import get_duplex_output_decision
+            from vllm_omni.outputs.duplex import get_duplex_output_decision
 
             # Listen units already arrive as StageMetricsMessage; the matching
             # finished OutputMessage is the same snapshot and must not be added again.

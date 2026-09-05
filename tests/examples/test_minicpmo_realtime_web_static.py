@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import re
 import shutil
 import subprocess
@@ -33,7 +36,7 @@ def test_client_uses_proxy_relative_realtime_url_and_model_policy_session():
     assert "new URL(config.realtimePath, window.location.href)" in source
     assert "url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'" in source
     assert "url.searchParams.set('autostart', '0')" in source
-    assert "url.searchParams.set('minicpmo45_native_duplex', '1')" in source
+    assert "url.searchParams.set('native_duplex', '1')" in source
     assert "auto_response: true" in source
     assert "input_audio_buffer.append" in source
     assert "input_audio_buffer.commit" not in source
