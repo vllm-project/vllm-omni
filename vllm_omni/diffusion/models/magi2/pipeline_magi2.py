@@ -253,8 +253,18 @@ def _validate_native_topology(od_config: OmniDiffusionConfig) -> None:
             unsupported.append(f"{name}={value}")
     if getattr(parallel, "enable_expert_parallel", False):
         unsupported.append("enable_expert_parallel")
-    if od_config.quantization_config is not None:
-        unsupported.append("quantization")
+    quant_config = od_config.quantization_config
+    if quant_config is not None:
+        from .layers import WEIGHT_DTYPE_BY_QUANT_METHOD
+
+        get_name = getattr(quant_config, "get_name", None)
+        method = get_name() if callable(get_name) else None
+        if method not in WEIGHT_DTYPE_BY_QUANT_METHOD:
+            # Anything other than our self-contained weight-only int8/fp8
+            # scheme (see layers.py) assumes vLLM's LinearBase contract,
+            # which Magi2GroupedLinear's custom weight layout/TP sharding
+            # doesn't fit.
+            unsupported.append(f"quantization={method!r}")
     if unsupported:
         raise ValueError(
             "MAGI-2 Preview uses Ulysses sequence parallelism and MoE-head "
@@ -582,9 +592,21 @@ class Magi2Pipeline(
 
         # Importing here keeps config-only model detection light.  The class is
         # an in-tree implementation; there is no dynamic remote-code import.
+        import dataclasses
+
         from .modeling_magi2 import Magi2PreviewTransformer
 
         MAGI2_PREVIEW_CONFIG.validate()
+        preview_config = MAGI2_PREVIEW_CONFIG
+        if od_config.quantization_config is not None:
+            # _validate_native_topology has already rejected any method not
+            # in WEIGHT_DTYPE_BY_QUANT_METHOD, so this is always one of our
+            # self-contained schemes. dataclasses.replace avoids mutating the
+            # module-level singleton shared by every MAGI-2 pipeline instance.
+            preview_config = dataclasses.replace(
+                MAGI2_PREVIEW_CONFIG, quant_config=od_config.quantization_config
+            )
+        self._preview_config = preview_config
         mmap_dlo = bool(
             od_config.enable_distributed_layerwise_offload and getattr(od_config, "dlo_use_allgather", True)
         )
@@ -593,13 +615,13 @@ class Magi2Pipeline(
             # only this rank's orthogonal DP shard.  Constructing the 212-GiB
             # Preview transformer on CPU first would defeat that memory model.
             with torch.device("meta"):
-                self.transformer = Magi2PreviewTransformer(MAGI2_PREVIEW_CONFIG)
+                self.transformer = Magi2PreviewTransformer(preview_config)
             # The mmap path is inference-only. Removing autograd ownership here
             # lets the shared DLO backend shard views without a MAGI-specific
             # detach branch.
             self.transformer.requires_grad_(False)
         else:
-            self.transformer = Magi2PreviewTransformer(MAGI2_PREVIEW_CONFIG)
+            self.transformer = Magi2PreviewTransformer(preview_config)
         self.data_proxy = Magi2DataProxy()
         self.sampler = Magi2PreviewSampler(
             self.transformer,
@@ -617,6 +639,7 @@ class Magi2Pipeline(
                 text_encoder: nn.Module = Magi2Qwen35TextEncoder(
                     str(root / "text_encoder"),
                     dtype=self.dtype,
+                    quant_config=od_config.quantization_config,
                 )
                 from vllm_omni.diffusion.models.lance.wan_vae import LanceWanVAE
 

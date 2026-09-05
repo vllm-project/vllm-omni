@@ -28,14 +28,28 @@ from .parallel import Magi2ParallelGroup, get_magi2_tp_group
 # ColumnParallelLinear/RowParallelLinear contract. `quant_config` is duck
 # typed (`get_name()`) rather than the vLLM `QuantizationConfig` type so this
 # module has no hard vLLM import for its quantization path.
-_SUPPORTED_QUANT_METHODS = frozenset({"int8"})
+#
+# Both formats here are weight-only, dynamic, symmetric quantization: the
+# int8/fp8 tensor is dequantized to the compute dtype before every matmul,
+# so neither needs a real int8/fp8 GEMM kernel or specific GPU generation to
+# run correctly (only to be fast) -- see WEIGHT_DTYPE_BY_QUANT_METHOD.
+# NVFP4 (block-scaled 4-bit) is intentionally not implemented here: it needs
+# a real block-scaled kernel to be worth the precision loss, tracked as a
+# separate path per the #7085 roadmap wording rather than folded into this
+# dequant-on-forward scheme.
+WEIGHT_DTYPE_BY_QUANT_METHOD: dict[str, torch.dtype] = {
+    "int8": torch.int8,
+    "fp8": torch.float8_e4m3fn,
+}
 
 
-def _is_int8_quant_config(quant_config: Any | None) -> bool:
+def _quant_weight_dtype(quant_config: Any | None) -> torch.dtype | None:
     if quant_config is None:
-        return False
+        return None
     get_name = getattr(quant_config, "get_name", None)
-    return callable(get_name) and get_name() in _SUPPORTED_QUANT_METHODS
+    if not callable(get_name):
+        return None
+    return WEIGHT_DTYPE_BY_QUANT_METHOD.get(get_name())
 
 
 def swiglu7(
@@ -148,7 +162,7 @@ class Magi2GroupedLinear(nn.Module):
                 self.bias.checkpoint_weight_transform = self.shard_checkpoint_bias
 
         self.quant_config = quant_config
-        self._int8_quantized = False
+        self._quantized_dtype: torch.dtype | None = None
 
     def _column_slices(self) -> tuple[tuple[int, int], ...]:
         splits = self.qkv_splits or (self.out_features,)
@@ -195,31 +209,43 @@ class Magi2GroupedLinear(nn.Module):
         shards = [grouped[:, start:end] for start, end in self._column_slices()]
         return torch.cat(shards, dim=1).reshape(-1)
 
-    def maybe_quantize_int8_(self) -> None:
-        """Quantize the (already-loaded) weight to per-expert, per-output-channel int8.
+    def maybe_quantize_(self) -> None:
+        """Quantize the (already-loaded) weight to per-expert, per-output-channel
+        int8 or fp8 (e4m3), per ``quant_config.get_name()``.
 
         Weight-only, symmetric, dynamic quantization: no calibration data or
         serialized scales are needed, so this can run right after checkpoint
-        loading. Activations stay in ``params_dtype``; the int8 weight is
+        loading. Activations stay in ``params_dtype``; the quantized weight is
         dequantized on the fly in `forward`, so this trades compute (one
-        extra elementwise multiply per forward) for ~2x smaller resident
-        weight memory vs bf16/fp16.
+        extra elementwise multiply per forward) for smaller resident weight
+        memory vs bf16/fp16 (~2x for int8/fp8). Because dequantization happens
+        before the matmul, this needs no int8/fp8 GEMM kernel or specific GPU
+        generation to run correctly.
         """
-        if self._int8_quantized or not _is_int8_quant_config(self.quant_config):
+        weight_dtype = _quant_weight_dtype(self.quant_config)
+        if self._quantized_dtype is not None or weight_dtype is None:
             return
         with torch.no_grad():
             grouped = self.weight.data.view(self.num_experts, self.local_out_features, self.local_in_features)
-            scale = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
-            quantized = (grouped / scale).round().clamp(-127, 127).to(torch.int8)
+            if weight_dtype == torch.int8:
+                scale = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
+                quantized = (grouped / scale).round().clamp(-127, 127).to(torch.int8)
+            else:
+                finfo = torch.finfo(weight_dtype)
+                scale = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / finfo.max
+                quantized = (grouped / scale).clamp(finfo.min, finfo.max).to(weight_dtype)
         del self._parameters["weight"]
-        self.register_buffer("weight_int8", quantized)
+        self.register_buffer("weight_quantized", quantized)
         self.register_buffer("weight_scale", scale.to(torch.float32))
         self.weight = None
-        self._int8_quantized = True
+        self._quantized_dtype = weight_dtype
+
+    # Backwards-compatible alias for the int8-only entry point.
+    maybe_quantize_int8_ = maybe_quantize_
 
     def _grouped_weight(self, compute_dtype: torch.dtype) -> torch.Tensor:
-        if self._int8_quantized:
-            return self.weight_int8.to(compute_dtype) * self.weight_scale.to(compute_dtype)
+        if self._quantized_dtype is not None:
+            return self.weight_quantized.to(compute_dtype) * self.weight_scale.to(compute_dtype)
         return self.weight.view(self.num_experts, self.local_out_features, self.local_in_features)
 
     def forward(
@@ -255,6 +281,57 @@ class Magi2GroupedLinear(nn.Module):
                 outputs = [part + bias[index] for index, part in enumerate(modality_dispatcher.dispatch(output))]
                 output = torch.cat(outputs, dim=0)
         return output
+
+
+class QuantizedLinear(nn.Module):
+    """Drop-in replacement for a plain ``nn.Linear`` with a quantized weight.
+
+    Same weight-only, dynamic, symmetric, dequant-on-forward scheme as
+    ``Magi2GroupedLinear.maybe_quantize_``, for models that aren't built out
+    of grouped linears -- e.g. the stock HF ``transformers`` text encoder
+    (``Qwen3_5TextModel``), which has ordinary ``nn.Linear`` submodules with
+    no per-expert grouping.
+    """
+
+    def __init__(self, linear: nn.Linear, weight_dtype: torch.dtype) -> None:
+        super().__init__()
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+        with torch.no_grad():
+            weight = linear.weight.data
+            if weight_dtype == torch.int8:
+                scale = weight.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
+                quantized = (weight / scale).round().clamp(-127, 127).to(torch.int8)
+            else:
+                finfo = torch.finfo(weight_dtype)
+                scale = weight.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / finfo.max
+                quantized = (weight / scale).clamp(finfo.min, finfo.max).to(weight_dtype)
+        self.register_buffer("weight_quantized", quantized)
+        self.register_buffer("weight_scale", scale.to(torch.float32))
+        self.bias = linear.bias
+
+    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+        weight = self.weight_quantized.to(tensor.dtype) * self.weight_scale.to(tensor.dtype)
+        return F.linear(tensor, weight, self.bias)
+
+
+def quantize_linear_modules_(module: nn.Module, quant_config: Any | None) -> int:
+    """Replace every plain ``nn.Linear`` child of ``module`` in place with a
+    ``QuantizedLinear``, per ``quant_config.get_name()``. Returns the number of
+    linears quantized; a no-op (returns 0) when ``quant_config`` names a
+    method this scheme doesn't support (see ``WEIGHT_DTYPE_BY_QUANT_METHOD``).
+    """
+    weight_dtype = _quant_weight_dtype(quant_config)
+    if weight_dtype is None:
+        return 0
+    count = 0
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear):
+            setattr(module, name, QuantizedLinear(child, weight_dtype))
+            count += 1
+        else:
+            count += quantize_linear_modules_(child, quant_config)
+    return count
 
 
 def make_grouped_linear(
@@ -480,7 +557,9 @@ __all__ = [
     "Magi2GroupedLinear",
     "ModalityDispatcher",
     "MultiModalityRMSNorm",
+    "QuantizedLinear",
     "make_grouped_linear",
+    "quantize_linear_modules_",
     "sinkhorn_knopp",
     "swiglu7",
 ]

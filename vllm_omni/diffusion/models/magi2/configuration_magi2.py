@@ -65,10 +65,11 @@ class Magi2PreviewConfig:
     attention_gating: bool = True
     mhc: Magi2MHCConfig = field(default_factory=Magi2MHCConfig)
     moe: Magi2MoEConfig = field(default_factory=Magi2MoEConfig)
-    # Applied only to the dense attention/MLP grouped linears (Magi2Attention,
-    # Magi2MLP). The MoE routed/shared-expert linears (Magi2MultiHeadMoELayer)
-    # are left unquantized here to avoid overlapping the in-progress fused
-    # expert kernel work tracked separately under M2 in #7085.
+    # Applied to the dense attention/MLP grouped linears (Magi2Attention,
+    # Magi2MLP) and the shared-expert linears in Magi2MultiHeadMoELayer. The
+    # routed-expert gather/SwiGLU7/scatter path (split_linear, moe_mlp,
+    # merge_linear) is left unquantized to avoid overlapping the in-progress
+    # fused expert kernel work tracked separately under M2 in #7085.
     quant_config: Any | None = None
 
     @property

@@ -262,6 +262,7 @@ class Magi2MultiHeadMoELayer(nn.Module):
             bias=False,
             dtype=config.params_dtype,
             parallel_mode="column",
+            quant_config=config.quant_config,
         )
         self.shared_expert_fc2 = make_grouped_linear(
             moe.shared_expert_intermediate_size,
@@ -269,6 +270,7 @@ class Magi2MultiHeadMoELayer(nn.Module):
             bias=False,
             dtype=config.params_dtype,
             parallel_mode="row",
+            quant_config=config.quant_config,
         )
         self.modality_specific_shared_expert_fc1 = make_grouped_linear(
             config.hidden_size,
@@ -277,6 +279,7 @@ class Magi2MultiHeadMoELayer(nn.Module):
             bias=False,
             dtype=config.params_dtype,
             parallel_mode="column",
+            quant_config=config.quant_config,
         )
         self.modality_specific_shared_expert_fc2 = make_grouped_linear(
             moe.modality_shared_expert_intermediate_size,
@@ -285,6 +288,7 @@ class Magi2MultiHeadMoELayer(nn.Module):
             bias=False,
             dtype=config.params_dtype,
             parallel_mode="row",
+            quant_config=config.quant_config,
         )
         tp_size = self.split_linear.tp_group.world_size
         self.local_shared_expert_intermediate_size = moe.shared_expert_intermediate_size // tp_size
@@ -739,7 +743,7 @@ class Magi2PreviewTransformer(nn.Module):
         if self.config.quant_config is not None:
             for module in self.modules():
                 if isinstance(module, Magi2GroupedLinear):
-                    module.maybe_quantize_int8_()
+                    module.maybe_quantize_()
 
         return loaded
 
