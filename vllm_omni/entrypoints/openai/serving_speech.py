@@ -1403,6 +1403,24 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._moss_processor_cache = proc
         return proc
 
+    def _get_moss_ref_encoder(self):
+        """Lazily build the per-server MOSS reference-audio encoder once."""
+        cached = getattr(self, "_moss_ref_encoder", None)
+        if cached is not None:
+            return cached
+        from vllm_omni.model_executor.models.moss_tts.reference_encoder import build_reference_encoder
+
+        # The variant's encode geometry (n_vq, working sample rate) is derived
+        # inside the model package; this layer only supplies the processor and
+        # the process-wide speaker cache.
+        encoder = build_reference_encoder(
+            self._get_moss_processor(),
+            variant=self._moss_variant,
+            speaker_cache=self._speaker_cache,
+        )
+        self._moss_ref_encoder = encoder
+        return encoder
+
     async def _build_moss_tts_params(
         self,
         request: OpenAICreateSpeechRequest,
@@ -1474,63 +1492,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # consumes, so skipping this path silently drops all voice-clone
         # conditioning and produces unconditioned/garbage audio online). ----
         proc = self._get_moss_processor()
-        n_vq = int(getattr(proc.model_config, "n_vq", 32))
-        # Local-v1.5 encodes reference audio at a fixed 24 kHz working rate
-        # regardless of its 48 kHz stereo *output* codec -- mirrors the
-        # offline example's hardcoded encode_audios_from_wav(sampling_rate=24000)
-        # for this variant; proc.model_config.sampling_rate there is the
-        # output rate (48000), the wrong value to resample the reference into.
-        sr_target = 24000 if v == "local" else int(getattr(proc.model_config, "sampling_rate", 24000))
-
-        # Reference-audio encoding + speaker caching lives in the model package
-        # (moss_tts.reference_encoder), mirroring Fish Speech / CosyVoice3 /
-        # Qwen3-TTS which keep reference handling with the model rather than in
-        # this shared serving file. Imported lazily so the API-server process
-        # only pulls it on the delay-family path (alongside the upstream proc).
-        from vllm_omni.model_executor.models.moss_tts.reference_encoder import encode_reference_codes
-
-        # Named-voice speaker cache is only valid for uploaded speakers
-        # without an inline ref_audio. ``request.voice`` plus a file/URL
-        # otherwise keys on (name, created_at=0) and skips the content-aware
-        # resolve — the adapter already applies this guard when tagging
-        # ``voice_name`` on tts_params.
-        _raw_voice = getattr(request, "voice", None)
-        _raw_voice = _raw_voice.strip() if isinstance(_raw_voice, str) else ""
-        _voice_lower = _raw_voice.lower() if _raw_voice else ""
-        _use_named_voice = bool(_voice_lower) and _voice_lower in self.uploaded_speakers and not has_inline_ref_audio
-        _voice = _voice_lower if _use_named_voice else ""
-        _voice_created = self._voice_created_at(_voice) if _voice else 0
-        _resolve_keys: list[str] = []
-
-        async def _tracked_resolve(ref_str: str) -> tuple[list, int, str]:
-            wav_list, sr, cache_key = await self._resolve_ref_audio(ref_str)
-            _resolve_keys.append(cache_key)
-            return wav_list, sr, cache_key
-
-        async def _encode_ref(ref_str: str, *, named_voice: bool) -> torch.Tensor:
-            # Named-voice cache is (voice_name, created_at). TTSD speaker 2 is a
-            # different clip, so it must stay anonymous or it reuses speaker 1.
-            use_named = named_voice and bool(_voice)
-            return await encode_reference_codes(
-                ref_str,
-                processor=proc,
-                resolve_ref_audio=_tracked_resolve,
-                speaker_cache=self._speaker_cache,
-                variant=v,
-                n_vq=n_vq,
-                sr_target=sr_target,
-                voice_name=_voice if use_named else None,
-                voice_created_at=_voice_created if use_named else 0,
-            )
 
         user_kwargs: dict[str, Any] = {"text": request.input or ""}
-        if v in ("tts", "local"):
-            user_kwargs["reference"] = [await _encode_ref(request.ref_audio, named_voice=True)]
-        elif v == "ttsd":
-            refs = [await _encode_ref(request.ref_audio, named_voice=True)]
-            if request.ref_audio_2:
-                refs.append(await _encode_ref(request.ref_audio_2, named_voice=False))
-            user_kwargs["reference"] = refs
+        resolve_keys: dict[int, str] = {}
+        if v in ("tts", "local", "ttsd"):
+            user_kwargs["reference"], resolve_keys = await self._encode_moss_references(
+                request,
+                has_inline_ref_audio=has_inline_ref_audio,
+                two_speaker=(v == "ttsd"),
+            )
         elif v == "sound_effect":
             user_kwargs["text"] = request.input or ""  # may be empty
             user_kwargs["ambient_sound"] = request.ambient_sound or ""
@@ -1563,11 +1533,53 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         }
         if request.max_new_tokens is not None:
             params["max_new_frames"] = [request.max_new_tokens]
-        if _resolve_keys:
-            params["ref_audio_cache_key"] = _resolve_keys[0]
-            if len(_resolve_keys) > 1:
-                params["ref_audio_2_cache_key"] = _resolve_keys[1]
+        if 0 in resolve_keys:
+            params["ref_audio_cache_key"] = resolve_keys[0]
+        if 1 in resolve_keys:
+            params["ref_audio_2_cache_key"] = resolve_keys[1]
         return params
+
+    async def _encode_moss_references(
+        self,
+        request: OpenAICreateSpeechRequest,
+        *,
+        has_inline_ref_audio: bool,
+        two_speaker: bool,
+    ) -> tuple[list, dict[int, str]]:
+        """Encode the request's reference clip(s) into MOSS RVQ code tensors.
+
+        Reference encoding + speaker caching lives in the model package
+        (moss_tts.reference_encoder), mirroring Fish Speech / CosyVoice3 /
+        Qwen3-TTS which keep reference handling with the model rather than in
+        this shared serving file. This method only resolves the serving-side
+        inputs the model helper needs: the generic audio resolver/artifact-key
+        lookups and whether the request may use the named-voice cache.
+
+        Returns ``(codes_per_speaker, resolve_keys)`` where ``resolve_keys``
+        maps the reference slot (0 = ref_audio, 1 = ref_audio_2) to its
+        content-aware resolve key, for salting the KV prefix cache.
+        """
+        from vllm_omni.model_executor.models.moss_tts.reference_encoder import encode_request_references
+
+        # Named-voice caching is only valid for uploaded speakers without an
+        # inline ref_audio: ``request.voice`` plus a file/URL would otherwise
+        # key on (name, created_at=0) and skip the content-aware resolve.
+        raw_voice = getattr(request, "voice", None)
+        raw_voice = raw_voice.strip() if isinstance(raw_voice, str) else ""
+        voice_lower = raw_voice.lower()
+        use_named_voice = bool(voice_lower) and voice_lower in self.uploaded_speakers and not has_inline_ref_audio
+        voice = voice_lower if use_named_voice else ""
+        voice_created = self._voice_created_at(voice) if voice else 0
+
+        return await encode_request_references(
+            self._get_moss_ref_encoder(),
+            request.ref_audio,
+            request.ref_audio_2 if two_speaker else None,
+            resolve_ref_audio=self._resolve_ref_audio,
+            get_artifact_key=self._get_resolved_ref_audio_artifact_key,
+            voice_name=voice or None,
+            voice_created_at=voice_created,
+        )
 
     async def _build_higgs_audio_v2_params(self, request: OpenAICreateSpeechRequest):
         """Build prompt_token_ids for higgs_audio_v2 via the upstream processor.
@@ -1649,8 +1661,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Build prompt_token_ids for higgs_audio_v3.
 
         Plain-text path: builds ``[tts, text, tokens, audio]``.
-        Voice-clone path: encodes reference audio, applies delay pattern,
-        builds ``[tts, (ref_text, tokens,) ref_audio, -100xN, text, tokens, audio]``.
+        Voice-clone path: encodes reference audio, applies delay pattern, and
+        records reference-audio prompt positions while submitting valid token IDs.
         """
         adapter = await self._resolve_higgs_audio_v3_adapter()
 
@@ -1681,12 +1693,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             num_ref_tokens=int(ref_codes_delayed.shape[0]),
             reference_text=request.ref_text or None,
         )
+        prompt_ids, audio_placeholder_positions = adapter.prepare_prompt_for_engine(prompt_ids)
         prompt = tokens_input(prompt_token_ids=prompt_ids)
         import torch
 
         prompt["additional_information"] = {
             "audio_input_ids": ref_codes_delayed.to(torch.long),
             "audio_input_ids_mask": torch.ones(ref_codes_delayed.shape[0], dtype=torch.bool),
+            "audio_placeholder_positions": audio_placeholder_positions,
             "ref_audio_cache_key": cache_key,
         }
         # Placeholder prompt ids do not change when a same-path file is

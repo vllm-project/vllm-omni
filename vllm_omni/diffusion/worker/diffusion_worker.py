@@ -1328,6 +1328,14 @@ class WorkerProc:
 
         if isinstance(result, dict) and wave_id is not None:
             result["wave_id"] = wave_id
+        if not should_reply:
+            # A rank that will not reply must not hand the result back: the busy
+            # loop binds it to a local that stays alive until the next request
+            # overwrites it, so a device-resident output -- for diffusion, an
+            # entire decoded video -- would occupy accelerator memory for the
+            # whole idle period on every rank that did not produce the reply.
+            # The `collect_rank_status` branch above already returns None here.
+            return None, False
         return result, should_reply
 
     def recv_message(self) -> Any:

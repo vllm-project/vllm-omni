@@ -13,8 +13,9 @@ transformers >= 5.10.1, < 5.15
 av>=14.0.0
 omegaconf>=2.3.0
 diffusers==0.40.0
-# Hub kernels, including LTX-2.5 NATTEN
-kernels==0.14.1
+# Hub kernels, including LTX-2.5 NATTEN. Keep this pin in sync with the
+# supported transformers range above.
+kernels==0.15.2
 safetensors>=0.8.0
 accelerate==1.12.0
 soundfile>=0.13.1

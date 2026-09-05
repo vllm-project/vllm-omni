@@ -216,7 +216,10 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                     if args.expect_function_call
                     else (
                         client.events.count("response.audio.delta") >= args.minimum_audio_chunks
-                        and (client.events.count("response.done") > completed_responses_at_commit)
+                        and (
+                            args.allow_incomplete_response
+                            or client.events.count("response.done") > completed_responses_at_commit
+                        )
                     )
                 )
             ),
@@ -227,7 +230,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         if client.events.errors():
             raise AssertionError(f"Realtime session emitted errors: {client.events.errors()}")
         done_events = _events(client, "response.done")
-        if not args.expect_function_call:
+        if not args.expect_function_call and not args.allow_incomplete_response:
             response = done_events[-1].get("response") if done_events else None
             status = response.get("status") if isinstance(response, dict) else None
             if status != "completed":
@@ -344,6 +347,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--instructions", default=DEFAULT_INSTRUCTIONS)
     parser.add_argument("--max-frames", type=int)
     parser.add_argument("--minimum-audio-chunks", type=int, default=1)
+    parser.add_argument(
+        "--allow-incomplete-response",
+        action="store_true",
+        help=(
+            "Accept a session whose responses all completed before the final "
+            "commit. A realtime-paced pipeline delivers each turn's audio and "
+            "response.done as the turn happens, so the strict "
+            "done-after-commit gate only holds when delivery lags the frame "
+            "clock; use this flag when measuring latency on fast configs."
+        ),
+    )
     parser.add_argument("--minimum-audio-rms", type=float, default=1e-4)
     parser.add_argument("--expect-function-call", action="store_true")
     parser.add_argument("--expected-function-name", default="generate_random_number")
