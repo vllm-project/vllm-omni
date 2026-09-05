@@ -317,6 +317,8 @@ Each 1-second window records:
 |---|---|
 | `windows.duration_s` | Wall time covered by the window |
 | `windows.loop_idle` / `windows.loop_active` | Orchestrator poll-loop iterations with no work vs. active forwarding |
+| `windows.dispatch_queue_size` | Ready-queue size sampled at each monitor window boundary |
+| `windows.dispatch_queue_high_water` | Maximum Event Driven ready-queue size observed in each window |
 | `replicas.<stage,replica>.outputs_queue_size` | MP client `outputs_queue` backlog for that replica |
 | `replicas.<stage,replica>.inflight` | Requests currently bound/routed to the replica |
 
@@ -330,6 +332,10 @@ event-driven loop (`VLLM_OMNI_EVENT_DRIVEN_ORCH=1`, see
 orchestrator wakes only once per 0.5 s reconcile timeout, while a busy one still
 records one iteration per routed output. Window counts and the `loop_active_pct`
 summary are therefore not comparable across the two modes.
+
+For Event Driven runs, use `dispatch_queue_high_water` rather than only the
+window-boundary `dispatch_queue_size`: a serial dispatcher can drain a burst
+before the window closes, hiding a transient ready-queue backlog in the latter.
 
 ### Relationship to other diagnostics
 
