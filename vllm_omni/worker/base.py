@@ -60,6 +60,13 @@ class OmniGPUWorkerBase(GPUWorker):
                 worker_name=worker_name,
                 local_rank=self.local_rank,
             )
+        elif profiler_config and profiler_config.profiler == "cuda":
+            # OmniGPUWorkerBase replaces vLLM's torch profiler above; keep the
+            # native CUDA profiler wrapper available for Nsight Systems capture
+            # through the /start_profile and /stop_profile endpoints as well.
+            from vllm.profiler.wrapper import CudaProfilerWrapper
+
+            self.profiler = CudaProfilerWrapper(profiler_config)
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         """Override to set trace filename before starting the profiler.
