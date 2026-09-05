@@ -16,7 +16,7 @@
 # limitations under the License.
 # Adapted from https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_flash_attention_utils.py
 from collections.abc import Callable
-from functools import lru_cache
+from functools import cache, lru_cache
 from typing import Any
 
 import torch
@@ -164,6 +164,89 @@ else:
 # If no FA backend available, SDPA backend will be selected at the platform level
 # flash_attn_func and flash_attn_varlen_func will be None
 HAS_FLASH_ATTN = flash_attn_func is not None or flash_attn_varlen_func is not None
+
+
+def _choose_vllm_flash_attn_version(
+    device_major: int,
+    requested: str | int | None,
+    supported_versions: frozenset[int],
+) -> int:
+    """Choose a vLLM-bundled FA kernel without model-specific policy."""
+
+    if requested is not None:
+        try:
+            version = int(requested)
+        except (TypeError, ValueError) as error:
+            raise ValueError("FlashAttention version must be 2, 3, or 4") from error
+        if version not in (2, 3, 4):
+            raise ValueError("FlashAttention version must be 2, 3, or 4")
+        if version not in supported_versions:
+            raise RuntimeError(f"FlashAttention {version} is unavailable on this device")
+        return version
+
+    if device_major >= 10 and 4 in supported_versions:
+        return 4
+    if device_major >= 9 and 3 in supported_versions:
+        return 3
+    if 2 in supported_versions:
+        return 2
+    raise RuntimeError("No vLLM-bundled FlashAttention 2/3/4 kernel is available")
+
+
+@cache
+def resolve_vllm_flash_attn_version(requested: str | int | None = None) -> int:
+    """Resolve an available vLLM-bundled FA2/FA3/FA4 implementation."""
+
+    if not current_omni_platform.is_cuda():
+        raise RuntimeError("vLLM-bundled versioned FlashAttention requires CUDA")
+
+    from vllm.vllm_flash_attn.flash_attn_interface import is_fa_version_supported
+
+    capability = current_omni_platform.get_device_capability()
+    if capability is None:
+        raise RuntimeError("Cannot resolve FlashAttention without a CUDA device capability")
+    supported_versions = frozenset(version for version in (2, 3, 4) if is_fa_version_supported(version))
+    return _choose_vllm_flash_attn_version(capability.major, requested, supported_versions)
+
+
+def vllm_flash_attn_varlen_with_lse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float | None = None,
+    softcap: float = 0.0,
+    causal: bool = False,
+    deterministic: bool = False,
+    fa_version: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run packed vLLM FlashAttention and retain LSE for post-processing."""
+
+    from vllm.vllm_flash_attn import flash_attn_varlen_func as vllm_flash_attn_varlen_func
+
+    version = resolve_vllm_flash_attn_version(fa_version)
+    out, lse = vllm_flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        int(max_seqlen_q),
+        cu_seqlens_q,
+        int(max_seqlen_k),
+        cu_seqlens_k=cu_seqlens_k,
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=None,
+        softcap=max(float(softcap), 0.0),
+        deterministic=deterministic,
+        return_softmax_lse=True,
+        fa_version=version,
+    )
+    return out, lse
 
 
 @lru_cache(maxsize=1)

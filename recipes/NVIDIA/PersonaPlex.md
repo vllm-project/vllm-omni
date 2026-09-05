@@ -1,7 +1,7 @@
 # PersonaPlex
 
-> Live full-duplex speech-to-speech (talk to the model in your browser, it listens
-> while it speaks) with persona and voice control, on the native vLLM-Omni engine.
+> Live full-duplex speech-to-speech (the model listens while it speaks) with
+> persona and voice control, on the native vLLM-Omni engine.
 
 ## Summary
 
@@ -11,8 +11,8 @@
 - Task: Full-duplex speech-to-speech. 24 kHz mic audio in, agent speech +
   inner-monologue text out, in 80 ms lockstep. Persona (role text) and voice
   (zero-shot clone) are set per session.
-- Mode: Live duplex WebSocket server with the official browser client, single or
-  multi-session (`--batch-size`), plus an offline WAV-in / WAV-out example
+- Mode: Live duplex WebSocket serving through the unified duplex stack
+  (`/v1/duplex` and `/v1/realtime?duplex=1`)
 - Maintainer: [`@linyueqian`](https://github.com/linyueqian)
 
 ## When to use this recipe
@@ -24,23 +24,21 @@ streaming Mimi codec are all native vLLM-Omni modules (Mimi runs on
 matching the reference implementation frame for frame on the golden replays used
 as the acceptance gate.
 
-PersonaPlex is the first Moshi-class (pure-lockstep) model in the experimental
-full-duplex framework (`vllm_omni/experimental/fullduplex/`), and the first with
-elastic multi-session batching: one engine hosts `--batch-size` concurrent
-conversations, callers join or leave on any 80 ms tick without disturbing live
-slots (greedy isolation is bit-exact).
+PersonaPlex is the first Moshi-class (pure-lockstep) model on the vLLM-Omni
+full-duplex serving stack: it plugs into the generic `/v1/duplex` handler
+through the standard plugin seams (`duplex_serving_adapter` /
+`duplex_runtime_extension` in its `pipeline.py`) with a model-specific
+package at `vllm_omni/model_executor/models/personaplex/duplex/`.
 
 ## References
 
-- Serving package:
-  [`vllm_omni/experimental/fullduplex/personaplex/`](../../vllm_omni/experimental/fullduplex/personaplex/)
+- Duplex serving package:
+  [`vllm_omni/model_executor/models/personaplex/duplex/`](../../vllm_omni/model_executor/models/personaplex/duplex/)
 - Native model modules (temporal / depformer / streaming Mimi):
   [`vllm_omni/model_executor/models/personaplex/`](../../vllm_omni/model_executor/models/personaplex/)
-- Online example (server + headless client):
+- Online serving example:
   [`examples/online_serving/personaplex/`](../../examples/online_serving/personaplex/)
-- Offline example:
-  [`examples/offline_inference/personaplex/personaplex_offline.py`](../../examples/offline_inference/personaplex/personaplex_offline.py)
-- Staged offline pipeline (talker -> Mimi code2wav, async-chunk streaming):
+- Staged pipeline (talker -> Mimi code2wav, async-chunk streaming):
   [`vllm_omni/deploy/personaplex.yaml`](../../vllm_omni/deploy/personaplex.yaml)
 - Integration PR: [vllm-project/vllm-omni#4771](https://github.com/vllm-project/vllm-omni/pull/4771)
 - Framework context: [RFC #3745](https://github.com/vllm-project/vllm-omni/issues/3745)
@@ -53,18 +51,20 @@ slots (greedy isolation is bit-exact).
 ## Why it is different from MiniCPM-o / JoyVL duplex
 
 | | MiniCPM-o 4.5 (#3907) | JoyVL | **PersonaPlex (this)** |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Cadence | 1 s chunk groups | ~1 fps frames | **80 ms lockstep (12.5 Hz)** |
 | Turn control | learned `⟨listen⟩`/`⟨speak⟩` | `</silence>`/`</response>` | **none, pure lockstep** |
 | Per step | variable-length token group | text decision | **1 user frame in -> 1 agent frame + 1 text token** |
 | Barge-in | at chunk boundary | n/a | **native (model always hears the user)** |
 | Session state | chunk-group KV | per-tick HTTP | **persistent ring KV + streaming Mimi state** |
 
-This is the lockstep ("parallel-frame joint") shape of the duplex adapter
-patterns: the adapter declares `DuplexCapability.continuous = True`, and
-`core.DuplexRuntime` runs ONE eternal response that consumes input frames as they
-arrive and drains on close. The flag is a small, default-off lifecycle mode, so
-turn-based adapters (JoyVL, MiniCPM-o) are unaffected.
+This is the lockstep ("parallel-frame joint") shape of full duplex: audio flows
+continuously in both directions with no client commits or external turn signals.
+On the unified stack this is expressed purely through the capability payload
+(`supports_client_commit=false`, `supports_external_turn_signal=false`,
+`supports_barge_in=false`); every session on a PersonaPlex deployment is native
+duplex (`is_enabled()` is unconditionally true). Turn-based models
+(MiniCPM-o 4.5) are unaffected.
 
 ## Architecture (Moshi RQ-Transformer, all native)
 
@@ -95,9 +95,7 @@ native modules, so other CUDA GPUs with enough memory are expected to work.
 
 - OS: Linux
 - Python: 3.10+ (CI covers 3.11 / 3.12)
-- vLLM-Omni: PR #4771 branch or current `main` once merged
-- Extra dependency for the live server: `pip install sphn` (Opus framing;
-  `aiohttp` already ships with vLLM)
+- vLLM-Omni: current `main`
 - `export HF_TOKEN=...` with access to the gated
   `nvidia/personaplex-7b-v1` repo (accept the license on the model page)
 
@@ -107,67 +105,49 @@ First run auto-downloads from the model repo: `model.safetensors`,
 
 #### Command
 
-Live duplex server (official browser client served at `/`):
+Live duplex serving through the unified stack:
 
 ```bash
-HF_TOKEN=... CUDA_VISIBLE_DEVICES=0 \
-python -m vllm_omni.experimental.fullduplex.personaplex.serving.server \
-    --port 8124 --voice NATF2.pt
+HF_TOKEN=... CUDA_VISIBLE_DEVICES=0 python -m vllm_omni.entrypoints.cli.main serve \
+  /path/to/personaplex-7b-v1 \
+  --omni \
+  --deploy-config vllm_omni/deploy/personaplex.yaml
 ```
 
-Multi-session on the same GPU (elastic batching, callers join/leave any tick):
-
-```bash
-HF_TOKEN=... CUDA_VISIBLE_DEVICES=0 \
-python -m vllm_omni.experimental.fullduplex.personaplex.serving.server \
-    --port 8124 --batch-size 4
-```
-
-Then open `http://localhost:8124/` and allow the microphone (use headphones so
-the agent does not hear itself). Headless alternative:
-
-```bash
-python examples/online_serving/personaplex/duplex_client.py \
-    --url ws://localhost:8124/api/chat --input user.wav --out reply.wav
-```
-
-Offline WAV-in / WAV-out (no server):
-
-```bash
-python examples/offline_inference/personaplex/personaplex_offline.py \
-    --input-wav question.wav --output-wav reply.wav --output-text reply.json \
-    --voice-prompt NATF2.pt --persona "You are a wise and friendly teacher."
-```
+This exposes `WS /v1/duplex` (native duplex dialect) and
+`WS /v1/realtime?duplex=1` (OpenAI Realtime projection; client API and wire
+protocol in [`docs/serving/realtime_duplex_api.md`](../../docs/serving/realtime_duplex_api.md)).
+Voice and persona are set per session via `extra_body`.
 
 #### Verification
 
 ```bash
-# GPU-free contract tests (stubbed FrameStepper)
-pytest tests/e2e/features/fullduplex/test_personaplex_adapter.py \
-       tests/e2e/features/fullduplex/test_personaplex_session.py \
-       tests/e2e/features/fullduplex/test_personaplex_batched.py -q
+# GPU-free contract tests (stage0 runtime + unified serving adapter)
+pytest tests/model_executor/models/personaplex/duplex/ -q
 
-# GPU e2e: batched isolation + slot recycle (coherence check needs a real
-# question WAV via PPLEX_QUESTION_WAV)
-pytest tests/e2e/features/fullduplex/test_personaplex_elastic.py -q
+# GPU e2e: paced 24 kHz PCM over /v1/realtime?duplex=1, two concurrent
+# sessions, overflow admission, slot recycling, non-silent output
+python tests/e2e/online_serving/personaplex_realtime_duplex.py \
+    --model /path/to/personaplex-7b-v1 \
+    --input-wav /path/to/speech.wav \
+    --output-dir /tmp/personaplex-realtime-duplex
 ```
-
-A green offline run producing a coherent spoken reply (and inner-monologue text
-in `reply.json`) is the quickest end-to-end check.
 
 #### Notes
 
-- Realtime budget is 80 ms/frame. Verified eager per-tick latency at
-  `--batch-size 4` is ~70-74 ms on this hardware class, i.e. all four
+- Realtime budget is 80 ms/frame. Verified eager per-tick latency at four
+  concurrent sessions is ~70-74 ms on this hardware class, i.e. all four
   conversations stay realtime; single-session has comfortable headroom.
 - Decoding is greedy only (temperature/top-k knobs are intentionally not
   exposed): greedy is what the parity gates pin against the reference
   implementation, and sampling amplifies sub-bit numeric drift into divergence.
-- With `--batch-size N`, connections beyond N are rejected until a slot frees;
-  a recycled slot is bit-exact with a fresh engine for the same inputs.
+- Session concurrency is governed by the deploy config
+  (`vllm_omni/deploy/personaplex.yaml`); connections beyond the limit are
+  rejected until a slot frees. A recycled slot is bit-exact with a fresh
+  engine for the same inputs.
 - Voice prompts: bundled `voices.tgz` names (`NATF*`/`NATM*` natural,
   `VARF*`/`VARM*` varied) or a path to your own `.pt`/`.wav`.
-- Run the browser client near the server. The 80 ms cadence is sensitive to
+- Run the client near the server. The 80 ms cadence is sensitive to
   network jitter; over a high-latency link playback can stutter regardless of
   engine speed. On localhost it is smooth.
 - Sliding window is 3000 frames (~4 min). The ring KV recycles beyond that;

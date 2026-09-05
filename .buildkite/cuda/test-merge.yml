@@ -183,6 +183,21 @@ steps:
           - tests/e2e/online_serving/run_minicpmo_realtime_duplex_soft_interrupt.py
           - vllm_omni/deploy/minicpmo_4_5.yaml
           - tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py
+          - vllm_omni/engine/duplex/
+          - vllm_omni/entrypoints/duplex/
+          # Public duplex client library + its unit suites: client-side
+          # changes must re-run the duplex e2e group. The live client probe
+          # (test_duplex_client_live.py, single GPU, core tier) runs in the
+          # ready pipeline's duplex group.
+          - vllm_omni/clients/
+          - tests/clients/
+          - vllm_omni/entrypoints/duplex_request_client.py
+          - vllm_omni/outputs/duplex.py
+          - vllm_omni/model_executor/duplex_sampling.py
+          - tests/engine/duplex/
+          - tests/entrypoints/duplex/
+          - tests/model_executor/models/minicpmo_4_5/duplex/
+          # Legacy Realtime probe client + video stacking used by the e2e drivers.
           - vllm_omni/experimental/fullduplex/
           - vllm_omni/model_executor/models/minicpmo_4_5/
           - vllm_omni/model_executor/models/step_audio2/

@@ -1,5 +1,7 @@
 # Diffusion Advanced Features
 
+<!-- markdownlint-disable MD028 MD060 -->
+
 ## Table of Contents
 
 - [Overview](#overview)
@@ -29,7 +31,6 @@ Cache methods trade minimal quality for significant speedup. Quality loss is typ
 |--------|-------------|----------|
 | **[TeaCache](diffusion/cache_acceleration/teacache.md)** | Adaptive caching using modulated inputs | Quick setup, balanced quality/speed on single GPU |
 | **[Cache-DiT](diffusion/cache_acceleration/cache_dit.md)** | Multiple caching techniques: DBCache, TaylorSeer, SCM | Fine-grained control, tunable quality-speed tradeoff |
-
 
 #### Lossless Acceleration
 
@@ -71,7 +72,6 @@ Extension methods add specialized capabilities to diffusion models beyond standa
 |--------|-------------|----------|
 | **[LoRA Inference](diffusion/lora.md)** | Enables inference with Low-Rank Adaptation (LoRA) adapters weights | Reinforcement learning extensions |
 | **[Frame Interpolation](diffusion/frame_interpolation.md)** | Inserts intermediate video frames after generation for smoother motion | Video generation pipelines that need higher temporal smoothness |
-
 
 ### Execution Modes
 
@@ -147,6 +147,7 @@ The following tables show which models support each feature:
 | **Cosmos3**              |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |          ❌          |   ✅    |             ✅             |      ✅ (decode)      |       ✅        |        ❌         |
 
 > Notes:
+>
 > 1. Nextstep_1(T2I) does not support cache acceleration methods such as TeaCache or Cache-DiT.
 > 2. `Tongyi-MAI/Z-Image-Turbo` is a distilled model with minimal NFEs; CFG-Parallel is not necessary.
 > 3. Cosmos3 T2I uses `Cosmos3OmniDiffusersPipeline` with `modalities=["image"]`. Model-level CPU offload swaps the nested UND reasoner and GEN generator pathways; layerwise offload remains available for blockwise GEN/UND offload.
@@ -164,24 +165,24 @@ The following tables show which models support each feature:
 | **LTX-2**                    |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **LTX-2.3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❌        |        ❌         |
 | **LTX-2.5**                  |     ❌     | ❓ (one-stage) | ❓ (Ulysses only) | ✅ (Full only) |         ❓         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |    ❓ (FP8)     |        ❌         |
-|  **SANA-Video-2B T2V I2V**   |     ❌     |     ❌      |          ❌           |       ✅       |  ✅ (TP=2 only)   |         ❌         |   ❌   |            ❌             |          ❌          |       ❌       |        ❌        |
+|  **SANA-Video-2B T2V I2V**   |     ❌     |     ❌      |   ✅ (`--usp`, frame-sharded)   |       ✅       |  ✅ (TP=2 only)   |         ❌         |   ❌   |            ❌             |          ❌          |       ❌       |        ❌        |
 | **Helios**                   |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |          ❌           |       ❌        |        ✅*        |
 | **HunyuanVideo-1.5 T2V I2V** |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **Cosmos3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **LongCat-Video-Avatar-1.5** |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **MiniMax-H3**               | ✅ (FL2VA) |     ✅      |           ✅           |       ❌        |       ✅ (DiT/TE)  |         ❌         |   ✅    |             ✅             |       ✅ (tile)       |      ✅ (DiT)      |        ❌         |
+| **MAGI-2 Preview**           |     ❌     |     ✅      |      ✅ (Ulysses)       |    ✅ (2-way)   |         ✅         |         ❌         |   ✅    | ✅ (1-GPU/LW; DLO DP-AG/SP no-AG) |       ✅ (tile)       |       ❌        |        ❌         |
 | **SANA-WM**                  |     ❌     |     ❌      |          ❌<sup>5</sup> |       ✅        |         ✅         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 
 > Notes:
 > 5. SANA-WM cannot support sequence parallelism: its bidirectional gated delta
->    recurrence carries state across frames, so a rank cannot denoise a slice of
->    the token sequence in isolation. Doing so would need a distributed scan or
->    an all-gather before every GDN block. The remaining ❌ columns are simply
->    unvalidated on this model, not known-broken.
+> recurrence carries state across frames, so a rank cannot denoise a slice of
+> the token sequence in isolation. Doing so would need a distributed scan or
+> an all-gather before every GDN block. The remaining ❌ columns are simply
+> unvalidated on this model, not known-broken.
 
 > **Step execution note:** Helios supports single-request step execution only;
 > use `max_num_seqs=1`.
-
 **Frame Interpolation Support**
 
 - **Supported**: Wan2.2 text-to-video, image-to-video, and TI2V pipelines; SANA-Video-2B native text-to-video and image-to-video pipelines
@@ -192,7 +193,6 @@ The following tables show which models support each feature:
 | Model                 | ⚡TeaCache | ⚡Cache-DiT | 🔀SP (Ulysses & Ring) | 🔀CFG-Parallel | 🔀Tensor-Parallel | 🔀Pipeline-Parallel | 🔀HSDP | 💾CPU Offload (Layerwise) | 💾VAE-Patch-Parallel | 💾Quantization | 🔄Step Execution |
 |-----------------------|:---------:|:----------:|:---------------------:|:--------------:|:-----------------:|:-------------------:|:------:|:-------------------------:|:--------------------:|:--------------:|:----------------:|
 | **Stable-Audio-Open** |     ✅     |     ❌      |           ❓           |       ❓        |         ❌         |          ❌          |   ✅    |             ✅             |          ❌           |       ✅        |        ❌         |
-
 
 ## Feature Compatibility
 
@@ -231,7 +231,6 @@ The following tables show which models support each feature:
        compatibility matrix in the [Distributed Layerwise Offloading guide](diffusion/offloader/distributed_layerwise_offload.md).
     5. The compatibility matrix uses FP8 as the representative quantization method.
     6. Step Execution is not compatible with any diffusion cache backend. LoRA is supported, but each scheduled batch must use a single adapter (requests with different `lora_request` or `lora_scale` are kept in separate batches).
-
 
 ## Multi-Thread Weight Loading
 

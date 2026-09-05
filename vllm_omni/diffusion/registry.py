@@ -296,6 +296,11 @@ _DIFFUSION_MODELS = {
         "pipeline_sana_video_i2v",
         "SanaImageToVideoPipeline",
     ),
+    "Magi2Pipeline": (
+        "magi2",
+        "pipeline_magi2",
+        "Magi2Pipeline",
+    ),
     "OmniVoicePipeline": (
         "omnivoice",
         "pipeline_omnivoice",
@@ -588,6 +593,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LingBotVideoPipeline": "get_lingbot_video_post_process_func",
     "SanaVideoPipeline": "get_sana_video_post_process_func",
     "SanaImageToVideoPipeline": "get_sana_video_i2v_post_process_func",
+    "Magi2Pipeline": "get_magi2_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",

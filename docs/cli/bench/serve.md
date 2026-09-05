@@ -1,11 +1,15 @@
 # vLLM-Omni Benchmark CLI Guide
+
 The vllm bench command launches the vLLM-Omni benchmark to evaluate the performance of multimodal models.
 
 ## Notes
+
 vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, and `openai-realtime-duplex` serving benchmark backends. It also adds the `omniinteract` dataset.
 
 ## Basic Parameter Description
+
 You can use `vllm bench serve --omni --help=all` to get descriptions of all parameters. The commonly used parameters are described below:
+
 - `--omni`
   Enable Omni (multimodal) mode, supporting multimodal inputs and outputs such as images, videos, and audio.
 
@@ -77,8 +81,8 @@ Specify to save benchmark results to a json file
 - `--random-prefix-len`
   Number of fixed prefix tokens before the random context in a request.
   The total input length is the sum of random-prefix-len and a random
-  context length sampled from [input_len * (1 - range_ratio),
-  input_len * (1 + range_ratio)].Only the random and random-mm modes
+  context length sampled from [input_len *(1 - range_ratio),
+  input_len* (1 + range_ratio)].Only the random and random-mm modes
   support this parameter.
 
 - `--random-input-len`
@@ -91,7 +95,7 @@ Specify to save benchmark results to a json file
   Range ratio for sampling input/output length,
   used only for random sampling. Must be in the range [0, 1) to define
   a symmetric sampling range
-  [length * (1 - range_ratio), length * (1 + range_ratio)].
+  [length *(1 - range_ratio), length* (1 + range_ratio)].
   Only the random and random-mm modes support this parameter.
 
 - `--random-mm-base-items-per-request`
@@ -137,6 +141,7 @@ Specify to save benchmark results to a json file
 ## Usage Examples
 
 ### Online Benchmark
+
 <details class="admonition abstract" markdown="1">
 <summary>Show more</summary>
 
@@ -162,7 +167,9 @@ vllm bench serve \
   --dataset-path ShareGPT_V3_unfiltered_cleaned_split.json \
   --percentile-metrics ttft,tpot,itl,e2el
 ```
+
 If successful, you will see the following output:
+
 ```text
 ============ Serving Benchmark Result ============
 Successful requests:                     2
@@ -264,6 +271,7 @@ Median AUDIO_RTF:                        0.47
 P99 AUDIO_RTF:                           0.48
 ==================================================
 ```
+
 Notes:
 We use audio generation time / audio duration to calculate RTF.
 
@@ -301,8 +309,12 @@ options apply. Use `--omniinteract-require-response` only for functional E2E cas
 Each completed case writes `output.wav`, `wav_transcript.json`, `events.json`, `result.json`, and a final `.done` marker under
 `--omniinteract-output-dir`. The root also contains `batch_summary.json` and `official_eval_manifest.jsonl`; failed cases write
 `.failed.json`. Runs sharing one output root are serialized. Completion validates transport, response lifecycle, and artifacts,
-not answer accuracy. Transcript timestamps are serialized playback-queue times. Clipped or cancelled outputs are ineligible and
-omitted from the official manifest; `audio_clipped_bytes` records output beyond the rounded video horizon.
+not answer accuracy. Transcript timestamps are serialized playback-queue times. Playback ACKs report cumulative progress
+incrementally along that serialized clock, like a live listener; the first ack for a response goes out as soon as its audio
+arrives, checkpointing the response's history position so a later committed user input updates it in place. A residual
+`playback_ack_too_late` rejection is recorded as an artifact warning rather than failing the case. Clipped or cancelled
+outputs are ineligible and omitted from the official manifest; `audio_clipped_bytes` records output beyond the rounded video
+horizon.
 
 TTFT, TTFP, and RTF start at client receipt of `response.created`. TPOT/ITL use engine stage-0 timing; ITL is emitted only when
 every token interval is present.
@@ -339,8 +351,8 @@ Generate synthetic image、video、audio inputs alongside random text prompts to
 Notes:
 
 - Works only with online benchmark via:
-  - the OpenAI chat backend (`--backend openai-chat-omni`) and endpoint `/v1/chat/completions`.
-  - the OpenAI edit image backend (`--backend openai-image-edits-omni`) and endpoint `/v1/images/edits`.
+    - the OpenAI chat backend (`--backend openai-chat-omni`) and endpoint `/v1/chat/completions`.
+    - the OpenAI edit image backend (`--backend openai-image-edits-omni`) and endpoint `/v1/images/edits`.
 
 Start the server (example):
 
@@ -351,6 +363,7 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni
 It is recommended to use the flag `--ignore-eos` to simulate real responses. You can set the size of the output via the arg `random-output-len`.
 
 Then run the benchmarking script:
+
 ```bash
 vllm bench serve \
     --omni \
@@ -420,6 +433,7 @@ How sampling works:
 - If a modality (e.g., image) reaches its limit from `--random-mm-limit-mm-per-prompt`, all buckets of that modality are excluded and the remaining bucket probabilities are renormalized before continuing.
 This should be seen as an edge case, and if this behavior can be avoided by setting `--random-mm-limit-mm-per-prompt` to a large number. Note that this might result in errors due to engine config `--limit-mm-per-prompt`.
 - The resulting request contains synthetic image data in `multi_modal_data` (OpenAI Chat format). When `random-mm` is used with the OpenAI Chat backend, prompts remain text and MM content is attached via `multi_modal_data`.
+
 </details>
 
 ### Multi-Stage Benchmark
@@ -434,6 +448,7 @@ vllm serve --omni --port 29999 --model ~/Qwen3-Omni-30B-A3B-Instruct
 ```
 
 Then run the benchmarking script (remember to add the flag `--print-stage`):
+
 ```bash
 vllm bench serve --omni \
   --dataset-name random \
@@ -453,6 +468,7 @@ vllm bench serve --omni \
 ```
 
 Besides the "Serving Benchmark Result", there will be "Stage Benchmark Result" below:
+
 ```text
 ============= Stage Benchmark Result =============
 =============== Stage 0 (thinker) ================
@@ -509,7 +525,9 @@ Mean AUDIO_RTF:                          0.24
 Median AUDIO_RTF:                        0.26
 P99 AUDIO_RTF:                           0.27
 ```
+
 Explanation:
+
 - stage_gen_time: Time from submitting a request to a specific stage to that stage finishing generation.
 
 - Serving TTFC (Time to First Chunk): Time from the HTTP request being accepted by the serving frontend to

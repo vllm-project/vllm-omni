@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from:
 # https://huggingface.co/openbmb/MiniCPM-o-4_5/blob/main/modeling_minicpmo.py
 #
@@ -3941,7 +3941,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         else:
             text_config = Qwen2Config.from_dict(config_dict)
             llm_arch = "Qwen2ForCausalLM"
-        from vllm_omni.experimental.fullduplex.minicpmo45.compat import (
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.compat import (
             patch_minicpmo_remote_config,
         )
 
