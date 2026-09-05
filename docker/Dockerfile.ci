@@ -1,4 +1,4 @@
-# Target vllm version: releases/v0.29.0 @ f5c3cc240bc1, installed on top of
+# Target vllm version: releases/v0.29.0 @ d2906cc19586, installed on top of
 # the v0.28.0 base image via the precompiled wheel pinned below. The pin and
 # base intentionally differ until an official v0.29.0 base image is published.
 #
@@ -57,7 +57,7 @@ RUN uv pip install --system -e ".[dev]"
 # (e.g. +gaeee7ef93.cu130) which pip/uv refuse to install from a PEP 503 package index.
 # The cu130 wheel index lives at /<commit>/cu130/vllm/ but the actual wheel files
 # are stored at the top level /<commit>/<wheel>.
-ENV VLLM_PRECOMPILED_WHEEL_COMMIT=f5c3cc240bc1fc0519694fe689edb87dee8dfd92
+ENV VLLM_PRECOMPILED_WHEEL_COMMIT=d2906cc1958658f296aeee8b248deea684f56add
 # Keep the base image's CUDA toolkit libs on the loader path. This does NOT by
 # itself guarantee libnvJitLink.so.13 resolves — the .so.13 JIT linker is
 # handled separately via ldconfig after the cu130 wheels are installed (see the
