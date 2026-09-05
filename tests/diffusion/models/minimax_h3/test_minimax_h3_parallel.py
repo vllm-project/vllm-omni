@@ -10,6 +10,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 def test_grouped_qkv_checkpoint_reorder():
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        _pack_grouped_qkv_to_qkv,
         _reorder_grouped_qkv_to_qkv,
     )
 
@@ -23,6 +24,42 @@ def test_grouped_qkv_checkpoint_reorder():
     )
 
     assert reordered[:, 0].tolist() == [0, 3, 1, 4, 2, 5]
+
+    destination = torch.empty_like(grouped)
+    _pack_grouped_qkv_to_qkv(
+        grouped,
+        destination,
+        num_query_groups=2,
+        heads_per_group=1,
+        head_dim=1,
+    )
+    assert torch.equal(destination, reordered)
+
+
+def test_grouped_qkv_direct_pack_matches_reorder_with_multiple_query_heads():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        _pack_grouped_qkv_to_qkv,
+        _reorder_grouped_qkv_to_qkv,
+    )
+
+    source = torch.arange(2 * 4 * 3 * 5, dtype=torch.float32).reshape(24, 5)
+    expected = _reorder_grouped_qkv_to_qkv(
+        source,
+        num_query_groups=2,
+        heads_per_group=2,
+        head_dim=3,
+    )
+    destination = torch.empty_like(source)
+
+    _pack_grouped_qkv_to_qkv(
+        source,
+        destination,
+        num_query_groups=2,
+        heads_per_group=2,
+        head_dim=3,
+    )
+
+    assert torch.equal(destination, expected)
 
 
 def test_transformer_declares_cache_sp_layerwise_offload_and_hsdp():

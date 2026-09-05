@@ -31,6 +31,8 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
+    TensorPacker,
+    TensorTransform,
 )
 from vllm_omni.host_weight_runtime import HostWeightLease
 from vllm_omni.platforms import current_omni_platform
@@ -123,7 +125,8 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         pin_memory: bool = True,
         shared_buffers: list[dict[torch.dtype, torch.Tensor] | None] | None = None,
         rank_local_mmap: bool = False,
-        tensor_transforms: dict[int, Any] | None = None,
+        tensor_transforms: dict[int, TensorTransform] | None = None,
+        tensor_packers: dict[int, TensorPacker] | None = None,
     ):
         assert isinstance(next_block, nn.Module), "transformer block must be type `torch.nn.Module`"
 
@@ -136,6 +139,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.rank_local_mmap = rank_local_mmap
         self.registered_mmap = False
         self.tensor_transforms = tensor_transforms or {}
+        self.tensor_packers = tensor_packers or {}
 
         self.copy_stream = copy_stream or current_omni_platform.Stream()
         self.comm_stream = comm_stream or current_omni_platform.Stream()
@@ -222,6 +226,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 self.next_block_parameters,
                 self.next_block_buffers,
                 self.tensor_transforms,
+                self.tensor_packers,
             )
         else:
             # Shard next block's weights and store local shard in pinned CPU memory.
@@ -277,7 +282,8 @@ class DistributedLayerwiseOffloadHook(ModelHook):
     def _collect_mmap_sources(
         params: dict[str, nn.Parameter],
         bufs: dict[str, torch.Tensor],
-        tensor_transforms: dict[int, Any] | None = None,
+        tensor_transforms: dict[int, TensorTransform] | None = None,
+        tensor_packers: dict[int, TensorPacker] | None = None,
     ) -> tuple[dict[torch.dtype, list[dict[str, Any]]], dict[torch.dtype, list[dict[str, Any]]]]:
         """Retain file-backed tensors and replace module storage with placeholders.
 
@@ -299,6 +305,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             dtype = source.dtype
             offset = offsets.get(dtype, 0)
             transform = (tensor_transforms or {}).get(id(target))
+            pack_into = (tensor_packers or {}).get(id(target))
             runtime_source = transform(source) if callable(transform) else source
             if runtime_source.dtype != dtype or runtime_source.shape != source.shape:
                 raise ValueError(
@@ -318,6 +325,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     "name": name,
                     "tensor": source.detach(),
                     "transform": transform,
+                    "pack_into": pack_into,
                 }
             )
             metadata.setdefault(dtype, []).append(
@@ -344,7 +352,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         dp_size: int,
         rank: int,
         pin_memory: bool,
-        tensor_transforms: dict[int, Any] | None = None,
+        tensor_transforms: dict[int, TensorTransform] | None = None,
     ) -> tuple[dict[torch.dtype, torch.Tensor], dict[torch.dtype, list[dict[str, Any]]]]:
         """Flatten params+buffers by dtype, split into DP shards, store local shard.
 
@@ -518,9 +526,18 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             destination = slot_buffers[dtype][:total_numel]
             sources = cpu_sources[dtype]
             for source_info, meta in zip(sources, metas, strict=True):
-                source = DistributedLayerwiseOffloadHook._resolve_mmap_source(source_info, meta, dtype)
                 start = meta["offset"]
                 physical_storage = destination[start : start + meta["numel"]]
+                pack_into = source_info.get("pack_into")
+                if callable(pack_into):
+                    runtime_destination = torch.as_strided(
+                        physical_storage,
+                        size=meta["shape"],
+                        stride=meta["stride"],
+                    )
+                    pack_into(source_info["tensor"], runtime_destination)
+                    continue
+                source = DistributedLayerwiseOffloadHook._resolve_mmap_source(source_info, meta, dtype)
                 if source.is_contiguous():
                     physical_storage.copy_(source.flatten())
                 else:
@@ -759,7 +776,8 @@ def apply_distributed_block_hook(
     pin_memory: bool = True,
     shared_buffers: list[dict[torch.dtype, torch.Tensor] | None] | None = None,
     rank_local_mmap: bool = False,
-    tensor_transforms: dict[int, Any] | None = None,
+    tensor_transforms: dict[int, TensorTransform] | None = None,
+    tensor_packers: dict[int, TensorPacker] | None = None,
 ) -> DistributedLayerwiseOffloadHook:
     """Register a DistributedLayerwiseOffloadHook on *module*."""
     registry = HookRegistry.get_or_create(module)
@@ -775,6 +793,7 @@ def apply_distributed_block_hook(
         shared_buffers=shared_buffers,
         rank_local_mmap=rank_local_mmap,
         tensor_transforms=tensor_transforms,
+        tensor_packers=tensor_packers,
     )
     registry.register_hook(DistributedLayerwiseOffloadHook._HOOK_NAME, hook)
     return hook
@@ -815,7 +834,8 @@ class PinnedResidentLayerGroup:
         pin_memory: bool,
         rank_local_mmap: bool = False,
         defer_staging: bool = False,
-        tensor_transforms: dict[int, Any] | None = None,
+        tensor_transforms: dict[int, TensorTransform] | None = None,
+        tensor_packers: dict[int, TensorPacker] | None = None,
     ) -> None:
         self.device = device
         self.copy_stream = copy_stream
@@ -835,6 +855,7 @@ class PinnedResidentLayerGroup:
                     params,
                     bufs,
                     tensor_transforms,
+                    tensor_packers,
                 )
                 cpu_shards = {}
             else:
@@ -1001,7 +1022,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self.host_weight_plan = host_weight_plan
         self._host_weight_lease: HostWeightLease | None = None
         self._host_registration: HostRegistration | None = None
-        self._mmap_transforms_by_tensor_id: dict[int, Any] = {}
+        self._mmap_transforms_by_tensor_id: dict[int, TensorTransform] = {}
+        self._mmap_packers_by_tensor_id: dict[int, TensorPacker] = {}
 
     def load_resident_layers(self) -> None:
         """Load the model-declared leading blocks for the denoise stage."""
@@ -1301,8 +1323,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # submodule), so associate deferred bounded transforms with the final
         # runtime tensor objects rather than the initial mmap replacements.
         self._mmap_transforms_by_tensor_id.clear()
+        self._mmap_packers_by_tensor_id.clear()
         for runtime_name, binding in plan.bindings.items():
-            if binding.transform is None:
+            if binding.transform is None and binding.pack_into is None:
                 continue
             parent_path, _, leaf_name = runtime_name.rpartition(".")
             parent = pipeline.get_submodule(parent_path)
@@ -1313,7 +1336,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 raise RuntimeError(
                     f"Host-weight transform target {runtime_name!r} no longer exists after post-load processing"
                 )
-            self._mmap_transforms_by_tensor_id[id(target)] = binding.transform
+            if binding.transform is not None:
+                self._mmap_transforms_by_tensor_id[id(target)] = binding.transform
+            if binding.pack_into is not None:
+                self._mmap_packers_by_tensor_id[id(target)] = binding.pack_into
 
         remaining_meta: list[str] = []
         for dit_name, dit_module in zip(modules.dit_names, modules.dits):
@@ -1526,6 +1552,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             shared_buffers=[None, None],
             rank_local_mmap=self._using_rank_local_mmap,
             tensor_transforms=self._mmap_transforms_by_tensor_id,
+            tensor_packers=self._mmap_packers_by_tensor_id,
         )
         sub_hooks = [last_hook]
         for i, block in enumerate(blocks[:-1]):
@@ -1543,6 +1570,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 shared_buffers=[None, None],
                 rank_local_mmap=self._using_rank_local_mmap,
                 tensor_transforms=self._mmap_transforms_by_tensor_id,
+                tensor_packers=self._mmap_packers_by_tensor_id,
             )
             sub_hooks.append(hook)
 
@@ -1828,6 +1856,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 shared_buffers=[None, None],
                 rank_local_mmap=self._using_rank_local_mmap,
                 tensor_transforms=self._mmap_transforms_by_tensor_id,
+                tensor_packers=self._mmap_packers_by_tensor_id,
             )
 
             block_hooks: list[DistributedLayerwiseOffloadHook] = [last_hook]
@@ -1846,6 +1875,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     shared_buffers=[None, None],
                     rank_local_mmap=self._using_rank_local_mmap,
                     tensor_transforms=self._mmap_transforms_by_tensor_id,
+                    tensor_packers=self._mmap_packers_by_tensor_id,
                 )
                 block_hooks.append(hook)
 
@@ -1877,6 +1907,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 rank_local_mmap=self._using_rank_local_mmap,
                 defer_staging=bool(self._all_hook_groups),
                 tensor_transforms=self._mmap_transforms_by_tensor_id,
+                tensor_packers=self._mmap_packers_by_tensor_id,
             )
             pipeline._dlo_residency_controller = self
 
@@ -1982,6 +2013,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         if self._host_registration is not None:
             raise HostRegistrationCleanupError("cannot close HWR mappings while host registration is still active")
         self._mmap_transforms_by_tensor_id.clear()
+        self._mmap_packers_by_tensor_id.clear()
         if hasattr(self, "_mmap_file_cache"):
             self._mmap_file_cache.clear()
             del self._mmap_file_cache

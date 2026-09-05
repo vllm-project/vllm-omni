@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from vllm_omni.host_weight_runtime import HostWeightLeaseCarrier
 
 TensorTransform = Callable[[torch.Tensor], torch.Tensor]
+TensorPacker = Callable[[torch.Tensor, torch.Tensor], None]
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class TensorBinding:
     checkpoint_key: str
     file_path: str
     transform: TensorTransform | None = None
+    pack_into: TensorPacker | None = None
 
 
 @dataclass(frozen=True)
@@ -336,6 +338,7 @@ def build_checkpoint_mmap_plan(
                 checkpoint_key=checkpoint_key,
                 file_path=file_path,
                 transform=policy.transform if policy is not None else None,
+                pack_into=policy.pack_into if policy is not None else None,
             )
 
         _validate_source_metadata(required, bindings)

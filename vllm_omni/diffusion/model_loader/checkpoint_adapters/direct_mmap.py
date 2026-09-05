@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Loader-side adapters for proven direct-checkpoint mmap layouts."""
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ class DirectMmapTensorPolicy:
 
     allow_custom_loader: bool = False
     transform: Callable[[torch.Tensor], torch.Tensor] | None = None
+    pack_into: Callable[[torch.Tensor, torch.Tensor], None] | None = None
 
 
 class DirectMmapAdapter(Protocol):
@@ -42,10 +43,12 @@ class _MiniMaxH3DirectMmapAdapter:
     ) -> DirectMmapTensorPolicy:
         del target
         transform = None
+        pack_into = None
         suffix = ".qkv_proj.weight"
         if runtime_name.endswith(suffix):
             from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
                 MiniMaxH3Attention,
+                _pack_grouped_qkv_to_qkv,
                 _reorder_grouped_qkv_to_qkv,
             )
 
@@ -62,9 +65,16 @@ class _MiniMaxH3DirectMmapAdapter:
                 heads_per_group=1,
                 head_dim=attention.head_dim,
             )
+            pack_into = partial(
+                _pack_grouped_qkv_to_qkv,
+                num_query_groups=attention.total_num_heads,
+                heads_per_group=1,
+                head_dim=attention.head_dim,
+            )
         return DirectMmapTensorPolicy(
             allow_custom_loader=True,
             transform=transform,
+            pack_into=pack_into,
         )
 
 

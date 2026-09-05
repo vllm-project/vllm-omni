@@ -217,6 +217,45 @@ def _reorder_grouped_qkv_to_qkv(
     )
 
 
+def _pack_grouped_qkv_to_qkv(
+    source: torch.Tensor,
+    destination: torch.Tensor,
+    *,
+    num_query_groups: int,
+    heads_per_group: int,
+    head_dim: int,
+) -> None:
+    """Pack grouped checkpoint QKV directly into a Q/K/V-major buffer."""
+    per_group = (heads_per_group + 2) * head_dim
+    expected_out = num_query_groups * per_group
+    if source.shape[0] != expected_out:
+        raise ValueError(
+            "qkv weight has incompatible output dim for grouped checkpoint layout: "
+            f"got {tuple(source.shape)}, expected first dim {expected_out}."
+        )
+    if destination.dtype != source.dtype or destination.shape != source.shape:
+        raise ValueError(
+            "qkv pack destination must match source metadata: "
+            f"source dtype={source.dtype}, shape={tuple(source.shape)}; "
+            f"destination dtype={destination.dtype}, shape={tuple(destination.shape)}"
+        )
+
+    rest_shape = source.shape[1:]
+    q_rows_per_group = heads_per_group * head_dim
+    grouped = source.reshape(num_query_groups, per_group, *rest_shape)
+    q, k, v = torch.split(
+        grouped,
+        [q_rows_per_group, head_dim, head_dim],
+        dim=1,
+    )
+    q_rows = num_query_groups * heads_per_group * head_dim
+    kv_rows = num_query_groups * head_dim
+    q_out, k_out, v_out = torch.split(destination, [q_rows, kv_rows, kv_rows], dim=0)
+    q_out.reshape(num_query_groups, q_rows_per_group, *rest_shape).copy_(q)
+    k_out.reshape(num_query_groups, head_dim, *rest_shape).copy_(k)
+    v_out.reshape(num_query_groups, head_dim, *rest_shape).copy_(v)
+
+
 def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> RMSNorm:
     # RMSNorm uses fp32 accumulation with bf16 inputs and outputs.
     # torch.nn.RMSNorm upcasts reduced-precision inputs for the variance
@@ -1600,4 +1639,5 @@ __all__ = [
     "MINIMAX_H3_FP32_PARAM_NAMES",
     "MiniMaxH3DiTModel",
     "_reorder_grouped_qkv_to_qkv",
+    "_pack_grouped_qkv_to_qkv",
 ]

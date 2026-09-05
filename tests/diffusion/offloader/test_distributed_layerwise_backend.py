@@ -650,6 +650,47 @@ class TestDistributedLayerwiseOffloadHook:
         assert next_block.weight.stride() == (1, 2)
         assert torch.equal(source, torch.arange(4, dtype=torch.float32).view(2, 2))
 
+    def test_rank_local_mmap_packer_bypasses_runtime_transform(self, dist_group, patched_offload_runtime):
+        current_block = nn.Linear(2, 2, bias=False)
+        next_block = nn.Linear(2, 2, bias=False)
+        next_block.weight.data.copy_(torch.arange(4, dtype=torch.float32).view(2, 2))
+        transform_calls = 0
+        pack_calls = 0
+
+        def transform(tensor):
+            nonlocal transform_calls
+            transform_calls += 1
+            return tensor.t()
+
+        def pack_into(source, destination):
+            nonlocal pack_calls
+            pack_calls += 1
+            destination.copy_(source.t())
+
+        hook = DistributedLayerwiseOffloadHook(
+            next_block=next_block,
+            device=torch.device("cpu"),
+            dp_group=None,
+            dp_size=1,
+            rank=0,
+            pin_memory=False,
+            rank_local_mmap=True,
+            tensor_transforms={id(next_block.weight): transform},
+            tensor_packers={id(next_block.weight): pack_into},
+        )
+        hook.initialize_hook(current_block)
+        assert transform_calls == 1  # One metadata validation during setup.
+
+        hook.cpu_staging_buffers = [
+            {torch.float32: torch.empty(4)},
+            {torch.float32: torch.empty(4)},
+        ]
+        hook.prefetch_layer(slot=0, non_blocking=False)
+
+        assert pack_calls == 1
+        assert transform_calls == 1
+        assert torch.equal(next_block.weight, torch.tensor([[0.0, 2.0], [1.0, 3.0]]))
+
     def test_rank_local_mmap_staging_is_bounded_by_largest_block(self, patched_offload_runtime):
         hooks = []
         for size in (4, 9):
