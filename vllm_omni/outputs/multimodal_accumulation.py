@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from typing import Any
 
 import torch
@@ -8,14 +11,19 @@ from vllm_omni.outputs.output_modality import DRAINABLE_MODALITIES
 CHUNK_METADATA_KEYS: frozenset[str] = frozenset(
     {
         "audio_text_total_chars",
+        "consumed_units",
         "duplex_epoch",
         "duplex_turn_id",
+        "finished",
         "llm_output_text_utf8",
         "segment_end",
+        "sequence_index",
         "tts_is_last_chunk",
         "turn_end",
     }
 )
+
+DELTA_CONTENT_KEYS: frozenset[str] = frozenset({"codec_units"})
 
 
 def _is_chunk_metadata_key(key: str) -> bool:
@@ -37,12 +45,14 @@ def replace_snapshot_keys(
 
 def drain_delta_payload(payload: MultimodalPayload) -> None:
     """Remove client-facing delta data while retaining request-level state."""
-    for modality_key in DRAINABLE_MODALITIES:
-        key = str(modality_key)
+    for drainable_key in (*DRAINABLE_MODALITIES, *DELTA_CONTENT_KEYS):
+        key = str(drainable_key)
         payload.tensors.pop(key, None)
         payload.metadata.pop(key, None)
 
     for metadata_key in CHUNK_METADATA_KEYS:
+        payload.tensors.pop(metadata_key, None)
+        payload.metadata.pop(metadata_key, None)
         flat_key = f"meta.{metadata_key}"
         payload.tensors.pop(flat_key, None)
         payload.metadata.pop(flat_key, None)

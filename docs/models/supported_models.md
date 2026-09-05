@@ -21,6 +21,7 @@ th {
 | -------------- | -------- | ------------------- | ------------ | --------- | ----- | ----------- | -------- |
 | `Qwen3OmniMoeForConditionalGeneration` | Qwen3-Omni | `Qwen/Qwen3-Omni-30B-A3B-Instruct` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen3-Omni.md) |
 | `Qwen2_5OmniForConditionalGeneration` | Qwen2.5-Omni | `Qwen/Qwen2.5-Omni-7B`, `Qwen/Qwen2.5-Omni-3B` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
+| `Omni2Speech2SQwen2ForCausalLM` | LLaMA-Omni 2<sup>2</sup> | `ICTNLP/LLaMA-Omni2-0.5B` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ICTNLP/LLaMA-Omni2.md) |
 | `MingFlashOmniForConditionalGeneration` + `MingImagePipeline` | Ming-flash-omni-2.0 (omni-speech + imagegen<sup>1</sup>) | `Jonathan1909/Ming-flash-omni-2.0` | ✅︎ | | | | — |
 | `BagelForConditionalGeneration` | BAGEL (DiT-only) | `ByteDance-Seed/BAGEL-7B-MoT` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `InternVLAA1Pipeline` | InternVLA-A1 | `InternRobotics/InternVLA-A1-3B` | ✅︎ | ✅︎ | | | — |
@@ -119,6 +120,10 @@ explicitly documented in that recipe. Other rows retain the implementation
 support metadata until their recipe is audited.
 
 ✅︎ indicates the model is supported on that backend. Empty cells mean not listed as supported on that backend.
+
+<sup>2</sup> The LLaMA-Omni 2 model and decoder checkpoints are intended for
+academic, non-commercial use. Review the upstream repository licenses before
+downloading, serving, or redistributing them.
 
 See the [LingBot-World 2.0 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Robbyant/LingBot-World-2.0.md)
 for offline and experimental realtime usage, supported controls, validation,

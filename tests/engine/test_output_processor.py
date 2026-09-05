@@ -163,6 +163,84 @@ def test_delta_drains_output_modality_per_step():
     assert torch.equal(hs2, out2_hidden[1])
 
 
+def test_delta_audio_drains_codec_units_and_replaces_stream_snapshots():
+    state = _make_state(RequestOutputKind.DELTA)
+    state.add_multimodal_tensor(
+        {
+            "model_outputs": torch.ones(4),
+            "codec_units": torch.tensor([1, 2]),
+            "sequence_index": torch.tensor(0),
+            "consumed_units": torch.tensor(2),
+            "finished": torch.tensor(False),
+        },
+        mm_type=AUDIO,
+    )
+
+    first = state.make_request_output([1], None, None, None)
+
+    assert first is not None and not isinstance(first, PoolingRequestOutput)
+    first_mm = first.outputs[0].multimodal_output
+    assert first_mm["codec_units"].tolist() == [1, 2]
+    assert first_mm["sequence_index"].item() == 0
+    assert first_mm["consumed_units"].item() == 2
+    assert first_mm["finished"].item() is False
+
+    state.add_multimodal_tensor(
+        {
+            "model_outputs": torch.ones(3),
+            "codec_units": torch.tensor([3]),
+            "sequence_index": torch.tensor(1),
+            "consumed_units": torch.tensor(3),
+            "finished": torch.tensor(True),
+        },
+        mm_type=AUDIO,
+    )
+
+    second = state.make_request_output([2], None, FinishReason.STOP, None)
+
+    assert second is not None and not isinstance(second, PoolingRequestOutput)
+    second_mm = second.outputs[0].multimodal_output
+    assert second_mm["codec_units"].tolist() == [3]
+    assert second_mm["sequence_index"].item() == 1
+    assert second_mm["consumed_units"].item() == 3
+    assert second_mm["finished"].item() is True
+
+
+def test_final_only_audio_accumulates_codec_units_and_replaces_stream_snapshots():
+    state = _make_state(RequestOutputKind.FINAL_ONLY)
+    state.add_multimodal_tensor(
+        {
+            "model_outputs": torch.ones(4),
+            "codec_units": torch.tensor([1, 2]),
+            "sequence_index": torch.tensor(0),
+            "consumed_units": torch.tensor(2),
+            "finished": torch.tensor(False),
+        },
+        mm_type=AUDIO,
+    )
+    assert state.make_request_output([1], None, None, None) is None
+
+    state.add_multimodal_tensor(
+        {
+            "model_outputs": torch.ones(3),
+            "codec_units": torch.tensor([3]),
+            "sequence_index": torch.tensor(1),
+            "consumed_units": torch.tensor(3),
+            "finished": torch.tensor(True),
+        },
+        mm_type=AUDIO,
+    )
+
+    result = state.make_request_output([2], None, FinishReason.STOP, None)
+
+    assert result is not None and not isinstance(result, PoolingRequestOutput)
+    multimodal_output = result.outputs[0].multimodal_output
+    assert multimodal_output["codec_units"].tolist() == [1, 2, 3]
+    assert multimodal_output["sequence_index"].item() == 1
+    assert multimodal_output["consumed_units"].item() == 3
+    assert multimodal_output["finished"].item() is True
+
+
 def test_cumulative_emits_consolidated_audio_each_step():
     """Ensure cumulative accumulates and consolidates modality keys every step."""
     s = _make_state(RequestOutputKind.CUMULATIVE)

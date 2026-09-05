@@ -383,6 +383,7 @@ class StageDeployConfig:
     # === Omni stage wrapper fields ===
     # Stage identity and Omni runtime placement.
     stage_id: int
+    model: str | None = None
     devices: str | None = None
     num_replicas: int = 1
     env: dict[str, Any] | None = None
@@ -594,7 +595,7 @@ def deploy_runtime_override_keys() -> frozenset[str]:
     They must remain overridable even if they are also modeled on
     ``OrchestratorArgs`` for top-level CLI parsing.
     """
-    return frozenset(_STAGE_DEPLOY_FIELDS) | frozenset(_PIPELINE_WIDE_ENGINE_FIELDS)
+    return (frozenset(_STAGE_DEPLOY_FIELDS) - {"model"}) | frozenset(_PIPELINE_WIDE_ENGINE_FIELDS)
 
 
 def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
@@ -1124,6 +1125,8 @@ class StageConfig:
         # CLI overrides take precedence over YAML defaults
         for key, value in runtime_overrides.items():
             if value is not None and key not in ("devices", "max_batch_size", "num_replicas"):
+                if key == "model" and engine_args.get("model") is not None:
+                    continue
                 engine_args[key] = value
 
         # Build runtime config from YAML defaults + CLI overrides

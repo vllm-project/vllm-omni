@@ -537,6 +537,39 @@ def test_update_intermediate_buffer_accumulates():
     assert torch.allclose(buf["b"], torch.tensor([2.0]))
 
 
+def test_consume_preprocess_once_buffer_keys_removes_only_declared_nested_values():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.model = SimpleNamespace(
+        preprocess_once_buffer_keys={
+            ("ids", "output"),
+            ("embed", "decode"),
+            ("hidden_states", "output"),
+        }
+    )
+    runner.model_intermediate_buffer["r1"] = {
+        "ids": {"output": [11, 12], "prompt": [7]},
+        "embed": {
+            "decode": torch.ones(2, 4),
+            "persistent": torch.full((1, 4), 2.0),
+        },
+        "hidden_states": {
+            "output": torch.ones(2, 4),
+            "last": torch.full((1, 4), 3.0),
+        },
+        "meta": {"finished": False},
+    }
+    runner.requests["r1"].additional_information_cpu = runner.model_intermediate_buffer["r1"]
+
+    OmniGPUModelRunner._consume_preprocess_once_buffer_keys(runner, "r1")
+
+    info = runner.model_intermediate_buffer["r1"]
+    assert info["ids"] == {"prompt": [7]}
+    assert set(info["embed"]) == {"persistent"}
+    assert set(info["hidden_states"]) == {"last"}
+    assert info["meta"] == {"finished": False}
+    assert runner.requests["r1"].additional_information_cpu is info
+
+
 def test_update_additional_information_deserializes_new_request_payload():
     from vllm_omni.engine.serialization import serialize_additional_information
 
@@ -768,8 +801,14 @@ def test_accumulate_full_payload_output_keeps_all_zero_qwen3_omni_prefill_placeh
 def test_full_payload_output_accumulation_hook_matrix():
     assert _make_full_payload_accumulation_runner(model_stage="thinker")._should_accumulate_full_payload_output()
     assert _make_full_payload_accumulation_runner(model_stage="talker")._should_accumulate_full_payload_output()
+    assert _make_full_payload_accumulation_runner(
+        model_stage="thinker",
+        final_output=True,
+    )._should_accumulate_full_payload_output()
     assert not _make_full_payload_accumulation_runner(
-        model_stage="code2wav", final_output=True
+        model_stage="code2wav",
+        final_output=True,
+        custom_process_next_stage_input_func=None,
     )._should_accumulate_full_payload_output()
     assert not _make_full_payload_accumulation_runner(
         model_stage="token2audio",

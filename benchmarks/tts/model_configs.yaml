@@ -7,6 +7,16 @@
 # is tracked here.
 
 models:
+  ICTNLP/LLaMA-Omni2-0.5B:
+    supported_tasks: [speech_to_speech]
+    backend: openai-chat-omni
+    endpoint: /v1/chat/completions
+    trust_remote_code: false
+    task_extra_body:
+      speech_to_speech:
+        modalities: [text, audio]
+        stream: true
+
   IndexTeam/IndexTTS-2.5:
     supported_tasks: [voice_clone]
     backend: openai-audio-speech

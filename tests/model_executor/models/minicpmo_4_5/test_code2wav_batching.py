@@ -12,6 +12,10 @@ import torch
 import torch.nn as nn
 
 import vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav as batched_token2wav_module
+from vllm_omni.model_executor.models.common.cosyvoice2_batched_token2wav import (
+    CosyVoice2BatchedState,
+    CosyVoice2BatchedToken2Wav,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
     _token2wav_sdpa_context,
@@ -262,6 +266,29 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     assert cache0.data_ptr() != cache1.data_ptr()
     assert cache0[0, 0, 0, 0, 0].item() == 10
     assert cache1[0, 0, 0, 0, 0].item() == 20
+
+
+def test_model_neutral_backend_runs_true_batch_and_returns_shared_state_type():
+    token2wav = _FakeToken2Wav()
+    adapter = CosyVoice2BatchedToken2Wav(token2wav)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 2)
+
+    audios, states = adapter.decode_batch(
+        torch.tensor([[10, 11], [20, 21]]),
+        prompt,
+        states,
+        last_chunk=False,
+    )
+
+    assert token2wav.flow.encoder.calls == [2, 2]
+    assert token2wav.flow.decoder.estimator.cfg_batches == [4, 4, 4, 4]
+    assert token2wav.hift.calls == [2]
+    assert len(audios) == len(states) == 2
+    assert all(isinstance(state, CosyVoice2BatchedState) for state in states)
+    assert states[0].flow_cache["estimator_cnn_cache"].data_ptr() != (
+        states[1].flow_cache["estimator_cnn_cache"].data_ptr()
+    )
 
 
 def test_relpos_encode_token_budget_leaves_room_for_upsample_and_cache():

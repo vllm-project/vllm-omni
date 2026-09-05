@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Custom model configs that cannot be expressed via HuggingFace Transformers alone,
 following the same pattern as vllm.transformers_utils.configs.
@@ -11,6 +11,7 @@ import importlib
 
 _CLASS_TO_MODULE: dict[str, str] = {
     "HiggsAudioV3Config": "vllm_omni.transformers_utils.configs.higgs_audio_v3",
+    "LlamaOmni2Config": "vllm_omni.transformers_utils.configs.llama_omni2",
     "Mammothmoda2Config": "vllm_omni.transformers_utils.configs.mammoth_moda2",
     "Mammothmoda2Qwen2_5_VLConfig": "vllm_omni.transformers_utils.configs.mammoth_moda2",
     "Mammothmoda2Qwen2_5_VLTextConfig": "vllm_omni.transformers_utils.configs.mammoth_moda2",
@@ -36,6 +37,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
 
 __all__ = [
     "HiggsAudioV3Config",
+    "LlamaOmni2Config",
     "Mammothmoda2Config",
     "Mammothmoda2Qwen2_5_VLConfig",
     "Mammothmoda2Qwen2_5_VLTextConfig",
@@ -80,6 +82,7 @@ from vllm_omni.transformers_utils.configs import dots_tts as _dots_tts  # noqa: 
 from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import glm_tts as _glm_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import higgs_audio_v3 as _higgs_audio_v3  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import llama_omni2 as _llama_omni2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import mammoth_moda2 as _mammoth_moda2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import ming_flash_omni as _ming_flash_omni  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import minimax_music3 as _minimax_music3  # noqa: F401, E402

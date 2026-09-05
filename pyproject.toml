@@ -163,7 +163,11 @@ where = ["."]
 include = ["vllm_omni*"]
 
 [tool.setuptools.package-data]
-"vllm_omni" = ["_version.py", "py.typed"]
+"vllm_omni" = [
+    "_version.py",
+    "py.typed",
+    "model_executor/models/llama_omni2/assets/*.npy",
+]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm

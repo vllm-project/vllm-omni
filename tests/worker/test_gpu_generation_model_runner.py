@@ -99,6 +99,20 @@ def test_sample_tokens_dict_output():
     assert output.multimodal_outputs[0]["audio"].shape == (1, 4)
 
 
+def test_sample_tokens_dict_list_skips_none_entry_per_request():
+    multimodal_outputs = {
+        "audio": [None],
+        "codec_units": [torch.tensor([12])],
+    }
+    runner = _make_runner(multimodal_outputs)
+
+    output = GPUGenerationModelRunner.sample_tokens(runner)
+
+    assert len(output.multimodal_outputs) == 1
+    assert "audio" not in output.multimodal_outputs[0]
+    assert output.multimodal_outputs[0]["codec_units"].tolist() == [12]
+
+
 class _StubSchedulerOutput:
     def __init__(self, total_num_scheduled_tokens):
         self.total_num_scheduled_tokens = total_num_scheduled_tokens

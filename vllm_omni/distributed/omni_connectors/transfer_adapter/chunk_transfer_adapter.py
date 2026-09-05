@@ -362,6 +362,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if confirmed_num_computed_tokens is None:
             confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
+        processor_manages_output_dedup = bool(
+            getattr(
+                self.custom_process_next_stage_input_func,
+                "manages_output_dedup",
+                False,
+            )
+        )
         processor_request = (
             self._snapshot_processor_request(request) if self.custom_process_next_stage_input_func else request
         )
@@ -380,8 +387,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             if sender_token is not None and sender_token.cancelled:
                 reject_reason = "previous sender generation is still draining"
             # If the request is preempted, skip the already saved chunks.
-            elif not is_segment_finished and confirmed_num_computed_tokens < self.requests_num_chunks_sent.get(
-                external_req_id, 0
+            elif (
+                not is_segment_finished
+                and not processor_manages_output_dedup
+                and confirmed_num_computed_tokens < self.requests_num_chunks_sent.get(external_req_id, 0)
             ):
                 logger.warning(
                     f"Enqueue save_async for request {external_req_id}, "
@@ -510,7 +519,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     and prompt_len > 0
                     else None
                 )
-                update_prompt = bool(was_resumable and has_prompt_payload and (chunk_id > 0 or replace_prompt))
+                update_prompt = bool(has_prompt_payload and (replace_prompt or (was_resumable and chunk_id > 0)))
                 self._pending_ar_prompt_updates[req_id] = (
                     request,
                     payload_data,
@@ -557,11 +566,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                             existing_sub = info.get(key)
                             merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
                             for subkey, subvalue in value.items():
-                                # A 1-D audio tensor is represented by the
-                                # placeholder prompt above, but sibling fields
-                                # such as the reference voice still belong in
-                                # the current runtime snapshot.
-                                if subkey == "audio" and not use_tensor_codes:
+                                # Keep codec tokens in the runtime payload even
+                                # when a 1-D tensor is also mirrored into
+                                # prompt_token_ids. Generation models such as
+                                # LLaMA-Omni2 Code2Wav consume request identity,
+                                # terminal metadata, and codes together from
+                                # runtime_additional_information. Explicit
+                                # replacement snapshots retain current-main's
+                                # prompt-only representation for the audio row.
+                                if subkey == "audio" and not use_tensor_codes and replace_snapshot:
                                     continue
                                 merged_sub[subkey] = subvalue
                             if merged_sub:
@@ -571,7 +584,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         existing_sub = info.get(key)
                         merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
                         for sk, sv in value.items():
-                            if key == "meta" and sk == "finished":
+                            if (
+                                key == "meta"
+                                and sk == "finished"
+                                and not (self.model_mode == "generation" and payload_finished)
+                            ):
                                 continue
                             merged_sub[sk] = sv
                         info[key] = merged_sub
@@ -817,6 +834,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._discard_from_chunk_deque(self.waiting_for_chunk_waiting_requests, request_id)
         self._discard_from_chunk_deque(self.waiting_for_chunk_running_requests, request_id)
         self._discard_from_chunk_deque(self._held_non_active, request_id)
+        self._pending_streaming_prefills.pop(request_id, None)
 
         self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)

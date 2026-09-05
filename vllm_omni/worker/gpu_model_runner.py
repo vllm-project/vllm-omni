@@ -1801,6 +1801,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                     input_embeds=embed_slice,
                     **req_infos,
                 )
+                if is_prefill:
+                    self._consume_preprocess_once_buffer_keys(req_id)
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(
                         (preprocess_input_ids.shape[0], req_embeds.shape[-1]),
@@ -2036,16 +2038,63 @@ class OmniGPUModelRunner(GPUModelRunner):
         gpu_keys: set[tuple[str, str]] = set()
         if hasattr(self, "model") and hasattr(self.model, "gpu_resident_buffer_keys"):
             gpu_keys = self.model.gpu_resident_buffer_keys
+        cumulative_keys = set(
+            getattr(
+                getattr(self, "model", None),
+                "cumulative_postprocess_output_buffer_keys",
+                (),
+            )
+            or ()
+        )
         existing = self.model_intermediate_buffer.setdefault(req_id, {})
         for k, v in upd.items():
             if isinstance(v, dict):
                 existing_sub = existing.setdefault(k, {})
                 for qual, val in v.items():
+                    if (
+                        (k, qual) in cumulative_keys
+                        and qual in existing_sub
+                        and isinstance(existing_sub[qual], torch.Tensor)
+                        and isinstance(val, torch.Tensor)
+                    ):
+                        previous = existing_sub[qual]
+                        val = torch.cat(
+                            [
+                                previous,
+                                val.detach().to(
+                                    device=previous.device,
+                                    dtype=previous.dtype,
+                                ),
+                            ],
+                            dim=0,
+                        )
                     self._store_value(existing_sub, qual, val, {q for tk, q in gpu_keys if tk == k})
             else:
                 self._store_value(existing, k, v, set())
         # Backward compatible: mirror to old setattr location
         setattr(req_state, "additional_information_cpu", existing)
+
+    def _consume_preprocess_once_buffer_keys(self, req_id: str) -> None:
+        keys = getattr(self.model, "preprocess_once_buffer_keys", ())
+        if not keys:
+            return
+        existing = self.model_intermediate_buffer.get(req_id)
+        if not isinstance(existing, dict):
+            return
+        for key in keys:
+            if isinstance(key, tuple) and len(key) == 2:
+                category, qualifier = key
+                nested = existing.get(category)
+                if not isinstance(nested, dict):
+                    continue
+                nested.pop(qualifier, None)
+                if not nested:
+                    existing.pop(category, None)
+            elif isinstance(key, str):
+                existing.pop(key, None)
+        req_state = self.requests.get(req_id)
+        if req_state is not None:
+            setattr(req_state, "additional_information_cpu", existing)
 
     def _replace_intermediate_buffer(self, req_id: str, upd: dict) -> None:
         """Replace one request's runtime payload with the current chunk."""

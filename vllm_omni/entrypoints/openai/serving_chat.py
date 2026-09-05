@@ -2789,6 +2789,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 audio_tensor = torch.cat(audio_data, dim=-1)
         else:
             audio_tensor = audio_data
+        if audio_tensor is not None and hasattr(audio_tensor, "numel") and audio_tensor.numel() == 0:
+            audio_tensor = None
         if audio_tensor is None:
             if not stream:
                 return self._create_error_response("Audio generation completed but no audio was produced.")

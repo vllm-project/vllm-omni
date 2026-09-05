@@ -1,0 +1,50 @@
+async_chunk: true
+trust_remote_code: false
+enable_prefix_caching: false
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 2
+    max_model_len: 4096
+    gpu_memory_utilization: 0.45
+    mm_processor_cache_gb: 0
+    enforce_eager: true
+    default_sampling_params:
+      temperature: 0.0
+      seed: 0
+      max_tokens: 12
+
+  - stage_id: 1
+    devices: "1"
+    max_num_seqs: 2
+    max_model_len: 4096
+    gpu_memory_utilization: 0.35
+    enforce_eager: true
+    async_scheduling: false
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      seed: 0
+      max_tokens: 100
+
+  - stage_id: 2
+    model: ICTNLP/cosy2_decoder
+    devices: "1"
+    dtype: float32
+    enforce_eager: true
+    max_num_seqs: 2
+    gpu_memory_utilization: 0.15
+    async_scheduling: false
+    enable_chunked_prefill: false
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      seed: 0
+      max_tokens: 4096

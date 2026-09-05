@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 import torch
 
@@ -34,6 +37,22 @@ def test_partition_code2wav_client_audio():
         "sr": torch.tensor(24000, dtype=torch.int32),
     }
     inter, client = partition_flat_payload(payload)
+    assert inter == {}
+    assert client == payload
+
+
+def test_partition_code2wav_client_stream_metadata():
+    payload = {
+        "model_outputs": torch.zeros(1, 2400),
+        "sr": torch.tensor(24000, dtype=torch.int32),
+        "codec_units": torch.tensor([3, 4], dtype=torch.long),
+        "finished": torch.tensor(True),
+        "sequence_index": torch.tensor(2, dtype=torch.int64),
+        "consumed_units": torch.tensor(20, dtype=torch.int64),
+    }
+
+    inter, client = partition_flat_payload(payload)
+
     assert inter == {}
     assert client == payload
 

@@ -167,6 +167,97 @@ comparisons, add `--request-seed 42`; production-performance runs should omit
 it. The trailing `--seed 0` controls Seed-TTS row selection rather than model
 sampling.
 
+#### LLaMA-Omni2 speech-to-speech A/B
+
+Start the native three-stage server on two GPUs:
+
+```bash
+vllm serve ICTNLP/LLaMA-Omni2-0.5B \
+    --omni \
+    --deploy-config vllm_omni/deploy/llama_omni2.yaml \
+    --port 8000
+```
+
+Use a fixed JSONL dataset so before/after runs send identical speech and text.
+Every row must contain exactly `id`, `audio`, and `text`; audio paths must be
+absolute:
+
+```json
+{"id":"sample-0001","audio":"/absolute/path/prompt.wav","text":"Respond to the speaker."}
+```
+
+Run each concurrency point at least three times. Keep the server commit, model
+snapshots, GPU placement, warmups, prompt count, and dataset unchanged within
+each before/after pair:
+
+```bash
+for run in 1 2 3; do
+  python benchmarks/tts/bench_tts.py \
+      --model ICTNLP/LLaMA-Omni2-0.5B \
+      --task speech_to_speech \
+      --dataset-path /absolute/path/fixed.jsonl \
+      --concurrency 1 4 8 \
+      --num-prompts 16 32 64 \
+      --num-warmups 2 \
+      --output-dir "./results/after-run${run}"
+done
+```
+
+Aggregate explicit result files. Repeating `--label`, `--before`, and `--after`
+lets one invocation enforce the complete gate:
+
+```bash
+python benchmarks/tts/summarize_llama_omni2_runs.py \
+    --label c1 \
+    --before results/before-c1-run{1,2,3}.json \
+    --after results/after-c1-run{1,2,3}.json \
+    --label c4 \
+    --before results/before-c4-run{1,2,3}.json \
+    --after results/after-c4-run{1,2,3}.json \
+    --label c8 \
+    --before results/before-c8-run{1,2,3}.json \
+    --after results/after-c8-run{1,2,3}.json \
+    --output results/llama-omni2-gate.json
+```
+
+The command exits nonzero if c1 median TTFP or RTF regresses by more than 5%,
+or if neither c4 nor c8 improves median RTF or audio throughput by at least
+10%. The report includes median, sample standard deviation, minimum, maximum,
+and relative change for all three metrics. Before computing those metrics, the
+summarizer rejects any run that does not report all requested prompts as
+completed, reports one or more failed requests, or has non-positive audio
+duration, RTF, TTFP, or throughput. This prevents an SSE or engine failure from
+being mistaken for a valid performance result.
+
+For Code2Wav attribution, start the server with both profiler variables set:
+
+```bash
+export VLLM_TORCH_PROFILER_DIR=/tmp/llama-omni2-profile
+export VLLM_OMNI_LLAMA_OMNI2_PROFILE_BATCHES=1
+```
+
+Capture only stage 2 around a representative concurrency-4 or concurrency-8
+run:
+
+```bash
+curl -X POST http://localhost:8000/start_profile \
+  -H 'Content-Type: application/json' \
+  -d '{"stages":[2]}'
+
+# Run the fixed-dataset benchmark while profiling is active.
+
+curl -X POST http://localhost:8000/stop_profile \
+  -H 'Content-Type: application/json' \
+  -d '{"stages":[2]}'
+```
+
+The resulting trace contains
+`llama_omni2.code2wav.flow[batch=N]`,
+`llama_omni2.code2wav.hift[batch=N]`, and
+`llama_omni2.code2wav.d2h[batch=N]` ranges. A valid batching attribution must
+show at least one Flow and HiFT range with `N > 1`; a configuration that only
+shows `batch=1` does not prove Code2Wav batching.
+
 ### 4. Plot a sweep
 
 ```bash
@@ -180,11 +271,12 @@ Outputs TTFP / RTF / throughput curves (and a markdown table) for every
 
 ## Task types
 
-| Task            | Dataset           | Request body                                        | Checkpoints that support it              |
-|-----------------|-------------------|-----------------------------------------------------|------------------------------------------|
-| `voice_clone`   | `seed-tts`        | `ref_audio` + `ref_text` + `task_type=Base`         | `Qwen3-TTS-*-Base`, `VoxCPM2`            |
-| `default_voice` | `seed-tts-text`   | `voice=Vivian` + `task_type=CustomVoice`            | `Qwen3-TTS-*-CustomVoice`                |
-| `voice_design`  | `seed-tts-design` | `instructions=<natural-language description>` + `task_type=VoiceDesign` | `Qwen3-TTS-*-CustomVoice` |
+| Task               | Dataset           | Request body                                                                | Checkpoints that support it       |
+|--------------------|-------------------|-----------------------------------------------------------------------------|-----------------------------------|
+| `voice_clone`      | `seed-tts`        | `ref_audio` + `ref_text` + `task_type=Base`                                 | `Qwen3-TTS-*-Base`, `VoxCPM2`     |
+| `default_voice`    | `seed-tts-text`   | `voice=Vivian` + `task_type=CustomVoice`                                    | `Qwen3-TTS-*-CustomVoice`         |
+| `voice_design`     | `seed-tts-design` | `instructions=<natural-language description>` + `task_type=VoiceDesign`     | `Qwen3-TTS-*-CustomVoice`         |
+| `speech_to_speech` | `llama-omni2-s2s` | input WAV + instruction, streamed text and audio output                     | `ICTNLP/LLaMA-Omni2-0.5B`         |
 
 **`-CustomVoice` checkpoints do NOT ship `speaker_encoder` weights**, so
 voice_clone requests raise `ValueError` at model runtime. Use `-Base` for
@@ -210,12 +302,13 @@ Then add the model's Deploy YAML under `vllm_omni/deploy/<model>.yaml`
 
 ## Datasets
 
-| Dataset            | Bundled? | Format            | Source                                                         |
-|--------------------|----------|-------------------|----------------------------------------------------------------|
-| `seed-tts-design`  | ✅       | 5-field meta.lst  | `benchmarks/build_dataset/seed_tts_design/en/meta.lst` (20 prompts) |
-| `seed_tts_smoke`   | ✅       | 4-field meta.lst  | `benchmarks/build_dataset/seed_tts_smoke/en/meta.lst` (20 text-only) |
-| `seed-tts`         | ❌       | 4-field meta.lst + WAVs | Google-Drive: [BytedanceSpeech/seed-tts-eval][seedtts] (~1.2 GB) |
-| `seed-tts-text`    | ❌       | 4-field meta.lst  | Same archive as `seed-tts` (wav column unused)                 |
+| Dataset           | Bundled? | Format                                      | Source                                                                      |
+|-------------------|----------|---------------------------------------------|-----------------------------------------------------------------------------|
+| `seed-tts-design` | Yes      | 5-field meta.lst                            | `benchmarks/build_dataset/seed_tts_design/en/meta.lst` (20 prompts)         |
+| `seed_tts_smoke`  | Yes      | 4-field meta.lst                            | `benchmarks/build_dataset/seed_tts_smoke/en/meta.lst` (20 text-only)        |
+| `seed-tts`        | No       | 4-field meta.lst + WAVs                     | Google-Drive: [BytedanceSpeech/seed-tts-eval][seedtts] (~1.2 GB)            |
+| `seed-tts-text`   | No       | 4-field meta.lst                            | Same archive as `seed-tts` (wav column unused)                              |
+| `llama-omni2-s2s` | No       | fixed 3-field JSONL + absolute WAV paths    | User-provided controlled A/B corpus                                         |
 
 [seedtts]: https://github.com/BytedanceSpeech/seed-tts-eval
 
@@ -227,11 +320,11 @@ For manual voice_clone / default_voice runs against the full corpus, follow
 
 `tests/dfx/perf/tests/test_tts.json` wires three perf regimes plus quality:
 
-| eval_phase    | concurrency | purpose                                                 | Baseline metrics                        |
-|---------------|-------------|---------------------------------------------------------|-----------------------------------------|
-| `latency`     | 1           | Single-request TTFP / RTF SLO                           | `median_audio_ttfp_ms`, `median_audio_rtf` |
-| `throughput`  | 8           | Codec-batching cliff sentinel (PDF #272 concurrency≥8)  | `median_audio_ttfp_ms`, `median_audio_rtf` |
-| `quality`     | 4           | WER / SIM / UTMOS regression (disabled in CI by default)| `mean_audio_rtf`                        |
+| eval_phase   | concurrency | purpose                                                  | Baseline metrics                            |
+|--------------|-------------|----------------------------------------------------------|---------------------------------------------|
+| `latency`    | 1           | Single-request TTFP / RTF SLO                            | `median_audio_ttfp_ms`, `median_audio_rtf`  |
+| `throughput` | 8           | Codec-batching cliff sentinel (PDF #272 concurrency≥8)   | `median_audio_ttfp_ms`, `median_audio_rtf`  |
+| `quality`    | 4           | WER / SIM / UTMOS regression (disabled in CI by default) | `mean_audio_rtf`                            |
 
 Why `median_*` for latency/throughput and `mean_*` for quality: latency
 distributions have cold-start tails that drag the mean; quality aggregates
@@ -245,10 +338,10 @@ PR #2558 — quality runs are manual / release-validation, not nightly).
 
 Observed on H20-3e, Qwen3-TTS-1.7B (measured pre-merge on this branch):
 
-| Task          | Model         | c=1    | c=4    | **c=8**    | c=16   | c=32   |
-|---------------|---------------|--------|--------|------------|--------|--------|
-| voice_clone   | 1.7B-Base     | RTF 0.15 / TTFP 165ms | 0.28 / 412ms | **0.49 / 1701ms** | 0.72 / 3355ms | 0.77 / 3772ms |
-| voice_design  | 1.7B-CustomVoice | RTF 0.08 / TTFP 53ms  | 0.11 / 154ms | **0.21 / 872ms**  | 0.33 / 1801ms | 0.38 / 1989ms |
+| Task         | Model             | c=1                   | c=4          | **c=8**            | c=16          | c=32          |
+|--------------|-------------------|-----------------------|--------------|--------------------|---------------|---------------|
+| voice_clone  | 1.7B-Base         | RTF 0.15 / TTFP 165ms | 0.28 / 412ms | **0.49 / 1701ms**  | 0.72 / 3355ms | 0.77 / 3772ms |
+| voice_design | 1.7B-CustomVoice  | RTF 0.08 / TTFP 53ms  | 0.11 / 154ms | **0.21 / 872ms**   | 0.33 / 1801ms | 0.38 / 1989ms |
 
 Both models show a **4–6× TTFP jump from c=4 to c=8** while audio throughput
 saturates around c=4–8 — the codec-bs=1 bottleneck documented in
@@ -257,11 +350,13 @@ sentinel for regressions in this area.
 
 ## File layout
 
-```
+```text
 benchmarks/tts/
 ├── README.md                  (this file)
 ├── bench_tts.py               CLI — serve-mode benchmark driver
 ├── plot_results.py            Generate per-task / per-concurrency curves
+├── summarize_llama_omni2_runs.py
+│                              Three-run A/B statistics and performance gate
 └── model_configs.yaml         Model registry (supported tasks + extra body)
 ```
 

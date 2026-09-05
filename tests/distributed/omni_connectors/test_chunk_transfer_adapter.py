@@ -721,6 +721,64 @@ def test_load_poll_generation_tensor_codes_use_placeholder_prompt(build_adapter)
     assert "req-tensor" in adapter._finished_load_reqs
 
 
+def test_load_poll_generation_1d_codes_remain_in_additional_information(
+    build_adapter,
+):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req(
+        "req-code2wav",
+        RequestStatus.WAITING,
+        external_req_id="external-code2wav",
+    )
+    codes = torch.tensor([101, 102], dtype=torch.long)
+    payload: OmniPayload = {
+        "codes": {"audio": codes},
+        "meta": {
+            "request_id": "external-code2wav",
+            "finished": torch.tensor(False, dtype=torch.bool),
+        },
+    }
+    connector.get.return_value = (payload, 16)
+
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
+
+    assert request.prompt_token_ids == [101, 102]
+    assert torch.equal(
+        request.additional_information["codes"]["audio"],
+        codes,
+    )
+
+
+def test_load_poll_generation_preserves_terminal_finished_metadata(
+    build_adapter,
+):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req(
+        "req-code2wav-terminal",
+        RequestStatus.WAITING,
+        external_req_id="external-code2wav-terminal",
+    )
+    request.additional_information = {
+        "meta": {
+            "request_id": "external-code2wav-terminal",
+            "finished": torch.tensor(False, dtype=torch.bool),
+        },
+    }
+    payload: OmniPayload = {
+        "codes": {"audio": torch.tensor([103], dtype=torch.long)},
+        "meta": {
+            "request_id": "external-code2wav-terminal",
+            "finished": torch.tensor(True, dtype=torch.bool),
+        },
+    }
+    connector.get.return_value = (payload, 16)
+
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
+
+    assert request.additional_information["meta"]["finished"].item() is True
+    assert "req-code2wav-terminal" in adapter.upstream_exhausted_requests
+
+
 def test_load_poll_generation_empty_nonterminal_chunk_keeps_polling(build_adapter):
     adapter, connector = build_adapter(stage_id=1, model_mode="generation")
     request = _req("req-empty-tensor", RequestStatus.WAITING, external_req_id="external-empty")
@@ -929,6 +987,139 @@ def test_send_single_request_terminal_chunk_still_flushes_processor(build_adapte
     assert bool(sent_payload.meta.is_segment_finished.item()) is False
 
 
+def test_llama_omni2_thinker_terminal_send_reclaims_canonical_state(build_adapter):
+    from vllm_omni.model_executor.stage_input_processors.llama_omni2 import (
+        thinker2talker_async_chunk,
+    )
+
+    adapter, _ = build_adapter(stage_id=0)
+    request = _req(
+        "thinker-internal",
+        RequestStatus.FINISHED_STOPPED,
+        external_req_id="thinker-external",
+    )
+    request.output_token_ids = [11, 12]
+    adapter.custom_process_next_stage_input_func = thinker2talker_async_chunk
+
+    adapter._send_single_request(
+        {
+            "multimodal_output": {"hidden_states": {"output": torch.tensor([[0.0, 11.0], [0.0, 12.0]])}},
+            "request": request,
+            "is_finished": True,
+            "is_segment_finished": False,
+        }
+    )
+
+    assert "thinker-external" not in adapter.request_payload
+    assert not hasattr(adapter, "_llama_omni2_stream_states")
+    assert not hasattr(adapter, "_llama_omni2_pending_thinker_rows")
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [RequestStatus.FINISHED_STOPPED, RequestStatus.FINISHED_ABORTED],
+)
+def test_llama_omni2_talker_terminal_send_reclaims_canonical_state(
+    build_adapter,
+    terminal_status,
+):
+    from vllm_omni.model_executor.stage_input_processors.llama_omni2 import (
+        talker2code2wav_async_chunk,
+    )
+
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req(
+        "talker-internal",
+        terminal_status,
+        external_req_id="talker-external",
+    )
+    adapter.custom_process_next_stage_input_func = talker2code2wav_async_chunk
+    talker2code2wav_async_chunk(
+        adapter,
+        {"codes": {"audio": torch.tensor([151766])}},
+        request,
+    )
+
+    adapter._send_single_request(
+        {
+            "multimodal_output": {"codes": {"audio": torch.tensor([151766, 151767])}},
+            "request": request,
+            "is_finished": True,
+            "is_segment_finished": False,
+        }
+    )
+
+    assert "talker-external" not in adapter.request_payload
+    assert not hasattr(adapter, "_llama_omni2_stream_states")
+
+
+def test_llama_omni2_terminal_processor_error_reclaims_state_after_marker_send(
+    build_adapter,
+):
+    from vllm_omni.model_executor.stage_input_processors.llama_omni2 import (
+        talker2code2wav_async_chunk,
+    )
+
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req(
+        "talker-internal",
+        RequestStatus.FINISHED_STOPPED,
+        external_req_id="talker-external",
+    )
+    adapter.custom_process_next_stage_input_func = talker2code2wav_async_chunk
+    talker2code2wav_async_chunk(
+        adapter,
+        {"codes": {"audio": torch.tensor([151766])}},
+        request,
+    )
+
+    adapter._send_single_request(
+        {
+            "multimodal_output": {"codes": {"audio": torch.tensor([151766, 151665])}},
+            "request": request,
+            "is_finished": True,
+            "is_segment_finished": False,
+        }
+    )
+
+    assert connector.put.called
+    assert "talker-external" not in adapter.request_payload
+    assert not hasattr(adapter, "_llama_omni2_stream_states")
+
+
+def test_llama_omni2_failed_terminal_send_preserves_state(build_adapter):
+    from vllm_omni.model_executor.stage_input_processors.llama_omni2 import (
+        talker2code2wav_async_chunk,
+    )
+
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req(
+        "talker-internal",
+        RequestStatus.FINISHED_STOPPED,
+        external_req_id="talker-external",
+    )
+    adapter.custom_process_next_stage_input_func = talker2code2wav_async_chunk
+    talker2code2wav_async_chunk(
+        adapter,
+        {"codes": {"audio": torch.tensor([151766])}},
+        request,
+    )
+    connector.put.return_value = (False, 0, {})
+
+    adapter._send_single_request(
+        {
+            "multimodal_output": {"codes": {"audio": torch.tensor([151766, 151767])}},
+            "request": request,
+            "is_finished": True,
+            "is_segment_finished": False,
+        }
+    )
+
+    assert connector.put.called
+    assert "talker-external" in adapter.request_payload
+    assert not hasattr(adapter, "_llama_omni2_stream_states")
+
+
 def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, monkeypatch):
     """Producer may return a struct with ``meta=None`` (e.g. payload that
     carries only ``embed`` or ``codes``). The sender's ``meta is not None``
@@ -1124,6 +1315,28 @@ def test_save_async_skips_stale_resumable_chunk_within_segment(build_adapter):
 
     assert len(adapter._pending_save_reqs) == 1
     assert adapter.requests_num_chunks_sent["ext-stream"] == 0
+
+
+def test_save_async_allows_processor_managed_output_dedup_after_reprefill(
+    build_adapter,
+):
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-codec", RequestStatus.WAITING, external_req_id="ext-codec")
+    request.num_computed_tokens = 2
+    adapter.requests_num_chunks_sent["ext-codec"] = 3
+
+    def processor_with_output_dedup(**kwargs):
+        return OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.tensor([1, 2], dtype=torch.long)),
+        )
+
+    processor_with_output_dedup.manages_output_dedup = True
+    adapter.custom_process_next_stage_input_func = processor_with_output_dedup
+
+    adapter.save_async(multimodal_output=None, request=request)
+
+    assert len(adapter._pending_save_reqs) == 1
+    assert adapter.requests_num_chunks_sent["ext-codec"] == 2
 
 
 def test_save_async_drops_late_previous_segment_after_boundary_reset(build_adapter):
@@ -1723,6 +1936,7 @@ def test_cleanup_clears_all_state(build_adapter):
     assert req_id not in adapter.get_req_chunk
     assert req_id not in adapter.requests_with_ready_chunks
     assert req_id not in adapter.request_ids_mapping
+    assert req_id not in adapter._pending_streaming_prefills
     assert req_id in adapter._cancelled_load_reqs
     assert req_id not in adapter._finished_load_reqs
     assert req_id not in adapter._pending_ar_prompt_updates

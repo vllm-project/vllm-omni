@@ -695,6 +695,71 @@ def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
     assert output.multimodal_outputs is None
 
 
+def test_build_omni_output_exports_cumulative_postprocess_buffer_keys(
+    monkeypatch,
+):
+    runner = _make_async_output_runner(engine_output_type="latent")
+    runner.requests = {"r1": SimpleNamespace()}
+    runner.model_intermediate_buffer = {
+        "r1": {"codes": {"audio": torch.tensor([7], dtype=torch.long)}},
+    }
+    runner.model = SimpleNamespace(
+        has_postprocess=True,
+        omni_pooler_payload_include_hidden=False,
+        cumulative_postprocess_output_buffer_keys={("codes", "audio")},
+        postprocess=lambda *args, **kwargs: {"codes": {"audio": torch.tensor([8], dtype=torch.long)}},
+    )
+
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_resolve_pooler_payload_req_ids",
+        lambda self, req_ids: ("latent", req_ids),
+    )
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_should_accumulate_full_payload_output",
+        lambda self: False,
+    )
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "get_omni_connector_output",
+        lambda self: None,
+    )
+
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=1,
+            num_scheduled_tokens={"r1": 1},
+        ),
+        hidden_states=torch.tensor([[1.0]]),
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={},
+        req_ids_output_copy=["r1"],
+        req_id_to_index_output_copy={"r1": 0},
+        valid_sampled_token_ids=[[8]],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=np.array([1], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.long),
+    )
+
+    assert output.inter_stage_outputs is not None
+    assert torch.equal(
+        output.inter_stage_outputs[0]["codes.audio"],
+        torch.tensor([7, 8], dtype=torch.long),
+    )
+    assert torch.equal(
+        runner.model_intermediate_buffer["r1"]["codes"]["audio"],
+        torch.tensor([7, 8], dtype=torch.long),
+    )
+
+
 def test_build_omni_output_splits_mm_by_scheduled_tokens_when_hidden_is_tail_only(monkeypatch):
     runner = _make_async_output_runner(engine_output_type="latent")
     runner.model.omni_pooler_payload_include_hidden = False
@@ -1834,6 +1899,7 @@ class TestPreferModelSamplerNoneFallback:
             "higgs_audio_v2",
             "higgs_audio_v3",
             "hunyuan_image3",
+            "llama_omni2",
             "minicpmo_4_5",
             "minimax_music3",
             "nemotron_voicechat",

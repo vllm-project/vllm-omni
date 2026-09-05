@@ -76,6 +76,7 @@ class OmniTokensPrompt(TokensPrompt):
     # Values may be torch.Tensor or list
     additional_information: NotRequired[dict[str, Any]]
     model_intermediate_buffer: NotRequired[dict[str, Any]]
+    sampling_params_override: NotRequired[dict[str, Any]]
 
 
 class OmniTokenInputs(TokensInput):

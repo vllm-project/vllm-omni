@@ -49,6 +49,10 @@ from vllm_omni.benchmarks.data_modules.daily_omni_dataset import (
     daily_omni_local_videos_dir,
     resolve_daily_omni_local_root,
 )
+from vllm_omni.benchmarks.data_modules.llama_omni2_s2s_dataset import (
+    LlamaOmni2S2SDataset,
+    LlamaOmni2S2SSampleRequest,
+)
 from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
     DEFAULT_OMNIINTERACT_REPO,
     OmniInteractDataset,
@@ -264,6 +268,15 @@ def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFu
     rfi.extra_body = base
 
 
+def _attach_llama_omni2_s2s_to_request_func_input(
+    sample: SampleRequest,
+    rfi: RequestFuncInput,
+) -> None:
+    if not isinstance(sample, LlamaOmni2S2SSampleRequest):
+        return
+    setattr(rfi, "omni_chat_messages", sample.llama_omni2_chat_messages)
+
+
 def _attach_omniinteract_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
     if not isinstance(sample, OmniInteractSampleRequest):
         return
@@ -378,6 +391,7 @@ def get_samples(args, tokenizer):
         "ttsd",
         "sound-effect",
     )
+    is_llama_omni2_s2s = args.dataset_name == "llama-omni2-s2s"
     is_omniinteract = args.dataset_name == "omniinteract"
 
     # Check if we need to handle omni-related backends/datasets
@@ -387,7 +401,9 @@ def get_samples(args, tokenizer):
         "openai-realtime-duplex",
         "daily-omni",
     ]
-    is_omni_dataset = is_daily_omni or is_seed_tts or is_omniinteract or args.dataset_name == "random-mm"
+    is_omni_dataset = (
+        is_daily_omni or is_seed_tts or is_llama_omni2_s2s or is_omniinteract or args.dataset_name == "random-mm"
+    )
 
     if not is_omni_backend and not is_omni_dataset:
         # Not an omni-related request, delegate to original implementation
@@ -562,6 +578,28 @@ def get_samples(args, tokenizer):
             no_oversample=args.no_oversample,
         )
         return input_requests
+
+    if is_llama_omni2_s2s:
+        if args.backend != "openai-chat-omni":
+            raise ValueError("LLaMA-Omni2 S2S requires --backend openai-chat-omni")
+        dataset_path = getattr(args, "dataset_path", None)
+        if not dataset_path:
+            raise ValueError("LLaMA-Omni2 S2S requires --dataset-path pointing to fixed JSONL")
+        dataset = LlamaOmni2S2SDataset(
+            dataset_path=dataset_path,
+            random_seed=args.seed,
+            disable_shuffle=getattr(args, "disable_shuffle", False),
+        )
+        out_len = getattr(args, "output_len", None)
+        if out_len is None:
+            out_len = getattr(args, "hf_output_len", None)
+        return dataset.sample(
+            tokenizer=tokenizer,
+            num_requests=args.num_prompts,
+            output_len=out_len or LlamaOmni2S2SDataset.DEFAULT_OUTPUT_LEN,
+            request_id_prefix=args.request_id_prefix,
+            no_oversample=args.no_oversample,
+        )
 
     if is_seed_tts:
         if args.backend not in (
@@ -2088,6 +2126,10 @@ async def benchmark(
     )
     _attach_daily_omni_to_request_func_input(input_requests[0], test_input)
     _attach_seed_tts_to_request_func_input(input_requests[0], test_input)
+    _attach_llama_omni2_s2s_to_request_func_input(
+        input_requests[0],
+        test_input,
+    )
     _attach_omniinteract_to_request_func_input(input_requests[0], test_input)
 
     if ready_check_timeout_sec > 0:
@@ -2154,6 +2196,10 @@ async def benchmark(
         )
         _attach_daily_omni_to_request_func_input(input_requests[0], profile_input)
         _attach_seed_tts_to_request_func_input(input_requests[0], profile_input)
+        _attach_llama_omni2_s2s_to_request_func_input(
+            input_requests[0],
+            profile_input,
+        )
         profile_output = await request_func(request_func_input=profile_input, session=session)
         if profile_output.success:
             print("Profiler started")
@@ -2265,6 +2311,10 @@ async def benchmark(
         )
         _attach_daily_omni_to_request_func_input(request, request_func_input)
         _attach_seed_tts_to_request_func_input(request, request_func_input)
+        _attach_llama_omni2_s2s_to_request_func_input(
+            request,
+            request_func_input,
+        )
         _attach_omniinteract_to_request_func_input(request, request_func_input)
         tasks.append(
             asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))

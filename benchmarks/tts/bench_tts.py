@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Universal TTS benchmark CLI for vllm-omni.
 
 Runs ``vllm bench serve --omni`` with model-aware defaults loaded from
@@ -55,6 +58,7 @@ _TASK_TO_DATASET: dict[str, str] = {
     "voice_design": "seed-tts-design",
     "dialogue": "ttsd",
     "sound_effect": "sound-effect",
+    "speech_to_speech": "llama-omni2-s2s",
 }
 
 # Default design dataset path (bundled with the repo)

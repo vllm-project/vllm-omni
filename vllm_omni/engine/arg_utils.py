@@ -29,6 +29,7 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "IndexTTS2TalkerForConditionalGeneration": "indextts2",
     "IndexTTS25S2MelDecoder": "indextts2_5",
     "IndexTTS25TalkerForConditionalGeneration": "indextts2_5",
+    "LlamaOmni2Code2Wav": "omni2_speech2s_qwen2",
     "OmniVoiceModel": "omnivoice",
     # PersonaPlex ships an empty config.json, so create_model_config() must patch
     # model_type=personaplex from the arch name or the staged pipeline can't load
@@ -267,10 +268,8 @@ class OmniEngineArgs(EngineArgs):
         return True
 
     def _patch_empty_hf_config(self, model_type: str) -> None:
-        """For models with empty config.json (e.g. CosyVoice3), create a
-        patched config in a temp directory with model_type set so that
-        transformers AutoConfig.from_pretrained can resolve the config class.
-        Sets self.hf_config_path to point to the patched directory."""
+        """Create a minimal usable HF config for nonstandard model repos."""
+        config_dict: dict[str, Any] = {}
         try:
             from transformers import PretrainedConfig
 
@@ -278,10 +277,10 @@ class OmniEngineArgs(EngineArgs):
             if config_dict.get("model_type"):
                 return  # config.json already has model_type, no patching needed
         except Exception:
-            # The official IndexTTS 2.5 bundle has no HuggingFace config.json.
+            # These native decoder bundles have no HuggingFace config.json.
             # Keep this exception model-scoped so other loader failures retain
             # vLLM's normal error path.
-            if model_type != "indextts2_5" or not os.path.isdir(self.model):
+            if model_type not in {"indextts2_5", "omni2_speech2s_qwen2"} or not os.path.isdir(self.model):
                 return
             config_path = os.path.join(self.model, "config.json")
             if os.path.lexists(config_path):

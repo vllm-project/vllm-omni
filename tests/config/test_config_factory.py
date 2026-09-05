@@ -1672,6 +1672,53 @@ stages:
         assert stages[1].yaml_runtime["devices"] == "1,2"
         assert stages[1].yaml_runtime["num_replicas"] == 2
 
+    def test_stage_deploy_config_accepts_per_stage_model_override(self, tmp_path):
+        path = tmp_path / "llama_omni2.yaml"
+        path.write_text("stages:\n  - stage_id: 0\n  - stage_id: 2\n    model: ICTNLP/cosy2_decoder\n")
+
+        deploy = load_deploy_config(path)
+
+        assert deploy.stages[0].model is None
+        assert deploy.stages[1].model == "ICTNLP/cosy2_decoder"
+
+    def test_merge_pipeline_deploy_uses_stage_model_override(self):
+        pipeline = PipelineConfig(
+            model_type="test_stage_model",
+            stages=(
+                StagePipelineConfig(stage_id=0, model_stage="thinker"),
+                StagePipelineConfig(
+                    stage_id=2,
+                    model_stage="code2wav",
+                    execution_type=StageExecutionType.LLM_GENERATION,
+                    input_sources=(0,),
+                    final_output=True,
+                    final_output_type="audio",
+                ),
+            ),
+        )
+        deploy = DeployConfig(
+            async_chunk=False,
+            stages=[
+                StageDeployConfig(stage_id=0),
+                StageDeployConfig(
+                    stage_id=2,
+                    model="ICTNLP/cosy2_decoder",
+                ),
+            ],
+        )
+
+        stages = merge_pipeline_deploy(
+            pipeline,
+            deploy,
+            {"model": "ICTNLP/LLaMA-Omni2-0.5B"},
+        )
+
+        stages[0].runtime_overrides = {"model": "ICTNLP/LLaMA-Omni2-0.5B"}
+        stages[1].runtime_overrides = {"model": "ICTNLP/LLaMA-Omni2-0.5B"}
+
+        assert stages[0].to_omegaconf().engine_args.model == "ICTNLP/LLaMA-Omni2-0.5B"
+        assert stages[1].to_omegaconf().engine_args.model == "ICTNLP/cosy2_decoder"
+
     def test_merge_pipeline_deploy_preserves_requires_multimodal_data(self):
         pipeline = PipelineConfig(
             model_type="test_mm",

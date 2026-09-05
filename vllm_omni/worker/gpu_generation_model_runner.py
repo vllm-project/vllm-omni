@@ -457,7 +457,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                                 f"Multimodal output list for key '{key}' has length {len(out)} "
                                 f"but expected {num_reqs} (one entry per request)."
                             )
-                        mm_payload[key] = out[i].detach().to("cpu").contiguous()
+                        request_output = out[i]
+                        if request_output is not None:
+                            mm_payload[key] = request_output.detach().to("cpu").contiguous()
                     elif isinstance(out, torch.Tensor):
                         mm_payload[key] = out.detach().to("cpu").contiguous()
                     else:

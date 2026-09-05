@@ -9,6 +9,27 @@ from vllm.model_executor.models.registry import (
 )
 
 _OMNI_MODELS = {
+    # LLaMA-Omni 2
+    "Omni2Speech2SQwen2ForCausalLM": (
+        "llama_omni2",
+        "llama_omni2",
+        "Omni2Speech2SQwen2ForCausalLM",
+    ),
+    "LlamaOmni2ThinkerForConditionalGeneration": (
+        "llama_omni2",
+        "llama_omni2_thinker",
+        "LlamaOmni2ThinkerForConditionalGeneration",
+    ),
+    "LlamaOmni2TalkerForConditionalGeneration": (
+        "llama_omni2",
+        "llama_omni2_talker",
+        "LlamaOmni2TalkerForConditionalGeneration",
+    ),
+    "LlamaOmni2Code2Wav": (
+        "llama_omni2",
+        "llama_omni2_code2wav",
+        "LlamaOmni2Code2Wav",
+    ),
     "Qwen2_5OmniForConditionalGeneration": (
         "qwen2_5_omni",
         "qwen2_5_omni",

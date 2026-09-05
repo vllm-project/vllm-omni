@@ -859,6 +859,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             scheduled_seq_len=scheduled_seq_len,
         )
         payload.update(mm_payload)
+        for category, qualifier in set(
+            getattr(
+                getattr(self, "model", None),
+                "cumulative_postprocess_output_buffer_keys",
+                (),
+            )
+            or ()
+        ):
+            buffered = self.model_intermediate_buffer.get(rid, {})
+            nested = buffered.get(category) if isinstance(buffered, dict) else None
+            if isinstance(nested, dict) and qualifier in nested:
+                payload.setdefault(category, {})[qualifier] = nested[qualifier]
         return payload
 
     def _merge_model_kv_transfer_metadata(
