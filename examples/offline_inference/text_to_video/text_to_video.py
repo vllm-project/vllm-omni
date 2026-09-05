@@ -287,8 +287,12 @@ def parse_args() -> argparse.Namespace:
         "--cache-backend",
         type=str,
         default=None,
-        choices=["cache_dit"],
-        help="Cache backend for acceleration (Wan2.2). Default: None.",
+        choices=["cache_dit", "tea_cache"],
+        help=(
+            "Cache backend to use for acceleration. "
+            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (TeaCache). "
+            "Default: None (no cache acceleration)."
+        ),
     )
     parser.add_argument(
         "--enable-cache-dit-summary",
