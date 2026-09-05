@@ -686,6 +686,17 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable VAE tiling for memory optimization (useful for mitigating OOM issues).",
         )
+        omni_config_group.add_argument(
+            "--vae-fast-path",
+            choices=("off", "lossless", "channels_last"),
+            default="lossless",
+            help=(
+                "Wan VAE decoder fast path. 'lossless' (default) installs bit-exact fused kernels; "
+                "'channels_last' additionally switches decoder convolutions to channels-last memory "
+                "format and fuses RMSNorm+SiLU (faster, not bit-exact); 'off' keeps the reference "
+                "diffusers implementation."
+            ),
+        )
 
         # Parallel weight loading (faster diffusion startup)
         omni_config_group.add_argument(

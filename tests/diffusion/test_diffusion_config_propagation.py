@@ -187,6 +187,17 @@ def test_qwen_image_edit_plus_sets_generic_multimodal_limit():
     assert od_config.max_multimodal_image_inputs == QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES
 
 
+def test_vae_fast_path_roundtrip():
+    assert _roundtrip_diffusion_config(model="x").vae_fast_path == "lossless"
+    od = _roundtrip_diffusion_config(model="x", vae_fast_path="channels_last")
+    assert od.vae_fast_path == "channels_last"
+
+
+def test_invalid_vae_fast_path_is_rejected():
+    with pytest.raises(ValueError, match="vae_fast_path"):
+        OmniDiffusionConfig(model="x", vae_fast_path="fast")
+
+
 def test_task_type_roundtrip():
     od = _roundtrip_diffusion_config(model="x", task_type="model-defined-task")
     assert od.task_type == "model-defined-task"

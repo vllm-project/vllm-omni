@@ -35,6 +35,23 @@ def test_serve_parser_accepts_no_async_chunk_and_marks_it_explicit() -> None:
     assert not explicit["async_chunk"]
 
 
+def test_serve_parser_accepts_vae_fast_path() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni"])
+    assert args.vae_fast_path == "lossless"
+    assert "vae_fast_path" not in args.get_explicit_kwargs_dict()
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--vae-fast-path", "channels_last"])
+    assert args.vae_fast_path == "channels_last"
+    assert args.get_explicit_kwargs_dict()["vae_fast_path"] == "channels_last"
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "fake-model", "--omni", "--vae-fast-path", "fast"])
+
+
 def test_serve_parser_accepts_strategy_config() -> None:
     """``--strategy-config`` must parse onto the ``strategy_config`` dest and be
     forwarded as an explicit kwarg so the engine can overlay the strategy."""

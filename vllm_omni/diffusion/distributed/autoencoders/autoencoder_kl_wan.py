@@ -18,6 +18,7 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     GridSpec,
     TileTask,
 )
+from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import decode_frames, is_installed
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -47,6 +48,22 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
     def decode(self, z: torch.Tensor, return_dict: bool = True):
         with self._execution_context():
             return super().decode(z, return_dict=return_dict)
+
+    def _decode(self, z: torch.Tensor, return_dict: bool = True):
+        if not is_installed(self):
+            return super()._decode(z, return_dict=return_dict)
+
+        # Same tiling dispatch as diffusers; only the chunk loop changes.
+        _, _, _, height, width = z.shape
+        tile_latent_min_height = self.tile_sample_min_height // self.spatial_compression_ratio
+        tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
+        if self.use_tiling and (width > tile_latent_min_width or height > tile_latent_min_height):
+            return self.tiled_decode(z, return_dict=return_dict)
+
+        out = decode_frames(self, z)
+        if not return_dict:
+            return (out,)
+        return DecoderOutput(sample=out)
 
 
 class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):

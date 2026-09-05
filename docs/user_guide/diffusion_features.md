@@ -250,6 +250,7 @@ The Diffusion Acceleration navigation groups the remaining guides as follows:
 | Parallelism | [Parallelism Overview](diffusion/parallelism/overview.md) |
 | Attention | [Attention Backends](diffusion/attention_backends.md) |
 | Compilation | [Regional Compilation](diffusion/regional_compilation.md) |
+| VAE decode | [Wan VAE Decoder Fast Path](diffusion/vae_fast_path.md) |
 | Video extension | [Frame Interpolation](diffusion/frame_interpolation.md) |
 | Startup | [Startup and Loading](diffusion/startup_and_loading.md) |
 | Adapters | [LoRA](diffusion/lora.md) |

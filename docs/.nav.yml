@@ -94,6 +94,7 @@ nav:
         - Hugging Face Hub: user_guide/diffusion/attention_backends/huggingface_hub.md
         - RainFusion: user_guide/diffusion/attention_backends/rainfusion.md
       - Regional Compilation: user_guide/diffusion/regional_compilation.md
+      - Wan VAE Decoder Fast Path: user_guide/diffusion/vae_fast_path.md
       - Frame Interpolation: user_guide/diffusion/frame_interpolation.md
       - Startup and Loading: user_guide/diffusion/startup_and_loading.md
       - LoRA: user_guide/diffusion/lora.md

@@ -41,6 +41,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Accepted values for ``OmniDiffusionConfig.vae_fast_path``.
+VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last")
+
 
 def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize legacy diffusion kwargs before config construction."""
@@ -835,6 +838,12 @@ class OmniDiffusionConfig:
     # VAE memory optimization parameters
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    # Wan VAE decoder fast path. ``"lossless"`` installs the bit-exact fused
+    # kernels on every diffusers Wan VAE, ``"channels_last"`` additionally
+    # converts decoder convolution weights to channels-last memory format and
+    # fuses RMSNorm+SiLU (faster, not bit-exact), ``"off"`` keeps the reference
+    # diffusers implementation.
+    vae_fast_path: str = "lossless"
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
@@ -1056,6 +1065,8 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        if self.vae_fast_path not in VAE_FAST_PATH_LEVELS:
+            raise ValueError(f"vae_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {self.vae_fast_path!r}")
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
                 "diffusion_compile_granularity must be 'regional' or 'full', "
