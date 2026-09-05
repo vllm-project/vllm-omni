@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -20,6 +21,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .parallel import Magi2ParallelGroup, get_magi2_tp_group
+
+# Quantization here is intentionally self-contained (no vLLM LinearBase
+# dependency): Magi2GroupedLinear stores a flattened [num_experts * out, in]
+# weight with its own TP sharding hooks, which doesn't fit vLLM's
+# ColumnParallelLinear/RowParallelLinear contract. `quant_config` is duck
+# typed (`get_name()`) rather than the vLLM `QuantizationConfig` type so this
+# module has no hard vLLM import for its quantization path.
+_SUPPORTED_QUANT_METHODS = frozenset({"int8"})
+
+
+def _is_int8_quant_config(quant_config: Any | None) -> bool:
+    if quant_config is None:
+        return False
+    get_name = getattr(quant_config, "get_name", None)
+    return callable(get_name) and get_name() in _SUPPORTED_QUANT_METHODS
 
 
 def swiglu7(
@@ -84,6 +100,7 @@ class Magi2GroupedLinear(nn.Module):
         parallel_mode: str | None = None,
         qkv_splits: tuple[int, int, int] | None = None,
         tp_group: Magi2ParallelGroup | None = None,
+        quant_config: Any | None = None,
     ) -> None:
         super().__init__()
         if parallel_mode not in (None, "column", "row"):
@@ -130,6 +147,9 @@ class Magi2GroupedLinear(nn.Module):
             if self.bias is not None and parallel_mode == "column":
                 self.bias.checkpoint_weight_transform = self.shard_checkpoint_bias
 
+        self.quant_config = quant_config
+        self._int8_quantized = False
+
     def _column_slices(self) -> tuple[tuple[int, int], ...]:
         splits = self.qkv_splits or (self.out_features,)
         offsets: list[tuple[int, int]] = []
@@ -175,12 +195,39 @@ class Magi2GroupedLinear(nn.Module):
         shards = [grouped[:, start:end] for start, end in self._column_slices()]
         return torch.cat(shards, dim=1).reshape(-1)
 
+    def maybe_quantize_int8_(self) -> None:
+        """Quantize the (already-loaded) weight to per-expert, per-output-channel int8.
+
+        Weight-only, symmetric, dynamic quantization: no calibration data or
+        serialized scales are needed, so this can run right after checkpoint
+        loading. Activations stay in ``params_dtype``; the int8 weight is
+        dequantized on the fly in `forward`, so this trades compute (one
+        extra elementwise multiply per forward) for ~2x smaller resident
+        weight memory vs bf16/fp16.
+        """
+        if self._int8_quantized or not _is_int8_quant_config(self.quant_config):
+            return
+        with torch.no_grad():
+            grouped = self.weight.data.view(self.num_experts, self.local_out_features, self.local_in_features)
+            scale = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
+            quantized = (grouped / scale).round().clamp(-127, 127).to(torch.int8)
+        del self._parameters["weight"]
+        self.register_buffer("weight_int8", quantized)
+        self.register_buffer("weight_scale", scale.to(torch.float32))
+        self.weight = None
+        self._int8_quantized = True
+
+    def _grouped_weight(self, compute_dtype: torch.dtype) -> torch.Tensor:
+        if self._int8_quantized:
+            return self.weight_int8.to(compute_dtype) * self.weight_scale.to(compute_dtype)
+        return self.weight.view(self.num_experts, self.local_out_features, self.local_in_features)
+
     def forward(
         self,
         tensor: torch.Tensor,
         modality_dispatcher: ModalityDispatcher | None = None,
     ) -> torch.Tensor:
-        weight = self.weight.view(self.num_experts, self.local_out_features, self.local_in_features)
+        weight = self._grouped_weight(tensor.dtype)
         bias_features = self.local_out_features if self.parallel_mode == "column" else self.out_features
         bias = self.bias.view(self.num_experts, bias_features) if self.bias is not None else None
         linear_bias = None if self.parallel_mode == "row" else bias
@@ -219,6 +266,7 @@ def make_grouped_linear(
     dtype: torch.dtype | None = None,
     parallel_mode: str | None = None,
     qkv_splits: tuple[int, int, int] | None = None,
+    quant_config: Any | None = None,
 ) -> Magi2GroupedLinear:
     return Magi2GroupedLinear(
         in_features,
@@ -228,6 +276,7 @@ def make_grouped_linear(
         dtype=dtype,
         parallel_mode=parallel_mode,
         qkv_splits=qkv_splits,
+        quant_config=quant_config,
     )
 
 

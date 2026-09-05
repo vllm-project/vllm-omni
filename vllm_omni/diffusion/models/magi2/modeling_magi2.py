@@ -28,6 +28,7 @@ from .configuration_magi2 import Magi2PreviewConfig
 from .layers import (
     ElementWiseFourierEmbed,
     MHCHandler,
+    Magi2GroupedLinear,
     ModalityDispatcher,
     MultiModalityRMSNorm,
     make_grouped_linear,
@@ -69,6 +70,7 @@ class Magi2Attention(nn.Module):
             bias=False,
             dtype=config.params_dtype,
             parallel_mode="column",
+            quant_config=config.quant_config,
         )
         self.linear_qkv = make_grouped_linear(
             config.hidden_size,
@@ -78,6 +80,7 @@ class Magi2Attention(nn.Module):
             dtype=config.params_dtype,
             parallel_mode="column",
             qkv_splits=(global_q_size, global_kv_size, global_kv_size),
+            quant_config=config.quant_config,
         )
         self.linear_proj = make_grouped_linear(
             global_q_size,
@@ -86,6 +89,7 @@ class Magi2Attention(nn.Module):
             bias=False,
             dtype=config.params_dtype,
             parallel_mode="row",
+            quant_config=config.quant_config,
         )
         self.tp_group = self.linear_qkv.tp_group
         self.num_heads_q = config.num_heads_q // self.tp_group.world_size
@@ -200,6 +204,7 @@ class Magi2MLP(nn.Module):
             bias=False,
             dtype=config.params_dtype,
             parallel_mode="column",
+            quant_config=config.quant_config,
         )
         self.down_proj = make_grouped_linear(
             intermediate_size,
@@ -208,6 +213,7 @@ class Magi2MLP(nn.Module):
             bias=False,
             dtype=config.params_dtype,
             parallel_mode="row",
+            quant_config=config.quant_config,
         )
 
     def forward(self, hidden_states: torch.Tensor, dispatcher: ModalityDispatcher) -> torch.Tensor:
@@ -729,6 +735,12 @@ class Magi2PreviewTransformer(nn.Module):
         missing = set(targets) - loaded
         if missing:
             raise ValueError(f"MAGI-2 preview checkpoint is missing {len(missing)} weights: {sorted(missing)[:8]}")
+
+        if self.config.quant_config is not None:
+            for module in self.modules():
+                if isinstance(module, Magi2GroupedLinear):
+                    module.maybe_quantize_int8_()
+
         return loaded
 
 
