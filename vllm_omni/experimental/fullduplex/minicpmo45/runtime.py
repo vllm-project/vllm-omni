@@ -136,7 +136,8 @@ def build_duplex_data_plane_prompt(
             token_budget = context_reserve + first_units * 12 - 1 + _duplex_vision_tokens(payload)
     if seq > 1 and duplex_payload_is_exact_chunks(payload):
         token_budget += 1
-    if final and duplex_payload_is_exact_chunks(payload):
+    response_in_progress = isinstance(payload, dict) and payload.get("_duplex_response_in_progress") is True
+    if final and duplex_payload_is_exact_chunks(payload) and not response_in_progress:
         token_budget += 12
     extra_body = session_config.get("extra_body")
     raw_token_id = runtime_config.get("duplex_scheduler_token_id")

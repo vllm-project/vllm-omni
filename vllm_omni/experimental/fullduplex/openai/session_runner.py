@@ -333,6 +333,12 @@ class DuplexSessionRunnerMixin:
             append_turn_id = payload_turn_id(payload)
             if append_turn_id is None:
                 append_turn_id = session.turn_id
+            runtime_payload = payload
+            if isinstance(payload, dict):
+                runtime_payload = {
+                    **payload,
+                    "_duplex_response_in_progress": session.active_response_id is not None,
+                }
             request_id = self._native_stage0_request_id(session, append_epoch)
             if final or precreate_response:
                 session.bind_request(request_id)
@@ -361,7 +367,7 @@ class DuplexSessionRunnerMixin:
                 try:
                     append_ok, emitted_response = await self._append_runtime_input(
                         session,
-                        payload,
+                        runtime_payload,
                         operation_id=(pcm_reservation.operation_id if pcm_reservation is not None else operation_id),
                         final=final,
                         send_json=emit_event,

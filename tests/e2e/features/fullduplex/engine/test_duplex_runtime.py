@@ -1,3 +1,4 @@
+from base64 import b64encode
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
@@ -396,6 +397,38 @@ def test_duplex_scheduler_token_budget_ignores_client_budget_fields():
         )
         == 16
     )
+
+
+@pytest.mark.parametrize(
+    ("response_in_progress", "expected_token_budget"),
+    [(False, 25), (True, 13)],
+)
+def test_exact_chunk_final_append_reserves_only_for_a_new_response(
+    response_in_progress: bool,
+    expected_token_budget: int,
+):
+    fence = DuplexFence("sid", turn_id=1, response_seq=1)
+    prompt = build_duplex_data_plane_prompt(
+        request_id=duplex_resource_request_id(fence, "stage0"),
+        fence=fence,
+        session_config={},
+        runtime_config={},
+        seq=2,
+        turn_seq=1,
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        payload={
+            "audio": b64encode(bytes(16000 * 4)).decode("ascii"),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+            "_duplex_response_in_progress": response_in_progress,
+        },
+        final=True,
+    )
+
+    duplex = prompt["model_intermediate_buffer"]["duplex"]
+    assert len(prompt["prompt_token_ids"]) == expected_token_budget
+    assert duplex["scheduler_token_budget"] == expected_token_budget
+    assert duplex["final"] is True
 
 
 def test_resource_state_rejects_fence_regression_and_requires_explicit_fence():

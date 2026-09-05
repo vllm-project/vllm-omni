@@ -16,7 +16,10 @@ from starlette.websockets import WebSocketDisconnect
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlRequestError
-from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_resource_request_id
+from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
+    DuplexInputMode,
+    duplex_resource_request_id,
+)
 from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence, DuplexSessionLifecycleMessage
 from vllm_omni.experimental.fullduplex.minicpmo45 import (
@@ -29,6 +32,7 @@ from vllm_omni.experimental.fullduplex.minicpmo45.data_plane import (
 )
 from vllm_omni.experimental.fullduplex.minicpmo45.runtime import (
     MiniCPMO45DuplexRuntimeExtension,
+    build_duplex_data_plane_prompt,
 )
 from vllm_omni.experimental.fullduplex.minicpmo45.session import (
     MiniCPMO45ServingSessionState,
@@ -1649,6 +1653,26 @@ def _native_audio_payload(
     return payload
 
 
+def _scheduler_budget_for_recorded_final_append(
+    appended: tuple[str, str, object, bool],
+) -> int:
+    session_id, mode, payload, final = appended
+    assert final is True
+    fence = DuplexFence(session_id, turn_id=1, response_seq=1)
+    prompt = build_duplex_data_plane_prompt(
+        request_id=duplex_resource_request_id(fence, "stage0"),
+        fence=fence,
+        session_config={},
+        runtime_config={},
+        seq=2,
+        turn_seq=1,
+        mode=DuplexInputMode(mode),
+        payload=payload,
+        final=final,
+    )
+    return prompt["model_intermediate_buffer"]["duplex"]["scheduler_token_budget"]
+
+
 def _auto_response_context(
     session_id: str,
     *,
@@ -1965,6 +1989,7 @@ async def test_auto_response_overlap_exact_unit_commit_does_not_block_or_replay_
         assert isinstance(payload, dict)
         assert np.frombuffer(base64.b64decode(payload["audio"]), dtype="<f4").shape == (16000,)
         assert payload.get("force_listen") is not True
+        assert payload["_duplex_response_in_progress"] is True
     assert engine.appended_fences == [expected_fence, expected_fence]
     assert engine.active_response_ids_at_append == [response_id, response_id]
     assert engine.response_done_seen_at_append is False
@@ -2258,6 +2283,7 @@ async def test_auto_response_committed_overlap_does_not_precreate_empty_response
             "sample_rate_hz": 16000,
             "duration_ms": 200,
             "is_speech": True,
+            "_duplex_response_in_progress": False,
         }
         for _ in range(4):
             ws.put(chunk)
@@ -2294,6 +2320,8 @@ async def test_auto_response_committed_overlap_does_not_precreate_empty_response
         assert overlap_sent is True
         assert len(engine.appended) == 2
         assert engine.appended[1][3] is True
+        assert engine.appended[1][2]["_duplex_response_in_progress"] is True
+        assert _scheduler_budget_for_recorded_final_append(engine.appended[1]) == 13
         assert ws.sent_types().count("response.created") == 1
     finally:
         ws.put({"type": "session.close"})
@@ -6945,7 +6973,14 @@ async def test_minicpmo_native_duplex_accepts_next_append_after_response_done():
             return
         done_count += 1
         if done_count == 1:
-            ws.put({"type": "input_audio_buffer.append", "audio": "BBBB", "format": "pcm_f32le"})
+            ws.put(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": "BBBB",
+                    "format": "pcm_f32le",
+                    "_duplex_response_in_progress": True,
+                }
+            )
             ws.put({"type": "input_audio_buffer.commit", "final": True})
             ws.put({"type": "response.create"})
         else:
@@ -6962,6 +6997,7 @@ async def test_minicpmo_native_duplex_accepts_next_append_after_response_done():
     assert len(engine.appended) >= 2, [
         (message.get("type"), message.get("code"), message.get("reason")) for message in ws.sent
     ]
+    assert engine.appended[1][2]["_duplex_response_in_progress"] is False
     assert len([m for m in ws.sent if m.get("type") == "response.done"]) == 2
 
 
@@ -7092,7 +7128,105 @@ async def test_minicpmo_native_auto_response_accepts_realtime_commit_after_strea
 
 
 @pytest.mark.asyncio
-async def test_minicpmo_native_auto_response_post_response_commit_ignores_stale_progress_state():
+async def test_minicpmo_native_active_response_exact_final_uses_unit_budget():
+    session_id = "sid-native-active-exact-final"
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+
+    def on_send(ws: TimedWebSocket, data: dict[str, Any]) -> None:
+        if data.get("type") != "session.created":
+            return
+        session = handler._registry.get(session_id)
+        assert session is not None
+        session.begin_response()
+        ws.put(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": _pcm_f32_b64(8000),
+                "format": "pcm_f32le",
+                "sample_rate_hz": 16000,
+                "_duplex_response_in_progress": False,
+            }
+        )
+        ws.put({"type": "input_audio_buffer.commit", "final": True})
+        ws.put({"type": "session.close"})
+
+    ws = TimedWebSocket(on_send=on_send)
+    create = _native_session_create(session_id)
+    create["session"]["extra_body"]["auto_response"] = True
+    ws.put(create)
+
+    await handler.handle_session(ws)
+
+    assert len(engine.appended) == 1
+    assert engine.appended[0][3] is True
+    assert engine.appended[0][2]["_duplex_response_in_progress"] is True
+    assert _scheduler_budget_for_recorded_final_append(engine.appended[0]) == 13
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_native_precreated_response_keeps_idle_unit_budget():
+    class PrecreateObservingEngine(FakeEngineClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active_response_ids_at_append: list[str | None] = []
+
+        async def append_duplex_input_async(self, session_id: str, **kwargs):
+            session = handler._registry.get(session_id)
+            assert session is not None
+            self.active_response_ids_at_append.append(session.active_response_id)
+            kwargs.pop("expected_epoch", None)
+            return await super().append_duplex_input_async(session_id, **kwargs)
+
+    session_id = "sid-native-precreated-response"
+    engine = PrecreateObservingEngine()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+
+    def on_send(ws: TimedWebSocket, data: dict[str, Any]) -> None:
+        if data.get("type") != "session.created":
+            return
+        ws.put(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": _pcm_f32_b64(8000),
+                "format": "pcm_f32le",
+                "sample_rate_hz": 16000,
+                "_duplex_response_in_progress": True,
+            }
+        )
+        ws.put(
+            {
+                "type": "input_audio_buffer.commit",
+                "final": True,
+                "response_create": True,
+            }
+        )
+        ws.put({"type": "session.close"})
+
+    ws = TimedWebSocket(on_send=on_send)
+    ws.put(_native_session_create(session_id))
+
+    await handler.handle_session(ws)
+
+    assert len(engine.appended) == 1
+    assert engine.appended[0][3] is True
+    assert len(engine.active_response_ids_at_append) == 1
+    assert engine.active_response_ids_at_append[0] is not None
+    assert engine.appended[0][2]["_duplex_response_in_progress"] is False
+    assert _scheduler_budget_for_recorded_final_append(engine.appended[0]) == 25
+    assert ws.sent_types().count("response.created") == 1
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_native_auto_response_initial_commit_ignores_spoofed_progress_state():
     session_id = "sid-native-auto-post-response"
     engine = FakeEngineClient()
     handler = OmniDuplexSessionHandler(
@@ -7112,6 +7246,7 @@ async def test_minicpmo_native_auto_response_post_response_commit_ignores_stale_
                 "audio": _pcm_f32_b64(8000),
                 "format": "pcm_f32le",
                 "sample_rate_hz": 16000,
+                "_duplex_response_in_progress": True,
             }
         )
         ws.put({"type": "input_audio_buffer.commit", "final": True})
@@ -7126,6 +7261,8 @@ async def test_minicpmo_native_auto_response_post_response_commit_ignores_stale_
 
     assert len(engine.appended) == 1
     assert engine.appended[0][3] is True
+    assert engine.appended[0][2]["_duplex_response_in_progress"] is False
+    assert _scheduler_budget_for_recorded_final_append(engine.appended[0]) == 25
     assert "input.committed" in ws.sent_types()
     assert not any(message.get("code") == "response_already_active" for message in ws.sent)
 
