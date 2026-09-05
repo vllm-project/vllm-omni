@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+import os
 from itertools import chain
 from typing import Any
 
@@ -41,6 +42,7 @@ class LayerwiseOffloadHook(ModelHook):
         device: torch.device,
         stream: current_omni_platform.Stream | None = None,
         pin_memory: bool = True,
+        timing_sink: dict[str, Any] | None = None,
     ):
         assert isinstance(next_block, nn.Module), "transformer block must be type `torch.nn.Module`"
 
@@ -59,6 +61,17 @@ class LayerwiseOffloadHook(ModelHook):
         self.next_block_buffers: dict[str, torch.Tensor] = {}
         self.dtype_cpu_flattened_weights: dict[torch.dtype, torch.Tensor] = {}
         self.dtype_metadata: dict[torch.dtype, list[dict[str, Any]]] = {}
+
+        # Optional per-round timing instrumentation (opt-in via
+        # ``VLLM_OMNI_OFFLOAD_TIMING=1``): records H2D prefetch and compute
+        # durations with CUDA events and aggregates them per full transformer
+        # pass (one denoise step for diffusion pipelines) into ``timing_sink``.
+        self._timing_sink = timing_sink
+        self._copy_start: current_omni_platform.Event | None = None
+        self._copy_end: current_omni_platform.Event | None = None
+        self._compute_start: current_omni_platform.Event | None = None
+        self._compute_end: current_omni_platform.Event | None = None
+        self._h2d_bytes = 0
 
     @staticmethod
     def _is_dtensor(t: torch.Tensor) -> bool:
@@ -218,12 +231,28 @@ class LayerwiseOffloadHook(ModelHook):
         evt = current_omni_platform.Event()
         gpu_weights: dict[torch.dtype, torch.Tensor] = {}
 
+        if self._timing_sink is not None:
+            # Timing events need ``enable_timing=True`` for ``elapsed_time``;
+            # the platform Event() default disables timing.
+            self._copy_start = torch.cuda.Event(enable_timing=True)
+            self._copy_end = torch.cuda.Event(enable_timing=True)
+            self._h2d_bytes = int(
+                sum(
+                    cpu_weight.numel() * cpu_weight.element_size()
+                    for cpu_weight in self.dtype_cpu_flattened_weights.values()
+                )
+            )
+
         with current_omni_platform.stream(self.copy_stream):
+            if self._timing_sink is not None and self._copy_start is not None:
+                self._copy_start.record(self.copy_stream)
             for dtype, cpu_weight in self.dtype_cpu_flattened_weights.items():
                 gpu_weight = torch.empty(cpu_weight.shape, dtype=dtype, device=self.device)
                 gpu_weight.copy_(cpu_weight, non_blocking=non_blocking)
                 gpu_weights[dtype] = gpu_weight
 
+            if self._timing_sink is not None and self._copy_end is not None:
+                self._copy_end.record(self.copy_stream)
             evt.record(self.copy_stream)
 
         for dtype, ordered_metadata in self.dtype_metadata.items():
@@ -271,6 +300,10 @@ class LayerwiseOffloadHook(ModelHook):
         if not self.is_materialized and self._prev_hook is not None:
             self._prev_hook.prefetch_layer(non_blocking=False)
 
+        if self._timing_sink is not None:
+            self._compute_start = torch.cuda.Event(enable_timing=True)
+            self._compute_start.record(current_omni_platform.current_stream())
+
         self.prefetch_layer(non_blocking=True)
 
         return args, kwargs
@@ -278,7 +311,83 @@ class LayerwiseOffloadHook(ModelHook):
     def post_forward(self, module: nn.Module, output: Any) -> Any:
         self.offload_layer()
 
+        if self._timing_sink is not None:
+            self._report_timing()
+
         return output
+
+    def _report_timing(self) -> None:
+        """Aggregate one block's H2D/compute events into the round sink.
+
+        Called from ``post_forward``.  Durations are NOT read here: the CUDA
+        events may still be in flight (reading ``elapsed_time`` too early
+        raises "Both events must be completed").  The events are stashed per
+        layer and the round is closed by the ``num_blocks``-th block, which
+        synchronizes once (one sync per denoise step, so the pipelined
+        overlap measurement is not perturbed per layer) and then computes all
+        durations.
+        """
+        sink = self._timing_sink
+        assert sink is not None
+        if self._compute_start is not None:
+            self._compute_end = torch.cuda.Event(enable_timing=True)
+            self._compute_end.record(current_omni_platform.current_stream())
+
+        if (
+            self._copy_start is not None
+            and self._copy_end is not None
+            and self._compute_start is not None
+            and self._compute_end is not None
+        ):
+            sink["layers"].append(
+                (
+                    self._copy_start,
+                    self._copy_end,
+                    self._compute_start,
+                    self._compute_end,
+                    self._h2d_bytes,
+                )
+            )
+        sink["count"] += 1
+
+        num_blocks = int(sink["num_blocks"])
+        if sink["count"] >= num_blocks:
+            # One synchronize per full transformer pass; by then every stashed
+            # event has completed, so elapsed_time reads are valid.
+            current_omni_platform.synchronize()
+
+            h2d_ms = 0.0
+            compute_ms = 0.0
+            h2d_bytes = 0
+            first_copy_start: torch.cuda.Event | None = None
+            last_compute_end: torch.cuda.Event | None = None
+            for copy_start, copy_end, compute_start, compute_end, bytes_ in sink["layers"]:
+                h2d_ms += copy_start.elapsed_time(copy_end)
+                compute_ms += compute_start.elapsed_time(compute_end)
+                h2d_bytes += bytes_
+                if first_copy_start is None:
+                    first_copy_start = copy_start
+                last_compute_end = compute_end
+
+            wall_ms = 0.0
+            if first_copy_start is not None and last_compute_end is not None:
+                wall_ms = first_copy_start.elapsed_time(last_compute_end)
+            total_ms = h2d_ms + compute_ms
+            overlap_ms = max(0.0, total_ms - wall_ms)
+            logger.info(
+                "layerwise offload timing (round of %d blocks): h2d=%.1f ms "
+                "(%.2f MiB), compute=%.1f ms, wall=%.1f ms, overlap=%.1f ms "
+                "(%.0f%% of h2d hidden behind compute)",
+                num_blocks,
+                h2d_ms,
+                h2d_bytes / (1024 * 1024),
+                compute_ms,
+                wall_ms,
+                overlap_ms,
+                100.0 * overlap_ms / h2d_ms if h2d_ms > 0 else 0.0,
+            )
+            sink["layers"].clear()
+            sink["count"] = 0
 
 
 def apply_block_hook(
@@ -287,9 +396,10 @@ def apply_block_hook(
     device: torch.device,
     stream: current_omni_platform.Stream | None = None,
     pin_memory: bool = True,
+    timing_sink: dict[str, Any] | None = None,
 ) -> LayerwiseOffloadHook:
     registry = HookRegistry.get_or_create(module)
-    hook = LayerwiseOffloadHook(next_block, device, stream, pin_memory)
+    hook = LayerwiseOffloadHook(next_block, device, stream, pin_memory, timing_sink=timing_sink)
     registry.register_hook(LayerwiseOffloadHook._HOOK_NAME, hook)
 
     return hook
@@ -390,6 +500,18 @@ class LayerWiseOffloadBackend(OffloadBackend):
                 if buffer is not None:
                     buffer.data = buffer.data.to(self.device, non_blocking=True)
 
+            # Optional per-round timing instrumentation (see
+            # ``LayerwiseOffloadHook._report_timing``).  Opt-in through the
+            # environment so default serving is untouched.
+            timing_sink: dict[str, Any] | None = None
+            if os.environ.get("VLLM_OMNI_OFFLOAD_TIMING") == "1":
+                timing_sink = {
+                    "num_blocks": num_blocks,
+                    "count": 0,
+                    "layers": [],
+                }
+                logger.info("layerwise offload timing instrumentation enabled (VLLM_OMNI_OFFLOAD_TIMING=1)")
+
             # Pre-fetch the first layer by manually calling the hook function on the last layer;
             # For subsequent requests, the first layer/block will be pre-fetched
             # during the last layer compute of the previous request.
@@ -400,6 +522,7 @@ class LayerWiseOffloadBackend(OffloadBackend):
                 self.device,
                 self.copy_stream,
                 self.config.pin_cpu_memory,
+                timing_sink,
             )
             last_hook.prefetch_layer(non_blocking=False)
 
@@ -413,6 +536,7 @@ class LayerWiseOffloadBackend(OffloadBackend):
                     self.device,
                     self.copy_stream,
                     self.config.pin_cpu_memory,
+                    timing_sink,
                 )
                 block_hooks.append(hook)
 

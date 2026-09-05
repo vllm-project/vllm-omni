@@ -118,6 +118,49 @@ def test_component_discovery_declarations():
     assert BooguImagePipeline._vae_modules == ["vae"]
 
 
+def test_offload_plan_declared():
+    from vllm_omni.diffusion.models.boogu_image import BooguImagePipeline
+
+    # The generic offload backends consume the declarative plan instead of
+    # heuristic discovery; the DiT block lists must match the transformer's
+    # own declaration.
+    plan = BooguImagePipeline._offload_plan
+    assert "mllm" in plan.on_demand_component_paths
+    assert "vae" in plan.on_demand_component_paths
+    assert "transformer" in plan.resident_dit_paths
+    assert plan.block_attrs == {"transformer": ("single_stream_layers", "double_stream_layers")}
+
+
+@pytest.mark.parametrize("offload_field", ["enable_cpu_offload", "enable_layerwise_offload"])
+def test_pipeline_respects_offload_managed_component_placement(offload_field, mocker, mock_dependencies):
+    """With offload enabled the backend owns placement: __init__ must not
+    eagerly move the mllm/vae to the device (the DiT alone is ~34.6 GiB)."""
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        BooguImagePipeline,
+    )
+
+    mllm_inner = mock_dependencies["mllm_wrapper"].model
+    vae = mock_dependencies["vae"]
+
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.float32,
+        num_gpus=1,
+        **{offload_field: True},
+    )
+    BooguImagePipeline(od_config=od_config)
+
+    assert mllm_inner.to.call_count == 0
+    assert vae.to.call_count == 0
+
+
+def test_pipeline_moves_components_without_offload(boogu_pipeline, mock_dependencies):
+    """Without offload the pipeline keeps the eager placement it always had."""
+    assert mock_dependencies["mllm_wrapper"].model.to.call_count == 1
+    assert mock_dependencies["vae"].to.call_count == 1
+
+
 def test_constructor_wires_components(boogu_pipeline, mock_dependencies):
     assert boogu_pipeline.scheduler is mock_dependencies["scheduler"]
     assert boogu_pipeline.processor is mock_dependencies["processor"]

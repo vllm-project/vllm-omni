@@ -21,8 +21,8 @@ Ported from the upstream ``boogu`` package
 import json
 import os
 from collections.abc import Iterable
-from contextlib import nullcontext
-from typing import ClassVar, cast
+from contextlib import contextmanager, nullcontext
+from typing import Any, ClassVar, cast
 
 import PIL.Image
 import torch
@@ -51,6 +51,7 @@ from vllm_omni.diffusion.models.boogu_image.scheduling_flow_match_euler_discrete
 )
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -226,6 +227,17 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
     _encoder_modules: ClassVar[list[str]] = ["mllm"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
 
+    # Declarative offload metadata consumed by the generic offload backends.
+    # The DiT is the 34.6 GiB resident-heavy component and is swapped against
+    # the mllm encoder (mutual exclusion, model-level) or streamed layer-by-
+    # layer (layerwise); the VAE and mllm stay on demand so their weight
+    # footprint does not sit on the device between calls.
+    _offload_plan: ClassVar[OffloadPlan] = OffloadPlan(
+        on_demand_component_paths=frozenset({"mllm", "vae"}),
+        resident_dit_paths=frozenset({"transformer"}),
+        block_attrs={"transformer": ("single_stream_layers", "double_stream_layers")},
+    )
+
     def __init__(
         self,
         *,
@@ -248,6 +260,14 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         self._execution_device = get_local_device()
         model = od_config.model
         local_files_only = os.path.exists(model)
+
+        # With CPU/layerwise offload the offload backend owns component
+        # placement (encoders and VAEs are pulled in on demand); eagerly
+        # moving every component to the device here would balloon peak VRAM
+        # past the offload point (the DiT alone is ~34.6 GiB).
+        managed_component_placement = bool(
+            getattr(od_config, "enable_cpu_offload", False) or getattr(od_config, "enable_layerwise_offload", False)
+        )
 
         # See ``hub_prefetch.py`` for the transformers v5 multi-worker subfolder
         # race; prefetch the whole component set before any from_pretrained.
@@ -280,7 +300,9 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         # ported, so keep only the inner ``Qwen3VLModel`` as the encoder.
         if hasattr(mllm, "lm_head"):
             mllm = mllm.model
-        self.mllm = mllm.to(self._execution_device)
+        if not managed_component_placement:
+            mllm = mllm.to(self._execution_device)
+        self.mllm = mllm
 
         self.processor = Qwen3VLProcessor.from_pretrained(
             model,
@@ -289,14 +311,17 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
             revision=od_config.revision,
         )
 
-        self.vae = from_pretrained_with_prefetch(
+        vae = from_pretrained_with_prefetch(
             AutoencoderKL.from_pretrained,
             model,
             subfolder="vae",
             prefetch_list=boogu_subfolders,
             local_files_only=local_files_only,
             revision=od_config.revision,
-        ).to(self._execution_device)
+        )
+        if not managed_component_placement:
+            vae = vae.to(self._execution_device)
+        self.vae = vae
 
         self.transformer = BooguImageTransformer2DModel(od_config=od_config)
 
@@ -744,6 +769,26 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
             preprocessed_images.append(ai.get("preprocessed_image"))
         return prompt_images, preprocessed_images
 
+    @contextmanager
+    def _resident_dit_layers_on_device(self, *, enabled: bool = True):
+        """Load DLO resident DiT layers for the denoise loop and release them after.
+
+        Distributed layerwise offload (``--enable-distributed-layerwise-offload
+        --dlo-resident-layers N``) keeps the model-declared leading transformer
+        blocks resident across a whole denoise loop: they are loaded onto the
+        device once before the first denoise step and offloaded again before
+        VAE decode so the VAE stage can reuse the HBM.  The DLO backend attaches
+        itself as ``_dlo_residency_controller``; without it this is a no-op.
+        """
+        controller: Any = getattr(self, "_dlo_residency_controller", None)
+        if controller is not None and enabled:
+            controller.load_resident_layers()
+        try:
+            yield
+        finally:
+            if controller is not None and enabled:
+                controller.offload_resident_layers()
+
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         # Prompt / negative-prompt extraction (mirrors the Ovis pattern; the
         # online API sometimes passes ``{"negative_prompt": None}``).
@@ -862,105 +907,111 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         # Reproduces the branch priority of upstream ``processing`` (double >
         # text-only > image-only > t2i text). Reference latents stay attached
         # to the same branches as in the original sequential implementation.
-        with self.progress_bar(total=num_timesteps) as progress_bar:
-            for i, t in enumerate(timesteps):
-                in_cfg_range = cfg_range[0] <= i / num_timesteps <= cfg_range[1]
-                text_gs = text_guidance_scale if in_cfg_range else 1.0
-                image_gs = image_guidance_scale if in_cfg_range else 1.0
+        #
+        # Distributed layerwise offload (--enable-distributed-layerwise-offload
+        # --dlo-resident-layers N) keeps the model-declared leading DiT blocks
+        # resident for the whole denoise loop; they are loaded once before the
+        # first step and released before VAE decode to bound peak HBM.
+        with self._resident_dit_layers_on_device(enabled=True):
+            with self.progress_bar(total=num_timesteps) as progress_bar:
+                for i, t in enumerate(timesteps):
+                    in_cfg_range = cfg_range[0] <= i / num_timesteps <= cfg_range[1]
+                    text_gs = text_guidance_scale if in_cfg_range else 1.0
+                    image_gs = image_guidance_scale if in_cfg_range else 1.0
 
-                positive_kwargs = dict(
-                    t=t,
-                    latents=latents,
-                    instruction_embeds=instruction_embeds,
-                    freqs_real=freqs_real,
-                    instruction_attention_mask=instruction_attention_mask,
-                    ref_image_hidden_states=ref_latents,
-                )
-
-                if task_type == "ti2i" and text_gs > 1.0 and image_gs > 1.0:
-                    # Double guidance: 3 predictions (cond+ref, neg+ref, neg+no-ref).
-                    negative_with_reference_kwargs = dict(
+                    positive_kwargs = dict(
                         t=t,
                         latents=latents,
-                        instruction_embeds=negative_instruction_embeds,
+                        instruction_embeds=instruction_embeds,
                         freqs_real=freqs_real,
-                        instruction_attention_mask=negative_instruction_attention_mask,
+                        instruction_attention_mask=instruction_attention_mask,
                         ref_image_hidden_states=ref_latents,
                     )
-                    uncond_kwargs = dict(
-                        t=t,
-                        latents=latents,
-                        instruction_embeds=negative_instruction_embeds,
-                        freqs_real=freqs_real,
-                        instruction_attention_mask=negative_instruction_attention_mask,
-                        ref_image_hidden_states=None,
-                    )
-                    model_pred = self.predict_noise_with_multi_branch_cfg(
-                        do_true_cfg=True,
-                        true_cfg_scale={"text": text_gs, "image": image_gs},
-                        branches_kwargs=[positive_kwargs, negative_with_reference_kwargs, uncond_kwargs],
-                        cfg_normalize=False,
-                    )
-                elif task_type == "ti2i" and text_gs > 1.0:
-                    # Text-only ti2i guidance: reference kept in the uncond pred.
-                    negative_kwargs = dict(
-                        t=t,
-                        latents=latents,
-                        instruction_embeds=negative_instruction_embeds,
-                        freqs_real=freqs_real,
-                        instruction_attention_mask=negative_instruction_attention_mask,
-                        ref_image_hidden_states=ref_latents,
-                    )
-                    model_pred = self.predict_noise_maybe_with_cfg(
-                        do_true_cfg=True,
-                        true_cfg_scale=text_gs,
-                        positive_kwargs=positive_kwargs,
-                        negative_kwargs=negative_kwargs,
-                        cfg_normalize=False,
-                    )
-                elif task_type == "ti2i" and image_gs > 1.0:
-                    # Image-only ti2i guidance: drop the reference in the uncond pred.
-                    negative_kwargs = dict(positive_kwargs, ref_image_hidden_states=None)
-                    model_pred = self.predict_noise_maybe_with_cfg(
-                        do_true_cfg=True,
-                        true_cfg_scale=image_gs,
-                        positive_kwargs=positive_kwargs,
-                        negative_kwargs=negative_kwargs,
-                        cfg_normalize=False,
-                    )
-                elif text_gs > 1.0:
-                    # Text-to-image classifier-free guidance.
-                    negative_kwargs = dict(
-                        t=t,
-                        latents=latents,
-                        instruction_embeds=negative_instruction_embeds,
-                        freqs_real=freqs_real,
-                        instruction_attention_mask=negative_instruction_attention_mask,
-                        ref_image_hidden_states=None,
-                    )
-                    model_pred = self.predict_noise_maybe_with_cfg(
-                        do_true_cfg=True,
-                        true_cfg_scale=text_gs,
-                        positive_kwargs=positive_kwargs,
-                        negative_kwargs=negative_kwargs,
-                        cfg_normalize=False,
-                    )
-                else:
-                    # CFG-off requests remain valid even if the server owns a
-                    # CFG process group: every rank evaluates only the positive
-                    # branch and no negative embeddings are required.
-                    model_pred = self.predict_noise_maybe_with_cfg(
-                        do_true_cfg=False,
-                        true_cfg_scale=1.0,
-                        positive_kwargs=positive_kwargs,
-                        negative_kwargs=None,
-                        cfg_normalize=False,
-                    )
 
-                do_true_cfg = text_gs > 1.0 or (task_type == "ti2i" and image_gs > 1.0)
-                latents = self.scheduler_step_maybe_with_cfg(model_pred, t, latents, do_true_cfg=do_true_cfg)
-                latents = latents.to(dtype=instruction_embeds.dtype)
-                progress_bar.update()
+                    if task_type == "ti2i" and text_gs > 1.0 and image_gs > 1.0:
+                        # Double guidance: 3 predictions (cond+ref, neg+ref, neg+no-ref).
+                        negative_with_reference_kwargs = dict(
+                            t=t,
+                            latents=latents,
+                            instruction_embeds=negative_instruction_embeds,
+                            freqs_real=freqs_real,
+                            instruction_attention_mask=negative_instruction_attention_mask,
+                            ref_image_hidden_states=ref_latents,
+                        )
+                        uncond_kwargs = dict(
+                            t=t,
+                            latents=latents,
+                            instruction_embeds=negative_instruction_embeds,
+                            freqs_real=freqs_real,
+                            instruction_attention_mask=negative_instruction_attention_mask,
+                            ref_image_hidden_states=None,
+                        )
+                        model_pred = self.predict_noise_with_multi_branch_cfg(
+                            do_true_cfg=True,
+                            true_cfg_scale={"text": text_gs, "image": image_gs},
+                            branches_kwargs=[positive_kwargs, negative_with_reference_kwargs, uncond_kwargs],
+                            cfg_normalize=False,
+                        )
+                    elif task_type == "ti2i" and text_gs > 1.0:
+                        # Text-only ti2i guidance: reference kept in the uncond pred.
+                        negative_kwargs = dict(
+                            t=t,
+                            latents=latents,
+                            instruction_embeds=negative_instruction_embeds,
+                            freqs_real=freqs_real,
+                            instruction_attention_mask=negative_instruction_attention_mask,
+                            ref_image_hidden_states=ref_latents,
+                        )
+                        model_pred = self.predict_noise_maybe_with_cfg(
+                            do_true_cfg=True,
+                            true_cfg_scale=text_gs,
+                            positive_kwargs=positive_kwargs,
+                            negative_kwargs=negative_kwargs,
+                            cfg_normalize=False,
+                        )
+                    elif task_type == "ti2i" and image_gs > 1.0:
+                        # Image-only ti2i guidance: drop the reference in the uncond pred.
+                        negative_kwargs = dict(positive_kwargs, ref_image_hidden_states=None)
+                        model_pred = self.predict_noise_maybe_with_cfg(
+                            do_true_cfg=True,
+                            true_cfg_scale=image_gs,
+                            positive_kwargs=positive_kwargs,
+                            negative_kwargs=negative_kwargs,
+                            cfg_normalize=False,
+                        )
+                    elif text_gs > 1.0:
+                        # Text-to-image classifier-free guidance.
+                        negative_kwargs = dict(
+                            t=t,
+                            latents=latents,
+                            instruction_embeds=negative_instruction_embeds,
+                            freqs_real=freqs_real,
+                            instruction_attention_mask=negative_instruction_attention_mask,
+                            ref_image_hidden_states=None,
+                        )
+                        model_pred = self.predict_noise_maybe_with_cfg(
+                            do_true_cfg=True,
+                            true_cfg_scale=text_gs,
+                            positive_kwargs=positive_kwargs,
+                            negative_kwargs=negative_kwargs,
+                            cfg_normalize=False,
+                        )
+                    else:
+                        # CFG-off requests remain valid even if the server owns a
+                        # CFG process group: every rank evaluates only the positive
+                        # branch and no negative embeddings are required.
+                        model_pred = self.predict_noise_maybe_with_cfg(
+                            do_true_cfg=False,
+                            true_cfg_scale=1.0,
+                            positive_kwargs=positive_kwargs,
+                            negative_kwargs=None,
+                            cfg_normalize=False,
+                        )
+
+                    do_true_cfg = text_gs > 1.0 or (task_type == "ti2i" and image_gs > 1.0)
+                    latents = self.scheduler_step_maybe_with_cfg(model_pred, t, latents, do_true_cfg=do_true_cfg)
+                    latents = latents.to(dtype=instruction_embeds.dtype)
+                    progress_bar.update()
 
         # 6. Decode.
         if output_type == "latent":
