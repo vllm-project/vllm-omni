@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 import queue
@@ -196,6 +196,59 @@ class TestRequestBatchCapability:
         )
 
         assert diffusion_engine_module.supports_request_batch(od_config) is True
+
+    def test_engine_rejects_multi_seq_diffusers_using_adapter_capability(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+    ) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="QwenImagePipeline",
+            custom_pipeline_args=None,
+            diffusion_load_format="diffusers",
+            streaming_output=False,
+            max_num_seqs=2,
+        )
+        registry_load = mocker.Mock(
+            side_effect=lambda model_class_name: (
+                _SingleRequestPipeline if model_class_name == "DiffusersAdapterPipeline" else _BatchCapablePipeline
+            )
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            registry_load,
+        )
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        with pytest.raises(ValueError, match="max_num_seqs=1"):
+            engine._resolve_execution_mode(od_config)
+
+        registry_load.assert_called_once_with("DiffusersAdapterPipeline")
+
+    def test_engine_prefers_batch_capable_custom_pipeline_over_diffusers_adapter(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+    ) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="QwenImagePipeline",
+            custom_pipeline_args={"pipeline_class": _BatchCapablePipeline},
+            diffusion_load_format="diffusers",
+            streaming_output=False,
+            max_num_seqs=2,
+        )
+        registry_load = mocker.Mock(return_value=_SingleRequestPipeline)
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            registry_load,
+        )
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+
+        assert engine._resolve_execution_mode(od_config) is DiffusionExecutionMode.REQUEST_BATCH
+        registry_load.assert_not_called()
 
     def test_supports_request_batch_uses_custom_pipeline_class(self, monkeypatch: pytest.MonkeyPatch) -> None:
         od_config = SimpleNamespace(

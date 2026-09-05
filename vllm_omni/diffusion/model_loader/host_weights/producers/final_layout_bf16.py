@@ -286,7 +286,7 @@ class FinalLayoutBF16Producer:
                 for record in shard
             )
             file_name = f"model-{index:05d}-of-{shard_count:05d}.safetensors"
-            with writer.open_tensor_file(file_name, specs) as output:
+            with writer.open_tensor_file(file_name, specs, ordered=True) as output:
                 for record in shard:
                     output.write_tensor(record.name, record.tensor.detach())
 

@@ -29,8 +29,10 @@ from vllm_omni.config.stage_config import (
     build_stage_runtime_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
+    normalize_pipeline_cli_overrides,
 )
 from vllm_omni.config.yaml_util import create_config
+from vllm_omni.diffusion.io_support import get_diffusion_output_type
 from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
 logger = init_logger(__name__)
@@ -436,6 +438,7 @@ class StageConfigFactory:
         load-balancer policy (``None`` when no strategy set one) travels with the
         stages instead of through a mutable out-param.
         """
+        cli_overrides = normalize_pipeline_cli_overrides(pipeline_cfg, cli_overrides)
         deploy_cfg: DeployConfig | None
         if user_deploy_config is not None:
             deploy_cfg = user_deploy_config
@@ -628,6 +631,7 @@ class StageConfigFactory:
             engine_args["dtype"] = str(engine_args["dtype"])
 
         engine_args.setdefault("max_num_seqs", 1)
+        model_class_name = engine_args.get("model_class_name")
 
         config_dict: dict[str, Any] = {
             "stage_id": 0,
@@ -638,7 +642,7 @@ class StageConfigFactory:
             },
             "engine_args": create_config(engine_args),
             "final_output": True,
-            "final_output_type": "image",
+            "final_output_type": get_diffusion_output_type(model_class_name),
         }
 
         return [config_dict]

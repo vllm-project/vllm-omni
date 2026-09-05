@@ -13,10 +13,12 @@ logger = init_logger(__name__)
 class XPUGenerationWorker(OmniWorkerMixin, XPUWorker):
     """XPU generation worker for the code2wav (non-AR waveform generation) stage in the Omni model."""
 
+    model_runner_cls = XPUGenerationModelRunner
+
     def init_device(self):
         super().init_device()
         if self.use_v2_model_runner:
             # OMNI: v2 model runner does not yet include omni hooks.
             logger.warning("OMNI XPUGenerationWorker forces v1 model runner for omni hooks.")
             self.use_v2_model_runner = False
-        self.model_runner: XPUGenerationModelRunner = XPUGenerationModelRunner(self.vllm_config, self.device)
+        self.model_runner = self.model_runner_cls(self.vllm_config, self.device)

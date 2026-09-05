@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 import multiprocessing as mp
@@ -848,6 +848,50 @@ class TestWorkerProcRpcRankStatus:
         gc_collect.assert_called_once_with()
         mock_platform.empty_cache.assert_called_once_with()
 
+    def test_execute_rpc_drops_the_result_on_ranks_that_will_not_reply(self):
+        """A rank that will not reply must not hand its output back.
+
+        The busy loop binds the returned object to a local that outlives the
+        RPC, so a device-resident result -- for diffusion, a whole decoded
+        video -- would occupy accelerator memory on every non-reply rank until
+        the next request replaces it.
+        """
+        proc = self._make_worker_proc()
+        payload = {"frames": object()}
+        proc.worker.execute_method = lambda *args, **kwargs: payload
+
+        result, should_reply = proc._execute_rpc(
+            {
+                "method": "execute_model",
+                "args": (),
+                "kwargs": {},
+                "output_rank": 1,
+                "exec_all_ranks": True,
+            }
+        )
+
+        assert should_reply is False
+        assert result is None, "a non-reply rank must not keep the output alive"
+
+    def test_execute_rpc_still_returns_the_result_on_the_replying_rank(self):
+        """The rank that owns the reply keeps returning the same object."""
+        proc = self._make_worker_proc()
+        payload = {"frames": object()}
+        proc.worker.execute_method = lambda *args, **kwargs: payload
+
+        result, should_reply = proc._execute_rpc(
+            {
+                "method": "execute_model",
+                "args": (),
+                "kwargs": {},
+                "output_rank": 0,
+                "exec_all_ranks": True,
+            }
+        )
+
+        assert should_reply is True
+        assert result is payload
+
     def test_execute_rpc_rejects_collect_rank_status_without_all_ranks(self):
         proc = self._make_worker_proc()
 
@@ -1079,6 +1123,42 @@ class TestStageDiffusionClientErrorPropagation:
 
         assert client.get_diffusion_output_nowait() is None
 
+    def test_error_response_preserves_scheduler_metrics(self):
+        from vllm_omni.metrics import definitions as metric_defs
+
+        client = self._make_client()
+        client._response_socket.recv.side_effect = [b"message", zmq.Again()]
+        client._decoder.decode.return_value = {
+            "type": "error",
+            "request_id": "req-error",
+            "error": "gpu fault",
+            "metrics": {metric_defs.DIFFUSION_SCHEDULER_WAITING_KEY: 0},
+        }
+
+        output = client.get_diffusion_output_nowait()
+
+        assert output is not None
+        assert output.error == "gpu fault"
+        assert output.metrics[metric_defs.DIFFUSION_SCHEDULER_WAITING_KEY] == 0
+
+    def test_metrics_response_creates_metrics_only_output(self):
+        from vllm_omni.metrics import definitions as metric_defs
+        from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
+
+        client = self._make_client()
+        client._response_socket.recv.side_effect = [b"message", zmq.Again()]
+        client._decoder.decode.return_value = {
+            "type": "metrics",
+            "metrics": {metric_defs.DIFFUSION_SCHEDULER_WAITING_KEY: 0},
+        }
+
+        output = client.get_diffusion_output_nowait()
+
+        assert output is not None
+        assert output.request_id == DIFFUSION_METRICS_ONLY_REQUEST_ID
+        assert output.error is None
+        assert output.metrics[metric_defs.DIFFUSION_SCHEDULER_WAITING_KEY] == 0
+
     def test_check_health_raises_when_proc_dead(self):
         """``check_health`` detects a dead subprocess via the manager's proc
         and raises ``EngineDeadError``, setting ``_engine_dead`` as a
@@ -1135,7 +1215,6 @@ class TestStageDiffusionClientErrorPropagation:
                 metadata,
                 "tcp://req",
                 "tcp://resp",
-                batch_size=1,
             )
 
     @pytest.mark.asyncio

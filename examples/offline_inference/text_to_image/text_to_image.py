@@ -599,6 +599,17 @@ def main():
             if args.seed is not None and hasattr(params, "seed"):
                 params.seed = args.seed
 
+            # MammothModa2's AR stage emits one visual token per grid cell,
+            # one EOL token per row, and one final look-ahead token whose hidden
+            # state is unavailable. Size the first stage from the prompt metadata
+            # instead of SamplingParams' default of 16 tokens.
+            prompt_info = prompt_dict.get("additional_information", {})
+            if idx == 0 and prompt_info.get("omni_task") == ["t2i"]:
+                ar_width = int(prompt_info.get("ar_width", [0])[0])
+                ar_height = int(prompt_info.get("ar_height", [0])[0])
+                if ar_width > 0 and ar_height > 0:
+                    params.max_tokens = ar_height * (ar_width + 1) + 1
+
     if not diffusion_replaced and len(sampling_params_list) == 1:
         sampling_params_list = [diffusion_params]
 

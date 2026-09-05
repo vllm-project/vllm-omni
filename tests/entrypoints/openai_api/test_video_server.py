@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Unit tests for OpenAI-compatible video generation endpoints.
 """
@@ -64,7 +64,13 @@ class MockVideoResult:
 
 class FakeAsyncOmni:
     def __init__(self):
-        self.stage_configs = [SimpleNamespace(stage_type="diffusion")]
+        self.stage_configs = [
+            SimpleNamespace(
+                stage_type="diffusion",
+                final_output=True,
+                final_output_type="video",
+            )
+        ]
         self.default_sampling_params_list = [OmniDiffusionSamplingParams()]
         self.model_class_name = "WanPipeline"
         self.captured_prompt = None
@@ -89,12 +95,13 @@ class FakeAsyncOmni:
         yield MockVideoResult(videos)
 
 
-def test_raw_and_base64_encoders_receive_no_policy_config(mocker: MockerFixture):
+def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixture):
     engine = FakeAsyncOmni()
     handler = OmniOpenAIServingVideo.for_diffusion(
         engine,
         model_name="test-model",
     )
+    assert handler._video_frame_converter.max_workers == 8
     raw_encoder = mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
         return_value=b"encoded-video",
@@ -111,8 +118,9 @@ def test_raw_and_base64_encoders_receive_no_policy_config(mocker: MockerFixture)
 
     asyncio.run(_generate_both_response_types())
 
-    assert "encoding_config" not in raw_encoder.call_args.kwargs
-    assert "encoding_config" not in base64_encoder.call_args.kwargs
+    assert raw_encoder.call_args.kwargs["frame_converter"] is handler._video_frame_converter
+    assert base64_encoder.call_args.kwargs["frame_converter"] is handler._video_frame_converter
+    handler.shutdown()
 
 
 def test_resolve_diffusion_od_config_falls_back_to_attribute():
@@ -627,6 +635,77 @@ def test_video_generation_bridges_request_fields(generation_request, expected_nu
         assert sampling.extra_args["duration"] == expected_duration
 
 
+def test_magi2_i2v_preserves_reference_geometry_for_model_preprocessing(test_client, mocker: MockerFixture):
+    image_bytes = _make_test_image_bytes((48, 32))
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "Magi2Pipeline"
+
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "A bear playing with yarn.",
+            "width": "96",
+            "height": "64",
+        },
+        files={"input_reference": ("input.png", image_bytes, "image/png")},
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    input_image = engine.captured_prompt["multi_modal_data"]["image"]
+    assert isinstance(input_image, Image.Image)
+    assert input_image.size == (48, 32)
+
+
+def test_magi2_serving_applies_native_defaults_and_rejects_explicit_frame_mismatch():
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "Magi2Pipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        diffusion_engine=engine,
+        model_name="sand-ai/MAGI-2-preview",
+    )
+
+    asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A fox walks through snow"), "defaults"))
+
+    sampling = engine.captured_sampling_params_list[0]
+    assert (sampling.width, sampling.height) == (896, 512)
+    assert sampling.num_frames == 125
+    assert sampling.fps == sampling.frame_rate == 12.5
+    assert sampling.num_inference_steps == 100
+    assert "duration" not in sampling.extra_args
+
+    with pytest.raises(HTTPException, match="10-second clips only"):
+        asyncio.run(
+            handler._run_and_extract(
+                VideoGenerationRequest(prompt="A fox walks through snow", seconds="5"),
+                "bad-duration",
+            )
+        )
+    with pytest.raises(HTTPException, match="10-second clips only"):
+        asyncio.run(
+            handler._run_and_extract(
+                VideoGenerationRequest(
+                    prompt="A fox walks through snow",
+                    extra_params={"duration": 5},
+                ),
+                "bad-duration-extra",
+            )
+        )
+
+    with pytest.raises(HTTPException, match="requires 125 frames"):
+        asyncio.run(
+            handler._run_and_extract(
+                VideoGenerationRequest(prompt="A fox walks through snow", num_frames=1),
+                "bad-frames",
+            )
+        )
+
+
 def test_i2v_video_generation_with_image_reference_form(test_client, mocker: MockerFixture):
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
@@ -826,6 +905,18 @@ def test_multi_video_generation_preserves_uploaded_files_until_generation(
     assert isinstance(engine.captured_prompt["multi_modal_data"]["audio"], str)
     assert engine.captured_sampling_params_list[0].extra_args["task"] == "ref2va"
     assert engine.captured_sampling_params_list[0].extra_args["duration"] == 15.0
+
+
+def test_mixed_reference_capability_uses_model_metadata_when_config_defaults_false(test_client):
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.model_class_name = None
+    handler._engine_client.stage_configs = [
+        SimpleNamespace(engine_args={"model_class_name": "MiniMaxH3TextEncoder"}),
+        SimpleNamespace(engine_args={"model_class_name": "MiniMaxH3Pipeline"}),
+    ]
+    handler._stage_configs = handler._engine_client.stage_configs
+
+    assert handler.supports_mixed_reference_inputs
 
 
 def test_decode_video_bytes_can_keep_first_frames():
@@ -1213,8 +1304,9 @@ def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFi
         audio=None,
         audio_sample_rate=None,
         video_codec_options=None,
+        frame_converter=None,
     ):
-        del video, fps, audio, video_codec_options
+        del video, fps, audio, video_codec_options, frame_converter
         audio_sample_rates.append(audio_sample_rate)
         return b"fake-video"
 
@@ -1682,6 +1774,11 @@ def test_video_request_validation():
     assert req.quality is None
     assert req.generate_sound is False
     assert req.sound_duration is None
+    assert VideoGenerationRequest(prompt="test", fps=12.5).resolve_video_params().fps == 12.5
+    with pytest.raises(ValueError):
+        VideoGenerationRequest(prompt="test", fps=float("inf"))
+    with pytest.raises(ValueError):
+        VideoGenerationRequest(prompt="test", video_params={"fps": float("nan")})
     assert VideoGenerationRequest(prompt="test", generate_sound=True, sound_duration=1.5).generate_sound is True
     with pytest.raises(ValueError):
         VideoGenerationRequest(prompt="test", size="invalid")
@@ -2209,6 +2306,8 @@ def test_sync_sampling_params_pass_through(test_client, mocker: MockerFixture):
         "/v1/videos/sync",
         data={
             "prompt": "param pass",
+            "seconds": "10",
+            "fps": "12.5",
             "num_inference_steps": "30",
             "guidance_scale": "6.5",
             "seed": "42",
@@ -2222,6 +2321,10 @@ def test_sync_sampling_params_pass_through(test_client, mocker: MockerFixture):
     assert captured.guidance_scale == 6.5
     assert captured.seed == 42
     assert captured.quality == "high"
+    assert captured.num_frames == 125
+    assert captured.fps == 12.5
+    assert captured.frame_rate == 12.5
+    assert captured.extra_args["duration"] == 10.0
 
 
 def test_sync_sana_wm_extra_params_payload_passes_to_engine_prompt(test_client, mocker: MockerFixture):

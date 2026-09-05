@@ -16,9 +16,24 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
+    is_cfg_group_initialized,
 )
 
 logger = init_logger(__name__)
+
+
+def _get_cfg_world_size_or_one() -> int:
+    """Return the CFG world size, defaulting only when no group exists.
+
+    Diffusion workers initialize the CFG process group even when its world
+    size is one.  Pipelines are also invoked directly by unit tests and some
+    offline integrations, though, where no distributed groups exist. Treat
+    that explicit case like a one-rank CFG group. Errors from an existing CFG
+    coordinator must propagate instead of silently selecting sequential CFG.
+    """
+    if not is_cfg_group_initialized():
+        return 1
+    return get_classifier_free_guidance_world_size()
 
 
 def _wrap(pred: torch.Tensor | tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
@@ -106,7 +121,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         """
         if do_true_cfg:
             # Automatically detect CFG parallel configuration
-            cfg_parallel_ready = get_classifier_free_guidance_world_size() > 1
+            cfg_parallel_ready = _get_cfg_world_size_or_one() > 1
 
             if cfg_parallel_ready:
                 cfg_group = get_cfg_group()
@@ -235,8 +250,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
         Predict noise with N-branch CFG dispatch across M GPUs.
 
         This is the multi-branch counterpart of predict_noise_maybe_with_cfg().
-        Use this for models with 3 or more CFG branches (e.g., OmniGen2, Bagel,
-        DreamID). Existing 2-branch models should continue using
+        Use this for models with 3 or more CFG branches (e.g., OmniGen2, Bagel).
+        Existing 2-branch models should continue using
         predict_noise_maybe_with_cfg().
 
         Args:
@@ -253,7 +268,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         """
         if do_true_cfg:
             n_branches = len(branches_kwargs)
-            cfg_world_size = get_classifier_free_guidance_world_size()
+            cfg_world_size = _get_cfg_world_size_or_one()
             cfg_parallel_ready = cfg_world_size > 1
 
             if cfg_parallel_ready:
@@ -474,7 +489,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         Returns:
             True if CFG parallel configuration is valid, False otherwise
         """
-        if get_classifier_free_guidance_world_size() == 1:
+        if _get_cfg_world_size_or_one() == 1:
             return True
 
         if true_cfg_scale <= 1:

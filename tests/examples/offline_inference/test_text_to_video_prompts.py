@@ -46,6 +46,9 @@ def test_text_to_video_builds_canonical_prompt(
 @pytest.mark.parametrize(
     ("model", "model_class_name", "preset_name"),
     [
+        ("Efficient-Large-Model/SANA-Video_2B_480p_diffusers", None, "sana_480p"),
+        ("Efficient-Large-Model/SANA-Video_2B_720p_diffusers", None, "sana_720p"),
+        ("/models/custom-checkpoint", "SanaVideoPipeline", "sana_480p"),
         ("robbyant/lingbot-video-dense-1.3b", None, "lingbot"),
         ("/models/custom-checkpoint", "LingBotVideoPipeline", "lingbot"),
         ("Lightricks/LTX-2", "LTX2DistilledPipeline", "ltx2_distilled"),

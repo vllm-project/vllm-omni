@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from vllm.lora.lora_weights import LoRALayerWeights
@@ -141,6 +143,37 @@ def test_lora_manager_replace_layers_does_not_rewrap_base_layer(monkeypatch):
     # Only the top-level layer should have been replaced; nested ".base_layer"
     # must be skipped to avoid nesting LoRA wrappers.
     assert replace_calls == ["foo"]
+
+
+def test_lora_manager_keeps_dlo_lora_buffers_on_compute_device(monkeypatch):
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    class _DLOLoRALayer(DummyBaseLayerWithLoRA):
+        lora_buffer_device = None
+
+        def _set_diffusion_lora_buffer_device(self, device):
+            self.lora_buffer_device = device
+
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DLOLoRALayer)
+    monkeypatch.setattr(
+        manager_mod,
+        "from_layer_diffusion",
+        lambda *, layer, **_kwargs: _DLOLoRALayer(layer),
+    )
+
+    pipeline = torch.nn.Module()
+    pipeline.od_config = SimpleNamespace(enable_distributed_layerwise_offload=True)
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.foo = _FakeLinearBase()
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    manager._replace_layers_with_lora(type("_PH", (), {"r": 1})())
+
+    assert pipeline.transformer.foo.lora_buffer_device == torch.device("cpu")
 
 
 def test_lora_manager_replaces_packed_layer_when_targeting_sublayers(monkeypatch):

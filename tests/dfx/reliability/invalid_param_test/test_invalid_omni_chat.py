@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Invalid inputs on Qwen3-Omni: ``POST /v1/chat/completions``, ``WS /v1/video/chat/stream``, ``WS /v1/realtime``."""
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 from tests.helpers.stage_config import get_deploy_config_path
 
 pytestmark = [pytest.mark.slow, pytest.mark.omni]
@@ -72,6 +72,9 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
         body["top_logprobs"] = 5
     elif case_id == "speaker_unknown":
         body["speaker"] = "zz_invalid_qwen3_omni_chat_speaker_xyz"
+    elif case_id == "audio_format_unsupported":
+        body["modalities"] = ["text", "audio"]
+        body["audio"] = {"voice": "alloy", "format": "aac"}
     else:
         raise AssertionError(f"unknown chat completions invalid case_id {case_id!r}")
     return {"json": body, "timeout": 120}
@@ -119,7 +122,7 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
         pytest.param(
             "response_format_json_schema_incomplete",
             400,
-            ("response_format", "value_error", "json_schema"),
+            ("response_format", "BadRequestError", "json_schema"),
             id="invalid_response_format_json_schema",
         ),
         pytest.param("logprobs_wrong_type", 400, "logprobs", id="logprobs_wrong_type", marks=_SKIP_ISSUE_3649),
@@ -135,12 +138,18 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
             ("Invalid speaker", "Supported"),
             id="speaker_unknown_preset",
         ),
+        pytest.param(
+            "audio_format_unsupported",
+            400,
+            ("Invalid audio format", "aac", "Supported formats"),
+            id="unsupported_audio_format",
+        ),
     ],
 )
 @pytest.mark.parametrize("omni_server", _QWEN3_OMNI_SERVER, indirect=True)
 def test_chat_completions_invalid_requests(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
     case_id: str,
     err_code: int | tuple[int, ...],
     err_message: str | tuple[str, ...],
@@ -148,7 +157,7 @@ def test_chat_completions_invalid_requests(
     cfg = _chat_completions_request_without_expectations(omni_server, case_id)
     cfg["err_code"] = err_code
     cfg["err_message"] = err_message
-    openai_client.send_chat_completions_http_request(cfg)[0]
+    online_client.send_chat_completions_http_request(cfg)[0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -174,7 +183,7 @@ _VIDEO_CHAT_WS_SESSION_MODALITIES_SCALAR = object()
 @pytest.mark.parametrize("omni_server", _QWEN3_OMNI_SERVER, indirect=True)
 def test_video_chat_stream_invalid_requests(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
     send_frames_spec: Any,
     err_message: str,
 ) -> None:
@@ -183,7 +192,7 @@ def test_video_chat_stream_invalid_requests(
     else:
         send_frames = send_frames_spec
     assert isinstance(send_frames, str)
-    openai_client.send_video_chat_stream_ws_request(
+    online_client.send_video_chat_stream_ws_request(
         {
             "send_frames": send_frames,
             "timeout": 120,
@@ -243,11 +252,12 @@ _REALTIME_WS_INVALID_AUDIO_APPEND = object()
 @pytest.mark.parametrize("omni_server", _QWEN3_OMNI_SERVER, indirect=True)
 def test_realtime_invalid_requests(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
     send_frames_spec: Any,
     ws_error_code: str,
     err_message: str | tuple[str, ...],
 ) -> None:
+    send_frames: Any
     if send_frames_spec is _REALTIME_WS_MODEL_MISMATCH:
         send_frames = json.dumps(
             {
@@ -262,7 +272,7 @@ def test_realtime_invalid_requests(
         ]
     else:
         send_frames = send_frames_spec
-    openai_client.send_realtime_ws_request(
+    online_client.send_realtime_ws_request(
         {
             "send_frames": send_frames,
             "timeout": 120,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E expansion tests for GLM-TTS online serving (nightly CI).
 
@@ -14,7 +14,7 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import load_test_audio_data_url
+from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
@@ -24,7 +24,7 @@ MODEL = os.environ.get("GLM_TTS_MODEL_PATH", "zai-org/GLM-TTS")
 REF_TEXT = "他当时还跟线下其他的站姐吵架，然后，打架进局子了。"
 
 DEPLOY_CONFIG = get_deploy_config_path("glm_tts.yaml")
-REF_AUDIO_URL = load_test_audio_data_url("glm_tts/jiayan_zh.wav")
+REF_AUDIO_URL = get_asset_path("glm_tts/jiayan_zh.wav", as_data_url=True)
 
 SYNC_EXTRA_ARGS = [
     "--trust-remote-code",
@@ -64,7 +64,7 @@ tts_async_chunk_server_params = [
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_sync_server_params, indirect=True)
-def test_voice_clone_zh_sync(omni_server, openai_client) -> None:
+def test_voice_clone_zh_sync(omni_server, online_client) -> None:
     """
     Test voice cloning TTS with Chinese text.
     Deploy Setting: glm_tts.yaml with ``--no-async-chunk`` (sync two-stage)
@@ -80,12 +80,12 @@ def test_voice_clone_zh_sync(omni_server, openai_client) -> None:
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
     }
-    openai_client.send_audio_speech_request(request_config)
+    online_client.send_audio_speech_request(request_config)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_async_chunk_server_params, indirect=True)
-def test_voice_clone_zh_async_chunk(omni_server, openai_client) -> None:
+def test_voice_clone_zh_async_chunk(omni_server, online_client) -> None:
     """
     Test voice cloning TTS with Chinese text via async_chunk streaming.
     Deploy Setting: glm_tts.yaml default ``async_chunk: true``
@@ -102,12 +102,12 @@ def test_voice_clone_zh_async_chunk(omni_server, openai_client) -> None:
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
     }
-    openai_client.send_audio_speech_request(request_config)
+    online_client.send_audio_speech_request(request_config)
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_sync_server_params, indirect=True)
-def test_models_endpoint(omni_server, openai_client) -> None:
+def test_models_endpoint(omni_server, online_client) -> None:
     """Test the /v1/models endpoint returns loaded model."""
-    models = openai_client.client.models.list()
+    models = online_client.client.models.list()
     assert len(models.data) > 0

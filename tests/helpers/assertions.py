@@ -1,5 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Assertion and response validation helpers for tests."""
 
+import base64
 import io
 import json
 import math
@@ -14,7 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 if TYPE_CHECKING:
-    from tests.helpers.runtime import DiffusionResponse
+    from tests.helpers.client import DiffusionResponse
 
 import av
 import numpy as np
@@ -24,7 +28,6 @@ from PIL import Image
 from tests.helpers.media import (
     convert_audio_bytes_to_text,
     cosine_similarity_text,
-    decode_b64_image,
     preprocess_text,
 )
 
@@ -171,7 +174,7 @@ def _short_transcript_contains_expected(transcript: str, expected: str) -> bool:
 def assert_image_diffusion_response(
     response: "DiffusionResponse",
     request_config: dict[str, Any],
-    run_level: str = None,
+    run_level: str | None = None,
 ) -> None:
     """
     Validate image diffusion response.
@@ -243,14 +246,15 @@ def assert_images_generations_response(
         assert isinstance(item, dict), "Image generation data entries must be objects"
         b64_json = item.get("b64_json")
         assert isinstance(b64_json, str) and b64_json, "Image generation response is missing b64_json"
-        image = decode_b64_image(b64_json)
+        image = Image.open(io.BytesIO(base64.b64decode(b64_json)))
+        image.load()
         assert_image_valid(image, width=width, height=height)
 
 
 def assert_video_diffusion_response(
     response: "DiffusionResponse",
     request_config: dict[str, Any],
-    run_level: str = None,
+    run_level: str | None = None,
 ) -> None:
     """
     Validate video diffusion response.
@@ -265,7 +269,9 @@ def assert_video_diffusion_response(
                 "height": ...,
                 "fps": ...,
                 ...
-            }
+            },
+            "expected_audio": {"sample_rate": 44100, "channels": 2},
+            "fps_tolerance": 0.01,
         }
     """
     form_data = request_config.get("form_data", {})
@@ -276,7 +282,8 @@ def assert_video_diffusion_response(
     expected_frames = _maybe_int(form_data.get("num_frames"))
     expected_width = _maybe_int(form_data.get("width"))
     expected_height = _maybe_int(form_data.get("height"))
-    expected_fps = _maybe_int(form_data.get("fps"))
+    expected_fps = _maybe_float(form_data.get("fps"))
+    expected_audio = request_config.get("expected_audio")
 
     # Skip num_frames assertion for Helios models because they round up frames
     model = request_config.get("model", "")
@@ -290,7 +297,19 @@ def assert_video_diffusion_response(
             width=expected_width,
             height=expected_height,
             fps=expected_fps,
+            fps_tolerance=request_config.get("fps_tolerance", 1.0),
         )
+        if expected_audio is not None:
+            assert isinstance(expected_audio, dict), "expected_audio must be an object"
+            sample_rate = _maybe_int(expected_audio.get("sample_rate"))
+            channels = _maybe_int(expected_audio.get("channels"))
+            assert sample_rate is not None, "expected_audio.sample_rate is required"
+            assert channels is not None, "expected_audio.channels is required"
+            assert_video_audio_valid(
+                vid_bytes,
+                sample_rate=sample_rate,
+                channels=channels,
+            )
 
 
 def assert_video_first_frame_matches(
@@ -319,7 +338,7 @@ def assert_video_first_frame_matches(
 def assert_audio_diffusion_response(
     response: "DiffusionResponse",
     request_config: dict[str, Any],
-    run_level: str = None,
+    run_level: str | None = None,
 ) -> None:
     """
     Validate audio diffusion response.
@@ -340,6 +359,12 @@ def _maybe_int(value: Any) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+def _maybe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    return float(value)
 
 
 def assert_image_valid(image: Path | Image.Image, *, width: int | None = None, height: int | None = None):
@@ -363,12 +388,14 @@ def assert_video_valid(
     width: int | None = None,
     height: int | None = None,
     fps: float | None = None,
+    fps_tolerance: float = 1.0,
 ) -> dict[str, int | float]:
     """Assert the MP4 has the expected resolution and frame count.
 
     For several diffusion backends, encoded MP4 frame count follows a codec-aligned
     convention (e.g. request `num_frames=8` can produce 9 encoded frames). Keep
     this compatibility behavior to avoid false negatives in online-serving tests.
+    Fixed-rate models can request a stricter ``fps_tolerance`` in frames/second.
     """
     temp_path = None
     cap = None
@@ -404,8 +431,9 @@ def assert_video_valid(
             assert actual_width == width, f"Expected width={width}, got {actual_width}"
         if height is not None:
             assert actual_height == height, f"Expected height={height}, got {actual_height}"
-        if fps is not None and actual_fps:
-            assert abs(actual_fps - float(fps)) < 1.0, f"Expected fps~={fps}, got {actual_fps}"
+        if fps is not None:
+            assert math.isfinite(actual_fps) and actual_fps > 0, f"Invalid video fps: {actual_fps}"
+            assert abs(actual_fps - float(fps)) < fps_tolerance, f"Expected fps~={fps}, got {actual_fps}"
         if num_frames is not None:
             expected_frames = (int(num_frames) // 4) * 4 + 1
             assert actual_frames == expected_frames, f"Expected frames={expected_frames}, got {actual_frames}"
@@ -427,6 +455,33 @@ def assert_video_valid(
                 temp_path.unlink()
             except OSError:
                 pass
+
+
+def assert_video_audio_valid(
+    video: Path | bytes | BytesIO,
+    *,
+    sample_rate: int,
+    channels: int,
+) -> None:
+    """Assert that an encoded video carries an audio stream with the requested format."""
+    if isinstance(video, Path):
+        source: str | BytesIO = str(video)
+    elif isinstance(video, bytes):
+        source = BytesIO(video)
+    elif isinstance(video, BytesIO):
+        video.seek(0)
+        source = video
+    else:
+        raise TypeError(f"Unsupported video type: {type(video)}")
+
+    with av.open(source) as container:
+        audio_streams = list(container.streams.audio)
+        assert audio_streams, "Video response does not contain an audio stream"
+        audio_stream = audio_streams[0]
+        actual_sample_rate = int(audio_stream.rate or 0)
+        actual_channels = int(audio_stream.channels or 0)
+        assert actual_sample_rate == sample_rate, f"Expected audio sample rate={sample_rate}, got {actual_sample_rate}"
+        assert actual_channels == channels, f"Expected audio channels={channels}, got {actual_channels}"
 
 
 def assert_audio_valid(
@@ -634,7 +689,7 @@ def _response_has_audio_output(response: Any) -> bool:
     return bool(audio_data)
 
 
-def _omni_assertion_needs_audio_transcript(request_config: dict[str, Any], run_level: str) -> bool:
+def _omni_assertion_needs_audio_transcript(request_config: dict[str, Any], run_level: str | None) -> bool:
     if run_level not in {"advanced_model", "full_model"}:
         return False
     modalities = request_config.get("modalities", ["text", "audio"])
@@ -656,18 +711,18 @@ def _omni_assertion_needs_audio_transcript(request_config: dict[str, Any], run_l
     return "text" in modalities
 
 
-def _speech_assertion_needs_audio_transcript(request_config: dict[str, Any], run_level: str) -> bool:
+def _speech_assertion_needs_audio_transcript(request_config: dict[str, Any], run_level: str | None) -> bool:
     if run_level not in {"advanced_model", "full_model"}:
         return False
     if request_config.get("response_format") == "pcm":
         return False
-    return bool(request_config.get("input"))
+    return bool(request_config.get("transcript_expected_text", request_config.get("input")))
 
 
 def _resolve_audio_transcript(
     response: Any,
     request_config: dict[str, Any],
-    run_level: str,
+    run_level: str | None,
     *,
     speech_api: bool,
 ) -> str | None:
@@ -842,28 +897,13 @@ def _assert_transcript_matches(
     )
 
 
-def assert_audio_speech_response(response: Any, request_config: dict[str, Any], run_level: str) -> None:
-    """Validate speech API results from :class:`~tests.helpers.runtime.OmniResponse`.
+def assert_audio_speech_response(response: Any, request_config: dict[str, Any], run_level: str | None = None) -> None:
+    """Validate speech API results from :class:`~tests.helpers.client.OmniResponse`.
 
-    When ``request_config`` carries ``status_code`` and/or ``err_message``, the
-    request is expected to be rejected: assert it failed and that the HTTP status
-    / error text match. Otherwise the normal success-path checks run.
+    Success-path checks only. Negative / contract cases belong on
+    :meth:`~tests.helpers.client.OnlineOmniClient.send_audio_speech_http_request`
+    with :func:`assert_http_error`.
     """
-    expected_status = request_config.get("status_code")
-    expected_err = request_config.get("err_message")
-    if expected_status is not None or expected_err is not None:
-        assert not response.success, "Expected an error response, but the request succeeded."
-        if expected_status is not None:
-            allowed = expected_status if isinstance(expected_status, (list, tuple)) else (expected_status,)
-            assert response.status_code in allowed, f"Expected HTTP status in {allowed}, got {response.status_code}"
-        if expected_err is not None:
-            alternatives = expected_err if isinstance(expected_err, (list, tuple)) else (expected_err,)
-            error_text = response.error_message or ""
-            assert any(alt in error_text for alt in alternatives), (
-                f"Expected one of {alternatives} in error text, got: {error_text!r}"
-            )
-        return
-
     assert response.success, "The request failed."
 
     # Optional floor on decoded audio size (models with very short clips may use a lower value).
@@ -884,6 +924,13 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
     elif req_fmt == "wav" and response.audio_format:
         assert req_fmt in response.audio_format
 
+    expected_sample_rate = request_config.get("sample_rate")
+    if expected_sample_rate is not None and req_fmt == "wav" and response.audio_bytes:
+        info = sf.info(io.BytesIO(response.audio_bytes))
+        assert info.samplerate == int(expected_sample_rate), (
+            f"Expected sample_rate={expected_sample_rate}, got {info.samplerate}"
+        )
+
     if run_level in {"advanced_model", "full_model"}:
         if req_fmt == "pcm" and response.audio_bytes:
             min_hnr_db = float(request_config.get("min_hnr_db", _MIN_PCM_SPEECH_HNR_DB))
@@ -891,7 +938,7 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
 
         transcript = _resolve_audio_transcript(response, request_config, run_level, speech_api=True)
         if transcript is not None:
-            expected_text = request_config.get("input")
+            expected_text = request_config.get("transcript_expected_text", request_config.get("input"))
             if expected_text:
                 print(f"audio content is: {transcript}")
                 print(f"input text is: {expected_text}")
@@ -910,7 +957,9 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
         )
 
 
-def assert_diffusion_response(response: "DiffusionResponse", request_config: dict[str, Any], run_level: str = None):
+def assert_diffusion_response(
+    response: "DiffusionResponse", request_config: dict[str, Any], run_level: str | None = None
+):
     assert response.success, "The request failed."
     has_any_content = any(content is not None for content in (response.images, response.videos, response.audios))
     assert has_any_content, "Response contains no images, videos, or audios"
@@ -976,9 +1025,9 @@ def assert_http_error(
     err_message: str | tuple[str, ...] | list[str] | None = None,
     websocket_json_message: bool = False,
 ) -> dict[str, Any] | None:
-    """Validate a raw-HTTP :class:`~tests.helpers.runtime.HttpResponse`-like object.
+    """Validate a raw-HTTP :class:`~tests.helpers.client.HttpResponse`-like object.
 
-    Used by :class:`~tests.helpers.runtime.OpenAIClientHandler` ``send_*_http_request`` helpers when
+    Used by :class:`~tests.helpers.client.OnlineOmniClient` ``send_*_http_request`` helpers when
     ``request_config`` contains optional ``err_code`` and/or ``err_message``.
 
     When ``websocket_json_message=True``, only ``json_body`` is checked (first JSON WebSocket text frame).
@@ -1049,5 +1098,6 @@ __all__ = [
     "assert_omni_response",
     "assert_video_diffusion_response",
     "assert_video_valid",
+    "assert_video_audio_valid",
     "assert_audio_valid",
 ]

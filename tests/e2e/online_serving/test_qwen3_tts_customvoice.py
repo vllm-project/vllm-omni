@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E Online tests for Qwen3-TTS model with text input and audio output.
 
@@ -93,7 +93,7 @@ def test_default_cuda_graph_startup(omni_server) -> None:
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_text_to_audio_001(omni_server, openai_client) -> None:
+def test_text_to_audio_001(omni_server, online_client) -> None:
     """
     Test text input processing and audio output via OpenAI API.
     Deploy Setting: default yaml
@@ -111,7 +111,7 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
         "voice": "vivian",
     }
 
-    openai_client.send_audio_speech_request(request_config, request_num=get_max_batch_size())
+    online_client.send_audio_speech_request(request_config, request_num=get_max_batch_size())
 
 
 @pytest.mark.core_model
@@ -119,7 +119,7 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_text_to_audio_002(omni_server, openai_client) -> None:
+def test_text_to_audio_002(omni_server, online_client) -> None:
     """
     Test text input processing and audio output via OpenAI API.
     Deploy Setting: default yaml
@@ -138,4 +138,4 @@ def test_text_to_audio_002(omni_server, openai_client) -> None:
         "voice": "vivian",
     }
 
-    openai_client.send_audio_speech_request(request_config)
+    online_client.send_audio_speech_request(request_config)

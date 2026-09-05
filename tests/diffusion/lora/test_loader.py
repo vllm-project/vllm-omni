@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from collections import defaultdict
 
 import pytest
@@ -106,7 +109,7 @@ def make_dummy_lora_state_dict(
     """
     key_a = f"{base_key}.{lora_a_suffix}"
     key_b = f"{base_key}.{lora_b_suffix}"
-    key_bias = f"{base_key}.{lora_bias_suffix}" if bias else None
+    key_bias = f"{base_key}.{lora_bias_suffix}"
 
     if weight_a is None:
         weight_a = torch.randn(RANK, HEAD_DIM)
@@ -436,3 +439,54 @@ def test_wan_load_lora_weights_targets_both_transformers(mocker: MockerFixture):
     assert_params_equal(pipeline.transformer, original_high)
     assert_params_equal(pipeline.transformer_2, original_low)
     assert "adapter0" not in pipeline.lora_loaded
+
+
+def test_prepare_lora_delta_disambiguates_prefix_overlapping_stacked_names():
+    """A fused name can be a prefix of another fused name.
+
+    SenseNova-U1 carries both `.qkv_proj` (understanding) and `.qkv_proj_mot_gen`
+    (generation). Selecting stacked mappings by substring matched both rules for
+    the generation weight and concatenated six shards into a delta twice as tall
+    as the parameter.
+    """
+    param_to_weight_names = {
+        ".qkv_proj_mot_gen": [".q_proj_mot_gen", ".k_proj_mot_gen", ".v_proj_mot_gen"],
+        ".qkv_proj": [".q_proj", ".k_proj", ".v_proj"],
+    }
+    state_dict = {}
+    for part in ("q", "k", "v"):
+        for tower in ("_mot_gen", ""):
+            base = f"layers.0.self_attn.{part}_proj{tower}"
+            state_dict[f"{base}.lora_A.weight"] = torch.ones(RANK, HEAD_DIM)
+            state_dict[f"{base}.lora_B.weight"] = torch.ones(HEAD_DIM, RANK)
+
+    for base_key in ("layers.0.self_attn.qkv_proj_mot_gen", "layers.0.self_attn.qkv_proj"):
+        delta, _ = _prepare_lora_delta(state_dict, base_key, param_to_weight_names)
+        assert delta.shape == (3 * HEAD_DIM, HEAD_DIM), base_key
+
+
+@pytest.mark.parametrize(
+    "fused, shards",
+    [
+        # qwen_image_transformer.py stacked_params_mapping
+        (".to_qkv", (".to_q", ".to_k", ".to_v")),
+        (".add_kv_proj", (".add_q_proj", ".add_k_proj", ".add_v_proj")),
+        # wan2_2_transformer.py stacked_params_mapping
+        (".attn1.to_qkv", (".attn1.to_q", ".attn1.to_k", ".attn1.to_v")),
+        # wan2_2_s2v_transformer.py stacked_params_mapping
+        (".self_attn.to_qkv", (".self_attn.q", ".self_attn.k", ".self_attn.v")),
+    ],
+)
+def test_prepare_lora_delta_unchanged_for_existing_fused_layouts(fused, shards):
+    """None of the fused names shipped today overlap by prefix, so matching on the
+    tail must select exactly the shards substring matching selected."""
+    param_to_weight_names = {fused: list(shards)}
+    base_key = f"blocks.0{fused}"
+    state_dict = {}
+    for shard in shards:
+        state_dict[f"blocks.0{shard}.lora_A.weight"] = torch.ones(RANK, HEAD_DIM)
+        state_dict[f"blocks.0{shard}.lora_B.weight"] = torch.ones(HEAD_DIM, RANK)
+
+    delta, used_keys = _prepare_lora_delta(state_dict, base_key, param_to_weight_names)
+    assert delta.shape == (len(shards) * HEAD_DIM, HEAD_DIM)
+    assert len(used_keys) == 2 * len(shards)

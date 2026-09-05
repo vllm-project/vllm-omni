@@ -50,6 +50,7 @@ DYNIN_OMNI_PIPELINE = PipelineConfig(
             engine_output_type="latent",
             custom_process_input_func=f"{_PROC}.token2text_to_token2image",
             custom_process_next_stage_input_func=f"{_PROC}.token2image_to_token2audio_full_payload",
+            requires_full_payload_input=True,
         ),
         StagePipelineConfig(
             stage_id=2,
@@ -60,6 +61,7 @@ DYNIN_OMNI_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="latent",
             custom_process_input_func=f"{_PROC}.token2image_to_token2audio",
+            requires_full_payload_input=True,
         ),
     ),
 )

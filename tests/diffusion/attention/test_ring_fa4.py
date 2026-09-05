@@ -72,3 +72,25 @@ def test_ring_prefers_fa4_on_blackwell(monkeypatch):
 
     assert strategy.run_attention(query, "key", "value", None) == "output"
     assert captured["attn_type"] is AttnType.FA4
+
+
+def test_flashinfer_wrapper_canonicalizes_unbatched_lse_to_bhs(monkeypatch):
+    seq_len = num_heads = 4
+    query = torch.randn(1, seq_len, num_heads, 8)
+    unbatched_out = torch.randn(seq_len, num_heads, 8)
+    unbatched_lse = torch.arange(num_heads * seq_len, dtype=torch.float32).reshape(num_heads, seq_len)
+    assert not torch.equal(unbatched_lse, unbatched_lse.transpose(0, 1))
+
+    def fake_prefill(_q, _k, _v, **_kwargs):
+        return unbatched_out.clone(), unbatched_lse.clone()
+
+    monkeypatch.setattr(ring_kernels, "HAS_FLASHINFER", True)
+    # FlashInfer symbols are only bound when HAS_FLASHINFER was true at import.
+    monkeypatch.setattr(ring_kernels, "single_prefill_with_kv_cache", fake_prefill, raising=False)
+    monkeypatch.setattr(ring_kernels, "_LOG2_E", 1.0, raising=False)
+
+    out, lse = ring_kernels.flashinfer_attn_forward(query, query, query, softmax_scale=0.1)
+
+    assert out.shape == query.shape
+    assert lse.shape == (1, num_heads, seq_len)
+    assert torch.equal(lse[0], unbatched_lse)

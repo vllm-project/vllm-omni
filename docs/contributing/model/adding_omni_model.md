@@ -29,7 +29,7 @@ Each stage is implemented as a separate model class that can be configured indep
 
 When adding a new model, you'll need to create the following structure:
 
-```
+```text
 vllm_omni/model_executor/models/
 └── your_model_name/              # Model directory (e.g., qwen3_omni)
     ├── __init__.py               # Exports main model class
@@ -422,22 +422,25 @@ The stage transition process follows these steps:
 Understanding the data structures is crucial for implementing stage transitions:
 
 **Input to your function:**
+
 - `stage_list[source_stage_id].engine_outputs`: List of `EngineCoreOutput` objects
--   -  Each contains `outputs`: List of `RequestOutput` objects
-    - Each `RequestOutput` has:
--   -  - `token_ids`: Generated token IDs
-       - `multimodal_output`: Dict with keys like `"code_predictor_codes"`, etc.These are the hidden states or intermediate outputs from the model's forward pass
-       - `prompt_token_ids`: Original prompt token IDs
+    - Each contains `outputs`: List of `RequestOutput` objects
+        - Each `RequestOutput` has:
+            - `token_ids`: Generated token IDs
+            - `multimodal_output`: Dict with keys like `"code_predictor_codes"`, etc. These are the hidden states or intermediate outputs from the model's forward pass
+            - `prompt_token_ids`: Original prompt token IDs
 
 **Output from your function:**
+
 - Must return `list[OmniTokensPrompt]` where each `OmniTokensPrompt` contains:
--   - `prompt_token_ids`: List[int] - Token IDs for the next stage
+    - `prompt_token_ids`: List[int] - Token IDs for the next stage
     - `additional_information`: Dict[str, Any] - Optional metadata (e.g., embeddings, hidden states)
     - `multi_modal_data`: Optional multimodal data if needed
 
 ### How Model Outputs Are Stored
 
 The model's `forward()` method returns an `OmniOutput` object that contains:
+
 - `text_hidden_states`: Final hidden states for text generation
 - `multimodal_outputs`: Dict containing intermediate outputs
 
@@ -464,6 +467,7 @@ def forward(self, ...):
 ```
 
 These keys are then accessible in your stage transition function:
+
 ```python
 # In stage_input_processors/qwen3_omni.py
 thinker_prefill_embeddings = output.multimodal_output["0"]  # Access by key
@@ -493,7 +497,7 @@ thinker_hidden_states = output.multimodal_output["24"]
 Create stage transition processors in `vllm_omni/model_executor/stage_input_processors/your_model_name.py`. Each inter-stage edge should provide a **coherent processor set** rather than a single monolithic function:
 
 | Suffix | Role | Runs when |
-|--------|------|-----------|
+| -------- | ------ | ----------- |
 | `*_full_payload` | Worker-side payload producer | `async_chunk=false`; accumulates tensors and ships via connector |
 | `*_async_chunk` | Scheduler-side streaming producer | `async_chunk=true`; emits per-chunk payloads |
 | `*_token_only` | Orchestrator placeholder builder | `async_chunk=false`; allocates downstream prompt slots only |
@@ -554,7 +558,16 @@ For comprehensive testing guidelines, please refer to the [Test Writing Guide](.
 
 ## Adding a Model Recipe
 
-After implementing and testing your model, please add a model recipe to the [vllm-project/recipes](https://github.com/vllm-project/recipes) repository. This helps other users understand how to use your model with vLLM-Omni.
+After implementing and testing your model, add a recipe under this repository's
+`recipes/` directory. Follow the
+[`add-recipe` skill](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/add-recipe/SKILL.md)
+and [`recipes/TEMPLATE.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/TEMPLATE.md),
+then update the model row in
+[`recipes/README.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/README.md).
+The external
+[vllm-project/recipes](https://github.com/vllm-project/recipes) repository can
+be used as a structural reference, but it is not the destination for a
+vLLM-Omni model recipe.
 
 ### What to Include
 
@@ -568,15 +581,10 @@ Your recipe should include:
 3. **Usage Examples**: Command-line examples demonstrating how to run the model
 4. **Configuration Details**: Important configuration parameters and their meanings
 
-### Example
-
-For reference, see the [LongCat recipe example](https://github.com/vllm-project/recipes/pull/179) which demonstrates the expected format and structure.
-
 ### Recipe Location
 
-Create your recipe file in the appropriate directory structure:
-- For organization-specific models: `OrganizationName/ModelName.md`
-- For general models: `ModelName.md`
+Create `recipes/<vendor>/<model-family>.md` and keep commands, feature status,
+hardware evidence, and limitations specific to the model family.
 
 The recipe should be a Markdown file that provides clear, reproducible instructions for users to get started with your model.
 
@@ -590,7 +598,7 @@ Adding a new model to vLLM-Omni involves:
 4. **Define pipeline topology and deploy defaults** in `pipeline.py` and `vllm_omni/deploy/`
 5. **Implement stage input processors** for stage transitions
 6. **Write tests** to verify functionality
-7. **Add model recipe** to the [vllm-project/recipes](https://github.com/vllm-project/recipes) repository (see [Adding a Model Recipe](#adding-a-model-recipe) section)
+7. **Add an in-repository model recipe** under `recipes/` and update its index (see [Adding a Model Recipe](#adding-a-model-recipe))
 
 ### Qwen3-Omni Reference Files
 
@@ -607,6 +615,7 @@ For a complete reference implementation, see:
 - **Testing**: `vllm_omni/tests/e2e/offline_inference/test_qwen3_omni.py`
 
 For more information, see:
+
 - [Architecture Overview](../../design/architecture_overview.md)
 - [Supported Models](../../models/supported_models.md)
 - [Pipeline and Deploy Configuration Guide](../../configuration/stage_configs.md)

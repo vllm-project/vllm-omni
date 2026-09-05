@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -42,9 +42,10 @@ class _RunnerKVBackend:
         self.kv_cache_config = config
 
 
-def _attention(*, enabled: bool) -> Attention:
+def _attention(*, enabled: bool, prefix: str = "image_attention") -> Attention:
     attention = Attention.__new__(Attention)
     nn.Module.__init__(attention)
+    attention.prefix = prefix
     attention.paged_kv_cache_role = "primary" if enabled else None
     attention.paged_kv_cache_dtype = torch.bfloat16
     attention.num_kv_heads = 2
@@ -80,6 +81,23 @@ def test_runner_discovers_native_spec_from_loaded_attention() -> None:
     assert spec.dtype is torch.bfloat16
     assert spec.indexes_kv_by_block_stride is True
     assert spec.non_causal is True
+
+
+def test_runner_uses_attention_prefix_as_canonical_layer_name() -> None:
+    runner = _runner(_attention(enabled=True, prefix="layers.0.self_attn.image_attn.attn"))
+
+    specs = runner.get_kv_cache_spec()
+
+    assert set(specs) == {"layers.0.self_attn.image_attn.attn"}
+
+
+def test_runner_rejects_duplicate_attention_prefixes() -> None:
+    runner = _runner(_attention(enabled=True, prefix="shared"))
+    second_attention = _attention(enabled=True, prefix="shared")
+    runner.pipeline.second_image_attention = second_attention
+
+    with pytest.raises(RuntimeError, match="Duplicate canonical paged Diffusion Attention prefix 'shared'"):
+        runner.get_kv_cache_spec()
 
 
 def test_runner_rejects_paged_mode_without_cache_enabled_attention() -> None:

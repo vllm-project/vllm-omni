@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import torch
@@ -83,6 +86,21 @@ class MoTRowParallelLinear(RowParallelLinear):
         # and process these secondary weights without requiring a dedicated,
         # boilerplate Module subclass just for the VAE pathway.
         self.gen_exp = torch.nn.Module()
+
+        # ``gen_exp`` participates in the same tensor-parallel layout as this
+        # layer.  vLLM's online quantizers inspect these attributes while
+        # processing weights (for example, FP8 uses them to share scales across
+        # TP ranks), so the lightweight container must expose the parallel
+        # linear metadata rather than only holding parameters.
+        for attr in (
+            "tp_rank",
+            "tp_size",
+            "input_size",
+            "input_size_per_partition",
+            "output_size",
+            "output_size_per_partition",
+        ):
+            setattr(self.gen_exp, attr, getattr(self, attr))
 
         # Select weight_loader consistent with text
         vae_weight_loader = (

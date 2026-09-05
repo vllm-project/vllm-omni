@@ -73,6 +73,15 @@ class StepBatchSamplingParamsKey:
     # because model acceleration hooks are shared by the whole worker batch.
     quality: str | None = None
 
+    # Step-mode engines can admit a model-specific full-forward fallback. Do
+    # not mix it with state-driven denoising in one scheduler wave.
+    use_step_execution: bool = True
+
+    # Pipeline-specific structure populated during preprocessing. This keeps
+    # model-owned settings that must be homogeneous (for example BAGEL CFG
+    # scales and renormalization) out of the generic sampling-params schema.
+    condition_key: tuple[Any, ...] | None = None
+
     # Output count. Requests with different num_outputs_per_prompt produce
     # differently shaped outputs and cannot share a batch.
     num_outputs_per_prompt: int = 1
@@ -157,6 +166,7 @@ class SchedulerRequestState:
     diffusion_kv_requests: tuple[DiffusionKVRequest, ...] = ()
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
+    queued_at: float = 0.0
 
     def is_finished(self) -> bool:
         return DiffusionRequestStatus.is_finished(self.status)

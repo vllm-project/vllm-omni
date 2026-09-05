@@ -26,9 +26,18 @@ primary_code_paths:
   - vllm_omni/entrypoints/client_request_state.py
   - vllm_omni/entrypoints/stage_utils.py
   - vllm_omni/entrypoints/utils.py
+  - vllm_omni/entrypoints/duplex/**
+  - vllm_omni/entrypoints/duplex_request_client.py
+  - vllm_omni/clients/**
 primary_path_exceptions:
   - path: vllm_omni/entrypoints/openai/errors.py
     owner: error_contracts.md
+  - path: vllm_omni/entrypoints/duplex/**
+    owner: ../fullduplex.md
+  - path: vllm_omni/entrypoints/duplex_request_client.py
+    owner: ../fullduplex.md
+  - path: vllm_omni/clients/**
+    owner: ../fullduplex.md
 related_code_paths:
   - vllm_omni/errors.py
   - vllm_omni/inputs/**
@@ -43,6 +52,7 @@ depends_on:
 validation_paths:
   - tests/entrypoints/test_omni_entrypoints.py
   - tests/entrypoints/test_async_omni.py
+  - tests/entrypoints/test_async_omni_pause_sleep_routing.py
   - tests/entrypoints/test_async_omni_duplex.py
   - tests/entrypoints/test_serve.py
   - tests/entrypoints/test_stream_finish_reason.py
@@ -119,7 +129,13 @@ promotion.
 
 Test request validation, protocol conversion, model-adapter routing,
 streaming, session identity, disconnect/cancellation, and error mapping for
-each affected offline or serving entrypoint.
+each affected offline or serving entrypoint. Sleep must wait for in-flight
+`generate()` admission before EngineCore offload; `wake_up` does not resume
+admission — callers must `resume_generation()`. Sleeping tags are tracked per
+stage so `wake_up(stage_ids=[0])` does not skip a later `wake_up(stage_ids=[1])`.
+Streaming input pumps take an admission slot immediately before each EngineCore
+ADD or update, not while waiting for the next client chunk. Frontend abort
+keeps `request_states` until `generate()` consumes the terminal output.
 
 ## Promotion gate
 

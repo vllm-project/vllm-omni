@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Loader-owned host-weight plans shared with diffusion offload backends."""
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ import json
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from safetensors import safe_open
@@ -20,6 +21,9 @@ from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
 )
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm_omni.host_weight_runtime import HostWeightLeaseCarrier
 
 TensorTransform = Callable[[torch.Tensor], torch.Tensor]
 
@@ -40,6 +44,7 @@ class HostWeightPlan:
     backing_kind: str
     bindings: dict[str, TensorBinding]
     planned_source_prefixes: frozenset[str] = frozenset()
+    lease_carrier: HostWeightLeaseCarrier | None = None
 
 
 @dataclass(frozen=True)
@@ -265,13 +270,46 @@ def _validate_source_metadata(
                 source = handle.get_slice(binding.checkpoint_key)
                 source_shape = tuple(source.get_shape())
                 source_dtype = _SAFETENSORS_DTYPES.get(source.get_dtype())
-                if source_shape != tuple(target.shape):
-                    raise _PlanIncompatibleError(
-                        f"shape mismatch for {runtime_name!r}: checkpoint={source_shape}, runtime={tuple(target.shape)}"
-                    )
-                if source_dtype is None or source_dtype != target.dtype:
+                if source_dtype is None:
                     raise _PlanIncompatibleError(
                         f"dtype mismatch for {runtime_name!r}: checkpoint={source.get_dtype()}, runtime={target.dtype}"
+                    )
+
+                runtime_shape = source_shape
+                runtime_dtype = source_dtype
+                if binding.transform is not None:
+                    # Adapter transforms can map full checkpoint tensors to a
+                    # rank-local runtime shape. Validate that contract without
+                    # materializing the source tensor during preflight.
+                    try:
+                        transformed = binding.transform(
+                            torch.empty(
+                                source_shape,
+                                dtype=source_dtype,
+                                device="meta",
+                            )
+                        )
+                    except (NotImplementedError, RuntimeError, TypeError, ValueError) as exc:
+                        raise _PlanIncompatibleError(
+                            f"checkpoint transform for {runtime_name!r} cannot be validated on tensor metadata: {exc}"
+                        ) from exc
+                    if not isinstance(transformed, torch.Tensor):
+                        raise _PlanIncompatibleError(
+                            f"checkpoint transform for {runtime_name!r} returned {type(transformed).__name__}, "
+                            "expected torch.Tensor"
+                        )
+                    runtime_shape = tuple(transformed.shape)
+                    runtime_dtype = transformed.dtype
+
+                if runtime_shape != tuple(target.shape):
+                    raise _PlanIncompatibleError(
+                        f"shape mismatch for {runtime_name!r}: checkpoint={source_shape}, "
+                        f"transformed={runtime_shape}, runtime={tuple(target.shape)}"
+                    )
+                if runtime_dtype != target.dtype:
+                    raise _PlanIncompatibleError(
+                        f"dtype mismatch for {runtime_name!r}: checkpoint={source.get_dtype()}, "
+                        f"transformed={runtime_dtype}, runtime={target.dtype}"
                     )
 
 

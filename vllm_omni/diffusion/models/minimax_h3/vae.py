@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax H3 remote-code VAE adapters and exact latent contracts."""
 
 from __future__ import annotations
@@ -21,8 +22,12 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     DistributedVaeMixin,
 )
 from vllm_omni.diffusion.distributed.parallel_state import get_world_group
-from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager
+from vllm_omni.diffusion.offloader.module_residency import (
+    BoundedAllocatorCache,
+    PinnedModuleStager,
+)
 
+from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
@@ -124,11 +129,18 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             component_path,
             self.config_dict,
         )
-        # Match the reference loader contract: video VAE weights stay FP32.
-        # Keyframe encoding is numerically sensitive to first casting the
-        # checkpoint through FP16; decode still runs under FP16 autocast.
+        # Match the reference loader contract before installing inference-only
+        # decoder fast paths. Keyframe encoding remains FP32; decoder Linear
+        # weights may be materialized in FP16 because reference decode casts
+        # those same tensors through CUDA autocast on every tile.
         initial_device = load_device or device
         self.remote.eval().to(device=initial_device, dtype=torch.float32)
+        decoder = getattr(self.remote.model, "decoder", None)
+        if decoder is not None:
+            install_h3_vae_optimizations(
+                decoder,
+                device=device,
+            )
         self._stager = None
         if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
             self._stager = PinnedModuleStager(
@@ -148,12 +160,21 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         else:
             self.remote.to(self._device_target)
 
+    def set_omni_component_cache(self, cache: BoundedAllocatorCache | None) -> None:
+        self._omni_component_cache = cache
+        if self._stager is not None:
+            self._stager.set_cache_retention(cache)
+
     def offload_to_cpu(self) -> None:
         if self._stager is not None:
             self._stager.offload()
         else:
             self.remote.to("cpu")
-            torch.accelerator.empty_cache()
+            cache = getattr(self, "_omni_component_cache", None)
+            if cache is None:
+                torch.accelerator.empty_cache()
+            else:
+                cache.release_if_needed()
 
     def set_parallel_size(
         self,
@@ -411,12 +432,21 @@ class MiniMaxH3AudioVAE(nn.Module):
         else:
             self.remote.to(self._device_target)
 
+    def set_omni_component_cache(self, cache: BoundedAllocatorCache | None) -> None:
+        self._omni_component_cache = cache
+        if self._stager is not None:
+            self._stager.set_cache_retention(cache)
+
     def offload_to_cpu(self) -> None:
         if self._stager is not None:
             self._stager.offload()
         else:
             self.remote.to("cpu")
-            torch.accelerator.empty_cache()
+            cache = getattr(self, "_omni_component_cache", None)
+            if cache is None:
+                torch.accelerator.empty_cache()
+            else:
+                cache.release_if_needed()
 
     @torch.inference_mode()
     def encode_waveform(

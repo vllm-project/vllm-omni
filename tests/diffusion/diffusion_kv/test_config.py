@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 
@@ -36,7 +36,7 @@ def test_non_mapping_omni_kv_config_is_rejected() -> None:
         OmniDiffusionConfig.from_kwargs(omni_kv_config="paged_scheduler")
 
 
-def test_paged_scheduler_rejects_dense_legacy_kv_receive() -> None:
+def test_paged_scheduler_rejects_dense_connector_kv_receive() -> None:
     with pytest.raises(ValueError, match="does not support imported AR KV"):
         OmniDiffusionConfig.from_kwargs(
             diffusion_kv_mode="paged_scheduler",

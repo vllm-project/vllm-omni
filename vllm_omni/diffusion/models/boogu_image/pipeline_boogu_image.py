@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Native vLLM-Omni pipeline for Boogu-Image-0.1.
 
@@ -11,17 +11,17 @@ Ported from the upstream ``boogu`` package
   loaded from the checkpoint subfolders; transformer weights arrive later via
   ``weights_sources`` + ``load_weights``).
 - Upstream ``encode_instruction`` is exposed as ``encode_prompt`` (the
-  vLLM-Omni convention, also hooked by the prompt-embed cache); only the
-  text-to-image path is ported. Instruction rewriting, prompt tuning,
-  reference-image (TI2I/I2I) encoding, double guidance, and vision-token
-  stripping are not ported.
-- ``forward()`` (denoise loop + VAE decode) is intentionally not implemented
-  yet; it lands together with the post-process registration.
+  vLLM-Omni convention, also hooked by the prompt-embed cache).
+- Text-to-image and single-reference TI2I inference share one native pipeline;
+  CFG branches use vLLM-Omni's shared two-branch/N-branch parallel helpers.
+- Instruction rewriting, prompt tuning, and vision-token stripping are not
+  ported.
 """
 
 import json
 import os
 from collections.abc import Iterable
+from contextlib import nullcontext
 from typing import ClassVar, cast
 
 import PIL.Image
@@ -31,11 +31,13 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
@@ -50,7 +52,7 @@ from vllm_omni.diffusion.models.boogu_image.scheduling_flow_match_euler_discrete
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = init_logger(__name__)
@@ -100,6 +102,20 @@ def get_boogu_image_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
+def _boogu_batch_compatibility_key(has_reference: bool, request_id: str) -> tuple:
+    """Request-batch isolation key. ``forward`` reads shared guidance/shape fields
+    from the batch's first request, so t2i and ti2i must not share a key.
+
+    ti2i is held at batch=1 (request-unique key) because
+    ``guidance_scale_2_provided`` is absent from ``RequestBatchSamplingParamsKey``
+    while ``forward`` reads it from the first request, so mixed-``_provided`` edits
+    with equal numeric ``guidance_scale_2`` would co-batch into the wrong mode.
+    """
+    if not has_reference:
+        return ("boogu_image", "t2i")
+    return ("boogu_image", "ti2i", request_id)
+
+
 def get_boogu_image_pre_process_func(od_config: OmniDiffusionConfig):
     """Build the pre-process callable for Boogu-Image reference (edit) input.
 
@@ -130,13 +146,15 @@ def get_boogu_image_pre_process_func(od_config: OmniDiffusionConfig):
     def pre_process_func(request: OmniDiffusionRequest):
         prompt = request.prompt
         if isinstance(prompt, str):
-            # Plain-text prompt cannot carry an image -> text-to-image, no-op.
+            # Plain-text prompt cannot carry an image -> text-to-image.
+            request.batch_compatibility_key = _boogu_batch_compatibility_key(False, request.request_id)
             return request
 
         multi_modal_data = prompt.get("multi_modal_data") or {}
         raw_image = multi_modal_data.get("image")
         if not raw_image:
-            # No reference image -> text-to-image, no-op (Base checkpoint).
+            # No reference image -> text-to-image (Base checkpoint).
+            request.batch_compatibility_key = _boogu_batch_compatibility_key(False, request.request_id)
             return request
 
         if isinstance(raw_image, list):
@@ -171,6 +189,7 @@ def get_boogu_image_pre_process_func(od_config: OmniDiffusionConfig):
         prompt["additional_information"]["preprocessed_image"] = preprocessed_image
         prompt["additional_information"]["prompt_image"] = prompt_image
         request.prompt = prompt
+        request.batch_compatibility_key = _boogu_batch_compatibility_key(True, request.request_id)
         return request
 
     return pre_process_func
@@ -189,7 +208,7 @@ SYSTEM_PROMPT_4_T2I_UNIFIED = (
 )
 
 
-class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery, SupportImageInput):
+class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, SupportsComponentDiscovery, SupportImageInput):
     """Boogu-Image text-to-image and image-editing (TI2I) pipeline.
 
     Native vLLM-Omni implementation. A request with a reference image (edit /
@@ -198,7 +217,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
     transformer's reference-image refiner path.
     """
 
-    supports_request_batch = False
+    supports_request_batch = True
 
     support_image_input: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
@@ -220,7 +239,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
                 subfolder="transformer",
-                revision=None,
+                revision=od_config.revision,
                 prefix="transformer.",
                 fall_back_to_pt=True,
             )
@@ -233,10 +252,18 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         # See ``hub_prefetch.py`` for the transformers v5 multi-worker subfolder
         # race; prefetch the whole component set before any from_pretrained.
         boogu_subfolders = ["scheduler", "vae", "mllm", "processor"]
-        prefetch_subfolders(model, boogu_subfolders, local_files_only=local_files_only)
+        prefetch_subfolders(
+            model,
+            boogu_subfolders,
+            local_files_only=local_files_only,
+            revision=od_config.revision,
+        )
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model, subfolder="scheduler", local_files_only=local_files_only
+            model,
+            subfolder="scheduler",
+            local_files_only=local_files_only,
+            revision=od_config.revision,
         )
 
         mllm = from_pretrained_with_prefetch(
@@ -246,6 +273,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             prefetch_list=boogu_subfolders,
             local_files_only=local_files_only,
             torch_dtype=od_config.dtype,
+            revision=od_config.revision,
         )
         # Upstream reuses the full VLM as an optional instruction rewriter and
         # encodes with its inner model (no ``lm_head``); the rewriter is not
@@ -255,7 +283,10 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         self.mllm = mllm.to(self._execution_device)
 
         self.processor = Qwen3VLProcessor.from_pretrained(
-            model, subfolder="processor", local_files_only=local_files_only
+            model,
+            subfolder="processor",
+            local_files_only=local_files_only,
+            revision=od_config.revision,
         )
 
         self.vae = from_pretrained_with_prefetch(
@@ -264,6 +295,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             subfolder="vae",
             prefetch_list=boogu_subfolders,
             local_files_only=local_files_only,
+            revision=od_config.revision,
         ).to(self._execution_device)
 
         self.transformer = BooguImageTransformer2DModel(od_config=od_config)
@@ -286,8 +318,6 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             raise NotImplementedError("Tensor parallelism is not supported by BooguImagePipeline.")
         if (parallel_config.sequence_parallel_size or 1) > 1:
             raise NotImplementedError("Sequence parallelism is not supported by BooguImagePipeline.")
-        if parallel_config.cfg_parallel_size > 1:
-            raise NotImplementedError("CFG parallelism is not supported by BooguImagePipeline.")
         if parallel_config.use_hsdp:
             raise NotImplementedError("HSDP is not supported by BooguImagePipeline.")
         if self.od_config.cache_backend not in (None, "", "none"):
@@ -411,8 +441,11 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             embeds = embeds.repeat(1, num_images_per_prompt, 1)
             reshaped_embeds = embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
 
-        mask = mask.repeat(num_images_per_prompt, 1)
-        reshaped_mask = mask.view(batch_size * num_images_per_prompt, -1)
+        # repeat_interleave (not repeat/tile) so mask rows stay request-major
+        # [p0, p0, p1, p1] to match the reshaped embeds above; a plain repeat
+        # tiles to [p0, p1, p0, p1] and mismatches when batch_size > 1 and
+        # num_images_per_prompt > 1.
+        reshaped_mask = mask.repeat_interleave(num_images_per_prompt, dim=0)
 
         return batch_size, seq_len, reshaped_embeds, reshaped_mask
 
@@ -531,7 +564,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         return height, width, ori_height, ori_width
 
     def predict(
-        self, t, latents, instruction_embeds, freqs_cis, instruction_attention_mask, ref_image_hidden_states=None
+        self, t, latents, instruction_embeds, freqs_real, instruction_attention_mask, ref_image_hidden_states=None
     ):
         """One transformer velocity prediction (upstream ``predict``).
 
@@ -544,10 +577,83 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             latents,
             timestep,
             instruction_embeds,
-            freqs_cis,
+            freqs_real,
             instruction_attention_mask,
             ref_image_hidden_states=ref_image_hidden_states,
         )
+
+    def predict_noise(self, **kwargs) -> torch.Tensor:
+        """Run one Boogu CFG branch through the native transformer."""
+        return self.predict(**kwargs)
+
+    def combine_cfg_noise(
+        self,
+        positive_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
+        negative_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
+        true_cfg_scale: float,
+        cfg_normalize: bool = False,
+        kwargs: dict | None = None,
+    ) -> torch.Tensor:
+        """Preserve Boogu's sequential two-branch CFG operation order."""
+        positive_items = positive_noise_pred if isinstance(positive_noise_pred, tuple) else (positive_noise_pred,)
+        negative_items = negative_noise_pred if isinstance(negative_noise_pred, tuple) else (negative_noise_pred,)
+        if len(positive_items) != 1 or len(negative_items) != 1:
+            raise ValueError("Boogu CFG expects exactly one prediction tensor per branch.")
+
+        positive = positive_items[0]
+        negative = negative_items[0]
+        combined = positive + (true_cfg_scale - 1) * (positive - negative)
+        if cfg_normalize:
+            combined = self.cfg_normalize_function(positive, combined)
+        return combined
+
+    def combine_multi_branch_cfg_noise(
+        self,
+        predictions: list[torch.Tensor],
+        true_cfg_scale: float | dict[str, float],
+        cfg_normalize: bool = False,
+    ) -> torch.Tensor:
+        """Combine Boogu CFG branches using the original operation order.
+
+        Although the usual two- and three-branch CFG formulas can be rewritten
+        algebraically, changing their floating-point operation order causes
+        small per-step differences that accumulate across the denoise loop.
+        Keep the sequential Boogu implementation's order so parallel branch
+        combination does not introduce an additional source of numeric drift.
+
+        The two-branch formula is::
+
+            positive + (scale - 1) * (positive - negative)
+
+        The three-branch order is ``[positive_with_reference,
+        negative_with_reference, negative_without_reference]`` and combines as::
+
+            positive_with_reference
+            + (text_scale - 1) * (positive_with_reference - negative_with_reference)
+            + (image_scale - 1) * (negative_with_reference - uncond)
+        """
+        if len(predictions) == 2:
+            if not isinstance(true_cfg_scale, float):
+                raise TypeError("Boogu two-branch CFG requires a scalar guidance scale.")
+            positive, negative = predictions
+            combined = positive + (true_cfg_scale - 1) * (positive - negative)
+            if cfg_normalize:
+                combined = self.cfg_normalize_function(positive, combined)
+            return combined
+        if len(predictions) != 3:
+            return super().combine_multi_branch_cfg_noise(predictions, true_cfg_scale, cfg_normalize)
+        if not isinstance(true_cfg_scale, dict):
+            raise TypeError("Boogu three-branch CFG requires text and image guidance scales.")
+
+        positive_with_reference, negative_with_reference, uncond = predictions
+        combined = (
+            positive_with_reference
+            + (true_cfg_scale["text"] - 1) * (positive_with_reference - negative_with_reference)
+            + (true_cfg_scale["image"] - 1) * (negative_with_reference - uncond)
+        )
+        if cfg_normalize:
+            combined = self.cfg_normalize_function(positive_with_reference, combined)
+        return combined
 
     def _encode_vae_image(self, img: torch.Tensor, generator=None) -> torch.Tensor:
         """Encode an image tensor into the VAE latent space (upstream ``encode_vae``).
@@ -556,19 +662,41 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         threads the request generator through so a fixed seed gives a
         reproducible reference latent.
         """
-        z0 = self.vae.encode(img.to(dtype=self.vae.dtype)).latent_dist.sample(generator=generator)
+        with self._vae_attention_context(img.device):
+            z0 = self.vae.encode(img.to(dtype=self.vae.dtype)).latent_dist.sample(generator=generator)
         if self.vae.config.shift_factor is not None:
             z0 = z0 - self.vae.config.shift_factor
         if self.vae.config.scaling_factor is not None:
             z0 = z0 * self.vae.config.scaling_factor
         return z0.to(dtype=self.vae.dtype)
 
+    @staticmethod
+    def _vae_attention_context(device: torch.device):
+        """Pin the VAE SDPA backend so worker topology cannot change results.
+
+        Boogu's float32 VAE attention can otherwise choose a different SDPA
+        backend in the in-process CFG=1 executor and the multi-process CFG>1
+        executor. The resulting small reference-latent differences accumulate
+        over the denoising loop. Prefer the default fast CUDA backend used by
+        Boogu and keep the math implementation as a CUDA fallback.
+
+        This pin is intentionally CUDA-only. CPU and vendor-specific accelerator
+        backends keep their platform defaults, so topology-independent VAE
+        parity is not guaranteed for those devices by this context.
+        """
+        if device.type != "cuda":
+            return nullcontext()
+        return sdpa_kernel(
+            [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH],
+            set_priority=True,
+        )
+
     def _build_ref_latents(
         self,
         preprocessed_images: list[torch.Tensor | None],
         num_images_per_prompt: int,
         device: torch.device,
-        generator=None,
+        generators: list[torch.Generator | None] | None = None,
     ) -> list[list[torch.Tensor] | None]:
         """VAE-encode per-sample reference images into the transformer's format.
 
@@ -577,17 +705,18 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         ``None`` (no reference / text-to-image) or a list of ``[C, H, W]``
         reference latents (one per reference image). Boogu editing uses a single
         reference image, so each non-empty entry is a one-element list.
-        """
-        # ``latent_dist.sample`` accepts only a single generator; a per-output
-        # generator list (num_outputs_per_prompt > 1) falls back to unseeded.
-        vae_generator = generator if isinstance(generator, torch.Generator) else None
 
+        ``generators`` holds one generator (or ``None``) per request, so each
+        reference latent is sampled with its own request's seed and batched
+        edits stay reproducible against the single-request path.
+        """
         ref_latents: list[list[torch.Tensor] | None] = []
-        for image in preprocessed_images:
+        for idx, image in enumerate(preprocessed_images):
             if image is None:
                 sample_latents: list[torch.Tensor] | None = None
             else:
-                latent = self._encode_vae_image(image.to(device=device), generator=vae_generator).squeeze(0)
+                generator = generators[idx] if generators is not None else None
+                latent = self._encode_vae_image(image.to(device=device), generator=generator).squeeze(0)
                 sample_latents = [latent]
             for _ in range(num_images_per_prompt):
                 ref_latents.append(sample_latents)
@@ -615,7 +744,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             preprocessed_images.append(ai.get("preprocessed_image"))
         return prompt_images, preprocessed_images
 
-    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         # Prompt / negative-prompt extraction (mirrors the Ovis pattern; the
         # online API sometimes passes ``{"negative_prompt": None}``).
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts]
@@ -629,7 +758,19 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         has_reference = any(img is not None for img in preprocessed_images)
         task_type = "ti2i" if has_reference else "t2i"
 
-        sp = req.sampling_params
+        # Fail-closed: a batched ti2i must never reach here (it is gated to batch=1).
+        if has_reference and req.num_reqs > 1:
+            raise RuntimeError(
+                f"BooguImagePipeline received a batched TI2I (edit) request "
+                f"(num_reqs={req.num_reqs}); TI2I batching is gated to batch=1 "
+                "pending guidance-mode / compatibility-key validation."
+            )
+
+        sampling_params_list = req.sampling_params_list
+        # Shared shape/step/guidance fields are guaranteed identical across the
+        # batch by RequestBatchSamplingParamsKey; request-local values (seeds,
+        # reference generators) are read per request below.
+        sp = sampling_params_list[0]
         device = self._execution_device
 
         height = sp.height or self.default_sample_size * self.vae_scale_factor
@@ -644,7 +785,15 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         if not has_reference:
             image_guidance_scale = 1.0
         num_images_per_prompt = sp.num_outputs_per_prompt if sp.num_outputs_per_prompt > 0 else 1
-        generator = sp.generator
+        # Per-request noise generators, collated into one flat list of length
+        # batch_size * num_images_per_prompt (request-major, output-minor).
+        generator = req.collate_request_generators(num_images_per_prompt, None)
+        # One generator per request for reference-latent sampling; a per-output
+        # generator list is not usable by ``latent_dist.sample`` and falls back
+        # to unseeded, matching the single-request path.
+        ref_generators = [
+            s.generator if isinstance(s.generator, torch.Generator) else None for s in sampling_params_list
+        ]
         max_sequence_length = sp.max_sequence_length or 1280
         output_type = sp.output_type or "pil"
         cfg_range = (0.0, 1.0)
@@ -685,7 +834,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         latent_channels = self.transformer.in_channels
         ref_latents = None
         if has_reference:
-            ref_latents = self._build_ref_latents(preprocessed_images, num_images_per_prompt, device, generator)
+            ref_latents = self._build_ref_latents(preprocessed_images, num_images_per_prompt, device, ref_generators)
 
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
@@ -697,7 +846,7 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
             generator,
         )
 
-        freqs_cis = BooguImageDoubleStreamRotaryPosEmbed.get_freqs_cis(
+        freqs_real = BooguImageDoubleStreamRotaryPosEmbed.get_freqs_real(
             self.transformer.axes_dim_rope,
             self.transformer.axes_lens,
             theta=10000,
@@ -709,71 +858,107 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
         timesteps = self.scheduler.timesteps
         num_timesteps = len(timesteps)
 
-        # 5. Denoise loop with (sequential) classifier-free guidance. Reproduces
-        # the branch priority of upstream ``processing`` (double > text-only >
-        # image-only > t2i text). Reference latents are kept in the conditional
-        # (and, for text-only ti2i, the unconditional) predictions.
+        # 5. Denoise loop with shared sequential/parallel CFG execution.
+        # Reproduces the branch priority of upstream ``processing`` (double >
+        # text-only > image-only > t2i text). Reference latents stay attached
+        # to the same branches as in the original sequential implementation.
         with self.progress_bar(total=num_timesteps) as progress_bar:
             for i, t in enumerate(timesteps):
                 in_cfg_range = cfg_range[0] <= i / num_timesteps <= cfg_range[1]
                 text_gs = text_guidance_scale if in_cfg_range else 1.0
                 image_gs = image_guidance_scale if in_cfg_range else 1.0
 
-                model_pred = self.predict(
-                    t, latents, instruction_embeds, freqs_cis, instruction_attention_mask, ref_latents
+                positive_kwargs = dict(
+                    t=t,
+                    latents=latents,
+                    instruction_embeds=instruction_embeds,
+                    freqs_real=freqs_real,
+                    instruction_attention_mask=instruction_attention_mask,
+                    ref_image_hidden_states=ref_latents,
                 )
 
                 if task_type == "ti2i" and text_gs > 1.0 and image_gs > 1.0:
                     # Double guidance: 3 predictions (cond+ref, neg+ref, neg+no-ref).
-                    model_pred_drop_text = self.predict(
-                        t,
-                        latents,
-                        negative_instruction_embeds,
-                        freqs_cis,
-                        negative_instruction_attention_mask,
-                        ref_latents,
+                    negative_with_reference_kwargs = dict(
+                        t=t,
+                        latents=latents,
+                        instruction_embeds=negative_instruction_embeds,
+                        freqs_real=freqs_real,
+                        instruction_attention_mask=negative_instruction_attention_mask,
+                        ref_image_hidden_states=ref_latents,
                     )
-                    model_pred_drop_all = self.predict(
-                        t,
-                        latents,
-                        negative_instruction_embeds,
-                        freqs_cis,
-                        negative_instruction_attention_mask,
-                        None,
+                    uncond_kwargs = dict(
+                        t=t,
+                        latents=latents,
+                        instruction_embeds=negative_instruction_embeds,
+                        freqs_real=freqs_real,
+                        instruction_attention_mask=negative_instruction_attention_mask,
+                        ref_image_hidden_states=None,
                     )
-                    delta_text = model_pred - model_pred_drop_text
-                    delta_image = model_pred_drop_text - model_pred_drop_all
-                    model_pred = model_pred + (text_gs - 1) * delta_text + (image_gs - 1) * delta_image
+                    model_pred = self.predict_noise_with_multi_branch_cfg(
+                        do_true_cfg=True,
+                        true_cfg_scale={"text": text_gs, "image": image_gs},
+                        branches_kwargs=[positive_kwargs, negative_with_reference_kwargs, uncond_kwargs],
+                        cfg_normalize=False,
+                    )
                 elif task_type == "ti2i" and text_gs > 1.0:
                     # Text-only ti2i guidance: reference kept in the uncond pred.
-                    model_pred_drop_text = self.predict(
-                        t,
-                        latents,
-                        negative_instruction_embeds,
-                        freqs_cis,
-                        negative_instruction_attention_mask,
-                        ref_latents,
+                    negative_kwargs = dict(
+                        t=t,
+                        latents=latents,
+                        instruction_embeds=negative_instruction_embeds,
+                        freqs_real=freqs_real,
+                        instruction_attention_mask=negative_instruction_attention_mask,
+                        ref_image_hidden_states=ref_latents,
                     )
-                    model_pred = model_pred + (text_gs - 1) * (model_pred - model_pred_drop_text)
+                    model_pred = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=True,
+                        true_cfg_scale=text_gs,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=negative_kwargs,
+                        cfg_normalize=False,
+                    )
                 elif task_type == "ti2i" and image_gs > 1.0:
                     # Image-only ti2i guidance: drop the reference in the uncond pred.
-                    model_pred_drop_image = self.predict(
-                        t, latents, instruction_embeds, freqs_cis, instruction_attention_mask, None
+                    negative_kwargs = dict(positive_kwargs, ref_image_hidden_states=None)
+                    model_pred = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=True,
+                        true_cfg_scale=image_gs,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=negative_kwargs,
+                        cfg_normalize=False,
                     )
-                    model_pred = model_pred + (image_gs - 1) * (model_pred - model_pred_drop_image)
                 elif text_gs > 1.0:
                     # Text-to-image classifier-free guidance.
-                    model_pred_drop_all = self.predict(
-                        t,
-                        latents,
-                        negative_instruction_embeds,
-                        freqs_cis,
-                        negative_instruction_attention_mask,
-                        None,
+                    negative_kwargs = dict(
+                        t=t,
+                        latents=latents,
+                        instruction_embeds=negative_instruction_embeds,
+                        freqs_real=freqs_real,
+                        instruction_attention_mask=negative_instruction_attention_mask,
+                        ref_image_hidden_states=None,
                     )
-                    model_pred = model_pred + (text_gs - 1) * (model_pred - model_pred_drop_all)
+                    model_pred = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=True,
+                        true_cfg_scale=text_gs,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=negative_kwargs,
+                        cfg_normalize=False,
+                    )
+                else:
+                    # CFG-off requests remain valid even if the server owns a
+                    # CFG process group: every rank evaluates only the positive
+                    # branch and no negative embeddings are required.
+                    model_pred = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=False,
+                        true_cfg_scale=1.0,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=None,
+                        cfg_normalize=False,
+                    )
 
-                latents = self.scheduler.step(model_pred, t, latents, return_dict=False)[0]
+                do_true_cfg = text_gs > 1.0 or (task_type == "ti2i" and image_gs > 1.0)
+                latents = self.scheduler_step_maybe_with_cfg(model_pred, t, latents, do_true_cfg=do_true_cfg)
                 latents = latents.to(dtype=instruction_embeds.dtype)
                 progress_bar.update()
 
@@ -786,8 +971,13 @@ class BooguImagePipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery
                 latents = latents / self.vae.config.scaling_factor
             if self.vae.config.shift_factor is not None:
                 latents = latents + self.vae.config.shift_factor
-            image = self.vae.decode(latents, return_dict=False)[0]
+            with self._vae_attention_context(latents.device):
+                image = self.vae.decode(latents, return_dict=False)[0]
             if (ori_height, ori_width) != (height, width):
                 image = F.interpolate(image, size=(ori_height, ori_width), mode="bilinear")
 
-        return DiffusionOutput(output=image)
+        return split_diffusion_output_by_request(
+            DiffusionOutput(output=image),
+            req,
+            num_outputs_per_prompt=num_images_per_prompt,
+        )

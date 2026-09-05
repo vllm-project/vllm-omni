@@ -4,14 +4,14 @@ vLLM-Omni provides an API for text-to-audio generation using diffusion-based mod
 
 Unlike the [Speech API](speech_api.md) which targets text-to-speech synthesis, the Audio Generate API is designed for general-purpose audio generation from text descriptions (sound effects, music, ambient soundscapes, etc.).
 
-Each server instance runs a single model (specified at startup via `vllm-omni serve <model> --omni`).
+Each server instance runs a single model (specified at startup via `vllm serve <model> --omni`).
 
 ## Quick Start
 
 ### Start the Server
 
 ```bash
-vllm-omni serve stabilityai/stable-audio-open-1.0 \
+vllm serve stabilityai/stable-audio-open-1.0 \
     --host 0.0.0.0 \
     --port 8091 \
     --gpu-memory-utilization 0.9 \
@@ -326,7 +326,7 @@ curl http://localhost:8091/health
 Enable debug logging:
 
 ```bash
-vllm-omni serve stabilityai/stable-audio-open-1.0 \
+vllm serve stabilityai/stable-audio-open-1.0 \
     --host 0.0.0.0 \
     --port 8091 \
     --gpu-memory-utilization 0.9 \

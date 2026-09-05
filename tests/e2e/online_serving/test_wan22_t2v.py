@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Online serving smoke for ``Wan-AI/Wan2.2-T2V-A14B-Diffusers`` (text-to-video via ``/v1/videos``).
@@ -18,7 +18,7 @@ import os
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -44,7 +44,7 @@ def _get_diffusion_feature_cases(model: str):
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
-def test_text_to_video_001(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:
+def test_text_to_video_001(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:
     """Default Wan2.2 T2V smoke: async ``/v1/videos`` job completes and returns video bytes."""
     request_config = {
         "model": omni_server.model,
@@ -60,4 +60,4 @@ def test_text_to_video_001(omni_server: OmniServer, openai_client: OpenAIClientH
             "seed": 42,
         },
     }
-    openai_client.send_video_diffusion_request(request_config)
+    online_client.send_video_diffusion_request(request_config)

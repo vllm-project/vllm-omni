@@ -541,6 +541,15 @@ class OmniServeCommand(CLISubcommand):
             "'advanced_uaa' enables the experimental UAA path for uneven sequence/head shapes.",
         )
         omni_config_group.add_argument(
+            "--ulysses-a2a-permute",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Enable fused permute-free Ulysses all-to-all over NCCL symmetric memory. "
+                "Only strict Ulysses layouts are eligible. Defaults to disabled."
+            ),
+        )
+        omni_config_group.add_argument(
             "--ring",
             "--ring-degree",
             dest="ring_degree",
@@ -738,6 +747,38 @@ class OmniServeCommand(CLISubcommand):
             help="Keep this many leading main-DiT blocks resident on the device "
             "while distributed layerwise offload streams the remaining blocks.",
         )
+        omni_config_group.add_argument(
+            "--host-weight-runtime-mode",
+            choices=("disabled", "preferred", "required"),
+            default="disabled",
+            help=(
+                "Host Weight Runtime policy for eligible no-AllGather DLO: "
+                "disabled does not consult HWR; preferred restores an exact hit "
+                "or canonically loads and publishes on a miss; required restores "
+                "an exact hit or fails startup. Populate a required store with "
+                "preferred first."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--host-weight-runtime-root",
+            type=str,
+            default=None,
+            help=(
+                "Writable node-local Host Weight Runtime store shared by workers "
+                "in one storage domain. Required for preferred and required; use "
+                "the same persistent path for population and serving."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--dlo-host-registration-limit-gib",
+            type=float,
+            default=0.0,
+            help=(
+                "Optional per-worker GiB ceiling for registering an HWR mmap for direct H2D. "
+                "Zero applies no additional ceiling. Eligible no-AllGather HWR hits attempt registration "
+                "under the existing pinned-memory policy and fall back to bounded staging when unavailable."
+            ),
+        )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
             "--boundary-ratio",
@@ -789,10 +830,9 @@ class OmniServeCommand(CLISubcommand):
         omni_config_group.add_argument(
             "--text-encoder-tp-size",
             type=int,
-            default=1,
+            default=None,
             help="Tensor-parallel degree for the diffusion text encoder. "
-            "Shards the Qwen3-VL encoder across the first N DiT ranks, "
-            "removing the rank-0 encoder memory hotspot in no-offload runs. "
+            "Shards the encoder across the first N DiT ranks. "
             "Equivalent to setting DiffusionParallelConfig.text_encoder_tp_size.",
         )
         omni_config_group.add_argument(

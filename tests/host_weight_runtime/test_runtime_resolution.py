@@ -17,6 +17,7 @@ from vllm_omni.host_weight_runtime import (
     FailureCode,
     HostWeightFailure,
     HostWeightLease,
+    HostWeightLeaseCarrier,
     HostWeightRuntime,
     HostWeightRuntimeConfig,
     IntegrityPolicy,
@@ -164,6 +165,28 @@ def test_local_production_then_exact_warm_hit_emits_one_terminal_report_each(tmp
     assert producer.calls == 1
     assert reports == [cold.report, warm.report]
     assert all(report.resolution_id for report in reports)
+
+
+def test_lease_carrier_is_single_take_and_process_local(tmp_path: Path) -> None:
+    identity = _identity()
+    producer = CountingProducer(identity)
+    runtime = HostWeightRuntime.from_config(
+        HostWeightRuntimeConfig(mode=RuntimeMode.PREFERRED, domain=_domain(tmp_path / "store"))
+    )
+    resolution = runtime.resolve(identity, producer=producer)
+    assert resolution.lease is not None
+
+    carrier = HostWeightLeaseCarrier(resolution.lease)
+    with pytest.raises(TypeError, match="cannot be serialized"):
+        carrier.__reduce_ex__(4)
+
+    lease = carrier.take()
+    assert lease is resolution.lease
+    with pytest.raises(RuntimeError, match="already taken"):
+        carrier.take()
+    carrier.close()  # ownership has moved; the carrier must not close twice.
+    assert not lease.closed
+    lease.close()
 
 
 @pytest.mark.parametrize(

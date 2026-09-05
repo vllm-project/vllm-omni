@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for OmniRequestState multimodal DELTA drain and consolidation guard."""
 
 from types import SimpleNamespace
@@ -581,18 +581,18 @@ def test_mm_only_terminal_finish_removes_request_state(monkeypatch):
 
 def test_no_detokenizer_make_request_output_with_routed_experts():
     """make_request_output accepts the routed_experts arg that the multimodal
-    output channel (_process_mm_only_outputs) passes positionally, and attaches
-    it to the completion output.
+    output channel (_process_mm_only_outputs) passes, and attaches it to the
+    completion output.
 
-    Regression: the call site passes 6 positional args
-    (..., kv_transfer_params, routed_experts) but the override previously took
-    only 5, raising TypeError on every generation-stage output.
+    routed_experts is omni-specific keyword-only: the 6th positional now
+    matches upstream's ec_transfer_params so that super().process_outputs()
+    calls do not misroute it.
     """
     s = _make_no_detok_state(RequestOutputKind.CUMULATIVE)
     s.add_multimodal_tensor(torch.randn(10), mm_type=AUDIO)
     routed_experts = np.zeros((2, 3), dtype=np.int32)
     # Mirror the exact call shape of _process_mm_only_outputs.
-    result = s.make_request_output([], None, FinishReason.STOP, None, None, routed_experts)
+    result = s.make_request_output([], None, FinishReason.STOP, None, None, routed_experts=routed_experts)
     assert result is not None
     assert not isinstance(result, PoolingRequestOutput)
     assert result.outputs[0].routed_experts is routed_experts
@@ -663,3 +663,99 @@ def test_mm_only_outputs_update_iteration_stats():
     assert finished.finish_reason == FinishReason.STOP
     assert finished.num_prompt_tokens == state.prompt_len
     assert finished.num_generation_tokens == 2
+
+
+def test_ec_transfer_params_survive_both_construction_paths():
+    """v0.28 contract: encoder-cache transfer metadata must reach
+    RequestOutput.ec_transfer_params through BOTH omni construction paths —
+    the upstream-delegating one (logprobs processor present) and the
+    no-detokenizer generation-stage one (direct RequestOutput build).
+    Regression: the override accepted the argument but dropped it."""
+    ec = {"remote_handle": "enc-cache-1"}
+
+    state = _make_state(RequestOutputKind.CUMULATIVE)
+    out = state.make_request_output([1], None, None, None, {"kv": 1}, ec)
+    assert out is not None and out.ec_transfer_params == ec
+
+    kwargs = dict(_DEFAULT_STATE_KWARGS)
+    kwargs.update(logprobs_processor=None, detokenizer=None)
+    gen_state = OmniRequestState(**kwargs, output_kind=RequestOutputKind.CUMULATIVE)
+    completion = gen_state._new_completion_output([1], None, None)
+    direct = gen_state._new_request_output("r", [completion], False, {"kv": 1}, ec)
+    assert direct.ec_transfer_params == ec
+
+
+def test_num_cache_creation_tokens_reaches_direct_request_output():
+    """v0.28 contract: prefix-cache creation usage must reach
+    RequestOutput.num_cache_creation_tokens through the no-detokenizer
+    direct build, which previously passed only num_cached_tokens."""
+    kwargs = dict(_DEFAULT_STATE_KWARGS)
+    kwargs.update(logprobs_processor=None, detokenizer=None)
+    gen_state = OmniRequestState(**kwargs, output_kind=RequestOutputKind.CUMULATIVE)
+    gen_state.num_cached_tokens = 3
+    gen_state.num_cache_creation_tokens = 2
+
+    completion = gen_state._new_completion_output([1], None, None)
+    direct = gen_state._new_request_output("r", [completion], False, None, None)
+
+    assert direct.num_cached_tokens == 3
+    assert direct.num_cache_creation_tokens == 2
+
+
+def _abort_processor_with_parent(child_ids: list[str]):
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor.request_states = {}
+    processor.external_req_ids = {}
+    processor.parent_requests = {}
+    processor._native_text_metrics_by_request = {}
+    processor.lora_states = SimpleNamespace(request_finished=lambda *_args, **_kwargs: None)
+    parent = SimpleNamespace(request_id="parent", child_requests=set(child_ids))
+    processor.parent_requests["parent"] = parent
+    for child_id in child_ids:
+        req_state = SimpleNamespace(
+            parent_req=parent,
+            lora_name=None,
+            output_kind=RequestOutputKind.CUMULATIVE,
+            detokenizer=SimpleNamespace(output_token_ids=[7, 8]),
+            queue=None,
+            external_req_id="parent",
+            make_request_output=MagicMock(return_value=SimpleNamespace(request_id=child_id)),
+        )
+        processor.request_states[child_id] = req_state
+    return processor, parent
+
+
+def test_abort_last_parallel_child_drops_parent_request():
+    processor, parent = _abort_processor_with_parent(["0_parent", "1_parent"])
+
+    aborted, _outputs = processor.abort_requests_collecting_outputs(["0_parent"], internal=True)
+    assert aborted == ["0_parent"]
+    assert "parent" in processor.parent_requests
+    assert parent.child_requests == {"1_parent"}
+
+    aborted, _outputs = processor.abort_requests_collecting_outputs(["1_parent"], internal=True)
+    assert aborted == ["1_parent"]
+    assert "parent" not in processor.parent_requests
+    assert not parent.child_requests
+
+
+def test_abort_snapshot_leaves_state_until_commit():
+    processor, parent = _abort_processor_with_parent(["0_parent"])
+    processor.external_req_ids["parent"] = ["0_parent"]
+
+    aborted, outputs = processor.abort_requests_collecting_outputs(
+        ["parent"],
+        internal=False,
+        commit_state=False,
+    )
+    assert aborted == ["0_parent"]
+    assert outputs
+    assert "0_parent" in processor.request_states
+    assert processor.external_req_ids["parent"] == ["0_parent"]
+    assert "parent" in processor.parent_requests
+    assert parent.child_requests == {"0_parent"}
+
+    processor.commit_aborted_request_state(["parent"], internal=False)
+    assert "0_parent" not in processor.request_states
+    assert "parent" not in processor.parent_requests
+    assert "parent" not in processor.external_req_ids

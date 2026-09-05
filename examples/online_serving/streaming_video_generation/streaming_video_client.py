@@ -8,7 +8,7 @@ the received bytes to disk when the session finishes or is interrupted.
 Image/reference input is intentionally not supported in this example yet.
 
 Requirements:
-    pip install websockets
+    pip install av websockets
 """
 
 import argparse
