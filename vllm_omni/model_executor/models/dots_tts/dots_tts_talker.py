@@ -77,7 +77,7 @@ def _require_config_block(hf_config: Any, name: str) -> dict[str, Any]:
         raise ValueError(
             f"dots.tts checkpoint config.json has no '{name}' block — cannot "
             "build the audio side path.  Expected the upstream dots.tts config "
-            "layout (e.g. rednote-hilab/dots.tts-soar)."
+            "layout (e.g. dots-studio/dots.tts-soar)."
         )
     return block
 
@@ -189,7 +189,7 @@ class _RequestState:
     vocoder_stream_state: Any | None = None
 
 
-# DiT transformer hyperparameters from rednote-hilab/dots.tts-soar config.json
+# DiT transformer hyperparameters from dots-studio/dots.tts-soar config.json
 # (the ``DiT`` block).  Mirrors the shape of an upstream pydantic config: DiT's
 # constructor calls ``transformer_config.to_dict()`` and reads ``.hidden_size``
 # / ``.num_layers``, so this @dataclass plus the ``to_dict`` helper satisfies
@@ -226,7 +226,7 @@ def _build_dit_config(hf_config: Any) -> _DiTConfig:
     return _DiTConfig(**_require_config_block(hf_config, "DiT"))
 
 
-# Patch encoder hyperparameters from rednote-hilab/dots.tts-soar config.json
+# Patch encoder hyperparameters from dots-studio/dots.tts-soar config.json
 # (the top-level ``patch_size`` and the ``PatchEncoder`` sub-block).
 #
 # Two layers of config:
@@ -505,7 +505,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
         """Resolve latent_stats.pt to a local filesystem path.
 
         ``vllm_config.model_config.model`` is typically an HF repo ID like
-        ``"rednote-hilab/dots.tts-soar"`` — joining it with ``"latent_
+        ``"dots-studio/dots.tts-soar"`` — joining it with ``"latent_
         stats.pt"`` gives a non-existent path.  Try the local-dir form
         first (covers ``--model /local/path``), then fall back to HF
         cache lookup with ``local_files_only=True`` so we never trigger

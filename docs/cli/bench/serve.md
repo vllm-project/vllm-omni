@@ -307,6 +307,26 @@ omitted from the official manifest; `audio_clipped_bytes` records output beyond 
 TTFT, TTFP, and RTF start at client receipt of `response.created`. TPOT/ITL use engine stage-0 timing; ITL is emitted only when
 every token interval is present.
 
+The checked-in local performance configuration measures four deterministic cases from each OmniInteract subset (12 videos
+total), with no benchmark warmups and a maximum concurrency of two. Each subset also sends one readiness request before its
+measured cases. Run it from the repository root with:
+
+```bash
+export HF_HOME=/path/to/persistent/huggingface-cache
+export BENCHMARK_DIR=tests/dfx/perf/results
+bash tools/nightly/run_nightly_jobs.sh \
+  --test-type local \
+  --model-type omni \
+  --label-substr minicpmo_4_5_omniinteract
+```
+
+The first run downloads the pinned OmniInteract archive into `HF_HOME`; later runs reuse that cache.
+
+It requires every case to commit its input, complete any emitted response lifecycles, and publish the expected WAV,
+transcript, event, and result artifacts without errors. A valid LISTEN-only case may have no response audio or transcript
+chunks. Official-manifest eligibility is reported separately because clipped or cancelled output is a benchmark-quality
+signal, not a transport failure. This local performance test does not score answer accuracy.
+
 ### Multi-Modal Benchmark
 
 <details class="admonition abstract" markdown="1">

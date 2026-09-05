@@ -69,7 +69,7 @@ th {
 | `CosyVoice3Model` | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `OmniVoiceModel` | OmniVoice | `k2-fsa/OmniVoice` | ✅︎ | | | ✅︎ | — |
 | `VoxCPM2TalkerForConditionalGeneration` | VoxCPM2 | `openbmb/VoxCPM2` | ✅︎ | | | ✅︎ | — |
-| `DotsTTSForConditionalGeneration` | dots.tts | `rednote-hilab/dots.tts-soar` | ✅︎ | | | | — |
+| `DotsTTSForConditionalGeneration` | dots.tts | `dots-studio/dots.tts-soar` | ✅︎ | | | | — |
 | `MammothModa2ForConditionalGeneration` | MammothModa2-Preview | `bytedance-research/MammothModa2-Preview` | ✅︎ | ✅︎ | | | — |
 | `MammothModa2ForConditionalGeneration` | MammothModa2-Dev (AR-only image understanding) | `bytedance-research/MammothModa2-Dev` | ✅︎ | | | | — |
 | `Flux2KleinPipeline` | FLUX.2-klein | `black-forest-labs/FLUX.2-klein-4B`, `black-forest-labs/FLUX.2-klein-9B` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
