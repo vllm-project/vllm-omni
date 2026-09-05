@@ -1,11 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
 from vllm_omni.model_executor.models.breeze_tts_2.modeling_breeze_tts_2_talker import (
     BreezeTTS2TalkerForGeneration,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _PaddedHead(nn.Module):

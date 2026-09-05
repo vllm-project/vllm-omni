@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Reference-audio encoding helpers for Breeze-TTS-2.
 
 The Breeze prompt uses a Qwen3-TTS tokenizer only for reference audio.  This
@@ -47,9 +50,7 @@ class BreezeReferenceAudioTokenizer:
 
         local_path = Path(model_path) / "audio_tokenizer"
         if not local_path.is_dir():
-            raise FileNotFoundError(
-                f"Breeze reference audio tokenizer was not found at {local_path}"
-            )
+            raise FileNotFoundError(f"Breeze reference audio tokenizer was not found at {local_path}")
         tokenizer = Qwen3TTSTokenizer.from_pretrained(str(local_path), **kwargs)
         return cls(tokenizer, num_codebooks=num_codebooks, codebook_size=codebook_size)
 

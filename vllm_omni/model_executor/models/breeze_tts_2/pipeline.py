@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Synchronous Breeze-TTS-2 pipeline: talker -> Mimi codec."""
 
 from vllm_omni.config.stage_config import (

@@ -1,9 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import numpy as np
+import pytest
 import torch
 
 from vllm_omni.model_executor.models.breeze_tts_2.audio_tokenizer import (
     BreezeReferenceAudioTokenizer,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _Tokenizer:

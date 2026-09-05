@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Breeze-TTS-2 request-to-prompt conversion.
 
 This module is intentionally limited to request preparation.  It creates the
@@ -37,8 +40,6 @@ class _TextSegment:
 class _AudioSegment:
     source: Any
     sample_rate: int | None
-
-
 
 
 class BreezeTTS2PromptBuilder:
@@ -193,9 +194,7 @@ class BreezeTTS2PromptBuilder:
             additional_information=additional_information,
         )
 
-    def _build_segments(
-        self, template: str, request: Mapping[str, Any]
-    ) -> list[_TextSegment | _AudioSegment]:
+    def _build_segments(self, template: str, request: Mapping[str, Any]) -> list[_TextSegment | _AudioSegment]:
         speaker = _speaker_prefix(request.get("speaker", "S0"))
         text = _required_text(request, "text")
         instruction = request.get("instruction")
@@ -261,6 +260,7 @@ class BreezeTTS2PromptBuilder:
             unk = getattr(self.tokenizer, "unk_token_id", None)
             if actual is None or (unk is not None and actual == unk) or int(actual) != expected:
                 raise ValueError(f"tokenizer id for {token!r} is {actual}, expected config value {expected}")
+
 
 def _infer_template(request: Mapping[str, Any]) -> str:
     has_ref = (

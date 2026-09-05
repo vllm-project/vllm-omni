@@ -1,6 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import pytest
 from vllm.model_executor.models.registry import ModelRegistry
 
 from vllm_omni.model_executor.models.registry import OmniModelRegistry
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_breeze_architectures_resolve_to_omni_classes():

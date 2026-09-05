@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """TTS model detection: registry-driven stage -> model-type resolution.
 
 ``serving_speech.py`` used to carry a hand-written 20-branch ladder mapping

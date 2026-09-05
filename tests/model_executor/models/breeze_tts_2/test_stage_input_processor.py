@@ -1,11 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_omni.model_executor.stage_input_processors.breeze_tts_2 import (
     talker2codec,
     talker2codec_full_payload,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_talker2codec_flattens_codebook_major():
@@ -28,9 +34,7 @@ def test_talker2codec_keeps_empty_request_terminal():
 
 def test_talker2codec_accepts_engine_core_output_wrapper():
     codes = torch.tensor([[7, 8]], dtype=torch.int16)
-    output = SimpleNamespace(
-        outputs=[SimpleNamespace(multimodal_output={"codes": {"audio": codes}})]
-    )
+    output = SimpleNamespace(outputs=[SimpleNamespace(multimodal_output={"codes": {"audio": codes}})])
 
     prompts = talker2codec([output])
 

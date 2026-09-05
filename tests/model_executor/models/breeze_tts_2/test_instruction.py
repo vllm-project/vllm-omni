@@ -1,9 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from types import SimpleNamespace
+
+import pytest
 
 from vllm_omni.entrypoints.openai.tts_adapters.breeze_tts_2 import BreezeTTS2Adapter
 from vllm_omni.model_executor.models.breeze_tts_2.prompt_builder import (
     BreezeTTS2PromptBuilder,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _Tokenizer:

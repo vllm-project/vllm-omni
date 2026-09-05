@@ -1,9 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from pathlib import Path
 
+import pytest
 import yaml
 
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.model_executor.models.breeze_tts_2.pipeline import BREEZE_TTS_2_PIPELINE
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_breeze_pipeline_is_registered_with_talker_and_codec_stages():

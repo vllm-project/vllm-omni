@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Breeze-TTS-2 serving adapter for synchronous full-payload generation."""
 
 import asyncio

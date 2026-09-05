@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Configuration classes for Breeze-TTS-2."""
 
 from __future__ import annotations
@@ -63,7 +66,7 @@ class BreezeTTS2Config(PretrainedConfig):
         use_cache: bool = True,
         vocab_size: int = 2051,
         sampling_rate: int = 24000,
-        codec_model_name_or_path: str = 'kyutai/mimi',
+        codec_model_name_or_path: str = "kyutai/mimi",
         **kwargs: Any,
     ) -> None:
         serialized_rope_parameters = kwargs.pop("rope_parameters", None)
@@ -232,8 +235,7 @@ class BreezeTTS2TextEncoderConfig(PretrainedConfig):
         if layer_types is None:
             # T5Gemma2 uses sliding attention except every sixth layer.
             layer_types = [
-                "full_attention" if (index + 1) % 6 == 0 else "sliding_attention"
-                for index in range(num_hidden_layers)
+                "full_attention" if (index + 1) % 6 == 0 else "sliding_attention" for index in range(num_hidden_layers)
             ]
         self.layer_types = list(layer_types)
         if rope_parameters is None:
@@ -352,6 +354,8 @@ class BreezeTTS2DepthDecoderConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.codebook_loss_weights = list(codebook_loss_weights)
         self.dtype = dtype
+
+
 AutoConfig.register("breeze", BreezeTTS2Config, exist_ok=True)
 
 

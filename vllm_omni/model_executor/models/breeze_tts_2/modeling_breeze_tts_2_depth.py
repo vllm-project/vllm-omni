@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -44,8 +47,8 @@ def _create_depth_causal_mask(
         kwargs["cache_position"] = cache_position
     return create_causal_mask(**kwargs)
 
-class BreezeDepthDecoderModel(nn.Module):
 
+class BreezeDepthDecoderModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -55,21 +58,14 @@ class BreezeDepthDecoderModel(nn.Module):
             self.audio_embed_size = config.audio_embed_size
         else:
             self.audio_embed_size = config.backbone_hidden_size
-        self.embed_tokens = nn.Embedding(
-            (config.num_codebooks * config.vocab_size), self.audio_embed_size
-        )
+        self.embed_tokens = nn.Embedding((config.num_codebooks * config.vocab_size), self.audio_embed_size)
         self.layers = nn.ModuleList(
-            [
-                BreezeDecoderLayer(config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
+            [BreezeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = BreezeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = BreezeRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
-        self.inputs_embeds_projector = nn.Linear(
-            self.audio_embed_size, config.hidden_size, bias=False
-        )
+        self.inputs_embeds_projector = nn.Linear(self.audio_embed_size, config.hidden_size, bias=False)
 
         if config.backbone_hidden_size != self.audio_embed_size:
             self.backbone_hidden_state_projector = nn.Linear(
@@ -108,28 +104,16 @@ class BreezeDepthDecoderModel(nn.Module):
             )
             position_ids = None
         if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "You must specify exactly one of input_ids or inputs_embeds."
-            )
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds.")
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
         if cache_position is None:
-            past_seen_tokens = (
-                past_key_values.get_seq_length() if past_key_values is not None else 0
-            )
-            inputs_seq_length = (
-                inputs_embeds.shape[1]
-                if inputs_embeds is not None
-                else input_ids.shape[1]
-            )
-            device = (
-                inputs_embeds.device if inputs_embeds is not None else input_ids.device
-            )
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_seq_length, device=device
-            )
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            inputs_seq_length = inputs_embeds.shape[1] if inputs_embeds is not None else input_ids.shape[1]
+            device = inputs_embeds.device if inputs_embeds is not None else input_ids.device
+            cache_position = torch.arange(past_seen_tokens, past_seen_tokens + inputs_seq_length, device=device)
 
         if inputs_embeds is None:
             codebook_idxs = torch.clamp(cache_position - 1, min=0)
@@ -139,9 +123,7 @@ class BreezeDepthDecoderModel(nn.Module):
             input_ids_are_first_codebook = cache_position[0] == 0
             if backbone_last_hidden_state is not None:
                 if self.backbone_hidden_state_projector is not None:
-                    inputs_embeds[:, 0] = self.backbone_hidden_state_projector(
-                        backbone_last_hidden_state
-                    )
+                    inputs_embeds[:, 0] = self.backbone_hidden_state_projector(backbone_last_hidden_state)
                 else:
                     inputs_embeds[:, 0] = backbone_last_hidden_state
             else:
@@ -186,6 +168,7 @@ class BreezeDepthDecoderModel(nn.Module):
             past_key_values=past_key_values if use_cache else None,
         )
 
+
 @use_kernel_forward_from_hub("RMSNorm")
 class BreezeRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -214,9 +197,7 @@ class BreezeRotaryEmbedding(nn.Module):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
-            self.rope_type = config.rope_scaling.get(
-                "rope_type", config.rope_scaling.get("type")
-            )
+            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
         else:
             self.rope_type = "default"
         self.max_seq_len_cached = config.max_position_embeddings
@@ -232,23 +213,12 @@ class BreezeRotaryEmbedding(nn.Module):
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
-        inv_freq_expanded = (
-            self.inv_freq[None, :, None]
-            .float()
-            .expand(position_ids.shape[0], -1, 1)
-            .to(x.device)
-        )
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
 
-        device_type = (
-            x.device.type
-            if isinstance(x.device.type, str) and x.device.type != "mps"
-            else "cpu"
-        )
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):  # Force float32
-            freqs = (
-                inv_freq_expanded.float() @ position_ids_expanded.float()
-            ).transpose(1, 2)
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
@@ -262,15 +232,9 @@ class BreezeMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(
-            self.hidden_size, self.intermediate_size, bias=config.mlp_bias
-        )
-        self.up_proj = nn.Linear(
-            self.hidden_size, self.intermediate_size, bias=config.mlp_bias
-        )
-        self.down_proj = nn.Linear(
-            self.intermediate_size, self.hidden_size, bias=config.mlp_bias
-        )
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
@@ -320,9 +284,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_key_value_heads, n_rep, slen, head_dim
-    )
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
@@ -344,12 +306,8 @@ def eager_attention_forward(
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
         attn_weights = attn_weights + causal_mask
 
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
-        query.dtype
-    )
-    attn_weights = nn.functional.dropout(
-        attn_weights, p=dropout, training=module.training
-    )
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
@@ -363,12 +321,8 @@ class BreezeAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        )
-        self.num_key_value_groups = (
-            config.num_attention_heads // config.num_key_value_heads
-        )
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
@@ -412,22 +366,16 @@ class BreezeAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin
-        )
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[
-                self.config._attn_implementation
-            ]
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -453,12 +401,8 @@ class BreezeDecoderLayer(nn.Module):
         self.self_attn = BreezeAttention(config=config, layer_idx=layer_idx)
 
         self.mlp = BreezeMLP(config)
-        self.input_layernorm = BreezeRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_attention_layernorm = BreezeRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.input_layernorm = BreezeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = BreezeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -508,9 +452,7 @@ class BreezeCodebooksHead(nn.Module):
         # by codebook-0..N tokens. Return logits for codebook-1..N.
         depth_states = hidden_states[:, 1 : self.num_codebooks, :]
         if depth_states.shape[1] > self.num_codebooks - 1:
-            raise ValueError(
-                f"depth decoder received too many input positions: {hidden_states.shape[1]}"
-            )
+            raise ValueError(f"depth decoder received too many input positions: {hidden_states.shape[1]}")
         return torch.einsum("bkh,khv->bkv", depth_states, self.weight[: depth_states.shape[1]])
 
 
@@ -564,9 +506,7 @@ class BreezeDepthDecoderForCausalLM(nn.Module):
                 )
                 actual = tuple(int(dim) for dim in tensor.shape)
                 if actual != expected:
-                    raise ValueError(
-                        f"Breeze depth weight {name!r} has shape {actual}, expected {expected}"
-                    )
+                    raise ValueError(f"Breeze depth weight {name!r} has shape {actual}, expected {expected}")
             loader = getattr(param, "weight_loader", None)
             if loader is None:
                 param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))

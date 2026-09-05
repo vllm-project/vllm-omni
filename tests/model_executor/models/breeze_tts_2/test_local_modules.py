@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import pytest
 import torch
 
 from vllm_omni.model_executor.models.breeze_tts_2.configuration_breeze_tts_2 import (
@@ -10,6 +14,8 @@ from vllm_omni.model_executor.models.breeze_tts_2.modeling_breeze_tts_2_depth im
 from vllm_omni.model_executor.models.breeze_tts_2.modeling_breeze_tts_2_text import (
     BreezeTTS2TextEncoder,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _depth_config() -> BreezeTTS2DepthDecoderConfig:

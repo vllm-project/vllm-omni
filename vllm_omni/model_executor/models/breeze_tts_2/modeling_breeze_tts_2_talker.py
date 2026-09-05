@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Breeze-TTS-2 stage-0 talker for vLLM-Omni.
 
 The scheduler samples Breeze codebook-0 tokens one at a time. The other 15
@@ -447,9 +450,7 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
             code0 = int(torch.argmax(main_logits, dim=-1).item())
             generated_frames = int(info.get("breeze_generated_frames", 0) or 0)
             max_new_frames = int(info.get("breeze_max_new_frames", -1))
-            terminal = code0 == self.codebook_vocab_size or (
-                max_new_frames > 0 and generated_frames >= max_new_frames
-            )
+            terminal = code0 == self.codebook_vocab_size or (max_new_frames > 0 and generated_frames >= max_new_frames)
             if terminal:
                 info["breeze_force_eos"] = True
                 existing = info.get("breeze_audio_codes")
@@ -500,7 +501,6 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
             },
             output_dir / f"breeze_{digest}.pt",
         )
-
 
     def _dump_golden_prefill(self, info: dict[str, Any], hidden: torch.Tensor) -> None:
         """Write the terminal-prompt hidden row for opt-in parity diagnostics."""
@@ -576,9 +576,7 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
             # ParallelLMHead stores a TP-local shard while checkpoint tensors
             # are global; validate against the global Breeze head shape.
             expected_shape = (
-                (self.codebook_vocab_size + 1, self.hidden_size)
-                if name == "lm_head.weight"
-                else tuple(param.shape)
+                (self.codebook_vocab_size + 1, self.hidden_size) if name == "lm_head.weight" else tuple(param.shape)
             )
             _check_weight_shape(name, tensor, expected_shape)
             loader = getattr(param, "weight_loader", default_weight_loader)
@@ -601,5 +599,6 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
                 if "embed_audio_tokens.weight" in loaded:
                     loaded.add("depth_decoder.model.embed_tokens.weight")
         return loaded
+
 
 __all__ = ["BreezeTTS2TalkerForGeneration"]

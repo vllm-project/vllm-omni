@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Breeze-TTS-2 stage-1 codec (codec codes -> waveform).
 
 The talker emits a frame-major ``(T, 16)`` matrix.  The stage input
@@ -80,9 +83,7 @@ class BreezeTTS2MimiCodec(nn.Module):
 
         self._num_codebooks = int(getattr(self.config, "num_codebooks", 16))
         self._codebook_size = int(codec_kwargs.get("codebook_size", 2048))
-        self._sample_rate = int(
-            codec_kwargs.get("sampling_rate", getattr(self.config, "sampling_rate", 24000))
-        )
+        self._sample_rate = int(codec_kwargs.get("sampling_rate", getattr(self.config, "sampling_rate", 24000)))
         self._decoder_state_cache: dict[str, dict[str, Any]] = {}
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
@@ -155,8 +156,7 @@ class BreezeTTS2MimiCodec(nn.Module):
                 )
             if int(flat.min()) < 0 or int(flat.max()) >= self._codebook_size:
                 raise ValueError(
-                    f"Breeze codec id outside [0, {self._codebook_size}): "
-                    f"min={int(flat.min())}, max={int(flat.max())}"
+                    f"Breeze codec id outside [0, {self._codebook_size}): min={int(flat.min())}, max={int(flat.max())}"
                 )
             frames = flat.numel() // self._num_codebooks
             codes = flat.reshape(self._num_codebooks, frames).unsqueeze(0)
@@ -196,8 +196,7 @@ class BreezeTTS2MimiCodec(nn.Module):
         request_ids = [str(request_id) for request_id in scheduler_request_ids]
         if len(request_ids) != len(requests):
             raise ValueError(
-                f"Breeze codec request id count {len(request_ids)} does not match "
-                f"input request count {len(requests)}"
+                f"Breeze codec request id count {len(request_ids)} does not match input request count {len(requests)}"
             )
         valid: list[tuple[str, torch.Tensor, bool]] = []
         for index, request_ids_tensor in enumerate(requests):
@@ -214,8 +213,7 @@ class BreezeTTS2MimiCodec(nn.Module):
                 continue
             if int(flat.min()) < 0 or int(flat.max()) >= self._codebook_size:
                 raise ValueError(
-                    f"Breeze codec id outside [0, {self._codebook_size}): "
-                    f"min={int(flat.min())}, max={int(flat.max())}"
+                    f"Breeze codec id outside [0, {self._codebook_size}): min={int(flat.min())}, max={int(flat.max())}"
                 )
             frames = int(flat.numel()) // self._num_codebooks
             valid.append((state_id, flat.reshape(self._num_codebooks, frames), finished))
@@ -249,9 +247,7 @@ class BreezeTTS2MimiCodec(nn.Module):
             left_context_size=25,
         )
         if len(decoded) != len(valid):
-            raise RuntimeError(
-                f"Breeze codec returned {len(decoded)} chunks for {len(valid)} requests"
-            )
+            raise RuntimeError(f"Breeze codec returned {len(decoded)} chunks for {len(valid)} requests")
         for request_index, waveform in zip(valid_indices, decoded, strict=True):
             if waveform.ndim == 2 and waveform.shape[0] == 1:
                 waveform = waveform[0]
@@ -287,9 +283,7 @@ class BreezeTTS2MimiCodec(nn.Module):
     def _decode_codes(self, codes: torch.Tensor) -> torch.Tensor:
         """Decode one ``(1, Q, T)`` sequence using Breeze's bundled codec."""
         if self._audio_tokenizer is not None:
-            wavs, sample_rate = self._audio_tokenizer.decode(
-                {"audio_codes": [codes[0].transpose(0, 1).contiguous()]}
-            )
+            wavs, sample_rate = self._audio_tokenizer.decode({"audio_codes": [codes[0].transpose(0, 1).contiguous()]})
             self._sample_rate = int(sample_rate)
             if not wavs:
                 raise RuntimeError("Breeze Qwen3-TTS tokenizer returned no waveform")
@@ -344,10 +338,7 @@ class BreezeTTS2MimiCodec(nn.Module):
             tokenizer_module = getattr(self._audio_tokenizer, "model", None)
             named_parameters = getattr(tokenizer_module, "named_parameters", None)
             if callable(named_parameters):
-                return {
-                    f"_audio_tokenizer.model.{name}"
-                    for name, _ in named_parameters()
-                }
+                return {f"_audio_tokenizer.model.{name}" for name, _ in named_parameters()}
             return set()
 
         params = dict(self._codec.named_parameters()) if self._codec is not None else {}

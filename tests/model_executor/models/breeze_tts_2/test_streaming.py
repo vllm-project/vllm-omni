@@ -1,6 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from collections import defaultdict
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_omni.model_executor.models.breeze_tts_2.modeling_breeze_tts_2_codec import (
@@ -9,6 +13,8 @@ from vllm_omni.model_executor.models.breeze_tts_2.modeling_breeze_tts_2_codec im
 from vllm_omni.model_executor.stage_input_processors.breeze_tts_2 import (
     talker2codec_async_chunk,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _TransferManager:

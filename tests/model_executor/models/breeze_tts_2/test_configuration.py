@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 from transformers.models.qwen3 import Qwen3Config
 
@@ -6,6 +9,8 @@ from vllm_omni.model_executor.models.breeze_tts_2.configuration_breeze_tts_2 imp
     BreezeTTS2DepthDecoderConfig,
     BreezeTTS2TextEncoderConfig,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _config() -> BreezeTTS2Config:
@@ -84,9 +89,7 @@ def test_transformers_five_roundtrip_preserves_nested_configs_and_rope():
 def test_nested_autoconfig_registration_is_idempotent():
     import importlib
 
-    module = importlib.import_module(
-        "vllm_omni.model_executor.models.breeze_tts_2.configuration_breeze_tts_2"
-    )
+    module = importlib.import_module("vllm_omni.model_executor.models.breeze_tts_2.configuration_breeze_tts_2")
     importlib.reload(module)
 
     assert module.BreezeTTS2Config.model_type == "breeze"

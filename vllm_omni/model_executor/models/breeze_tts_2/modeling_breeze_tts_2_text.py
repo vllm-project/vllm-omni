@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Breeze T5Gemma2 text encoder.
 
 The Breeze checkpoint contains a T5Gemma2 encoder, not the older T5Gemma
@@ -90,8 +93,10 @@ def _repeat_kv(hidden_states: torch.Tensor, repeats: int) -> torch.Tensor:
     if repeats == 1:
         return hidden_states
     batch, heads, seq_len, head_dim = hidden_states.shape
-    return hidden_states[:, :, None, :, :].expand(batch, heads, repeats, seq_len, head_dim).reshape(
-        batch, heads * repeats, seq_len, head_dim
+    return (
+        hidden_states[:, :, None, :, :]
+        .expand(batch, heads, repeats, seq_len, head_dim)
+        .reshape(batch, heads * repeats, seq_len, head_dim)
     )
 
 

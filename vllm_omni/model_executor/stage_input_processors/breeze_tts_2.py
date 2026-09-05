@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Stage-0 to stage-1 input conversion for Breeze-TTS-2.
 
 The prompt builder and the reference-audio tokenizer live under the Breeze
@@ -71,8 +74,7 @@ def _extract_audio_codes(output: Any) -> torch.Tensor | None:
         audio = audio[0]
     if audio.ndim not in (1, 2):
         raise ValueError(
-            "Breeze audio codes must have shape (T, Q) or codebook-major (Q*T,), "
-            f"got {tuple(audio.shape)}"
+            f"Breeze audio codes must have shape (T, Q) or codebook-major (Q*T,), got {tuple(audio.shape)}"
         )
     return audio.to(device="cpu", dtype=torch.long).contiguous()
 

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Generate deterministic Breeze-TTS-2 golden frames with the upstream runtime.
 
 This tool is intentionally separate from vLLM-Omni: it imports the unmodified
@@ -71,9 +74,9 @@ def main() -> None:
     from breeze_infer.templates import get_template, prepare_inputs
 
     device = resolve_device()
+    # ``torch.manual_seed`` seeds CUDA RNGs as well, so no device-specific
+    # seeding call is needed here.
     torch.manual_seed(0)
-    if device.startswith("cuda"):
-        torch.cuda.manual_seed_all(0)
     tokenizer, model, audio_tokenizer = load_runtime(
         args.model,
         device=device,
@@ -91,9 +94,7 @@ def main() -> None:
             return
         hidden = getattr(output, "last_hidden_state", None)
         if isinstance(hidden, torch.Tensor):
-            first_backbone_hidden.append(
-                hidden[0, -1].detach().cpu().to(torch.float32).contiguous()
-            )
+            first_backbone_hidden.append(hidden[0, -1].detach().cpu().to(torch.float32).contiguous())
 
     model.backbone_model.register_forward_hook(_capture_first_backbone_hidden)
 
@@ -184,9 +185,7 @@ def main() -> None:
             "min_code": int(frames.min().item()) if frames.numel() else None,
             "max_code": int(frames.max().item()) if frames.numel() else None,
             "audio_samples": int(audio.numel()),
-            "audio_sha256": __import__("hashlib").sha256(
-                (case_dir / "upstream.wav").read_bytes()
-            ).hexdigest(),
+            "audio_sha256": __import__("hashlib").sha256((case_dir / "upstream.wav").read_bytes()).hexdigest(),
         }
         manifest["cases"].append(entry)
         print(json.dumps(entry), flush=True)
