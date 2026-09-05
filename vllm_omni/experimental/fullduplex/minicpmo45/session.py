@@ -29,6 +29,11 @@ class MiniCPMO45ServingSessionState:
     pending_silence_task: asyncio.Task[bool] | None = None
     pending_silence_owner_id: str | None = None
     silence_continuation_scheduler: Callable[..., Awaitable[bool]] | None = None
+    # Deadline-aligned silence continuation state: the monotonic time the most
+    # recent native input unit was submitted, and the next silence-continuation
+    # deadline (in monotonic seconds). Real user input resets the chain.
+    last_native_submit_monotonic: float = 0.0
+    silence_deadline_monotonic: float | None = None
 
     def retain_committed_audio(
         self,

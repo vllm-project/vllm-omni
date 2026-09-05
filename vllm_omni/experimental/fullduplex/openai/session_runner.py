@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 from contextlib import suppress
 from copy import deepcopy
@@ -45,6 +46,40 @@ from vllm_omni.experimental.fullduplex.openai.websocket import (
 logger = init_logger(__name__)
 
 _MAX_EVENT_BYTES = 15 * 1024 * 1024
+
+
+def compute_silence_continuation_deadline(
+    *,
+    chunk_period_s: float,
+    now: float,
+    last_submit: float,
+    prior_deadline: float | None,
+) -> tuple[float, float]:
+    """Compute the deadline-aligned silence continuation delay.
+
+    Unit N+1 is scheduled for ``submission_time_N + chunk_period_s``; the
+    function returns ``(delay_s, next_deadline)`` where ``delay_s`` is the
+    remaining sleep budget (``max(0, deadline - now)``) and ``next_deadline``
+    advances from the prior deadline (not from ``now``) so that processing
+    time does not accumulate as timer drift.
+
+    Args:
+        chunk_period_s: Nominal model-time unit duration in seconds.
+        now: Current ``time.monotonic()`` value.
+        last_submit: ``time.monotonic()`` when unit N was submitted.
+        prior_deadline: Deadline of unit N (``None`` for the first
+            continuation, which anchors to ``last_submit``).
+
+    Returns:
+        ``(delay_s, next_deadline)`` in monotonic seconds.
+    """
+    if prior_deadline is None:
+        base = last_submit if last_submit > 0.0 else now
+        deadline = base + chunk_period_s
+    else:
+        deadline = prior_deadline
+    delay_s = max(0.0, deadline - now)
+    return delay_s, deadline + chunk_period_s
 
 
 class DuplexSessionRunnerMixin:
@@ -359,6 +394,13 @@ class DuplexSessionRunnerMixin:
             async def _run() -> bool:
                 nonlocal runtime_closed
                 try:
+                    # Record the monotonic submission time of this native input
+                    # unit so silence continuations can align to a 1 s cadence.
+                    # A real (non-silence) input supersedes any pending silence
+                    # and re-anchors the continuation deadline chain.
+                    native.last_native_submit_monotonic = time.monotonic()
+                    if not silence_continuation:
+                        native.silence_deadline_monotonic = None
                     append_ok, emitted_response = await self._append_runtime_input(
                         session,
                         payload,
@@ -561,7 +603,20 @@ class DuplexSessionRunnerMixin:
                 float(session.capabilities.chunk_period_ms or 1000) / 1000.0,
             )
             if continuation_delay_s > 0:
-                await asyncio.sleep(continuation_delay_s)
+                # Deadline-aligned silence continuation: schedule unit N+1 at
+                # submission_time_N + chunk_period and sleep only the remaining
+                # budget after unit N's audio is produced. Deadlines advance
+                # from the prior deadline (not from the current time) so that
+                # processing time does not accumulate as timer drift. A real
+                # input append resets the chain (see start_native_append).
+                delay_s, next_deadline = compute_silence_continuation_deadline(
+                    chunk_period_s=continuation_delay_s,
+                    now=time.monotonic(),
+                    last_submit=native.last_native_submit_monotonic,
+                    prior_deadline=native.silence_deadline_monotonic,
+                )
+                if delay_s > 0:
+                    await asyncio.sleep(delay_s)
                 if (
                     actor.native_append_tail is not append_tail
                     or ((append_tail is None or append_tail.done()) and real_native_input_waiting())
@@ -576,6 +631,9 @@ class DuplexSessionRunnerMixin:
                     )
                 ):
                     return False
+                # Advance from the prior deadline only after a successful submit
+                # path is reached; _run() re-anchors on real user input.
+                native.silence_deadline_monotonic = next_deadline
 
             def _still_valid() -> bool:
                 return not real_native_input_waiting() and not self._native_silence_continuation_is_stale(
