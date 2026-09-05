@@ -1229,6 +1229,7 @@ def test_broadcast_model_weights_invokes_dist_broadcast(mocker):
     model = nn.Module()
     model.linear = nn.Linear(2, 2)
     model.register_buffer("buf", torch.tensor([1.0, 2.0]))
+    model.register_buffer("int_buf", torch.tensor([1, 2, 3], dtype=torch.long))
 
     od_config = SimpleNamespace(
         dtype=torch.float32,
@@ -1239,6 +1240,44 @@ def test_broadcast_model_weights_invokes_dist_broadcast(mocker):
     loader = DiffusersPipelineLoader(LoadConfig(), od_config)
     loader._broadcast_model_weights(model, target_device=torch.device("cpu"), src_rank=0)
 
-    # linear.weight, linear.bias, and buf -> 3 broadcast calls
-    assert len(broadcast_calls) == 3
+    # float32 tensors (linear.weight, linear.bias, buf) are coalesced into 1 bucket,
+    # and int64 tensor (int_buf) is in a separate bucket -> 2 coalesced broadcast calls
+    assert len(broadcast_calls) == 2
     assert all(src == 0 for _, src in broadcast_calls)
+
+
+def test_broadcast_model_weights_receiver_copies_data(mocker):
+    """Ensure receiver rank copies broadcasted flat tensor data into its model parameters/buffers."""
+    mocker.patch("torch.distributed.is_initialized", return_value=True)
+    mocker.patch("torch.distributed.get_world_size", return_value=2)
+    mocker.patch("torch.distributed.get_rank", return_value=1)
+    mocker.patch("torch.distributed.get_backend", return_value="gloo")
+    mocker.patch("torch.distributed.barrier")
+
+    # Simulate broadcast by filling the flat tensor with source values
+    def mock_broadcast(tensor, src):
+        if tensor.dtype == torch.float32:
+            tensor.fill_(3.14)
+        elif tensor.dtype == torch.long:
+            tensor.fill_(42)
+
+    mocker.patch("torch.distributed.broadcast", side_effect=mock_broadcast)
+
+    model = nn.Module()
+    model.linear = nn.Linear(2, 2)
+    model.register_buffer("buf", torch.zeros(2))
+    model.register_buffer("int_buf", torch.zeros(3, dtype=torch.long))
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(use_hsdp=True),
+        enable_broadcast_weight_load=True,
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    loader._broadcast_model_weights(model, target_device=torch.device("cpu"), src_rank=0)
+
+    assert torch.allclose(model.linear.weight, torch.tensor(3.14))
+    assert torch.allclose(model.linear.bias, torch.tensor(3.14))
+    assert torch.allclose(model.buf, torch.tensor(3.14))
+    assert torch.equal(model.int_buf, torch.tensor([42, 42, 42], dtype=torch.long))

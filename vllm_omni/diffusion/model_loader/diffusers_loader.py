@@ -504,8 +504,9 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         model: nn.Module,
         target_device: torch.device,
         src_rank: int = 0,
+        bucket_cap_bytes: int = 256 * 1024 * 1024,
     ) -> None:
-        """Broadcast model parameters and buffers from src_rank to all other ranks."""
+        """Broadcast model parameters and buffers from src_rank to all other ranks using coalesced bucketing."""
         if not torch.distributed.is_initialized() or torch.distributed.get_world_size() <= 1:
             return
 
@@ -522,56 +523,68 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             world_size,
         )
         t0 = time.perf_counter()
-        count = 0
-        total_bytes = 0
 
-        # Broadcast parameters
-        for _, param in model.named_parameters():
-            if param.numel() == 0:
-                continue
-            count += 1
-            total_bytes += param.numel() * param.element_size()
+        all_tensors = [p.data for _, p in model.named_parameters() if p.numel() > 0] + [
+            b.data for _, b in model.named_buffers() if b.numel() > 0
+        ]
+        if not all_tensors:
+            return
 
-            if is_cpu_backend:
-                torch.distributed.broadcast(param.data, src=src_rank)
-            else:
-                if rank == src_rank:
-                    dev_tensor = param.data.to(target_device, non_blocking=False)
-                    torch.distributed.broadcast(dev_tensor, src=src_rank)
-                    del dev_tensor
-                else:
-                    dev_tensor = torch.empty(
-                        param.data.shape,
-                        dtype=param.data.dtype,
-                        device=target_device,
-                    )
-                    torch.distributed.broadcast(dev_tensor, src=src_rank)
-                    param.data.copy_(dev_tensor.cpu(), non_blocking=False)
-                    del dev_tensor
+        count = len(all_tensors)
+        total_bytes = sum(t.numel() * t.element_size() for t in all_tensors)
 
-        # Broadcast buffers
-        for _, buf in model.named_buffers():
-            if buf.numel() == 0:
-                continue
-            count += 1
-            total_bytes += buf.numel() * buf.element_size()
+        # Group tensors into buckets by dtype and maximum byte size
+        buckets: list[list[torch.Tensor]] = []
+        curr_bucket: list[torch.Tensor] = []
+        curr_bytes = 0
+
+        for tensor in all_tensors:
+            t_bytes = tensor.numel() * tensor.element_size()
+            if curr_bucket and (curr_bucket[0].dtype != tensor.dtype or curr_bytes + t_bytes > bucket_cap_bytes):
+                buckets.append(curr_bucket)
+                curr_bucket = []
+                curr_bytes = 0
+            curr_bucket.append(tensor)
+            curr_bytes += t_bytes
+
+        if curr_bucket:
+            buckets.append(curr_bucket)
+
+        for bucket in buckets:
+            tot_numel = sum(t.numel() for t in bucket)
+            dtype = bucket[0].dtype
 
             if is_cpu_backend:
-                torch.distributed.broadcast(buf.data, src=src_rank)
+                if rank == src_rank:
+                    flat_cpu = torch.cat([t.reshape(-1) for t in bucket])
+                else:
+                    flat_cpu = torch.empty(tot_numel, dtype=dtype)
+                torch.distributed.broadcast(flat_cpu, src=src_rank)
+                if rank != src_rank:
+                    offset = 0
+                    for t in bucket:
+                        n = t.numel()
+                        t.copy_(flat_cpu[offset : offset + n].view_as(t))
+                        offset += n
+                del flat_cpu
             else:
                 if rank == src_rank:
-                    dev_tensor = buf.data.to(target_device, non_blocking=False)
-                    torch.distributed.broadcast(dev_tensor, src=src_rank)
-                    del dev_tensor
+                    flat_cpu = torch.cat([t.reshape(-1) for t in bucket])
+                    dev_flat = flat_cpu.to(target_device, non_blocking=False)
+                    del flat_cpu
+                    torch.distributed.broadcast(dev_flat, src=src_rank)
+                    del dev_flat
                 else:
-                    dev_tensor = torch.empty(
-                        buf.data.shape,
-                        dtype=buf.data.dtype,
-                        device=target_device,
-                    )
-                    torch.distributed.broadcast(dev_tensor, src=src_rank)
-                    buf.data.copy_(dev_tensor.cpu(), non_blocking=False)
-                    del dev_tensor
+                    dev_flat = torch.empty(tot_numel, dtype=dtype, device=target_device)
+                    torch.distributed.broadcast(dev_flat, src=src_rank)
+                    flat_cpu = dev_flat.to("cpu", non_blocking=False)
+                    del dev_flat
+                    offset = 0
+                    for t in bucket:
+                        n = t.numel()
+                        t.copy_(flat_cpu[offset : offset + n].view_as(t), non_blocking=False)
+                        offset += n
+                    del flat_cpu
 
         if not is_cpu_backend and target_device.type != "cpu":
             from vllm_omni.platforms import current_omni_platform
@@ -582,9 +595,10 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         elapsed = time.perf_counter() - t0
         gb = total_bytes / 1e9
         logger.info(
-            "Worker %d: Shared weight broadcast complete (%d tensors, %.2f GB) in %.2fs (%.2f GB/s)",
+            "Worker %d: Shared weight broadcast complete (%d tensors, %d buckets, %.2f GB) in %.2fs (%.2f GB/s)",
             rank,
             count,
+            len(buckets),
             gb,
             elapsed,
             gb / max(elapsed, 1e-6),

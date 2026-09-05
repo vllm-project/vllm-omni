@@ -84,8 +84,8 @@ def _prepare_lora_delta(
                 a = lora_state_dict[lora_a_key]
                 b = lora_state_dict[lora_b_key]
                 if compute_device is not None and compute_device.type != "cpu":
-                    a = a.to(compute_device, non_blocking=True)
-                    b = b.to(compute_device, non_blocking=True)
+                    a = a.to(compute_device)
+                    b = b.to(compute_device)
                 delta = torch.matmul(b, a)
                 stacked_deltas.append(delta)
                 used_keys.add(lora_a_key)
@@ -112,8 +112,8 @@ def _prepare_lora_delta(
     a = lora_state_dict[lora_a_key]
     b = lora_state_dict[lora_b_key]
     if compute_device is not None and compute_device.type != "cpu":
-        a = a.to(compute_device, non_blocking=True)
-        b = b.to(compute_device, non_blocking=True)
+        a = a.to(compute_device)
+        b = b.to(compute_device)
     delta = torch.matmul(b, a)
     used_keys.add(lora_a_key)
     used_keys.add(lora_b_key)
