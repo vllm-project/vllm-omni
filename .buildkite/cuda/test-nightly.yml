@@ -361,6 +361,14 @@ steps:
           - pytest -s -v tests/e2e/offline_inference/test_wan22_autoround_w4a16_expansion.py -m "full_model and cuda" --run-level "full_model"
         mirror_hardwares: h100_2
 
+      - label: ":full_moon: Diffusion X2V · Wan2.2 Device-Postprocess Equivalence Test"
+        timeout_in_minutes: 90
+        commands:
+          - |
+            VLLM_OMNI_DEVICE_POSTPROCESS_MODEL=Wan-AI/Wan2.2-TI2V-5B-Diffusers \
+              pytest -s -v tests/e2e/offline_inference/test_device_postprocess_equivalence.py -m "full_model and cuda" --run-level "full_model"
+        mirror_hardwares: h100_1
+
       - label: ":full_moon: Diffusion X2V · Wan2.2 Accuracy Test"
         timeout_in_minutes: 180
         commands:

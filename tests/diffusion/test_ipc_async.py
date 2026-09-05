@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for IPC async D2H stream packing."""
+
+from unittest.mock import ANY
 
 import pytest
 import torch
@@ -43,7 +45,7 @@ class TestPackTensorIfLargeWithD2hStream:
         tensor = torch.zeros(1)
         d2h = mocker.MagicMock()
         _pack_value_if_large(tensor, d2h_stream=d2h)
-        mock_pack.assert_called_once_with(tensor, d2h_stream=d2h)
+        mock_pack.assert_called_once_with(tensor, d2h_stream=d2h, created=None)
 
     def test_pack_value_if_large_passes_stream_through_dict(self, mocker):
         """d2h_stream propagates through dict container packing."""
@@ -93,7 +95,7 @@ class TestPackDiffusionFieldsWithD2hStream:
         d2h = mocker.MagicMock()
         out = DiffusionOutput(output=torch.zeros(1))
         _pack_diffusion_fields(out, d2h_stream=d2h)
-        mock_pack_value.assert_called_once_with(torch.zeros(1), d2h_stream=d2h)
+        mock_pack_value.assert_called_once_with(torch.zeros(1), d2h_stream=d2h, created=None)
 
     def test_trajectory_fields_packed_with_stream(self, mocker):
         mock_pack_tensor = mocker.patch(
@@ -120,7 +122,12 @@ class TestPackDiffusionOutputShmWithD2hStream:
         d2h = mocker.MagicMock()
         out = DiffusionOutput()
         pack_diffusion_output_shm(out, d2h_stream=d2h)
-        mock_pack_fields.assert_called_once_with(out, d2h_stream=d2h)
+        mock_pack_fields.assert_called_once_with(
+            out,
+            d2h_stream=d2h,
+            created=ANY,
+            pending_updates=ANY,
+        )
 
     def test_rpc_envelope_path_with_stream(self, mocker):
         mock_pack_fields = mocker.patch(
@@ -130,11 +137,11 @@ class TestPackDiffusionOutputShmWithD2hStream:
         result = DiffusionOutput()
         envelope = {"type": "diffusion_rpc_result", "result": result}
         pack_diffusion_output_shm(envelope, d2h_stream=d2h)
-        # envelope["result"] is replaced in-place by pack_diffusion_output_shm;
-        # assert with the original reference, not the replaced one.
         mock_pack_fields.assert_called_once_with(
             result,
             d2h_stream=d2h,
+            created=ANY,
+            pending_updates=ANY,
         )
 
     @pytest.mark.parametrize("wrapped_in_rpc_envelope", [False, True])
@@ -147,7 +154,12 @@ class TestPackDiffusionOutputShmWithD2hStream:
         tagged = {"dp_rank": 1, "output": result}
         value = {"type": "diffusion_rpc_result", "result": tagged} if wrapped_in_rpc_envelope else tagged
         pack_diffusion_output_shm(value, d2h_stream=d2h)
-        mock_pack_fields.assert_called_once_with(result, d2h_stream=d2h)
+        mock_pack_fields.assert_called_once_with(
+            result,
+            d2h_stream=d2h,
+            created=ANY,
+            pending_updates=ANY,
+        )
 
     def test_runner_output_path_with_stream(self, mocker):
         mock_pack_fields = mocker.patch(
@@ -163,9 +175,9 @@ class TestPackDiffusionOutputShmWithD2hStream:
             result=result,
         )
         pack_diffusion_output_shm(runner_out, d2h_stream=d2h)
-        # runner_out.result is replaced in-place by pack_diffusion_output_shm;
-        # assert with the original reference, not the replaced one.
         mock_pack_fields.assert_called_once_with(
             result,
             d2h_stream=d2h,
+            created=ANY,
+            pending_updates=ANY,
         )

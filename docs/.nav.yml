@@ -70,6 +70,7 @@ nav:
       - Overview and Compatibility:
         - Overview: user_guide/diffusion_features.md
         - Feature Compatibility: user_guide/feature_compatibility.md
+      - Device-side Video Postprocessing: user_guide/diffusion/device_side_video_postprocess.md
       - CPU Offloading:
         - Overview: user_guide/diffusion/cpu_offload.md
         - Model-Level: user_guide/diffusion/offloader/cpu_offload.md

@@ -10,9 +10,19 @@ import torch
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, VideoOutputTransportConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
+from vllm_omni.diffusion.media import (
+    DiffusionMediaOutput,
+    VideoMediaOutput,
+    VideoTensorEncoding,
+    VideoTensorLayout,
+    VideoTensorSpec,
+    VideoValueRange,
+)
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -144,6 +154,19 @@ def _make_request():
     )
 
 
+def _raw_video_media(batch_size: int = 1, tensor: torch.Tensor | None = None) -> DiffusionMediaOutput:
+    return DiffusionMediaOutput(
+        video=VideoMediaOutput(
+            tensor=tensor if tensor is not None else torch.randn(batch_size, 3, 2, 4, 5),
+            spec=VideoTensorSpec(
+                layout=VideoTensorLayout.BCTHW,
+                encoding=VideoTensorEncoding.NORMALIZED_FLOAT,
+                value_range=VideoValueRange.NEGATIVE_ONE_TO_ONE,
+            ),
+        )
+    )
+
+
 def _make_request_with_params(req_id: str, sampling_params):
     return SimpleNamespace(
         request_id=req_id,
@@ -214,6 +237,7 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
         enable_cache_dit_summary=enable_cache_dit_summary,
         parallel_config=SimpleNamespace(use_hsdp=False),
         streaming_output=False,
+        video_output_transport=VideoOutputTransportConfig(),
     )
     runner.diffusion_kv_backend = DiffusionKVModelRunnerBackend(
         vllm_config=runner.vllm_config,
@@ -545,6 +569,48 @@ def test_execute_stepwise_streaming_returns_chunks_at_boundaries(monkeypatch):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_execute_stepwise_prepares_typed_media(monkeypatch):
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline = _ChunkStepPipeline([DiffusionOutput(media=_raw_video_media())])
+    runner.od_config.streaming_output = True
+    runner.od_config.step_execution = True
+    runner.od_config.video_output_transport = VideoOutputTransportConfig(enable_device_postprocess=True)
+    req = OmniDiffusionRequest(
+        prompt="a prompt",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=4),
+        request_id="req",
+    )
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
+        scheduled_new_reqs=[NewRequestData(request_id="req", req=req)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
+
+    DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=1,
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData(request_ids=["req"]),
+        finished_req_ids=set(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
+    result = DiffusionModelRunner.execute_stepwise(runner, scheduler_output).get_request_output("req").result
+
+    assert result.media.prepared_for_transport is True
+    assert result.media.video.spec.encoding is VideoTensorEncoding.UINT8_FRAMES
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_execute_stepwise_streaming_decodes_final_only_pipeline(monkeypatch):
     """Step streaming still returns a final output when no chunk boundaries exist."""
     runner = _make_runner(cache_backend=None, cache_backend_name=None)
@@ -816,6 +882,7 @@ def _make_batch_runner(pipeline):
         cache_backend="none",
         enable_cache_dit_summary=False,
         parallel_config=SimpleNamespace(use_hsdp=False),
+        video_output_transport=VideoOutputTransportConfig(),
     )
     runner.kv_transfer_manager = SimpleNamespace(
         receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None,
@@ -937,6 +1004,21 @@ def test_execute_model_batch_uses_runner_output_helper(monkeypatch):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_execute_model_batch_prepares_typed_media_before_return(monkeypatch):
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
+    runner = _make_batch_runner(_BatchPipeline(outputs=[DiffusionOutput(media=_raw_video_media())]))
+    runner.od_config.video_output_transport = VideoOutputTransportConfig(enable_device_postprocess=True)
+
+    result = DiffusionModelRunner.execute_model_batch(runner, _make_scheduler_output(num_reqs=1), runner.od_config)
+
+    prepared = result.runner_outputs[0].result.media
+    assert prepared.prepared_for_transport is True
+    assert prepared.video.spec.encoding is VideoTensorEncoding.UINT8_FRAMES
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_split_diffusion_output_by_request_slices_single_and_multi_request_outputs():
     reqs = [_make_request(), _make_request()]
     reqs[0].request_id = "req-0"
@@ -954,6 +1036,36 @@ def test_split_diffusion_output_by_request_slices_single_and_multi_request_outpu
     )
 
     assert single[0].output == ["img-0a", "img-0b"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_split_diffusion_output_by_request_preserves_typed_media():
+    reqs = [_make_request(), _make_request()]
+    batch = DiffusionRequestBatch(requests=reqs)
+    source = torch.randn(4, 3, 2, 4, 5)
+    result = DiffusionOutput(media=_raw_video_media(tensor=source))
+
+    outputs = split_diffusion_output_by_request(result, batch, num_outputs_per_prompt=2)
+
+    assert [output.media.video.tensor.shape for output in outputs] == [
+        torch.Size([2, 3, 2, 4, 5]),
+        torch.Size([2, 3, 2, 4, 5]),
+    ]
+    assert all(output.media.prepared_for_transport is False for output in outputs)
+    torch.testing.assert_close(outputs[0].media.video.tensor, source[:2])
+    torch.testing.assert_close(outputs[1].media.video.tensor, source[2:])
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_split_diffusion_output_by_request_validates_media_batch_dimension():
+    reqs = [_make_request(), _make_request()]
+    batch = DiffusionRequestBatch(requests=reqs)
+    result = DiffusionOutput(media=_raw_video_media(batch_size=3))
+
+    with pytest.raises(ValueError, match=r"request_count \* num_outputs_per_prompt \(4\), got 3"):
+        split_diffusion_output_by_request(result, batch, num_outputs_per_prompt=2)
 
 
 @pytest.mark.core_model

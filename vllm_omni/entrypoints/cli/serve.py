@@ -58,6 +58,16 @@ def _nonneg_finite_float(value: str) -> float:
     return parsed
 
 
+def _json_object(value: str) -> dict[str, object]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("must be a JSON object")
+    return parsed
+
+
 def _ensure_vllm_platform():
     """Ensure vLLM's current_platform is valid before arg parsing.
 
@@ -655,6 +665,14 @@ class OmniServeCommand(CLISubcommand):
             "TeaCache: '{\"rel_l1_thresh\": 0.2}'. "
             'MagCache: \'{"mag_threshold": 0.24, "mag_max_skip_steps": 5, "mag_retention_ratio": 0.1}\'. '
             "Calibration mode: add '\"mag_calibrate\": true'",
+        )
+        omni_config_group.add_argument(
+            "--video-output-transport",
+            type=_json_object,
+            default=None,
+            help=(
+                "JSON object configuring video output preparation, for example '{\"enable_device_postprocess\": true}'."
+            ),
         )
         omni_config_group.add_argument(
             "--enable-cache-dit-summary",

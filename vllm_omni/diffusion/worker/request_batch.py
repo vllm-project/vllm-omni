@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Request-level batch abstraction for diffusion runner."""
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.media import DiffusionMediaOutput, slice_diffusion_media_output
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
@@ -35,6 +36,18 @@ def split_diffusion_output_by_request(
     """Split a batched DiffusionOutput into one output per request."""
     if num_outputs_per_prompt <= 0:
         raise ValueError(f"num_outputs_per_prompt must be positive, got {num_outputs_per_prompt}.")
+    if result.media is not None and result.output is not None:
+        raise ValueError("DiffusionOutput cannot contain both media and legacy output")
+    if result.media is not None and not isinstance(result.media, DiffusionMediaOutput):
+        raise TypeError(f"DiffusionOutput.media must be DiffusionMediaOutput, got {type(result.media).__name__}")
+    if result.media is not None:
+        expected_batch = req.num_reqs * num_outputs_per_prompt
+        actual_batch = result.media.video.tensor.shape[0]
+        if actual_batch != expected_batch:
+            raise ValueError(
+                f"Video media batch dimension must equal request_count * num_outputs_per_prompt "
+                f"({expected_batch}), got {actual_batch}"
+            )
 
     return [
         DiffusionOutput(
@@ -42,6 +55,15 @@ def split_diffusion_output_by_request(
                 result.output,
                 idx * num_outputs_per_prompt,
                 (idx + 1) * num_outputs_per_prompt,
+            ),
+            media=(
+                slice_diffusion_media_output(
+                    result.media,
+                    idx * num_outputs_per_prompt,
+                    (idx + 1) * num_outputs_per_prompt,
+                )
+                if result.media is not None
+                else None
             ),
             error=result.error,
             finished=result.finished,

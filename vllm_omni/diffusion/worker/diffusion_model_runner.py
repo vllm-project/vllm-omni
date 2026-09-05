@@ -51,6 +51,7 @@ from vllm_omni.diffusion.models.interface import (
     supports_step_execution,
 )
 from vllm_omni.diffusion.offloader import enable_offload_backend
+from vllm_omni.diffusion.postprocess.device_reduction import prepare_diffusion_media_for_transport
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -657,6 +658,21 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 od_config.cache_backend,
             )
 
+    def _prepare_output_for_transport(
+        self,
+        output: DiffusionOutput,
+        sampling_params: OmniDiffusionSamplingParams,
+    ) -> DiffusionOutput:
+        if output.media is not None:
+            if output.output is not None:
+                raise ValueError("DiffusionOutput cannot contain both media and legacy output")
+            output.media = prepare_diffusion_media_for_transport(
+                output.media,
+                od_config=self.od_config,
+                sampling_params=sampling_params,
+            )
+        return output
+
     def _runner_output_from_outputs(
         self,
         reqs: list[OmniDiffusionRequest],
@@ -751,6 +767,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         allow_single_output=allow_single_output,
                         pipeline_name=type(self.pipeline).__name__,
                     )
+                with record_function("prepare_output_for_transport"):
+                    outputs = [
+                        self._prepare_output_for_transport(output, req.sampling_params)
+                        for req, output in zip(reqs, outputs, strict=True)
+                    ]
 
             if is_primary and outputs and record_output_peak_memory:
                 batch_peak_memory_mb = self._sample_peak_memory_mb()
@@ -1258,6 +1279,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                                 clear_pipeline_stage_durations(self.pipeline)
                                 result = self.pipeline.post_decode(req)
                                 if result is not None:
+                                    result = self._prepare_output_for_transport(result, req.sampling)
                                     self._attach_stepwise_metrics(
                                         req,
                                         result,

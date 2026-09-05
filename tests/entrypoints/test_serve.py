@@ -60,6 +60,30 @@ def test_serve_parser_accepts_deploy_config() -> None:
     assert args.get_explicit_kwargs_dict()["deploy_config"] == "/tmp/deploy.yaml"
 
 
+def test_serve_parser_accepts_video_output_transport() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        ["serve", "fake-model", "--omni", "--video-output-transport", '{"enable_device_postprocess": true}']
+    )
+
+    expected = {"enable_device_postprocess": True}
+    assert args.video_output_transport == expected
+    assert args.get_explicit_kwargs_dict()["video_output_transport"] == expected
+
+
+@pytest.mark.parametrize("value", ["{not json", "[]"])
+def test_serve_parser_rejects_invalid_video_output_transport(value: str) -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "fake-model", "--omni", "--video-output-transport", value])
+
+
 def test_serve_parser_rejects_stage_configs_path() -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")

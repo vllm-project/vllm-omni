@@ -1390,3 +1390,58 @@ def test_diffusion_quantization_mapping_reaches_terminal_config(monkeypatch):
 
     assert cfg.quantization_config is not None
     assert cfg.quantization_config.get_name() == "int8"
+
+
+def test_video_output_transport_mapping_is_normalized() -> None:
+    from vllm_omni.diffusion.data import VideoOutputTransportConfig
+
+    cfg = omni_config_module._DiffusionConfigProjection(
+        video_output_transport={"enable_device_postprocess": True},
+    )
+
+    assert isinstance(cfg.video_output_transport, VideoOutputTransportConfig)
+    assert cfg.video_output_transport.enable_device_postprocess is True
+
+
+def test_omni_diffusion_config_normalizes_video_output_transport_mapping() -> None:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, VideoOutputTransportConfig
+
+    cfg = OmniDiffusionConfig(
+        model=None,
+        video_output_transport={"enable_device_postprocess": True},
+    )
+
+    assert isinstance(cfg.video_output_transport, VideoOutputTransportConfig)
+    assert cfg.video_output_transport.enable_device_postprocess is True
+
+
+def test_video_output_transport_rejects_non_boolean_flag() -> None:
+    from vllm_omni.diffusion.data import VideoOutputTransportConfig
+
+    with pytest.raises(TypeError, match="enable_device_postprocess must be a bool"):
+        VideoOutputTransportConfig(enable_device_postprocess="true")  # type: ignore[arg-type]
+
+
+def test_video_output_transport_survives_stage_override_filtering() -> None:
+    from vllm_omni.config.stage_config import build_stage_runtime_overrides, deploy_runtime_override_keys
+
+    transport = {"enable_device_postprocess": True}
+    overrides = build_stage_runtime_overrides(0, {"video_output_transport": transport})
+
+    assert "video_output_transport" in deploy_runtime_override_keys()
+    assert overrides["video_output_transport"] == transport
+
+
+def test_video_output_transport_reaches_default_diffusion_stage() -> None:
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+
+    transport = {"enable_device_postprocess": True}
+    stages = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "model": "unused",
+            "model_class_name": "UnknownPipeline",
+            "video_output_transport": transport,
+        }
+    )
+
+    assert stages[0]["engine_args"]["video_output_transport"] == transport

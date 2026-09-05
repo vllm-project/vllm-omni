@@ -60,7 +60,11 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     model_parallel_is_initialized,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
-from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, pack_diffusion_output_shm
+from vllm_omni.diffusion.ipc import (
+    DIFFUSION_RPC_RESULT_ENVELOPE,
+    pack_diffusion_output_shm,
+    payload_carries_typed_media,
+)
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, LoRABackend
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -1122,7 +1126,15 @@ class WorkerProc:
         # Sync path (original, or async fallback).
         try:
             pack_diffusion_output_shm(output)
+        except (TypeError, ValueError):
+            raise
         except Exception as e:
+            # Typed media that fails to pack is left unprepared/on device (the
+            # pack is failure-atomic and does not mutate it), so enqueueing it
+            # would ship a broken payload. Re-raise memory/packing failures here
+            # instead of swallowing them for typed media.
+            if payload_carries_typed_media(output):
+                raise
             if hasattr(output, "output"):
                 logger.warning("SHM pack failed for model output: %s", e)
         self._enqueue_result(output)
