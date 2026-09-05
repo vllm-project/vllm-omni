@@ -631,6 +631,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # RequestBatchSamplingParamsKey, so the first request's num_inference_steps applies
         # to the whole runner batch.
         num_inference_steps = first_req.sampling_params.num_inference_steps
+        if num_inference_steps is None and first_req.sampling_params.timesteps is not None:
+            num_inference_steps = len(first_req.sampling_params.timesteps)
+        if num_inference_steps is None and first_req.sampling_params.sigmas is not None:
+            num_inference_steps = len(first_req.sampling_params.sigmas)
+        if num_inference_steps is None:
+            num_inference_steps = getattr(self.pipeline, "default_num_inference_steps", None)
         if num_inference_steps is None and od_config.cache_backend in (
             "tea_cache",
             "step_cache",
@@ -927,10 +933,21 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
 
-    def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[list[StepRequestState], list[str]]:
-        """Step-before update: cleanup finished requests and get/create one running state."""
-        for request_id in scheduler_output.finished_req_ids:
+    def _cleanup_finished_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> None:
+        """Retire state and paged-KV rows released by the scheduler wave."""
+        finished_req_ids = scheduler_output.finished_req_ids
+        for request_id in finished_req_ids:
             self.state_cache.pop(request_id, None)
+
+        if (
+            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+            and finished_req_ids
+        ):
+            self.remove_diffusion_kv_requests(list(finished_req_ids))
+
+    def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[list[StepRequestState], list[str]]:
+        """Resolve cached state and create state for newly admitted requests."""
 
         resolved: list[StepRequestState] = []
         new_request_ids: list[str] = []
@@ -1068,6 +1085,38 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             record_output_peak_memory=True,
         )
 
+    def _execute_non_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
+        """Run a complete legacy forward for requests excluded from step mode."""
+        if scheduler_output.scheduled_cached_reqs.request_ids:
+            raise ValueError("A non-step fallback batch cannot contain cached stepwise requests.")
+
+        runner_outputs: list[RunnerOutput] = []
+        for index, new_req in enumerate(scheduler_output.scheduled_new_reqs):
+            try:
+                result = self.execute_model(
+                    new_req.req,
+                    kv_prefetch_job=getattr(scheduler_output, "kv_prefetch_job", None) if index == 0 else None,
+                    diffusion_kv_metadata=new_req.diffusion_kv_metadata,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Non-step fallback execution failed for %s",
+                    new_req.request_id,
+                    exc_info=True,
+                )
+                result = DiffusionOutput(error=str(exc))
+
+            step_index = getattr(new_req.req.sampling_params, "step_index", None)
+            runner_outputs.append(
+                RunnerOutput(
+                    request_id=new_req.request_id,
+                    step_index=0 if step_index is None else step_index,
+                    finished=True,
+                    result=result,
+                )
+            )
+        return BatchRunnerOutput.from_list(runner_outputs)
+
     def _execute_stepwise(
         self,
         scheduler_output: DiffusionSchedulerOutput,
@@ -1079,8 +1128,28 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Execute one step with explicit validation and profiling policy."""
 
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
+        # A scheduler wave can release a previous stepwise request while it
+        # admits a full-forward fallback request. Do this before dispatch so
+        # the fallback does not bypass normal state/KV retirement.
+        self._cleanup_finished_step_requests(scheduler_output)
         for new_req in scheduler_output.scheduled_new_reqs:
             validate_new_request_data_identity(new_req)
+        non_step_requests = [
+            new_req
+            for new_req in scheduler_output.scheduled_new_reqs
+            if not getattr(new_req.req, "use_step_execution", True)
+        ]
+        if non_step_requests:
+            scheduled_request_count = len(scheduler_output.scheduled_new_reqs) + len(
+                scheduler_output.scheduled_cached_reqs.request_ids
+            )
+            if len(non_step_requests) != scheduled_request_count:
+                raise ValueError("Cannot mix stepwise and non-step fallback requests in one scheduler batch.")
+            # This wave has no stepwise requests, so the previous batch cannot
+            # be reused and must not keep its step tensors alive.
+            self.input_batch = None
+            return self._execute_non_step_requests(scheduler_output)
+        for new_req in scheduler_output.scheduled_new_reqs:
             if validate_kv_metadata:
                 self._validate_diffusion_kv_metadata(
                     request_id=new_req.req.request_id,
@@ -1096,15 +1165,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         # Scheduler metadata is installed only for newly admitted requests;
         # cached requests continue to use the row installed on their first
-        # step. Paged rows are retired here for scheduler-finished requests so
-        # a subsequent wave can reuse the native table slots. Dense execution
-        # must not issue Worker KV cleanup side effects.
-        if (
-            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
-            is DiffusionKVCacheMode.PAGED_SCHEDULER
-            and scheduler_output.finished_req_ids
-        ):
-            self.remove_diffusion_kv_requests(list(scheduler_output.finished_req_ids))
+        # step. Finished-state retirement is shared with full-forward
+        # fallback dispatch above.
         installed_request_ids: list[str] = []
         try:
             for new_req in scheduler_output.scheduled_new_reqs:

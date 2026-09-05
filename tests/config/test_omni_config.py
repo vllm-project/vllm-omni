@@ -339,6 +339,37 @@ def test_stage_cli_field_selection_defers_ownership_validation_until_sources_are
     assert omni_config_module._stage_cli_overrides(0, {"enable_lora": True}) == {"enable_lora": True}
 
 
+@pytest.mark.parametrize(
+    ("model_type", "diffusion_stage_ids"),
+    [
+        ("bagel", {1}),
+        ("bagel_think", {1}),
+        ("bagel_single_stage", {0}),
+    ],
+)
+def test_step_execution_cli_is_scoped_to_diffusion_stages(model_type, diffusion_stage_ids):
+    omni_config = _from_pipeline_key(model_type, cli_overrides={"step_execution": True})
+
+    for stage in omni_config.stage_configs:
+        if stage.stage_id in diffusion_stage_ids:
+            assert isinstance(stage, VllmOmniDiffusionStageConfig)
+            assert stage.diffusion_config.step_execution is True
+        else:
+            assert not hasattr(stage, "diffusion_config")
+
+
+def test_stage_scoped_step_execution_ignores_bagel_ar_stage():
+    omni_config = _from_pipeline_key(
+        "bagel",
+        cli_overrides={
+            "stage_0_step_execution": True,
+            "stage_1_step_execution": True,
+        },
+    )
+
+    assert omni_config.stage_by_id(1).diffusion_config.step_execution is True
+
+
 def test_runtime_num_gpus_is_derived_from_parallel_world_size():
     omni_config = _from_pipeline_key("hunyuan_image3_dit")
     stage = omni_config.stage_by_id(0)

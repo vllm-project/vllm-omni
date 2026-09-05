@@ -848,6 +848,50 @@ class TestWorkerProcRpcRankStatus:
         gc_collect.assert_called_once_with()
         mock_platform.empty_cache.assert_called_once_with()
 
+    def test_execute_rpc_drops_the_result_on_ranks_that_will_not_reply(self):
+        """A rank that will not reply must not hand its output back.
+
+        The busy loop binds the returned object to a local that outlives the
+        RPC, so a device-resident result -- for diffusion, a whole decoded
+        video -- would occupy accelerator memory on every non-reply rank until
+        the next request replaces it.
+        """
+        proc = self._make_worker_proc()
+        payload = {"frames": object()}
+        proc.worker.execute_method = lambda *args, **kwargs: payload
+
+        result, should_reply = proc._execute_rpc(
+            {
+                "method": "execute_model",
+                "args": (),
+                "kwargs": {},
+                "output_rank": 1,
+                "exec_all_ranks": True,
+            }
+        )
+
+        assert should_reply is False
+        assert result is None, "a non-reply rank must not keep the output alive"
+
+    def test_execute_rpc_still_returns_the_result_on_the_replying_rank(self):
+        """The rank that owns the reply keeps returning the same object."""
+        proc = self._make_worker_proc()
+        payload = {"frames": object()}
+        proc.worker.execute_method = lambda *args, **kwargs: payload
+
+        result, should_reply = proc._execute_rpc(
+            {
+                "method": "execute_model",
+                "args": (),
+                "kwargs": {},
+                "output_rank": 0,
+                "exec_all_ranks": True,
+            }
+        )
+
+        assert should_reply is True
+        assert result is payload
+
     def test_execute_rpc_rejects_collect_rank_status_without_all_ranks(self):
         proc = self._make_worker_proc()
 
