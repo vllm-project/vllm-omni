@@ -10,6 +10,8 @@ Covers:
   - ``process_audios``: >30s audio unpads per chunk without ``TypeError``
   - multiple >30s audios unpad in chunk order
   - <=30s audio unpadding byte-identical to the pre-fix behavior
+  - ``MiniCPMOAudioFeatureInputs``: a batch mixing a >30s and a <=30s audio
+    (different slice counts) validates instead of raising
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from vllm.multimodal.inputs import (
 
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMMultiModalProcessor,
+    MiniCPMOAudioFeatureInputs,
     MiniCPMOMultiModalDataParser,
     _minicpmo_field_config,
 )
@@ -152,3 +155,41 @@ class TestProcessAudiosUnpadding:
         assert len(features) == 1
         assert features[0].shape == (_FEAT_DIM, 980)
         assert torch.equal(features[0], fake_outputs["audio_features"][0][:, :980])
+
+
+class TestMixedChunkCountBatchValidation:
+    def test_batch_mixes_different_slice_counts(self) -> None:
+        # A >30s audio (3 slices) and a <=30s audio (2 slices) scheduled in
+        # the same encoder batch: audio_feature_lens is a list of per-audio
+        # tensors with different lengths (3 vs 2). Before the fix this raised
+        # ValueError: "audio_feature_lens contains inconsistent shapes".
+        audio_feature_lens = [
+            torch.tensor([_CHUNK_FRAMES, _CHUNK_FRAMES, 1]),
+            torch.tensor([_CHUNK_FRAMES, 1]),
+        ]
+        audio_features = [torch.zeros(_FEAT_DIM, _CHUNK_FRAMES) for _ in range(5)]
+
+        inputs = MiniCPMOAudioFeatureInputs(
+            type="audio_features",
+            audio_features=audio_features,
+            audio_feature_lens=audio_feature_lens,
+        )
+
+        assert inputs.audio_feature_lens is audio_feature_lens
+
+    def test_single_slice_count_batch_still_validated(self) -> None:
+        # Same slice count per audio (the common case) must still validate,
+        # unaffected by marking "s" dynamic.
+        audio_feature_lens = [
+            torch.tensor([_CHUNK_FRAMES, 1]),
+            torch.tensor([_CHUNK_FRAMES, 1]),
+        ]
+        audio_features = [torch.zeros(_FEAT_DIM, _CHUNK_FRAMES) for _ in range(4)]
+
+        inputs = MiniCPMOAudioFeatureInputs(
+            type="audio_features",
+            audio_features=audio_features,
+            audio_feature_lens=audio_feature_lens,
+        )
+
+        assert inputs.audio_feature_lens is audio_feature_lens
