@@ -1,6 +1,6 @@
 # Text-To-Speech
 
-vLLM-Omni supports several autoregressive TTS models. They share a mostly
+vLLM-Omni supports several autoregressive and diffusion-based TTS models. They share a mostly
 common CLI shape (`--text`, `--ref-audio`, `--ref-text`, plus an
 output-path flag — `--output-dir` for most, `--output` for OmniVoice) and
 live together in this hub. Each model has its own subdirectory containing
@@ -15,6 +15,7 @@ list of supported architectures across all modalities, see
 | Model | HuggingFace repo | Stages | Voice cloning | Streaming | Special modes | Sample rate |
 |---|---|---|---|---|---|---|
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 24 kHz |
+| F5-TTS | `SWivid/F5-TTS/F5TTS_v1_Base` | single (flow-matching DiT + vocoder) | ✓ (`--ref-audio` + `--ref-text`) | — | Cache-DiT / CFG-parallel / TP / DiT CUDA graph | 24 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
 | Gepard-1.0 | `nineninesix/gepard-1.0` | single (native AR + NanoCodec) | — (zero-shot; cloning WIP) | — (serving WIP) | zero-shot | 22.05 kHz |
 | GLM-TTS | `zai-org/GLM-TTS` | 2 (AR + DiT) | ✓ (required) | ✓ | — | 24 kHz |
@@ -480,6 +481,53 @@ Streaming is exposed through the online OpenAI Speech API (`stream=true`). See [
 ### Notes
 - Output: 48 kHz mono WAV.
 - Deploy config: `vllm_omni/deploy/voxcpm2.yaml` (auto-loaded by HF `model_type`).
+
+---
+
+## F5-TTS
+
+Single-stage flow-matching DiT TTS at 24 kHz (SWivid). The DiT generates
+a mel spectrogram via Euler ODE sampling with sway sampling and
+classifier-free guidance; a vocoder (Vocos by default, BigVGAN for the
+`F5TTS_Base_bigvgan` variant) decodes it to waveform. Voice cloning takes
+reference audio plus its transcript.
+
+### Quick start
+```bash
+python examples/offline_inference/text_to_speech/f5_tts/end2end.py \
+    --text "Hello, this is a test of F5 TTS running on vLLM Omni."
+```
+
+### Voice cloning
+```bash
+python examples/offline_inference/text_to_speech/f5_tts/end2end.py \
+    --text "Hello world." \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "Transcript of the reference audio."
+```
+Reference audio should be 3-12 seconds, mono, any sample rate (resampled
+to 24 kHz internally).
+
+### Cache acceleration
+Cache-DiT is the supported accelerator (measured 1.62x with zero quality
+loss): `--cache-backend cache_dit`. TeaCache (step-level caching) is
+**not supported** for F5-TTS — flow-matching + sway sampling leaves no
+quality-preserving steps to skip (48+ configs tuned during development).
+
+### Streaming
+Not supported yet; the full mel is synthesized before vocoder decode.
+
+### Notes
+- Output: 24 kHz mono WAV.
+- No deploy config needed: F5-TTS runs on the default single-stage
+  diffusion config (reference values in `vllm_omni/deploy/f5_tts.yaml`;
+  the 3-segment model id `SWivid/F5-TTS/F5TTS_v1_Base` is required).
+- Variants: `F5TTS_v1_Base` (default), `F5TTS_v1_Base_no_zero_init`,
+  `F5TTS_Base` (pe_attn_head=1), `F5TTS_Base_bigvgan` (BigVGAN vocoder).
+- Acceleration knobs: tensor parallelism, CFG parallelism, Cache-DiT, and
+  DiT CUDA Graph replay for batch-1 requests (opt-in via
+  `--stage-overrides '{"0":{"extras":{"f5_dit_cudagraph":true}}}'`;
+  disabled automatically when a cache backend is active).
 
 ---
 

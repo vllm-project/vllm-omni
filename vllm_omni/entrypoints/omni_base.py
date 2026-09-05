@@ -18,6 +18,7 @@ from vllm.transformers_utils.repo_utils import file_or_path_exists
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.diffusion.models.f5_tts.hf_utils import is_f5_model
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
@@ -75,6 +76,11 @@ def _weak_shutdown_engine(engine: AsyncOmniEngine) -> None:
 
 def omni_snapshot_download(model_id: str) -> str:
     if os.path.exists(model_id):
+        return model_id
+
+    # F5-TTS checkpoints are addressed as repo/subfolder and need
+    # custom resolution later, so avoid passing the invalid repo id form to HF.
+    if is_f5_model(model_id):
         return model_id
 
     # Object-storage models must remain URIs until each stage constructs its

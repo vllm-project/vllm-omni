@@ -22,6 +22,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     filter_files_not_needed_for_inference,
     maybe_download_from_modelscope,
     multi_thread_safetensors_weights_iterator,
+    pt_weights_iterator,
     safetensors_weights_iterator,
 )
 from vllm.transformers_utils.repo_utils import hf_api
@@ -341,6 +342,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         if use_multithread:
             num_threads = getattr(self.od_config, "num_weight_load_threads", 4)
             # Keep deterministic shard order before passing to vLLM helper.
+            # use_multithread already requires use_safetensors, so only the
+            # safetensors multithread iterator is reachable here.
             sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
             weights_iterator = multi_thread_safetensors_weights_iterator(
                 sorted_hf_weights_files,
@@ -348,11 +351,17 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 max_workers=num_threads,
             )
         else:
-            weights_iterator = safetensors_weights_iterator(
-                hf_weights_files,
-                self.load_config.use_tqdm_on_load,
-                self.load_config.safetensors_load_strategy,
-            )
+            if use_safetensors:
+                weights_iterator = safetensors_weights_iterator(
+                    hf_weights_files,
+                    self.load_config.use_tqdm_on_load,
+                    self.load_config.safetensors_load_strategy,
+                )
+            else:
+                weights_iterator = pt_weights_iterator(
+                    hf_weights_files,
+                    self.load_config.use_tqdm_on_load,
+                )
 
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()

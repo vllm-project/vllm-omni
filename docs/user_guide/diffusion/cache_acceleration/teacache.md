@@ -157,6 +157,10 @@ _MODEL_COEFFICIENTS = {
 - Maximum quality requirements where no degradation is acceptable
 - Very short inference runs (< 20 steps) where caching overhead may outweigh benefits
 
+> **F5-TTS note**: TeaCache is not supported for F5-TTS. Extensive tuning
+> (48+ configurations) confirmed that step-level caching is fundamentally
+> incompatible with flow-matching + sway sampling. Use CacheDiT instead
+> (block-level caching, 1.62x speedup with zero quality loss).
 
 ---
 

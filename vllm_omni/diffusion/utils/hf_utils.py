@@ -8,6 +8,8 @@ from functools import lru_cache
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
+from vllm_omni.diffusion.models.f5_tts.hf_utils import is_f5_model
+
 logger = init_logger(__name__)
 
 DIFFUSION_MODEL_INDEX_FILES = (
@@ -135,6 +137,12 @@ def is_diffusion_model(model_name: str) -> bool:
     2. Check using vllm's get_hf_file_to_dict utility
     3. Try the standard diffusers approach (may fail due to import issues)
     """
+    # F5-TTS uses a bespoke subfolder layout (``SWivid/F5-TTS/<variant>``);
+    # the cheap string check runs before the signature-based native checks.
+    if is_f5_model(model_name):
+        logger.debug("Detected F5-TTS model reference")
+        return True
+
     # Some native diffusion checkpoints have neither a standard Diffusers
     # index nor a root HF config. Recognize their exact Hub ID/local signature.
     if resolve_native_diffusion_model_class(model_name) is not None:

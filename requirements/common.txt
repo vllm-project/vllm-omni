@@ -39,3 +39,10 @@ pydantic-settings>=2.0.0
 gguf>=0.10.0
 # Required for running the Cosmos3 model with guardrails enabled (default behavior).
 cosmos-guardrail>=0.3.1
+pydub>=0.25.1
+# F5-TTS vocoders: vocos (default) and bigvgan (F5TTS_Base_bigvgan variant).
+# Both are imported lazily by vllm_omni/diffusion/models/f5_tts/audio_utils.py.
+vocos>=0.1.0
+bigvgan>=0.1.0
+# F5-TTS pinyin tokenizer: required when synthesizing Chinese text.
+pypinyin>=0.50.0
