@@ -170,3 +170,15 @@ def test_cfg_branches_carry_their_own_layout() -> None:
 
     assert positive.layout is layouts[0]
     assert negative.layout is layouts[1]
+
+
+def test_pre_adapter_embeds_directly_in_checkpoint_dtype() -> None:
+    model = _tiny_model(params_dtype=torch.bfloat16)
+    packed = torch.randn(6, 4)
+    indices = torch.tensor([0, 1]), torch.tensor([2, 3]), torch.tensor([4, 5])
+
+    with torch.no_grad():
+        hidden = model.pre_adapter(packed, *indices)
+
+    assert hidden.dtype == torch.bfloat16
+    assert hidden.shape == (6, model.config.virtual_width)

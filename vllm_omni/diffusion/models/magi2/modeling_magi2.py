@@ -344,30 +344,23 @@ class Magi2PreAdapter(nn.Module):
         audio_indices: torch.Tensor,
         text_indices: torch.Tensor,
     ) -> torch.Tensor:
-        output = torch.zeros(
+        # Every token belongs to exactly one modality, so the three copies
+        # below cover the whole buffer.  Embedding in fp32 and rounding each
+        # modality once matches the released cast at the block boundary.
+        output = torch.empty(
             packed.shape[0],
             self.adapter_dim,
-            dtype=torch.float32,
+            dtype=self.config.params_dtype,
             device=packed.device,
         )
-        if text_indices.numel():
-            output.index_copy_(
-                0,
-                text_indices,
-                self.text_embedder(packed.index_select(0, text_indices)[:, : self.config.text_in_channels].float()),
-            )
-        if audio_indices.numel():
-            output.index_copy_(
-                0,
-                audio_indices,
-                self.audio_embedder(packed.index_select(0, audio_indices)[:, : self.config.audio_in_channels].float()),
-            )
-        if video_indices.numel():
-            output.index_copy_(
-                0,
-                video_indices,
-                self.video_embedder(packed.index_select(0, video_indices)[:, : self.config.video_in_channels].float()),
-            )
+        for indices, embedder, in_channels in (
+            (text_indices, self.text_embedder, self.config.text_in_channels),
+            (audio_indices, self.audio_embedder, self.config.audio_in_channels),
+            (video_indices, self.video_embedder, self.config.video_in_channels),
+        ):
+            if indices.numel():
+                tokens = packed[:, :in_channels].index_select(0, indices).float()
+                output.index_copy_(0, indices, embedder(tokens).to(output.dtype))
         return output
 
 
