@@ -1605,10 +1605,16 @@ def acquire_device_locks(
     stage_id: int,
     engine_args_dict: dict[str, Any],
     stage_init_timeout: int,
+    visible_devices: str | None = None,
 ) -> list[int]:
     """Acquire exclusive file locks on devices needed by this stage.
 
     Returns list of lock file descriptors that must be released after init.
+
+    ``visible_devices`` (comma-separated, CUDA_VISIBLE_DEVICES format) takes
+    precedence over the device-control env var. Pass it instead of scoping a
+    device env: the flock wait below must not run under the spawn-env lock, or
+    it deadlocks against replicas holding device locks (opposing lock ordering).
     """
     lock_fds: list[int] = []
     try:
@@ -1638,9 +1644,12 @@ def acquire_device_locks(
             * cfg_parallel_size
         )
 
-        # Get physical device IDs
-        device_control_env = current_omni_platform.device_control_env_var
-        visible_devices_str = os.environ.get(device_control_env)
+        # Physical device IDs: explicit list first, else the env var.
+        if visible_devices is not None:
+            visible_devices_str = visible_devices
+        else:
+            device_control_env = current_omni_platform.device_control_env_var
+            visible_devices_str = os.environ.get(device_control_env)
         physical_devices: list[int] = []
 
         if visible_devices_str:

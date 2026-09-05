@@ -1036,7 +1036,7 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
     prev_device_env = os.environ.get(device_env_var)
     os.environ[device_env_var] = "0"
 
-    def _capture_acquire_device_locks(*_args):
+    def _capture_acquire_device_locks(*_args, **_kwargs):
         nonlocal captured_timeout
         captured_timeout = _args[2]
         return []
@@ -1068,6 +1068,204 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
             os.environ[device_env_var] = prev_device_env
 
     assert captured_timeout == stage_init_timeout
+
+
+def test_acquire_device_locks_prefers_explicit_visible_devices(monkeypatch):
+    """acquire_device_locks(visible_devices=...) must not read the device env."""
+    import vllm_omni.engine.stage_init_utils as init_utils
+    from vllm_omni.platforms import current_omni_platform
+
+    device_env_var = current_omni_platform.device_control_env_var
+    # Poison the env: if the function reads it, it would lock device 7.
+    monkeypatch.setenv(device_env_var, "7")
+
+    locked: list[str] = []
+    real_open = os.open
+
+    def _capture_open(path, *args, **kwargs):
+        if isinstance(path, str) and "vllm_omni_device_" in path:
+            locked.append(path)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(init_utils.os, "open", _capture_open)
+
+    lock_fds = init_utils.acquire_device_locks(
+        0,
+        {"tensor_parallel_size": 1},
+        stage_init_timeout=5,
+        visible_devices="3",
+    )
+    try:
+        assert any("vllm_omni_device_3_init.lock" in p for p in locked)
+        assert not any("vllm_omni_device_7_init.lock" in p for p in locked)
+    finally:
+        init_utils.release_device_locks(lock_fds)
+
+
+def test_initialize_local_llm_replica_does_not_hold_spawn_lock_during_device_lock_wait(monkeypatch):
+    """Regression: the flock wait must run outside the spawn-env lock, or
+    colocated stages deadlock through lock-order inversion
+    (spawn-lock+flock vs flock+spawn-lock)."""
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = StageRuntime(
+        stage_configs=[],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=30,
+        diffusion_batch_size=1,
+        async_chunk=False,
+    )
+
+    fake_vllm_config = types.SimpleNamespace()
+    fake_addresses = types.SimpleNamespace(inputs=["in"], outputs=["out"], frontend_stats_publish_address=None)
+
+    plan = ReplicaInitPlan(
+        replica_id=0,
+        num_replicas=1,
+        launch_mode="local",
+        stage_cfg=types.SimpleNamespace(engine_args={}, runtime=types.SimpleNamespace(devices="1,3")),
+        metadata=types.SimpleNamespace(stage_id=1, runtime_cfg={"devices": "1,3"}),
+        stage_connector_spec={},
+        omni_kv_connector=(None, None, None),
+        stage_vllm_config=fake_vllm_config,
+        executor_class=object,
+        engine_args_dict={},
+    )
+
+    observed: dict[str, object] = {}
+
+    def _fake_acquire_device_locks(*_args, **_kwargs):
+        # The deadlock happened exactly here: the flock wait ran while the
+        # spawn-env lock was held. Assert it is free at this point.
+        observed["spawn_lock_held"] = runtime._spawn_device_lock.locked()
+        observed["visible_devices"] = _kwargs.get("visible_devices")
+        return []
+
+    monkeypatch.setattr(runtime_mod, "acquire_device_locks", _fake_acquire_device_locks)
+    monkeypatch.setattr(
+        runtime_mod,
+        "resolve_stage_physical_devices",
+        lambda *_a, **_k: "1,3",
+    )
+
+    from vllm_omni.engine.stage_engine_startup import StageReplicaResources
+
+    @contextlib.contextmanager
+    def _fake_launch_stage_replica(**_kwargs):
+        yield StageReplicaResources(
+            manager=types.SimpleNamespace(shutdown=lambda: None),
+            addresses=fake_addresses,
+        )
+
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", _fake_launch_stage_replica)
+    monkeypatch.setattr(
+        runtime_mod.StageEngineCoreClientBase,
+        "make_async_mp_client",
+        staticmethod(lambda **_: types.SimpleNamespace(shutdown=lambda: None)),
+    )
+
+    runtime._initialize_local_llm_replica(plan, 30)
+
+    assert observed["spawn_lock_held"] is False
+    assert observed["visible_devices"] == "1,3"
+
+
+def test_parallel_replica_init_with_shared_device_does_not_deadlock(monkeypatch):
+    """End-to-end deadlock reproducer: two replicas with overlapping devices
+    initializing in parallel must both complete. Uses real flocks (high device
+    ids) and a fake launch that takes the spawn-env lock like the real path;
+    before the fix this timed out.
+    """
+    import threading
+
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = StageRuntime(
+        stage_configs=[],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=30,
+        diffusion_batch_size=1,
+        async_chunk=False,
+    )
+
+    fake_addresses = types.SimpleNamespace(inputs=["in"], outputs=["out"], frontend_stats_publish_address=None)
+
+    def _make_plan(stage_id: int, devices: str, tp: int) -> ReplicaInitPlan:
+        return ReplicaInitPlan(
+            replica_id=0,
+            num_replicas=1,
+            launch_mode="local",
+            stage_cfg=types.SimpleNamespace(engine_args={}, runtime=types.SimpleNamespace(devices=devices)),
+            metadata=types.SimpleNamespace(stage_id=stage_id, runtime_cfg={"devices": devices}),
+            stage_connector_spec={},
+            omni_kv_connector=(None, None, None),
+            stage_vllm_config=types.SimpleNamespace(),
+            executor_class=object,
+            engine_args_dict={"tensor_parallel_size": tp},
+        )
+
+    # High device ids so the real /tmp flock files never clash with real GPUs.
+    plans = {
+        0: ("101,102", 2),  # "thinker": locks devices 101+102
+        1: ("102", 1),  # "talker": colocated on device 102
+    }
+    device_map = {0: "101,102", 1: "102"}
+
+    monkeypatch.setattr(
+        runtime_mod,
+        "resolve_stage_physical_devices",
+        lambda stage_id, *_a, **_k: device_map[stage_id],
+    )
+
+    from vllm_omni.engine.stage_engine_startup import StageReplicaResources
+
+    @contextlib.contextmanager
+    def _fake_launch_stage_replica(**kwargs):
+        # Mimic the real launcher: it enters scoped_spawn_device_env, which
+        # takes the spawn-env lock while the subprocess spawns.
+        spawn_lock = kwargs.get("spawn_device_lock")
+        expected_lock = getattr(runtime, "_spawn_device_lock", None)
+        assert expected_lock is not None and spawn_lock is expected_lock, (
+            "launch_stage_replica must still receive the runtime's own spawn-env lock. "
+            "If the wiring changed, fix this fake instead of relaxing the check: with a "
+            "different lock the two threads below never contend and this reproducer "
+            "silently stops exercising the deadlock."
+        )
+        with spawn_lock:
+            time.sleep(0.2)
+            yield StageReplicaResources(
+                manager=types.SimpleNamespace(shutdown=lambda: None),
+                addresses=fake_addresses,
+            )
+
+    monkeypatch.setattr(runtime_mod, "launch_stage_replica", _fake_launch_stage_replica)
+    monkeypatch.setattr(
+        runtime_mod.StageEngineCoreClientBase,
+        "make_async_mp_client",
+        staticmethod(lambda **_: types.SimpleNamespace(shutdown=lambda: None)),
+    )
+
+    errors: list[BaseException] = []
+
+    def _init(stage_id: int) -> None:
+        devices, tp = plans[stage_id]
+        try:
+            runtime._initialize_local_llm_replica(_make_plan(stage_id, devices, tp), 30)
+        except BaseException as exc:  # pragma: no cover - surfaced via assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_init, args=(sid,), daemon=True) for sid in plans]
+    for t in threads:
+        t.start()
+    deadline = time.time() + 30
+    for t in threads:
+        t.join(timeout=max(0.1, deadline - time.time()))
+
+    stuck = [t for t in threads if t.is_alive()]
+    assert not stuck, "parallel replica init deadlocked (threads still waiting on locks after 30s)"
+    assert not errors, f"replica init raised: {errors!r}"
 
 
 def test_build_engine_args_cli_tokenizer_overrides_inferred_base_tokenizer(tmp_path):
