@@ -647,4 +647,4 @@ python examples/offline_inference/text_to_speech/breeze_tts_2/end2end.py \
 
 - Output: 24 kHz mono WAV; `--max-new-tokens` caps generated frames (80 ms each).
 - Speaker tags `--voice S0`..`S9` (default `S0`) select the timbre in non-reference modes; with `--ref-audio` the timbre comes from the reference clip.
-- Deploy config: `vllm_omni/deploy/breeze_tts_2.yaml` (auto-loaded by HF `model_type`); see [`recipes/BreezeBlue/Breeze-TTS-2.md`](../../../../recipes/BreezeBlue/Breeze-TTS-2.md) for the online-serving recipe.
+- Deploy config: `vllm_omni/deploy/breeze_tts_2.yaml` (auto-loaded by HF `model_type`); see [`recipes/BreezeBlue/Breeze-TTS-2.md`](../../../recipes/BreezeBlue/Breeze-TTS-2.md) for the online-serving recipe.

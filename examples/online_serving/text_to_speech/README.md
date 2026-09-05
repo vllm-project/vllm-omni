@@ -774,4 +774,4 @@ curl -N -X POST http://localhost:8091/v1/audio/speech \
 - Only `sample_rate=24000` is accepted; `speed` must be `1.0`.
 - `guidance_scale`/`cfg_scale` must be `1.0`; `negative_prompt` is rejected (CFG companion support is a follow-up).
 - `instructions` without `ref_audio` is voice design; with `ref_audio`+`ref_text` it is voice direction.
-- See [`recipes/BreezeBlue/Breeze-TTS-2.md`](../../../../recipes/BreezeBlue/Breeze-TTS-2.md) for the full recipe and the offline example under [`examples/offline_inference/text_to_speech/breeze_tts_2/`](../../offline_inference/text_to_speech/breeze_tts_2/).
+- See [`recipes/BreezeBlue/Breeze-TTS-2.md`](../../../recipes/BreezeBlue/Breeze-TTS-2.md) for the full recipe and the offline example under [`examples/offline_inference/text_to_speech/breeze_tts_2/`](../../offline_inference/text_to_speech/breeze_tts_2/).
