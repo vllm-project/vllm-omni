@@ -101,8 +101,11 @@ class DiffusionLoRAManager:
         # Static adapter configured at startup (`--lora-path`). Requests that
         # don't name an adapter fall back to it, so the static adapter acts as
         # a resident default instead of being deactivated by the first plain
-        # request.
+        # request. `_static_lora_scale` records the startup `--lora-scale` so
+        # plain requests restore it instead of silently rebinding at the
+        # sampling-params default of 1.0.
         self._static_lora_request: LoRARequest | None = None
+        self._static_lora_scale: float = 1.0
 
         logger.info(
             "Initializing DiffusionLoRAManager: device=%s, dtype=%s, max_cached_adapters=%d, static_lora_path=%s",
@@ -120,6 +123,7 @@ class DiffusionLoRAManager:
                 lora_path=lora_path,
             )
             self._static_lora_request = init_request
+            self._static_lora_scale = lora_scale
             self.set_active_adapter(init_request, lora_scale)
 
     def _compute_supported_lora_modules(self) -> set[str]:
@@ -229,10 +233,20 @@ class DiffusionLoRAManager:
             lora_request: The LoRA request, or None to use the static default
                 adapter (deactivating all adapters when no static default was
                 configured).
-            lora_scale: The external scale for the LoRA adapter.
+            lora_scale: The external scale for the LoRA adapter. When falling
+                back to the static startup adapter, the sampling-params
+                default of 1.0 is treated as "unspecified" and the startup
+                `--lora-scale` is restored instead; any other value (including
+                0, the explicit opt-out) is honored as a per-request override.
         """
         if lora_request is None and self._static_lora_request is not None:
             lora_request = self._static_lora_request
+            if math.isclose(lora_scale, 1.0):
+                # A plain request carries the sampling-params default scale,
+                # which is indistinguishable from an explicit scale=1.0.
+                # Restore the scale the static adapter was started with so a
+                # non-default (or zero) startup scale survives the fallback.
+                lora_scale = self._static_lora_scale
 
         if lora_request is None:
             if self._active_adapter_id is None:

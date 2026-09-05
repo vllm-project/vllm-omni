@@ -690,3 +690,97 @@ def test_lora_manager_discovers_unet_component(monkeypatch):
     assert "unet.down_block.proj" in manager._lora_modules
     # Verify the module was actually replaced in the tree (not just recorded)
     assert isinstance(pipeline.unet.down_block.proj, _DummyBaseLayerWithLoRA)
+
+
+def _patch_static_adapter_load(monkeypatch, rank: int = 2):
+    """Patch class-level adapter loading so a manager can be constructed with
+    a startup `lora_path`. Returns the dummy LoRA model whose wrapper records
+    set_lora/reset_lora calls.
+    """
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyLoRALayer)
+
+    lora_model = _DummyLM(rank=rank)
+
+    def _fake_load(self, _req: LoRARequest):
+        peft_helper = type("PH", (), {"r": rank})()
+        return lora_model, peft_helper
+
+    def _fake_replace(self, _peft_helper):
+        self._lora_modules = {"transformer.foo": lora_model.transformer.foo}
+
+    monkeypatch.setattr(DiffusionLoRAManager, "_load_adapter", _fake_load)
+    monkeypatch.setattr(DiffusionLoRAManager, "_replace_layers_with_lora", _fake_replace)
+    return lora_model
+
+
+def test_static_adapter_fallback_restores_startup_scale(monkeypatch):
+    """Regression: a plain request (no lora_request) carries the
+    sampling-params default scale of 1.0, which must not silently rebind the
+    static startup adapter at 1.0 when it was started with another scale.
+    """
+    lora_model = _patch_static_adapter_load(monkeypatch)
+    foo = lora_model.transformer.foo
+    startup_scale = 0.25
+
+    manager = DiffusionLoRAManager(
+        pipeline=_DummyPipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        lora_path="/tmp/static_adapter",
+        lora_scale=startup_scale,
+    )
+
+    # Startup activation applies the startup scale.
+    assert len(foo.set_calls) == 1
+    assert torch.all(foo.set_calls[0][1] == startup_scale)
+
+    # A plain request must not rebind at the default 1.0; the adapter is
+    # already active at the startup scale, so nothing happens.
+    manager.set_active_adapter(None, lora_scale=1.0)
+    assert len(foo.set_calls) == 1
+
+    # Explicit per-request overrides are still honored.
+    manager.set_active_adapter(None, lora_scale=0.6)
+    assert len(foo.set_calls) == 2
+    assert torch.all(foo.set_calls[1][1] == 0.6)
+
+    # The explicit scale=0 opt-out still deactivates the static adapter.
+    manager.set_active_adapter(None, lora_scale=0.0)
+    assert foo.reset_calls == 1
+    assert manager._active_adapter_id is None
+
+    # The next plain request re-activates it at the startup scale again.
+    manager.set_active_adapter(None, lora_scale=1.0)
+    assert len(foo.set_calls) == 3
+    assert torch.all(foo.set_calls[2][1] == startup_scale)
+
+
+def test_static_adapter_zero_startup_scale_stays_inactive(monkeypatch):
+    """Regression: `--lora-scale 0` keeps the static adapter disabled; a plain
+    request must not re-enable it at the default 1.0.
+    """
+    lora_model = _patch_static_adapter_load(monkeypatch)
+    foo = lora_model.transformer.foo
+
+    manager = DiffusionLoRAManager(
+        pipeline=_DummyPipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        lora_path="/tmp/static_adapter",
+        lora_scale=0.0,
+    )
+
+    assert manager._active_adapter_id is None
+    assert len(foo.set_calls) == 0
+
+    # A plain request falls back to the startup scale (0) and stays inactive.
+    manager.set_active_adapter(None, lora_scale=1.0)
+    assert manager._active_adapter_id is None
+    assert len(foo.set_calls) == 0
+
+    # An explicit non-zero override can still opt in per request.
+    manager.set_active_adapter(None, lora_scale=0.5)
+    assert len(foo.set_calls) == 1
+    assert torch.all(foo.set_calls[0][1] == 0.5)
