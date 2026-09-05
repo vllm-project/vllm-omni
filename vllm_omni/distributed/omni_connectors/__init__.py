@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from .connectors.base import OmniConnectorBase
 from .connectors.mooncake_store_connector import MooncakeStoreConnector
@@ -22,6 +22,11 @@ try:
     from .connectors.mori_transfer_engine_connector import MoriTransferEngineConnector
 except ImportError:
     MoriTransferEngineConnector = None  # RDMA deps (msgspec/zmq/mori) not installed
+
+try:
+    from .connectors.nixl_connector import NixlConnector
+except ImportError:
+    NixlConnector = None  # NIXL deps not installed
 from .factory import OmniConnectorFactory
 from .utils.config import ConnectorSpec, OmniTransferConfig
 from .utils.initialization import (
@@ -50,6 +55,7 @@ __all__ = [
     "MooncakeStoreConnector",
     "MooncakeTransferEngineConnector",
     "MoriTransferEngineConnector",
+    "NixlConnector",
     "SharedMemoryConnector",
     "YuanrongConnector",
     "YuanrongTransferEngineConnector",

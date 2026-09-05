@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unified data-plane communication mixin for Model Runners.
 
 All connector.put()/get() calls are consolidated here. Background I/O
@@ -25,10 +25,9 @@ from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
-from vllm_omni.distributed.omni_connectors.utils.config import (
-    ConnectorSpec,
-    get_stage_connector_role,
-)
+from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec, get_stage_connector_role
+from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_connector_spec
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import get_local_tp_rank, get_omni_replica_id
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.payload_span import (
     get_tensor_span,
@@ -156,7 +155,11 @@ class OmniConnectorModelRunnerMixin:
                 getattr(topology, "target_tp_size", None),
                 getattr(topology, "local_rank", None),
             )
-            if all(isinstance(value, int) for value in effective_mapping):
+            if (
+                isinstance(effective_mapping[0], int)
+                and isinstance(effective_mapping[1], int)
+                and isinstance(effective_mapping[2], int)
+            ):
                 rank_cfg = {
                     "from_tp": effective_mapping[0],
                     "to_tp": effective_mapping[1],
@@ -605,14 +608,19 @@ class OmniConnectorModelRunnerMixin:
         from_stage: str,
         to_stage: str,
         connector_get_key: str,
+        metadata: dict[str, Any] | None = None,
     ) -> Any:
         """Receive one ordinary non-KV stage payload on the local leader rank only."""
         tp_group = self._get_local_tp_group()
         if tp_group is None or getattr(tp_group, "world_size", 1) <= 1:
-            return connector.get(from_stage, to_stage, connector_get_key)
+            if metadata is None:
+                return connector.get(from_stage, to_stage, connector_get_key)
+            return connector.get(from_stage, to_stage, connector_get_key, metadata)
         if not self.is_data_transfer_rank():
             return None
-        return connector.get(from_stage, to_stage, connector_get_key)
+        if metadata is None:
+            return connector.get(from_stage, to_stage, connector_get_key)
+        return connector.get(from_stage, to_stage, connector_get_key, metadata)
 
     def _recv_full_payload_result(
         self,
@@ -620,6 +628,7 @@ class OmniConnectorModelRunnerMixin:
         from_stage: str,
         to_stage: str,
         connector_get_key: str,
+        metadata: dict[str, Any] | None = None,
     ) -> Any:
         """Receive one full-payload transfer on the local leader rank only."""
         return self._recv_ordinary_stage_result(
@@ -627,6 +636,7 @@ class OmniConnectorModelRunnerMixin:
             from_stage,
             to_stage,
             connector_get_key,
+            metadata,
         )
 
     def _recv_async_chunk_result(
@@ -635,6 +645,7 @@ class OmniConnectorModelRunnerMixin:
         from_stage: str,
         to_stage: str,
         connector_get_key: str,
+        metadata: dict[str, Any] | None = None,
     ) -> Any:
         """Receive one ordinary async chunk on the local leader rank only."""
         return self._recv_ordinary_stage_result(
@@ -642,6 +653,7 @@ class OmniConnectorModelRunnerMixin:
             from_stage,
             to_stage,
             connector_get_key,
+            metadata,
         )
 
     @staticmethod
@@ -1786,6 +1798,14 @@ class OmniConnectorModelRunnerMixin:
         chunk_id = self._get_req_chunk[req_id]
         external_req_id = self._request_ids_mapping.get(req_id, req_id)
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
+        request = self._pending_load_reqs.get(req_id)
+        sender_info = getattr(request, "payload_sender_info", None)
+        metadata = None
+        if isinstance(sender_info, dict):
+            host = sender_info.get("host")
+            port = sender_info.get("zmq_port")
+            if host and port:
+                metadata = {"source_host": str(host), "source_port": int(port)}
 
         if self._async_chunk:
             result = self._recv_async_chunk_result(
@@ -1793,6 +1813,7 @@ class OmniConnectorModelRunnerMixin:
                 str(target_stage_id),
                 str(self._stage_id),
                 connector_get_key,
+                metadata,
             )
         else:
             result = self._recv_full_payload_result(
@@ -1800,6 +1821,7 @@ class OmniConnectorModelRunnerMixin:
                 str(target_stage_id),
                 str(self._stage_id),
                 connector_get_key,
+                metadata,
             )
 
         if result is None:
@@ -2137,7 +2159,15 @@ class OmniConnectorModelRunnerMixin:
         elif not isinstance(extra, dict):
             raise RuntimeError(f"Invalid extra config for connector {name}: expected dict, got {type(extra).__name__}")
 
-        spec = ConnectorSpec(name=name, extra=extra)
+        stage_id = int(getattr(model_config, "stage_id", extra.get("stage_id", 0)))
+        role = extra.get("role")
+        spec = resolve_connector_spec(
+            ConnectorSpec(name=name, extra=extra),
+            stage_id=stage_id,
+            role=str(role) if role is not None else None,
+            local_rank=get_local_tp_rank(),
+            replica_id=get_omni_replica_id(),
+        )
         try:
             return OmniConnectorFactory.create_connector(spec)
         except Exception as exc:
@@ -2327,7 +2357,8 @@ class OmniConnectorModelRunnerMixin:
         tp_group = self._get_local_tp_group()
         if tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
             return getattr(tp_group, "rank_in_group", 0) == 0
-        return self._local_rank == 0
+        # Runners that skip init_omni_connectors (diffusion) have no _local_rank.
+        return getattr(self, "_local_rank", 0) == 0
 
     def get_kv_connector_key(
         self,

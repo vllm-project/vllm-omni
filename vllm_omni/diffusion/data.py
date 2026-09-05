@@ -937,6 +937,15 @@ class OmniDiffusionConfig:
     # Model-specific function for collecting CFG KV caches (set at runtime)
     cfg_kv_collect_func: Any | None = None
 
+    # Conditioning keys fetched from the upstream stage over the omni connector
+    # rather than carried inline through the orchestrator. Empty disables the
+    # worker-side connector receive path.
+    stage_input_payload_keys: tuple[str, ...] = ()
+
+    # Keys handed to the next stage over the omni connector. Empty disables the
+    # worker-side connector send path.
+    stage_output_payload_keys: tuple[str, ...] = ()
+
     # Quantization: str method name, dict config, QuantizationConfig, or None.
     # str is resolved to {"method": <str>} internally.
     # Per-component: {"transformer": {"method": "fp8"}, "vae": None}

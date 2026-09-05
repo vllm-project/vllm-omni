@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Stage Core Process for vLLM-Omni V1 architecture.
 
@@ -88,6 +91,7 @@ class StageEngineCoreProc(EngineCoreProc):
         scheduler_request, current_wave = super().preprocess_add_request(request)
         scheduler_request.additional_information = request.additional_information
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
+        scheduler_request.payload_sender_info = request.payload_sender_info
         return scheduler_request, current_wave
 
     @staticmethod

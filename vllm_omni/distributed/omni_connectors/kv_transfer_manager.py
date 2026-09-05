@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unified OmniConnector and KV cache transfer management."""
 
 import enum
@@ -922,7 +922,9 @@ class OmniKVTransferManager:
         The base host/port are also stored so that the receive path can
         construct per-rank metadata for heterogeneous TP scenarios.
         """
-        if not self.config.need_recv_cache:
+        # A stage can sit on the receiving end of a payload-only edge, where the
+        # sender endpoint still has to be applied even though no KV is expected.
+        if not self.config.need_recv_cache and (self.config.connector_config or {}).get("role") != "receiver":
             return
 
         actual_info = self._resolve_sender_info(sender_info, sender_stage_id=sender_stage_id)
