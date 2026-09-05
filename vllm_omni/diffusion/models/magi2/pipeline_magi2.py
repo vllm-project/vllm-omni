@@ -260,10 +260,8 @@ def _validate_native_topology(od_config: OmniDiffusionConfig) -> None:
         get_name = getattr(quant_config, "get_name", None)
         method = get_name() if callable(get_name) else None
         if method not in WEIGHT_DTYPE_BY_QUANT_METHOD:
-            # Anything other than our self-contained weight-only int8/fp8
-            # scheme (see layers.py) assumes vLLM's LinearBase contract,
-            # which Magi2GroupedLinear's custom weight layout/TP sharding
-            # doesn't fit.
+            # Anything else assumes vLLM's LinearBase contract, which
+            # Magi2GroupedLinear's custom weight layout doesn't fit.
             unsupported.append(f"quantization={method!r}")
     if unsupported:
         raise ValueError(
@@ -599,10 +597,8 @@ class Magi2Pipeline(
         MAGI2_PREVIEW_CONFIG.validate()
         preview_config = MAGI2_PREVIEW_CONFIG
         if od_config.quantization_config is not None:
-            # _validate_native_topology has already rejected any method not
-            # in WEIGHT_DTYPE_BY_QUANT_METHOD, so this is always one of our
-            # self-contained schemes. dataclasses.replace avoids mutating the
-            # module-level singleton shared by every MAGI-2 pipeline instance.
+            # dataclasses.replace avoids mutating the singleton shared by
+            # every MAGI-2 pipeline instance.
             preview_config = dataclasses.replace(
                 MAGI2_PREVIEW_CONFIG, quant_config=od_config.quantization_config
             )

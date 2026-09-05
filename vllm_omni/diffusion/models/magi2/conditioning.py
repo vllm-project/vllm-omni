@@ -254,10 +254,7 @@ class Magi2Qwen35TextEncoder(nn.Module):
             local_files_only=local_files_only,
         )
         self.text_model.eval().requires_grad_(False)
-        # Weight-only, dequant-on-forward quantization of the encoder's plain
-        # nn.Linear layers -- see QuantizedLinear/quantize_linear_modules_ in
-        # layers.py. A no-op when quant_config is None or names an
-        # unsupported method.
+        # No-op when quant_config is None or unsupported; see layers.py.
         quantize_linear_modules_(self.text_model, quant_config)
 
     def _tokenize(self, prompt: str, *, offsets: bool = False):

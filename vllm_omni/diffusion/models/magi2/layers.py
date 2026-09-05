@@ -22,21 +22,12 @@ import torch.nn.functional as F
 
 from .parallel import Magi2ParallelGroup, get_magi2_tp_group
 
-# Quantization here is intentionally self-contained (no vLLM LinearBase
-# dependency): Magi2GroupedLinear stores a flattened [num_experts * out, in]
-# weight with its own TP sharding hooks, which doesn't fit vLLM's
-# ColumnParallelLinear/RowParallelLinear contract. `quant_config` is duck
-# typed (`get_name()`) rather than the vLLM `QuantizationConfig` type so this
-# module has no hard vLLM import for its quantization path.
-#
-# Both formats here are weight-only, dynamic, symmetric quantization: the
-# int8/fp8 tensor is dequantized to the compute dtype before every matmul,
-# so neither needs a real int8/fp8 GEMM kernel or specific GPU generation to
-# run correctly (only to be fast) -- see WEIGHT_DTYPE_BY_QUANT_METHOD.
-# NVFP4 (block-scaled 4-bit) is intentionally not implemented here: it needs
-# a real block-scaled kernel to be worth the precision loss, tracked as a
-# separate path per the #7085 roadmap wording rather than folded into this
-# dequant-on-forward scheme.
+# Self-contained (no vLLM LinearBase) since Magi2GroupedLinear's flattened
+# weight layout and TP hooks don't fit ColumnParallelLinear/RowParallelLinear.
+# `quant_config` is duck typed (`get_name()`) to avoid a hard vLLM import.
+# Weight-only, dequantized before every matmul, so no real int8/fp8 GEMM
+# kernel is needed for correctness. NVFP4 isn't implemented: it needs a real
+# block-scaled kernel this scheme doesn't provide (separate path, see #7085).
 WEIGHT_DTYPE_BY_QUANT_METHOD: dict[str, torch.dtype] = {
     "int8": torch.int8,
     "fp8": torch.float8_e4m3fn,
@@ -210,17 +201,9 @@ class Magi2GroupedLinear(nn.Module):
         return torch.cat(shards, dim=1).reshape(-1)
 
     def maybe_quantize_(self) -> None:
-        """Quantize the (already-loaded) weight to per-expert, per-output-channel
-        int8 or fp8 (e4m3), per ``quant_config.get_name()``.
-
-        Weight-only, symmetric, dynamic quantization: no calibration data or
-        serialized scales are needed, so this can run right after checkpoint
-        loading. Activations stay in ``params_dtype``; the quantized weight is
-        dequantized on the fly in `forward`, so this trades compute (one
-        extra elementwise multiply per forward) for smaller resident weight
-        memory vs bf16/fp16 (~2x for int8/fp8). Because dequantization happens
-        before the matmul, this needs no int8/fp8 GEMM kernel or specific GPU
-        generation to run correctly.
+        """Quantize the loaded weight to per-expert, per-output-channel int8
+        or fp8, per ``quant_config.get_name()``. Call once, after checkpoint
+        loading; a no-op if already quantized or the method is unsupported.
         """
         weight_dtype = _quant_weight_dtype(self.quant_config)
         if self._quantized_dtype is not None or weight_dtype is None:
@@ -239,9 +222,6 @@ class Magi2GroupedLinear(nn.Module):
         self.register_buffer("weight_scale", scale.to(torch.float32))
         self.weight = None
         self._quantized_dtype = weight_dtype
-
-    # Backwards-compatible alias for the int8-only entry point.
-    maybe_quantize_int8_ = maybe_quantize_
 
     def _grouped_weight(self, compute_dtype: torch.dtype) -> torch.Tensor:
         if self._quantized_dtype is not None:
@@ -286,11 +266,9 @@ class Magi2GroupedLinear(nn.Module):
 class QuantizedLinear(nn.Module):
     """Drop-in replacement for a plain ``nn.Linear`` with a quantized weight.
 
-    Same weight-only, dynamic, symmetric, dequant-on-forward scheme as
-    ``Magi2GroupedLinear.maybe_quantize_``, for models that aren't built out
-    of grouped linears -- e.g. the stock HF ``transformers`` text encoder
-    (``Qwen3_5TextModel``), which has ordinary ``nn.Linear`` submodules with
-    no per-expert grouping.
+    Same scheme as ``Magi2GroupedLinear.maybe_quantize_``, for models built
+    out of ordinary ``nn.Linear``s rather than grouped linears -- e.g. the
+    stock HF ``Qwen3_5TextModel`` text encoder.
     """
 
     def __init__(self, linear: nn.Linear, weight_dtype: torch.dtype) -> None:
