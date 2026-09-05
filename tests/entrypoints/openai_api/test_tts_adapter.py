@@ -61,6 +61,7 @@ EXPECTED_MODEL_TYPES = {
     "higgs_audio_v2",
     "higgs_audio_v3",
     "glm_tts",
+    "breeze_tts_2",
     "step_audio2",
     "indextts2",
     "indextts2_5",

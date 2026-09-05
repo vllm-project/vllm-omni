@@ -74,7 +74,8 @@ class BreezeTTS2PromptBuilder:
                 f"{self.scheduler_token_id} >= {scheduler_vocab_size}"
             )
         self.num_codebooks = int(config.num_codebooks)
-        self.codebook_size = _resolve_codebook_size(config)
+        # 2048 is the Breeze codec default when the checkpoint omits the key.
+        self.codebook_size = int(config.codec_config.get("codebook_size", 2048))
         if self.num_codebooks <= 0 or self.codebook_size <= 0:
             raise ValueError("num_codebooks and codec codebook_size must be positive")
         self._validate_audio_special_tokens()
@@ -322,10 +323,6 @@ def _normalize_codes(codes: Any, num_codebooks: int, codebook_size: int) -> torc
     if int(codes.min()) < 0 or int(codes.max()) >= codebook_size:
         raise ValueError(f"reference code outside [0, {codebook_size})")
     return codes.to(dtype=torch.int16)
-
-
-def _resolve_codebook_size(config: Any) -> int:
-    return int(config.codec_config["codebook_size"])
 
 
 __all__ = ["BreezeTTS2PromptBuilder"]

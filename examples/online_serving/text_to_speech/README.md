@@ -14,6 +14,7 @@ For the full list of supported architectures across all modalities, see
 
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
 |---|---|---|---|---|---|
+| Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker tags (`S0`..`S9`, default `S0`) | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
 | IndexTTS-2 | `IndexTeam/IndexTTS-2` | ✓ (`ref_audio` or uploaded `voice`) | `stream=true` response, non-chunk | uploaded audio voice only; no presets | — |
@@ -714,3 +715,63 @@ The demo handles voice-preset selection and reference-audio upload. `voxtral_tts
 - Voice presets are listed on the HF model card (`mistralai/Voxtral-4B-TTS-2603`).
 - Voice cloning is gated upstream and may require a recent `mistral_common`.
 - A standalone CLI client is not yet shipped; the gradio demo is the canonical reference for now.
+
+## Breeze-TTS-2
+
+Two-stage AR TTS (T5Gemma2 + Qwen3 talker with a depth decoder → bundled Qwen3-TTS codec) at 24 kHz mono, from [BreezeBlue](https://huggingface.co/BreezeBlue/Breeze-TTS-2). Four modes are selected automatically from the request fields: plain (`input`), voice design (`instructions`), clone (`ref_audio`+`ref_text`), and voice direction (reference trio + `instructions`).
+
+### Launch
+
+```bash
+vllm serve BreezeBlue/Breeze-TTS-2 --omni --port 8091
+# or:
+./breeze_tts_2/run_server.sh
+```
+
+The deploy config at `vllm_omni/deploy/breeze_tts_2.yaml` auto-loads (async-chunk streaming, 8-frame inter-stage chunks).
+
+### Sending requests
+
+```bash
+# Plain synthesis (speaker tags S0..S9, default S0)
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, this is Breeze TTS 2 on vLLM-Omni.",
+        "voice": "S0",
+        "response_format": "wav",
+        "sample_rate": 24000
+    }' --output breeze_plain.wav
+
+# Voice direction (clone a reference, then steer the delivery)
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "We need to discuss what happened last night.",
+        "ref_audio": "file:///path/to/reference.wav",
+        "ref_text": "The exact transcript of the reference audio.",
+        "instructions": "Speak slowly with a restrained, serious tone.",
+        "response_format": "wav"
+    }' --output breeze_direction.wav
+```
+
+### Streaming PCM
+
+```bash
+curl -N -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Streaming output from Breeze TTS 2.",
+        "stream": true,
+        "stream_format": "audio",
+        "response_format": "pcm",
+        "sample_rate": 24000
+    }' --output breeze_stream.pcm
+```
+
+### Notes
+
+- Only `sample_rate=24000` is accepted; `speed` must be `1.0`.
+- `guidance_scale`/`cfg_scale` must be `1.0`; `negative_prompt` is rejected (CFG companion support is a follow-up).
+- `instructions` without `ref_audio` is voice design; with `ref_audio`+`ref_text` it is voice direction.
+- See [`recipes/BreezeBlue/Breeze-TTS-2.md`](../../../../recipes/BreezeBlue/Breeze-TTS-2.md) for the full recipe and the offline example under [`examples/offline_inference/text_to_speech/breeze_tts_2/`](../../offline_inference/text_to_speech/breeze_tts_2/).

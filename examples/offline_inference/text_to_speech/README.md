@@ -14,6 +14,7 @@ list of supported architectures across all modalities, see
 
 | Model | HuggingFace repo | Stages | Voice cloning | Streaming | Special modes | Sample rate |
 |---|---|---|---|---|---|---|
+| Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | 2 (talker + codec) | ✓ | ✓ (async chunk) | voice design / voice direction (`--instruction`) | 24 kHz |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 24 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
 | Gepard-1.0 | `nineninesix/gepard-1.0` | single (native AR + NanoCodec) | — (zero-shot; cloning WIP) | — (serving WIP) | zero-shot | 22.05 kHz |
@@ -613,6 +614,37 @@ python examples/offline_inference/text_to_speech/voxtral_tts/end2end.py \
 Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-TTS-2603`).
 
 ### Notes
+
 - `--num-prompts N` replicates the prompt for performance measurement.
 - `--concurrency M` requires `--streaming` and must evenly divide `--num-prompts`.
 - Run `--help` for the full argument surface.
+
+---
+
+## Breeze-TTS-2
+
+Two-stage AR TTS (T5Gemma2 + Qwen3 talker with a depth decoder → bundled Qwen3-TTS codec) at 24 kHz mono. The prompt builder picks one of four templates automatically: plain, voice design (`--instruction`), clone (`--ref-audio` + `--ref-text`), or voice direction (reference + `--instruction`).
+
+### Quick start
+
+```bash
+python examples/offline_inference/text_to_speech/breeze_tts_2/end2end.py \
+    --model BreezeBlue/Breeze-TTS-2 \
+    --text "Hello, this is Breeze TTS 2 running on vLLM Omni."
+```
+
+### Voice direction
+
+```bash
+python examples/offline_inference/text_to_speech/breeze_tts_2/end2end.py \
+    --text "We need to discuss what happened last night." \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "The exact transcript of the reference audio." \
+    --instruction "Speak slowly with a restrained, serious tone."
+```
+
+### Notes
+
+- Output: 24 kHz mono WAV; `--max-new-tokens` caps generated frames (80 ms each).
+- Speaker tags `--voice S0`..`S9` (default `S0`) select the timbre in non-reference modes; with `--ref-audio` the timbre comes from the reference clip.
+- Deploy config: `vllm_omni/deploy/breeze_tts_2.yaml` (auto-loaded by HF `model_type`); see [`recipes/BreezeBlue/Breeze-TTS-2.md`](../../../../recipes/BreezeBlue/Breeze-TTS-2.md) for the online-serving recipe.

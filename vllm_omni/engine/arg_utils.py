@@ -54,6 +54,9 @@ def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
 
+        from vllm_omni.model_executor.models.breeze_tts_2.configuration_breeze_tts_2 import (
+            BreezeTTS2Config,
+        )
         from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
             IndexTTS2Config,
             IndexTTS25Config,
@@ -74,9 +77,6 @@ def _register_omni_hf_configs() -> None:
         )
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
-        )
-        from vllm_omni.model_executor.models.breeze_tts_2.configuration_breeze_tts_2 import (
-            BreezeTTS2Config,
         )
         from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
         from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
