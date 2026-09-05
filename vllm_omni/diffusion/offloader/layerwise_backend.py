@@ -14,6 +14,7 @@ from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig
+from .block_discovery import get_blocks_from_dit as discover_offload_blocks
 from .module_collector import ModuleDiscovery
 
 logger = init_logger(__name__)
@@ -390,9 +391,9 @@ class LayerWiseOffloadBackend(OffloadBackend):
                 if buffer is not None:
                     buffer.data = buffer.data.to(self.device, non_blocking=True)
 
-            # Pre-fetch the first layer by manually calling the hook function on the last layer;
-            # For subsequent requests, the first layer/block will be pre-fetched
-            # during the last layer compute of the previous request.
+            # Prefetch ring is local to this rank: last executable layer prefetches
+            # the first executable layer. PP placeholders are excluded by discovery
+            # so wrap-around stays inside blocks[start_layer:end_layer].
             last_block, first_block = blocks[-1], blocks[0]
             last_hook = apply_block_hook(
                 last_block,
@@ -466,61 +467,11 @@ class LayerWiseOffloadBackend(OffloadBackend):
 
     @staticmethod
     def get_blocks_from_dit(model: nn.Module) -> tuple[list[str], list[nn.Module]]:
+        """Retrieve executable blocks for the prefetch ring.
+
+        Pipeline-parallel models keep a full-length block list with
+        ``PPMissingLayer`` placeholders. Discovery returns only
+        ``blocks[start_layer:end_layer]`` so the last local layer prefetches
+        the first local layer of the next forward.
         """
-        Retrieve blocks and attribute names from provided DiT model. Blocks attribute names
-        are found by `_layerwise_offload_blocks_attrs` set to DiT models. For example,
-
-        ```
-        class WanTransformer3DModel(nn.Module):
-            _layerwise_offload_blocks_attrs = ["blocks"]
-        ```
-
-        Returns:
-            Tuple of (blocks_attr_names, blocks)
-        """
-        blocks_attr_names = LayerWiseOffloadBackend.get_blocks_attr_names(model)
-        if not blocks_attr_names:
-            logger.warning(
-                f"No _layerwise_offload_blocks_attrs defined for {model.__class__.__name__}, "
-                "skipping layerwise offloading"
-            )
-            return [], []
-
-        blocks = []
-        for name in blocks_attr_names:
-            attr = getattr(model, name, None)
-            if attr is None:
-                raise AttributeError(
-                    f"Attribute '{name}' declared in _layerwise_offload_blocks_attrs "
-                    f"does not exist on model {model.__class__.__name__}"
-                )
-            try:
-                attr_iter = iter(attr)
-            except TypeError:
-                if isinstance(attr, nn.Module):
-                    logger.warning(
-                        "Attribute '%s' on %s is not iterable; treating it as one block.",
-                        name,
-                        model.__class__.__name__,
-                    )
-                    blocks.append(attr)
-                    continue
-
-                logger.warning(
-                    "Attribute '%s' on %s is not iterable (got %s); skipping it.",
-                    name,
-                    model.__class__.__name__,
-                    type(attr).__name__,
-                )
-            else:
-                blocks.extend(attr_iter)
-
-        if not blocks:
-            logger.warning(
-                "No blocks found in %s for %s, skipping layerwise offloading",
-                blocks_attr_names,
-                model.__class__.__name__,
-            )
-            return [], []
-
-        return blocks_attr_names, blocks
+        return discover_offload_blocks(model)

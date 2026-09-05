@@ -9,8 +9,35 @@ from __future__ import annotations
 
 from torch import nn
 from vllm.logger import init_logger
+from vllm.model_executor.models.utils import PPMissingLayer
 
 logger = init_logger(__name__)
+
+
+def _is_pp_missing_layer(module: nn.Module) -> bool:
+    return isinstance(module, PPMissingLayer)
+
+
+def select_local_offload_blocks(model: nn.Module, modules: list[nn.Module]) -> list[nn.Module]:
+    """Keep the blocks that actually run on this rank for the prefetch ring.
+
+    Pipeline-parallel DiTs built with vLLM ``make_layers`` store a full-length
+    ``ModuleList`` and fill non-local slots with ``PPMissingLayer``. The offload
+    hook ring must skip those placeholders so the last local layer prefetches
+    the first local layer of the next forward.
+    """
+    if not modules:
+        return []
+
+    executable_modules = [module for module in modules if not _is_pp_missing_layer(module)]
+    if len(executable_modules) != len(modules):
+        logger.info(
+            "Filtered layerwise offload ring from %d blocks to %d executable blocks",
+            len(modules),
+            len(executable_modules),
+        )
+
+    return executable_modules
 
 
 def get_blocks_attr_names(model: nn.Module) -> list[str]:
@@ -36,12 +63,16 @@ def set_blocks_attr_names(model: nn.Module, names: list[str]) -> None:
 
 
 def get_blocks_from_dit(model: nn.Module) -> tuple[list[str], list[nn.Module]]:
-    """Retrieve blocks and attribute names from provided DiT model."""
+    """Retrieve executable blocks and attribute names from a DiT model.
+
+    Each declared block container is filtered before containers are concatenated,
+    so the prefetch ring wraps inside executable layers rather than across
+    ``PPMissingLayer`` placeholders.
+    """
     blocks_attr_names = get_blocks_attr_names(model)
     if not blocks_attr_names:
         logger.warning(
-            f"No _layerwise_offload_blocks_attrs defined for {model.__class__.__name__}, "
-            "skipping distributed layerwise offloading"
+            f"No _layerwise_offload_blocks_attrs defined for {model.__class__.__name__}, skipping layerwise offloading"
         )
         return [], []
 
@@ -54,7 +85,7 @@ def get_blocks_from_dit(model: nn.Module) -> tuple[list[str], list[nn.Module]]:
                 f"does not exist on model {model.__class__.__name__}"
             )
         try:
-            attr_iter = iter(attr)
+            collected = list(iter(attr))
         except TypeError:
             if isinstance(attr, nn.Module):
                 logger.warning(
@@ -62,21 +93,20 @@ def get_blocks_from_dit(model: nn.Module) -> tuple[list[str], list[nn.Module]]:
                     name,
                     model.__class__.__name__,
                 )
-                blocks.append(attr)
+                collected = [attr]
+            else:
+                logger.warning(
+                    "Attribute '%s' on %s is not iterable (got %s); skipping it.",
+                    name,
+                    model.__class__.__name__,
+                    type(attr).__name__,
+                )
                 continue
-
-            logger.warning(
-                "Attribute '%s' on %s is not iterable (got %s); skipping it.",
-                name,
-                model.__class__.__name__,
-                type(attr).__name__,
-            )
-        else:
-            blocks.extend(attr_iter)
+        blocks.extend(select_local_offload_blocks(model, collected))
 
     if not blocks:
         logger.warning(
-            "No blocks found in %s for %s, skipping distributed layerwise offloading",
+            "No blocks found in %s for %s, skipping layerwise offloading",
             blocks_attr_names,
             model.__class__.__name__,
         )
