@@ -91,6 +91,42 @@ def _forget_active_hwr_registration(
         ]
 
 
+def _stage_shards_and_allgather(
+    *,
+    cpu_shards: dict[torch.dtype, torch.Tensor],
+    gpu_shard_buffers: dict[torch.dtype, torch.Tensor],
+    full_gpu_buffers: dict[torch.dtype, torch.Tensor],
+    copy_stream: Any,
+    comm_stream: Any,
+    shard_group: torch.distributed.ProcessGroup,
+    shard_world_size: int,
+    non_blocking: bool,
+) -> Any:
+    """Copy local weight shards to device and reconstruct full buffers."""
+    local_gpu_shards: dict[torch.dtype, torch.Tensor] = {}
+    with current_omni_platform.stream(copy_stream):
+        for dtype, cpu_shard in cpu_shards.items():
+            local_gpu_shard = gpu_shard_buffers[dtype][: cpu_shard.numel()]
+            local_gpu_shard.copy_(
+                cpu_shard,
+                non_blocking=non_blocking,
+            )
+            local_gpu_shards[dtype] = local_gpu_shard
+
+    ready = current_omni_platform.Event()
+    comm_stream.wait_stream(copy_stream)
+    with current_omni_platform.stream(comm_stream):
+        for dtype, local_gpu_shard in local_gpu_shards.items():
+            output_numel = local_gpu_shard.numel() * shard_world_size
+            torch.distributed.all_gather_into_tensor(
+                full_gpu_buffers[dtype][:output_numel],
+                local_gpu_shard,
+                group=shard_group,
+            )
+        ready.record(comm_stream)
+    return ready
+
+
 # Threshold (in MB) for deciding whether a non-block DiT submodule should
 # use layerwise offload (streaming hooks) or be moved to GPU as a resident
 # module.  Submodules larger than this are offloaded to save HBM; smaller
@@ -260,16 +296,6 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                         )
                     )
             self._cached_repoint.append(repoint)
-
-        # Pre-compute AG output sizes (avoid sum() per layer).
-        self._ag_output_sizes: dict[torch.dtype, int] = {}
-        for dtype, metas in self.metadata.items():
-            total_numel = sum(m["numel"] for m in metas)
-            if self.rank_local_mmap:
-                self._ag_output_sizes[dtype] = total_numel
-            else:
-                shard_numel = self.cpu_shards[dtype].numel()
-                self._ag_output_sizes[dtype] = shard_numel * self.dp_size if self.dp_size > 1 else total_numel
 
         return module
 
@@ -586,11 +612,11 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         """
         self.copy_stream.wait_stream(current_omni_platform.current_stream())
 
-        evt = current_omni_platform.Event()
         gpu_weights = self.gpu_buffers[slot]
         assert gpu_weights is not None, f"gpu_buffers[{slot}] not allocated"
 
         if self.dp_size <= 1 or self.dp_group is None:
+            evt = current_omni_platform.Event()
             if self.rank_local_mmap and self.registered_mmap:
                 with current_omni_platform.stream(self.copy_stream):
                     self._copy_mmap_sources_to_device(
@@ -613,33 +639,18 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     # finished.  The shared event protects reuse by another hook.
                     self.cpu_staging_events[slot] = evt
         else:
-            gpu_shards: dict[torch.dtype, torch.Tensor] = {}
             shard_bufs = self.gpu_shard_buffers[slot]
             assert shard_bufs is not None, f"gpu_shard_buffers[{slot}] not allocated"
-            with current_omni_platform.stream(self.copy_stream):
-                for dtype, cpu_shard in self.cpu_shards.items():
-                    gpu_shard = shard_bufs[dtype][: cpu_shard.numel()]
-                    gpu_shard.copy_(cpu_shard, non_blocking=non_blocking)
-                    gpu_shards[dtype] = gpu_shard
-
-            self.comm_stream.wait_stream(self.copy_stream)
-            with current_omni_platform.stream(self.comm_stream):
-                for dtype, local_shard in gpu_shards.items():
-                    # Slice the shared (max-sized) output buffer down to this
-                    # block's actual AllGather output size. The buffers are
-                    # sized to the *largest* block across all groups, so for any
-                    # smaller block the full buffer would violate the
-                    # all_gather_into_tensor contract
-                    # (output.numel() == world_size * input.numel()).
-                    # Repoint offsets are relative to the block's flattened
-                    # buffer, so a prefix slice is safe.
-                    gw = gpu_weights[dtype][: self._ag_output_sizes[dtype]]
-                    torch.distributed.all_gather_into_tensor(
-                        gw,
-                        local_shard,
-                        group=self.dp_group,
-                    )
-                evt.record(self.comm_stream)
+            evt = _stage_shards_and_allgather(
+                cpu_shards=self.cpu_shards,
+                gpu_shard_buffers=shard_bufs,
+                full_gpu_buffers=gpu_weights,
+                copy_stream=self.copy_stream,
+                comm_stream=self.comm_stream,
+                shard_group=self.dp_group,
+                shard_world_size=self.dp_size,
+                non_blocking=non_blocking,
+            )
 
         self.ready_events[slot] = evt
         self._prefetch_done = evt
@@ -802,9 +813,11 @@ class PinnedResidentLayerGroup:
     leaving it only restores zero-sized placeholders and releases the device
     buffers.  This lets the following VAE stage reuse the same HBM.
 
-    The resident path is intentionally local-shard only.  With tensor
-    parallelism, the regular model loader has already produced each rank's TP
-    shard, so no DP AllGather is required or desirable here.
+    In no-AllGather mode, the regular model loader has already produced each
+    rank's complete rank-local tensors.  In AllGather mode, each rank keeps
+    only its DLO shard on host and reconstructs the selected layers once when
+    the denoise stage starts.  The full device weights are then reused by all
+    denoise steps and released before the following stage.
     """
 
     def __init__(
@@ -813,18 +826,32 @@ class PinnedResidentLayerGroup:
         device: torch.device,
         copy_stream: Any,
         pin_memory: bool,
+        shard_group: torch.distributed.ProcessGroup | None = None,
+        shard_world_size: int = 1,
+        shard_rank: int = 0,
+        comm_stream: Any | None = None,
         rank_local_mmap: bool = False,
         defer_staging: bool = False,
         tensor_transforms: dict[int, Any] | None = None,
     ) -> None:
         self.device = device
         self.copy_stream = copy_stream
+        self.comm_stream = comm_stream or current_omni_platform.Stream()
+        self.shard_group = shard_group
+        self.shard_world_size = shard_world_size
+        self.shard_rank = shard_rank
         self.loaded = False
         self.rank_local_mmap = rank_local_mmap
         self.registered_mmap = False
         self.pin_memory = pin_memory
         self._states: list[dict[str, Any]] = []
         self._gpu_buffers: list[dict[torch.dtype, torch.Tensor]] = []
+        self._gpu_shard_buffers: list[dict[torch.dtype, torch.Tensor]] = []
+
+        if rank_local_mmap and shard_world_size > 1:
+            raise ValueError("rank-local mmap resident layers do not support DLO AllGather")
+        if shard_world_size > 1 and shard_group is None:
+            raise ValueError("resident-layer AllGather requires a process group")
 
         for block in blocks:
             params = dict(block.named_parameters())
@@ -841,8 +868,8 @@ class PinnedResidentLayerGroup:
                 cpu_shards, metadata = DistributedLayerwiseOffloadHook._shard_and_pin(
                     params,
                     bufs,
-                    dp_size=1,
-                    rank=0,
+                    dp_size=shard_world_size,
+                    rank=shard_rank,
                     pin_memory=pin_memory,
                     tensor_transforms=tensor_transforms,
                 )
@@ -855,6 +882,12 @@ class PinnedResidentLayerGroup:
                     "metadata": metadata,
                 }
             )
+
+        logger.info(
+            "Prepared %d resident block(s) with %s",
+            len(self._states),
+            "stage-entry AllGather from DLO host shards" if self.shard_world_size > 1 else "rank-local host weights",
+        )
 
         self._cpu_staging_buffers: list[dict[torch.dtype, torch.Tensor]] = []
         self._cpu_staging_events: list[Any | None] = [None, None]
@@ -885,13 +918,51 @@ class PinnedResidentLayerGroup:
             block_buffers: dict[torch.dtype, torch.Tensor] = {}
             for dtype, metas in state["metadata"].items():
                 total = sum(meta["numel"] for meta in metas)
+                if self.shard_world_size > 1:
+                    total = state["cpu_shards"][dtype].numel() * self.shard_world_size
                 block_buffers[dtype] = torch.empty(total, dtype=dtype, device=self.device)
             gpu_buffers.append(block_buffers)
 
+        gpu_shard_buffers: list[dict[torch.dtype, torch.Tensor]] = []
+        if self.shard_world_size > 1:
+            max_shard_sizes: dict[torch.dtype, int] = {}
+            for state in self._states:
+                for dtype, shard in state["cpu_shards"].items():
+                    max_shard_sizes[dtype] = max(max_shard_sizes.get(dtype, 0), shard.numel())
+            for _ in range(min(2, len(self._states))):
+                gpu_shard_buffers.append(
+                    {
+                        dtype: torch.empty(numel, dtype=dtype, device=self.device)
+                        for dtype, numel in max_shard_sizes.items()
+                    }
+                )
+
         self.copy_stream.wait_stream(current_omni_platform.current_stream())
-        ready = current_omni_platform.Event()
-        with current_omni_platform.stream(self.copy_stream):
-            for index, (state, block_buffers) in enumerate(zip(self._states, gpu_buffers)):
+        ready: Any | None = None
+        slot_events: list[Any | None] = [None] * len(gpu_shard_buffers)
+        for index, (state, block_buffers) in enumerate(zip(self._states, gpu_buffers)):
+            if self.shard_world_size > 1:
+                slot = index % len(gpu_shard_buffers)
+                previous_gather = slot_events[slot]
+                if previous_gather is not None:
+                    self.copy_stream.wait_event(previous_gather)
+                if self.shard_group is None:
+                    raise RuntimeError("resident-layer AllGather process group is unavailable")
+                ready = _stage_shards_and_allgather(
+                    cpu_shards=state["cpu_shards"],
+                    gpu_shard_buffers=gpu_shard_buffers[slot],
+                    full_gpu_buffers=block_buffers,
+                    copy_stream=self.copy_stream,
+                    comm_stream=self.comm_stream,
+                    shard_group=self.shard_group,
+                    shard_world_size=self.shard_world_size,
+                    non_blocking=self.pin_memory,
+                )
+                slot_events[slot] = ready
+                continue
+
+            ready = current_omni_platform.Event()
+            with current_omni_platform.stream(self.copy_stream):
                 if self.rank_local_mmap and self.registered_mmap:
                     DistributedLayerwiseOffloadHook._copy_mmap_sources_to_device(
                         state["cpu_sources"],
@@ -899,34 +970,34 @@ class PinnedResidentLayerGroup:
                         block_buffers,
                         non_blocking=True,
                     )
-                    continue
-                if self.rank_local_mmap:
-                    slot = index % 2
-                    previous_copy = self._cpu_staging_events[slot]
-                    if previous_copy is not None:
-                        synchronize = getattr(previous_copy, "synchronize", None)
-                        if callable(synchronize):
-                            synchronize()
-                        else:
-                            current_omni_platform.synchronize()
-                    cpu_weights = DistributedLayerwiseOffloadHook._pack_mmap_sources(
-                        state["cpu_sources"],
-                        state["metadata"],
-                        self._cpu_staging_buffers[slot],
-                    )
                 else:
-                    cpu_weights = state["cpu_shards"]
+                    if self.rank_local_mmap:
+                        slot = index % 2
+                        previous_copy = self._cpu_staging_events[slot]
+                        if previous_copy is not None:
+                            synchronize = getattr(previous_copy, "synchronize", None)
+                            if callable(synchronize):
+                                synchronize()
+                            else:
+                                current_omni_platform.synchronize()
+                        cpu_weights = DistributedLayerwiseOffloadHook._pack_mmap_sources(
+                            state["cpu_sources"],
+                            state["metadata"],
+                            self._cpu_staging_buffers[slot],
+                        )
+                    else:
+                        cpu_weights = state["cpu_shards"]
 
-                for dtype, cpu_weight in cpu_weights.items():
-                    block_buffers[dtype].copy_(
-                        cpu_weight,
-                        non_blocking=cpu_weight.is_pinned(),
-                    )
-                if self.rank_local_mmap:
+                    for dtype, cpu_weight in cpu_weights.items():
+                        block_buffers[dtype].copy_(
+                            cpu_weight,
+                            non_blocking=cpu_weight.is_pinned(),
+                        )
+                if self.rank_local_mmap and not self.registered_mmap:
                     slot_ready = current_omni_platform.Event()
                     slot_ready.record(self.copy_stream)
                     self._cpu_staging_events[slot] = slot_ready
-            ready.record(self.copy_stream)
+                ready.record(self.copy_stream)
 
         for state, block_buffers in zip(self._states, gpu_buffers):
             targets = state["targets"]
@@ -942,8 +1013,10 @@ class PinnedResidentLayerGroup:
                         ),
                     )
 
-        current_omni_platform.current_stream().wait_event(ready)
+        if ready is not None:
+            current_omni_platform.current_stream().wait_event(ready)
         self._gpu_buffers = gpu_buffers
+        self._gpu_shard_buffers = gpu_shard_buffers
         self.loaded = True
 
     def offload(self) -> None:
@@ -958,6 +1031,7 @@ class PinnedResidentLayerGroup:
             for target in state["targets"].values():
                 set_tensor_storage(target, make_offload_placeholder(target))
         self._gpu_buffers.clear()
+        self._gpu_shard_buffers.clear()
         self.loaded = False
 
 
@@ -1874,6 +1948,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 self.device,
                 self.copy_stream,
                 self.config.pin_cpu_memory,
+                shard_group=self.dp_group,
+                shard_world_size=self.dp_size,
+                shard_rank=self.rank,
+                comm_stream=self.comm_stream,
                 rank_local_mmap=self._using_rank_local_mmap,
                 defer_staging=bool(self._all_hook_groups),
                 tensor_transforms=self._mmap_transforms_by_tensor_id,
@@ -1885,8 +1963,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         if not self._all_hook_groups:
             self.enabled = bool(self._resident_blocks)
-            if self._using_mmap and not self.enabled:
+            if self._using_mmap and (not self.enabled or not self._using_rank_local_mmap):
                 self._release_mmap_handles()
+            if self.enabled:
+                self._cleanup_after_loading()
             return
 
         # Unified allocation: 2 shared output buffers + 2 shared shard buffers

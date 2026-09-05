@@ -62,7 +62,7 @@ omni = Omni(
 | `--data-parallel-size N` | DP ranks and AllGather weight-sharding group | `1` |
 | `--dlo-use-allgather` | Shard host weights and reconstruct with AllGather | `true` |
 | `--dlo-no-use-allgather` | Stream complete rank-local blocks without a DLO weight collective | `false` |
-| `--dlo-resident-layers N` | Keep N leading main-DiT blocks on device; requires no-AllGather and model-declared resident paths | `0` |
+| `--dlo-resident-layers N` | Keep N leading main-DiT blocks on device for the denoise stage; requires model-declared resident paths | `0` |
 | `--host-weight-runtime-mode {disabled,preferred,required}` | HWR policy: no interaction, populate on a miss, or require an exact hit | `disabled` |
 | `--host-weight-runtime-root PATH` | Writable node-local HWR store shared by workers in one storage domain; required for `preferred` and `required` | unset |
 | `--dlo-host-registration-limit-gib N` | Optional per-worker ceiling for registering an HWR mmap; zero adds no ceiling | `0` |
@@ -272,8 +272,10 @@ must enter each collective.
   complete FP8 model in host memory before DLO retains only its shard. Other
   online quantization methods require no-AllGather until their runtime layouts
   are validated.
-- Resident leading layers require `--dlo-no-use-allgather` and a model
-  `OffloadPlan` that declares eligible `resident_dit_paths`.
+- Resident leading layers require a model `OffloadPlan` that declares eligible
+  `resident_dit_paths`. In AllGather mode, each rank keeps only its host shard
+  and reconstructs resident layers once when the denoise stage starts; all
+  denoise steps then reuse the full device weights.
 - DP concurrency requires an explicit, identical inference-step count.
 
 Sharing quantized or otherwise unvalidated transformed layouts through a

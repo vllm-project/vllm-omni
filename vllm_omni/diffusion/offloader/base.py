@@ -133,12 +133,6 @@ class OffloadConfig:
         )
         if dlo_resident_layers < 0:
             raise ValueError(f"dlo_resident_layers must be >= 0, got {dlo_resident_layers}")
-        if dlo_resident_layers and dlo_use_allgather:
-            raise ValueError(
-                "dlo_resident_layers currently requires --dlo-no-use-allgather so "
-                "resident blocks use weights prepared by the standard TP-aware loader"
-            )
-
         # If dlo_use_allgather=False, force dp_size=1 (each rank independent)
         if enable_distributed_layerwise_offload and not dlo_use_allgather:
             dp_size = 1

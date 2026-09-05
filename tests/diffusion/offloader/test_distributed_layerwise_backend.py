@@ -689,6 +689,62 @@ class TestDistributedLayerwiseOffloadHook:
 
 
 class TestPinnedResidentLayerGroup:
+    def test_allgather_reconstructs_once_per_denoise_stage(
+        self,
+        patched_offload_runtime,
+        monkeypatch,
+    ):
+        blocks = [nn.Linear(3, 2, bias=False), nn.Linear(3, 2, bias=False)]
+        expected = []
+        for index, block in enumerate(blocks):
+            block.weight.data.copy_(torch.arange(6, dtype=torch.float32).reshape(2, 3) + index * 10)
+            expected.append(block.weight.detach().clone())
+
+        process_group = object()
+        gathered = []
+
+        def fake_allgather(output, local_shard, *, group):
+            expected_weight = expected[len(gathered) % len(expected)].flatten()
+            assert group is process_group
+            assert torch.equal(local_shard, expected_weight[:3])
+            output.copy_(expected_weight)
+            gathered.append(output.detach().clone())
+
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_allgather)
+        group = PinnedResidentLayerGroup(
+            blocks,
+            device=torch.device("cpu"),
+            copy_stream=DummyStream(),
+            comm_stream=DummyStream(),
+            pin_memory=False,
+            shard_group=process_group,
+            shard_world_size=2,
+            shard_rank=0,
+        )
+
+        assert all(block.weight.numel() == 0 for block in blocks)
+        assert all(state["cpu_shards"][torch.float32].numel() == 3 for state in group._states)
+
+        group.load()
+        assert len(gathered) == 2
+        for block, expected_weight in zip(blocks, expected):
+            assert torch.equal(block.weight, expected_weight)
+
+        # Repeated denoise steps reuse the reconstructed device weights.
+        group.load()
+        assert len(gathered) == 2
+
+        group.offload()
+        assert all(block.weight.numel() == 0 for block in blocks)
+        assert group._gpu_shard_buffers == []
+
+        # A new denoise stage reconstructs resident weights once again.
+        group.load()
+        assert len(gathered) == 4
+        for block, expected_weight in zip(blocks, expected):
+            assert torch.equal(block.weight, expected_weight)
+        group.offload()
+
     def test_load_offload_reuses_pinned_master_weights(self, patched_offload_runtime):
         blocks = [nn.Linear(2, 2), nn.Linear(2, 2)]
         expected = []
@@ -2202,7 +2258,7 @@ class TestConfigValidation:
         assert config.dp_size == 1  # forced to 1 when no AllGather
         assert config.dlo_resident_layers == 20
 
-    def test_resident_layers_with_allgather_rejected(self):
+    def test_resident_layers_with_allgather_preserve_shard_group(self):
         class FakePC:
             data_parallel_size = 2
             use_hsdp = False
@@ -2218,8 +2274,10 @@ class TestConfigValidation:
             parallel_config = FakePC()
             model = "/fake/path"
 
-        with pytest.raises(ValueError, match="requires --dlo-no-use-allgather"):
-            OffloadConfig.from_od_config(FakeODConfig())
+        config = OffloadConfig.from_od_config(FakeODConfig())
+        assert config.dp_size == 2
+        assert config.dlo_use_allgather
+        assert config.dlo_resident_layers == 20
 
     def test_num_inference_steps_none_rejected(self):
         """DP multi-concurrency should reject None num_inference_steps."""
