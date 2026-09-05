@@ -301,17 +301,24 @@ def _write_atomic_json(path: Path, value: object, *, mode: int = 0o444) -> None:
     data = canonical_json(value)
     handle = tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False)
     temporary = Path(handle.name)
+    write_error: BaseException | None = None
     try:
         with handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-            os.fchmod(handle.fileno(), mode)
-            os.fsync(handle.fileno())
+            try:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+                os.fchmod(handle.fileno(), mode)
+                os.fsync(handle.fileno())
+            except BaseException as error:
+                write_error = error
+                raise
         os.replace(temporary, path)
     except BaseException:
         with contextlib.suppress(OSError):
             temporary.unlink(missing_ok=True)
+        if write_error is not None:
+            raise write_error
         raise
     _fsync_directory(path.parent)
 

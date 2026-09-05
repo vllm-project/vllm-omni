@@ -506,9 +506,11 @@ def test_atomic_json_cleanup_failure_preserves_replace_error(
     assert len(list(tmp_path.glob(".domain.json.*.tmp"))) == 1
 
 
+@pytest.mark.parametrize("close_fails", [False, True])
 def test_atomic_json_write_failure_preserves_error_when_cleanup_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    close_fails: bool,
 ) -> None:
     path = tmp_path / "domain.json"
     write_error = OSError(errno.EIO, "injected write failure")
@@ -522,7 +524,11 @@ def test_atomic_json_write_failure_preserves_error_when_cleanup_fails(
             raise PermissionError(errno.EACCES, "injected cleanup failure")
         original_unlink(target, missing_ok=missing_ok)
 
-    _inject_temporary_file_failure(monkeypatch, write_error=write_error)
+    _inject_temporary_file_failure(
+        monkeypatch,
+        write_error=write_error,
+        close_error=OSError(errno.EIO, "injected close failure") if close_fails else None,
+    )
     monkeypatch.setattr(Path, "unlink", fail_temporary_unlink)
 
     with pytest.raises(OSError) as error:
