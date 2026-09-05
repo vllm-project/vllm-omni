@@ -889,6 +889,10 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         cfg = vllm_config.model_config.hf_config
         self.model_stage = vllm_config.model_config.model_stage
         self.multimodal_config = vllm_config.model_config.multimodal_config
+        # AR stage: retain full-payload hidden slices on device across decode
+        # steps and adapt the payload once at request end. Transport remains
+        # the existing connector path (see mammoth_moda2.ar2dit_full_payload).
+        self.omni_payload_at_request_end = self.model_stage == "ar"
 
         # For debugging/alignment with qwen2.5-omni: explicitly nullify unused stages.
         self.ar = None

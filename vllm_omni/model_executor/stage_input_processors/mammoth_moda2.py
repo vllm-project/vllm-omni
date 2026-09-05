@@ -3,9 +3,13 @@
 from collections.abc import Mapping
 from typing import Any
 
+import torch
 from vllm.inputs import TextPrompt
+from vllm.logger import init_logger
 
 from vllm_omni.inputs.data import OmniTokensPrompt
+
+logger = init_logger(__name__)
 
 
 def _as_dict(prompt: Any) -> dict[str, Any]:
@@ -29,6 +33,67 @@ def _coerce_dim(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return iv if iv > 0 else default
+
+
+def _first_int(values: Any) -> int | None:
+    if isinstance(values, (list, tuple)):
+        values = values[0] if values else None
+    try:
+        return int(values)
+    except (TypeError, ValueError):
+        return None
+
+
+def _maybe_synthesize_t2i_token_ids(
+    gen_token_ids: list[int],
+    generated_hidden_len: int,
+    addi_info: Mapping[str, Any],
+) -> list[int]:
+    """Fill async T2I placeholders with ids that preserve DiT mask categories.
+
+    Known sampled ids are retained. Missing visual positions use the first
+    visual-vocabulary id because DiT only consumes visual/EOL membership when
+    splitting hidden states; this does not reconstruct sampled token identity.
+    """
+    if generated_hidden_len <= 0:
+        return gen_token_ids
+    if len(gen_token_ids) == generated_hidden_len and all(token_id != -1 for token_id in gen_token_ids):
+        return gen_token_ids
+
+    omni_task = addi_info.get("omni_task")
+    if not isinstance(omni_task, list) or not omni_task or omni_task[0] != "t2i":
+        return gen_token_ids
+
+    ar_width = _first_int(addi_info.get("ar_width"))
+    ar_height = _first_int(addi_info.get("ar_height"))
+    visual_start = _first_int(addi_info.get("visual_token_start_id"))
+    eol_token_id = _first_int(addi_info.get("eol_token_id"))
+    if (
+        ar_width is None
+        or ar_width <= 0
+        or ar_height is None
+        or ar_height <= 0
+        or visual_start is None
+        or eol_token_id is None
+    ):
+        return gen_token_ids
+
+    row_stride = ar_width + 1
+    expected_hidden_len = ar_height * row_stride
+    if generated_hidden_len != expected_hidden_len:
+        raise ValueError(
+            "mammoth_moda2 generated hidden states length mismatch: "
+            f"expected {expected_hidden_len} from AR grid {ar_width}x{ar_height}, "
+            f"got {generated_hidden_len}"
+        )
+
+    synthesized = [
+        eol_token_id if pos % row_stride == ar_width else visual_start for pos in range(generated_hidden_len)
+    ]
+    for pos, token_id in enumerate(gen_token_ids[:generated_hidden_len]):
+        if token_id != -1:
+            synthesized[pos] = token_id
+    return synthesized
 
 
 def ar2dit(
@@ -113,3 +178,114 @@ def ar2dit(
         )
 
     return dit_inputs
+
+
+def ar2dit_token_only(
+    source_outputs: list[Any],
+    prompt: Any = None,
+    _requires_multimodal_data: bool = False,
+) -> list[OmniTokensPrompt]:
+    """Sync-side placeholder for the DiT stage; tensors arrive via the full-payload connector.
+
+    In request-end full-payload mode the AR stage retains hidden states in the
+    runner-side accumulator and ships them through the stage connector once the
+    request finishes (see ``ar2dit_full_payload``). The DiT request therefore
+    only needs placeholder token ids to be schedulable.
+    """
+    del prompt
+    dit_inputs: list[OmniTokensPrompt] = []
+    for ar_output in source_outputs:
+        if not getattr(ar_output, "finished", False):
+            continue
+        dit_inputs.append(
+            OmniTokensPrompt(
+                prompt_token_ids=[0],
+                additional_information=None,
+                multi_modal_data=None,
+                mm_processor_kwargs=None,
+            )
+        )
+    return dit_inputs
+
+
+def ar2dit_full_payload(
+    transfer_manager: Any,
+    pooling_output: dict[str, Any],
+    request: Any,
+    **_: Any,
+) -> dict[str, Any] | None:
+    """Producer-side request-end payload adapter for the existing connector.
+
+    The AR runner emits per-step ``pooling_output["hidden"]`` slices (one slice
+    per scheduled span). In request-end full-payload mode
+    (``omni_payload_at_request_end``) those slices are retained on the device by
+    the full-payload accumulator, so by the time this builder fires at request
+    end, ``pooling_output["hidden"]`` is the full prefill+decode hidden-state
+    trajectory of size ``len(prompt_token_ids) + len(output_token_ids) - 1``
+    (the final look-ahead token has no hidden state). This is the single place
+    where the GPU -> CPU + float32 materialization happens. This function only
+    adapts the payload; the transfer manager/connector owns serialization and
+    transport. The emitted schema matches the legacy ``ar2dit`` bridge.
+    """
+    del transfer_manager
+    rid = getattr(request, "external_req_id", None) or getattr(request, "request_id", "?")
+    if not isinstance(pooling_output, dict) or not isinstance(pooling_output.get("hidden"), torch.Tensor):
+        logger.error(
+            "mammoth_moda2.ar2dit_full_payload: missing 'hidden' tensor payload "
+            "(type=%s, keys=%s) for req=%s; DiT stage will time out waiting for input.",
+            type(pooling_output).__name__,
+            sorted(pooling_output) if isinstance(pooling_output, dict) else None,
+            rid,
+        )
+        return None
+
+    hidden = pooling_output["hidden"]
+    prompt_token_ids = list(getattr(request, "prompt_token_ids", None) or [])
+    # Exclude the final look-ahead token: it has no corresponding hidden state.
+    gen_token_ids = list(getattr(request, "output_token_ids", None) or [])[:-1]
+
+    # Single D2H + float32 materialization for the whole request. float32 so the
+    # tensor crosses the stage boundary (the serializer uses numpy, which has no
+    # bf16); the DiT re-casts to the model dtype.
+    full_hidden_states = hidden.detach().to("cpu").float().contiguous()
+    hidden_total = int(full_hidden_states.shape[0])
+    generated_hidden_len = hidden_total - len(prompt_token_ids)
+
+    # Image size / sampling knobs come from the AR prompt metadata carried on
+    # the request. Defaults mirror the legacy ar2dit bridge.
+    addi_info = getattr(request, "additional_information_cpu", None)
+    if not isinstance(addi_info, Mapping):
+        addi_info = {}
+
+    gen_token_ids = _maybe_synthesize_t2i_token_ids(gen_token_ids, generated_hidden_len, addi_info)
+    if any(token_id == -1 for token_id in gen_token_ids):
+        raise ValueError(f"mammoth_moda2 unresolved output token placeholders for req={rid}")
+    full_token_ids = prompt_token_ids + gen_token_ids
+    if hidden_total != len(full_token_ids):
+        raise ValueError(
+            "mammoth_moda2 hidden states length mismatch: "
+            f"expected {len(full_token_ids)} (prompt={len(prompt_token_ids)}, "
+            f"generated={len(gen_token_ids)}), got {hidden_total} for req={rid}"
+        )
+
+    image_height = _coerce_dim((addi_info.get("image_height") or [None])[0], 1024)
+    image_width = _coerce_dim((addi_info.get("image_width") or [None])[0], 1024)
+    text_guidance_scale = (addi_info.get("text_guidance_scale") or [9.0])[0]
+    cfg_range = addi_info.get("cfg_range") or [0.0, 1.0]
+    num_inference_steps = (addi_info.get("num_inference_steps") or [50])[0]
+
+    # The text/image condition split is performed in the DiT pipeline, which
+    # sources the distinguishing token ids from the model config. Pass through
+    # the raw AR hidden states + token ids and the question/answer boundary.
+    return {
+        # float32 so the tensor crosses the stage boundary (the serializer uses
+        # numpy, which has no bf16); the DiT re-casts to the model dtype.
+        "full_hidden_states": full_hidden_states,
+        "full_token_ids": full_token_ids,
+        "answer_start_index": [len(prompt_token_ids)],
+        "image_height": [int(image_height)],
+        "image_width": [int(image_width)],
+        "text_guidance_scale": [float(text_guidance_scale)],
+        "cfg_range": [float(cfg_range[0]), float(cfg_range[1])],
+        "num_inference_steps": [int(num_inference_steps)],
+    }

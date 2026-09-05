@@ -1847,22 +1847,36 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         )
 
         if self.omni_prefix_cache is None and needs_scheduled_hidden_payload and not audio_sparse_output:
-            num_valid_tokens = min(
-                int(scheduler_output.total_num_scheduled_tokens),
-                int(hidden_states.shape[0]),
-            )
-            if len(downstream_req_ids) == len(req_ids_output_copy):
-                with record_function_or_nullcontext("omni_output_builder:hidden_d2h/scheduled"):
-                    hidden_states_cpu = _to_cpu_contiguous(hidden_states[:num_valid_tokens])
-            else:
+            if defer_full_payload_d2h:
+                # Request-end full-payload mode: retain per-request hidden
+                # slices on the producing device for accumulator lifetime
+                # safety. This only removes per-step host materialization;
+                # the existing connector still owns request-end D2H/transport.
                 req_hidden_states_cpu = {}
-                with record_function_or_nullcontext("omni_output_builder:hidden_d2h/per_request"):
+                with record_function_or_nullcontext("omni_output_builder:hidden_snapshot/per_request"):
                     for rid in downstream_req_ids:
                         idx = req_id_to_index_output_copy[rid]
                         start = int(query_start_loc_cpu[idx])
                         sched = int(num_scheduled_tokens_np[idx])
                         end = start + sched
-                        req_hidden_states_cpu[rid] = _to_cpu_contiguous(hidden_states[start:end])
+                        req_hidden_states_cpu[rid] = snapshot_mm_payload({"hidden": hidden_states[start:end]})["hidden"]
+            else:
+                num_valid_tokens = min(
+                    int(scheduler_output.total_num_scheduled_tokens),
+                    int(hidden_states.shape[0]),
+                )
+                if len(downstream_req_ids) == len(req_ids_output_copy):
+                    with record_function_or_nullcontext("omni_output_builder:hidden_d2h/scheduled"):
+                        hidden_states_cpu = _to_cpu_contiguous(hidden_states[:num_valid_tokens])
+                else:
+                    req_hidden_states_cpu = {}
+                    with record_function_or_nullcontext("omni_output_builder:hidden_d2h/per_request"):
+                        for rid in downstream_req_ids:
+                            idx = req_id_to_index_output_copy[rid]
+                            start = int(query_start_loc_cpu[idx])
+                            sched = int(num_scheduled_tokens_np[idx])
+                            end = start + sched
+                            req_hidden_states_cpu[rid] = _to_cpu_contiguous(hidden_states[start:end])
 
         # NOTE: pooler_output here is used only for the full-payload accumulation
         # path (accumulate_full_payload_output) and is NOT passed on the wire via
