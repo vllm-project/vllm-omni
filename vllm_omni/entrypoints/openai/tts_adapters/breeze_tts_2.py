@@ -34,6 +34,10 @@ class BreezeTTS2Adapter(ARTTSAdapter):
     stage_keys = frozenset({"breeze_tts_2"})
     model_archs = frozenset({"BreezeForConditionalGeneration"})
     name = "breeze_tts_2"
+    # Breeze's architecture is unique, while its stage id is namespaced and not
+    # shared.  Resolve architecture-only deployments ahead of generic/default
+    # stage-key detectors without competing with VoxCPM's priority-10 rule.
+    detect_priority = 9
     supported_output_sample_rates = frozenset({24000})
 
     def _load_supported_speakers(self) -> set[str]:
@@ -108,7 +112,7 @@ class BreezeTTS2Adapter(ARTTSAdapter):
         if request.ref_audio is not None:
             ref_audio = request.ref_audio[0] if isinstance(request.ref_audio, list) else request.ref_audio
             wav_list, sr, cache_key = await server._resolve_ref_audio(ref_audio)
-            payload["ref_audio"] = (np.asarray(wav_list, dtype=np.float32), int(sr))
+            payload["ref_audio"] = np.asarray(wav_list, dtype=np.float32)
             payload["ref_audio_sample_rate"] = int(sr)
         else:
             cache_key = None

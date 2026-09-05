@@ -322,19 +322,6 @@ class BreezeTTS2TextEncoder(nn.Module):
         params = dict(self.named_parameters())
         loaded: set[str] = set()
         for name, tensor in weights:
-            # Checkpoints seen in the wild use either ``text_encoder.*``,
-            # ``text_encoder.encoder.*`` or an extra ``model.*`` wrapper.
-            # Normalize all wrapper combinations before resolving local
-            # parameter names.
-            changed = True
-            while changed:
-                changed = False
-                for prefix in ("model.", "encoder."):
-                    if name.startswith(prefix):
-                        name = name[len(prefix) :]
-                        changed = True
-            if name.startswith("text_encoder."):
-                name = name[len("text_encoder.") :]
             target = name
             shard_id: str | int | None = None
             for packed_name, source_name, source_id in stacked_params_mapping:
@@ -351,7 +338,7 @@ class BreezeTTS2TextEncoder(nn.Module):
                 loader(parameter, tensor)
             else:
                 loader(parameter, tensor, shard_id)
-            loaded.add(name)
+            loaded.add(target)
         return loaded
 
 

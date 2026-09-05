@@ -72,9 +72,9 @@ def test_talker2codec_full_payload_transposes_accumulated_frames():
     )
 
 
-def test_talker2codec_full_payload_accepts_connector_keyword_and_returns_struct():
+def test_talker2codec_full_payload_accepts_runner_pooling_output():
     payload = talker2codec_full_payload(
-        multimodal_output={"codes": {"audio": torch.tensor([[9, 8]], dtype=torch.int16)}},
+        pooling_output={"codes.audio": torch.tensor([[9, 8]], dtype=torch.int16)},
         request=None,
     )
 

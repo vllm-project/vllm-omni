@@ -21,6 +21,7 @@ BREEZE_TTS_2_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
+            async_chunk_process_next_stage_input_func=f"{_PROC}.talker2codec_async_chunk",
             custom_process_next_stage_input_func=f"{_PROC}.talker2codec_full_payload",
             sampling_constraints={
                 "detokenize": False,
@@ -39,6 +40,7 @@ BREEZE_TTS_2_PIPELINE = PipelineConfig(
             sync_process_input_func=f"{_PROC}.talker2codec",
             sampling_constraints={"detokenize": True},
             requires_full_payload_input=True,
+            retains_state_across_chunks=True,
         ),
     ),
 )

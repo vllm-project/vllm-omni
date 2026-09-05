@@ -36,7 +36,6 @@ class BreezeReferenceAudioTokenizer:
         cls,
         model_path: str,
         *,
-        audio_tokenizer_path: str | None = None,
         num_codebooks: int = 16,
         codebook_size: int = 2048,
         **kwargs: Any,
@@ -46,25 +45,17 @@ class BreezeReferenceAudioTokenizer:
             Qwen3TTSTokenizer,
         )
 
-        if audio_tokenizer_path is None:
-            local_path = Path(model_path) / "audio_tokenizer"
-            if not local_path.is_dir():
-                raise FileNotFoundError(
-                    "Breeze reference audio tokenizer was not found at "
-                    f"{local_path}; provide audio_tokenizer_path explicitly"
-                )
-            audio_tokenizer_path = str(local_path)
-        tokenizer = Qwen3TTSTokenizer.from_pretrained(audio_tokenizer_path, **kwargs)
+        local_path = Path(model_path) / "audio_tokenizer"
+        if not local_path.is_dir():
+            raise FileNotFoundError(
+                f"Breeze reference audio tokenizer was not found at {local_path}"
+            )
+        tokenizer = Qwen3TTSTokenizer.from_pretrained(str(local_path), **kwargs)
         return cls(tokenizer, num_codebooks=num_codebooks, codebook_size=codebook_size)
 
     @torch.inference_mode()
     def encode(self, audio: Any, sample_rate: int | None = None) -> torch.Tensor:
-        """Encode one path, waveform, or ``(waveform, sample_rate)`` pair."""
-        # A tuple is the explicit ``(waveform, sample_rate)`` form.  Do not
-        # interpret a two-sample Python list as that pair.
-        if isinstance(audio, tuple) and len(audio) == 2 and _is_sample_rate(audio[1]):
-            audio, sample_rate = audio[0], int(audio[1])
-
+        """Encode one waveform or audio source into ``(T, Q)`` codes."""
         if isinstance(audio, torch.Tensor):
             audio = audio.detach().cpu().numpy()
         elif isinstance(audio, list) and audio and all(isinstance(x, (int, float)) for x in audio):
@@ -90,10 +81,11 @@ class BreezeReferenceAudioTokenizer:
         if codes is None:
             raise ValueError("reference audio tokenizer returned no audio_codes")
 
-        if isinstance(codes, (tuple, list)) and codes and not _is_tensor_like(codes):
+        if isinstance(codes, (tuple, list)) and codes:
             # Qwen3TTSTokenizer returns one tensor per input waveform.
-            if len(codes) == 1:
-                codes = codes[0]
+            if len(codes) != 1:
+                raise ValueError(f"only one reference waveform is supported, got {len(codes)}")
+            codes = codes[0]
         codes = torch.as_tensor(codes)
         if codes.ndim == 3:
             if codes.shape[0] != 1:
@@ -118,18 +110,6 @@ class BreezeReferenceAudioTokenizer:
             )
         # int16 is enough for Mimi/Qwen3-TTS codes and halves IPC/cache memory.
         return codes.to(dtype=torch.int16)
-
-
-def _is_sample_rate(value: Any) -> bool:
-    try:
-        value = int(value)
-    except (TypeError, ValueError):
-        return False
-    return 1_000 <= value <= 200_000
-
-
-def _is_tensor_like(value: Any) -> bool:
-    return isinstance(value, (torch.Tensor, np.ndarray))
 
 
 __all__ = ["BreezeReferenceAudioTokenizer"]

@@ -9,7 +9,10 @@ generation order without importing HuggingFace GenerationMixin.
 
 from __future__ import annotations
 
+import hashlib
+import os
 from collections.abc import Iterable, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -41,21 +44,11 @@ def _prefixed(prefix: str, name: str) -> str:
 
 def _normalize_request_infos(infos: Any) -> list[dict[str, Any]] | None:
     """Normalize runner metadata to one mutable dict per request."""
-    if isinstance(infos, Mapping):
-        # A single request may be passed as the info dict itself. A mapping of
-        # request ids to info dicts is the alternate runner representation.
-        if any(key in infos for key in ("prompt_ids", "additional_information", "_omni_is_prefill")):
-            return [infos if isinstance(infos, dict) else dict(infos)]
-        values = list(infos.values())
-        if all(isinstance(value, Mapping) for value in values):
-            return [value if isinstance(value, dict) else dict(value) for value in values]
+    if not isinstance(infos, Sequence) or isinstance(infos, (str, bytes, bytearray)):
         return None
-    if isinstance(infos, Sequence) and not isinstance(infos, (str, bytes, bytearray)):
-        return [
-            value if isinstance(value, dict) else dict(value) if isinstance(value, Mapping) else {}
-            for value in infos
-        ]
-    return None
+    if not all(isinstance(info, dict) for info in infos):
+        return None
+    return infos
 
 
 def _iter_request_rows(
@@ -88,29 +81,6 @@ def _iter_request_rows(
     )
 
 
-def _scalar_int(value: Any, *, default: int) -> int:
-    if isinstance(value, torch.Tensor):
-        if value.numel() == 0:
-            return default
-        value = value.reshape(-1)[0].item()
-    elif isinstance(value, (list, tuple)):
-        if not value:
-            return default
-        value = value[0]
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _resolve_max_new_frames(info: Mapping[str, Any]) -> int:
-    for key in ("breeze_max_new_frames", "max_new_frames", "_omni_max_tokens"):
-        value = _scalar_int(info.get(key), default=-1)
-        if value > 0:
-            return value
-    return -1
-
-
 def _check_weight_shape(name: str, tensor: torch.Tensor, expected: tuple[int, ...]) -> None:
     """Fail early for Breeze-owned, non-sharded checkpoint tensors."""
     actual = tuple(int(dim) for dim in tensor.shape)
@@ -124,6 +94,11 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
     have_multimodal_outputs = True
     has_preprocess = True
     has_postprocess = True
+    # Stage 0 emits a tiny per-frame codec payload. Let the AR runner snapshot
+    # it through the async-output path instead of the final-only client path.
+    use_async_omni_output = True
+    eager_omni_postprocess_before_async_output = True
+    omni_pooler_payload_include_hidden = False
     input_modalities = "text"
     gpu_resident_buffer_keys: set[tuple[str, str]] = {
         ("hidden_states", "last"),
@@ -133,6 +108,8 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
         super().__init__()
         self.vllm_config = vllm_config
         self.config: BreezeTTS2Config = vllm_config.model_config.hf_config
+        self._async_chunk = bool(vllm_config.model_config.async_chunk)
+        self._golden_dump_dir = os.environ.get("VLLM_OMNI_BREEZE_GOLDEN_DIR")
 
         backbone_config = self.config.backbone_config
         backbone_vllm_config = vllm_config.with_hf_config(
@@ -144,6 +121,12 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
             vllm_config=backbone_vllm_config,
             prefix=_prefixed(prefix, "model"),
         )
+        # Upstream's Qwen3 adapter keeps only decoder layers/norm/RoPE and
+        # replaces the standard text embedding with Breeze's summed audio/text
+        # tables.  Breeze always supplies ``inputs_embeds`` through preprocess,
+        # so remove the unused Qwen embedding instead of allocating and then
+        # reporting an uninitialized 151936x2048 parameter at load time.
+        self.model.embed_tokens = nn.Identity()
 
         self.hidden_size = int(backbone_config.hidden_size)
         self.num_codebooks = int(self.config.num_codebooks)
@@ -155,10 +138,9 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
             else self.codebook_vocab_size
         )
         self.codebook_eos_token_id = int(self.config.codebook_eos_token_id)
-        self.codebook_pad_token_id = int(self.config.codebook_pad_token_id)
         self.audio_token_id = int(self.config.audio_token_id)
         self.audio_eos_token_id = int(self.config.audio_eos_token_id)
-        self.text_pad_token_id = int(getattr(self.config, "pad_token_id", 0) or 0)
+        self.text_pad_token_id = int(self.config.pad_token_id)
 
         self.lm_head = ParallelLMHead(
             self.codebook_vocab_size + 1,
@@ -177,10 +159,7 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
         # Keep Breeze's standalone text table even though the normal path
         # uses T5Gemma2 outputs. It is part of the checkpoint contract and is
         # also the correct fallback when a checkpoint omits text_encoder.
-        self.embed_text_tokens = nn.Embedding(
-            int(getattr(self.config, "text_vocab_size", 262158)),
-            self.hidden_size,
-        )
+        self.embed_text_tokens = nn.Embedding(int(self.config.text_vocab_size), self.hidden_size)
         self.register_buffer(
             "audio_token_offsets",
             torch.arange(self.num_codebooks, dtype=torch.long) * self.codebook_vocab_size,
@@ -194,7 +173,7 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
             bias=False,
         )
         self.depth_decoder = BreezeDepthDecoderForCausalLM(self.config.depth_decoder_config)
-        if bool(getattr(self.config, "tie_codebooks_embeddings", False)):
+        if bool(self.config.tie_codebooks_embeddings):
             # The upstream HF model ties these tables. Sharing the Parameter
             # also prevents a tied checkpoint from leaving the depth input
             # embedding randomly initialized when only one key is serialized.
@@ -208,30 +187,17 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
     # Embedding and backbone hooks
     # ------------------------------------------------------------------
 
-    def embed_audio_codes(self, codes: torch.Tensor) -> torch.Tensor:
-        """Return summed Breeze audio embedding for ``(..., 16)`` codes."""
-        if codes.shape[-1] != self.num_codebooks:
-            raise ValueError(f"expected {self.num_codebooks} codebooks, got {tuple(codes.shape)}")
-        codes = codes.to(dtype=torch.long)
+    def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
+        """Embed complete generated codec frames; scalar ids are invalid."""
+        if input_ids.ndim < 1 or input_ids.shape[-1] != self.num_codebooks:
+            raise ValueError(
+                "Breeze embed_input_ids requires complete codec frames with shape "
+                f"(..., {self.num_codebooks}), got {tuple(input_ids.shape)}"
+            )
+        codes = input_ids.to(dtype=torch.long)
         offsets = self.audio_token_offsets.to(device=codes.device)
         ids = codes.clamp(0, self.codebook_vocab_size - 1) + offsets
         return self.embed_audio_tokens(ids).sum(dim=-2)
-
-    def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
-        """Embed generated full codec frames or a scalar codebook-0 id."""
-        if input_ids.ndim >= 2 and input_ids.shape[-1] == self.num_codebooks:
-            return self.embed_audio_codes(input_ids)
-        original_shape = input_ids.shape
-        scalar = input_ids.to(torch.long).reshape(-1).clamp(0, self.codebook_vocab_size - 1)
-        frame = torch.full(
-            (scalar.numel(), self.num_codebooks),
-            self.codebook_eos_token_id,
-            dtype=torch.long,
-            device=scalar.device,
-        )
-        frame[:, 0] = scalar
-        embeds = self.embed_audio_codes(frame)
-        return embeds.reshape(*original_shape, self.hidden_size)
 
     def forward(
         self,
@@ -294,13 +260,11 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
             if input_values is None:
                 raise ValueError("Breeze audio placeholders require input_values")
             codes = torch.as_tensor(input_values, device=device, dtype=torch.long)
-            if codes.ndim == 3 and codes.shape[0] == 1:
-                codes = codes[0]
             if codes.ndim != 2 or codes.shape[-1] != self.num_codebooks:
                 raise ValueError(f"Breeze input_values must be (T, {self.num_codebooks})")
             if int(codes.shape[0]) != int(audio_mask.sum()):
                 raise ValueError("Breeze reference code count does not match audio placeholders")
-            output[audio_mask] = self.embed_audio_codes(codes).to(dtype=output.dtype)
+            output[audio_mask] = self.embed_input_ids(codes).to(dtype=output.dtype)
 
         eos_mask = prompt_ids == self.audio_eos_token_id
         if bool(eos_mask.any()):
@@ -310,7 +274,7 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
                 dtype=torch.long,
                 device=device,
             )
-            output[eos_mask] = self.embed_audio_codes(eos_codes).expand(int(eos_mask.sum()), -1)
+            output[eos_mask] = self.embed_input_ids(eos_codes).expand(int(eos_mask.sum()), -1)
         return output
 
     def preprocess(
@@ -321,14 +285,16 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Build prefill embeddings and consume one completed frame per decode."""
         del input_embeds
-        info = _merge_info(info_dict)
+        info = dict(info_dict)
         span_len = int(input_ids.shape[0])
         is_prefill = bool(info.get("_omni_is_prefill", span_len > 1))
         if is_prefill:
-            full_ids = info.get("prompt_ids", input_ids)
+            full_ids = info.get("prompt_ids")
+            if not isinstance(full_ids, torch.Tensor):
+                raise RuntimeError("Breeze prefill is missing prompt_ids")
             full_embeds = info.get("breeze_prompt_embeds")
             if not isinstance(full_embeds, torch.Tensor):
-                full_embeds = self._build_prompt_embeddings(torch.as_tensor(full_ids), info).detach().cpu().contiguous()
+                full_embeds = self._build_prompt_embeddings(full_ids, info).detach().cpu().contiguous()
             offset = int(info.get("breeze_prefill_offset", info.get("_omni_num_computed_tokens", 0)) or 0)
             take = full_embeds[offset : offset + span_len].to(device=input_ids.device)
             if take.shape[0] != span_len:
@@ -339,20 +305,43 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
                 {
                     "breeze_prompt_embeds": full_embeds,
                     "breeze_prefill_offset": offset + span_len,
-                    "breeze_step": int(info.get("breeze_step", 0) or 0),
                     "breeze_generated_frames": int(info.get("breeze_generated_frames", 0) or 0),
-                    "breeze_max_new_frames": _resolve_max_new_frames(info),
-                    "breeze_finished": bool(info.get("breeze_finished", False)),
+                    "breeze_max_new_frames": int(info.get("breeze_max_new_frames", -1)),
                 },
             )
 
         frame = info.get("breeze_current_frame")
         if isinstance(frame, torch.Tensor) and frame.numel() == self.num_codebooks:
             frame = frame.to(device=input_ids.device, dtype=torch.long).reshape(1, 1, -1)
-            embeds = self.embed_audio_codes(frame).reshape(1, -1)
+            embeds = self.embed_input_ids(frame).reshape(1, -1)
             safe_id = frame[..., 0].reshape_as(input_ids).to(dtype=input_ids.dtype)
             return safe_id, embeds, {}
-        return input_ids, self.embed_input_ids(input_ids.reshape(1, 1)), {}
+        has_breeze_state = any(
+            key in info
+            for key in (
+                "breeze_current_frame",
+                "breeze_audio_codes",
+                "breeze_generated_frames",
+                "breeze_prompt_embeds",
+            )
+        )
+        if has_breeze_state:
+            # A real decode must consume the full frame produced from the
+            # preceding backbone hidden state. A scalar fallback would silently
+            # fill codebooks 1..15 with EOS and corrupt AR state.
+            raise RuntimeError(
+                "Breeze decode is missing breeze_current_frame; refusing scalar fallback "
+                "because it would fill codebooks 1..15 with EOS"
+            )
+        # Runner-only dummy execution has no Breeze codec state. It must not
+        # invent a semantically invalid audio frame; a stable zero embedding is
+        # sufficient for shape/profiling warmup.
+        dummy_embeds = torch.zeros(
+            (*input_ids.shape, self.hidden_size),
+            device=input_ids.device,
+            dtype=self.embed_audio_tokens.weight.dtype,
+        )
+        return input_ids, dummy_embeds, {}
 
     def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
         if hidden_states.numel() == 0:
@@ -373,15 +362,7 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
             hidden_states = hidden_states.text_hidden_states
         if hidden_states is None:
             return None
-        logits = self.logits_processor(self.lm_head, hidden_states)
-        if logits is None:
-            return None
-        if self._codec_disallowed_mask is None or self._codec_disallowed_mask.device != logits.device:
-            mask = torch.zeros(logits.shape[-1], dtype=torch.bool, device=logits.device)
-            if self.codebook_size < self.codebook_vocab_size:
-                mask[self.codebook_size : self.codebook_vocab_size] = True
-            self._codec_disallowed_mask = mask
-        logits = logits.masked_fill(self._codec_disallowed_mask, float("-inf"))
+        logits = self._main_head_logits(hidden_states)
 
         # ``make_omni_output`` runs immediately before this hook. It records
         # requests whose previous hidden state selected EOS or reached the
@@ -400,10 +381,19 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
                     row[:, self.codebook_vocab_size] = 0.0
         return logits
 
+    def _main_head_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        if logits is None:
+            raise RuntimeError("Breeze main head returned no logits")
+        if self._codec_disallowed_mask is None or self._codec_disallowed_mask.device != logits.device:
+            mask = torch.zeros(logits.shape[-1], dtype=torch.bool, device=logits.device)
+            if self.codebook_size < self.codebook_vocab_size:
+                mask[self.codebook_size : self.codebook_vocab_size] = True
+            self._codec_disallowed_mask = mask
+        return logits.masked_fill(self._codec_disallowed_mask, float("-inf"))
+
     @torch.no_grad()
     def _generate_depth_codes(self, backbone_hidden: torch.Tensor, code0: int) -> torch.Tensor:
-        if code0 < 0 or code0 >= self.codebook_size:
-            return torch.empty((0,), dtype=torch.long, device=backbone_hidden.device)
         sequence = torch.tensor([[0, code0]], dtype=torch.long, device=backbone_hidden.device)
         generated = [int(code0)]
         for _ in range(self.num_codebooks - 1):
@@ -418,7 +408,7 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
             next_code = int(torch.argmax(logits, dim=-1).item())
             generated.append(next_code)
             sequence = torch.cat([sequence, torch.tensor([[next_code]], device=sequence.device)], dim=1)
-        return torch.tensor(generated, dtype=torch.long, device=backbone_hidden.device)
+        return torch.tensor(generated, dtype=torch.long, device=backbone_hidden.device).unsqueeze(0)
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
@@ -426,7 +416,7 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
             self._batch_state_spans = None
             return model_outputs
         hidden = model_outputs
-        infos = kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or []
+        infos = kwargs.get("model_intermediate_buffer", [])
         spans = kwargs.get("request_token_spans")
         info_items = _normalize_request_infos(infos)
         if info_items is None:
@@ -438,19 +428,8 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
         self._batch_state = info_items
         self._batch_state_spans = spans
         per_request_codes: list[torch.Tensor] = []
-        has_codes = False
+
         for index, info in enumerate(info_items):
-            if not isinstance(info, dict):
-                per_request_codes.append(hidden.new_empty((0, self.num_codebooks), dtype=torch.long))
-                continue
-            if bool(info.get("_omni_is_prefill", False)):
-                existing = info.get("breeze_audio_codes")
-                per_request_codes.append(
-                    existing
-                    if isinstance(existing, torch.Tensor)
-                    else hidden.new_empty((0, self.num_codebooks), dtype=torch.long)
-                )
-                continue
             if spans is not None and index < len(spans):
                 row_start = max(0, int(spans[index][0]))
                 row_end = min(int(spans[index][1]), int(hidden.shape[0]))
@@ -462,45 +441,28 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
                 per_request_codes.append(hidden.new_empty((0, self.num_codebooks), dtype=torch.long))
                 continue
             row_hidden = hidden[row_end - 1]
-            main_logits = self.logits_processor(self.lm_head, row_hidden.reshape(1, -1))
-            if self._codec_disallowed_mask is None or self._codec_disallowed_mask.device != main_logits.device:
-                mask = torch.zeros(main_logits.shape[-1], dtype=torch.bool, device=main_logits.device)
-                if self.codebook_size < self.codebook_vocab_size:
-                    mask[self.codebook_size : self.codebook_vocab_size] = True
-                self._codec_disallowed_mask = mask
-            main_logits = main_logits.masked_fill(self._codec_disallowed_mask, float("-inf"))
+            if self._golden_dump_dir and bool(info.get("_omni_is_prefill", False)):
+                self._dump_golden_prefill(info, row_hidden)
+            main_logits = self._main_head_logits(row_hidden.reshape(1, -1))
             code0 = int(torch.argmax(main_logits, dim=-1).item())
             generated_frames = int(info.get("breeze_generated_frames", 0) or 0)
-            max_new_frames = _scalar_int(info.get("breeze_max_new_frames"), default=-1)
-            if max_new_frames > 0 and generated_frames >= max_new_frames:
+            max_new_frames = int(info.get("breeze_max_new_frames", -1))
+            terminal = code0 == self.codebook_vocab_size or (
+                max_new_frames > 0 and generated_frames >= max_new_frames
+            )
+            if terminal:
                 info["breeze_force_eos"] = True
-                info["breeze_finished"] = True
                 existing = info.get("breeze_audio_codes")
-                if isinstance(existing, torch.Tensor) and existing.numel():
-                    per_request_codes.append(existing)
-                    has_codes = True
-                else:
-                    per_request_codes.append(hidden.new_empty((0, self.num_codebooks), dtype=torch.long))
-                    has_codes = True
+                per_request_codes.append(
+                    existing
+                    if isinstance(existing, torch.Tensor) and existing.numel() and not self._async_chunk
+                    else hidden.new_empty((0, self.num_codebooks), dtype=torch.long)
+                )
                 continue
+            if code0 < 0 or code0 >= self.codebook_size:
+                raise RuntimeError(f"Breeze main head produced invalid codec id {code0}")
+
             frame = self._generate_depth_codes(row_hidden, code0)
-            if frame.numel() == 0:
-                # The sampled 2051 class is the main EOS.  The final decode
-                # step may therefore have no new frame, but a direct/sync
-                # downstream path still needs the frames accumulated before
-                # EOS.  Full-payload transport uses REPLACE semantics for
-                # this complete sequence, so re-emitting it is idempotent.
-                info["breeze_force_eos"] = True
-                info["breeze_finished"] = True
-                existing = info.get("breeze_audio_codes")
-                if isinstance(existing, torch.Tensor) and existing.numel():
-                    per_request_codes.append(existing)
-                    has_codes = True
-                else:
-                    per_request_codes.append(hidden.new_empty((0, self.num_codebooks), dtype=torch.long))
-                    has_codes = True
-                continue
-            frame = frame.reshape(1, self.num_codebooks)
             accumulated = info.get("breeze_audio_codes")
             accumulated = (
                 torch.cat([accumulated.to(frame.device), frame], dim=0)
@@ -510,14 +472,61 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
             info["breeze_audio_codes"] = accumulated
             info["breeze_current_frame"] = frame[0].detach()
             info["breeze_generated_frames"] = generated_frames + 1
-            info["breeze_step"] = int(info.get("breeze_step", 0) or 0) + 1
             info["breeze_force_eos"] = False
-            info["breeze_finished"] = False
-            per_request_codes.append(accumulated)
-            has_codes = True
-        if not has_codes:
-            return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+            per_request_codes.append(frame if self._async_chunk else accumulated)
+        if self._golden_dump_dir:
+            for info in info_items:
+                self._dump_golden_frames(info)
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs={"codes": {"audio": per_request_codes}})
+
+    def _dump_golden_frames(self, info: dict[str, Any]) -> None:
+        """Write terminal codec frames for opt-in golden-parity diagnostics."""
+        codes = info.get("breeze_audio_codes")
+        if not info.get("breeze_force_eos", False) or not isinstance(codes, torch.Tensor) or codes.numel() == 0:
+            return
+        prompt_ids = info.get("prompt_ids")
+        if not isinstance(prompt_ids, torch.Tensor):
+            raise RuntimeError("Breeze golden dump is missing prompt_ids")
+        digest = hashlib.sha256(prompt_ids.detach().cpu().numpy().tobytes()).hexdigest()[:16]
+        output_dir = Path(self._golden_dump_dir)  # type: ignore[arg-type]
+        output_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "template": info.get("template"),
+                "prompt_ids": prompt_ids.cpu(),
+                "codes": codes.detach().cpu().to(torch.long).contiguous(),
+                "generated_frames": int(info.get("breeze_generated_frames", 0) or 0),
+                "finished": True,
+            },
+            output_dir / f"breeze_{digest}.pt",
+        )
+
+
+    def _dump_golden_prefill(self, info: dict[str, Any], hidden: torch.Tensor) -> None:
+        """Write the terminal-prompt hidden row for opt-in parity diagnostics."""
+        prompt_ids = info.get("prompt_ids")
+        if not isinstance(prompt_ids, torch.Tensor):
+            raise RuntimeError("Breeze golden dump is missing prompt_ids")
+        digest = hashlib.sha256(prompt_ids.detach().cpu().numpy().tobytes()).hexdigest()[:16]
+        output_dir = Path(self._golden_dump_dir)  # type: ignore[arg-type]
+        output_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "template": info.get("template"),
+                "prompt_ids": prompt_ids.cpu(),
+                "hidden": hidden.detach().reshape(-1).cpu().to(torch.float32).contiguous(),
+            },
+            output_dir / f"prefill_{digest}.pt",
+        )
+
+    def on_requests_finished(self, finished_req_ids: Iterable[str]) -> None:
+        """Drop cross-step references retained for the finished AR requests."""
+        del finished_req_ids
+        # Codec/frame state lives in request-local additional_information and is
+        # freed with the Request. Only the short logits-to-state mapping is
+        # model-owned and must not leak into the next micro-batch.
+        self._batch_state = None
+        self._batch_state_spans = None
 
     # ------------------------------------------------------------------
     # Weight loading
@@ -552,9 +561,7 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
                 continue
             if name.startswith("text_encoder."):
                 text_name = name[len("text_encoder.") :]
-                if text_name.startswith("encoder."):
-                    text_name = text_name[len("encoder.") :]
-                text_weights.append(("encoder." + text_name, tensor))
+                text_weights.append((text_name, tensor))
                 continue
             if name.startswith("depth_decoder."):
                 depth_weights.append((name[len("depth_decoder.") :], tensor))
@@ -574,7 +581,8 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
                 else tuple(param.shape)
             )
             _check_weight_shape(name, tensor, expected_shape)
-            default_weight_loader(param, tensor)
+            loader = getattr(param, "weight_loader", default_weight_loader)
+            loader(param, tensor)
             loaded.add(target)
 
         if backbone_weights:
@@ -583,16 +591,15 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
             loaded.update("text_encoder." + key for key in self.text_encoder.load_weights(text_weights))
         if depth_weights:
             loaded.update("depth_decoder." + key for key in self.depth_decoder.load_weights(depth_weights))
+            if bool(getattr(self.config, "tie_codebooks_embeddings", False)):
+                # The checkpoint serializes only one side of the tied table.
+                # ``named_parameters(remove_duplicate=True)`` exposes it as the
+                # talker-owned ``embed_audio_tokens.weight``, so report both
+                # aliases to the strict weight tracker.
+                if "depth_decoder.model.embed_tokens.weight" in loaded:
+                    loaded.add("embed_audio_tokens.weight")
+                if "embed_audio_tokens.weight" in loaded:
+                    loaded.add("depth_decoder.model.embed_tokens.weight")
         return loaded
-
-
-def _merge_info(info_dict: Mapping[str, Any]) -> dict[str, Any]:
-    merged = dict(info_dict)
-    nested = merged.get("additional_information")
-    if isinstance(nested, Mapping):
-        for key, value in nested.items():
-            merged.setdefault(key, value)
-    return merged
-
 
 __all__ = ["BreezeTTS2TalkerForGeneration"]

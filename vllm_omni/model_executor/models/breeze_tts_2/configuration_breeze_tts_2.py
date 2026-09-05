@@ -66,6 +66,9 @@ class BreezeTTS2Config(PretrainedConfig):
         codec_model_name_or_path: str = 'kyutai/mimi',
         **kwargs: Any,
     ) -> None:
+        serialized_rope_parameters = kwargs.pop("rope_parameters", None)
+        if rope_scaling is None and serialized_rope_parameters is not None:
+            rope_scaling = serialized_rope_parameters
         # Breeze stores the Qwen3 backbone in backbone_config. This follows the
         # MOSS-TTS pattern and deliberately does not declare sub_configs.
         if backbone_config is None:
@@ -136,6 +139,12 @@ class BreezeTTS2Config(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_key_value_heads = num_key_value_heads
         self.rms_norm_eps = rms_norm_eps
+        if rope_scaling is not None:
+            # Preserve the upstream legacy field while also satisfying the
+            # normalized ``rope_parameters`` validation added in Transformers 5.
+            rope_scaling = dict(rope_scaling)
+            rope_scaling.setdefault("rope_type", rope_scaling.get("type", "default"))
+            rope_scaling.setdefault("rope_theta", rope_theta)
         self.rope_scaling = rope_scaling
         self.rope_theta = rope_theta
         self.text_encoder_bucket_max_length_ratio = text_encoder_bucket_max_length_ratio
@@ -148,13 +157,6 @@ class BreezeTTS2Config(PretrainedConfig):
         self.vocab_size = vocab_size
         self.sampling_rate = sampling_rate
         self.codec_model_name_or_path = codec_model_name_or_path
-
-        # Aliases used by code shared with MOSS-TTS.
-        self.n_vq = audio_num_codebooks
-        self.audio_pad_code = codebook_pad_token_id
-        self.audio_pad_token_id = codebook_pad_token_id
-        self.audio_start_token_id = audio_token_id
-        self.audio_end_token_id = audio_eos_token_id
 
         if not getattr(self, "architectures", None):
             self.architectures = ["BreezeForConditionalGeneration"]
@@ -288,9 +290,15 @@ class BreezeTTS2DepthDecoderConfig(PretrainedConfig):
         codebook_loss_weights: list[int] | None = None,
         dtype: str = "bfloat16",
         tie_word_embeddings: bool = False,
+        pad_token_id: int | None = 0,
         **kwargs: Any,
     ) -> None:
         kwargs.pop("model_type", None)
+        # Transformers 5 serializes the normalized field as
+        # ``rope_parameters`` while the upstream Breeze checkpoint calls it
+        # ``rope_scaling``.  Normalize before ``PretrainedConfig`` validates
+        # so ``to_dict() -> BreezeTTS2DepthDecoderConfig(**dict)`` round-trips.
+        serialized_rope_parameters = kwargs.pop("rope_parameters", None)
         if rope_scaling is None:
             rope_scaling = {
                 "factor": 32.0,
@@ -301,12 +309,21 @@ class BreezeTTS2DepthDecoderConfig(PretrainedConfig):
             }
         if codebook_loss_weights is None:
             codebook_loss_weights = [3]
+        if num_codebooks <= 0 or vocab_size <= 0:
+            raise ValueError("num_codebooks and vocab_size must be positive")
+        rope_parameters = dict(serialized_rope_parameters or rope_scaling)
+        rope_parameters.setdefault("rope_type", rope_parameters.get("type", "default"))
+        rope_parameters.setdefault("rope_theta", rope_theta)
 
         super().__init__(
             vocab_size=vocab_size,
             tie_word_embeddings=tie_word_embeddings,
+            pad_token_id=pad_token_id,
             **kwargs,
         )
+        # The vLLM depth decoder is a plain ``nn.Module``, so it does not get
+        # Transformers' PreTrainedModel default attention initialization.
+        self._attn_implementation = getattr(self, "_attn_implementation", None) or "eager"
         self.hidden_size = hidden_size
         self.backbone_hidden_size = backbone_hidden_size
         self.audio_embed_size = audio_embed_size
@@ -319,8 +336,12 @@ class BreezeTTS2DepthDecoderConfig(PretrainedConfig):
         self.hidden_act = hidden_act
         self.rms_norm_eps = rms_norm_eps
         self.rope_theta = rope_theta
-        self.rope_scaling = dict(rope_scaling)
-        self.rope_parameters = dict(rope_scaling)
+        self.rope_parameters = dict(getattr(self, "rope_parameters", None) or rope_parameters)
+        self.rope_parameters.setdefault("rope_theta", rope_theta)
+        # Transformers 4 exposes this as a plain attribute; Transformers 5
+        # implements ``rope_scaling`` as a property backed by rope_parameters.
+        if not hasattr(type(self), "rope_scaling"):
+            self.rope_scaling = self.rope_parameters
         self.rope_type = rope_scaling.get("rope_type", "default")
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
@@ -331,24 +352,7 @@ class BreezeTTS2DepthDecoderConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.codebook_loss_weights = list(codebook_loss_weights)
         self.dtype = dtype
-
-    @property
-    def rvq(self) -> int:
-        return self.num_codebooks
-
-    @property
-    def num_code_groups(self) -> int:
-        return self.num_codebooks
-
-    @property
-    def audio_vocab_size(self) -> int:
-        return self.vocab_size
-
-
-
-AutoConfig.register("breeze", BreezeTTS2Config)
-AutoConfig.register("breeze_depth_decoder_model", BreezeTTS2DepthDecoderConfig)
-AutoConfig.register("t5gemma2_text", BreezeTTS2TextEncoderConfig)
+AutoConfig.register("breeze", BreezeTTS2Config, exist_ok=True)
 
 
 __all__ = [

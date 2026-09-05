@@ -24,6 +24,7 @@ logger = init_logger(__name__)
 # concatenates rank-2 tensors, which would duplicate all earlier frames.
 # Replace the latest complete sequence instead.
 _FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset({"codes.audio"})
+_DEFAULT_CODEC_CHUNK_FRAMES = 8
 
 
 def _extract_audio_codes(output: Any) -> torch.Tensor | None:
@@ -118,34 +119,19 @@ def talker2codec_full_payload(
     pooling_output: Mapping[str, Any] | None = None,
     request: Any = None,
     is_finished: bool = False,
-    **kwargs: Any,
 ) -> OmniPayloadStruct | None:
     """Build the final Stage-1 payload from accumulated talker codes.
 
-    ``pooling_output`` is normally already flattened by the AR runner
-    (``codes.audio``), but nested payloads are accepted for connector paths
-    that bypass that helper.  Mimi consumes codebook-major IDs, so the
-    frame-major talker matrix is transposed before flattening.
+    ``pooling_output`` is the AR runner's flattened per-request payload. Mimi
+    consumes codebook-major IDs, so the frame-major talker matrix is transposed
+    before flattening.
     """
     del transfer_manager, request, is_finished
-    # The connector calls this hook with ``multimodal_output``.  Accepting
-    # ``pooling_output`` as well keeps direct/unit-test callers compatible with
-    # older vLLM-Omni versions.
-    if pooling_output is None:
-        pooling_output = kwargs.get("multimodal_output")
     if not isinstance(pooling_output, Mapping):
         return None
     audio = pooling_output.get("codes.audio")
     if audio is None:
-        nested = pooling_output.get("codes")
-        if isinstance(nested, Mapping):
-            audio = nested.get("audio")
-    if audio is None:
         return None
-    if isinstance(audio, (list, tuple)):
-        if len(audio) != 1:
-            raise ValueError(f"expected one Breeze audio-code tensor, got {len(audio)}")
-        audio = audio[0]
     codes = torch.as_tensor(audio, dtype=torch.long)
     if codes.numel() == 0:
         return None
@@ -161,4 +147,74 @@ def talker2codec_full_payload(
     )
 
 
-__all__ = ["talker2codec", "talker2codec_full_payload"]
+def _extract_current_audio_frame(
+    multimodal_output: Mapping[str, Any] | None,
+) -> torch.Tensor | None:
+    """Extract the single ``(Q,)`` frame emitted by async Stage 0."""
+    if not isinstance(multimodal_output, Mapping):
+        return None
+    codes = multimodal_output.get("codes")
+    audio = codes.get("audio") if isinstance(codes, Mapping) else None
+    if audio is None:
+        return None
+    frame = torch.as_tensor(audio, dtype=torch.long).reshape(-1)
+    if frame.numel() == 0:
+        return None
+    return frame.cpu().contiguous()
+
+
+def _codec_chunk_frames(transfer_manager: Any) -> int:
+    connector = getattr(transfer_manager, "connector", None)
+    raw_config = getattr(connector, "config", {}) or {}
+    config = raw_config.get("extra", {}) if isinstance(raw_config, Mapping) else {}
+    value = config.get("breeze_codec_chunk_frames")
+    try:
+        chunk_frames = int(value) if value is not None else _DEFAULT_CODEC_CHUNK_FRAMES
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid Breeze codec_chunk_frames={value!r}") from exc
+    if chunk_frames <= 0:
+        raise ValueError(f"Breeze codec_chunk_frames must be positive, got {chunk_frames}")
+    return chunk_frames
+
+
+def talker2codec_async_chunk(
+    transfer_manager: Any,
+    multimodal_output: Mapping[str, Any] | None,
+    request: Any,
+    is_finished: bool = False,
+) -> OmniPayloadStruct | None:
+    """Batch Stage-0 frames and send only the un-emitted codebook-major tail."""
+    request_id = request.external_req_id
+    finished = bool(is_finished or request.is_finished())
+    frame = _extract_current_audio_frame(multimodal_output)
+    if frame is not None:
+        transfer_manager.code_prompt_token_ids[request_id].append(frame)
+
+    pending = transfer_manager.code_prompt_token_ids[request_id]
+    chunk_frames = _codec_chunk_frames(transfer_manager)
+    if not pending and not finished:
+        return None
+    if len(pending) < chunk_frames and not finished:
+        return None
+
+    if pending:
+        # Stage 0 supplies frame-major ``(T, Q)`` rows. The Qwen3-TTS decoder
+        # consumes ``(Q, T)``, so transpose before flattening the emitted tail.
+        tail = torch.stack(pending, dim=0)
+        flat = tail.transpose(0, 1).contiguous().reshape(-1)
+    else:
+        flat = torch.empty(0, dtype=torch.long)
+    pending.clear()
+
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=flat),
+        meta=MetaStruct(
+            request_id=request_id,
+            code_flat_numel=int(flat.numel()),
+            codec_streaming=True,
+            finished=torch.tensor(finished, dtype=torch.bool),
+        ),
+    )
+
+
+__all__ = ["talker2codec", "talker2codec_async_chunk", "talker2codec_full_payload"]

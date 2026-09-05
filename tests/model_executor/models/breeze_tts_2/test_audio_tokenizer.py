@@ -16,7 +16,7 @@ class _Tokenizer:
 def test_reference_audio_tokenizer_normalizes_codebook_major_output():
     adapter = BreezeReferenceAudioTokenizer(_Tokenizer())
 
-    codes = adapter.encode((np.zeros(32, dtype=np.float32), 16000))
+    codes = adapter.encode(np.zeros(32, dtype=np.float32), 16000)
 
     assert tuple(codes.shape) == (2, 16)
     assert codes.dtype == torch.int16

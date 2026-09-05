@@ -136,6 +136,7 @@ _PIPELINE_STAGES = [
     "audio_tokenizer",
     "audio_vae",
     "aura",
+    "breeze_tts_2",
     "code2wav",
     "cosyvoice3_code2wav",
     "cosyvoice3_talker",
@@ -182,6 +183,7 @@ _STAGES = [*_PIPELINE_STAGES, None, "vae", "not_a_real_stage"]
 _ARCHS = [
     None,
     "VoxCPM2TalkerForConditionalGeneration",
+    "BreezeForConditionalGeneration",
     "MingTTSForConditionalGeneration",
     "CovoAudioForConditionalGeneration",
     "MyCovoAudioThing",

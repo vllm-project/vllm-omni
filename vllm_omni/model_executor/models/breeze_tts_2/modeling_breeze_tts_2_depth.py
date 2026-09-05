@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from inspect import signature
+from typing import Any
 
 import torch
 from torch import nn
@@ -12,12 +14,36 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring, logging
+from transformers.utils import TransformersKwargs, logging
 from transformers.utils.deprecation import deprecate_kwarg
 
 logger = logging.get_logger(__name__)
 
-@auto_docstring
+
+def _create_depth_causal_mask(
+    *,
+    config: Any,
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    past_key_values: Cache | None,
+    position_ids: torch.LongTensor | None,
+    cache_position: torch.LongTensor,
+) -> torch.Tensor | None:
+    """Bridge Transformers 4.57 and 5.x ``create_causal_mask`` contracts."""
+    parameters = signature(create_causal_mask).parameters
+    kwargs: dict[str, Any] = {
+        "config": config,
+        "attention_mask": attention_mask,
+        "past_key_values": past_key_values,
+        "position_ids": position_ids,
+    }
+    if "inputs_embeds" in parameters:
+        kwargs["inputs_embeds"] = inputs_embeds
+    else:
+        kwargs["input_embeds"] = inputs_embeds
+        kwargs["cache_position"] = cache_position
+    return create_causal_mask(**kwargs)
+
 class BreezeDepthDecoderModel(nn.Module):
 
     def __init__(self, config):
@@ -56,7 +82,6 @@ class BreezeDepthDecoderModel(nn.Module):
         # Avoid PreTrainedModel.post_init here because this module is a plain
         # nn.Module used for eager per-frame inference.
 
-    @auto_docstring
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -128,13 +153,13 @@ class BreezeDepthDecoderModel(nn.Module):
 
         inputs_embeds = self.inputs_embeds_projector(inputs_embeds)
 
-        causal_mask = create_causal_mask(
+        causal_mask = _create_depth_causal_mask(
             config=self.config,
-            input_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=position_ids,
+            cache_position=cache_position,
         )
 
         hidden_states = inputs_embeds
@@ -528,14 +553,10 @@ class BreezeDepthDecoderForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded: set[str] = set()
         for name, tensor in weights:
-            if name.startswith("model.") or name.startswith("codebooks_head."):
-                target = name
-            else:
-                target = name
-            param = params_dict.get(target)
+            param = params_dict.get(name)
             if param is None:
                 continue
-            if target == "codebooks_head.weight":
+            if name == "codebooks_head.weight":
                 expected = (
                     int(self.config.num_codebooks) - 1,
                     int(self.config.hidden_size),
@@ -551,7 +572,7 @@ class BreezeDepthDecoderForCausalLM(nn.Module):
                 param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
             else:
                 loader(param, tensor)
-            loaded.add(target)
+            loaded.add(name)
         return loaded
 
 

@@ -30,6 +30,20 @@ class _Tokenizer:
             ids.append(values)
         return {"input_ids": ids}
 
+    def decode(self, ids, *, skip_special_tokens=False):
+        del skip_special_tokens
+        rendered = []
+        for token_id in ids:
+            if token_id == 262144:
+                rendered.append("<|AUDIO|>")
+            elif token_id == 262145:
+                rendered.append("<|audio_eos|>")
+            elif token_id in (2, 1):
+                continue
+            else:
+                rendered.append(chr(int(token_id) - 1000))
+        return "".join(rendered)
+
 
 class _RenderingTokenizer(_Tokenizer):
     """Tiny tokenizer that preserves Breeze placeholders after decode."""
@@ -56,21 +70,6 @@ class _RenderingTokenizer(_Tokenizer):
             ids.append(row)
         return {"input_ids": ids}
 
-    def decode(self, ids, *, skip_special_tokens=False):
-        del skip_special_tokens
-        rendered = []
-        for token_id in ids:
-            if token_id == 262144:
-                rendered.append("<|AUDIO|>")
-            elif token_id == 262145:
-                rendered.append("<|audio_eos|>")
-            elif token_id in (2, 1):
-                continue
-            else:
-                rendered.append(chr(int(token_id) - 1000))
-        return "".join(rendered)
-
-
 class _ReferenceEncoder:
     def __init__(self):
         self.calls = []
@@ -84,6 +83,8 @@ def _config():
     return SimpleNamespace(
         audio_token_id=262144,
         audio_eos_token_id=262145,
+        pad_token_id=0,
+        backbone_config=SimpleNamespace(vocab_size=100000),
         num_codebooks=16,
         codec_config={"codebook_size": 2048},
     )
@@ -106,7 +107,7 @@ def test_build_instruction_prompt():
 
 def test_build_reference_prompt_and_reuse_encoder():
     encoder = _ReferenceEncoder()
-    builder = BreezeTTS2PromptBuilder(_Tokenizer(), _config(), encoder)
+    builder = BreezeTTS2PromptBuilder(_RenderingTokenizer(), _config(), encoder)
 
     prompt = builder.build(
         {
