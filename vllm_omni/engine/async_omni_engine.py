@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Async Omni Engine for vLLM-Omni multi-stage runtime.
 
@@ -47,6 +50,7 @@ from vllm_omni.engine.async_engine_utils import (
 )
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
+    AbortResultMessage,
     AddCompanionRequestMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
@@ -375,9 +379,13 @@ class AsyncOmniEngine:
                     getattr(self, "_duplex_runtime_extension_path", None)
                 )
                 if duplex_runtime_extension is not None:
+                    stage_clients = []
+                    for pool in self.stage_pools:
+                        assert pool.stage_client is not None
+                        stage_clients.append(pool.stage_client)
                     validate_duplex_runtime_extension(
                         duplex_runtime_extension,
-                        sampling_defaults=tuple(pool.stage_client.default_sampling_params for pool in self.stage_pools),
+                        sampling_defaults=tuple(client.default_sampling_params for client in stage_clients),
                     )
 
             orchestrator = Orchestrator(
@@ -685,6 +693,7 @@ class AsyncOmniEngine:
             )
 
             # Full input processing (tokenization, multimodal, etc.)
+            assert self.input_processor is not None
             _t_preprocess = time.perf_counter()
             try:
                 request = self.input_processor.process_inputs(
@@ -763,11 +772,13 @@ class AsyncOmniEngine:
             Exception: Whatever prompt expansion or input processing raised.
                 The caller is expected to let it reach the client.
         """
+        assert self.prompt_expand_func is not None
         expanded = self.prompt_expand_func(original_prompt, stage0_params)
         if not expanded:
             return []
 
         companions: list[AddCompanionRequestMessage] = []
+        assert self.input_processor is not None
         for ep in expanded:
             cid = f"{parent_id}{ep.request_id_suffix}"
             companion_prompt = ep.prompt
@@ -864,7 +875,7 @@ class AsyncOmniEngine:
                 "mag_max_skip_steps": 5,
                 "mag_retention_ratio": 0.1,
             }
-        if cache_backend in ("step_cache"):
+        if cache_backend == "step_cache":
             return {
                 "step_cache_dit_enabled": True,
                 "velocity_sim_thresholds": [0.95, 0.93],
@@ -1018,10 +1029,12 @@ class AsyncOmniEngine:
         if (
             kwargs.get("diffusion_attention_config") is not None
             or kwargs.get("diffusion_attention_backend") is not None
+            or kwargs.get("fastvideo_vsa_topk") is not None
         ):
             attention_config = parse_attention_config(
                 kwargs.get("diffusion_attention_config"),
                 attention_backend=kwargs.get("diffusion_attention_backend"),
+                fastvideo_vsa_topk=kwargs.get("fastvideo_vsa_topk"),
             )
 
         stage_engine_args = {
@@ -1223,6 +1236,7 @@ class AsyncOmniEngine:
                 if (
                     kwargs.get("diffusion_attention_config") is not None
                     or kwargs.get("diffusion_attention_backend") is not None
+                    or kwargs.get("fastvideo_vsa_topk") is not None
                 ):
                     has_stage_attention = (
                         hasattr(cfg.engine_args, "diffusion_attention_config")
@@ -1232,6 +1246,7 @@ class AsyncOmniEngine:
                         cfg.engine_args.diffusion_attention_config = parse_attention_config(
                             kwargs.get("diffusion_attention_config"),
                             attention_backend=kwargs.get("diffusion_attention_backend"),
+                            fastvideo_vsa_topk=kwargs.get("fastvideo_vsa_topk"),
                         )
                 quantization_config = kwargs.get("diffusion_quantization_config") or kwargs.get("quantization_config")
                 if quantization_config is not None:
@@ -1722,14 +1737,51 @@ class AsyncOmniEngine:
         return self.stage_metadata[stage_id]
 
     def abort(self, request_ids: list[str]) -> None:
-        """Send abort message to the Orchestrator."""
+        """Fire-and-forget abort: enqueue and return without waiting.
+
+        Prefer :meth:`abort_async` when the caller needs acknowledgment that
+        stage aborts, binding release, and orchestrator request cleanup finished.
+        """
         if self.request_queue is None:
             raise RuntimeError("request_queue is not initialized")
         self.request_queue.sync_q.put(AbortRequestMessage(request_ids=request_ids))
 
-    async def abort_async(self, request_ids: list[str]) -> None:
-        """Async abort API."""
-        self.abort(request_ids)
+    async def abort_async(
+        self,
+        request_ids: list[str],
+        timeout: float | None = None,
+    ) -> None:
+        """Abort requests and wait for orchestrator acknowledgment.
+
+        Unlike :meth:`abort`, this generates an ``rpc_id``, correlates the
+        :class:`AbortResultMessage` via :class:`CorrelatedRpcClient`, and
+        raises if the orchestrator reports failure or times out.
+        """
+        if self.request_queue is None:
+            raise RuntimeError("request_queue is not initialized")
+        transport = self._correlated_rpc_client
+        if transport is None:
+            raise RuntimeError("correlated RPC client is not initialized")
+
+        rpc_id = uuid.uuid4().hex
+        msg = AbortRequestMessage(request_ids=request_ids, rpc_id=rpc_id)
+
+        def _wait() -> AbortResultMessage:
+            result_msg = transport.execute(
+                ("abort", rpc_id),
+                msg,
+                timeout=timeout,
+                timeout_message=f"abort timed out after {timeout} seconds",
+                block_on_submit=True,
+            )
+            if not isinstance(result_msg, AbortResultMessage):
+                raise RuntimeError(f"unexpected abort result type: {type(result_msg).__name__}")
+            return result_msg
+
+        loop = asyncio.get_running_loop()
+        result_msg = await loop.run_in_executor(None, _wait)
+        if not result_msg.success:
+            raise RuntimeError(result_msg.error or "abort failed")
 
     def submit_interaction(
         self,

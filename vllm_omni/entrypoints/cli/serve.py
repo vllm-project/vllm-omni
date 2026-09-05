@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Omni serve command for vLLM-Omni.
 
@@ -605,6 +608,12 @@ class OmniServeCommand(CLISubcommand):
             "Sets the default backend for all diffusion attention roles, e.g. 'FLASH_ATTN'. "
             "May be combined with --diffusion-attention-config.per_role.* overrides, "
             "but mutually exclusive with --diffusion-attention-config.default.backend.",
+        )
+        omni_config_group.add_argument(
+            "--fastvideo-vsa-topk",
+            type=int,
+            default=None,
+            help="Number of key/value blocks selected per query block by FASTVIDEO_VSA.",
         )
         omni_config_group.add_argument(
             "--diffusion-attention-config",
