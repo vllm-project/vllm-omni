@@ -3164,12 +3164,17 @@ def _validate_control_upload(
     return normalized_type
 
 
-def _attach_control_upload(request: VideoGenerationRequest, control_type: str, control_path: str) -> None:
-    """Attach a persisted control using the declared model control contract."""
+def _attach_control_upload(
+    request: VideoGenerationRequest,
+    control_type: str,
+    control_path: str | None = None,
+) -> None:
+    """Declare an uploaded control and attach its persisted path when available."""
     extra_params = dict(request.extra_params or {})
     existing = extra_params.get(control_type)
     control_params = dict(existing) if isinstance(existing, Mapping) else {}
-    control_params["control_path"] = control_path
+    if control_path is not None:
+        control_params["control_path"] = control_path
     extra_params[control_type] = control_params
     request.extra_params = extra_params
 
@@ -3457,6 +3462,11 @@ async def _parse_video_form(
         )
 
     normalized_control_type = _validate_control_upload(handler, request, control_reference, control_type)
+    if normalized_control_type is not None:
+        # Make the selected transfer mode visible while choosing the model's
+        # reference-video decode policy. The upload itself stays unpersisted
+        # until reference parsing succeeds, preserving failure cleanup.
+        _attach_control_upload(request, normalized_control_type)
 
     supports_mixed_reference_inputs = bool(getattr(handler, "supports_mixed_reference_inputs", False))
     if input_reference is not None:

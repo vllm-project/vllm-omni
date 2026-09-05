@@ -343,6 +343,8 @@ def _cosmos3_stage_configs():
     return [
         SimpleNamespace(
             stage_type="diffusion",
+            final_output=True,
+            final_output_type="video",
             engine_args=SimpleNamespace(model_class_name="Cosmos3OmniDiffusersPipeline"),
         )
     ]
@@ -2196,6 +2198,41 @@ def test_cosmos3_accepts_optional_uploaded_control(
     assert engine.captured_control_reference_bytes[control_type] == control_bytes
     assert len(engine.captured_prompt["multi_modal_data"]["video"]) == 3
     assert not Path(captured["control_path"]).exists()
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+def test_cosmos3_uploaded_control_selects_transfer_reference_video_decode_policy(
+    endpoint,
+    test_client,
+    mocker: MockerFixture,
+):
+    _mock_encode_video_bytes(mocker, b"controlled-video")
+    test_client.app.state.stage_configs = _cosmos3_stage_configs()
+
+    response = test_client.post(
+        endpoint,
+        data={
+            "prompt": "Preserve all conditioning motion.",
+            "control_type": "wsm",
+            "num_frames": "9",
+            "extra_params": json.dumps({"num_first_chunk_conditional_frames": 9}),
+        },
+        files=[
+            (
+                "input_reference",
+                ("input.mp4", _make_test_video_bytes(num_frames=6), "video/mp4"),
+            ),
+            ("control_reference", ("wsm.mp4", b"control", "video/mp4")),
+        ],
+    )
+
+    assert response.status_code == 200
+    if not endpoint.endswith("/sync"):
+        video_id = response.json()["id"]
+        _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    assert len(engine.captured_prompt["multi_modal_data"]["video"]) == 6
 
 
 def test_cosmos3_control_upload_is_optional(test_client, mocker: MockerFixture):
