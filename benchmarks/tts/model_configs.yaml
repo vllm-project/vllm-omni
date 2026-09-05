@@ -7,6 +7,15 @@
 # is tracked here.
 
 models:
+  BreezeBlue/Breeze-TTS-2:
+    supported_tasks: [default_voice, voice_design]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      default_voice: {}
+      voice_design:
+        task_type: VoiceDesign
+
   IndexTeam/IndexTTS-2.5:
     supported_tasks: [voice_clone]
     backend: openai-audio-speech
