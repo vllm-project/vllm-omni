@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import math
 import time
@@ -425,30 +426,36 @@ class OmniOpenAIServingVideo:
             if "video_codec_options" in request.extra_params:
                 video_codec_options = request.extra_params["video_codec_options"]
 
+        # Same reason as the byte path below: encoding is CPU-bound and holds
+        # the event loop for its whole duration when called inline. This one
+        # encodes every video in the response, so it holds it for longer.
+        def _encode_all() -> list[VideoData]:
+            return [
+                VideoData(
+                    b64_json=(
+                        encode_video_base64(
+                            video,
+                            fps=artifacts.output_fps,
+                            video_codec_options=video_codec_options,
+                            frame_converter=self._video_frame_converter,
+                        )
+                        if artifacts.audios[idx] is None
+                        else encode_video_base64(
+                            video,
+                            fps=artifacts.output_fps,
+                            audio=artifacts.audios[idx],
+                            audio_sample_rate=artifacts.audio_sample_rate,
+                            video_codec_options=video_codec_options,
+                            frame_converter=self._video_frame_converter,
+                        )
+                    ),
+                    action=artifacts.actions[idx],
+                )
+                for idx, video in enumerate(artifacts.videos)
+            ]
+
         _t_encode_start = time.perf_counter()
-        video_data = [
-            VideoData(
-                b64_json=(
-                    encode_video_base64(
-                        video,
-                        fps=artifacts.output_fps,
-                        video_codec_options=video_codec_options,
-                        frame_converter=self._video_frame_converter,
-                    )
-                    if artifacts.audios[idx] is None
-                    else encode_video_base64(
-                        video,
-                        fps=artifacts.output_fps,
-                        audio=artifacts.audios[idx],
-                        audio_sample_rate=artifacts.audio_sample_rate,
-                        video_codec_options=video_codec_options,
-                        frame_converter=self._video_frame_converter,
-                    )
-                ),
-                action=artifacts.actions[idx],
-            )
-            for idx, video in enumerate(artifacts.videos)
-        ]
+        video_data = await asyncio.to_thread(_encode_all)
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4+base64): %.2f ms", _t_encode_ms)
         return VideoGenerationResponse(
@@ -493,8 +500,14 @@ class OmniOpenAIServingVideo:
             logger.info("Action-only video request %s completed; skipping MP4 encoding.", reference_id)
             return b"", artifacts.stage_durations, artifacts.peak_memory_mb, action
 
+        # Muxing is CPU-bound and can run for seconds, so it goes to a worker
+        # thread. Calling it inline blocks the event loop for its whole
+        # duration: the server answers nothing at all while it runs, /health
+        # and /v1/models included, so a long render reads as a dead server to
+        # anything watching it.
         _t_encode_start = time.perf_counter()
-        video_bytes = _encode_video_bytes(
+        video_bytes = await asyncio.to_thread(
+            _encode_video_bytes,
             artifacts.videos[0],
             fps=artifacts.output_fps,
             **({"audio": audio, "audio_sample_rate": artifacts.audio_sample_rate} if audio is not None else {}),
