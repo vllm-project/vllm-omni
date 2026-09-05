@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Deterministic tests for the CFG-companion output lifecycle.
 
 Regression suite for the companion-output race behind the nightly Bagel
@@ -214,6 +214,57 @@ async def test_companion_abort_fails_deferred_parent():
     # Idempotent: a repeated abort of the same companion is a no-op.
     await orch._handle_abort(AbortRequestMessage(request_ids=["p__neg"]))
     assert orch.output_async_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_expired_companion_wait_fails_parent_and_cleans_bundle():
+    """A silent companion stall must not leave its parent pending forever."""
+    orch = _make_orchestrator()
+    orch._cfg_tracker = CfgCompanionTracker(clock=lambda: 100.0)
+    orch._cfg_companion_timeout_s = 10.0
+    orch._cfg_tracker.register_companion("p", "neg", "p__neg")
+    orch.request_states["p"] = _req_state()
+    orch.request_states["p__neg"] = _req_state(final_stage_id=0)
+    orch._cfg_tracker.defer_parent("p", {"parent": True}, stage_id=0)
+
+    assert await orch._reap_expired_cfg_parents(now=110.0) == 1
+
+    msg = orch.output_async_queue.get_nowait()
+    assert isinstance(msg, ErrorMessage)
+    assert msg.request_id == "p"
+    assert msg.stage_id == 0
+    assert msg.status_code == 504
+    assert "deadline exceeded after 10s" in msg.error
+    assert "p__neg" in msg.error
+    assert not orch.request_states
+    assert not orch._cfg_tracker.has_companions("p")
+    assert orch._cfg_tracker.pop_pending_parent("p") is None
+    aborted = {rid for pool in orch.stage_pools for batch in pool.aborted for rid in batch}
+    assert {"p", "p__neg"} <= aborted
+
+    assert await orch._reap_expired_cfg_parents() == 0
+    assert orch.output_async_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_cfg_companion_reaper_continues_after_poll_timeout(monkeypatch):
+    """The periodic poll timeout must be handled on every supported Python."""
+    orch = _make_orchestrator()
+    orch._shutdown_event = asyncio.Event()
+    orch._cfg_companion_reaper_interval_s = 0.001
+    reap_count = 0
+
+    async def reap_once() -> int:
+        nonlocal reap_count
+        reap_count += 1
+        orch._shutdown_event.set()
+        return 0
+
+    monkeypatch.setattr(orch, "_reap_expired_cfg_parents", reap_once)
+
+    await asyncio.wait_for(orch._cfg_companion_reaper_loop(), timeout=1)
+
+    assert reap_count == 1
 
 
 @pytest.mark.asyncio

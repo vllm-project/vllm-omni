@@ -58,6 +58,14 @@ def _nonneg_finite_float(value: str) -> float:
     return parsed
 
 
+def _positive_finite_float(value: str) -> float:
+    """Argparse type for finite, positive floats."""
+    parsed = _nonneg_finite_float(value)
+    if parsed == 0:
+        raise argparse.ArgumentTypeError(f"must be a finite positive number, got {value!r}")
+    return parsed
+
+
 def _ensure_vllm_platform():
     """Ensure vLLM's current_platform is valid before arg parsing.
 
@@ -347,6 +355,15 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=10,
             help="The timeout for the batch.",
+        )
+        omni_config_group.add_argument(
+            "--cfg-companion-timeout",
+            type=_positive_finite_float,
+            default=600.0,
+            help=(
+                "Maximum seconds a parent request may wait for CFG companion "
+                "outputs before the request is failed (default: 600)."
+            ),
         )
         omni_config_group.add_argument(
             "--worker-backend",

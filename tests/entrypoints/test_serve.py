@@ -79,6 +79,27 @@ def test_serve_parser_accepts_four_way_cfg_parallelism() -> None:
     assert args.cfg_parallel_size == 4
 
 
+def test_serve_parser_accepts_cfg_companion_timeout() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--cfg-companion-timeout", "45"])
+
+    assert args.cfg_companion_timeout == 45.0
+    assert args.get_explicit_kwargs_dict()["cfg_companion_timeout"] == 45.0
+
+
+@pytest.mark.parametrize("value", ["0", "nan", "inf"])
+def test_serve_parser_rejects_invalid_cfg_companion_timeout(value: str) -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "fake-model", "--omni", "--cfg-companion-timeout", value])
+
+
 def test_serve_parser_accepts_ulysses_a2a_permute() -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")
