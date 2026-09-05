@@ -4,7 +4,6 @@
 import importlib
 import sys
 from argparse import Namespace
-from unittest.mock import Mock
 
 import pytest
 
@@ -95,7 +94,7 @@ async def test_failed_warmups_abort_without_exposing_response_errors(
 
 
 async def test_benchmark_does_not_start_measurement_after_failed_warmup(
-    monkeypatch, diffusion_benchmark, warmup_args, input_requests
+    monkeypatch, mocker, diffusion_benchmark, warmup_args, input_requests
 ):
     args = Namespace(
         **vars(warmup_args),
@@ -121,10 +120,10 @@ async def test_benchmark_does_not_start_measurement_after_failed_warmup(
         args.endpoint,
         (failed_request, args.endpoint),
     )
-    dataset = Mock(spec=diffusion_benchmark.RandomDataset)
+    dataset = mocker.Mock(spec=diffusion_benchmark.RandomDataset)
     dataset.get_requests.return_value = input_requests
-    monkeypatch.setattr(diffusion_benchmark, "RandomDataset", Mock(return_value=dataset))
-    timer = Mock(spec=diffusion_benchmark.time)
+    monkeypatch.setattr(diffusion_benchmark, "RandomDataset", mocker.Mock(return_value=dataset))
+    timer = mocker.Mock(spec=diffusion_benchmark.time)
     timer.perf_counter.side_effect = AssertionError("measurement started after failed warmup")
     monkeypatch.setattr(diffusion_benchmark, "time", timer)
 
