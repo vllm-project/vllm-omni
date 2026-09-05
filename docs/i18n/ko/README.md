@@ -48,7 +48,7 @@ vLLM-Omni는 다음 기능들을 통해 유연하고 쉽게 사용할 수 있습
 - OpenAI 호환 API 서버
 - 스트리밍 오디오 동시 입출력을 지원하는 실시간 서빙 (실험적 기능)
 
-vLLM-Omni는 Hugging Face에서 주요 오픈소스 모델 대부분을 원활하게 지원합니다:
+vLLM-Omni는 Hugging Face의 주요 오픈소스 모델 대부분을 원활하게 지원합니다:
 
 - **옴니 모달리티 모델(Omni-modality models)** (예: Qwen3-Omni, MiniCPM-o 4.5, Cosmos3, HunyuanImage, BAGEL)
 - **TTS 모델(TTS models)** (예: Qwen3-TTS, VoxCPM2, Ming-Omni-TTS, CosyVoice3)
