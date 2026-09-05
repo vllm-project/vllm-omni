@@ -208,9 +208,20 @@ class BreezeTTS2MimiCodec(nn.Module):
             state_id = request_ids[index]
             finished = self._meta_bool(runtime_info, "finished")
             flat = self._payload_codes(request_ids_tensor, runtime_info)
-            if flat.numel() == 0 or flat.numel() % self._num_codebooks != 0:
+            if flat.numel() == 0:
+                # Terminal marker: the stage-0 processor sends an empty
+                # payload with ``finished=True`` once generation ends.
                 self._decoder_state_cache.pop(state_id, None)
                 continue
+            if flat.numel() % self._num_codebooks != 0:
+                # A partial frame means the transport payload is corrupt.
+                # Silently resetting decoder state would corrupt the rest of
+                # the stream; fail loudly instead. The scheduler aborts the
+                # request and ``on_requests_finished`` releases the state.
+                raise ValueError(
+                    f"Breeze codec chunk length {int(flat.numel())} is not divisible by "
+                    f"num_codebooks {self._num_codebooks}"
+                )
             if int(flat.min()) < 0 or int(flat.max()) >= self._codebook_size:
                 raise ValueError(
                     f"Breeze codec id outside [0, {self._codebook_size}): min={int(flat.min())}, max={int(flat.max())}"

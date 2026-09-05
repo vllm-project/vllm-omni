@@ -180,6 +180,48 @@ def test_frame_budget_forces_eos_on_followup_step():
     assert info["breeze_force_eos"] is True
 
 
+def test_async_chunk_mode_skips_full_accumulation():
+    model = _talker()
+    model._async_chunk = True
+    model._generate_depth_codes = lambda hidden, code0: _depth_codes(model, hidden, code0)
+    info = {"breeze_generated_frames": 0, "breeze_max_new_frames": 8}
+    hidden = torch.arange(16, dtype=torch.float32).reshape(1, 16)
+
+    for _ in range(3):
+        output = model.make_omni_output(
+            hidden,
+            model_intermediate_buffer=[info],
+            request_token_spans=[(0, 1)],
+        )
+        assert output.multimodal_outputs["codes"]["audio"][0].shape == (1, 4)
+
+    # Streaming keeps only the per-frame tail; the cumulative buffer (and its
+    # per-step torch.cat) must not exist without the opt-in golden dump.
+    assert "breeze_audio_codes" not in info
+    assert info["breeze_generated_frames"] == 3
+    assert torch.equal(info["breeze_current_frame"], torch.tensor([2, 3, 4, 5]))
+
+
+def test_async_chunk_mode_keeps_accumulation_for_golden_dump(tmp_path):
+    model = _talker()
+    model._async_chunk = True
+    model._golden_dump_dir = str(tmp_path)
+    model._generate_depth_codes = lambda hidden, code0: _depth_codes(model, hidden, code0)
+    info = {"breeze_generated_frames": 0, "breeze_max_new_frames": 8}
+    hidden = torch.arange(16, dtype=torch.float32).reshape(1, 16)
+
+    for _ in range(3):
+        output = model.make_omni_output(
+            hidden,
+            model_intermediate_buffer=[info],
+            request_token_spans=[(0, 1)],
+        )
+        assert output.multimodal_outputs["codes"]["audio"][0].shape == (1, 4)
+
+    assert info["breeze_audio_codes"].shape == (3, 4)
+    assert torch.equal(info["breeze_audio_codes"][-1], torch.tensor([2, 3, 4, 5]))
+
+
 def test_opt_in_golden_dump_writes_terminal_frames(tmp_path):
     model = _talker()
     model._golden_dump_dir = str(tmp_path)

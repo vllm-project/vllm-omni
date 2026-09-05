@@ -93,3 +93,53 @@ def test_stateful_codec_batches_request_chunks_and_releases_finished_state():
 
     codec.on_requests_finished(["scheduler-live"])
     assert codec._decoder_state_cache == {}
+
+
+def test_stateful_codec_rejects_partial_frame_chunk():
+    decoder = _Decoder()
+    codec = object.__new__(BreezeTTS2MimiCodec)
+    codec._async_chunk = True
+    codec._num_codebooks = 4
+    codec._codebook_size = 8
+    codec._sample_rate = 24_000
+    codec._audio_tokenizer = SimpleNamespace(model=SimpleNamespace(decoder=decoder))
+    codec._decoder_state_cache = {}
+
+    # 5 codes cannot form a whole frame; a silent state reset would corrupt
+    # the rest of the stream, so the codec must fail loudly.
+    with pytest.raises(ValueError, match="not divisible"):
+        codec.forward(
+            torch.tensor([0, 1, 2, 3, 4], dtype=torch.long),
+            runtime_additional_information=[{"meta": {"request_id": "bad", "finished": False}}],
+            seq_token_counts=[5],
+            request_ids=["scheduler-bad"],
+        )
+    assert decoder.calls == []
+
+
+def test_stateful_codec_terminal_marker_pops_state_without_decoding():
+    decoder = _Decoder()
+    codec = object.__new__(BreezeTTS2MimiCodec)
+    codec._async_chunk = True
+    codec._num_codebooks = 4
+    codec._codebook_size = 8
+    codec._sample_rate = 24_000
+    codec._audio_tokenizer = SimpleNamespace(model=SimpleNamespace(decoder=decoder))
+    codec._decoder_state_cache = {"scheduler-live": {}, "scheduler-done": {}}
+
+    output = codec.forward(
+        torch.tensor([0, 1, 2, 3], dtype=torch.long),
+        runtime_additional_information=[
+            {"meta": {"request_id": "live", "finished": False}},
+            {"meta": {"request_id": "done", "finished": True}},
+        ],
+        seq_token_counts=[4, 0],
+        request_ids=["scheduler-live", "scheduler-done"],
+    )
+
+    # The empty terminal marker decodes nothing and releases its state; the
+    # live request still decodes its own chunk.
+    assert len(decoder.calls) == 1
+    assert decoder.calls[0][0][0] == 1
+    assert [item.numel() for item in output.multimodal_outputs["model_outputs"]] == [1920, 0]
+    assert codec._decoder_state_cache == {"scheduler-live": {}}

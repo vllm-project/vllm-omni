@@ -413,6 +413,18 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
             sequence = torch.cat([sequence, torch.tensor([[next_code]], device=sequence.device)], dim=1)
         return torch.tensor(generated, dtype=torch.long, device=backbone_hidden.device).unsqueeze(0)
 
+    @staticmethod
+    def _accumulate_codes(info: dict[str, Any], frame: torch.Tensor) -> torch.Tensor:
+        """Append one ``(1, Q)`` frame to the request's cumulative codes."""
+        accumulated = info.get("breeze_audio_codes")
+        accumulated = (
+            torch.cat([accumulated.to(frame.device), frame], dim=0)
+            if isinstance(accumulated, torch.Tensor) and accumulated.numel()
+            else frame
+        )
+        info["breeze_audio_codes"] = accumulated
+        return accumulated
+
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
             self._batch_state = None
@@ -464,17 +476,19 @@ class BreezeTTS2TalkerForGeneration(nn.Module):
                 raise RuntimeError(f"Breeze main head produced invalid codec id {code0}")
 
             frame = self._generate_depth_codes(row_hidden, code0)
-            accumulated = info.get("breeze_audio_codes")
-            accumulated = (
-                torch.cat([accumulated.to(frame.device), frame], dim=0)
-                if isinstance(accumulated, torch.Tensor) and accumulated.numel()
-                else frame
-            )
-            info["breeze_audio_codes"] = accumulated
             info["breeze_current_frame"] = frame[0].detach()
             info["breeze_generated_frames"] = generated_frames + 1
             info["breeze_force_eos"] = False
-            per_request_codes.append(frame if self._async_chunk else accumulated)
+            if self._async_chunk:
+                # Streaming consumers only ever read the per-frame tail. The
+                # cumulative buffer exists for full-payload transport and the
+                # opt-in golden dump; maintaining it here would also cost an
+                # O(T^2) tensor-cat per request.
+                if self._golden_dump_dir:
+                    self._accumulate_codes(info, frame)
+                per_request_codes.append(frame)
+            else:
+                per_request_codes.append(self._accumulate_codes(info, frame))
         if self._golden_dump_dir:
             for info in info_items:
                 self._dump_golden_frames(info)

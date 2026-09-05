@@ -75,8 +75,11 @@ def test_two_requests_accumulate_and_emit_independent_frames():
     # request 1 still has budget and emits its next tail frame.
     assert second.multimodal_outputs["codes"]["audio"][0].numel() == 0
     assert torch.equal(second.multimodal_outputs["codes"]["audio"][1][0], _frame(3))
-    assert infos[0]["breeze_audio_codes"].shape == (2, 4)
-    assert infos[1]["breeze_audio_codes"].shape == (2, 4)
+    # Async streaming only maintains the per-frame tail; the cumulative
+    # buffer is deliberately not grown (request 0 keeps its pre-seeded
+    # entry untouched, request 1 never gains one).
+    assert infos[0]["breeze_audio_codes"].shape == (1, 4)
+    assert "breeze_audio_codes" not in infos[1]
     assert infos[0]["breeze_force_eos"] is True
     assert infos[1]["breeze_force_eos"] is False
 
