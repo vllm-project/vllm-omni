@@ -14,6 +14,7 @@ import asyncio
 import concurrent.futures
 import copy
 import json
+import os
 import queue
 import shutil
 import threading
@@ -70,7 +71,11 @@ from vllm_omni.engine.messages import (
     OutputMessage,
     StageSubmissionMessage,
 )
-from vllm_omni.engine.orchestrator import Orchestrator
+from vllm_omni.engine.orchestrator import (
+    _EVENT_DRIVEN_ORCH_ENV,
+    Orchestrator,
+    _event_driven_orch_default_for_pipeline,
+)
 from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_client import StageClient
@@ -213,6 +218,12 @@ class AsyncOmniEngine:
             pipeline_config.duplex_serving_adapter if pipeline_config is not None else None
         )
         self._duplex_control_enabled = bool(pipeline_config and pipeline_config.duplex_control_enabled)
+        if (
+            _EVENT_DRIVEN_ORCH_ENV not in os.environ
+            and pipeline_config is not None
+            and _event_driven_orch_default_for_pipeline(pipeline_config.model_type)
+        ):
+            os.environ[_EVENT_DRIVEN_ORCH_ENV] = "1"
         self.duplex_session_config = DuplexSessionRuntimeConfig()
         if deploy_config_path is not None:
             self.duplex_session_config = load_deploy_config(deploy_config_path).duplex_session

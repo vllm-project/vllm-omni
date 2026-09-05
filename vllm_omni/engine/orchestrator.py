@@ -78,7 +78,7 @@ def cleanup_request_artifact_dirs(artifact_dirs: set[str] | list[str]) -> None:
 # 1 ms poll cadence to event-driven wakeups: one reader task per live LLM stage
 # replica awaits `client.get_output_async()` directly — the same pattern vLLM's
 # own AsyncLLM output handler uses — and feeds a single serial dispatch queue.
-# Default off; the legacy poll loop remains the fallback.
+# Default is off except for pipelines with an explicit validated default.
 _EVENT_DRIVEN_ORCH_ENV = "VLLM_OMNI_EVENT_DRIVEN_ORCH"
 
 # How often the event-driven loop reconciles its reader-task set against
@@ -86,8 +86,16 @@ _EVENT_DRIVEN_ORCH_ENV = "VLLM_OMNI_EVENT_DRIVEN_ORCH"
 _ORCH_READER_RECONCILE_INTERVAL_S = 0.5
 
 
-def _event_driven_orch_enabled() -> bool:
-    return os.environ.get(_EVENT_DRIVEN_ORCH_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
+def _event_driven_orch_enabled(*, default: bool = False) -> bool:
+    value = os.environ.get(_EVENT_DRIVEN_ORCH_ENV)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _event_driven_orch_default_for_pipeline(pipeline_model_type: str | None) -> bool:
+    """Return whether a pipeline has a validated event-driven default."""
+    return pipeline_model_type == "qwen3_tts"
 
 
 if TYPE_CHECKING:
