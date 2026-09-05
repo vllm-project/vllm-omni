@@ -347,7 +347,7 @@ async def test_forward_to_dead_downstream_stage_fails_request_not_server(orchest
 
 
 @pytest.mark.asyncio
-async def test_add_request_to_dead_stage_fails_request_not_server(orchestrator_factory) -> None:
+async def test_add_request_to_dead_stage_fails_request_not_server(orchestrator_factory, tmp_path) -> None:
     """A new request entering a stage that already lost all replicas fails that
     request instead of raising out of the request handler and tearing the server
     down. The guard runs before request state is registered, so nothing leaks.
@@ -370,7 +370,11 @@ async def test_add_request_to_dead_stage_fails_request_not_server(orchestrator_f
         r0.die = True
         await _wait_for(lambda: pool.live_replica_ids() == [])
 
-        # A new request now enters a stage with no live replica.
+        # A new request now enters a stage with no live replica. Its preprocessed
+        # artifacts must be cleaned even though request state is never registered.
+        artifact_dir = tmp_path / "request-artifacts"
+        artifact_dir.mkdir()
+        (artifact_dir / "prepared.mp4").touch()
         await _enqueue_add_request(
             orchestrator_fixture,
             request_id="req-after",
@@ -378,6 +382,7 @@ async def test_add_request_to_dead_stage_fails_request_not_server(orchestrator_f
             original_prompt={"prompt": "b"},
             sampling_params_list=[_sampling_params()],
             final_stage_id=0,
+            request_artifact_dirs=[str(artifact_dir)],
         )
 
         error_msg = await _wait_for_error_message(orchestrator_fixture, request_id="req-after")
@@ -387,6 +392,7 @@ async def test_add_request_to_dead_stage_fails_request_not_server(orchestrator_f
         assert orchestrator_fixture.thread.is_alive()
         # Guard runs before registration, so the failed request never enters state.
         assert "req-after" not in orchestrator_fixture.orchestrator.request_states
+        assert not artifact_dir.exists()
     finally:
         if orchestrator_fixture.thread.is_alive():
             orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
