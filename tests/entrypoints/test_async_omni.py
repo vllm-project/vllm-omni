@@ -5,6 +5,7 @@ import asyncio
 import re
 from types import SimpleNamespace
 
+import anyio
 import pytest
 from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -411,6 +412,40 @@ def test_generate_cancellation_converges_after_engine_shutdown_starts(mocker):
         assert submitted_request_ids[0].startswith("cancel-shutdown-")
         assert omni.request_states == {}
         engine.request_queue.sync_q.put.assert_not_called()
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.cpu
+def test_generate_waits_for_abort_inside_cancelled_asgi_scope():
+    async def run_test():
+        submitted = anyio.Event()
+        acknowledged = []
+
+        async def add_request(**kwargs):
+            submitted.set()
+
+        async def abort(request_ids):
+            await anyio.sleep(0)
+            acknowledged.extend(request_ids)
+
+        omni = get_async_omni_instance(fake_add_request=add_request, fake_abort_request=abort)
+
+        async def collect():
+            async for _ in omni.generate(
+                prompt={"prompt": "prompt"},
+                request_id="cancel-asgi",
+                sampling_params_list=[SimpleNamespace()],
+                output_modalities=["image"],
+            ):
+                pass
+
+        async with anyio.create_task_group() as group:
+            group.start_soon(collect)
+            await submitted.wait()
+            group.cancel_scope.cancel()
+        assert len(acknowledged) == 1 and acknowledged[0].startswith("cancel-asgi-")
+        assert omni.request_states == {}
 
     asyncio.run(run_test())
 
