@@ -570,6 +570,7 @@ async def _enqueue_add_request(
     final_output_stage_ids: list[int] | None = None,
     entry_stage_id: int = 0,
     lora_request: LoRARequest | None = None,
+    request_artifact_dirs: list[str] | None = None,
 ) -> None:
     orchestrator_fixture.request_sync_q.put_nowait(
         StageSubmissionMessage(
@@ -586,6 +587,7 @@ async def _enqueue_add_request(
             enqueue_ts=time.perf_counter(),
             entry_stage_id=entry_stage_id,
             lora_request=lora_request,
+            request_artifact_dirs=request_artifact_dirs,
         )
     )
 
