@@ -10,12 +10,19 @@ import base64
 import json
 import time
 from argparse import Namespace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from pytest_mock import MockerFixture
+from vllm.benchmarks.datasets import SampleRequest
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
+from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
+    OmniInteractCase,
+    OmniInteractSampleRequest,
+    OmniInteractSessionOptions,
+)
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SeedTTSSampleRequest,
     SeedTTSTextSampleRequest,
@@ -24,6 +31,7 @@ from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
     _apply_stage0_token_timings,
     _attach_seed_tts_to_request_func_input,
+    _prepare_omniinteract_batch,
     async_request_openai_chat_omni_completions,
     async_request_openai_realtime_duplex,
     should_request_stage_metrics,
@@ -31,6 +39,45 @@ from vllm_omni.benchmarks.patch.patch import (
 from vllm_omni.clients.duplex import EventCollector
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("missing", ["omniinteract_case", "omniinteract_options"])
+def test_prepare_omniinteract_batch_requires_metadata(mocker: MockerFixture, tmp_path: Path, missing: str) -> None:
+    sample = OmniInteractSampleRequest(
+        prompt="",
+        prompt_len=0,
+        expected_output_len=0,
+        omniinteract_case=OmniInteractCase("1q1a", "clip.mp4", tmp_path / "clip.mp4", tmp_path / "clip.json", "test"),
+        omniinteract_options=OmniInteractSessionOptions(tmp_path, 30.0, 30.0, "ref.wav"),
+    )
+    setattr(sample, missing, None)
+    clear_case = mocker.patch("vllm_omni.benchmarks.patch.patch.clear_case_artifacts")
+    clear_batch = mocker.patch("vllm_omni.benchmarks.patch.patch.clear_batch_artifacts")
+
+    with pytest.raises(ValueError, match="require session options and a case"):
+        _prepare_omniinteract_batch([sample])
+
+    clear_case.assert_not_called()
+    clear_batch.assert_not_called()
+
+
+def test_prepare_omniinteract_batch_cleans_shared_root_once(mocker: MockerFixture, tmp_path: Path) -> None:
+    case = OmniInteractCase("1q1a", "clip.mp4", tmp_path / "clip.mp4", tmp_path / "clip.json", "test")
+    sample = OmniInteractSampleRequest(
+        prompt="",
+        prompt_len=0,
+        expected_output_len=0,
+        omniinteract_case=case,
+        omniinteract_options=OmniInteractSessionOptions(tmp_path, 30.0, 30.0, "ref.wav"),
+    )
+    clear_case = mocker.patch("vllm_omni.benchmarks.patch.patch.clear_case_artifacts")
+    clear_batch = mocker.patch("vllm_omni.benchmarks.patch.patch.clear_batch_artifacts")
+
+    _prepare_omniinteract_batch([SampleRequest(prompt="text", prompt_len=1, expected_output_len=1), sample, sample])
+
+    assert clear_case.call_count == 2
+    clear_case.assert_called_with(tmp_path, case)
+    clear_batch.assert_called_once_with(tmp_path.resolve())
 
 
 def _seed_tts_request_func_input() -> RequestFuncInput:
@@ -233,6 +280,8 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
     )
 
     client = FakeRealtimeClient.last_instance
+    assert client is not None
+    assert client.configure_kwargs is not None
     assert client.configure_kwargs["native_duplex"] is False
     assert client.configure_kwargs["extra_body"] == {
         "ref_audio": "data:audio/wav;base64,AAAA",
