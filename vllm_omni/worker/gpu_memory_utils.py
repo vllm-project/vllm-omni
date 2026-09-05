@@ -3,8 +3,8 @@
 
 """NVML-based per-process GPU memory utilities.
 
-Shared across worker types (OmniGPUWorkerBase, DiffusionWorker, etc.)
-for process-scoped GPU memory accounting.
+Used by DiffusionWorker for process-scoped memory reporting. LLM workers size
+their KV cache through device-level profiling, without these NVML helpers.
 """
 
 from __future__ import annotations
@@ -20,21 +20,6 @@ from vllm.third_party.pynvml import (
 )
 
 logger = init_logger(__name__)
-
-
-def is_process_scoped_memory_available() -> bool:
-    """Check if NVML process-scoped memory tracking is available.
-
-    When True, concurrent stage initialization is safe because each
-    process can accurately measure its own GPU memory via NVML.
-    When False, sequential initialization (file locks) is needed.
-    """
-    try:
-        nvmlInit()
-        nvmlShutdown()
-        return True
-    except Exception:
-        return False
 
 
 def parse_cuda_visible_devices() -> list[str | int]:

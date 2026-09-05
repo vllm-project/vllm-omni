@@ -71,7 +71,13 @@ def test_requested_uses_ceil_of_total_times_util():
     assert out == math.ceil(total * util)
 
 
-def test_cap_logs_one_error_with_both_budgets(caplog):
+def test_cap_logs_one_error_with_both_budgets(caplog, monkeypatch):
+    from vllm_omni.worker.memory_utils import logger
+
+    # vLLM may disable propagation on its parent logger; capture this logger
+    # directly so the assertion does not depend on global logging setup.
+    monkeypatch.setattr(logger, "handlers", [caplog.handler])
+    monkeypatch.setattr(logger, "propagate", False)
     # A firing cap is a misconfiguration signal, so it must be ERROR level and name
     # both the requested and the granted budget.
     snap = _snapshot(total=100 * GIB, free=30 * GIB)
@@ -84,6 +90,8 @@ def test_cap_logs_one_error_with_both_budgets(caplog):
     message = errors[0].getMessage()
     assert "requested 90" in message and "granting 30" in message
     assert "sum to <= 1.0" in message
+    assert "If parallel-stage admission passed" in message
+    assert "reserve shortfall" in message
 
 
 def test_no_cap_logs_nothing(caplog):
