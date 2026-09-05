@@ -46,20 +46,108 @@ class LetterBoxTransform:
         return transforms.functional.pad(img, padding=[pad_left, pad_top, pad_right, pad_bottom], fill=0)
 
 
+class FractionalCenterCrop:
+    """Center-crop an image by a fractional factor of its current dimensions.
+
+    The crop size is computed as int(dim * fraction) for each spatial dim (floor behavior),
+    matching the behavior used in Isaac-GR00T's FractionalCenterCrop.
+    """
+
+    def __init__(self, fraction: float):
+        assert 0.0 < fraction <= 1.0, "fraction must be in (0, 1]"
+        self.fraction = fraction
+
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        import math
+
+        *leading_dims, c, h, w = img.shape
+        new_h = int(h * self.fraction)
+        new_w = int(w * self.fraction)
+        top = (h - new_h) // 2
+        left = (w - new_w) // 2
+        if leading_dims:
+            batch_size = math.prod(leading_dims)
+            img_r = img.reshape(batch_size, c, h, w)
+            cropped = img_r[:, :, top : top + new_h, left : left + new_w]
+            return cropped.reshape(leading_dims + [c, new_h, new_w])
+        return img[:, top : top + new_h, left : left + new_w]
+
+
+class SmallestMaxSize:
+    """Resize while preserving aspect ratio so that the smallest side equals `size`.
+
+    Uses the provided interpolation mode. This mirrors albumentations.SmallestMaxSize.
+    """
+
+    def __init__(self, size: int, interpolation=transforms.InterpolationMode.BOX):
+        assert size > 0
+        self.size = int(size)
+        self.interpolation = interpolation
+
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        *leading_dims, c, h, w = img.shape
+        if h == 0 or w == 0:
+            return img
+        if min(h, w) == self.size:
+            return img
+        scale = self.size / float(min(h, w))
+        new_h = int(round(h * scale))
+        new_w = int(round(w * scale))
+        # Use torchvision Resize with explicit (H, W)
+        resize = transforms.Resize(size=(new_h, new_w), interpolation=self.interpolation)
+        if leading_dims:
+            batch_size = int(torch.tensor(leading_dims).prod().item()) if leading_dims else 1
+            img_r = img.reshape(batch_size, c, h, w)
+            resized = resize(img_r)
+            return resized.reshape(leading_dims + [c, new_h, new_w])
+        return resize(img)
+
+
 def _build_eval_image_transform(
     image_target_size: list[int],
     image_crop_size: list[int],
+    use_albumentations: bool = False,
+    letter_box_transform: bool = True,
+    crop_fraction: float = 0.95,
+    shortest_image_edge: int = 256,
 ) -> transforms.Compose:
-    """Deterministic eval/inference image transform (letterbox → resize → centercrop → resize)."""
-    return transforms.Compose(
-        [
-            transforms.ToImage(),
-            LetterBoxTransform(),
-            transforms.Resize(size=image_target_size),
-            transforms.CenterCrop(size=image_crop_size),
-            transforms.Resize(size=image_target_size),
-        ]
-    )
+    """Deterministic eval/inference image transform.
+
+    Two modes are supported to match upstream Isaac-GR00T checkpoints:
+      - use_albumentations=True: emulates the albumentations recipe used in Isaac-GR00T
+        (optional letterbox -> SmallestMaxSize(shortest_image_edge, INTER_AREA) ->
+        FractionalCenterCrop(crop_fraction) -> Resize(image_target_size, INTER_AREA)).
+      - use_albumentations=False: preserves the original vLLM-Omni pipeline
+        (optional letterbox -> Resize(image_target_size) -> CenterCrop(image_crop_size)
+        -> Resize(image_target_size)).
+
+    The function intentionally avoids importing albumentations to keep the repo
+    dependency-free and reproduces the deterministic behaviour using torchvision
+    transforms and small helpers above.
+    """
+    steps = [transforms.ToImage()]
+
+    if use_albumentations:
+        # Only apply letterbox when explicitly requested in the processor config.
+        if letter_box_transform:
+            steps.append(LetterBoxTransform())
+        if shortest_image_edge is not None:
+            # Use BOX (area-like) interpolation to match cv2.INTER_AREA used by Isaac.
+            steps.append(SmallestMaxSize(shortest_image_edge, interpolation=transforms.InterpolationMode.BOX))
+        if crop_fraction is not None:
+            steps.append(FractionalCenterCrop(crop_fraction))
+        # Resize back to target size using BOX/area-like interpolation.
+        steps.append(transforms.Resize(size=image_target_size, interpolation=transforms.InterpolationMode.BOX))
+    else:
+        # Preserve historical vLLM-Omni behavior for callers that don't opt into
+        # the albumentations-style pipeline.
+        if letter_box_transform:
+            steps.append(LetterBoxTransform())
+        steps.append(transforms.Resize(size=image_target_size))
+        steps.append(transforms.CenterCrop(size=image_crop_size))
+        steps.append(transforms.Resize(size=image_target_size))
+
+    return transforms.Compose(steps)
 
 
 logger = init_logger(__name__)
@@ -176,6 +264,8 @@ class Gr00tN1d7Processor(ProcessorMixin):
         image_target_size: list[int] = None,
         shortest_image_edge: int = 256,
         crop_fraction: float = 0.95,
+        use_albumentations: bool = False,
+        letter_box_transform: bool = True,
         random_rotation_angle: int | None = None,
         color_jitter_params: dict[str, float] | None = None,
         formalize_language: bool = True,
@@ -237,6 +327,8 @@ class Gr00tN1d7Processor(ProcessorMixin):
                 self.embodiment_id_mapping[k] = v
         self.shortest_image_edge = shortest_image_edge
         self.crop_fraction = crop_fraction
+        self.use_albumentations = use_albumentations
+        self.letter_box_transform = letter_box_transform
 
         self.statistics: dict[str, dict[str, dict[str, dict[str, list[float]]]]] = {}
 
@@ -244,6 +336,10 @@ class Gr00tN1d7Processor(ProcessorMixin):
         self.eval_image_transform = _build_eval_image_transform(
             image_target_size,
             image_crop_size,
+            use_albumentations=self.use_albumentations,
+            letter_box_transform=self.letter_box_transform,
+            crop_fraction=self.crop_fraction,
+            shortest_image_edge=self.shortest_image_edge,
         )
         self._collator = self.data_collator_class(
             model_name=model_name,
@@ -470,6 +566,8 @@ class Gr00tN1d7Processor(ProcessorMixin):
                 "color_jitter_params": self.color_jitter_params,
                 "shortest_image_edge": self.shortest_image_edge,
                 "crop_fraction": self.crop_fraction,
+                "use_albumentations": self.use_albumentations,
+                "letter_box_transform": self.letter_box_transform,
                 "model_name": self.model_name,
                 "model_type": self.model_type,
                 "formalize_language": self.formalize_language,
