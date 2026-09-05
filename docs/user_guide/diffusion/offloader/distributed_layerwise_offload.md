@@ -10,6 +10,11 @@ otherwise DLO streams the ordinary loader's rank-local tensors.
 See the [DLO feature design](../../../design/feature/offloader/distributed_layerwise_offload.md)
 for the implementation contract and compatibility matrix.
 
+This PR does not introduce HSDP + DLO AllGather support. That combination is
+rejected to avoid double sharding; use HSDP without DLO or combine HSDP with
+the no-AllGather DLO path. The FS-axis support described in earlier drafts is
+not part of this PR.
+
 ## Execution model
 
 DLO overlaps three operations with a fixed two-block device buffer:
@@ -63,6 +68,18 @@ omni = Omni(
 | `--dlo-use-allgather` | Shard host weights and reconstruct with AllGather | `true` |
 | `--dlo-no-use-allgather` | Stream complete rank-local blocks without a DLO weight collective | `false` |
 | `--dlo-resident-layers N` | Keep N leading main-DiT blocks on device; requires no-AllGather and model-declared resident paths | `0` |
+| `--dlo-chunk-size-mb N` | Full-chunk target size in MiB for the chunked H2D + AllGather pipeline | `64` |
+| `--dlo-pin-budget-gb GB` | Pinned host-memory budget for DLO weight shards; unset means unlimited | `None` |
+| `--dlo-pin-failure-policy POLICY` | `fail` aborts on pin-budget or allocation failure; `whole_block_fallback` degrades to pageable whole-block transport | `fail` |
+
+A larger `--dlo-chunk-size-mb` reduces collective overhead per block but raises
+the device staging footprint; a smaller value improves H2D/AllGather overlap
+granularity. Set `--dlo-pin-budget-gb` to cap pinned host memory on nodes
+where replicas compete for it, and pair it with
+`--dlo-pin-failure-policy whole_block_fallback` to degrade to pageable
+whole-block transport instead of aborting when the budget is exceeded or a
+pinned allocation fails.
+
 | `--host-weight-runtime-mode {disabled,preferred,required}` | HWR policy: no interaction, populate on a miss, or require an exact hit | `disabled` |
 | `--host-weight-runtime-root PATH` | Writable node-local HWR store shared by workers in one storage domain; required for `preferred` and `required` | unset |
 | `--dlo-host-registration-limit-gib N` | Optional per-worker ceiling for registering an HWR mmap; zero adds no ceiling | `0` |
@@ -265,8 +282,9 @@ must enter each collective.
   and eligible no-AllGather configurations may use HWR final-layout artifacts,
   but direct checkpoint mmap provides no shared-mmap host-memory guarantee for
   TP greater than one.
-- HSDP plus AllGather is rejected to avoid double sharding. HSDP without
-  AllGather has limited end-to-end validation.
+- HSDP plus AllGather is rejected to avoid double sharding and is not a
+  capability introduced by this PR. HSDP without AllGather has limited
+  end-to-end validation.
 - Per-tensor online FP8 linears use the ordinary loader and can run with either
   DLO transfer path. With AllGather, every rank temporarily materializes the
   complete FP8 model in host memory before DLO retains only its shard. Other

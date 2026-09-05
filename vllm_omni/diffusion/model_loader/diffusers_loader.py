@@ -1057,10 +1057,54 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         if not outer_dits:
             raise ValueError("No DiT modules discovered for HSDP sharding")
 
+        # Stage 1 chunked weight transport: when DLO+AllGather is active the
+        # repeated DiT blocks belong to the chunk engine, not to FSDP. They must
+        # be resolved BEFORE apply_hsdp_to_model so they can be excluded from
+        # wrapping; a parameter with two owners would end up sharded twice.
+        chunk_ownership = None
+        _dist_offload = getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+        _use_ag = getattr(self.od_config, "dlo_use_allgather", True)
+        if _dist_offload and _use_ag:
+            from vllm_omni.diffusion.offloader.block_discovery import (
+                discover_chunk_owned_blocks,
+            )
+
+            resolved = discover_chunk_owned_blocks(model)
+            if resolved:
+                chunk_ownership = resolved
+                logger.info(
+                    "Resolved %d chunk-owned repeated blocks before HSDP wrapping",
+                    len(resolved.blocks),
+                )
+                # Handoff to DistributedLayerwiseOffloadBackend.enable(), which
+                # reads these off the pipeline into self._chunk_ownership /
+                # self._block_ids. This follows the loader -> backend attribute
+                # convention already used for _dlo_residency_controller and
+                # _omni_layerwise_hooks.
+                model._dlo_chunk_ownership = resolved
+                model._dlo_block_ids = resolved.block_ids
+            else:
+                logger.info(
+                    "DLO+AllGather is active but %s declares no repeated blocks; HSDP will wrap the whole model",
+                    type(model).__name__,
+                )
+
         # Apply HSDP sharding to each outermost DiT transformer
         for name, trans in zip(outer_dit_names, outer_dits):
             logger.debug("Applying HSDP to %s", name)
-            apply_hsdp_to_model(trans, hsdp_config, target_device=target_device)
+            # Each DiT only ignores the chunk-owned blocks it actually contains.
+            dit_chunk_blocks: list[nn.Module] = []
+            if chunk_ownership is not None:
+                trans_module_ids = {id(sub) for sub in trans.modules()}
+                dit_chunk_blocks = [
+                    entry.module for entry in chunk_ownership.blocks if id(entry.module) in trans_module_ids
+                ]
+            apply_hsdp_to_model(
+                trans,
+                hsdp_config,
+                target_device=target_device,
+                chunk_owned_blocks=dit_chunk_blocks or None,
+            )
 
         # HSDP only shards transformer modules. All other runtime modules must
         # be placed on the execution device explicitly after sharding.

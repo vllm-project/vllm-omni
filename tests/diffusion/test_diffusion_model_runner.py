@@ -1040,11 +1040,17 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
         model_class_name="NextStep11Pipeline",
         enforce_eager=True,
         streaming_output=False,
+        max_num_seqs=1,
     )
 
     monkeypatch.setattr(model_runner_module, "LoadConfig", lambda: object())
     monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _DummyLoader)
     monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _DummyMemoryProfiler)
+    monkeypatch.setattr(
+        model_runner_module.current_omni_platform,
+        "init_diffusion_model_runner_runtime",
+        lambda **_kwargs: None,
+    )
     monkeypatch.setattr(
         model_runner_module,
         "enable_offload_backend",
@@ -1187,3 +1193,59 @@ def test_vllm_set_forward_context_implementation(monkeypatch):
             ),
         ),
     ], ERROR_MESSAGE
+
+
+def test_stepwise_wraps_offload_request_context(monkeypatch):
+    """Stepwise execution must enter the offload backend's request lifecycle
+    (review: #6374 — stepwise DLO bypassed begin/end generation)."""
+    from contextlib import contextmanager as _cm
+
+    entered: list[bool] = []
+
+    @_cm
+    def _recording_context():
+        entered.append(True)
+        yield
+
+    runner = DiffusionModelRunner.__new__(DiffusionModelRunner)
+    runner.od_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        cache_backend=None,
+        streaming_output=False,
+    )
+    runner.offload_backend = SimpleNamespace(request_context=_recording_context)
+    runner.vllm_config = None
+    runner.pipeline = SimpleNamespace(
+        interrupt=False,
+        denoise_step=lambda *a, **k: None,
+        step_scheduler=lambda *a, **k: None,
+    )
+    runner.state_cache = {}
+
+    state = SimpleNamespace(
+        latents=torch.zeros(1, 1),
+        request_id="r0",
+        step_index=0,
+        denoise_completed=False,
+        request_denoise_completed=False,
+        chunk_denoise_completed=False,
+    )
+    monkeypatch.setattr(runner, "_supports_step_mode", lambda: True)
+    monkeypatch.setattr(runner, "_update_states", lambda _out: ([state], []))
+    monkeypatch.setattr(runner, "_prepare_batch_inputs", lambda states, ids: SimpleNamespace(latents=torch.zeros(1, 1)))
+    monkeypatch.setattr(model_runner_module, "scatter_latents", lambda *a, **k: None)
+    monkeypatch.setattr(
+        model_runner_module,
+        "clear_pipeline_stage_durations",
+        lambda _p: None,
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "consume_pipeline_stage_durations",
+        lambda _p: {},
+    )
+
+    scheduler_output = SimpleNamespace(scheduled_new_reqs=[])
+    runner._execute_stepwise(scheduler_output, validate_kv_metadata=False, record_output_peak_memory=False)
+
+    assert entered == [True]

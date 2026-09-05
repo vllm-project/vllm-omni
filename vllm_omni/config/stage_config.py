@@ -478,6 +478,9 @@ class StageDeployConfig:
     enable_distributed_layerwise_offload: bool | None = None
     dlo_use_allgather: bool | None = None
     dlo_resident_layers: int | None = None
+    dlo_chunk_size_mb: int | None = None
+    dlo_pin_budget_gb: float | None = None
+    dlo_pin_failure_policy: str | None = None
     host_weight_runtime_mode: str | None = None
     host_weight_runtime_root: str | None = None
     dlo_host_registration_limit_gib: float | None = None

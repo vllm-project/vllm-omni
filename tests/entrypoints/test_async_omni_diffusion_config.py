@@ -427,7 +427,7 @@ def test_serve_cli_forwards_distilled_lora_to_diffusion_stage():
 
 
 def test_serve_cli_forwards_distributed_offload_residency():
-    """Ensure the two-GPU DLO placement controls reach the diffusion stage."""
+    """Ensure DLO placement controls reach the diffusion stage."""
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
     OmniServeCommand().subparser_init(subparsers)
@@ -454,6 +454,39 @@ def test_serve_cli_forwards_distributed_offload_residency():
     assert engine_args["enable_distributed_layerwise_offload"] is True
     assert engine_args["dlo_use_allgather"] is False
     assert engine_args["dlo_resident_layers"] == 20
+
+
+def test_serve_cli_forwards_dlo_transport_controls():
+    """Ensure the chunk-size / pin-budget / pin-policy DLO controls reach the diffusion stage."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--enable-distributed-layerwise-offload",
+            "--dlo-chunk-size-mb",
+            "32",
+            "--dlo-pin-budget-gb",
+            "0.5",
+            "--dlo-pin-failure-policy",
+            "whole_block_fallback",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    engine_args = stage_cfg["engine_args"]
+
+    assert args.dlo_chunk_size_mb == 32
+    assert args.dlo_pin_budget_gb == 0.5
+    assert args.dlo_pin_failure_policy == "whole_block_fallback"
+    assert engine_args["dlo_chunk_size_mb"] == 32
+    assert engine_args["dlo_pin_budget_gb"] == 0.5
+    assert engine_args["dlo_pin_failure_policy"] == "whole_block_fallback"
 
 
 def test_serve_cli_forwards_hwr_policy_for_no_allgather_dlo():

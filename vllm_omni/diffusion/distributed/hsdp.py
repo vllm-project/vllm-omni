@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -93,6 +93,7 @@ def apply_hsdp_to_model(
     model: nn.Module,
     hsdp_config: HSDPInferenceConfig,
     target_device: torch.device | None = None,
+    chunk_owned_blocks: Sequence[nn.Module] | None = None,
 ) -> nn.Module:
     """
     Apply HSDP sharding to a model that already has weights loaded.
@@ -107,6 +108,13 @@ def apply_hsdp_to_model(
             _hsdp_ignored_modules, those modules are excluded from FSDP's
             mesh-driven device placement, so the caller must specify where to
             put them. Optional only when there are no ignored modules.
+        chunk_owned_blocks: Repeated DiT blocks delegated to the chunked FS
+            offload engine. Their parameters and buffers are added to
+            ``ignored_params`` so FSDP never wraps them, giving every tensor
+            exactly one owner. Unlike ``_hsdp_ignored_modules``, these tensors
+            are deliberately left where they are: the chunk engine keeps them
+            in pinned host memory and streams them per layer, so moving them
+            to ``target_device`` would defeat the offload and blow up HBM.
 
     Returns:
         HSDP-wrapped model ready for inference
@@ -198,12 +206,39 @@ def apply_hsdp_to_model(
             target_device,
         )
 
+    # Repeated blocks delegated to the chunked FS offload engine. Adding their
+    # tensors to ignored_params is what guarantees a single owner per parameter:
+    # the chunk engine streams them, so FSDP must not wrap or shard them.
+    #
+    # These tensors are intentionally NOT moved to target_device. The chunk
+    # engine holds them in pinned host memory and copies each block in on
+    # demand; materializing all of them on the device would defeat the offload.
+    chunk_owned_tensors: set[torch.Tensor] = set()
+    if chunk_owned_blocks:
+        for block in chunk_owned_blocks:
+            chunk_owned_tensors.update(block.parameters())
+            chunk_owned_tensors.update(block.buffers())
+        # Count only tensors this delegation contributes, so tensors already
+        # ignored for other reasons are not double counted.
+        newly_delegated = chunk_owned_tensors - ignored_params
+        ignored_params.update(chunk_owned_tensors)
+        logger.info(
+            "HSDP delegated %d repeated blocks (%d parameter tensors) to chunked FS offload",
+            len(chunk_owned_blocks),
+            len(newly_delegated),
+        )
+
     # Serialized low-bit checkpoints may store packed weights in integer
     # Parameters (for example, ModelOpt NVFP4 uses uint8) and global scales as
     # scalar Parameters. FSDP2 cannot represent non-floating or zero-dimensional
     # sharded parameters. Keep those tensors resident and replicated; eligible
     # scales, biases, and other parameters remain HSDP-sharded.
+    # Chunk-owned tensors are already ignored and must stay in host memory, so
+    # they are excluded here: otherwise a packed integer or scalar parameter
+    # inside a delegated block would be moved to target_device below.
     unshardable_params = _unshardable_parameters(model)
+    if chunk_owned_tensors:
+        unshardable_params -= chunk_owned_tensors
     if unshardable_params:
         if target_device is None:
             raise ValueError(

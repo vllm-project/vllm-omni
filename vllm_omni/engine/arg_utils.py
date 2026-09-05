@@ -577,6 +577,9 @@ class OrchestratorArgs:
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = 0
+    dlo_chunk_size_mb: int = 64
+    dlo_pin_budget_gb: float | None = None
+    dlo_pin_failure_policy: str = "fail"
     host_weight_runtime_mode: str = "disabled"
     host_weight_runtime_root: str | None = None
     dlo_host_registration_limit_gib: float = 0.0

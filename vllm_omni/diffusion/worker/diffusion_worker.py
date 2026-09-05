@@ -671,6 +671,18 @@ class DiffusionWorker:
             return {"dp_rank": get_data_parallel_rank(), "output": output}
         return output
 
+    def get_runtime_metrics(
+        self,
+        reset_peaks: bool = False,
+        reset_transport_counters: bool = False,
+    ) -> dict:
+        """Expose model-runner transport and device metrics over worker RPC."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        return self.model_runner.get_runtime_metrics(
+            reset_peaks=reset_peaks,
+            reset_transport_counters=reset_transport_counters,
+        )
+
     def execute_model_batch(
         self, scheduler_output: DiffusionSchedulerOutput, od_config: OmniDiffusionConfig
     ) -> BatchRunnerOutput:
@@ -1471,7 +1483,7 @@ class WorkerProc:
 
         shutdown_triggered = False
 
-        def signal_handler(signum: int, frame) -> None:
+        def signal_handler(signum: int, _frame) -> None:
             nonlocal shutdown_triggered
             if not shutdown_triggered:
                 shutdown_triggered = True

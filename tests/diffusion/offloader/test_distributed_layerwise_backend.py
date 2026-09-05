@@ -26,9 +26,17 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
 )
 from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
 from vllm_omni.diffusion.offloader.block_discovery import (
+    ChunkOwnedBlock,
+    ChunkOwnership,
     get_blocks_attr_names,
     get_blocks_from_dit,
     set_blocks_attr_names,
+)
+from vllm_omni.diffusion.offloader.chunked_transport import (
+    PinBudget,
+    TransportBackendKind,
+    build_part_manifest,
+    pack_local_shard,
 )
 from vllm_omni.diffusion.offloader.distributed_layerwise_backend import (
     DistributedLayerwiseOffloadBackend,
@@ -45,6 +53,15 @@ from vllm_omni.diffusion.offloader.offload_plan import (
     get_offload_plan,
 )
 from vllm_omni.diffusion.offloader.startup import OffloadStartupState, attach_offload_startup_state
+from vllm_omni.diffusion.offloader.tensor_utils import (
+    make_offload_placeholder,
+    set_tensor_storage,
+)
+from vllm_omni.diffusion.offloader.weight_transport_backend import (
+    ReferenceBackend,
+    TransportCapability,
+    select_transport,
+)
 from vllm_omni.host_weight_runtime import MappedHostRegion
 from vllm_omni.platforms import current_omni_platform
 
@@ -112,21 +129,95 @@ def _make_values(start: float) -> torch.Tensor:
     return torch.arange(start, start + 4, dtype=torch.float32)
 
 
+def _make_prepared_hook(
+    next_block: nn.Module,
+    *,
+    weight_shard_group=None,
+    weight_shard_size: int = 1,
+    weight_shard_rank: int = 0,
+    copy_stream=None,
+    comm_stream=None,
+    shared_buffers=None,
+) -> DistributedLayerwiseOffloadHook:
+    specs = []
+    targets = {}
+    for name, tensor, is_buffer in [
+        *((name, tensor, False) for name, tensor in next_block.named_parameters()),
+        *((name, tensor, True) for name, tensor in next_block.named_buffers()),
+    ]:
+        local = tensor.to_local() if hasattr(tensor, "to_local") else tensor.detach()
+        transform = getattr(tensor, "mmap_weight_transform", None)
+        if callable(transform) and getattr(tensor, "mmap_weight_transform_pending", False):
+            local = transform(local)
+        specs.append((name, local, is_buffer))
+        targets[name] = tensor
+
+    manifest = build_part_manifest(
+        specs,
+        block_id=id(next_block),
+        part_id="block",
+        weight_shard_size=weight_shard_size,
+        weight_shard_rank=weight_shard_rank,
+        chunk_size_bytes=1024 * 1024,
+        alignment_bytes=1,
+    )
+    cpu_shards = pack_local_shard(
+        specs,
+        manifest,
+        allocator=lambda numel, dtype: torch.empty(numel, dtype=dtype),
+    )
+    metadata = {
+        dtype_manifest.dtype: [
+            {
+                "name": tensor.name,
+                "offset": tensor.offset,
+                "numel": tensor.numel,
+                "shape": torch.Size(tensor.shape),
+                "stride": tensor.stride,
+            }
+            for tensor in dtype_manifest.tensors
+        ]
+        for dtype_manifest in manifest.dtypes
+    }
+    transported_names = {tensor.name for dtype_manifest in manifest.dtypes for tensor in dtype_manifest.tensors}
+    for name in transported_names:
+        set_tensor_storage(targets[name], make_offload_placeholder(targets[name]))
+
+    return DistributedLayerwiseOffloadHook(
+        next_block=next_block,
+        device=torch.device("cpu"),
+        weight_shard_group=weight_shard_group,
+        weight_shard_size=weight_shard_size,
+        weight_shard_rank=weight_shard_rank,
+        copy_stream=copy_stream,
+        comm_stream=comm_stream,
+        shared_buffers=shared_buffers,
+        prepared_host_part={
+            "cpu_shards": cpu_shards,
+            "metadata": metadata,
+            "manifest": manifest,
+            "fallback_reason": "pageable test shard",
+        },
+        data_transport_backend=ReferenceBackend(
+            TransportCapability(
+                world_size=weight_shard_size,
+                rank=weight_shard_rank,
+                global_ranks=tuple(range(weight_shard_size)),
+            )
+        ),
+    )
+
+
 class TestDistributedLayerwiseOffloadHook:
     def test_shard_and_pin_single_rank(self, dist_group, patched_offload_runtime):
         """With dp_size=1, the shard should equal the full weights."""
         current_block = TinyBlock(_make_values(1.0))
         next_block = TinyBlock(_make_values(10.0))
 
-        hook = DistributedLayerwiseOffloadHook(
-            next_block=next_block,
-            device=torch.device("cpu"),
-            dp_group=None,
-            dp_size=1,
-            rank=0,
+        hook = _make_prepared_hook(
+            next_block,
             copy_stream=DummyStream(),
             comm_stream=DummyStream(),
-            pin_memory=False,
         )
 
         hook.initialize_hook(current_block)
@@ -156,15 +247,10 @@ class TestDistributedLayerwiseOffloadHook:
         expected_stride = next_block.weight.stride()
         assert expected_stride == (1, 4)
 
-        hook = DistributedLayerwiseOffloadHook(
-            next_block=next_block,
-            device=torch.device("cpu"),
-            dp_group=None,
-            dp_size=1,
-            rank=0,
+        hook = _make_prepared_hook(
+            next_block,
             copy_stream=DummyStream(),
             comm_stream=DummyStream(),
-            pin_memory=False,
         )
         hook.initialize_hook(current_block)
         hook.prefetch_layer(slot=0, non_blocking=False)
@@ -200,25 +286,21 @@ class TestDistributedLayerwiseOffloadHook:
         expected_scale = rank0_block.weight_scale.detach().clone()
         expected_stride = rank0_block.weight.stride()
 
-        rank0_hook = DistributedLayerwiseOffloadHook(
-            next_block=rank0_block,
-            device=torch.device("cpu"),
-            dp_group=object(),
-            dp_size=2,
-            rank=0,
+        rank0_hook = _make_prepared_hook(
+            rank0_block,
+            weight_shard_group=object(),
+            weight_shard_size=2,
+            weight_shard_rank=0,
             copy_stream=DummyStream(),
             comm_stream=DummyStream(),
-            pin_memory=False,
         )
-        rank1_hook = DistributedLayerwiseOffloadHook(
-            next_block=rank1_block,
-            device=torch.device("cpu"),
-            dp_group=object(),
-            dp_size=2,
-            rank=1,
+        rank1_hook = _make_prepared_hook(
+            rank1_block,
+            weight_shard_group=object(),
+            weight_shard_size=2,
+            weight_shard_rank=1,
             copy_stream=DummyStream(),
             comm_stream=DummyStream(),
-            pin_memory=False,
         )
         rank0_hook.initialize_hook(current_block)
         rank1_hook.initialize_hook(OnlineFp8Block())
@@ -404,15 +486,10 @@ class TestDistributedLayerwiseOffloadHook:
         current_block = TinyBlock(_make_values(1.0))
         next_block = TinyBlock(_make_values(10.0))
 
-        hook = DistributedLayerwiseOffloadHook(
-            next_block=next_block,
-            device=torch.device("cpu"),
-            dp_group=None,
-            dp_size=1,
-            rank=0,
+        hook = _make_prepared_hook(
+            next_block,
             copy_stream=DummyStream(),
             comm_stream=DummyStream(),
-            pin_memory=False,
         )
 
         hook.initialize_hook(current_block)
@@ -439,15 +516,10 @@ class TestDistributedLayerwiseOffloadHook:
         current_block = TinyBlock(_make_values(1.0))
         next_block = TinyBlock(_make_values(10.0))
 
-        hook = DistributedLayerwiseOffloadHook(
-            next_block=next_block,
-            device=torch.device("cpu"),
-            dp_group=None,
-            dp_size=1,
-            rank=0,
+        hook = _make_prepared_hook(
+            next_block,
             copy_stream=DummyStream(),
             comm_stream=DummyStream(),
-            pin_memory=False,
         )
 
         hook.initialize_hook(current_block)
@@ -470,19 +542,44 @@ class TestDistributedLayerwiseOffloadHook:
 
         assert hook.current_slot == 0
 
+    def test_offload_layer_retires_prev_ticket_and_event_together(self, dist_group, patched_offload_runtime):
+        """offload_layer must retire the previous hook's ready ticket and ready
+        event as a pair, so the next ring reuse does not fail fast on a leftover
+        event whose ticket is gone (review: #6374)."""
+        block_a = TinyBlock(_make_values(1.0))
+        block_b = TinyBlock(_make_values(10.0))
+
+        hook_a = _make_prepared_hook(
+            block_b,
+            copy_stream=DummyStream(),
+            comm_stream=DummyStream(),
+        )
+        hook_a.initialize_hook(block_a)
+        hook_b = _make_prepared_hook(
+            block_a,
+            copy_stream=DummyStream(),
+            comm_stream=DummyStream(),
+        )
+        hook_b.initialize_hook(block_b)
+        hook_b._prev_hook = hook_a
+
+        # hook_a produced slot 0 for hook_b's compute.
+        hook_a.prefetch_layer(slot=0, non_blocking=False)
+        assert hook_a.ready_tickets[0] is not None
+        assert hook_a.ready_events[0] is not None
+
+        hook_b.current_slot = 0
+        hook_b.offload_layer()
+
+        assert hook_a.ready_tickets[0] is None
+        assert hook_a.ready_events[0] is None
+
     def test_device_buffers_allocated(self, dist_group, patched_offload_runtime):
         """Verify exactly two device buffers are allocated."""
         current_block = TinyBlock(_make_values(1.0))
         next_block = TinyBlock(_make_values(10.0))
 
-        hook = DistributedLayerwiseOffloadHook(
-            next_block=next_block,
-            device=torch.device("cpu"),
-            dp_group=None,
-            dp_size=1,
-            rank=0,
-            pin_memory=False,
-        )
+        hook = _make_prepared_hook(next_block)
 
         hook.initialize_hook(current_block)
 
@@ -508,13 +605,10 @@ class TestDistributedLayerwiseOffloadHook:
         next_block.weight = nn.Parameter(torch.arange(100, 108, dtype=torch.float32))
 
         # Simulate dp_size=4, rank=1
-        hook = DistributedLayerwiseOffloadHook(
-            next_block=next_block,
-            device=torch.device("cpu"),
-            dp_group=None,
-            dp_size=4,
-            rank=1,
-            pin_memory=False,
+        hook = _make_prepared_hook(
+            next_block,
+            weight_shard_size=4,
+            weight_shard_rank=1,
         )
 
         hook.initialize_hook(block)
@@ -534,18 +628,11 @@ class TestDistributedLayerwiseOffloadHook:
         next_block.weight = nn.Parameter(torch.arange(100, 103, dtype=torch.float32))
 
         # 3 elements, dp_size=2: both ranks get ceil(3/2)=2 elements (padded)
-        hook0 = DistributedLayerwiseOffloadHook(
-            next_block=next_block,
-            device=torch.device("cpu"),
-            dp_group=None,
-            dp_size=2,
-            rank=0,
-            pin_memory=False,
+        hook0 = _make_prepared_hook(
+            next_block,
+            weight_shard_size=2,
+            weight_shard_rank=0,
         )
-        # Need fresh next_block for each hook since init replaces tensors
-        next_block0 = nn.Module()
-        next_block0.weight = nn.Parameter(torch.arange(100, 103, dtype=torch.float32))
-        hook0.next_block = next_block0
         hook0.initialize_hook(block)
 
         shard0 = hook0.cpu_shards[torch.float32]
@@ -556,13 +643,10 @@ class TestDistributedLayerwiseOffloadHook:
         next_block1.weight = nn.Parameter(torch.arange(100, 103, dtype=torch.float32))
         block1 = nn.Module()
         block1.weight = nn.Parameter(torch.arange(3, dtype=torch.float32))
-        hook1 = DistributedLayerwiseOffloadHook(
-            next_block=next_block1,
-            device=torch.device("cpu"),
-            dp_group=None,
-            dp_size=2,
-            rank=1,
-            pin_memory=False,
+        hook1 = _make_prepared_hook(
+            next_block1,
+            weight_shard_size=2,
+            weight_shard_rank=1,
         )
         hook1.initialize_hook(block1)
 
@@ -576,22 +660,33 @@ class TestDistributedLayerwiseOffloadHook:
         block.weight = nn.Parameter(torch.zeros(4, dtype=torch.float32))
         next_block = nn.Module()
         next_block.weight = nn.Parameter(torch.arange(4, dtype=torch.float32))
+        next_block.weight.mmap_weight_transform = lambda tensor: tensor.flip(0)
+        next_block.weight.mmap_weight_transform_pending = True
 
-        def transform(tensor):
-            return tensor.flip(0)
-
-        hook = DistributedLayerwiseOffloadHook(
-            next_block=next_block,
-            device=torch.device("cpu"),
-            dp_group=None,
-            dp_size=2,
-            rank=0,
-            pin_memory=False,
-            tensor_transforms={id(next_block.weight): transform},
+        hook = _make_prepared_hook(
+            next_block,
+            weight_shard_size=2,
+            weight_shard_rank=0,
         )
         hook.initialize_hook(block)
 
         assert torch.equal(hook.cpu_shards[torch.float32], torch.tensor([3.0, 2.0]))
+
+    def test_regular_loader_weight_does_not_reapply_mmap_transform(self, dist_group, patched_offload_runtime):
+        block = nn.Module()
+        block.weight = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+        next_block = nn.Module()
+        next_block.weight = nn.Parameter(torch.arange(4, dtype=torch.float32))
+        next_block.weight.mmap_weight_transform = lambda tensor: tensor.flip(0)
+
+        hook = _make_prepared_hook(
+            next_block,
+            weight_shard_size=2,
+            weight_shard_rank=0,
+        )
+        hook.initialize_hook(block)
+
+        assert torch.equal(hook.cpu_shards[torch.float32], torch.tensor([0.0, 1.0]))
 
     def test_transform_is_not_applied_without_a_loader_plan(self, dist_group, patched_offload_runtime):
         block = nn.Module()
@@ -599,17 +694,182 @@ class TestDistributedLayerwiseOffloadHook:
         next_block = nn.Module()
         next_block.weight = nn.Parameter(torch.arange(4, dtype=torch.float32))
 
-        hook = DistributedLayerwiseOffloadHook(
-            next_block=next_block,
-            device=torch.device("cpu"),
-            dp_group=None,
-            dp_size=2,
-            rank=0,
-            pin_memory=False,
+        hook = _make_prepared_hook(
+            next_block,
+            weight_shard_size=2,
+            weight_shard_rank=0,
         )
         hook.initialize_hook(block)
 
         assert torch.equal(hook.cpu_shards[torch.float32], torch.tensor([0.0, 1.0]))
+
+    def test_rank_local_pack_preserves_transform_and_stride(self, dist_group, patched_offload_runtime):
+        """Rank-local packing applies registered transforms and round-trips
+        the transformed (transposed) weight through prefetch with its
+        physical stride preserved.
+
+        This covers the sharded AllGather path (weight_shard_size > 1), which
+        packs blocks into private Host shards.  The rank-local mmap path
+        (weight_shard_size == 1 with a checkpoint_mmap plan) retains sources
+        instead; see test_rank_local_mmap_retains_source_and_uses_staging.
+        """
+        current_block = nn.Linear(2, 2, bias=False)
+        next_block = nn.Linear(2, 2, bias=False)
+        next_block.weight.data.copy_(torch.arange(4, dtype=torch.float32).view(2, 2))
+        next_block.weight.mmap_weight_transform = lambda tensor: tensor.t()
+        next_block.weight.mmap_weight_transform_pending = True
+
+        hook = _make_prepared_hook(
+            next_block,
+            copy_stream=DummyStream(),
+            comm_stream=DummyStream(),
+        )
+        hook.initialize_hook(current_block)
+        hook.prefetch_layer(slot=0, non_blocking=False)
+
+        assert torch.equal(
+            next_block.weight,
+            torch.tensor([[0.0, 2.0], [1.0, 3.0]]),
+        )
+        assert next_block.weight.stride() == (1, 2)
+
+    def test_plan_transform_is_applied_by_block_tensor_specs(self, dist_group, patched_offload_runtime):
+        """The backend applies loader-plan transforms when collecting block tensors."""
+        block = nn.Module()
+        block.weight = nn.Parameter(torch.arange(4, dtype=torch.float32))
+
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+            ),
+            torch.device("cpu"),
+        )
+        backend._mmap_transforms_by_tensor_id[id(block.weight)] = lambda tensor: tensor.flip(0)
+
+        specs = backend._block_tensor_specs(block)
+        local = next(tensor for name, tensor, _ in specs if name == "weight")
+        assert torch.equal(local, torch.tensor([3.0, 2.0, 1.0, 0.0]))
+
+        # Without a registered transform the raw tensor is collected.
+        backend._mmap_transforms_by_tensor_id.clear()
+        specs = backend._block_tensor_specs(block)
+        local = next(tensor for name, tensor, _ in specs if name == "weight")
+        assert torch.equal(local, torch.tensor([0.0, 1.0, 2.0, 3.0]))
+
+    def test_transform_changing_numel_or_dtype_family_rejected(self, dist_group, patched_offload_runtime):
+        """Transforms that alter numel or dtype family fail fast (review: #6374)."""
+        block = nn.Module()
+        block.weight = nn.Parameter(torch.arange(4, dtype=torch.float32))
+
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+            ),
+            torch.device("cpu"),
+        )
+
+        backend._mmap_transforms_by_tensor_id[id(block.weight)] = lambda tensor: tensor[:2]
+        with pytest.raises(RuntimeError, match="changed numel"):
+            backend._block_tensor_specs(block)
+
+        backend._mmap_transforms_by_tensor_id[id(block.weight)] = lambda tensor: tensor.to(torch.int32)
+        with pytest.raises(RuntimeError, match="changed the dtype family"):
+            backend._block_tensor_specs(block)
+
+        # A view-only transform (stride change) stays legal.
+        backend._mmap_transforms_by_tensor_id[id(block.weight)] = lambda tensor: tensor.view(2, 2).t()
+        specs = backend._block_tensor_specs(block)
+        local = next(tensor for name, tensor, _ in specs if name == "weight")
+        assert local.shape == (2, 2)
+
+    def test_drain_transport_continues_after_hook_failure(self, dist_group, patched_offload_runtime):
+        """A failing hook does not stop the remaining hooks from draining (review: #6374)."""
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+            ),
+            torch.device("cpu"),
+        )
+        drained: list[str] = []
+
+        class _StubHook:
+            def __init__(self, name, exc=None):
+                self.name = name
+                self._exc = exc
+
+            def drain_request(self):
+                drained.append(self.name)
+                if self._exc is not None:
+                    raise self._exc
+
+        backend._all_hook_groups = [
+            [_StubHook("ok-1"), _StubHook("bad", RuntimeError("future failed")), _StubHook("ok-2")]
+        ]
+        backend._shared_slot_group = None
+
+        with pytest.raises(RuntimeError, match="future failed"):
+            backend._drain_transport()
+        assert drained == ["ok-1", "bad", "ok-2"]
+
+    def test_prepare_host_storage_aborts_cleanly_on_pin_failure(self, dist_group, patched_offload_runtime):
+        """An agreed pin failure with policy=fail drops packed state (review: #6374)."""
+        import vllm_omni.diffusion.offloader.distributed_layerwise_backend as backend_module
+
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=True,
+                dlo_pin_failure_policy="fail",
+                weight_shard_size=1,
+            ),
+            torch.device("cpu"),
+        )
+        block = nn.Module()
+        block.weight = nn.Parameter(torch.arange(4, dtype=torch.float32))
+        ownership = ChunkOwnership()
+        ownership.block_ids[id(block)] = 0
+        ownership.blocks.append(ChunkOwnedBlock(module=block, path="blocks.0"))
+        backend._planned_manifests = {id(block): None}  # pack is monkeypatched; manifest unused
+        backend._forced_fallback_reason = None
+        backend._prepared_host_parts = {id(block): {"cpu_shards": {}}}
+        released = []
+        backend._release_mmap_handles = lambda: released.append(True)
+
+        def _raising_pack(*args, **kwargs):
+            raise RuntimeError("pin_memory failed")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(backend_module, "pack_local_shard", _raising_pack)
+            with pytest.raises(RuntimeError, match="pinned allocation failed"):
+                backend._prepare_host_storage(ownership)
+        assert backend._prepared_host_parts == {}
+        assert released == [True]
+
+    def test_disable_releases_prepared_host_storage(self, dist_group, patched_offload_runtime):
+        """disable() must drop the backend-level prepared Host parts together
+        with the pin-budget accounting, not only the hooks' cpu_shards, so the
+        pinned Host memory is actually released and no stale metrics survive an
+        enable/disable cycle (review: #6374)."""
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=True,
+            ),
+            torch.device("cpu"),
+        )
+        backend.enabled = True
+        backend._prepared_host_parts = {0: {"cpu_shards": {torch.float32: torch.empty(4)}}}
+        backend._planned_manifests = {0: object()}
+        backend.pin_budget = PinBudget(limit_bytes=1 << 20)
+
+        backend.disable()
+
+        assert backend._prepared_host_parts == {}
+        assert backend._planned_manifests == {}
+        assert backend.pin_budget is None
 
     def test_rank_local_mmap_retains_source_and_uses_staging(self, dist_group, patched_offload_runtime):
         current_block = nn.Linear(2, 2, bias=False)
@@ -623,9 +883,9 @@ class TestDistributedLayerwiseOffloadHook:
         hook = DistributedLayerwiseOffloadHook(
             next_block=next_block,
             device=torch.device("cpu"),
-            dp_group=None,
-            dp_size=1,
-            rank=0,
+            weight_shard_group=None,
+            weight_shard_size=1,
+            weight_shard_rank=0,
             pin_memory=False,
             rank_local_mmap=True,
             tensor_transforms={id(next_block.weight): transform},
@@ -659,9 +919,9 @@ class TestDistributedLayerwiseOffloadHook:
             hook = DistributedLayerwiseOffloadHook(
                 next_block=next_block,
                 device=torch.device("cpu"),
-                dp_group=None,
-                dp_size=1,
-                rank=0,
+                weight_shard_group=None,
+                weight_shard_size=1,
+                weight_shard_rank=0,
                 pin_memory=False,
                 shared_buffers=[None, None],
                 rank_local_mmap=True,
@@ -785,13 +1045,11 @@ class TestPinnedResidentLayerGroup:
         next_block = nn.Module()
         next_block.weight = nn.Parameter(torch.arange(3, dtype=torch.float32))
 
-        hook = DistributedLayerwiseOffloadHook(
-            next_block=next_block,
-            device=torch.device("cpu"),
-            dp_group=object(),
-            dp_size=2,
-            rank=0,
-            pin_memory=False,
+        hook = _make_prepared_hook(
+            next_block,
+            weight_shard_group=object(),
+            weight_shard_size=2,
+            weight_shard_rank=0,
         )
         hook.initialize_hook(block)
         # Simulate unified buffers sized for a larger heterogeneous block.
@@ -930,9 +1188,9 @@ def test_registered_mmap_hook_bypasses_host_staging(patched_offload_runtime):
     hook = DistributedLayerwiseOffloadHook(
         next_block=next_block,
         device=torch.device("cpu"),
-        dp_group=None,
-        dp_size=1,
-        rank=0,
+        weight_shard_group=None,
+        weight_shard_size=1,
+        weight_shard_rank=0,
         pin_memory=False,
         rank_local_mmap=True,
     )
@@ -1253,6 +1511,7 @@ class TestMmapWeightLoading:
                 pin_cpu_memory=False,
                 dp_size=1,
                 dlo_use_allgather=True,
+                dlo_pin_failure_policy="whole_block_fallback",
             ),
             torch.device("cpu"),
             host_weight_plan=result.plan,
@@ -1261,9 +1520,21 @@ class TestMmapWeightLoading:
         backend.enable(pipeline)
 
         assert backend._using_rank_local_mmap
-        assert backend.dp_group is None
-        assert all(hook.rank_local_mmap for group in backend._all_hook_groups for hook in group)
+        assert backend.weight_shard_group is None
+        hooks = [hook for group in backend._all_hook_groups for hook in group]
+        assert hooks
+        # Rank-local (weight_shard_size=1) with a checkpoint_mmap plan: hooks
+        # retain the mmap views as the host backing and stream with plain H2D.
+        # No chunked packing runs — no prepared parts and no per-block private
+        # pinned shards — and the mmap file handles stay open until disable().
+        assert all(hook.weight_shard_size == 1 for hook in hooks)
+        assert all(hook.weight_shard_group is None for hook in hooks)
+        assert not backend._prepared_host_parts
+        assert all(hook.cpu_shards == {} for hook in hooks)
+        assert all(hook.cpu_sources for hook in hooks)
+        assert hasattr(backend, "_mmap_file_cache")
         backend.disable()
+        assert not hasattr(backend, "_mmap_file_cache")
 
     def test_hwr_carrier_is_taken_and_released_after_bounded_staging(self, patched_offload_runtime):
         """A warm HWR plan uses the existing two-slot rank-local transport."""
@@ -1338,7 +1609,7 @@ class TestMmapWeightLoading:
         pipeline, backend, carrier, lease = _hwr_backend()
         monkeypatch.setattr(
             backend,
-            "_allocate_shared_buffers",
+            "_allocate_shared_rank_local_buffers",
             lambda hooks: (_ for _ in ()).throw(RuntimeError("device buffer allocation failed")),
         )
 
@@ -1409,14 +1680,7 @@ class TestCrossGroupSharedBuffer:
         block_a = TinyBlock(_make_values(1.0))
         block_b = TinyBlock(_make_values(10.0))
 
-        hook_a = DistributedLayerwiseOffloadHook(
-            next_block=block_b,
-            device=torch.device("cpu"),
-            dp_group=None,
-            dp_size=1,
-            rank=0,
-            pin_memory=False,
-        )
+        hook_a = _make_prepared_hook(block_b)
         hook_a.initialize_hook(block_a)
 
         # Prefetch to make block_a "materialized" (non-empty params)
@@ -1475,13 +1739,11 @@ class TestAllGatherOutputSlicing:
         large_block.weight = nn.Parameter(torch.arange(100, 132, dtype=torch.float32))
 
         def make_hook(next_block: nn.Module) -> DistributedLayerwiseOffloadHook:
-            hook = DistributedLayerwiseOffloadHook(
-                next_block=next_block,
-                device=torch.device("cpu"),
-                dp_group=dist.group.WORLD,  # non-None -> AllGather path (mocked below)
-                dp_size=dp_size,
-                rank=0,
-                pin_memory=False,
+            hook = _make_prepared_hook(
+                next_block,
+                weight_shard_group=dist.group.WORLD,
+                weight_shard_size=dp_size,
+                weight_shard_rank=0,
             )
             current_block = nn.Module()
             current_block.weight = nn.Parameter(torch.zeros(4, dtype=torch.float32))
@@ -1493,8 +1755,11 @@ class TestAllGatherOutputSlicing:
         hooks = [hook_small, hook_large]
 
         # Assign max-sized shared buffers exactly as backend.enable() does.
-        shared_buffers = DistributedLayerwiseOffloadBackend._allocate_shared_buffers(hooks)
-        shared_shard_buffers = DistributedLayerwiseOffloadBackend._allocate_shared_shard_buffers(hooks)
+        backend = object.__new__(DistributedLayerwiseOffloadBackend)
+        backend.device = torch.device("cpu")
+        manifests = [hook.manifest for hook in hooks]
+        shared_buffers = backend._allocate_shared_buffers(manifests)
+        shared_shard_buffers = backend._allocate_shared_chunk_buffers(manifests)
         for hook in hooks:
             hook.gpu_buffers = shared_buffers
             hook.gpu_shard_buffers = shared_shard_buffers
@@ -2202,6 +2467,128 @@ class TestConfigValidation:
         assert config.dp_size == 1  # forced to 1 when no AllGather
         assert config.dlo_resident_layers == 20
 
+    def _make_weight_shard_backend(self, weight_shard_size: int, use_hsdp: bool):
+        from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
+        from vllm_omni.diffusion.offloader.distributed_layerwise_backend import (
+            DistributedLayerwiseOffloadBackend,
+        )
+
+        config = OffloadConfig(
+            strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+            use_hsdp=use_hsdp,
+            dlo_use_allgather=True,
+            weight_shard_size=weight_shard_size,
+        )
+        backend = DistributedLayerwiseOffloadBackend(config, torch.device("cpu"))
+        backend.weight_shard_size = weight_shard_size
+        return backend
+
+    def test_non_hsdp_dp_group_resolver(self, monkeypatch):
+        """Non-HSDP DLO resolves the DP group for the weight collective.
+
+        Regression coverage for the review finding that non-HSDP configs
+        (DP > 1) were rejected by the HSDP-only FS-group branch."""
+        import torch.distributed as dist
+
+        import vllm_omni.diffusion.distributed.parallel_state as ps
+
+        backend = self._make_weight_shard_backend(weight_shard_size=4, use_hsdp=False)
+        coord = SimpleNamespace(
+            device_group=object(),
+            cpu_group=object(),
+            rank_in_group=2,
+            world_size=4,
+            ranks=[0, 1, 2, 3],
+            rank=2,
+        )
+        monkeypatch.setattr(dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(ps, "get_data_parallel_world_size", lambda: 4)
+        monkeypatch.setattr(ps, "get_dp_group", lambda: coord)
+        dedicated = object()
+        captured: dict[str, object] = {}
+
+        def fake_new_group(ranks, backend=None, use_local_synchronization=False):
+            captured["ranks"] = list(ranks)
+            captured["backend"] = backend
+            captured["use_local_synchronization"] = use_local_synchronization
+            return dedicated
+
+        monkeypatch.setattr(dist, "new_group", fake_new_group)
+        monkeypatch.setattr(dist, "get_backend", lambda group: "hccl")
+
+        backend._init_weight_shard_group()
+
+        assert backend.weight_shard_group is dedicated
+        assert captured["ranks"] == coord.ranks
+        assert captured["backend"] == "hccl"
+        assert captured["use_local_synchronization"] is True
+        assert backend.weight_shard_cpu_group is coord.cpu_group
+        assert backend.weight_shard_rank == 2
+        assert backend.weight_shard_ranks == tuple(coord.ranks)
+        assert backend.config.weight_shard_size == 4
+
+    def test_non_hsdp_sp_group_resolver_when_dp1(self, monkeypatch):
+        """DP=1 with SP>1 falls back to the SP group for weight sharding."""
+        import torch.distributed as dist
+
+        import vllm_omni.diffusion.distributed.parallel_state as ps
+
+        backend = self._make_weight_shard_backend(weight_shard_size=2, use_hsdp=False)
+        coord = SimpleNamespace(
+            device_group=object(),
+            cpu_group=object(),
+            rank_in_group=1,
+            world_size=2,
+            ranks=[0, 1],
+            rank=1,
+        )
+        monkeypatch.setattr(dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(ps, "get_data_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(ps, "get_sp_group", lambda: coord)
+        dedicated = object()
+        captured: dict[str, object] = {}
+
+        def fake_new_group(ranks, backend=None, use_local_synchronization=False):
+            captured["ranks"] = list(ranks)
+            captured["backend"] = backend
+            captured["use_local_synchronization"] = use_local_synchronization
+            return dedicated
+
+        monkeypatch.setattr(dist, "new_group", fake_new_group)
+        monkeypatch.setattr(dist, "get_backend", lambda group: "hccl")
+
+        backend._init_weight_shard_group()
+
+        assert backend.weight_shard_group is dedicated
+        assert captured["ranks"] == coord.ranks
+        assert captured["backend"] == "hccl"
+        assert captured["use_local_synchronization"] is True
+        assert backend.weight_shard_cpu_group is coord.cpu_group
+        assert backend.weight_shard_rank == 1
+        assert backend.weight_shard_ranks == tuple(coord.ranks)
+
+    def test_non_hsdp_resolver_rejects_group_size_mismatch(self, monkeypatch):
+        """A resolved group whose size differs from the config degree fails fast."""
+        import torch.distributed as dist
+
+        import vllm_omni.diffusion.distributed.parallel_state as ps
+
+        backend = self._make_weight_shard_backend(weight_shard_size=4, use_hsdp=False)
+        coord = SimpleNamespace(
+            device_group=object(),
+            cpu_group=object(),
+            rank_in_group=0,
+            world_size=2,
+            ranks=[0, 1],
+            rank=0,
+        )
+        monkeypatch.setattr(dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(ps, "get_data_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(ps, "get_dp_group", lambda: coord)
+
+        with pytest.raises(ValueError, match="does not match the resolved group"):
+            backend._init_weight_shard_group()
+
     def test_resident_layers_with_allgather_rejected(self):
         class FakePC:
             data_parallel_size = 2
@@ -2409,15 +2796,10 @@ class TestDynamicSlotTracking:
         block = TinyBlock(_make_values(1.0))
         next_block = TinyBlock(_make_values(2.0))
 
-        hook = DistributedLayerwiseOffloadHook(
-            next_block=next_block,
-            device=torch.device("cpu"),
-            dp_group=None,
-            dp_size=1,
-            rank=0,
+        hook = _make_prepared_hook(
+            next_block,
             copy_stream=DummyStream(),
             comm_stream=DummyStream(),
-            pin_memory=False,
         )
         hook.initialize_hook(block)
 
@@ -2435,27 +2817,17 @@ class TestDynamicSlotTracking:
         block_a = TinyBlock(_make_values(1.0))
         block_b = TinyBlock(_make_values(2.0))
 
-        hook_a = DistributedLayerwiseOffloadHook(
-            next_block=block_b,
-            device=torch.device("cpu"),
-            dp_group=None,
-            dp_size=1,
-            rank=0,
+        hook_a = _make_prepared_hook(
+            block_b,
             copy_stream=DummyStream(),
             comm_stream=DummyStream(),
-            pin_memory=False,
         )
         hook_a.initialize_hook(block_a)
 
-        hook_b = DistributedLayerwiseOffloadHook(
-            next_block=block_a,
-            device=torch.device("cpu"),
-            dp_group=None,
-            dp_size=1,
-            rank=0,
+        hook_b = _make_prepared_hook(
+            block_a,
             copy_stream=DummyStream(),
             comm_stream=DummyStream(),
-            pin_memory=False,
         )
         hook_b.initialize_hook(block_b)
 
@@ -2472,3 +2844,15 @@ class TestDynamicSlotTracking:
         # pre_forward should override to slot 1
         hook_b.pre_forward(block_b)
         assert hook_b.current_slot == 1, "pre_forward should read _prev_hook._prefetched_slot=1, not keep initial 0"
+
+
+class TestTransportBackendSelection:
+    def test_auto_keeps_reference_chunked_schedule(self):
+        capability = TransportCapability(world_size=4, rank=0, global_ranks=(0, 1, 2, 3))
+        selection = select_transport(TransportBackendKind.AUTO, capability)
+        assert selection.effective_backend is TransportBackendKind.GROUP_SCATTER_AG
+
+    def test_auto_single_rank_uses_reference(self):
+        capability = TransportCapability(world_size=1, rank=0, global_ranks=(0,))
+        selection = select_transport(TransportBackendKind.AUTO, capability)
+        assert selection.effective_backend is TransportBackendKind.REFERENCE
