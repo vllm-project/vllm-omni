@@ -287,6 +287,52 @@ Recommended viewers:
 
 For upstream background on the underlying vLLM profiling infrastructure, see the [vLLM profiling guide](https://docs.vllm.ai/en/stable/contributing/profiling/).
 
+## 6. Profiling Omni AR/TTS stages
+
+For Omni AR and TTS stages, put `profiler_config` under each stage that should
+be captured. The serving API then controls a narrow window with
+`POST /start_profile` and `POST /stop_profile`; model initialization and
+warmup stay outside the trace.
+
+Example stage override for a host-stack torch trace:
+
+```bash
+PROFILE='{"profiler":"torch","torch_profiler_dir":"/tmp/qwen3_tts_profile",'\
+'"torch_profiler_with_stack":true,"torch_profiler_record_shapes":false,'\
+'"torch_profiler_use_gzip":true,"torch_profiler_dump_cuda_time_total":true}'
+
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni \
+  --deploy-config vllm_omni/deploy/qwen3_tts_high_concurrency.yaml \
+  --stage-overrides "{\"0\":{\"profiler_config\":$PROFILE},\"1\":{\"profiler_config\":$PROFILE}}"
+```
+
+After one or more warmup requests, capture one short measured request:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/start_profile \
+  -H 'Content-Type: application/json' -d '{"stages":[0,1]}'
+# send one fixed /v1/audio/speech or /v1/chat/completions request here
+curl -sS -X POST http://127.0.0.1:8000/stop_profile \
+  -H 'Content-Type: application/json' -d '{"stages":[0,1]}'
+```
+
+For an Nsight Systems CUDA timeline, use the same stage override with
+`{"profiler":"cuda"}` and wrap the server:
+
+```bash
+nsys profile --trace=cuda,nvtx,osrt --sample=process-tree \
+  --cpuctxsw=process-tree --trace-fork-before-exec=true \
+  --capture-range=cudaProfilerApi --capture-range-end=stop-shutdown \
+  --cuda-graph-trace=node -o /tmp/qwen3_tts_nsys \
+  vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni ...
+```
+
+For Omni AR workers, `profiler="cuda"` requires the native CUDA profiler
+wrapper and uses `cudaProfilerStart/Stop`; the report is only valid if the
+`/start_profile` and `/stop_profile` calls both succeed. Use `nsys stats` for
+CUDA API, GPU kernel, OS runtime, and NVTX summaries. Treat profiler latency as
+diagnostic only; use a separate no-profiler run for performance numbers.
+
 ## 7. Orchestrator Monitor
 
 > **Warning:** Diagnostic only. Adds lightweight counters on the orchestrator poll loop and per-replica queue depth. Disable in production unless you are actively debugging orchestrator saturation.
