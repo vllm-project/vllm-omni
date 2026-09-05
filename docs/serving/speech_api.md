@@ -340,7 +340,7 @@ All REST API parameters are supported, plus:
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
 | `stream_audio` | bool | false | Stream one or more PCM chunks for each TTS request over WebSocket |
-| `split_granularity` | string | `"none"` | `"none"`: one request per `input.done`. `"sentence"`: split on `.!?` plus CJK `。！？…`, Indic danda `।॥`, and Arabic `؟`. `"clause"`: also split on `,;，；،`. |
+| `split_granularity` | string | `"none"` | `"none"`: one request per `input.done`. `"sentence"`: split on `.!?` plus CJK `。！？…`, Indic danda `।॥`, and Arabic `؟`. `"clause"`: also split on `,;，；،؛`. |
 | `seed` | integer | null | Forwarded to the speech engine for this session |
 
 ASCII punctuation only ends a unit when whitespace or `input.done` follows it,

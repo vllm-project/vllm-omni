@@ -34,6 +34,7 @@ _SCRIPT_CLAUSE_TERMINATORS = _SCRIPT_SENTENCE_TERMINATORS | {
     "，",
     "；",
     "،",  # Arabic comma
+    "؛",  # Arabic semicolon
 }
 
 _SENTENCE_TERMINATORS = _ASCII_SENTENCE_TERMINATORS | _SCRIPT_SENTENCE_TERMINATORS
@@ -75,6 +76,11 @@ _ABBREVIATIONS = frozenset(
         "p.m",
     }
 )
+_MAX_ABBREVIATION_LEN = max(len(abbrev) for abbrev in _ABBREVIATIONS)
+
+
+def _is_token_char(ch: str) -> bool:
+    return ch.isalnum() or ch == "."
 
 
 def _is_numeric_separator(buffer: str, index: int) -> bool:
@@ -90,9 +96,15 @@ def _is_abbreviation(buffer: str, index: int) -> bool:
     """True for the `.` of `Dr.`, `e.g.`, or an initial like `J.`."""
     if buffer[index] != ".":
         return False
+    # Bounded so a frame of `a.a.a...` cannot walk the whole prefix at every
+    # `.`. Every abbreviation fits inside the limit, so hitting it can only
+    # rule a token out, never produce a false positive.
+    limit = max(0, index - _MAX_ABBREVIATION_LEN)
     start = index
-    while start > 0 and (buffer[start - 1].isalnum() or buffer[start - 1] == "."):
+    while start > limit and _is_token_char(buffer[start - 1]):
         start -= 1
+    if start > 0 and _is_token_char(buffer[start - 1]):
+        return False
     token = buffer[start:index]
     if not token:
         return False

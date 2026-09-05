@@ -3,6 +3,7 @@
 
 import pytest
 
+from vllm_omni.entrypoints.openai import speech_text_splitter
 from vllm_omni.entrypoints.openai.speech_text_splitter import SpeechTextSplitter, extract_complete_units
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -43,6 +44,27 @@ class TestExtractCompleteUnits:
     def test_abbreviations_and_initials_do_not_split(self):
         units, _, _ = extract_complete_units("Dr. Smith, e.g. J. R. Tolkien. Next.", frozenset(".!?"), flush=True)
         assert units == ["Dr. Smith, e.g. J. R. Tolkien.", "Next."]
+
+    def test_long_token_before_period_is_not_an_abbreviation(self):
+        units, _, _ = extract_complete_units("We landed in Washington. Next.", frozenset(".!?"), flush=True)
+        assert units == ["We landed in Washington.", "Next."]
+
+    def test_abbreviation_lookback_is_bounded(self, monkeypatch):
+        # One WebSocket frame can reach ~128 KiB; an unbounded lookback walked
+        # the whole prefix at every `.`, quadratic in the frame size.
+        checks = 0
+        is_token_char = speech_text_splitter._is_token_char
+
+        def counting_is_token_char(ch):
+            nonlocal checks
+            checks += 1
+            return is_token_char(ch)
+
+        monkeypatch.setattr(speech_text_splitter, "_is_token_char", counting_is_token_char)
+        text = "a." * 20000
+        units, _, _ = extract_complete_units(text, frozenset(".!?"), flush=True)
+        assert units == [text]
+        assert checks <= len(text) * (speech_text_splitter._MAX_ABBREVIATION_LEN + 1)
 
     def test_cjk_period_completes_once_the_next_char_is_known(self):
         # The trailing 。 waits: a closing delimiter could still follow it.
@@ -95,6 +117,10 @@ class TestSpeechTextSplitter:
     def test_clause_mode_splits_on_comma(self):
         splitter = SpeechTextSplitter("clause")
         assert splitter.feed("Hello, world. ") == ["Hello,", "world."]
+
+    def test_clause_mode_splits_on_arabic_semicolon(self):
+        splitter = SpeechTextSplitter("clause")
+        assert splitter.feed("مرحبا؛ كيف حالك") == ["مرحبا؛"]
 
     def test_empty_flush(self):
         splitter = SpeechTextSplitter("sentence")
