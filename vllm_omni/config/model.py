@@ -121,6 +121,9 @@ class OmniModelConfig(ModelConfig):
     async_chunk: bool = False
     # Stage-1 active stream slots; 0 keeps legacy chunk-level round-robin.
     active_stream_window: int = 0
+    # Multi-step decode window size for this AR stage (0 = disabled).  See
+    # vllm_omni/core/sched/multi_step_decode.py for the eligibility rules.
+    multi_step_decode_steps: int = 0
     model_stage: str = "thinker"
     model_arch: str | None = None
     worker_type: str | None = None

@@ -46,6 +46,11 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 from vllm_omni.distributed.omni_connectors.utils.config import get_stage_connector_role, stage_sends_async_output
 from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.platforms.npu.worker.multi_step_decode import (
+    execute_multi_step_window,
+    shrink_refused_multi_step_window,
+    validate_multi_step_plan,
+)
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -142,6 +147,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             )
         self._downstream_payload_cache: dict[str, bool] = {}
         self._init_duplex_sampling_state()
+        # Completed multi-step window output awaiting sample_tokens(); see
+        # multi_step_decode.execute_multi_step_window.
+        self._multi_step_pending_output: OmniModelRunnerOutput | None = None
 
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
@@ -455,6 +463,26 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             kv_connector_metadata = scheduler_output.kv_connector_metadata
             if kv_connector_metadata is not None:
                 get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
+        #  -------------------------------------- Omni-new -------------------------------------------------
+
+        #  -------------------------------------- Omni-new -------------------------------------------------
+        # [Omni] Multi-step decode window.  When the scheduler emitted a
+        # window plan and this runner can host it, the K decode steps
+        # (forward -> sampling -> input feedback) run inside this single
+        # engine call; the built output is stashed for sample_tokens().
+        # Any refusal here falls back to the normal single-step path below
+        # -- the scheduler-side reconcile in update_from_output absorbs
+        # the accounting shortfall.
+        multi_step_plan = validate_multi_step_plan(self, scheduler_output)
+        if multi_step_plan is not None:
+            execute_multi_step_window(self, scheduler_output, multi_step_plan)
+            return None
+        # Runner declined the planned window: shrink the K-token schedule
+        # back to one token per request so the single-step fallback below
+        # never executes the un-produced K-1 slots (see
+        # shrink_refused_multi_step_window); the scheduler-side reconcile
+        # absorbs the reservation shortfall.
+        shrink_refused_multi_step_window(scheduler_output)
         #  -------------------------------------- Omni-new -------------------------------------------------
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -902,6 +930,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        #  -------------------------------------- Omni-new -------------------------------------------------
+        # [Omni] A multi-step window already produced its full output inside
+        # execute_model(); hand it over unchanged.
+        pending_multi_step_output = self._multi_step_pending_output
+        if pending_multi_step_output is not None:
+            self._multi_step_pending_output = None
+            return pending_multi_step_output
+        #  -------------------------------------- Omni-new -------------------------------------------------
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
