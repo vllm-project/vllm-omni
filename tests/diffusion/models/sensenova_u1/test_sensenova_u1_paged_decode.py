@@ -17,6 +17,7 @@ import torch
 from vllm.lora.layers import BaseLayerWithLoRA
 
 import vllm_omni.diffusion.models.sensenova_u1.paged_decode as paged_decode
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.sensenova_u1.paged_decode import (
     BLOCK_SIZE,
     BUCKETS,
@@ -169,15 +170,27 @@ def test_length_lives_in_device_tensors():
 
 
 # ---------------------------------------------------------------------------
-# The capture contract. These need CUDA and the bundled flash-attention kernel.
+# The capture contract. Graph tests need a torch.cuda-compatible accelerator;
+# paged-attention equivalence also needs the bundled kernel's paged API.
 # ---------------------------------------------------------------------------
 
-cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+accelerator_only = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="torch.cuda-compatible accelerator required",
+)
+
+# PyTorch exposes ROCm devices through ``torch.cuda``, but the imported
+# ``vllm.vllm_flash_attn`` paged API is CUDA-only. Do not use the runtime probe
+# in this marker: a missing or incompatible extension in a CUDA build is a CI
+# configuration failure and must make these tests fail rather than skip.
+paged_decode_only = pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_omni_platform.is_cuda(),
+    reason="vLLM's paged FlashAttention API is CUDA-only",
+)
 
 
-@cuda_only
-@pytest.mark.cuda
-@pytest.mark.L4
+@paged_decode_only
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_paged_attention_matches_sdpa_over_the_same_buffer():
     import torch.nn.functional as F
 
@@ -216,9 +229,8 @@ def test_paged_attention_matches_sdpa_over_the_same_buffer():
     torch.testing.assert_close(got.float(), want.float(), atol=2e-3, rtol=2e-3)
 
 
-@cuda_only
-@pytest.mark.cuda
-@pytest.mark.L4
+@paged_decode_only
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_a_captured_graph_follows_a_later_length():
     """One capture has to serve every length in the bucket.
 
@@ -277,9 +289,8 @@ def test_a_captured_graph_follows_a_later_length():
     torch.testing.assert_close(out.float(), want.float(), atol=2e-3, rtol=2e-3)
 
 
-@cuda_only
-@pytest.mark.cuda
-@pytest.mark.L4
+@paged_decode_only
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_a_captured_graph_writes_each_step_to_its_own_slot():
     """The write slot has to be a device tensor, not a Python index.
 
@@ -338,9 +349,8 @@ def test_a_captured_graph_writes_each_step_to_its_own_slot():
     torch.testing.assert_close(flat_k[n - 1].float(), kept.float())
 
 
-@cuda_only
-@pytest.mark.cuda
-@pytest.mark.L4
+@paged_decode_only
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_a_whole_decode_loop_matches_the_unpaged_path():
     """Per-step kernel equivalence is not loop equivalence.
 
@@ -404,9 +414,8 @@ class _StubLM(torch.nn.Module):
         return SimpleNamespace(logits=x.unsqueeze(0))
 
 
-@cuda_only
-@pytest.mark.cuda
-@pytest.mark.L4
+@accelerator_only
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_the_decode_graph_captures_into_the_shared_platform_pool(monkeypatch):
     """``_decode_context`` builds a runner per request, so a private capture pool
     hands every request its own arena and never gives it back. Measured on a
@@ -548,10 +557,12 @@ def test_a_kernel_missing_any_kwarg_we_pass_is_not_supported(monkeypatch):
 def test_only_q_k_and_v_reach_the_kernel_positionally(monkeypatch):
     """A positional standard argument binds to whatever a future wheel puts in
     that slot, and the probe above only checks that the names exist."""
-    seen = {}
+    seen_args: tuple[object, ...] = ()
+    seen_kwargs: dict[str, object] = {}
 
-    def recorder(*args, **kwargs):
-        seen["args"], seen["kwargs"] = args, kwargs
+    def recorder(*args: object, **kwargs: object):
+        nonlocal seen_args, seen_kwargs
+        seen_args, seen_kwargs = args, kwargs
         return torch.zeros(1, N_HEADS, HEAD_DIM)
 
     monkeypatch.setattr(paged_decode, "_flash_varlen", lambda: recorder)
@@ -564,8 +575,8 @@ def test_only_q_k_and_v_reach_the_kernel_positionally(monkeypatch):
         torch.zeros(1, KV_HEADS, 1, HEAD_DIM),
         1.0,
     )
-    assert len(seen["args"]) == 3, "only q, k and v may be positional"
-    assert set(seen["kwargs"]) == {
+    assert len(seen_args) == 3, "only q, k and v may be positional"
+    assert set(seen_kwargs) == {
         "max_seqlen_q",
         "cu_seqlens_q",
         "max_seqlen_k",
@@ -685,9 +696,8 @@ def test_no_capture_crosses_a_request_once_lora_wrappers_are_installed(monkeypat
     assert getattr(host, "_paged_decode", None) is None, "an adapted capture was left on the pipeline"
 
 
-@cuda_only
-@pytest.mark.cuda
-@pytest.mark.L4
+@accelerator_only
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_a_second_request_replays_the_first_capture(monkeypatch):
     """Reuse is only worth anything if the capture survives it."""
     dev = torch.device("cuda")
