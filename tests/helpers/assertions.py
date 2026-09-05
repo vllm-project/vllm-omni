@@ -271,6 +271,7 @@ def assert_video_diffusion_response(
                 ...
             },
             "expected_audio": {"sample_rate": 44100, "channels": 2},
+            "fps_tolerance": 0.01,
         }
     """
     form_data = request_config.get("form_data", {})
@@ -296,6 +297,7 @@ def assert_video_diffusion_response(
             width=expected_width,
             height=expected_height,
             fps=expected_fps,
+            fps_tolerance=request_config.get("fps_tolerance", 1.0),
         )
         if expected_audio is not None:
             assert isinstance(expected_audio, dict), "expected_audio must be an object"
@@ -386,12 +388,14 @@ def assert_video_valid(
     width: int | None = None,
     height: int | None = None,
     fps: float | None = None,
+    fps_tolerance: float = 1.0,
 ) -> dict[str, int | float]:
     """Assert the MP4 has the expected resolution and frame count.
 
     For several diffusion backends, encoded MP4 frame count follows a codec-aligned
     convention (e.g. request `num_frames=8` can produce 9 encoded frames). Keep
     this compatibility behavior to avoid false negatives in online-serving tests.
+    Fixed-rate models can request a stricter ``fps_tolerance`` in frames/second.
     """
     temp_path = None
     cap = None
@@ -427,8 +431,9 @@ def assert_video_valid(
             assert actual_width == width, f"Expected width={width}, got {actual_width}"
         if height is not None:
             assert actual_height == height, f"Expected height={height}, got {actual_height}"
-        if fps is not None and actual_fps:
-            assert abs(actual_fps - float(fps)) < 1.0, f"Expected fps~={fps}, got {actual_fps}"
+        if fps is not None:
+            assert math.isfinite(actual_fps) and actual_fps > 0, f"Invalid video fps: {actual_fps}"
+            assert abs(actual_fps - float(fps)) < fps_tolerance, f"Expected fps~={fps}, got {actual_fps}"
         if num_frames is not None:
             expected_frames = (int(num_frames) // 4) * 4 + 1
             assert actual_frames == expected_frames, f"Expected frames={expected_frames}, got {actual_frames}"
