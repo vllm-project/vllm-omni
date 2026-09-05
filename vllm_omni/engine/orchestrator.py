@@ -453,6 +453,7 @@ class Orchestrator:
         prom_metrics: Any = None,
         log_stats: bool = False,
         enable_orch_monitor: bool = False,
+        event_driven_orch_default: bool = False,
         duplex_runtime_extension: DuplexRuntimeExtension | None = None,
         enable_duplex_control: bool = False,
         duplex_session_config: DuplexSessionRuntimeConfig | None = None,
@@ -527,7 +528,7 @@ class Orchestrator:
 
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
-        self._event_driven_orch = _event_driven_orch_enabled()
+        self._event_driven_orch = _event_driven_orch_enabled(default=event_driven_orch_default)
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
