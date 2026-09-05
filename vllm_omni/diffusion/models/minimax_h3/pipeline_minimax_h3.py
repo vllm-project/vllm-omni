@@ -129,6 +129,8 @@ from .npu.lora import (
     load_minimax_h3_native_lora,
 )
 from .packed_sequence import (
+    MINIMAX_H3_MAX_PAD_SEQ_LEN,
+    MINIMAX_H3_SEQ_ALIGN,
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
 )
@@ -283,6 +285,7 @@ _MINIMAX_H3_DENOISE_INPUT_KEYS = (
     "visual_condition_shapes",
     "audio_condition_lengths",
     "keyframe_frame_indices",
+    "pad_seq_len",
 )
 
 # ``StepRequestState.extra`` keys owned by the step-execution path.
@@ -525,6 +528,28 @@ def _resolve_minimax_h3_num_outputs(value: Any) -> int:
     return value
 
 
+def _resolve_pad_seq_len(value: object) -> int | None:
+    """Validate the optional packed-length pin from ``extra_args``.
+
+    The packer itself only needs a value that covers the used rows. A request
+    field needs two more guards: an unaligned value would silently open yet
+    another compiled shape, and an unbounded one would size every structural
+    tensor the packer allocates.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise OmniClientError("MiniMax H3 pad_seq_len must be an integer")
+    pinned = int(value)
+    if pinned <= 0:
+        raise OmniClientError(f"MiniMax H3 pad_seq_len must be positive, got {pinned}")
+    if pinned % MINIMAX_H3_SEQ_ALIGN:
+        raise OmniClientError(f"MiniMax H3 pad_seq_len must be a multiple of {MINIMAX_H3_SEQ_ALIGN}, got {pinned}")
+    if pinned > MINIMAX_H3_MAX_PAD_SEQ_LEN:
+        raise OmniClientError(f"MiniMax H3 pad_seq_len must be at most {MINIMAX_H3_MAX_PAD_SEQ_LEN}, got {pinned}")
+    return pinned
+
+
 def _minimax_h3_output_seeds(seed: int, num_outputs: int) -> list[int]:
     return [int(seed) + output_index for output_index in range(int(num_outputs))]
 
@@ -664,12 +689,16 @@ class MiniMaxH3Pipeline(
 
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformers_ref"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
-    _vae_modules: ClassVar[list[str]] = ["video_vae", "audio_vae"]
+    # The video and audio VAEs are staged by the pipeline itself: it calls
+    # ``load_to_device()`` / ``offload_to_cpu()`` around every encode and decode.
+    # They are therefore deliberately kept out of component discovery so that no
+    # offload backend or model loader relocates them behind the pipeline's back.
+    _vae_modules: ClassVar[list[str]] = []
     _offload_plan: ClassVar[OffloadPlan] = OffloadPlan(
         offload_submodules={"token_refiner": "blocks"},
         resident_dit_paths=frozenset({"transformer"}),
         encoder_block_attrs={"text_encoder": ("vision.blocks", "text_model.layers")},
-        on_demand_component_paths=frozenset({"text_encoder", "video_vae", "audio_vae"}),
+        on_demand_component_paths=frozenset({"text_encoder"}),
     )
     _PROFILER_TARGETS: ClassVar[list[str]] = [
         "_prepare_reference_videos",
@@ -1030,22 +1059,37 @@ class MiniMaxH3Pipeline(
             self.text_encoder_group = None
             self.text_encoder = None
             self._encoder_modules = []
-        stage_components = bool(
-            od_config.enable_layerwise_offload or getattr(od_config, "enable_distributed_layerwise_offload", False)
-        )
-        component_load_device = torch.device("cpu") if stage_components else self.device
+        stage_vaes = self._stages_component_family("vae")
+        component_load_device = self._vae_load_device()
         self.video_vae = MiniMaxH3VideoVAE(
             os.path.join(model_path, "video_vae"),
             device=self.device,
             load_device=component_load_device,
+            trust_remote_code=od_config.trust_remote_code,
         )
         self.audio_vae = MiniMaxH3AudioVAE(
             os.path.join(model_path, "audio_vae"),
             device=self.device,
             load_device=component_load_device,
+            trust_remote_code=od_config.trust_remote_code,
         )
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
+
+        # Self-witness at the decision point, with the quantities that decided
+        # it: which families were selected, what each site concluded, and where
+        # the VAE weights actually landed. "No error at startup" does not show
+        # that the selection reached these sites.
+        logger.info(
+            "MiniMax-H3 component residency: layerwise=%s distributed_layerwise=%s selection=%s "
+            "vae_staged=%s text_encoder_staged=%s vae_load_device=%s",
+            bool(od_config.enable_layerwise_offload),
+            bool(getattr(od_config, "enable_distributed_layerwise_offload", False)),
+            sorted(od_config.layerwise_component_selection()),
+            stage_vaes,
+            self._stages_component_family("text_encoder"),
+            component_load_device,
+        )
 
         self._dlo_component_cache = None
         if getattr(od_config, "enable_distributed_layerwise_offload", False):
@@ -1519,12 +1563,10 @@ class MiniMaxH3Pipeline(
             # swaps the resident DiT and encoder.
             return self.text_encoder(input_ids, **vision_kwargs)
 
-        if self.od_config.enable_layerwise_offload or getattr(
-            self.od_config, "enable_distributed_layerwise_offload", False
-        ):
+        if self._stages_component_family("text_encoder"):
             # Layerwise DiT offload already provides the low-residency encoder
             # phase used by the checkpoint reference.
-            with self._component_on_device(self.text_encoder):
+            with self._component_on_device(self.text_encoder, family="text_encoder"):
                 return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
 
         # Keep both Qwen and DiT resident across requests. Moving either model
@@ -1533,12 +1575,46 @@ class MiniMaxH3Pipeline(
         self.text_encoder.load_to_device()
         return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
 
-    def _uses_manual_component_offload(self) -> bool:
+    def _vae_load_device(self) -> torch.device:
+        """Where the VAE weights are materialized at construction.
+
+        This pipeline stages its own VAEs whenever layer-wise offloading is
+        active, so the weights are built in host memory and moved in only for
+        the encode and decode windows.
+        """
+
+        return torch.device("cpu") if self._stages_component_family("vae") else self.device
+
+    def _stages_component_family(self, family: str) -> bool:
+        """Whether this pipeline host-stages ``family`` between uses.
+
+        Distributed layer-wise offload shards every component it manages, so it
+        stages every family here as well.
+
+        Under plain layer-wise offload, ``--layerwise-offload-components`` names
+        the families the backend may place, and a family left out stays fully
+        device-resident. A pipeline that stages such a family itself has to read
+        the same selection, otherwise it drags an unselected component back to
+        the host after every use. That applies to ``text_encoder``, which
+        component discovery reports.
+
+        It does not apply to the VAEs. They are deliberately kept out of
+        component discovery (see ``_vae_modules``), so no backend ever places
+        them and no backend is affected by whether ``vae`` is selected. If the
+        pipeline also stopped staging them, the VAEs would simply stay wherever
+        they were loaded with no component owning their residency, which is the
+        opposite of what an operator asks for by enabling layer-wise offload.
+        Pipeline-staged VAEs are therefore always staged by the pipeline.
+        """
+
         od_config = getattr(self, "od_config", None)
-        return bool(
-            getattr(od_config, "enable_layerwise_offload", False)
-            or getattr(od_config, "enable_distributed_layerwise_offload", False)
-        )
+        if getattr(od_config, "enable_distributed_layerwise_offload", False):
+            return True
+        if not getattr(od_config, "enable_layerwise_offload", False):
+            return False
+        if family == "vae":
+            return True
+        return family in od_config.layerwise_component_selection()
 
     def enable_omni_model_cpu_offload(
         self,
@@ -1552,7 +1628,17 @@ class MiniMaxH3Pipeline(
 
         components = ModuleDiscovery.discover(self)
         dits = components.dits
-        stages = [*components.encoders, *components.vaes]
+        # The VAEs are intentionally absent from component discovery, so the
+        # model-level offload stages are listed explicitly here.
+        stages = [
+            component
+            for component in (
+                getattr(self, "text_encoder", None),
+                getattr(self, "video_vae", None),
+                getattr(self, "audio_vae", None),
+            )
+            if component is not None
+        ]
         modules = [*dits, *stages]
         apply_sequential_offload(
             dit_modules=dits,
@@ -1577,12 +1663,12 @@ class MiniMaxH3Pipeline(
         self._model_cpu_offload_modules = []
 
     @contextmanager
-    def _component_on_device(self, component: nn.Module):
+    def _component_on_device(self, component: nn.Module, *, family: str):
         if getattr(self, "_model_cpu_offload_modules", None):
             with sequential_offload_component(component):
                 yield
             return
-        staged = self._uses_manual_component_offload()
+        staged = self._stages_component_family(family)
         try:
             if staged:
                 component.load_to_device()
@@ -1613,6 +1699,31 @@ class MiniMaxH3Pipeline(
                             logger.exception("Failed to release retained allocator cache after offload failure")
                     raise
 
+    @staticmethod
+    def _is_output_owner_rank() -> bool:
+        """Whether this rank's output is returned by the diffusion executor."""
+        return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+
+    def _offload_model_cpu_stage_output(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Release a decoded output's storage before a later seed reloads the DiT.
+
+        Model-level CPU offload makes the VAE hook evict the DiT before decode.
+        For a multi-output request, however, the next seed reloads the DiT while
+        the preceding decoded output would otherwise still occupy the device.
+        The reply rank performs the D2H copy early; ranks whose outputs are not
+        consumed retain only a metadata placeholder for the final concatenation.
+
+        Call this on the tensor that is actually returned to the engine. Audio is
+        released inside ``decode``; video is released by the callers of ``decode``
+        only after ``_prepare_minimax_h3_video_output`` has quantized it, so the
+        early D2H copy carries ``uint8`` frames rather than the decoded floats.
+        """
+        if not getattr(self, "_model_cpu_offload_modules", None):
+            return tensor
+        if self._is_output_owner_rank():
+            return tensor.cpu()
+        return torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
+
     def _encode_visual_conditions(
         self,
         images: list[Image.Image],
@@ -1626,7 +1737,9 @@ class MiniMaxH3Pipeline(
         # Keep image and video references in one residency window when both
         # appear in a request; otherwise the video branch would reload the VAE.
         needs_video_vae = video_count > 0 or (rank == 0 and bool(images))
-        video_vae_context = self._component_on_device(self.video_vae) if needs_video_vae else nullcontext()
+        video_vae_context = (
+            self._component_on_device(self.video_vae, family="vae") if needs_video_vae else nullcontext()
+        )
         with video_vae_context:
             if images:
                 image_rows = None
@@ -1787,7 +1900,9 @@ class MiniMaxH3Pipeline(
         # Embedded and standalone audio are consecutive direct Audio-VAE
         # calls. Keep the component resident across both paths.
         needs_audio_vae = any(has_audio) or bool(standalone_audios)
-        audio_vae_context = self._component_on_device(self.audio_vae) if needs_audio_vae else nullcontext()
+        audio_vae_context = (
+            self._component_on_device(self.audio_vae, family="vae") if needs_audio_vae else nullcontext()
+        )
         with audio_vae_context:
             embedded_condition, embedded_lengths = self._encode_video_audio_conditions_resident(
                 prepared_videos,
@@ -1871,6 +1986,7 @@ class MiniMaxH3Pipeline(
         visual_condition_shapes: list[tuple[int, int, int]] | None = None,
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
+        pad_seq_len: int | None = None,
     ) -> dict[str, Any]:
         """Build the packed layout, initial rows, anchors, and sigma schedules.
 
@@ -1900,6 +2016,7 @@ class MiniMaxH3Pipeline(
                 latent_w=latent_w,
                 audio_t=audio_t,
                 ref_blocks=ref_blocks,
+                seq_len=pad_seq_len,
             )
         else:
             packed = minimax_h3_packed_sequence(
@@ -1911,7 +2028,19 @@ class MiniMaxH3Pipeline(
                 include_keyframe_cond=task == "fl2va",
                 keyframe_frame_indices=keyframe_frame_indices if task == "fl2va" else None,
                 frame_count=num_frames if task == "fl2va" else None,
+                seq_len=pad_seq_len,
             )
+        # Report the effective shape at info level exactly when a request pins
+        # it, so a deployment can confirm the pin landed without raising the
+        # log level for every request.
+        log = logger.info if pad_seq_len is not None else logger.debug
+        log(
+            "MiniMax H3 packed sequence: task=%s pad_seq_len=%s used=%d seq_len=%d",
+            task,
+            pad_seq_len,
+            int(packed["cu_seqlens"][1]),
+            int(packed["seq_len"]),
+        )
 
         tags = packed["token_tags"].clone()
         tags[packed["text_pos"]] = text_tags.cpu()
@@ -2047,6 +2176,7 @@ class MiniMaxH3Pipeline(
         visual_condition_shapes: list[tuple[int, int, int]] | None = None,
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
+        pad_seq_len: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         inputs = self._build_denoise_inputs(
             task=task,
@@ -2070,6 +2200,7 @@ class MiniMaxH3Pipeline(
             visual_condition_shapes=visual_condition_shapes,
             audio_condition_lengths=audio_condition_lengths,
             keyframe_frame_indices=keyframe_frame_indices,
+            pad_seq_len=pad_seq_len,
         )
         branch = inputs["branch"]
         transformer = self._transformer_for_task(task)
@@ -2108,7 +2239,7 @@ class MiniMaxH3Pipeline(
         height: int,
         width: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        with self._component_on_device(self.video_vae):
+        with self._component_on_device(self.video_vae, family="vae"):
             with current_omni_platform.create_autocast_context(
                 device_type=self.device.type,
                 dtype=torch.float16,
@@ -2116,8 +2247,9 @@ class MiniMaxH3Pipeline(
             ):
                 video = self.video_vae.decode_latent(video_latent)
         video = video[..., :height, :width].contiguous()
-        with self._component_on_device(self.audio_vae):
+        with self._component_on_device(self.audio_vae, family="vae"):
             audio = self.audio_vae.decode_latent(audio_latent)
+        audio = self._offload_model_cpu_stage_output(audio)
         return video, audio
 
     @staticmethod
@@ -2420,6 +2552,7 @@ class MiniMaxH3Pipeline(
         base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
         video_shift = float(extra.get("flow_shift", self.default_video_shift))
         audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
+        pad_seq_len = _resolve_pad_seq_len(extra.get("pad_seq_len"))
         quality_plan = self._quality_policy.resolve(
             quality=quality,
             num_inference_steps=num_steps,
@@ -2446,6 +2579,7 @@ class MiniMaxH3Pipeline(
             "visual_condition_shapes": visual_shapes,
             "audio_condition_lengths": audio_lengths,
             "keyframe_frame_indices": keyframe_frame_indices,
+            "pad_seq_len": pad_seq_len,
             "seed": seed,
             "num_steps": num_steps,
             "video_shift": video_shift,
@@ -2484,7 +2618,13 @@ class MiniMaxH3Pipeline(
                 height=context["height"],
                 width=context["width"],
             )
-            videos.append(_prepare_minimax_h3_video_output(video))
+            # Rebind rather than append the expression: the local would
+            # otherwise keep the decoded frames' device storage alive for the
+            # rest of the iteration, and the next seed's diffuse() -- the DiT
+            # reload this release exists to make room for -- runs before the
+            # loop rebinds it. post_decode() rebinds for the same reason.
+            video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
+            videos.append(video)
             audios.append(audio)
         video = videos[0] if len(videos) == 1 else torch.cat(videos, dim=0)
         audio = audios[0] if len(audios) == 1 else torch.cat(audios, dim=0)
@@ -2789,7 +2929,7 @@ class MiniMaxH3Pipeline(
             height=shape["height"],
             width=shape["width"],
         )
-        video = _prepare_minimax_h3_video_output(video)
+        video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
         return DiffusionOutput(
             output=(video, audio),
             post_process_func=get_minimax_h3_post_process_func(self.od_config),

@@ -1402,53 +1402,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
     def _try_layerwise_offload_encoder(self, module: nn.Module, name: str, plan: OffloadPlan | None) -> bool:
         """Stream plan-declared encoder blocks on each rank without AllGather."""
-        if plan is None or name not in plan.encoder_block_attrs:
-            return False
-        if getattr(module, "_omni_layerwise_enabled", False):
-            return True
+        from vllm_omni.diffusion.offloader.layerwise_backend import stream_declared_encoder_blocks
 
-        from operator import attrgetter
-
-        from vllm_omni.diffusion.offloader.layerwise_backend import apply_block_hook
-
-        hooks = []
-        block_groups = []
-        copy_stream = current_omni_platform.Stream()
-        for block_path in plan.encoder_block_attrs[name]:
-            try:
-                blocks = attrgetter(block_path)(module)
-            except AttributeError:
-                logger.warning("Encoder offload path %s.%s was not found", name, block_path)
-                continue
-            if not isinstance(blocks, nn.ModuleList) or len(blocks) <= 1:
-                logger.warning("Encoder offload path %s.%s is not a streamable block list", name, block_path)
-                continue
-            group_hooks = [
-                apply_block_hook(blocks[-1], blocks[0], self.device, copy_stream, self.config.pin_cpu_memory)
-            ]
-            group_hooks.extend(
-                apply_block_hook(block, blocks[index + 1], self.device, copy_stream, self.config.pin_cpu_memory)
-                for index, block in enumerate(blocks[:-1])
-            )
-            for index, hook in enumerate(group_hooks):
-                hook._prev_hook = group_hooks[index - 1]
-            hooks.extend(group_hooks)
-            block_groups.append(blocks)
-
-        if not hooks:
-            return False
-        # The component lifecycle uses these generic attributes to keep only
-        # non-block encoder state resident during the encode phase.
-        module._omni_layerwise_hooks = hooks
-        module._omni_layerwise_block_groups = block_groups
-        module._omni_layerwise_enabled = True
-        logger.info(
-            "Enabled rank-local layerwise offload for encoder %s (%d blocks across %d stacks)",
-            name,
-            sum(len(blocks) for blocks in block_groups),
-            len(block_groups),
-        )
-        return True
+        return stream_declared_encoder_blocks(module, name, plan, self.device, pin_memory=self.config.pin_cpu_memory)
 
     def _try_layerwise_offload_submodule(self, module: nn.Module, name: str, plan: OffloadPlan | None = None) -> bool:
         """Try to apply layerwise offload to a large submodule's blocks.

@@ -55,6 +55,9 @@ class OffloadConfig:
     # Optional per-worker ceiling for registering an HWR mmap. Zero means no
     # additional ceiling; pin_cpu_memory controls whether registration is tried.
     dlo_host_registration_limit_gib: float = 0.0
+    # Component families layer-wise offloading may manage; a family left out
+    # stays fully device-resident (see OmniDiffusionConfig.layerwise_offload_components).
+    layerwise_components: frozenset[str] = frozenset({"dit", "text_encoder", "vae"})
 
     @classmethod
     def from_od_config(cls, od_config: OmniDiffusionConfig) -> "OffloadConfig":
@@ -159,6 +162,9 @@ class OffloadConfig:
                 "rank-local weights) or disable HSDP."
             )
 
+        selection = getattr(od_config, "layerwise_component_selection", None)
+        layerwise_components = frozenset(selection()) if callable(selection) else OffloadConfig.layerwise_components
+
         return cls(
             strategy=strategy,
             pin_cpu_memory=pin_cpu_memory,
@@ -167,6 +173,7 @@ class OffloadConfig:
             dlo_use_allgather=dlo_use_allgather,
             dlo_resident_layers=dlo_resident_layers,
             dlo_host_registration_limit_gib=dlo_host_registration_limit_gib,
+            layerwise_components=layerwise_components,
         )
 
 

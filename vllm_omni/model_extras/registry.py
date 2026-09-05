@@ -178,6 +178,16 @@ def default_image_to_image_prompt(
     return result
 
 
+def _always_preserve_reference_image_size(
+    *,
+    model: str | None,
+    revision: str | None = None,
+) -> bool:
+    """Declare that a pipeline owns reference-image geometry."""
+    del model, revision
+    return True
+
+
 _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "BagelPipeline": {
         "extra_body_params": BAGEL_EXTRA_BODY_PARAMS,
@@ -218,6 +228,15 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "output_tensor_range": "zero_to_one",
         # Shared T2I/I2V envelopes select the output modality. LingBot's
         # pipeline owns model-specific validation and normalization.
+    },
+    **{
+        model_class_name: {
+            "reference_image_size_resolver": _always_preserve_reference_image_size,
+        }
+        for model_class_name in (
+            "MiniMaxH3Pipeline",
+            "MiniMaxH3ModularPipeline",
+        )
     },
     **{
         model_class_name: {

@@ -18,8 +18,14 @@ stream.
 | ... | ... | ... | ... |
 | last block | Prefetch block 0 | Compute last block | Free last block |
 
-Encoders, VAE modules, and non-block DiT modules such as embeddings and norms
-remain device resident.
+Encoders are device resident by default. A pipeline may declare which of an
+encoder's submodules are streamable block stacks, through
+`OffloadPlan.encoder_block_attrs`; those stacks are paged the same way DiT
+blocks are, and only the encoder's non-block state (norms, embeddings,
+projections) is placed on the device. VAE modules and non-block DiT modules
+such as embeddings and norms remain device resident. Components that a pipeline
+stages by itself are kept out of component discovery, so layer-wise offloading
+never relocates them.
 
 ## Usage
 
@@ -36,6 +42,37 @@ omni = Omni(
 vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers \
   --omni --enable-layerwise-offload
 ```
+
+By default, layerwise offloading may manage every component family. Use
+`--layerwise-offload-components` to narrow that set:
+
+```bash
+vllm serve MODEL --omni --enable-layerwise-offload \
+  --layerwise-offload-components text_encoder,vae
+```
+
+The value is a non-empty comma-separated list drawn from `dit`,
+`text_encoder`, and `vae`; unknown names fail configuration validation.
+Every family is gated the same way in the backend:
+
+- `dit` left out: the complete DiT stays device-resident and no DiT streaming
+  hooks are installed.
+- `text_encoder` left out: encoders are placed on the device and nothing else
+  is done to them -- no block streaming and no host parking, *even if the
+  pipeline declares an encoder block stack or declares the encoder on-demand*.
+- `vae` left out: VAEs are placed on the device. Discovered VAEs are made
+  resident either way, so this family does not change what the backend does to
+  them; it exists so that a selection can name every family explicitly.
+
+A family left out of the selection stays fully device-resident, and that is a
+contract on both sides. A pipeline that manages its own encoder residency must
+read the selection before it host-stages a component: otherwise the backend
+places an unselected component on the device and the pipeline pulls it back
+after every use, paying a host round trip for weights the operator asked to
+keep resident. `MiniMaxH3Pipeline._stages_component_family` is the reference
+implementation. Pipeline-staged VAEs are always staged by the pipeline: they
+are kept out of component discovery, so no backend places them and the
+selection has nothing to say about them.
 
 ## Model integration
 

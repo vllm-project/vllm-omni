@@ -8,7 +8,7 @@ import random
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import diffusers
 import huggingface_hub
@@ -811,6 +811,13 @@ class OmniDiffusionConfig:
     enable_cpu_offload: bool = False
     # Layer-wise offloading (block-level offloading) parameters
     enable_layerwise_offload: bool = False
+    # Which component families layer-wise offloading may manage, as a comma
+    # list drawn from {dit, text_encoder, vae}. None means all of them (the
+    # existing behavior). A family left out stays fully device-resident: e.g.
+    # "text_encoder,vae" keeps the DiT whole on the device while the other
+    # components are streamed/staged -- the topology used when the DiT fits
+    # but the encoders and VAEs do not.
+    layerwise_offload_components: str | None = None
     # Distributed layer-wise offloading with H2D + AllGather overlap (RFC-1)
     enable_distributed_layerwise_offload: bool = False
     # If True: shard weights 1/dp_size + AllGather (saves CPU memory, requires
@@ -1055,7 +1062,27 @@ class OmniDiffusionConfig:
             f"Failed to find available port after {max_attempts} attempts (started from port {original_port})"
         )
 
+    LAYERWISE_COMPONENT_FAMILIES: ClassVar[frozenset[str]] = frozenset({"dit", "text_encoder", "vae"})
+
+    def layerwise_component_selection(self) -> frozenset[str]:
+        """The component families layer-wise offloading may manage.
+
+        ``None`` selects every family, which is the pre-existing behavior.
+        """
+        if self.layerwise_offload_components is None:
+            return self.LAYERWISE_COMPONENT_FAMILIES
+        return frozenset(part.strip() for part in self.layerwise_offload_components.split(",") if part.strip())
+
     def __post_init__(self):
+        if self.layerwise_offload_components is not None:
+            # Fail loudly: a typo here would otherwise silently change which
+            # components stay resident, and that is a capacity decision.
+            unknown = self.layerwise_component_selection() - self.LAYERWISE_COMPONENT_FAMILIES
+            if unknown or not self.layerwise_component_selection():
+                raise ValueError(
+                    "layerwise_offload_components must be a non-empty comma list drawn from "
+                    f"{sorted(self.LAYERWISE_COMPONENT_FAMILIES)}, got {self.layerwise_offload_components!r}"
+                )
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
                 "diffusion_compile_granularity must be 'regional' or 'full', "

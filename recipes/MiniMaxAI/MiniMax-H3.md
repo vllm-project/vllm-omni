@@ -1157,8 +1157,9 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
 - `--cfg-parallel-size > 1` is rejected by design (CFG-distilled, no negative branch).
 - VAE patch parallelism requires size 1 or the full DiT group size and supports the
   H3 native `tile` mode only.
-- A U2 x Ring2 hybrid currently fails with an attention-mask length mismatch; use
-  pure Ulysses.
+- Ulysses x Ring hybrid attention supports H3's single-request contiguous suffix
+  padding. Arbitrary attention masks and multi-request packed batches remain
+  unsupported on the Ring path.
 - Online FP8 with DLO AllGather temporarily materializes the complete FP8 model
   in host memory on every rank during startup before retaining only each rank's
   shard. Size startup host memory for that transient peak.

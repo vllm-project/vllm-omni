@@ -574,6 +574,7 @@ class OrchestratorArgs:
     num_weight_load_threads: int = 4
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
+    layerwise_offload_components: str | None = None
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = 0

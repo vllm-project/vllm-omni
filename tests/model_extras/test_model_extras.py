@@ -290,6 +290,16 @@ def test_reference_image_size_policy_threads_revision(monkeypatch: pytest.Monkey
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+@pytest.mark.parametrize("model_class_name", ["MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"])
+def test_minimax_h3_preserves_reference_image_size(model_class_name: str) -> None:
+    assert should_preserve_reference_image_size(
+        model_class_name,
+        model="MiniMaxAI/MiniMax-H3",
+    )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_ming_flash_omni_extra_registry_declares_request_and_response_params() -> None:
     assert get_extra_body_params("MingImagePipeline") == frozenset(
         {

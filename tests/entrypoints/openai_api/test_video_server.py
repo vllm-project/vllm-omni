@@ -566,6 +566,32 @@ def test_i2v_resize_policy_can_defer_to_pipeline(monkeypatch):
     }
 
 
+def test_i2v_minimax_h3_preserves_reference_geometry():
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        diffusion_engine=engine,
+        model_name="MiniMaxAI/MiniMax-H3",
+    )
+    image = Image.new("RGB", (48, 32))
+
+    asyncio.run(
+        handler._run_and_extract(
+            VideoGenerationRequest(prompt="A bear playing with yarn.", width=96, height=64),
+            "minimax-h3-reference-geometry",
+            reference_image=ReferenceImage(image),
+        )
+    )
+
+    assert engine.captured_prompt is not None
+    assert engine.captured_sampling_params_list is not None
+    input_image = engine.captured_prompt["multi_modal_data"]["image"]
+    assert isinstance(input_image, Image.Image)
+    assert input_image.size == (48, 32)
+    sampling_params = engine.captured_sampling_params_list[0]
+    assert (sampling_params.width, sampling_params.height) == (96, 64)
+
+
 def test_i2v_extra_params_dimensions_preserve_input_image_geometry(test_client, mocker: MockerFixture):
     image_bytes = _make_test_image_bytes((48, 48))
     mocker.patch(

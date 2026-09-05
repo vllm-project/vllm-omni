@@ -52,11 +52,23 @@ def _load_component_config(component_path: str) -> dict[str, Any]:
 def _load_remote_component(
     component_path: str,
     config: dict[str, Any],
+    *,
+    trust_remote_code: bool,
 ) -> nn.Module:
     auto_map = config.get("auto_map") or {}
     class_reference = auto_map.get("AutoModel")
     if not isinstance(class_reference, str):
         raise ValueError(f"{component_path}/config.json must define auto_map.AutoModel")
+    if not trust_remote_code:
+        raise ValueError(
+            f"Loading {component_path} executes the modeling code shipped with "
+            f"the checkpoint (auto_map.AutoModel = {class_reference}). Pass "
+            "--trust-remote-code (or trust_remote_code=True) to allow it."
+        )
+    # ``trust_remote_code`` is checked here rather than forwarded to
+    # ``get_class_from_dynamic_module``: that helper takes no such argument and
+    # would silently absorb it into ``**kwargs``, so forwarding it would read
+    # like a gate while executing the remote code unconditionally.
     component_cls = get_class_from_dynamic_module(
         class_reference,
         component_path,
@@ -121,6 +133,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         *,
         device: torch.device,
         load_device: torch.device | None = None,
+        trust_remote_code: bool = False,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -128,6 +141,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.remote = _load_remote_component(
             component_path,
             self.config_dict,
+            trust_remote_code=trust_remote_code,
         )
         # Match the reference loader contract before installing inference-only
         # decoder fast paths. Keyframe encoding remains FP32; decoder Linear
@@ -153,6 +167,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.use_slicing = False
         self.parallel_size = 1
         self.device_module = torch.get_device_module()
+        self._tile_gather_buffers: dict[tuple[Any, ...], torch.Tensor] = {}
+        self._tile_gather_stats = {"hits": 0, "allocs": 0, "bytes": 0}
+        self._checkpoint_tile_gather = None
+        if self._tile_gather_reuse_enabled():
+            self._install_persistent_tile_gather()
 
     def load_to_device(self) -> None:
         if self._stager is not None:
@@ -217,6 +236,124 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         package = self.remote.__class__.__module__.rsplit(".", 1)[0]
         parallel_module = importlib.import_module(f"{package}.parallel")
         return parallel_module.get_parallel_state()
+
+    def _tile_gather_reuse_enabled(self) -> bool:
+        """Whether this device needs the tiled-VAE gather buffer pinned.
+
+        XPU only. The accumulation this guards against is an XCCL-side
+        registration that is kept for every distinct receive-buffer address and
+        never reclaimed; no other backend in tree does that, so everywhere else
+        the checkpoint's own method is left in place and behaviour is unchanged.
+        """
+
+        return self._device_target.type == "xpu"
+
+    def _install_persistent_tile_gather(self) -> None:
+        """Route the checkpoint's tiled-VAE gather through a pinned buffer.
+
+        The checkpoint's ``_all_gather_tiled_results`` allocates its gather
+        output afresh on every call. Model-level offload calls ``empty_cache()``
+        once per request, so the next request's output lands on a new device
+        address; XCCL registers a non-reclaimable resource per new receive
+        address, and the registrations accumulate until the card is full. The
+        replacement below keeps one landing buffer per (shape, dtype, device)
+        alive on this adapter, so the address the collective writes to is the
+        same one every request.
+
+        The override is bound on the checkpoint *instance*, not its class: the
+        class is remote code shared by every component loaded from the same
+        checkpoint, and only this adapter knows the device it runs on.
+        """
+
+        self._checkpoint_tile_gather = self.model._all_gather_tiled_results
+        self.model._all_gather_tiled_results = self._persistent_tile_gather
+        logger.info(
+            "[H3_VAE_GATHER] persistent tile gather installed device=%s",
+            self._device_target.type,
+        )
+
+    def _persistent_tile_gather(
+        self,
+        tasks: list[torch.Tensor],
+        num_tiles: int,
+    ) -> list[torch.Tensor]:
+        """Equal-shape replacement for the checkpoint's tiled-result gather.
+
+        Contract kept identical to the checkpoint's method: return a list of
+        ``num_tiles`` tensors in global tile order, and raise on an empty local
+        share so a rank that owns no tile cannot silently skip the collective.
+
+        Tile ownership is round-robin (``range(sp_rank, num_tiles, sp_size)``),
+        so every rank can compute every other rank's task count from
+        ``num_tiles`` and ``sp_size`` alone. That makes the per-rank payloads
+        equal once the leading task dimension is padded to ``max_tasks``, which
+        is what lets a single ``all_gather_into_tensor`` into a pinned buffer
+        replace the variable-shape gather.
+
+        Returned tiles are cloned out of the buffer: the buffer is overwritten
+        by the next call and callers hold the tiles past that point.
+        """
+
+        state = self._native_parallel_state()
+        group = state["sp_process_group"]
+        sp_size = int(state["sp_size"])
+        sp_rank = int(state["sp_rank"])
+
+        if not tasks:
+            raise ValueError(f"Found empty tasks on sp rank {sp_rank}")
+
+        max_tasks = -(-num_tiles // sp_size)
+        if len(tasks) > max_tasks:
+            raise ValueError(
+                f"sp rank {sp_rank} holds {len(tasks)} tiles but round-robin "
+                f"ownership of {num_tiles} tiles across {sp_size} ranks allows "
+                f"at most {max_tasks}"
+            )
+        if len(tasks) == max_tasks:
+            stacked = torch.stack(tasks, dim=0)
+        else:
+            # Pad the leading (task) dimension only. The padded slots belong to
+            # ranks whose share is short by construction, and the unpacking loop
+            # below never reads them back.
+            stacked = tasks[0].new_empty((max_tasks, *tasks[0].shape))
+            torch.stack(tasks, dim=0, out=stacked[: len(tasks)])
+            stacked[len(tasks) :].zero_()
+
+        key = (tuple(stacked.shape), stacked.dtype, str(stacked.device))
+        buffer = self._tile_gather_buffers.get(key)
+        if buffer is None:
+            buffer = stacked.new_empty((sp_size, *stacked.shape))
+            self._tile_gather_buffers[key] = buffer
+            self._tile_gather_stats["allocs"] += 1
+            self._tile_gather_stats["bytes"] += buffer.numel() * buffer.element_size()
+            reuse = "alloc"
+        else:
+            self._tile_gather_stats["hits"] += 1
+            reuse = "hit"
+        # Quantities, not just presence: a line that only says "installed"
+        # cannot distinguish a buffer that is being reused from one that is
+        # reallocated every request, which is the whole failure being fixed.
+        # Debug level, because this fires once per decoder tile batch (12 times
+        # per request on the canonical 1344x768 geometry) and the one-shot
+        # "installed" line above is what an operator needs at info level.
+        logger.debug(
+            "[H3_VAE_GATHER] reuse=%s key=%s/%s buf_ptr=0x%x hits=%d allocs=%d resident_mib=%.2f",
+            reuse,
+            tuple(stacked.shape),
+            stacked.dtype,
+            buffer.data_ptr(),
+            self._tile_gather_stats["hits"],
+            self._tile_gather_stats["allocs"],
+            self._tile_gather_stats["bytes"] / (1024.0 * 1024.0),
+        )
+        dist.all_gather_into_tensor(buffer, stacked, group=group)
+
+        results: list[torch.Tensor] = [None] * num_tiles  # type: ignore[list-item]
+        for rank in range(sp_size):
+            num_rank_tasks = -(-(num_tiles - rank) // sp_size)
+            for k in range(num_rank_tasks):
+                results[k * sp_size + rank] = buffer[rank][k].clone()
+        return results
 
     def _decoder_tile_count(self, latent: torch.Tensor) -> int:
         """Number of decoder tiles the checkpoint will split ``latent`` into.
@@ -404,6 +541,7 @@ class MiniMaxH3AudioVAE(nn.Module):
         *,
         device: torch.device,
         load_device: torch.device | None = None,
+        trust_remote_code: bool = False,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -411,6 +549,7 @@ class MiniMaxH3AudioVAE(nn.Module):
         self.remote = _load_remote_component(
             component_path,
             self.config_dict,
+            trust_remote_code=trust_remote_code,
         )
         # The checkpoint's audio VAE contract is FP32 for both reference
         # encoding and waveform decoding.

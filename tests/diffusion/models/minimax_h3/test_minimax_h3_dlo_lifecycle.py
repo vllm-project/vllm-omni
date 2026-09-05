@@ -69,7 +69,7 @@ def test_manual_component_failure_forces_retained_cache_release(mocker):
     component.offload_to_cpu.side_effect = _OffloadAbort("offload failed")
 
     with pytest.raises(RuntimeError, match="component failed"):
-        with pipeline._component_on_device(component):
+        with pipeline._component_on_device(component, family="vae"):
             raise RuntimeError("component failed")
 
     component.load_to_device.assert_called_once_with()
@@ -90,10 +90,10 @@ def test_manual_component_offload_failure_forces_retained_cache_release(mocker):
     component = mocker.Mock()
     component.offload_to_cpu.side_effect = [None, _OffloadAbort("offload failed")]
 
-    with pipeline._component_on_device(component):
+    with pipeline._component_on_device(component, family="vae"):
         pass
     with pytest.raises(_OffloadAbort, match="offload failed"):
-        with pipeline._component_on_device(component):
+        with pipeline._component_on_device(component, family="vae"):
             pass
 
     assert component.load_to_device.call_count == 2

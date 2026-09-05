@@ -13,6 +13,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 _ItemT = TypeVar("_ItemT")
@@ -111,7 +113,7 @@ def test_pipeline_import_registry_and_component_discovery():
     )
     assert MiniMaxH3Pipeline._dit_modules == ["transformer", "transformers_ref"]
     assert MiniMaxH3Pipeline._encoder_modules == ["text_encoder"]
-    assert MiniMaxH3Pipeline._vae_modules == ["video_vae", "audio_vae"]
+    assert MiniMaxH3Pipeline._vae_modules == []
 
 
 def test_encoder_free_stage_skips_text_encoder_during_dlo_discovery():
@@ -126,13 +128,14 @@ def test_encoder_free_stage_skips_text_encoder_during_dlo_discovery():
     pipeline.text_encoder = None
     pipeline._dit_modules = ["transformer"]
     pipeline._encoder_modules = []
-    pipeline._vae_modules = ["video_vae", "audio_vae"]
 
     discovered = ModuleDiscovery.discover(pipeline)
 
     assert discovered.dit_names == ["transformer"]
     assert discovered.encoder_names == []
-    assert discovered.vae_names == ["video_vae", "audio_vae"]
+    # The pipeline stages both VAEs itself, so discovery must not report them.
+    assert discovered.vaes == []
+    assert discovered.vae_names == []
 
 
 def test_encoder_free_stage_skips_missing_component_during_dlo_registration():
@@ -272,6 +275,7 @@ def test_combined_task_inference_and_transformer_routing():
         ("ref2va", "ref2va", 1, "Ref2VA", ["Ref2VA"], {"ref2va"}),
     ],
 )
+@pytest.mark.parametrize("trust_remote_code", [False, True])
 def test_pipeline_loads_task_selected_dits_and_shared_components_once(
     monkeypatch,
     tmp_path,
@@ -281,6 +285,7 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
     component_partition,
     source_partitions,
     expected_tasks,
+    trust_remote_code,
 ):
     from vllm_omni.diffusion.data import (
         DiffusionParallelConfig,
@@ -312,6 +317,7 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
             (tmp_path / partition_name / component).mkdir()
 
     created: dict[str, list[Any]] = {"dit": [], "text_encoder": [], "video_vae": [], "audio_vae": []}
+    created_kwargs: dict[str, list[Any]] = {"text_encoder": [], "video_vae": [], "audio_vae": []}
 
     class FakeModule(torch.nn.Module):
         def __init__(self, *args, **kwargs):
@@ -325,6 +331,7 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
     def component_factory(name):
         def create(path, *args, **kwargs):
             created[name].append(str(path))
+            created_kwargs[name].append(kwargs)
             return FakeModule()
 
         return create
@@ -396,6 +403,7 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
             cfg_parallel_size=1,
             text_encoder_tp_size=1,
         ),
+        trust_remote_code=trust_remote_code,
     )
     pipeline = pipeline_module.MiniMaxH3Pipeline(od_config=od_config)
 
@@ -406,6 +414,10 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
     assert created["text_encoder"] == [str(component_path / "text_encoder")]
     assert created["video_vae"] == [str(component_path / "video_vae")]
     assert created["audio_vae"] == [str(component_path / "audio_vae")]
+    # The checkpoint VAEs execute the modeling code shipped with the weights, so
+    # the pipeline must hand them the engine's trust_remote_code decision.
+    for component in ("video_vae", "audio_vae"):
+        assert [kwargs["trust_remote_code"] for kwargs in created_kwargs[component]] == [trust_remote_code]
     assert len(tokenizer_calls) == 1
     assert len(processor_calls) == 1
     expected_dit_modules = ["transformer", "transformers_ref"] if expected_dits == 2 else ["transformer"]
@@ -905,6 +917,64 @@ def test_packed_attention_keeps_padding_mask_for_other_backends():
     )
 
 
+def test_ring_packed_attention_publishes_prefix_length_without_global_mask():
+    attention = _fake_packed_attention("CUDNN_ATTN")
+    attention.attention.use_ring = True
+    q = torch.randn(4, 2, 4)
+
+    attention._run_packed_attention(
+        q,
+        q,
+        q,
+        cu_seqlens=torch.tensor([0, 5, 8], dtype=torch.int32),
+        max_seqlen=5,
+        packed_total=8,
+    )
+
+    metadata = attention.attention.metadata
+    assert metadata.attn_mask is None
+    assert metadata.extra["valid_kv_length"] == 5
+
+
+def test_ring_packed_attention_keeps_mask_when_runtime_sp_is_inactive(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer
+
+    class InactiveContext:
+        sp_active = False
+
+    attention = _fake_packed_attention("CUDNN_ATTN")
+    attention.attention.use_ring = True
+    monkeypatch.setattr(
+        minimax_h3_transformer,
+        "is_forward_context_available",
+        lambda: True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        minimax_h3_transformer,
+        "get_forward_context",
+        InactiveContext,
+        raising=False,
+    )
+    q = torch.randn(8, 2, 4)
+
+    attention._run_packed_attention(
+        q,
+        q,
+        q,
+        cu_seqlens=torch.tensor([0, 5, 8], dtype=torch.int32),
+        max_seqlen=5,
+        packed_total=8,
+    )
+
+    metadata = attention.attention.metadata
+    assert torch.equal(
+        metadata.attn_mask,
+        torch.tensor([[True, True, True, True, True, False, False, False]]),
+    )
+    assert metadata.extra["npu_attn_varlen"] is True
+
+
 def _fake_packed_attention(
     backend_name: str,
     *,
@@ -925,6 +995,10 @@ def _fake_packed_attention(
         @classmethod
         def supports_multi_doc_packed_varlen(cls) -> bool:
             return supports_multi_doc
+
+        @classmethod
+        def supports_packed_mask_free(cls) -> bool:
+            return False
 
     class FakeAttention(torch.nn.Module):
         attn_backend = FakeBackend
@@ -1311,7 +1385,7 @@ def test_layerwise_offload_releases_text_encoder(offload_flag):
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = SimpleNamespace(
+    pipeline.od_config = OmniDiffusionConfig(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
         enable_distributed_layerwise_offload=False,
@@ -1360,7 +1434,7 @@ def test_distributed_layerwise_offload_stages_vae_component():
     )
     component = Mock()
 
-    with pipeline._component_on_device(component):
+    with pipeline._component_on_device(component, family="vae"):
         component.load_to_device.assert_called_once_with()
         component.offload_to_cpu.assert_not_called()
 
@@ -1484,7 +1558,7 @@ def test_video_vae_keeps_reference_fp32_weights(monkeypatch):
     monkeypatch.setattr(
         vae_module,
         "_load_remote_component",
-        lambda _path, _config: FakeRemote(),
+        lambda _path, _config, *, trust_remote_code: FakeRemote(),
     )
 
     video_vae = vae_module.MiniMaxH3VideoVAE(
@@ -1515,7 +1589,7 @@ def test_video_vae_can_load_on_cpu_for_staged_gpu_residency(monkeypatch):
     monkeypatch.setattr(
         vae_module,
         "_load_remote_component",
-        lambda _path, _config: FakeRemote(),
+        lambda _path, _config, *, trust_remote_code: FakeRemote(),
     )
 
     video_vae = vae_module.MiniMaxH3VideoVAE(
@@ -1550,7 +1624,7 @@ def test_video_vae_uses_snapshot_stager_for_accelerator_target(monkeypatch):
     monkeypatch.setattr(
         vae_module,
         "_load_remote_component",
-        lambda _path, _config: FakeRemote(),
+        lambda _path, _config, *, trust_remote_code: FakeRemote(),
     )
     monkeypatch.setattr(vae_module, "PinnedModuleStager", stager_cls)
 
@@ -1569,6 +1643,123 @@ def test_video_vae_uses_snapshot_stager_for_accelerator_target(monkeypatch):
     )
     stager.load.assert_called_once_with()
     stager.offload.assert_called_once_with()
+
+
+def test_remote_component_refuses_untrusted_checkpoint_code(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    loaded = []
+
+    def spy_get_class(class_reference, component_path):
+        loaded.append((class_reference, component_path))
+        raise AssertionError("checkpoint code must not be resolved when untrusted")
+
+    monkeypatch.setattr(vae_module, "get_class_from_dynamic_module", spy_get_class)
+
+    with pytest.raises(ValueError, match="--trust-remote-code"):
+        vae_module._load_remote_component(
+            "/checkpoints/video_vae",
+            {"auto_map": {"AutoModel": "modeling_vae.VideoVAE"}},
+            trust_remote_code=False,
+        )
+
+    assert loaded == []
+
+
+def test_remote_component_resolves_checkpoint_code_when_trusted(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    class FakeComponent(torch.nn.Module):
+        @classmethod
+        def from_pretrained(cls, component_path):
+            module = cls()
+            module.loaded_from = component_path
+            return module
+
+    loaded = []
+
+    def spy_get_class(class_reference, component_path):
+        loaded.append((class_reference, component_path))
+        return FakeComponent
+
+    monkeypatch.setattr(vae_module, "get_class_from_dynamic_module", spy_get_class)
+
+    module = vae_module._load_remote_component(
+        "/checkpoints/video_vae",
+        {"auto_map": {"AutoModel": "modeling_vae.VideoVAE"}},
+        trust_remote_code=True,
+    )
+
+    # Negative control: the trusted path stays byte-for-byte the pre-gate call.
+    assert loaded == [("modeling_vae.VideoVAE", "/checkpoints/video_vae")]
+    assert module.loaded_from == "/checkpoints/video_vae"
+
+
+@pytest.mark.parametrize("vae_cls_name", ["MiniMaxH3VideoVAE", "MiniMaxH3AudioVAE"])
+@pytest.mark.parametrize("trusted", [True, False])
+def test_vae_forwards_trust_remote_code_to_loader(monkeypatch, vae_cls_name, trusted):
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    class FakeRemote(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Linear(1, 1)
+
+    forwarded = []
+
+    def spy_load(_component_path, _config, *, trust_remote_code):
+        forwarded.append(trust_remote_code)
+        return FakeRemote()
+
+    monkeypatch.setattr(
+        vae_module,
+        "_load_component_config",
+        lambda _path: {
+            "latent_channels": 1,
+            "latents_mean": [0.0],
+            "latents_std": [1.0],
+            "sample_rate": 32000,
+        },
+    )
+    monkeypatch.setattr(vae_module, "_load_remote_component", spy_load)
+
+    vae_cls = getattr(vae_module, vae_cls_name)
+    vae_cls(
+        "unused",
+        device=torch.device("cpu"),
+        trust_remote_code=trusted,
+    )
+
+    assert forwarded == [trusted]
+
+
+@pytest.mark.parametrize("vae_cls_name", ["MiniMaxH3VideoVAE", "MiniMaxH3AudioVAE"])
+def test_vae_defaults_to_refusing_checkpoint_code(monkeypatch, vae_cls_name):
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    forwarded = []
+
+    def spy_load(_component_path, _config, *, trust_remote_code):
+        forwarded.append(trust_remote_code)
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(
+        vae_module,
+        "_load_component_config",
+        lambda _path: {
+            "latent_channels": 1,
+            "latents_mean": [0.0],
+            "latents_std": [1.0],
+            "sample_rate": 32000,
+        },
+    )
+    monkeypatch.setattr(vae_module, "_load_remote_component", spy_load)
+
+    vae_cls = getattr(vae_module, vae_cls_name)
+    with pytest.raises(AssertionError, match="unreachable"):
+        vae_cls("unused", device=torch.device("cpu"))
+
+    assert forwarded == [False]
 
 
 def test_video_vae_encode_uses_configured_parallel_tiling():
@@ -2520,3 +2711,112 @@ def test_encoder_load_places_every_source_in_its_own_rows(tmp_path):
     }
     for source, rows in slices.items():
         assert torch.equal(rows, torch.full_like(rows, _SOURCE_FILL[source])), source
+
+
+def _pad_seq_len_batch(pad_seq_len):
+    """A t2va request that pins the packed length through ``extra_args``."""
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    extra_args = {"task": "t2va", "aspect_ratio": "16:9"}
+    if pad_seq_len is not None:
+        extra_args["pad_seq_len"] = pad_seq_len
+    sampling = OmniDiffusionSamplingParams(
+        quality="lossless",
+        width=1344,
+        height=768,
+        fps=24,
+        num_frames=124,
+        num_inference_steps=None,
+        extra_args=extra_args,
+    )
+    return DiffusionRequestBatch(
+        [
+            OmniDiffusionRequest(
+                prompt="pinned packed length",
+                sampling_params=sampling,
+                request_id="pad-seq-len",
+            )
+        ]
+    )
+
+
+@pytest.mark.parametrize("pinned, expected", [(None, None), (54080, 54080)])
+def test_pad_seq_len_reaches_diffuse_from_extra_args(pinned, expected):
+    """The request field must arrive at ``diffuse``, not stop at validation."""
+    diffuse_calls: list[dict[str, Any]] = []
+    pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
+
+    pipeline.forward(_pad_seq_len_batch(pinned))
+
+    assert [call["pad_seq_len"] for call in diffuse_calls] == [expected]
+
+
+@pytest.mark.parametrize("task", ["t2va", "ref2va"])
+def test_pad_seq_len_reaches_the_packer_for_every_task_family(task, monkeypatch):
+    """``diffuse`` must hand the pin to whichever packer the task uses."""
+    import vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 as module
+
+    class _CapturedError(Exception):
+        pass
+
+    recorded = {}
+
+    def _capture(**kwargs):
+        recorded.update(kwargs)
+        raise _CapturedError
+
+    monkeypatch.setattr(module, "minimax_h3_packed_sequence", _capture)
+    monkeypatch.setattr(module, "minimax_h3_packed_sequence_ref2va_blocks", _capture)
+
+    pipeline = _distilled_pipeline([], {"fl2va": None, "ref2va": None})
+    pipeline._initial_noise = lambda **kwargs: (torch.zeros(1), torch.zeros(1))
+
+    with pytest.raises(_CapturedError):
+        pipeline._build_denoise_inputs(
+            task=task,
+            text_embeddings=torch.ones(7, 2),
+            text_tags=torch.ones(7, dtype=torch.long),
+            seed=0,
+            latent_t=2,
+            latent_h=4,
+            latent_w=6,
+            audio_t=3,
+            num_frames=5,
+            num_steps=2,
+            video_shift=12.0,
+            audio_shift=3.0,
+            base_schedule=None,
+            visual_condition=None,
+            visual_condition_shape=(1, 4, 6),
+            audio_condition=None,
+            ref_audio_t=1,
+            pad_seq_len=192,
+        )
+
+    assert recorded["seq_len"] == 192
+
+
+@pytest.mark.parametrize("value", [0, -64, 100, "128", True, 1.5, (1 << 20) + 64])
+def test_pad_seq_len_request_validation_rejects_bad_values(value):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _resolve_pad_seq_len,
+    )
+    from vllm_omni.errors import OmniClientError
+
+    with pytest.raises(OmniClientError):
+        _resolve_pad_seq_len(value)
+
+
+def test_pad_seq_len_request_validation_accepts_aligned_values():
+    from vllm_omni.diffusion.models.minimax_h3.packed_sequence import (
+        MINIMAX_H3_MAX_PAD_SEQ_LEN,
+    )
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _resolve_pad_seq_len,
+    )
+
+    assert _resolve_pad_seq_len(None) is None
+    assert _resolve_pad_seq_len(54080) == 54080
+    assert _resolve_pad_seq_len(MINIMAX_H3_MAX_PAD_SEQ_LEN) == MINIMAX_H3_MAX_PAD_SEQ_LEN

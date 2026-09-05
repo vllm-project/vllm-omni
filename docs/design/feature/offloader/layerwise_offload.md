@@ -40,8 +40,10 @@ A DiT declares ordered block-container attributes using
 be an executable `nn.Module`; ordering must match forward execution. Multiple
 containers are concatenated in execution order.
 
-Non-block DiT modules, encoders, VAEs, and declared resident modules are not
-streamed by this backend.
+Non-block DiT modules, VAEs, and declared resident modules are not streamed by
+this backend. Encoders are not streamed either, unless the pipeline declares
+block stacks for them in `OffloadPlan.encoder_block_attrs`, in which case those
+stacks go through the same hook ring as DiT blocks.
 
 ## Invariants and limitations
 
