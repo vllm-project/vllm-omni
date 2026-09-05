@@ -27,6 +27,7 @@ stages:
     max_num_batched_tokens: 32768
     max_num_seqs: 64
     gpu_memory_utilization: 0.9
+    moe_backend: triton
     trust_remote_code: true
     enable_prefix_caching: false
     devices: "0"
@@ -38,6 +39,7 @@ stages:
     max_num_batched_tokens: 32768
     max_num_seqs: 64
     gpu_memory_utilization: 0.6
+    moe_backend: triton
     trust_remote_code: true
     enable_prefix_caching: false
     devices: "1"

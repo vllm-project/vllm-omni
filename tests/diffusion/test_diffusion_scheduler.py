@@ -255,6 +255,15 @@ class TestGetStepBatchSamplingParamsKey:
         b = scheduler._build_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5))
         assert a == b
 
+    def test_distinguishes_pipeline_condition_structure(self) -> None:
+        scheduler = _ConcreteScheduler()
+        a = self._make()
+        b = self._make()
+        a.batch_compatibility_key = ("bagel_cfg", 1.0)
+        b.batch_compatibility_key = ("bagel_cfg", 4.0)
+
+        assert scheduler._build_sampling_params_key(a) != scheduler._build_sampling_params_key(b)
+
 
 class TestGetRequestBatchSamplingParamsKey:
     """Tests for the request-batch compatibility key builder on RequestScheduler."""
@@ -1558,6 +1567,22 @@ class TestStepScheduler:
         assert _new_ids(sched_output) == [req_a, req_b]
         assert sched_output.num_running_reqs == 2
         assert sched_output.num_waiting_reqs == 0
+
+    def test_batches_incompatible_pipeline_conditions_separately(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+        request_a = _make_step_request("a")
+        request_b = _make_step_request("b")
+        request_a.batch_compatibility_key = ("bagel_cfg", 1.0)
+        request_b.batch_compatibility_key = ("bagel_cfg", 4.0)
+
+        req_a = scheduler.add_request(request_a)
+        scheduler.add_request(request_b)
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_a]
+        assert sched_output.num_running_reqs == 1
+        assert sched_output.num_waiting_reqs == 1
 
     def test_step_batch_allows_different_num_inference_steps(self) -> None:
         scheduler = StepScheduler()

@@ -991,10 +991,13 @@ git push origin your-branch --force-with-lease
 
 ## Adding a Model Recipe
 
-After implementing and testing your model, add a model recipe to the
-[vllm-project/recipes](https://github.com/vllm-project/recipes) repository so users can
-get started quickly. See [Adding an Omni-Modality Model](./adding_omni_model.md#adding-a-model-recipe)
-for the expected format.
+After implementing and testing your model, add a recipe under this repository's
+`recipes/` directory. Follow the
+[`add-recipe` skill](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/add-recipe/SKILL.md)
+and [`recipes/TEMPLATE.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/TEMPLATE.md),
+update the model row in
+[`recipes/README.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/README.md),
+and synchronize the relevant TTS example and speech API documentation.
 
 ## Summary
 
@@ -1011,7 +1014,7 @@ Adding a TTS model to vLLM-Omni involves:
 8. **Online serving** - add all 5 integration points to `serving_speech.py` in one commit
 9. **Tests** - cover single request, batching, and streaming
 10. **Pre-commit + DCO** - run `pre-commit` before pushing; sign every commit with `git commit -s`
-11. **Model recipe** - add to [vllm-project/recipes](https://github.com/vllm-project/recipes)
+11. **Model recipe** - add under the in-repository `recipes/` directory and update its index
 12. **Invariants** - re-check I1–I5 (streaming contract, consumer hygiene, hot-loop discipline, validation pyramid, per-request state) at the end of every phase
 
 ### Qwen3-TTS Reference Files

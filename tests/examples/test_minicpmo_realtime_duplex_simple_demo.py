@@ -175,21 +175,26 @@ def test_open_streaming_response_requires_post_commit_drain():
 
 def test_final_input_commit_checkpoints_playback_first():
     demo = _load_demo_module()
-    client = demo.RealtimeDuplexClient("ws://unused")
-    client.events.add(
+    collector = demo.EventCollector()
+    collector.add(
         {
             "type": "response.created",
             "response": {"id": "resp-zero-audio"},
         }
     )
-    calls = []
+    calls: list[dict[str, object]] = []
 
-    async def send(event):
-        calls.append(event)
+    class _Client:
+        async def ack_playback(self, played_ms, *, response_id=None, item_id=None, committed_ms=None):
+            calls.append({"type": "playback.ack", "response_id": response_id, "played_ms": int(played_ms)})
 
-    client.send = send
-    commit_sent_at_s = asyncio.run(demo._commit_input_after_playback_checkpoint(client))
+        async def commit(self):
+            calls.append({"type": "input_audio_buffer.commit"})
 
+    commit_sent_at_s = asyncio.run(demo._commit_input_after_playback_checkpoint(_Client(), collector))
+
+    # The zero-audio response is still acked (0 ms) before the commit: the
+    # ack checkpoints its history position on the server.
     assert [event["type"] for event in calls] == ["playback.ack", "input_audio_buffer.commit"]
     assert calls[0]["response_id"] == "resp-zero-audio"
     assert calls[0]["played_ms"] == 0

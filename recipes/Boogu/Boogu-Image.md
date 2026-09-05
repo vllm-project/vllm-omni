@@ -39,9 +39,10 @@ rendering. The Edit and Edit-Turbo checkpoints use the same native
 
 ## Hardware Support
 
-This recipe documents tested configurations for CUDA GPU serving. The native
-pipeline runs single-GPU; multi-GPU parallelism, CPU offload, and cache
-acceleration are not yet supported for this model (see Notes).
+This recipe documents supported configurations for CUDA GPU serving. The native
+pipeline supports single-GPU inference and classifier-free-guidance (CFG)
+parallelism. CPU offload, cache acceleration, and other multi-GPU dimensions
+remain unsupported (see Notes).
 
 ## GPU
 
@@ -108,8 +109,24 @@ curl -s http://localhost:8091/v1/chat/completions \
   The model's maximum native resolution is 2K.
 - **Known limitations (not yet supported):** CPU offload
   (`--enable-cpu-offload` / `--enable-layerwise-offload`), Cache-DiT
-  (`--cache-backend cache_dit`), and multi-GPU parallelism (TP / SP / CFG /
-  HSDP) are planned follow-ups and are not validated for this model yet.
+  (`--cache-backend cache_dit`), and TP / SP / HSDP multi-GPU parallelism.
+
+### 2 x H100 (CFG parallel, Base T2I)
+
+Base T2I has two predictions per guided denoising step, so two CFG ranks map
+one-to-one to the positive and negative-text branches:
+
+```bash
+vllm serve Boogu/Boogu-Image-0.1-Base \
+  --omni \
+  --cfg-parallel-size 2 \
+  --port 8091
+```
+
+Use `guidance_scale > 1.0` to activate the parallel two-branch path. Requests
+with `guidance_scale=1.0` remain valid on the same server: every rank evaluates
+only the positive branch, no negative embeddings are built, and no guidance is
+applied.
 
 ## Image editing (Boogu-Image-0.1-Edit)
 
@@ -122,6 +139,33 @@ is sent).
 
 ```bash
 vllm serve Boogu/Boogu-Image-0.1-Edit --omni --port 8091
+```
+
+For text-only or image-only guidance, use two CFG ranks:
+
+```bash
+vllm serve Boogu/Boogu-Image-0.1-Edit \
+  --omni \
+  --cfg-parallel-size 2 \
+  --port 8091
+```
+
+Double guidance has three predictions per denoising step. It supports either
+two ranks (round-robin assignment: rank 0 runs branches 0 and 2) or three ranks
+(one branch per rank):
+
+```bash
+# Practical two-GPU configuration
+vllm serve Boogu/Boogu-Image-0.1-Edit \
+  --omni \
+  --cfg-parallel-size 2 \
+  --port 8091
+
+# Maximum branch parallelism
+vllm serve Boogu/Boogu-Image-0.1-Edit \
+  --omni \
+  --cfg-parallel-size 3 \
+  --port 8091
 ```
 
 ### Verification
@@ -175,11 +219,29 @@ curl -s http://localhost:8091/v1/chat/completions \
     default `1.0` = off). Setting it `> 1.0` enables the double-guidance path
     (3 model predictions per step), steering more strongly toward the reference
     image.
+- **CFG-size recommendations:**
+
+  | Request mode | Scales | Predictions per step | Recommended CFG size |
+  | --- | --- | ---: | ---: |
+  | Base T2I text guidance | `guidance_scale > 1`, no reference | 2 | 2 |
+  | Edit text-only guidance | `guidance_scale > 1`, `guidance_scale_2 = 1` | 2 | 2 |
+  | Edit image-only guidance | `guidance_scale = 1`, `guidance_scale_2 > 1` | 2 | 2 |
+  | Edit double guidance | both scales `> 1` | 3 | 2 (practical) or 3 (maximum parallelism) |
+  | CFG off | both scales `= 1` | 1 | Reuse a size-2 server safely; no speedup expected |
+
+  Double guidance preserves Boogu's original combination:
+
+  ```text
+  pred = positive_with_reference
+       + (text_scale - 1) * (positive_with_reference - negative_with_reference)
+       + (image_scale - 1) * (negative_with_reference - uncond)
+  ```
 - **Output resolution:** the output size follows the reference image (upstream
   `align_res`, on by default for a single reference), so `height`/`width` are
   derived from the input and requested sizes are not applied for edits.
-- **Same limitations** as the Base checkpoint apply (no CPU offload, Cache-DiT,
-  or multi-GPU parallelism yet).
+- **Same limitations** as the Base checkpoint apply except that CFG parallelism
+  is supported as described above; CPU offload, Cache-DiT, TP, SP, and HSDP are
+  still unsupported.
 - **Offline editing:** the shared offline example
   [`examples/offline_inference/image_to_image/image_edit.py`](../../examples/offline_inference/image_to_image/image_to_image.md)
   supports Boogu-Image-Edit directly
@@ -251,3 +313,21 @@ curl -s http://localhost:8091/v1/chat/completions \
   the regular Edit checkpoint applies.
 - **Known limitations:** the same single-GPU limitations as Base and Edit apply;
   CPU offload, Cache-DiT, and multi-GPU parallelism are not yet validated.
+
+## Performance validation
+
+The checked-in single-device A40 measurements remain the current Boogu
+baseline: Base T2I is about 16.37 s request latency at concurrency 1 and Edit
+text-only guidance is about 29.64 s for 512x512, 28-step requests, with roughly
+36.8 GB peak memory. CFG-parallel A/B numbers must be collected on the same
+hardware and software revision before reporting a speedup; do not compare a
+multi-GPU result against these A40 numbers as if it were a controlled A/B.
+
+Run the dedicated perf rows in
+`tests/dfx/perf/tests/test_boogu_image_vllm_omni.json` and
+`tests/dfx/perf/tests/test_boogu_image_edit_vllm_omni.json` on 2x/3x H100, then
+record latency, throughput, and per-GPU peak memory beside the single-device
+run. The expected shape is close to the general CFG-parallel range (roughly
+1.5x-1.8x for balanced two-branch workloads); the three-branch Edit result will
+depend on whether two-rank round-robin or full three-rank execution is used and
+must be reported from measurement rather than assumed.

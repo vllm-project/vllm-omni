@@ -15,12 +15,12 @@ from vllm_omni.experimental.fullduplex.client import (
     read_pcm16_wav,
     write_pcm16_wav,
 )
-from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
-    MiniCPMO45DuplexPolicy,
-)
 from vllm_omni.experimental.fullduplex.video_stacking import (
     concat_frames,
     unit_subframe_offsets,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
+    MiniCPMO45DuplexPolicy,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -28,7 +28,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def test_realtime_client_builds_explicit_native_duplex_url():
     url = build_realtime_url(
-        "ws://localhost:8099/v1/realtime?custom=1&duplex=0&model=stale&minicpmo45_native_duplex=0&session_id=stale",
+        "ws://localhost:8099/v1/realtime?custom=1&duplex=0&model=stale&native_duplex=0&session_id=stale",
         "openbmb/MiniCPM-o-4_5",
         session_id="session-a",
     )
@@ -38,7 +38,7 @@ def test_realtime_client_builds_explicit_native_duplex_url():
         "custom": ["1"],
         "duplex": ["1"],
         "model": ["openbmb/MiniCPM-o-4_5"],
-        "minicpmo45_native_duplex": ["1"],
+        "native_duplex": ["1"],
         "session_id": ["session-a"],
     }
 
@@ -65,7 +65,7 @@ def test_realtime_client_builds_resume_only_url_when_autostart_disabled():
 
     query = parse_qs(urlsplit(url).query)
     assert query["autostart"] == ["0"]
-    assert query["minicpmo45_native_duplex"] == ["1"]
+    assert query["native_duplex"] == ["1"]
 
 
 @pytest.mark.asyncio
@@ -232,7 +232,7 @@ async def test_realtime_client_configure_explicit_tts_opts_out_of_native_duplex(
     session_extra_body = client.sent[0]["session"]["extra_body"]
     assert session_extra_body == {
         "ref_audio": "data:audio/wav;base64,AAAA",
-        "minicpmo45_native_duplex": False,
+        "native_duplex": False,
     }
 
 
