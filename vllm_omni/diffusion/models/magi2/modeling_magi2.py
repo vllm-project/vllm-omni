@@ -27,8 +27,8 @@ from .attention import Magi2PackedAttentionKernel, VarlenHandler, apply_rotary_e
 from .configuration_magi2 import Magi2PreviewConfig
 from .layers import (
     ElementWiseFourierEmbed,
-    MHCHandler,
     Magi2GroupedLinear,
+    MHCHandler,
     ModalityDispatcher,
     MultiModalityRMSNorm,
     make_grouped_linear,

@@ -599,9 +599,7 @@ class Magi2Pipeline(
         if od_config.quantization_config is not None:
             # dataclasses.replace avoids mutating the singleton shared by
             # every MAGI-2 pipeline instance.
-            preview_config = dataclasses.replace(
-                MAGI2_PREVIEW_CONFIG, quant_config=od_config.quantization_config
-            )
+            preview_config = dataclasses.replace(MAGI2_PREVIEW_CONFIG, quant_config=od_config.quantization_config)
         self._preview_config = preview_config
         mmap_dlo = bool(
             od_config.enable_distributed_layerwise_offload and getattr(od_config, "dlo_use_allgather", True)
