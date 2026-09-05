@@ -107,6 +107,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (  # noqa: E402,F401
     breeze_tts_2,
     cosyvoice3,
     covo_audio,
+    dots_tts,
     fish_speech,
     glm_tts,
     higgs_audio_v2,

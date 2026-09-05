@@ -32,7 +32,7 @@ if TOKENIZER:
 pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.parametrize(
     "omni_server",
     [

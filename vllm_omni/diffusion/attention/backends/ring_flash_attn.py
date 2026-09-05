@@ -95,7 +95,8 @@ def ring_flash_attn_forward(
             if attn_type == AttnType.SPARSE_SAGE:
                 out, lse = block_out, block_lse
             else:
-                out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+                # Ring kernel wrappers canonicalize LSE to (B, H, S).
+                out, lse = update_out_and_lse(out, lse, block_out, block_lse, lse_layout="bhs")
 
         if step + 1 != comm.world_size:
             comm.wait()

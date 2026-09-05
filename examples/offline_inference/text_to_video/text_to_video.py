@@ -10,12 +10,18 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm_omni.diffusion.data import resolve_model_class_name
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
-from vllm_omni.model_extras import get_extra_body_params, get_model_class_name, get_output_tensor_range
+from vllm_omni.model_extras import (
+    get_extra_body_params,
+    get_model_class_name,
+    get_output_tensor_range,
+    get_video_generation_defaults,
+)
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -135,9 +141,17 @@ _MODEL_PRESETS = {
 }
 
 
-def _detect_preset(model: str, model_class_name: str | None = None) -> dict:
+def _detect_preset(
+    model: str,
+    model_class_name: str | None = None,
+    extra_body: dict[str, Any] | None = None,
+) -> dict:
     model_lower = model.lower()
-    class_lower = (model_class_name or "").lower()
+    resolved_model_class_name = model_class_name or resolve_model_class_name(model)
+    class_lower = (resolved_model_class_name or "").lower()
+    video_defaults = get_video_generation_defaults(resolved_model_class_name, extra_body)
+    if video_defaults is not None:
+        return video_defaults.cli_defaults()
     if "sana-video" in model_lower or "sana_video" in model_lower or "sanavideo" in class_lower:
         return _MODEL_PRESETS["sana_720p" if "720p" in model_lower else "sana_480p"]
     if "lingbot" in model_lower or "lingbotvideo" in class_lower:
@@ -221,7 +235,8 @@ def parse_extra_body(value: str) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate a video from a text prompt. "
-        "Supports Wan2.2, HunyuanVideo-1.5, Helios, LingBot-Video, and other text-to-video models."
+        "Supports Wan2.2, HunyuanVideo-1.5, Helios, LingBot-Video, MAGI-2, "
+        "and other text-to-video models."
     )
     parser.add_argument(
         "--model",
@@ -288,7 +303,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         choices=["cache_dit"],
-        help="Cache backend for acceleration (Wan2.2). Default: None.",
+        help="Cache backend for supported diffusion pipelines. Default: None.",
     )
     parser.add_argument(
         "--enable-cache-dit-summary",
@@ -296,7 +311,7 @@ def parse_args() -> argparse.Namespace:
         help="Enable cache-dit summary logging after diffusion forward passes.",
     )
     parser.add_argument("--output", type=str, default=None, help="Output path (mp4). Default: model-specific.")
-    parser.add_argument("--fps", type=int, default=None, help="Frames per second for the output video.")
+    parser.add_argument("--fps", type=float, default=None, help="Frames per second for the output video.")
     parser.add_argument(
         "--vae-use-slicing",
         action="store_true",
@@ -321,6 +336,30 @@ def parse_args() -> argparse.Namespace:
         "--enable-layerwise-offload",
         action="store_true",
         help="Enable layerwise (blockwise) offloading on DiT modules.",
+    )
+    parser.add_argument(
+        "--enable-distributed-layerwise-offload",
+        action="store_true",
+        help="Enable distributed layerwise offloading with overlapped host-to-device weight streaming.",
+    )
+    parser.add_argument(
+        "--dlo-use-allgather",
+        dest="dlo_use_allgather",
+        action="store_true",
+        default=True,
+        help="Use shard + AllGather weight reconstruction for distributed layerwise offload (default: enabled).",
+    )
+    parser.add_argument(
+        "--dlo-no-use-allgather",
+        dest="dlo_use_allgather",
+        action="store_false",
+        help="Stream standard-loader rank-local weights without DLO sharding or AllGather.",
+    )
+    parser.add_argument(
+        "--dlo-resident-layers",
+        type=int,
+        default=0,
+        help="Number of leading main-DiT blocks to keep device-resident during distributed layerwise offload.",
     )
     parser.add_argument(
         "--audio-sample-rate",
@@ -464,15 +503,17 @@ def _extract_peak_memory_mb(result: Any) -> float:
 def main():
     args = parse_args()
     model_class_name = args.model_class_name
+    resolved_model_class_name = model_class_name or resolve_model_class_name(args.model)
+    video_defaults = get_video_generation_defaults(resolved_model_class_name, args.extra_body)
 
-    preset = _detect_preset(args.model, model_class_name)
+    preset = _detect_preset(args.model, resolved_model_class_name, args.extra_body)
     for key, default_val in preset.items():
         if getattr(args, key.replace("-", "_"), None) is None:
             setattr(args, key.replace("-", "_"), default_val)
     model_class_name = args.model_class_name
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
-    # Cache-dit config (Wan2.2 only)
+    # Shared Cache-DiT defaults for pipelines that declare an adapter.
     cache_config = None
     if args.cache_backend == "cache_dit":
         cache_config = {
@@ -501,6 +542,9 @@ def main():
         cfg_parallel_size=args.cfg_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
         vae_patch_parallel_size=args.vae_patch_parallel_size,
+        use_hsdp=args.use_hsdp,
+        hsdp_shard_size=args.hsdp_shard_size,
+        hsdp_replicate_size=args.hsdp_replicate_size,
         pipeline_parallel_size=args.pipeline_parallel_size,
         enable_expert_parallel=args.enable_expert_parallel,
         enforce_eager=args.enforce_eager,
@@ -509,6 +553,9 @@ def main():
         cache_config=cache_config,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
+        enable_distributed_layerwise_offload=args.enable_distributed_layerwise_offload,
+        dlo_use_allgather=args.dlo_use_allgather,
+        dlo_resident_layers=args.dlo_resident_layers,
     )
     if args.deploy_config:
         omni_kwargs["deploy_config"] = args.deploy_config
@@ -572,6 +619,8 @@ def main():
         )
 
     negative_prompt = args.negative_prompt
+    if negative_prompt is None and video_defaults is not None:
+        negative_prompt = video_defaults.default_negative_prompt
     if negative_prompt is None and all(preset is not _MODEL_PRESETS[name] for name in ("lingbot", "ltx2", "ltx23")):
         # Preserve the historical empty-prompt behavior for non-LTX examples.
         negative_prompt = ""
@@ -591,7 +640,10 @@ def main():
         num_frames=args.num_frames,
         extra_args=extra_args,
     )
-    if args.frame_rate is not None:
+    if video_defaults is not None:
+        sampling_kwargs["fps"] = args.fps
+        sampling_kwargs["frame_rate"] = args.frame_rate or args.fps
+    elif args.frame_rate is not None:
         sampling_kwargs["frame_rate"] = args.frame_rate
     if args.guidance_scale_high is not None:
         sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high

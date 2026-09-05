@@ -22,7 +22,7 @@ import uuid
 import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import Any, Literal, cast
 
 import janus
 import torch
@@ -58,6 +58,13 @@ from vllm_omni.engine.async_engine_utils import (
     upgrade_to_omni_request,
     weak_shutdown_async_omni_engine,
 )
+from vllm_omni.engine.duplex.control_client import DuplexControlClient
+from vllm_omni.engine.duplex.lease import DuplexLeaseActivity
+from vllm_omni.engine.duplex.messages import DuplexFence
+from vllm_omni.engine.duplex.runtime import (
+    load_duplex_runtime_extension,
+    validate_duplex_runtime_extension,
+)
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AbortResultMessage,
@@ -89,11 +96,6 @@ from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 
 logger = init_logger(__name__)
-
-if TYPE_CHECKING:
-    from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlClient
-    from vllm_omni.experimental.fullduplex.engine.lease import DuplexLeaseActivity
-    from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 
 _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256
@@ -183,6 +185,10 @@ class AsyncOmniEngine:
         self._omni_heartbeat_timeout: float = float(kwargs.get("omni_heartbeat_timeout") or 30.0)
         if self._omni_heartbeat_timeout <= 0:
             raise ValueError(f"--omni-heartbeat-timeout must be > 0, got {self._omni_heartbeat_timeout}")
+        # Concurrent same-device stage init (admission + SH/EX phase locks).
+        # Sourced from the parallel_stage_init orchestrator/CLI arg (config,
+        # not an env var); default False preserves serial init.
+        self._parallel_stage_init: bool = bool(kwargs.get("parallel_stage_init") or False)
 
         if single_stage_mode:
             logger.info(
@@ -320,6 +326,7 @@ class AsyncOmniEngine:
             stage_init_timeout=stage_init_timeout,
             async_chunk=self.async_chunk,
             tokenizer=self.tokenizer,
+            parallel_stage_init=self._parallel_stage_init,
             single_stage_id_filter=self._single_stage_id_filter,
             omni_master_address=self._omni_master_address,
             omni_master_port=self._omni_master_port,
@@ -389,11 +396,6 @@ class AsyncOmniEngine:
             membership_controller = self._runtime.create_membership_controller()
             duplex_runtime_extension = None
             if self._duplex_control_enabled:
-                from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
-                    load_duplex_runtime_extension,
-                    validate_duplex_runtime_extension,
-                )
-
                 duplex_runtime_extension = load_duplex_runtime_extension(
                     getattr(self, "_duplex_runtime_extension_path", None)
                 )
@@ -1812,8 +1814,6 @@ class AsyncOmniEngine:
         )
 
     def _get_duplex_control_client(self) -> DuplexControlClient:
-        from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlClient
-
         client = getattr(self, "_duplex_control_client", None)
         if client is None:
             transport = getattr(self, "_correlated_rpc_client", None)

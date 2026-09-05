@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Strict PersonaPlex validation for the unified OpenAI Realtime duplex path."""
 
 from __future__ import annotations
@@ -18,15 +18,70 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import numpy as np
 
-from vllm_omni.experimental.fullduplex.client import (
-    RealtimeDuplexClient,
-    wait_for,
+try:
+    import websockets
+    from websockets.exceptions import ConnectionClosed
+except ImportError as exc:  # pragma: no cover - driver dependency.
+    raise SystemExit("Install websockets first: pip install websockets") from exc
+
+from vllm_omni.clients.duplex import (
+    EventCollector,
     write_pcm16_wav,
+)
+from vllm_omni.clients.duplex import (
+    wait_for_condition as wait_for,
 )
 
 SAMPLE_RATE_HZ = 24_000
 FRAME_SAMPLES = 1_920
 FRAME_PERIOD_S = FRAME_SAMPLES / SAMPLE_RATE_HZ
+
+
+class RawRealtimeProbe:
+    """Raw-event Realtime probe: one websocket plus an :class:`EventCollector`.
+
+    This driver speaks the wire protocol directly (it validates handshake
+    errors such as admission limits, which the public
+    :class:`vllm_omni.clients.duplex.DuplexClient` treats as failures), so it
+    keeps a transport-only client and reads everything from ``.events``.
+    """
+
+    def __init__(self, url: str, *, max_size: int = 64 * 1024 * 1024) -> None:
+        self.url = url
+        self.max_size = max_size
+        self.events = EventCollector()
+        self._ws = None
+        self._reader_task: asyncio.Task[None] | None = None
+
+    async def __aenter__(self) -> RawRealtimeProbe:
+        self._ws = await websockets.connect(self.url, max_size=self.max_size)
+        self._reader_task = asyncio.create_task(self._read_events())
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        if self._ws is not None:
+            await self._ws.close()
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _read_events(self) -> None:
+        try:
+            while True:
+                raw = await self._ws.recv()
+                if not isinstance(raw, str):
+                    continue
+                event = json.loads(raw)
+                if isinstance(event, dict):
+                    self.events.add(event)
+        except ConnectionClosed:
+            return
+
+    async def send(self, event: dict[str, object]) -> None:
+        await self._ws.send(json.dumps(event))
 
 
 def _input_identity(
@@ -83,7 +138,7 @@ def _read_wav_as_float32(path: Path) -> np.ndarray:
     return pcm
 
 
-def _events(client: RealtimeDuplexClient, event_type: str) -> list[dict[str, object]]:
+def _events(client: RawRealtimeProbe, event_type: str) -> list[dict[str, object]]:
     return [event for event in client.events.events if event.get("type") == event_type]
 
 
@@ -93,8 +148,8 @@ async def _open_session(
     session_id: str,
     persona: str,
     expect_error: bool = False,
-) -> tuple[RealtimeDuplexClient, dict[str, object]]:
-    client = RealtimeDuplexClient(_realtime_url(args.url, args.model, session_id))
+) -> tuple[RawRealtimeProbe, dict[str, object]]:
+    client = RawRealtimeProbe(_realtime_url(args.url, args.model, session_id))
     await client.__aenter__()
     await client.send(
         {
@@ -121,7 +176,7 @@ async def _open_session(
     return client, _events(client, event_type)[-1]
 
 
-async def _close_session(client: RealtimeDuplexClient, *, timeout_s: float) -> None:
+async def _close_session(client: RawRealtimeProbe, *, timeout_s: float) -> None:
     await client.send({"type": "session.close"})
     await wait_for(
         lambda: client.events.count("session.closed") > 0,
@@ -132,7 +187,7 @@ async def _close_session(client: RealtimeDuplexClient, *, timeout_s: float) -> N
 
 
 async def _stream_frames(
-    client: RealtimeDuplexClient,
+    client: RawRealtimeProbe,
     pcm: np.ndarray,
     *,
     max_frames: int | None = None,
@@ -186,7 +241,7 @@ def _audio_frame_stats(
     }
 
 
-def _response_ids(client: RealtimeDuplexClient) -> set[str]:
+def _response_ids(client: RawRealtimeProbe) -> set[str]:
     return {
         str(event["response_id"])
         for event in _events(client, "response.audio.delta")
@@ -195,7 +250,7 @@ def _response_ids(client: RealtimeDuplexClient) -> set[str]:
 
 
 def _session_result(
-    client: RealtimeDuplexClient,
+    client: RawRealtimeProbe,
     *,
     input_frames: int,
     args: argparse.Namespace,
@@ -268,7 +323,7 @@ def _capabilities(created: dict[str, object]) -> dict[str, object]:
     return capabilities
 
 
-def _save(output_dir: Path, name: str, client: RealtimeDuplexClient, raw: bytes) -> None:
+def _save(output_dir: Path, name: str, client: RawRealtimeProbe, raw: bytes) -> None:
     (output_dir / f"{name}-events.jsonl").write_text(
         "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in client.events.events),
         encoding="utf-8",

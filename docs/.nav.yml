@@ -17,6 +17,7 @@ nav:
       - Streaming and Realtime:
         - Realtime Audio: serving/realtime_api.md
         - Full Duplex: serving/full_duplex_api.md
+        - Realtime Duplex Reference: serving/realtime_duplex_api.md
         - Streaming Video Input: serving/video_stream_api.md
         - Streaming Video Output: serving/streaming_video_output_api.md
         - OpenPI Robot Policy: serving/openpi_api.md

@@ -13,6 +13,8 @@ import vllm_omni.diffusion.data as diffusion_data
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient, dummy_messages_from_mix_data
 from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionSpec,
     DiffusionOutput,
     DiffusionParallelConfig,
     OmniDiffusionConfig,
@@ -141,14 +143,106 @@ class TestPipelineArgumentsHandling:
         assert isinstance(output.output, MockPipelineOutput)
         assert output.output.image is stub_image
 
+    @staticmethod
+    def _make_adapter(backend: str, set_attention_backend):
+        adapter = DiffusersAdapterPipeline(
+            od_config=_make_od_config(
+                diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend=backend)),
+            )
+        )
+        adapter._pipeline = SimpleNamespace(
+            transformer=SimpleNamespace(set_attention_backend=set_attention_backend),
+        )
+        return adapter
+
+    def test_explicit_unbound_backend_is_rejected(self):
+        calls: list[str] = []
+        adapter = self._make_adapter("CUDNN_ATTN", calls.append)
+
+        with pytest.raises(ValueError, match="do not provide a binding"):
+            adapter._set_attention_backend()
+
+        assert calls == []
+
+    def test_failed_explicit_backend_does_not_fallback_to_native(self):
+        calls: list[str] = []
+
+        def reject_backend(backend):
+            calls.append(backend)
+            raise RuntimeError(f"{backend} unavailable")
+
+        adapter = self._make_adapter("SAGE_ATTN", reject_backend)
+
+        with pytest.raises(RuntimeError, match="explicitly selected attention backend 'SAGE_ATTN'"):
+            adapter._set_attention_backend()
+
+        assert calls == ["sage_hub", "sage", "sage_varlen"]
+        assert "native" not in calls
+
+    def test_explicit_flash_attn_3_hub_does_not_fallback_to_fa2_or_local(self, monkeypatch):
+        monkeypatch.setattr(DiffusersAdapterPipeline, "_is_blackwell_gpu", lambda self: False)
+        calls: list[str] = []
+
+        def accept_later_backends(backend):
+            calls.append(backend)
+            if backend in ("flash_hub", "flash_varlen_hub", "flash", "flash_varlen", "_native_flash"):
+                return
+            raise RuntimeError(f"{backend} unavailable")
+
+        adapter = self._make_adapter("FLASH_ATTN_3_HUB", accept_later_backends)
+
+        with pytest.raises(RuntimeError, match="explicitly selected attention backend 'FLASH_ATTN_3_HUB'"):
+            adapter._set_attention_backend()
+
+        assert calls == ["_flash_3_hub", "_flash_3_varlen_hub"]
+
+    def test_explicit_flash_attn_hub_does_not_fallback_to_local(self, monkeypatch):
+        monkeypatch.setattr(DiffusersAdapterPipeline, "_is_blackwell_gpu", lambda self: False)
+        calls: list[str] = []
+
+        def accept_local_flash(backend):
+            calls.append(backend)
+            if backend in ("flash", "flash_varlen", "_native_flash"):
+                return
+            raise RuntimeError(f"{backend} unavailable")
+
+        adapter = self._make_adapter("FLASH_ATTN_HUB", accept_local_flash)
+
+        with pytest.raises(RuntimeError, match="explicitly selected attention backend 'FLASH_ATTN_HUB'"):
+            adapter._set_attention_backend()
+
+        assert calls == ["flash_hub", "flash_varlen_hub"]
+
+    def test_explicit_torch_sdpa_maps_to_diffusers_native(self):
+        calls: list[str] = []
+        adapter = self._make_adapter("TORCH_SDPA", calls.append)
+
+        adapter._set_attention_backend()
+
+        assert calls == ["native"]
+
     @pytest.mark.parametrize(
         "feature_id",
-        ["cfg_parallel", "ulysses", "ring", "teacache", "cache_dit", "enforce_eager", "unsupported_quantization"],
+        [
+            "cfg_parallel",
+            "tensor_parallel",
+            "ulysses",
+            "ring",
+            "teacache",
+            "cache_dit",
+            "enforce_eager",
+            "unsupported_quantization",
+        ],
     )
     def test_adapter_guard_unsupported_feature(self, feature_id):
         if feature_id == "cfg_parallel":
             od_config = _make_od_config(
                 parallel_config=DiffusionParallelConfig(cfg_parallel_size=2, sequence_parallel_size=1),
+                cache_backend="none",
+            )
+        elif feature_id == "tensor_parallel":
+            od_config = _make_od_config(
+                parallel_config=DiffusionParallelConfig(tensor_parallel_size=2, sequence_parallel_size=1),
                 cache_backend="none",
             )
         elif feature_id == "ulysses":

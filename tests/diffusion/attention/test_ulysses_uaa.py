@@ -322,6 +322,50 @@ def test_advanced_uaa_hybrid_rejects_non_gqa_shapes(monkeypatch: pytest.MonkeyPa
         strategy.pre_attention(query, key, value, None)
 
 
+def test_strict_ulysses_reshards_vsa_gate_with_qkv(monkeypatch) -> None:
+    from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.attention.parallel.ulysses.get_ulysses_mode",
+        lambda default: "strict",
+    )
+    calls: list[torch.Tensor] = []
+
+    def fake_all_to_all(pg, tensor, scatter_idx, gather_idx, use_sync):
+        del pg, scatter_idx, gather_idx, use_sync
+        calls.append(tensor)
+        return tensor.reshape(tensor.shape[0], tensor.shape[1] * 2, tensor.shape[2] // 2, tensor.shape[3])
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.attention.parallel.ulysses.SeqAllToAll4D.apply",
+        fake_all_to_all,
+    )
+    strategy = UlyssesParallelAttention(
+        sp_group=SimpleNamespace(
+            ulysses_group=object(),
+            ulysses_world_size=2,
+            ulysses_rank=0,
+            ring_world_size=1,
+        ),
+        scatter_idx=2,
+        gather_idx=1,
+        use_sync=False,
+    )
+    query = torch.arange(24).reshape(1, 3, 4, 2)
+    key = query + 10
+    value = query + 20
+    gate = query + 100
+    metadata = AttentionMetadata(extra={"gate_compress": gate})
+
+    query_out, _, _, metadata_out, _ = strategy.pre_attention(query, key, value, metadata)
+
+    assert all(actual is expected for actual, expected in zip(calls, (query, key, value, gate), strict=True))
+    assert query_out.shape == (1, 6, 2, 2)
+    assert metadata_out is metadata
+    assert metadata.extra["gate_compress"].shape == query_out.shape
+    torch.testing.assert_close(metadata.extra["gate_compress"], gate.reshape_as(query_out))
+
+
 def _run_attention_case(
     local_rank: int,
     world_size: int,

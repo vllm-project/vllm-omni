@@ -795,6 +795,10 @@ def test_cudnn_packed_attention_uses_python_length_without_padding_mask():
 
 
 def test_packed_attention_skips_mask_for_packed_mask_free_backend():
+    from vllm_omni.diffusion.attention.backends.abstract import (
+        VideoTokenLayout,
+        VideoTokenSpan,
+    )
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         MiniMaxH3Attention,
     )
@@ -821,6 +825,10 @@ def test_packed_attention_skips_mask_for_packed_mask_free_backend():
     torch.nn.Module.__init__(attention)
     attention.attention = FakeAttention()
     q = torch.randn(8, 2, 4)
+    video_layout = VideoTokenLayout(
+        used_len=5,
+        video_spans=(VideoTokenSpan(start=3, latent_grid=(1, 1, 2), role="target"),),
+    )
 
     attention._run_packed_attention(
         q,
@@ -829,6 +837,9 @@ def test_packed_attention_skips_mask_for_packed_mask_free_backend():
         cu_seqlens=torch.tensor([0, 5, 8], dtype=torch.int32),
         max_seqlen=5,
         packed_total=8,
+        video_layout=video_layout,
+        vsa_prefix_segments=(1, 2),
+        gate_compress=torch.ones_like(q),
     )
 
     metadata = attention.attention.metadata
@@ -836,6 +847,11 @@ def test_packed_attention_skips_mask_for_packed_mask_free_backend():
     assert metadata.attn_mask is None
     assert metadata.extra["valid_kv_length"] == 5
     assert metadata.extra["npu_attn_varlen"] is True
+    assert metadata.video_layout is video_layout
+    assert metadata.extra["vsa_h3_prefix_segments"] == (1, 2)
+    assert "vsa_h3_video_shape" not in metadata.extra
+    assert "vsa_h3_target_start" not in metadata.extra
+    assert metadata.extra["gate_compress"].shape == (1, *q.shape)
     packed_padding = metadata.packed_padding
     assert packed_padding is not None
     assert packed_padding.q_length == 5

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project and the HuggingFace Team.
 # All rights reserved.
 #
@@ -35,6 +36,7 @@ based on the plan specification.
 from __future__ import annotations
 
 import inspect
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -46,8 +48,10 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     AnySequenceParallelInput,
     SequenceParallelConfig,
     SequenceParallelInput,
+    SequenceParallelInputType,
     SequenceParallelModelPlan,
     SequenceParallelOutput,
+    SequenceParallelOutputType,
     SequenceParallelPartialInput,
 )
 from vllm_omni.diffusion.distributed.sp_sharding import sp_gather, sp_shard
@@ -69,18 +73,18 @@ class ModuleForwardMetadata:
     """
 
     cached_parameter_indices: dict[str, int] | None = None
-    _cls: type | None = None
+    _cls: type[nn.Module] | None = None
 
     def _get_parameter_from_args_kwargs(
         self,
-        identifier: str,
-        args: tuple = (),
-        kwargs: dict | None = None,
+        identifier: str | int,
+        args: Sequence[Any] = (),
+        kwargs: dict[str, Any] | None = None,
     ) -> tuple[Any, bool, int | None]:
         """Get a parameter value from args or kwargs by name.
 
         Args:
-            identifier: The parameter name to look up.
+            identifier: The parameter name to look up, or a positional index.
             args: Positional arguments passed to forward.
             kwargs: Keyword arguments passed to forward.
 
@@ -94,6 +98,11 @@ class ModuleForwardMetadata:
             ValueError: If parameter not found in signature.
         """
         kwargs = kwargs or {}
+
+        if isinstance(identifier, int):
+            if identifier < len(args):
+                return args[identifier], False, identifier
+            return None, False, identifier
 
         # First check kwargs
         if identifier in kwargs:
@@ -164,7 +173,7 @@ class SequenceParallelSplitHook(ModelHook):
 
     def __init__(
         self,
-        metadata: dict[str | int, AnySequenceParallelInput | list[AnySequenceParallelInput]],
+        metadata: SequenceParallelInputType,
         config: SequenceParallelConfig,
     ) -> None:
         super().__init__()
@@ -191,6 +200,8 @@ class SequenceParallelSplitHook(ModelHook):
                 continue
 
             # Get the parameter value
+            if self.module_forward_metadata is None:
+                raise RuntimeError("SequenceParallelSplitHook.initialize_hook must run before forward")
             input_val, is_kwarg, index = self.module_forward_metadata._get_parameter_from_args_kwargs(
                 name, args_list, kwargs
             )
@@ -200,6 +211,10 @@ class SequenceParallelSplitHook(ModelHook):
 
             # Shard the input
             if isinstance(input_val, torch.Tensor):
+                if not isinstance(spm, (SequenceParallelInput, SequenceParallelPartialInput)):
+                    raise ValueError(
+                        f"Expected SequenceParallelInput for tensor parameter '{name}', got {type(spm).__name__}"
+                    )
                 input_val = self._prepare_sp_input(input_val, spm, args_list, kwargs)
             elif isinstance(input_val, (list, tuple)):
                 # Handle list/tuple of tensors with per-element config
@@ -221,6 +236,8 @@ class SequenceParallelSplitHook(ModelHook):
 
             # Update args or kwargs
             if is_kwarg:
+                if not isinstance(name, str):
+                    raise TypeError(f"Keyword parameter name must be str, got {type(name).__name__}")
                 kwargs[name] = input_val
             elif index is not None and index < len(args_list):
                 args_list[index] = input_val
@@ -270,8 +287,8 @@ class SequenceParallelSplitHook(ModelHook):
     def _resolve_text_len(
         self,
         sp_input: SequenceParallelPartialInput,
-        args: tuple,
-        kwargs: dict,
+        args: Sequence[Any],
+        kwargs: dict[str, Any],
     ) -> int:
         """Resolve text length from the source specification."""
         source = sp_input.text_len_source
@@ -285,6 +302,8 @@ class SequenceParallelSplitHook(ModelHook):
 
         # Try to get from kwargs/args
         try:
+            if self.module_forward_metadata is None:
+                raise RuntimeError("SequenceParallelSplitHook.initialize_hook must run before forward")
             val, _, _ = self.module_forward_metadata._get_parameter_from_args_kwargs(source, args, kwargs)
             if val is None:
                 raise ValueError(f"Parameter '{source}' is None, cannot determine text length.")
@@ -306,8 +325,8 @@ class SequenceParallelSplitHook(ModelHook):
         self,
         x: torch.Tensor,
         sp_input: AnySequenceParallelInput,
-        args: tuple = (),
-        kwargs: dict | None = None,
+        args: Sequence[Any] = (),
+        kwargs: dict[str, Any] | None = None,
     ) -> torch.Tensor:
         """Shard a tensor according to the input specification."""
         kwargs = kwargs or {}
@@ -382,7 +401,7 @@ class SequenceParallelSplitHook(ModelHook):
         2. Creates an attention mask indicating valid vs padding positions
         3. Stores the mask and padding info in ForwardContext
         """
-        from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
+        from vllm_omni.diffusion.attention.selector import get_attn_backend_for_capability
         from vllm_omni.diffusion.distributed.parallel_state import (
             get_ring_parallel_world_size,
             get_sequence_parallel_rank,
@@ -408,12 +427,14 @@ class SequenceParallelSplitHook(ModelHook):
             if od_config is not None:
                 attention_config = od_config.diffusion_attention_config
 
-        attn_backend, _ = get_attn_backend_for_role(
+        attn_backend = get_attn_backend_for_capability(
             role="self",
-            head_size=-1,
             attention_config=attention_config,
         )
-        if not attn_backend.supports_attention_mask:
+        attention_spec = None
+        if attention_config is not None:
+            attention_spec, _ = attention_config.resolve_with_source(role="self")
+        if not attn_backend.supports_attention_mask(attention_spec):
             raise ValueError(
                 f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "
                 f"Cannot use {attn_backend.get_name()} which does not support attention_mask. "
@@ -468,12 +489,14 @@ class SequenceParallelGatherHook(ModelHook):
 
     def __init__(
         self,
-        metadata: SequenceParallelOutput | list[SequenceParallelOutput],
+        metadata: SequenceParallelOutputType,
         config: SequenceParallelConfig,
     ) -> None:
         super().__init__()
         if isinstance(metadata, SequenceParallelOutput):
             metadata = [metadata]
+        elif isinstance(metadata, tuple):
+            metadata = list(metadata)
         self.metadata = metadata
         self.config = config
 
@@ -630,6 +653,7 @@ def apply_sequence_parallel(
         logger.debug(f"Applying SP hooks to '{module_id}' ({len(submodule)} module(s))")
 
         for m in submodule:
+            hook: SequenceParallelSplitHook | SequenceParallelGatherHook
             if isinstance(sp_model_plan, dict):
                 # Input specification
                 hook = SequenceParallelSplitHook(sp_model_plan, config)
@@ -638,6 +662,8 @@ def apply_sequence_parallel(
                 # Output specification
                 if isinstance(sp_model_plan, SequenceParallelOutput):
                     sp_model_plan = [sp_model_plan]
+                elif isinstance(sp_model_plan, tuple):
+                    sp_model_plan = list(sp_model_plan)
                 if not all(isinstance(x, SequenceParallelOutput) or x is None for x in sp_model_plan):
                     raise ValueError(f"Expected SequenceParallelOutput elements, got {sp_model_plan}")
                 hook = SequenceParallelGatherHook(sp_model_plan, config)

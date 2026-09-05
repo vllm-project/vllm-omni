@@ -5,6 +5,8 @@ import pytest
 
 from tests.helpers.mark import (
     _gpu_res_platforms,
+    get_skus_for_platform,
+    get_supported_card_counts,
     hardware_marks,
     hardware_test,
 )
@@ -19,6 +21,18 @@ def _mark_names(marks) -> set[str]:
 def test_gpu_platforms_come_from_pyproject_gpu_tag():
     assert "npu" not in _gpu_res_platforms()
     assert "gpu" not in _gpu_res_platforms()
+
+
+def test_get_skus_for_platform_cuda_excludes_other_accelerators():
+    cuda_skus = get_skus_for_platform("cuda")
+    assert cuda_skus >= {"H100", "H200", "H800", "L4", "B200"}
+    assert "MI325" not in cuda_skus
+    assert "A2" not in cuda_skus
+    assert get_skus_for_platform("rocm") == {"MI325"}
+
+
+def test_get_supported_card_counts_comes_from_pyproject():
+    assert get_supported_card_counts() == frozenset(range(1, 9))
 
 
 def test_default_num_cards_adds_cards_1():
@@ -137,3 +151,14 @@ def test_cuda_registered_skus_attach_sku_and_cards(sku):
 def test_cuda_rejects_sku_from_another_platform():
     with pytest.raises(ValueError, match="Invalid cuda resource type"):
         hardware_marks(res={"cuda": "MI325"})
+
+
+def test_cuda_multi_sku_attaches_all_skus_and_one_cards_mark():
+    names = _mark_names(hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=2))
+    assert names >= {"H100", "B200", "cuda", "gpu", "cards_2"}
+    assert "cards_1" not in names
+
+
+def test_non_cuda_rejects_sku_list():
+    with pytest.raises(ValueError, match="rocm resource must be a string"):
+        hardware_marks(res={"rocm": ["MI325"]})
