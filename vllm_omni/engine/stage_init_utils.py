@@ -1769,7 +1769,7 @@ def acquire_device_locks(
                     logger.warning(
                         "Failed to acquire lock for device %s: %s. Continuing WITHOUT "
                         "device-init serialization; concurrent initialization on this "
-                        "device may mis-measure available memory.",
+                        "device may incorrectly measure available memory.",
                         device_id,
                         e,
                     )
