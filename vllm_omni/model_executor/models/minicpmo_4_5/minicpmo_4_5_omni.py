@@ -64,6 +64,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
       codec-token deltas for the separate Code2Wav stage.
     """
 
+    # Stage-qualified multi-step decode capability.  This wrapper class backs
+    # both AR stages, so the capability is declared per stage instead of as a
+    # blanket class flag: only the talker ("tts") runs the small-model
+    # host-bound decode that multi-step windows amortize.  See
+    # vllm_omni.core.sched.multi_step_decode.model_supports_multi_step.
+    supports_multi_step_stages = ("tts",)
+
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):

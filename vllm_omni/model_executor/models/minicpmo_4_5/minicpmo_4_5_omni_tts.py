@@ -125,6 +125,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
     requires_request_sample_eligibility = True
 
+    # Multi-step decode window contract (see
+    # vllm_omni/core/sched/multi_step_decode.py): ``preprocess()`` builds
+    # every decode-step embedding purely from the request-local state chain
+    # (the previous sampled codec token via ``audio_codes.current`` plus the
+    # per-request audio state), and ``make_omni_output()`` advances that
+    # state in place -- so K decode steps can be replayed inside one engine
+    # step with intermediate steps skipping the per-step OmniOutput wire
+    # wrapping.
+    supports_multi_step_decode = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import MiniCPMOConfig
@@ -503,7 +513,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             if state.get("finished"):
                 stop_rows.append(hidden.new_tensor([float("-inf"), 0.0]))
                 codec_deltas.append(empty_delta)
-                terminal_flags.append(torch.tensor(False, dtype=torch.bool))
+                # The request already emitted its terminal codec (EOS or the
+                # token limit).  Report finished=True so a multi-step window
+                # early-exits on this step instead of burning the remaining
+                # steps on dead rows; downstream consumers treat the flag
+                # idempotently (chunk-finished bookkeeping is a set add).
+                terminal_flags.append(torch.tensor(True, dtype=torch.bool))
                 continue
             if not sample_eligible[index]:
                 # vLLM computes a logit row for incomplete chunked prefills but
