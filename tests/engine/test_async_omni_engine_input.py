@@ -10,6 +10,7 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
+from vllm_omni.engine.messages import AddCompanionRequestMessage, StageSubmissionMessage
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
@@ -587,6 +588,40 @@ def test_cfg_companion_build_returns_messages_without_enqueueing(mocker: MockerF
     assert companions[0].companion_id == "req__cfg_text"
     assert companions[0].parent_id == "req"
     engine.request_queue.sync_q.put.assert_not_called()
+
+
+def test_add_request_announces_cfg_companions_with_parent(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    parent = StageSubmissionMessage(
+        type="add_request",
+        request_id="req",
+        prompt=_make_engine_core_request("req"),
+        original_prompt={"prompt": "positive"},
+        output_prompt_text=None,
+        sampling_params_list=[SamplingParams(max_tokens=8)],
+        final_stage_id=1,
+        preprocess_ms=0,
+        request_timestamp=0,
+        enqueue_ts=0,
+    )
+    companion = AddCompanionRequestMessage(
+        companion_id="req__cfg_text",
+        parent_id="req",
+        role="cfg_text",
+        prompt=_make_engine_core_request("req__cfg_text"),
+        companion_prompt_text=None,
+        sampling_params_list=parent.sampling_params_list,
+    )
+    engine.prompt_expand_func = object()
+    engine.request_queue = mocker.Mock()
+    mocker.patch.object(engine, "_build_add_request_message", return_value=parent)
+    mocker.patch.object(engine, "_build_cfg_companions", return_value=[companion])
+
+    engine.add_request("req", {"prompt": "positive"}, final_stage_id=1)
+
+    queued = [call.args[0] for call in engine.request_queue.sync_q.put.call_args_list]
+    assert queued == [parent, companion]
+    assert parent.cfg_companion_ids == {"cfg_text": "req__cfg_text"}
 
 
 def test_cfg_expansion_returning_nothing_is_not_an_error(mocker: MockerFixture):

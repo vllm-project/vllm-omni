@@ -1474,6 +1474,7 @@ class AsyncOmniEngine:
                         request_id, msg.original_prompt, stage0_params, effective_spl
                     )
 
+            msg.cfg_companion_ids = {companion.role: companion.companion_id for companion in companions} or None
             self.request_queue.sync_q.put(msg)
         except BaseException:
             for artifact_dir in msg.request_artifact_dirs or ():
