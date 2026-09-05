@@ -104,7 +104,6 @@ _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
 def _stable_engine_arg_environment(monkeypatch, tmp_path):
     from vllm_omni import platforms
 
-    monkeypatch.delenv("VLLM_USE_FLASHINFER_MOE_FP16", raising=False)
     xcodec_model = tmp_path / "xcodec-model"
     xcodec_model.mkdir()
     monkeypatch.setenv("XCODEC1_PATH", str(xcodec_model))
@@ -135,6 +134,25 @@ def _stable_engine_arg_environment(monkeypatch, tmp_path):
         worker_module = types.ModuleType(f"test.{worker_type}")
         setattr(worker_module, "Worker", _TestWorker)
         monkeypatch.setitem(sys.modules, worker_module.__name__, worker_module)
+
+
+def test_qwen3_omni_defaults_to_triton_moe_backend():
+    engine_args = {"model_arch": "Qwen3OmniMoeForConditionalGeneration"}
+
+    stage_init_utils._maybe_set_qwen3_omni_moe_backend(engine_args)
+
+    assert engine_args["moe_backend"] == "triton"
+
+
+def test_qwen3_omni_preserves_explicit_moe_backend():
+    engine_args = {
+        "model_arch": "Qwen3OmniMoeForConditionalGeneration",
+        "moe_backend": "flashinfer",
+    }
+
+    stage_init_utils._maybe_set_qwen3_omni_moe_backend(engine_args)
+
+    assert engine_args["moe_backend"] == "flashinfer"
 
 
 def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, str]:
@@ -517,6 +535,8 @@ def test_typed_engine_args_preserve_explicit_backend_default_overrides(tmp_path)
 
     assert {name: legacy_args[name] for name in expected} == expected
     assert {name: typed_args[name] for name in expected} == expected
+    assert legacy_args["moe_backend"] == "triton"
+    assert typed_args["moe_backend"] == "triton"
 
 
 @pytest.mark.parametrize("stage_scoped", [False, True], ids=["global", "stage-scoped"])

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -16,11 +16,10 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
-@pytest.mark.parametrize(("step_execution", "expected_steps"), [(False, 1), (True, 1)])
+@pytest.mark.parametrize("step_execution", [False, True])
 def test_dummy_run_uses_enough_steps_for_execution_mode(
     monkeypatch: pytest.MonkeyPatch,
     step_execution: bool,
-    expected_steps: int,
 ) -> None:
     engine = DiffusionEngine.__new__(DiffusionEngine)
     engine.od_config = type(
@@ -50,7 +49,7 @@ def test_dummy_run_uses_enough_steps_for_execution_mode(
     engine._dummy_run()
 
     assert len(captured_requests) == 1
-    assert captured_requests[0].sampling_params.num_inference_steps == expected_steps
+    assert captured_requests[0].sampling_params.num_inference_steps == 2
 
 
 def test_dummy_run_num_frames_uses_explicit_model_setting(monkeypatch: pytest.MonkeyPatch) -> None:

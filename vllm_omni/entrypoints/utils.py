@@ -26,6 +26,7 @@ from vllm_omni.config.yaml_util import create_config, load_yaml_config
 from vllm_omni.diffusion.utils.hf_utils import (
     _looks_like_dreamzero,
     get_diffusion_model_index,
+    resolve_native_diffusion_model_class,
 )
 from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.inputs.data import OmniSamplingParams
@@ -294,7 +295,10 @@ def resolve_model_config_path(model: str) -> str | None:
         model_type = hf_config.model_type
     except (ValueError, Exception):
         # If standard transformers format fails, try diffusers format
-        if get_diffusion_model_index(config_source) is not None:
+        native_model_class = resolve_native_diffusion_model_class(config_source)
+        if native_model_class is not None:
+            model_type = native_model_class
+        elif get_diffusion_model_index(config_source) is not None:
             model_type = _try_get_class_name_from_diffusers_config(config_source)
             if model_type is None:
                 raise ValueError(

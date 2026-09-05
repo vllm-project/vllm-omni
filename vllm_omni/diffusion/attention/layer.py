@@ -46,6 +46,7 @@ def _try_extract_layer_index(prefix: str) -> int | None:
 
 class Attention(nn.Module):
     _scheduler_paged_kv = False
+    _has_custom_attention = False
 
     def __init__(
         self,
@@ -74,6 +75,11 @@ class Attention(nn.Module):
         # attention remains dense and contributes no native KVCacheSpec.
         paged_kv_cache_role: str | None = None,
         paged_kv_cache_dtype: torch.dtype | None = None,
+        # Model-owned kernel for architectures whose attention contract cannot
+        # be represented by the generic backend interface (for example packed
+        # varlen attention with learned sink logits). The shared Attention
+        # layer still owns parallel dispatch and compile boundaries.
+        custom_attention: nn.Module | None = None,
     ):
         super().__init__()
 
@@ -93,6 +99,8 @@ class Attention(nn.Module):
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.head_size = head_size
 
+        self._has_custom_attention = custom_attention is not None
+
         # Resolve backend via role-aware config.
         # The global diffusion config is set during model init via
         # set_current_diffusion_config(); no env-var re-parsing needed here.
@@ -108,91 +116,103 @@ class Attention(nn.Module):
         model_class_name = getattr(config, "model_class_name", None) if config is not None else None
         allow_trtllm_default = get_diffusion_model_metadata(model_class_name).attention_mask_free
 
-        attn_backend_cls, spec = get_attn_backend_for_role(
-            role=role,
-            head_size=head_size,
-            attention_config=attention_config,
-            role_category=role_category,
-            allow_trtllm_default=allow_trtllm_default,
-        )
         scheduler_paged_kv = (
             config is not None
             and getattr(config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
             is DiffusionKVCacheMode.PAGED_SCHEDULER
         )
         self._scheduler_paged_kv = scheduler_paged_kv
-        if (
-            scheduler_paged_kv
-            and paged_kv_cache_role is not None
-            and spec is None
-            and not attn_backend_cls.supports_paged_kv
-        ):
-            # FLASH_ATTN is an Omni selector, not a device-specific kernel.
-            # vLLM resolves it to CUDA FlashAttention on GPU and Ascend native
-            # attention on NPU. A platform may legitimately default dense
-            # attention to CUDNN/SDPA (for example when optional dense FA
-            # extras are absent), but a paged layer must advertise the
-            # capability so the Worker can register its native cache view.
-            # Load that selector from the registry: this is not a user-explicit
-            # dense FLASH_ATTN request, so skip platform explicit-backend
-            # validation (Blackwell would otherwise require CuTe FA4). Formal
-            # paged execution still delegates to vLLM's native paged backend.
-            from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+        if custom_attention is None:
+            attn_backend_cls, spec = get_attn_backend_for_role(
+                role=role,
+                head_size=head_size,
+                attention_config=attention_config,
+                role_category=role_category,
+                allow_trtllm_default=allow_trtllm_default,
+            )
+            if (
+                scheduler_paged_kv
+                and paged_kv_cache_role is not None
+                and spec is None
+                and not attn_backend_cls.supports_paged_kv
+            ):
+                # FLASH_ATTN is an Omni selector, not a device-specific kernel.
+                # vLLM resolves it to CUDA FlashAttention on GPU and Ascend native
+                # attention on NPU. A platform may legitimately default dense
+                # attention to CUDNN/SDPA (for example when optional dense FA
+                # extras are absent), but a paged layer must advertise the
+                # capability so the Worker can register its native cache view.
+                # Load that selector from the registry: this is not a user-explicit
+                # dense FLASH_ATTN request, so skip platform explicit-backend
+                # validation (Blackwell would otherwise require CuTe FA4). Formal
+                # paged execution still delegates to vLLM's native paged backend.
+                from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 
-            dense_backend_name = attn_backend_cls.get_name()
-            attn_backend_cls = DiffusionAttentionBackendEnum.FLASH_ATTN.get_class()
-            logger.info(
-                "Resolved marked paged diffusion attention role=%r to %r because the platform default %r "
-                "does not support Scheduler-owned KV",
-                role,
-                attn_backend_cls.get_name(),
-                dense_backend_name,
+                dense_backend_name = attn_backend_cls.get_name()
+                attn_backend_cls = DiffusionAttentionBackendEnum.FLASH_ATTN.get_class()
+                logger.info(
+                    "Resolved marked paged diffusion attention role=%r to %r because the platform default %r "
+                    "does not support Scheduler-owned KV",
+                    role,
+                    attn_backend_cls.get_name(),
+                    dense_backend_name,
+                )
+            parallel_config = getattr(config, "parallel_config", None)
+            allgather_degree = getattr(parallel_config, "allgather_degree", 1)
+            # TODO: Move AllGather-KV compatibility into an AttentionBackend capability
+            # so validation does not depend on backend names.
+            if not skip_sequence_parallel and allgather_degree > 1 and attn_backend_cls.get_name() == "TRTLLM_ATTN":
+                raise ValueError(
+                    "TRTLLM_ATTN does not support AllGather-KV sequence parallelism. "
+                    "Set --allgather-degree 1 or select another diffusion attention backend."
+                )
+            self.attn_spec = spec
+            if spec is not None:
+                backend_kwargs = spec.backend_kwargs()
+                self.backend_pref = spec.backend
+                self.backend_explicit = True
+                logger.debug("Attention(role=%s) → backend=%s", role, spec.backend)
+            else:
+                # Propagate the resolved platform default so Ring Attention can
+                # make a compatible automatic selection on the current GPU.
+                self.backend_pref = attn_backend_cls.get_name()
+                logger.debug("Attention(role=%s) → platform default (%s)", role, self.backend_pref)
+
+            self.attn_backend = attn_backend_cls
+            self.attn_impl_cls = self.attn_backend.get_impl_cls()
+            self.attention = self.attn_impl_cls(
+                num_heads=num_heads,
+                head_size=head_size,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                num_kv_heads=num_kv_heads,
+                qkv_layout=qkv_layout,
+                prefix=prefix,
+                backend_kwargs=backend_kwargs,
+                role=role,
+                backend_explicit=self.backend_explicit,
             )
-        parallel_config = getattr(config, "parallel_config", None)
-        allgather_degree = getattr(parallel_config, "allgather_degree", 1)
-        # TODO: Move AllGather-KV compatibility into an AttentionBackend capability
-        # so validation does not depend on backend names.
-        if not skip_sequence_parallel and allgather_degree > 1 and attn_backend_cls.get_name() == "TRTLLM_ATTN":
-            raise ValueError(
-                "TRTLLM_ATTN does not support AllGather-KV sequence parallelism. "
-                "Set --allgather-degree 1 or select another diffusion attention backend."
+            # Some model-specific paths call this helper directly. The main backend
+            # dispatch below never switches to it implicitly.
+            self.sdpa_fallback = SDPABackend.get_impl_cls()(
+                num_heads=num_heads,
+                head_size=head_size,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                num_kv_heads=num_kv_heads,
+                qkv_layout=qkv_layout,
             )
-        self.attn_spec = spec
-        if spec is not None:
-            backend_kwargs = spec.backend_kwargs()
-            self.backend_pref = spec.backend
-            self.backend_explicit = True
-            logger.debug("Attention(role=%s) → backend=%s", role, spec.backend)
         else:
-            # Propagate the resolved platform default so Ring Attention can
-            # make a compatible automatic selection on the current GPU.
-            self.backend_pref = attn_backend_cls.get_name()
-            logger.debug("Attention(role=%s) → platform default (%s)", role, self.backend_pref)
-
-        self.attn_backend = attn_backend_cls
-        self.attn_impl_cls = self.attn_backend.get_impl_cls()
-        self.attention = self.attn_impl_cls(
-            num_heads=num_heads,
-            head_size=head_size,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            num_kv_heads=num_kv_heads,
-            qkv_layout=qkv_layout,
-            prefix=prefix,
-            backend_kwargs=backend_kwargs,
-            role=role,
-            backend_explicit=self.backend_explicit,
-        )
-        # Some model-specific paths call this helper directly. The main backend
-        # dispatch below never switches to it implicitly.
-        self.sdpa_fallback = SDPABackend.get_impl_cls()(
-            num_heads=num_heads,
-            head_size=head_size,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            num_kv_heads=num_kv_heads,
-            qkv_layout=qkv_layout,
-        )
+            if paged_kv_cache_role is not None:
+                raise ValueError("custom_attention does not support Scheduler-managed paged KV")
+            if not skip_sequence_parallel:
+                raise ValueError("custom_attention must own its communication and requires skip_sequence_parallel=True")
+            self.attn_spec = None
+            self.attn_backend = None
+            self.attn_impl_cls = type(custom_attention)
+            self.attention = custom_attention
+            self.sdpa_fallback = None
+            logger.debug("Attention(role=%s) → custom kernel=%s", role, type(custom_attention).__name__)
 
         self.softmax_scale = softmax_scale
         self.scatter_idx = scatter_idx
@@ -269,7 +289,7 @@ class Attention(nn.Module):
         return self.parallel_strategy
 
     def _init_kv_cache_quantization(self, config) -> None:
-        if config is None:
+        if config is None or self._has_custom_attention:
             return
         dtype = getattr(config, "diffusion_kv_cache_dtype", None)
         if dtype == "auto":
@@ -467,6 +487,9 @@ class Attention(nn.Module):
         return self.paged_kv_cache_role is not None and self._active_paged_kv_adapter() is not None
 
     def _run_local_attention(self, query, key, value, attn_metadata):
+        if self._has_custom_attention:
+            return self.attention(query, key, value, attn_metadata)
+
         self._assert_metadata_compatible(attn_metadata)
 
         in_kv_memory_profile = is_forward_context_available() and get_forward_context().in_diffusion_kv_memory_profile
@@ -493,6 +516,8 @@ class Attention(nn.Module):
 
     def _assert_metadata_compatible(self, attn_metadata: AttentionMetadata | None) -> None:
         if attn_metadata is None:
+            return
+        if self.attn_backend is None:
             return
         backend_name = self.attn_backend.get_name()
         if attn_metadata.attn_mask is not None and not self.attn_backend.supports_attention_mask(

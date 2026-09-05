@@ -1141,7 +1141,11 @@ class DiffusionEngine:
             height=512,
             width=512,
             guidance_scale=0.0,
-            num_inference_steps=1,
+            # Dummy warmup must exercise at least one denoising iteration in
+            # every execution mode. Some pipelines (for example BAGEL) perform
+            # ``num_inference_steps - 1`` scheduler updates and reject an empty
+            # one-step schedule.
+            num_inference_steps=2,
         )
         if req is None:
             logger.info("Skipping dummy warmup run (num_frames=0)")

@@ -13,7 +13,6 @@ import argparse
 
 from vllm.benchmarks.serve import add_cli_args
 
-from vllm_omni.benchmarks.serve import main
 from vllm_omni.entrypoints.cli.benchmark.base import OmniBenchmarkSubcommandBase
 from vllm_omni.entrypoints.cli.benchmark.cli_args import (
     add_omni_args,
@@ -38,5 +37,11 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
 
     @staticmethod
     def cmd(args: argparse.Namespace) -> None:
+        # Deferred: the benchmark runtime imports the duplex client library
+        # (vllm_omni.clients), which must stay out of the CLI import graph —
+        # this module is imported by `vllm-omni serve` as well
+        # (tests/engine/test_duplex_import_boundary.py enforces the boundary).
+        from vllm_omni.benchmarks.serve import main
+
         preprocess_serve_args(args)
         main(args)

@@ -25,9 +25,9 @@ from vllm_omni.benchmarks import serve as benchmark_serve
 from vllm_omni.benchmarks.data_modules import omniinteract_dataset as data
 from vllm_omni.benchmarks.metrics.metrics import calculate_metrics
 from vllm_omni.benchmarks.patch import patch as benchmark_patch
+from vllm_omni.clients.duplex import EventCollector
 from vllm_omni.entrypoints.cli.benchmark.cli_args import preprocess_serve_args
 from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
-from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
@@ -42,8 +42,8 @@ def _case(tmp_path: Path, *, subset: str = "1q1a", name: str = "video.mp4") -> d
     return data.OmniInteractCase(subset, name, video, annotation, "multi_turn")
 
 
-def _collector(*events: tuple[dict[str, object], float]) -> RealtimeEventCollector:
-    collector = RealtimeEventCollector()
+def _collector(*events: tuple[dict[str, object], float]) -> EventCollector:
+    collector = EventCollector()
     for event, received_at in events:
         collector.add(event, received_at_s=received_at)
     return collector
@@ -136,7 +136,7 @@ def _successful_output(
     *,
     audio_time: float = 10.0,
     status: str = "completed",
-) -> tuple[data.OmniInteractCase, RealtimeEventCollector, oi.OmniInteractCaseResult]:
+) -> tuple[data.OmniInteractCase, EventCollector, oi.OmniInteractCaseResult]:
     case = _case(tmp_path)
     collector = _collector(
         (_created(), 9.9),
@@ -151,7 +151,7 @@ def _successful_output(
 def _write_success(
     root: Path,
     case: data.OmniInteractCase,
-    collector: RealtimeEventCollector,
+    collector: EventCollector,
     result: oi.OmniInteractCaseResult,
     **kwargs,
 ):
@@ -285,7 +285,7 @@ def test_response_ledger_rejects_identity_errors(events, match: str):
 
 
 class _CompletionClient:
-    def __init__(self, collector: RealtimeEventCollector):
+    def __init__(self, collector: EventCollector):
         self.events, self.acks = collector, []
 
     def raise_if_reader_stopped(self) -> None:
@@ -334,13 +334,71 @@ async def test_deferred_commit_ignores_the_prior_response_terminal():
 
 
 @pytest.mark.asyncio
-async def test_playback_acks_only_after_serial_audio_drain():
-    collector = _collector((_audio(samples=2400), 10.0), (_done(), 10.01))
+async def test_playback_acks_incrementally_along_the_serial_clock():
+    # 1 s of audio playing from t=10.0: the first ack checkpoints the
+    # response as soon as audio arrives, later acks report cumulative
+    # progress at least every _ACK_STEP_MS of new audio, and the completion
+    # ack lands exactly at the total once the serial clock drains it.
+    collector = _collector((_audio(samples=24_000), 10.0), (_done(), 10.01))
     client, playback = _CompletionClient(collector), oi._Playback()
     await playback.acknowledge(client, now=10.05)
-    assert client.acks == []
+    assert client.acks == [("r1", 50)]  # checkpoint ack, reserves the slot
     await playback.acknowledge(client, now=10.1)
-    assert client.acks == [("r1", 100)]
+    assert client.acks == [("r1", 50)]  # step not reached, no spam
+    await playback.acknowledge(client, now=10.3)
+    assert client.acks == [("r1", 50), ("r1", 300)]
+    await playback.acknowledge(client, now=11.0)
+    assert client.acks == [("r1", 50), ("r1", 300), ("r1", 1000)]
+    assert playback.completion_acked == {"r1"}
+    await playback.acknowledge(client, now=11.5)
+    assert client.acks[-1] == ("r1", 1000)  # completion acked once
+
+
+@pytest.mark.asyncio
+async def test_playback_checkpoint_ack_fires_before_audio_plays():
+    # Audio queued but none played yet: a 0 ms checkpoint ack still goes out
+    # so a later input commit cannot displace the response's history slot.
+    collector = _collector((_audio(samples=24_000), 10.0), (_done(), 10.01))
+    client, playback = _CompletionClient(collector), oi._Playback()
+    await playback.acknowledge(client, now=10.0)
+    assert client.acks == [("r1", 0)]
+
+
+@pytest.mark.asyncio
+async def test_acks_continue_after_committed_input():
+    # A later committed user input must not stop the acks: the checkpointed
+    # response's history slot is updated in place, so the drain ack for the
+    # tail is still delivered afterwards.
+    collector = _collector(
+        (_audio(samples=24_000), 10.0),
+        (_done(), 10.01),
+        ({"type": "input_audio_buffer.committed"}, 10.4),
+    )
+    client, playback = _CompletionClient(collector), oi._Playback()
+    await playback.acknowledge(client, now=10.05)
+    assert client.acks == [("r1", 50)]
+    await playback.acknowledge(client, now=11.5)
+    assert client.acks == [("r1", 50), ("r1", 1000)]
+    assert playback.completion_acked == {"r1"}
+
+
+def test_tolerated_playback_ack_rejection_is_a_warning_not_a_failure():
+    collector = _collector(
+        (
+            {
+                "type": "error",
+                "error": {"type": "invalid_request_error", "code": "playback_ack_too_late"},
+            },
+            1.0,
+        ),
+    )
+    warnings: list[str] = []
+    oi._raise_if_session_terminated(collector, 0, warnings=warnings)
+    assert warnings == ["tolerated in-flight server rejection: playback_ack_too_late"]
+
+    collector.add({"type": "error", "error": {"code": "bad_event", "message": "boom"}}, received_at_s=1.1)
+    with pytest.raises(RuntimeError, match="bad_event"):
+        oi._raise_if_session_terminated(collector, 0, warnings=warnings)
 
 
 @pytest.mark.parametrize(
@@ -421,29 +479,33 @@ def test_publication_failure_removes_partial_success_bundle(tmp_path: Path, monk
 def test_atomic_write_preserves_destination_on_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     destination = tmp_path / "output.wav"
     destination.write_bytes(b"old")
-    monkeypatch.setattr(oi, "write_pcm16_wav", lambda *a, **k: (_ for _ in ()).throw(OSError("write")))
+    monkeypatch.setattr(
+        "vllm_omni.clients.duplex.write_pcm16_wav",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("write")),
+    )
     with pytest.raises(OSError):
         oi._atomic_write_wav(destination, b"\0\0", 24_000)
     assert destination.read_bytes() == b"old"
     assert not list(tmp_path.glob(".*.tmp"))
 
 
-class _RealtimeClient:
+class _RealtimeClient(oi._RealtimeSession):
+    """Fake transport over the real session wrapper: URL and session-config
+    construction stay real, only the network-facing calls are stubbed."""
+
     instances: list[_RealtimeClient] = []
 
-    def __init__(self, url: str, **kwargs):
-        self.url, self.events, self.acks, self.configure_kwargs = url, RealtimeEventCollector(), [], {}
+    def __init__(self, config: oi.OmniInteractBenchmarkConfig, session_id: str, reference_audio: str):
+        super().__init__(config, session_id, reference_audio)
+        self.acks: list[tuple[str, int]] = []
         self.instances.append(self)
 
     async def __aenter__(self):
+        self.events.add({"type": "session.created", "session": {"capabilities": {"chunk_period_ms": 1000}}})
         return self
 
     async def __aexit__(self, *args):
         return None
-
-    async def configure(self, model: str, **kwargs) -> None:
-        self.configure_kwargs = kwargs
-        self.events.add({"type": "session.created", "session": {"capabilities": {"chunk_period_ms": 1000}}})
 
     async def send(self, event: dict[str, object]) -> None:
         return None
@@ -480,7 +542,7 @@ async def test_public_runner_executes_one_prepared_session(tmp_path: Path, monke
         extra_body={"custom": "value"},
     )
     prepared = data.OmniInteractPreparedInput(1.0, b"\0\0\0\0", ("frame",), "data:audio/wav;base64,ref")
-    monkeypatch.setattr(oi, "RealtimeDuplexClient", _RealtimeClient)
+    monkeypatch.setattr(oi, "_RealtimeSession", _RealtimeClient)
     monkeypatch.setattr(oi, "_COMPLETION_SETTLE_S", 0.0)
     result = await oi.run_omniinteract_case(
         case,
@@ -491,8 +553,15 @@ async def test_public_runner_executes_one_prepared_session(tmp_path: Path, monke
     assert result.success and result.transcript == "answer" and result._artifact_context is not None
     assert not config.output_root.exists()
     assert "autostart=0" in _RealtimeClient.instances[-1].url
-    assert _RealtimeClient.instances[-1].configure_kwargs["extra_body"] == {"custom": "value"}
-    assert _RealtimeClient.instances[-1].acks == [("r1", 1)]
+    session_config = _RealtimeClient.instances[-1].session_config
+    assert session_config.extra_body["custom"] == "value"
+    assert session_config.extra_body["native_duplex"] is True
+    assert session_config.ref_audio == "data:audio/wav;base64,ref"
+    acks = _RealtimeClient.instances[-1].acks
+    # Cumulative acks for the one response: an optional 0 ms checkpoint the
+    # moment its audio arrived, then the exact total once drained.
+    assert acks[-1] == ("r1", 1)
+    assert acks in ([("r1", 1)], [("r1", 0), ("r1", 1)])
 
 
 def test_standard_sample_loading_prepares_media_before_timing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -521,7 +590,12 @@ def test_standard_sample_loading_prepares_media_before_timing(tmp_path: Path, mo
     )
     preprocess_serve_args(args)
     assert args.endpoint == "/v1/realtime"
-    monkeypatch.setattr(benchmark_patch, "reference_audio_data_url", lambda _: "data:audio/wav;base64,ref")
+    # The benchmark patch module imports the duplex client library lazily
+    # (it must stay out of the CLI import graph), so patch the provider.
+    monkeypatch.setattr(
+        "vllm_omni.clients.duplex.reference_audio_data_url",
+        lambda _: "data:audio/wav;base64,ref",
+    )
     monkeypatch.setattr(benchmark_patch, "prepare_media", lambda *a, **k: (1.0, b"pcm", ["frame"]))
     samples = benchmark_patch.get_samples(args, None)
     assert len(samples) == args.num_prompts == 3

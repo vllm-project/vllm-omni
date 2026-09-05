@@ -351,6 +351,8 @@ extend-ignore-re = [
 ]
 [tool.typos.default.extend-words]
 ue = "ue"
+# Einstein-summation index tuple for head/expert/dimension axes.
+hed = "hed"
 semantics = "semantics"
 fullset = "fullset"
 Vai = "Vai"

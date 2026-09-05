@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Generic Cache-DiT backend lifecycle and integration."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from operator import attrgetter
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
@@ -28,7 +29,20 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RefreshCacheContextFunc: TypeAlias = Callable[[Any, int, bool], None]
-CacheDiTEnabler: TypeAlias = Callable[[Any, DiffusionCacheConfig], RefreshCacheContextFunc]
+
+
+@dataclass(frozen=True)
+class CacheDiTEnableResult:
+    """Custom-enabler result with the exact targets needed for teardown."""
+
+    refresh: RefreshCacheContextFunc
+    targets: tuple[Any, ...]
+
+
+CacheDiTEnabler: TypeAlias = Callable[
+    [Any, DiffusionCacheConfig],
+    RefreshCacheContextFunc | CacheDiTEnableResult,
+]
 
 # Model-specific implementations register themselves when the package loads.
 CUSTOM_DIT_ENABLERS: dict[str, CacheDiTEnabler] = {}
@@ -56,13 +70,15 @@ def _dit_module_names(pipeline: SupportsComponentDiscovery) -> tuple[str, ...]:
 def cache_summary(pipeline: SupportsComponentDiscovery, details: bool = True) -> None:
     """Log Cache-DiT statistics for every transformer on the pipeline."""
 
-    transformers = [attrgetter(name)(pipeline) for name in _dit_module_names(pipeline)]
-    for transformer in transformers:
-        if not BlockAdapter.is_cached(transformer):
+    targets = getattr(pipeline, "_cache_dit_targets", None)
+    if targets is None:
+        targets = tuple(attrgetter(name)(pipeline) for name in _dit_module_names(pipeline))
+    for target in targets:
+        if not BlockAdapter.is_cached(target):
             continue
-        cache_dit.summary(transformer, details=details)
+        cache_dit.summary(target, details=details)
 
-    if not transformers:
+    if not targets:
         logger.warning("CacheDiT summary failed; this pipeline has no defined transformer attribute")
 
 
@@ -261,8 +277,13 @@ class CacheDiTBackend(CacheBackend):
         self._cache_targets = []
         if custom_enabler is not None:
             logger.info("Using custom cache-dit enabler for model: %s", pipeline_name)
-            self._refresh_funcs = [custom_enabler(pipeline, self.config)]
-            self._cache_targets = [_default_get_pipeline_transformer(pipeline)]
+            result = custom_enabler(pipeline, self.config)
+            if isinstance(result, CacheDiTEnableResult):
+                self._refresh_funcs = [result.refresh]
+                self._cache_targets = list(result.targets)
+            else:
+                self._refresh_funcs = [result]
+                self._cache_targets = [_default_get_pipeline_transformer(pipeline)]
         else:
             for name in _dit_module_names(pipeline):
                 get_transformer = _make_pipeline_transformer_getter(name)
@@ -281,6 +302,8 @@ class CacheDiTBackend(CacheBackend):
                 self._cache_targets.append(cache_target)
             if not self._refresh_funcs:
                 raise ValueError(f"Pipeline {pipeline_name} has no declared DiT modules for Cache-DiT")
+
+        pipeline._cache_dit_targets = tuple(self._cache_targets)
 
         self.enabled = True
         logger.info("Cache-dit enabled successfully on %s", pipeline_name)
@@ -302,6 +325,8 @@ class CacheDiTBackend(CacheBackend):
         finally:
             self._refresh_funcs = []
             self._cache_targets = []
+            if hasattr(pipeline, "_cache_dit_targets"):
+                del pipeline._cache_dit_targets
             self.enabled = False
 
     def refresh(self, pipeline: SupportsComponentDiscovery, num_inference_steps: int, verbose: bool = True) -> None:
@@ -320,6 +345,7 @@ class CacheDiTBackend(CacheBackend):
 
 __all__ = [
     "CUSTOM_DIT_ENABLERS",
+    "CacheDiTEnableResult",
     "CacheDiTBackend",
     "cache_summary",
     "enable_cache_for_dit",
