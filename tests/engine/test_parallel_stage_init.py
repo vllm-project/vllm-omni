@@ -355,9 +355,11 @@ def _stub_platform(monkeypatch, seen: list[int], total: int = 80 * 1024**3):
     [
         ("3,4,5", "1", 4, 1),  # restricted visibility
         ("1,0", "0", 1, 0),  # reordered visibility
+        ("5,GPU-deadbeef", "0", 5, 0),  # mixed identifiers, numeric first
+        ("GPU-deadbeef,5", "1", 5, 1),  # mixed identifiers, numeric second
         ("0,1,2,3", "2", 2, 2),  # identity
     ],
-    ids=["restricted", "reordered", "identity"],
+    ids=["restricted", "reordered", "mixed-numeric-first", "mixed-numeric-second", "identity"],
 )
 def test_admission_capacity_uses_visible_ordinal(monkeypatch, baseline, devices, physical, ordinal):
     """The ledger stays keyed by physical id, but the capacity query is translated.
@@ -433,7 +435,29 @@ def test_parallel_init_refuses_ray_backed_executor():
     replica.executor_class = _RayBackedExecutor
     plans = [LogicalStageInitPlan(stage_idx=0, stage_id=0, replicas=[replica])]
 
-    with pytest.raises(RuntimeError, match="cannot guard a Ray-backed executor"):
+    with pytest.raises(RuntimeError, match="cannot guard Ray-backed or multi-node executors"):
+        runtime._reject_unguardable_executors(plans)
+
+
+@pytest.mark.parametrize(
+    ("use_ray", "nnodes", "reason"),
+    [
+        (True, 1, "Ray-backed"),
+        (False, 2, r"multi-node \(nnodes=2\)"),
+    ],
+    ids=["parallel-config-ray", "multi-node-mp"],
+)
+def test_parallel_init_refuses_unguardable_parallel_config(use_ray, nnodes, reason):
+    """The config guard also covers non-Ray executors spread across nodes."""
+    runtime = _runtime(parallel_stage_init=True)
+    vllm_config = types.SimpleNamespace(
+        parallel_config=types.SimpleNamespace(use_ray=use_ray, nnodes=nnodes),
+    )
+    replica = _llm_replica(0, 0, "0", vllm_config=vllm_config)
+    replica.executor_class = _LocalExecutor
+    plans = [LogicalStageInitPlan(stage_idx=0, stage_id=0, replicas=[replica])]
+
+    with pytest.raises(RuntimeError, match=reason):
         runtime._reject_unguardable_executors(plans)
 
 
@@ -512,6 +536,13 @@ def test_legacy_device_lock_never_unlinks_the_path():
 
     assert not hasattr(siu, "_cleanup_stale_lock_if_dead")
     assert "unlink" not in inspect.getsource(siu.acquire_device_locks)
+
+    # Test cleanup runs in many autouse/runtime fixtures and must not unlink the
+    # shared production lock path either. Persistent unlocked flock files are
+    # harmless; deleting one can split live holders across different inodes.
+    helper_source = (Path(__file__).parents[1] / "helpers" / "clean.py").read_text()
+    assert "_cleanup_stale_device_locks" not in helper_source
+    assert "vllm_omni_device_*_init.lock" not in helper_source
 
 
 def test_legacy_lock_cannot_break_a_live_shared_holder(tmp_path, monkeypatch):

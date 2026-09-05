@@ -534,9 +534,10 @@ class StageRuntime:
         parent skips its own device lock when ``parallel_stage_init`` is on —
         while only advertising the protection, so refuse before anything spawns.
 
-        Detection uses the ``uses_ray`` class attribute vLLM sets on
-        ``RayDistributedExecutor`` / ``RayExecutorV2`` (and that custom executors
-        are expected to set), rather than matching backend strings.
+        Ray detection uses both the executor's ``uses_ray`` class attribute and
+        ``ParallelConfig.use_ray``. Multi-node multiprocessing/external-launcher
+        configurations are detected through ``ParallelConfig.nnodes``. Both are
+        refused because some workers can live outside the driver's host.
 
         Remote replicas are skipped: they are launched by the runtime owning their
         node and are already ``ADMISSION_EXEMPT`` in this host's ledger.
@@ -547,17 +548,29 @@ class StageRuntime:
                 if replica.launch_mode == "remote":
                     continue
                 executor_class = replica.executor_class
-                if executor_class is not None and getattr(executor_class, "uses_ray", False):
+                parallel_config = getattr(replica.stage_vllm_config, "parallel_config", None)
+                uses_ray = bool(getattr(executor_class, "uses_ray", False)) or bool(
+                    getattr(parallel_config, "use_ray", False)
+                )
+                nnodes = int(getattr(parallel_config, "nnodes", 1) or 1)
+                reasons: list[str] = []
+                if uses_ray:
+                    reasons.append("Ray-backed")
+                if nnodes > 1:
+                    reasons.append(f"multi-node (nnodes={nnodes})")
+                if reasons:
+                    executor_name = getattr(executor_class, "__name__", "unknown executor")
                     offenders.append(
-                        f"stage{replica.metadata.stage_id}/replica{replica.replica_id} ({executor_class.__name__})"
+                        f"stage{replica.metadata.stage_id}/replica{replica.replica_id} "
+                        f"({executor_name}; {', '.join(reasons)})"
                     )
         if offenders:
             raise RuntimeError(
-                "parallel_stage_init cannot guard a Ray-backed executor: the SH/EX phase locks "
-                "are node-local file locks and the admission ledger only accounts for this "
-                "host's devices, so workers placed on other nodes would initialize unprotected. "
+                "parallel_stage_init cannot guard Ray-backed or multi-node executors: the SH/EX "
+                "phase locks are node-local file locks and the admission ledger only accounts "
+                "for this host's devices, so workers placed on other nodes would initialize unprotected. "
                 f"Offending replicas: {', '.join(offenders)}. Disable parallel_stage_init for "
-                "this deployment, or use a non-Ray executor backend."
+                "this deployment, or use a single-node non-Ray executor backend."
             )
 
     def _run_stage_admission(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
@@ -610,25 +623,23 @@ class StageRuntime:
             if not baseline:
                 # No device-control env captured: ordinals are physical ids.
                 return physical_id
-            visible: list[int] = []
-            for tok in baseline.split(","):
+            for ordinal, tok in enumerate(baseline.split(",")):
                 tok = tok.strip()
                 if not tok:
                     continue
                 try:
-                    visible.append(int(tok))
+                    candidate = int(tok)
                 except ValueError:
-                    # Non-integer visibility (UUID / MIG) has no ordinal mapping;
-                    # such stages already fail to resolve to integer ids above.
-                    return physical_id
-            try:
-                return visible.index(physical_id)
-            except ValueError:
-                raise StageAdmissionError(
-                    f"Physical device {physical_id} is not in the visibility baseline "
-                    f"{baseline!r} captured at init, so its capacity cannot be measured "
-                    "from this process. Refusing to admit against an unknown device."
-                ) from None
+                    # UUID/MIG entries cannot be converted to physical integer
+                    # ids, but they still occupy an ordinal in the visible list.
+                    continue
+                if candidate == physical_id:
+                    return ordinal
+            raise StageAdmissionError(
+                f"Physical device {physical_id} is not in the visibility baseline "
+                f"{baseline!r} captured at init, so its capacity cannot be measured "
+                "from this process. Refusing to admit against an unknown device."
+            )
 
         def _total_memory(device_id: int) -> int:
             ordinal = _visible_ordinal(device_id)
