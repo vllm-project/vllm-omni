@@ -19,7 +19,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 class _TransferManager:
     def __init__(self, chunk_frames: int = 4):
-        self.connector = SimpleNamespace(config={"extra": {"breeze_codec_chunk_frames": chunk_frames}})
+        self.connector = SimpleNamespace(config={"breeze_codec_chunk_frames": chunk_frames})
         self.code_prompt_token_ids = defaultdict(list)
 
 
@@ -142,4 +142,5 @@ def test_stateful_codec_terminal_marker_pops_state_without_decoding():
     assert len(decoder.calls) == 1
     assert decoder.calls[0][0][0] == 1
     assert [item.numel() for item in output.multimodal_outputs["model_outputs"]] == [1920, 0]
-    assert codec._decoder_state_cache == {"scheduler-live": {}}
+    assert list(codec._decoder_state_cache) == ["scheduler-live"]
+    assert codec._decoder_state_cache["scheduler-live"]["prefix_frames"] == 0

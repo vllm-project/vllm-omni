@@ -167,8 +167,9 @@ def _extract_current_audio_frame(
 
 def _codec_chunk_frames(transfer_manager: Any) -> int:
     connector = getattr(transfer_manager, "connector", None)
-    raw_config = getattr(connector, "config", {}) or {}
-    config = raw_config.get("extra", {}) if isinstance(raw_config, Mapping) else {}
+    # SharedMemoryConnector stores its ConnectorSpec.extra directly in
+    # ``connector.config``; there is no second ``extra`` wrapper at runtime.
+    config = getattr(connector, "config", {}) or {}
     value = config.get("breeze_codec_chunk_frames")
     try:
         chunk_frames = int(value) if value is not None else _DEFAULT_CODEC_CHUNK_FRAMES
