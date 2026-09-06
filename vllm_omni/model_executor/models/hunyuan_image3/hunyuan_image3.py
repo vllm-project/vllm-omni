@@ -279,19 +279,25 @@ class HunyuanModel(HunYuanModel):
                 if is_pp_missing_parameter(name, self):
                     continue
 
-                assert loaded_weight.shape[0] % den == 0
-                units = loaded_weight.shape[0] // den
-
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                offset = 0
-                for shard_id, num in split_param:
-                    new_offset = offset + num * units
-                    if func:
-                        weight_loader(param, func(loaded_weight)[offset:new_offset], shard_id)
-                    else:
-                        weight_loader(param, loaded_weight[offset:new_offset], shard_id)
-                    offset = new_offset
+                if loaded_weight.ndim == 0:
+                    for shard_id, _ in split_param:
+                        weight_loader(param, loaded_weight, shard_id)
+                else:
+                    assert loaded_weight.shape[0] % den == 0
+                    units = loaded_weight.shape[0] // den
+
+                    offset = 0
+                    maybe_split_weight = func(loaded_weight) if func else loaded_weight
+                    for shard_id, num in split_param:
+                        new_offset = offset + num * units
+                        weight_loader(
+                            param,
+                            maybe_split_weight[offset:new_offset],
+                            shard_id,
+                        )
+                        offset = new_offset
 
                 loaded_params.add(name)
                 break
@@ -336,17 +342,27 @@ class HunyuanModel(HunYuanModel):
                     # here since otherwise we may skip experts with other
                     # available replicas.
                     weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
-                    assert loaded_weight.shape[0] % den == 0
-                    units = loaded_weight.shape[0] // den
+                    if loaded_weight.ndim == 0:
+                        success = weight_loader(
+                            param,
+                            loaded_weight,
+                            name_mapped,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                            return_success=True,
+                        )
+                    else:
+                        assert loaded_weight.shape[0] % den == 0
+                        units = loaded_weight.shape[0] // den
 
-                    success = weight_loader(
-                        param,
-                        loaded_weight[offset * units : offset * units + units],
-                        name_mapped,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                        return_success=True,
-                    )
+                        success = weight_loader(
+                            param,
+                            loaded_weight[offset * units : offset * units + units],
+                            name_mapped,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                            return_success=True,
+                        )
                     if success:
                         loaded_params.add(name_mapped)
                         is_found = True
@@ -1558,9 +1574,13 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self._timestep_token_id = tokenizer.convert_tokens_to_ids("<timestep>")
         self._start_ratio_id = tokenizer.convert_tokens_to_ids("<img_ratio_0>")
         self._end_ratio_id = tokenizer.convert_tokens_to_ids("<img_ratio_32>")
+        if self._start_ratio_id is None or self._end_ratio_id is None:
+            raise ValueError("Tokenizer must define <img_ratio_0> through <img_ratio_32>")
         ratio_33 = tokenizer.convert_tokens_to_ids("<img_ratio_33>")
         ratio_36 = tokenizer.convert_tokens_to_ids("<img_ratio_36>")
-        self._ratio_other_slices = [(ratio_33, ratio_36 + 1)]
+        self._ratio_other_slices = []
+        if ratio_33 is not None and ratio_36 is not None:
+            self._ratio_other_slices.append((ratio_33, ratio_36 + 1))
         # Build the full set of ratio token IDs for use as stop tokens.
         self._all_ratio_ids = set(range(self._start_ratio_id, self._end_ratio_id + 1))
         for s, e in self._ratio_other_slices:
