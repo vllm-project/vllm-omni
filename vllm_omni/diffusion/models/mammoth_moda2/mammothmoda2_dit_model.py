@@ -1,4 +1,5 @@
-import math
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import torch
 import torch.nn.functional as F
@@ -6,27 +7,16 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.attention_processor import Attention
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_utils import ModelMixin
-from einops import rearrange, repeat
+from einops import rearrange
 from torch import nn
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
-from .rope_real import RotaryPosEmbedReal
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
+from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 
-try:
-    from transformers.modeling_flash_attention_utils import (  # type: ignore
-        flash_attn_varlen_func,  # pyright: ignore[reportAttributeAccessIssue]
-        is_flash_attn_available,
-    )
-except Exception:  # pragma: no cover - best-effort compatibility
-    flash_attn_varlen_func = None  # type: ignore[assignment]
-
-    def is_flash_attn_available() -> bool:  # type: ignore[override]
-        return False
-
-
-from .rope_real import apply_real_rotary_emb
-
-_HAS_FLASH_ATTN_VARLEN = bool(is_flash_attn_available()) and flash_attn_varlen_func is not None
+from .rope_real import RotaryPosEmbedReal, apply_real_rotary_emb
 
 
 class LuminaRMSNormZero(nn.Module):
@@ -278,9 +268,14 @@ class SimpleQFormerImageRefiner(nn.Module):
 
 
 class AttnProcessor:
-    def __init__(self) -> None:
-        if not hasattr(F, "scaled_dot_product_attention"):
-            raise ImportError("AttnProcessor requires PyTorch 2.0+ (F.scaled_dot_product_attention).")
+    """Self-attention for the MammothModa2 DiT through the shared Omni attention layer.
+
+    The model-specific parts stay here: the projections, the per-head QK RMSNorm
+    and the interleaved real RoPE. The kernel, the padding mask and the
+    grouped-query heads are the shared backend's job, so K/V are handed over
+    with their native head count instead of being replicated to the query
+    head count first.
+    """
 
     def __call__(
         self,
@@ -289,118 +284,74 @@ class AttnProcessor:
         encoder_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb: torch.Tensor | None = None,
-        base_sequence_length: int | None = None,
+        query_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, sequence_length, _ = hidden_states.shape
 
-        # Get Query-Key-Value Pair
         query = attn.to_q(hidden_states)
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
 
-        query_dim = query.shape[-1]
-        inner_dim = key.shape[-1]
-        head_dim = query_dim // attn.heads
+        head_dim = query.shape[-1] // attn.heads
+        kv_heads = key.shape[-1] // head_dim
         dtype = query.dtype
 
-        # Get key-value heads
-        kv_heads = inner_dim // head_dim
+        if sequence_length == 0 or key.shape[1] == 0:
+            # The pipeline's default unconditional branch is a text stream with
+            # zero tokens (negative_prompt_embeds has no rows), so under CFG the
+            # context refiner attends over an empty sequence. SDPA returns an
+            # empty tensor for that; the flash-attention varlen fallback builds
+            # cu_seqlens with arange(step=seq_len) and rejects step 0. Nothing
+            # to attend to either way, so hand the projection an empty input.
+            empty = query.new_zeros(batch_size, sequence_length, attn.heads * head_dim)
+            return attn.to_out[1](attn.to_out[0](empty))
 
-        # Reshape tensors for attention computation
         query = query.view(batch_size, -1, attn.heads, head_dim)
         key = key.view(batch_size, -1, kv_heads, head_dim)
         value = value.view(batch_size, -1, kv_heads, head_dim)
 
-        # Apply Query-Key normalization
         if attn.norm_q is not None:
             query = attn.norm_q(query)
         if attn.norm_k is not None:
             key = attn.norm_k(key)
 
-        # Apply Rotary Position Embeddings
         if image_rotary_emb is not None:
             query = apply_real_rotary_emb(query, image_rotary_emb[0], image_rotary_emb[1])
             key = apply_real_rotary_emb(key, image_rotary_emb[0], image_rotary_emb[1])
 
         query, key = query.to(dtype), key.to(dtype)
 
-        # Calculate attention scale
-        if base_sequence_length is not None:
-            softmax_scale = math.sqrt(math.log(sequence_length, base_sequence_length)) * attn.scale
-        else:
-            softmax_scale = attn.scale
-
-        if _HAS_FLASH_ATTN_VARLEN and attention_mask is not None and hidden_states.is_cuda:
-            # Flash-Attn varlen expects packed tokens + cu_seqlens. Here we only need
-            # the self-attention case (q/k/v share the same padding mask).
+        if attention_mask is not None:
             attention_mask = attention_mask.to(torch.bool)
-            seqlens = attention_mask.sum(dim=-1, dtype=torch.int32)
-            indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
-            max_seqlen = int(seqlens.max().item())
-            cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
 
-            query_states = query.reshape(batch_size * sequence_length, attn.heads, head_dim)[indices]
-            key_states = key.reshape(batch_size * sequence_length, kv_heads, head_dim)[indices]
-            value_states = value.reshape(batch_size * sequence_length, kv_heads, head_dim)[indices]
-
-            if kv_heads < attn.heads:
-                key_states = repeat(key_states, "l h c -> l (h k) c", k=attn.heads // kv_heads)
-                value_states = repeat(value_states, "l h c -> l (h k) c", k=attn.heads // kv_heads)
-
-            attn_output_unpad = flash_attn_varlen_func(
-                query_states,
-                key_states,
-                value_states,
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                dropout_p=0.0,
-                causal=False,
-                softmax_scale=softmax_scale,
-            )
-
-            out = torch.zeros(
-                (batch_size * sequence_length, attn.heads, head_dim),
-                device=attn_output_unpad.device,
-                dtype=attn_output_unpad.dtype,
-            )
-            out[indices] = attn_output_unpad
-            hidden_states = out.view(batch_size, sequence_length, attn.heads, head_dim).flatten(-2)
-            hidden_states = hidden_states.type_as(query)
+        # SP must keep its collectives, including FP32 inputs configured for
+        # SDPA. The local fallback is only safe without SP.
+        use_sp = not attn.omni_attn.skip_sequence_parallel and attn.omni_attn.parallel_strategy.enabled
+        if dtype in (torch.float16, torch.bfloat16) or not hidden_states.is_cuda or use_sp:
+            attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
+            hidden_states = attn.omni_attn(query, key, value, attn_metadata)
         else:
-            # PyTorch SDPA path.
-            attn_mask = None
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(torch.bool)
-                attn_mask = attention_mask.view(batch_size, 1, 1, -1)
-
-            query = query.transpose(1, 2)  # [B, H, S, D]
-            key = key.transpose(1, 2)  # [B, H_kv, S, D]
-            value = value.transpose(1, 2)
-
-            if kv_heads < attn.heads:
-                key = key.repeat_interleave(attn.heads // kv_heads, dim=1)
-                value = value.repeat_interleave(attn.heads // kv_heads, dim=1)
-
+            # FlashAttention supports only fp16/bf16 and raises on fp32 (which the
+            # previous SDPA arithmetic served); the CPU path already resolves to
+            # SDPA and handles fp32. Keep fp32 on CUDA on SDPA with native
+            # grouped-query attention (no KV-head replication).
+            q, k, v = query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
+            attn_mask = attention_mask[:, None, None, :] if attention_mask is not None else None
             hidden_states = F.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask=attn_mask,
-                dropout_p=0.0,
-                is_causal=False,
-                scale=softmax_scale,
-            )
+                q, k, v, attn_mask=attn_mask, scale=attn.scale, enable_gqa=kv_heads < attn.heads
+            ).transpose(1, 2)
 
-            if attention_mask is not None:
-                # Keep padding tokens consistent with the flash-varlen path (zero output).
-                hidden_states = hidden_states * attention_mask[:, None, :, None]
+        if query_attention_mask is None:
+            query_attention_mask = attention_mask
+        if query_attention_mask is not None:
+            # Padded rows carry nothing downstream; keep them at zero as the
+            # previous varlen path did, since neither backend does it for us.
+            # Ulysses has already restored rank-local queries here, whereas
+            # attention_mask describes the global keys seen by the kernel.
+            hidden_states = hidden_states * query_attention_mask[:, :, None, None]
 
-            hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
-            hidden_states = hidden_states.type_as(query)
+        hidden_states = hidden_states.reshape(batch_size, sequence_length, attn.heads * head_dim).type_as(query)
 
-        # Apply output projection
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
 
@@ -417,6 +368,7 @@ class TransformerBlock(nn.Module):
         ffn_dim_multiplier: float,
         norm_eps: float,
         modulation: bool = True,
+        skip_sequence_parallel: bool = False,
     ) -> None:
         """Initialize the transformer block."""
         super().__init__()
@@ -441,6 +393,18 @@ class TransformerBlock(nn.Module):
         # 显式使用 transformers 的 Qwen2RMSNorm，避免依赖 diffusers 内部创建的 `RMSNorm` 再做递归替换。
         self.attn.norm_q = Qwen2RMSNorm(self.head_dim, eps=1e-5)
         self.attn.norm_k = Qwen2RMSNorm(self.head_dim, eps=1e-5)
+        # The kernel itself runs through the shared Omni attention layer: backend
+        # selection, padding-mask handling and native grouped-query heads live
+        # there. It owns no parameters, so checkpoint keys are unchanged. The
+        # diffusers Attention above is kept for its projections and QK norms.
+        self.attn.omni_attn = OmniAttention(
+            num_heads=num_attention_heads,
+            head_size=self.head_dim,
+            causal=False,
+            softmax_scale=self.attn.scale,
+            num_kv_heads=num_kv_heads,
+            skip_sequence_parallel=skip_sequence_parallel,
+        )
 
         # Initialize feed-forward network
         self.feed_forward = LuminaFeedForward(
@@ -463,6 +427,7 @@ class TransformerBlock(nn.Module):
         attention_mask: torch.Tensor,
         image_rotary_emb: torch.Tensor,
         temb: torch.Tensor | None = None,
+        query_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.modulation:
             if temb is None:
@@ -474,6 +439,7 @@ class TransformerBlock(nn.Module):
                 encoder_hidden_states=norm_hidden_states,
                 attention_mask=attention_mask,
                 image_rotary_emb=image_rotary_emb,
+                query_attention_mask=query_attention_mask,
             )
             hidden_states = hidden_states + gate_msa.unsqueeze(1).tanh() * self.norm2(attn_output)
             mlp_output = self.feed_forward(self.ffn_norm1(hidden_states) * (1 + scale_mlp.unsqueeze(1)))
@@ -485,6 +451,7 @@ class TransformerBlock(nn.Module):
                 encoder_hidden_states=norm_hidden_states,
                 attention_mask=attention_mask,
                 image_rotary_emb=image_rotary_emb,
+                query_attention_mask=query_attention_mask,
             )
             hidden_states = hidden_states + self.norm2(attn_output)
             mlp_output = self.feed_forward(self.ffn_norm1(hidden_states))
@@ -493,8 +460,41 @@ class TransformerBlock(nn.Module):
         return hidden_states
 
 
+class _MammothModa2SPInputBoundary(nn.Module):
+    """Shard only the joint main-transformer stream, after the refiners.
+
+    RoPE is computed globally first, then sliced with the corresponding tokens.
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_cos: torch.Tensor,
+        rotary_sin: torch.Tensor,
+        query_attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return hidden_states, rotary_cos, rotary_sin, query_attention_mask
+
+
+class _MammothModa2SPOutputBoundary(nn.Module):
+    """Restore the original joint sequence before output norm/image extraction."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states
+
+
 class Transformer2DModel(ModelMixin, ConfigMixin):
     """MammothModa2 DiT transformer"""
+
+    _sp_plan = {
+        "sp_input_boundary": {
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            2: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            3: SequenceParallelInput(split_dim=1, expected_dims=2, split_output=True, auto_pad=True),
+        },
+        "sp_output_boundary": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
 
     @register_to_config
     def __init__(
@@ -518,6 +518,8 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         """Initialize the  transformer model."""
         super().__init__()
         self.hidden_size = hidden_size
+        self.sp_input_boundary = _MammothModa2SPInputBoundary()
+        self.sp_output_boundary = _MammothModa2SPOutputBoundary()
 
         # Validate configuration
         if (hidden_size // num_attention_heads) != sum(axes_dim_rope):
@@ -563,6 +565,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     ffn_dim_multiplier,
                     norm_eps,
                     modulation=True,
+                    skip_sequence_parallel=True,
                 )
                 for _ in range(num_refiner_layers)
             ]
@@ -578,6 +581,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     ffn_dim_multiplier,
                     norm_eps,
                     modulation=True,
+                    skip_sequence_parallel=True,
                 )
                 for _ in range(num_refiner_layers)
             ]
@@ -593,6 +597,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     ffn_dim_multiplier,
                     norm_eps,
                     modulation=False,
+                    skip_sequence_parallel=True,
                 )
                 for _ in range(num_refiner_layers)
             ]
@@ -752,10 +757,98 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
 
         return text_hidden_states, img_tokens
 
-    def _apply_transformer_layers(self, hidden_states, attention_mask, rotary_emb, temb):
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask, rotary_emb, temb)
-        return hidden_states
+    def _validate_sequence_parallel(self) -> None:
+        """Fail before computation if runtime configuration did not reach SP.
+
+        Applying a config or starting two ranks alone is insufficient: the
+        runtime must construct shared attention in an initialized SP context
+        and install both model-boundary hooks.
+        """
+        ctx = get_forward_context() if is_forward_context_available() else None
+        cfg = ctx.omni_diffusion_config if ctx is not None else None
+        strategies = [layer.attn.omni_attn.parallel_strategy for layer in self.layers]
+        boundary_hooks = []
+        for boundary, hook_name in (
+            (self.sp_input_boundary, "sp_input---sp_input_boundary"),
+            (self.sp_output_boundary, "sp_output---sp_output_boundary"),
+        ):
+            registry = getattr(boundary, "_hook_registry", None)
+            boundary_hooks.append(registry.get_hook(hook_name) if registry is not None else None)
+        if cfg is None or cfg.parallel_config.sequence_parallel_size == 1:
+            if any(strategy.enabled for strategy in strategies) or any(hook is not None for hook in boundary_hooks):
+                raise RuntimeError("MammothModa2 SP requires its diffusion ForwardContext on every forward.")
+            return
+
+        parallel = cfg.parallel_config
+        if (
+            parallel.ulysses_degree != 2
+            or parallel.ring_degree != 1
+            or parallel.allgather_degree != 1
+            or parallel.cfg_parallel_size != 1
+            or parallel.tensor_parallel_size != 1
+            or parallel.pipeline_parallel_size != 1
+            or parallel.data_parallel_size not in (None, 1)
+            or parallel.vae_patch_parallel_size != 1
+            or parallel.use_hsdp
+            or parallel.enable_expert_parallel
+        ):
+            raise ValueError(
+                "MammothModa2 SP currently supports only two-rank Ulysses with replicated refiners/VAE "
+                "and without Ring, TP, PP, DP, HSDP, EP or CFG parallelism."
+            )
+        if parallel.ulysses_mode == "strict" and (self.config.num_attention_heads % 2 or self.config.num_kv_heads % 2):
+            raise ValueError("MammothModa2's uneven Q/KV heads require ulysses_mode='advanced_uaa' for two-rank SP.")
+
+        for hook in boundary_hooks:
+            if hook is None:
+                raise RuntimeError(
+                    "MammothModa2 SP requires the runtime to apply the complete Transformer2DModel._sp_plan."
+                )
+            if (hook.config.ulysses_degree, hook.config.ring_degree, hook.config.allgather_degree) != (2, 1, 1):
+                raise RuntimeError("MammothModa2 SP boundary hooks must use the same two-rank Ulysses configuration.")
+        if any(strategy.name != "ulysses" for strategy in strategies):
+            raise RuntimeError("Construct MammothModa2 attention inside the initialized Ulysses ForwardContext.")
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_sequence_parallel_world_size,
+            get_ulysses_parallel_world_size,
+        )
+
+        if (get_sequence_parallel_world_size(), get_ulysses_parallel_world_size()) != (2, 2):
+            raise RuntimeError("MammothModa2 SP requires initialized sequence/Ulysses groups of size two.")
+
+    def _apply_transformer_layers(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        temb: torch.Tensor | None,
+    ) -> torch.Tensor:
+        ctx = get_forward_context() if is_forward_context_available() else None
+        if ctx is not None:
+            previous = (ctx.sp_original_seq_len, ctx.sp_padding_size, ctx._sp_shard_depth)
+            equal_pad_depth = len(ctx._sp_equal_pad_stack)
+            # Sequential CFG branches can have different joint sequence lengths.
+            # The shared auto-pad hook records only the first length it sees.
+            ctx.sp_original_seq_len = None
+            ctx.sp_padding_size = 0
+        try:
+            hidden_states, rotary_cos, rotary_sin, query_mask = self.sp_input_boundary(
+                hidden_states, rotary_emb[0], rotary_emb[1], attention_mask
+            )
+            if ctx is not None and ctx.sp_padding_size:
+                # Ulysses sees global keys; output queries are rank-local again.
+                attention_mask = F.pad(attention_mask, (0, ctx.sp_padding_size), value=False)
+            for layer in self.layers:
+                hidden_states = layer(hidden_states, attention_mask, (rotary_cos, rotary_sin), temb, query_mask)
+            return self.sp_output_boundary(hidden_states)
+        finally:
+            if ctx is not None:
+                # Also unwind a split whose block/gather raised, so the next
+                # branch/request cannot inherit a stale sharded-region depth.
+                ctx.sp_original_seq_len, ctx.sp_padding_size, ctx._sp_shard_depth = previous
+                # A failed block/gather leaves this boundary's equal-padding
+                # marker behind; preserve any enclosing boundary's markers.
+                del ctx._sp_equal_pad_stack[equal_pad_depth:]
 
     def forward(
         self,
@@ -769,6 +862,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         ar_image_attention_mask: torch.Tensor | None = None,
         return_dict: bool = False,
     ) -> torch.Tensor:
+        self._validate_sequence_parallel()
         batch_size, height, width = self._validate_inputs(
             hidden_states, text_hidden_states, text_attention_mask, ref_image_hidden_states, return_dict
         )
