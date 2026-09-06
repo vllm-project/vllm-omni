@@ -105,10 +105,14 @@ class DiffusionMXFP4Config(QuantizationConfig):
         self,
         is_checkpoint_mxfp4_serialized: bool = False,
         ignored_layers: list[str] | None = None,
+        quark_export_format: str | None = None,
     ) -> None:
         super().__init__()
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.ignored_layers = ignored_layers or []
+        # "mxfp4": bf16 weights packed to FP4 at load. "mxfp4_packed": weights already
+        # packed on disk (weight_shuffle + weight_scale), loaded as-is.
+        self.quark_export_format = quark_export_format
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -136,9 +140,11 @@ class DiffusionMXFP4Config(QuantizationConfig):
         ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
         if not ignored_layers:
             ignored_layers = cls.get_from_keys_or(config, ["modules_to_not_convert"], None)
+        export_format = cls.get_from_keys_or(config, ["quark_export_format"], None)
         return cls(
             is_checkpoint_mxfp4_serialized=is_serialized,
             ignored_layers=ignored_layers,
+            quark_export_format=export_format,
         )
 
     def get_quant_method(
@@ -162,7 +168,9 @@ class DiffusionMXFP4Config(QuantizationConfig):
                 if "gfx950" not in gcn_arch:
                     raise NotImplementedError(f"MXFP4 on ROCm requires gfx950 (MI355X). Detected: {gcn_arch}")
                 if self.is_checkpoint_mxfp4_serialized:
-                    raise NotImplementedError("Pre-quantized MXFP4 checkpoints are not yet supported on ROCm.")
+                    if self.quark_export_format == "mxfp4_packed":
+                        return ROCmMxfp4PackedLinearMethod(self)
+                    return ROCmMxfp4OfflineLinearMethod(self)
                 return ROCmMxfp4OnlineLinearMethod(self)
             raise NotImplementedError(
                 "DiffusionMXFP4Config (W4A4 MXFP4) is currently only supported "
@@ -486,6 +494,139 @@ class ROCmMxfp4OnlineLinearMethod(_LazyWeightMixin, ROCmMxfp4LinearMethod):
 
         # Delegate to the base class which does AITER quant + shuffle.
         ROCmMxfp4LinearMethod.process_weights_after_loading(self, layer)
+
+
+# ---------------------------------------------------------------------------
+# ROCm MXFP4 offline method (pre-quantized/calibrated checkpoint)
+# ---------------------------------------------------------------------------
+
+
+class ROCmMxfp4OfflineLinearMethod(ROCmMxfp4LinearMethod):
+    """ROCm W4A4 MXFP4 offline linear method for a Quark-calibrated checkpoint.
+
+    The checkpoint stores calibrated bf16 weights that already hold MXFP4-rounded
+    values (produced offline by Quark: SmoothQuant + MXFP4). At load we pack them to
+    the AITER FP4 layout with the same transform the online path uses (per_1x32 +
+    shuffle) - identical GEMM, just calibrated weights.
+
+    Difference from the online method: the weight arrives from a real serialized
+    checkpoint (a normal loadable bf16 param), NOT from meta-device dummy init. So we
+    register a standard weight in create_weights and reuse the base pack in
+    process_weights_after_loading.
+    """
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.orig_dtype = params_dtype
+
+        # Calibrated bf16 weight (N, K) - a standard loadable param. The FP4 packing
+        # happens at process_weights_after_loading via the base AITER transform.
+        layer.register_parameter(
+            "weight",
+            ModelWeightParameter(
+                data=torch.empty(output_size_per_partition, input_size_per_partition, dtype=params_dtype),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            ),
+        )
+
+    # process_weights_after_loading inherited from ROCmMxfp4LinearMethod:
+    # aiter per_1x32 quant + shuffle_weight(16,16) on the loaded calibrated weight.
+
+
+# ---------------------------------------------------------------------------
+# ROCm MXFP4 packed method (weights pre-packed to the AITER FP4 layout on disk)
+# ---------------------------------------------------------------------------
+
+
+class ROCmMxfp4PackedLinearMethod(ROCmMxfp4LinearMethod):
+    """ROCm W4A4 MXFP4 method for a checkpoint whose weights are already packed.
+
+    The checkpoint stores the AITER FP4 layout directly (as uint8):
+      weight_shuffle : float4_e2m1fn_x2 (N, K/2)   per_1x32 + shuffle_weight(16, 16)
+      weight_scale   : float8_e8m0fnu   (N, K/32)  per-group-of-32 scale
+    process_weights_after_loading only views the bytes back to their FP4/e8m0 dtypes;
+    no packing at load. apply/_quant_matmul are inherited.
+
+    TP=1 only: packing is per output row, so N-axis (output-dim) sharding and QKV/MLP
+    fusion are safe, but K-axis (input-dim) sharding of a packed weight is not.
+    """
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.orig_dtype = params_dtype
+
+        # Packed FP4 weight, 2 values per byte -> (N, K/2) uint8. output_dim=0 lets the
+        # fused/sharded loaders place row-slices; input_dim=None keeps the packed K axis
+        # unsharded.
+        layer.register_parameter(
+            "weight_shuffle",
+            ModelWeightParameter(
+                data=torch.empty(output_size_per_partition, input_size_per_partition // 2, dtype=torch.uint8),
+                input_dim=None,
+                output_dim=0,
+                weight_loader=weight_loader,
+            ),
+        )
+        # Per-group e8m0 scale: (N, K/32) uint8.
+        num_groups = (input_size_per_partition + 31) // 32
+        layer.register_parameter(
+            "weight_scale",
+            ModelWeightParameter(
+                data=torch.empty(output_size_per_partition, num_groups, dtype=torch.uint8),
+                input_dim=None,
+                output_dim=0,
+                weight_loader=weight_loader,
+            ),
+        )
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+
+        # View the loaded uint8 bytes back to their real dtypes.
+        w = layer.weight_shuffle.data.view(torch.float4_e2m1fn_x2)
+        s = layer.weight_scale.data.view(torch.float8_e8m0fnu)
+
+        # Swap params for buffers so the inherited apply()/_quant_matmul reads
+        # weight_shuffle / weight_scale exactly as the pack-at-load path does.
+        if isinstance(layer.weight_shuffle, torch.nn.Parameter):
+            delattr(layer, "weight_shuffle")
+        if isinstance(layer.weight_scale, torch.nn.Parameter):
+            delattr(layer, "weight_scale")
+        layer.register_buffer("weight_shuffle", w, persistent=True)
+        layer.register_buffer("weight_scale", s, persistent=True)
+
+        layer._already_called_process_weights_after_loading = True
 
 
 # ---------------------------------------------------------------------------
