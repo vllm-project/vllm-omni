@@ -364,6 +364,8 @@ class HunyuanImage3Pipeline(
 
     def __init__(self, od_config: OmniDiffusionConfig) -> None:
         self.hf_config = get_config(od_config.model, trust_remote_code=True)
+        self.hf_config.cfg_distilled = _config_flag(self.hf_config, "cfg_distilled")
+        self.hf_config.use_meanflow = _config_flag(self.hf_config, "use_meanflow")
         super().__init__(self.hf_config)
         # update diffusion config
         self.generation_config = GenerationConfig.from_pretrained(od_config.model)
@@ -1280,7 +1282,9 @@ class HunyuanImage3Pipeline(
 
         # 4. Encode conditional images
         # Skip encoding if AR KV reuse is enabled
-        has_ar_kv = kwargs.get("ar_kv_data")
+        from vllm_omni.diffusion.forward_context import get_paged_kv_computed_tokens
+
+        has_ar_kv = kwargs.get("ar_kv_data") or any(get_paged_kv_computed_tokens())
         if batch_cond_image_info is not None and len(batch_cond_image_info[0]) > 0 and not has_ar_kv:
             cond_vae_images, cond_timestep, cond_vit_images = self._encode_cond_image(
                 batch_cond_image_info, cfg_factor[mode], generator=generator

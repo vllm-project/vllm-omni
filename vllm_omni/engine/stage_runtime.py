@@ -402,12 +402,35 @@ class StageRuntime:
                 )
 
             for replica_id in range(num_replicas):
-                replica_cfg = copy.deepcopy(stage_cfg) if replica_id > 0 else stage_cfg
+                native_kv = (
+                    stage_cfg.engine_args.get("kv_transfer_config")
+                    if isinstance(stage_cfg.engine_args, Mapping)
+                    else getattr(stage_cfg.engine_args, "kv_transfer_config", None)
+                )
+                replica_cfg = copy.deepcopy(stage_cfg) if replica_id > 0 or native_kv else stage_cfg
+                if native_kv and base_metadata.stage_type == "diffusion":
+                    kv_config = replica_cfg.engine_args["kv_transfer_config"]
+                    kv_config["engine_id"] = f"{kv_config['engine_id']}-s{stage_id}-r{replica_id}"
                 if stage_idx in replica_devices_map:
                     replica_cfg.runtime.devices = replica_devices_map[stage_idx][replica_id]
 
                 replica_metadata = extract_legacy_stage_metadata(replica_cfg)
                 replica_metadata.replica_id = replica_id
+                replica_vllm_config = stage_vllm_config
+                if native_kv and stage_vllm_config is not None:
+                    replica_vllm_config = copy.deepcopy(stage_vllm_config)
+                    kv_config = replica_vllm_config.kv_transfer_config
+                    kv_config.engine_id = f"{kv_config.engine_id}-s{stage_id}-r{replica_id}"
+                    if kv_config.kv_connector == "MooncakeConnector" and kv_config.kv_role == "kv_producer":
+                        extra = kv_config.kv_connector_extra_config
+                        port = int(extra.get("bootstrap_port", 8998)) + replica_id
+                        extra["bootstrap_addr"] = f"http://{kv_config.kv_ip}:{port}"
+                        runtime_cfg = copy.deepcopy(replica_metadata.runtime_cfg or {})
+                        runtime_cfg["env"] = {
+                            **(runtime_cfg.get("env") or {}),
+                            "VLLM_MOONCAKE_BOOTSTRAP_PORT": str(port),
+                        }
+                        replica_metadata.runtime_cfg = runtime_cfg
                 if launch_mode == "remote" and replica_metadata.stage_type != "diffusion":
                     replica_metadata.runtime_cfg = None
                 replicas.append(
@@ -419,7 +442,7 @@ class StageRuntime:
                         metadata=replica_metadata,
                         stage_connector_spec=stage_connector_spec,
                         omni_kv_connector=omni_kv_connector,
-                        stage_vllm_config=stage_vllm_config,
+                        stage_vllm_config=replica_vllm_config,
                         executor_class=executor_class,
                         engine_args_dict=copy.deepcopy(engine_args_dict) if engine_args_dict is not None else None,
                     )

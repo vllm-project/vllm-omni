@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.sched.interface import CachedRequestData
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -159,7 +162,7 @@ class DiffusionExecutor(ABC):
         # ranks are not silently dropped.
         self.collective_rpc("set_kv_cache_configs", args=(kv_cache_configs, resolved_max_model_len))
 
-    def remove_diffusion_kv_requests(self, request_ids: list[str]) -> None:
+    def remove_diffusion_kv_requests(self, request_ids: list[str | tuple[str, int]]) -> None:
         """Clear request rows on every Worker after Scheduler retirement."""
 
         unique_request_ids = list(dict.fromkeys(request_ids))
@@ -169,6 +172,29 @@ class DiffusionExecutor(ABC):
             "remove_diffusion_kv_requests",
             args=(unique_request_ids,),
         )
+
+    def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput) -> KVConnectorOutput | None:
+        if scheduler_output.kv_connector_metadata is None:
+            return
+        transfer_output = replace(
+            scheduler_output,
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            kv_prefetch_job=None,
+        )
+        outputs: list[KVConnectorOutput] = self.collective_rpc(
+            "prepare_kv_for_forward",
+            args=(transfer_output,),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+        if len(outputs) != self.od_config.num_gpus or any(
+            output.invalid_block_ids
+            or not scheduler_output.kv_transfer_request_ids.issubset(output.finished_recving or ())
+            for output in outputs
+        ):
+            raise RuntimeError("Diffusion KV receive did not complete on every rank")
+        return outputs[0]
 
     @abstractmethod
     def shutdown(self) -> None:

@@ -1231,7 +1231,7 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
         ulysses_degree=2,
     )
 
-    assert selected_backends == [(adapter_module.AttentionBackendEnum.FLASH_ATTN, {}, 2)]
+    assert selected_backends == [(adapter_module.AttentionBackendEnum.FLASH_ATTN, {}, 1)]
     assert specialized_backends == [(native_backend, 2)]
     assert config.attention_config.backend is None
     assert config.attention_config.backend_per_kind is original_backend_per_kind
