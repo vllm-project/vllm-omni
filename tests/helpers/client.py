@@ -12,6 +12,7 @@ import copy
 import io
 import json
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from io import BytesIO
 from pathlib import Path
@@ -2114,6 +2115,123 @@ class OfflineOmniClient:
         )
         result = OmniResponse(success=True, audio_bytes=wav_buf.getvalue(), audio_format="audio/wav")
         assert_audio_speech_response(result, request_config, run_level="core_model")
+        return result
+
+    def send_tokenized_tts_request(self, request_config: dict[str, Any]) -> OmniResponse:
+        """Offline TTS for models whose engine prompt is *pre-tokenized*.
+
+        Fish-Speech-style DualAR models (and any model whose prompt embeds codec
+        codes) cannot go through :meth:`send_audio_speech_request`: the prompt is
+        built by the caller as ``prompt_token_ids`` plus per-request
+        ``additional_information``, not from ``mm_processor_kwargs``.
+
+        request_config keys:
+          - ``prompt_token_ids``: ``list[int]`` or ``list[list[int]]`` (one entry
+            per request).
+          - ``additional_information``: dict, or list of dicts matching
+            ``prompt_token_ids``.
+          - ``expected_sample_rate``: asserted against the reported ``sr``.
+          - ``min_duration_s`` / ``max_duration_s``: bounds on decoded audio.
+          - plus every key ``assert_audio_speech_response`` understands
+            (``response_format``, ``min_audio_bytes``, ``input``, ...).
+        """
+        token_ids = request_config.get("prompt_token_ids")
+        if not token_ids:
+            raise ValueError("request_config must contain 'prompt_token_ids'")
+        batched_ids = token_ids if isinstance(token_ids[0], (list, tuple)) else [token_ids]
+
+        extra = request_config.get("additional_information")
+        if extra is None:
+            batched_extra: list[dict[str, Any] | None] = [None] * len(batched_ids)
+        elif isinstance(extra, dict):
+            batched_extra = [extra] * len(batched_ids)
+        else:
+            batched_extra = list(extra)
+        if len(batched_extra) != len(batched_ids):
+            raise ValueError("'additional_information' must match the number of prompts")
+
+        prompts: list[dict[str, Any]] = []
+        for ids, info in zip(batched_ids, batched_extra, strict=True):
+            prompt: dict[str, Any] = {"prompt_token_ids": list(ids)}
+            if info is not None:
+                prompt["additional_information"] = info
+            prompts.append(prompt)
+
+        start_time = time.perf_counter()
+        outputs = self.runner.omni.generate(prompts)
+        e2e_latency = time.perf_counter() - start_time
+
+        assert len(outputs) == len(prompts), f"Expected {len(prompts)} outputs, got {len(outputs)}"
+        expected_sr = request_config.get("expected_sample_rate")
+        min_duration = request_config.get("min_duration_s")
+        max_duration = request_config.get("max_duration_s")
+
+        result = OmniResponse()
+        wavs: list[torch.Tensor] = []
+        for index, stage_output in enumerate(outputs):
+            assert stage_output.outputs, f"Request {index} produced no output"
+            multimodal_output = stage_output.outputs[0].multimodal_output
+            assert isinstance(multimodal_output, Mapping), (
+                f"Request {index}: expected a mapping, got {type(multimodal_output)}"
+            )
+
+            # Never use ``a or b`` here: truthiness on a tensor raises.
+            audio = multimodal_output.get("model_outputs")
+            if audio is None:
+                audio = multimodal_output.get("audio")
+            assert audio is not None, f"Request {index}: no audio key in {sorted(multimodal_output)}"
+            if isinstance(audio, list):
+                chunks = [torch.as_tensor(chunk).float().cpu().reshape(-1) for chunk in audio if chunk is not None]
+                assert chunks, f"Request {index}: audio list contained no tensors"
+                audio = torch.cat(chunks, dim=0)
+            wav = torch.as_tensor(audio).float().cpu().reshape(-1)
+            assert wav.numel() > 0, f"Request {index}: decoded audio is empty"
+            wavs.append(wav)
+
+            sr_raw = multimodal_output.get("sr")
+            if isinstance(sr_raw, list):
+                sr_raw = sr_raw[-1] if sr_raw else None
+            assert sr_raw is not None, f"Request {index}: missing sample rate"
+            sample_rate = int(sr_raw.item() if hasattr(sr_raw, "item") else sr_raw)
+            if expected_sr is not None:
+                assert sample_rate == int(expected_sr), (
+                    f"Request {index}: expected sample rate {expected_sr}, got {sample_rate}"
+                )
+
+            duration_s = wav.numel() / sample_rate
+            if min_duration is not None:
+                assert duration_s >= float(min_duration), (
+                    f"Request {index}: audio too short ({duration_s:.2f}s < {min_duration}s)"
+                )
+            if max_duration is not None:
+                assert duration_s <= float(max_duration), (
+                    f"Request {index}: audio too long ({duration_s:.2f}s > {max_duration}s)"
+                )
+
+            wav_buf = io.BytesIO()
+            sf.write(wav_buf, wav.numpy(), samplerate=sample_rate, format="WAV", subtype="PCM_16")
+            result = OmniResponse(
+                success=True,
+                audio_bytes=wav_buf.getvalue(),
+                audio_format="audio/wav",
+                e2e_latency=e2e_latency,
+            )
+            assert_audio_speech_response(result, request_config, run_level="core_model")
+
+        if request_config.get("assert_distinct_outputs") and len(wavs) > 1:
+            # Distinct inputs must decode to distinct audio. Leaked per-request
+            # codec state shows up as two requests producing (near-)identical
+            # waveforms; different lengths already prove distinctness.
+            for i in range(len(wavs)):
+                for j in range(i + 1, len(wavs)):
+                    a, b = wavs[i], wavs[j]
+                    if a.numel() != b.numel():
+                        continue
+                    max_diff = (a - b).abs().max().item()
+                    assert max_diff > 1e-3, (
+                        f"Requests {i} and {j} produced near-identical audio "
+                        f"(max sample diff {max_diff:.2e}); possible codec-state crosstalk"
+                    )
         return result
 
     def start_profile(self, profile_prefix: str | None = None, stages: list[int] | None = None) -> list[Any]:

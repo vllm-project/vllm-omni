@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Custom model configs that cannot be expressed via HuggingFace Transformers alone,
 following the same pattern as vllm.transformers_utils.configs.
@@ -10,6 +10,9 @@ from __future__ import annotations
 import importlib
 
 _CLASS_TO_MODULE: dict[str, str] = {
+    "Audio8TTSConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
+    "Audio8TTSSlowARConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
+    "Audio8TTSFastARConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
     "HiggsAudioV3Config": "vllm_omni.transformers_utils.configs.higgs_audio_v3",
     "Mammothmoda2Config": "vllm_omni.transformers_utils.configs.mammoth_moda2",
     "Mammothmoda2Qwen2_5_VLConfig": "vllm_omni.transformers_utils.configs.mammoth_moda2",
@@ -35,6 +38,9 @@ _CLASS_TO_MODULE: dict[str, str] = {
 }
 
 __all__ = [
+    "Audio8TTSConfig",
+    "Audio8TTSFastARConfig",
+    "Audio8TTSSlowARConfig",
     "HiggsAudioV3Config",
     "Mammothmoda2Config",
     "Mammothmoda2Qwen2_5_VLConfig",
@@ -75,6 +81,7 @@ def __dir__():
 
 # Eagerly import all config modules so their AutoConfig.register() side-effects
 # run as soon as `vllm_omni.transformers_utils.configs` is imported.
+from vllm_omni.transformers_utils.configs import audio8_tts as _audio8_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import cosyvoice3 as _cosyvoice3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import dots_tts as _dots_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402

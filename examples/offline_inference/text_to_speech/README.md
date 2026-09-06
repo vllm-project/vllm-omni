@@ -14,6 +14,7 @@ list of supported architectures across all modalities, see
 
 | Model | HuggingFace repo | Stages | Voice cloning | Streaming | Special modes | Sample rate |
 |---|---|---|---|---|---|---|
+| Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | dual-AR | ✓ | ✓ | 11 languages | 44.1 kHz |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 24 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
 | Gepard-1.0 | `nineninesix/gepard-1.0` | single (native AR + NanoCodec) | — (zero-shot; cloning WIP) | — (serving WIP) | zero-shot | 22.05 kHz |
@@ -41,6 +42,57 @@ python examples/offline_inference/text_to_speech/<model>/end2end.py \
 ```
 
 `--ref-audio` and `--ref-text` are optional (text-only synthesis works without them) and must be provided together for voice cloning. The exotic scripts — Qwen3-TTS, Voxtral TTS, CosyVoice3 — accept additional model-specific flags documented in their per-model section below. Qwen3-TTS in particular uses its own argparse surface (`--query-type`, `--audio-path`, etc.) and does not follow the common shape; see its section.
+
+---
+
+## Audio8 TTS Preview
+
+0.6B DualAR text-to-speech model (Audio8) with its own 44.1 kHz neural audio
+codec: a slow AR transformer predicts one semantic token per codec frame, and a
+4-layer fast AR predicts that frame's remaining 9 codebooks.
+
+### Prerequisites
+No extra packages: the codec architecture ships in tree and its weights
+(`codec.pth`) come with the checkpoint.
+
+### Quick start
+```bash
+python examples/offline_inference/text_to_speech/audio8_tts/end2end.py \
+    --text "Welcome to Audio8 TTS, a compact multilingual text to speech model."
+```
+
+### Voice cloning
+```bash
+python examples/offline_inference/text_to_speech/audio8_tts/end2end.py \
+    --text "Welcome to Audio8 TTS." \
+    --ref-audio /path/to/reference.wav \
+    --ref-text  "The exact transcript of the reference recording."
+```
+The reference transcript must match what is actually spoken in the clip;
+a mismatch degrades both stability and speaker similarity.
+
+### Streaming
+```bash
+python examples/offline_inference/text_to_speech/audio8_tts/end2end.py \
+    --text "Welcome to Audio8 TTS." --streaming
+```
+
+### Notes
+- Output: 44.1 kHz mono WAV; the codec emits ~21.5 frames/s (2048 samples per frame).
+- Context is 2048 packed text+audio positions, so `max_model_len` is 2048.
+- Greedy decoding (`temperature: 0`) is degenerate for this checkpoint — it
+  ends the utterance almost immediately. Keep the deploy defaults
+  (`temperature 0.7`, `top_k 50`, `top_p 0.9`), which also match
+  `generation_config.json`.
+- Repetition-Aware Sampling is applied to the semantic token: a repeat inside
+  the last 10 frames is re-drawn from a flatter distribution instead of being
+  masked out.
+- `--num-prompts 4` smoke-tests concurrency (stage 0 runs `max_num_seqs: 4`).
+
+### Measured behaviour (1x H20, shared GPU)
+`--streaming` on a 58-character English sentence: TTFA ~0.74 s (4-frame first
+chunk), 7 chunks, 1.55 s wall for 3.16 s of audio (RTF ~0.49). Treat these as
+smoke-test magnitudes, not a benchmark.
 
 ---
 
