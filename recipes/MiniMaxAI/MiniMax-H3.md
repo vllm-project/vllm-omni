@@ -117,11 +117,12 @@ same time on a host sized for this minimum.
 The consumer-GPU profiles below are HBM budgets only. They still require the
 host-RAM budget above.
 
-### Single GPU: accuracy and memory first
+### Single GPU: blockwise capacity path
 
-The single-GPU configuration uses model-level CPU offload.
-This matches the accuracy-qualified reference path and prevents the Qwen3-VL
-encoder and DiT from being resident on the GPU at the same time.
+Use ordinary layerwise offload when one GPU cannot keep the Qwen3-VL encoder
+and DiT resident together. The component list below streams the active DiT,
+the Qwen vision blocks, and the first 50 Qwen text layers. Encoder blocks stay
+rank-local; the video/audio VAEs remain resident.
 
 ```bash
 export MODEL=MiniMaxAI/MiniMax-H3
@@ -129,20 +130,37 @@ export PORT=8091
 
 CUDA_VISIBLE_DEVICES=0 \
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
-VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 \
+VLLM_OMNI_VIDEO_SYNC_TIMEOUT=14400 \
 vllm serve "${MODEL}" \
   --omni \
   --host 0.0.0.0 \
   --port "${PORT}" \
   --trust-remote-code \
+  --task-type fl2va \
   --num-gpus 1 \
-  --enable-cpu-offload \
+  --diffusion-offload-config \
+  '{"mode":"layer","components":["dit","text_encoder"]}' \
+  --enforce-eager \
   --diffusion-attention-backend FLASH_ATTN
 ```
 
-Use a GPU with enough memory for the active H3 component and enough system RAM
-for both offloaded DiTs plus the shared components. Model-level offload keeps
-the two DiTs mutually exclusive on GPU, but adds PCIe/NVLink transfer latency.
+This is a capacity profile, not a latency profile: every denoising step streams
+DiT blocks over the host link, while encoder blocks are streamed only during
+the short conditioning phase. It requires host memory for the complete
+checkpoint plus pinned transfer buffers. Re-measure peak HBM on the target
+shape; this command does not claim a particular GPU model as validated.
+
+A one-B300 correctness smoke selected only `text_encoder` (keeping the DiT and
+VAEs resident) and completed a 384x672, 5-second T2VA request with two denoise
+steps. It installed 77 encoder hooks across the vision and text stacks, used a
+77,728 MiB worker peak, and measured 2.803 seconds encode, 2.706 seconds
+denoise, and 4.503 seconds decode. These reduced-step numbers validate the
+execution path; they are not a quality or production-latency benchmark.
+
+To use whole-component behavior, change the config to
+`{"mode":"module","components":["dit","text_encoder"]}`. Module
+offload swaps the complete encoder and DiT and therefore has a higher
+encode-phase peak than encoder blockwise offload.
 
 ### Two 24/32 GB GPUs: TP2 distributed layerwise offload
 
@@ -278,7 +296,7 @@ steady-state latency. H3 is CFG-distilled, so `--cfg-parallel-size` must remain
 
 ### Attention Backends
 
-On datacenter Blackwell GPUs, MiniMax H3 defaults to dense BF16
+On supported datacenter Blackwell systems, MiniMax H3 defaults to dense BF16
 `TRTLLM_ATTN`; no attention backend flag is required. To select it explicitly,
 use:
 
@@ -298,17 +316,33 @@ FA4 remains available by explicitly selecting the `FLASH_ATTN` backend:
 --diffusion-attention-backend FLASH_ATTN
 ```
 
-On Blackwell, `FLASH_ATTN` selects FA4. Confirm the server log contains
-`Using CuTe FlashAttention-4 on Blackwell` before recording FA4 measurements.
+With the optional `[fa4]` dependency installed, `FLASH_ATTN` prefers FA4 on
+Blackwell. Confirm the server log contains `Using CuTe FlashAttention-4 on
+Blackwell` before recording FA4 measurements.
 
-`TRTLLM_ATTN` additionally supports two **lossy** optimizations for the long main
-DiT attention sequence: SAGE attention quantization and Skip-Softmax Sparse
-Attention. SAGE quantizes Q/K to the configured dtype and V to FP8. This example uses
-`fp8_e4m3` for Q/K; B200 also supports `int8` Q/K. The TRTLLM SAGE path fixes V
-to FP8, so vLLM-Omni only exposes the Q/K dtype. The token refiner is a short
-attention path, so the `per_role` override leaves SAGE and Skip-Softmax disabled
-for it. The example enables the calibration-free Skip-Softmax path with
-`threshold=0.05`, after the normalized timestep reaches `0.97`:
+`TRTLLM_ATTN` additionally offers two **lossy** optimizations for the long main
+DiT attention sequence: SAGE attention quantization and Skip-Softmax sparse
+attention. Both work under the pure Ulysses parallelism of the profile above
+(`--usp 4 --ring 1`). The example below enables both:
+
+- SAGE with `fp8_e4m3` Q/K; P and V are always FP8 in this kernel. B200
+  additionally supports `int8` Q/K, which preserves accuracy better than FP8.
+- Skip-Softmax with a direct `threshold=0.05` (the calibrated
+  `target_sparsity` control needs ModelOpt metadata that the official H3
+  checkpoint does not include). Together with the cutoff below this is a
+  **conservative** setting: a low threshold skips only clearly negligible tiles,
+  and a cutoff close to `1.0` leaves a substantial dense prefix. Raise
+  `threshold` or lower `disabled_until_timestep` for more speedup once quality
+  is verified.
+- `disabled_until_timestep=0.97` keeps the early high-noise steps dense. The
+  gate compares against the video sigma, which H3's default flow shift of 12
+  keeps high for much of the run: at 50 steps, `0.99`, `0.97`, and `0.95`
+  leave the first 6, 14, and 19 of 49 denoiser forwards dense. See the
+  [Skip-Softmax design](https://github.com/vllm-project/vllm-omni/blob/main/docs/design/feature/skip_softmax.md#timestep-gating)
+  for how the cutoff maps to steps.
+- A `per_role` entry that keeps the token refiner, a short attention path,
+  dense. A per-role spec does not inherit `quant` or `skip_softmax` from
+  `default`.
 
 ```bash
 --diffusion-attention-config '{
@@ -332,10 +366,13 @@ for it. The example enables the calibration-free Skip-Softmax path with
 }'
 ```
 
-For configuration details, see
-[TRTLLM_ATTN Backend and Skip-Softmax](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/diffusion/attention_backends.md#trtllm_attn-backend-and-skip-softmax)
+Both optimizations trade fidelity for speed and their effects compound.
+Compare against dense output on the same prompt and seed before adopting them.
+For the full key reference, see
+[Skip-Softmax](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/diffusion/attention_backends/trtllm.md#skip-softmax)
 and
-[TRTLLM_ATTN SAGE Quantization](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/diffusion/attention_backends.md#trtllm_attn-sage-quantization).
+[SAGE quantization](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/diffusion/attention_backends/trtllm.md#sage-quantization)
+in the TRTLLM attention guide.
 
 ### Text encoder tensor parallelism
 
@@ -464,10 +501,9 @@ Add this option to an existing H3 server command:
 
 Use the FL2VA-only partition for this capacity test. Loading the combined
 service would also load the Ref2VA DiT and would test a different memory
-budget. A no-offload capacity check should contain none of
-`--enable-cpu-offload`, `--enable-layerwise-offload`, or
-`--enable-distributed-layerwise-offload`. VAE tiling changes decode placement
-but does not offload model weights to the CPU.
+budget. A no-offload capacity check should omit
+`--diffusion-offload-config` and all legacy `--enable-*-offload` aliases. VAE
+tiling changes decode placement but does not offload model weights to the CPU.
 
 The run passes the capacity check when the server initializes, the request
 finishes without CUDA OOM or Xid errors, `peak_used_mib` remains below the
@@ -499,10 +535,11 @@ For example, keep the first main block's attention projections in BF16 with:
 ```
 
 The structured option replaces `--quantization fp8`. Online FP8 can be used
-with H3 layerwise offload and with both DLO transfer paths. The default
-AllGather path uses the ordinary loader to finalize FP8 weights and scales
-before sharding them across ranks. `--dlo-no-use-allgather` instead retains
-complete rank-local tensors and avoids the synchronized request-wave contract.
+with H3 layerwise offload and with either DiT DLO transfer. DiT `allgather`
+uses the ordinary loader to finalize FP8 weights and scales before sharding
+them across ranks. DiT `rank-local` instead retains complete loader-produced
+tensors and avoids the synchronized request-wave contract. H3's TP-sharded
+text encoder uses `rank-local`.
 
 ## AMD ROCm (gfx942 / gfx950)
 
@@ -547,6 +584,13 @@ vllm serve "${MODEL}" \
   --num-gpus 1 --enable-cpu-offload \
   --diffusion-attention-backend FLASH_ATTN
 ```
+
+This validated ROCm capacity recipe intentionally retains the compatibility
+full-topology alias because MiniMax-H3 also stages its VAEs on that path. The
+compact API in this release selects only `dit` and `text_encoder`, so replacing
+the flag would change residency rather than perform a mechanical migration.
+No removal deadline is assigned until the compact API offers equivalent
+component coverage.
 
 ### ROCm four GPUs
 
@@ -962,13 +1006,27 @@ mostly base H3 weights on a four-step schedule. Offload is refused for the same
 reason - `--enable-cpu-offload`, `--enable-layerwise-offload` and
 `--enable-distributed-layerwise-offload` all bypass the fusion, so they fail fast.
 
-> [!NOTE]
-> Only the **Dense / Data-Free** variant is supported today. The three VSA
-> variants carry `.set_weight` compression gates for modules that do not exist
-> in vLLM-Omni's dense H3 attention, and the release states dense attention is
-> not a supported substitute for them, so they are refused at startup rather
-> than silently run wrong. Video Sparse Attention for H3's packed
-> `[text | cond | audio | video]` sequence is follow-up work.
+The VSA variants are supported through FastVideo's external kernel. Install a
+`fastvideo-kernel` build that provides the `fastvideo_kernel` Python module,
+then add the following flags to the same command:
+
+```bash
+--diffusion-attention-backend FASTVIDEO_VSA \
+--fastvideo-vsa-topk 64
+```
+
+FastH3 VSA applies its learned `.set_weight` compression gates to the complete
+packed `[text | cond | audio | video]` document using the official H3 geometry:
+text/condition/audio prefix tiles never cross segment boundaries, and target
+video rows use `(4, 4, 4)` 3-D tiles (64 tokens). Prefix queries remain dense;
+video queries select all prefix tiles plus the configured top-k video tiles.
+Pure Ulysses sequence parallelism is supported: the learned gate follows the
+same sequence-to-head all-to-all as Q/K/V before VSA runs. Ring and all-gather
+SP remain unsupported because they do not present a complete packed sequence
+to each block-sparse kernel rank.
+
+The Dense / Data-Free variant does not require `fastvideo-kernel` and should be
+served with a dense attention backend.
 
 Measured on 8x NVIDIA B300 with USP8, VAE patch-parallel 8, `TRTLLM_ATTN`, at
 1344x768, 4.4 s, seed 1101, one warmup excluded and two runs recorded:

@@ -487,6 +487,10 @@ def test_dlo_offload_plan_includes_token_refiner():
 
     assert MiniMaxH3Pipeline._offload_plan.offload_submodules == {"token_refiner": "blocks"}
     assert MiniMaxH3Pipeline._offload_plan.resident_dit_paths == frozenset({"transformer"})
+    assert MiniMaxH3Pipeline._offload_plan.encoder_component_types == {"text_encoder": "text_encoder"}
+    assert MiniMaxH3Pipeline._offload_plan.encoder_block_attrs == {
+        "text_encoder": ("vision.blocks", "text_model.layers")
+    }
 
 
 def test_joint_postprocess_is_multiprocessing_picklable():
@@ -795,6 +799,10 @@ def test_cudnn_packed_attention_uses_python_length_without_padding_mask():
 
 
 def test_packed_attention_skips_mask_for_packed_mask_free_backend():
+    from vllm_omni.diffusion.attention.backends.abstract import (
+        VideoTokenLayout,
+        VideoTokenSpan,
+    )
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         MiniMaxH3Attention,
     )
@@ -821,6 +829,10 @@ def test_packed_attention_skips_mask_for_packed_mask_free_backend():
     torch.nn.Module.__init__(attention)
     attention.attention = FakeAttention()
     q = torch.randn(8, 2, 4)
+    video_layout = VideoTokenLayout(
+        used_len=5,
+        video_spans=(VideoTokenSpan(start=3, latent_grid=(1, 1, 2), role="target"),),
+    )
 
     attention._run_packed_attention(
         q,
@@ -829,6 +841,9 @@ def test_packed_attention_skips_mask_for_packed_mask_free_backend():
         cu_seqlens=torch.tensor([0, 5, 8], dtype=torch.int32),
         max_seqlen=5,
         packed_total=8,
+        video_layout=video_layout,
+        vsa_prefix_segments=(1, 2),
+        gate_compress=torch.ones_like(q),
     )
 
     metadata = attention.attention.metadata
@@ -836,6 +851,11 @@ def test_packed_attention_skips_mask_for_packed_mask_free_backend():
     assert metadata.attn_mask is None
     assert metadata.extra["valid_kv_length"] == 5
     assert metadata.extra["npu_attn_varlen"] is True
+    assert metadata.video_layout is video_layout
+    assert metadata.extra["vsa_h3_prefix_segments"] == (1, 2)
+    assert "vsa_h3_video_shape" not in metadata.extra
+    assert "vsa_h3_target_start" not in metadata.extra
+    assert metadata.extra["gate_compress"].shape == (1, *q.shape)
     packed_padding = metadata.packed_padding
     assert packed_padding is not None
     assert packed_padding.q_length == 5
@@ -1169,6 +1189,12 @@ def test_text_encoder_stub_constructs_without_group_or_weights():
     from vllm_omni.diffusion.models.minimax_h3.encoder import (
         MiniMaxH3Qwen3VLEncoder,
     )
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        MiniMaxH3Pipeline,
+    )
+    from vllm_omni.diffusion.offloader.component_utils import (
+        get_encoder_block_groups,
+    )
 
     encoder = MiniMaxH3Qwen3VLEncoder(
         "/nonexistent/text_encoder",
@@ -1181,6 +1207,25 @@ def test_text_encoder_stub_constructs_without_group_or_weights():
     # The stub has no parameters, so it never contributes to the runner's
     # strict missing-parameter check on non-encoder ranks.
     assert list(encoder.named_parameters()) == []
+    assert (
+        get_encoder_block_groups(
+            encoder,
+            "text_encoder",
+            MiniMaxH3Pipeline._offload_plan,
+            strict=True,
+        )
+        == []
+    )
+
+    # An arbitrary empty module is not silently treated as a distributed
+    # stub; explicit plans still validate their declared paths.
+    with pytest.raises(ValueError, match=r"text_encoder\.vision\.blocks was not found"):
+        get_encoder_block_groups(
+            nn.Module(),
+            "text_encoder",
+            MiniMaxH3Pipeline._offload_plan,
+            strict=True,
+        )
 
 
 def test_global_quant_config_is_shared_by_dit_and_encoder():
@@ -1287,10 +1332,38 @@ def test_model_offload_uses_hooked_text_encoder_call():
 
 
 @pytest.mark.parametrize(
-    "offload_flag",
-    ["enable_layerwise_offload", "enable_distributed_layerwise_offload"],
+    ("enable_layerwise", "enable_distributed"),
+    [(True, False), (False, True)],
 )
-def test_layerwise_offload_releases_text_encoder(offload_flag):
+def test_legacy_layer_offload_preserves_minimax_stage_lifecycle(enable_layerwise, enable_distributed):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = SimpleNamespace(
+        diffusion_offload_config=None,
+        enable_cpu_offload=False,
+        enable_layerwise_offload=enable_layerwise,
+        enable_distributed_layerwise_offload=enable_distributed,
+    )
+    pipeline.text_encoder = Mock()
+    expected = torch.ones(2, 3)
+    pipeline.text_encoder.encode_ids.return_value = expected
+
+    actual = pipeline._encode_text_hidden(torch.tensor([1, 2]), {})
+
+    assert actual is expected
+    pipeline.text_encoder.load_to_device.assert_called_once_with()
+    pipeline.text_encoder.offload_to_cpu.assert_called_once_with()
+
+    vae = Mock()
+    with pipeline._component_on_device(vae):
+        pass
+    vae.load_to_device.assert_called_once_with()
+    vae.offload_to_cpu.assert_called_once_with()
+
+
+def test_layerwise_encoder_selection_releases_text_encoder():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
@@ -1299,8 +1372,11 @@ def test_layerwise_offload_releases_text_encoder(offload_flag):
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
         enable_distributed_layerwise_offload=False,
+        diffusion_offload_config={
+            "mode": "layer",
+            "components": ["text_encoder"],
+        },
     )
-    setattr(pipeline.od_config, offload_flag, True)
     pipeline.text_encoder = Mock()
     expected = torch.ones(2, 3)
     pipeline.text_encoder.encode_ids.return_value = expected
@@ -1312,7 +1388,7 @@ def test_layerwise_offload_releases_text_encoder(offload_flag):
     pipeline.text_encoder.offload_to_cpu.assert_called_once_with()
 
 
-def test_distributed_layerwise_offload_releases_text_encoder():
+def test_layerwise_dit_only_keeps_text_encoder_resident():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
@@ -1320,7 +1396,8 @@ def test_distributed_layerwise_offload_releases_text_encoder():
     pipeline.od_config = SimpleNamespace(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
-        enable_distributed_layerwise_offload=True,
+        enable_distributed_layerwise_offload=False,
+        diffusion_offload_config={"mode": "layer", "components": ["dit"]},
     )
     pipeline.text_encoder = Mock()
     expected = torch.ones(2, 3)
@@ -1330,25 +1407,30 @@ def test_distributed_layerwise_offload_releases_text_encoder():
 
     assert actual is expected
     pipeline.text_encoder.load_to_device.assert_called_once_with()
-    pipeline.text_encoder.offload_to_cpu.assert_called_once_with()
+    pipeline.text_encoder.offload_to_cpu.assert_not_called()
 
 
-def test_distributed_layerwise_offload_stages_vae_component():
+def test_dit_encoder_selection_keeps_vae_resident():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.od_config = SimpleNamespace(
+        enable_cpu_offload=False,
         enable_layerwise_offload=False,
-        enable_distributed_layerwise_offload=True,
+        enable_distributed_layerwise_offload=False,
+        diffusion_offload_config={
+            "mode": "layer",
+            "components": ["dit", "text_encoder"],
+        },
     )
     component = Mock()
 
     with pipeline._component_on_device(component):
-        component.load_to_device.assert_called_once_with()
-        component.offload_to_cpu.assert_not_called()
+        pass
 
-    component.offload_to_cpu.assert_called_once_with()
+    component.load_to_device.assert_not_called()
+    component.offload_to_cpu.assert_not_called()
 
 
 def test_distributed_layerwise_resident_blocks_are_stage_scoped():
@@ -1395,57 +1477,6 @@ def test_distributed_layerwise_resident_blocks_can_be_skipped():
 
     controller.load_resident_layers.assert_not_called()
     controller.offload_resident_layers.assert_not_called()
-
-
-def test_encoder_layerwise_offload_keeps_tp_blocks_rank_local(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3.encoder import (
-        MiniMaxH3Qwen3VLEncoder,
-    )
-
-    class Stack(torch.nn.Module):
-        def __init__(self, count):
-            super().__init__()
-            self.blocks = torch.nn.ModuleList([torch.nn.Linear(2, 2) for _ in range(count)])
-
-    class TextStack(torch.nn.Module):
-        def __init__(self, count):
-            super().__init__()
-            self.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2) for _ in range(count)])
-
-    hooks = []
-
-    def fake_apply(block, next_block, device, stream, pin_memory):
-        hook = SimpleNamespace(
-            block=block,
-            next_block=next_block,
-            device=device,
-            stream=stream,
-            pin_memory=pin_memory,
-            _prev_hook=None,
-            offload_layer=Mock(),
-        )
-        hooks.append(hook)
-        return hook
-
-    monkeypatch.setattr(
-        "vllm_omni.diffusion.offloader.layerwise_backend.apply_block_hook",
-        fake_apply,
-    )
-    monkeypatch.setattr(
-        "vllm_omni.platforms.current_omni_platform.Stream",
-        Mock(return_value="copy-stream"),
-    )
-    encoder = object.__new__(MiniMaxH3Qwen3VLEncoder)
-    torch.nn.Module.__init__(encoder)
-    encoder.device_target = torch.device("cpu")
-    encoder.vision = Stack(2)
-    encoder.text_model = TextStack(3)
-
-    encoder.enable_omni_layerwise_offload(pin_memory=False)
-
-    assert len(hooks) == 5
-    assert all(hook._prev_hook is not None for hook in hooks)
-    assert all(hook.device == torch.device("cpu") for hook in hooks)
 
 
 def test_video_vae_keeps_reference_fp32_weights(monkeypatch):

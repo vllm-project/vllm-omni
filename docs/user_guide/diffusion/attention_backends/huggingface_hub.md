@@ -12,12 +12,12 @@ implementations to reduce numerical drift and sampling divergence.
 ## Installation
 
 ```bash
-pip install kernels==0.14.1
+pip install kernels==0.15.2
 ```
 
-If `kernels` is unavailable, vLLM-Omni warns and falls back to the
-corresponding local FlashAttention implementation. On CUDA devices older than
-Hopper, `FLASH_ATTN_3_HUB` falls back to `FLASH_ATTN_HUB`.
+If `kernels` is unavailable, an explicit `FLASH_ATTN_HUB` or
+`FLASH_ATTN_3_HUB` selection raises. Automatic / `FLASH_ATTN` selection in the
+Diffusers adapter may still walk hub then local FlashAttention backends.
 
 ## Usage
 

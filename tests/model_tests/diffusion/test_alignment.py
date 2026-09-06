@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Tests for alignment between _DIFFUSION_MODELS and DIFFUSION_TEST_SETTINGS; if
 tests in this file are failing, you are probably adding a new model, and need
@@ -61,15 +64,12 @@ EXCLUDED_MODELS = [
     "HunyuanVideo15Pipeline",
     "HunyuanVideo15ImageToVideoPipeline",
     "LingBotVideoPipeline",
-    # The common harness does not yet define an image-to-video task or supply
-    # an input image. SANA I2V is covered by
-    # tests/diffusion/models/sana_video/test_pipeline_sana_video.py and
-    # tests/e2e/online_serving/test_sana_video_expansion.py. SANA T2V is exercised through
-    # the common tiny-model setting in model_settings.py.
-    "SanaImageToVideoPipeline",
     # Requires camera/action assets and persistent AR state; covered by its
     # dedicated contract tests and real-checkpoint E2E smoke instead.
     "LingBotWorldCausalDMDPipeline",
+    # The 270+ GiB multimodal checkpoint needs 4/8-way native sequence/head
+    # parallel execution; covered by focused native contract and GPU tests.
+    "Magi2Pipeline",
     "OmniVoicePipeline",
     "OmniVoice",
     "Cosmos3OmniDiffusersPipeline",

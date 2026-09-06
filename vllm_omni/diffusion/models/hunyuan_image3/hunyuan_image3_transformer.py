@@ -630,6 +630,7 @@ class ImageInfo:
 
         self.add_timestep_token = kwargs.get("add_timestep_token", True)
         self.add_guidance_token = kwargs.get("add_guidance_token", False)
+        self.add_timestep_r_token = kwargs.get("add_timestep_r_token", False)
         self.use_front_boi_token = kwargs.get("use_front_boi_token", True)
         self.add_image_shape_token = kwargs.get("add_image_shape_token", True)
 
@@ -667,6 +668,7 @@ class ImageInfo:
                 token_length=self.image_token_length,
                 add_timestep_token=self.add_timestep_token,
                 add_guidance_token=self.add_guidance_token,
+                add_timestep_r_token=self.add_timestep_r_token,
                 use_front_boi_token=self.use_front_boi_token,
                 add_image_shape_token=self.add_image_shape_token,
                 base_size=self.base_size,
@@ -1442,6 +1444,9 @@ class HunyuanImage3Config(PretrainedConfig):
         vit=None,
         vit_processor=None,
         vit_aligner=None,
+        # Distillation flags
+        cfg_distilled: bool = False,
+        use_meanflow: bool = False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -1521,6 +1526,10 @@ class HunyuanImage3Config(PretrainedConfig):
         self.patch_embed_hidden_dim = patch_embed_hidden_dim
         self.image_base_size = image_base_size
 
+        # Distillation flags
+        self.cfg_distilled = cfg_distilled
+        self.use_meanflow = use_meanflow
+
         # token id
         self.eod_token_id = eod_token_id
         self.im_start_id = im_start_id
@@ -1555,7 +1564,7 @@ class HunyuanImage3ImageProcessor:
         )
         self.vision_encoder_processor = Siglip2ImageProcessorFast.from_dict(config.vit_processor)
 
-    def build_image_info(self, image_size):
+    def build_image_info(self, image_size, add_guidance_token=False, add_timestep_r_token=False):
         # parse image size (HxW, H:W, or <img_ratio_i>)
         if isinstance(image_size, str):
             if image_size.startswith("<img_ratio_"):
@@ -1592,6 +1601,8 @@ class HunyuanImage3ImageProcessor:
             token_height=token_height,
             base_size=base_size,
             ratio_index=ratio_idx,
+            add_guidance_token=add_guidance_token,
+            add_timestep_r_token=add_timestep_r_token,
         )
         return image_info
 
@@ -2244,6 +2255,8 @@ class HunyuanImage3Model(nn.Module):
             "timestep_emb",
             "time_embed",
             "time_embed_2",
+            # These embeddings belong to the outer pipeline model rather than
+            # this transformer core and are loaded by the outer weight loader.
             "guidance_emb",
             "timestep_r_emb",
         ]
@@ -2802,6 +2815,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             "position_ids",
             "image_mask",
             "gen_timestep_scatter_index",
+            "guidance_scatter_index",
+            "timesteps_r_scatter_index",
             "cond_vae_image_mask",
             "cond_vit_image_mask",
             "cond_timestep_scatter_index",
@@ -2971,9 +2986,12 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         model_kwargs["attention_mask"] = model_kwargs["attention_mask"][:, :, positive_reuse_len:, :]
         model_kwargs["position_ids"] = model_kwargs["position_ids"][:, positive_reuse_len:]
 
-        # Shift image_mask and gen_timestep_scatter_index to match truncated sequence
+        # Shift generated-image placeholder indices to match the truncated sequence.
         model_kwargs["image_mask"] = model_kwargs["image_mask"][:, positive_reuse_len:]
         model_kwargs["gen_timestep_scatter_index"] = model_kwargs["gen_timestep_scatter_index"] - positive_reuse_len
+        for key in ("guidance_scatter_index", "timesteps_r_scatter_index"):
+            if model_kwargs.get(key) is not None:
+                model_kwargs[key] = model_kwargs[key] - positive_reuse_len
         model_kwargs["ar_kv_reuse_offset"] = positive_reuse_len
 
         # cond-image have computed in ar, we may skip it by index in the future.
@@ -3016,7 +3034,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         self.model.inject_ar_kv_into_layers(ar_kv_data, positive_reuse_len)
 
         # 3. negative cfg prefill
-        if self.do_classifier_free_guidance:
+        # For CFG distilled models, skip negative CFG prefill (cfg_factor=1, no negative prompt)
+        if self.do_classifier_free_guidance and not self.model.config.cfg_distilled:
             self._maybe_run_negative_cfg_prefill(
                 input_ids=input_ids,
                 model_kwargs=model_kwargs,
@@ -3124,7 +3143,12 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         self._guidance_rescale = guidance_rescale
 
         # Detect CFG parallel configuration (only 2-branch layout is supported)
-        cfg_parallel_ready = self.do_classifier_free_guidance and get_classifier_free_guidance_world_size() == 2
+        # For CFG distilled models, skip CFG parallel (cfg_factor=1, no negative branch)
+        cfg_parallel_ready = (
+            self.do_classifier_free_guidance
+            and not self.model.config.cfg_distilled
+            and get_classifier_free_guidance_world_size() == 2
+        )
 
         # Define call parameters
         device = self._execution_device
@@ -3177,7 +3201,11 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             attention_mask = attention_mask[s]
             self._split_model_kwargs_for_cfg_parallel(model_kwargs, batch_size, cfg_rank)
         else:
-            cfg_factor = 1 + self.do_classifier_free_guidance
+            # For CFG distilled models, cfg_factor is always 1 (CFG embedded in model)
+            if self.model.config.cfg_distilled:
+                cfg_factor = 1
+            else:
+                cfg_factor = 1 + self.do_classifier_free_guidance
             cfg_rank = None
 
         b, _, q_len1, seq_len = attention_mask.shape
@@ -3219,6 +3247,13 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     # Sequential CFG: double the batch
                     latent_model_input = torch.cat([latents] * cfg_factor)
 
+                if self.model.config.use_meanflow:
+                    r = self.scheduler.get_timestep_r(t)
+                    r_expand = r.repeat(latent_model_input.shape[0])
+                else:
+                    r_expand = None
+                model_kwargs["timesteps_r"] = r_expand
+
                 t_expand = t.repeat(latent_model_input.shape[0])
 
                 # ---- TeaCache: decide whether to compute or reuse ----
@@ -3240,6 +3275,13 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     tc_prev_mod = cur_mod.detach()
 
                 if should_compute:
+                    # Handle guidance for CFG distilled models
+                    if self.model.config.cfg_distilled:
+                        model_kwargs["guidance"] = torch.tensor(
+                            [1000.0 * self._guidance_scale],
+                            device=self.device,
+                            dtype=torch.bfloat16,
+                        ).repeat(latent_model_input.shape[0])
                     model_inputs = self.model.prepare_inputs_for_generation(
                         input_ids,
                         images=latent_model_input,
@@ -3259,7 +3301,12 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     pred = tc_prev_pred
 
                 # Perform guidance
-                if cfg_parallel_ready:
+                # For CFG distilled models, guidance is already embedded in the model,
+                # so we skip the explicit CFG computation
+                if self.model.config.cfg_distilled:
+                    # CFG distilled: guidance is handled internally via guidance_emb
+                    pass
+                elif cfg_parallel_ready:
                     # CFG parallel: all_gather → all ranks combine locally (no broadcast needed)
                     gathered = cfg_group.all_gather(pred, separate_tensors=True)
                     pred = self.cfg_operator(gathered[0], gathered[1], self.guidance_scale, step=i)
