@@ -543,7 +543,9 @@ class MHCHandler:
         alpha_post, bias_post, post_logits = post
         alpha_residual, bias_residual, residual_logits = residual
         use_fused_coefficients = (
-            os.environ.get("MAGI2_FUSED_MHC_COEFFICIENTS", "0") == "1"
+            # Validated on S5000; set MAGI2_FUSED_MHC_COEFFICIENTS=0 to roll
+            # back if an older MUSA runtime lacks this custom op.
+            os.environ.get("MAGI2_FUSED_MHC_COEFFICIENTS", "1") == "1"
             and os.environ.get("MAGI2_DETERMINISTIC", "0") != "1"
             and residual_logits.device.type in {"musa", "privateuseone"}
             and residual_logits.dtype == torch.float32
