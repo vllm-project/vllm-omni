@@ -67,8 +67,8 @@ class _FakeHunyuanModel(_FakeModel):
             use_cla=False,
         )
 
-    def get_expert_mapping(self) -> tuple[list[object], dict[str, object]]:
-        return [], {}
+    def get_expert_mapping(self) -> list[object]:
+        return []
 
     def _split_qkv_weight(self, weight: torch.Tensor) -> torch.Tensor:
         return weight
