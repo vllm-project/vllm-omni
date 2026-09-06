@@ -13,9 +13,11 @@ from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
     available_bot_tasks,
     available_tasks,
+    build_ar_prompt_inputs,
     build_prompt,
     build_prompt_tokens,
     resolve_stop_token_ids,
+    validate_special_token_ids,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -296,19 +298,42 @@ def _repo_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[4]
 
 
-def test_end2end_routes_through_shared_prompt_utils():
-    end2end_path = _repo_root() / "examples" / "offline_inference" / "hunyuan_image3" / "end2end.py"
-    tree = ast.parse(end2end_path.read_text(encoding="utf-8"))
+def test_example_routes_through_shared_seam():
+    """Neither the shared task examples nor the ``model_extras`` seam itself
+    should duplicate AR prompt tokenization.
 
-    local_func_names = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
-    assert not (local_func_names & {"build_prompt", "build_prompt_tokens"})
+    After the model_extras migration, t2i / image-editing run through the
+    shared ``text_to_image.py`` / ``image_edit.py`` examples (both call
+    ``build_ar_stage_inputs``), and t2t / i2t run through the shared
+    ``x_to_text.py`` example (which calls ``build_x_to_text_prompt``). This
+    test pins that both ``model_extras.hunyuan_image3`` seam functions
+    delegate to ``prompt_utils.build_ar_prompt_inputs`` / ``build_ar_stage_inputs``
+    rather than re-implementing tokenization inline.
+    """
+    seam_path = _repo_root() / "vllm_omni" / "model_extras" / "hunyuan_image3.py"
+    seam_tree = ast.parse(seam_path.read_text(encoding="utf-8"))
 
-    imported_from_prompt_utils: set[str] = set()
-    for node in ast.walk(tree):
+    local_func_names = {n.name for n in ast.walk(seam_tree) if isinstance(n, ast.FunctionDef)}
+    assert not (local_func_names & {"build_prompt", "build_prompt_tokens", "resolve_stop_token_ids"})
+
+    # build_x_to_text_prompt must route through build_ar_stage_inputs, not
+    # re-derive the AR prefill / stop-token logic itself.
+    build_x_to_text_prompt_node = next(
+        n for n in ast.walk(seam_tree) if isinstance(n, ast.FunctionDef) and n.name == "build_x_to_text_prompt"
+    )
+    called_names = {
+        node.func.id
+        for node in ast.walk(build_x_to_text_prompt_node)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "build_ar_stage_inputs" in called_names
+
+    # The model_extras seam itself must delegate to the shared prompt_utils.
+    routed_from_prompt_utils: set[str] = set()
+    for node in ast.walk(seam_tree):
         if isinstance(node, ast.ImportFrom) and node.module and node.module.endswith("hunyuan_image3.prompt_utils"):
-            imported_from_prompt_utils.update(alias.name for alias in node.names)
-    expected_imports = {"build_prompt_tokens", "resolve_stop_token_ids", "resolve_sys_type"}
-    assert expected_imports <= imported_from_prompt_utils
+            routed_from_prompt_utils.update(alias.name for alias in node.names)
+    assert "build_ar_prompt_inputs" in routed_from_prompt_utils
 
 
 _HUNYUAN_MODEL_ID = "tencent/HunyuanImage-3.0-Instruct"
@@ -331,3 +356,87 @@ def test_segment_tokenize_diverges_from_full_string_encode():
     full_ids = tok.encode(build_prompt(user_prompt, task="i2t", bot_task=None), add_special_tokens=False)
     assert seg_ids != full_ids
     assert len(seg_ids) >= len(full_ids)
+
+
+def test_build_ar_prompt_inputs_tokenizer_path_matches_build_prompt_tokens():
+    """With a tokenizer, the helper delegates to build_prompt_tokens (parity)."""
+    tok = FakeTokenizer()
+    ar = build_ar_prompt_inputs("a red panda", task="t2i", bot_task="think", tokenizer=tok)
+    expected = build_prompt_tokens("a red panda", FakeTokenizer(), task="t2i", bot_task="think")
+    assert ar.prompt is None
+    assert ar.prompt_token_ids == expected.token_ids
+    assert ar.system_prompt_type == expected.system_prompt_type
+    # think + no explicit size -> AR predicts ratio, so stop range is non-trivial.
+    assert len(ar.stop_token_ids) > 1
+
+
+def test_build_ar_prompt_inputs_string_fallback_without_tokenizer():
+    """Without a tokenizer, the helper returns the build_prompt string form."""
+    ar = build_ar_prompt_inputs("a red panda", task="t2i", bot_task="recaption")
+    assert ar.prompt_token_ids is None
+    assert ar.prompt == build_prompt("a red panda", task="t2i", bot_task="recaption")
+    assert ar.system_prompt_type
+    assert ar.stop_token_ids
+
+
+def test_build_ar_prompt_inputs_explicit_size_stops_at_terminator():
+    """Explicit image_size makes 'recaption' stop at </recaption> only."""
+    ar = build_ar_prompt_inputs("x", task="t2i", bot_task="recaption", image_size="1024x1024")
+    assert ar.stop_token_ids == [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"]]
+
+
+def test_build_ar_prompt_inputs_comprehension_stops_on_answer():
+    """Text-output tasks (t2t / i2t) stop on <answer>."""
+    ar = build_ar_prompt_inputs("hi", task="t2t")
+    assert ar.stop_token_ids == [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]]
+
+
+class _MatchingTokenizer:
+    """Reports exactly HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS -- a "real" tokenizer
+    that hasn't drifted from the hardcoded table."""
+
+    def convert_tokens_to_ids(self, tok: str) -> int:
+        return HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS[tok]
+
+
+class _DriftedTokenizer:
+    """Reports a different id for one token -- simulates a model/tokenizer
+    revision bump shifting special-token ids out from under the hardcoded
+    table."""
+
+    def convert_tokens_to_ids(self, tok: str) -> int:
+        if tok == "<think>":
+            return 999999
+        return HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS[tok]
+
+
+class _BaseCheckpointTokenizer:
+    """Simulates tencent/HunyuanImage-3.0 (base): reports the same
+    model_class_name as -Instruct, but its vocab doesn't include the
+    Instruct-only <img_ratio_33>-<img_ratio_36> tokens -- convert_tokens_to_ids
+    falls back to unk_token_id for those, like a real HF tokenizer would."""
+
+    unk_token_id = 0
+    _INSTRUCT_ONLY = {"<img_ratio_33>", "<img_ratio_36>"}
+
+    def convert_tokens_to_ids(self, tok: str) -> int:
+        if tok in self._INSTRUCT_ONLY:
+            return self.unk_token_id
+        return HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS[tok]
+
+
+def test_validate_special_token_ids_passes_for_matching_tokenizer():
+    validate_special_token_ids(_MatchingTokenizer())  # must not raise
+
+
+def test_validate_special_token_ids_raises_on_drift():
+    with pytest.raises(ValueError, match="<think>.*expected 128023.*got 999999"):
+        validate_special_token_ids(_DriftedTokenizer())
+
+
+def test_validate_special_token_ids_tolerates_base_checkpoint_missing_tokens():
+    """The base checkpoint's tokenizer not recognizing Instruct-only ratio
+    tokens (unk_token_id, not a real drifted id) must not be flagged as a
+    mismatch -- both checkpoints share model_class_name, so this hook fires
+    for either one."""
+    validate_special_token_ids(_BaseCheckpointTokenizer())  # must not raise

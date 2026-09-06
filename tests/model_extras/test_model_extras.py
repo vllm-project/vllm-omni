@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 import pytest
@@ -593,6 +594,210 @@ def test_declared_extra_args_apply_to_existing_sampling_params() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_hunyuan_image3_extra_registry_declares_request_and_response_params() -> None:
+    assert get_extra_body_params("HunyuanImage3Pipeline") == frozenset(
+        {
+            "bot_task",
+            "use_system_prompt",
+            "system_prompt",
+            "negative_prompt",
+        }
+    )
+    assert get_extra_output_params("HunyuanImage3Pipeline") == frozenset()
+    assert should_init_extra_args_for_non_diffusion_stages("HunyuanImage3Pipeline") is True
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_extra_registry_matches_runtime_model_class_name() -> None:
+    # od_config.model_class_name resolves to "HunyuanImage3ForCausalMM" at
+    # runtime; "HunyuanImage3Pipeline" is kept only as a compatibility alias.
+    assert get_extra_body_params("HunyuanImage3ForCausalMM") == get_extra_body_params("HunyuanImage3Pipeline")
+    assert get_extra_output_params("HunyuanImage3ForCausalMM") == get_extra_output_params("HunyuanImage3Pipeline")
+    assert should_init_extra_args_for_non_diffusion_stages(
+        "HunyuanImage3ForCausalMM"
+    ) == should_init_extra_args_for_non_diffusion_stages("HunyuanImage3Pipeline")
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_image_to_image_prompt_builder() -> None:
+    img = Image.new("RGB", (64, 64))
+    out = build_image_to_image_prompt(
+        "HunyuanImage3Pipeline",
+        prompt="make it snow",
+        negative_prompt=None,
+        input_image=img,
+    )
+    assert out == {
+        "prompt": "make it snow",
+        "modalities": ["image"],
+        "multi_modal_data": {"image": img},
+    }
+
+
+class _FakeHunyuanTokenizer:
+    """Minimal tokenizer with distinct ids so AR token assertions are unambiguous."""
+
+    SPECIAL = {
+        "<|startoftext|>": 1,
+        "<img>": 2,
+        "<think>": 3,
+        "<recaption>": 4,
+    }
+
+    def convert_tokens_to_ids(self, tok: str) -> int:
+        return self.SPECIAL.get(tok, 0)
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        # Offset well above the special-id range to avoid collisions.
+        return [500 + len(text)]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_ar_input_builder_registered() -> None:
+    from vllm_omni.model_extras import get_ar_input_builder
+
+    builder = get_ar_input_builder("HunyuanImage3Pipeline")
+    assert builder is not None
+    assert get_ar_input_builder("HunyuanImage3ForCausalMM") is builder
+    # Models without the hook return None.
+    assert get_ar_input_builder("WanVACEPipeline") is None
+    assert get_ar_input_builder(None) is None
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_ar_tokenizer_validator_registered() -> None:
+    from vllm_omni.model_extras import get_ar_tokenizer_validator
+
+    validator = get_ar_tokenizer_validator("HunyuanImage3Pipeline")
+    assert validator is not None
+    assert get_ar_tokenizer_validator("HunyuanImage3ForCausalMM") is validator
+    # Models without the hook return None.
+    assert get_ar_tokenizer_validator("WanVACEPipeline") is None
+    assert get_ar_tokenizer_validator(None) is None
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_build_ar_stage_inputs_t2i_string_fallback() -> None:
+    from vllm_omni.model_extras.hunyuan_image3 import build_ar_stage_inputs
+
+    ar = build_ar_stage_inputs(
+        prompt="a red panda",
+        tokenizer=None,
+        extra_body={"bot_task": "recaption"},
+        num_images=0,
+        height=1024,
+        width=1024,
+    )
+    # No tokenizer -> string prompt form; image modality; recaption + explicit
+    # size stops at </recaption> only.
+    assert ar.prompt_token_ids is None
+    assert ar.prompt and "a red panda" in ar.prompt
+    assert ar.modalities == ["image"]
+    assert ar.use_system_prompt
+    assert len(ar.stop_token_ids) == 1
+    # stop_token_ids belong to stage 0 (HunyuanImage3's single AR stage) --
+    # declared explicitly, not inferred by the caller from stage type.
+    assert ar.stage_indices == [0]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_build_ar_stage_inputs_t2i_tokenizer_parity() -> None:
+    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt_tokens
+    from vllm_omni.model_extras.hunyuan_image3 import build_ar_stage_inputs
+
+    ar = build_ar_stage_inputs(
+        prompt="a red panda",
+        tokenizer=_FakeHunyuanTokenizer(),
+        extra_body={"bot_task": "think"},
+        num_images=0,
+    )
+    expected = build_prompt_tokens("a red panda", _FakeHunyuanTokenizer(), task="t2i", bot_task="think")
+    assert ar.prompt is None
+    assert ar.prompt_token_ids == expected.token_ids
+    assert ar.modalities == ["image"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_build_ar_stage_inputs_it2i_inserts_image_placeholders() -> None:
+    from vllm_omni.model_extras.hunyuan_image3 import build_ar_stage_inputs
+
+    ar = build_ar_stage_inputs(
+        prompt="edit it",
+        tokenizer=_FakeHunyuanTokenizer(),
+        extra_body={},
+        num_images=2,
+    )
+    # Two reference images -> two <img> placeholder ids (2) in the AR prefill.
+    assert ar.prompt_token_ids is not None
+    assert ar.prompt_token_ids.count(_FakeHunyuanTokenizer.SPECIAL["<img>"]) == 2
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_build_ar_stage_inputs_comprehension_text_output() -> None:
+    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
+    )
+    from vllm_omni.model_extras.hunyuan_image3 import build_ar_stage_inputs
+
+    # t2t (no image, text output) -> text modality, stop on <answer>.
+    ar_t2t = build_ar_stage_inputs("hi", tokenizer=None, extra_body={}, num_images=0, text_output=True)
+    assert ar_t2t.modalities == ["text"]
+    assert ar_t2t.stop_token_ids == [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]]
+
+    # i2t (image, text output) -> single <img> placeholder in the prefill.
+    ar_i2t = build_ar_stage_inputs(
+        "describe", tokenizer=_FakeHunyuanTokenizer(), extra_body={}, num_images=1, text_output=True
+    )
+    assert ar_i2t.modalities == ["text"]
+    assert ar_i2t.prompt_token_ids.count(_FakeHunyuanTokenizer.SPECIAL["<img>"]) == 1
+
+
+class _RealIdHunyuanTokenizer:
+    """Mirrors HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS exactly, so validate_ar_tokenizer
+    accepts it -- unlike _FakeHunyuanTokenizer above, whose ids are deliberately
+    wrong to exercise the drift-detection failure path."""
+
+    unk_token_id = -1
+
+    def convert_tokens_to_ids(self, tok: str) -> int:
+        from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+            HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
+        )
+
+        return HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS.get(tok, self.unk_token_id)
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        return [900 + len(text)]
+
+
+def _patch_hunyuan_autotokenizer(monkeypatch: pytest.MonkeyPatch, tokenizer: object) -> list[str]:
+    """Patch the ``AutoTokenizer`` that ``hunyuan_image3.build_x_to_text_prompt``
+    imports locally, recording the models it was asked to load."""
+    calls: list[str] = []
+
+    class _FakeAutoTokenizer:
+        @staticmethod
+        def from_pretrained(model: str, trust_remote_code: bool = False) -> object:
+            calls.append(model)
+            assert trust_remote_code is True
+            return tokenizer
+
+    fake_transformers = type(sys)("transformers")
+    fake_transformers.AutoTokenizer = _FakeAutoTokenizer
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    return calls
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_mammothmoda2_extra_registry_declares_request_and_response_params() -> None:
     for model_class_name in (
         "MammothModa2DiTPipeline",
@@ -616,6 +821,59 @@ def test_mammothmoda2_extra_registry_declares_request_and_response_params() -> N
         width=256,
     )
     assert wrapper_prompt["additional_information"]["omni_task"] == ["t2i"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_x_to_text_prompt_builder_t2t(monkeypatch: pytest.MonkeyPatch) -> None:
+    """t2t (no image) routes through build_ar_stage_inputs and stops on <answer>."""
+    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
+    )
+    from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as hunyuan_build_x_to_text_prompt
+
+    calls = _patch_hunyuan_autotokenizer(monkeypatch, _RealIdHunyuanTokenizer())
+    prompt_dict, stop_token_ids = hunyuan_build_x_to_text_prompt(
+        "tencent/HunyuanImage-3.0-Instruct", "What is the capital of France?", has_image=False
+    )
+
+    assert calls == ["tencent/HunyuanImage-3.0-Instruct"]
+    assert prompt_dict["modalities"] == ["text"]
+    assert prompt_dict["prompt_token_ids"] is not None
+    assert prompt_dict["prompt_token_ids"].count(HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img>"]) == 0
+    assert stop_token_ids == [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_x_to_text_prompt_builder_i2t(monkeypatch: pytest.MonkeyPatch) -> None:
+    """i2t (image) inserts exactly one <img> placeholder and still stops on <answer>."""
+    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
+    )
+    from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as hunyuan_build_x_to_text_prompt
+
+    _patch_hunyuan_autotokenizer(monkeypatch, _RealIdHunyuanTokenizer())
+    prompt_dict, stop_token_ids = hunyuan_build_x_to_text_prompt(
+        "tencent/HunyuanImage-3.0-Instruct", "Describe this image.", has_image=True
+    )
+
+    assert prompt_dict["modalities"] == ["text"]
+    assert prompt_dict["prompt_token_ids"].count(HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img>"]) == 1
+    assert stop_token_ids == [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_x_to_text_prompt_builder_validates_tokenizer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tokenizer whose special-token ids have drifted must be rejected here too --
+    x_to_text.py (unlike text_to_image.py/image_edit.py) has no registry-driven
+    ar_tokenizer_validator wiring of its own, so this seam must self-validate."""
+    from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as hunyuan_build_x_to_text_prompt
+
+    _patch_hunyuan_autotokenizer(monkeypatch, _FakeHunyuanTokenizer())
+    with pytest.raises(ValueError, match="no longer match"):
+        hunyuan_build_x_to_text_prompt("tencent/HunyuanImage-3.0-Instruct", "Hello.", has_image=False)
 
 
 @pytest.mark.core_model

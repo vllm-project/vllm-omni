@@ -28,7 +28,21 @@ from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.hunyuan_image3 import (
+    HUNYUAN_IMAGE3_EXTRA_BODY_PARAMS,
+    HUNYUAN_IMAGE3_EXTRA_OUTPUT_PARAMS,
+    HUNYUAN_IMAGE3_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+)
+from vllm_omni.model_extras.hunyuan_image3 import (
+    build_ar_stage_inputs as build_hunyuan_image3_ar_stage_inputs,
+)
+from vllm_omni.model_extras.hunyuan_image3 import (
+    build_image_to_image_prompt as build_hunyuan_image3_image_to_image_prompt,
+)
 from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as build_hunyuan_x_to_text_prompt
+from vllm_omni.model_extras.hunyuan_image3 import (
+    validate_ar_tokenizer as validate_hunyuan_image3_ar_tokenizer,
+)
 from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.ltx2 import (
     LTX_EXTRA_BODY_PARAMS,
@@ -233,6 +247,19 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
             "LTX2DistilledTwoStagePipeline",
         )
     },
+    # HunyuanImage3 keys on the model architecture name that ``get_model_class_name``
+    # reports at runtime for its AR+DiT / AR-only / DiT-only deploys
+    # (``od_config.model_class_name`` == the diffusion registry arch key). The
+    # "HunyuanImage3Pipeline" alias is kept for any path that surfaces the
+    # pipeline class name instead.
+    "HunyuanImage3ForCausalMM": {
+        "extra_body_params": HUNYUAN_IMAGE3_EXTRA_BODY_PARAMS,
+        "extra_output_params": HUNYUAN_IMAGE3_EXTRA_OUTPUT_PARAMS,
+        "init_extra_args_for_non_diffusion_stages": HUNYUAN_IMAGE3_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+        "image_to_image_prompt_builder": build_hunyuan_image3_image_to_image_prompt,
+        "ar_input_builder": build_hunyuan_image3_ar_stage_inputs,
+        "ar_tokenizer_validator": validate_hunyuan_image3_ar_tokenizer,
+    },
     "SanaVideoPipeline": {
         "extra_body_params": SANA_VIDEO_EXTRA_BODY_PARAMS,
     },
@@ -262,6 +289,10 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
 for model_class_name in ("LTX2Pipeline", "LTX2TwoStagePipeline"):
     _EXTRA_SPECS[model_class_name]["transformer_config_subfolder_resolver"] = ltx_transformer_config_subfolder
 
+
+# Alias: some code paths surface HunyuanImage3's pipeline class name rather than
+# the architecture name; point both at the same spec.
+_EXTRA_SPECS["HunyuanImage3Pipeline"] = _EXTRA_SPECS["HunyuanImage3ForCausalMM"]
 
 # Multi-stage discovery reports the top-level wrapper rather than its DiT
 # submodule, so both names must resolve to the same request builders.
@@ -356,6 +387,32 @@ def should_preserve_reference_image_size(
 def should_init_extra_args_for_non_diffusion_stages(model_class_name: str | None) -> bool:
     spec = _get_spec(model_class_name)
     return bool(spec and spec.get("init_extra_args_for_non_diffusion_stages", False))
+
+
+def get_ar_input_builder(model_class_name: str | None) -> Callable[..., Any] | None:
+    """Return a model's AR-stage input builder, or ``None`` if undeclared.
+
+    Models with a text/AR stage that needs template-formatted prompt tokens
+    and AR stop tokens (e.g. HunyuanImage3) declare an ``ar_input_builder``.
+    The shared task examples call it generically when present, so the example
+    scripts stay model-agnostic; models without one are unaffected.
+    """
+    spec = _get_spec(model_class_name)
+    return spec.get("ar_input_builder") if spec is not None else None
+
+
+def get_ar_tokenizer_validator(model_class_name: str | None) -> Callable[[Any], None] | None:
+    """Return a model's AR-tokenizer validator, or ``None`` if undeclared.
+
+    Models whose AR prompt/stop-token logic depends on hardcoded special
+    token ids (e.g. HunyuanImage3) declare an ``ar_tokenizer_validator`` to
+    check those ids against whatever tokenizer actually loads at runtime.
+    The shared task examples call it generically, right after loading a real
+    tokenizer, so model/tokenizer revision drift fails loudly instead of
+    silently producing a request with the wrong stop tokens.
+    """
+    spec = _get_spec(model_class_name)
+    return spec.get("ar_tokenizer_validator") if spec is not None else None
 
 
 def build_text_to_image_prompt(

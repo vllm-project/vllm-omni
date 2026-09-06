@@ -96,6 +96,7 @@ from typing import Any
 import torch
 from PIL import Image
 
+from vllm_omni.diffusion.data import logger
 from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
 from vllm_omni.entrypoints.omni import Omni
@@ -103,11 +104,98 @@ from vllm_omni.entrypoints.openai.stage_params import clone_sampling_params
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_extras import (
     build_image_to_image_prompt,
+    get_ar_input_builder,
+    get_ar_tokenizer_validator,
     get_extra_body_params,
     get_model_class_name,
     should_init_extra_args_for_non_diffusion_stages,
 )
 from vllm_omni.platforms import current_omni_platform
+
+
+def _apply_ar_stage_inputs(
+    ar_input_builder: Any,
+    *,
+    model: str,
+    prompt_text: str,
+    extra_body: dict[str, Any],
+    num_images: int,
+    height: int | None,
+    width: int | None,
+    prompt_dict: dict[str, Any],
+    sampling_params_list: list[Any],
+    text_output: bool = False,
+    trust_remote_code: bool = False,
+    validate_tokenizer: Any | None = None,
+    allow_tokenizer_fallback: bool = False,
+) -> None:
+    """Apply a model's declared AR-stage inputs to the request in place.
+
+    Mirrors the helper in ``text_to_image.py``: loads the tokenizer for
+    byte-for-byte HF-parity AR tokenization, asks the model's
+    ``ar_input_builder`` for the AR prefill + stop tokens, and writes them
+    onto ``prompt_dict`` and the non-diffusion (AR) stage params.
+    Model-agnostic -- only the declared-hook contract is assumed.
+
+    ``trust_remote_code`` must be threaded in from the caller's own resolved
+    ``--trust-remote-code`` flag -- this is a separate tokenizer load outside
+    the main engine, so it needs the same explicit user opt-in rather than
+    defaulting to trusting whatever ``--model`` was passed.
+
+    ``validate_tokenizer``, when the model declares one via
+    ``get_ar_tokenizer_validator``, is called on a successfully-loaded real
+    tokenizer -- outside the load's try/except, so a validation failure (a
+    model/tokenizer revision drifting from hardcoded special-token ids)
+    raises instead of being swallowed into the string-prompt fallback.
+
+    ``allow_tokenizer_fallback`` (default ``False``, i.e. fail fast): a
+    tokenizer load failure normally raises, since silently degrading to the
+    string-prompt form can produce a request that completes with subtly
+    wrong stop tokens instead of surfacing the real problem (missing
+    ``--trust-remote-code``, network/cache issue, etc.). Set ``True`` only
+    for explicit unit tests or a deliberate offline-compat run where the
+    caller has already decided a degraded prompt is acceptable.
+    """
+    try:
+        from transformers import AutoTokenizer
+
+        ar_tokenizer: Any | None = AutoTokenizer.from_pretrained(model, trust_remote_code=trust_remote_code)
+    except Exception as exc:  # noqa: BLE001 - re-raised unless the caller opts into the fallback
+        if not allow_tokenizer_fallback:
+            raise
+        logger.warning(f"AR tokenizer load failed ({exc}); falling back to string prompt (no BPE parity).")
+        ar_tokenizer = None
+
+    if ar_tokenizer is not None and validate_tokenizer is not None:
+        validate_tokenizer(ar_tokenizer)
+
+    ar_inputs = ar_input_builder(
+        prompt=prompt_text,
+        tokenizer=ar_tokenizer,
+        extra_body=extra_body,
+        num_images=num_images,
+        height=height,
+        width=width,
+        text_output=text_output,
+    )
+
+    if ar_inputs.prompt_token_ids is not None:
+        prompt_dict["prompt_token_ids"] = ar_inputs.prompt_token_ids
+    elif ar_inputs.prompt is not None:
+        prompt_dict["prompt"] = ar_inputs.prompt
+    if ar_inputs.use_system_prompt:
+        prompt_dict["use_system_prompt"] = ar_inputs.use_system_prompt
+    prompt_dict["modalities"] = ar_inputs.modalities
+
+    # Apply stop_token_ids to exactly the stage(s) the builder names -- not
+    # "whichever stage isn't a diffusion stage," which would misfire on any
+    # future topology with more than one non-diffusion stage.
+    for stage_index in ar_inputs.stage_indices:
+        if stage_index >= len(sampling_params_list):
+            continue
+        stage_params = sampling_params_list[stage_index]
+        if not isinstance(stage_params, OmniDiffusionSamplingParams) and hasattr(stage_params, "stop_token_ids"):
+            stage_params.stop_token_ids = ar_inputs.stop_token_ids
 
 
 def parse_profiler_config(value: str) -> dict[str, Any]:
@@ -419,6 +507,22 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Trust and execute custom modeling code from the model repo (required by e.g. HunyuanImage-3.0).",
+    )
+    parser.add_argument(
+        "--allow-tokenizer-fallback",
+        action="store_true",
+        help=(
+            "For models with a declared ar_input_builder (e.g. HunyuanImage-3.0): if loading "
+            "the AR tokenizer fails, degrade to the string-prompt form (no BPE parity) instead "
+            "of failing the run. Off by default -- a tokenizer load failure usually means a "
+            "missing --trust-remote-code or a network/cache issue that's worth surfacing, not "
+            "silently masking with a possibly-wrong prompt."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -492,6 +596,8 @@ def main():
     )
     if args.enforce_eager is not None:
         omni_kwargs["enforce_eager"] = args.enforce_eager
+    if args.trust_remote_code:
+        omni_kwargs["trust_remote_code"] = True
     if args.deploy_config:
         omni_kwargs["deploy_config"] = args.deploy_config
     omni = Omni(**omni_kwargs)
@@ -583,6 +689,26 @@ def main():
 
     if not diffusion_replaced and len(sampling_params_list) == 1:
         sampling_params_list = [diffusion_params]
+
+    # Models with an AR text stage (e.g. HunyuanImage3 image-editing) declare an
+    # ar_input_builder; build the AR prefill + stop tokens declaratively from the
+    # plain prompt + reference image count + extra_args. Others are untouched.
+    ar_input_builder = get_ar_input_builder(model_class_name)
+    if ar_input_builder is not None:
+        _apply_ar_stage_inputs(
+            ar_input_builder,
+            model=args.model,
+            prompt_text=args.prompt,
+            extra_body=extra_args_from_cli,
+            num_images=len(input_images),
+            height=args.height,
+            width=args.width,
+            prompt_dict=prompt_dict,
+            sampling_params_list=sampling_params_list,
+            trust_remote_code=args.trust_remote_code,
+            validate_tokenizer=get_ar_tokenizer_validator(model_class_name),
+            allow_tokenizer_fallback=args.allow_tokenizer_fallback,
+        )
 
     outputs = omni.generate(prompt_dict, sampling_params_list=sampling_params_list)
     generation_end = time.perf_counter()
