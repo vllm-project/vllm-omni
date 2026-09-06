@@ -99,11 +99,11 @@ class Omni(OmniBase):
         sampling_params_list: Sequence[OmniSamplingParams],
         use_tqdm: bool | Callable[..., tqdm] = True,
     ) -> Generator[OmniRequestOutput, None, None]:
-        gen = self._run_generation(prompts, sampling_params_list, use_tqdm)
-        try:
-            yield from gen
-        finally:
-            self.close()
+        yield from self._run_generation(
+            prompts,
+            sampling_params_list,
+            use_tqdm,
+        )
 
     def _run_generation(
         self,

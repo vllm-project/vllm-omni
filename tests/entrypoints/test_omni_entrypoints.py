@@ -734,7 +734,7 @@ def test_omni_generate_py_generator_yields_final_outputs_for_each_request(monkey
         f"{engine.submitted[1]['request_id']}-stage0-0",
         f"{engine.submitted[1]['request_id']}-stage2-final",
     ]
-    assert engine.shutdown_called is True
+    assert engine.shutdown_called is not True
 
 
 def test_omni_generate_returns_list_when_not_using_generator(monkeypatch: pytest.MonkeyPatch):
@@ -780,7 +780,7 @@ def test_omni_generate_diffusion_only_yields_single_image_per_request(monkeypatc
         [f"{engine.submitted[0]['request_id']}-image"],
         [f"{engine.submitted[1]['request_id']}-image"],
     ]
-    assert engine.shutdown_called is True
+    assert engine.shutdown_called is not True
 
 
 def test_omni_generate_llm_diffusion_yields_final_text_then_image_per_request(
@@ -813,7 +813,7 @@ def test_omni_generate_llm_diffusion_yields_final_text_then_image_per_request(
         [f"{engine.submitted[1]['request_id']}-image"],
     ]
     assert engine.submitted[0]["sampling_params_list"][0].output_kind == RequestOutputKind.FINAL_ONLY
-    assert engine.shutdown_called is True
+    assert engine.shutdown_called is not True
 
 
 def test_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPatch):
@@ -1294,3 +1294,31 @@ def test_omni_errored_property_dead_stage(monkeypatch: pytest.MonkeyPatch):
         assert app.errored is False
     finally:
         app.shutdown()
+
+
+def test_omni_pygenerator_does_not_kill_engine(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        on_add_request=_enqueue_async_three_stage_outputs,
+    )
+
+    _patch_engine(monkeypatch, engine)
+
+    app = Omni("dummy-model")
+    # Evaluating the generator should not shut down the engine
+    list(app.generate(["hello"], py_generator=True))
+    assert not engine.shutdown_called
+
+
+def test_del_shutsdown_engine(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        on_add_request=_enqueue_async_three_stage_outputs,
+    )
+
+    _patch_engine(monkeypatch, engine)
+
+    app = Omni("dummy-model")
+    assert not engine.shutdown_called
+    del app
+    assert engine.shutdown_called
