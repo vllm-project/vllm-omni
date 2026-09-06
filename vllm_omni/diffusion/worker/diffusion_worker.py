@@ -791,6 +791,11 @@ class DiffusionWorker:
 
         usage_before = allocator.get_current_usage()
 
+        if self.model_runner is not None:
+            clear_prompt_embed_cache = getattr(self.model_runner, "clear_prompt_embed_cache", None)
+            if callable(clear_prompt_embed_cache):
+                clear_prompt_embed_cache()
+
         if level == 2 and self.model_runner is not None:
             self.model_runner.release_captured_graphs()
             logger.info(f"[Worker {self.rank}] CUDA Graphs cleared.")
