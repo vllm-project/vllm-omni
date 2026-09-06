@@ -45,6 +45,10 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
+from vllm_omni.diffusion.layers.qwen_select01_modulation import (
+    fused_layernorm_select01,
+    fused_residual_layernorm_select01,
+)
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
@@ -848,8 +852,18 @@ class QwenImageTransformerBlock(nn.Module):
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
 
         # Process image stream - norm1 + modulation
-        img_scale1, img_shift1, img_gate1 = self._modulate(img_mod1, modulate_index)
-        img_modulated = self.img_norm1(hidden_states, img_scale1, img_shift1)
+        if modulate_index is not None:
+            img_modulated, img_gate1 = fused_layernorm_select01(
+                hidden_states,
+                img_mod1,
+                modulate_index,
+                self.img_norm1.eps,
+                self.img_norm1.layernorm.weight,
+                self.img_norm1.layernorm.bias,
+            )
+        else:
+            img_scale1, img_shift1, img_gate1 = self._modulate(img_mod1, modulate_index)
+            img_modulated = self.img_norm1(hidden_states, img_scale1, img_shift1)
 
         # Process text stream - norm1 + modulation
         txt_scale1, txt_shift1, txt_gate1 = self._modulate(txt_mod1)
@@ -874,12 +888,26 @@ class QwenImageTransformerBlock(nn.Module):
         img_attn_output, txt_attn_output = attn_output
 
         # Apply attention gates and add residual (like in Megatron)
-        hidden_states = hidden_states + img_gate1 * img_attn_output
+        hidden_states_before_attn = hidden_states
+        if modulate_index is None:
+            hidden_states = hidden_states + img_gate1 * img_attn_output
         encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
 
         # Process image stream - norm2 + MLP
-        img_scale2, img_shift2, img_gate2 = self._modulate(img_mod2, modulate_index)
-        img_modulated2 = self.img_norm2(hidden_states, img_scale2, img_shift2)
+        if modulate_index is not None:
+            img_modulated2, hidden_states, img_gate2 = fused_residual_layernorm_select01(
+                img_attn_output,
+                hidden_states_before_attn,
+                img_gate1,
+                img_mod2,
+                modulate_index,
+                self.img_norm2.eps,
+                self.img_norm2.layernorm.weight,
+                self.img_norm2.layernorm.bias,
+            )
+        else:
+            img_scale2, img_shift2, img_gate2 = self._modulate(img_mod2, modulate_index)
+            img_modulated2 = self.img_norm2(hidden_states, img_scale2, img_shift2)
 
         img_mlp_output = self.img_mlp(img_modulated2)
         hidden_states = hidden_states + img_gate2 * img_mlp_output
