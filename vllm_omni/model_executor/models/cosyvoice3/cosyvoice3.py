@@ -218,6 +218,11 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
         cls._s3_model = (model, _s3, device)
         return cls._s3_model
 
+    @classmethod
+    def _release_s3_model(cls) -> None:
+        """Drop the class-level s3tokenizer model (largest GPU consumer)."""
+        cls._s3_model = None
+
     def _extract_speech_token_via_s3(self, audio, return_device):
         """Drop-in replacement for ``extract_speech_token`` that uses the
         S3Tokenizer PyTorch model on GPU. Returns the same
@@ -406,6 +411,43 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
                 insertion=insertion_end,
             ),
         ]
+
+
+def clear_process_runtime_caches() -> None:
+    """Release CosyVoice3's process-wide caches built in the main process.
+
+    These caches (keyed by ``model_dir``, never evicted) keep GPU/host memory
+    pinned for the lifetime of the process, so a server that swaps models or a
+    test worker that runs several models in one PID grows monotonically. This
+    drops them so memory falls back to the irreducible CUDA-context floor; it is
+    invoked from the engine shutdown path (``OmniBase._shutdown_base``).
+    """
+    # Largest GPU consumer first: the class-level s3tokenizer model.
+    CosyVoice3MultiModalProcessor._release_s3_model()
+
+    # TensorRT campplus engines + execution contexts.
+    try:
+        from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_trt import (
+            clear_campplus_trt_cache,
+        )
+
+        clear_campplus_trt_cache()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("CosyVoice3: campplus TRT cache clear failed: %s", exc)
+
+    # Per-model runtime components (tokenizer, feat_extractor, ONNX session).
+    # campplus_trt entries are already released above; drop the dict so the
+    # remaining CPU-side objects are freed too.
+    _RUNTIME_COMPONENTS_CACHE.clear()
+
+    # Speaker-embedding artifact cache (shared singleton).
+    try:
+        get_speaker_cache().clear()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("CosyVoice3: speaker cache clear failed: %s", exc)
+
+    if torch.cuda.is_available():
+        torch.accelerator.empty_cache()
 
 
 class CosyVoice3DummyInputsBuilder(BaseDummyInputsBuilder[CosyVoice3MultiModalProcessingInfo]):

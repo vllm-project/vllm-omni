@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 import weakref
 from collections.abc import Mapping, Sequence
@@ -811,3 +812,13 @@ class OmniBase(PDDisaggregationMixin):
         if finalizer is not None and finalizer.alive:
             finalizer.detach()
         self.engine.shutdown()
+        # Release model-side process-wide caches built in this (main) process,
+        # e.g. CosyVoice3's mm-processor / TensorRT / s3tokenizer caches. Only
+        # touch a model module if it was actually imported, so shutdown never
+        # forces a heavy optional import.
+        cosyvoice3 = sys.modules.get("vllm_omni.model_executor.models.cosyvoice3.cosyvoice3")
+        if cosyvoice3 is not None:
+            try:
+                cosyvoice3.clear_process_runtime_caches()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("CosyVoice3 process cache cleanup failed: %s", exc)
