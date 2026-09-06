@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 VFM Transformer for vllm-omni.
 
 Implements the Mixture-of-Transformers architecture with two pathways:
@@ -401,7 +401,7 @@ class TimestepEmbedder(nn.Module):
         max_period: int = 10000,
     ) -> None:
         super().__init__()
-        # Following diffusers naming pattern here for checkpoint compatibility.
+        # Preserve checkpoint-compatible parameter names.
         self.linear_1 = nn.Linear(frequency_embedding_size, hidden_size, bias=True)
         self.act = nn.SiLU()
         self.linear_2 = nn.Linear(hidden_size, hidden_size, bias=True)
@@ -1651,6 +1651,72 @@ class Cosmos3VFMTransformer(nn.Module):
         pad = (-(base + sound_frames)) % ulysses_size
         return sound_frames + pad
 
+    def _run_gen_layers(
+        self,
+        hidden_gen: torch.Tensor,
+        *,
+        s_video: int,
+        s_control: int,
+        s_action: int,
+        s_sound: int,
+        has_action: bool,
+        has_sound: bool,
+        has_control: bool,
+        ulysses_size: int,
+        use_multi_control_attention: bool,
+        multi_control_token_sizes: tuple[int, ...] | None,
+        multi_control_weights: tuple[float, ...] | None,
+    ) -> torch.Tensor:
+        """Run the complete GEN decoder between full-layout boundaries."""
+        if self.cached_kv is None or self.cached_freqs_gen is None:
+            raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
+        self._validate_gen_sequence_parallel(
+            s_gen=hidden_gen.shape[1],
+            s_video=s_video,
+            s_control=s_control,
+            s_action=s_action,
+            s_sound=s_sound,
+            has_action=has_action,
+            has_sound=has_sound,
+            has_control=has_control,
+            ulysses_size=1 if use_multi_control_attention else ulysses_size,
+        )
+        freqs_cos, freqs_sin = self.cached_freqs_gen
+        if not use_multi_control_attention:
+            hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
+        freqs_gen = (freqs_cos, freqs_sin)
+
+        if len(self.gen_layers) == len(self.cached_kv):
+            for layer, (k_und, v_und) in zip(self.gen_layers, self.cached_kv, strict=True):
+                hidden_gen = layer(
+                    hidden_gen,
+                    k_und=k_und,
+                    v_und=v_und,
+                    freqs_cos=freqs_cos,
+                    freqs_sin=freqs_sin,
+                    control_token_sizes=multi_control_token_sizes,
+                    control_weights=multi_control_weights,
+                )
+                # Cache-dit's block wrapper may return a tuple; unwrap it.
+                if isinstance(hidden_gen, tuple):
+                    hidden_gen = hidden_gen[0]
+        else:
+            # Cache-dit patches gen_layers to a grouped wrapper.
+            for layer in self.gen_layers:
+                hidden_gen = layer(
+                    hidden_gen,
+                    cached_kv=self.cached_kv,
+                    freqs_gen=freqs_gen,
+                    control_token_sizes=multi_control_token_sizes,
+                    control_weights=multi_control_weights,
+                )
+                if isinstance(hidden_gen, tuple):
+                    hidden_gen = hidden_gen[0]
+
+        if not use_multi_control_attention:
+            hidden_gen = self.gen_sp_gather(hidden_gen)
+        return hidden_gen
+
     # -- Forward -------------------------------------------------------------
 
     def forward(
@@ -1902,56 +1968,42 @@ class Cosmos3VFMTransformer(nn.Module):
                 hidden_parts.append(hidden_sound)
             hidden_gen = torch.cat(hidden_parts, dim=1)
 
-            # Run GEN layers.  UND K/V (replicated) is passed to each layer;
-            # the Cosmos3CrossAttention forwards them as joint_key/value so the
-            # framework Attention handles the Ulysses head-slicing internally.
-            if self.cached_kv is None or self.cached_freqs_gen is None:
-                raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
-            self._validate_gen_sequence_parallel(
-                s_gen=hidden_gen.shape[1],
-                s_video=s_video,
-                s_control=s_control,
-                s_action=s_action,
-                s_sound=s_sound,
-                has_action=has_action,
-                has_sound=has_sound,
-                has_control=has_control,
-                ulysses_size=1 if use_multi_control_attention else ulysses_size,
+            # SeaCache's root hook controls this full-layout boundary. Skipping
+            # bypasses every GEN block (and therefore layerwise-offload prefetch)
+            # while keeping input packing, normalization, and prediction heads fresh.
+            gen_input = hidden_gen
+            cached_residual = getattr(self, "_seacache_residual", None)
+            can_reuse = (
+                bool(getattr(self, "_seacache_skip", False))
+                and isinstance(cached_residual, torch.Tensor)
+                and cached_residual.shape == gen_input.shape
+                and cached_residual.device == gen_input.device
+                and cached_residual.dtype == gen_input.dtype
             )
-            freqs_cos, freqs_sin = self.cached_freqs_gen
-            if not use_multi_control_attention:
-                hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
-            freqs_gen = (freqs_cos, freqs_sin)
-
-            if len(self.gen_layers) == len(self.cached_kv):
-                for layer, (k_und, v_und) in zip(self.gen_layers, self.cached_kv, strict=True):
-                    hidden_gen = layer(
-                        hidden_gen,
-                        k_und=k_und,
-                        v_und=v_und,
-                        freqs_cos=freqs_cos,
-                        freqs_sin=freqs_sin,
-                        control_token_sizes=multi_control_token_sizes,
-                        control_weights=multi_control_weights,
-                    )
-                    # Cache-dit's block wrapper may return a tuple; unwrap it.
-                    if isinstance(hidden_gen, tuple):
-                        hidden_gen = hidden_gen[0]
+            if can_reuse:
+                hidden_gen = gen_input + cached_residual
             else:
-                # Cache-dit patches gen_layers to a grouped wrapper.
-                for layer in self.gen_layers:
-                    hidden_gen = layer(
-                        hidden_gen,
-                        cached_kv=self.cached_kv,
-                        freqs_gen=freqs_gen,
-                        control_token_sizes=multi_control_token_sizes,
-                        control_weights=multi_control_weights,
-                    )
-                    if isinstance(hidden_gen, tuple):
-                        hidden_gen = hidden_gen[0]
-
-            if not use_multi_control_attention:
-                hidden_gen = self.gen_sp_gather(hidden_gen)
+                if getattr(self, "_seacache_skip", False):
+                    # Fail open and refresh history when the packed GEN layout
+                    # changed between diffusion calls.
+                    self._seacache_skip = False
+                    self._seacache_record = True
+                hidden_gen = self._run_gen_layers(
+                    hidden_gen,
+                    s_video=s_video,
+                    s_control=s_control,
+                    s_action=s_action,
+                    s_sound=s_sound,
+                    has_action=has_action,
+                    has_sound=has_sound,
+                    has_control=has_control,
+                    ulysses_size=ulysses_size,
+                    use_multi_control_attention=use_multi_control_attention,
+                    multi_control_token_sizes=multi_control_token_sizes,
+                    multi_control_weights=multi_control_weights,
+                )
+                if getattr(self, "_seacache_record", False):
+                    self._seacache_last_residual = hidden_gen - gen_input
 
             # Final norm and project back to latent space
             hidden_gen = self.norm_moe_gen(hidden_gen)

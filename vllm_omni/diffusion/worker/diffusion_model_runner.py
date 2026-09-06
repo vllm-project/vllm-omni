@@ -656,12 +656,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             num_inference_steps = getattr(self.pipeline, "default_num_inference_steps", None)
         if num_inference_steps is None and od_config.cache_backend in (
             "tea_cache",
+            "sea_cache",
             "step_cache",
         ):
             # When num_inference_steps is None, some pipelines defer to their
-            # own defaults. TeaCache refresh ignores this value; step_cache
-            # refresh is a no-op because per-chunk state resets in the denoise
-            # loop. Use the pipeline default when available to keep refresh
+            # own defaults. These backends use refresh to reset request state;
+            # runtime step metadata is either unused or resolved in the
+            # pipeline. Use the pipeline default when available to keep refresh
             # behavior aligned with single-request execution.
             num_inference_steps = getattr(self.pipeline, "num_inference_steps", 0) or 0
 

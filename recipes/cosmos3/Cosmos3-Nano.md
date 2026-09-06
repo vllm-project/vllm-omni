@@ -105,6 +105,25 @@ vllm serve nvidia/Cosmos3-Nano \
   --init-timeout 1800
 ```
 
+For Cosmos3, SeaCache is the recommended default choice when opting into
+diffusion caching. Caching remains opt-in; add `--cache-backend sea_cache` to
+the command above. Its default threshold and maximum cached-step streak are
+tuned for Cosmos3, so no `--cache-config` is required.
+
+Override individual defaults with a JSON cache configuration; for example:
+
+```bash
+vllm serve nvidia/Cosmos3-Nano \
+  --omni \
+  --cache-backend sea_cache \
+  --cache-config '{"sea_threshold":0.2,"sea_max_consecutive_cached":3}'
+```
+
+Lower `sea_threshold` values and smaller `sea_max_consecutive_cached` caps are
+more conservative. Higher values allow more cached steps and may improve
+speed, but can increase quality loss. Setting `sea_max_consecutive_cached` to
+`0` removes the streak cap.
+
 To run **without** guardrails (you are responsible for license compliance),
 add `--no-guardrails` (no token/`cosmos-guardrail` needed). For extra GPUs use
 `--ulysses-degree N` (context parallel) or `--tensor-parallel-size N`;
@@ -306,7 +325,7 @@ vllm serve nvidia/Cosmos3-Nano-Policy-DROID \
 
 #### Notes
 
-- **Measured latency (1x B300, bf16, guardrails off):**
+- **Measured latency (1x B300, bf16, guardrails off, diffusion cache off):**
   - T2I 1024² — 10 / 25 / 50 steps → ~0.4 / 0.7 / **1.3 s**
   - T2V 1280×720 @ 35 steps — 25 / 49 / 93 / **189** frames → ~7 / 15 / 33 / **~93 s**
   - I2V 1280×720, 189 frames @ 35 steps → ~**99 s**
@@ -503,7 +522,7 @@ so an md5 comparison across two runs also works as a smoke check.
   a ~390 s build of the VAE decode path *for that shape*, so warming 1024² images
   does nothing for 189-frame video. At 720p / 189 frames / 35 steps this is
   **540 s cold vs 161 s warm, with byte-identical output**.
-- **Measured on 1x MI350X (bf16, guardrails off, warm):** T2I 1024² @ 50 steps
+- **Measured on 1x MI350X (bf16, guardrails off, diffusion cache off, warm):** T2I 1024² @ 50 steps
   **~2.7 s**; T2V 1280×720 / 189 frames @ 35 steps **~161 s**, of which ~92% is
   the DiT denoise loop and ~4% VAE decode, so optimization effort belongs in the
   denoise loop. The optional flags act on different terms of the memory bill and
@@ -692,7 +711,7 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
 
 #### Notes
 
-- **Measured latency (1x Ascend 910B / 910C, bf16, guardrails off):**
+- **Measured latency (1x Ascend 910B / 910C, bf16, guardrails off, diffusion cache off):**
   - T2I 1024² — 10 steps → ~8 s
   - T2V 1280×720 @ 20 steps — 49 frames → ~55 s
   - I2V 1280×720 @ 10 steps — 25 frames → ~25 s
