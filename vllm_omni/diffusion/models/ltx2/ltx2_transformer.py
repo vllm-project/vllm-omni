@@ -49,6 +49,7 @@ from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.layers.gated_residual import gated_residual
 
 logger = init_logger(__name__)
 
@@ -1064,7 +1065,7 @@ class LTX2VideoTransformerBlock(nn.Module):
             attention_mask=self_attention_mask,
             perturbation_mask=video_self_attention_perturbation_mask,
         )
-        hidden_states = hidden_states + attn_hidden_states * gate_msa
+        hidden_states = gated_residual(hidden_states, attn_hidden_states, gate_msa)
 
         # 1.2. Audio Self-Attention
         audio_ada_params = self.get_mod_params(self.audio_scale_shift_table, temb_audio, batch_size)
@@ -1084,7 +1085,7 @@ class LTX2VideoTransformerBlock(nn.Module):
             attention_mask=audio_self_attention_mask,
             perturbation_mask=audio_self_attention_perturbation_mask,
         )
-        audio_hidden_states = audio_hidden_states + attn_audio_hidden_states * audio_gate_msa
+        audio_hidden_states = gated_residual(audio_hidden_states, attn_audio_hidden_states, audio_gate_msa)
 
         # 2. Video and Audio Cross-Attention with text embeddings (Q: Video/Audio; K,V: Text)
         if self.cross_attn_adaln:
@@ -1190,7 +1191,7 @@ class LTX2VideoTransformerBlock(nn.Module):
                 )
                 if a2v_cross_attention_perturbation_mask is not None:
                     a2v_attn_hidden_states = a2v_attn_hidden_states * a2v_cross_attention_perturbation_mask
-                hidden_states = hidden_states + a2v_gate * a2v_attn_hidden_states
+                hidden_states = gated_residual(hidden_states, a2v_attn_hidden_states, a2v_gate)
 
             # 3.3. Video-to-Audio Cross Attention: Q: Audio; K,V: Video
             if use_v2a_cross_attention:
@@ -1210,16 +1211,16 @@ class LTX2VideoTransformerBlock(nn.Module):
                 )
                 if v2a_cross_attention_perturbation_mask is not None:
                     v2a_attn_hidden_states = v2a_attn_hidden_states * v2a_cross_attention_perturbation_mask
-                audio_hidden_states = audio_hidden_states + v2a_gate * v2a_attn_hidden_states
+                audio_hidden_states = gated_residual(audio_hidden_states, v2a_attn_hidden_states, v2a_gate)
 
         # 4. Feedforward
         norm_hidden_states = self.norm3(hidden_states) * (1 + scale_mlp) + shift_mlp
         ff_output = self.ff(norm_hidden_states)
-        hidden_states = hidden_states + ff_output * gate_mlp
+        hidden_states = gated_residual(hidden_states, ff_output, gate_mlp)
 
         norm_audio_hidden_states = self.audio_norm3(audio_hidden_states) * (1 + audio_scale_mlp) + audio_shift_mlp
         audio_ff_output = self.audio_ff(norm_audio_hidden_states)
-        audio_hidden_states = audio_hidden_states + audio_ff_output * audio_gate_mlp
+        audio_hidden_states = gated_residual(audio_hidden_states, audio_ff_output, audio_gate_mlp)
 
         return hidden_states, audio_hidden_states
 
