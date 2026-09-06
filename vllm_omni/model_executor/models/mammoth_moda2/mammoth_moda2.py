@@ -91,11 +91,23 @@ def moe_enable(moe_type, layer_type, layer_idx) -> bool:
     return layer_type in moe_type and start <= layer_idx < end
 
 
+MoeTokenRouting = tuple[torch.Tensor, torch.Tensor]
+
+
+def _build_moe_token_routing(gen_token_mask: torch.Tensor | None) -> MoeTokenRouting | None:
+    if gen_token_mask is None:
+        return None
+    flat_mask = gen_token_mask.reshape(-1)
+    return torch.where(flat_mask)[0], torch.where(~flat_mask)[0]
+
+
 def moe_forward(
     hidden_states: torch.Tensor,
     und_expert: Callable[[torch.Tensor], torch.Tensor],
     gen_expert: Callable[[torch.Tensor], torch.Tensor] | None,
     gen_token_mask: torch.Tensor | None = None,
+    *,
+    token_routing: MoeTokenRouting | None = None,
 ) -> torch.Tensor:
     """Perform Mixture-of-Experts (MoE) routing and forward pass.
 
@@ -120,6 +132,9 @@ def moe_forward(
             If provided, takes `(N, D)` tensor, returns `(N, D_out)`.
         gen_token_mask (torch.Tensor | None): Boolean mask indicating generation tokens.
             Shape matches `hidden_states` (excluding feature dim). True for generation tokens.
+        token_routing (MoeTokenRouting | None): Precomputed generation and
+            understanding token positions. When provided, avoids rebuilding
+            routing in each decoder layer.
 
     Returns:
         torch.Tensor: The processed hidden states with the same shape as input (except potentially
@@ -128,10 +143,10 @@ def moe_forward(
     if gen_expert is None:
         return und_expert(hidden_states)
 
-    if gen_token_mask is None or not gen_token_mask.any():
+    if token_routing is None:
+        token_routing = _build_moe_token_routing(gen_token_mask)
+    if token_routing is None:
         return und_expert(hidden_states)
-    if gen_token_mask.all():
-        return gen_expert(hidden_states)
 
     if hidden_states.ndim == 2:
         flat_hid = hidden_states
@@ -146,19 +161,27 @@ def moe_forward(
 
     # Validate before reshape to catch shape mismatches where numel() would
     # coincidentally match after flattening dimensions of different sizes.
-    if gen_token_mask.numel() != total_tokens:  # type: ignore[union-attr]
+    if gen_token_mask is not None and gen_token_mask.numel() != total_tokens:
         raise ValueError(
             "gen_token_mask shape mismatch: "
             f"mask={tuple(gen_token_mask.shape)}, hidden_states={tuple(hidden_states.shape)}"
         )
-    # mask: [num_tokens] or [B, L] -> flatten to [total_tokens]
-    flat_mask = gen_token_mask.reshape(-1)  # type: ignore[union-attr]
-    gen_pos = torch.where(flat_mask)[0]
-    und_pos = torch.where(~flat_mask)[0]
-    permute_order = torch.cat([gen_pos, und_pos], dim=0)
-    inverse_order = torch.argsort(permute_order)
-    gen_token_num = int(flat_mask.sum().item())
-    gen_hid, und_hid = flat_hid[permute_order].split([gen_token_num, total_tokens - gen_token_num], dim=0)
+
+    gen_pos, und_pos = token_routing
+    if gen_pos.numel() + und_pos.numel() != total_tokens:
+        raise ValueError(
+            "token_routing size mismatch: "
+            f"routing={gen_pos.numel() + und_pos.numel()}, hidden_states={tuple(hidden_states.shape)}"
+        )
+    if gen_pos.numel() == 0:
+        return und_expert(hidden_states)
+    if und_pos.numel() == 0:
+        return gen_expert(hidden_states)
+
+    gen_pos = gen_pos.to(device=flat_hid.device)
+    und_pos = und_pos.to(device=flat_hid.device)
+    gen_hid = flat_hid.index_select(0, gen_pos)
+    und_hid = flat_hid.index_select(0, und_pos)
 
     # 1.1 Generation tokens (True)
     gen_out = gen_expert(gen_hid)  # (N_gen, D)
@@ -167,8 +190,13 @@ def moe_forward(
     und_out = und_expert(und_hid)  # (N_und, D)
     out_dim = und_out.shape[-1]
 
-    merged = torch.cat([gen_out, und_out], dim=0)
-    merged = merged[inverse_order]
+    merged = torch.empty(
+        (total_tokens, out_dim),
+        dtype=und_out.dtype,
+        device=und_out.device,
+    )
+    merged.index_copy_(0, gen_pos, gen_out)
+    merged.index_copy_(0, und_pos, und_out)
 
     if hidden_states.ndim == 2:
         return merged.view(total_tokens, out_dim).contiguous()
@@ -253,6 +281,7 @@ class Mammoth2DecoderLayer(Qwen2DecoderLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         gen_token_mask: torch.Tensor | None = None,
+        token_routing: MoeTokenRouting | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
@@ -267,7 +296,13 @@ class Mammoth2DecoderLayer(Qwen2DecoderLayer):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = moe_forward(hidden_states, self.mlp, self.gen_mlp, gen_token_mask)
+        hidden_states = moe_forward(
+            hidden_states,
+            self.mlp,
+            self.gen_mlp,
+            gen_token_mask,
+            token_routing=token_routing,
+        )
         return hidden_states, residual
 
 
@@ -410,32 +445,45 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
     def model(self) -> MammothModa2Qwen2ForCausalLM:
         return self
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def get_input_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        token_routing: MoeTokenRouting | None = None,
+    ) -> torch.Tensor:
         if not self.extra_gen_vocab or self.gen_embed_tokens is None:
             return self.embed_tokens(input_ids)
 
-        gen_mask = input_ids >= int(self.gen_vocab_start_index)
-        if not gen_mask.any():
+        if token_routing is None:
+            gen_mask = input_ids >= int(self.gen_vocab_start_index)
+            token_routing = _build_moe_token_routing(gen_mask)
+        assert token_routing is not None
+        gen_pos, base_pos = token_routing
+
+        if gen_pos.numel() == 0:
             return self.embed_tokens(input_ids)
-        if gen_mask.all():
+        if base_pos.numel() == 0:
             gen_ids = input_ids - int(self.gen_vocab_start_index)
             return self.gen_embed_tokens(gen_ids)
 
         flat_ids = input_ids.reshape(-1)
-        flat_mask = gen_mask.reshape(-1)
+        gen_pos = gen_pos.to(device=flat_ids.device)
+        base_pos = base_pos.to(device=flat_ids.device)
+        if gen_pos.numel() + base_pos.numel() != flat_ids.numel():
+            raise ValueError(
+                "token_routing size mismatch: "
+                f"routing={gen_pos.numel() + base_pos.numel()}, input_ids={tuple(input_ids.shape)}"
+            )
         out = torch.empty(
             (flat_ids.shape[0], self.config.hidden_size),
             dtype=self.embed_tokens.weight.dtype,  # type: ignore[attr-defined]
             device=flat_ids.device,
         )
 
-        base_pos = torch.where(~flat_mask)[0]
-        gen_pos = torch.where(flat_mask)[0]
-        if base_pos.numel() > 0:
-            out[base_pos] = self.embed_tokens(flat_ids[base_pos])
-        if gen_pos.numel() > 0:
-            gen_ids = flat_ids[gen_pos] - int(self.gen_vocab_start_index)
-            out[gen_pos] = self.gen_embed_tokens(gen_ids)
+        base_ids = flat_ids.index_select(0, base_pos)
+        gen_ids = flat_ids.index_select(0, gen_pos) - int(self.gen_vocab_start_index)
+        out.index_copy_(0, base_pos, self.embed_tokens(base_ids))
+        out.index_copy_(0, gen_pos, self.gen_embed_tokens(gen_ids))
         return out.view(*input_ids.shape, -1).contiguous()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -450,30 +498,41 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
         deepstack_input_embeds: IntermediateTensors | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
-            else:
-                assert input_ids is not None
-                hidden_states = self.get_input_embeddings(input_ids)
-            # gen_token_mask: True indicates image generation tokens, which use gen_mlp.
-            # In vLLM v1 path, only inputs_embeds might be provided, with input_ids set to None.
-            # In this case, gen tokens cannot be distinguished by ID, falling back to und_expert.
+            # gen_token_mask: True indicates image generation tokens, which use
+            # gen_embed_tokens and gen_mlp. Build the routing metadata once for
+            # this pipeline stage and reuse it for embeddings and every layer.
             if self.gen_vocab_start_index is None or input_ids is None:
                 gen_token_mask = None
             else:
                 gen_token_mask = input_ids >= self.gen_vocab_start_index
+            token_routing = _build_moe_token_routing(gen_token_mask)
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                assert input_ids is not None
+                hidden_states = self.get_input_embeddings(
+                    input_ids,
+                    token_routing=token_routing,
+                )
             residual = None
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
             gen_token_mask = intermediate_tensors.tensors.get("gen_token_mask")
+            token_routing = _build_moe_token_routing(gen_token_mask)
 
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
-            hidden_states, residual = layer(positions, hidden_states, residual, gen_token_mask)
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                residual,
+                gen_token_mask,
+                token_routing,
+            )
             # The vision encoder's deepstack_visual_indexes select which vision
             # layers produce these features. The resulting tensors are keyed
             # 0..N-1 and, as in Qwen3-Omni, are injected into the first N
@@ -595,6 +654,7 @@ class Mammoth3DecoderLayer(Qwen3DecoderLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         gen_token_mask: torch.Tensor | None = None,
+        token_routing: MoeTokenRouting | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
@@ -608,6 +668,7 @@ class Mammoth3DecoderLayer(Qwen3DecoderLayer):
             self.mlp,
             self.gen_mlp,
             gen_token_mask if self.moe_enable else None,
+            token_routing=token_routing if self.moe_enable else None,
         )
         return hidden_states, residual
 
