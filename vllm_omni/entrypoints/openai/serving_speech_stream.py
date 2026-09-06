@@ -3,8 +3,10 @@
 
 """WebSocket handler for streaming text input TTS.
 
-Accepts text incrementally via WebSocket, buffers it until input.done, and
-generates audio once for the buffered input using the existing TTS pipeline.
+Accepts text incrementally via WebSocket. By default (split_granularity=none)
+it buffers until input.done and generates audio once for the buffered input.
+Opting into split_granularity=sentence or clause emits a TTS request at each
+detected boundary so incremental STT/LLM clients can hear audio before flush.
 
 input.done is a flush, not a close: it ends the current utterance and the
 connection stays open, so the next utterance reuses the same connection
@@ -13,9 +15,10 @@ session.close, on the idle timeout, or when the client closes the socket.
 The session config is sticky across flushes and can be replaced by sending
 another session.config between utterances.
 
-"Utterance" here names the flush unit rather than any linguistic unit: it is
-whatever text the client had buffered when it sent input.done, from a word to
-several paragraphs, synthesized as a single request.
+"Utterance" here names the flush unit. With split_granularity=none it is
+whatever text was buffered when input.done arrived, synthesized as one
+request. With sentence/clause splitting it is still one input.done cycle,
+but sentence_index counts linguistic units inside that flush.
 
 Protocol:
     Client -> Server:
@@ -32,11 +35,10 @@ Protocol:
         {"type": "audio.done", "utterance_index": 0, "sentence_index": 0}
         {"type": "session.done", "utterance_index": 0, "total_sentences": N}
         {"type": "error", "message": "..."}
-        # session.done ends the flushed utterance, not the connection. An
-        # utterance is just the flush unit: whatever text was buffered when
-        # input.done arrived, of any length. utterance_index counts those
-        # flushes across the connection, while sentence_index counts within
-        # one of them and so pairs with total_sentences.
+        # session.done ends the flushed utterance, not the connection.
+        # utterance_index counts input.done flushes. sentence_index counts
+        # TTS requests inside one flush (always 0 of 1 when split_granularity
+        # is none; 0..N-1 when sentence/clause splitting is enabled).
 
     Server -> Client (when word_timestamps=true):
         {"type": "audio.start", "utterance_index": 0, "sentence_index": 0,
@@ -64,6 +66,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     StreamingSpeechSessionConfig,
 )
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.speech_text_splitter import SpeechTextSplitter
 from vllm_omni.utils.forced_aligner import extract_word_timestamps
 
 logger = init_logger(__name__)
@@ -79,11 +82,10 @@ _MAX_INPUT_TEXT_MESSAGE_SIZE = 128 * 1024
 class OmniStreamingSpeechHandler:
     """Handles WebSocket sessions for streaming text-input TTS.
 
-    A connection carries one or more utterances. Text arrives incrementally,
-    is buffered until input.done, and audio is generated once for the
-    buffered input using the existing OmniOpenAIServingSpeech pipeline. The
-    connection outlives each utterance so a client can keep synthesizing on
-    it without reconnecting.
+    A connection carries one or more utterances. Text arrives incrementally.
+    With split_granularity=none it is buffered until input.done and synthesized
+    as one request. sentence/clause modes emit a request at each boundary,
+    including before input.done. The connection outlives each utterance.
 
     Args:
         speech_service: The existing TTS serving instance (reused for
@@ -105,17 +107,20 @@ class OmniStreamingSpeechHandler:
     async def handle_session(self, websocket: WebSocket) -> None:
         """Main loop for a single WebSocket connection.
 
-        Serves any number of utterances: text is buffered until input.done,
-        which flushes it as one TTS request and then leaves the connection
-        open for the next one. Rejecting a message is only fatal before the
-        first valid session.config; afterwards the error is reported and the
-        connection survives.
+        Serves any number of utterances. input.done always ends a flush;
+        split_granularity controls whether that flush is one TTS request or
+        several sentence/clause requests.
         """
         await websocket.accept()
 
         config: StreamingSpeechSessionConfig | None = None
-        text_parts: list[str] = []
+        splitter = SpeechTextSplitter("none")
         utterance_index = 0
+        sentence_index = 0
+        # An utterance is in progress from the first input.text until the next
+        # input.done. Buffered text is not enough to detect it: sentence/clause
+        # splitting can leave the buffer empty after emitting a unit.
+        utterance_open = False
 
         try:
             while True:
@@ -140,10 +145,10 @@ class OmniStreamingSpeechHandler:
                 msg_type = msg.get("type")
 
                 if msg_type == "session.config":
-                    if text_parts:
+                    if utterance_open:
                         await self._send_error(
                             websocket,
-                            "session.config cannot be applied while input is buffered; send input.done first",
+                            "session.config cannot be applied while an utterance is in progress; send input.done first",
                         )
                         continue
                     new_config = await self._build_config(websocket, msg)
@@ -152,6 +157,7 @@ class OmniStreamingSpeechHandler:
                             return  # Error already sent, connection closing
                         continue  # Keep serving with the previous config
                     config = new_config
+                    splitter = SpeechTextSplitter(config.split_granularity)
 
                 elif config is None:
                     await self._send_error(
@@ -165,32 +171,39 @@ class OmniStreamingSpeechHandler:
                     if not isinstance(text, str):
                         await self._send_error(websocket, "input.text requires a string value")
                         continue
-                    text_parts.append(text)
-
-                elif msg_type == "input.done":
-                    full_text = "".join(text_parts).strip()
-                    text_parts.clear()
-                    total_sentences = 0
-                    if full_text:
-                        # However long the buffered text is, the pipeline takes
-                        # it as one request, so every flush is sentence 0 of 1.
+                    if text:
+                        utterance_open = True
+                    for unit in splitter.feed(text):
                         await self._generate_and_send(
                             websocket,
                             config,
-                            full_text,
+                            unit,
                             utterance_index=utterance_index,
-                            sentence_index=0,
+                            sentence_index=sentence_index,
                         )
-                        total_sentences = 1
+                        sentence_index += 1
+
+                elif msg_type == "input.done":
+                    for unit in splitter.flush():
+                        await self._generate_and_send(
+                            websocket,
+                            config,
+                            unit,
+                            utterance_index=utterance_index,
+                            sentence_index=sentence_index,
+                        )
+                        sentence_index += 1
 
                     await websocket.send_json(
                         {
                             "type": "session.done",
                             "utterance_index": utterance_index,
-                            "total_sentences": total_sentences,
+                            "total_sentences": sentence_index,
                         }
                     )
                     utterance_index += 1
+                    sentence_index = 0
+                    utterance_open = False
 
                 elif msg_type == "session.close":
                     await websocket.close()
@@ -310,6 +323,7 @@ class OmniStreamingSpeechHandler:
             speaker_embedding=config.speaker_embedding,
             stream=config.stream_audio,
             word_timestamps=config.word_timestamps,
+            seed=config.seed,
         )
 
         start_payload = {
