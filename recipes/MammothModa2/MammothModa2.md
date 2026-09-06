@@ -243,8 +243,9 @@ most one 8-bit level (mean absolute difference 0.005415).
 The BF16 fixed-conditioning replay uses one real AR payload, identical
 initial noise, conditions and masks, 50 steps, seed 42 and guidance 4. Each
 configuration runs one observed warmup and three uninstrumented measured
-requests. Both SDPA and FlashAttention preserve exact self-repeat and
-cross-rank output agreement. SP=1 and SP=2 are not bit-identical: normalized
+requests. Both SDPA and FlashAttention preserve exact self-repeat; observed
+denoiser predictions and VAE inputs agree exactly across ranks.
+SP=1 and SP=2 are not bit-identical: normalized
 RGB mean absolute error is 0.001682 for SDPA and 0.001817 for FlashAttention;
 PSNR is 51.03/47.57 dB and SSIM is 0.9961/0.9950 respectively. These are
 single-prompt numerical/visual controls, not broad image-quality certification.
