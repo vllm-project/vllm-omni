@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Reference:
 #   - PixDiT_T2I: pid/_src/networks/pixeldit_official.py
 #   - LQ projection: pid/_src/networks/lq_projection_2d.py
@@ -197,6 +197,22 @@ class PidNet(PixDiT_T2I):
 
         return s_main, y_emb
 
+    @staticmethod
+    def _slice_batch(v, i, b):
+        """Slice a batch-major tensor arg to sample i (pass through non-batch values)."""
+        if isinstance(v, torch.Tensor) and v.dim() > 0 and v.shape[0] == b:
+            return v[i : i + 1]
+        return v
+
+    @staticmethod
+    def _sp_world_size() -> int:
+        try:
+            from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size
+
+            return int(get_sequence_parallel_world_size())
+        except Exception:
+            return 1
+
     def forward(
         self,
         x,
@@ -210,6 +226,24 @@ class PidNet(PixDiT_T2I):
         degrade_sigma=None,
     ):
         B, _, H, W = x.shape
+        if B > 1 and (self._sp_active() or self._sp_world_size() > 1):
+            outs = []
+            for i in range(B):
+                outs.append(
+                    self.forward(
+                        x[i : i + 1],
+                        self._slice_batch(t, i, B),
+                        y[i : i + 1],
+                        s=self._slice_batch(s, i, B),
+                        mask=self._slice_batch(mask, i, B),
+                        lq_video_or_image=self._slice_batch(lq_video_or_image, i, B),
+                        lq_latent=self._slice_batch(lq_latent, i, B),
+                        lq_mask=self._slice_batch(lq_mask, i, B),
+                        degrade_sigma=self._slice_batch(degrade_sigma, i, B),
+                    )
+                )
+            return torch.cat(outs, dim=0)
+
         Hs = H // self.patch_size
         Ws = W // self.patch_size
         L = Hs * Ws

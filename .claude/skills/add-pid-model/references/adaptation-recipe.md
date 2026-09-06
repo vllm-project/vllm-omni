@@ -157,8 +157,8 @@ PID_CHECKPOINT_REGISTRY["your_backbone"] = (
 ```
 
 Also export `YOUR_BACKBONE_PID_NET_CONFIG` from `pid/__init__.py`, and add
-the backbone name to `PidNetConfig.backbone`'s `Literal` if you want typed
-validation.
+the backbone name to the mapping in `get_pid_net_config()` for validated
+lookup.
 
 > **VAE characteristics** come from the target LDM: `vae.config` (latent
 > channels) + `vae_scale_factor` + packing. `(lq_latent_channels,

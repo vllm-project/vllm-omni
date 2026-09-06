@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ __all__ = [
     "PidPassthrough",
     "stepwise_pid_active",
     "decode_stepwise_output",
+    "validate_pid_override",
 ]
 
 # -- module init ------------------------------------------------------------
@@ -89,6 +90,34 @@ def _pid_sp_world_size() -> int:
 
 
 # -- decode core ------------------------------------------------------------
+
+_PID_OVERRIDE_KEYS = ("enabled", "scale", "num_steps", "seed", "degrade_sigma")
+_PID_OVERRIDE_TYPES: dict[str, tuple[type, ...]] = {
+    "enabled": (bool,),
+    "scale": (int,),
+    "num_steps": (int,),
+    "seed": (int,),
+    "degrade_sigma": (int, float),
+}
+
+
+def validate_pid_override(pid_override: Any) -> None:
+    if pid_override is None:
+        return
+    if not isinstance(pid_override, dict):
+        raise ValueError(f"pid_decode must be a dict, got {type(pid_override).__name__}")
+    for key, value in pid_override.items():
+        if key not in _PID_OVERRIDE_KEYS:
+            raise ValueError(f"pid_decode has unknown key {key!r}; allowed keys: {sorted(_PID_OVERRIDE_KEYS)}")
+        expected = _PID_OVERRIDE_TYPES[key]
+        if isinstance(value, bool) and bool not in expected:
+            raise ValueError(f"pid_decode.{key} must be {expected[0].__name__}, got {type(value).__name__}")
+        if not isinstance(value, expected):
+            raise ValueError(f"pid_decode.{key} must be {expected[0].__name__}, got {type(value).__name__}")
+    if "scale" in pid_override and pid_override["scale"] < 1:
+        raise ValueError(f"pid_decode.scale must be >= 1, got {pid_override['scale']}")
+    if "num_steps" in pid_override and pid_override["num_steps"] < 1:
+        raise ValueError(f"pid_decode.num_steps must be >= 1, got {pid_override['num_steps']}")
 
 
 def decode_with_pid(
@@ -221,6 +250,11 @@ def maybe_pid_passthrough(pipeline: Any, reqs: list[Any], od_config: Any) -> Pid
       (batch output_type is uniform).
     """
     config = _resolve_pid_config(od_config)
+    # Strict per-request validation for every request carrying a pid_decode
+    # dict (enabled or not): unknown keys / bad types must fail the request,
+    # not be silently filtered.
+    for ov in (getattr(req.sampling_params, "pid_decode", None) for req in reqs):
+        validate_pid_override(ov)
     overrides = [getattr(req.sampling_params, "pid_decode", None) for req in reqs]
     requested = [ov for ov in overrides if ov is not None and ov.get("enabled") is True]
 
@@ -285,16 +319,23 @@ def _has_initial_latent(sp: Any) -> bool:
 def stepwise_pid_active(pipeline: Any, state: Any) -> bool:
     """Whether stepwise post_decode should use PiD for this state."""
     decoder = getattr(pipeline, "_pid_decoder", None)
-    if decoder is None:
-        return False
     sampling = getattr(state, "sampling", None)
+    override = getattr(sampling, "pid_decode", None) if sampling is not None else None
+    validate_pid_override(override)
+    if decoder is None:
+        if override is not None and override.get("enabled") is True:
+            raise RuntimeError(
+                "PiD decode was requested per-request (pid_decode.enabled=True) but the "
+                "pipeline was not configured with --pid-enable at startup. Restart the "
+                "service with --pid-enable to enable this feature."
+            )
+        return False
     if sampling is None:
         return False
     if (getattr(sampling, "output_type", None) or "pil") == "latent":
         return False
     if _has_initial_latent(sampling):
         return False
-    override = getattr(sampling, "pid_decode", None)
     if override is not None and override.get("enabled") is False:
         return False
     return True

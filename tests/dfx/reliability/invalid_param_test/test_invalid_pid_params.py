@@ -62,12 +62,11 @@ def test_images_generations_invalid_pid_decode(omni_server, openai_client, pid_d
     )
 
 
-@pytest.mark.parametrize("omni_server_function", _NO_PID_SERVER, indirect=True)
-def test_images_generations_pid_enabled_without_server_flag(omni_server_function, openai_client_function) -> None:
-    """``pid_decode.enabled=True`` on a server without ``--pid-enable`` -> 4xx/5xx (mixin RuntimeError)."""
-    body = _minimal_body(omni_server_function)
+@pytest.mark.parametrize("omni_server", _NO_PID_SERVER, indirect=True)
+def test_images_generations_pid_enabled_without_server_flag(omni_server, openai_client) -> None:
+    body = _minimal_body(omni_server)
     body["pid_decode"] = {"enabled": True, "scale": 4}
-    openai_client_function.send_images_generations_http_request(
+    openai_client.send_images_generations_http_request(
         {
             "json": body,
             "timeout": 300,

@@ -20,6 +20,7 @@ from vllm_omni.diffusion.pid.runner_integration import (
     init_pid_decoder_on,
     maybe_pid_passthrough,
     stepwise_pid_active,
+    validate_pid_override,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -241,3 +242,60 @@ def test_decode_stepwise_output_noop_without_decoder():
     state = SimpleNamespace(sampling=SimpleNamespace(height=512, width=512, pid_decode=None), prompt="x")
     result = DiffusionOutput(output=torch.zeros(1))
     assert decode_stepwise_output(pipe, state, result) is result
+
+
+# -- validate_pid_override -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "ov",
+    [
+        None,
+        {},
+        {"enabled": True},
+        {"enabled": False, "scale": 2, "num_steps": 4, "seed": 7, "degrade_sigma": 0.1},
+    ],
+)
+def test_validate_pid_override_accepts_valid(ov):
+    validate_pid_override(ov)
+
+
+@pytest.mark.parametrize(
+    "ov, match",
+    [
+        ("bad", "must be a dict"),
+        ({"extra": 1}, "unknown key 'extra'"),
+        ({"scales": 4}, "unknown key 'scales'"),
+        ({"scale": -1}, "scale must be >= 1"),
+        ({"scale": "4"}, "scale must be int"),
+        ({"scale": True}, "scale must be int"),
+        ({"num_steps": 0}, "num_steps must be >= 1"),
+        ({"num_steps": 4.0}, "num_steps must be int"),
+        ({"enabled": 1}, "enabled must be bool"),
+        ({"degrade_sigma": "x"}, "degrade_sigma must be"),
+    ],
+)
+def test_validate_pid_override_rejects_invalid(ov, match):
+    with pytest.raises(ValueError, match=match):
+        validate_pid_override(ov)
+
+
+def test_validate_pid_override_called_in_batch_path():
+    """Unknown keys fail the request in maybe_pid_passthrough (not silently filtered)."""
+    pipe = _Pipe(decoder=object(), config=_cfg())
+    reqs = [_Req(pid_decode={"extra": 1})]
+    with pytest.raises(ValueError, match="unknown key 'extra'"):
+        maybe_pid_passthrough(pipe, reqs, None)
+
+
+def test_stepwise_enabled_true_without_decoder_raises():
+    """Streaming path converges with batch path: explicit enabled=True raises."""
+    pipe = _Pipe()
+    state = SimpleNamespace(
+        sampling=SimpleNamespace(
+            output_type="pil", pid_decode={"enabled": True}, latents=None, image_latent=None, strength=None
+        ),
+        prompt="a cat",
+    )
+    with pytest.raises(RuntimeError, match="--pid-enable"):
+        stepwise_pid_active(pipe, state)

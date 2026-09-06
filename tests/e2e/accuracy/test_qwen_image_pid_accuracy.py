@@ -9,7 +9,6 @@ Two quality guard lines:
    reference for the same prompt/seed (guards regression of the distilled
    student). Skipped when the golden reference image is absent.
 
-Thresholds are initial suggestions; calibrate on H100 before enabling.
 """
 
 from __future__ import annotations
@@ -24,6 +23,7 @@ import requests
 from PIL import Image
 
 from tests.e2e.accuracy.helpers import assert_similarity, model_output_dir
+from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer
 
 pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
@@ -66,13 +66,15 @@ def _omni_pid(*, enabled: bool) -> Image.Image:
         return img
 
 
-def _golden_reference() -> Image.Image | None:
+def _golden_reference(artifact_root: Path) -> Image.Image | None:
     # Produced once with nvidia/PiD scripts/pipeline_demo.py for the same prompt/seed.
-    golden = model_output_dir(Path(__file__).parent, "qwen_image_pid") / "golden_4x.png"
+    golden = model_output_dir(artifact_root, "qwen_image_pid") / "golden_4x.png"
     return Image.open(golden).convert("RGB") if golden.exists() else None
 
 
-def test_pid_4x_structure_preserved() -> None:
+@pytest.mark.benchmark
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+def test_pid_4x_structure_preserved(accuracy_artifact_root: Path) -> None:
     """PiD 4x downsampled to 512 matches the VAE 512 baseline (no content drift)."""
     pid_4x = _omni_pid(enabled=True)
     assert pid_4x.size == (2048, 2048)
@@ -87,9 +89,11 @@ def test_pid_4x_structure_preserved() -> None:
     )
 
 
-def test_pid_4x_golden_match() -> None:
+@pytest.mark.benchmark
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+def test_pid_4x_golden_match(accuracy_artifact_root: Path) -> None:
     """PiD 4x output matches the nvidia/PiD official reference (distill determinism)."""
-    golden = _golden_reference()
+    golden = _golden_reference(accuracy_artifact_root)
     if golden is None:
         pytest.skip("missing nvidia/PiD official reference output; skipping golden comparison")
     pid_4x = _omni_pid(enabled=True)
