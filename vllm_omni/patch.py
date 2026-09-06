@@ -20,7 +20,6 @@ from vllm.v1.request import StreamingUpdate as _OriginalStreamingUpdate
 import vllm_omni.logger  # noqa: F401
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
-from vllm_omni.model_executor.layers.rotary_embedding import OmniMRotaryEmbedding
 from vllm_omni.request import OmniRequest, OmniStreamingUpdate
 
 _PATCH_LOGGER = logging.getLogger("vllm_omni.patch")
@@ -305,6 +304,11 @@ for module_name, module in list(sys.modules.items()):
     if hasattr(module, "TokensPrompt") and module.TokensPrompt == _OriginalTokensPrompt:
         module.TokensPrompt = OmniTokensPrompt
     if hasattr(module, "MRotaryEmbedding") and module.MRotaryEmbedding == _OriginalMRotaryEmbedding:
+        # Lazy import: OmniMRotaryEmbedding is NPU/AR-path specific; keep it
+        # out of the unconditional import graph so pure diffusion stages can
+        # run without vllm-ascend.
+        from vllm_omni.model_executor.layers.rotary_embedding import OmniMRotaryEmbedding
+
         module.MRotaryEmbedding = OmniMRotaryEmbedding
     if hasattr(module, "Request") and module.Request == _OriginalRequest:
         module.Request = OmniRequest

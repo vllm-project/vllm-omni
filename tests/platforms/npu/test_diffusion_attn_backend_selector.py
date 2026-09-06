@@ -77,6 +77,10 @@ class _FakeOmniPlatformEnum(Enum):
     NPU = "npu"
 
 
+class _FakePlatformEnum(Enum):
+    OOT = "oot"
+
+
 class _FakeNPUPlatform:
     pass
 
@@ -101,6 +105,11 @@ def _load_platform_module(monkeypatch: pytest.MonkeyPatch):
             warning=lambda *a, **k: None,
             error=lambda *a, **k: None,
         ),
+    )
+    _install_fake_module(
+        monkeypatch,
+        "vllm.platforms.interface",
+        PlatformEnum=_FakePlatformEnum,
     )
     _install_fake_module(monkeypatch, "vllm_ascend")
     _install_fake_module(monkeypatch, "vllm_ascend.platform", NPUPlatform=_FakeNPUPlatform)

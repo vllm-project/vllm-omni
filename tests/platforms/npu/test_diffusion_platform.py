@@ -28,10 +28,10 @@ def test_paged_config_uses_ascend_kernel_block_size() -> None:
     from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 
     from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
-    from vllm_omni.platforms.npu.platform import NPUOmniPlatform
+    from vllm_omni.platforms.npu.ar_platform import ARNPUOmniPlatform
 
     vllm_config = SimpleNamespace(cache_config=SimpleNamespace(block_size=16))
-    NPUOmniPlatform.configure_diffusion_vllm_config(
+    ARNPUOmniPlatform.configure_diffusion_vllm_config(
         vllm_config,
         SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER),
     )
@@ -47,16 +47,16 @@ def test_strict_ulysses_paged_backend_bypasses_ascend_pcp() -> None:
         AscendAttentionMetadataBuilder,
     )
 
-    from vllm_omni.platforms.npu.platform import NPUOmniPlatform
+    from vllm_omni.platforms.npu.ar_platform import ARNPUOmniPlatform
 
     assert (
-        NPUOmniPlatform.get_diffusion_paged_kv_attn_backend(
+        ARNPUOmniPlatform.get_diffusion_paged_kv_attn_backend(
             AscendAttentionBackend,
             ulysses_degree=1,
         )
         is AscendAttentionBackend
     )
-    backend = NPUOmniPlatform.get_diffusion_paged_kv_attn_backend(
+    backend = ARNPUOmniPlatform.get_diffusion_paged_kv_attn_backend(
         AscendAttentionBackend,
         ulysses_degree=2,
     )

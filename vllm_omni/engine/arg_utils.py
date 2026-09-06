@@ -120,6 +120,19 @@ def register_omni_models_to_vllm():
 
     from vllm_omni.model_executor.models.registry import _OMNI_MODELS
 
+    # Ensure vLLM's current_platform is the Omni platform before any
+    # ``from vllm.platforms import current_platform`` binds a value (e.g.
+    # inside vllm.utils.mem_utils.DeviceMemoryProfiler). vLLM 0.26 resolves
+    # ``current_platform`` lazily via module ``__getattr__``; without
+    # vllm-ascend that resolves to UnspecifiedPlatform, whose
+    # ``get_current_memory_usage`` raises. Platforms opt in via
+    # ``adopt_as_vllm_platform()``.
+    from vllm_omni.platforms import current_omni_platform
+
+    adopt = getattr(current_omni_platform, "adopt_as_vllm_platform", None)
+    if callable(adopt):
+        adopt()
+
     _register_omni_hf_configs()
 
     # Unconditionally (re)register every omni arch into the upstream global
