@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2025 The HuggingFace Team and SANA-Video Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,6 +36,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
+from vllm_omni.diffusion.layers.residual_gate import residual_gate_add
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
@@ -972,7 +976,7 @@ class SanaVideoTransformerBlock(nn.Module):
         norm_hidden_states = norm_hidden_states.to(hidden_states.dtype)
 
         attn_output = self.attn1(norm_hidden_states, rotary_emb=rotary_emb)
-        hidden_states = hidden_states + gate_msa * attn_output
+        hidden_states = residual_gate_add(hidden_states, attn_output, gate_msa)
 
         # 3. Cross Attention
         if self.attn2 is not None:
@@ -990,7 +994,7 @@ class SanaVideoTransformerBlock(nn.Module):
         norm_hidden_states = norm_hidden_states.unflatten(1, (frames, height, width))
         ff_output = self.ff(norm_hidden_states)
         ff_output = ff_output.flatten(1, 3)
-        hidden_states = hidden_states + gate_mlp * ff_output
+        hidden_states = residual_gate_add(hidden_states, ff_output, gate_mlp)
 
         return hidden_states
 

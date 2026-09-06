@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 
@@ -64,6 +64,20 @@ _GOLDEN_PREFIX = torch.tensor(
         -0.3732060790,
     ]
 )
+
+
+def test_residual_gate_add_cpu_fallback_matches_eager():
+    from vllm_omni.diffusion.layers.residual_gate import residual_gate_add
+
+    torch.manual_seed(5)
+    residual = torch.randn(2, 7, 24, dtype=torch.bfloat16)
+    update = torch.randn_like(residual)
+    gate = torch.randn(2, 1, 24, dtype=torch.bfloat16)
+
+    expected = residual + gate * update
+    actual = residual_gate_add(residual, update, gate)
+
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.parametrize(
