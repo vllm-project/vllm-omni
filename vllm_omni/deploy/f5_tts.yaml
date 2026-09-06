@@ -1,0 +1,45 @@
+# F5-TTS deploy reference: single-stage diffusion TTS on L4.
+#
+# F5-TTS is a flow-matching DiT that generates mel spectrograms from text,
+# then decodes them with a vocoder (Vocos/BigVGAN). The entire pipeline
+# runs inside a single diffusion stage via --omni.
+#
+# Verified on 1x L4 24GB. Peak memory ~8 GiB (FP32 DiT + vocoder).
+# BFloat16 reduces to ~5 GiB with negligible quality loss.
+#
+# NOTE: F5-TTS is not in the pipeline registry, so serving builds the
+# default single-stage diffusion config and this file is NOT auto-loaded
+# (stages below are reference values). To enable the DiT CUDA Graph
+# replay, pass the extras through stage overrides:
+#
+#   vllm serve SWivid/F5-TTS/F5TTS_v1_Base --omni --trust-remote-code \
+#     --stage-overrides '{"0":{"extras":{"f5_dit_cudagraph":true}}}'
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.85
+    # Keeps the in-stage vLLM engine eager; orthogonal to the F5 DiT CUDA
+    # Graph replay below, which is a pipeline-owned capture of the DiT hot
+    # path (vllm_omni/diffusion/models/f5_tts/cuda_graph_dit_wrapper.py).
+    enforce_eager: true
+    devices: "0"
+    cache_backend:
+    cache_config:
+    # F5 DiT CUDA Graph replay (opt-in). Graph capture with an active cache
+    # backend (Cache-DiT / TeaCache) is gated until validated; per-step cache
+    # decisions must not be baked into a captured graph. Under tensor
+    # parallelism or HSDP the wrapper stays eager instead (collective /
+    # parameter-gather forwards are not manually capturable).
+    extras:
+      f5_dit_cudagraph: true
+      f5_dit_cudagraph_max_graphs: 8
+      f5_dit_cudagraph_with_cache: false
+    parallel_config:
+      tensor_parallel_size: 1
+      cfg_parallel_size: 1
+      use_hsdp: false
+    default_sampling_params:
+      seed: 42

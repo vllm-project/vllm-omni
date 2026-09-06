@@ -23,6 +23,10 @@ from vllm_omni.config.config_factory import (
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import _DEPLOY_DIR
 from vllm_omni.config.yaml_util import create_config, load_yaml_config
+from vllm_omni.diffusion.models.f5_tts.hf_utils import (
+    F5_PIPELINE_CLASS,
+    is_f5_model,
+)
 from vllm_omni.diffusion.utils.hf_utils import (
     _looks_like_dreamzero,
     get_diffusion_model_index,
@@ -85,6 +89,9 @@ def _try_get_class_name_from_diffusers_config(model: str) -> str | None:
     Returns:
         Model type string if found, None otherwise
     """
+    if is_f5_model(model):
+        return F5_PIPELINE_CLASS
+
     model_index = get_diffusion_model_index(model)
     if model_index and isinstance(model_index, dict) and "_class_name" in model_index:
         logger.debug(f"Found Diffusers model type '{model_index['_class_name']}'")
@@ -284,6 +291,11 @@ def resolve_model_config_path(model: str) -> str | None:
     Raises:
         ValueError: If model_type cannot be determined
     """
+    # F5-TTS ships no transformers/diffusers config; its deploy yaml is the
+    # single source of truth, so skip file-based config resolution.
+    if is_f5_model(model):
+        return None
+
     # Object-storage URIs are streamed by vLLM's Run:AI streamer only after
     # each stage builds its ModelConfig, so config resolution here reads the
     # local copy that vLLM-Omni materializes for such URIs. Name-based

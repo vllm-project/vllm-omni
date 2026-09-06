@@ -14,6 +14,7 @@ For the full list of supported architectures across all modalities, see
 
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
 | --- | --- | --- | --- | --- | --- |
+| F5-TTS | `SWivid/F5-TTS/F5TTS_v1_Base` | ✓ (`ref_audio`+`ref_text`) | — | — | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
 | IndexTTS-2 | `IndexTeam/IndexTTS-2` | ✓ (`ref_audio` or uploaded `voice`) | `stream=true` response, non-chunk | uploaded audio voice only; no presets | — |
@@ -97,6 +98,49 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 22.05 kHz for IndexTTS-2, and 24 kHz for many others).
 
 For full request-shape documentation (all parameters, response formats, error codes), see the [Speech API reference](../../../docs/serving/speech_api.md).
+
+---
+
+## F5-TTS
+
+Single-stage flow-matching DiT TTS at 24 kHz. Voice cloning takes
+`ref_audio` (URL or base64 data URL) plus its transcript `ref_text`.
+`num_inference_steps` (default 32) and `guidance_scale` (default 2.0) are
+request-level fields. Cache-DiT acceleration is available via
+`--cache-backend cache_dit`; TeaCache is not supported for this
+architecture (flow-matching + sway sampling).
+
+### Launch
+
+```bash
+vllm serve SWivid/F5-TTS/F5TTS_v1_Base --omni --trust-remote-code --port 8091
+```
+
+The 3-segment model id is required; F5-TTS runs on the default
+single-stage diffusion config (no deploy config). Enable the DiT CUDA
+Graph replay with
+`--stage-overrides '{"0":{"extras":{"f5_dit_cudagraph":true}}}'`
+(reference values in `vllm_omni/deploy/f5_tts.yaml`).
+
+### Sending requests
+
+```bash
+REF_BASE64=$(base64 -w 0 /path/to/reference.wav)
+
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    --output output.wav \
+    -d '{
+        "input": "Hello, this is a test of F5 TTS online serving.",
+        "ref_audio": "data:audio/wav;base64,'"${REF_BASE64}"'",
+        "ref_text": "Transcript of the reference audio.",
+        "num_inference_steps": 32,
+        "guidance_scale": 2.0
+    }'
+```
+
+A ready-made client is available at
+`examples/online_serving/text_to_speech/f5_tts/openai_speech_client.py`.
 
 ---
 

@@ -196,6 +196,11 @@ _DIFFUSION_MODELS = {
         "pipeline_pi0",
         "Pi0Pipeline",
     ),
+    "F5TTSPipeline": (
+        "f5_tts",
+        "pipeline_f5_tts",
+        "F5TTSPipeline",
+    ),
     "LongCatImageEditPipeline": (
         "longcat_image",
         "pipeline_longcat_image_edit",
@@ -562,6 +567,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MiniMaxH3Pipeline": "get_minimax_h3_post_process_func",
     "MiniMaxH3ModularPipeline": "get_minimax_h3_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
+    "F5TTSPipeline": "get_f5_tts_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",

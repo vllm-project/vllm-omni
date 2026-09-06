@@ -1366,13 +1366,30 @@ class OmniDiffusionConfig:
         Diffusers-style models expose a pipeline index with ``_class_name``.
         Non-diffusers models (e.g. Bagel, NextStep) only have ``config.json``,
         so we fall back to reading that and mapping model_type manually.
+        F5-TTS checkpoints have no standard config; use bespoke discovery.
         """
         from vllm.transformers_utils.config import get_hf_file_to_dict
 
+        from vllm_omni.diffusion.models.f5_tts.hf_utils import (
+            F5_PIPELINE_CLASS,
+            build_f5_transformer_config,
+            is_f5_model,
+        )
         from vllm_omni.diffusion.utils.hf_utils import (
             get_diffusion_model_index,
             resolve_native_diffusion_model_class,
         )
+
+        # F5-TTS checkpoints have no standard config; use bespoke discovery.
+        if is_f5_model(self.model):
+            if self.model_class_name is None:
+                self.model_class_name = F5_PIPELINE_CLASS
+            tf_config_dict = build_f5_transformer_config(
+                self.model, revision=self.revision,
+            )
+            self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
+            self.update_multimodal_support()
+            return
 
         assert self.model is not None
         try:

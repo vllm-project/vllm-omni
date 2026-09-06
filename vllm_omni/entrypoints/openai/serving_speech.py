@@ -37,6 +37,7 @@ from vllm.utils import random_uuid
 from vllm.utils.async_utils import make_async
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.diffusion.models.f5_tts.hf_utils import is_f5_model
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin, StreamingAudioResampler
 from vllm_omni.entrypoints.openai.protocol.audio import (
     AudioResponse,
@@ -1294,6 +1295,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Check if the current model is a supported TTS model."""
         return self._find_tts_stage() is not None
 
+    def _is_f5_tts_model(self) -> bool:
+        if not self._diffusion_mode:
+            return False
+        # for_diffusion() instances only carry _diffusion_model_name;
+        # __init__-constructed instances carry model_name.
+        model_name = getattr(self, "_diffusion_model_name", None) or getattr(self, "model_name", None)
+        return is_f5_model(model_name)
+
+    @staticmethod
+    def _audio_value_numel(audio_value: Any) -> int:
+        if hasattr(audio_value, "numel"):
+            return int(audio_value.numel())
+        return int(np.asarray(audio_value).size)
+
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
         sample_rate_error = self._validate_speech_sample_rate(request)
@@ -2307,8 +2322,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     chunk_np = (
                         chunk_tensor.float().detach().cpu().numpy() if hasattr(chunk_tensor, "float") else chunk_tensor
                     )
-                    if chunk_np.ndim > 1:
-                        chunk_np = chunk_np.squeeze()
+                    chunk_np = self._normalize_audio_tensor_for_output(chunk_np)
                     if resampler is not None:
                         chunk_np = resampler.process(chunk_np)
                         if chunk_np.size == 0:
@@ -3135,7 +3149,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise ValueError(
                     "The /v1/audio/speech endpoint is only supported for "
                     "dedicated TTS models (e.g., Qwen3-TTS, Voxtral, Fish "
-                    "Speech, CosyVoice3, OmniVoice, VoxCPM2). For omni "
+                    "Speech, CosyVoice3, OmniVoice, VoxCPM2, F5-TTS). For omni "
                     "models like Qwen3-Omni, use /v1/chat/completions with "
                     '\'"modalities": ["audio"]\' instead.'
                 )
@@ -3384,7 +3398,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             elif isinstance(audio_tensor, list):
                 async_chunk = bool(getattr(self.engine_client.model_config, "async_chunk", False))
                 if async_chunk:
-                    non_empty_chunks = [candidate for candidate in audio_tensor if candidate.numel() > 0]
+                    non_empty_chunks = [
+                        candidate
+                        for candidate in audio_tensor
+                        if self._audio_value_numel(candidate) > 0
+                    ]
                     audio_tensor = (
                         torch.cat(non_empty_chunks, dim=-1) if non_empty_chunks else np.zeros((0,), dtype=np.float32)
                     )
@@ -3393,14 +3411,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     audio_tensor = np.zeros((0,), dtype=np.float32)
                     # Non-async Qwen3-TTS returns cumulative history snapshots, so keep the latest non-empty tensor.
                     for candidate in reversed(audio_history):
-                        if candidate.numel() > 0:
+                        if self._audio_value_numel(candidate) > 0:
                             audio_tensor = candidate
                             break
             if hasattr(audio_tensor, "float"):
                 audio_tensor = audio_tensor.float().detach().cpu().numpy()
-
-            if audio_tensor.ndim > 1:
-                audio_tensor = audio_tensor.squeeze()
+            audio_tensor = self._normalize_audio_tensor_for_output(audio_tensor)
 
             if self._tts_model_type in _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES and int(np.size(audio_tensor)) == 0:
                 # Audex contract: zero codec tokens must fail the request, not
@@ -3464,25 +3480,53 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise ValueError(err)
 
             request_id = f"speech-{random_uuid()}"
-            prompt: dict[str, Any] = {"input": request.input}
-            if request.ref_audio:
-                wav, sr, _ = await self._resolve_ref_audio(request.ref_audio)
-                prompt["ref_audio"] = (np.asarray(wav, dtype=np.float32), sr)
-            if request.ref_text:
-                prompt["ref_text"] = request.ref_text
-            if request.voice:
-                if request.voice in self.uploaded_speakers and not has_inline_ref_audio:
-                    prompt["voice_name"] = request.voice
-                    prompt["voice_created_at"] = self._voice_created_at(request.voice)
-            if request.language:
-                prompt["lang"] = request.language
-            if request.instructions:
-                prompt["instruct"] = request.instructions
+            if self._is_f5_tts_model():
+                # F5-TTS reads ref_text / lang from additional_information
+                # (see pipeline_f5_tts.forward). ref_audio is resolved through
+                # the serving MediaConnector here — NOT passed as a raw
+                # locator — so allowed_local_media_path / allowed_media_domains
+                # policy is enforced exactly as for the OmniVoice path.
+                additional: dict[str, Any] = {}
+                if request.ref_audio:
+                    wav, sr, _ = await self._resolve_ref_audio(request.ref_audio)
+                    additional["ref_audio"] = (np.asarray(wav, dtype=np.float32), sr)
+                if request.ref_text:
+                    additional["ref_text"] = request.ref_text
+                if request.language:
+                    additional["lang"] = request.language
+                if not additional.get("ref_audio"):
+                    return self._diffusion_error_response(
+                        "F5-TTS requires reference audio: provide ref_audio (URL / base64 / file) "
+                        "or an uploaded voice.",
+                        status_code=400,
+                    )
+                prompt: dict[str, Any] = {
+                    "prompt": request.input,
+                    "additional_information": additional,
+                }
+            else:
+                # Upstream diffusion prompt layout (e.g. OmniVoice): ref_audio
+                # is resolved to a decoded (wav, sr) tuple at the top level.
+                prompt = {"input": request.input}
+                if request.ref_audio:
+                    wav, sr, _ = await self._resolve_ref_audio(request.ref_audio)
+                    prompt["ref_audio"] = (np.asarray(wav, dtype=np.float32), sr)
+                if request.ref_text:
+                    prompt["ref_text"] = request.ref_text
+                if request.voice:
+                    if request.voice in self.uploaded_speakers and not has_inline_ref_audio:
+                        prompt["voice_name"] = request.voice
+                        prompt["voice_created_at"] = self._voice_created_at(request.voice)
+                if request.language:
+                    prompt["lang"] = request.language
+                if request.instructions:
+                    prompt["instruct"] = request.instructions
 
             logger.info(
-                "Diffusion TTS speech request %s: voice_clone=%s",
+                "Diffusion TTS speech request %s: text=%s voice_clone=%s",
                 request_id,
-                "ref_audio" in prompt,
+                request.input[:50] + "..." if len(request.input) > 50 else request.input,
+                bool(request.ref_audio),
             )
             _rl = getattr(self, "request_logger", None)
             if _rl:
@@ -3495,13 +3539,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise ValueError("extra_params must be a JSON object/dict.")
             extra = dict(request.extra_params or {})
             if request.seed is not None:
+                # OmniVoice reads seed from extra_args; most other diffusion
+                # pipelines (including F5-TTS) read sampling_params.seed,
+                # which the runner also turns into a torch.Generator.
                 extra["seed"] = request.seed
-            # Apply extra_params from the request to sampling params
-            sampling_params_list = self._diffusion_engine.default_sampling_params_list
-            if extra:
-                import copy
 
-                sampling_params_list = copy.deepcopy(sampling_params_list)
+            import copy
+            sampling_params_list = copy.deepcopy(
+                self._diffusion_engine.default_sampling_params_list
+            )
+            if request.num_inference_steps is not None:
+                sampling_params_list[0].num_inference_steps = request.num_inference_steps
+            if request.guidance_scale is not None:
+                sampling_params_list[0].guidance_scale = request.guidance_scale
+                sampling_params_list[0].guidance_scale_provided = True
+            if request.seed is not None:
+                sampling_params_list[0].seed = request.seed
+            if extra:
                 if sampling_params_list[0].extra_args is None:
                     sampling_params_list[0].extra_args = {}
                 sampling_params_list[0].extra_args.update(extra)
