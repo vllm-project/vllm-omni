@@ -117,7 +117,14 @@ def padding_mels(data: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         padded_feats: Padded tensor of shape (batch, n_mels, max_T)
         feats_lengths: Lengths of each sequence
     """
-    feats_lengths = torch.tensor([s.size(1) - 2 for s in data], dtype=torch.int32)
+    # Keep the full mel length, including the two boundary frames produced by
+    # Step-Audio2's 479-sample right padding.  The Step-Audio2 reference
+    # implementation uses this same length for prompt expansion and encoder
+    # masking.  Dropping the boundary frames here makes very short, non-empty
+    # audio inconsistent:
+    # prompt expansion produces one placeholder while the encoder produces no
+    # embeddings.
+    feats_lengths = torch.tensor([s.size(1) for s in data], dtype=torch.int32)
     feats = [s.t() for s in data]
     padded_feats = pad_sequence(feats, batch_first=True, padding_value=0)
     return padded_feats.transpose(1, 2), feats_lengths
@@ -344,11 +351,11 @@ def calculate_audio_feature_length(mel_length: int) -> int:
         >>> calculate_audio_feature_length(1000)
         125
     """
-    encoder_output_len = (mel_length + 1) // 4
+    encoder_output_len = (mel_length + 1) // 2 // 2
 
     adapter_output_len = (encoder_output_len - 1) // 2 + 1
 
-    return max(1, adapter_output_len)
+    return adapter_output_len
 
 
 class StepAudio2Processor(ProcessorMixin):
