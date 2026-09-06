@@ -1,16 +1,168 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Video/audio muxing utilities using PyAV (no ffmpeg binary dependency)."""
 
 from __future__ import annotations
 
 import io
-from collections.abc import Iterable
+import queue
+import threading
+from collections.abc import Iterable, Mapping
 from fractions import Fraction
 from typing import Any, cast
 
 import av
 import numpy as np
+
+_CHUNKED_MP4_DONE = object()
+
+
+def normalize_video_codec_options(value: Any) -> dict[str, str] | None:
+    """Coerce a request's ``video_codec_options`` into PyAV's str->str contract.
+
+    The value reaches a worker straight from ``extra_params``, so reject a
+    non-mapping here rather than letting it fail inside the encoder after the
+    decode has already run.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("video_codec_options must be a JSON object of encoder option names to values")
+    return {str(key): str(item) for key, item in value.items()}
+
+
+def _validate_video_chunk(chunk: np.ndarray, *, width: int, height: int) -> None:
+    """Validate a ``(T, H, W, 3)`` uint8 RGB chunk against a session's frame size."""
+    if chunk.ndim != 4 or chunk.shape[-1] != 3:
+        raise ValueError("video chunk must have shape (T, H, W, 3)")
+    if chunk.dtype != np.uint8:
+        raise ValueError("video chunk must have dtype uint8")
+    if chunk.shape[1] != height or chunk.shape[2] != width:
+        raise ValueError("video chunks in a session must use a consistent frame size")
+
+
+class ChunkedMP4Encoder:
+    """Encode temporal video chunks while the producer is still decoding.
+
+    A bounded queue and one muxing worker provide ordered backpressure while
+    keeping host memory bounded by ``max_pending`` chunks. Chunks use the same
+    ``(T, H, W, 3)`` uint8 contract as :func:`mux_video_audio_bytes`.
+    """
+
+    def __init__(
+        self,
+        *,
+        width: int,
+        height: int,
+        fps: float,
+        audio_waveform: np.ndarray | None = None,
+        audio_sample_rate: int | None = None,
+        max_pending: int = 2,
+        video_codec: str = "h264",
+        audio_codec: str = "aac",
+        crf: str = "18",
+        video_codec_options: dict[str, str] | None = None,
+    ) -> None:
+        if max_pending <= 0:
+            raise ValueError("max_pending must be positive")
+        if width <= 0 or height <= 0:
+            raise ValueError("width and height must be positive")
+        self.width = int(width)
+        self.height = int(height)
+        self._queue: queue.Queue[object] = queue.Queue(maxsize=max_pending)
+        self._result: bytes | None = None
+        self._error: BaseException | None = None
+        self._closed = False
+        self._state_lock = threading.Lock()
+
+        def run() -> None:
+            try:
+                self._result = mux_av_video_audio_bytes(
+                    self._frames(),
+                    width=self.width,
+                    height=self.height,
+                    audio_waveform=audio_waveform,
+                    fps=fps,
+                    audio_sample_rate=audio_sample_rate,
+                    video_codec=video_codec,
+                    audio_codec=audio_codec,
+                    crf=crf,
+                    video_codec_options=video_codec_options,
+                )
+            except BaseException as exc:
+                self._error = exc
+                self._drain_until_done()
+
+        self._thread = threading.Thread(target=run, name="chunked-mp4", daemon=True)
+        self._thread.start()
+
+    def _drain_until_done(self) -> None:
+        while self._queue.get() is not _CHUNKED_MP4_DONE:
+            pass
+
+    def _frames(self):
+        while True:
+            chunk = self._queue.get()
+            if chunk is _CHUNKED_MP4_DONE:
+                return
+            assert isinstance(chunk, np.ndarray)
+            for frame_data in chunk:
+                yield av.VideoFrame.from_ndarray(frame_data, format="rgb24")
+
+    def _validate_chunk(self, chunk: np.ndarray) -> None:
+        _validate_video_chunk(chunk, width=self.width, height=self.height)
+
+    def _raise_if_failed(self) -> None:
+        if self._error is not None:
+            raise self._error
+        if self._closed:
+            raise RuntimeError("ChunkedMP4Encoder is already closed")
+
+    def push(self, chunk: np.ndarray) -> None:
+        """Queue one ordered uint8 chunk, applying bounded backpressure."""
+        self._validate_chunk(chunk)
+        self._raise_if_failed()
+        self._queue.put(chunk)
+
+    def _send_done(self) -> None:
+        self._queue.put(_CHUNKED_MP4_DONE)
+
+    def finish(self) -> bytes:
+        """Flush the muxer and return complete progressive MP4 bytes."""
+        with self._state_lock:
+            if self._closed:
+                if self._error is not None:
+                    raise self._error
+                assert self._result is not None
+                return self._result
+            self._closed = True
+        self._send_done()
+        self._thread.join()
+        if self._error is not None:
+            raise self._error
+        assert self._result is not None
+        return self._result
+
+    def abort(self) -> None:
+        """Stop the worker after producer cancellation or an upstream error."""
+        with self._state_lock:
+            if self._closed:
+                self._thread.join()
+                return
+            self._closed = True
+        self._send_done()
+        self._thread.join()
+
+    close = abort
+
+    def __enter__(self) -> ChunkedMP4Encoder:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is None:
+            self.finish()
+        else:
+            self.abort()
 
 
 class FragmentedMP4Muxer:
@@ -57,12 +209,7 @@ class FragmentedMP4Muxer:
         """Mux a batch of ``uint8`` RGB frames and return newly written MP4 bytes."""
         if self._closed:
             raise RuntimeError("Cannot mux frames after FragmentedMP4Muxer.close().")
-        if video_frames.ndim != 4 or video_frames.shape[-1] != 3:
-            raise ValueError("video_frames must have shape (T, H, W, 3).")
-        if video_frames.dtype != np.uint8:
-            raise ValueError("video_frames must be uint8.")
-        if video_frames.shape[1] != self._stream.height or video_frames.shape[2] != self._stream.width:
-            raise ValueError("All fragmented MP4 chunks in a session must use the same frame size.")
+        _validate_video_chunk(video_frames, width=self._stream.width, height=self._stream.height)
 
         for frame_data in video_frames:
             frame = av.VideoFrame.from_ndarray(frame_data, format="rgb24")
