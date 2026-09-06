@@ -138,6 +138,7 @@ def test_resumable_generation_stop_marks_segment_boundary() -> None:
     sched.recompute_kv_load_failures = False
     sched.connector = None
     sched.kv_cache_manager.take_events.return_value = None
+    sched.kv_cache_manager.estimate_cached_tokens.return_value = 0
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
 
@@ -410,12 +411,13 @@ class TestRealignRequestStatusToQueues:
         assert stale.status == RequestStatus.RUNNING
         assert clean.status == RequestStatus.RUNNING
 
-    def test_finished_request_is_skipped(self) -> None:
+    def test_non_resumable_finished_request_is_skipped(self) -> None:
         """Already-finished requests must not be touched -- they may
         have legitimate finished statuses (FINISHED_STOPPED etc.) that
         a status flip would corrupt.
         """
         req = _make_request(request_id="req-finished")
+        req.resumable = False
         req.status = RequestStatus.FINISHED_STOPPED
 
         sched = _RealignSchedulerStub(

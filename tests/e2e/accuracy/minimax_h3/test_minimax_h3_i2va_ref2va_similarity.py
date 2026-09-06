@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -119,6 +119,9 @@ def _model_name(model_env_var: str = MODEL_ENV_VAR, component: str = "FL2VA") ->
 def _server_args() -> list[str]:
     return [
         "--trust-remote-code",
+        # Both official-reference requests use fixed shapes. Keep regional
+        # compilation static so cold Inductor codegen is stable across CI nodes.
+        "--no-diffusion-compile-dynamic",
         "--num-gpus",
         "4",
         "--usp",

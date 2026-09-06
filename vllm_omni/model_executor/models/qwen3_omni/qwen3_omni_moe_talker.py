@@ -18,6 +18,9 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.model_executor.models.qwen3_omni.quantization import (
+    Qwen3OmniNestedSupportsQuant,
+)
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_code_predictor_mtp import (
     Qwen3OmniMoeTalkerCodePredictor,
 )
@@ -32,6 +35,7 @@ logger = init_logger(__name__)
 class Qwen3OmniMoeTalkerForConditionalGeneration(
     nn.Module,
     SupportsPP,
+    Qwen3OmniNestedSupportsQuant,
 ):
     """
     Qwen3 Omni MoE Talker - Converts text to audio codec codes.
@@ -58,8 +62,10 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
             "talker.model.": "language_model.model.",
             # Codec head remains separate (outputs audio codes, not text)
             "talker.codec_head.": "codec_head.",
-            # Code predictor: Now matches HF structure exactly (has .model sub-module)
-            # e.g., "talker.code_predictor.model.codec_embedding.0" → "code_predictor.model.codec_embedding.0"
+            # Code predictor: keep the subtree under ``code_predictor.``.
+            # ``CodePredictorWrapper.load_weights`` accepts both current
+            # ``model.*`` body names and legacy body-direct names such as
+            # ``layers.*`` / ``codec_embedding.*``.
             "talker.code_predictor.": "code_predictor.",
             # Projection layers
             "talker.text_projection.": "text_projection.",

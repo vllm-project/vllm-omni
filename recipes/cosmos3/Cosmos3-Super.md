@@ -125,6 +125,23 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
   under the top-level `action` field. Verified on the 64B Super under
   `--cfg-parallel-size 2`: async `policy` returns the predicted action (`[16, 10]`)
   and the rollout video reliably.
+- **Transfer controls:** same semantics as Nano — `extra_params` may include
+  `edge`, `blur`, `depth`, `seg`, or `wsm` hints; see the Cosmos3-Nano recipe
+  for the request shapes and full option list. Every hint accepts a
+  non-negative `control_weight`; weights are normalized across active controls
+  and therefore only set their relative influence. A single positive weight
+  always normalizes to `1.0`; use `control_guidance` to change the absolute
+  strength of a single control. With two or more active controls, the
+  per-control attention passes run replicated on every sequence-parallel
+  (Ulysses) rank, so Ulysses does not reduce per-rank memory or latency for
+  multi-control transfer requests. Transfer always uses Cosmos3's
+  transfer-specific system prompt, appends a control-adherence directive by
+  default (`emphasize_control_in_prompt: false` disables it), and enables
+  duration/FPS and resolution metadata on both CFG branches
+  (`use_duration_template` / `use_resolution_template` to disable;
+  `negative_metadata_mode` accepts `same`, `inverse`, or `none`, defaulting to
+  `same`). Transfer does not add a negative prompt automatically; an optional
+  reference prompt is provided in [`negative_prompt.json`](negative_prompt.json).
 
 ## NPU
 

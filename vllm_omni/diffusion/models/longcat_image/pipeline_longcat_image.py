@@ -233,7 +233,7 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
 
         # See ``hub_prefetch.py`` for the transformers v5 multi-worker subfolder
         # race; prefetch the whole component set before any from_pretrained.
-        longcat_subfolders = ["scheduler", "text_encoder", "tokenizer", "vae"]
+        longcat_subfolders = ["scheduler", "text_encoder", "text_processor", "tokenizer", "vae"]
         prefetch_subfolders(model, longcat_subfolders, local_files_only=local_files_only)
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
@@ -248,7 +248,7 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
             local_files_only=local_files_only,
         )
         self.text_processor = Qwen2VLProcessor.from_pretrained(
-            model, subfolder="tokenizer", local_files_only=local_files_only
+            model, subfolder="text_processor", local_files_only=local_files_only
         )
         self.vae = from_pretrained_with_prefetch(
             AutoencoderKL.from_pretrained,
@@ -627,6 +627,7 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfile
                 negative_kwargs = {
                     "hidden_states": latents,
                     "timestep": timestep / 1000,
+                    "guidance": guidance,
                     "encoder_hidden_states": negative_prompt_embeds,
                     "txt_ids": negative_text_ids,
                     "img_ids": latent_image_ids,

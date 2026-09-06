@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Structured payload types for inter-stage communication.
 
 Categories under ``OmniPayload``:
@@ -12,11 +12,15 @@ Categories under ``OmniPayload``:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import msgspec
 import numpy as np
 import torch
+
+REQUEST_ARTIFACT_DIRS_KEY = "_omni_request_artifact_dirs"
+TRANSFORM_OWNED_META_KEYS = frozenset({"minimax_h3_prepared_reference_videos"})
 
 if TYPE_CHECKING:
     from vllm_omni.engine import AdditionalInformationEntry, AdditionalInformationPayload
@@ -59,6 +63,7 @@ class Ids(TypedDict, total=False):
     output: list[int]
     speech_token: list[int]
     prior_image: list[int]
+    streaming_prompt_previous_codes: list[int]
 
 
 class OmniPayloadMeta(TypedDict, total=False):
@@ -78,6 +83,7 @@ class OmniPayloadMeta(TypedDict, total=False):
     override_keys: list[tuple[str, str]]
     num_processed_tokens: int
     next_stage_prompt_len: int
+    next_stage_generation_tokens: int
     replace_streaming_prompt: bool
     next_stage_prompt_ids: list[int]
     ar_width: int
@@ -97,6 +103,13 @@ class OmniPayloadMeta(TypedDict, total=False):
     ref_context_included: bool
     talker_prefill_offset: int
     omni_final_stage_id: int
+    # Per-request audio seed. Stages that draw their own noise (flow-matching
+    # / diffusion decoders) need the producing stage's seed to stay
+    # reproducible, and the producing stage's SamplingParams do not travel
+    # with the payload.
+    audio_seed: int
+    token_role_ids: torch.Tensor
+    minimax_h3_prepared_reference_videos: str
 
 
 class OmniPayload(TypedDict, total=False):
@@ -117,7 +130,9 @@ class OmniPayload(TypedDict, total=False):
 # ── msgspec.Struct mirror of the TypedDicts (runtime-validated) ──
 
 
-class _StructBase(msgspec.Struct, omit_defaults=True, kw_only=True, forbid_unknown_fields=True):
+class _StructBase(  # type: ignore[call-arg]
+    msgspec.Struct, omit_defaults=True, kw_only=True, forbid_unknown_fields=True
+):
     pass
 
 
@@ -161,6 +176,7 @@ class IdsStruct(_StructBase):
     output: list[int] | None = None
     speech_token: list[int] | None = None
     prior_image: list[int] | None = None
+    streaming_prompt_previous_codes: list[int] | None = None
 
 
 class MetaStruct(_StructBase):
@@ -177,6 +193,7 @@ class MetaStruct(_StructBase):
     override_keys: list[tuple[str, str]] | None = None
     num_processed_tokens: int | None = None
     next_stage_prompt_len: int | None = None
+    next_stage_generation_tokens: int | None = None
     replace_streaming_prompt: bool | None = None
     next_stage_prompt_ids: list[int] | None = None
     ar_width: int | None = None
@@ -191,6 +208,12 @@ class MetaStruct(_StructBase):
     codec_streaming: bool | None = None
     codec_frame_valid: torch.Tensor | None = None
     ref_code_len: int | None = None
+    # Expected FINAL length of a growing async-chunk sequence, when the
+    # producer knows it up front (e.g. a frame-locked AR stage whose
+    # max_tokens is exact). Lets consumers size fixed-capacity state (such as
+    # a CUDA-graph StaticCache bucket) optimally instead of assuming the
+    # worst case.
+    expected_total_tokens: int | None = None
     ref_context_size: int | None = None
     ref_context_request_id: str | None = None
     ref_context_included: bool | None = None
@@ -199,6 +222,9 @@ class MetaStruct(_StructBase):
     codec_left_context_frames: int | None = None
     code_flat_numel: int | None = None
     omni_final_stage_id: int | None = None
+    audio_seed: int | None = None
+    token_role_ids: torch.Tensor | None = None
+    minimax_h3_prepared_reference_videos: str | None = None
 
 
 class OmniPayloadStruct(_StructBase):
@@ -312,7 +338,7 @@ def _dtype_to_name(dtype: torch.dtype) -> str:
 _NESTED_KEYS = frozenset({"hidden_states", "embed", "ids", "codes", "meta"})
 
 
-def flatten_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def flatten_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Flatten a nested ``OmniPayload`` to dotted keys.
 
     Nested sub-dicts under ``_NESTED_KEYS`` are expanded:

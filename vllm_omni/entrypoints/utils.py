@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import json
 import os
 import types
@@ -19,10 +22,11 @@ from vllm_omni.config.config_factory import (
 )
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import _DEPLOY_DIR
-from vllm_omni.config.yaml_util import create_config, load_yaml_config, merge_configs
+from vllm_omni.config.yaml_util import create_config, load_yaml_config
 from vllm_omni.diffusion.utils.hf_utils import (
     _looks_like_dreamzero,
     get_diffusion_model_index,
+    resolve_native_diffusion_model_class,
 )
 from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.inputs.data import OmniSamplingParams
@@ -291,7 +295,10 @@ def resolve_model_config_path(model: str) -> str | None:
         model_type = hf_config.model_type
     except (ValueError, Exception):
         # If standard transformers format fails, try diffusers format
-        if get_diffusion_model_index(config_source) is not None:
+        native_model_class = resolve_native_diffusion_model_class(config_source)
+        if native_model_class is not None:
+            model_type = native_model_class
+        elif get_diffusion_model_index(config_source) is not None:
             model_type = _try_get_class_name_from_diffusers_config(config_source)
             if model_type is None:
                 raise ValueError(
@@ -369,11 +376,12 @@ def load_stage_configs_from_model(
 ) -> tuple[list, str | None]:
     """Load stage configurations from model's default config file.
 
-    For models registered in the pipeline registry (new path), uses
+    For models registered in the pipeline registry, uses
     ``StageConfigFactory.create_legacy_stage_configs_from_model()`` which merges
     PipelineConfig + DeployConfig + CLI overrides.
 
-    For other models (legacy path), loads stage configs from YAML.
+    Models that cannot be resolved through the registry return no stages so the
+    caller can apply its default stage configuration, when available.
 
     Args:
         model: Model name or path (used to determine model_type)
@@ -383,7 +391,7 @@ def load_stage_configs_from_model(
         stage_overrides: Per-stage overrides from --stage-overrides.
         strategy_config_path: Optional path to a composable-parallel
             ``strategy.yaml`` whose derived sizing is overlaid onto the
-            registry-merged stages (opt-in; ignored on the legacy YAML path).
+            registry-merged stages.
 
     Returns:
         ``(stage_configs, omni_lb_policy)``: the list of stage configuration
@@ -427,69 +435,17 @@ def load_stage_configs_from_model(
         # Convert StageConfig objects to OmegaConf for backward compat
         return [stage.to_omegaconf() for stage in stages], omni_lb_policy
 
-    # Legacy fallback: load from YAML. A composable-parallel strategy cannot be
-    # applied here (it overlays onto registry-merged stages), so warn rather than
-    # silently dropping the operator's --strategy-config.
+    strategy_note = ""
     if strategy_config_path is not None:
-        logger.warning(
-            "--strategy-config (%s) was provided but model %r resolves via the "
-            "legacy stage_configs YAML path, which does not support "
-            "composable-parallel strategies; the strategy is ignored. Use a "
-            "registry-based model to apply it.",
-            strategy_config_path,
-            model,
-        )
-    stage_config_path = resolve_model_config_path(model)
-    if stage_config_path is None:
-        return [], None
-    stage_configs = load_stage_configs_from_yaml(
-        config_path=stage_config_path,
-        base_engine_args=base_engine_args,
-        prefer_stage_engine_args=True,
+        strategy_note = f" Strategy config {strategy_config_path!r} was not applied."
+    logger.warning(
+        "No registered PipelineConfig resolved for model %r. Legacy `stage_args` "
+        "YAMLs are no longer supported; register the pipeline and provide deployment "
+        "overrides through `deploy_config`.%s",
+        model,
+        strategy_note,
     )
-    return stage_configs, None
-
-
-def load_stage_configs_from_yaml(
-    config_path: str,
-    base_engine_args: dict | None = None,
-    prefer_stage_engine_args: bool = True,
-) -> list:
-    """Load stage configurations from a YAML file (legacy OmegaConf path).
-
-    TODO(@lishunyang12): remove once all models use PipelineConfig + DeployConfig.
-
-    Args:
-        config_path: Path to the YAML configuration file
-        base_engine_args: Engine args supplied by the caller.
-        prefer_stage_engine_args: When True, YAML stage args override caller
-            engine args. When False, caller engine args override YAML defaults.
-
-    Returns:
-        List of stage configuration dictionaries from the file's stage_args
-    """
-    if base_engine_args is None:
-        base_engine_args = {}
-    config_data = load_yaml_config(config_path)
-    stage_args = config_data.stage_args
-    global_async_chunk = config_data.get("async_chunk", False)
-    # Convert any nested dataclass objects to dicts before creating DictConfig
-    base_engine_args = _convert_dataclasses_to_dict(base_engine_args)
-    base_engine_args = create_config(base_engine_args)
-    for stage_arg in stage_args:
-        base_engine_args_tmp = base_engine_args.copy()
-        # Update base_engine_args with stage-specific engine_args if they exist
-        if hasattr(stage_arg, "engine_args") and stage_arg.engine_args is not None:
-            if prefer_stage_engine_args:
-                merged_engine_args = merge_configs(base_engine_args_tmp, stage_arg.engine_args)
-            else:
-                merged_engine_args = merge_configs(stage_arg.engine_args, base_engine_args_tmp)
-            base_engine_args_tmp = create_config(merged_engine_args)
-        stage_type = getattr(stage_arg, "stage_type", "llm")
-        if hasattr(stage_arg, "runtime") and stage_arg.runtime is not None and stage_type != "diffusion":
-            base_engine_args_tmp.async_chunk = global_async_chunk
-        stage_arg.engine_args = base_engine_args_tmp
-    return stage_args
+    return [], None
 
 
 def filter_stages(
@@ -592,17 +548,62 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
     ``value`` may be a raw JSON string (as supplied on the CLI) or an
     already-parsed mapping. Returns ``None`` when no overrides are given.
 
+    Only the **shape** of the override mapping is validated here:
+
+    - top-level must be a dict
+    - keys must be non-negative ASCII integer strings (stage ids)
+    - values must be dicts
+
+    Field-name / type / range validation is intentionally not done at this
+    layer. The downstream resolver forwards every surviving key as
+    ``stage_<id>_<key>`` into ``cli_overrides`` (see
+    ``load_stage_configs_from_model``); field semantics live in
+    ``StageConfigFactory`` for registered pipelines, and the
+    default-diffusion fallback in ``async_omni_engine.py`` reads
+    ``stage_zero_overrides["extras"]`` for unregistered ones. Unknown
+    engine-arg keys that don't match ``OmniEngineArgs`` are dropped with
+    a warning at ``filter_dataclass_kwargs`` rather than failing here,
+    so a typo surfaces in the log instead of being silently lost.
+
     Raises:
-        ValueError: when ``value`` is a string that is not valid JSON.
+        ValueError: when ``value`` is not a valid per-stage override
+            mapping (invalid JSON, non-dict top level, non-ASCII-digit
+            stage id, non-dict value).
     """
     if not value:
         return None
     if isinstance(value, str):
         try:
-            return json.loads(value)
+            parsed = json.loads(value)
         except json.JSONDecodeError as exc:
             raise ValueError(f"--stage-overrides is not valid JSON: {exc}. Got: {value!r}") from exc
-    return value
+    else:
+        parsed = value
+
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"--stage-overrides must be a JSON object mapping stage_id -> overrides, "
+            f"got {type(parsed).__name__}: {parsed!r}"
+        )
+    if not parsed:
+        return None
+
+    for stage_id_str, overrides in parsed.items():
+        # ``str.isdigit()`` accepts Unicode digit classes (e.g. fullwidth
+        # ``"０"``); downstream's ``_STAGE_OVERRIDE_PATTERN`` is ASCII-only
+        # (``^stage_(\d+)_(.+)$``), so a non-ASCII-digit key would parse
+        # here and silently misroute as a global key. ``isascii()`` closes
+        # that hole.
+        if not isinstance(stage_id_str, str) or not stage_id_str.isdigit() or not stage_id_str.isascii():
+            raise ValueError(
+                f"--stage-overrides keys must be non-negative integer stage ids (as strings), got {stage_id_str!r}"
+            )
+        if not isinstance(overrides, dict):
+            raise ValueError(
+                f"--stage-overrides[{stage_id_str!r}] must be an object, got {type(overrides).__name__}: {overrides!r}"
+            )
+
+    return parsed
 
 
 def load_and_resolve_stage_configs(
@@ -651,6 +652,18 @@ def load_and_resolve_stage_configs(
             stage_configs = []
 
     stage_configs = filter_stages(config_path, stage_configs, kwargs)
+
+    # ``revision`` selects the model source for every stage. Keep the global
+    # CLI pin on each stage's engine args so diffusion config construction can
+    # pass it through to all component loaders. The registry-to-legacy-stage
+    # conversion currently drops this inherited vLLM EngineArgs field.
+    revision = (kwargs or {}).get("revision")
+    if revision is not None:
+        for stage_config in stage_configs:
+            engine_args = stage_config.get("engine_args") if hasattr(stage_config, "get") else None
+            if engine_args is not None and engine_args.get("revision") is None:
+                engine_args["revision"] = revision
+
     logger.debug(f"stage_configs: {stage_configs}")
 
     return config_path, stage_configs, omni_lb_policy
@@ -757,6 +770,11 @@ def filter_dataclass_kwargs(cls: Any, kwargs: dict) -> dict:
     filtered_kwargs = {}
     for k, v in kwargs.items():
         if k not in valid_fields:
+            logger.warning(
+                "Dropping unknown %s field %r (not declared on the dataclass)",
+                cls.__name__,
+                k,
+            )
             continue
         field = valid_fields[k]
         filtered_kwargs[k] = _filter_value(v, field.type)

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Omni serve command for vLLM-Omni.
 
@@ -538,6 +541,15 @@ class OmniServeCommand(CLISubcommand):
             "'advanced_uaa' enables the experimental UAA path for uneven sequence/head shapes.",
         )
         omni_config_group.add_argument(
+            "--ulysses-a2a-permute",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Enable fused permute-free Ulysses all-to-all over NCCL symmetric memory. "
+                "Only strict Ulysses layouts are eligible. Defaults to disabled."
+            ),
+        )
+        omni_config_group.add_argument(
             "--ring",
             "--ring-degree",
             dest="ring_degree",
@@ -605,6 +617,12 @@ class OmniServeCommand(CLISubcommand):
             "Sets the default backend for all diffusion attention roles, e.g. 'FLASH_ATTN'. "
             "May be combined with --diffusion-attention-config.per_role.* overrides, "
             "but mutually exclusive with --diffusion-attention-config.default.backend.",
+        )
+        omni_config_group.add_argument(
+            "--fastvideo-vsa-topk",
+            type=int,
+            default=None,
+            help="Number of key/value blocks selected per query block by FASTVIDEO_VSA.",
         )
         omni_config_group.add_argument(
             "--diffusion-attention-config",
@@ -686,29 +704,40 @@ class OmniServeCommand(CLISubcommand):
 
         # diffusion model offload parameters
         omni_config_group.add_argument(
+            "--diffusion-offload-config",
+            type=json.loads,
+            default=None,
+            help="Diffusion CPU-offload config as JSON. "
+            "Set mode to module or layer, list dit and/or text_encoder in "
+            "components, and put layer-only tuning under layer_options. "
+            "Layer settings are weight_transfer (rank-local or allgather) and "
+            "resident_layers (DiT only).",
+        )
+        omni_config_group.add_argument(
             "--enable-cpu-offload",
             action="store_true",
-            help="Enable CPU offloading for diffusion models.",
+            help="Compatibility alias for model-level CPU offload. New integrations should use "
+            "--diffusion-offload-config with mode=module and explicit components.",
         )
         omni_config_group.add_argument(
             "--enable-layerwise-offload",
             action="store_true",
-            help="Enable layerwise (blockwise) offloading on DiT modules.",
+            help="Compatibility alias for layerwise CPU offload. New integrations should use "
+            "--diffusion-offload-config with mode=layer and explicit components.",
         )
         omni_config_group.add_argument(
             "--enable-distributed-layerwise-offload",
             action="store_true",
-            help="Enable distributed layerwise offloading with H2D + AllGather overlap. "
-            "Shards weights across DP ranks, stores only 1/DP_size on each host, "
-            "and overlaps H2D transfers and AllGather with computation. "
-            "DP size is automatically derived from the parallel configuration.",
+            help="Compatibility alias for distributed layerwise CPU offload. "
+            "New integrations should use mode=layer and configure weight transfer per component.",
         )
         omni_config_group.add_argument(
             "--dlo-use-allgather",
             dest="dlo_use_allgather",
             action="store_true",
             default=True,
-            help="Use shard + AllGather for weight reconstruction (default: True). "
+            help="Compatibility option; use component weight_transfer=allgather in new configurations. "
+            "Use shard + AllGather for weight reconstruction (default: True). "
             "When disabled (--dlo-no-use-allgather), each rank streams the "
             "standard loader's rank-local tensors via H2D only — no additional "
             "DP sharding, no AllGather, and no concurrent-request requirement.",
@@ -718,6 +747,7 @@ class OmniServeCommand(CLISubcommand):
             dest="dlo_use_allgather",
             action="store_false",
             help=(
+                "Compatibility option; use component weight_transfer=rank-local in new configurations. "
                 "Disable AllGather and stream standard-loader rank-local weights "
                 "independently (including existing TP shards)."
             ),
@@ -726,8 +756,39 @@ class OmniServeCommand(CLISubcommand):
             "--dlo-resident-layers",
             type=int,
             default=0,
-            help="Keep this many leading main-DiT blocks resident on the device "
-            "while distributed layerwise offload streams the remaining blocks.",
+            help="Compatibility option; use layer_options.dit.resident_layers in new configurations.",
+        )
+        omni_config_group.add_argument(
+            "--host-weight-runtime-mode",
+            choices=("disabled", "preferred", "required"),
+            default="disabled",
+            help=(
+                "Host Weight Runtime policy for eligible no-AllGather DLO: "
+                "disabled does not consult HWR; preferred restores an exact hit "
+                "or canonically loads and publishes on a miss; required restores "
+                "an exact hit or fails startup. Populate a required store with "
+                "preferred first."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--host-weight-runtime-root",
+            type=str,
+            default=None,
+            help=(
+                "Writable node-local Host Weight Runtime store shared by workers "
+                "in one storage domain. Required for preferred and required; use "
+                "the same persistent path for population and serving."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--dlo-host-registration-limit-gib",
+            type=float,
+            default=0.0,
+            help=(
+                "Optional per-worker GiB ceiling for registering an HWR mmap for direct H2D. "
+                "Zero applies no additional ceiling. Eligible no-AllGather HWR hits attempt registration "
+                "under the existing pinned-memory policy and fall back to bounded staging when unavailable."
+            ),
         )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
@@ -780,10 +841,9 @@ class OmniServeCommand(CLISubcommand):
         omni_config_group.add_argument(
             "--text-encoder-tp-size",
             type=int,
-            default=1,
+            default=None,
             help="Tensor-parallel degree for the diffusion text encoder. "
-            "Shards the Qwen3-VL encoder across the first N DiT ranks, "
-            "removing the rank-0 encoder memory hotspot in no-offload runs. "
+            "Shards the encoder across the first N DiT ranks. "
             "Equivalent to setting DiffusionParallelConfig.text_encoder_tp_size.",
         )
         omni_config_group.add_argument(
@@ -823,13 +883,12 @@ class OmniServeCommand(CLISubcommand):
             default=False,
             help="Enable chunked streaming output for diffusion (mainly video generation) models that support it.",
         )
-
         # TTS-specific parameters
         omni_config_group.add_argument(
             "--tts-max-instructions-length",
             type=int,
             default=None,
-            help="Maximum length for TTS voice style instructions (overrides stage config, default: 500).",
+            help="Maximum length for TTS voice style instructions (overrides the pipeline default, default: 500).",
         )
 
         # Disable safety guardrails for this server (currently only applicable for Cosmos3)

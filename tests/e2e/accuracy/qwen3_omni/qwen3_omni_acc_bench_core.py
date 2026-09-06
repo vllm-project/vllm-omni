@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Shared helpers for Qwen3-Omni Daily-Omni / Seed-TTS ``vllm bench serve --omni`` accuracy runs.
 
 Local dataset paths are **optional**. When ``VLLM_DAILY_OMNI_QA_JSON`` + ``VLLM_DAILY_OMNI_VIDEO_DIR``
@@ -28,7 +29,7 @@ DEFAULT_SEED_TTS_HF_REPO = "zhaochenyang20/seed-tts-eval"
 
 
 class OmniBenchServerEndpoint(Protocol):
-    """Anything with ``host`` / ``port`` / ``model`` (e.g. :class:`tests.conftest.OmniServer`)."""
+    """Anything with ``host`` / ``port`` / ``model`` (e.g. :class:`tests.helpers.runtime.OmniServer`)."""
 
     host: str
     port: int

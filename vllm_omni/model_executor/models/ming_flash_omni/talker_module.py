@@ -33,9 +33,14 @@ from vllm.platforms import current_platform
 from x_transformers.x_transformers import RotaryEmbedding
 
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
+from vllm_omni.model_executor.models.common.ming.aggregator import Aggregator
 from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE
-from vllm_omni.model_executor.models.common.ming.dit import CondEmbedder, DiTBlock, FinalLayer, get_epss_timesteps
-from vllm_omni.model_executor.models.common.ming.fm import apply_sway_sampling, integrate_cfm_steps
+from vllm_omni.model_executor.models.common.ming.cfm_solver import (
+    apply_sway_sampling,
+    get_epss_timesteps,
+    integrate_cfm_steps,
+)
+from vllm_omni.model_executor.models.common.ming.dit_blocks import CondEmbedder, DiTBlock, FinalLayer
 
 logger = init_logger(__name__)
 
@@ -456,58 +461,6 @@ def silence_holder(
     if non_sil_len < speech.shape[-1]:
         sil_cache["holder"].append(speech[..., non_sil_len:])
     return speech_out, sil_cache
-
-
-########################################################################
-# Audio Postprocess
-# Ported from:
-# https://github.com/inclusionAI/Ming/blob/e58533db227031990c5a6864dcf5f08fb53ed0d2/talker_module/aggregator.py
-########################################################################
-
-
-class Aggregator(nn.Module):
-    """Maps generated audio latent patches back to LLM embedding space."""
-
-    def __init__(
-        self,
-        in_channels: int = 64,
-        hidden_size: int = 1152,
-        depth: int = 28,
-        num_heads: int = 16,
-        mlp_ratio: float = 4.0,
-        llm_input_dim: int = 896,
-        **kwargs,
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = in_channels
-        self.num_heads = num_heads
-
-        self.word_embedder = nn.Embedding(1, hidden_size)
-        self.x_embedder = nn.Linear(in_channels, hidden_size)
-        self.hidden_size = hidden_size
-
-        self.rotary_embed = RotaryEmbedding(hidden_size // num_heads)
-
-        self.blocks = nn.ModuleList(
-            [DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, **kwargs) for _ in range(depth)]
-        )
-        self.final_layer = FinalLayer(hidden_size, llm_input_dim)
-
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-        x = self.x_embedder(x)
-        cls_embed = self.word_embedder(torch.zeros((x.shape[0], 1), dtype=torch.long, device=x.device))
-        x = torch.cat([cls_embed, x], dim=1)
-
-        rope = self.rotary_embed.forward_from_seq_len(x.shape[1])
-        if mask is not None:
-            mask_pad = mask.clone().detach()[:, :1]
-            mask = torch.cat([mask_pad, mask], dim=-1)
-        for block in self.blocks:
-            x = block(x, mask, rope)
-        x = self.final_layer(x)
-        x = x[:, :1, :]
-        return x
 
 
 ########################################################################

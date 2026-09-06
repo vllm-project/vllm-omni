@@ -1,21 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Smoke test for HunyuanImage-3.0 Image-to-Text (I2T) pipeline."""
 
 from collections.abc import Generator
-from pathlib import Path
 
 import pytest
-import torch
 from PIL import Image
 
+from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni import Omni
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt
 
 MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct"
-REPO_ROOT = Path(__file__).resolve().parents[3]
-STAGE_CONFIG_PATH = REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "hunyuan_image3_i2t.yaml"
+DEPLOY_CONFIG_PATH = get_deploy_config_path("hunyuan_image3_ar.yaml")
 
 # First 20 generated token IDs from the HF greedy reference on this input.
 # vllm-omni AR output matches this prefix bitwise; the two implementations
@@ -52,13 +51,13 @@ pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 def omni() -> Generator[Omni, None, None]:
     with OmniRunner(
         MODEL_NAME,
-        deploy_config=str(STAGE_CONFIG_PATH),
+        deploy_config=DEPLOY_CONFIG_PATH,
         trust_remote_code=True,
     ) as runner:
         yield runner.omni
 
 
-@pytest.mark.skipif(torch.accelerator.device_count() < 4, reason="Need at least 4 CUDA GPUs.")
+@hardware_test(res={"cuda": "H100"}, num_cards=4)
 def test_i2t_generates_text(omni: Omni) -> None:
     """Verify I2T output's first 20 token IDs match the HF greedy baseline."""
     # Solid-color image keeps the input self-contained and reproducible.

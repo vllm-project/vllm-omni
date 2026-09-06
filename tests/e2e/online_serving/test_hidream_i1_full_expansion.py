@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 End-to-end diffusion coverage for HiDream-I1-Full in online serving mode.
 
@@ -12,7 +15,7 @@ image resolution.
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient, dummy_messages_from_mix_data
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
@@ -49,7 +52,7 @@ def _get_hidream_i1_image_feature_cases(model: str):
 @pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4662")
 def test_hidream_i1_image(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
 ):
     """Validate HiDream-I1-Full online serving with CPU offload."""
 
@@ -67,4 +70,4 @@ def test_hidream_i1_image(
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)

@@ -6,11 +6,6 @@ from vllm_omni.diffusion.distributed.hsdp import (
     HSDPInferenceConfig,
     apply_hsdp_to_model,
 )
-from vllm_omni.diffusion.distributed.parallel_state import (
-    get_fs_group,
-    get_fully_shard_rank,
-    get_fully_shard_world_size,
-)
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelConfig,
     SequenceParallelInput,
@@ -46,8 +41,4 @@ __all__ = [
     "get_sharding_validator",
     "HSDPInferenceConfig",
     "apply_hsdp_to_model",
-    # FS (Fully Shard) utilities
-    "get_fs_group",
-    "get_fully_shard_rank",
-    "get_fully_shard_world_size",
 ]

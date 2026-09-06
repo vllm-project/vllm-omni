@@ -69,7 +69,7 @@ python examples/offline_inference/text_to_speech/voxcpm2/end2end.py \
 
 ### Notes
 - Output: 48 kHz mono WAV.
-- Stage config: `vllm_omni/model_executor/stage_configs/voxcpm2.yaml` (default).
+- Deploy config: `vllm_omni/deploy/voxcpm2.yaml` (default).
 
 ---
 
@@ -152,7 +152,7 @@ python examples/offline_inference/text_to_speech/fish_speech/end2end.py \
     --text "Hello, this is a streaming test." \
     --streaming
 ```
-Streaming requires `async_chunk: true` in the stage config.
+Streaming requires `async_chunk: true` in the deploy config.
 
 ### Notes
 - Output: 44.1 kHz mono WAV.
@@ -274,7 +274,7 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py \
     --streaming \
     --output-dir /tmp/out_stream
 ```
-Streaming requires `async_chunk: true` in the stage config.
+Streaming requires `async_chunk: true` in the deploy config.
 
 ### Batched decoding
 The Code2Wav stage supports batched decoding through the SpeechTokenizer. Configure both stages with `max_num_seqs > 1` via `--stage-overrides` and pass multiple prompts via `--txt-prompts`:

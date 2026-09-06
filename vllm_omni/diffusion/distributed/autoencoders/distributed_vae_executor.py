@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
+from vllm_omni.diffusion.distributed.parallel_state import get_world_group
 
 logger = init_logger(__name__)
 
@@ -45,7 +45,8 @@ class DistributedVaeExecutor:
     """
 
     def __init__(self):
-        self.group = get_dit_group()
+        # Use a dedicated process group spanning the complete worker WORLD.
+        self.group = get_world_group().device_group
         self.world_size = dist.get_world_size(self.group)
         self.rank = dist.get_rank(self.group)
         self.parallel_size = 1
@@ -189,7 +190,7 @@ class DistributedVaeMixin:
         if self.distributed_executor.parallel_size > pp_size:
             logger.warning(
                 f"vae_patch_parallel_size={self.distributed_executor.parallel_size} "
-                f"is greater than dit_group={world_size};"
-                f" using dit_group size={world_size}"
+                f"is greater than WORLD={world_size};"
+                f" using WORLD size={world_size}"
             )
         return True

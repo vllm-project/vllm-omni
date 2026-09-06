@@ -25,14 +25,15 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
-from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.model_executor.model_loader.weight_utils import resolve_model_to_local_path
+from vllm_omni.model_executor.models.common.ming.aggregator import Aggregator
 from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE, AudioVAEConfig
 from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.transformers_utils.configs.ming_flash_omni import MingFlashOmniTalkerConfig
 
 from .prompt_utils import DEFAULT_PROMPT as MING_DEFAULT_PROMPT
-from .talker_module import CFM, Aggregator, DiT, MingAudioGenerator, build_tts_input
+from .talker_module import CFM, DiT, MingAudioGenerator, build_tts_input
 from .text_processing import segment_and_normalize
 from .voice_presets import VoicePresetRegistry
 
@@ -119,7 +120,11 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             DiT(llm_input_dim=self.hidden_size, **config.flowmodel),
             steps=config.steps,
         )
-        self.aggregator = Aggregator(llm_input_dim=self.hidden_size, **config.aggregator)
+        # config.aggregator still wins `in_channels` if the checkpoint states it.
+        self.aggregator = Aggregator(
+            llm_input_dim=self.hidden_size,
+            **{"in_channels": self.latent_dim, **config.aggregator},
+        )
         self.stop_head = nn.Linear(self.hidden_size, 2, bias=True)
         self.spk_head = nn.Linear(SPEAKER_EMBEDDING_DIM, self.hidden_size, bias=True)
 
@@ -525,27 +530,22 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
 
     def _iter_talker_safetensors(self) -> Iterable[tuple[str, torch.Tensor]]:
         """Yield (name, tensor) pairs from talker/model*.safetensors."""
-        model_path = self._model_path
-        # Try local path first
-        for candidate in (os.path.join(model_path, "talker"), model_path):
+        model_root = resolve_model_to_local_path(
+            self._model_path,
+            allow_download=True,
+            allow_patterns=["talker/model*.safetensors"],
+            cache_dir=self.vllm_config.load_config.download_dir,
+        )
+
+        # Nested talker/ layout first, then a flat checkpoint at the root.
+        for candidate in (os.path.join(model_root, "talker"), model_root):
             sf_files = sorted(glob_module.glob(os.path.join(candidate, "model*.safetensors")))
             if sf_files:
                 for sf_path in sf_files:
                     yield from load_file(sf_path, device="cpu").items()
                 return
 
-        # HF hub fallback: download only the talker checkpoint files
-        model_root = download_weights_from_hf_specific(
-            model_path,
-            self.vllm_config.load_config.download_dir,
-            allow_patterns=["talker/model*.safetensors"],
-        )
-        talker_dir = os.path.join(model_root, "talker")
-        sf_files = sorted(glob_module.glob(os.path.join(talker_dir, "model*.safetensors")))
-        if not sf_files:
-            raise RuntimeError(f"No talker safetensors found under {model_root}. Expected talker/model*.safetensors.")
-        for sf_path in sf_files:
-            yield from load_file(sf_path, device="cpu").items()
+        raise RuntimeError(f"No talker safetensors found under {model_root}. Expected talker/model*.safetensors.")
 
     def _load_vae_weights(self) -> set[str]:
         """Load AudioVAE weights from talker/vae/model.safetensors."""

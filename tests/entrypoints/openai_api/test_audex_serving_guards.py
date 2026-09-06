@@ -26,8 +26,13 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _serving(model_type: str = "audex") -> OmniOpenAIServingSpeech:
+    from vllm_omni.entrypoints.openai.tts_adapters import resolve_adapter
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+
     serving = OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
     serving._tts_model_type = model_type
+    adapter_cls = resolve_adapter(model_type)
+    serving._adapter = adapter_cls(SpeechServingContext(server=serving)) if adapter_cls is not None else None
     serving._mark_ref_audio_artifact_ready_for_request = lambda request_id: None
     serving._discard_ref_audio_artifact_warmup = lambda request_id: None
     return serving
@@ -154,7 +159,7 @@ class TestAudexCfgValidation:
         assert _adapter().validate(_speech_request(cfg_scale=None)) is None
         serving = TestAudexCfgInjection()._serving_with_fake_tokenizer()
         params = SimpleNamespace(extra_args={"cfg_scale": None})
-        out = serving._inject_audex_cfg_pair_args("req-1", {"prompt": "p"}, params)
+        out = serving._adapter._inject_audex_cfg_pair_args("req-1", {"prompt": "p"}, params)
         assert out.extra_args == {}
 
     @pytest.mark.parametrize("key", ["cfg_role", "cfg_pair_id", "cfg_null_prompt"])
@@ -177,21 +182,21 @@ class TestAudexCfgInjection:
     def test_no_extra_args_is_untouched(self):
         serving = self._serving_with_fake_tokenizer()
         params = SimpleNamespace(extra_args=None)
-        out = serving._inject_audex_cfg_pair_args("req-1", {"prompt": self._cond_prompt()}, params)
+        out = serving._adapter._inject_audex_cfg_pair_args("req-1", {"prompt": self._cond_prompt()}, params)
         assert out.extra_args is None
         assert params.extra_args is None
 
     def test_scale_one_leaves_params_byte_identical(self):
         serving = self._serving_with_fake_tokenizer()
         params = SimpleNamespace(extra_args={"cfg_scale": 1.0})
-        out = serving._inject_audex_cfg_pair_args("req-1", {"prompt": self._cond_prompt()}, params)
+        out = serving._adapter._inject_audex_cfg_pair_args("req-1", {"prompt": self._cond_prompt()}, params)
         assert out.extra_args == {}
 
     def test_guided_request_gains_pair_contract(self):
         serving = self._serving_with_fake_tokenizer()
         params = SimpleNamespace(extra_args={"cfg_scale": 1.5})
         cond = self._cond_prompt("Some transcription text here.")
-        out = serving._inject_audex_cfg_pair_args("req-42", {"prompt": cond}, params)
+        out = serving._adapter._inject_audex_cfg_pair_args("req-42", {"prompt": cond}, params)
 
         extra = out.extra_args
         assert extra["cfg_scale"] == 1.5
@@ -207,14 +212,14 @@ class TestAudexCfgInjection:
         serving = self._serving_with_fake_tokenizer()
         params = SimpleNamespace(extra_args={"cfg_scale": 1.5})
         with pytest.raises(ValueError, match="adapter-built text prompt"):
-            serving._inject_audex_cfg_pair_args("req-1", {"prompt_token_ids": [1]}, params)
+            serving._adapter._inject_audex_cfg_pair_args("req-1", {"prompt_token_ids": [1]}, params)
 
     def test_injection_never_mutates_input_params(self):
         """The input may be the engine's SHARED default params (review P2):
         pair state must land only on the returned clone."""
         serving = self._serving_with_fake_tokenizer()
         shared = SimpleNamespace(extra_args={"cfg_scale": 1.5}, temperature=0.1)
-        out = serving._inject_audex_cfg_pair_args("req-7", {"prompt": self._cond_prompt()}, shared)
+        out = serving._adapter._inject_audex_cfg_pair_args("req-7", {"prompt": self._cond_prompt()}, shared)
         assert out is not shared
         assert shared.extra_args == {"cfg_scale": 1.5}
         assert shared.temperature == 0.1
@@ -252,11 +257,11 @@ def test_guided_injection_sets_guided_temperature():
     serving = TestAudexCfgInjection()._serving_with_fake_tokenizer()
     cond = TestAudexCfgInjection()._cond_prompt()
     params = SimpleNamespace(extra_args={"cfg_scale": 1.5}, temperature=0.1)
-    out = serving._inject_audex_cfg_pair_args("req-1", {"prompt": cond}, params)
+    out = serving._adapter._inject_audex_cfg_pair_args("req-1", {"prompt": cond}, params)
     assert out.temperature == 0.05
 
     unguided = SimpleNamespace(extra_args={"cfg_scale": 1.0}, temperature=0.1)
-    out = serving._inject_audex_cfg_pair_args("req-2", {"prompt": cond}, unguided)
+    out = serving._adapter._inject_audex_cfg_pair_args("req-2", {"prompt": cond}, unguided)
     assert out.temperature == 0.1
 
 
@@ -340,7 +345,7 @@ class TestAudexTTAInjection:
     def test_default_injection_applies_rvq_and_cfg3(self):
         serving = self._serving()
         params = SimpleNamespace(extra_args=None)
-        out = serving._inject_audex_tta_args("req-9", self._prompt(), params)
+        out = serving._adapter._inject_audex_tta_args("req-9", self._prompt(), params)
 
         extra = out.extra_args
         rvq = extra["tta_rvq"]
@@ -355,15 +360,15 @@ class TestAudexTTAInjection:
     def test_explicit_scale_one_disables_cfg_but_keeps_rvq(self):
         serving = self._serving()
         params = SimpleNamespace(extra_args={"cfg_scale": 1.0})
-        out = serving._inject_audex_tta_args("req-1", self._prompt(), params)
+        out = serving._adapter._inject_audex_tta_args("req-1", self._prompt(), params)
         assert "tta_rvq" in out.extra_args
         assert "cfg_scale" not in out.extra_args
         assert "cfg_role" not in out.extra_args
 
     def test_rvq_contract_cached_per_process(self):
         serving = self._serving()
-        out_a = serving._inject_audex_tta_args("a", self._prompt(), SimpleNamespace(extra_args=None))
-        out_b = serving._inject_audex_tta_args("b", self._prompt(), SimpleNamespace(extra_args=None))
+        out_a = serving._adapter._inject_audex_tta_args("a", self._prompt(), SimpleNamespace(extra_args=None))
+        out_b = serving._adapter._inject_audex_tta_args("b", self._prompt(), SimpleNamespace(extra_args=None))
         assert out_a.extra_args["tta_rvq"] is out_b.extra_args["tta_rvq"]
 
     def test_injection_never_mutates_input_params(self):
@@ -372,8 +377,8 @@ class TestAudexTTAInjection:
         per-request pair state must land only on the returned clone."""
         serving = self._serving()
         shared = SimpleNamespace(extra_args=None)
-        out_1 = serving._inject_audex_tta_args("req-1", self._prompt(), shared)
-        out_2 = serving._inject_audex_tta_args("req-2", self._prompt(), shared)
+        out_1 = serving._adapter._inject_audex_tta_args("req-1", self._prompt(), shared)
+        out_2 = serving._adapter._inject_audex_tta_args("req-2", self._prompt(), shared)
         assert shared.extra_args is None
         assert out_1 is not shared and out_2 is not shared
         assert out_1.extra_args["cfg_pair_id"] == "req-1"

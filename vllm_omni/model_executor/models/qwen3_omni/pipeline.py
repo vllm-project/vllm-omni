@@ -61,6 +61,7 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
                 "detokenize": False,
                 "stop_token_ids": [2150],
             },
+            requires_full_payload_input=True,
         ),
         StagePipelineConfig(
             stage_id=2,
@@ -73,6 +74,7 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
             engine_output_type="audio",
             supports_native_mrv2_data_plane=True,
             sampling_constraints={"detokenize": True},
+            requires_full_payload_input=True,
         ),
     ),
 )

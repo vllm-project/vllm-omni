@@ -13,7 +13,7 @@ Ascend-specific workarounds that must not live in the shared GPU model file:
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from types import MethodType
 
 import numpy as np
@@ -113,20 +113,16 @@ def patch_step_audio2_hift_for_npu(hift: torch.nn.Module) -> None:
 
 
 @contextmanager
-def npu_token2wav_sdpa_context() -> Iterator[None]:
+def npu_token2wav_sdpa_context(*, require_math: bool = False) -> Iterator[None]:
     """Expand CosyVoice masks + force MATH SDPA to avoid FA 161001."""
-    try:
-        from vllm_omni.platforms.npu.models.cosyvoice2_dit_attn import (
-            apply_cosyvoice2_dit_attn_npu_patch,
-            npu_math_sdpa_context,
-        )
+    from vllm_omni.platforms.npu.models.cosyvoice2_dit_attn import (
+        apply_cosyvoice2_dit_attn_npu_patch,
+        npu_math_sdpa_context,
+    )
 
-        apply_cosyvoice2_dit_attn_npu_patch()
-        with npu_math_sdpa_context():
-            yield
-    except Exception:
-        with nullcontext():
-            yield
+    apply_cosyvoice2_dit_attn_npu_patch()
+    with npu_math_sdpa_context(require_available=require_math):
+        yield
 
 
 def _patched_ensure_models_loaded(self) -> None:

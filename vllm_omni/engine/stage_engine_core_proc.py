@@ -32,7 +32,7 @@ from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm_omni.distributed.omni_coordinator import create_stage_coord_client
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.stage_init_utils import (
-    maybe_apply_audex_cfg_patches,
+    maybe_apply_cfg_scheduler_patches,
     set_death_signal,
 )
 
@@ -40,6 +40,35 @@ logger = init_logger(__name__)
 
 
 _SIGNAL_EXIT_BASE = 128
+
+
+def _install_phase_locks(kwargs: dict[str, Any], local_dp_rank: int) -> None:
+    """Wrap ``kwargs["executor_class"]`` with the SH/EX phase-lock guard.
+
+    Fail-closed: ``parallel_stage_init`` promises that every memory-mutating
+    init phase in this child runs under the per-device locks, so a missing
+    ``vllm_config`` or ``executor_class`` must abort the launch rather than
+    silently proceed with an unguarded parallel initialization.
+    """
+    from vllm_omni.engine.stage_phase_lock import (
+        DevicePhaseLock,
+        wrap_executor_with_phase_locks,
+    )
+
+    missing = [key for key in ("vllm_config", "executor_class") if kwargs.get(key) is None]
+    if missing:
+        raise RuntimeError(
+            f"parallel_stage_init is enabled but EngineCore kwargs are missing {missing}, "
+            "so the SH/EX phase-lock guard cannot be installed. Refusing to run an "
+            "unguarded parallel initialization; fix the launch plumbing or disable "
+            "parallel_stage_init."
+        )
+    locker = DevicePhaseLock.from_child(kwargs["vllm_config"], local_dp_rank)
+    kwargs["executor_class"] = wrap_executor_with_phase_locks(kwargs["executor_class"], locker)
+    logger.info(
+        "[StageEngineCoreProc] parallel_stage_init: SH/EX phase locks on devices %s",
+        locker.device_ids,
+    )
 
 
 def _signal_exit_code(signum: int) -> int:
@@ -93,6 +122,7 @@ class StageEngineCoreProc(EngineCoreProc):
         omni_coordinator_address: str | None = None,
         omni_stage_id: int | None = None,
         omni_replica_id: int = 0,
+        omni_parallel_stage_init: bool = False,
         **kwargs: Any,
     ) -> None:
         """Launch StageEngineCoreProc busy loop in background process.
@@ -158,9 +188,19 @@ class StageEngineCoreProc(EngineCoreProc):
                 _vllm_engine_core_module.EngineCoreRequest,
             )
 
-            # Audex CFG scheduler patches must land before EngineCore builds
-            # its Scheduler; gated on the stage's logits_processors config.
-            maybe_apply_audex_cfg_patches(kwargs.get("vllm_config"))
+            # CFG pairing scheduler patches must land before EngineCore builds
+            # its Scheduler; gated on the stage's logits_processors and its
+            # default sampling extra_args.
+            maybe_apply_cfg_scheduler_patches(kwargs.get("vllm_config"))
+
+            # When parallel stage init is enabled, wrap this driver's executor
+            # so its memory-mutating phases (load / KV alloc / capture) hold a
+            # per-device LOCK_SH and its profiling measurement holds LOCK_EX.
+            # The wrapper must be installed here (in the engine-core child):
+            # phase boundaries live inside EngineCore.__init__, invisible to the
+            # orchestrator. See vllm_omni.engine.stage_phase_lock.
+            if omni_parallel_stage_init:
+                _install_phase_locks(kwargs, local_dp_rank)
 
             engine_core = StageEngineCoreProc(
                 *args,

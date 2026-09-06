@@ -27,7 +27,7 @@ from typing import Any
 from prometheus_client import Counter, Histogram
 
 from vllm_omni.metrics import definitions as defs
-from vllm_omni.metrics.utils import count_audio_frames, extract_mm_output
+from vllm_omni.metrics.utils import observe_audio_finalize, observe_diffusion_finalize
 
 _stage_labels = list(defs.STAGE_LABELS)
 
@@ -102,6 +102,40 @@ _diffusion_preprocess_family = Histogram(
 _diffusion_postprocess_family = Histogram(
     defs.DIFFUSION_POSTPROCESS_S,
     "Diffusion output postprocessing (VAE decode) time per request in seconds.",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_FAST_BUCKETS,
+)
+_vae_decode_family = Histogram(
+    defs.VAE_DECODE_S,
+    "VAE decode latency in seconds (latents -> pixels/audio/video).",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_BUCKETS,
+)
+_diffusion_forward_family = Histogram(
+    defs.DIFFUSION_FORWARD_S,
+    "Diffusion forward-only latency in seconds (denoise loop; excludes "
+    "preprocess / postprocess / VAE decode / KV load). Absent when the "
+    "pipeline profiler is off.",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_BUCKETS,
+)
+_diffusion_kv_load_family = Histogram(
+    defs.DIFFUSION_KV_LOAD_S,
+    "Diffusion KV-recv latency in seconds (AR→diffusion KV fetch; absent when "
+    "the stage has no upstream KV to receive).",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_FAST_BUCKETS,
+)
+_image_ttfp_family = Histogram(
+    defs.IMAGE_TTFP_S,
+    "Image time-to-first-output in seconds (stage submit → first image materialized; non-streaming single-image). "
+    "Stage-level, not e2e — excludes API queue and inter-stage transfer before the image stage.",
+    labelnames=_stage_labels,
+    buckets=defs.SECONDS_BUCKETS,
+)
+_denoise_step_latency_family = Histogram(
+    defs.DENOISE_STEP_LATENCY_S,
+    "Mean per-step denoise forward latency in seconds (forward_time / num_inference_steps).",
     labelnames=_stage_labels,
     buckets=defs.SECONDS_FAST_BUCKETS,
 )
@@ -206,6 +240,31 @@ class OmniModalityMetrics:
             replica=replica,
         ).observe(seconds)
 
+    def observe_vae_decode(self, stage: str, replica: str, seconds: float) -> None:
+        if not self._log_stats or seconds < 0:
+            return
+        _vae_decode_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(seconds)
+
+    def observe_diffusion_forward(self, stage: str, replica: str, seconds: float) -> None:
+        if not self._log_stats or seconds < 0:
+            return
+        _diffusion_forward_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(seconds)
+
+    def observe_diffusion_kv_load(self, stage: str, replica: str, seconds: float) -> None:
+        if not self._log_stats or seconds < 0:
+            return
+        _diffusion_kv_load_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(seconds)
+
+    def observe_image_ttfp(self, stage: str, replica: str, seconds: float) -> None:
+        if not self._log_stats or seconds < 0:
+            return
+        _image_ttfp_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(seconds)
+
+    def observe_denoise_step_latency(self, stage: str, replica: str, seconds: float) -> None:
+        if not self._log_stats or seconds <= 0:
+            return
+        _denoise_step_latency_family.labels(model_name=self._model_name, stage=stage, replica=replica).observe(seconds)
+
 
 def observe_modality_at_finalize(
     mod_metrics: OmniModalityMetrics,
@@ -216,61 +275,34 @@ def observe_modality_at_finalize(
     stage_metrics: Any,
     engine_outputs: Any,
 ) -> None:
-    """Route audio-path observations for a finalized request.
+    """Route per-modality observations for a finalized request.
 
     Used by ``omni_base._process_single_result`` inside the e2e_done finalize
-    guard so it fires once per request. Skips text path (covered by upstream
-    ``vllm:*{stage="thinker", ...}``) and any case where required inputs are
-    missing — caller should not need to pre-validate.
+    guard so it fires once per request. Text path falls through — covered by
+    upstream ``vllm:*{stage="thinker", ...}``. Caller should not need to
+    pre-validate; missing inputs are silently skipped.
 
     audio_ttfp is intentionally NOT observed here; it's emitted by the
     streaming hook at first-packet time, not at finalize.
     """
-    if replica_id is None or stage_metrics is None or output_type is None:
+    if replica_id is None or stage_metrics is None:
         return
 
-    stage_label = str(stage_id)
-    replica_label = str(replica_id)
-    gen_time_s = float(getattr(stage_metrics, "stage_gen_time_ms", 0.0)) / 1000.0
-    mm_out = extract_mm_output(engine_outputs)
+    observe_diffusion_finalize(
+        mod_metrics,
+        stage_id=stage_id,
+        replica_id=replica_id,
+        stage_metrics=stage_metrics,
+    )
 
     if output_type == "audio":
-        sample_rate = defs.resolve_audio_sample_rate(mm_out)
-        n_frames = int(getattr(stage_metrics, "audio_generated_frames", 0) or 0)
-        if n_frames == 0:
-            n_frames = count_audio_frames(mm_out)
-        mod_metrics.inc_audio_frames(stage_label, replica_label, n_frames)
-        duration_s = n_frames / sample_rate if sample_rate > 0 else 0.0
-        if duration_s > 0:
-            mod_metrics.observe_audio_duration(stage_label, replica_label, duration_s)
-            mod_metrics.observe_audio_rtf(
-                stage_label,
-                replica_label,
-                defs.compute_audio_rtf(gen_time_s, duration_s),
-            )
-        else:
-            mod_metrics.inc_audio_skipped(stage_label, replica_label, "no_audio_data")
-
-    dm = getattr(stage_metrics, "diffusion_metrics", None)
-    if dm:
-        _key_map = {
-            "diffusion_engine_exec_time_s": mod_metrics.observe_diffusion_exec,
-            "preprocess_time_s": mod_metrics.observe_diffusion_preprocess,
-            "postprocess_time_s": mod_metrics.observe_diffusion_postprocess,
-        }
-        for key, observe_fn in _key_map.items():
-            val = dm.get(key)
-            if val is not None:
-                observe_fn(stage_label, replica_label, float(val))
-
-        exec_time = dm.get("diffusion_engine_exec_time_s")
-        num_steps = dm.get("num_inference_steps")
-        if exec_time is not None and num_steps and num_steps > 0:
-            mod_metrics.observe_diffusion_exec_per_step(
-                stage_label,
-                replica_label,
-                float(exec_time) / int(num_steps),
-            )
+        observe_audio_finalize(
+            mod_metrics,
+            stage_id=stage_id,
+            replica_id=replica_id,
+            stage_metrics=stage_metrics,
+            engine_outputs=engine_outputs,
+        )
 
 
 def observe_audio_first_packet(

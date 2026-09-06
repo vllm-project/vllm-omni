@@ -504,6 +504,35 @@ def test_model_cpu_offload_moves_reasoner_and_generator_between_cpu_and_device(
     assert generator_param.device == accelerator_device
 
 
+def test_multi_control_attention_weights_target_outputs() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3CrossAttention
+
+    class ControlValueAttention:
+        def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+            del k
+            # Each per-control K/V layout is [text, control_i, target].
+            return v[:, 1:2].expand(q.shape[0], q.shape[1], -1, -1)
+
+    attention = SimpleNamespace(multi_control_attn=ControlValueAttention())
+    q = torch.zeros(1, 3, 1, 1)
+    k = torch.zeros_like(q)
+    v = torch.tensor([[[[10.0]], [[20.0]], [[30.0]]]])
+    text_kv = torch.zeros(1, 1, 1, 1)
+
+    output = Cosmos3CrossAttention._forward_multi_control(
+        attention,
+        q,
+        k,
+        v,
+        text_kv,
+        text_kv,
+        control_token_sizes=(1, 1),
+        control_weights=(0.25, 0.75),
+    )
+
+    torch.testing.assert_close(output, torch.tensor([[[10.0], [20.0], [17.5]]]))
+
+
 def test_forward_accepts_transfer_control_latents(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
 
@@ -521,9 +550,21 @@ def test_forward_accepts_transfer_control_latents(monkeypatch: pytest.MonkeyPatc
         video_shape=(1, 2, 2),
         fps=24.0,
         control_latents=[torch.ones_like(hidden_states), torch.full_like(hidden_states, 2.0)],
+        control_weights=[1.0, 3.0],
     )
 
     assert tuple(output.shape) == tuple(hidden_states.shape)
+    with pytest.raises(ValueError, match="control_weights length"):
+        model(
+            hidden_states=hidden_states,
+            timestep=torch.tensor([1.0]),
+            text_ids=torch.tensor([[1, 2]], dtype=torch.long),
+            text_mask=torch.ones(1, 2, dtype=torch.long),
+            video_shape=(1, 2, 2),
+            fps=24.0,
+            control_latents=[torch.ones_like(hidden_states), torch.full_like(hidden_states, 2.0)],
+            control_weights=[1.0],
+        )
     with pytest.raises(ValueError, match="control latent shape"):
         model(
             hidden_states=hidden_states,

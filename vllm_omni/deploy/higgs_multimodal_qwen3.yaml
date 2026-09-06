@@ -83,3 +83,10 @@ stages:
       max_tokens: 65536
       seed: 42
       repetition_penalty: 1.0
+
+platforms:
+  rocm:
+    stages:
+      - stage_id: 0
+        # FlashInfer is not supported on ROCm.
+        attention_backend: TRITON_ATTN

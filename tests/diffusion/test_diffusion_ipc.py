@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import contextlib
 import multiprocessing as mp
@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 from multiprocessing import shared_memory
+from multiprocessing.connection import Connection
 
 import numpy as np
 import pytest
@@ -29,7 +30,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 def _large_numel(dtype: torch.dtype) -> int:
-    return (_SHM_TENSOR_THRESHOLD // torch.empty((), dtype=dtype).element_size()) + 1
+    return int(_SHM_TENSOR_THRESHOLD // torch.empty((), dtype=dtype).element_size()) + 1
 
 
 def _cleanup_shm_handle(value: object) -> None:
@@ -38,7 +39,7 @@ def _cleanup_shm_handle(value: object) -> None:
             _unpack_if_shm_handle(value)
 
 
-def _result_queue_worker(connection, rank: int) -> None:
+def _result_queue_worker(connection: Connection, rank: int) -> None:
     """Send one nested NumPy result through a worker-owned MessageQueue."""
     result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
     try:
@@ -180,7 +181,7 @@ def test_diffusion_output_dict_tensors_round_trip_through_shm() -> None:
 
 
 def test_diffusion_output_tuple_tensors_round_trip_through_shm() -> None:
-    # LTX2 / DreamID return (video, audio) tuples as DiffusionOutput.output.
+    # LTX2 returns (video, audio) tuples as DiffusionOutput.output.
     video = torch.arange(300_000, dtype=torch.float32)
     audio = torch.arange(300_000, dtype=torch.float32) * 3
     output = DiffusionOutput(output=(video, audio))
@@ -309,11 +310,9 @@ def test_per_request_views_of_a_batch_tensor_do_not_ship_whole_storage() -> None
     """Regression: per-request slices used to pickle the whole batch storage.
 
     Each view is under the packing threshold, but pickle writes the entire
-    shared storage per view, so a batch's message grew by the full batch
-    tensor once per request and overflowed the ring buffer.
+    shared storage per view. Packing must key off storage nbytes so those
+    views become SHM handles instead of going on the wire.
     """
-    import pickle
-
     num_requests = 16
     # Each row stays under the threshold; the shared storage is well over it.
     row_numel = _SHM_TENSOR_THRESHOLD // (2 * torch.empty((), dtype=torch.float32).element_size())
@@ -321,6 +320,13 @@ def test_per_request_views_of_a_batch_tensor_do_not_ship_whole_storage() -> None
     per_request = batch[0]
     assert per_request.nelement() * per_request.element_size() <= _SHM_TENSOR_THRESHOLD
     assert per_request.untyped_storage().nbytes() > _SHM_TENSOR_THRESHOLD
+
+    packed_view = _pack_value_if_large(per_request)
+    try:
+        assert isinstance(packed_view, dict)
+        assert packed_view["__tensor_shm__"] is True
+    finally:
+        _cleanup_shm_handle(packed_view)
 
     output = BatchRunnerOutput.from_list(
         [
@@ -332,16 +338,10 @@ def test_per_request_views_of_a_batch_tensor_do_not_ship_whole_storage() -> None
             for i in range(num_requests)
         ]
     )
-    unpacked_size = len(pickle.dumps(output, protocol=pickle.HIGHEST_PROTOCOL))
 
     pack_diffusion_output_shm(output)
-    packed_size = len(pickle.dumps(output, protocol=pickle.HIGHEST_PROTOCOL))
 
     assert output.runner_outputs[0].result.trajectory_latents["__tensor_shm__"] is True
-    # Whole storage per request before; handles only after.
-    storage_bytes = per_request.untyped_storage().nbytes()
-    assert unpacked_size > num_requests * storage_bytes / 2
-    assert packed_size < _SHM_TENSOR_THRESHOLD
 
     unpack_diffusion_output_shm(output)
     for i in range(num_requests):
@@ -380,31 +380,37 @@ def test_pack_value_recurses_nested_dicts_and_lists_without_mutating_inline_valu
     large = torch.arange(_large_numel(torch.float32), dtype=torch.float32)
     small = torch.arange(8, dtype=torch.float32)
     list_tensor = torch.arange(_large_numel(torch.float32), dtype=torch.float32)
+    original_list = [list_tensor]
     payload = {
         "media": {
             "large": large,
             "small": small,
         },
-        "list_value": [list_tensor],
+        "list_value": original_list,
         "metadata": {"prompt": "keep inline"},
     }
 
     packed = _pack_value_if_large(payload)
 
     try:
+        assert isinstance(packed, dict)
         assert packed is not payload
-        assert packed["media"] is not payload["media"]
-        assert packed["media"]["large"]["__tensor_shm__"] is True
-        assert packed["media"]["small"] is small
+        media = packed["media"]
+        list_value = packed["list_value"]
+        assert isinstance(media, dict)
+        assert isinstance(list_value, list)
+        assert media is not payload["media"]
+        assert media["large"]["__tensor_shm__"] is True
+        assert media["small"] is small
         # Lists are recursed too: the large tensor inside is packed and a new
         # list is returned, while the input payload is left untouched.
-        assert packed["list_value"] is not payload["list_value"]
-        assert packed["list_value"][0]["__tensor_shm__"] is True
-        assert payload["list_value"][0] is list_tensor
+        assert list_value is not original_list
+        assert list_value[0]["__tensor_shm__"] is True
+        assert original_list[0] is list_tensor
         assert packed["metadata"] == {"prompt": "keep inline"}
 
-        torch.testing.assert_close(_unpack_if_shm_handle(packed["media"]["large"]), large)
-        torch.testing.assert_close(_unpack_if_shm_handle(packed["list_value"][0]), list_tensor)
+        torch.testing.assert_close(_unpack_if_shm_handle(media["large"]), large)
+        torch.testing.assert_close(_unpack_if_shm_handle(list_value[0]), list_tensor)
     finally:
         if isinstance(packed, dict):
             _cleanup_shm_handle(packed.get("media", {}).get("large"))

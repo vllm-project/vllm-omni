@@ -111,6 +111,17 @@ Mark early findings as preliminary and continue. This is not a GitHub comment.
   but do not publish review events without separate authorization.
 - Record DCO, pre-commit, required CI, and mergeability. Pending or unknown gates
   do not block source review.
+- GitHub Actions `SKIP` omits SPDX, shellcheck, markdownlint, mypy-3.10, and
+  test-mark coverage. A green GHA pre-commit job does not prove those local
+  gates passed. New files still need the full Linting list: Omni SPDX
+  (`vLLM-Omni project`), no stdlib `re`/`base64` in `vllm_omni/`, no new
+  pickle / Hugging Face Hub API / `torch.cuda` call sites, test marks, TTS
+  adapter ratchet, Buildkite schema, and native shellcheck on macOS/Windows.
+  See [Linting](https://vllm-omni.readthedocs.io/en/latest/contributing/#linting).
+- Expanding `CHECK_IMPORTS[*].allowed_files`, `ALLOWED_FILES`,
+  `MAX_MODEL_TYPE_BRANCHES`, or Buildkite `SKIP_FILES` is a policy change.
+  Do not rubber-stamp allowlist/budget growth; require justification and
+  prefer fixing the call site.
 - Treat a failed gate as its own evidence. Do not restate its formatting/lint
   output as a new code-review finding.
 - Open CI logs only when the first failing step overlaps the frozen diff or

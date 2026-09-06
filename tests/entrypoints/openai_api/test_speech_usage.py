@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for speech token-usage accounting (issue #4646).
 
 These exercise the pure usage logic without a model/server: input-token
@@ -203,6 +204,14 @@ def test_output_tokens_from_stage_metrics():
     # Final output carries stage metrics; stage-0 num_tokens_out is the count.
     acc.observe(_final_res(stage0_out=77))
     assert acc.total() == 77
+
+
+def test_output_tokens_preserves_stage0_finish_reason():
+    acc = SpeechOutputTokenCounter()
+    res = _final_res(stage0_out=128)
+    res.metrics["stage_metrics"]["0"]["finish_reason"] = "length"
+    acc.observe(res)
+    assert acc.stage0_finish_reason == "length"
 
 
 def test_output_tokens_takes_max_across_stages():

@@ -935,8 +935,8 @@ class GatedProjectedSumRMSNorm(nn.Module):
         audio_emb = audio_emb / self.num_codebooks
 
         # projections run in model dtype (BF16)
-        audio_h = self.audio_proj(audio_emb)
-        text_h = self.text_proj(text_emb)
+        audio_h = self.audio_proj(audio_emb.to(dtype=self.audio_proj.weight.dtype))
+        text_h = self.text_proj(text_emb.to(dtype=self.text_proj.weight.dtype))
 
         dtype = audio_h.dtype
 
@@ -1141,14 +1141,24 @@ class RVQEARTTSModel(nn.Module):
         subword_ids: Tensor | None,
         subword_mask: Tensor | None,
         uncond_dec_flag: Tensor,
+        subword_embeds: Tensor | None = None,
     ) -> Tensor:
-        """Computes the final conditioning tensor by combining all sources."""
+        """Computes the final conditioning tensor by combining all sources.
+
+        ``subword_embeds`` short-circuits the CharAwareSubwordEncoder with a
+        precomputed embedding (same shape as its output). Besides skipping the
+        char-level backbone, this path is free of host syncs
+        (``subword_mask.any()`` / the encoder's ``.cpu().tolist()``), which
+        makes it CUDA-graph capturable.
+        """
         cond = torch.zeros((1, 1, self.hidden_size), device=uncond_dec_flag.device)
 
         if self.embed_context is not None and context_hidden_state is not None:
             cond = cond + self.embed_context(context_hidden_state)
 
-        if self.embed_subword is not None and subword_ids is not None:
+        if subword_embeds is not None:
+            cond = cond + subword_embeds
+        elif self.embed_subword is not None and subword_ids is not None:
             # Infer subword mask from context if not provided
             if subword_mask is None and context_hidden_state is not None:
                 subword_mask = torch.any(context_hidden_state != 0, dim=-1)
@@ -1244,6 +1254,8 @@ class RVQEARTTSModel(nn.Module):
         ignore_eos_flag_stop: bool = False,
         asr_speech_tokens_emb: Tensor | None = None,
         audio_prompt_latent: Tensor | None = None,
+        subword_embeds: Tensor | None = None,
+        cache_position: Tensor | None = None,
     ) -> RVQEARTTSOutput:
         """
         Performs a forward pass handling training, generation, or single-step inference.
@@ -1302,7 +1314,7 @@ class RVQEARTTSModel(nn.Module):
             pre_bos_mask = bos_mask.cumsum(dim=1) == 0  # [B, T, 1]
 
             # Apply projection to model size
-            code_embed = self.embed_code(code_embed)
+            code_embed = self.embed_code(code_embed.to(dtype=self.embed_code.weight.dtype))
 
             # Choose projection
             if self.config.get("audio_prompt_encoder_config", None):
@@ -1336,7 +1348,7 @@ class RVQEARTTSModel(nn.Module):
             code_embeds = code_embed + bos_mask * self.bos_emb
 
         else:  # Inference
-            code_embeds = self.embed_code(self.depthsum_embedding(code))
+            code_embeds = self.embed_code(self.depthsum_embedding(code).to(dtype=self.embed_code.weight.dtype))
             uncond_dec_flag = torch.zeros(code.size(0), 1, 1, device=code.device, dtype=torch.bool)
 
         if guidance_enabled:
@@ -1352,13 +1364,17 @@ class RVQEARTTSModel(nn.Module):
                 subword_ids = torch.cat([subword_ids] * 2, 0)
                 if subword_mask is not None:
                     subword_mask = torch.cat([subword_mask] * 2, 0)
+            if subword_embeds is not None:
+                subword_embeds = torch.cat([subword_embeds] * 2, 0)
             if asr_speech_tokens_emb is not None:
                 asr_speech_tokens_emb = torch.cat([asr_speech_tokens_emb] * 2, 0)
 
             uncond_dec_flag = torch.cat([uncond_dec_flag, torch.ones_like(uncond_dec_flag)], 0)
 
         # Prepare conditioning
-        cond = self._prepare_conditioning(context_hidden_state, subword_ids, subword_mask, uncond_dec_flag)
+        cond = self._prepare_conditioning(
+            context_hidden_state, subword_ids, subword_mask, uncond_dec_flag, subword_embeds=subword_embeds
+        )
 
         if asr_speech_tokens_emb is not None:
             cond = cond + asr_speech_tokens_emb
@@ -1368,13 +1384,20 @@ class RVQEARTTSModel(nn.Module):
         else:
             inputs_embeds = code_embeds + cond
 
-        # Main backbone pass
+        # Main backbone pass. cache_position is threaded only when provided so
+        # backbones without the parameter keep working (it is required for
+        # StaticCache-based decoding, where the write index cannot be derived
+        # from the cache contents).
+        backbone_kwargs: dict[str, Any] = {}
+        if cache_position is not None:
+            backbone_kwargs["cache_position"] = cache_position
         backbone_outputs = self.backbone(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            **backbone_kwargs,
         )
         hidden_states = backbone_outputs.last_hidden_state
 
@@ -1564,7 +1587,9 @@ class RVQEARTTSModel(nn.Module):
             else:
                 eos_flag = lm_logits.argmax(-1) == 1
 
-            if torch.all(eos_flag) and not ignore_eos_flag_stop:
+            # Check the cheap Python flag first: evaluating torch.all() forces a
+            # host sync per frame even when the result is ignored.
+            if not ignore_eos_flag_stop and torch.all(eos_flag):
                 return None, lm_logits, eos_flag
         else:
             lm_logits = None
@@ -1573,17 +1598,18 @@ class RVQEARTTSModel(nn.Module):
         # Initialize the full code tensor
         code = torch.zeros((b, t, d), dtype=torch.long, device=device) + self.config.codebook_size
 
-        # 3. Set up the iterative denoising schedule for the continuous part
-        rates = torch.linspace(0.0, 1.0, num_iter + 1, device=device)[:-1].unsqueeze(-1)
-        masking_rates = get_masking_rate(rates, exponent=exponent)
-        num_maskings = torch.ceil(masking_rates * self.config.num_quantizers).long()
-
-        ks = num_maskings - F.pad(num_maskings[1:], [0, 0, 0, 1])
+        # 3. Set up the iterative denoising schedule for the continuous part.
+        # The schedule is a pure function of (num_iter, exponent,
+        # num_quantizers) — compute it once as Python ints and cache it, so the
+        # per-frame loop below runs without any GPU->CPU sync (`.item()` /
+        # `torch.all(k == 0)` on a device tensor would stall the dispatch
+        # pipeline several times per 80 ms frame).
+        ks = self._unmask_schedule(num_iter, float(exponent))
 
         # 4. Iteratively unmask the continuous part of the code
         cnt = 0
         for i, k in enumerate(ks):
-            if torch.all(k == 0):
+            if k == 0:
                 continue
 
             # Prepare input for the MoG head
@@ -1591,9 +1617,9 @@ class RVQEARTTSModel(nn.Module):
             top_p_or_k_i = top_p_or_k[i] if top_p_or_k is not None else 1.0
             noise_scale_i = noise_scale[i] if noise_scale is not None else 1.0
 
-            mog_input_embeds = self.embed_code(self.depthsum_embedding(code))
+            mog_input_embeds = self.embed_code(self.depthsum_embedding(code).to(self.embed_code.weight.dtype))
             if self.config.random_target_masking:
-                mog_input_embeds += self.embed_target_mask(cnt + k - 1)
+                mog_input_embeds += self.embed_target_mask(torch.tensor(cnt + k - 1, device=device))
             if guidance_scale_i > 0.0:
                 mog_input_embeds = torch.cat(
                     [mog_input_embeds + hidden_states, mog_input_embeds + uncond_hidden_states], 0
@@ -1607,9 +1633,25 @@ class RVQEARTTSModel(nn.Module):
                 top_p_or_k=top_p_or_k_i,
             )
             z = mog_mu + torch.exp(mog_logs) * torch.randn_like(mog_mu) * noise_scale_i
-            code = depthsum_encoding_step(self.rvq_embs, z, code, cnt, k[0].item())
-            cnt += k[0].item()
+            code = depthsum_encoding_step(self.rvq_embs, z, code, cnt, k)
+            cnt += k
         return code, lm_logits, eos_flag
+
+    def _unmask_schedule(self, num_iter: int, exponent: float) -> list[int]:
+        """Per-iteration unmask counts as Python ints (cached; sync-free loop)."""
+        cache = getattr(self, "_unmask_schedule_cache", None)
+        if cache is None:
+            cache = {}
+            self._unmask_schedule_cache = cache
+        key = (int(num_iter), float(exponent), int(self.config.num_quantizers))
+        ks = cache.get(key)
+        if ks is None:
+            rates = torch.linspace(0.0, 1.0, num_iter + 1)[:-1].unsqueeze(-1)
+            masking_rates = get_masking_rate(rates, exponent=exponent)
+            num_maskings = torch.ceil(masking_rates * self.config.num_quantizers).long()
+            ks = (num_maskings - F.pad(num_maskings[1:], [0, 0, 0, 1])).reshape(-1).tolist()
+            cache[key] = ks
+        return ks
 
     def load_state_dict(self, state_dict, strict: bool = True):
         try:

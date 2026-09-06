@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Unit tests for WorkerWrapperBase class.
@@ -12,6 +12,7 @@ This module tests the WorkerWrapperBase implementation:
 - Dynamic worker class extension
 """
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -203,6 +204,27 @@ class TestWorkerWrapperBaseDelegation:
         result = wrapper.shutdown()
         wrapper.worker.shutdown.assert_called_once()
         assert result is None
+
+    def test_worker_shutdown_disables_offloader_before_distributed_teardown(self, mocker: MockerFixture):
+        events: list[str] = []
+        offload_backend = mocker.Mock()
+        offload_backend.disable.side_effect = lambda: events.append("offload")
+        kv_manager = mocker.Mock()
+        kv_manager.shutdown_prefetch.side_effect = lambda: events.append("kv")
+        destroy = mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env",
+            side_effect=lambda: events.append("distributed"),
+        )
+        worker = DiffusionWorker.__new__(DiffusionWorker)
+        worker.model_runner = SimpleNamespace(
+            offload_backend=offload_backend,
+            kv_transfer_manager=kv_manager,
+        )
+
+        worker.shutdown()
+
+        assert events == ["offload", "kv", "distributed"]
+        destroy.assert_called_once_with()
 
 
 # -------------------------------------------------------------------------

@@ -18,6 +18,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
+from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 
 BLOCK = 16
 POS = "positive"
@@ -53,6 +54,21 @@ def dreamzero_like_spec(*, capacity: int = 2) -> ARDiffusionKVCacheSpec:
         kv_branches=(ARDiffusionKVBranchSpec(POS, 0), ARDiffusionKVBranchSpec(NEG, 1)),
         session_capacity=capacity,
         cross_attention=(ARDiffusionCrossAttentionKVSpec("text", 8),),
+    )
+
+
+def tiny_spec(*, capacity: int = 2) -> ARDiffusionKVCacheSpec:
+    return ARDiffusionKVCacheSpec(
+        num_layers=1,
+        num_kv_heads=1,
+        head_size=1,
+        tokens_per_frame=1,
+        frames_per_block=3,
+        window_frames=3,
+        sink_frames=3,
+        kv_branches=(ARDiffusionKVBranchSpec("main", 0),),
+        session_capacity=capacity,
+        cross_attention=(ARDiffusionCrossAttentionKVSpec("text", 2),),
     )
 
 
@@ -103,6 +119,7 @@ def make_runner(
     *,
     available_bytes: int = 1 << 28,
     step_execution: bool = False,
+    gpu_memory_fraction: float = 0.1,
 ) -> ARDiffusionModelRunner:
     runner = object.__new__(ARDiffusionModelRunner)
     runner.od_config = SimpleNamespace(
@@ -113,7 +130,10 @@ def make_runner(
     )
     runner.device = torch.device("cpu")
     runner.pipeline = pipeline
-    runner.ar_diffusion_kv_config = ARDiffusionKVConfig(enable=True)
+    runner.ar_diffusion_kv_config = ARDiffusionKVConfig(
+        enable=True,
+        gpu_memory_fraction=gpu_memory_fraction,
+    )
     runner.kv_cache = None
     runner._ar_diffusion_capability = None
     runner._ar_diffusion_kv_cache_spec = None
@@ -132,12 +152,59 @@ def commit_one_frame(runner: ARDiffusionModelRunner, session_id: str, kv_branch:
     return state
 
 
+def commit_one_block(runner: ARDiffusionModelRunner, session_id: str, kv_branch: str):
+    state = runner._get_or_create_session(session_id)
+    assert runner.kv_cache is not None
+    seq_len = BLOCK * runner.kv_cache.frames_per_block
+    ctx = state.get_kv_caches(kv_branch, seq_len=seq_len, commit_current=True)[0].forward_ctx
+    ctx.ensure_video_slots(torch.device("cpu"))
+    state.commit_paged_context(kv_branch)
+    return state
+
+
 def test_ar_runner_rejects_pipeline_without_capability():
     runner = object.__new__(ARDiffusionModelRunner)
     runner.od_config = SimpleNamespace(max_num_seqs=1)
     runner.pipeline = object()
     with pytest.raises(TypeError, match="SupportsARDiffusionPipeline"):
         runner._preallocate_kv_cache(available_bytes=1 << 20)
+
+
+def test_runner_uses_typed_tick_as_authoritative_session_contract():
+    tick = ARDiffusionTickRequest(
+        session_id="world-7",
+        request_id="request-3",
+        chunk_index=3,
+        reset=True,
+    )
+    req = SimpleNamespace(
+        request_id="request-3",
+        sampling_params=SimpleNamespace(extra_args=tick.to_extra_args()),
+    )
+
+    session_id, extra_args, parsed = ARDiffusionModelRunner._request_session(req)
+
+    assert session_id == "world-7"
+    assert extra_args == tick.to_extra_args()
+    assert parsed == tick
+
+
+def test_runner_keeps_engine_request_id_separate_from_tick_correlation_id():
+    tick = ARDiffusionTickRequest(
+        session_id="world-7",
+        request_id="client-request-3",
+        chunk_index=3,
+    )
+    req = SimpleNamespace(
+        request_id="engine-request-uuid",
+        sampling_params=SimpleNamespace(extra_args=tick.to_extra_args()),
+    )
+
+    session_id, _, parsed = ARDiffusionModelRunner._request_session(req)
+
+    assert session_id == "world-7"
+    assert req.request_id == "engine-request-uuid"
+    assert parsed.request_id == "client-request-3"
 
 
 def test_lingbot_like_single_branch_session_reuse_reset_and_close():
@@ -170,6 +237,31 @@ def test_lingbot_like_single_branch_session_reuse_reset_and_close():
     assert pipeline.closes == ["s1"]
 
 
+def test_lingbot_like_interleaved_sessions_keep_independent_kv_partitions():
+    runner = make_runner(CapablePipeline(lingbot_like_spec(capacity=2)))
+    kv = runner.kv_cache
+    assert kv is not None
+
+    session_a = commit_one_block(runner, "world-a", "main")
+    a0_blocks = kv.window_block_ids(session_a.adapter("main"))
+    session_b = commit_one_block(runner, "world-b", "main")
+    b0_blocks = kv.window_block_ids(session_b.adapter("main"))
+    session_a_again = commit_one_block(runner, "world-a", "main")
+    a1_blocks = kv.window_block_ids(session_a_again.adapter("main"))
+
+    assert session_a_again is session_a
+    assert session_a.adapter("main").request_id == "ar::world-a::main"
+    assert session_b.adapter("main").request_id == "ar::world-b::main"
+    assert session_a.adapter("main").completed_chunks == 6
+    assert session_b.adapter("main").completed_chunks == 3
+    assert len(a0_blocks) == 3
+    assert len(b0_blocks) == 3
+    assert len(a1_blocks) == 6
+    assert set(a0_blocks) <= set(a1_blocks)
+    assert set(a1_blocks).isdisjoint(b0_blocks)
+    assert tuple(runner._sessions) == ("world-b", "world-a")
+
+
 def test_lingbot_like_sink_survives_sliding_window_eviction():
     runner = make_runner(CapablePipeline(lingbot_like_spec()))
     kv = runner.kv_cache
@@ -198,12 +290,12 @@ def test_dreamzero_like_two_branches_are_independent():
 
 
 def test_lru_eviction_releases_blocks_and_notifies_pipeline():
-    pipeline = CapablePipeline(lingbot_like_spec(capacity=8))
+    pipeline = CapablePipeline(lingbot_like_spec(capacity=2))
     runner = make_runner(pipeline)
     kv = runner.kv_cache
     assert kv is not None
-    assert runner._session_capacity == 1
-    assert kv.session_capacity == 1
+    assert runner._session_capacity == 2
+    assert kv.session_capacity == 2
     free_total = kv.manager.block_pool.get_num_free_blocks()
     old = commit_one_frame(runner, "old", "main")
     k = torch.randn(1, 8, 4, 64)
@@ -211,11 +303,54 @@ def test_lru_eviction_releases_blocks_and_notifies_pipeline():
     assert kv.manager.block_pool.get_num_free_blocks() < free_total
 
     runner._get_or_create_session("new")
+    assert tuple(runner._sessions) == ("old", "new")
+    runner._get_or_create_session("newest")
 
-    assert tuple(runner._sessions) == ("new",)
+    assert tuple(runner._sessions) == ("new", "newest")
     assert pipeline.closes == ["old"]
     assert "old" not in kv._cross_sessions
     assert kv.manager.block_pool.get_num_free_blocks() == free_total
+
+
+def test_budget_reduced_capacity_drives_runner_lru():
+    pipeline = CapablePipeline(tiny_spec(capacity=2))
+    # One tiny LingBot-like session requires 128 bytes; two require 192.
+    runner = make_runner(
+        pipeline,
+        available_bytes=128,
+        gpu_memory_fraction=1.0,
+    )
+    kv = runner.kv_cache
+    assert kv is not None
+    assert kv.requested_session_capacity == 2
+    assert kv.session_capacity == 1
+    assert runner._session_capacity == 1
+
+    runner._get_or_create_session("old")
+    runner._get_or_create_session("new")
+
+    assert tuple(runner._sessions) == ("new",)
+    assert pipeline.closes == ["old"]
+
+
+def test_dreamzero_like_requested_capacity_is_capped_by_budget():
+    spec = dreamzero_like_spec(capacity=64)
+    # Per all-layer self-KV page: 65,536 bytes. Two resident sessions need:
+    # managed=(2 * (2 * 6 + 4) + 2)=34 pages, scratch=8 pages,
+    # cross-attention=1 page/session, for 44 pages total.
+    page_bytes = 65_536
+    pipeline = CapablePipeline(spec)
+    runner = make_runner(
+        pipeline,
+        available_bytes=44 * page_bytes,
+        gpu_memory_fraction=1.0,
+    )
+    kv = runner.kv_cache
+    assert kv is not None
+    assert kv.requested_session_capacity == 64
+    assert kv.session_capacity == 2
+    assert runner._session_capacity == 2
+    assert kv.cross_attention_reserved_bytes == 2 * page_bytes
 
 
 def test_forward_exception_releases_pending_allocation_and_model_state(monkeypatch):
@@ -232,7 +367,10 @@ def test_forward_exception_releases_pending_allocation_and_model_state(monkeypat
         raise RuntimeError("layer exploded")
 
     monkeypatch.setattr(DiffusionModelRunner, "execute_model", boom)
-    request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={"session_id": "broken"}))
+    request = SimpleNamespace(
+        request_id="broken-request",
+        sampling_params=SimpleNamespace(extra_args={"session_id": "broken"}),
+    )
 
     with pytest.raises(RuntimeError, match="layer exploded"):
         runner.execute_model(request)
@@ -263,7 +401,10 @@ def test_synchronize_exception_uses_forward_cleanup_path(monkeypatch):
     monkeypatch.setattr(DiffusionModelRunner, "execute_model", return_after_allocation)
     monkeypatch.setattr(torch.accelerator, "synchronize", synchronize_boom)
     runner.device = torch.device("cuda")
-    request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={"session_id": "broken"}))
+    request = SimpleNamespace(
+        request_id="broken-request",
+        sampling_params=SimpleNamespace(extra_args={"session_id": "broken"}),
+    )
 
     with pytest.raises(RuntimeError, match="asynchronous kernel failed"):
         runner.execute_model(request)

@@ -117,10 +117,23 @@ def test_encode_image_base64():
 class MockGenerationResult:
     """Mock result object compatible with current diffusion output shape."""
 
-    def __init__(self, images):
+    def __init__(self, images, stage_durations=None, peak_memory_mb=0.0):
         self.images = images
-        self.stage_durations = {}
-        self.peak_memory_mb = 0.0
+        self.stage_durations = {} if stage_durations is None else stage_durations
+        self.peak_memory_mb = peak_memory_mb
+
+
+def _stub_engine_generate_with_metrics(engine, *, stage_durations, peak_memory_mb):
+    """Stub engine.generate to return profiler metrics."""
+
+    async def generate(*args, **kwargs):
+        yield MockGenerationResult(
+            [Image.new("RGB", (16, 16), color="blue")],
+            stage_durations=stage_durations,
+            peak_memory_mb=peak_memory_mb,
+        )
+
+    engine.generate = generate
 
 
 class MockStageResult:
@@ -970,6 +983,53 @@ def test_image_edits_streaming_rejects_single_stage_before_loading_url(test_clie
 
     assert response.status_code == 400
     assert "multi-stage" in response.json()["detail"]
+
+
+def test_generate_images_returns_metrics_single_stage(test_client):
+    """Single-stage /v1/images/generations copies getattr metrics onto the response."""
+    stage_durations = {"queue_wait_ms": 1.0, "stage_0_gen_ms": 2.0}
+    peak_memory_mb = 1024.0
+    _stub_engine_generate_with_metrics(
+        test_client.app.state.engine_client,
+        stage_durations=stage_durations,
+        peak_memory_mb=peak_memory_mb,
+    )
+
+    response = test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a cat", "n": 1, "size": "256x256"},
+    )
+    assert response.status_code == 200
+    assert response.json()["metrics"] == {
+        "stage_durations": stage_durations,
+        "peak_memory_mb": peak_memory_mb,
+    }
+
+
+def test_generate_images_returns_metrics_multistage(async_omni_test_client):
+    """Multi-stage /v1/images/generations unpacks generate_diffusion_images metrics."""
+    stage_durations = {
+        "queue_wait_ms": 1.0,
+        "preprocess_ms": 2.0,
+        "stage_0_gen_ms": 3.0,
+        "stage_1_gen_ms": 4.0,
+    }
+    peak_memory_mb = 2048.0
+    _stub_engine_generate_with_metrics(
+        async_omni_test_client.app.state.engine_client,
+        stage_durations=stage_durations,
+        peak_memory_mb=peak_memory_mb,
+    )
+
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a cat", "n": 1, "size": "256x256"},
+    )
+    assert response.status_code == 200
+    assert response.json()["metrics"] == {
+        "stage_durations": stage_durations,
+        "peak_memory_mb": peak_memory_mb,
+    }
 
 
 def test_generate_images_max_size_rejected(async_omni_test_client):
@@ -1985,6 +2045,56 @@ def test_image_edit_with_seed_zero(async_omni_test_client):
         f"Expected seed=0, but got seed={captured_sampling_params.seed}. "
         "This indicates the bug where seed=0 is treated as falsy."
     )
+
+
+def test_image_edits_returns_metrics_single_stage(test_client):
+    """Single-stage /v1/images/edits copies getattr metrics onto the response."""
+    stage_durations = {"queue_wait_ms": 1.0, "stage_0_gen_ms": 2.0}
+    peak_memory_mb = 1024.0
+    _stub_engine_generate_with_metrics(
+        test_client.app.state.engine_client,
+        stage_durations=stage_durations,
+        peak_memory_mb=peak_memory_mb,
+    )
+
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes((16, 16)))],
+        data={"prompt": "edit me"},
+    )
+    assert response.status_code == 200
+    assert response.json()["metrics"] == {
+        "stage_durations": stage_durations,
+        "peak_memory_mb": peak_memory_mb,
+    }
+
+
+def test_image_edits_returns_metrics_multistage(async_omni_test_client):
+    """Multi-stage /v1/images/edits unpacks generate_diffusion_images metrics."""
+    stage_durations = {
+        "queue_wait_ms": 1.0,
+        "preprocess_ms": 2.0,
+        "ar2diffusion_ms": 3.0,
+        "stage_0_gen_ms": 4.0,
+        "stage_1_gen_ms": 5.0,
+    }
+    peak_memory_mb = 2048.0
+    _stub_engine_generate_with_metrics(
+        async_omni_test_client.app.state.engine_client,
+        stage_durations=stage_durations,
+        peak_memory_mb=peak_memory_mb,
+    )
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes((16, 16)))],
+        data={"prompt": "edit me"},
+    )
+    assert response.status_code == 200
+    assert response.json()["metrics"] == {
+        "stage_durations": stage_durations,
+        "peak_memory_mb": peak_memory_mb,
+    }
 
 
 def test_image_edit_with_seed_zero_single_stage(test_client):

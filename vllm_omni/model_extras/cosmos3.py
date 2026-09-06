@@ -9,6 +9,7 @@ COSMOS3_EXTRA_BODY_PARAMS = frozenset(
         "max_sequence_length",
         "use_resolution_template",
         "use_duration_template",
+        "negative_metadata_mode",
         "use_system_prompt",
         "system_prompt",
         "negative_prompt",

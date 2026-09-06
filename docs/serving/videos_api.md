@@ -41,7 +41,7 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 ### Endpoints
 
 | Endpoint | Method | Description |
-|----------|--------|-------------|
+| ---------- | -------- | ------------- |
 | `/v1/videos` | `POST` | Create an asynchronous video generation job |
 | `/v1/videos/sync` | `POST` | Generate a video synchronously and return raw video bytes |
 | `/v1/videos/{video_id}` | `GET` | Retrieve job status and metadata |
@@ -56,7 +56,7 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 #### OpenAI-style fields
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `prompt` | string | **required** | Text prompt for video generation |
 | `model` | string | server's model | Optional model name |
 | `seconds` | string | null | Requested clip duration in seconds |
@@ -66,7 +66,7 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 #### vLLM-Omni extension fields
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `input_reference` | file | null | Uploaded reference image or video for image-to-video/video-to-video requests |
 | `image_reference` | string | null | JSON-encoded reference image payload; do not combine with `input_reference` or `video_reference` |
 | `video_reference` | string | null | JSON-encoded reference video payload; do not combine with `input_reference` or `image_reference` |
@@ -161,11 +161,29 @@ are not implemented yet. Models may expose additional V2V controls through
 `extra_params`. For example, Cosmos3 supports
 `condition_frame_indexes_vision` and `condition_video_keep` to select which
 decoded reference frames are used as clean conditioning. Cosmos3 transfer mode
-also accepts `edge`, `blur`, `depth`, `seg`, or `wsm` control hints plus
-transfer options such as `control_path`, `control_guidance`,
-`control_guidance_interval`, `num_video_frames_per_chunk`,
-`num_conditional_frames`, `show_control_condition`, and `show_input`; see the
-Cosmos3 recipe for complete examples.
+also accepts `edge`, `blur`, `depth`, `seg`, or `wsm` control hints. Each hint
+may specify its own `control_path` and `control_weight`. Request-level transfer
+options include
+`control_guidance`, `control_guidance_interval`,
+`emphasize_control_in_prompt`, `num_video_frames_per_chunk`,
+`num_conditional_frames`, `show_control_condition`, and `show_input`. Transfer
+uses its transfer-specific system prompt and, by default, appends a
+control-adherence directive to the positive prompt. It adds duration/FPS and
+resolution metadata to both CFG branches but does not add a negative prompt
+automatically. The Cosmos3 recipe includes an optional reference negative
+prompt and shows how to pass it. Set `emphasize_control_in_prompt`,
+`use_duration_template`, or `use_resolution_template` to `false` to disable the
+corresponding addition. `negative_metadata_mode` accepts `same`, `inverse`, or
+`none` and defaults to `same` for transfer. See the Cosmos3 recipe for complete
+examples.
+
+HTTP redirects for `image_reference.image_url` follow vLLM's
+`VLLM_MEDIA_URL_ALLOW_REDIRECTS` setting. Before starting the server, set it to
+`1` (the default) to allow redirects or `0` to reject them. A redirect target
+can differ from the original host, and vLLM-Omni does not yet fully implement
+upstream vLLM's media URL allowlist protection. Deployments should therefore
+treat remote media URLs as untrusted and choose this setting as part of their
+URL access policy.
 
 ### Speech-to-Video
 
@@ -184,7 +202,6 @@ curl -s http://localhost:8091/v1/videos \
   -F "guidance_scale=4.5" \
   -F "fps=16"
 ```
-
 
 ### Synchronous Generation
 

@@ -45,7 +45,7 @@ MusicGen-style delay pattern).
 **Online serving:**
 
 ```bash
-vllm-omni serve bosonai/higgs-audio-v3-tts-4b \
+vllm serve bosonai/higgs-audio-v3-tts-4b \
     --host 0.0.0.0 --port 8095 \
     --trust-remote-code --omni
 ```

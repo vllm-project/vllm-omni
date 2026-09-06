@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Comprehensive tests of diffusion features that are available in online serving mode
 and are supported by the following models:
@@ -19,10 +22,10 @@ assert_diffusion_response validates successful generation and the expected
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient, dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 PROMPT = "A futuristic city skyline at twilight, cyberpunk style, ultra-detailed, high resolution."
 NEGATIVE_PROMPT = "low quality, blurry, distorted, deformed, watermark"
@@ -183,7 +186,7 @@ def _get_diffusion_feature_cases(model: str):
 )
 def test_bagel(
     omni_server: OmniServer,
-    openai_client: OpenAIClientHandler,
+    online_client: OnlineOmniClient,
 ):
     """L4 diffusion feature coverage for Bagel on H100.
 
@@ -218,4 +221,4 @@ def test_bagel(
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)

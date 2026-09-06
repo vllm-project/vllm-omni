@@ -17,11 +17,15 @@ implementation contract; it is not, by itself, a general support claim.
 
 ### Runtime and stage execution
 
+- [Full-Duplex Runtime (MiniCPM-o 4.5)](fullduplex.md)
+- [Full-Duplex Runtime (PersonaPlex)](fullduplex-personaplex.md)
 - [Disaggregated Inference](feature/disaggregated_inference.md)
+- [Host Weight Runtime](feature/host_weight_runtime.md)
 - [Async Chunk](feature/async_chunk.md)
 - [Async Diffusion Output](feature/async_diffusion_output.md)
 - [Async Omni Output Materialization](feature/omni_async_output_materialization.md)
 - [Automatic Prefix Caching in Omni Models](feature/prefix_caching.md)
+- [Realtime AR-Diffusion Sessions](feature/realtime_ar_diffusion.md)
 
 ### Communication
 
@@ -62,7 +66,7 @@ The design contracts separate selection mechanics from backend algorithms:
 #### CPU offloading
 
 - [Overview and Shared Contracts](feature/offloader/README.md)
-- [Model-Level Offload](feature/offloader/cpu_offload.md)
+- [Model-Level Offload](feature/offloader/module_offload.md)
 - [Layerwise Offload](feature/offloader/layerwise_offload.md)
 - [Distributed Layerwise Offload](feature/offloader/distributed_layerwise_offload.md)
 
@@ -87,14 +91,15 @@ The design contracts separate selection mechanics from backend algorithms:
 - [Model Integration](module/model_integration.md)
 - [Autoregressive Runtime](module/ar_runtime.md)
 - Diffusion
-  - [Overview](module/diffusion/index.md)
-  - [Runtime](module/diffusion/diffusion_runtime.md)
-  - [Model Integration](module/diffusion/diffusion_model_integration.md)
-  - [Continuous Batching](module/diffusion/continuous_batching.md)
-  - [Parallelism](module/diffusion/parallelism.md)
-  - [Offloader](module/diffusion/offloader.md)
+    - [Overview](module/diffusion/index.md)
+    - [Runtime](module/diffusion/diffusion_runtime.md)
+    - [Model Integration](module/diffusion/diffusion_model_integration.md)
+    - [Continuous Batching](module/diffusion/continuous_batching.md)
+    - [Parallelism](module/diffusion/parallelism.md)
+    - [Offloader](module/diffusion/offloader.md)
 - [Execution Platforms](module/execution_platforms.md)
 - [Cache Management](module/cache_management.md)
+- [Host Weight Runtime](module/host_weight_runtime.md)
 - [Quantization](module/quantization.md)
 - [Observability](module/observability.md)
 - [Profiling](module/profiling.md)

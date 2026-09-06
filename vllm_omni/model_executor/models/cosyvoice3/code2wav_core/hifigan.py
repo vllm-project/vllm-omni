@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from https://github.com/FunAudioLLM/CosyVoice/tree/main/cosyvoice/hifigan
 # Copyright (c) 2024 Alibaba Inc (authors: Xiang Lyu, Kai Hu)
 
@@ -494,7 +494,7 @@ class HiFTGenerator(nn.Module):
             self.istft_params["n_fft"],
             self.istft_params["hop_len"],
             self.istft_params["n_fft"],
-            window=self.stft_window,
+            window=self._get_stft_window(x),
             return_complex=True,
         )
         spec = torch.view_as_real(spec)  # [B, F, TT, 2]
@@ -509,9 +509,14 @@ class HiFTGenerator(nn.Module):
             self.istft_params["n_fft"],
             self.istft_params["hop_len"],
             self.istft_params["n_fft"],
-            window=self.stft_window,
+            window=self._get_stft_window(magnitude),
         )
         return inverse_transform
+
+    def _get_stft_window(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.stft_window.device != tensor.device:
+            self.stft_window = self.stft_window.to(tensor.device)
+        return self.stft_window
 
     def _decode_pre_istft(
         self,
@@ -696,7 +701,11 @@ class CausalHiFTGenerator(HiFTGenerator):
         self.ups.apply(init_weights)
         self.conv_post.apply(init_weights)
         self.reflection_pad = nn.ReflectionPad1d((1, 0))
-        self.stft_window = torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32))
+        self.register_buffer(
+            "stft_window",
+            torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32)),
+            persistent=False,
+        )
         self.conv_pre_look_right = conv_pre_look_right
         self.f0_predictor = f0_predictor
 

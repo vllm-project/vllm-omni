@@ -138,7 +138,7 @@ def _make_file_lora_request(adapter_dir: Path) -> LoRARequest:
 
 
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.diffusion,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
 ]

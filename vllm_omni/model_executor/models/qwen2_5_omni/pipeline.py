@@ -47,6 +47,7 @@ QWEN2_5_OMNI_PIPELINE = PipelineConfig(
                 "detokenize": True,
                 "stop_token_ids": [8294],
             },
+            requires_full_payload_input=True,
         ),
         StagePipelineConfig(
             stage_id=2,
@@ -59,6 +60,7 @@ QWEN2_5_OMNI_PIPELINE = PipelineConfig(
             engine_output_type="audio",
             sync_process_input_func=f"{_PROC}.talker2code2wav_token_only",
             sampling_constraints={"detokenize": True},
+            requires_full_payload_input=True,
         ),
     ),
 )

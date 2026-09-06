@@ -69,11 +69,66 @@ steps:
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
           HF_TOKEN: "${HF_TOKEN}"
         commands:
+          # Pin the Seed-TTS scorer to the second card: _get_eval_device() otherwise
+          # auto-picks npu:0, which the omni server under test already fills with its
+          # KV cache, so Whisper OOMs on `.to(device)` and every clip reports
+          # "ASR / WER failed".
+          - export SEED_TTS_WER_EVAL=1
+          - export SEED_TTS_EVAL_DEVICE=npu:1
           - |
             set +e
             pytest -s -v tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py -m "full_model and npu and A3" --run-level full_model
             EXIT=$$?
             buildkite-agent artifact upload "tests/e2e/accuracy/minicpmo_4_5/results/*.json"
+            exit $$EXIT
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test"
+        key: nightly-omni-performance-minicpmo-4-5-npu
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          HF_TOKEN: "${HF_TOKEN}"
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "npu and A3" --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test (A2)"
+        key: nightly-omni-performance-minicpmo-4-5-npu-a2
+        timeout_in_minutes: 180
+        mirror_hardwares: a2b3_npu_1
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          HF_TOKEN: "${HF_TOKEN}"
+          HF_HUB_OFFLINE: "1"
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "npu and A2" --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+      - label: ":full_moon: Omni · MiniCPM-o 4.5 · Duplex Seed-TTS Perf Test"
+        key: nightly-omni-performance-minicpmo-4-5-duplex-seed-tts-npu
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          HF_TOKEN: "${HF_TOKEN}"
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "npu and A3" --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_duplex_seed_tts.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
   - group: ":card_index_dividers: TTS Model Test"
     key: nightly-tts-test-group
@@ -95,33 +150,6 @@ steps:
             pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m npu --test-config-file tests/dfx/perf/tests/test_tts.json
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
-            exit $$EXIT
-  - group: ":card_index_dividers: Diffusion X2I(&A&T) Model Test"
-    key: nightly-diffusion-x2iat-group
-    depends_on: upload-nightly-pipeline
-    if: >-
-      build.env("NIGHTLY") == "1" ||
-      build.pull_request.labels includes "nightly-test" ||
-      build.pull_request.labels includes "diffusion-x2iat-test"
-    steps:
-      - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image-Edit-2511"
-        key: nightly-diffusion-x2iat-performance-qwen-image-edit-2511
-        timeout_in_minutes: 180
-        mirror_hardwares: a3_npu_8
-        env:
-          VLLM_WORKER_MULTIPROC_METHOD: spawn
-          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-          HF_TOKEN: "${HF_TOKEN}"
-          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
-        commands:
-          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
-          - export CACHE_DIT_VERSION=1.5.0
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m npu --test-config-file tests/dfx/perf/tests/test_qwen_image_edit_2511_vllm_omni.json
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
-            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
             exit $$EXIT
   - group: ":card_index_dividers: Diffusion I2I Model Test"
     key: nightly-HunyuanImage3-x2i-test-group

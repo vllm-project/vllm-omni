@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E Online tests for Qwen3-TTS model with text input and audio output.
 
@@ -14,7 +14,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import load_test_audio_data_url
+from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
@@ -24,7 +24,7 @@ DEFAULT_AUDIO_SPEECH_TIMEOUT_S = 180.0
 # Vendored under tests/assets/qwen3_tts/clone_2.wav so the server does not need
 # to fetch the reference audio over HTTPS at request time (CI runners in some
 # regions cannot reach the original Aliyun OSS host; see issue #3263).
-REF_AUDIO_URL = load_test_audio_data_url("qwen3_tts/clone_2.wav")
+REF_AUDIO_URL = get_asset_path("qwen3_tts/clone_2.wav", as_data_url=True)
 REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 
 
@@ -55,11 +55,10 @@ tts_server_params = [
 
 
 @pytest.mark.advanced_model
-@pytest.mark.core_model
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_text_to_audio_001(omni_server, openai_client) -> None:
+def test_text_to_audio_001(omni_server, online_client) -> None:
     """
     Test text input processing and audio output via OpenAI API.
     Deploy Setting: default yaml
@@ -80,14 +79,14 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
     }
-    openai_client.send_audio_speech_request(request_config, request_num=get_max_batch_size("few"))
+    online_client.send_audio_speech_request(request_config, request_num=get_max_batch_size("few"))
 
 
 @pytest.mark.advanced_model
 @pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
-def test_text_to_audio_002(omni_server, openai_client) -> None:
+def test_text_to_audio_002(omni_server, online_client) -> None:
     """
     Test text input processing and audio output via OpenAI API.
     Deploy Setting: default yaml
@@ -108,4 +107,4 @@ def test_text_to_audio_002(omni_server, openai_client) -> None:
         "ref_audio": REF_AUDIO_URL,
         "ref_text": REF_TEXT,
     }
-    openai_client.send_audio_speech_request(request_config)
+    online_client.send_audio_speech_request(request_config)

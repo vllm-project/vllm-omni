@@ -102,8 +102,20 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
 
     @classmethod
     def record_device_event(cls) -> torch.Event | None:
+        """Record an XPU event on the current stream to mark tensor readiness.
+
+        Deliberately a device-agnostic ``torch.Event`` rather than a
+        ``torch.xpu.Event``. The consumer (the async diffusion output thread)
+        waits with ``torch.Stream.wait_event`` on a generic ``torch.Stream``,
+        and that C-level binding silently no-ops for a ``torch.xpu.Event``
+        instead of enqueuing the dependency — the side stream then starts its
+        D2H copy while the compute stream is still writing the tensor, so the
+        host reads a partially-written image (garbage rows at the bottom of the
+        output). ``torch.Event`` dispatches through the accelerator hooks and
+        the wait is honored, which is the actual fix.
+        """
         try:
-            event = torch.xpu.Event()
+            event = torch.Event()
             event.record()
             return event
         except Exception:

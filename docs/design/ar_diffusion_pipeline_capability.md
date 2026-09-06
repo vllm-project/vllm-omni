@@ -4,6 +4,9 @@
 > `experimental/ar_diffusion` contract. It follows the ownership and lifecycle
 > direction in [#5137](https://github.com/vllm-project/vllm-omni/issues/5137),
 > but it is not yet part of the stable module-design hierarchy.
+>
+> The end-to-end request, identity, failure, and memory contracts are documented
+> in [Realtime AR-Diffusion sessions](feature/realtime_ar_diffusion.md).
 
 `ARDiffusionEngine` is an opt-in diffusion backend for pipelines that keep
 autoregressive attention KV across requests. The engine only selects
@@ -51,14 +54,13 @@ time, and its inherited batch/step entry points also fail explicitly. Supporting
 those paths requires a batch-aware state-binding contract rather than silently
 bypassing `bind_ar_diffusion_state()`.
 
-The current implementation retains one session per model instance. A request
-for a different `session_id` closes the resident session through the same LRU
-lifecycle used by explicit close and failure cleanup before allocating the new
-one. Self-attention and cross-attention memory are therefore sized for one
-resident session even if the pipeline declares a larger `session_capacity`.
-This prioritizes rollout throughput and prevents block-pool exhaustion before a
-count-based eviction can run. Multi-session residency can be added later with a
-memory-backed capacity calculation or allocation-pressure eviction.
+The implementation may retain multiple sessions per model instance. It selects
+the largest feasible capacity up to the pipeline's `session_capacity`, based on
+self-attention pages, cross-attention allocations, scratch, and declared
+model-owned state. One session is admitted whenever it fits actual free device
+memory; `gpu_memory_fraction` controls additional residency. Requests beyond
+that capacity evict the least-recently-used session through the same lifecycle
+hook used by explicit close and failure cleanup.
 
 Scratch storage is also capability-driven. `frames_per_block` reserves space for
 an uncommitted current video block, while `max_scratch_tokens_per_branch`

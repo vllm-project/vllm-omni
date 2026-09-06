@@ -110,9 +110,10 @@ outputs of each pair agreed to within 115 bytes.
 Four-GPU T2VA repeats: 273.8 s and 269.5 s, peaking at 15,560 MiB and
 15,612 MiB. Four-GPU Ref2VA is a single successful end-to-end run (545.2 s,
 16,448 MiB). Follow-up Ref2VA requests on this build completed diffusion but
-then hit the engine's hardcoded 30 s async output wait
-(`_ASYNC_OUTPUT_TIMEOUT` in `diffusion_engine.py`) during post-compute D2H,
-so they are not reported as repeats.
+then hit the engine's async output wait during post-compute D2H, so they are
+not reported as repeats. That wait was a hardcoded 30 s when these numbers were
+taken; it is now `VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT` (default 600 s), so a rerun on
+current main should not lose these repeats to the bound.
 
 Relative to the two-GPU baseline on the same shape, four-GPU TP2×USP2 was about
 1.6× faster for both tasks, while per-GPU peak HBM stayed in the mid-15 GiB

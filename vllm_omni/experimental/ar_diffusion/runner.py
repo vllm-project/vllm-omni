@@ -21,6 +21,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 
 logger = init_logger(__name__)
 
@@ -51,7 +52,6 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     """
 
     _WARMUP_SID = "__ardiffusion_warmup__"
-    _MAX_RESIDENT_SESSIONS = 1
 
     def __init__(self, vllm_config: object, od_config: OmniDiffusionConfig, device: torch.device) -> None:
         super().__init__(vllm_config, od_config, device)
@@ -123,7 +123,6 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self.ar_diffusion_kv_config = config
         self._ar_diffusion_capability = capability
         self._ar_diffusion_kv_cache_spec = spec
-        self._session_capacity = min(spec.session_capacity, self._MAX_RESIDENT_SESSIONS)
         self.kv_cache = ARDiffusionKVCache(
             config,
             num_layers=spec.num_layers,
@@ -134,12 +133,14 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             max_model_len=spec.max_model_len,
             available_bytes=self._available_memory_bytes() if available_bytes is None else available_bytes,
             kv_branches=spec.kv_branches,
-            session_capacity=self._session_capacity,
+            session_capacity=spec.session_capacity,
             cross_attention_lengths=spec.cross_attention_lengths,
             frames_per_block=spec.frames_per_block,
             max_scratch_tokens_per_branch=spec.max_scratch_tokens_per_branch,
+            model_owned_state_bytes_per_session=spec.model_owned_state_bytes_per_session,
             device=self.device,
         )
+        self._session_capacity = self.kv_cache.session_capacity
         logger.info(
             "AR-Diffusion KV cache: blocks=%d layers=%d local_kv_heads=%d head_size=%d "
             "tokens/frame=%d frames/block=%d window=%d sink=%d kv_branches=%s cross=%s "
@@ -230,9 +231,14 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         return state
 
     @staticmethod
-    def _request_session(req: OmniDiffusionRequest) -> tuple[str, dict]:
+    def _request_session(
+        req: OmniDiffusionRequest,
+    ) -> tuple[str, dict, ARDiffusionTickRequest | None]:
         extra_args = req.sampling_params.extra_args or {}
-        return str(extra_args.get("session_id") or "default"), extra_args
+        tick = ARDiffusionTickRequest.from_extra_args(extra_args)
+        if tick is not None:
+            return tick.session_id, extra_args, tick
+        return str(extra_args.get("session_id") or "default"), extra_args, None
 
     def execute_model(
         self,
@@ -245,8 +251,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         if capability is None:
             raise RuntimeError("AR-Diffusion capability missing after KV cache initialization")
 
-        session_id, extra_args = self._request_session(req)
-        if extra_args.get("reset", False):
+        session_id, extra_args, tick = self._request_session(req)
+        reset = tick.reset if tick is not None else bool(extra_args.get("reset", False))
+        close_session = tick.close_session if tick is not None else bool(extra_args.get("close_session", False))
+        if reset:
             self.reset_session(session_id)
         state = self._get_or_create_session(session_id)
         started = time.perf_counter()
@@ -268,7 +276,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             )
             raise
         self._perf_e2e_times.append(time.perf_counter() - started)
-        if extra_args.get("close_session", False):
+        if close_session:
             self.close_session(session_id)
         return output
 

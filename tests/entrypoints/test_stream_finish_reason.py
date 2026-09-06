@@ -16,20 +16,21 @@ Key invariants tested:
   - voice/speaker parameter compatibility in chat completions
 """
 
-import json
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from vllm.entrypoints.openai.chat_completion.protocol import (
-    ChatCompletionRequest,
-    ChatCompletionResponseStreamChoice,
-)
-from vllm.entrypoints.openai.engine.protocol import DeltaMessage
-from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.outputs import CompletionOutput, RequestOutput
 
+from tests.helpers.serving_chat import (
+    build_serving_chat,
+    collect_stream,
+    make_request,
+    make_text_omni_output,
+    parse_sse_chunks,
+)
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -39,43 +40,6 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _make_text_omni_output(
-    request_id: str = "test-req",
-    text: str = "hello",
-    token_ids: list[int] | None = None,
-    finish_reason: str | None = None,
-    index: int = 0,
-    num_prompt_tokens: int = 3,
-) -> OmniRequestOutput:
-    """Build an OmniRequestOutput wrapping a text RequestOutput."""
-    if token_ids is None:
-        token_ids = [10, 11, 12]
-    res = RequestOutput(
-        request_id=request_id,
-        prompt="test",
-        prompt_token_ids=list(range(num_prompt_tokens)),
-        prompt_logprobs=None,
-        outputs=[
-            CompletionOutput(
-                index=index,
-                text=text,
-                token_ids=token_ids,
-                cumulative_logprob=0.0,
-                logprobs=None,
-                finish_reason=finish_reason,
-                stop_reason=None,
-            )
-        ],
-        finished=finish_reason is not None,
-    )
-    return OmniRequestOutput.from_stage_output(
-        res,
-        request_id=request_id,
-        final_output_type="text",
-        finished=finish_reason is not None,
-    )
 
 
 def _make_audio_omni_output(
@@ -230,14 +194,14 @@ async def _collect_stream(gen):
 @pytest.mark.asyncio
 async def test_single_modality_text_only_one_stop():
     """Text-only streaming: exactly one chunk has finish_reason='stop'."""
-    serving_chat = _build_serving_chat()
-    request = _make_request(modalities=["text"])
+    serving_chat = build_serving_chat()
+    request = make_request(modalities=["text"])
 
     async def result_generator():
-        yield _make_text_omni_output(text="he", token_ids=[10, 11], finish_reason=None)
-        yield _make_text_omni_output(text="llo", token_ids=[12], finish_reason="stop")
+        yield make_text_omni_output(text="he", token_ids=[10, 11], finish_reason=None)
+        yield make_text_omni_output(text="llo", token_ids=[12], finish_reason="stop")
 
-    raw_lines = await _collect_stream(
+    raw_lines = await collect_stream(
         serving_chat.chat_completion_stream_generator(
             request=request,
             result_generator=result_generator(),
@@ -249,7 +213,7 @@ async def test_single_modality_text_only_one_stop():
         )
     )
 
-    chunks = _parse_sse_chunks(raw_lines)
+    chunks = parse_sse_chunks(raw_lines)
     finish_reasons = [c["choices"][0]["finish_reason"] for c in chunks if c.get("choices")]
 
     assert finish_reasons[-1] == "stop"
@@ -261,15 +225,15 @@ async def test_single_modality_text_only_one_stop():
 @pytest.mark.asyncio
 async def test_multi_modal_text_audio_only_last_stop():
     """text+audio: text finish sends finish_reason=null, audio sends stop."""
-    serving_chat = _build_serving_chat()
-    request = _make_request(modalities=["text", "audio"])
+    serving_chat = build_serving_chat()
+    request = make_request(modalities=["text", "audio"])
 
     async def result_generator():
-        yield _make_text_omni_output(text="he", token_ids=[10, 11], finish_reason=None)
-        yield _make_text_omni_output(text="llo", token_ids=[12], finish_reason="stop")
+        yield make_text_omni_output(text="he", token_ids=[10, 11], finish_reason=None)
+        yield make_text_omni_output(text="llo", token_ids=[12], finish_reason="stop")
         yield _make_audio_omni_output()
 
-    raw_lines = await _collect_stream(
+    raw_lines = await collect_stream(
         serving_chat.chat_completion_stream_generator(
             request=request,
             result_generator=result_generator(),
@@ -281,7 +245,7 @@ async def test_multi_modal_text_audio_only_last_stop():
         )
     )
 
-    chunks = _parse_sse_chunks(raw_lines)
+    chunks = parse_sse_chunks(raw_lines)
     finish_reasons = [ch["finish_reason"] for c in chunks for ch in c.get("choices", [])]
 
     assert finish_reasons.count("stop") == 1
@@ -297,18 +261,18 @@ async def test_multi_modal_text_audio_only_last_stop():
 @pytest.mark.asyncio
 async def test_multi_modal_n2_independent_per_choice():
     """n=2 with text+audio: each choice gets exactly one stop, at the end."""
-    serving_chat = _build_serving_chat()
-    request = _make_request(modalities=["text", "audio"], n=2)
+    serving_chat = build_serving_chat()
+    request = make_request(modalities=["text", "audio"], n=2)
 
     async def result_generator():
-        yield _make_text_omni_output(text="A", token_ids=[10], finish_reason=None, index=0)
-        yield _make_text_omni_output(text="B", token_ids=[20], finish_reason=None, index=1)
-        yield _make_text_omni_output(text="", token_ids=[11], finish_reason="stop", index=0)
-        yield _make_text_omni_output(text="", token_ids=[21], finish_reason="stop", index=1)
+        yield make_text_omni_output(text="A", token_ids=[10], finish_reason=None, index=0)
+        yield make_text_omni_output(text="B", token_ids=[20], finish_reason=None, index=1)
+        yield make_text_omni_output(text="", token_ids=[11], finish_reason="stop", index=0)
+        yield make_text_omni_output(text="", token_ids=[21], finish_reason="stop", index=1)
         yield _make_audio_omni_output(index=0)
         yield _make_audio_omni_output(index=1)
 
-    raw_lines = await _collect_stream(
+    raw_lines = await collect_stream(
         serving_chat.chat_completion_stream_generator(
             request=request,
             result_generator=result_generator(),
@@ -320,7 +284,7 @@ async def test_multi_modal_n2_independent_per_choice():
         )
     )
 
-    chunks = _parse_sse_chunks(raw_lines)
+    chunks = parse_sse_chunks(raw_lines)
     per_choice: dict[int, list] = {}
     for c in chunks:
         for ch in c.get("choices", []):
@@ -334,13 +298,13 @@ async def test_multi_modal_n2_independent_per_choice():
 @pytest.mark.asyncio
 async def test_single_modality_audio_only_one_stop():
     """Audio-only streaming: the audio chunk carries finish_reason='stop'."""
-    serving_chat = _build_serving_chat()
-    request = _make_request(modalities=["audio"])
+    serving_chat = build_serving_chat()
+    request = make_request(modalities=["audio"])
 
     async def result_generator():
         yield _make_audio_omni_output()
 
-    raw_lines = await _collect_stream(
+    raw_lines = await collect_stream(
         serving_chat.chat_completion_stream_generator(
             request=request,
             result_generator=result_generator(),
@@ -352,7 +316,7 @@ async def test_single_modality_audio_only_one_stop():
         )
     )
 
-    chunks = _parse_sse_chunks(raw_lines)
+    chunks = parse_sse_chunks(raw_lines)
     finish_reasons = [ch["finish_reason"] for c in chunks for ch in c.get("choices", [])]
 
     assert finish_reasons.count("stop") == 1
@@ -377,8 +341,8 @@ async def test_streaming_audio_metrics_resolve_replica_id(
     import vllm_omni.entrypoints.openai.serving_chat as serving_chat_mod
     from vllm_omni.entrypoints.client_request_state import ClientRequestState
 
-    serving_chat = _build_serving_chat()
-    request = _make_request(modalities=["audio"])
+    serving_chat = build_serving_chat()
+    request = make_request(modalities=["audio"])
     req_state = ClientRequestState(
         request_id="internal-req",
         external_request_id="test-req",
@@ -405,7 +369,7 @@ async def test_streaming_audio_metrics_resolve_replica_id(
     async def result_generator():
         yield _make_audio_omni_output(stage_id=2, replica_id=output_replica_id, audio_samples=2400)
 
-    await _collect_stream(
+    await collect_stream(
         serving_chat.chat_completion_stream_generator(
             request=request,
             result_generator=result_generator(),
@@ -436,15 +400,15 @@ async def test_streaming_audio_metrics_resolve_replica_id(
 async def test_declared_modality_not_produced_emits_fallback_stop():
     """If request.modalities declares ["text","audio"] but engine only produces
     text, a fallback stop chunk is emitted at stream end."""
-    serving_chat = _build_serving_chat()
-    request = _make_request(modalities=["text", "audio"])
+    serving_chat = build_serving_chat()
+    request = make_request(modalities=["text", "audio"])
 
     async def result_generator():
         # Engine only produces text, no audio output at all
-        yield _make_text_omni_output(text="hi", token_ids=[10], finish_reason=None)
-        yield _make_text_omni_output(text="!", token_ids=[11], finish_reason="stop")
+        yield make_text_omni_output(text="hi", token_ids=[10], finish_reason=None)
+        yield make_text_omni_output(text="!", token_ids=[11], finish_reason="stop")
 
-    raw_lines = await _collect_stream(
+    raw_lines = await collect_stream(
         serving_chat.chat_completion_stream_generator(
             request=request,
             result_generator=result_generator(),
@@ -456,7 +420,7 @@ async def test_declared_modality_not_produced_emits_fallback_stop():
         )
     )
 
-    chunks = _parse_sse_chunks(raw_lines)
+    chunks = parse_sse_chunks(raw_lines)
     finish_reasons = [ch["finish_reason"] for c in chunks for ch in c.get("choices", [])]
 
     # Text finish is suppressed (audio not seen yet), but fallback stop
@@ -469,15 +433,15 @@ async def test_declared_modality_not_produced_emits_fallback_stop():
 async def test_declared_modality_not_produced_text_finish_suppressed():
     """When text finishes but audio (declared in modalities) never appears,
     the text finish chunk has finish_reason=null (suppressed)."""
-    serving_chat = _build_serving_chat()
-    request = _make_request(modalities=["text", "audio"])
+    serving_chat = build_serving_chat()
+    request = make_request(modalities=["text", "audio"])
 
     async def result_generator():
-        yield _make_text_omni_output(text="hi", token_ids=[10], finish_reason=None)
-        yield _make_text_omni_output(text="!", token_ids=[11], finish_reason="stop")
+        yield make_text_omni_output(text="hi", token_ids=[10], finish_reason=None)
+        yield make_text_omni_output(text="!", token_ids=[11], finish_reason="stop")
         # No audio output — stream ends
 
-    raw_lines = await _collect_stream(
+    raw_lines = await collect_stream(
         serving_chat.chat_completion_stream_generator(
             request=request,
             result_generator=result_generator(),
@@ -489,7 +453,7 @@ async def test_declared_modality_not_produced_text_finish_suppressed():
         )
     )
 
-    chunks = _parse_sse_chunks(raw_lines)
+    chunks = parse_sse_chunks(raw_lines)
 
     # Find the text finish chunk (content "!")
     for c in chunks:
@@ -513,8 +477,8 @@ async def test_audio_chunk_without_waveform_keeps_stream_alive():
     yields (field, value) tuples, so the loop raised
     ``AttributeError: 'tuple' object has no attribute 'finish_reason'``.
     """
-    serving_chat = _build_serving_chat()
-    request = _make_request(modalities=["text", "audio"])
+    serving_chat = build_serving_chat()
+    request = make_request(modalities=["text", "audio"])
 
     empty_audio = _make_audio_omni_output()
     empty_audio.outputs[0].multimodal_output = {"audio": []}
@@ -525,11 +489,11 @@ async def test_audio_chunk_without_waveform_keeps_stream_alive():
     serving_chat._create_audio_choice = create_audio_choice
 
     async def result_generator():
-        yield _make_text_omni_output(text="hi", token_ids=[10], finish_reason=None)
-        yield _make_text_omni_output(text="!", token_ids=[11], finish_reason="stop")
+        yield make_text_omni_output(text="hi", token_ids=[10], finish_reason=None)
+        yield make_text_omni_output(text="!", token_ids=[11], finish_reason="stop")
         yield empty_audio
 
-    raw_lines = await _collect_stream(
+    raw_lines = await collect_stream(
         serving_chat.chat_completion_stream_generator(
             request=request,
             result_generator=result_generator(),
@@ -542,7 +506,7 @@ async def test_audio_chunk_without_waveform_keeps_stream_alive():
     )
 
     assert not any("Error in chat completion stream generator" in line for line in raw_lines)
-    chunks = _parse_sse_chunks(raw_lines)
+    chunks = parse_sse_chunks(raw_lines)
     finish_reasons = [ch["finish_reason"] for c in chunks for ch in c.get("choices", [])]
     assert finish_reasons.count("stop") == 1, f"Expected 1 stop, got {finish_reasons}"
     assert finish_reasons[-1] == "stop"
@@ -553,18 +517,18 @@ async def test_audio_choice_error_response_is_not_iterated_as_choices():
     """Any ErrorResponse from the audio path is skipped, not iterated."""
     from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 
-    serving_chat = _build_serving_chat()
-    request = _make_request(modalities=["text", "audio"])
+    serving_chat = build_serving_chat()
+    request = make_request(modalities=["text", "audio"])
 
     serving_chat._create_audio_choice = MagicMock(
         side_effect=lambda omni_res, role, request, stream=False: serving_chat._create_error_response("boom")
     )
 
     async def result_generator():
-        yield _make_text_omni_output(text="hi", token_ids=[10], finish_reason="stop")
+        yield make_text_omni_output(text="hi", token_ids=[10], finish_reason="stop")
         yield _make_audio_omni_output()
 
-    raw_lines = await _collect_stream(
+    raw_lines = await collect_stream(
         serving_chat.chat_completion_stream_generator(
             request=request,
             result_generator=result_generator(),
@@ -578,7 +542,7 @@ async def test_audio_choice_error_response_is_not_iterated_as_choices():
 
     assert isinstance(serving_chat._create_error_response("boom"), ErrorResponse)
     assert not any("AttributeError" in line for line in raw_lines)
-    chunks = _parse_sse_chunks(raw_lines)
+    chunks = parse_sse_chunks(raw_lines)
     finish_reasons = [ch["finish_reason"] for c in chunks for ch in c.get("choices", [])]
     assert finish_reasons.count("stop") == 1, f"Expected 1 stop, got {finish_reasons}"
 

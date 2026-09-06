@@ -8,7 +8,7 @@ Two-stage pipeline: **thinker** (multimodal understanding) → **talker + Token2
 
 - Install talker deps: `pip install stepaudio2-minicpmo`
 - `--trust-remote-code` is always passed by `end2end.py` (required for MiniCPMO)
-- See [stage configuration docs](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) for memory tuning
+- See [pipeline and deploy configuration docs](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) for memory tuning
 
 ## Run examples
 

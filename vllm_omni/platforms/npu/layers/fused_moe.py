@@ -29,6 +29,40 @@ def _ensure_forward_context_attr(name: str, annotation: Any, default: Any) -> No
         setattr(_vllm_fc.ForwardContext, name, default)
 
 
+def _ensure_ascend_moe_customop_registered() -> None:
+    """Register vllm-ascend's out-of-tree MoE layer implementations here.
+
+    vllm-ascend registers its OOT layers from ``register_ascend_customop``,
+    which only ever runs inside their own ``NPUWorker.__init__``. The diffusion
+    path runs on omni's DiffusionWorker, so the OOT registry stays empty and
+    ``PluggableLayer.__new__`` falls back to the upstream classes. FusedMoE then
+    breaks outright: vllm-ascend's ``patch_fused_moe`` passes
+    ``n_shared_experts`` through ``routed_experts_args``, which only
+    ``AscendRoutedExperts`` accepts.
+
+    Only the MoE pair is registered, not the full ``REGISTERED_ASCEND_OPS``
+    table. Most of that table assumes a text-generation ``ModelConfig``:
+    ``AscendRotaryEmbedding.__init__`` reads ``model_config.use_mla`` and
+    ``hf_text_config.qk_rope_head_dim``, neither of which exists on the
+    diffusion config shim. ``AscendRoutedExperts``/``AscendMoERunner`` only need
+    ``parallel_config``, which the shim does provide.
+    """
+    from vllm.model_executor.custom_op import CustomOp, op_registry_oot
+    from vllm_ascend.ops.fused_moe.fused_moe import AscendMoERunner
+    from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
+
+    ascend_moe_ops: dict[str, type] = {
+        "MoERunner": AscendMoERunner,
+        "RoutedExperts": AscendRoutedExperts,
+    }
+    for name, op_cls in ascend_moe_ops.items():
+        # register_oot asserts on duplicates, so skip names vllm-ascend already
+        # claimed. Its own registration is authoritative when it has run.
+        if name in op_registry_oot:
+            continue
+        CustomOp.register_oot(_decorated_op_cls=op_cls, name=name)
+
+
 def _init_mc2_group_for_diffusion(
     backend: str,
     local_rank: int,
@@ -65,6 +99,8 @@ def _select_moe_comm_method(vllm_config: VllmConfig) -> MoECommType | None:
 
 def prepare_fused_moe_runtime() -> None:
     vllm_config = omni_get_ctx().vllm_config
+
+    _ensure_ascend_moe_customop_registered()
 
     backend = torch.distributed.get_backend(get_world_group().device_group)
     local_rank = get_world_group().local_rank

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -401,6 +401,52 @@ def test_sample_tolerates_padded_rows_without_history():
     assert out.sampled_token_ids.shape == (2, 1)
 
 
+def test_sample_excludes_non_finite_logits():
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[]])
+    metadata.temperature.fill_(0.5)
+    logits = torch.tensor([[float("nan"), 1.0, float("inf"), float("-inf")]], dtype=torch.bfloat16)
+
+    out = model.sample(logits, metadata)
+
+    assert out is not None
+    assert out.sampled_token_ids.tolist() == [[1]]
+
+
+def test_sample_preserves_allowed_token_mask_with_invalid_logits():
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[]])
+    metadata.allowed_token_ids_mask = torch.tensor([[True, False, True]])
+    logits = torch.tensor([[float("nan"), 1.0, float("inf")]], dtype=torch.float32)
+
+    out = model.sample(logits, metadata)
+
+    assert out is not None
+    assert out.sampled_token_ids.tolist() == [[1]]
+
+
+def test_sample_rejects_rows_without_finite_logits():
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[]])
+    metadata.allowed_token_ids_mask = torch.tensor([[True, False, True]])
+    logits = torch.tensor([[0.0, float("nan"), 0.0]], dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="no finite logits"):
+        model.sample(logits, metadata)
+
+
+def test_sample_keeps_only_finite_token_after_ras_rejection():
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[1] * 10])
+    metadata.allowed_token_ids_mask = torch.tensor([[True, False, True]])
+    logits = torch.tensor([[0.0, 1.0, 0.0]], dtype=torch.float32)
+
+    out = model.sample(logits, metadata)
+
+    assert out is not None
+    assert out.sampled_token_ids.tolist() == [[1]]
+
+
 def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
     metadata = _make_sampling_metadata(output_token_ids=[[1, 2, 3]])
     expected = SamplerOutput(
@@ -423,9 +469,14 @@ def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
     _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
+
+    def model_sample(logits, sampling_metadata):
+        calls.append(logits.clone())
+        return expected
+
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
-        sample=lambda logits, sampling_metadata: calls.append(logits.clone()) or expected,
+        sample=model_sample,
     )
     runner.sampler = lambda **_: (_ for _ in ()).throw(AssertionError("fallback sampler should not be used"))
 
@@ -459,12 +510,14 @@ def test_gpu_ar_model_runner_supplies_req_output_history_to_model_sampler():
     _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
+
+    def model_sample(logits, sampling_metadata):
+        seen_histories.append([list(x) for x in sampling_metadata.output_token_ids])
+        return SamplerOutput(sampled_token_ids=torch.tensor([[7]], dtype=torch.int32), logprobs_tensors=None)
+
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
-        sample=lambda logits, sampling_metadata: (
-            seen_histories.append([list(x) for x in sampling_metadata.output_token_ids])
-            or SamplerOutput(sampled_token_ids=torch.tensor([[7]], dtype=torch.int32), logprobs_tensors=None)
-        ),
+        sample=model_sample,
     )
     runner.sampler = lambda **_: (_ for _ in ()).throw(AssertionError("fallback sampler should not be used"))
 
@@ -504,12 +557,14 @@ def test_gpu_ar_model_runner_repairs_async_placeholders_for_model_sampler():
     _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
+
+    def model_sample(logits, sampling_metadata):
+        seen_histories.append([list(x) for x in sampling_metadata.output_token_ids])
+        return SamplerOutput(sampled_token_ids=torch.tensor([[7]], dtype=torch.int32), logprobs_tensors=None)
+
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
-        sample=lambda logits, sampling_metadata: (
-            seen_histories.append([list(x) for x in sampling_metadata.output_token_ids])
-            or SamplerOutput(sampled_token_ids=torch.tensor([[7]], dtype=torch.int32), logprobs_tensors=None)
-        ),
+        sample=model_sample,
     )
     runner.sampler = lambda **_: (_ for _ in ()).throw(AssertionError("fallback sampler should not be used"))
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for the Sequence Parallelism (SP) framework.
 
 These tests verify the SP plan mechanism and hooks work correctly without
@@ -17,6 +17,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -419,13 +420,14 @@ class TestHookRegistration:
 # =============================================================================
 
 
-@pytest.mark.L4
 class TestModelSpPlans:
     """Test that model _sp_plan definitions are valid.
 
     These tests import actual model classes to verify _sp_plan structure.
     May require GPU for model imports.
     """
+
+    pytestmark = hardware_marks(res={"cuda": "L4"})
 
     def test_zimage_transformer_sp_plan(self):
         """Test ZImageTransformer2DModel _sp_plan structure.
@@ -986,6 +988,89 @@ class TestDimensionValidation:
         result = hook._prepare_sp_input(tensor_4d, metadata["x"], (), {})
         # Since expected_dims=3 but tensor has 4 dims, should return original
         assert result.shape == tensor_4d.shape
+
+    def test_auto_pad_calls_attention_mask_capability(self, monkeypatch):
+        from vllm_omni.diffusion.attention import selector
+        from vllm_omni.diffusion.distributed import parallel_state
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+        from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelSplitHook
+
+        class NoMaskBackend:
+            @classmethod
+            def supports_attention_mask(cls, attention_spec=None):
+                del attention_spec
+                return False
+
+            @staticmethod
+            def get_name():
+                return "NO_MASK_BACKEND"
+
+        monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(selector, "get_attn_backend_for_capability", lambda **kwargs: NoMaskBackend)
+
+        hook = SequenceParallelSplitHook(
+            metadata={},
+            config=SequenceParallelConfig(ulysses_degree=2, ring_degree=1),
+        )
+        tensor = torch.randn(1, 3, 8)
+
+        with pytest.raises(ValueError, match="does not support attention_mask"):
+            hook._shard_with_auto_pad(tensor, dim=1)
+
+    def test_auto_pad_allows_explicit_cudnn(self, monkeypatch):
+        from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, OmniDiffusionConfig
+        from vllm_omni.diffusion.distributed import parallel_state
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+        from vllm_omni.diffusion.forward_context import set_forward_context
+        from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelSplitHook
+
+        monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(parallel_state, "get_sequence_parallel_rank", lambda: 0)
+        monkeypatch.setattr(parallel_state, "get_ring_parallel_world_size", lambda: 1)
+
+        hook = SequenceParallelSplitHook(
+            metadata={},
+            config=SequenceParallelConfig(ulysses_degree=2, ring_degree=1),
+        )
+        tensor = torch.randn(1, 3, 8)
+        od_config = OmniDiffusionConfig(
+            model="test",
+            dtype=torch.float32,
+            diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="CUDNN_ATTN")),
+        )
+
+        with set_forward_context(omni_diffusion_config=od_config):
+            result = hook._shard_with_auto_pad(tensor, dim=1)
+
+        # seq_len=3 padded to 4, then sharded by world_size=2 → rank 0 gets 2.
+        assert result.shape == (1, 2, 8)
+
+    def test_auto_pad_rejects_explicit_flashinfer_cute_on_blackwell(self, monkeypatch):
+        from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, OmniDiffusionConfig
+        from vllm_omni.diffusion.distributed import parallel_state
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+        from vllm_omni.diffusion.forward_context import set_forward_context
+        from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelSplitHook
+
+        monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(parallel_state, "get_sequence_parallel_rank", lambda: 0)
+        monkeypatch.setattr(parallel_state, "get_ring_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 0))
+
+        hook = SequenceParallelSplitHook(
+            metadata={},
+            config=SequenceParallelConfig(ulysses_degree=2, ring_degree=1),
+        )
+        tensor = torch.randn(1, 3, 8)
+        od_config = OmniDiffusionConfig(
+            model="test",
+            dtype=torch.float32,
+            diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="FLASHINFER_ATTN")),
+        )
+
+        with set_forward_context(omni_diffusion_config=od_config):
+            with pytest.raises(ValueError, match="does not support attention_mask"):
+                hook._shard_with_auto_pad(tensor, dim=1)
 
 
 @pytest.mark.cpu

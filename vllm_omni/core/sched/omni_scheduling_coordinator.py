@@ -88,19 +88,15 @@ def uses_full_payload_input_coordinator(model_config: Any) -> bool:
     """Returns True if this stage parks pending requests in
     WAITING_FOR_INPUT awaiting a full_payload delivery on the worker connector.
 
-    Gated by (model_arch, model_stage) — see _FULL_PAYLOAD_INPUT_STAGES for the
-    rationale on why this is a whitelist instead of a marker-driven structural
-    gate.
+    Gated by the topology-declared ``requires_full_payload_input`` capability on
+    downstream (stage_id > 0) stages, and only on the non-async-chunk path
+    (async-chunk stages are fed through the streamed connector instead).
     """
     if getattr(model_config, "stage_id", 0) <= 0:
         return False
     if getattr(model_config, "async_chunk", False):
         return False
-    key = (
-        getattr(model_config, "model_arch", None),
-        getattr(model_config, "model_stage", None),
-    )
-    return key in _FULL_PAYLOAD_INPUT_STAGES
+    return bool(getattr(model_config, "requires_full_payload_input", False))
 
 
 class OmniSchedulingCoordinator:

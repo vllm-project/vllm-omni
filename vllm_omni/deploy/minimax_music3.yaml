@@ -1,0 +1,130 @@
+# MiniMax-Music3 deploy: Stage 0 (AR talker) -> Stage 1 (acoustic decoder),
+# both on one 140 GB card, streaming 200-frame windows over shared memory.
+#
+# Auto-discovered default for model_type=minimax_music3.
+#
+# Classifier-free guidance is mandatory for this checkpoint: every request
+# decodes as a cond/uncond pair in stage 0, so stage-0 KV, max_num_seqs and
+# prefill budget are all sized for TWO rows per user request. The stage-0
+# extra_args block below is what turns on has_sampling_extra_args (so per-row
+# sampling extra args reach the model's forward) and is also how the CFG
+# scheduler patches learn this stage is paired.
+pipeline: minimax_music3
+async_chunk: true
+
+# The repo-root config.json reports model_type=minimax_music3, which upstream
+# transformers does not ship a config class for.
+trust_remote_code: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      # Stream stereo PCM back to the client as stage 1 finishes each window.
+      codec_streaming: true
+      # Window geometry is fixed by the checkpoint (200-frame windows on a
+      # 100-frame hop, models/minimax_music3/constants.py), so there are no
+      # codec_chunk_frames knobs here: changing the window changes the audio.
+      shm_threshold_bytes: 65536
+      connector_get_sleep_s: 0.01
+      # One window is 200 AR frames = 8 s of music, so stage 1 waits far longer
+      # for a chunk than a per-step codec stage would. First chunk additionally
+      # covers stage-0 prefill of both CFG rows.
+      connector_get_max_wait_first_chunk: 30000
+      connector_get_max_wait: 10000
+
+stages:
+  - stage_id: 0
+    # 16 rows = 8 concurrent guided requests, since CFG doubles every request.
+    max_num_seqs: 16
+    # ~16 GB of bf16 Qwen3-8B weights plus KV for 16 full-length rows
+    # (36 layers x 8 KV heads x 128 head_dim ~= 144 KB/token, so ~1.4 GB per
+    # 10240-token row) fits comfortably inside 0.6 of a 140 GB card.
+    gpu_memory_utilization: 0.6
+    dtype: bfloat16
+    # The checkpoint's max_position_embeddings is 10240 and the whole song is
+    # decoded in-context. Note this cannot hold a max-length prompt AND a
+    # max-length song at the same time: the prompt cap is 5000 tokens and the
+    # frame budget is 9000, which overruns 10240. That is a property of the
+    # checkpoint, not of this file; long captions shorten the maximum song.
+    max_model_len: 10240
+    # One scheduler step must be able to prefill both rows of a pair
+    # (2 x 5000 prompt tokens) so the cond/uncond pair stays step-locked.
+    max_num_batched_tokens: 10240
+    # Two rows at 8B is a launch-bound decode step, so the backbone is
+    # captured. FULL_DECODE_ONLY only ever dispatches a graph for a uniform
+    # decode batch; prefill and mixed steps stay eager, which is what the
+    # talker's frame-feedback fallback is for. The talker's own sampler and
+    # depth decoder run after the graph, not inside it.
+    #
+    # What makes the forward capturable: the frame feedback writes a
+    # fixed-size slab in prepare_runner_inputs (outside the captured region)
+    # and the forward selects over it with torch.where, instead of an
+    # index_copy against an index tensor whose address and length changed
+    # every step. The row-to-request binding the sampler reads is likewise
+    # rebuilt in prepare_runner_inputs, because a replayed step never runs
+    # the forward's Python body.
+    enforce_eager: false
+    compilation_config:
+      # No compilation. The talker walks the backbone's decoder layers itself,
+      # so the compiled Qwen3Model.forward is never entered and inductor has
+      # nothing to do; what the mode still decides is which kernels vLLM
+      # defaults to. Left at its non-eager default it picks the elementwise
+      # PyTorch norms over the fused vllm_c ones, which is both slower and
+      # numerically different: measured here, that alone moved the sampled
+      # codes off the eager trajectory by frame 4. Graph capture is
+      # independent of this and still happens.
+      mode: 0
+      # 16 rows is the stage ceiling, i.e. 8 guided requests.
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16]
+      cudagraph_mode: FULL_DECODE_ONLY
+      cudagraph_num_of_warmups: 1
+      # Belt and braces on the same point: the non-eager default is "none",
+      # which hands the norm and activation ops to elementwise PyTorch.
+      custom_ops: ["all"]
+    # A CFG pair must be sampled inside one engine step for the logits blend
+    # and the cond->uncond token copy to line up.
+    async_scheduling: false
+    # Off during bring-up: the uncond row is a long run of identical
+    # <|audio_cfg|> tokens and would take a much larger prefix-cache hit than
+    # its cond partner, which is exactly the num_computed_tokens skew the CFG
+    # pair patches then have to undo.
+    enable_prefix_caching: false
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 1.0
+      # The frame budget is enforced by the model. This ceiling only has to
+      # leave room for the extra step that delivers the final window.
+      max_tokens: 9002
+      extra_args:
+        cfg_role: cond
+        cfg_scale: 1.5
+
+  - stage_id: 1
+    # One row per user request: the uncond companion is stage-0-final and
+    # never reaches the acoustic stage.
+    max_num_seqs: 8
+    # No KV cache on this stage; the budget only covers the DiT and DAV
+    # weights plus per-window latents and activations.
+    gpu_memory_utilization: 0.2
+    # The flow-matching solver degrades measurably in bfloat16
+    # (SUPPORTED_ACOUSTIC_DTYPES in models/minimax_music3/constants.py).
+    dtype: float32
+    enforce_eager: true
+    # Async scheduling builds per-request payloads against the NEXT step's
+    # input batch, which breaks when chunk arrival staggers requests.
+    async_scheduling: false
+    enable_prefix_caching: false
+    # One placeholder prompt token per arriving window, so a six-minute song
+    # (90 windows) needs a tiny context.
+    max_model_len: 4096
+    max_num_batched_tokens: 4096
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 4096
+      seed: 0

@@ -74,6 +74,8 @@ def test_t2va_and_fl2va_packing_keep_update_rows_separate():
     assert fl2va["update_mask"].sum().item() == 12
     assert (~fl2va["update_mask"]).sum().item() == 6
     assert t2va["audio_pos"].numel() == fl2va["audio_pos"].numel() == 6
+    assert t2va["video_spans"] == ({"start": 10, "latent_grid": (2, 2, 3), "role": "target"},)
+    assert fl2va["video_spans"] == ({"start": 16, "latent_grid": (2, 2, 3), "role": "target"},)
 
 
 def test_ref2va_packing_tracks_video_and_audio_update_masks():
@@ -99,6 +101,33 @@ def test_ref2va_packing_tracks_video_and_audio_update_masks():
     assert packed["audio_pos"].numel() == 10
     assert packed["audio_update_mask"].sum().item() == 6
     assert packed["cu_seqlens"].tolist() == [0, 30, 64]
+
+
+def test_ref2va_packing_publishes_physical_video_spans_only():
+    from vllm_omni.diffusion.models.minimax_h3.packed_sequence import (
+        minimax_h3_packed_sequence_ref2va_blocks,
+    )
+
+    packed = minimax_h3_packed_sequence_ref2va_blocks(
+        text_len=4,
+        latent_t=2,
+        latent_h=4,
+        latent_w=6,
+        audio_t=3,
+        ref_blocks=[
+            {"kind": "image", "latent_h": 4, "latent_w": 4},
+            {"kind": "video_audio", "ref_audio_t": 2, "latent_t": 2, "latent_h": 4, "latent_w": 6},
+            {"kind": "audio", "ref_audio_t": 1},
+            {"kind": "video", "ref_audio_t": 0, "latent_t": 1, "latent_h": 4, "latent_w": 4},
+        ],
+    )
+
+    # Image and all audio rows intentionally stay out of the sparse spans.
+    assert packed["video_spans"] == (
+        {"start": 12, "latent_grid": (2, 2, 3), "role": "reference"},
+        {"start": 26, "latent_grid": (1, 2, 2), "role": "reference"},
+        {"start": 36, "latent_grid": (2, 2, 3), "role": "target"},
+    )
 
 
 def test_condition_noise_is_seeded_and_keeps_clean_anchor_at_timestep_one():

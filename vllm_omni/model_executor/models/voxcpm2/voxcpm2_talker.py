@@ -42,6 +42,7 @@ from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
     iter_custom_voice_profiles,
     load_validated_profile_tensors,
+    validate_voxcpm2_profile,
 )
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 
@@ -963,7 +964,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         loaded = 0
         for profile in iter_custom_voice_profiles(custom_voice_dir, expected_model_type="voxcpm2"):
-            tensors = load_validated_profile_tensors(profile, expected_model_type="voxcpm2")
+            tensors = load_validated_profile_tensors(
+                profile,
+                expected_model_type="voxcpm2",
+                validate_profile=validate_voxcpm2_profile,
+            )
             if tensors is None:
                 continue
 
@@ -3013,9 +3018,18 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     merged_cpu = merged.detach().cpu().float()
                     mm["model_outputs"] = list(merged_cpu.split(sizes))
                     mm["sr"] = [sr for _ in ready_req_ids]
+                    # Dense mode still yields a strict SUBSET of the batch when
+                    # some requests emit no audio this step (e.g. prefill
+                    # phase). Without the marker the runner indexes these
+                    # per-request lists by batch position and misroutes audio
+                    # across requests; the marker declares meta.req_id
+                    # alignment.
+                    mm["meta"] = {"req_id": ready_req_ids, "sparse_audio": ["1"]}
                 else:
                     mm["model_outputs"] = list(audio_by_req.values())
                     mm["sr"] = [sr for _ in audio_by_req]
+                    # Same subset hazard as the coalesce branch above.
+                    mm["meta"] = {"req_id": list(audio_by_req), "sparse_audio": ["1"]}
             elif self._uses_sparse_audio_outputs():
                 mm["model_outputs"] = []
                 mm["sr"] = []

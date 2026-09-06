@@ -63,7 +63,7 @@ def test_text_to_image_moe(omni_server: OmniServer, openai_client: OpenAIClientH
     )
 
 
-@pytest.mark.full_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_server_cases(MODEL), indirect=True)
 def test_video_generation_modes_moe(omni_server: OmniServer, openai_client: OpenAIClientHandler) -> None:

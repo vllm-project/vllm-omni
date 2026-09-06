@@ -28,6 +28,8 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
     model runners for text generation stages (e.g., thinker stages).
     """
 
+    model_runner_cls = GPUARModelRunner
+
     @instrument(span_name="Init device")
     def init_device(self):
         if self.device_config.device_type in ("cuda", "musa"):

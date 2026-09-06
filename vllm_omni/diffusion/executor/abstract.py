@@ -5,10 +5,12 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
     from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
@@ -22,10 +24,15 @@ class DiffusionExecutor(ABC):
     def get_class(od_config: OmniDiffusionConfig) -> type[DiffusionExecutor]:
         executor_class: type[DiffusionExecutor]
         distributed_executor_backend = od_config.distributed_executor_backend
-        # Keep backward-compatible behavior for callers/configs that omit this
-        # field and rely on the historical diffusion default backend.
+        # Mirror vLLM's `world_size == 1 -> "uni"` default
+        # (vllm/config/parallel.py). A single-GPU diffusion deployment has
+        # nothing to distribute: spawning a worker only adds MessageQueues,
+        # /dev/shm output segments, and a second model load. Explicit "mp"
+        # keeps process isolation and RPC timeouts. Multi-GPU still defaults
+        # to "mp".
         if distributed_executor_backend is None:
-            distributed_executor_backend = "mp"
+            num_gpus = od_config.num_gpus or 1
+            distributed_executor_backend = "uni" if num_gpus == 1 else "mp"
 
         if isinstance(distributed_executor_backend, type):
             if not issubclass(distributed_executor_backend, DiffusionExecutor):
@@ -40,6 +47,10 @@ class DiffusionExecutor(ABC):
             from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 
             executor_class = MultiprocDiffusionExecutor
+        elif distributed_executor_backend == "uni":
+            from vllm_omni.diffusion.executor.uniproc_executor import UniProcDiffusionExecutor
+
+            executor_class = UniProcDiffusionExecutor
         elif distributed_executor_backend == "external_launcher":
             raise NotImplementedError("external_launcher backend is not yet supported.")
         elif isinstance(distributed_executor_backend, str):
@@ -114,6 +125,50 @@ class DiffusionExecutor(ABC):
         no-op implementation.
         """
         return None
+
+    def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
+        """Collect rank-local native specs after every Worker loads its model."""
+
+        result = self.collective_rpc(
+            "get_kv_cache_specs",
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+        if not isinstance(result, list):
+            raise TypeError(f"get_kv_cache_specs returned {type(result).__name__}, expected list")
+        return result
+
+    def determine_available_kv_memory(self, profile_requests: list[OmniDiffusionRequest]) -> list[int]:
+        """Profile and collect the KV memory budget on every Worker rank."""
+
+        result = self.collective_rpc(
+            "determine_available_kv_memory",
+            args=(profile_requests,),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+        if not isinstance(result, list) or not all(isinstance(value, int) for value in result):
+            raise TypeError("determine_available_kv_memory must return list[int]")
+        return result
+
+    def set_kv_cache_configs(self, kv_cache_configs: list[KVCacheConfig], resolved_max_model_len: int) -> None:
+        """Send rank-local configs and the resolved model length to all Workers."""
+
+        # The default control-plane RPC mode executes on every rank and has
+        # rank 0 return the gathered rank statuses, so failures on nonzero
+        # ranks are not silently dropped.
+        self.collective_rpc("set_kv_cache_configs", args=(kv_cache_configs, resolved_max_model_len))
+
+    def remove_diffusion_kv_requests(self, request_ids: list[str]) -> None:
+        """Clear request rows on every Worker after Scheduler retirement."""
+
+        unique_request_ids = list(dict.fromkeys(request_ids))
+        if not unique_request_ids:
+            return
+        self.collective_rpc(
+            "remove_diffusion_kv_requests",
+            args=(unique_request_ids,),
+        )
 
     @abstractmethod
     def shutdown(self) -> None:

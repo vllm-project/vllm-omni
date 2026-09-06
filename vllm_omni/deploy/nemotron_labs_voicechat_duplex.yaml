@@ -1,0 +1,100 @@
+# Nemotron VoiceChat native Full-Duplex deployment.
+#
+# One scheduler segment consumes one 1280-sample (80 ms) microphone frame.
+# Stage 0 remains one resumable request, so its NemotronH KV/Mamba state is
+# preserved between frame appends. Stage 1 and the codec overlap per frame.
+#
+# The default is the FAST profile (TTFP 712 ms -> 408 ms and realtime audio
+# delivery — one 80 ms packet per frame, median inter-chunk gap ~81 ms,
+# RTF ~1.01 on the bundled turn_taking fixture, 1x H100): the thinker runs
+# bf16 + CUDA graphs (inherited from the streaming base) and the talker's
+# Gemma3 backbone runs as a native vLLM model on PagedAttention, so the
+# duplex session length is unbounded (no StaticCache bucket cap) and the
+# per-frame talker cost drops below the vendored step. Every fast setting is
+# marked with a "PARITY:" comment here and in the streaming base; apply those
+# edits for the eager fp32 reference execution.
+#
+# Native-talker semantics:
+#   * stage 1 sets max_num_batched_tokens: 64 so the speaker-prompt prefill
+#     (hf_overrides.talker_init_len positions, embeddings precomputed — no
+#     step-to-step feedback) runs as ONE chunked prefill at session start.
+#     The per-frame code feedback IS strictly sequential, so the
+#     thinker->talker producer ships at most one new timeline token per
+#     chunk (drip; see thinker2talker_async_chunk) — at most one timeline
+#     position is ever schedulable per engine step.
+#   * the connector extra `native_talker: true` makes the thinker->talker
+#     producer append one engine position PER NEW timeline token (engine
+#     positions map 1:1 onto timeline steps).
+#   * matching NeMo's realtime pipeline, the talker never sees the system
+#     prompt (it conditions the thinker only); the duplex timeline is one
+#     anchor PAD + the per-frame text tokens.
+#   * classifier-free guidance is OFF by default (measured ASR-equivalent at
+#     this checkpoint's guidance_scale=0.2); opt in via
+#     hf_overrides.native_talker_guidance below (duplex pacing stays
+#     realtime with it on).
+base_config: nemotron_labs_voicechat_streaming.yaml
+pipeline: nemotron_voicechat
+session_mode: duplex
+active_stream_window: 1
+
+duplex_session:
+  idle_ttl_s: 300
+  disconnect_grace_s: 30
+  reaper_interval_s: 5
+  resume_replay_ttl_s: 60
+  resume_replay_max_bytes_per_session: 8388608
+  max_pending_input_bytes_per_session: 16777216
+  max_pending_turns_per_session: 4
+  max_sessions: 1
+  completed_append_cache_size: 256
+  # Startup warmup: run two silent frames through a throwaway session before
+  # real clients are admitted, so one-time costs (kernel JIT, first
+  # prefill/decode paths, codec caches) never land on the first user.
+  warmup_frames: 2
+
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      codec_chunk_frames: 1
+      # PARITY: delete this line together with the stage-1 hf_overrides
+      # below (the vendored talker drains chunks model-side and keeps the
+      # 1-position-per-chunk default).
+      native_talker: true
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    async_scheduling: false
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1
+      ignore_eos: true
+      seed: 0
+
+  - stage_id: 1
+    max_num_seqs: 1
+    async_scheduling: false
+    # PARITY: set enforce_eager: true, delete max_num_batched_tokens and the
+    # hf_overrides block (and the connector's native_talker flag above) for
+    # the vendored eager talker of the reference duplex deployment.
+    enforce_eager: false
+    max_num_batched_tokens: 64
+    hf_overrides:
+      use_native_talker: true
+      talker_init_len: 37
+      # The prewarmed placeholder prompt must cover the speaker-prompt
+      # prefill positions (read by the orchestrator's async-chunk prewarm).
+      async_chunk_prewarm_prompt_len: 37
+      # Classifier-free guidance: mirrors the stream on the vendored HF
+      # backbone (captured StaticCache step) and blends per NeMo's
+      # generate_step math (~+8.5 ms/frame, still realtime). Requires
+      # gpu_memory_utilization ~0.18 on this stage.
+      # native_talker_guidance: true
+
+  - stage_id: 2
+    max_num_seqs: 1
+    async_scheduling: false

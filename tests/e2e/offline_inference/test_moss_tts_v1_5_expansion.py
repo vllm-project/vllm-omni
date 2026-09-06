@@ -28,10 +28,14 @@ _OMNI_RUNNER_PARAM = (
     {"stage_init_timeout": 600, "trust_remote_code": True},
 )
 
+_SKIP_ISSUE_6417 = pytest.mark.skip(
+    reason="https://github.com/vllm-project/vllm-omni/issues/6417",
+)
+
 pytestmark = [
-    pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/4643"),
     pytest.mark.slow,
     pytest.mark.tts,
+    _SKIP_ISSUE_6417,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
 ]
 

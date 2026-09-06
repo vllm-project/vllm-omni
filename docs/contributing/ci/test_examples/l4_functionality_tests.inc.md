@@ -1,8 +1,8 @@
-**Scope**
+#### Scope
 
 For diffusion models, the L4 functionality test covers all or common *diffusion features* that are supported by this model, including several [parallelism acceleration methods](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/parallelism_acceleration/), [CPU offloading](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/cpu_offload/), [TeaCache](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/teacache/) and [Cache-DiT](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/cache_dit_acceleration/) cache backends, [quantization methods](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/quantization/overview/).
 
-**Test Case Design**
+#### Test Case Design
 
 For a *high priority* model (currently listed in [issue #1832](https://github.com/vllm-project/vllm-omni/issues/1832)), we use several test cases, each with multiple features turned on, so that each supported feature is tested in at least one test case. This is to relieve the GPU workload on the CI machine. The suggested test case combination is as follows:
 
@@ -34,12 +34,12 @@ For a *normal priority* model, further reduce the number of test cases.
 
 Currently all the features are available in online serving mode. Hence, only need to add `tests/e2e/online_serving/test_{model}_expansion.py`.
 
-**Code Style**
+#### Code Style
 
-- Validation: test that the multimodal output files of your model have the correct shapes. `OpenAIClientHandler.send_diffusion_request` should have taken care of this.
+- Validation: test that the multimodal output files of your model have the correct shapes. `OnlineOmniClient.send_diffusion_request` should have taken care of this.
 - Test marks: always add `full_model` and `diffusion` for L4 nightly `test_*_expansion.py` cases. Add GPU-related marks if needed. Ref: [Markers for Tests](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/ci/test_writing_guide/#markers-for-tests).
 - To maximize code reuse, you may refer to
-    - `tests/conftest.py` for `omni_server` (running server in subprocess) and `openai_client` fixtures (sending requests and validating output), `generate_synthetic_image` and `assert_XXX_valid` helper.
+    - `tests/conftest.py` for `omni_server` (running server in subprocess) and `online_client` fixtures (sending requests and validating output), `generate_synthetic_image` and `assert_XXX_valid` helper.
     - `tests/helpers/mark.py` for `@hardware_test(...)` and `hardware_marks`.
     - [Parametrizing tests (pytest doc)](https://docs.pytest.org/en/stable/example/parametrize.html) to reuse test function implementation for different cases.
 - Doc: add a concise docstring for each test function.

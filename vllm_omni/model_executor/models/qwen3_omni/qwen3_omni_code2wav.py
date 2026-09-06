@@ -28,11 +28,14 @@ from vllm.model_executor.models.utils import (  # type: ignore
 )
 
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
+from vllm_omni.model_executor.models.qwen3_omni.quantization import (
+    Qwen3OmniNestedSupportsQuant,
+)
 
 logger = init_logger(__name__)
 
 
-class Qwen3OmniMoeCode2Wav(nn.Module):
+class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
     """
     Qwen3 Omni MoE Code2Wav - Converts num_quantizers-layer RVQ codec codes to audio waveform.
 

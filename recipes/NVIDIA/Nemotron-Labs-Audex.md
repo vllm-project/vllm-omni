@@ -51,10 +51,10 @@ NemotronH (~3B active parameters). Pick the pipeline by task:
 `model_type` auto-resolves `audex_tts.yaml`):
 
 ```bash
-vllm-omni serve nvidia/Nemotron-Labs-Audex-2B \
+vllm serve nvidia/Nemotron-Labs-Audex-2B \
     --host 0.0.0.0 --port 8097 \
     --trust-remote-code --omni
-# other modes: add --stage-configs-path vllm_omni/deploy/audex_{tta,thinker_only,s2s}.yaml
+# other modes: add --deploy-config vllm_omni/deploy/audex_{tta,thinker_only,s2s}.yaml
 # or use the launcher: MODE=s2s PORT=8098 examples/online_serving/audex/run_server.sh
 ```
 
@@ -109,10 +109,10 @@ The 30B REQUIRES its explicit deploy yaml (the shared HF `model_type`
 auto-resolves to the 2B-tuned config otherwise):
 
 ```bash
-vllm-omni serve nvidia/Nemotron-Labs-Audex-30B-A3B \
+vllm serve nvidia/Nemotron-Labs-Audex-30B-A3B \
     --host 0.0.0.0 --port 8097 \
     --trust-remote-code --omni \
-    --stage-configs-path vllm_omni/deploy/audex_tts_30b.yaml
+    --deploy-config vllm_omni/deploy/audex_tts_30b.yaml
 # or: SIZE=30b MODE=tts examples/online_serving/audex/run_server.sh
 ```
 

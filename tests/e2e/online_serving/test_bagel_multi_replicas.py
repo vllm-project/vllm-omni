@@ -1,6 +1,11 @@
-"""Nightly-only e2e coverage for BAGEL diffusion multi-replica serving.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+"""Weekly e2e coverage for BAGEL diffusion multi-replica serving.
 
 This test needs 4 H100 GPUs; keep it out of generic test_bagel_* jobs.
+It is covered by the weekly Diffusion · H100 · Multi-GPU lane
+(``.buildkite/cuda/test-weekly.yml``, ``mirror_hardwares: h100_4``).
 """
 
 import os
@@ -17,7 +22,7 @@ MODEL = "ByteDance-Seed/BAGEL-7B-MoT"
 MULTI_REPLICA_DEPLOY = get_deploy_config_path("ci/bagel_multi_replicas_4gpu.yaml")
 ROUTE_STRESS_REQUESTS = 6
 
-pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
 
 test_params = [
     OmniServerParams(
@@ -31,7 +36,7 @@ test_params = [
 
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_multi_stage_diffusion_uses_multi_replica_dit_stage(omni_server, openai_client) -> None:
+def test_multi_stage_diffusion_uses_multi_replica_dit_stage(omni_server, online_client) -> None:
     request_config = {
         "model": omni_server.model,
         "messages": dummy_messages_from_mix_data(
@@ -47,7 +52,7 @@ def test_multi_stage_diffusion_uses_multi_replica_dit_stage(omni_server, openai_
         },
     }
 
-    responses = openai_client.send_diffusion_request(request_config, request_num=ROUTE_STRESS_REQUESTS)
+    responses = online_client.send_diffusion_request(request_config, request_num=ROUTE_STRESS_REQUESTS)
 
     assert len(responses) == ROUTE_STRESS_REQUESTS
     assert all(response.success for response in responses)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -151,6 +151,7 @@ def test_cosmos3_extra_registry_declares_request_and_response_params(pipeline_na
             "max_sequence_length",
             "use_resolution_template",
             "use_duration_template",
+            "negative_metadata_mode",
             "use_system_prompt",
             "system_prompt",
             "negative_prompt",
@@ -195,19 +196,19 @@ def test_cosmos3_extra_registry_declares_request_and_response_params(pipeline_na
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_magi_human_extra_registry_declares_request_and_response_params() -> None:
-    assert get_extra_body_params("MagiHumanPipeline") == frozenset(
+def test_magi2_extra_registry_is_preview_only() -> None:
+    assert get_extra_body_params("Magi2Pipeline") == frozenset(
         {
             "seconds",
-            "audio_path",
+            "resolution",
             "image_path",
-            "sr_height",
-            "sr_width",
-            "sr_num_inference_steps",
+            "output_width",
+            "output_height",
+            "deterministic",
         }
     )
-    assert get_extra_output_params("MagiHumanPipeline") == frozenset()
-    assert should_init_extra_args_for_non_diffusion_stages("MagiHumanPipeline") is False
+    assert get_extra_output_params("Magi2Pipeline") == frozenset()
+    assert should_init_extra_args_for_non_diffusion_stages("Magi2Pipeline") is False
 
 
 @pytest.mark.core_model
@@ -383,47 +384,6 @@ def test_ming_flash_omni_image_to_image_prompt_builder() -> None:
         "target_w": 256,
     }
     assert "negative_prompt" not in result
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
-def test_audiox_extra_registry_declares_request_and_response_params() -> None:
-    assert get_extra_body_params("AudioXPipeline") == frozenset(
-        {
-            "audiox_task",
-            "seconds_start",
-            "seconds_total",
-            "sigma_min",
-            "sigma_max",
-            "cfg_rescale",
-            "video_path",
-            "audio_path",
-        }
-    )
-    assert get_extra_output_params("AudioXPipeline") == frozenset({"audiox_task"})
-    assert should_init_extra_args_for_non_diffusion_stages("AudioXPipeline") is False
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
-def test_audiox_declared_extra_args_route_into_sampling_params() -> None:
-    params = OmniDiffusionSamplingParams()
-    declared = get_extra_body_params("AudioXPipeline")
-    apply_declared_extra_args(
-        params,
-        declared,
-        {
-            "audiox_task": "t2a",
-            "seconds_total": 10.0,
-            "sigma_min": 0.03,
-            "unknown": "ignored",
-        },
-    )
-    assert params.extra_args == {
-        "audiox_task": "t2a",
-        "seconds_total": 10.0,
-        "sigma_min": 0.03,
-    }
 
 
 @pytest.mark.core_model

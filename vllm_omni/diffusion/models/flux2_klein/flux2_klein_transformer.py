@@ -49,10 +49,21 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
+from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
 
 logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+
+_FLUX2_STACKED_PARAMS_MAPPING = (
+    (".to_qkv.", ".to_q.", "q"),
+    (".to_qkv.", ".to_k.", "k"),
+    (".to_qkv.", ".to_v.", "v"),
+    (".add_kv_proj", ".add_q_proj", "q"),
+    (".add_kv_proj", ".add_k_proj", "k"),
+    (".add_kv_proj", ".add_v_proj", "v"),
+)
 
 
 def _join_prefix(prefix: str, name: str) -> str:
@@ -770,6 +781,14 @@ class Flux2Transformer2DModel(nn.Module):
     Supports Sequence Parallelism (Ulysses and Ring) when configured via OmniDiffusionConfig.
     """
 
+    # Constructor state plus complete final-layout parameters and persistent
+    # buffers is sufficient to reconstruct a ready base-model transformer.
+    # Changes to the packed mapping or restore invariants require a version bump.
+    host_weight_restore_contract = FinalLayoutModelContract(
+        implementation_id="flux2-klein-dit",
+        version="1",
+    )
+
     _cache_dit_adapter_config = CacheDiTAdapterConfig(
         block_forward_patterns={
             "transformer_blocks": ForwardPattern.Pattern_1,
@@ -817,6 +836,9 @@ class Flux2Transformer2DModel(nn.Module):
         quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
+        # Warm HWR restoration skips load_weights(), so loader consumers such
+        # as LoRA discovery must not depend on that method to create this state.
+        self.stacked_params_mapping = list(_FLUX2_STACKED_PARAMS_MAPPING)
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
         self.config = SimpleNamespace(
@@ -1004,18 +1026,78 @@ class Flux2Transformer2DModel(nn.Module):
             return (output,)
         return Transformer2DModelOutput(sample=output)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            (".to_qkv.", ".to_q.", "q"),
-            (".to_qkv.", ".to_k.", "k"),
-            (".to_qkv.", ".to_v.", "v"),
-            (".add_kv_proj", ".add_q_proj", "q"),
-            (".add_kv_proj", ".add_k_proj", "k"),
-            (".add_kv_proj", ".add_v_proj", "v"),
-        ]
-        # Expose packed shard mappings for LoRA handling of fused projections.
-        self.stacked_params_mapping = stacked_params_mapping
+    def validate_restored_host_weights(self) -> None:
+        """Validate the tensor-complete BF16 base-model restore contract."""
+        if not isinstance(self.stacked_params_mapping, (list, tuple)) or (
+            tuple(self.stacked_params_mapping) != _FLUX2_STACKED_PARAMS_MAPPING
+        ):
+            raise ValueError("FLUX.2-klein packed QKV mapping is not constructor-stable")
 
+        stack_specs = (
+            ("transformer_blocks", self.config.num_layers, Flux2TransformerBlock),
+            ("single_transformer_blocks", self.config.num_single_layers, Flux2SingleTransformerBlock),
+        )
+        for name, expected_count, block_type in stack_specs:
+            blocks = getattr(self, name, None)
+            if not isinstance(blocks, nn.ModuleList) or len(blocks) != expected_count or expected_count <= 0:
+                raise ValueError(
+                    f"FLUX.2-klein {name} is incomplete: expected {expected_count} blocks, "
+                    f"got {len(blocks) if isinstance(blocks, nn.ModuleList) else 'missing'}"
+                )
+            if any(not isinstance(block, block_type) for block in blocks):
+                raise ValueError(f"FLUX.2-klein {name} contains an unexpected block implementation")
+
+        required_modules = (
+            "pos_embed",
+            "rope_prepare",
+            "time_guidance_embed",
+            "double_stream_modulation_img",
+            "double_stream_modulation_txt",
+            "single_stream_modulation",
+            "x_embedder",
+            "context_embedder",
+            "norm_out",
+            "proj_out",
+        )
+        for name in required_modules:
+            if not isinstance(getattr(self, name, None), nn.Module):
+                raise ValueError(f"FLUX.2-klein required module {name!r} is missing")
+
+        parameter_count = 0
+        stack_parameter_coverage = {name: False for name, _, _ in stack_specs}
+        for name, parameter in self.named_parameters():
+            parameter_count += 1
+            for stack_name in stack_parameter_coverage:
+                if name.startswith(f"{stack_name}."):
+                    stack_parameter_coverage[stack_name] = True
+            if parameter.is_meta or parameter.device.type != "cpu":
+                raise ValueError(f"FLUX.2-klein parameter {name!r} is not materialized on CPU")
+            if parameter.dtype is not torch.bfloat16:
+                raise ValueError(f"FLUX.2-klein parameter {name!r} must stay bf16, got {parameter.dtype}")
+            if parameter.layout is not torch.strided or not parameter.is_contiguous():
+                raise ValueError(f"FLUX.2-klein parameter {name!r} must use contiguous strided layout")
+            if parameter.numel() == 0:
+                raise ValueError(f"FLUX.2-klein parameter {name!r} is empty")
+        if parameter_count == 0 or not all(stack_parameter_coverage.values()):
+            raise ValueError("FLUX.2-klein restore did not materialize both transformer block stacks")
+
+        for name, buffer in self.named_buffers():
+            parent_path, _, leaf_name = name.rpartition(".")
+            owner = self.get_submodule(parent_path)
+            persistent = leaf_name not in owner._non_persistent_buffers_set
+            loader_buffer = name.endswith((".beta", ".eps"))
+            if loader_buffer and not persistent:
+                raise ValueError(f"FLUX.2-klein loader buffer {name!r} must be persistent")
+            if not persistent:
+                continue
+            if buffer.is_meta or buffer.device.type != "cpu":
+                raise ValueError(f"FLUX.2-klein persistent buffer {name!r} is not materialized on CPU")
+            if buffer.layout is not torch.strided or not buffer.is_contiguous():
+                raise ValueError(f"FLUX.2-klein persistent buffer {name!r} must use contiguous strided layout")
+            if loader_buffer and (buffer.dtype is not torch.bfloat16 or buffer.numel() != 1):
+                raise ValueError(f"FLUX.2-klein loader buffer {name!r} must be a scalar bf16 tensor")
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())
 
         for name, buffer in self.named_buffers():
@@ -1026,7 +1108,7 @@ class Flux2Transformer2DModel(nn.Module):
         for name, loaded_weight in weights:
             original_name = name
             mapped = False
-            for param_name, weight_name, shard_id in stacked_params_mapping:
+            for param_name, weight_name, shard_id in self.stacked_params_mapping:
                 if weight_name not in original_name:
                     continue
                 name = original_name.replace(weight_name, param_name)

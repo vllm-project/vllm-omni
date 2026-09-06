@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 End-to-end tests for Bagel with shared memory connector: img2img and text2img.
@@ -13,7 +13,6 @@ End-to-end tests for Bagel with shared memory connector: img2img and text2img.
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-import socket
 from typing import Any
 
 import pytest
@@ -80,15 +79,6 @@ EXPECTED_OUTPUT_SIZE = (1024, 672)
 def _load_input_image() -> Image.Image:
     """Load the test input image via vllm's ImageAsset."""
     return ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
-
-
-def _find_free_port() -> int:
-    """Find and return a free ephemeral port by binding to port 0."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        s.listen(1)
-        port = s.getsockname()[1]
-    return port
 
 
 def _configure_sampling_params(omni: Omni, num_inference_steps: int = 15) -> list:

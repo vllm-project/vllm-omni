@@ -52,15 +52,48 @@ class _MossTTSLocalAttention(nn.Module):
         self.c_proj = nn.Linear(hidden_size, hidden_size, bias=True)
         inv_freq = 1.0 / (rope_base ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("_rope_cos_cache", torch.empty(0), persistent=False)
+        self.register_buffer("_rope_sin_cache", torch.empty(0), persistent=False)
 
-    def _rope_cos_sin(
-        self, seq_len: int, device: torch.device, dtype: torch.dtype
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        position_ids = torch.arange(seq_len, device=device, dtype=torch.float32)
-        freqs = torch.einsum("s,d->sd", position_ids, self.inv_freq.to(device=device))
+    def prepare_rope_cache(
+        self,
+        max_seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        """Materialize frame-local RoPE values once per device/dtype.
+
+        Local Depth positions always restart at zero and never exceed the
+        number of RVQ codebooks (12 for MOSS-TTS Local v1.5).  Building
+        arange/einsum/cos/sin inside every one of the 12 depth steps creates
+        many tiny kernels and also bloats the enclosing talker CUDA graph.
+        Keep one non-persistent cache and slice it for prefix execution.
+        """
+        if max_seq_len <= 0:
+            return
+        cache = self._rope_cos_cache
+        if cache.numel() > 0 and cache.device == device and cache.dtype == dtype and int(cache.shape[1]) >= max_seq_len:
+            return
+
+        position_ids = torch.arange(max_seq_len, device=device, dtype=torch.float32)
+        inv_freq = self.inv_freq.to(device=device, dtype=torch.float32)
+        freqs = torch.einsum("s,d->sd", position_ids, inv_freq)
         cos = freqs.cos().repeat_interleave(2, dim=-1).to(dtype)
         sin = freqs.sin().repeat_interleave(2, dim=-1).to(dtype)
-        return cos.view(1, seq_len, 1, self.head_dim), sin.view(1, seq_len, 1, self.head_dim)
+        self._rope_cos_cache = cos.view(1, max_seq_len, 1, self.head_dim)
+        self._rope_sin_cache = sin.view(1, max_seq_len, 1, self.head_dim)
+
+    def _rope_cos_sin(
+        self,
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self.prepare_rope_cache(seq_len, device, dtype)
+        return (
+            self._rope_cos_cache[:, :seq_len],
+            self._rope_sin_cache[:, :seq_len],
+        )
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -200,9 +233,15 @@ class MossTTSLocalDepthTransformer(nn.Module):
         batch_size = backbone_last_hidden.shape[0]
         dtype = self.ln_f.weight.dtype
 
+        # Populate the complete [0, n_vq) table before torch.compile traces
+        # _forward_prefix or the runner captures talker_mtp.  The compiled /
+        # captured body then contains only fixed-address cache slices rather
+        # than cache construction or buffer replacement.
+        for block in self.h:
+            block.attn.prepare_rope_cache(n_vq, backbone_last_hidden.device, dtype)
+
         embeds = backbone_last_hidden.new_zeros((batch_size, n_vq, self.hidden_size), dtype=dtype)
         embeds[:, 0, :] = backbone_last_hidden.to(dtype)
-
         hidden = self._run_prefix(embeds[:, :1, :])
         local_hidden = hidden[:, 0, :]
 

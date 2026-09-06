@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Example online tests for Dynin-Omni model.
 """
@@ -64,7 +64,7 @@ def _build_i2i_messages(prompt: str) -> list[dict]:
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
-def test_send_i2i_request_001(omni_server, openai_client) -> None:
+def test_send_i2i_request_001(omni_server, online_client) -> None:
     request_config = {
         "model": omni_server.model,
         "messages": _build_i2i_messages(I2I_PROMPT),
@@ -73,27 +73,27 @@ def test_send_i2i_request_001(omni_server, openai_client) -> None:
             "sampling_params_list": [dict(_I2I_STAGE_SAMPLING) for _ in range(_STAGE_COUNT)],
         },
     }
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
-def test_send_t2i_request_001(omni_server, openai_client) -> None:
+def test_send_t2i_request_001(omni_server, online_client) -> None:
     request_config = {
         "model": omni_server.model,
         "messages": _build_t2i_messages(T2I_PROMPT),
         "modalities": ["image"],
     }
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
-def test_send_t2s_request_001(omni_server, openai_client) -> None:
+def test_send_t2s_request_001(omni_server, online_client) -> None:
     request_config = {
         "model": omni_server.model,
         "messages": _build_t2s_messages(T2S_PROMPT),
         "modalities": ["audio"],
         "audio_ref_text": T2S_PROMPT,
     }
-    openai_client.send_omni_request(request_config)
+    online_client.send_omni_request(request_config)

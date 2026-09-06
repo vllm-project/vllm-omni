@@ -9,7 +9,7 @@
 #       --deploy-config vllm_omni/deploy/bagel_single_stage.yaml
 #
 # Or programmatically:
-#   Omni(model="...", deploy_config_path="vllm_omni/deploy/bagel_single_stage.yaml")
+#   Omni(model="...", deploy_config="vllm_omni/deploy/bagel_single_stage.yaml")
 
 pipeline: bagel_single_stage
 async_chunk: false

@@ -81,7 +81,7 @@ MammothModa2 generation parameters as a JSON object through `--extra-body`:
 ```bash
 python examples/offline_inference/text_to_image/text_to_image.py \
   --model ./MammothModa2-Preview \
-  --stage-configs-path vllm_omni/deploy/mammoth_moda2.yaml \
+  --deploy-config vllm_omni/deploy/mammoth_moda2.yaml \
   --prompt "A stylish woman riding a motorcycle in NYC, movie poster style" \
   --height 1024 \
   --width 1024 \
@@ -131,6 +131,44 @@ exists and is a valid image:
 ls -lh mammoth_t2i.png
 python -c "from PIL import Image; print(Image.open('mammoth_t2i.png').size)"
 ```
+
+### 1x AMD MI300X, MammothModa2 Preview
+
+#### Environment
+
+- OS: Linux 6.8.0-134-generic, x86_64
+- Container: official ROCm image built from `docker/Dockerfile.rocm`
+- Python: 3.12.13
+- PyTorch: 2.11.0+gitd0c8b1f
+- Driver / runtime: AMD 6.19.14.31400000 / ROCm 7.2.53211
+- GPU: one AMD Instinct MI300X, `gfx942:sramecc+:xnack-`, 191.69 GiB visible HBM
+- vLLM version: 0.27.0+rocm723
+- vLLM Omni version or commit: `73e1368c7bb940efe1a025859c9d6c8eeeb2e3f0`
+- Installed vLLM Omni package metadata: `0.27.0rc2.dev44+g55abdade9.rocm`
+
+#### Offline Commands
+
+The checked run used the committed stage split, with `gpu_memory_utilization` set to 0.5 for AR and 0.3 for DiT:
+
+```bash
+python3 examples/offline_inference/text_to_image/text_to_image.py \
+    --model bytedance-research/MammothModa2-Preview \
+    --deploy-config vllm_omni/deploy/mammoth_moda2.yaml \
+    --prompt "A stylish woman riding a motorcycle in NYC, movie poster style" \
+    --height 1024 \
+    --width 1024 \
+    --seed 42 \
+    --extra-body '{"text_guidance_scale": 4.0, "cfg_range": [0.0, 1.0], "num_inference_steps": 50}' \
+    --enable-diffusion-pipeline-profiler \
+    --log-stats \
+    --output mammoth_t2i.png
+```
+
+#### Verification
+
+The first request took 85.224 seconds. The AR stage generated 4,161 visual tokens in 72.996 seconds, and the DiT stage took 12.163 seconds. AR weight loading used 21.4 GiB and took 8.250 seconds. DiT weight loading used 5.49 GiB and took 1.824 seconds. The largest one second whole device memory sample was 106.57 GiB, including the AR KV cache reserved by the 0.5 memory setting.
+
+The output was a valid 1024 by 1024 RGB PNG.
 
 ## MammothModa2-Dev unified inference
 

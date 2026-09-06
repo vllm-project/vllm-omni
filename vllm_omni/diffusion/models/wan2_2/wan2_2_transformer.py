@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import math
 from collections.abc import Iterable
@@ -419,6 +419,24 @@ class WanSelfAttention(nn.Module):
             prefix=prefix,
         )
 
+        # FastVideo VSA checkpoints may add a learned projection that gates
+        # the compressed global branch. Zero initialization makes checkpoints
+        # without these weights sparse-only, with no user-facing mode switch.
+        self.to_gate_compress: ColumnParallelLinear | None = None
+        if self.attn.attn_backend.get_name() == "FASTVIDEO_VSA":
+            self.to_gate_compress = ColumnParallelLinear(
+                dim,
+                self.inner_dim,
+                bias=True,
+                gather_output=False,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_gate_compress" if prefix else "to_gate_compress",
+            )
+            nn.init.zeros_(self.to_gate_compress.weight)
+            if self.to_gate_compress.bias is not None:
+                nn.init.zeros_(self.to_gate_compress.bias)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -440,6 +458,15 @@ class WanSelfAttention(nn.Module):
         query = query.unflatten(2, (self.num_heads, self.head_dim))
         key = key.unflatten(2, (self.num_kv_heads, self.head_dim))
         value = value.unflatten(2, (self.num_kv_heads, self.head_dim))
+
+        if self.to_gate_compress is not None:
+            gate_result = self.to_gate_compress(hidden_states)
+            gate_compress = gate_result[0] if isinstance(gate_result, tuple) else gate_result
+            gate_compress = gate_compress.unflatten(2, (self.num_heads, self.head_dim))
+            if attn_metadata is None:
+                attn_metadata = AttentionMetadata(extra={"gate_compress": gate_compress})
+            else:
+                attn_metadata.extra["gate_compress"] = gate_compress
 
         # Apply rotary embeddings
         if rotary_emb is not None:
@@ -709,6 +736,8 @@ class WanTransformerBlock(nn.Module):
         temb: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         hidden_states_mask: torch.Tensor | None = None,
+        vsa_dit_seq_shape: tuple[int, int, int] | None = None,
+        preserve_vsa_all_blocks: bool = False,
     ) -> torch.Tensor:
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
@@ -729,7 +758,12 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         norm_hidden_states = self.norm1(hidden_states, scale_msa, shift_msa).type_as(hidden_states)
-        self_attn_metadata = AttentionMetadata(attn_mask=hidden_states_mask)
+        self_attn_extra = {}
+        if vsa_dit_seq_shape is not None:
+            self_attn_extra["vsa_dit_seq_shape"] = vsa_dit_seq_shape
+        if preserve_vsa_all_blocks:
+            self_attn_extra["preserve_vsa_all_blocks"] = True
+        self_attn_metadata = AttentionMetadata(attn_mask=hidden_states_mask, extra=self_attn_extra)
         attn_output = self.attn1(norm_hidden_states, rotary_emb, self_attn_metadata)
         hidden_states = (hidden_states + attn_output * gate_msa).type_as(hidden_states)
 
@@ -910,6 +944,9 @@ class WanTransformer3DModel(nn.Module):
             pos_embed_seq_len=pos_embed_seq_len,
         )
 
+        # DMD/FastVideo checkpoints retain VSA semantics when top-k selects every block.
+        self.preserve_vsa_all_blocks = False
+
         # 3. Transformer blocks — partitioned across PP stages via vLLM's `make_layers`.
         # It computes the [start_layer, end_layer) slice for this rank and fills the remaining slots
         # with PPMissingLayer so that weight names stay globally consistent.
@@ -1044,8 +1081,19 @@ class WanTransformer3DModel(nn.Module):
             )
 
         # Transformer blocks
+        # Preserve the post-patch (T, H, W) grid so VSA can partition
+        # the flattened DiT sequence into spatiotemporal blocks.
+        vsa_dit_seq_shape = (post_patch_num_frames, post_patch_height, post_patch_width)
         for block in self.blocks[self.start_layer : self.end_layer]:
-            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, hidden_states_mask)
+            hidden_states = block(
+                hidden_states,
+                encoder_hidden_states,
+                timestep_proj,
+                rotary_emb,
+                hidden_states_mask,
+                vsa_dit_seq_shape,
+                self.preserve_vsa_all_blocks,
+            )
 
         if not is_pipeline_last_stage():
             # Non-last PP stage: hand the token sequence to the caller via IntermediateTensors.
