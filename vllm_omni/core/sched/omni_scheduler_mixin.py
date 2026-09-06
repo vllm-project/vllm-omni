@@ -149,6 +149,7 @@ class OmniSchedulerMixin:
 
     def _replace_streaming_session(self, session: Request, update: StreamingUpdate) -> None:
         """Replace a downstream stage's placeholder with its next payload."""
+        session.max_tokens = update.max_tokens
         session._omni_segment_generation = int(getattr(session, "_omni_segment_generation", 0) or 0) + 1
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is not None:
