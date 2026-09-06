@@ -4,15 +4,19 @@
 import json
 import math
 import os
+import subprocess
+import sys
 import threading
 from collections.abc import Callable
 from contextlib import AbstractContextManager, ExitStack, contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from tests.dfx.conftest import (
+    create_paired_benchmark_pytest_params,
     create_paired_omni_benchmark_pytest_params,
     create_test_parameter_mapping,
     get_benchmark_params_for_server,
@@ -21,7 +25,7 @@ from tests.dfx.conftest import (
     load_benchmark_configs,
     run_benchmark,
 )
-from tests.helpers.runtime import OmniServer
+from tests.dfx.perf.scripts.sglang_omni_server import SglangOmniServer, sglang_server_entries
 
 # Optional JSON field ``mark`` is applied as pytest marks via
 # ``create_paired_omni_benchmark_pytest_params`` (e.g. ``"mark": [{"hardware_marks":
@@ -29,6 +33,9 @@ from tests.helpers.runtime import OmniServer
 
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_OMNI_BENCHMARK_SCRIPT = _REPO_ROOT / "benchmarks" / "omni" / "omni_benchmark_serving.py"
 
 
 def _get_config_file_from_argv() -> str | None:
@@ -59,7 +66,34 @@ else:
 
 DEPLOY_CONFIGS_DIR = Path(__file__).parent.parent / "deploy"
 server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS)
-paired_benchmark_params = create_paired_omni_benchmark_pytest_params(BENCHMARK_CONFIGS, DEPLOY_CONFIGS_DIR)
+_server_types = {config.get("server_type", "vllm-omni") for config in BENCHMARK_CONFIGS}
+if len(_server_types) != 1:
+    raise ValueError(f"A benchmark config file must use one server type, got: {sorted(_server_types)}")
+SERVER_TYPE = next(iter(_server_types), "vllm-omni")
+if SERVER_TYPE == "sglang-omni":
+
+    def _sglang_marks(config: dict[str, Any]) -> list[pytest.MarkDecorator]:
+        marks: list[pytest.MarkDecorator] = []
+        for item in config.get("mark", []):
+            if isinstance(item, str):
+                marks.append(getattr(pytest.mark, item))
+                continue
+            hardware = item.get("hardware_marks", {})
+            for platform, resource in hardware.get("res", {}).items():
+                marks.extend((getattr(pytest.mark, platform), getattr(pytest.mark, resource)))
+            cards = hardware.get("num_cards")
+            if isinstance(cards, int):
+                marks.append(getattr(pytest.mark, f"cards_{cards}"))
+        return marks
+
+    _server_entries = sglang_server_entries(BENCHMARK_CONFIGS)
+    paired_benchmark_params = create_paired_benchmark_pytest_params(
+        _server_entries,
+        {name: get_benchmark_params_for_server(name, server_to_benchmark_mapping) for _, name in _server_entries},
+        {config["test_name"]: _sglang_marks(config) for config in BENCHMARK_CONFIGS},
+    )
+else:
+    paired_benchmark_params = create_paired_omni_benchmark_pytest_params(BENCHMARK_CONFIGS, DEPLOY_CONFIGS_DIR)
 
 _omni_server_lock = threading.Lock()
 
@@ -95,6 +129,8 @@ class _SingleActiveContext:
 
 @contextmanager
 def _start_omni_server(server_param):
+    from tests.helpers.runtime import OmniServer
+
     test_name, model, stage_config_path, stage_overrides, extra_cli_args, use_omni = server_param
 
     print(f"Starting OmniServer with test: {test_name}, model: {model}")
@@ -135,6 +171,9 @@ def omni_server_context():
 
 @pytest.fixture
 def omni_server(request, omni_server_context):
+    if SERVER_TYPE == "sglang-omni":
+        key = json.dumps(request.param, sort_keys=True)
+        return omni_server_context.acquire(key, lambda: SglangOmniServer(request.param))
     return omni_server_context.acquire(request.param, lambda: _start_omni_server(request.param))
 
 
@@ -206,6 +245,40 @@ def assert_result(result, params, num_prompt) -> None:
         ), f"Not every duplex session emitted {expected_audio_turns} audio turns"
 
 
+def _run_sglang_omni_benchmark(
+    *,
+    args: list[str],
+    test_name: str,
+    flow: Any,
+    dataset_name: str,
+    num_prompt: int,
+    **_: Any,
+) -> dict[str, Any]:
+    """Drive SGLang-Omni without requiring a ``vllm`` console script on PATH."""
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    result_dir = Path(os.environ.get("BENCHMARK_DIR", "tests/dfx/perf/results"))
+    result_dir.mkdir(parents=True, exist_ok=True)
+    result_path = result_dir / f"result_{test_name}_{dataset_name}_{flow}_{num_prompt}_{timestamp}.json"
+    command = [
+        sys.executable,
+        str(_OMNI_BENCHMARK_SCRIPT),
+        "--request-backend",
+        "sglang_omni",
+        "--output-file",
+        str(result_path),
+        *args,
+    ]
+    subprocess.run(command, cwd=_REPO_ROOT, check=True)
+    with result_path.open(encoding="utf-8") as result_file:
+        return json.load(result_file)
+
+
+def _dispatch_run_benchmark(**kwargs: Any) -> dict[str, Any]:
+    if SERVER_TYPE == "sglang-omni":
+        return _run_sglang_omni_benchmark(**kwargs)
+    return run_benchmark(**kwargs)
+
+
 @pytest.mark.benchmark
 @pytest.mark.parametrize(
     "omni_server,benchmark_params",
@@ -224,7 +297,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
     print(f"Running benchmark for model: {model}")
     print(f"Benchmark parameters: {benchmark_params}")
 
-    resource_label = get_runtime_resource_label()
+    resource_label = omni_server.resource_label if SERVER_TYPE == "sglang-omni" else get_runtime_resource_label()
 
     def to_list(value, default=None):
         if value is None:
@@ -247,7 +320,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
     elif len(num_prompt_list) != max_len and max_len > 0:
         raise ValueError("The number of prompts does not match the QPS or max_concurrency")
 
-    args = ["--host", host, "--port", str(port)]
+    args = ["--host", host, "--port", str(port), "--model", model]
     exclude_keys = {
         "request_rate",
         "baseline",
@@ -286,7 +359,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
     # QPS / request-rate sweep
     for sweep_index, (qps, num_prompt) in enumerate(zip(qps_list, num_prompt_list)):
         args = args + ["--request-rate", str(qps), "--num-prompts", str(num_prompt)]
-        result = run_benchmark(
+        result = _dispatch_run_benchmark(
             args=args,
             test_name=test_name,
             flow=qps,
@@ -304,7 +377,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
     # concurrency test
     for sweep_index, (concurrency, num_prompt) in enumerate(zip(max_concurrency_list, num_prompt_list)):
         args = args + ["--max-concurrency", str(concurrency), "--num-prompts", str(num_prompt), "--request-rate", "inf"]
-        result = run_benchmark(
+        result = _dispatch_run_benchmark(
             args=args,
             test_name=test_name,
             flow=concurrency,

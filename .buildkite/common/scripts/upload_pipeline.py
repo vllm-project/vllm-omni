@@ -138,6 +138,11 @@ def _format_bootstrap_if(expr: str) -> str:
 
 
 def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
+    nightly_label_if = NIGHTLY_LABEL_IF
+    if platform == "cuda":
+        nightly_label_if = (
+            f'({NIGHTLY_LABEL_IF}) || (build.branch != "main" && build.pull_request.labels includes "sglang-omni-test")'
+        )
     if platform == "npu":
         ready_upload = READY_LABEL_IF
         merge_upload = BOOTSTRAP_DISABLED_IF
@@ -162,10 +167,10 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
 
         ready_expr = ready_upload if l2_enabled else BOOTSTRAP_DISABLED_IF
         merge_expr = merge_upload if l3_enabled else BOOTSTRAP_DISABLED_IF
-        nightly_expr = NIGHTLY_LABEL_IF
+        nightly_expr = nightly_label_if
         weekly_expr = weekly_label_if if platform == "cuda" else BOOTSTRAP_DISABLED_IF
 
-        image_parts = [f"({NIGHTLY_LABEL_IF})"]
+        image_parts = [f"({nightly_label_if})"]
         if platform == "cuda":
             image_parts.append(f"({weekly_label_if})")
         if l2_enabled:
@@ -177,7 +182,7 @@ def _compute_bootstrap_if_exprs(*, decision, platform: str) -> dict[str, str]:
         image_expr = BOOTSTRAP_ENABLED_IF
         ready_expr = ready_upload
         merge_expr = merge_upload if platform == "cuda" else BOOTSTRAP_DISABLED_IF
-        nightly_expr = NIGHTLY_LABEL_IF
+        nightly_expr = nightly_label_if
         weekly_expr = weekly_label_if if platform == "cuda" else BOOTSTRAP_DISABLED_IF
 
     return {
