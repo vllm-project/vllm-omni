@@ -73,12 +73,15 @@ class OffloadConfig:
     # Optional per-worker ceiling for registering an HWR mmap. Zero means no
     # additional ceiling; pin_cpu_memory controls whether registration is tried.
     dlo_host_registration_limit_gib: float = 0.0
+    dlo_host_registration_mode: str = "auto"
     # ``None`` preserves the model's legacy plan-driven component topology;
     # a frozenset is an explicit compact-API selection.
     components: frozenset[str] | None = None
     dlo_transfers: dict[str, DLOTransfer] | None = None
 
     def __post_init__(self) -> None:
+        if self.dlo_host_registration_mode not in ("auto", "disabled"):
+            raise ValueError("dlo_host_registration_mode must be auto or disabled")
         if self.components is not None:
             self.components = parse_offload_components(self.components)
         if self.dlo_transfers is None:
@@ -174,7 +177,9 @@ class OffloadConfig:
         dlo_transfers = dict(resolved.transfers)
         dlo_resident_layers = resolved.resident_layers
         dit_uses_allgather = resolved.uses_allgather(DIT_COMPONENT)
+        registration_mode = getattr(od_config, "dlo_host_registration_mode", "auto")
         dlo_host_registration_limit_gib = validate_dlo_host_registration_options(
+            mode=registration_mode,
             limit_gib=getattr(od_config, "dlo_host_registration_limit_gib", 0.0),
             enable_dlo=enable_distributed_layerwise_offload,
             use_allgather=dit_uses_allgather,
@@ -210,6 +215,7 @@ class OffloadConfig:
             dlo_use_allgather=dit_uses_allgather,
             dlo_resident_layers=dlo_resident_layers,
             dlo_host_registration_limit_gib=dlo_host_registration_limit_gib,
+            dlo_host_registration_mode=registration_mode,
             components=components,
             dlo_transfers=dlo_transfers,
         )

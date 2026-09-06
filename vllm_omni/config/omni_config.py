@@ -739,6 +739,7 @@ class _DiffusionConfigProjection:
     dlo_resident_layers: int = Field(default=0, ge=0)
     host_weight_runtime_mode: Literal["disabled", "preferred", "required"] = "disabled"
     host_weight_runtime_root: str | None = None
+    dlo_host_registration_mode: str = "auto"
     dlo_host_registration_limit_gib: float = Field(default=0.0, ge=0)
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
@@ -895,6 +896,7 @@ class _DiffusionConfigProjection:
         )
         self.dlo_host_registration_limit_gib = validate_dlo_host_registration_options(
             limit_gib=self.dlo_host_registration_limit_gib,
+            mode=self.dlo_host_registration_mode,
             enable_dlo=self.enable_distributed_layerwise_offload,
             use_allgather=self.dlo_use_allgather,
             hwr_mode=self.host_weight_runtime_mode,
