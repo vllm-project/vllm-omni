@@ -30,6 +30,7 @@ class _FakeCheckpointModel:
     def __init__(self):
         self.vae_ratio = RATIO
         self.parallel_tiling = True
+        self.stack_tiling = False
         self.decoded_with = []
 
     def split_tiles(self, input_len, is_decoder=False):
@@ -57,6 +58,7 @@ def _vae(parallel_size, state):
     vae.model = _FakeCheckpointModel()
     vae.remote = remote
     vae.parallel_size = parallel_size
+    vae.stack_tiling_mode = "false"
     return vae
 
 
@@ -87,6 +89,33 @@ def test_tile_count_uses_the_decoder_grid_not_the_encoder_one(h, w, decoder_tile
     px_h, px_w = h * RATIO, w * RATIO
     as_encoder = len(vae.model.split_tiles(px_h, False)[0]) * len(vae.model.split_tiles(px_w, False)[0])
     assert as_encoder == encoder_tiles != decoder_tiles
+
+
+@pytest.mark.parametrize(
+    ("parallel_size", "h", "w", "expected"),
+    [
+        (1, 48, 84, True),
+        (2, 48, 84, True),
+        (4, 48, 84, True),
+        (8, 48, 84, True),
+        (16, 48, 84, False),
+        (4, 16, 16, False),
+    ],
+)
+def test_auto_stack_tiling_requires_multiple_tiles_per_rank(parallel_size, h, w, expected):
+    vae = _vae(parallel_size, {})
+    vae.set_stack_tiling("auto")
+
+    assert MiniMaxH3VideoVAE._should_stack_decode_tiles(vae, _latent(h, w)) is expected
+
+
+@pytest.mark.parametrize(("mode", "expected"), [(False, False), (True, True), ("false", False), ("true", True)])
+def test_stack_tiling_configuration_accepts_bool_and_string_modes(mode, expected):
+    vae = _vae(1, {})
+
+    vae.set_stack_tiling(mode)
+
+    assert vae.model.stack_tiling is expected
 
 
 def test_rank_local_tiling_restores_the_group_state():
@@ -156,6 +185,7 @@ def _dispatch_vae(parallel_size):
         seen["sp_enabled"] = state["sp_enabled"]
         seen["sp_process_group"] = state["sp_process_group"]
         seen["parallel_tiling"] = vae.model.parallel_tiling
+        seen["stack_tiling"] = vae.model.stack_tiling
         # the guard never inspects the decoded shape, so keep it small
         return torch.zeros(1, 3, 2, 4, 4)
 
@@ -212,3 +242,15 @@ def test_decode_latent_leaves_the_group_state_alone_when_the_grid_is_large_enoug
     assert seen["sp_enabled"] is True
     assert seen["sp_process_group"] is state["sp_process_group"]
     assert seen["parallel_tiling"] is True
+
+
+def test_decode_latent_restores_native_stack_tiling_state():
+    vae, _, seen = _dispatch_vae(4)
+    vae.set_stack_tiling("auto")
+    # The adapter must not leak its per-request decision into the remote VAE.
+    vae.model.stack_tiling = True
+
+    MiniMaxH3VideoVAE.decode_latent(vae, _latent(16, 16))
+
+    assert seen["stack_tiling"] is False
+    assert vae.model.stack_tiling is True

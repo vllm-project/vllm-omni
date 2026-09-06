@@ -9,7 +9,7 @@ import json
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.distributed as dist
@@ -115,6 +115,8 @@ class _AudioVAEDeterminismContext(AbstractContextManager):
 class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     """Adapter around the checkpoint's native parallel-tiled video VAE."""
 
+    supports_stack_tiling: ClassVar[bool] = True
+
     def __init__(
         self,
         component_path: str,
@@ -153,6 +155,30 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.use_slicing = False
         self.parallel_size = 1
         self.device_module = torch.get_device_module()
+        self.stack_tiling_mode = "false"
+
+    def set_stack_tiling(self, mode: str | bool) -> None:
+        """Configure native decoder tile batching.
+
+        ``auto`` is resolved per decode because the useful batch size depends
+        on both the request's tile grid and the VAE parallel group size.
+        """
+        if not hasattr(self.model, "stack_tiling"):
+            raise RuntimeError("MiniMax H3 video VAE remote model does not expose stack_tiling")
+        if isinstance(mode, bool):
+            mode = "true" if mode else "false"
+        if mode not in ("auto", "true", "false"):
+            raise ValueError(f"invalid VAE stacked-tiling mode: {mode!r}")
+        self.stack_tiling_mode = mode
+        self.model.stack_tiling = mode == "true"
+
+    def _should_stack_decode_tiles(self, latent: torch.Tensor) -> bool:
+        if self.stack_tiling_mode != "auto":
+            return self.stack_tiling_mode == "true"
+        # Stacking is worthwhile when every rank has more than one tile in
+        # the common round-robin distribution. The tile grid is global and
+        # therefore identical on all ranks.
+        return self._decoder_tile_count(latent) >= 2 * self.parallel_size
 
     def load_to_device(self) -> None:
         if self._stager is not None:
@@ -388,7 +414,18 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             tiling_context = nullcontext()
 
         with tiling_context:
-            decoded = self.model.decode_base(latent * std + mean)
+            stack_tiling_mode = getattr(self, "stack_tiling_mode", "false")
+            if stack_tiling_mode == "false" and not hasattr(self.model, "stack_tiling"):
+                # Keep the default path compatible with older H3 snapshots
+                # that predate the native stacked-tiling attribute.
+                decoded = self.model.decode_base(latent * std + mean)
+            else:
+                previous_stack_tiling = self.model.stack_tiling
+                self.model.stack_tiling = self._should_stack_decode_tiles(latent)
+                try:
+                    decoded = self.model.decode_base(latent * std + mean)
+                finally:
+                    self.model.stack_tiling = previous_stack_tiling
         frames = self.model.processor.revert_tensor(decoded)
         if frames.ndim == 4:
             frames = frames.unsqueeze(0).transpose(1, 2)
