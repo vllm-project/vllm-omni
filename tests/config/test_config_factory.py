@@ -1385,7 +1385,10 @@ stages:
         monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda _engine_args: None)
 
         deploy = load_deploy_config(get_deploy_config_path("minimax_h3_disaggregated.yaml"))
-        assert deploy.stages[1].engine_extras["model_loaded"] == {"text_encoder": False}
+        assert deploy.stages[1].engine_extras["model_loaded"] == {
+            "text_encoder": False,
+            "vae_encoder": False,
+        }
         stages = merge_pipeline_deploy(OMNI_PIPELINES["minimax_h3_disaggregated"], deploy)
         resolved = [stage_init_utils.build_engine_args_dict(stage.to_omegaconf(), str(model_root)) for stage in stages]
 

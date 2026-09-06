@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any
 
 import torch
@@ -389,6 +390,26 @@ class MiniMaxH3EncoderConditioning:
     audio_condition_lengths: tuple[int, ...] = ()
     ref_blocks: tuple[dict[str, Any], ...] = ()
     keyframe_frame_indices: tuple[int, ...] = ()
+
+    @classmethod
+    def from_components(
+        cls,
+        text: MiniMaxH3TextConditioning,
+        media: MiniMaxH3EncoderMediaConditioning,
+    ) -> MiniMaxH3EncoderConditioning:
+        """Combine local encoder results without a stage-wire round trip."""
+        text = MiniMaxH3TextConditioning.from_payload(text.to_payload())
+        _validate_condition_tensors(
+            media.visual_condition,
+            media.visual_condition_shapes,
+            media.audio_condition,
+            media.audio_condition_lengths,
+        )
+        return cls(
+            hidden_states=text.hidden_states,
+            token_tags=text.token_tags,
+            **{item.name: getattr(media, item.name) for item in fields(media)},
+        )
 
     @classmethod
     def from_omni_payload(cls, payload: Mapping[str, Any]) -> MiniMaxH3EncoderConditioning:

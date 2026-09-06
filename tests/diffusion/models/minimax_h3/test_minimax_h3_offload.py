@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import contextmanager
 from unittest.mock import Mock
@@ -10,14 +10,23 @@ import torch
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
-def test_h3_profiler_targets_exclude_encoder_stage_work():
+def test_h3_full_pipeline_profiler_includes_local_encoding():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     targets = MiniMaxH3Pipeline._PROFILER_TARGETS
-    assert targets == ["diffuse", "decode", "prepare_encode", "denoise_step", "post_decode"]
+    assert targets == [
+        "encode_prompt",
+        "_encode_local_media",
+        "diffuse",
+        "decode",
+        "prepare_encode",
+        "denoise_step",
+        "post_decode",
+    ]
 
 
-def test_h3_model_cpu_offload_registers_direct_vae_stages(monkeypatch):
+@pytest.mark.parametrize("load_text_encoder", [True, False])
+def test_h3_model_cpu_offload_registers_direct_vae_stages(monkeypatch, load_text_encoder):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
 
@@ -27,6 +36,9 @@ def test_h3_model_cpu_offload_registers_direct_vae_stages(monkeypatch):
     pipeline.transformers_ref = torch.nn.Linear(2, 2)
     pipeline.video_vae = torch.nn.Linear(2, 2)
     pipeline.audio_vae = torch.nn.Linear(2, 2)
+    pipeline._encoder_modules = ["text_encoder"] if load_text_encoder else []
+    if load_text_encoder:
+        pipeline.text_encoder = torch.nn.Linear(2, 2)
     apply_offload = Mock()
     remove_offload = Mock()
     monkeypatch.setattr(module, "apply_sequential_offload", apply_offload)
@@ -39,7 +51,7 @@ def test_h3_model_cpu_offload_registers_direct_vae_stages(monkeypatch):
     )
 
     dits = [pipeline.transformer, pipeline.transformers_ref]
-    stages = [pipeline.video_vae, pipeline.audio_vae]
+    stages = [*([pipeline.text_encoder] if load_text_encoder else []), pipeline.video_vae, pipeline.audio_vae]
     apply_offload.assert_called_once_with(
         dit_modules=dits,
         encoder_modules=stages,

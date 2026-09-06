@@ -27,6 +27,7 @@ from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MINIMAX_H3_PRESENTATION_TASK_KEY,
     MiniMaxH3EncoderConditioning,
 )
+from vllm_omni.model_executor.models.minimax_h3.encoder_processing import _audio_items, _load_audio
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     minimax_h3_ref2va_presentation,
     minimax_h3_ref2va_video_presentation,
@@ -36,9 +37,7 @@ from vllm_omni.model_executor.models.minimax_h3.text_encoder import (
     _build_minimax_h3_presentation,
 )
 from vllm_omni.model_executor.stage_input_processors.minimax_h3 import (
-    _audio_items,
     _diffusion_sampling_params,
-    _load_audio,
     encoder2diffusion,
     prepare_encoder_prompt,
 )
