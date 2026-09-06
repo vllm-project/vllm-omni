@@ -255,6 +255,56 @@ of:
   the TP=4 configuration before increasing batch size. GPU memory utilization
   is not a useful primary tuning knob for this DiT-only recipe.
 
+### Scheduler-managed paged KV (request mode)
+
+HunyuanImage-3 can use Scheduler-managed paged KV in request-level execution.
+The current paged implementation uses unquantized BF16 KV and requires the
+logical `FLASH_ATTN` backend. The following command reuses the standard DiT
+deploy file and supplies the paged-only stage settings with
+`--stage-overrides`:
+
+For the mode-selection guide, configuration field reference, and parallelism
+limits, see the [Scheduler-Managed Paged KV Cache user guide](../../docs/user_guide/diffusion/paged_kv_cache.md).
+
+```bash
+vllm serve tencent/HunyuanImage-3.0-Instruct \
+  --omni \
+  --trust-remote-code \
+  --port 8091 \
+  --deploy-config vllm_omni/deploy/hunyuan_image3_dit.yaml \
+  --stage-overrides \
+  '{"0":{"diffusion_kv_mode":"paged_scheduler","diffusion_kv_max_rows_per_request":2,"kv_cache_memory_bytes":536870912,"step_execution":false,"diffusion_attention_backend":"FLASH_ATTN"}}'
+```
+
+Here `kv_cache_memory_bytes` reserves a 512 MiB physical KV pool per Worker
+and rank, and `diffusion_kv_max_rows_per_request=2` reserves the two internal
+rows used by standard positive/negative CFG. Use `1` when CFG is disabled.
+Keep `max_num_seqs=1`: this paged Hunyuan path does not currently batch
+independent public requests.
+
+Generate an image after `/health` reports ready:
+
+```bash
+curl -s http://localhost:8091/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "modalities": ["image"],
+    "messages": [{"role": "user", "content": "A red ceramic vase on a wooden table"}],
+    "extra_body": {
+      "height": 1024,
+      "width": 1024,
+      "num_inference_steps": 20,
+      "guidance_scale": 5.0,
+      "seed": 1234
+    }
+  }' | jq -r '.choices[0].message.content[0].image_url.url' \
+    | cut -d',' -f2- | base64 -d > hunyuan_image3_paged.png
+```
+
+This mode is also implemented on Ascend NPU, where `FLASH_ATTN` resolves to
+Ascend FIA. Hunyuan paged step execution, quantized paged KV, and CPU/DLO
+offload combinations are not validated; use `dense_legacy` for those cases.
+
 ### 2x B200 ModelOpt mixed FP8/NVFP4
 
 #### Environment

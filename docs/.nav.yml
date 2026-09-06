@@ -79,6 +79,8 @@ nav:
       - Cache Acceleration:
         - TeaCache: user_guide/diffusion/cache_acceleration/teacache.md
         - Cache-DiT: user_guide/diffusion/cache_acceleration/cache_dit.md
+      - KV Cache:
+        - Scheduler-Managed Paged KV Cache: user_guide/diffusion/paged_kv_cache.md
       - Parallelism:
         - Overview: user_guide/diffusion/parallelism/overview.md
         - CFG Parallel: user_guide/diffusion/parallelism/cfg_parallel.md
@@ -151,6 +153,7 @@ nav:
         - Attention Optimization:
           - Backend Selection: design/feature/attention_backend_selection.md
           - Skip-Softmax: design/feature/skip_softmax.md
+          - Scheduler-Managed Paged KV Cache: design/feature/diffusion_paged_kv_cache.md
         - CPU Offloading:
           - Overview: design/feature/offloader/README.md
           - Model-Level: design/feature/offloader/module_offload.md

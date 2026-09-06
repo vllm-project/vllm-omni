@@ -63,6 +63,7 @@ The design contracts separate selection mechanics from backend algorithms:
 
 - [Attention Backend Selection](feature/attention_backend_selection.md)
 - [Skip-Softmax](feature/skip_softmax.md)
+- [Scheduler-Managed Paged KV Cache for Diffusion DiT Stages](feature/diffusion_paged_kv_cache.md)
 
 #### CPU offloading
 
