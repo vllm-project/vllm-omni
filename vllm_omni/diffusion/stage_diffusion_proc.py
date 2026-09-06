@@ -495,6 +495,35 @@ class StageDiffusionProc:
                                 f"collective_rpc {msg['method']} (rpc_id={rpc_id}): {e!s}"
                             )
 
+                elif msg_type == "get_load":
+                    # DTPS: report this replica's DiT scheduler queue depth + request-id sets to the orchestrator.
+                    try:
+                        sched = getattr(self._engine, "scheduler", None) if self._engine else None
+                        if sched is None:
+                            waiting, running = 0, 0
+                            waiting_ids: list[str] = []
+                            running_ids: list[str] = []
+                        else:
+                            waiting = len(getattr(sched, "_waiting", ()) or ())
+                            running = len(getattr(sched, "_running", ()) or ())
+                            waiting_ids = list(getattr(sched, "_waiting", ()) or [])
+                            running_ids = list(getattr(sched, "_running", ()) or [])
+                    except Exception:
+                        logger.debug("get_load: failed to read scheduler state", exc_info=True)
+                        waiting, running = 0, 0
+                        waiting_ids, running_ids = [], []
+                    await response_socket.send(
+                        encoder.encode(
+                            {
+                                "type": "load_result",
+                                "waiting": int(waiting),
+                                "running": int(running),
+                                "waiting_ids": waiting_ids,
+                                "running_ids": running_ids,
+                            }
+                        )
+                    )
+
                 elif msg_type == "shutdown":
                     break
 
