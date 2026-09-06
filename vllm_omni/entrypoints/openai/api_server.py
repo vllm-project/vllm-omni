@@ -2100,6 +2100,7 @@ async def generate_images(
             extra_args["flow_shift"] = request.flow_shift
         if extra_args:
             gen_params.extra_args = extra_args
+        _update_if_not_none(gen_params, "extra_args", request.extra_args)
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
         lora_request, lora_scale = _parse_lora_request(request.lora)
         _update_if_not_none(gen_params, "lora_request", lora_request)

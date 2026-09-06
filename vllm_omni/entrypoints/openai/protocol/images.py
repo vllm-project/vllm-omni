@@ -166,6 +166,15 @@ class ImageGenerationRequest(BaseModel):
         ),
     )
 
+    # vllm-omni extension for model-specific parameters
+    extra_args: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Optional model-specific parameters. Examples: "
+            "{'apply_pe': False} to disable Prompt Enhancement for ERNIE-Image."
+        ),
+    )
+
     # VAE memory optimizations (set at model init, included for completeness)
     vae_use_slicing: bool | None = Field(default=False, description="Enable VAE slicing")
     vae_use_tiling: bool | None = Field(default=False, description="Enable VAE tiling")
