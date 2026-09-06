@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Video/audio muxing utilities using PyAV (no ffmpeg binary dependency)."""
+"""Video/audio muxing utilities.
+
+CPU encoding uses PyAV (no ffmpeg binary dependency); the *_nvenc codecs are
+encoded on GPU through torchcodec's NVENC backend.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +15,9 @@ from typing import Any, cast
 
 import av
 import numpy as np
+
+# Video codecs handled by torchcodec's CUDA (NVENC) encoder instead of PyAV.
+NVENC_VIDEO_CODECS = frozenset(("h264_nvenc", "hevc_nvenc", "av1_nvenc"))
 
 
 class FragmentedMP4Muxer:
@@ -268,4 +275,77 @@ def mux_av_video_audio_bytes(
             for packet in a_stream.encode():
                 container.mux(packet)
 
+    return buf.getvalue()
+
+
+def mux_video_audio_bytes_nvenc(
+    video_frames: np.ndarray,
+    audio_waveform: np.ndarray | None = None,
+    *,
+    fps: float = 25.0,
+    audio_sample_rate: int = 44100,
+    video_codec: str = "h264_nvenc",
+    video_codec_options: dict[str, str] | None = None,
+) -> bytes:
+    """Encode uint8 frames on GPU through torchcodec's NVENC backend.
+
+    ``video_frames`` must have shape ``(T, H, W, 3)`` (RGB); the RGB-to-NV12
+    conversion and the H.264/HEVC/AV1 encode both run on the GPU.
+    ``video_codec_options`` accepts the ``preset``/``crf`` keys handled by
+    torchcodec directly; any other key is forwarded to the FFmpeg encoder as an
+    extra option (e.g. ``{"rc": "vbr", "cq": "23"}`` for h264_nvenc).
+
+    Raises:
+        RuntimeError: If no CUDA device or no NVENC runtime is available.
+    """
+    import torch
+    from torchcodec.encoders import Encoder
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("NVENC video encoding requires a CUDA device.")
+    if video_frames.ndim != 4 or video_frames.shape[-1] != 3 or video_frames.dtype != np.uint8:
+        raise ValueError("NVENC video encoding expects contiguous uint8 frames shaped (T, H, W, 3).")
+
+    _, height, width, _ = video_frames.shape
+    frames = (
+        torch.from_numpy(np.ascontiguousarray(video_frames))
+        .permute(0, 3, 1, 2)
+        .contiguous()
+        .to("cuda", non_blocking=True)
+    )
+
+    options = dict(video_codec_options or {})
+    preset = options.pop("preset", None)
+    crf = options.pop("crf", None)
+
+    encoder = Encoder()
+    video_stream = encoder.add_video(
+        height=height,
+        width=width,
+        frame_rate=float(fps),
+        device="cuda",
+        codec=video_codec,
+        preset=preset,
+        crf=float(crf) if crf is not None else None,
+        extra_options=options or None,
+    )
+
+    audio_stream = None
+    samples: np.ndarray | None = None
+    if audio_waveform is not None:
+        samples = audio_waveform.astype(np.float32)
+        if samples.ndim == 1:
+            samples = samples.reshape(1, -1)
+        elif samples.ndim == 2 and samples.shape[0] > samples.shape[1]:
+            samples = np.ascontiguousarray(samples.T)
+        audio_stream = encoder.add_audio(
+            sample_rate=int(audio_sample_rate),
+            num_channels=int(samples.shape[0]),
+        )
+
+    buf = io.BytesIO()
+    with encoder.open_file_like(buf, format="mp4"):
+        video_stream.add_frames(frames)
+        if audio_stream is not None and samples is not None:
+            audio_stream.add_samples(torch.from_numpy(samples))
     return buf.getvalue()

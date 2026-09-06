@@ -10,11 +10,18 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     VLLM_VIDEO_AUDIO_DELTA_MODE: Literal["fast", "slow"] = "fast"
     VLLM_VIDEO_ASYNC_CHUNK: Literal["on", "off"] = "on"
+    VLLM_VIDEO_ENCODE_CODEC: Literal["h264", "h264_nvenc", "hevc_nvenc", "av1_nvenc"] = "h264"
 
 logger = logging.getLogger(__name__)
 _warned_invalid_envs: set[tuple[str, str]] = set()
 _VIDEO_AUDIO_DELTA_MODE = "VLLM_VIDEO_AUDIO_DELTA_MODE"
 _VIDEO_ASYNC_CHUNK = "VLLM_VIDEO_ASYNC_CHUNK"
+_VIDEO_ENCODE_CODEC = "VLLM_VIDEO_ENCODE_CODEC"
+
+# Video codecs accepted for MP4 response encoding. The *_nvenc variants are
+# encoded on GPU through torchcodec's NVENC backend; anything else goes
+# through the PyAV (CPU) path.
+VIDEO_ENCODE_CODEC_CHOICES = ("h264", "h264_nvenc", "hevc_nvenc", "av1_nvenc")
 
 
 def _choice_env(
@@ -42,6 +49,11 @@ environment_variables: dict[str, Callable[[], str]] = {
         _VIDEO_ASYNC_CHUNK,
         "on",
         ("on", "off"),
+    ),
+    _VIDEO_ENCODE_CODEC: lambda: _choice_env(
+        _VIDEO_ENCODE_CODEC,
+        "h264",
+        VIDEO_ENCODE_CODEC_CHOICES,
     ),
 }
 
