@@ -1470,48 +1470,94 @@ class FilesystemHostWeightStore:
                         total += file_stat.st_size
         return total
 
+    @contextlib.contextmanager
+    def _cleanup_locks(self, key: str) -> Iterator[None]:
+        """Exclude cooperative builders and leases without waiting for them."""
+        try:
+            build_lock = FileLock(self._build_lock_path(key), exclusive=True, deadline=None, nonblocking=True)
+        except FileLockTimeoutError as exc:
+            raise HostWeightError(
+                _failure(
+                    ResolutionStage.LIFECYCLE,
+                    FailureCode.ACTIVE_BUILD_TIMEOUT,
+                    f"artifact {key} has an active builder",
+                    retryable=True,
+                )
+            ) from exc
+        with build_lock:
+            try:
+                artifact_lock = FileLock(self._artifact_lock_path(key), exclusive=True, deadline=None, nonblocking=True)
+            except FileLockTimeoutError as exc:
+                raise HostWeightError(
+                    _failure(
+                        ResolutionStage.LIFECYCLE,
+                        FailureCode.ACTIVE_LEASE,
+                        f"artifact {key} has an active lease",
+                        retryable=True,
+                    )
+                ) from exc
+            with artifact_lock:
+                yield
+
     def cleanup(self, identity: WeightArtifactIdentity) -> HostWeightFailure | None:
         """Explicitly remove an inactive artifact without waiting for leases."""
         try:
-            try:
-                build_lock = FileLock(
-                    self._build_lock_path(identity.key),
-                    exclusive=True,
-                    deadline=None,
-                    nonblocking=True,
-                )
-            except FileLockTimeoutError:
-                return _failure(
-                    ResolutionStage.LIFECYCLE,
-                    FailureCode.ACTIVE_BUILD_TIMEOUT,
-                    f"artifact {identity.key} has an active builder",
-                    retryable=True,
-                )
-            with build_lock:
-                try:
-                    artifact_lock = FileLock(
-                        self._artifact_lock_path(identity.key),
-                        exclusive=True,
-                        deadline=None,
-                        nonblocking=True,
-                    )
-                except FileLockTimeoutError:
-                    return _failure(
-                        ResolutionStage.LIFECYCLE,
-                        FailureCode.ACTIVE_LEASE,
-                        f"artifact {identity.key} has an active lease",
-                        retryable=True,
-                    )
-                with artifact_lock:
-                    self._repair_quarantine_transitions_locked(identity.key)
-                    self._quarantine_locked(identity.key, reason="cleanup")
-                    self._remove_cleanup_tombstones_locked(identity.key)
-                    self._remove_deny_locked(identity.key)
+            with self._cleanup_locks(identity.key):
+                self._repair_quarantine_transitions_locked(identity.key)
+                self._quarantine_locked(identity.key, reason="cleanup")
+                self._remove_cleanup_tombstones_locked(identity.key)
+                self._remove_deny_locked(identity.key)
+        except HostWeightError as exc:
+            return exc.failure
         except OSError as exc:
             return _failure(
                 ResolutionStage.LIFECYCLE,
                 FailureCode.QUARANTINE_FAILED,
                 f"failed to clean up artifact {identity.key}: {exc}",
+                retryable=True,
+            )
+        return None
+
+    def cleanup_quarantined(self, storage_name: str) -> HostWeightFailure | None:
+        """Remove one quarantine inventory entry, preserving the current artifact.
+
+        A retry also finishes earlier cleanup tombstones for the same key.
+        Active builders or leases are reported rather than interrupted.
+        """
+        key, separator, suffix = storage_name.partition(".")
+        if (
+            not separator
+            or not suffix
+            or "\0" in storage_name
+            or _ARTIFACT_KEY_RE.fullmatch(key) is None
+            or Path(storage_name).name != storage_name
+        ):
+            raise ValueError("quarantined storage_name must be a single inventory basename with an artifact key")
+        try:
+            with self._cleanup_locks(key):
+                entry = self.quarantine_dir / storage_name
+                exists = _path_exists_without_following(entry)
+                if exists and not stat.S_ISDIR(entry.lstat().st_mode):
+                    return _failure(
+                        ResolutionStage.LIFECYCLE,
+                        FailureCode.QUARANTINE_FAILED,
+                        f"quarantine entry is not a directory: {storage_name}",
+                    )
+                self._repair_quarantine_transitions_locked(key)
+                if exists and not storage_name.startswith(f"{key}.cleanup."):
+                    tombstone = self.quarantine_dir / f"{key}.cleanup.{uuid.uuid4().hex}"
+                    _move_artifact_locked(entry, tombstone)
+                self._remove_cleanup_tombstones_locked(key)
+                # A previous attempt may have removed the tombstone but failed
+                # its parent sync. Retry that sync even when no entry remains.
+                _fsync_directory(self.quarantine_dir)
+        except HostWeightError as exc:
+            return exc.failure
+        except OSError as exc:
+            return _failure(
+                ResolutionStage.LIFECYCLE,
+                FailureCode.QUARANTINE_FAILED,
+                f"failed to remove quarantined entry {storage_name}: {exc}",
                 retryable=True,
             )
         return None
