@@ -31,6 +31,13 @@ class VoxtralTTSAdapter(ARTTSAdapter):
             if fmt_err:
                 return fmt_err
 
+            if not self._has_encoder_weights():
+                return (
+                    "Voice cloning with 'ref_audio' requires the full Voxtral checkpoint "
+                    "with encoder weights. The open-source variant only supports "
+                    "preset voices via the 'voice' parameter."
+                )
+
         if request.voice is not None:
             request.voice = request.voice.lower()
             available_speakers = server._get_available_speakers()
@@ -63,3 +70,20 @@ class VoxtralTTSAdapter(ARTTSAdapter):
         request_id: str | None = None,
     ) -> list:
         return apply_max_new_tokens(sampling_params_list, request)
+
+    def _has_encoder_weights(self) -> bool:
+        """Check if the loaded checkpoint contains encoder weights.
+
+        The open-source Voxtral checkpoint omits encoder weights (input_proj,
+        encoder_blocks), which are required for ref_audio voice cloning.
+        """
+        from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
+
+        model_name = self.ctx.engine_client.model_config.model
+        config_dict = get_hf_file_to_dict("params.json", model_name)
+
+        for key in config_dict.keys():
+            if key.startswith(("input_proj.", "encoder_blocks.")):
+                return True
+
+        return False
