@@ -29,13 +29,15 @@ is produced from sound latents rather than from ``multi_modal_data["audio"]``.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import fields
-from typing import Any, ClassVar
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import PIL.Image
@@ -60,6 +62,7 @@ from vllm_omni.diffusion.models.interface import (
     ReferenceVideoDecodeSpec,
     SupportImageInput,
     SupportsComponentDiscovery,
+    SupportsStepExecution,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_match_euler_discrete import (
@@ -81,6 +84,10 @@ from vllm_omni.experimental.world_models.session_state import (
     resolve_session_state_config,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import StepRequestState
 
 from .action import (
     ACTION_MODE_FORWARD_DYNAMICS,
@@ -842,6 +849,7 @@ class Cosmos3OmniDiffusersPipeline(
     CFGParallelMixin,
     SupportImageInput,
     SupportsComponentDiscovery,
+    SupportsStepExecution,
     ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
 ):
@@ -886,6 +894,7 @@ class Cosmos3OmniDiffusersPipeline(
     """
 
     support_image_input: ClassVar[bool] = True
+    supports_step_execution: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
     _dit_modules: ClassVar[list[str]] = ["transformer.language_model", "transformer"]
     _encoder_modules: ClassVar[list[str]] = []
@@ -1083,6 +1092,11 @@ class Cosmos3OmniDiffusersPipeline(
         # stays in sync.
         self._cache_dit_requires_paired_cfg = False
 
+        # Step-wise execution keeps per-request state on the runner-owned
+        # StepRequestState (state.extra); the pipeline holds no per-request
+        # caches so cancelled / failed requests cannot leak GPU tensors here.
+        self._validate_step_execution_config(od_config)
+
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
@@ -1225,6 +1239,751 @@ class Cosmos3OmniDiffusersPipeline(
                 return replacement + suffix
 
         return None
+
+    # -----------------------------------------------------------------------
+    # Step-wise execution (SupportsStepExecution protocol)
+    # -----------------------------------------------------------------------
+
+    def _parse_request_from_state(self, state: StepRequestState) -> SimpleNamespace:
+        """Build the parameter namespace from StepRequestState fields."""
+        first_prompt = state.prompt
+        if isinstance(first_prompt, dict):
+            prompt = first_prompt.get("prompt", "")
+            negative_prompt = first_prompt.get("negative_prompt")
+            additional_info = first_prompt.get("additional_information", {}) or {}
+            image_tensor = additional_info.get("preprocessed_image")
+            video_tensor = additional_info.get("preprocessed_video")
+            transfer_video_tensor = additional_info.get("preprocessed_transfer_video")
+            transfer_input_fps = positive_float(additional_info.get("transfer_input_fps"))
+        else:
+            prompt = first_prompt
+            negative_prompt = None
+            image_tensor = None
+            video_tensor = None
+            transfer_video_tensor = None
+            transfer_input_fps = None
+
+        sp = state.sampling
+        extra_args = getattr(sp, "extra_args", {}) or {}
+
+        # Determine mode (shared normalization/validation with forward()'s
+        # _is_t2i_request: rejects None-typed, unknown, and image+video
+        # modalities instead of silently guessing a generation mode).
+        is_t2i = "image" in self._normalize_prompt_modalities(first_prompt)
+        sound_enabled = self._is_sound_request(first_prompt, sp)
+        action_mode = self._get_action_mode(first_prompt, sp)
+        action_enabled = action_mode is not None
+        is_v2v = video_tensor is not None and not is_t2i and not action_enabled
+
+        # Resolve defaults
+        if is_t2i:
+            height = sp.height or (
+                COSMOS3_EDGE_T2I_DEFAULT_HEIGHT if self.is_edge_model else COSMOS3_T2I_DEFAULT_HEIGHT
+            )
+            width = sp.width or (COSMOS3_EDGE_T2I_DEFAULT_WIDTH if self.is_edge_model else COSMOS3_T2I_DEFAULT_WIDTH)
+            num_frames = 1
+            num_inference_steps = sp.num_inference_steps or COSMOS3_T2I_DEFAULT_NUM_INFERENCE_STEPS
+            guidance_scale = self._resolve_guidance_scale(sp, COSMOS3_T2I_DEFAULT_GUIDANCE_SCALE)
+            default_flow_shift = COSMOS3_T2I_DEFAULT_FLOW_SHIFT
+            default_guidance_interval: tuple[float, float] | None = COSMOS3_T2I_DEFAULT_GUIDANCE_INTERVAL
+        else:
+            height = sp.height or (
+                COSMOS3_EDGE_T2V_DEFAULT_HEIGHT if self.is_edge_model else COSMOS3_T2V_DEFAULT_HEIGHT
+            )
+            width = sp.width or (COSMOS3_EDGE_T2V_DEFAULT_WIDTH if self.is_edge_model else COSMOS3_T2V_DEFAULT_WIDTH)
+            default_guidance_scale = (
+                COSMOS3_EDGE_T2V_DEFAULT_GUIDANCE_SCALE if self.is_edge_model else COSMOS3_T2V_DEFAULT_GUIDANCE_SCALE
+            )
+            num_frames = sp.num_frames or COSMOS3_T2V_DEFAULT_NUM_FRAMES
+            num_inference_steps = sp.num_inference_steps or COSMOS3_T2V_DEFAULT_NUM_INFERENCE_STEPS
+            guidance_scale = self._resolve_guidance_scale(sp, default_guidance_scale)
+            default_flow_shift = self._engine_init_flow_shift
+            default_guidance_interval = None
+
+        if action_enabled:
+            action_chunk_param = self._get_sp_param(sp, "action_chunk_size", None)
+            if action_chunk_param is not None:
+                action_chunk_size = int(action_chunk_param)
+                if sp.num_frames is None:
+                    num_frames = action_chunk_size + 1
+            elif sp.num_frames is None:
+                action_chunk_size = 16
+                num_frames = action_chunk_size + 1
+            else:
+                action_chunk_size = int(num_frames) - 1
+            if action_chunk_size <= 0:
+                raise ValueError(f"Cosmos3 action_chunk_size must be positive, got {action_chunk_size}.")
+            num_inference_steps = sp.num_inference_steps or 30
+            guidance_scale = self._resolve_guidance_scale(sp, 1.0)
+            default_flow_shift = 5.0
+
+        if not is_t2i and not action_enabled:
+            num_frames = _ceil_video_num_frames(num_frames, self.vae_scale_factor_temporal)
+
+        domain_id = None
+        if action_enabled:
+            domain_id = resolve_domain_id(
+                domain_id=self._get_sp_param(sp, "domain_id", None),
+                domain_name=self._get_sp_param(sp, "domain_name", None),
+                require_explicit=True,
+            )
+
+        flow_shift_target = float(self._get_sp_param(sp, "flow_shift", default_flow_shift))
+        guidance_interval = self._get_sp_param(sp, "guidance_interval", default_guidance_interval)
+        frame_rate = self._get_sp_param(sp, "resolved_frame_rate") or self._get_sp_param(sp, "frame_rate") or 24.0
+        max_sequence_length = (
+            self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
+            or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
+        )
+        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", is_v2v))
+
+        if negative_prompt is None:
+            negative_prompt = ""
+
+        seed = self._resolve_seed(sp, sp.generator)
+        generator = sp.generator
+        if generator is None:
+            generator = torch.Generator(device=self.device).manual_seed(seed)
+            sp.generator = generator
+
+        return SimpleNamespace(
+            first_prompt=first_prompt,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            image_tensor=image_tensor,
+            video_tensor=video_tensor,
+            transfer_video_tensor=transfer_video_tensor,
+            transfer_input_fps=transfer_input_fps,
+            is_t2i=is_t2i,
+            is_v2v=is_v2v,
+            sound_enabled=sound_enabled,
+            action_enabled=action_enabled,
+            action_mode=action_mode,
+            action_chunk_size=action_chunk_size if action_enabled else None,
+            domain_id=domain_id,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            flow_shift_target=flow_shift_target,
+            guidance_interval=guidance_interval,
+            frame_rate=frame_rate,
+            max_sequence_length=max_sequence_length,
+            use_system_prompt=use_system_prompt,
+            seed=seed,
+            generator=generator,
+            sp=sp,
+            extra_args=extra_args,
+        )
+
+    def prepare_encode(
+        self,
+        state: StepRequestState,
+        **kwargs: Any,
+    ) -> StepRequestState:
+        """Prepare request-level inputs: tokenize, prepare latents, set timesteps."""
+        p = self._parse_request_from_state(state)
+
+        # Reject transfer in step mode — it has a separate code path.
+        transfer_config = resolve_transfer_config(p.sp, p.first_prompt)
+        if transfer_config is not None:
+            raise ValueError("Cosmos3 transfer inference is not supported in step execution mode yet.")
+
+        # Reuse forward()'s request validation so step mode cannot silently
+        # bypass mode restrictions (distilled/Edge limits, action/sound combo
+        # checks, transformer module checks, image+video exclusivity).
+        self._validate_distilled_generation_mode(
+            is_t2i=p.is_t2i,
+            image_tensor=p.image_tensor,
+            action_enabled=p.action_enabled,
+            transfer_config=None,
+            is_v2v=p.is_v2v,
+            sound_enabled=p.sound_enabled,
+        )
+        self._validate_edge_generation_mode(
+            transfer_config=None,
+            is_v2v=p.is_v2v,
+            sound_enabled=p.sound_enabled,
+        )
+        if p.action_enabled and p.is_t2i:
+            raise ValueError("Cosmos3 action generation is supported only for video outputs.")
+        if p.action_enabled and p.sound_enabled:
+            raise ValueError("Cosmos3 action+sound joint generation is not supported in this phase.")
+        if p.action_enabled and not getattr(self.transformer, "action_gen", False):
+            raise ValueError(
+                "Cosmos3 action generation was requested, but the transformer was "
+                "initialized without action modules. Check that the checkpoint config "
+                "enables action_gen and includes action weights."
+            )
+        if p.sound_enabled and p.is_t2i:
+            raise ValueError(
+                "Cosmos3 sound generation is supported only for video outputs in "
+                "this phase; text-to-image with sound is unsupported."
+            )
+        if p.sound_enabled and not getattr(self.transformer, "sound_gen", False):
+            raise ValueError(
+                "Cosmos3 sound generation was requested, but the transformer was "
+                "initialized without sound modules. Check that the checkpoint config "
+                "enables sound_gen or defines sound_dim and includes sound weights."
+            )
+        if p.image_tensor is not None and p.video_tensor is not None and not p.action_enabled:
+            raise ValueError("Cosmos3 non-action generation accepts either image or video input, not both.")
+        if p.video_tensor is not None and p.is_t2i:
+            raise ValueError("Cosmos3 video-to-video generation is supported only for video outputs.")
+
+        # RoboLab/OpenPI observations route to an action-only envelope code path
+        # in forward() that is not wired into step execution yet — reject instead
+        # of silently degrading to plain video generation.
+        step_extra_args = p.sp.extra_args if isinstance(getattr(p.sp, "extra_args", None), dict) else {}
+        if step_extra_args.get("robot_obs") is not None or step_extra_args.get("observation") is not None:
+            raise NotImplementedError(
+                "Cosmos3 RoboLab/OpenPI observation requests are not supported in step execution mode yet."
+            )
+
+        # forward() realizes T2I num_outputs_per_prompt > 1 by looping the whole
+        # diffusion; the step path is single-sample per request for now.
+        num_outputs = max(1, int(self._get_sp_param(p.sp, "num_outputs_per_prompt", 1) or 1))
+        if num_outputs > 1:
+            raise NotImplementedError(
+                f"Cosmos3 step execution requires num_outputs_per_prompt == 1; got {num_outputs}."
+            )
+
+        # Tokenize prompts
+        cond_ids, cond_mask, uncond_ids, uncond_mask = self._format_and_tokenize_prompts(
+            p.prompt,
+            p.negative_prompt,
+            p.num_frames,
+            p.frame_rate,
+            p.height,
+            p.width,
+            p.max_sequence_length,
+            p.sp,
+            p.use_system_prompt,
+            is_t2i=p.is_t2i,
+        )
+
+        # Prepare latents (T2I/T2V/I2V/V2V/action)
+        action_latents = None
+        action_velocity_mask = None
+        action_condition_latents = None
+        raw_action_dim = None
+        action_offset = 1
+
+        if p.action_enabled:
+            if p.video_tensor is not None and p.video_tensor.ndim == 4:
+                p.video_tensor = p.video_tensor.unsqueeze(0)
+            if p.video_tensor is not None and p.video_tensor.ndim != 5:
+                raise ValueError(
+                    "Cosmos3 action video tensor must have shape [1, 3, T, H, W] "
+                    f"or [3, T, H, W], got {tuple(p.video_tensor.shape)}."
+                )
+            if p.video_tensor is not None and p.video_tensor.shape[2] < p.num_frames:
+                pad = p.video_tensor[:, :, -1:].repeat(1, 1, p.num_frames - p.video_tensor.shape[2], 1, 1)
+                p.video_tensor = torch.cat([p.video_tensor, pad], dim=2)
+            elif p.video_tensor is not None and p.video_tensor.shape[2] > p.num_frames:
+                p.video_tensor = p.video_tensor[:, :, : p.num_frames]
+
+            if p.action_mode == ACTION_MODE_INVERSE_DYNAMICS and p.video_tensor is None:
+                raise ValueError("Cosmos3 inverse_dynamics action mode requires multi_modal_data['video'].")
+            if p.action_mode in {ACTION_MODE_POLICY, ACTION_MODE_FORWARD_DYNAMICS} and p.image_tensor is None:
+                if p.video_tensor is None:
+                    raise ValueError(
+                        f"Cosmos3 action_mode={p.action_mode!r} requires multi_modal_data['image'] "
+                        "or multi_modal_data['video']."
+                    )
+                p.image_tensor = p.video_tensor[:, :, 0]
+
+            raw_action_dim_param = self._get_sp_param(p.sp, "raw_action_dim", None)
+            raw_action_dim = int(raw_action_dim_param) if raw_action_dim_param is not None else None
+            action_prepared = self._prepare_action_latents(
+                mode=p.action_mode,
+                action_chunk_size=p.action_chunk_size,
+                raw_action_dim=raw_action_dim,
+                generator=p.generator,
+                sp=p.sp,
+                clean_action=None,
+                condition_indexes=None,
+            )
+            action_latents, action_velocity_mask, action_condition_latents, raw_action_dim = action_prepared
+            action_offset = action_start_frame_offset(p.action_mode, p.action_chunk_size, p.num_frames)
+
+        if p.action_enabled and p.video_tensor is not None:
+            latents, velocity_mask, condition_latents = self._prepare_latents_action_video(
+                p.video_tensor, p.action_mode, p.height, p.width, p.num_frames, p.generator
+            )
+            image_latent = condition_latents[:, :, 0:1]
+        elif p.is_v2v:
+            condition_frame_indexes_vision = normalize_condition_frame_indexes_vision(
+                self._get_sp_param(
+                    p.sp,
+                    "condition_frame_indexes_vision",
+                    self._get_prompt_param(p.first_prompt, "condition_frame_indexes_vision", None),
+                )
+            )
+            latents, velocity_mask, condition_latents = self._prepare_latents_v2v(
+                p.video_tensor, p.height, p.width, p.num_frames, p.generator, condition_frame_indexes_vision
+            )
+            image_latent = None
+        elif p.image_tensor is not None and not p.is_t2i:
+            latents, velocity_mask, image_latent = self._prepare_latents_i2v(
+                p.image_tensor, p.height, p.width, p.num_frames, p.generator
+            )
+            condition_latents = None
+        else:
+            latents = self._prepare_latents(p.height, p.width, p.num_frames, p.generator)
+            velocity_mask = None
+            image_latent = None
+            condition_latents = None
+
+        T_latent = latents.shape[2]
+        H_latent = latents.shape[3]
+        W_latent = latents.shape[4]
+        video_shape = (T_latent, H_latent, W_latent)
+
+        # Prepare sound latents
+        sound_latents = None
+        target_audio_samples = None
+        sound_sample_rate = None
+        if p.sound_enabled:
+            target_audio_samples, _, sound_sample_rate = self._resolve_sound_target_samples(
+                p.sp, p.num_frames, p.frame_rate
+            )
+            sound_latents, _ = self._prepare_sound_latents(
+                target_audio_samples, p.generator, sp_video_shape=video_shape
+            )
+
+        # Build shared_kwargs for transformer forward
+        shared_kwargs: dict[str, Any] = dict(video_shape=video_shape, fps=p.frame_rate)
+        if velocity_mask is not None:
+            shared_kwargs["noisy_frame_mask"] = velocity_mask
+        if p.action_enabled:
+            shared_kwargs.update(
+                action_domain_ids=torch.tensor([p.domain_id], dtype=torch.long, device=self.device),
+                action_noisy_mask=action_velocity_mask,
+                action_start_frame_offset=action_offset,
+                action_fps=float(self._get_sp_param(p.sp, "action_fps", p.frame_rate) or p.frame_rate),
+            )
+
+        # Set timesteps, then snapshot a per-request scheduler. FlowUniPC keeps
+        # multistep history / step index as mutable instance state, so sharing
+        # ``self.scheduler`` across interleaved step requests would cross-
+        # contaminate them (same pattern as qwen_image / hunyuan_image3).
+        self._set_timesteps(p.num_inference_steps, device=self.device, shift=p.flow_shift_target)
+        req_scheduler = copy.deepcopy(self.scheduler)
+        timesteps = req_scheduler.timesteps
+
+        # Initialize UND K/V session state
+        session_id = state.request_id
+        kv_state = self._new_cosmos3_state(session_id)
+        self._kv_reset_und(kv_state)
+
+        # Populate state fields consumed by InputBatch / step_scheduler
+        state.latents = latents
+        state.timesteps = timesteps
+        state.step_index = 0
+        # Cosmos3 handles CFG internally via predict_noise_maybe_with_cfg,
+        # not via InputBatch's do_true_cfg mechanism.
+        state.do_true_cfg = False
+        state.prompt_embeds = torch.zeros(1, 1, device=latents.device, dtype=latents.dtype)
+
+        # Pipeline-private per-request state
+        state.extra["p"] = p
+        state.extra["req_scheduler"] = req_scheduler
+        state.extra["timesteps"] = timesteps
+        state.extra["cond_ids"] = cond_ids
+        state.extra["cond_mask"] = cond_mask
+        state.extra["uncond_ids"] = uncond_ids
+        state.extra["uncond_mask"] = uncond_mask
+        state.extra["shared_kwargs"] = shared_kwargs
+        state.extra["velocity_mask"] = velocity_mask
+        state.extra["image_latent"] = image_latent
+        state.extra["condition_latents"] = condition_latents
+        state.extra["action_latents"] = action_latents
+        state.extra["action_velocity_mask"] = action_velocity_mask
+        state.extra["action_condition_latents"] = action_condition_latents
+        state.extra["raw_action_dim"] = raw_action_dim
+        state.extra["sound_latents"] = sound_latents
+        state.extra["target_audio_samples"] = target_audio_samples
+        state.extra["sound_sample_rate"] = sound_sample_rate
+        state.extra["video_shape"] = video_shape
+        state.extra["kv_state"] = kv_state
+        state.extra["session_id"] = session_id
+        state.extra["_current_latents"] = latents
+        state.extra["_cond_cache"] = (None, None)
+        state.extra["_uncond_cache"] = (None, None)
+        state.extra["_current_step_index"] = 0
+        state.extra["_pred_shapes"] = None
+
+        return state
+
+    def denoise_step(
+        self,
+        input_batch: InputBatch,
+        *,
+        states: Sequence[StepRequestState] | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | None:
+        """Run one denoise forward for all requests in the batch.
+
+        Single-request path only; multi-request batching is a future optimization.
+        Fail loudly rather than silently returning wrong predictions for the
+        trailing requests (the runner slices ``noise_pred`` per request along
+        the batch dimension). Per-request state lives on the runner-owned
+        ``StepRequestState.extra`` — the pipeline keeps no per-request cache,
+        so cancelled / failed requests cannot leak GPU tensors here.
+        """
+        if len(input_batch.request_ids) > 1:
+            raise NotImplementedError(
+                "Cosmos3 step execution currently supports a single active request; "
+                f"got {len(input_batch.request_ids)}. Multi-request batching is not "
+                "implemented yet."
+            )
+        batch_states = tuple(states) if states is not None else tuple(input_batch.states)
+        if not batch_states:
+            raise ValueError("Cosmos3 denoise_step received an empty request batch.")
+        extra = batch_states[0].extra
+        if not extra:
+            raise ValueError(f"No step state found for request {input_batch.request_ids[0]}")
+
+        return self._step_denoise_single(extra)
+
+    def _step_denoise_single(self, extra: dict[str, Any]) -> torch.Tensor | None:
+        """Execute one denoising step for a single request. Returns noise_pred."""
+        p = extra["p"]
+        step_index = extra["_current_step_index"]
+        latents = extra["_current_latents"]
+        timesteps = extra["timesteps"] if extra.get("timesteps") is not None else self.scheduler.timesteps
+
+        t = timesteps[step_index]
+        timestep = t.unsqueeze(0)
+
+        cond_ids = extra["cond_ids"]
+        cond_mask = extra["cond_mask"]
+        uncond_ids = extra["uncond_ids"]
+        uncond_mask = extra["uncond_mask"]
+        shared_kwargs = extra["shared_kwargs"]
+        action_latents = extra["action_latents"]
+        sound_latents = extra["sound_latents"]
+        kv_state = extra["kv_state"]
+        guidance_scale = p.guidance_scale
+        guidance_interval = p.guidance_interval
+
+        do_cfg = guidance_scale > 1.0
+        cfg_parallel = self._cfg_parallel_active() and do_cfg
+
+        def _cfg_active_at(t_val: torch.Tensor) -> bool:
+            if guidance_interval is None:
+                return True
+            t_scalar = float(t_val.item()) if torch.is_tensor(t_val) else float(t_val)
+            lo, hi = guidance_interval
+            return lo <= t_scalar <= hi
+
+        if cfg_parallel:
+            # Each CFG-parallel rank runs exactly one branch.
+            cfg_rank_is_negative = get_classifier_free_guidance_rank() != 0
+            step_scale = guidance_scale if _cfg_active_at(t) else 1.0
+            self._kv_load_und(kv_state, is_negative=cfg_rank_is_negative)
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=True,
+                true_cfg_scale=step_scale,
+                positive_kwargs=dict(
+                    hidden_states=latents,
+                    timestep=timestep,
+                    text_ids=cond_ids,
+                    text_mask=cond_mask,
+                    action_latents=action_latents,
+                    sound_latents=sound_latents,
+                    **shared_kwargs,
+                ),
+                negative_kwargs=dict(
+                    hidden_states=latents,
+                    timestep=timestep,
+                    text_ids=uncond_ids,
+                    text_mask=uncond_mask,
+                    action_latents=action_latents,
+                    sound_latents=sound_latents,
+                    **shared_kwargs,
+                ),
+                cfg_normalize=False,
+            )
+            if kv_state is not None:
+                self._kv_capture_und(kv_state, is_negative=cfg_rank_is_negative)
+        elif do_cfg:
+            cond_cache = extra["_cond_cache"]
+            uncond_cache = extra["_uncond_cache"]
+            keep_uncond_for_cache = self._cache_requires_paired_cfg()
+
+            cfg_active = _cfg_active_at(t)
+
+            # Cond forward
+            if not self._kv_load_und(kv_state, is_negative=False):
+                self.transformer.cached_kv, self.transformer.cached_freqs_gen = cond_cache
+            noise_cond = self.transformer(
+                hidden_states=latents,
+                timestep=timestep,
+                text_ids=cond_ids,
+                text_mask=cond_mask,
+                action_latents=action_latents,
+                sound_latents=sound_latents,
+                **shared_kwargs,
+            )
+            if kv_state is not None:
+                self._kv_capture_und(kv_state, is_negative=False)
+            elif cond_cache[0] is None:
+                extra["_cond_cache"] = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
+
+            # Uncond forward (if CFG active or cache-dit needs paired CFG)
+            if cfg_active or keep_uncond_for_cache:
+                if not self._kv_load_und(kv_state, is_negative=True):
+                    self.transformer.cached_kv, self.transformer.cached_freqs_gen = uncond_cache
+                noise_uncond = self.transformer(
+                    hidden_states=latents,
+                    timestep=timestep,
+                    text_ids=uncond_ids,
+                    text_mask=uncond_mask,
+                    action_latents=action_latents,
+                    sound_latents=sound_latents,
+                    **shared_kwargs,
+                )
+                if kv_state is not None:
+                    self._kv_capture_und(kv_state, is_negative=True)
+                elif uncond_cache[0] is None:
+                    extra["_uncond_cache"] = (
+                        self.transformer.cached_kv,
+                        self.transformer.cached_freqs_gen,
+                    )
+                step_scale = guidance_scale if cfg_active else 1.0
+                noise_pred = self.combine_cfg_noise(noise_cond, noise_uncond, step_scale, cfg_normalize=False)
+            else:
+                noise_pred = noise_cond
+        else:
+            # No CFG: single cond forward
+            self._kv_load_und(kv_state, is_negative=False)
+            noise_pred = self.transformer(
+                hidden_states=latents,
+                timestep=timestep,
+                text_ids=cond_ids,
+                text_mask=cond_mask,
+                action_latents=action_latents,
+                sound_latents=sound_latents,
+                **shared_kwargs,
+            )
+            if kv_state is not None:
+                self._kv_capture_und(kv_state, is_negative=False)
+
+        # The runner slices ``noise_pred`` per request along the batch dimension,
+        # which cannot carry per-modality tuples. Flatten multimodal (video/
+        # action/sound) predictions into a single packed tensor and record the
+        # per-modality shapes so ``step_scheduler`` can unpack it.
+        if isinstance(noise_pred, tuple):
+            batch = noise_pred[0].shape[0]
+            extra["_pred_shapes"] = [pred.shape for pred in noise_pred]
+            noise_pred = torch.cat([pred.reshape(batch, -1) for pred in noise_pred], dim=1)
+        else:
+            extra["_pred_shapes"] = None
+
+        return noise_pred
+
+    def step_scheduler(
+        self,
+        state: StepRequestState,
+        noise_pred: torch.Tensor | None,
+        **kwargs: Any,
+    ) -> None:
+        """Apply scheduler step and advance step_index.
+
+        Handles velocity_mask, condition re-injection (I2V/V2V), and
+        joint action/sound latent pack/unpack.
+        """
+        if not state.extra:
+            raise ValueError(f"No step state found for request {state.request_id}")
+        extra = state.extra
+
+        p = extra["p"]
+        step_index = state.step_index
+        latents = extra["_current_latents"]
+        action_latents = extra["action_latents"]
+        sound_latents = extra["sound_latents"]
+        velocity_mask = extra["velocity_mask"]
+        image_latent = extra["image_latent"]
+        condition_latents = extra["condition_latents"]
+        action_velocity_mask = extra["action_velocity_mask"]
+        action_condition_latents = extra["action_condition_latents"]
+        raw_action_dim = extra["raw_action_dim"]
+        generator = p.generator
+
+        # Per-request scheduler (deepcopy'd in prepare_encode): FlowUniPC keeps
+        # multistep history / step index as mutable instance state.
+        req_scheduler = extra.get("req_scheduler") or self.scheduler
+
+        timesteps = extra["timesteps"] if extra.get("timesteps") is not None else req_scheduler.timesteps
+        t = timesteps[step_index]
+
+        # Split noise prediction if action/sound are present
+        has_action = action_latents is not None
+        has_sound = sound_latents is not None
+        pred_shapes = extra.get("_pred_shapes")
+        if (has_action or has_sound) and pred_shapes is not None:
+            # denoise_step returned a flattened packed tensor (the runner slices
+            # noise_pred along the batch dimension, so tuples cannot pass through).
+            if not isinstance(noise_pred, torch.Tensor):
+                raise ValueError("Cosmos3 multimodal step path expected a packed tensor prediction.")
+            batch = noise_pred.shape[0]
+            preds: list[torch.Tensor] = []
+            unpack_offset = 0
+            for shape in pred_shapes:
+                numel = 1
+                for dim in shape[1:]:
+                    numel *= dim
+                preds.append(noise_pred[:, unpack_offset : unpack_offset + numel].reshape(shape))
+                unpack_offset += numel
+            video_pred = preds[0]
+            action_pred = preds[1] if has_action else None
+            sound_pred = preds[2 if has_action else 1] if has_sound else None
+        elif has_action or has_sound:
+            if not isinstance(noise_pred, tuple):
+                raise ValueError("Cosmos3 multimodal diffusion expects transformer predictions as a tuple.")
+            video_pred = noise_pred[0]
+            idx = 1
+            action_pred = noise_pred[idx] if has_action else None
+            if has_action:
+                idx += 1
+            sound_pred = noise_pred[idx] if has_sound else None
+        else:
+            if isinstance(noise_pred, tuple):
+                raise ValueError("Cosmos3 video-only diffusion received tuple predictions.")
+            video_pred = noise_pred
+            action_pred = None
+            sound_pred = None
+
+        # Apply velocity mask (I2V/V2V)
+        if velocity_mask is not None:
+            if image_latent is not None and condition_latents is None:
+                video_pred[:, :, 0:1, :, :] = 0
+            else:
+                video_pred = video_pred * velocity_mask
+
+        # Apply action velocity mask
+        if action_pred is not None and action_velocity_mask is not None:
+            action_pred = action_pred * action_velocity_mask
+            if raw_action_dim is not None and 0 < raw_action_dim < action_pred.shape[-1]:
+                action_pred[..., raw_action_dim:] = 0
+
+        # Scheduler step
+        if action_latents is None and sound_latents is None:
+            latents = req_scheduler.step(video_pred, t, latents, generator=generator, return_dict=False)[0]
+        else:
+            # Joint pack/unpack for action/sound
+            tensors = [video_pred]
+            latents_list = [latents]
+            if action_pred is not None:
+                tensors.append(action_pred)
+                latents_list.append(action_latents)
+            if sound_pred is not None:
+                tensors.append(sound_pred)
+                latents_list.append(sound_latents)
+
+            batch = latents.shape[0]
+            flats_pred = [tensor.reshape(batch, -1) for tensor in tensors]
+            flats_lat = [tensor.reshape(batch, -1) for tensor in latents_list]
+            shapes = [tensor.shape for tensor in latents_list]
+            numels = [flat.shape[1] for flat in flats_lat]
+
+            packed_noise = torch.cat(flats_pred, dim=1)
+            packed_latents = torch.cat(flats_lat, dim=1)
+            packed_next = req_scheduler.step(packed_noise, t, packed_latents, generator=generator, return_dict=False)[0]
+
+            # Unpack
+            offset = 0
+            latents = packed_next[:, offset : offset + numels[0]].reshape(shapes[0])
+            offset += numels[0]
+            if action_latents is not None:
+                action_latents = packed_next[:, offset : offset + numels[1]].reshape(shapes[1])
+                offset += numels[1]
+            if sound_latents is not None:
+                idx = 2 if action_latents is not None else 1
+                sound_latents = packed_next[:, offset : offset + numels[idx]].reshape(shapes[idx])
+
+        # Condition re-injection (I2V/V2V)
+        if condition_latents is not None and velocity_mask is not None:
+            latents = velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
+        elif image_latent is not None:
+            latents[:, :, 0:1, :, :] = image_latent
+
+        # Action condition re-injection
+        if action_latents is not None and action_condition_latents is not None and action_velocity_mask is not None:
+            action_latents = (
+                action_velocity_mask * action_latents + (1.0 - action_velocity_mask) * action_condition_latents
+            )
+
+        # Update state
+        extra["_current_latents"] = latents
+        extra["action_latents"] = action_latents
+        extra["sound_latents"] = sound_latents
+        extra["_current_step_index"] = step_index + 1
+        state.latents = latents
+        state.step_index += 1
+
+    def post_decode(
+        self,
+        state: StepRequestState,
+        **kwargs: Any,
+    ) -> DiffusionOutput:
+        """Decode final latents into video/image + cleanup."""
+        if not state.extra:
+            raise ValueError(f"No step state found for request {state.request_id}")
+        extra = state.extra
+
+        p = extra["p"]
+        latents = extra["_current_latents"]
+        action_latents = extra["action_latents"]
+        sound_latents = extra["sound_latents"]
+
+        # Decode video/image
+        video = self._decode_latents(latents)
+
+        # Decode sound if present
+        result: dict[str, Any]
+        if p.sound_enabled:
+            target_audio_samples = extra["target_audio_samples"]
+            sound_sample_rate = extra["sound_sample_rate"]
+            if sound_latents is None or target_audio_samples is None or sound_sample_rate is None:
+                raise ValueError("Cosmos3 sound generation finished without sound latents.")
+            audio = self._decode_sound_latents(sound_latents, target_audio_samples)
+            result = {"video": video, "audio": audio, "audio_sample_rate": sound_sample_rate}
+        elif p.action_enabled:
+            if action_latents is None or extra["raw_action_dim"] is None or p.domain_id is None:
+                raise ValueError("Cosmos3 action generation finished without action latents.")
+            action = action_latents[:, :, : extra["raw_action_dim"]].detach().cpu()
+            result = {
+                "payload": {"video": video, "actions": action},
+                "metadata": {
+                    "actions": {
+                        "raw_action_dim": extra["raw_action_dim"],
+                        "action_mode": p.action_mode,
+                        "domain_id": p.domain_id,
+                    }
+                },
+            }
+        elif p.is_t2i:
+            result = {"image": video}
+        else:
+            result = {"video": video}
+
+        # Cleanup UND K/V session and release per-request tensors held in
+        # state.extra so the runner can drop the state without leaks. (If a
+        # request is cancelled before post_decode, the SessionStateManager's
+        # count-based eviction reclaims the K/V session eventually.)
+        kv_state = extra.get("kv_state")
+        session_id = extra.get("session_id")
+        if kv_state is not None and session_id is not None:
+            self._memory_manager.drop_session(session_id)
+        else:
+            self.transformer.reset_cache()
+        state.extra.clear()
+
+        return DiffusionOutput(output=result)
 
     # Checkpoint adapters use this hook before model-specific weight loading.
     remap_checkpoint_key = _remap_ckpt_key
@@ -1760,8 +2519,32 @@ class Cosmos3OmniDiffusersPipeline(
         """
         if not req.prompts:
             return False
-        first_prompt = req.prompts[0]
-        modalities = first_prompt.get("modalities", []) if isinstance(first_prompt, dict) else []
+        return "image" in Cosmos3OmniDiffusersPipeline._normalize_prompt_modalities(req.prompts[0])
+
+    @staticmethod
+    def _validate_step_execution_config(od_config: Any) -> None:
+        """Reject engine configs the step path cannot honor, at pipeline init.
+
+        The step engine may otherwise schedule a second request while the
+        first is mid-denoise; ``denoise_step`` only supports one active
+        request, so fail at startup instead of mid-execution.
+        """
+        if getattr(od_config, "step_execution", False) and int(getattr(od_config, "max_num_seqs", 1)) > 1:
+            raise ValueError(
+                "Cosmos3 step execution currently requires max_num_seqs=1; "
+                "multi-request batching is not implemented yet."
+            )
+
+    @staticmethod
+    def _normalize_prompt_modalities(prompt_data: Any) -> list[str]:
+        """Normalize and validate prompt-level ``modalities``.
+
+        Shared by ``forward()`` (via ``_is_t2i_request``) and the step path
+        (``_parse_request_from_state``) so both entry points apply identical
+        normalization (``None`` -> [], bare string -> single-element list) and
+        reject the same invalid requests instead of silently guessing a mode.
+        """
+        modalities = prompt_data.get("modalities", []) if isinstance(prompt_data, dict) else []
         if modalities is None:
             modalities = []
         if isinstance(modalities, str):
@@ -1772,7 +2555,7 @@ class Cosmos3OmniDiffusersPipeline(
         accepted_modalities = ["image", "video", "text", "audio"]
         if any(x not in accepted_modalities for x in modalities):
             raise ValueError(f"Incorrect modality value in {modalities}, expected one of {accepted_modalities}.")
-        return "image" in modalities
+        return modalities
 
     def _set_timesteps(self, num_inference_steps: int, device: str | torch.device, shift: float) -> None:
         if self.is_distilled_model:
