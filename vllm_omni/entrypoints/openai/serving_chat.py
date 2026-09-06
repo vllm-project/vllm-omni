@@ -112,6 +112,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.image_api_utils import (
+    encode_image_base64,
     encode_image_base64_with_compression,
     validate_layered_layers,
 )
@@ -3827,9 +3828,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         flat_images.append(item)
 
                 for img in flat_images:
-                    with BytesIO() as buffer:
-                        img.save(buffer, format="PNG")
-                        img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                    img_base64 = await asyncio.to_thread(encode_image_base64, img)
                     image_contents.append(
                         {
                             "type": "image_url",
