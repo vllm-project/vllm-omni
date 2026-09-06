@@ -17,6 +17,13 @@ from transformers.cache_utils import DynamicCache
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
+from vllm_omni.model_executor.models.model_local_kv import (
+    ModelLocalKVScope,
+    ModelLocalKVSpec,
+    RowDriver,
+    spec_from_hf_config,
+)
+
 logger = init_logger(__name__)
 
 
@@ -165,6 +172,85 @@ class CUDAGraphDecoderWrapper:
     def _maybe_log_stats(self) -> None:
         if self._stats_log_every > 0 and self._stats_total_requests % self._stats_log_every == 0:
             self.log_decode_stats()
+
+    @staticmethod
+    def _retained_kv_caches(states: dict) -> list[tuple[int, DynamicCache]]:
+        """Find the KV caches a capture kept alive, with their batch rows.
+
+        Walks the stored ``cache`` payload instead of assuming which capture
+        path populates it: ``_decode_icl_first_chunk`` fills its dict on the
+        decoder side, so the only reliable count is the one taken from the
+        objects themselves after warmup.
+        """
+        found: list[tuple[int, DynamicCache]] = []
+        for state in states.values():
+            payload = state.get("cache")
+            if not isinstance(payload, dict):
+                continue
+            for value in payload.values():
+                if not isinstance(value, DynamicCache):
+                    continue
+                layers = getattr(value, "layers", None)
+                keys = getattr(layers[0], "keys", None) if layers else None
+                if keys is None:
+                    continue
+                found.append((int(keys.shape[0]), value))
+        return found
+
+    def model_local_kv_specs(self) -> list[ModelLocalKVSpec]:
+        """Declare only the graph-resident copies this wrapper retains.
+
+        The per-decode cache is declared by the decoder itself, because it
+        exists whether or not graphs were captured. What is specific to this
+        wrapper is that every captured shape keeps its dummy ``DynamicCache``
+        alive for replay (``combined_states``, ``icl_prefix_states`` and
+        ``xvec_prefix_states`` all store ``cache``), for the process lifetime.
+
+        Rows come from the state dicts rather than the configured capture
+        lists: a capture that raised is logged and skipped, so the configured
+        shape count would over-report. The trade is that a capture whose
+        tensors transformers has not yet materialized contributes nothing, so
+        this is a floor rather than a contract.
+        """
+        config = self.decoder.config
+        try:
+            dtype = next(self.decoder.parameters()).dtype
+        except StopIteration:  # parameterless stub, only reachable in tests
+            return []
+
+        # Physical, not logical: the sliding window truncates on every write,
+        # so a stream of thousands of frames never occupies more than this.
+        physical = self.prefix_length - 1
+        retained = [
+            *self._retained_kv_caches(self.combined_states),
+            *self._retained_kv_caches(self.icl_prefix_states),
+            *self._retained_kv_caches(self.xvec_prefix_states),
+        ]
+        batched_captures = sum(rows for rows, _ in retained)
+
+        if not batched_captures:
+            return []
+        return [
+            spec_from_hf_config(
+                config,
+                name="codec_decoder_graph_pool",
+                dtype=dtype,
+                physical_capacity_positions=physical,
+                capacity_source=f"sliding_window({self.prefix_length}) - 1",
+                scope=ModelLocalKVScope.MODEL,
+                rows=RowDriver.FIXED,
+                rows_fixed=batched_captures,
+                rows_reason=(
+                    f"rows across {len(retained)} retained caches in "
+                    f"{len(self.combined_states)} suffix / {len(self.icl_prefix_states)} icl-prefix / "
+                    f"{len(self.xvec_prefix_states)} xvec-prefix captures"
+                ),
+                allocation_note=(
+                    "counted from caches transformers has materialized; captures whose tensors are still "
+                    "unallocated report nothing, so this is a floor for the xvec path"
+                ),
+            )
+        ]
 
     def log_decode_stats(self) -> None:
         if not getattr(self, "_stats_enabled", False) or self._stats_total_requests == 0:

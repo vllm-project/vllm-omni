@@ -36,6 +36,7 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
+from vllm_omni.model_executor.models.model_local_kv import collect_model_local_kv_specs
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -192,6 +193,52 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._maybe_enable_output_token_ids_for_model_sampler()
         self._init_talker_mtp()
         self._prewarm_attention_capture_workspaces()
+        self._report_model_local_kv()
+
+    def _report_model_local_kv(self) -> None:
+        """Log attention KV this model holds outside the paged manager.
+
+        Reporting only. Two of these caches are captured into CUDA graphs
+        during ``load_model``, so NVML already charges them to the process
+        before ``determine_available_memory()`` samples it; subtracting the
+        declared total from the KV budget would double-count them. What is not
+        charged is the per-request half, which appears after profiling and
+        scales with ``max_num_seqs``.
+
+        Wrapped whole: a memory report has no business breaking model load,
+        and this runs on platforms these declarations have never been
+        exercised on.
+        """
+        try:
+            self._log_model_local_kv()
+        except Exception:
+            logger.warning("Model-local KV reporting failed; continuing", exc_info=True)
+
+    def _log_model_local_kv(self) -> None:
+        specs = collect_model_local_kv_specs(getattr(self, "model", None))
+        if not specs:
+            return
+        max_num_seqs = max(1, int(self.scheduler_config.max_num_seqs))
+        total = sum(spec.peak_bytes(max_num_seqs) for _, spec in specs)
+        logger.info(
+            "Model-local KV (outside the paged manager): %.2f MiB across %d declaration(s) at max_num_seqs=%d",
+            total / (1 << 20),
+            len(specs),
+            max_num_seqs,
+        )
+        for path, spec in specs:
+            logger.info(
+                "  %s.%s: %.2f MiB (%d rows from %s x %.2f MiB/row, scope=%s, %d positions from %s)",
+                path or type(self.model).__name__,
+                spec.name,
+                spec.peak_bytes(max_num_seqs) / (1 << 20),
+                spec.row_count(max_num_seqs),
+                spec.rows.value if spec.rows.value != "fixed" else f"fixed({spec.rows_fixed}; {spec.rows_reason})",
+                spec.bytes_per_row / (1 << 20),
+                spec.scope.value,
+                spec.physical_capacity_positions,
+                spec.capacity_source,
+            )
 
     def _maybe_enable_output_token_ids_for_model_sampler(self) -> None:
         if getattr(self.model, "logitsprocs_need_output_token_ids", False):

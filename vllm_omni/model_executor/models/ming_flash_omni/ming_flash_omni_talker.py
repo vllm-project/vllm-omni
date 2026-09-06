@@ -157,6 +157,17 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             patch_size=self.patch_size,
         )
 
+    def model_local_kv_specs(self):
+        """Forward to the generator, which owns the talker's StaticCache.
+
+        ``MingAudioGenerator`` is a plain object rather than a submodule, so
+        the module-tree walk cannot reach it on its own.
+        """
+        generator = getattr(self, "audio_generator", None)
+        if generator is None:
+            return []
+        return generator.model_local_kv_specs()
+
     @property
     def device(self) -> torch.device:
         return next(self.model.parameters()).device

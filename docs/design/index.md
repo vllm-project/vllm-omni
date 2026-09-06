@@ -25,6 +25,7 @@ implementation contract; it is not, by itself, a general support claim.
 - [Async Diffusion Output](feature/async_diffusion_output.md)
 - [Async Omni Output Materialization](feature/omni_async_output_materialization.md)
 - [Automatic Prefix Caching in Omni Models](feature/prefix_caching.md)
+- [Model-local KV Caches](feature/model_local_kv_caches.md)
 - [Realtime AR-Diffusion Sessions](feature/realtime_ar_diffusion.md)
 
 ### Communication

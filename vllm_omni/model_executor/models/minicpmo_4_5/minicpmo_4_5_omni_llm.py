@@ -137,6 +137,13 @@ def _encode_tokens(tokenizer: Any, prompt: str) -> list[int]:
 
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
+from vllm_omni.model_executor.models.model_local_kv import (
+    ModelLocalKVScope,
+    ModelLocalKVSpec,
+    RowDriver,
+    spec_from_hf_config,
+)
+
 logger = init_logger(__name__)
 hf_logger = logging.get_logger(__name__)
 
@@ -2621,6 +2628,51 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
         self.layers = nn.ModuleList(
             [MiniCPMWhisperEncoderLayer(config, layer_idx=i) for i in range(config.encoder_layers)]
         )
+
+    def model_local_kv_specs(self) -> list[ModelLocalKVSpec]:
+        """Declare the streaming encoder's self-attention cache.
+
+        Bounded by learned position embeddings, not by ``max_model_len``: the
+        cache cannot outgrow ``embed_positions``, and past that point the
+        forward pass repeats the last position rather than extending.
+
+        Whisper is encoder-only self-attention here, so kv-heads equal
+        attention heads. Layer count is read off the built ``self.layers``
+        rather than the config, so a partially built encoder reports what it
+        actually has.
+
+        Declared per session, not per sequence. Each streaming session state
+        owns its own ``audio_past_key_values`` and the encoder runs at batch
+        size one, so ``max_num_seqs`` is the wrong number here.
+
+        One session is the unit rather than the configured cap, because the cap
+        is not visible from the model and the setting that carries it cannot
+        distinguish "duplex off" from "one session" -- so a cap-scaled figure
+        would report a cache that a non-duplex deployment never allocates. An
+        earlier revision grew a capacity driver and an engine-side field to
+        carry that number for this one declarer; the arithmetic is a
+        multiplication the reader can do when they need the ceiling.
+        """
+        return [
+            spec_from_hf_config(
+                self.config,
+                name="whisper_encoder_self_attn",
+                dtype=self.conv1.weight.dtype,
+                layers=len(self.layers),
+                kv_heads=self.config.encoder_attention_heads,
+                head_dim=self.config.d_model // self.config.encoder_attention_heads,
+                physical_capacity_positions=int(self.embed_positions.weight.shape[0]),
+                capacity_source="embed_positions rows (max_source_positions)",
+                scope=ModelLocalKVScope.SESSION,
+                rows=RowDriver.FIXED,
+                rows_fixed=1,
+                rows_reason="one EncoderDecoderCache per streaming session, encoder runs at batch size 1",
+                allocation_note=(
+                    "only allocated on the streaming path, where use_cache is set; scales with the "
+                    "configured duplex session cap"
+                ),
+            )
+        ]
 
     def forward(
         self,
