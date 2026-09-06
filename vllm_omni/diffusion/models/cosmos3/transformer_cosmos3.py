@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 VFM Transformer for vllm-omni.
 
 Implements the Mixture-of-Transformers architecture with two pathways:
@@ -1705,14 +1705,6 @@ class Cosmos3VFMTransformer(nn.Module):
             raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")
         t, h, w = video_shape
         hp, wp, _, _ = self._pad_to_patch_size(h, w)
-        text_lengths = text_mask.sum(dim=1)
-        min_real_len = int(text_lengths.min().item())
-        max_real_len = int(text_lengths.max().item())
-        if min_real_len != max_real_len:
-            raise ValueError(
-                f"Cosmos3 requires identical real text lengths within a batch "
-                f"(got min={min_real_len}, max={max_real_len})."
-            )
         has_action = action_latents is not None
         has_sound = sound_latents is not None
         if control_latents is None:
@@ -1804,6 +1796,15 @@ class Cosmos3VFMTransformer(nn.Module):
         # cached alongside UND K/V by both the bespoke and session-state paths.
         need_kv = self.cached_kv is None
         if need_kv or self.cached_freqs_gen is None:
+            if need_kv:
+                text_lengths = text_mask.sum(dim=1)
+                min_real_len = int(text_lengths.min().item())
+                max_real_len = int(text_lengths.max().item())
+                if min_real_len != max_real_len:
+                    raise ValueError(
+                        f"Cosmos3 requires identical real text lengths within a batch "
+                        f"(got min={min_real_len}, max={max_real_len})."
+                    )
             freqs_und, freqs_gen = self._compute_rope_freqs(
                 text_mask,
                 t,

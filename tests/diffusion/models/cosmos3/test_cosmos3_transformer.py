@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -398,6 +398,54 @@ def test_forward_returns_video_prediction(monkeypatch: pytest.MonkeyPatch) -> No
         video_shape=(1, 2, 2),
         fps=24.0,
     )
+
+    assert tuple(output.shape) == (1, 2, 1, 2, 2)
+
+
+def test_forward_rejects_nonuniform_text_lengths_on_cache_miss(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+
+    with pytest.raises(ValueError, match="identical real text lengths"):
+        model(
+            hidden_states=torch.zeros(2, 2, 1, 2, 2),
+            timestep=torch.ones(2),
+            text_ids=torch.tensor([[1, 2], [1, 0]], dtype=torch.long),
+            text_mask=torch.tensor([[1, 1], [1, 0]], dtype=torch.long),
+            video_shape=(1, 2, 2),
+            fps=24.0,
+        )
+
+
+def test_forward_cache_hit_avoids_text_length_scalar_sync(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(), dtype=torch.float32)
+    )
+    kwargs = {
+        "hidden_states": torch.zeros(1, 2, 1, 2, 2),
+        "timestep": torch.tensor([1.0]),
+        "text_ids": torch.tensor([[1, 2]], dtype=torch.long),
+        "text_mask": torch.ones(1, 2, dtype=torch.long),
+        "video_shape": (1, 2, 2),
+        "fps": 24.0,
+    }
+
+    model(**kwargs)
+    assert model.cached_kv is not None
+
+    def fail_item(_self):
+        raise AssertionError("cache-hit forward must not read text lengths through Python")
+
+    monkeypatch.setattr(torch.Tensor, "item", fail_item)
+
+    output = model(**kwargs)
 
     assert tuple(output.shape) == (1, 2, 1, 2, 2)
 
