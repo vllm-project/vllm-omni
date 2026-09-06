@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -48,6 +48,87 @@ class Gr00tN1d7Pipeline(nn.Module):
             strict=self.strict,
         )
         self._validate_policy_server_config(model_config.get("policy_server_config"))
+
+        # Resolved here so it lands on the instance before the runner's post-load
+        # hook calls setup_compile().
+        #
+        # Prefer the stage-level ``compile_mode`` (an unrecognised stage key, so it
+        # rides in ``engine_extras``, which base_config overlays deep-merge). A
+        # ``model_config.compile_mode`` is honoured too for direct edits of this
+        # model's deploy YAML, but note that an overlay setting ``model_config:``
+        # replaces the base block wholesale rather than merging it -- only the
+        # keys in _DEEP_MERGE_KEYS are merged -- which would drop
+        # ``policy_server_config`` and silently disable OpenPI serving.
+        self.compile_mode = str(
+            getattr(od_config, "compile_mode", None) or model_config.get("compile_mode") or "default"
+        )
+
+    def setup_compile(self) -> None:
+        """torch.compile the action head, which dominates kernel-launch overhead.
+
+        Called by ``DiffusionModelRunner`` after load when the stage is not
+        ``enforce_eager``. GR00T is launch-bound rather than compute-bound: an
+        Nsight Systems capture of one steady-state request on an A30 shows 5,086
+        kernel launches with a 6 us median duration, and the GPU busy for only
+        70 ms of a 144 ms request -- the host spends the other ~74 ms feeding it.
+        The denoise loop alone issues 3,099 of those launches for 34 ms of GPU work.
+
+        Only the action head is compiled. Its shapes are fixed by the checkpoint
+        (batch 1, ``action_horizon`` 40, ``num_inference_timesteps`` 4), so Dynamo
+        specialises once and never recompiles. The Qwen3-VL backbone is left eager
+        on purpose: its token count varies per observation, which both defeats CUDA
+        graph capture (``assert dst.data_ptr() == src.data_ptr()``) and moves the
+        actions past the e2e tolerance (eef_9d 1.5e-2 against atol 1e-2).
+
+        ``compile_mode`` on the stage selects the torch.compile mode; measured on an
+        A30 against the eager baseline:
+
+            default          -32% latency (146.9 -> 102.9 ms), +43% throughput
+            reduce-overhead  -32% latency (146.9 ->  99.3 ms), +48% throughput
+
+        ``default`` is the default here: it carries 92% of the win with none of the
+        CUDA graph static-address constraints.
+        """
+        mode = getattr(self, "compile_mode", "default")
+        if not torch.cuda.is_available():
+            logger.info("GR00T setup_compile skipped: CUDA is not available.")
+            return
+
+        if "reduce-overhead" in mode:
+            # The action head runs three compiled regions back-to-back inside one
+            # torch.inference_mode() block. cudagraph_trees' warmup teardown trips
+            #   cudagraph_trees.py dealloc_current_path_weakrefs
+            #   AssertionError: len(node.tensor_weakrefs) == len(node.stack_traces)
+            # on that pattern, so use the flat cudagraphify path, which keeps no
+            # per-path bookkeeping.
+            try:
+                import torch._inductor.config as inductor_config
+
+                inductor_config.triton.cudagraph_trees = False
+                logger.info("GR00T setup_compile: disabled cudagraph_trees for reduce-overhead.")
+            except Exception as exc:
+                logger.warning("GR00T setup_compile: could not disable cudagraph_trees (%s).", exc)
+
+        head = self.policy.model.action_head
+        # dynamic=False: every shape in the action head is fixed by the checkpoint.
+        compile_kwargs = {"mode": mode, "dynamic": False}
+        targets = (
+            "model",  # DiT -- num_inference_timesteps calls per request
+            "action_encoder",  # per denoise step
+            "action_decoder",  # per denoise step
+        )
+
+        for attr in targets:
+            module = getattr(head, attr, None)
+            if module is None:
+                logger.warning("GR00T setup_compile: action_head.%s missing, skipped.", attr)
+                continue
+            try:
+                setattr(head, attr, torch.compile(module, **compile_kwargs))
+            except Exception as exc:
+                logger.warning("GR00T setup_compile: action_head.%s failed (%s), left eager.", attr, exc)
+
+        logger.info("GR00T setup_compile: compiled action head with mode=%s.", mode)
 
     def _validate_policy_server_config(self, psc: Mapping[str, Any] | None) -> None:
         """Fail fast if the deploy handshake drifts from the loaded checkpoint.
