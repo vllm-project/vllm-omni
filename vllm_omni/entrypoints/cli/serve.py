@@ -107,10 +107,15 @@ class OmniServeCommand(CLISubcommand):
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
 
-        if getattr(args, "no_guardrails", False):
+        # None when neither --guardrails nor --no-guardrails was passed, in which
+        # case model_config is left alone entirely: whatever the deploy config or
+        # the code default says stands. Marking model_config explicit is what makes
+        # the flag win over a `guardrails:` key in a deploy YAML.
+        guardrails = getattr(args, "guardrails", None)
+        if guardrails is not None:
             existing = getattr(args, "model_config", None)
             model_config = dict(existing) if isinstance(existing, dict) else {}
-            model_config["guardrails"] = False
+            model_config["guardrails"] = guardrails
             args.model_config = model_config
             explicit_keys = getattr(args, "explicit_keys", None)
             if explicit_keys is not None:
@@ -891,13 +896,31 @@ class OmniServeCommand(CLISubcommand):
             help="Maximum length for TTS voice style instructions (overrides the pipeline default, default: 500).",
         )
 
-        # Disable safety guardrails for this server (currently only applicable for Cosmos3)
+        # Force safety guardrails on or off for this server (currently only
+        # applicable for Cosmos3). BooleanOptionalAction gives both spellings from
+        # one action, which is what keeps them tracked: a mutually exclusive group
+        # obtained from a TrackingGroup is created on the real parser only, so its
+        # arguments would never reach the shadow parser.
+        #
+        # The positive spelling is not redundant with the default. Guardrails
+        # default ON in code, but a deploy config may set `guardrails: false` on a
+        # stage, and a stage-level `false` is a hard off that no per-request
+        # override can undo -- `--guardrails` is how to get them back without
+        # editing the YAML. `default=None` leaves model_config untouched when
+        # neither spelling is passed.
         # TODO: drop once --model-config-override lands (3/N config refactor)
         omni_config_group.add_argument(
-            "--no-guardrails",
-            dest="no_guardrails",
-            action="store_true",
-            help="Disable Cosmos3 text/video safety guardrails for this server.",
+            "--guardrails",
+            dest="guardrails",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Enable or disable Cosmos3 text/video safety guardrails for this "
+                "server. --guardrails overrides a `guardrails: false` set by a "
+                "deploy config and requires the gated `cosmos-guardrail` package; "
+                "--no-guardrails disables them. Unset leaves the deploy config or "
+                "the model default in charge."
+            ),
         )
 
         # Enable diffusion pipeline profiling

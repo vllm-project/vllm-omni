@@ -1,0 +1,103 @@
+# nvidia/Cosmos3-Super-Text2Image, co-located: both Mixture-of-Transformers
+# towers in one diffusion stage.
+#
+# Cosmos3 is a two-tower MoT model (an autoregressive UND tower plus a diffusion
+# GEN tower), but this topology keeps both in a single
+# Cosmos3OmniDiffusersPipeline stage that does text encode + denoise + VAE decode
+# together, so there is no stage router, no cross-stage handoff, and -- at this
+# default -- no collectives at all: every parallel degree is 1 and HSDP is off.
+#
+# THIS FILE IS OPT-IN
+# -------------------
+# The cosmos3_omni pipeline deliberately declares no default_deploy_config_name,
+# so nothing here applies unless you ask for it by name:
+#
+#   vllm-omni serve nvidia/Cosmos3-Super-Text2Image \
+#     --deploy-config cosmos3_super_t2i.yaml
+#
+# Running without --deploy-config keeps the previous behaviour exactly: one
+# default stage built from CLI args, guardrails on, no pinned memory or batching
+# knobs. This file is the recommended single-card layout, not the baseline.
+#
+# ONE CARD IS ENOUGH, AND IS THE FASTER LAYOUT
+# --------------------------------------------
+# Both towers together are 120.91 GiB of bf16 weights, which fits on one H200
+# (141 GB = 131.3 GiB). Measured on one card at 20 steps, guardrails off, all
+# figures as GiB of peak *allocated* memory:
+#
+#   1024x1024   120.4 GiB peak   253.8 ms/step
+#   1536x1536   127.4 GiB peak   558.2 ms/step
+#   2048x2048   130.7 GiB peak  1085.1 ms/step
+#
+# 2048x2048 leaves well under a GiB on the card, so treat it as the ceiling for
+# this layout rather than a supported operating point. (The 121.56 GiB the worker
+# logs after loading is allocator-*reserved*, which is why it can read higher than
+# the 1024x1024 peak-allocated figure -- the two are measured differently.)
+#
+# Adding a second card as cfg_parallel_size 2 + hsdp_shard_size 2 makes 1024x1024
+# *slower* (439.4 ms/step), because HSDP all-gathers each layer's shard from the
+# peer every step and that costs more than splitting the two CFG branches saves.
+# So scale out for headroom, not for speed:
+#
+#   guardrails on, max_num_seqs > 1, or resolutions past 2048x2048 will not fit
+#   on one card. Then widen `devices` and keep
+#   cfg_parallel_size x ulysses_degree == hsdp_shard_size == len(devices):
+#     2 GPUs -> cfg_parallel_size 2, use_hsdp true, hsdp_shard_size 2  (62.37 GiB
+#               reserved per GPU, 65.6 GiB peak at 1024x1024)
+#     4 GPUs -> also ulysses_degree 2, hsdp_shard_size 4  (~31 GiB per GPU)
+#     8 GPUs -> also ulysses_degree 4, hsdp_shard_size 8  (the upstream reference
+#               layout, ~23.5 GiB per GPU)
+#   ulysses_degree must divide the latent sequence length (1024x1024 gives a GEN
+#   sequence of 32*32 = 1024 tokens).
+#
+# For one stage per tower, see cosmos3_super_t2i_disagg.yaml.
+async_chunk: false
+
+stages:
+  # `devices` are LOGICAL indexes into the process's CUDA_VISIBLE_DEVICES, not
+  # physical ids: _map_device_list treats each entry as a 0-based index into the
+  # visible list and silently drops any entry >= len(visible).
+  - stage_id: 0
+    devices: "0"
+    # One request in flight. Not a model limitation -- it is what makes the
+    # single-card layout above fit: a second concurrent request adds a second set
+    # of latents and activations on top of 120.91 GiB of resident weights. Raise
+    # it together with `devices` (see the scaling note above), not on its own.
+    max_num_seqs: 1
+    # Headroom for the peaks in the table above. 0.9 of a 131.3 GiB card is
+    # 118.2 GiB, which is already less than the 120.4 GiB a 1024x1024 request
+    # peaks at. This knob only binds when diffusion_kv_mode is PAGED_SCHEDULER
+    # (that is the only path that calls determine_available_kv_memory, which is
+    # what fails with "No memory remains for Diffusion KV cache"); in the default
+    # DENSE_LEGACY mode it is inert. Set correctly here so switching modes does
+    # not turn into a startup failure.
+    gpu_memory_utilization: 0.97
+    # No torch.compile / CUDA graphs. Compilation of a 62 B-parameter two-tower
+    # model costs minutes of startup for a step time that is already
+    # collective-free and memory-bound, and graph capture wants memory this layout
+    # does not have spare. Drop this line once you have scaled out to >= 4 GPUs
+    # and are serving steady traffic, where the warmup amortizes.
+    enforce_eager: true
+    # Everything omitted here (tensor/data/pipeline parallel, ulysses, ring, cfg,
+    # hsdp_replicate_size) keeps its DiffusionParallelConfig default of 1, so
+    # use_hsdp: false is the only line this block needs -- it is already the
+    # default, and is stated to make the single-card layout explicit rather than
+    # inherited.
+    parallel_config:
+      use_hsdp: false
+    engine_args:
+      model_config:
+        # guardrails default ON, and the pre-process hook eager-loads the *gated*
+        # guardrail models at pipeline build time -- so the default path
+        # hard-fails wherever `cosmos-guardrail` is not installed. `serve
+        # --no-guardrails` and the offline example's `--extra-body` reach the same
+        # setting per run; this makes the default work. Drop this line -- or pass
+        # `serve --guardrails` -- to enable them.
+        guardrails: false
+    # Deliberately no `default_sampling_params` block. Nothing generation-related
+    # is pinned here: num_inference_steps, guidance_scale, height, width, seed and
+    # flow_shift all stay unset so Cosmos3's own T2I defaults apply (1024x1024,
+    # 50 steps, guidance 7.0, flow_shift 3.0) and the request body stays
+    # authoritative. In particular a fixed seed does not belong in a deployment
+    # file: it would make every request that names no seed return the same image
+    # for the life of the server.

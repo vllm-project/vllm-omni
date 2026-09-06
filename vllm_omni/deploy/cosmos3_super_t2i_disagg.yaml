@@ -1,0 +1,189 @@
+# nvidia/Cosmos3-Super-Text2Image, disaggregated one stage per
+# Mixture-of-Transformers tower, one GPU per stage:
+#
+#   stage 0 "reasoner"  UND / autoregressive tower  1 GPU
+#         |  per-layer text K/V (~256 KiB per token per branch)
+#   stage 1 "generator" GEN / diffusion tower + VAE 1 GPU  ->  image
+#
+# Each tower is ~31.2 B params = 58.1 GiB in bf16, which fits uncut on one H200
+# (141 GB = 131.3 GiB), so this layout needs no weight sharding and no intra-stage
+# collectives at all: every parallel degree is 1 and HSDP is off. That makes it the
+# simplest possible disaggregated deploy -- and the one to reach for when NCCL is
+# unhealthy, since the only cross-GPU traffic left is the K/V handoff, which
+# travels through the Dynamo connector rather than NCCL.
+#
+# THE HANDOFF IS NOT SMALL
+# ------------------------
+# K/V is grouped-query and bf16 (8 KV heads x 128 head_dim x 2 bytes), so one
+# token costs 4 KiB per layer for K and V together and ~256 KiB per token per
+# branch across 64 layers. The payload is trimmed to the real prompt length, so a
+# 256-token formatted prompt is ~64 MiB per branch and ~128 MiB once guidance
+# turns on the unconditional branch too. That crosses the stage edge once per
+# request, against a GEN tower that then runs num_inference_steps times -- but it
+# scales linearly with prompt length, and `max_sequence_length` (4096) puts the
+# worst case in the GiB range. The reasoner logs the size of every payload and
+# warns past COSMOS3_UND_PAYLOAD_WARN_MIB.
+#
+# The cost is that the two CFG branches now run sequentially inside stage 1
+# instead of concurrently on separate ranks, so a guided request costs about two
+# denoise passes. To recover that, give stage 1 a second GPU and set
+# cfg_parallel_size: 2 + use_hsdp: true, hsdp_shard_size: 2 (and widen its
+# `devices` to "0,1"). Beyond that, 4 GPUs per stage takes stage 1 to
+# cfg 2 x ulysses_degree 2 with hsdp_shard_size: 4 -- 1024x1024 gives a GEN
+# sequence of 32*32 = 1024 tokens, divisible by ulysses_degree as the
+# transformer requires.
+#
+# KEEP tensor_parallel_size EQUAL ON THE TWO STAGES
+# -------------------------------------------------
+# UND K/V is TP-sharded: the reasoner emits
+# [B, S_und, num_kv_heads // tp_size, head_dim] and stage 1's cross-attention
+# consumes exactly that shape, derived from *its own* TP size. Nothing in the
+# stage plumbing ties the two together, so scaling one stage's
+# tensor_parallel_size without the other produces a payload the other cannot
+# consume. The generator checks this at install time and raises naming both TP
+# sizes, so it fails loudly rather than silently -- but it fails. Every other
+# parallel degree (cfg, ulysses, ring, hsdp) is stage-local and free to differ.
+#
+# The topology itself is declared in code -- see
+# vllm_omni/diffusion/models/cosmos3_pipeline_config.py -- and selected by the
+# `pipeline:` key below; this file only carries deployment knobs. `pipeline:` is
+# consulted by StageConfigFactory ahead of any HF model_type inference, which is
+# what keeps the co-located `cosmos3_omni` deploy unaffected by this topology
+# merely existing in the registry.
+pipeline: cosmos3_omni_disagg
+
+# Mandatory for a multi-stage pipeline whose stages have input_sources: with
+# async_chunk enabled, merge_pipeline_deploy requires a stage to declare an
+# async_chunk_process_next_stage_input_func and raises otherwise. Chunking buys
+# nothing here anyway -- a T2I request is a single indivisible unit of work.
+async_chunk: false
+
+# NO PER-STAGE default_sampling_params
+# ------------------------------------
+# Neither stage below pins any generation parameter: leaving num_inference_steps,
+# guidance_scale, height, width, seed and flow_shift unset lets Cosmos3's T2I
+# defaults apply (1024x1024, 50 steps, guidance 7.0, flow_shift 3.0) and keeps the
+# request body authoritative.
+#
+# It would not do what you want anyway. A diffusion stage's YAML defaults are read
+# once at startup into default_sampling_params_list, and then every current request
+# path *replaces* them wholesale with one request-level OmniDiffusionSamplingParams
+# object, cloned per stage: the offline example does it in text_to_image.py, and the
+# OpenAI image endpoints do it via build_stage_sampling_params_list(...,
+# replace_diffusion_params=True), which builds one params object from the *first*
+# diffusion stage and hands a clone to all of them. So a value pinned on one stage
+# and not the other is silently dropped rather than honored -- verified on hardware:
+# max_sequence_length: 256 on stage 1 alone left both stages resolving 4096 and
+# produced a byte-identical image.
+#
+# The invariant that matters is real regardless of route: the two towers must
+# resolve the text conditioning identically. The reasoner encodes the
+# unconditional branch only when guidance_scale > 1, and the generator looks its
+# branches up by a fingerprint of the tokenized prompt, which depends on
+# max_sequence_length, use_system_prompt and the geometry. Anything that makes the
+# two stages disagree -- a per-stage `sampling_constraints` in the pipeline's stage
+# specs, which *is* applied per stage and survives the replacement above, or a
+# future config route -- surfaces as a replay-table miss: a loud RuntimeError
+# rather than a wrong image, but a failed request either way. Keep generation
+# parameters identical across the two stages.
+stages:
+  # ---------------------------------------------------------------- stage 0 --
+  # UND tower only, 64 decoder layers. Runs once per request (twice with CFG,
+  # once per prompt branch), emits per-layer K/V, then goes idle -- which is
+  # exactly the asymmetry that makes splitting worthwhile.
+  #
+  # `devices` are LOGICAL indexes into the process's CUDA_VISIBLE_DEVICES, NOT
+  # physical ids: _map_device_list treats each entry as a 0-based index into the
+  # visible list and silently drops any entry >= len(visible), which surfaces
+  # later as "Stage N requires K device(s) ... but J device(s) are available".
+  # Both stage workers are launched with the SAME visible set, so index 0 here
+  # and index 1 on stage 1 are two different cards -- one per stage. Launching
+  # with a narrowed per-stage visible set instead would make both indexes resolve
+  # to that stage's only card, which also works but says far less.
+  #
+  # No Ulysses and no HSDP: the UND sequence is a few hundred text tokens, far
+  # too short to be worth splitting, it is traversed once rather than once per
+  # denoising step, and the weights already fit on one card.
+  #
+  # This stage also builds a VAE it never uses (~1 GiB), because it inherits
+  # Cosmos3OmniDiffusersPipeline.__init__ verbatim. Cheap, and worth far more
+  # than a forked copy of that constructor.
+  - stage_id: 0
+    devices: "0"
+    # One request in flight per stage. The two stages still pipeline across
+    # requests -- that is the point of the split -- so this does not serialize the
+    # deployment; it bounds the memory each stage needs on top of its 58.1 GiB of
+    # resident weights. Raise it together with that stage's `devices`.
+    max_num_seqs: 1
+    # This stage holds one tower (58.1 GiB) on a 131.3 GiB card, so it has room to
+    # spare and the exact value does not bind here. Kept explicit and equal to
+    # stage 1's for symmetry. The knob only takes effect when diffusion_kv_mode is
+    # PAGED_SCHEDULER; in the default DENSE_LEGACY mode it is inert.
+    gpu_memory_utilization: 0.9
+    # No torch.compile / CUDA graphs. This stage runs one forward per request, so
+    # there is nothing for a compiled graph to amortize against -- unlike stage 1,
+    # where it may eventually be worth turning off.
+    enforce_eager: true
+    parallel_config:
+      # tensor_parallel_size must equal stage 1's -- see the note at the top.
+      tensor_parallel_size: 1
+      data_parallel_size: 1
+      pipeline_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      cfg_parallel_size: 1
+      use_hsdp: false
+    engine_args:
+      model_config:
+        # Cosmos3 guardrails default ON and the pre-process hook eager-loads the
+        # gated guardrail models at pipeline build time, hard-failing when
+        # `cosmos-guardrail` is not installed. Drop this line -- or pass
+        # `serve --guardrails` -- to enable them.
+        #
+        # Enabling them costs more here than co-located: both stages run the
+        # stock pre-process hook and both receive the prompt text, so the text
+        # safety check runs twice per request, and each stage loads its own copy
+        # of the guardrail models. Set it on both stages or neither -- guardrails
+        # on stage 1 alone would let a blocked prompt through the reasoner and
+        # only catch it on the decoded image.
+        guardrails: false
+
+  # ---------------------------------------------------------------- stage 1 --
+  # GEN tower + VAE decode: run once per denoising step (50 by default), so this
+  # is where essentially all the FLOPs are. The UND tower is replaced by a replay
+  # stub fed from stage 0, so no UND weights are loaded here at all -- which is
+  # what keeps this stage inside one card too.
+  #
+  # devices "1": the second card of the shared visible set, so this stage runs on
+  # a different physical GPU from the reasoner.
+  #
+  # sequence_parallel_size is deliberately absent: __post_init__ derives it as
+  # ulysses_degree * ring_degree and overwrites anything set here.
+  - stage_id: 1
+    devices: "1"
+    max_num_seqs: 1
+    # Same reasoning as stage 0: one tower on a 131.3 GiB card, and the knob only
+    # binds under PAGED_SCHEDULER. This is the stage to raise first if you do
+    # switch modes, since it is the one that allocates latents and decodes.
+    gpu_memory_utilization: 0.9
+    # Start eager. Unlike stage 0 this stage runs num_inference_steps forwards per
+    # request, so compilation does have something to amortize against -- worth
+    # revisiting under steady traffic, once the layout has the spare memory for
+    # graph capture.
+    enforce_eager: true
+    parallel_config:
+      # Must match stage 0's tensor_parallel_size -- see the note at the top.
+      # cfg_parallel_size / ulysses_degree / hsdp are stage-local and are the
+      # knobs to reach for when scaling this stage out.
+      tensor_parallel_size: 1
+      data_parallel_size: 1
+      pipeline_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      cfg_parallel_size: 1
+      use_hsdp: false
+    engine_args:
+      model_config:
+        # Matches stage 0, and must: this is the only stage that decodes pixels,
+        # so it is the only one that can run the image safety check.
+        guardrails: false

@@ -24,6 +24,11 @@ recommended parallelism differ. Mode is selected per request (T2I →
 - Model card (authoritative usage + example assets): <https://huggingface.co/nvidia/Cosmos3-Super>
 - Nano recipe (same APIs/params): [`Cosmos3-Nano.md`](./Cosmos3-Nano.md)
 - Pipeline: [`vllm_omni/diffusion/models/cosmos3/pipeline_cosmos3.py`](../../vllm_omni/diffusion/models/cosmos3/pipeline_cosmos3.py)
+- Recommended single-card T2I layout (opt-in via `--deploy-config`):
+  [`vllm_omni/deploy/cosmos3_super_t2i.yaml`](../../vllm_omni/deploy/cosmos3_super_t2i.yaml)
+- Experimental one-stage-per-tower T2I split, for when both towers do not fit on
+  one card:
+  [Cosmos3 Tower Disaggregation](../../docs/features/cosmos3_tower_disaggregation.md)
 
 ## Hardware Support
 
@@ -110,11 +115,11 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync -H "Accept: video/mp4" \
 #### Notes
 
 - **Measured (2x B300, bf16, guardrails off, official 2-GPU config above):**
-  - T2I 1024², 50 steps → **~6 s**
-  - T2V 1280×720, 189 frames, 35 steps → **~197 s**
-  - I2V 1280×720, 189 frames, 35 steps → **~200 s**
-  - T2V + sound (189 frames, 35 steps) → **~198 s**, output muxes **AAC 48 kHz stereo**
-  - (NVIDIA's reference: 8×H200 @ 50 steps ≈ 55 s/video; 2×H200 @ 35 steps ≈ 3 min/video.)
+    - T2I 1024², 50 steps → **~6 s**
+    - T2V 1280×720, 189 frames, 35 steps → **~197 s**
+    - I2V 1280×720, 189 frames, 35 steps → **~200 s**
+    - T2V + sound (189 frames, 35 steps) → **~198 s**, output muxes **AAC 48 kHz stereo**
+    - (NVIDIA's reference: 8×H200 @ 50 steps ≈ 55 s/video; 2×H200 @ 35 steps ≈ 3 min/video.)
 - **Memory:** ~61.5 GiB per GPU when sharded across 2 GPUs (HSDP shard 2); repo ~135 GB on disk.
 - Same generation defaults, supported sizes, V2V reference-video controls
   (`condition_frame_indexes_vision`, `condition_video_keep`), and

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 text/image/video/sound/action pipeline for vllm-omni.
 
 One pipeline class serves the Cosmos3 family modes. Output modality is selected
@@ -1393,6 +1393,47 @@ class Cosmos3OmniDiffusersPipeline(
         if val is not None:
             return val
         return default
+
+    # -- Shared text-conditioning parameter resolution -----------------------
+    #
+    # ``forward`` below and ``Cosmos3ReasonerPipeline.encode_prompt_to_kv`` in
+    # ``pipeline_cosmos3_disagg`` must resolve these identically. The
+    # disaggregated topology tokenizes the prompt on *both* stages -- the
+    # reasoner to compute the UND K/V, the generator to look that K/V up by a
+    # fingerprint of the token ids -- so any divergence in a value that reaches
+    # the tokenizer turns into a replay-table miss at runtime. Resolving them in
+    # one place is what makes that agreement structural instead of a comment.
+
+    def _resolve_t2i_geometry(self, sp: OmniDiffusionSamplingParams) -> tuple[int, int]:
+        """Resolve the (height, width) a T2I request will be generated at.
+
+        Read from ``sp`` directly rather than through ``_get_sp_param``: the
+        image-generation path always fills these in from the request size.
+        """
+        height = int(
+            sp.height or (COSMOS3_EDGE_T2I_DEFAULT_HEIGHT if self.is_edge_model else COSMOS3_T2I_DEFAULT_HEIGHT)
+        )
+        width = int(sp.width or (COSMOS3_EDGE_T2I_DEFAULT_WIDTH if self.is_edge_model else COSMOS3_T2I_DEFAULT_WIDTH))
+        return height, width
+
+    def _resolve_text_encode_params(
+        self,
+        sp: OmniDiffusionSamplingParams,
+        *,
+        default_use_system_prompt: bool,
+    ) -> tuple[int, bool, float]:
+        """Resolve the tokenization knobs: (max_sequence_length, use_system_prompt, frame_rate).
+
+        ``default_use_system_prompt`` is ``is_v2v`` on the co-located path and
+        ``False`` for T2I, which is the only mode the tower split supports.
+        """
+        max_sequence_length = int(
+            self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
+            or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
+        )
+        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", default_use_system_prompt))
+        frame_rate = self._get_sp_param(sp, "resolved_frame_rate") or self._get_sp_param(sp, "frame_rate") or 24.0
+        return max_sequence_length, use_system_prompt, float(frame_rate)
 
     def _get_robolab_transform(self):
         if self._robolab_transform is None:
@@ -3664,10 +3705,9 @@ class Cosmos3OmniDiffusersPipeline(
         #        Edge guidance=5, shift=3;
         #        no guidance interval
         if is_t2i:
-            height = sp.height or (
-                COSMOS3_EDGE_T2I_DEFAULT_HEIGHT if self.is_edge_model else COSMOS3_T2I_DEFAULT_HEIGHT
-            )
-            width = sp.width or (COSMOS3_EDGE_T2I_DEFAULT_WIDTH if self.is_edge_model else COSMOS3_T2I_DEFAULT_WIDTH)
+            # Shared with the disaggregated reasoner stage; see
+            # _resolve_t2i_geometry.
+            height, width = self._resolve_t2i_geometry(sp)
             num_frames = 1
             num_inference_steps = sp.num_inference_steps or COSMOS3_T2I_DEFAULT_NUM_INFERENCE_STEPS
             guidance_scale = self._resolve_guidance_scale(sp, COSMOS3_T2I_DEFAULT_GUIDANCE_SCALE)
@@ -3738,12 +3778,12 @@ class Cosmos3OmniDiffusersPipeline(
         flow_shift_target = float(self._get_sp_param(sp, "flow_shift", default_flow_shift))
         guidance_interval = self._get_sp_param(sp, "guidance_interval", default_guidance_interval)
 
-        frame_rate = self._get_sp_param(sp, "resolved_frame_rate") or self._get_sp_param(sp, "frame_rate") or 24.0
-        max_sequence_length = (
-            self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
-            or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
+        # Shared with the disaggregated reasoner stage; see
+        # _resolve_text_encode_params.
+        max_sequence_length, use_system_prompt, frame_rate = self._resolve_text_encode_params(
+            sp,
+            default_use_system_prompt=is_v2v,
         )
-        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", is_v2v))
 
         if action_enabled and action_video_tensor is None:
             extra_action_video = self._get_sp_param(sp, "action_video", None)

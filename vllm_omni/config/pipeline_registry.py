@@ -33,6 +33,10 @@ from vllm.logger import init_logger
 from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
+from vllm_omni.diffusion.models.cosmos3_pipeline_config import (
+    COSMOS3_DISAGG_PIPELINE,
+    COSMOS3_PIPELINE,
+)
 from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE
 from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_S2S_PIPELINE,
@@ -143,6 +147,11 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "dreamzero": DREAMZERO_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
     "pi0": PI0_PIPELINE,
+    "cosmos3_omni": COSMOS3_PIPELINE,
+    # Opt-in two-stage topology over the co-located `cosmos3_omni` checkpoint;
+    # selected only by an explicit `pipeline: cosmos3_omni_disagg` in the deploy
+    # YAML (see cosmos3_pipeline_config for why it declares no architectures).
+    "cosmos3_omni_disagg": COSMOS3_DISAGG_PIPELINE,
     "gepard": GEPARD_PIPELINE,
     "glm_image": GLM_IMAGE_PIPELINE,
     "hunyuan_image_3_moe": HUNYUAN_IMAGE3_PIPELINE,

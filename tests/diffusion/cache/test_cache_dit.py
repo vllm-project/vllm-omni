@@ -58,6 +58,7 @@ def test_custom_cache_dit_enablers_are_registered_explicitly():
         "Wan22S2VPipeline": cd_model_specific.enable_cache_for_wan22_s2v,
         "Cosmos3OmniDiffusersPipeline": cd_model_specific.enable_cache_for_cosmos3,
         "Cosmos3OmniPipeline": cd_model_specific.enable_cache_for_cosmos3,
+        "Cosmos3GeneratorPipeline": cd_model_specific.enable_cache_for_cosmos3,
         "Krea2Pipeline": cd_model_specific.enable_cache_for_krea2,
         "Magi2Pipeline": cd_model_specific.enable_cache_for_magi2,
     }

@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 guardrail hooks for vllm-omni.
 
 Thin adapter around the ``cosmos_guardrail`` package's ``CosmosSafetyChecker``
 (Blocklist + Qwen3Guard for text, RetinaFace face-blur for video).
 
-Enabled by default. Disable server-wide with ``--cosmos3-no-guardrails`` (which
-sets ``od_config.model_config["guardrails"] = False``); per-request overrides
-ride on ``sampling_params.extra_args["guardrails"]``.
+Enabled by default. ``serve --no-guardrails`` / ``--guardrails`` set
+``od_config.model_config["guardrails"]`` server-wide; per-request overrides ride
+on ``sampling_params.extra_args["guardrails"]``, but only in the permissive
+direction: a server-level False leaves the guardrail singletons unpopulated, so no
+request can re-enable what the server turned off.
 """
 
 from __future__ import annotations
