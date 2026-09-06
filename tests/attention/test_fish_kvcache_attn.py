@@ -169,6 +169,28 @@ def test_fish_kvcache_attn_guard_rejects_unsupported_block_size(monkeypatch):
     )
 
 
+def test_fish_kvcache_attn_guard_rejects_non_dense_head_dimension(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
+    monkeypatch.setattr(fish_kvcache_attn, "is_available", lambda: True)
+    key_cache = torch.empty((8, 16, 8, 256), dtype=torch.float16)[..., ::2]
+    value_cache = torch.empty((8, 16, 8, 256), dtype=torch.float16)[..., ::2]
+
+    assert key_cache.stride(-1) == 2
+    assert not fish_kvcache_attn.can_use_fish_kvcache_attn(
+        query=torch.empty((4, 32, 128), dtype=torch.float16),
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=torch.zeros((4, 8), dtype=torch.int32),
+        seq_lens=torch.ones((4,), dtype=torch.int32),
+        max_query_len=1,
+        max_seq_len=128,
+        dcp_world_size=1,
+        use_cascade=False,
+        alibi_slopes=None,
+        sliding_window=None,
+    )
+
+
 def test_fish_kvcache_backend_wraps_only_model_instance(monkeypatch):
     fish_kvcache_backend.reset_fish_kvcache_attn_stats()
     monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
@@ -262,24 +284,10 @@ def test_fish_kvcache_backend_unbinds_kv_on_vllm_cache_layout(monkeypatch):
     assert captured["value"] == expected
 
 
-def test_fish_kvcache_vllm_cache_unbinds_then_falls_back_until_contiguous(monkeypatch):
-    # End-to-end with the real vLLM cache layout and the real (unmocked) guard.
-    #
-    # The point of the transpose+split fix: unbind(1) on the old 5-D layout
-    # raised "too many values to unpack" on the vLLM 0.23.0 layout, and the
-    # upstream now packs K/V into the last dimension (4-D shape). The
-    # transpose(1, 2) + split correctly unpacks into separate key/value tensors
-    # and the backend gracefully falls back to the original attention with
-    # correct output. This test guards that fix and must NOT depend on the fast
-    # path firing.
-    #
-    # It also documents a known limitation (tracked separately):
-    # transpose(1, 2) on the interleaved (B, H, N, 2*D) layout yields
-    # *non-contiguous* key/value views, which the guard rejects on the
-    # is_contiguous() check. So the dimensions are compatible (4-D,
-    # block_size=16, head_size=128) -- the only thing keeping the fast path
-    # from engaging is contiguity, not shape. Making the fast path actually
-    # fire would require a .contiguous() copy and is out of scope here.
+def test_fish_kvcache_vllm_strided_cache_hits_fast_path(monkeypatch):
+    # Backend-level regression with the real vLLM cache layout and guard.
+    # transpose(1, 2) + split produces non-contiguous K/V views, so the Triton
+    # kernel must consume their strides directly without materializing copies.
     fish_kvcache_backend.reset_fish_kvcache_attn_stats()
     monkeypatch.setenv("VLLM_OMNI_FISH_KVCACHE_ATTN", "1")
     monkeypatch.setattr(fish_kvcache_backend, "is_available", lambda: True)
@@ -291,9 +299,11 @@ def test_fish_kvcache_vllm_cache_unbinds_then_falls_back_until_contiguous(monkey
 
     decode_calls = []
 
-    def fake_decode(*args, **kwargs):
-        del args, kwargs
-        decode_calls.append(True)
+    def fake_decode(query, key_cache, value_cache, block_table, seq_lens, out, *, scale, max_seq_len):
+        del query, block_table, seq_lens, scale, max_seq_len
+        decode_calls.append((key_cache.stride(), value_cache.stride()))
+        out.fill_(1)
+        return out
 
     monkeypatch.setattr(fish_kvcache_backend, "fish_decode_kvcache_attn", fake_decode)
 
@@ -304,22 +314,22 @@ def test_fish_kvcache_vllm_cache_unbinds_then_falls_back_until_contiguous(monkey
     output = torch.zeros_like(query)
     kv_cache = torch.zeros(cache_shape, dtype=torch.float16)
 
-    # Root cause record: transpose(1,2) + split gives the right 4-D shape but
-    # a non-contiguous view.
+    # Root cause record: transpose(1, 2) + split gives the right 4-D shape but
+    # a non-contiguous view with K/V packed in the same backing allocation.
     key_cache, value_cache = kv_cache.transpose(1, 2).split(head_size, dim=-1)
     assert tuple(key_cache.shape) == (num_blocks, block_size, num_kv_heads, head_size)
     assert not key_cache.is_contiguous()
+    assert value_cache.storage_offset() == head_size
 
-    # transpose+split no longer crashes (unbind(1) would have raised here) and
-    # the request completes via the correct fallback path.
     result = model.layers[0].self_attn.attn.impl.forward(None, query, None, None, kv_cache, _metadata(), output)
 
     assert result is output
-    assert decode_calls == []
-    assert model.layers[0].self_attn.attn.impl.original_calls == 1
-    assert torch.equal(output, torch.full_like(output, 2))
+    assert decode_calls == [(key_cache.stride(), value_cache.stride())]
+    assert model.layers[0].self_attn.attn.impl.original_calls == 0
+    assert torch.equal(output, torch.ones_like(output))
     stats = fish_kvcache_backend.get_fish_kvcache_attn_stats()
-    assert stats["fallback_count_by_reason"] == {"guard_miss": 1}
+    assert stats["small_hit_count"] == 1
+    assert stats["fallback_count_by_reason"] == {}
 
 
 def test_fish_kvcache_backend_install_is_idempotent(monkeypatch):
@@ -1037,6 +1047,63 @@ def test_fish_kvcache_native_op_matches_reference(seq_len, dtype, batch_size):
     torch.testing.assert_close(out, expected, atol=3e-2, rtol=3e-2)
 
 
+@pytest.mark.cuda
+@pytest.mark.parametrize("seq_len", [512, 2048])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not fish_kvcache_attn.is_available(),
+    reason="Fish kvcache Triton attention is not available",
+)
+def test_fish_kvcache_native_op_matches_reference_with_vllm_strided_cache(seq_len, dtype):
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    batch_size = 2
+    block_size = 16
+    num_q_heads = 4
+    num_kv_heads = 2
+    head_dim = 128
+    max_blocks = (seq_len + block_size - 1) // block_size
+    num_blocks = batch_size * max_blocks + 3
+    scale = head_dim**-0.5
+
+    q = torch.randn((batch_size, num_q_heads, head_dim), device=device, dtype=dtype)
+    packed_kv_cache = torch.randn(
+        (num_blocks, num_kv_heads, block_size, 2 * head_dim),
+        device=device,
+        dtype=dtype,
+    )
+    k_cache, v_cache = packed_kv_cache.transpose(1, 2).split(head_dim, dim=-1)
+    assert not k_cache.is_contiguous()
+    assert k_cache.stride() == v_cache.stride()
+    assert v_cache.storage_offset() == head_dim
+
+    block_table = torch.empty((batch_size, max_blocks), device=device, dtype=torch.int32)
+    for batch_idx in range(batch_size):
+        pages = torch.arange(
+            batch_idx * max_blocks,
+            (batch_idx + 1) * max_blocks,
+            device=device,
+            dtype=torch.int32,
+        )
+        block_table[batch_idx] = torch.flip(pages, dims=[0])
+    seq_lens = torch.full((batch_size,), seq_len, device=device, dtype=torch.int32)
+
+    out = torch.empty_like(q)
+    fish_kvcache_attn.fish_decode_kvcache_attn(
+        q,
+        k_cache,
+        v_cache,
+        block_table,
+        seq_lens,
+        out,
+        scale=scale,
+        max_seq_len=seq_len,
+    )
+
+    expected = _reference_decode_attention(q, k_cache, v_cache, block_table, seq_lens, scale)
+    torch.testing.assert_close(out, expected, atol=3e-2, rtol=3e-2)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not fish_kvcache_attn.is_available(),
     reason="Fish kvcache Triton attention is not available",
@@ -1094,8 +1161,13 @@ def test_fish_kvcache_native_op_handles_mixed_short_and_long_seq_lens():
     scale = head_dim**-0.5
 
     q = torch.randn((batch_size, num_q_heads, head_dim), device=device, dtype=dtype)
-    k_cache = torch.randn((num_blocks, block_size, num_kv_heads, head_dim), device=device, dtype=dtype)
-    v_cache = torch.randn((num_blocks, block_size, num_kv_heads, head_dim), device=device, dtype=dtype)
+    packed_kv_cache = torch.randn(
+        (num_blocks, num_kv_heads, block_size, 2 * head_dim),
+        device=device,
+        dtype=dtype,
+    )
+    k_cache, v_cache = packed_kv_cache.transpose(1, 2).split(head_dim, dim=-1)
+    assert not k_cache.is_contiguous()
     block_table = torch.empty((batch_size, max_blocks), device=device, dtype=torch.int32)
     for batch_idx in range(batch_size):
         pages = torch.arange(batch_idx * max_blocks, (batch_idx + 1) * max_blocks, device=device, dtype=torch.int32)
@@ -1137,8 +1209,13 @@ def test_fish_kvcache_native_op_handles_zero_short_and_long_seq_lens():
     scale = head_dim**-0.5
 
     q = torch.randn((batch_size, num_q_heads, head_dim), device=device, dtype=dtype)
-    k_cache = torch.randn((num_blocks, block_size, num_kv_heads, head_dim), device=device, dtype=dtype)
-    v_cache = torch.randn((num_blocks, block_size, num_kv_heads, head_dim), device=device, dtype=dtype)
+    packed_kv_cache = torch.randn(
+        (num_blocks, num_kv_heads, block_size, 2 * head_dim),
+        device=device,
+        dtype=dtype,
+    )
+    k_cache, v_cache = packed_kv_cache.transpose(1, 2).split(head_dim, dim=-1)
+    assert not k_cache.is_contiguous()
     block_table = torch.empty((batch_size, max_blocks), device=device, dtype=torch.int32)
     for batch_idx in range(batch_size):
         pages = torch.arange(batch_idx * max_blocks, (batch_idx + 1) * max_blocks, device=device, dtype=torch.int32)
@@ -1169,8 +1246,9 @@ def test_fish_kvcache_native_op_can_be_captured_by_cuda_graph():
     device = torch.device("cuda")
     dtype = torch.float16
     q = torch.randn((2, 4, 128), device=device, dtype=dtype)
-    k_cache = torch.randn((8, 16, 2, 128), device=device, dtype=dtype)
-    v_cache = torch.randn((8, 16, 2, 128), device=device, dtype=dtype)
+    packed_kv_cache = torch.randn((8, 2, 16, 256), device=device, dtype=dtype)
+    k_cache, v_cache = packed_kv_cache.transpose(1, 2).split(128, dim=-1)
+    assert not k_cache.is_contiguous()
     block_table = torch.arange(8, device=device, dtype=torch.int32).reshape(2, 4)
     seq_lens = torch.full((2,), 64, device=device, dtype=torch.int32)
     out = torch.empty_like(q)
@@ -1221,8 +1299,13 @@ def test_fish_kvcache_native_long_op_can_be_captured_by_cuda_graph():
     max_blocks = (seq_len + block_size - 1) // block_size
 
     q = torch.randn((2, num_q_heads, head_dim), device=device, dtype=dtype)
-    k_cache = torch.randn((2 * max_blocks, block_size, num_kv_heads, head_dim), device=device, dtype=dtype)
-    v_cache = torch.randn((2 * max_blocks, block_size, num_kv_heads, head_dim), device=device, dtype=dtype)
+    packed_kv_cache = torch.randn(
+        (2 * max_blocks, num_kv_heads, block_size, 2 * head_dim),
+        device=device,
+        dtype=dtype,
+    )
+    k_cache, v_cache = packed_kv_cache.transpose(1, 2).split(head_dim, dim=-1)
+    assert not k_cache.is_contiguous()
     block_table = torch.arange(2 * max_blocks, device=device, dtype=torch.int32).reshape(2, max_blocks)
     seq_lens = torch.full((2,), seq_len, device=device, dtype=torch.int32)
     out = torch.empty_like(q)
