@@ -179,7 +179,7 @@ collection, examples, bug reports, or logs.
 
 ## Model-specific variables
 
-The audit found 56 variables read by a single model or pipeline family. They are
+The audit found 58 variables read by a single model or pipeline family. They are
 not listed as public usage options here because doing so would turn implementation
 escape hatches into an accidental compatibility contract.
 
@@ -188,7 +188,7 @@ Every audited model-specific name has a migration disposition in the
 
 | Disposition | Count | Required outcome |
 | --- | ---: | --- |
-| Promote | 33 | Move a stable setting into typed stage or model configuration. |
+| Promote | 35 | Move a stable setting into typed stage or model configuration. |
 | Request scope | 6 | Move request-varying behavior into a declared request-option schema. |
 | External | 0 | Retain only when a supported third-party library owns the contract. |
 | Internalize | 11 | Keep a debug or diagnostic switch out of public documentation and configuration. |

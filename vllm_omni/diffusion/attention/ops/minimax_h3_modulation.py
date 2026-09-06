@@ -133,7 +133,8 @@ def _indexed_gate_rms_norm_scale_shift_kernel(
     residual = tl.load(residual_ptr + row * stride_residual_row + columns, mask=mask, other=0.0).to(tl.float32)
     gate = tl.load(gate_ptr + index * stride_gate_row + columns, mask=mask, other=0.0).to(tl.float32)
     branch = tl.load(branch_ptr + row * stride_branch_row + columns, mask=mask, other=0.0).to(tl.float32)
-    updated = residual + gate * branch
+    # Match the BF16 residual value consumed by the unfused RMSNorm path.
+    updated = (residual + gate * branch).to(tl.bfloat16).to(tl.float32)
     tl.store(residual_out_ptr + row * hidden_size + columns, updated, mask=mask)
 
     weight = tl.load(weight_ptr + columns, mask=mask, other=0.0).to(tl.float32)

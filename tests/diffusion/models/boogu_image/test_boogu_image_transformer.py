@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import logging
 import os
@@ -61,6 +61,20 @@ def _force_default_gemm(monkeypatch):
         "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
         lambda: default_unquantized_gemm,
     )
+
+
+@pytest.fixture(autouse=True)
+def _force_torch_sdpa():
+    """Pin TORCH_SDPA so CPU shape tests do not pick CUDA-only backends (FA3)."""
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.data import AttentionConfig
+
+    od_config = SimpleNamespace(
+        diffusion_attention_config=AttentionConfig(default="TORCH_SDPA"),
+        parallel_config=SimpleNamespace(ring_degree=1),
+    )
+    with set_current_diffusion_config(od_config):
+        yield
 
 
 def _randomize_parameters(module: torch.nn.Module) -> None:
@@ -314,6 +328,74 @@ def test_transformer_instantiates():
     # patch_size^2 * in_channels -> hidden_size
     assert model.x_embedder.in_features == 2 * 2 * 4
     assert model.x_embedder.out_features == HIDDEN_SIZE
+
+
+@pytest.fixture
+def recording_quant_config():
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+    class RecordingQuantConfig(QuantizationConfig):
+        def __init__(self):
+            super().__init__()
+            self.prefixes: list[str] = []
+
+        @classmethod
+        def get_name(cls):
+            return "recording"
+
+        @classmethod
+        def get_supported_act_dtypes(cls):
+            return [torch.float32]
+
+        @classmethod
+        def get_min_capability(cls):
+            return 0
+
+        @classmethod
+        def get_config_filenames(cls):
+            return []
+
+        @classmethod
+        def from_config(cls, config):
+            return cls()
+
+        def get_quant_method(self, layer, prefix):
+            self.prefixes.append(prefix)
+            return UnquantizedLinearMethod()
+
+    return RecordingQuantConfig()
+
+
+def test_transformer_propagates_quant_config_and_prefix(recording_quant_config):
+    from vllm.model_executor.layers.linear import LinearBase
+
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        BooguImageTransformer2DModel,
+    )
+
+    model = BooguImageTransformer2DModel(
+        od_config=_tiny_od_config(),
+        quant_config=recording_quant_config,
+        prefix="transformer",
+    )
+
+    configured_prefixes = set()
+    for name, module in model.named_modules():
+        if isinstance(module, LinearBase):
+            qualified_name = f"transformer.{name}"
+            assert module.prefix == qualified_name
+            assert module.quant_config is recording_quant_config
+            configured_prefixes.add(qualified_name)
+
+    assert set(recording_quant_config.prefixes) == configured_prefixes
+    assert {name for name, module in model.named_modules() if isinstance(module, torch.nn.Linear)} == {
+        "x_embedder",
+        "ref_image_patch_embedder",
+        "time_caption_embed.timestep_embedder.linear_1",
+        "time_caption_embed.timestep_embedder.linear_2",
+        "time_caption_embed.caption_embedder.1",
+    }
 
 
 def test_transformer_preprocesses_multiple_instruction_feature_layers():
