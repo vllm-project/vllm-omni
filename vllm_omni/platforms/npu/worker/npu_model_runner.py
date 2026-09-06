@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from functools import partial
 from typing import Any
@@ -20,7 +20,8 @@ from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable
 from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 
-from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
+from vllm_omni.core.prefix_cache.group_view import check_prefix_cache_kv_groups
+from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms.npu._310p import is_310p
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -36,34 +37,27 @@ else:
 
 class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
     def initialize_kv_cache(self, kv_cache_config) -> None:
-        """Create the omni tensor prefix cache.
-
-        The omni prefix cache is used to store the hidden states of the prefix tokens
-        """
+        """Stage the omni prefix-cache config (hidden / mm tensors reused on hits)."""
         NPUModelRunner.initialize_kv_cache(self, kv_cache_config)
-        if self.omni_prefix_cache is None and self.cache_config.enable_prefix_caching:
+        if getattr(self, "_omni_prefix_cache_cfg", None) is None and self.cache_config.enable_prefix_caching:
             # Read num_blocks back off self.kv_cache_config: vllm-ascend
             # deepcopies the config it was handed, so the value it stored is the
             # authoritative one, not our caller's argument.
             num_blocks = self.kv_cache_config.num_blocks
-            self.omni_prefix_cache = OmniTensorPrefixCache(
+            # Controller runs in eager mode on NPU (no CUDA streams:
+            # submit() completes the copy+scatter synchronously). Built once
+            # on the first step via the inherited _ensure_omni_prefix_cache.
+            check_prefix_cache_kv_groups(getattr(self.kv_cache_config, "kv_cache_groups", None))
+            self._omni_prefix_cache_cfg = PrefixCacheConfig.from_vllm_config(
                 num_blocks=num_blocks,
                 block_size=self.cache_config.block_size,
-                hidden_size=self.model_config.get_hidden_size(),
-                hs_dtype=self.dtype,
+                scheduler_config=self.scheduler_config,
+                model_config=self.model_config,
             )
             logger.info(
-                "Initialized omni prefix cache on NPU (num_blocks=%d, block_size=%d, hidden_size=%d). "
-                "Hidden-state cache is pinned host memory of roughly %.1f GiB; each per-token "
-                "multimodal output key allocates another tensor of the same block shape.",
+                "Initialized omni prefix cache on NPU (eager mode, num_blocks=%d, block_size=%d).",
                 num_blocks,
                 self.cache_config.block_size,
-                self.model_config.get_hidden_size(),
-                num_blocks
-                * self.cache_config.block_size
-                * self.model_config.get_hidden_size()
-                * self.dtype.itemsize
-                / (1024**3),
             )
 
     def load_model(self, *args, **kwargs) -> None:
@@ -84,6 +78,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             if callable(candidate):
                 override_fn = candidate
         self._sampled_token_ids_cpu_override = override_fn
+        self._snapshot_prefix_cache_model_flags(model)
         self._omni_query_start_loc_model_kwarg = bool(getattr(model, "supports_omni_query_start_loc", False))
         self._maybe_enable_output_token_ids_for_model_sampler()
         self._init_talker_mtp()
