@@ -28,6 +28,7 @@ from einops import rearrange
 from torch.nn import functional as F
 
 from .attention import VarlenHandler
+from .layers import ModalityDispatcher
 
 
 class Modality(IntEnum):
@@ -62,6 +63,51 @@ class Magi2PreviewDataProxyConfig:
             raise ValueError("time_channel_dim must be non-negative")
 
 
+@dataclass(frozen=True)
+class Magi2SequenceLayout:
+    """Packed-sequence metadata built by the proxy once per request."""
+
+    coords_mapping: torch.Tensor
+    modality_mapping: torch.Tensor
+    varlen_handler: VarlenHandler
+
+
+@dataclass(frozen=True)
+class Magi2TokenLayout:
+    """Rank-local modality metadata built by the transformer once per request."""
+
+    dispatcher: ModalityDispatcher
+    video_indices: torch.Tensor
+    audio_indices: torch.Tensor
+    text_indices: torch.Tensor
+    rope: torch.Tensor
+
+
+@dataclass
+class Magi2PackedLayout:
+    """Request-scoped packing metadata shared by every denoising step.
+
+    Token layout is fixed for the lifetime of a request, so the sequence part
+    is filled on the first proxy call and the token part on the first
+    transformer forward, after sequence-parallel dispatch.
+    """
+
+    sequence: Magi2SequenceLayout | None = None
+    tokens: Magi2TokenLayout | None = None
+
+    def resolve_tokens(self, modality_mapping: torch.Tensor, rope: torch.Tensor) -> Magi2TokenLayout:
+        time_mask = modality_mapping == int(Modality.TIME)
+        modality_mapping = torch.where(time_mask, int(Modality.TEXT), modality_mapping)
+        self.tokens = Magi2TokenLayout(
+            dispatcher=ModalityDispatcher(modality_mapping, 3),
+            video_indices=torch.nonzero(modality_mapping == int(Modality.VIDEO)).flatten(),
+            audio_indices=torch.nonzero(modality_mapping == int(Modality.AUDIO)).flatten(),
+            text_indices=torch.nonzero(modality_mapping == int(Modality.TEXT)).flatten(),
+            rope=rope,
+        )
+        return self.tokens
+
+
 @dataclass
 class ModelInput:
     """Unpacked tensors for one native preview-transformer invocation."""
@@ -83,6 +129,7 @@ class ModelInput:
     ref_image_feat: torch.Tensor | None = None
     ref_image_feat_len: torch.Tensor | None = None
     ref_image_special_token_embedding: torch.Tensor | None = None
+    layout: Magi2PackedLayout | None = None
 
 
 def _to_int(value: int | torch.Tensor) -> int:
@@ -521,20 +568,23 @@ class PackedModelInput:
     """Request-owned packed transformer arguments and output layout."""
 
     token_sequence: torch.Tensor
-    coords_mapping: torch.Tensor
-    modality_mapping: torch.Tensor
-    varlen_handler: VarlenHandler
     time_token_sequence: torch.Tensor
     output_layout: SimplePackedData
+    layout: Magi2PackedLayout
 
     @property
-    def model_args(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, VarlenHandler, torch.Tensor]:
+    def model_args(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, VarlenHandler, torch.Tensor, Magi2PackedLayout]:
+        sequence = self.layout.sequence
+        assert sequence is not None
         return (
             self.token_sequence,
-            self.coords_mapping,
-            self.modality_mapping,
-            self.varlen_handler,
+            sequence.coords_mapping,
+            sequence.modality_mapping,
+            sequence.varlen_handler,
             self.time_token_sequence,
+            self.layout,
         )
 
 
@@ -653,20 +703,24 @@ class Magi2DataProxy:
             )
 
         packed = SimplePackedData(items)
-        cu_seqlens = packed.cu_seqlen.to(device=data.x_t.device, dtype=torch.int32)
-        varlen_handler = VarlenHandler(
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=packed.max_seqlen,
-            max_seqlen_k=packed.max_seqlen,
-        )
+        layout = data.layout if data.layout is not None else Magi2PackedLayout()
+        if layout.sequence is None:
+            cu_seqlens = packed.cu_seqlen.to(device=data.x_t.device, dtype=torch.int32)
+            layout.sequence = Magi2SequenceLayout(
+                coords_mapping=packed.coords_mapping,
+                modality_mapping=packed.modality_mapping,
+                varlen_handler=VarlenHandler(
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=packed.max_seqlen,
+                    max_seqlen_k=packed.max_seqlen,
+                ),
+            )
         return PackedModelInput(
             token_sequence=packed.token_sequence,
-            coords_mapping=packed.coords_mapping,
-            modality_mapping=packed.modality_mapping,
-            varlen_handler=varlen_handler,
             time_token_sequence=packed.time_token_sequence,
             output_layout=packed,
+            layout=layout,
         )
 
     @staticmethod
@@ -679,7 +733,10 @@ class Magi2DataProxy:
 
 __all__ = [
     "Magi2DataProxy",
+    "Magi2PackedLayout",
     "Magi2PreviewDataProxyConfig",
+    "Magi2SequenceLayout",
+    "Magi2TokenLayout",
     "Modality",
     "ModelInput",
     "PackedModelInput",
