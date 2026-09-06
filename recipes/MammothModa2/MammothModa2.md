@@ -138,16 +138,18 @@ Use one A800 per stage so AR and DiT memory and timing are attributable. The
 per-stage override changes placement only; both stages remain single-rank.
 
 ```bash
-vllm serve ./MammothModa2-Preview --omni \
+VLLM_LOGGING_LEVEL=DEBUG vllm serve ./MammothModa2-Preview --omni \
   --deploy-config vllm_omni/deploy/mammoth_moda2.yaml \
   --stage-overrides '{"0":{"devices":"0"},"1":{"devices":"1"}}' \
   --port 8099 \
   --log-stats
 ```
 
-The server log for stage 1 must name `StageDiffusionClient`,
-`DiffusionEngine`, and `MammothModa2DiTPipeline`. Seeing the legacy generation
-model runner for stage 1 is a failed migration.
+Startup logs should identify stage 1 as `StageDiffusionClient` and resolve it
+to `MammothModa2DiTPipeline`. `DiffusionEngine` step timing is a DEBUG-level,
+per-request message, so it appears only after sending a text-to-image request
+with `VLLM_LOGGING_LEVEL=DEBUG`; it is not a startup marker. Seeing the legacy
+generation model runner for stage 1 is a failed migration.
 
 ### 1x AMD MI300X, MammothModa2 Preview (pre-migration baseline)
 
