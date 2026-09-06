@@ -206,6 +206,8 @@ def ar2diffusion(
     if mm_data:
         prompt_images = mm_data.get("image")
         if prompt_images is None:
+            prompt_images = mm_data.get("img2img")
+        if prompt_images is None:
             prompt_images = mm_data.get("images")
         if prompt_images is not None:
             diffusion_input["multi_modal_data"] = {"image": prompt_images}
