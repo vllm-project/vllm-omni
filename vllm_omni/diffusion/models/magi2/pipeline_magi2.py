@@ -695,6 +695,11 @@ class Magi2Pipeline(
 
         return self.video_decoder.module
 
+    def setup_compile(self) -> None:
+        """Compile the transformer regions; the attention and MoE kernels stay eager."""
+
+        self.transformer.compile_regions(fullgraph=True, dynamic=self.od_config.diffusion_compile_dynamic)
+
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],

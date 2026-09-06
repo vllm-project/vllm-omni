@@ -16,6 +16,7 @@ import os
 from collections.abc import Iterable
 from enum import IntEnum
 from functools import partial
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -28,6 +29,7 @@ from .configuration_magi2 import Magi2PreviewConfig
 from .layers import (
     ElementWiseFourierEmbed,
     MHCHandler,
+    MHCTensorTuple,
     ModalityDispatcher,
     MultiModalityRMSNorm,
     make_grouped_linear,
@@ -131,14 +133,12 @@ class Magi2Attention(nn.Module):
         start = self.tp_group.rank * self.num_heads_q
         return checkpoint_tensor[:, start : start + self.num_heads_q]
 
-    def forward(
+    def project(
         self,
         hidden_states: torch.Tensor,
         rope: torch.Tensor,
-        varlen_handler: VarlenHandler,
         modality_dispatcher: ModalityDispatcher,
-        cp_split_sizes: list[int] | torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         normalized = self.pre_norm(hidden_states, modality_dispatcher)
         gates = self.linear_g(normalized, modality_dispatcher)
         qkv = self.linear_qkv(normalized, modality_dispatcher)
@@ -160,8 +160,17 @@ class Magi2Attention(nn.Module):
         q = apply_rotary_emb(q, cos, sin).squeeze(0).to(self.config.params_dtype)
         k = apply_rotary_emb(k, cos, sin).squeeze(0).to(self.config.params_dtype)
         v = v.squeeze(0).to(self.config.params_dtype)
+        return q, k, v, gates
 
-        output = self.packed_attention(
+    def attend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        varlen_handler: VarlenHandler,
+        cp_split_sizes: list[int] | torch.Tensor,
+    ) -> torch.Tensor:
+        return self.packed_attention(
             q,
             k,
             v,
@@ -173,7 +182,14 @@ class Magi2Attention(nn.Module):
                 }
             ),
         )
-        output = modality_dispatcher.permute(output)
+
+    def output(
+        self,
+        attention: torch.Tensor,
+        gates: torch.Tensor,
+        modality_dispatcher: ModalityDispatcher,
+    ) -> torch.Tensor:
+        output = modality_dispatcher.permute(attention)
         output = output * torch.sigmoid(gates)
         output = output.reshape(-1, self.q_size).to(self.config.params_dtype)
         return self.linear_proj(output, modality_dispatcher)
@@ -304,12 +320,21 @@ class Magi2MultiHeadMoELayer(nn.Module):
             modality.contiguous(), dispatcher
         )
 
-    def forward(self, hidden_states: torch.Tensor, dispatcher: ModalityDispatcher) -> torch.Tensor:
+    def route_input(
+        self,
+        hidden_states: torch.Tensor,
+        dispatcher: ModalityDispatcher,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         normalized = self.pre_norm(hidden_states, dispatcher)
-        routed = self.split_linear(normalized)
-        routed = self.moe_mlp(routed)
-        routed = self.merge_linear(routed)
-        return routed + self._shared_experts(normalized, dispatcher)
+        return normalized, self.split_linear(normalized)
+
+    def combine(
+        self,
+        normalized: torch.Tensor,
+        routed: torch.Tensor,
+        dispatcher: ModalityDispatcher,
+    ) -> torch.Tensor:
+        return self.merge_linear(routed) + self._shared_experts(normalized, dispatcher)
 
 
 class Magi2PreAdapter(nn.Module):
@@ -417,8 +442,10 @@ class Magi2TransformerLayer(nn.Module):
         self.mlp: nn.Module
         if layer_index in config.moe.layers:
             self.mlp = Magi2MultiHeadMoELayer(config)
+            self.region_methods = ("_attention_input", "_moe_input", "_moe_output")
         else:
             self.mlp = Magi2MLP(config, num_modality=num_modality)
+            self.region_methods = ("_attention_input", "_dense_output")
         self._init_mhc(num_modality)
 
     def _init_mhc(self, num_modality: int) -> None:
@@ -517,6 +544,74 @@ class Magi2TransformerLayer(nn.Module):
         )
         return self.mhc_handler.hyper_connect(streams, output, post, residual)
 
+    # The layer forward is split into compile regions around the two eager
+    # kernels: packed attention and the multi-head MoE.
+
+    def _attention_input(
+        self,
+        hidden_states: torch.Tensor,
+        rope: torch.Tensor,
+        modality_dispatcher: ModalityDispatcher,
+    ) -> tuple[torch.Tensor, MHCTensorTuple, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        streams = hidden_states.reshape(hidden_states.shape[0], self.config.mhc.num_streams, self.config.hidden_size)
+        attention_logits = self._branch_logits(streams, "attn", modality_dispatcher)
+        attention_input = self._branch_input(streams, "attn", attention_logits)
+        q, k, v, gates = self.attention.project(attention_input, rope, modality_dispatcher)
+        return streams, attention_logits, q, k, v, gates
+
+    def _mlp_input(
+        self,
+        streams: torch.Tensor,
+        attention: torch.Tensor,
+        gates: torch.Tensor,
+        attention_logits: MHCTensorTuple,
+        modality_dispatcher: ModalityDispatcher,
+    ) -> tuple[torch.Tensor, MHCTensorTuple, torch.Tensor]:
+        attention_output = self.attention.output(attention, gates, modality_dispatcher)
+        streams = self._connect(streams, attention_output, "attn", attention_logits)
+        mlp_logits = self._branch_logits(streams, "mlp", modality_dispatcher)
+        return streams, mlp_logits, self._branch_input(streams, "mlp", mlp_logits)
+
+    def _dense_output(
+        self,
+        streams: torch.Tensor,
+        attention: torch.Tensor,
+        gates: torch.Tensor,
+        attention_logits: MHCTensorTuple,
+        modality_dispatcher: ModalityDispatcher,
+    ) -> torch.Tensor:
+        streams, mlp_logits, mlp_input = self._mlp_input(
+            streams, attention, gates, attention_logits, modality_dispatcher
+        )
+        streams = self._connect(streams, self.mlp(mlp_input, modality_dispatcher), "mlp", mlp_logits)
+        return streams.reshape(streams.shape[0], -1)
+
+    def _moe_input(
+        self,
+        streams: torch.Tensor,
+        attention: torch.Tensor,
+        gates: torch.Tensor,
+        attention_logits: MHCTensorTuple,
+        modality_dispatcher: ModalityDispatcher,
+    ) -> tuple[torch.Tensor, MHCTensorTuple, torch.Tensor, torch.Tensor]:
+        streams, mlp_logits, mlp_input = self._mlp_input(
+            streams, attention, gates, attention_logits, modality_dispatcher
+        )
+        normalized, routed = self.mlp.route_input(mlp_input, modality_dispatcher)
+        return streams, mlp_logits, normalized, routed
+
+    def _moe_output(
+        self,
+        streams: torch.Tensor,
+        mlp_logits: MHCTensorTuple,
+        normalized: torch.Tensor,
+        routed: torch.Tensor,
+        modality_dispatcher: ModalityDispatcher,
+    ) -> torch.Tensor:
+        mlp_output = self.mlp.combine(normalized, routed, modality_dispatcher)
+        streams = self._connect(streams, mlp_output, "mlp", mlp_logits)
+        return streams.reshape(streams.shape[0], -1)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -525,22 +620,15 @@ class Magi2TransformerLayer(nn.Module):
         modality_dispatcher: ModalityDispatcher,
         cp_split_sizes: list[int] | torch.Tensor,
     ) -> torch.Tensor:
-        streams = hidden_states.reshape(hidden_states.shape[0], self.config.mhc.num_streams, self.config.hidden_size)
-        attention_logits = self._branch_logits(streams, "attn", modality_dispatcher)
-        attention_input = self._branch_input(streams, "attn", attention_logits)
-        attention_output = self.attention(
-            attention_input,
-            rope,
-            varlen_handler,
-            modality_dispatcher,
-            cp_split_sizes,
+        streams, attention_logits, q, k, v, gates = self._attention_input(hidden_states, rope, modality_dispatcher)
+        attention = self.attention.attend(q, k, v, varlen_handler, cp_split_sizes)
+        if not isinstance(self.mlp, Magi2MultiHeadMoELayer):
+            return self._dense_output(streams, attention, gates, attention_logits, modality_dispatcher)
+        streams, mlp_logits, normalized, routed = self._moe_input(
+            streams, attention, gates, attention_logits, modality_dispatcher
         )
-        streams = self._connect(streams, attention_output, "attn", attention_logits)
-        mlp_logits = self._branch_logits(streams, "mlp", modality_dispatcher)
-        mlp_input = self._branch_input(streams, "mlp", mlp_logits)
-        mlp_output = self.mlp(mlp_input, modality_dispatcher)
-        streams = self._connect(streams, mlp_output, "mlp", mlp_logits)
-        return streams.reshape(streams.shape[0], -1)
+        routed = self.mlp.moe_mlp(routed)
+        return self._moe_output(streams, mlp_logits, normalized, routed, modality_dispatcher)
 
 
 class Magi2TransformerBlock(nn.Module):
@@ -621,6 +709,15 @@ class Magi2PreviewTransformer(nn.Module):
         """Expose Preview layers to the shared offload block discovery API."""
 
         return self.block.layers
+
+    def compile_regions(self, **compile_kwargs: Any) -> None:
+        """Compile the dense compute between the eager attention and MoE kernels."""
+
+        self.pre_adapter.forward = torch.compile(self.pre_adapter.forward, **compile_kwargs)
+        self.post_adapter.forward = torch.compile(self.post_adapter.forward, **compile_kwargs)
+        for layer in self.block.layers:
+            for name in layer.region_methods:
+                setattr(layer, name, torch.compile(getattr(layer, name), **compile_kwargs))
 
     def forward(
         self,
