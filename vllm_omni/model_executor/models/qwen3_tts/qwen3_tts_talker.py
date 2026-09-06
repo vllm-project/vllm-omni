@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 import numpy as np
@@ -496,6 +497,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # the same req_id ordering that indexes sampling_metadata.
         self._req_x_vector_only: dict[str, bool | None] = {}
         self._batch_req_ids: list[str] = []
+        self._mrv2_silence_ban_mask: torch.Tensor | None = None
 
         # Keys that should stay on GPU in model_intermediate_buffer to avoid
         # CPU-to-GPU round-trips on every decode step.
@@ -641,6 +643,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Suppress silence-region tokens for the first N decode frames (#4966). The
         # per-request decode step is the length of its generated-token history.
         ban_n = self._silence_ban_frames
+        if ban_n > 0 and sampling_metadata is None and self._mrv2_silence_ban_mask is not None:
+            if self._mrv2_silence_ban_mask.shape[0] != logits.shape[0]:
+                raise ValueError("MRV2 silence-ban batch must match the sampled logits rows")
+            return logits.masked_fill(self._mrv2_silence_ban_mask & self._silence_mask, float("-inf"))
         if ban_n > 0 and sampling_metadata is not None:
             output_token_ids = getattr(sampling_metadata, "output_token_ids", None)
             if output_token_ids is None or len(output_token_ids) != logits.shape[0]:
@@ -1209,10 +1215,43 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         device: torch.device,
     ) -> None:
         """Batch new MRv2 prefill slots without rebuilding a req-id map."""
+        if self._silence_ban_frames > 0:
+            for info in req_infos:
+                self._req_x_vector_only[info["req_id"]] = resolve_x_vector_only(info)
         self._prompt_builder.preprocess_infos_batch(
             req_infos=req_infos,
             device=device,
         )
+
+    @contextmanager
+    def mrv2_sampling_context(self, *, req_ids: list[str], num_output_tokens: torch.Tensor) -> Iterator[None]:
+        """Scope the silence gate to sampling, never prompt-logprob computation."""
+        self.set_batch_req_ids(req_ids)
+        self._mrv2_silence_ban_mask = None
+        if self._silence_ban_frames > 0:
+            in_scope = torch.tensor(
+                [self._req_x_vector_only.get(req_id) is True for req_id in req_ids],
+                device=num_output_tokens.device,
+                dtype=torch.bool,
+            )
+            self._mrv2_silence_ban_mask = (in_scope & (num_output_tokens < self._silence_ban_frames)).unsqueeze(1)
+        try:
+            yield
+        finally:
+            self._mrv2_silence_ban_mask = None
+
+    def set_batch_req_ids(self, req_ids: Sequence[str]) -> None:
+        """Record the current batch's req_ids, in the order that indexes logits.
+
+        Called by the runner after the forward and before ``compute_logits``,
+        with the same ``input_batch`` ordering that ``sampling_metadata``
+        uses. Doubles as the eviction point: any request no longer in the batch
+        has finished or been aborted, so its recorded mode is dropped.
+        """
+        self._batch_req_ids = list(req_ids)
+        if len(self._req_x_vector_only) > len(self._batch_req_ids):
+            live = set(self._batch_req_ids)
+            self._req_x_vector_only = {k: v for k, v in self._req_x_vector_only.items() if k in live}
 
     def _encode_ref_audio_batch(self, wavs: list[np.ndarray], sr: int, *, device: torch.device) -> list[torch.Tensor]:
         fe = self._encoder_feature_extractor

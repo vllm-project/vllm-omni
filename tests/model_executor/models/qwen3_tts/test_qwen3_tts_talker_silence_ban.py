@@ -59,6 +59,7 @@ def _make_talker(*, ban_frames: int, logits: torch.Tensor, modes=None):
     object.__setattr__(talker, "_silence_mask", silence_mask)
     object.__setattr__(talker, "_codec_disallowed_mask", torch.zeros((_VOCAB,), dtype=torch.bool))
     object.__setattr__(talker, "_batch_req_ids", req_ids)
+    object.__setattr__(talker, "_mrv2_silence_ban_mask", None)
     object.__setattr__(
         talker,
         "_req_x_vector_only",
@@ -76,6 +77,45 @@ def _metadata(*steps: int):
 
 def _banned(row: torch.Tensor) -> set[int]:
     return {int(i) for i in torch.nonzero(torch.isinf(row) & (row < 0)).flatten()}
+
+
+def test_mrv2_silence_ban_tracks_batch_order_scope_and_decode_window() -> None:
+    talker = _make_talker(ban_frames=3, logits=torch.zeros((3, _VOCAB)), modes=[True, False, True])
+    with talker.mrv2_sampling_context(
+        req_ids=["req2", "req1", "req0"],
+        num_output_tokens=torch.tensor([3, 0, 1]),
+    ):
+        logits = talker.compute_logits(torch.zeros((3, 4)))
+
+    assert _banned(logits[0]) == set()
+    assert _banned(logits[1]) == set()
+    assert _banned(logits[2]) == set(_SILENCE_IDS)
+
+    # Prompt logprobs are computed after sampling and must remain unmasked.
+    assert not torch.isneginf(talker.compute_logits(torch.zeros((3, 4)))).any()
+
+    with talker.mrv2_sampling_context(
+        req_ids=["req2", "req1", "req0"],
+        num_output_tokens=torch.tensor([4, 1, 3]),
+    ):
+        assert not torch.isneginf(talker.compute_logits(torch.zeros((3, 4)))).any()
+
+
+def test_mrv2_prefill_records_generation_mode_before_prompt_preparation() -> None:
+    talker = _mode_talker()
+    infos = [
+        {"req_id": "xvec", **_info(xvec=True)},
+        {"req_id": "icl", **_info(xvec=False)},
+    ]
+    seen = []
+
+    def prepare(**kwargs):
+        assert talker._req_x_vector_only == {"xvec": True, "icl": False}
+        seen.append(kwargs["req_infos"])
+
+    object.__setattr__(talker, "_prompt_builder", SimpleNamespace(preprocess_infos_batch=prepare))
+    talker.preprocess_batch_mrv2(req_infos=infos, device=torch.device("cpu"))
+    assert seen == [infos]
 
 
 # -------------------- the step gate --------------------

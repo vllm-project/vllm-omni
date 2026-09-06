@@ -1,5 +1,6 @@
 """Unit tests for OmniARModelRunner v2."""
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -147,7 +148,8 @@ def test_non_last_pp_rank_uses_vllm_027_pp_handler() -> None:
     assert output.kv_connector_output is connector_output
 
 
-def test_last_pp_rank_runs_connector_after_sampling_state_is_finalized(monkeypatch) -> None:
+@pytest.mark.parametrize("needs_history", [False, True])
+def test_last_pp_rank_runs_connector_after_sampling_state_is_finalized(monkeypatch, needs_history) -> None:
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
     input_batch = SimpleNamespace(
         req_ids=["req"],
@@ -184,8 +186,35 @@ def test_last_pp_rank_runs_connector_after_sampling_state_is_finalized(monkeypat
             torch.tensor([0]),
         )
     )
-    runner.model = SimpleNamespace(compute_logits=MagicMock())
-    runner.prompt_logprobs_worker = SimpleNamespace(compute_prompt_logprobs=MagicMock(return_value={}))
+    sampling_active = False
+
+    @contextmanager
+    def sampling_context(*, req_ids, num_output_tokens):
+        nonlocal sampling_active
+        assert needs_history
+        assert req_ids == ["req"]
+        torch.testing.assert_close(num_output_tokens, torch.tensor([2]))
+        sampling_active = True
+        try:
+            yield
+        finally:
+            sampling_active = False
+
+    def check_sample(*_args):
+        assert sampling_active is needs_history
+        return runner.sample.return_value
+
+    def prompt_logprobs(*_args):
+        assert not sampling_active
+        return {}
+
+    runner.sample.side_effect = check_sample
+    runner.model = SimpleNamespace(
+        compute_logits=MagicMock(),
+        logitsprocs_need_output_token_ids=needs_history,
+        mrv2_sampling_context=sampling_context,
+    )
+    runner.prompt_logprobs_worker = SimpleNamespace(compute_prompt_logprobs=MagicMock(side_effect=prompt_logprobs))
     runner.postprocess_sampled = MagicMock()
     connector_output = object()
 

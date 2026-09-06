@@ -10,6 +10,7 @@ Extends ``OmniGPUModelRunner`` with:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any
 
 import numpy as np
@@ -185,11 +186,24 @@ class OmniARModelRunner(OmniGPUModelRunner):
             self._last_multimodal_snapshot_slot = None
 
         # --- Standard v2 sampling ---
-        sampler_output, num_sampled, num_rejected = self.sample(
-            text_hidden,
-            input_batch,
-            grammar_output,
-        )
+        sampling_context = nullcontext()
+        model_sampling_context = getattr(self.model, "mrv2_sampling_context", None)
+        if callable(model_sampling_context) and getattr(self.model, "logitsprocs_need_output_token_ids", False):
+            # seq_lens includes this forward's input, but not its sampled token:
+            # final prefill has zero prior outputs; the first decode has one.
+            sampling_context = model_sampling_context(
+                req_ids=input_batch.req_ids,
+                num_output_tokens=(
+                    input_batch.seq_lens[: input_batch.num_reqs]
+                    - self.req_states.prompt_len.gpu[input_batch.idx_mapping]
+                ),
+            )
+        with sampling_context:
+            sampler_output, num_sampled, num_rejected = self.sample(
+                text_hidden,
+                input_batch,
+                grammar_output,
+            )
         if self.pp_handler is not None:
             self.pp_handler.broadcast(
                 sampler_output.sampled_token_ids,
