@@ -72,3 +72,32 @@ def test_empty_text_stream_on_the_default_backend():
             image_rotary_emb=(angles.cos().to(torch.bfloat16), angles.sin().to(torch.bfloat16)),
         )
     assert out.shape == (1, 0, DIM)
+
+
+@pytest.mark.parametrize("dt", [torch.float32], ids=["fp32"])
+def test_fp32_falls_back_to_sdpa_and_matches_reference(dt):
+    """FlashAttention only supports fp16/bf16 and raises on fp32, which the
+    previous SDPA arithmetic served. The processor keeps fp32 on SDPA with native
+    GQA. Without the dtype gate the shared FLASH_ATTN call raises on fp32."""
+    torch.manual_seed(0)
+    block = (
+        TransformerBlock(DIM, HEADS, KV_HEADS, multiple_of=256, ffn_dim_multiplier=1.0, norm_eps=1e-5)
+        .cuda()
+        .to(dt)
+        .eval()
+    )
+    seq = 512
+    hidden = torch.randn(2, seq, DIM, device="cuda", dtype=dt)
+    mask = torch.ones(2, seq, dtype=torch.bool, device="cuda")
+    mask[0, seq - 40 :] = False
+    angles = torch.rand(1, seq, block.head_dim, device="cuda")
+    rotary = (angles.cos().to(dt), angles.sin().to(dt))
+    with torch.no_grad():
+        got = block.attn(
+            hidden_states=hidden, encoder_hidden_states=hidden, attention_mask=mask, image_rotary_emb=rotary
+        )
+        want = _reference_attention(block.attn, hidden, mask, rotary)
+    assert torch.isfinite(got).all()
+    assert torch.count_nonzero(got[~mask]) == 0
+    diff = (got.float() - want.float()).abs()[mask]
+    assert diff.max().item() < 1e-3, diff.max().item()
