@@ -5,14 +5,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from contextlib import nullcontext
+import time
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from typing import Any, ClassVar
 
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
+from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -59,6 +61,8 @@ from .ltx2_request import (
     LTXRequestMixin,
     validate_pipeline_request,
 )
+
+logger = init_logger(__name__)
 
 
 def _run_ltx_vocoder(vocoder: nn.Module, generated_mel: torch.Tensor) -> torch.Tensor:
@@ -195,7 +199,7 @@ class LTXRuntime(
     connector_batches_cfg = False
     distributed_video_decode = True
     support_image_input = False
-    dummy_run_num_frames = 1
+    dummy_run_num_frames: ClassVar[int] = 0
     preserve_sp_padded_audio_duration = False
     reports_stage_durations = False
 
@@ -206,6 +210,14 @@ class LTXRuntime(
             raise ValueError(
                 f"{self.__class__.__name__} does not support ulysses_mode='advanced_uaa'. "
                 "Use the default ulysses_mode='strict' for LTX sequence parallelism."
+            )
+        ring_degree = getattr(parallel_config, "ring_degree", 1)
+        allgather_degree = getattr(parallel_config, "allgather_degree", 1)
+        if ring_degree != 1 or allgather_degree != 1:
+            raise ValueError(
+                f"{self.__class__.__name__} supports pure Ulysses sequence parallelism only. "
+                "Set ring_degree=1 and allgather_degree=1; "
+                f"got {ring_degree=} and {allgather_degree=}."
             )
         self.model_version = detect_ltx_model_version(od_config.model, revision=getattr(od_config, "revision", None))
         self.use_diffusion_decoder = _ltx2_use_diffusion_decoder(od_config, self.model_version)
@@ -354,27 +366,29 @@ class LTXRuntime(
                 )
             )
             self._enter_phase(phase_recipe)
-            phase_inputs = self._build_phase_inputs(
-                request_inputs,
-                phase_recipe,
-                phase_results[-1] if phase_results else None,
-            )
+            with self._profile_phase_method("_build_phase_inputs", phase_recipe.name):
+                phase_inputs = self._build_phase_inputs(
+                    request_inputs,
+                    phase_recipe,
+                    phase_results[-1] if phase_results else None,
+                )
             if phase_sigmas is not None:
                 phase_inputs = replace(phase_inputs, num_inference_steps=len(phase_sigmas) - 1)
             noise_scale = phase_recipe.noise_scale
             if override_sigmas is not None and phase_recipe.input_transform == "spatial_upsample":
                 noise_scale = float(override_sigmas[0])
-            phase_result = self.run_phase(
-                req,
-                phase_inputs,
-                noise_scale=noise_scale,
-                sigmas=phase_sigmas,
-                timesteps=None,
-                attention_kwargs=None,
-                phase_recipe=phase_recipe,
-                image=image,
-                prompt_context=prompt_context,
-            )
+            with self._profile_phase_method("run_phase", phase_recipe.name):
+                phase_result = self.run_phase(
+                    req,
+                    phase_inputs,
+                    noise_scale=noise_scale,
+                    sigmas=phase_sigmas,
+                    timesteps=None,
+                    attention_kwargs=None,
+                    phase_recipe=phase_recipe,
+                    image=image,
+                    prompt_context=prompt_context,
+                )
             phase_results.append(phase_result)
             prompt_context = phase_result.forward_context.prompt_context
 
@@ -384,7 +398,45 @@ class LTXRuntime(
             video=phase_results[self.pipeline_recipe.video_output_phase].video,
             audio=phase_results[self.pipeline_recipe.audio_output_phase].audio,
         )
-        return self.decode_phase(output_phase)
+        with self._profile_phase_method("decode_phase"):
+            output = self.decode_phase(output_phase)
+        return self._attach_profiled_stage_durations(output)
+
+    @contextmanager
+    def _profile_phase_method(self, method_name: str, phase_name: str | None = None) -> Iterator[None]:
+        if not getattr(self, "enable_diffusion_pipeline_profiler", False):
+            yield
+            return
+
+        metric_parts = [self.__class__.__name__]
+        if phase_name is not None:
+            metric_parts.append(phase_name)
+        metric_parts.append(method_name)
+        metric_name = ".".join(metric_parts)
+
+        if current_omni_platform.is_available():
+            current_omni_platform.synchronize()
+        start_time = time.perf_counter()
+        try:
+            yield
+        finally:
+            if current_omni_platform.is_available():
+                current_omni_platform.synchronize()
+            duration = time.perf_counter() - start_time
+            logger.info("[DiffusionPipelineProfiler] %s took %.6fs", metric_name, duration)
+            with self._profiler_lock:
+                self._stage_durations[metric_name] = self._stage_durations.get(metric_name, 0.0) + duration
+
+    def _attach_profiled_stage_durations(
+        self, output: DiffusionOutput | list[DiffusionOutput]
+    ) -> DiffusionOutput | list[DiffusionOutput]:
+        if not getattr(self, "enable_diffusion_pipeline_profiler", False):
+            return output
+        stage_durations = self.stage_durations
+        outputs = output if isinstance(output, list) else [output]
+        for item in outputs:
+            item.stage_durations = dict(stage_durations)
+        return output
 
     def _enter_phase(self, phase: LTXPhaseRecipe) -> None:
         self._active_phase_name = phase.name

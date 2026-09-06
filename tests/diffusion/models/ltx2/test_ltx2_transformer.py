@@ -141,16 +141,54 @@ def test_ltx_transformer_exposes_hsdp_shard_conditions_for_blocks():
 
 
 @pytest.mark.parametrize("rope_type", ["interleaved", "split"])
-def test_ltx_sp_plan_shards_video_and_audio_timesteps_together(rope_type):
-    root_plan = LTX2VideoTransformer3DModel._build_sp_plan(rope_type)[""]
+def test_ltx_sp_plan_only_shards_video_stream(rope_type):
+    plan = LTX2VideoTransformer3DModel._build_sp_plan(rope_type)
+    root_plan = plan[""]
 
-    video_timestep = root_plan["timestep"]
-    audio_timestep = root_plan["audio_timestep"]
+    assert set(root_plan) == {"hidden_states", "keyframes_mask", "timestep"}
+    assert root_plan["hidden_states"].split_dim == 1
+    assert root_plan["keyframes_mask"].split_dim == 1
+    assert root_plan["timestep"].split_dim == 1
+    assert root_plan["timestep"].expected_dims == 2
+    assert not root_plan["timestep"].split_output
+    assert set(plan) == {"", "rope", "cross_attn_rope", "proj_out"}
 
-    assert video_timestep.split_dim == audio_timestep.split_dim == 1
-    assert video_timestep.expected_dims == audio_timestep.expected_dims == 2
-    assert not video_timestep.split_output
-    assert not audio_timestep.split_output
+
+def test_ltx_attention_assigns_video_only_sp_modes(monkeypatch):
+    modes = {}
+
+    class FakeAttention(nn.Module):
+        def __init__(self, *, prefix, sequence_parallel_mode="local", **_kwargs):
+            super().__init__()
+            modes[prefix.rsplit(".", 1)[-1]] = sequence_parallel_mode
+
+    class FakeFeedForward(nn.Module):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+
+    monkeypatch.setattr(ltx2_transformer, "LTX2Attention", FakeAttention)
+    monkeypatch.setattr(ltx2_transformer, "LTX2FeedForward", FakeFeedForward)
+
+    LTX2VideoTransformerBlock(
+        dim=8,
+        num_attention_heads=2,
+        attention_head_dim=4,
+        cross_attention_dim=8,
+        audio_dim=8,
+        audio_num_attention_heads=2,
+        audio_attention_head_dim=4,
+        audio_cross_attention_dim=8,
+        prefix="transformer_blocks.0",
+    )
+
+    assert modes == {
+        "attn1": "video_self",
+        "audio_attn1": "local",
+        "attn2": "local",
+        "audio_attn2": "local",
+        "audio_to_video_attn": "local",
+        "video_to_audio_attn": "video_to_audio",
+    }
 
 
 def test_ltx_sp_keeps_cross_attention_key_padding_mask(monkeypatch):
