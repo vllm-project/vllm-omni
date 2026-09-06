@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """MingFlashOmniTTS serving adapter."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 
@@ -64,6 +64,38 @@ class MingFlashOmniTTSAdapter(ARTTSAdapter):
         server = self.ctx.server
         prompt = server._build_ming_flash_omni_prompt(request)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="ming_flash_omni_tts")
+
+    def apply_sampling_overrides(
+        self,
+        sampling_params_list: list,
+        request: "OpenAICreateSpeechRequest",
+        prompt: dict[str, Any] | None = None,
+        request_id: str | None = None,
+    ) -> list:
+        """Size Stage-0 for the native-paged talker.
+
+        The paged Qwen2 backbone runs one AR step per audio frame, so
+        ``max_tokens`` must cover the full decode budget (mirrored into
+        ``max_decode_steps`` on the prompt) and generation stops on the talker
+        EOS (token id 1).
+        """
+        import copy
+
+        from vllm_omni.entrypoints.openai.serving_speech import _TTS_MAX_NEW_TOKENS_MAX
+
+        if not sampling_params_list:
+            return sampling_params_list
+
+        sampling_params_list = copy.deepcopy(sampling_params_list)
+        max_tokens = request.max_new_tokens or getattr(sampling_params_list[0], "max_tokens", None)
+        max_tokens = int(max_tokens or _TTS_MAX_NEW_TOKENS_MAX)
+        sampling_params_list[0].max_tokens = max_tokens
+        if isinstance(prompt, dict):
+            prompt.setdefault("additional_information", {})["max_decode_steps"] = max_tokens
+        stop_token_ids = set(getattr(sampling_params_list[0], "stop_token_ids", None) or [])
+        stop_token_ids.add(1)
+        sampling_params_list[0].stop_token_ids = sorted(stop_token_ids)
+        return sampling_params_list
 
     def _load_supported_speakers(self) -> set[str]:
         # Speaker selection is driven by caption JSON rather than a static table.

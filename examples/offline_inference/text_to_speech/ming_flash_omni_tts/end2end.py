@@ -16,6 +16,10 @@ from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
     DEFAULT_PROMPT,
     create_instruction,
 )
+from vllm_omni.model_executor.stage_input_processors.ming_flash_omni import (
+    build_ming_talker_prompt_token_ids_for_info,
+    get_ming_talker_tokenizer,
+)
 
 MODEL_NAME = "Jonathan1909/Ming-flash-omni-2.0"
 
@@ -85,6 +89,10 @@ def parse_args():
     )
     parser.add_argument("--text", type=str, default=None, help="Override default text for the selected case.")
     parser.add_argument("--output", type=str, default=None, help="Output wav path.")
+    parser.add_argument("--seed", type=int, default=None, help="Optional deterministic Ming talker seed.")
+    parser.add_argument("--max-decode-steps", type=int, default=200, help="Maximum talker decode steps.")
+    parser.add_argument("--min-new-token", type=int, default=None, help="Minimum talker decode steps before stop.")
+    parser.add_argument("--no-stream-decode", action="store_true", help="Decode the final latent sequence in one pass.")
     parser.add_argument("--log-stats", action="store_true", default=False, help="Enable stats logging.")
     parser.add_argument("--init-timeout", type=int, default=600, help="Engine init timeout in seconds.")
     parser.add_argument("--stage-init-timeout", type=int, default=300, help="Single stage init timeout in seconds.")
@@ -101,14 +109,32 @@ def main():
     decode_args = {
         # Standalone TTS deployment
         "ming_task": "instruct",
-        "max_decode_steps": 200,
+        "max_decode_steps": args.max_decode_steps,
         "cfg": 2.0,
         "sigma": 0.25,
         "temperature": 0.0,
     }
+    if args.min_new_token is not None:
+        decode_args["min_new_token"] = args.min_new_token
+    if args.seed is not None:
+        decode_args["seed"] = args.seed
+    if args.no_stream_decode:
+        decode_args["stream_decode"] = False
+    additional_information = {**messages, **decode_args}
+    tokenizer = get_ming_talker_tokenizer(getattr(omni, "engine", None))
+    if tokenizer is None:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(args.model, subfolder="talker/llm", trust_remote_code=True)
+    prompt_token_ids = build_ming_talker_prompt_token_ids_for_info(
+        text=messages["text"],
+        additional_info=additional_information,
+        tokenizer=tokenizer,
+    ) or [0]
+
     req = OmniTokensPrompt(
-        prompt_token_ids=[0],
-        additional_information={**messages, **decode_args},
+        prompt_token_ids=prompt_token_ids,
+        additional_information=additional_information,
     )
 
     outputs = omni.generate(req)

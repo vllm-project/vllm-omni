@@ -3,7 +3,7 @@
 """Ming-flash-omni-2.0 pipeline topology (frozen).
 
 Stage 0: Thinker — multimodal understanding + text generation.
-Stage 1: Talker  — text -> audio waveform via CFM + AudioVAE.
+Stage 1: Talker  — scheduler-driven native-paged Qwen2 -> CFM -> AudioVAE.
 
 The thinker -> talker bridge passes the detokenized text rather than
 hidden states; the talker has a self-contained Qwen2 LLM that retokenizes
@@ -51,7 +51,7 @@ MING_FLASH_OMNI_PIPELINE = PipelineConfig(
             # Talker is a self-contained Qwen2 LLM + CFM + AudioVAE;
             # it does not share the thinker backbone, so it gets its own arch.
             model_arch="MingFlashOmniTalkerForConditionalGeneration",
-            execution_type=StageExecutionType.LLM_GENERATION,
+            execution_type=StageExecutionType.LLM_AR,
             input_sources=(0,),
             final_output=True,
             final_output_type="audio",
@@ -59,6 +59,10 @@ MING_FLASH_OMNI_PIPELINE = PipelineConfig(
             engine_output_type="audio",
             tokenizer_subdir="talker/llm",
             sync_process_input_func=f"{_PROC}.thinker2talker_token_only",
+            # The native-paged talker signals EOS via stop-token id 1
+            # (see compute_logits); declare it here so deploy configs
+            # cannot silently drop it.
+            sampling_constraints={"stop_token_ids": [1]},
         ),
     ),
 )
@@ -73,7 +77,7 @@ MING_FLASH_OMNI_TTS_PIPELINE = PipelineConfig(
         StagePipelineConfig(
             stage_id=0,
             model_stage="ming_tts",
-            execution_type=StageExecutionType.LLM_GENERATION,
+            execution_type=StageExecutionType.LLM_AR,
             input_sources=(),
             final_output=True,
             final_output_type="audio",
@@ -81,6 +85,10 @@ MING_FLASH_OMNI_TTS_PIPELINE = PipelineConfig(
             hf_config_name="talker_config",
             engine_output_type="audio",
             tokenizer_subdir="talker/llm",
+            # The native-paged talker signals EOS via stop-token id 1
+            # (see compute_logits); declare it here so deploy configs
+            # cannot silently drop it.
+            sampling_constraints={"stop_token_ids": [1]},
         ),
     ),
 )

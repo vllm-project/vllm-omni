@@ -85,6 +85,32 @@ def maybe_expand_image_gen_prompt(
 
 DEFAULT_PROMPT = "Please generate speech based on the following description.\n"
 
+# Max characters per TTS segment. The stage input processor and the talker must
+# segment identically — the processor sizes prompt-KV slots from the first
+# segment that the talker will then synthesize — so both read this constant.
+DEFAULT_MAX_TEXT_LENGTH = 50
+
+
+def resolve_ming_prompt_fields(additional_info: dict[str, Any]) -> tuple[bool, str, str | None, bool]:
+    """Resolve ``(is_omni_task, prompt, instruction, use_zero_spk_emb)`` for a talker request.
+
+    The stage input processor sizes prompt-KV slots from these fields and the
+    talker builds the prefill embeddings from them, so both sides must resolve
+    them identically or the slot count and the embeddings drift apart.
+
+    ``ming_task="omni"`` (thinker -> talker hand-off) pins the upstream Ming
+    defaults; ``"instruct"`` (standalone TTS) honours caller-supplied fields.
+    """
+    if additional_info.get("ming_task", "instruct") == "omni":
+        return True, DEFAULT_PROMPT, None, additional_info.get("spk_emb") is None
+    return (
+        False,
+        additional_info.get("prompt", DEFAULT_PROMPT),
+        additional_info.get("instruction"),
+        bool(additional_info.get("use_zero_spk_emb", False)),
+    )
+
+
 BASE_CAPTION_TEMPLATE: dict[str, Any] = {
     "audio_sequence": [
         {
@@ -135,6 +161,8 @@ __all__ = [
     "DEFAULT_NUM_QUERY_TOKENS",
     "maybe_expand_image_gen_prompt",
     "DEFAULT_PROMPT",
+    "DEFAULT_MAX_TEXT_LENGTH",
+    "resolve_ming_prompt_fields",
     "BASE_CAPTION_TEMPLATE",
     "create_instruction",
 ]

@@ -20,21 +20,17 @@
 # GLIDE: https://github.com/openai/glide-text2im
 # MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
 # --------------------------------------------------------
-import logging
-from functools import cached_property
-from queue import Queue
-from threading import Lock
+import os
 
 import torch
 import torch.nn as nn
-from transformers import PreTrainedTokenizerBase, Qwen2Config, Qwen2Model, StaticCache
+from transformers import PreTrainedTokenizerBase, Qwen2Config
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
 from x_transformers.x_transformers import RotaryEmbedding
 
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
 from vllm_omni.model_executor.models.common.ming.aggregator import Aggregator
-from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE
+from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE, AudioVAEConfig
 from vllm_omni.model_executor.models.common.ming.cfm_solver import (
     apply_sway_sampling,
     get_epss_timesteps,
@@ -173,146 +169,6 @@ class CFM(nn.Module):
         return integrate_cfm_steps(fn, y0, t, sde_args, sde_rnd, self.steps)
 
 
-class CFMGraphExecutor:
-    """CUDA graph-accelerated executor for CFM + Aggregator + StopHead pipeline."""
-
-    def __init__(self, config, cfm, aggregator, stop_head: nn.Linear):
-        self.config = config
-        self.cfm = cfm
-        self.aggregator = aggregator
-        self.stop_head = stop_head
-        self.initialized = False
-
-        self.last_hidden_state_placeholder = None
-        self.his_lat_placeholder = None
-        self.randn_like_placeholder = None
-        self.t_placeholder = None
-        self.sde_args_placeholder = None
-        self.sde_rnd_placeholder = None
-        self.gen_lat_placeholder = None
-        self.inputs_embeds_placeholder = None
-        self.stop_out_placeholder = None
-        self.graph = None
-
-    def execute(
-        self,
-        input_tensor: torch.Tensor,
-        his_lat: torch.Tensor,
-        cfg_strength: float = 2.0,
-        sigma: float = 0.25,
-        temperature: float = 0.0,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        bat_size, his_patch_size, z_dim = his_lat.shape
-        randn_tensor = torch.randn(
-            (bat_size, self.config.patch_size, z_dim), device=input_tensor.device, dtype=input_tensor.dtype
-        )
-        t = get_epss_timesteps(self.config.steps, device=input_tensor.device, dtype=input_tensor.dtype)
-        sde_rnd = torch.randn(
-            (self.config.steps, *randn_tensor.shape), device=input_tensor.device, dtype=input_tensor.dtype
-        )
-
-        if not self.initialized:
-            self._initialize_graph(input_tensor, his_lat, randn_tensor, sde_rnd)
-
-        self.last_hidden_state_placeholder.copy_(input_tensor)
-        self.his_lat_placeholder.copy_(his_lat)
-        self.randn_like_placeholder.copy_(randn_tensor)
-        self.t_placeholder.copy_(t)
-        self.sde_args_placeholder[0] = cfg_strength
-        self.sde_args_placeholder[1] = sigma
-        self.sde_args_placeholder[2] = temperature
-        self.sde_rnd_placeholder.copy_(sde_rnd)
-
-        self.graph.replay()
-
-        gen_lat = torch.empty_like(self.gen_lat_placeholder)
-        gen_lat.copy_(self.gen_lat_placeholder)
-
-        inputs_embeds = torch.empty_like(self.inputs_embeds_placeholder)
-        inputs_embeds.copy_(self.inputs_embeds_placeholder)
-
-        stop_out = torch.empty_like(self.stop_out_placeholder)
-        stop_out.copy_(self.stop_out_placeholder)
-
-        return gen_lat, inputs_embeds, stop_out
-
-    def _initialize_graph(
-        self,
-        input_tensor: torch.Tensor,
-        his_lat: torch.Tensor,
-        randn_tensor: torch.Tensor,
-        sde_rnd: torch.Tensor,
-    ) -> None:
-        self.last_hidden_state_placeholder = torch.empty_like(input_tensor)
-        self.his_lat_placeholder = torch.empty_like(his_lat)
-        self.randn_like_placeholder = torch.empty_like(randn_tensor)
-        self.t_placeholder = get_epss_timesteps(self.config.steps, device=input_tensor.device, dtype=input_tensor.dtype)
-        self.sde_args_placeholder = torch.empty(3, device=input_tensor.device, dtype=input_tensor.dtype)
-        self.sde_rnd_placeholder = torch.empty_like(sde_rnd)
-
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph, pool=current_platform.get_global_graph_pool()):
-            self.gen_lat_placeholder = self.cfm.sample(
-                self.last_hidden_state_placeholder,
-                self.his_lat_placeholder,
-                self.randn_like_placeholder,
-                self.t_placeholder,
-                self.sde_args_placeholder,
-                self.sde_rnd_placeholder,
-            )
-            self.inputs_embeds_placeholder = self.aggregator(self.gen_lat_placeholder)
-            self.stop_out_placeholder = self.stop_head(self.last_hidden_state_placeholder[:, -1, :]).softmax(dim=-1)
-
-        self.initialized = True
-
-
-class CFMGraphExecutorPool:
-    """Thread-safe pool of CFMGraphExecutors for concurrent inference."""
-
-    def __init__(self, config, cfm, aggregator, stop_head: nn.Linear, pool_size: int = 1):
-        self.config = config
-        self.cfm = cfm
-        self.aggregator = aggregator
-        self.stop_head = stop_head
-        self.pool_size = pool_size
-        self.pool = Queue(maxsize=pool_size)
-        self.lock = Lock()
-
-        for _ in range(pool_size):
-            executor = CFMGraphExecutor(config, cfm, aggregator, stop_head)
-            self.pool.put(executor)
-
-    def acquire(self) -> CFMGraphExecutor:
-        return self.pool.get()
-
-    def release(self, executor: CFMGraphExecutor) -> None:
-        self.pool.put(executor)
-
-    def execute(
-        self,
-        input_tensor: torch.Tensor,
-        his_lat: torch.Tensor,
-        cfg_strength: float = 2.0,
-        sigma: float = 0.25,
-        temperature: float = 0.0,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        executor = self.acquire()
-        try:
-            return executor.execute(
-                input_tensor, his_lat, cfg_strength=cfg_strength, sigma=sigma, temperature=temperature
-            )
-        finally:
-            self.release(executor)
-
-
-########################################################################
-# Audio Postprocess
-# Adapted from:
-# https://github.com/inclusionAI/Ming/blob/e58533db227031990c5a6864dcf5f08fb53ed0d2/modeling_bailing_talker.py
-########################################################################
-
-
-@torch.no_grad()
 def resample(waveform: torch.Tensor, orig_sr: int, target_sr: int) -> torch.Tensor:
     """Resample a waveform via linear interpolation (no torchaudio dep).
 
@@ -504,41 +360,14 @@ def build_tts_input(
         prompt_text: Reference text for zero-shot voice cloning.
         prompt_wav_emb: Reference-wav embeddings to inject.
     """
-    spk_emb_prompt: list[int] = []
-    if spk_emb is not None:
-        for i in range(len(spk_emb)):
-            spk_emb_prompt.extend(
-                tokenizer.encode(f"  speaker_{i + 1}:")
-                + tokenizer.encode("<|vision_start|>")
-                + tokenizer.encode("<|vision_pad|>")
-                + tokenizer.encode("<|vision_end|>\n")
-            )
-
-    instruction_prompt: list[int] = []
-    if instruction is not None:
-        instruction_prompt = tokenizer.encode(instruction) + tokenizer.encode("<|im_end|>")
-
-    prompt_text_token: list[int] = []
-    prompt_latent_token: list[int] = []
-    if prompt_wav_emb is not None and prompt_text is not None:
-        prompt_text_token = tokenizer.encode(prompt_text)
-        prompt_latent_token = tokenizer.encode("<audioPatch>") * prompt_wav_emb.size(1)
-
-    prompt2 = [] if _looks_like_music_prompt(text) else tokenizer.encode(" Text input:\n")
-
-    input_part = (
-        tokenizer.encode("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n")
-        + tokenizer.encode("<|im_start|>user\n")
-        + tokenizer.encode(prompt)
-        + spk_emb_prompt
-        + prompt2
-        + prompt_text_token
-        + tokenizer.encode(text)
-        + tokenizer.encode("<|im_end|>\n")
-        + tokenizer.encode("<|im_start|>assistant\n")
-        + instruction_prompt
-        + tokenizer.encode("<audio>")
-        + prompt_latent_token
+    input_part = build_tts_prompt_token_ids(
+        tokenizer=tokenizer,
+        text=text,
+        prompt=prompt,
+        spk_emb_count=(len(spk_emb) if spk_emb is not None else 0),
+        instruction=instruction,
+        prompt_text=prompt_text,
+        prompt_wav_len=(int(prompt_wav_emb.size(1)) if prompt_wav_emb is not None else 0),
     )
 
     input_ids = torch.tensor(input_part, dtype=torch.long, device=device).unsqueeze(0)
@@ -565,21 +394,120 @@ def build_tts_input(
     return inputs_embeds, input_ids
 
 
+def build_tts_prompt_token_ids(
+    *,
+    tokenizer: PreTrainedTokenizerBase,
+    text: str,
+    prompt: str,
+    spk_emb_count: int = 0,
+    instruction: str | None = None,
+    prompt_text: str | None = None,
+    prompt_wav_len: int = 0,
+) -> list[int]:
+    """Build token IDs for the Ming talker prefill prompt.
+
+    This mirrors ``build_tts_input`` exactly, but does not require model
+    weights. Native vLLM scheduling needs the prompt length before model
+    ``preprocess()`` builds embeddings, so stage input processors use this
+    helper to allocate the correct number of paged-KV slots.
+    """
+    spk_emb_prompt: list[int] = []
+    for i in range(max(0, int(spk_emb_count))):
+        spk_emb_prompt.extend(
+            tokenizer.encode(f"  speaker_{i + 1}:")
+            + tokenizer.encode("<|vision_start|>")
+            + tokenizer.encode("<|vision_pad|>")
+            + tokenizer.encode("<|vision_end|>\n")
+        )
+
+    instruction_prompt: list[int] = []
+    if instruction is not None:
+        instruction_prompt = tokenizer.encode(instruction) + tokenizer.encode("<|im_end|>")
+
+    prompt_text_token: list[int] = []
+    prompt_latent_token: list[int] = []
+    if prompt_wav_len > 0 and prompt_text is not None:
+        prompt_text_token = tokenizer.encode(prompt_text)
+        prompt_latent_token = tokenizer.encode("<audioPatch>") * int(prompt_wav_len)
+
+    prompt2 = [] if _looks_like_music_prompt(text) else tokenizer.encode(" Text input:\n")
+
+    return (
+        tokenizer.encode("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n")
+        + tokenizer.encode("<|im_start|>user\n")
+        + tokenizer.encode(prompt)
+        + spk_emb_prompt
+        + prompt2
+        + prompt_text_token
+        + tokenizer.encode(text)
+        + tokenizer.encode("<|im_end|>\n")
+        + tokenizer.encode("<|im_start|>assistant\n")
+        + instruction_prompt
+        + tokenizer.encode("<audio>")
+        + prompt_latent_token
+    )
+
+
+def ming_prompt_wav_len(
+    num_samples: int,
+    *,
+    hop_size: int,
+    vae_patch_size: int,
+    patch_size: int,
+) -> int:
+    """Prompt-wav frames for ``num_samples`` samples at the AudioVAE sample rate.
+
+    One LLM token per ``hop_size * vae_patch_size * patch_size`` samples, with a
+    partial group zero-padded to a whole one (see ``_build_wav_embeddings``), so
+    the stage input processor can size prompt-KV slots without loading the VAE.
+    """
+    samples_per_frame = int(hop_size) * max(1, int(vae_patch_size)) * int(patch_size)
+    if samples_per_frame <= 0 or num_samples <= 0:
+        return 0
+    return -(-int(num_samples) // samples_per_frame)  # ceil division
+
+
+def resolve_audio_vae_config(
+    audio_vae_path: str | None, talker_dir: str, model_path: str
+) -> tuple[AudioVAEConfig, str | tuple[str, str]] | None:
+    """Resolve the AudioVAE config and where its weights live.
+
+    Returns ``(config, source)`` where source is a local directory or an
+    ``(repo_id, subfolder)`` HF hub tuple. Shared by the talker's VAE init and
+    the prompt-wav geometry derivation so the two can never disagree about
+    which config applies.
+    """
+    vae_path = audio_vae_path or os.path.join(talker_dir, "vae")
+    if os.path.isdir(vae_path):
+        try:
+            return AudioVAEConfig.from_pretrained(vae_path), vae_path
+        except Exception as e:
+            logger.warning("Failed to load AudioVAE config from %s: %s", vae_path, e)
+    for subfolder in ("talker/vae", "vae"):
+        try:
+            config = AudioVAEConfig.from_pretrained(model_path, subfolder=subfolder, trust_remote_code=True)
+            return config, (model_path, subfolder)
+        except Exception:
+            continue
+    return None
+
+
 ########################################################################
 # Audio Generator
 ########################################################################
 
 
 class MingAudioGenerator:
-    """Generator driving prefill -> AR decode -> VAE decode
-    for a single TTS request. The generator is stateless across requests.
+    """Audio-side helpers for the scheduler-driven talker: per-step CFM
+    sampling, the duration cap, and VAE waveform decode. The AR loop itself
+    is owned by the vLLM scheduler; this class is stateless across requests.
     """
 
     def __init__(
         self,
         config,
         llm_config: Qwen2Config,
-        model: Qwen2Model,
+        model: nn.Module,
         cfm: CFM,
         aggregator: Aggregator,
         stop_head: torch.nn.Module,
@@ -588,7 +516,6 @@ class MingAudioGenerator:
         his_patch_size: int,
         latent_dim: int,
         cfg_strength: float,
-        use_cuda_graphs: bool,
     ) -> None:
         self._config = config
         self._llm_config = llm_config
@@ -603,18 +530,9 @@ class MingAudioGenerator:
         self.latent_dim = latent_dim
         self.cfg_strength = cfg_strength
 
-        self._use_cuda_graphs = use_cuda_graphs
-
         # For FA2, let it see a full-length seq Q
         # trailing latent frames prepended on each decode call
         self._vae_decode_pad_frames = 32
-
-    @cached_property
-    def _sampler_pool(self) -> CFMGraphExecutorPool | None:
-        device = next(self._model.parameters()).device
-        if self._use_cuda_graphs and device.type == "cuda":
-            return CFMGraphExecutorPool(self._config, self._cfm, self._aggregator, self._stop_head, pool_size=1)
-        return None
 
     def duration_capped_steps(self, text_len: int, requested_max_steps: int) -> int:
         """Apply the original Ming duration heuristic as a cap on decode steps."""
@@ -633,62 +551,6 @@ class MingAudioGenerator:
         max_steps_by_duration = max(1, int(max_duration_s / seconds_per_step))
         return min(requested_max_steps, max_steps_by_duration)
 
-    @torch.no_grad()
-    def generate_latents(
-        self,
-        inputs_embeds: torch.Tensor,
-        *,
-        prompt_wav_lat: torch.Tensor | None = None,
-        min_new_token: int = 10,
-        max_steps: int = 1000,
-        cfg: float | None = None,
-        sigma: float = 0.25,
-        temperature: float = 0.0,
-        use_static_cache: bool = True,
-    ) -> list[torch.Tensor]:
-        """Autoregressive LLM + CFM sampling loop"""
-        if cfg is None:
-            cfg = self.cfg_strength
-        device = next(self._model.parameters()).device
-        dtype = next(self._model.parameters()).dtype
-
-        his_lat = self._init_his_lat(prompt_wav_lat, device, dtype)
-        past_key_values, max_cache_len = self._init_kv_cache(use_static_cache, device, dtype)
-        prefill_len = inputs_embeds.shape[1]
-        all_latents: list[torch.Tensor] = []
-
-        for step in range(min(max_steps, max_cache_len - prefill_len)):
-            last_hs = self.llm_step(
-                inputs_embeds,
-                step=step,
-                past_key_values=past_key_values,
-                use_static_cache=use_static_cache,
-            )
-            gen_lat, inputs_embeds, stop_out = self.cfm_sample_step(
-                last_hs, his_lat, cfg=cfg, sigma=sigma, temperature=temperature
-            )
-            his_lat = self._update_his_lat(his_lat, gen_lat)
-            all_latents.append(gen_lat)
-
-            stop_prob = stop_out.cpu()[0, 1].item()
-
-            if logger.isEnabledFor(logging.DEBUG):
-                if step % 50 == 0 or step < 5:
-                    logger.debug(
-                        "step=%d stop_prob=%.4f hs_norm=%.4f lat_norm=%.4f emb_norm=%.4f",
-                        step,
-                        stop_prob,
-                        last_hs.float().norm().item(),
-                        gen_lat.float().norm().item(),
-                        inputs_embeds.float().norm().item(),
-                    )
-
-            if step > min_new_token and stop_prob > 0.5:
-                logger.debug("Stopping at step %d with stop_prob=%.4f", step, stop_prob)
-                break
-
-        return all_latents
-
     def cfm_sample_step(
         self,
         last_hidden_state: torch.Tensor,
@@ -697,29 +559,43 @@ class MingAudioGenerator:
         cfg: float | None = None,
         sigma: float = 0.25,
         temperature: float = 0.0,
+        randn_tensor: torch.Tensor | None = None,
+        sde_rnd: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run one CFM sampling step.
+        """Run one CFM sampling step (eager).
 
-        This is the CFM one-shot sampling step with CUDA-graph fast path.
+        CUDA-graph acceleration of this step is intentionally out of scope for
+        the native-paged port; it is tracked separately under the CFMGraphExecutor
+        perf work in RFC #4129.
         """
         if cfg is None:
             cfg = self.cfg_strength
 
-        if self._sampler_pool is not None:
-            return self._sampler_pool.execute(last_hidden_state, his_lat, cfg, sigma, temperature)
-
         bat_size, _, z_dim = his_lat.shape
-        randn_tensor = torch.randn(
-            (bat_size, self.patch_size, z_dim),
-            device=last_hidden_state.device,
-            dtype=last_hidden_state.dtype,
-        )
+        expected_randn_shape = (bat_size, self.patch_size, z_dim)
+        if randn_tensor is None:
+            randn_tensor = torch.randn(
+                expected_randn_shape,
+                device=last_hidden_state.device,
+                dtype=last_hidden_state.dtype,
+            )
+        else:
+            if tuple(randn_tensor.shape) != expected_randn_shape:
+                raise ValueError(f"randn_tensor shape must be {expected_randn_shape}, got {tuple(randn_tensor.shape)}")
+            randn_tensor = randn_tensor.to(device=last_hidden_state.device, dtype=last_hidden_state.dtype)
+
         t = get_epss_timesteps(self._config.steps, device=last_hidden_state.device, dtype=last_hidden_state.dtype)
-        sde_rnd = torch.randn(
-            (self._config.steps, *randn_tensor.shape),
-            device=last_hidden_state.device,
-            dtype=last_hidden_state.dtype,
-        )
+        expected_sde_shape = (self._config.steps, *expected_randn_shape)
+        if sde_rnd is None:
+            sde_rnd = torch.randn(
+                expected_sde_shape,
+                device=last_hidden_state.device,
+                dtype=last_hidden_state.dtype,
+            )
+        else:
+            if tuple(sde_rnd.shape) != expected_sde_shape:
+                raise ValueError(f"sde_rnd shape must be {expected_sde_shape}, got {tuple(sde_rnd.shape)}")
+            sde_rnd = sde_rnd.to(device=last_hidden_state.device, dtype=last_hidden_state.dtype)
         sde_args = torch.tensor(
             [cfg, sigma, temperature],
             device=last_hidden_state.device,
@@ -746,35 +622,6 @@ class MingAudioGenerator:
         )
         return waveform
 
-    def llm_step(
-        self,
-        inputs_embeds: torch.Tensor,
-        *,
-        step: int,
-        past_key_values: StaticCache | None,
-        use_static_cache: bool,
-    ) -> torch.Tensor:
-        if step == 0 or not use_static_cache:
-            outputs = self._model(
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                use_cache=True,
-            )
-        else:
-            past_seen_tokens = int(past_key_values.get_seq_length())
-            cache_position = torch.arange(
-                past_seen_tokens,
-                past_seen_tokens + inputs_embeds.shape[1],
-                device=inputs_embeds.device,
-            )
-            outputs = self._model(
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                use_cache=True,
-                cache_position=cache_position,
-            )
-        return outputs.last_hidden_state[:, -1:, :]
-
     def _init_his_lat(
         self, prompt_wav_lat: torch.Tensor | None, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
@@ -786,21 +633,6 @@ class MingAudioGenerator:
             else:
                 his_lat[:, start_index:, :] = prompt_wav_lat
         return his_lat
-
-    def _init_kv_cache(
-        self, use_static_cache: bool, device: torch.device, dtype: torch.dtype
-    ) -> tuple[StaticCache | None, int]:
-        max_cache_len = 2048
-        if not use_static_cache:
-            return None, max_cache_len
-        cache = StaticCache(
-            config=self._llm_config,
-            max_batch_size=1,
-            max_cache_len=max_cache_len,
-            device=device,
-            dtype=dtype,
-        )
-        return cache, max_cache_len
 
     def _update_his_lat(self, his_lat: torch.Tensor, gen_lat: torch.Tensor) -> torch.Tensor:
         if self.his_patch_size == self.patch_size:
