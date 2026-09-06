@@ -36,12 +36,11 @@ class OmniGPUWorkerBase(GPUWorker):
     for custom trace naming, background gzip, and trace path collection.
     """
 
-    def load_model(self, *args, **kwargs):
+    def load_model(self, *, load_dummy_weights: bool = False) -> None:
         with self._maybe_get_memory_pool_context("weights"):
-            res = super().load_model(*args, **kwargs)
+            super().load_model(load_dummy_weights=load_dummy_weights)
             current_omni_platform.synchronize()
             gc.collect()
-            return res
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

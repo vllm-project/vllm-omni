@@ -12,6 +12,7 @@ Workers are constructed via ``object.__new__`` with only the attributes each
 method reads; module-level collaborators are monkeypatched. Pure CPU.
 """
 
+import inspect
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
@@ -24,6 +25,22 @@ from vllm_omni.worker.base import OmniGPUWorkerBase
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 GIB = 1024**3
+
+
+def test_load_model_signature_and_forwarding(monkeypatch):
+    assert inspect.signature(OmniGPUWorkerBase.load_model, eval_str=True) == inspect.signature(
+        base.GPUWorker.load_model, eval_str=True
+    )
+    worker = object.__new__(OmniGPUWorkerBase)
+    events = []
+    worker._maybe_get_memory_pool_context = lambda tag: nullcontext()
+    monkeypatch.setattr(
+        base.GPUWorker, "load_model", lambda self, *, load_dummy_weights: events.append(load_dummy_weights)
+    )
+    monkeypatch.setattr(base, "current_omni_platform", SimpleNamespace(synchronize=lambda: events.append("sync")))
+    monkeypatch.setattr(base.gc, "collect", lambda: events.append("gc"))
+    worker.load_model(load_dummy_weights=True)
+    assert events == [True, "sync", "gc"]
 
 
 def _fake_memory_profiling(*, non_torch: int, torch_peak: int):

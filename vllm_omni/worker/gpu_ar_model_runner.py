@@ -28,7 +28,13 @@ from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    AsyncModelRunnerOutput,
+    LogprobsTensors,
+    RoutedExpertsTensors,
+    make_empty_encoder_model_runner_output,
+)
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -45,6 +51,7 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
+from vllm_omni.distributed.ray_utils.utils import calculate_total_bytes, maybe_disable_pin_memory_for_ray
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import (
@@ -163,23 +170,22 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         self,
         *,
         model_runner_output_builder: Callable[[], OmniModelRunnerOutput],
+        sampled_token_ids: torch.Tensor,
+        logprobs_tensors: LogprobsTensors | None,
+        invalid_req_indices: list[int],
+        async_output_copy_stream: torch.cuda.Stream,
+        vocab_size: int,
         cuda_device: torch.device | int | str | None = None,
-        **kwargs: Any,
+        routed_experts: RoutedExpertsTensors | None = None,
+        check_ep_fault: bool = False,
+        num_nans: torch.Tensor | None = None,
     ) -> None:
-        sampled_token_ids = kwargs.pop("sampled_token_ids")
-        logprobs_tensors = kwargs.pop("logprobs_tensors")
-        invalid_req_indices = kwargs.pop("invalid_req_indices")
-        async_output_copy_stream = kwargs.pop("async_output_copy_stream")
-        vocab_size = kwargs.pop("vocab_size")
-        routed_experts = kwargs.pop("routed_experts", None)
-        num_nans = kwargs.pop("num_nans", None)
-        # Upstream AsyncGPUModelRunnerOutput added check_ep_fault / _has_fault
-        # for EP all2all fault tolerance (PR #43637). Omni doesn't use this
-        # feature but must consume the kwarg to prevent TypeError from stray
-        # kwargs and initialize the attribute so super().get_output() works.
-        kwargs.pop("check_ep_fault", False)
-        if kwargs:
-            raise TypeError(f"Unexpected OmniAsyncGPUModelRunnerOutput kwargs: {sorted(kwargs)}")
+        # Mirrors upstream AsyncGPUModelRunnerOutput.__init__ minus
+        # model_runner_output (built asynchronously here) plus the builder and
+        # device. ``check_ep_fault`` (EP all2all fault tolerance, upstream
+        # PR #43637) is accepted for signature parity; Omni does not use it
+        # but initializes ``_has_fault`` so super().get_output() works.
+        del check_ep_fault
 
         self._model_runner_output = None
         self._invalid_req_indices = invalid_req_indices
@@ -353,17 +359,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         self._downstream_payload_cache: dict[str, bool] = {}
         self._init_duplex_sampling_state()
 
-    def load_model(self, *args, **kwargs) -> None:
-        super().load_model(*args, **kwargs)
+    def load_model(self, load_dummy_weights: bool = False) -> None:
+        super().load_model(load_dummy_weights=load_dummy_weights)
         self._resolve_duplex_sampling_hook(force=True)
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
-        from vllm_omni.distributed.ray_utils.utils import (
-            calculate_total_bytes,
-            maybe_disable_pin_memory_for_ray,
-        )
-
         total_bytes = calculate_total_bytes(size, dtype)
 
         # Use the context manager to temporarily disable pinning if needed
@@ -522,6 +523,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # 5. Release all CUDA graphs unconditionally (upstream only does this
         #    on ROCm; on CUDA the graphs are only freed by Python GC during
         #    interpreter shutdown, which is too late to prevent memory spikes).
+        # lazy: teardown-only; keeps the vllm.compilation wrappers off the runner's import path
         from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
         from vllm.compilation.cuda_graph import CUDAGraphWrapper
 
@@ -692,42 +694,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         model = getattr(self, "model", None)
         keys = getattr(model, "deferred_prefix_cache_mm_keys", ())
         return set(keys or ())
-
-    def _maybe_update_prefix_cache(
-        self,
-        hidden_states: torch.Tensor,
-        hidden_states_cpu: torch.Tensor | None,
-        multimodal_outputs: dict,
-        num_tokens_unpadded: int,
-        num_tokens_padded: int,
-    ):
-        """If prefix caching is enabled and it's the last pipeline parallelism rank,
-        retrieve the hidden states & multimodal outputs from the prefix cache based
-        on our batch slot mappings.
-        """
-        # Cache hidden states if we've enabled hidden state prefix caching
-        # unless this isn't the last pipeline parallelism rank.
-        is_last_pp_rank = get_pp_group().is_last_rank
-        if hidden_states_cpu is not None and not is_last_pp_rank:
-            raise RuntimeError("hidden_states_cpu staging is only valid on the last pipeline parallel rank.")
-        if self.omni_prefix_cache is not None and is_last_pp_rank:
-            # If this happens, it generally means the model is not following the correct
-            # interface yet and is therefore currently not compatible with prefix cache.
-            hs_for_cache = hidden_states if self._model_needs_full_prefix_hidden_states() else None
-            # FIX: The .cpu attribute of slot_mapping is stale (not updated by the Triton
-            # _compute_slot_mapping_kernel which only writes to .gpu). We must use .gpu and
-            # sync back to CPU to get the correctly computed slot mapping.
-            slot_mapping_gpu = self.input_batch.block_table[0].slot_mapping.gpu
-            slot_mapping_cpu = slot_mapping_gpu[:num_tokens_padded].cpu()
-            self.omni_prefix_cache.update_omni_tensor_prefix_cache(
-                hidden_states=hs_for_cache,
-                multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
-                num_tokens_unpadded=num_tokens_unpadded,
-                slot_mapping=slot_mapping_cpu,
-                num_tokens_padded=num_tokens_padded,
-                skip_mm_cache_keys=self._deferred_prefix_cache_mm_keys(),
-                hidden_states_cpu=hidden_states_cpu,
-            )
 
     def _maybe_get_combined_prefix_cache_tensors(
         self,
@@ -1580,8 +1546,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
     def _snapshot_query_start_loc_cpu(self) -> Any:
         query_start_loc_cpu = self.query_start_loc.cpu
-        if callable(query_start_loc_cpu):
-            query_start_loc_cpu = query_start_loc_cpu()
         if isinstance(query_start_loc_cpu, torch.Tensor):
             return query_start_loc_cpu.detach().cpu().clone()
         if isinstance(query_start_loc_cpu, np.ndarray):
@@ -1609,9 +1573,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             return scheduler_output
 
     def _should_return_omni_routed_experts(self) -> bool:
-        model_config = getattr(self, "model_config", None)
-        if model_config is None:
-            model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        model_config = self.model_config
         return bool(getattr(model_config, "enable_return_routed_experts", False)) and bool(
             getattr(self, "routed_experts_initialized", False)
         )
@@ -1675,9 +1637,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if self.speculative_config is not None:
             return False
 
-        model_config = getattr(self, "model_config", None)
-        if model_config is None:
-            model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        model_config = self.model_config
         if not bool(getattr(model_config, "async_chunk", False)):
             return False
         if bool(getattr(model_config, "enable_return_routed_experts", False)):

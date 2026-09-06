@@ -56,7 +56,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
     - Reuses GPUModelRunner preparation, multimodal handling, and TP/PP/DP glue.
     - Does not compute logits or perform token sampling.
-    - Executes generation process and returns tensors via `pooler_output`.
+    - Executes the generation pass and returns tensors via `multimodal_outputs`.
     """
 
     def __init__(self, *args, **kwargs):
@@ -460,8 +460,18 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                         mm_payload[key] = out[i].detach().to("cpu").contiguous()
                     elif isinstance(out, torch.Tensor):
                         mm_payload[key] = out.detach().to("cpu").contiguous()
+                    elif isinstance(out, (int, float, bool)):
+                        # Batch-wide scalars (e.g. IndexTTS2's {"sr": 22050})
+                        # get the same tensorization _ensure_tensor_values applies.
+                        mm_payload[key] = torch.tensor(out)
+                    elif out is None:
+                        # An absent output for this key, not an error.
+                        continue
                     else:
-                        logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
+                        raise TypeError(
+                            f"Unsupported multimodal output type for key '{key}': "
+                            f"{type(out).__name__} (expected Tensor, per-request list, or scalar)"
+                        )
                 per_req_payloads.append(_ensure_tensor_values(mm_payload))
         else:
             raise RuntimeError("Unsupported diffusion output type")
@@ -527,8 +537,12 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         """Run generation from codec codes to waveforms.
 
         Args:
-            scheduler_output: Contains codec codes in input_ids or additional info
-            intermediate_tensors: PP intermediate tensors if applicable
+            input_ids: Codec codes (or None when ``inputs_embeds`` carries the input).
+            positions: Position ids for the batch.
+            intermediate_tensors: PP intermediate tensors if applicable.
+            inputs_embeds: Precomputed input embeddings, if any.
+            model_kwargs: Extra model keyword arguments for this step.
+            logits_indices: Row indices the model treats as logits positions.
 
         Returns:
             Audio waveforms: [batch, 1, waveform_len] or list of tensors
@@ -545,13 +559,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             sampler=self.sampler,
         )
 
-        if hasattr(self.model, "forward"):
-            return self._model_forward(**kwargs)
-
-        raise RuntimeError(
-            "The loaded model does not expose diffusion interfaces 'sample', "
-            "'forward', or 'diffuse'. Please implement one of them or adapt the runner."
-        )
+        return self._model_forward(**kwargs)
 
     @torch.inference_mode()
     def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -979,7 +987,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
         # Add `is_profile` here to pre-allocate communication buffers
         hidden_states, _ = self._dummy_run(self.max_num_tokens, is_profile=True)
-        output = None
         self._sync_device()
         del hidden_states
         self.encoder_cache.clear()

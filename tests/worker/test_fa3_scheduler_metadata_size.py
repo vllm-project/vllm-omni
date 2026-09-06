@@ -1,18 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Characterization of ``OmniGPUModelRunner.initialize_metadata_builders``.
 
 Upstream ``FlashAttentionMetadataBuilder`` pre-allocates ``scheduler_metadata``
-for only ``max_num_seqs + 1`` entries, but FA3 with split scheduling
-(``max_num_splits > 1``) may need ``max_num_seqs * max_num_splits + 1`` during
-CUDA-graph capture. ``OmniGPUModelRunner`` re-sizes the buffer up to that
-requirement after upstream init — this test pins that Omni-specific workaround
-exactly.
+for ``1 + round_up(max_cudagraph_batch, 4) * 4`` entries, the size FA3's tile
+scheduler emits, which does not grow with ``max_num_splits``. An earlier Omni
+workaround re-sized that buffer to ``max_num_seqs * max_num_splits + 1`` after
+upstream init; it was a verified over-allocation and is gone. This test pins
+that the Omni override leaves every builder's buffer exactly as upstream sized
+it, whatever the split count.
 
 It drives the Omni runner's OWN method (with the upstream ``super()`` call
-stubbed and a fake builder standing in), so a change to the resize is caught and
-a failure is unambiguously an Omni-runner regression. Pure CPU — no model, no
-CUDA, no flashinfer.
+stubbed and a fake builder standing in). Pure CPU — no model, no CUDA, no
+flashinfer.
 """
 
 from types import SimpleNamespace
@@ -44,19 +44,21 @@ def _make_runner(monkeypatch, *, max_num_seqs: int, builders: list) -> OmniGPUMo
     return runner
 
 
-def test_resizes_up_when_split_scheduling_needs_more(monkeypatch):
-    max_num_seqs, splits, prealloc = 32, 4, 33  # 33 == upstream default (max_num_seqs + 1)
+def test_no_resize_when_split_scheduling_exceeds_prealloc(monkeypatch):
+    # The removed workaround would have grown this buffer to max_num_seqs * splits + 1.
+    max_num_seqs, splits, prealloc = 32, 4, 33
     builder = _builder(prealloc=prealloc, max_num_splits=splits)
     runner = _make_runner(monkeypatch, max_num_seqs=max_num_seqs, builders=[builder])
+    original = builder.scheduler_metadata
 
     OmniGPUModelRunner.initialize_metadata_builders(runner, None, None)
 
-    assert builder.scheduler_metadata.shape[0] == max_num_seqs * splits + 1
-    assert builder.scheduler_metadata.dtype == torch.int32
+    assert builder.scheduler_metadata is original
+    assert builder.scheduler_metadata.shape[0] == prealloc
 
 
 def test_no_resize_when_not_split_scheduling(monkeypatch):
-    builder = _builder(prealloc=33, max_num_splits=1)  # max_num_splits <= 1 -> workaround skipped
+    builder = _builder(prealloc=33, max_num_splits=1)
     runner = _make_runner(monkeypatch, max_num_seqs=32, builders=[builder])
     original = builder.scheduler_metadata
 
@@ -67,7 +69,7 @@ def test_no_resize_when_not_split_scheduling(monkeypatch):
 
 def test_no_resize_when_prealloc_already_sufficient(monkeypatch):
     max_num_seqs, splits = 32, 4
-    builder = _builder(prealloc=max_num_seqs * splits + 1, max_num_splits=splits)  # already big enough
+    builder = _builder(prealloc=max_num_seqs * splits + 1, max_num_splits=splits)
     runner = _make_runner(monkeypatch, max_num_seqs=max_num_seqs, builders=[builder])
     original = builder.scheduler_metadata
 
