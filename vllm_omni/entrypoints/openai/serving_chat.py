@@ -3602,12 +3602,28 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 text = prompt[: max(cap - base_len, 0)]
                 logger.debug("Diffusion chat request %s: prompt=%r", request_id, text)
 
+            model_config = getattr(self.engine_client, "model_config", None)
+            if model_config is not None:
+                connector = MediaConnector(
+                    allowed_local_media_path=getattr(model_config, "allowed_local_media_path", "") or "",
+                    allowed_media_domains=getattr(model_config, "allowed_media_domains", None),
+                )
+            else:
+                connector = MediaConnector(
+                    allowed_local_media_path="",
+                    allowed_media_domains=None,
+                )
+
             # Decode reference images if provided
             pil_images: list[Image.Image] = []
-            for img_b64 in reference_images:
+            for img_str in reference_images:
                 try:
-                    img_bytes = base64.b64decode(img_b64)
-                    pil_images.append(Image.open(BytesIO(img_bytes)))
+                    if img_str.startswith(("http://", "https://")):
+                        result = await connector.fetch_image_async(img_str)
+                        pil_images.append(result.media)
+                    else:
+                        img_bytes = base64.b64decode(img_str)
+                        pil_images.append(Image.open(BytesIO(img_bytes)))
                 except Exception as e:
                     logger.warning("Failed to decode reference image: %s", e)
 
@@ -3953,6 +3969,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                     images.append(b64_data)
                                 except ValueError:
                                     logger.warning("Invalid data URL format")
+                            elif url.startswith(("http://", "https://")):
+                                images.append(url)
                         elif item.get("type") == "video_url":
                             url = item.get("video_url", {}).get("url", "")
                             if isinstance(url, str) and url:
