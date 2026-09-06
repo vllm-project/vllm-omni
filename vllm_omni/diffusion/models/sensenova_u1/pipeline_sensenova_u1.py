@@ -687,8 +687,7 @@ class SenseNovaU1Pipeline(
         **_kw,
     ):
         B, L = z.shape[0], z.shape[1]
-        denoising_model = self.language_model if cache_dit_skip else self.denoising_transformer
-        outputs = denoising_model(
+        outputs = self.denoising_transformer(
             inputs_embeds=input_embeds,
             image_gen_indicators=torch.ones(
                 (input_embeds.shape[0], input_embeds.shape[1]), dtype=torch.bool, device=input_embeds.device
@@ -1135,25 +1134,21 @@ class SenseNovaU1Pipeline(
 
     def _denoise(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i):
         if not is_it2i:
-            has_cached_partner = t >= p.cfg_interval[0] and t <= p.cfg_interval[1] and p.cfg_scale > 1
+            do_true_cfg = t >= p.cfg_interval[0] and t <= p.cfg_interval[1] and p.cfg_scale > 1
             cond_kwargs = self._get_cfg_kwargs(
-                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not has_cached_partner
+                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not do_true_cfg
             )
-
-            in_interval = t >= p.cfg_interval[0] and t <= p.cfg_interval[1]
-            if not (in_interval and p.cfg_scale > 1):
-                return self.predict_noise(**cond_kwargs)
-
-            uncond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, branch="uncond")
-            noise_pred = self.predict_noise_maybe_with_cfg(
-                do_true_cfg=True,
+            uncond_kwargs = (
+                self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, branch="uncond") if do_true_cfg else None
+            )
+            return self.predict_noise_maybe_with_cfg(
+                do_true_cfg=do_true_cfg,
                 true_cfg_scale=p.cfg_scale,
                 positive_kwargs=cond_kwargs,
                 negative_kwargs=uncond_kwargs,
                 cfg_normalize=p.cfg_norm,
                 kwargs={"step_i": step_i, "is_it2i": is_it2i},
             )
-            return noise_pred
         else:
             use_cfg = (t > p.cfg_interval[0] and t < p.cfg_interval[1]) or p.cfg_interval[0] == 0
             needs_cfg = p.cfg_scale != 1 or p.img_cfg_scale != 1
@@ -1163,7 +1158,12 @@ class SenseNovaU1Pipeline(
             )
 
             if not use_cfg or not needs_cfg:
-                return self.predict_noise(**cond_kwargs)
+                return self.predict_noise_maybe_with_cfg(
+                    do_true_cfg=False,
+                    true_cfg_scale=1.0,
+                    positive_kwargs=cond_kwargs,
+                    negative_kwargs=None,
+                )
 
             cfg_norm = p.cfg_norm if (p.cfg_scale > 1 or p.img_cfg_scale > 1) else None
             if p.img_cfg_scale == 1:
@@ -1187,6 +1187,8 @@ class SenseNovaU1Pipeline(
                     kwargs={"is_it2i": is_it2i},
                 )
             else:
+                # CacheDiT still cannot track 3-way CFG; skip that backend on
+                # img_cond. TeaCache is tagged per branch and caches all three.
                 image_cond_kwargs = self._get_cfg_kwargs(
                     caches, image_embeds, t, z, ns, p, branch="img_cond", cache_dit_skip=True
                 )

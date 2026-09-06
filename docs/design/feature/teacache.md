@@ -31,18 +31,17 @@ vLLM-omni provides a **hook-based** TeaCache system that requires **zero changes
 The TeaCache system consists of three main components:
 
 | Component | Purpose | Location |
-|-----------|---------|----------|
+| ----------- | --------- | ---------- |
 | [`CacheContext`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/cache/#vllm_omni.diffusion.cache.CacheContext) | Dataclass containing model-specific information for caching | `vllm_omni/diffusion/cache/teacache/context.py` |
 | [`EXTRACTOR_REGISTRY`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/cache/teacache/extractors/#vllm_omni.diffusion.cache.teacache.extractors.EXTRACTOR_REGISTRY) | Maps transformer class names to extractor functions | `vllm_omni/diffusion/cache/teacache/extractors.py` |
 | [`TeaCacheConfig`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/cache/#vllm_omni.diffusion.cache.TeaCacheConfig) | Configuration including thresholds and polynomial coefficients | `vllm_omni/diffusion/cache/teacache/config.py` |
 
 The hook handles all caching logic automatically, including:
 
-- CFG-aware state management (separate states for positive/negative branches)
+- CFG-aware state management (separate cache state per branch)
 - CFG-parallel compatibility
 - L1 distance computation with polynomial rescaling
 - Residual caching and reuse
-
 
 ---
 
@@ -57,6 +56,7 @@ To add TeaCache support for a new model, you need to:
 ### Step 1: Model-Specific Preprocessing
 
 Extract and process model inputs. This typically involves:
+
 - Embedding image/latent inputs
 - Processing text encoder outputs (if dual-stream)
 - Creating timestep embeddings
@@ -196,14 +196,14 @@ Package all information into a `CacheContext` object.
 **CacheContext Fields:**
 
 | Field | Type | Purpose |
-|-------|------|---------|
+| ------- | ------ | --------- |
 | `modulated_input` | `torch.Tensor` | Tensor used for cache decision (similarity comparison) |
 | `hidden_states` | `torch.Tensor` | Current hidden states (will be modified by caching) |
-| `encoder_hidden_states` | `torch.Tensor | None` | Encoder states for dual-stream models, `None` for single-stream |
+| `encoder_hidden_states` | `torch.Tensor \| None` | Encoder states for dual-stream models, `None` for single-stream |
 | `temb` | `torch.Tensor` | Timestep embedding tensor |
 | `run_transformer_blocks` | `Callable[[], tuple]` | Executes transformer blocks, returns `(hidden_states, [encoder_hidden_states])` |
 | `postprocess` | `Callable[[torch.Tensor], Any]` | Applies final transformations to produce model output |
-| `extra_states` | `dict | None` | Optional dict for additional model-specific state |
+| `extra_states` | `dict \| None` | Optional dict for additional model-specific state |
 
 ### Step 6: Register the Extractor
 
@@ -239,7 +239,6 @@ _MODEL_COEFFICIENTS = {
 }
 ```
 
-
 **Initial approach:** Start with coefficients from a similar model architecture, then tune empirically following [Customization](#customization) section.
 
 ---
@@ -258,10 +257,10 @@ The polynomial coefficients rescale L1 distances between consecutive modulated i
 - Training data characteristics
 - Noise prediction behavior across timesteps
 
-| Approach | Performance | Effort |
-|----------|-------------|--------|
-| Using defaults from similar model | Within 5-10% of optimal | Low |
-| Estimating custom coefficients | Best performance | Medium |
+| Approach                          | Performance             | Effort |
+| --------------------------------- | ----------------------- | ------ |
+| Using defaults from similar model | Within 5-10% of optimal | Low    |
+| Estimating custom coefficients    | Best performance        | Medium |
 
 #### Implement Data Collection Adapter
 
@@ -330,6 +329,7 @@ print(f"Estimated coefficients: {coeffs}")
 ```
 
 Note: some models may require the vLLM context and config to be initialized to initialize vLLM modules. To this end, you may need a workaround like the following to be able to run coefficient estimation.
+
 ```python
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.distributed.parallel_state import (
@@ -360,11 +360,10 @@ if __name__ == "__main__":
         <create the estimator + run estimation here>
 ```
 
-
 **Data Statistics Guide:**
 
 | Metric | Good Range | Warning Signs |
-|--------|------------|---------------|
+| -------- | ------------ | --------------- |
 | **Count** | 2000-5000+ | < 1000: too few prompts |
 | **Input Diffs (x)** | 0.01-0.10 | Very small (<0.001): model may not modulate properly |
 | **Output Diffs (y)** | Should correlate with x | No correlation: check extractor |
@@ -418,6 +417,7 @@ See more detailed examples in [user guide for teacache](../../user_guide/diffusi
 **Problem:** The transformer class name doesn't exist in `EXTRACTOR_REGISTRY`.
 
 **Solution:** Check the class name and add to registry:
+
 ```python
 # Check transformer class name
 print(pipeline.transformer.__class__.__name__)
@@ -439,6 +439,7 @@ EXTRACTOR_REGISTRY["YourTransformer2DModel"] = extract_your_context
 - **Missing coefficients in config:**
 
 **Solution:** Add coefficients to `_MODEL_COEFFICIENTS` in `config.py`, or pass custom coefficients:
+
 ```python
 omni = Omni(
     model="your-model",
@@ -458,6 +459,7 @@ omni = Omni(
 **Problem:** `rel_l1_thresh` is too aggressive, causing cache reuse when outputs differ significantly.
 
 **Solution:** Lower the threshold:
+
 ```python
 cache_config={"rel_l1_thresh": 0.1}  # Try 0.1-0.2
 ```
@@ -473,7 +475,7 @@ cache_config={"rel_l1_thresh": 0.1}  # Try 0.1-0.2
 Complete examples in the codebase:
 
 | Model | Path | Pattern | Notes |
-|-------|------|---------|-------|
+| ------- | ------ | --------- | ------- |
 | **Qwen-Image** | `vllm_omni/diffusion/cache/teacache/extractors.py` | Dual-stream | `extract_qwen_context` |
 | **Bagel** | `vllm_omni/diffusion/cache/teacache/extractors.py` | Omni model | `extract_bagel_context` |
 | **TeaCache Core** | `vllm_omni/diffusion/cache/teacache/` | Base implementation | Hook and config |
