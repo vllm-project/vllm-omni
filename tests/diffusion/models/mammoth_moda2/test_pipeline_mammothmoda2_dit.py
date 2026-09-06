@@ -211,6 +211,15 @@ def test_parse_request_rejects_explicit_zero_steps() -> None:
         _pipeline_shell()._parse_request(_batch(sampling=OmniDiffusionSamplingParams(num_inference_steps=0)))
 
 
+@pytest.mark.parametrize(("standard_steps", "expected_steps"), [(7, 7), (None, 50)])
+def test_parse_request_falls_through_null_legacy_step_count(standard_steps, expected_steps) -> None:
+    sampling = OmniDiffusionSamplingParams(
+        num_inference_steps=standard_steps, extra_args={"num_inference_steps": None}
+    )
+    parsed = _pipeline_shell()._parse_request(_batch(sampling=sampling))
+    assert parsed.num_inference_steps == expected_steps
+
+
 def test_parse_request_synthesizes_dummy_ar_conditions() -> None:
     batch = _batch(
         request_id="dummy_req_id",

@@ -220,11 +220,13 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             text_guidance_scale = float(guidance)
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(f"Invalid text_guidance_scale for request {request_id}") from exc
-        steps = extra_args.get(
-            "num_inference_steps", sampling.num_inference_steps if sampling.num_inference_steps is not None else 50
-        )
+        raw_num_inference_steps = extra_args.get("num_inference_steps")
+        if raw_num_inference_steps is None:
+            raw_num_inference_steps = sampling.num_inference_steps
+        if raw_num_inference_steps is None:
+            raw_num_inference_steps = 50
         try:
-            num_inference_steps = int(steps)
+            num_inference_steps = int(raw_num_inference_steps)
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(f"Invalid num_inference_steps for request {request_id}") from exc
         if num_inference_steps <= 0:
