@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from types import SimpleNamespace
+from dataclasses import dataclass
 from unittest.mock import patch
 
 import pytest
 import torch
+from diffusers.configuration_utils import FrozenDict
 from torch import nn
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, TransformerConfig
@@ -26,6 +27,10 @@ def _raw_config() -> dict:
         "model_type": "mammothmoda2",
         "llm_config": {
             "model_type": "mammothmoda2_qwen2_5_vl",
+            "image_token_id": 900,
+            "video_token_id": 901,
+            "vision_start_token_id": 902,
+            "vision_end_token_id": 903,
             "text_config": {
                 "model_type": "mammothmoda2_qwen2_5_vl_text",
                 "hidden_size": 8,
@@ -68,7 +73,8 @@ def test_root_weight_source_loads_combined_checkpoint_once() -> None:
 
 
 def test_root_weight_source_forwards_revision() -> None:
-    config = SimpleNamespace(model="/models/MammothModa2-Preview", revision="rev-7")
+    config = _od_config()
+    config.revision = "rev-7"
     assert _root_weight_source(config).revision == "rev-7"
 
 
@@ -81,7 +87,8 @@ def test_pipeline_declares_native_components_and_single_request_mode_only() -> N
 
 
 def test_root_weight_source_rejects_missing_model_path() -> None:
-    config = SimpleNamespace(model=None, revision=None)
+    config = _od_config()
+    config.model = ""
     with pytest.raises(ValueError, match="model path"):
         _root_weight_source(config)
 
@@ -90,13 +97,7 @@ def _pipeline_shell() -> MammothModa2DiTPipeline:
     pipeline = object.__new__(MammothModa2DiTPipeline)
     nn.Module.__init__(pipeline)
     pipeline.device = torch.device("cpu")
-    pipeline.config = SimpleNamespace(
-        llm_config=SimpleNamespace(gen_vocab_start_index=100),
-        image_token_id=900,
-        video_token_id=901,
-        vision_start_token_id=902,
-        vision_end_token_id=903,
-    )
+    pipeline.config = _build_mammoth_config(_od_config())
     pipeline._llm_hidden_size = 8
     return pipeline
 
@@ -251,12 +252,17 @@ def test_parse_request_synthesizes_dummy_ar_conditions() -> None:
     assert parsed.answer_start_index == 1
 
 
+@dataclass
+class _TimeCaptionEmbeddingStub:
+    image_embedder: nn.Module | None = None
+
+
 class _FakeTransformer(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.anchor = nn.Parameter(torch.zeros(1))
-        self.config = SimpleNamespace(in_channels=4)
-        self.time_caption_embed = SimpleNamespace(image_embedder=None)
+        self.config = FrozenDict(in_channels=4)
+        self.time_caption_embed = _TimeCaptionEmbeddingStub()
         self.calls = 0
 
     def forward(self, *, hidden_states, **kwargs):
@@ -268,7 +274,7 @@ class _FakeVae(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.anchor = nn.Parameter(torch.zeros(1))
-        self.config = SimpleNamespace(scaling_factor=None, shift_factor=None)
+        self.config = FrozenDict(scaling_factor=None, shift_factor=None)
 
     def decode(self, latents, return_dict=False):
         assert return_dict is False

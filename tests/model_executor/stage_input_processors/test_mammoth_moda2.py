@@ -1,23 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
 from vllm_omni.model_executor.stage_input_processors.mammoth_moda2 import ar2diffusion
+from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _source_output(*, include_latent: bool = True):
+def _source_output(*, include_latent: bool = True) -> OmniRequestOutput:
     multimodal_output = {"latent": torch.arange(32, dtype=torch.float32).reshape(4, 8)} if include_latent else {}
-    completion = SimpleNamespace(
-        cumulative_token_ids=[100, 101, 102],
-        multimodal_output=multimodal_output,
+    completion = MultimodalCompletionOutput(
+        index=0,
+        text="",
+        token_ids=[100, 101, 102],
+        cumulative_logprob=None,
+        logprobs=None,
+        finish_reason="stop",
+        multimodal_output=MultimodalPayload(tensors=multimodal_output),
     )
-    return SimpleNamespace(
+    # The native output processor attaches this inter-stage field.
+    completion.cumulative_token_ids = [100, 101, 102]
+    return OmniRequestOutput(
         request_id="req-7",
         prompt_token_ids=[10, 11],
         outputs=[completion],
@@ -71,6 +78,6 @@ def test_ar2diffusion_reports_missing_latent_with_request_id() -> None:
 
 def test_ar2diffusion_rejects_hidden_state_length_mismatch() -> None:
     source = _source_output()
-    source.outputs[0].multimodal_output["latent"] = torch.zeros(3, 8)
+    source.outputs[0].multimodal_output.tensors["latent"] = torch.zeros(3, 8)
     with pytest.raises(ValueError, match="Hidden states length mismatch"):
         ar2diffusion([source], {})
