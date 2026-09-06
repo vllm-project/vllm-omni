@@ -107,6 +107,8 @@ def test_real_hooks_preserve_global_rope_masks_and_reset_cfg_padding(monkeypatch
                 for actual, expected in zip(image_rotary_emb, local_rope):
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                 assert ctx.sp_active and ctx._sp_shard_depth == 1
+                assert ctx._sp_equal_pad_stack == [True]
+                assert ctx.sp_rank_local_seq_lens_equal
                 assert ctx.sp_padding_size == pad
                 assert ctx.sp_original_seq_len == (seq if pad else None)
                 seen.append(True)
@@ -126,6 +128,7 @@ def test_real_hooks_preserve_global_rope_masks_and_reset_cfg_padding(monkeypatch
             assert ctx.sp_padding_size == 0
             assert ctx.sp_original_seq_len is None
             assert ctx._sp_shard_depth == 0 and not ctx.sp_active
+            assert ctx._sp_equal_pad_stack == []
 
 
 def test_processor_uses_global_key_mask_and_local_output_mask(monkeypatch):
@@ -156,7 +159,8 @@ def test_processor_uses_global_key_mask_and_local_output_mask(monkeypatch):
 
 
 @pytest.mark.parametrize("failure_at", ["split", "block", "gather"])
-def test_sp_context_is_restored_when_a_branch_raises(monkeypatch, failure_at):
+@pytest.mark.parametrize("outer_boundaries", [(), (False,)], ids=["fresh", "nested"])
+def test_sp_context_is_restored_when_a_branch_raises(monkeypatch, failure_at, outer_boundaries):
     model = _model()
     sp_hooks.apply_sequence_parallel(model, SequenceParallelConfig(ulysses_degree=2), model._sp_plan)
     for module in (parallel_state, sp_sharding):
@@ -187,10 +191,15 @@ def test_sp_context_is_restored_when_a_branch_raises(monkeypatch, failure_at):
         ctx.sp_plan_hooks_applied = True
         # Restore the caller's metadata exactly, not just a fresh-context default.
         ctx.sp_original_seq_len, ctx.sp_padding_size = 11, 1
+        ctx._sp_shard_depth = len(outer_boundaries)
+        ctx._sp_equal_pad_stack.extend(outer_boundaries)
+        original_stack = ctx._sp_equal_pad_stack
         with pytest.raises(RuntimeError, match="injected branch failure"):
             model._apply_transformer_layers(hidden, mask, rotary, None)
-        assert (ctx.sp_original_seq_len, ctx.sp_padding_size, ctx._sp_shard_depth) == (11, 1, 0)
-        assert not ctx.sp_active
+        assert (ctx.sp_original_seq_len, ctx.sp_padding_size, ctx._sp_shard_depth) == (11, 1, len(outer_boundaries))
+        assert ctx.sp_active == bool(outer_boundaries)
+        assert ctx._sp_equal_pad_stack is original_stack
+        assert ctx._sp_equal_pad_stack == list(outer_boundaries)
 
 
 @pytest.mark.parametrize("text_len", [0, 3, 4])

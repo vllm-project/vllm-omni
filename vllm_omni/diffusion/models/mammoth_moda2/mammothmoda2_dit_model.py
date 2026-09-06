@@ -826,6 +826,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         ctx = get_forward_context() if is_forward_context_available() else None
         if ctx is not None:
             previous = (ctx.sp_original_seq_len, ctx.sp_padding_size, ctx._sp_shard_depth)
+            equal_pad_depth = len(ctx._sp_equal_pad_stack)
             # Sequential CFG branches can have different joint sequence lengths.
             # The shared auto-pad hook records only the first length it sees.
             ctx.sp_original_seq_len = None
@@ -845,6 +846,9 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                 # Also unwind a split whose block/gather raised, so the next
                 # branch/request cannot inherit a stale sharded-region depth.
                 ctx.sp_original_seq_len, ctx.sp_padding_size, ctx._sp_shard_depth = previous
+                # A failed block/gather leaves this boundary's equal-padding
+                # marker behind; preserve any enclosing boundary's markers.
+                del ctx._sp_equal_pad_stack[equal_pad_depth:]
 
     def forward(
         self,

@@ -101,6 +101,7 @@ def _runtime_replay(rank, device, dtype):
                     actual = pipeline(request).output
                     ctx = get_forward_context()
                     assert (ctx.sp_original_seq_len, ctx.sp_padding_size, ctx._sp_shard_depth) == (None, 0, 0)
+                    assert ctx._sp_equal_pad_stack == []
                 assert actual.shape == expected.shape == (1, 3, 32, 48)
                 assert torch.isfinite(actual).all()
                 tolerance = 2e-2 if dtype == torch.bfloat16 else 1e-4
@@ -185,6 +186,8 @@ def _worker(rank, port, output_dir, dtype, backend):
                         assert inputs[1].shape == (1, local_seq * 2)
                         assert inputs[4].shape == (1, local_seq)
                         assert ctx._sp_shard_depth == 1
+                        assert ctx._sp_equal_pad_stack == [True]
+                        assert ctx.sp_rank_local_seq_lens_equal
                         assert ctx.sp_padding_size == global_seq % 2
                         assert module.attn.omni_attn._get_active_parallel_strategy().name == "ulysses"
                         seen_main.append(True)
@@ -214,6 +217,7 @@ def _worker(rank, port, output_dir, dtype, backend):
                     assert len(seen_main) == len(seen_attention) == 2
                     assert len(seen_refiners) == 2
                     assert ctx._sp_shard_depth == 0
+                    assert ctx._sp_equal_pad_stack == []
                     assert ctx.sp_padding_size == 0 and ctx.sp_original_seq_len is None
                     assert actual.shape == expected.shape and torch.isfinite(actual).all()
                     # BF16 uses a 7-bit mantissa; keep the FP32 bound unchanged.
