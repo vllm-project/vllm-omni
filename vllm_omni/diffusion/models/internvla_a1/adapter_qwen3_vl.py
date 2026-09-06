@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import torch
 import torch.nn as nn
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
@@ -174,14 +176,22 @@ class Qwen3VLTextModel(HFQwen3VLTextModel):
         else:
             text_position_ids = position_ids[0]
 
-        attention_mask = create_causal_mask(
-            config=self.config,
-            input_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            position_ids=text_position_ids,
-        )
+        # Prepare mask arguments
+        mask_kwargs = {
+            "config": self.config,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "position_ids": text_position_ids,
+        }
+        # Handle API changes across transformers versions
+        sig = inspect.signature(create_causal_mask)
+        if "input_embeds" in sig.parameters:
+            mask_kwargs["input_embeds"] = inputs_embeds
+            mask_kwargs["cache_position"] = cache_position
+        else:
+            mask_kwargs["inputs_embeds"] = inputs_embeds
+
+        attention_mask = create_causal_mask(**mask_kwargs)
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
