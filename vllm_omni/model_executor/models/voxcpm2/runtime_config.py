@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import Any
 
 from vllm.logger import init_logger
@@ -31,6 +32,15 @@ class _VoxCPM2RuntimeConfig:
     enable_batched_cfm: bool = True
     deterministic_cfm_noise: bool = False
     deterministic_cfm_seed: int = 20260601
+    # Prevents the learned stop head from ending a request before it has had
+    # a fair chance to render the input text. Native VoxCPM2 (src/voxcpm)
+    # checks `i > min_len` (default min_len=2), so it cannot stop before four
+    # audio patches have been generated. The vLLM-Omni port dropped that guard,
+    # allowing a near-tied stop-vs-continue logit (made noisier on later steps
+    # by CFM sampling noise feeding back into the AR state) to end generation
+    # on the first few patches.
+    min_decode_steps_per_text_token: float = 0.0
+    min_decode_steps_floor: int = 0
     audio_emit_every: int = 1
     vae_decode_every: int = 3
     enable_delayed_audio_copy: bool = False
@@ -71,6 +81,23 @@ class _VoxCPM2RuntimeConfig:
 
     def _normalized(self) -> _VoxCPM2RuntimeConfig:
         cfg = self
+        normalized_ratio = (
+            cfg.min_decode_steps_per_text_token if math.isfinite(cfg.min_decode_steps_per_text_token) else 0.0
+        )
+        normalized_ratio = max(0.0, normalized_ratio)
+        normalized_floor = max(0, cfg.min_decode_steps_floor)
+        if normalized_ratio != cfg.min_decode_steps_per_text_token or normalized_floor != cfg.min_decode_steps_floor:
+            logger.warning(
+                "Invalid VoxCPM2 minimum decode configuration (per_text_token=%r, floor=%r); "
+                "clamping to non-negative values.",
+                cfg.min_decode_steps_per_text_token,
+                cfg.min_decode_steps_floor,
+            )
+            cfg = dataclasses.replace(
+                cfg,
+                min_decode_steps_per_text_token=normalized_ratio,
+                min_decode_steps_floor=normalized_floor,
+            )
         if cfg.enable_batched_cfm and cfg.enable_cfm_cuda_graph:
             logger.warning(
                 "VoxCPM2 batched CFM and CFM CUDA Graph are mutually exclusive; "
@@ -102,6 +129,16 @@ class _VoxCPM2RuntimeConfig:
 
     def unified_decode_graph_available(self, *, use_cuda_graph: bool) -> bool:
         return bool(use_cuda_graph and self.enable_unified_decode_graph and not self.deterministic_cfm_noise)
+
+    def minimum_decode_steps(self, *, text_token_count: int, max_decode_steps: int) -> int:
+        """Return the guarded decode count, excluding the prefill audio patch."""
+        token_count = max(0, int(text_token_count))
+        decode_cap = max(0, int(max_decode_steps))
+        minimum = max(
+            self.min_decode_steps_floor,
+            math.ceil(token_count * self.min_decode_steps_per_text_token),
+        )
+        return min(decode_cap, minimum)
 
     @staticmethod
     def _coerce_value(key: str, value: Any, default: Any) -> Any:

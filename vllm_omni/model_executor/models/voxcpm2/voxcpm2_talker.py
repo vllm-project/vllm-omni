@@ -263,6 +263,7 @@ class _RequestState:
     # Shape (n_pad_frames, feat_dim) on GPU. None before first decode.
     decode_pad: torch.Tensor | None = None
     decode_step_count: int = 0
+    min_decode_steps: int = 0
     request_start_time: float = 0.0
     prefill_completed: bool = False
     is_last_prefill_chunk: bool = False
@@ -2713,7 +2714,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         pending: list[tuple[_RequestState, torch.Tensor]] = []
         for state in states:
-            if state.is_stopping or state.precomputed_is_stopping is not None:
+            if state.is_stopping:
+                continue
+            if state.decode_step_count < state.min_decode_steps:
+                state.precomputed_is_stopping = False
+                continue
+            if state.precomputed_is_stopping is not None:
                 continue
             stop_logits = state.precomputed_stop_logits
             if stop_logits is None or stop_logits.device.type != current_omni_platform.device_type:
@@ -2735,6 +2741,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     def _should_stop_from_cached_logits(state: _RequestState) -> bool:
         if state.is_stopping:
             return True
+        if state.decode_step_count < state.min_decode_steps:
+            state.precomputed_is_stopping = False
+            return False
         cached = state.precomputed_is_stopping
         if cached is not None:
             return cached
@@ -2953,7 +2962,16 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 if i >= bsz:
                     break
                 state = self._active_states.get(req_id)
-                if stop_logits is not None:
+                force_continue = (
+                    state is not None and not state.is_stopping and state.decode_step_count < state.min_decode_steps
+                )
+                if force_continue:
+                    # Below the per-request minimum: never let the sampler pick the
+                    # stop token, regardless of what the raw stop head says.
+                    logits[i, 0] = 1.0
+                    state.precomputed_stop_logits = None
+                    state.precomputed_is_stopping = None
+                elif stop_logits is not None:
                     if state is not None and state.is_stopping:
                         logits[i, 0] = 0.0
                         logits[i, 1] = 1.0
@@ -3097,6 +3115,13 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 state.prefill_completed = False
                 state.is_last_prefill_chunk = False
                 state.decode_step_count = 0
+                # The prefill tail has already generated the first audio patch while
+                # decode_step_count is still zero. A threshold of N therefore allows
+                # the learned stop head after N + 1 generated patches.
+                state.min_decode_steps = self._runtime_config.minimum_decode_steps(
+                    text_token_count=len(token_ids),
+                    max_decode_steps=self._max_decode_steps,
+                )
                 state.precomputed_stop_logits = None
                 state.precomputed_is_stopping = None
                 state.last_audio_patch_gpu = None
