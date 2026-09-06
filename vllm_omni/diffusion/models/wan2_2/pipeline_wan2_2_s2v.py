@@ -33,6 +33,11 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
+    WanClipMP4Session,
+    resolve_wan_preencode_mp4,
+    resolve_wan_video_codec_options,
+)
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     load_transformer_config,
     load_wan_weights_with_optional_gate,
@@ -62,6 +67,10 @@ _S2V_DEFAULT_NEG_PROMPT = (
 # ---------------------------------------------------------------------------
 
 _AUDIO_VIDEO_RATE = 30
+
+# S2V generates at a fixed rate; the worker-side encoder and the post-process
+# payload must report the same one.
+S2V_OUTPUT_FPS = 16
 
 
 def _s2v_audio_condition_key(audio: str | np.ndarray | None) -> tuple[Any, ...]:
@@ -280,6 +289,10 @@ def get_wan22_s2v_post_process_func(
         if output_type == "latent":
             return video
 
+        if isinstance(video, list) and all(isinstance(item, (bytes, bytearray, memoryview)) for item in video):
+            # The worker already muxed the audio into these bytes.
+            return {"video": [bytes(item) for item in video], "audio": None, "fps": S2V_OUTPUT_FPS}
+
         processed_video = video_processor.postprocess_video(video, output_type=output_type)
 
         if audio_waveform is not None:
@@ -287,7 +300,7 @@ def get_wan22_s2v_post_process_func(
                 "video": processed_video,
                 "audio": audio_waveform,
                 "audio_sample_rate": audio_sr,
-                "fps": 16,
+                "fps": S2V_OUTPUT_FPS,
             }
         return processed_video
 
@@ -1177,6 +1190,7 @@ class Wan22S2VPipeline(
         )
         num_steps = common.num_inference_steps or num_inference_steps
         num_outputs_per_prompt = common.num_outputs_per_prompt or 1
+        preencode_mp4 = resolve_wan_preencode_mp4(common, output_type=output_type or "np")
 
         if common.guidance_scale_provided:
             guidance_scale = common.guidance_scale
@@ -1315,6 +1329,18 @@ class Wan22S2VPipeline(
 
         # ---- 6. Multi-clip autoregressive denoising ----
         clips: list[torch.Tensor] = []
+        # Encode each finished clip while the next one denoises, instead of
+        # concatenating the whole video first.
+        mp4_session = (
+            WanClipMP4Session(
+                audio_waveforms=[raw_audio_waveforms[index // num_outputs_per_prompt] for index in range(batch_size)],
+                audio_sample_rate=raw_audio_sr,
+                fps=S2V_OUTPUT_FPS,
+                video_codec_options=resolve_wan_video_codec_options(common),
+            )
+            if preencode_mp4
+            else None
+        )
         # Keep a pixel-space buffer of the trailing motion_frames for the
         # autoregressive connection between clips.
         videos_last_frames = torch.zeros([batch_size, 3, motion_frames, height, width], dtype=dtype, device=device)
@@ -1459,14 +1485,20 @@ class Wan22S2VPipeline(
             if r < num_repeat - 1:
                 motion_latents = self.prepare_motion_latents(videos_last_frames, device=device).to(dtype=dtype)
 
-            clips.append(clip_video.cpu())
+            if mp4_session is not None:
+                mp4_session.push_clip(clip_video)
+            else:
+                clips.append(clip_video.cpu())
 
             # Free VRAM between clips
             if current_omni_platform.is_available():
                 current_omni_platform.empty_cache()
 
-        # ---- Concatenate all clips ----
-        output = torch.cat(clips, dim=2)  # [B, C, T_total, H, W]
+        # ---- Assemble the output ----
+        if mp4_session is not None:
+            output = mp4_session.finish()  # one progressive MP4 per batch entry
+        else:
+            output = torch.cat(clips, dim=2)  # [B, C, T_total, H, W]
 
         outputs = split_diffusion_output_by_request(
             DiffusionOutput(
@@ -1476,6 +1508,9 @@ class Wan22S2VPipeline(
             req,
             num_outputs_per_prompt=num_outputs_per_prompt,
         )
+        if mp4_session is not None:
+            # The waveform is already muxed into each container.
+            return outputs
         for request_output, raw_audio_waveform in zip(outputs, raw_audio_waveforms):
             request_output.output = (request_output.output, raw_audio_waveform, raw_audio_sr)
         return outputs

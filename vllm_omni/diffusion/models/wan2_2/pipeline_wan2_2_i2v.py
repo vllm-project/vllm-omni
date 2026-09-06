@@ -31,6 +31,13 @@ from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.utils import _load_json
+from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
+    decode_wan_latents_to_mp4,
+    resolve_wan_output_fps,
+    resolve_wan_preencode_mp4,
+    resolve_wan_video_codec_options,
+    wan_preencoded_mp4_payload,
+)
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     _WAN_TEXT_ENCODER_OFFLOAD_PLAN,
     build_wan_scheduler,
@@ -70,6 +77,9 @@ def get_wan22_i2v_post_process_func(
             output_type = sampling_params.output_type
         if output_type == "latent":
             return video
+        encoded = wan_preencoded_mp4_payload(video)
+        if encoded is not None:
+            return encoded
         video_metadata = {}
         if sampling_params is not None and getattr(sampling_params, "enable_frame_interpolation", False):
             video, multiplier = interpolate_video_tensor(
@@ -519,6 +529,7 @@ class Wan22I2VPipeline(
         num_steps = 40 if common.num_inference_steps is None else common.num_inference_steps
 
         output_type = common.output_type or "np"
+        preencode_mp4 = resolve_wan_preencode_mp4(common, output_type=output_type)
         num_outputs_per_prompt = common.num_outputs_per_prompt or 1
         attention_kwargs: dict | None = None
 
@@ -745,7 +756,15 @@ class Wan22I2VPipeline(
                 latents.device, latents.dtype
             )
             latents = latents / latents_std + latents_mean
-            output = self.vae.decode(latents, return_dict=False)[0]
+            if preencode_mp4:
+                output = decode_wan_latents_to_mp4(
+                    self.vae,
+                    latents,
+                    fps=resolve_wan_output_fps(common),
+                    video_codec_options=resolve_wan_video_codec_options(common),
+                )
+            else:
+                output = self.vae.decode(latents, return_dict=False)[0]
 
         if DEBUG_PERF:
             current_omni_platform.synchronize()

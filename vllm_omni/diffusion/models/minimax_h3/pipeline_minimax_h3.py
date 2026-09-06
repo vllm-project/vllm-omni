@@ -64,6 +64,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
+from vllm_omni.diffusion.utils.media_utils import normalize_video_codec_options
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError, client_error_from_metadata
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -370,6 +371,19 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
     if not isinstance(output, tuple) or len(output) != 2:
         return output
     video, audio = output
+    if isinstance(video, (bytes, bytearray, memoryview)):
+        video = [video]
+    if isinstance(video, list) and all(isinstance(item, (bytes, bytearray, memoryview)) for item in video):
+        encoded_videos = [bytes(item) for item in video]
+    else:
+        encoded_videos = None
+    if encoded_videos is not None:
+        return {
+            "video": encoded_videos,
+            "audio": [None] * len(encoded_videos),
+            "audio_sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE,
+            "fps": MINIMAX_H3_FPS,
+        }
     if video.dtype != torch.uint8 or video.ndim != 5 or video.shape[-1] not in (3, 4):
         # Float or channel-first frames would reach the muxer as a black or
         # banded video rather than as an error.
@@ -2133,6 +2147,80 @@ class MiniMaxH3Pipeline(
             audio_t=audio_t,
         )
 
+    def decode_to_mp4(
+        self,
+        video_latent: torch.Tensor,
+        audio_latent: torch.Tensor,
+        *,
+        height: int,
+        width: int,
+        max_pending: int = 2,
+        batch_frames: int = 17,
+        video_codec_options: dict[str, str] | None = None,
+    ) -> bytes:
+        """Decode and encode one output on the worker without full-video materialization.
+
+        Audio is decoded first so the incremental mux session can attach its audio
+        stream before temporal video chunks arrive. The callback receives committed
+        float32 ``BCTHW`` frames, performs the requested-size crop and uint8
+        conversion in the worker, then applies bounded backpressure to the encoder.
+        """
+        from vllm_omni.diffusion.utils.media_utils import ChunkedMP4Encoder
+
+        if batch_frames <= 0:
+            raise ValueError("batch_frames must be positive")
+
+        with self._component_on_device(self.audio_vae):
+            audio = self.audio_vae.decode_latent(audio_latent)
+        audio_np = audio.detach().float().cpu().numpy()
+        if audio_np.ndim == 3 and audio_np.shape[0] == 1:
+            audio_np = audio_np[0]
+        encoder = ChunkedMP4Encoder(
+            width=width,
+            height=height,
+            fps=MINIMAX_H3_FPS,
+            audio_waveform=audio_np,
+            audio_sample_rate=MINIMAX_H3_AUDIO_SAMPLE_RATE,
+            max_pending=max_pending,
+            video_codec_options=video_codec_options,
+        )
+
+        pending_chunks: list[torch.Tensor] = []
+        pending_frames = 0
+
+        def flush_pending() -> None:
+            nonlocal pending_frames
+            if not pending_chunks:
+                return
+            batched = torch.cat(pending_chunks, dim=1)
+            encoder.push(batched[0].cpu().numpy())
+            pending_chunks.clear()
+            pending_frames = 0
+
+        def on_chunk(frames: torch.Tensor) -> None:
+            nonlocal pending_frames
+            prepared = _prepare_minimax_h3_video_output(frames[..., :height, :width])
+            if prepared.shape[0] != 1:
+                raise ValueError("MiniMax H3 chunked MP4 encoding currently expects one output per decoder")
+            pending_chunks.append(prepared)
+            pending_frames += int(prepared.shape[1])
+            if pending_frames >= batch_frames:
+                flush_pending()
+
+        try:
+            with self._component_on_device(self.video_vae):
+                with current_omni_platform.create_autocast_context(
+                    device_type=self.device.type,
+                    dtype=torch.float16,
+                    enabled=True,
+                ):
+                    self.video_vae.decode_latent_with_chunks(video_latent, on_chunk)
+            flush_pending()
+            return encoder.finish()
+        except BaseException:
+            encoder.abort()
+            raise
+
     def decode(
         self,
         video_latent: torch.Tensor,
@@ -2485,6 +2573,8 @@ class MiniMaxH3Pipeline(
             "audio_shift": audio_shift,
             "base_schedule": base_schedule,
             "num_outputs": num_outputs,
+            "preencode_mp4": bool(extra.get("preencode_mp4", False)),
+            "video_codec_options": normalize_video_codec_options(extra.get("video_codec_options")),
         }
 
     @staticmethod
@@ -2511,16 +2601,32 @@ class MiniMaxH3Pipeline(
         audios = []
         for output_seed in _minimax_h3_output_seeds(context["seed"], num_outputs):
             video_latent, audio_latent = self.diffuse(**{**denoise_kwargs, "seed": output_seed})
-            video, audio = self.decode(
-                video_latent,
-                audio_latent,
-                height=context["height"],
-                width=context["width"],
-            )
-            videos.append(_prepare_minimax_h3_video_output(video))
-            audios.append(audio)
-        video = videos[0] if len(videos) == 1 else torch.cat(videos, dim=0)
-        audio = audios[0] if len(audios) == 1 else torch.cat(audios, dim=0)
+            if context["preencode_mp4"]:
+                videos.append(
+                    self.decode_to_mp4(
+                        video_latent,
+                        audio_latent,
+                        height=context["height"],
+                        width=context["width"],
+                        video_codec_options=context["video_codec_options"],
+                    )
+                )
+                audios.append(None)
+            else:
+                video, audio = self.decode(
+                    video_latent,
+                    audio_latent,
+                    height=context["height"],
+                    width=context["width"],
+                )
+                videos.append(_prepare_minimax_h3_video_output(video))
+                audios.append(audio)
+        if videos and isinstance(videos[0], bytes):
+            video = videos[0] if len(videos) == 1 else videos
+            audio = None
+        else:
+            video = videos[0] if len(videos) == 1 else torch.cat(videos, dim=0)
+            audio = audios[0] if len(audios) == 1 else torch.cat(audios, dim=0)
         return DiffusionOutput(
             output=(video, audio),
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
@@ -2645,6 +2751,8 @@ class MiniMaxH3Pipeline(
                     "latent_h": context["latent_h"],
                     "latent_w": context["latent_w"],
                     "audio_t": context["audio_t"],
+                    "preencode_mp4": context.get("preencode_mp4", False),
+                    "video_codec_options": context.get("video_codec_options"),
                 },
             }
         )
@@ -2816,13 +2924,23 @@ class MiniMaxH3Pipeline(
             latent_w=shape["latent_w"],
             audio_t=shape["audio_t"],
         )
-        video, audio = self.decode(
-            video_latent,
-            audio_latent,
-            height=shape["height"],
-            width=shape["width"],
-        )
-        video = _prepare_minimax_h3_video_output(video)
+        if shape.get("preencode_mp4", False):
+            video = self.decode_to_mp4(
+                video_latent,
+                audio_latent,
+                height=shape["height"],
+                width=shape["width"],
+                video_codec_options=shape.get("video_codec_options"),
+            )
+            audio = None
+        else:
+            video, audio = self.decode(
+                video_latent,
+                audio_latent,
+                height=shape["height"],
+                width=shape["width"],
+            )
+            video = _prepare_minimax_h3_video_output(video)
         return DiffusionOutput(
             output=(video, audio),
             post_process_func=get_minimax_h3_post_process_func(self.od_config),

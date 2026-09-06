@@ -215,6 +215,36 @@ curl -X POST http://localhost:8091/v1/videos/sync \
   -o output.mp4
 ```
 
+## Output Encoding
+
+These `extra_params` control how the server turns decoded frames into MP4 bytes.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `preencode_mp4` | boolean | false | Encode the MP4 on the worker while the VAE is still decoding, instead of after the full video is materialized |
+| `video_codec_options` | object | null | Encoder options passed through to the H.264 encoder, such as `{"preset": "ultrafast", "threads": "0"}` |
+
+With `preencode_mp4` enabled, each committed VAE chunk leaves the accelerator and
+is encoded while later chunks are still decoding, so host transfer and CPU
+encoding overlap the remaining decode instead of following it. The response is
+unchanged: the same complete MP4, byte-for-byte equivalent frames.
+
+```bash
+curl -X POST http://localhost:8091/v1/videos/sync \
+  -F "prompt=A small robot walking through a neon city" \
+  -F 'extra_params={"preencode_mp4": true, "video_codec_options": {"preset": "ultrafast"}}' \
+  -o output.mp4
+```
+
+`preencode_mp4` applies to the complete-MP4 response paths only. The
+`/v1/realtime/video` WebSocket endpoint rejects it, because that path already
+overlaps encoding through its own incremental fragmented-MP4 encoder. Wan also
+rejects it together with `enable_frame_interpolation`, which needs the decoded
+frames the pre-encoded path no longer materializes.
+
+Support is per model: MiniMax-H3 and Wan 2.2 (T2V and I2V) implement it, and
+other models ignore the flag and take the full-decode path.
+
 ## Storage
 
 Set `VLLM_OMNI_SERVER_STORAGE__PATH` to control where asynchronous video outputs are

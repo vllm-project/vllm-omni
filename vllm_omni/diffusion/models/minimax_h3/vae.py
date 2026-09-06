@@ -27,6 +27,7 @@ from vllm_omni.diffusion.offloader.module_residency import (
     PinnedModuleStager,
 )
 
+from .chunked_decode import MiniMaxH3VideoChunkCallback, decode_h3_chunks
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
 
@@ -357,17 +358,6 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
 
     @torch.inference_mode()
     def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
-        channels = int(self.config_dict["latent_channels"])
-        mean = torch.tensor(
-            self.config_dict["latents_mean"],
-            device=latent.device,
-            dtype=latent.dtype,
-        ).view(1, channels, 1, 1, 1)
-        std = torch.tensor(
-            self.config_dict["latents_std"],
-            device=latent.device,
-            dtype=latent.dtype,
-        ).view(1, channels, 1, 1, 1)
         # The checkpoint hands rank r the tiles ``range(r, num_tiles, sp_size)``
         # and then rejects an empty share inside the gather. A rank with no
         # tiles raises and leaves the collective while the others block in it
@@ -388,13 +378,42 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             tiling_context = nullcontext()
 
         with tiling_context:
-            decoded = self.model.decode_base(latent * std + mean)
-        frames = self.model.processor.revert_tensor(decoded)
+            decoded = self.model.decode_base(self._denormalize_latent(latent))
+        return self._normalize_decoded_frames(self.model.processor.revert_tensor(decoded))
+
+    def _denormalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        channels = int(self.config_dict["latent_channels"])
+        mean = torch.tensor(self.config_dict["latents_mean"], device=latent.device, dtype=latent.dtype)
+        std = torch.tensor(self.config_dict["latents_std"], device=latent.device, dtype=latent.dtype)
+        shape = (1, channels, 1, 1, 1)
+        return latent * std.view(shape) + mean.view(shape)
+
+    @staticmethod
+    def _normalize_decoded_frames(decoded: torch.Tensor) -> torch.Tensor:
+        """Canonicalize remote H3 decoder output to [B,C,T,H,W]."""
+        frames = decoded
         if frames.ndim == 4:
             frames = frames.unsqueeze(0).transpose(1, 2)
         if frames.ndim != 5:
             raise ValueError(f"unexpected decoded video shape {tuple(frames.shape)}")
         return frames.float()
+
+    @torch.inference_mode()
+    def decode_latent_with_chunks(
+        self,
+        latent: torch.Tensor,
+        chunk_callback: MiniMaxH3VideoChunkCallback | None,
+    ) -> torch.Tensor:
+        """Decode temporal clips and synchronously publish frames-only chunks."""
+        if not callable(getattr(self.model, "_adaptive_decode", None)):
+            raise RuntimeError("Loaded MiniMax-H3 VAE does not expose temporal decode primitives")
+        group = None
+        if self.is_distributed_enabled():
+            group = self._native_parallel_state().get("sp_process_group")
+            if group is None or dist.get_world_size(group) != self.parallel_size:
+                raise RuntimeError("MiniMax-H3 VAE chunk decode has an invalid spatial-parallel group")
+        # Native H3 tiling performs its own collectives for every temporal clip.
+        return decode_h3_chunks(self, latent, chunk_callback, group=group)
 
 
 class MiniMaxH3AudioVAE(nn.Module):
