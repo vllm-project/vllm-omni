@@ -31,6 +31,7 @@ from huggingface_hub import snapshot_download
 from PIL import Image
 from transformers import AutoTokenizer
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization import QuantizationConfig
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -432,6 +433,52 @@ def _optimized_scale(positive_flat, negative_flat):
 
 
 # ---------------------------------------------------------------------------
+# Gen-only FP8 wrapper
+# ---------------------------------------------------------------------------
+
+
+class _GenOnlyQuantConfig:
+    """Wraps an inner QuantizationConfig so only ``*_mot_gen`` layers are quantized.
+
+    SenseNova-U1 uses Mixture-of-Tokenizers with duplicate weights per layer:
+    understanding path (``qkv_proj``, ``mlp``) and generation path
+    (``qkv_proj_mot_gen``, ``mlp_mot_gen``).  The RFC requires FP8 only on the
+    gen-path GEMMs during denoising; und-path layers stay in BF16.
+
+    Duck-typed adapter (not a ``QuantizationConfig`` subclass): ``get_name`` and
+    ``get_quant_method`` are custom; everything else delegates to the inner config
+    via ``__getattr__``. It is attached only to this model's ``language_model``
+    and is consumed solely through ``get_quant_method`` by ``LinearBase``; the
+    global weight-loader/registry use the original config in
+    ``od_config.quantization_config``, not this wrapper.
+
+    The quantization is intentionally non-uniform: ``get_quant_method`` is
+    prefix-dependent (inner FP8 only for ``mot_gen`` layers, BF16 elsewhere).
+    ``get_name`` therefore reports ``"fp8_gen_only"`` instead of delegating to the
+    inner ``"fp8"``, so introspection/logging reflect that this is not a uniform
+    FP8 config. This name is a local descriptor only — it is not registered in
+    ``QuantizationMethods``, so do not feed it back into any name-based registry
+    lookup.
+    """
+
+    def __init__(self, inner: QuantizationConfig):
+        self._inner = inner
+
+    def get_name(self) -> str:
+        return "fp8_gen_only"
+
+    def get_quant_method(self, layer, prefix: str = ""):
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+        if "mot_gen" in prefix:
+            return self._inner.get_quant_method(layer, prefix)
+        return UnquantizedLinearMethod()
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
@@ -509,9 +556,15 @@ class SenseNovaU1Pipeline(
         self.img_context_token_id = self.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         self.img_start_token_id = self.tokenizer.convert_tokens_to_ids(IMG_START_TOKEN)
 
-        # Language model (TP-aware)
+        # Language model (TP-aware).
+        # Wrap quant_config so only gen-path (mot_gen) layers are quantized;
+        # understanding-path layers stay in BF16.
+        quant_config = od_config.quantization_config
+        if quant_config is not None:
+            quant_config = _GenOnlyQuantConfig(quant_config)
         self.language_model = SenseNovaU1ForCausalLM(
             self.llm_cfg,
+            quant_config=quant_config,
             prefix="language_model",
         )
         # Cache-DiT hooks pipeline.transformer(.blocks), so it must point at the
