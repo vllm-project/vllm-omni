@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -231,6 +232,77 @@ def test_filter_mrope_kwargs_preserves_flexible_model_kwargs():
     }
 
     assert _filter_mrope_kwargs_for_model(FlexibleMRoPEModel(), kwargs) is kwargs
+
+
+class _RequestGeneratorModelStub:
+    def __init__(self, *, requires_tts_local_generator: bool):
+        self.requires_tts_local_generator = requires_tts_local_generator
+
+
+def _runner_for_request_generator(*, requires_tts_local_generator: bool) -> OmniGPUModelRunner:
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.model = _RequestGeneratorModelStub(
+        requires_tts_local_generator=requires_tts_local_generator,
+    )
+    return runner
+
+
+def test_greedy_tts_local_seed_creates_request_generator():
+    runner = _runner_for_request_generator(requires_tts_local_generator=True)
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        seed=42,
+        extra_args={"tts_local_seed": 42},
+    )
+    assert sampling_params.sampling_type == SamplingType.GREEDY
+
+    generator = OmniGPUModelRunner._create_request_generator(runner, sampling_params)
+
+    assert generator is not None
+    expected = torch.empty(8).normal_(generator=torch.Generator(device="cpu").manual_seed(42))
+    actual = torch.empty(8).normal_(generator=generator)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_greedy_tts_default_seed_without_marker_stays_unseeded():
+    runner = _runner_for_request_generator(requires_tts_local_generator=True)
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        seed=42,
+        extra_args={},
+    )
+    assert sampling_params.sampling_type == SamplingType.GREEDY
+
+    assert OmniGPUModelRunner._create_request_generator(runner, sampling_params) is None
+
+
+def test_non_opted_in_greedy_model_ignores_tts_local_seed():
+    runner = _runner_for_request_generator(requires_tts_local_generator=False)
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        seed=42,
+        extra_args={"tts_local_seed": 42},
+    )
+    assert sampling_params.sampling_type == SamplingType.GREEDY
+
+    assert OmniGPUModelRunner._create_request_generator(runner, sampling_params) is None
+
+
+def test_random_seed_request_generator_behavior_is_preserved():
+    runner = _runner_for_request_generator(requires_tts_local_generator=False)
+    sampling_params = SamplingParams(
+        seed=17,
+        extra_args=None,
+    )
+    assert sampling_params.sampling_type == SamplingType.RANDOM_SEED
+
+    generator = OmniGPUModelRunner._create_request_generator(runner, sampling_params)
+
+    assert generator is not None
+    expected = torch.empty(8).normal_(generator=torch.Generator(device="cpu").manual_seed(17))
+    actual = torch.empty(8).normal_(generator=generator)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
