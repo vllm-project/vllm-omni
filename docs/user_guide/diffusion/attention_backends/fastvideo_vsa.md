@@ -20,6 +20,11 @@ dtypes, sequence-parallel execution, or kernel failures fall back to
 sequence-parallel context is one of those fallbacks; the H3 route supports pure
 Ulysses and rejects ring or all-gather sequence parallelism at startup.
 
+MiniMax-H3 can optionally execute the block-sparse attention compute through
+FlashInfer. This also requires a FlashInfer build that provides the blk64 VSA
+APIs. Explicit FlashInfer selection fails instead of silently falling back if
+the requested native kernel is unavailable or its launch fails.
+
 ## Enable the backend
 
 For online serving, select the backend with the existing attention backend
@@ -53,6 +58,28 @@ Do not combine `--diffusion-attention-backend` with an explicit
 `diffusion_attention_config.default.backend`. The top-k value must be positive
 and is valid only when the default backend is `FASTVIDEO_VSA`.
 
+### Choose the MiniMax-H3 compute kernel
+
+The default `fastvideo` provider preserves the existing FastVideo kernel. To
+select the architecture-specific FlashInfer provider for MiniMax-H3, use the
+structured configuration:
+
+```bash
+vllm-omni serve <model> \
+  --diffusion-attention-config \
+  '{"default":{"backend":"FASTVIDEO_VSA","fastvideo_vsa_topk":64,"fastvideo_vsa_h3_kernel_backend":"flashinfer"}}'
+```
+
+The `flashinfer` provider dispatches the same 64-token, variable-tail block
+contract to:
+
+- the native CUDA/C++ blk64 kernel on SM100 and SM103 (BF16); or
+- the CuTe DSL blk64 kernel on SM120 and SM121 (FP16 or BF16).
+
+Both kernels require head dimension 128. The provider changes only the
+block-sparse attention compute; H3 block scoring, top-k selection, and learned
+compression-gate behavior stay unchanged.
+
 For a deploy YAML stage, use either the shorthand fields:
 
 ```yaml
@@ -71,6 +98,7 @@ stages:
       default:
         backend: FASTVIDEO_VSA
         fastvideo_vsa_topk: 64
+        fastvideo_vsa_h3_kernel_backend: flashinfer
 ```
 
 ## Choose top-k
@@ -123,6 +151,9 @@ the backend guarantees sparse execution:
 - `route=VSA` means top-k block selection is active.
 - `route=VSA_ALL_BLOCKS` means the FastVideo DMD checkpoint retained all
   blocks through the VSA kernel.
+- `compute_backend=flashinfer` followed by `FlashInfer
+  vsa_sm120_blk64_cute_dsl` or `vsa_sm100_blk64_cuda` confirms the native H3
+  compute path.
 - `route=SDPA` or `FASTVIDEO_VSA falling back to SDPA: ...` means dense SDPA
   executed; the warning includes the reason.
 

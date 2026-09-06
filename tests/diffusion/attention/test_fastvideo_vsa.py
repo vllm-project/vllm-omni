@@ -19,6 +19,7 @@ from vllm_omni.diffusion.attention.backends.fastvideo_vsa import (
     FastVideoVSABackend,
     FastVideoVSAImpl,
     _build_h3_block_map,
+    _flashinfer_h3_vsa_bshd_impl,
     _get_h3_tile_metadata,
 )
 from vllm_omni.diffusion.attention.backends.registry import (
@@ -314,6 +315,94 @@ def test_h3_forward_keeps_prefix_dense_and_selects_top_k_video_tiles(monkeypatch
         *(x.float().transpose(1, 2) for x in (query, query, query))
     ).transpose(1, 2)
     torch.testing.assert_close(dense.float(), reference, atol=2e-2, rtol=2e-2)
+
+
+def test_h3_flashinfer_route_does_not_add_fastvideo_pair_padding(monkeypatch):
+    calls: dict[str, Any] = {}
+
+    def fake_flashinfer(q, k, v, block_map, variable_block_sizes, softmax_scale):
+        calls["q_shape"] = tuple(q.shape)
+        calls["block_map_shape"] = tuple(block_map.shape)
+        calls["variable_block_sizes"] = variable_block_sizes.tolist()
+        calls["softmax_scale"] = softmax_scale
+        return q
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.attention.backends.fastvideo_vsa._flashinfer_h3_vsa_bshd_op",
+        fake_flashinfer,
+    )
+    impl = _h3_impl(topk=1, h3_kernel_backend="flashinfer")
+    prefix_segments, video_shape = (5,), (8, 4, 4)
+    seq_len = 5 + 8 * 4 * 4
+    query = torch.randn(1, seq_len, 2, 8, dtype=torch.bfloat16)
+
+    output = impl.forward_cuda(query, query, query, _h3_metadata(prefix_segments, video_shape))
+
+    assert calls["q_shape"] == (1, 3 * 64, 2, 8)
+    assert calls["block_map_shape"] == (1, 2, 3, 3)
+    assert calls["variable_block_sizes"] == [5, 64, 64]
+    assert calls["softmax_scale"] == 8**-0.5
+    torch.testing.assert_close(output, query)
+
+
+def test_h3_explicit_flashinfer_route_never_silently_falls_back(monkeypatch):
+    def failing_flashinfer(*args, **kwargs):
+        raise RuntimeError("flashinfer launch failed")
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.attention.backends.fastvideo_vsa._flashinfer_h3_vsa_bshd_op",
+        failing_flashinfer,
+    )
+    impl = _h3_impl(h3_kernel_backend="flashinfer")
+    query = torch.randn(1, 5 + 2 * 4 * 4, 2, 8, dtype=torch.bfloat16)
+
+    with pytest.raises(RuntimeError, match="flashinfer launch failed"):
+        impl.forward_cuda(query, query, query, _h3_metadata((5,), (2, 4, 4)))
+
+
+@pytest.mark.parametrize(
+    ("capability", "module_name", "function_name"),
+    [
+        ((10, 3), "flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk64", "bsa_attn_sm100_blk64_fwd"),
+        ((12, 0), "flashinfer.cute_dsl.sparse.bsa_attn_sm120", "bsa_attn_sm120_blk64_fwd"),
+    ],
+)
+def test_flashinfer_h3_provider_selects_arch_specific_blk64_kernel(monkeypatch, capability, module_name, function_name):
+    calls: dict[str, Any] = {}
+
+    def map_to_index(block_map):
+        blocks = block_map.shape[-1]
+        index = torch.arange(blocks, dtype=torch.int32).expand_as(block_map).clone()
+        counts = torch.full(block_map.shape[:-1], blocks, dtype=torch.int32)
+        return index, counts
+
+    index_module = types.ModuleType("fastvideo_kernel.triton_kernels.index")
+    setattr(index_module, "map_to_index", map_to_index)
+    monkeypatch.setitem(sys.modules, "fastvideo_kernel.triton_kernels.index", index_module)
+
+    def kernel(q, k, v, q2k_idx, block_sparse_num, **kwargs):
+        calls["q2k_dtype"] = q2k_idx.dtype
+        calls["block_sparse_num"] = block_sparse_num
+        calls.update(kwargs)
+        return q + k + v, None
+
+    kernel_module = types.ModuleType(module_name)
+    setattr(kernel_module, function_name, kernel)
+    monkeypatch.setitem(sys.modules, module_name, kernel_module)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
+
+    query = torch.randn(1, 128, 2, 128, dtype=torch.bfloat16)
+    block_map = torch.ones(1, 2, 2, 2, dtype=torch.bool)
+    block_sizes = torch.tensor([64, 64], dtype=torch.int32)
+    output = _flashinfer_h3_vsa_bshd_impl(query, query, query, block_map, block_sizes, 128**-0.5)
+
+    torch.testing.assert_close(output, 3 * query)
+    assert calls["q2k_dtype"] == torch.int32
+    assert calls["block_sparse_num"] == 2
+    assert calls["block_sizes"].tolist() == [64, 64]
+    assert calls["q2k_block_nums"].shape == (1, 2, 2)
+    assert calls["softmax_scale"] == 128**-0.5
+    assert calls["return_lse"] is False
 
 
 def test_h3_forward_applies_the_learned_compression_gate(monkeypatch):

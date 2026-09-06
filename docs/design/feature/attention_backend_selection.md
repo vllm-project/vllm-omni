@@ -62,7 +62,8 @@ unstructured keyword dictionaries:
   validation;
 - `skip_softmax` is consumed by TRTLLM; and
 - `block_sparse` is consumed by block-sparse backends such as RainFusion; and
-- `fastvideo_vsa_topk` is consumed by FastVideo VSA.
+- `fastvideo_vsa_topk` and `fastvideo_vsa_h3_kernel_backend` are consumed by
+  FastVideo VSA.
 
 A backend reads only the fields it owns and rejects incompatible values. New
 options should be added to a shared typed spec only when more than one backend

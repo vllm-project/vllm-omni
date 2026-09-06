@@ -1793,6 +1793,7 @@ class AttentionSpec:
     skip_softmax: SkipSoftmaxSpec | None = None
     quant: AttnQuantSpec | None = None
     fastvideo_vsa_topk: int | None = None
+    fastvideo_vsa_h3_kernel_backend: str | None = None
     block_sparse: BlockSparseSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
@@ -1817,6 +1818,12 @@ class AttentionSpec:
                 raise ValueError("fastvideo_vsa_topk is only supported by the FASTVIDEO_VSA backend.")
             if self.fastvideo_vsa_topk <= 0:
                 raise ValueError("fastvideo_vsa_topk must be positive.")
+        if self.fastvideo_vsa_h3_kernel_backend is not None:
+            if self.backend.upper() != "FASTVIDEO_VSA":
+                raise ValueError("fastvideo_vsa_h3_kernel_backend is only supported by the FASTVIDEO_VSA backend.")
+            self.fastvideo_vsa_h3_kernel_backend = self.fastvideo_vsa_h3_kernel_backend.lower()
+            if self.fastvideo_vsa_h3_kernel_backend not in {"fastvideo", "flashinfer"}:
+                raise ValueError("fastvideo_vsa_h3_kernel_backend must be 'fastvideo' or 'flashinfer'.")
         if self.backend.upper() in BLOCK_SPARSE_BACKENDS:
             # Selecting the backend is the opt-in; without an explicit block the
             # defaults apply rather than silently running dense.
@@ -1861,6 +1868,8 @@ class AttentionSpec:
                 kw["quant"] = quant_kw
         if self.fastvideo_vsa_topk is not None:
             kw["topk"] = self.fastvideo_vsa_topk
+        if self.fastvideo_vsa_h3_kernel_backend is not None:
+            kw["h3_kernel_backend"] = self.fastvideo_vsa_h3_kernel_backend
         if self.block_sparse is not None:
             bs = self.block_sparse
             kw["sparsity"] = bs.sparsity
@@ -1939,7 +1948,14 @@ class AttentionConfig:
             normalized[role] = node
             return
 
-        spec_keys = {"backend", "skip_softmax", "quant", "fastvideo_vsa_topk", "block_sparse"}
+        spec_keys = {
+            "backend",
+            "skip_softmax",
+            "quant",
+            "fastvideo_vsa_topk",
+            "fastvideo_vsa_h3_kernel_backend",
+            "block_sparse",
+        }
         node_dict = dict(node)
         node_keys = set(node_dict)
         if node_keys & spec_keys:

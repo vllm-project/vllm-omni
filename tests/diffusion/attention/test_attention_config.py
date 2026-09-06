@@ -106,6 +106,19 @@ class TestAttentionSpec:
         with pytest.raises(ValueError, match="only supported by the FASTVIDEO_VSA"):
             AttentionSpec(backend="TORCH_SDPA", fastvideo_vsa_topk=96)
 
+    def test_fastvideo_vsa_h3_kernel_backend_serialized(self):
+        spec = AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_h3_kernel_backend="FlashInfer")
+        assert spec.backend_kwargs() == {"h3_kernel_backend": "flashinfer"}
+
+    @pytest.mark.parametrize("value", ["triton", "cuda", "cute_dsl"])
+    def test_fastvideo_vsa_h3_kernel_backend_rejected(self, value):
+        with pytest.raises(ValueError, match="must be 'fastvideo' or 'flashinfer'"):
+            AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_h3_kernel_backend=value)
+
+    def test_fastvideo_vsa_h3_kernel_backend_rejected_for_other_backend(self):
+        with pytest.raises(ValueError, match="only supported by the FASTVIDEO_VSA"):
+            AttentionSpec(backend="TORCH_SDPA", fastvideo_vsa_h3_kernel_backend="flashinfer")
+
     def test_block_sparse_defaults_applied_when_backend_selected(self):
         spec = AttentionSpec(backend="RAINFUSION_ATTN")
         assert spec.block_sparse.sparsity == 0.8
