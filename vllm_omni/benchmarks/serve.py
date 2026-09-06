@@ -31,6 +31,8 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
         os.environ["SEED_TTS_WER_SAVE_ITEMS"] = "1"
     if getattr(args, "daily_omni_save_eval_items", False):
         os.environ["DAILY_OMNI_SAVE_EVAL_ITEMS"] = "1"
+    if getattr(args, "omni_request_timeout_s", None) is not None:
+        os.environ["OMNI_REQUEST_TIMEOUT_S"] = str(args.omni_request_timeout_s)
     set_print_stage(getattr(args, "print_stage", False))
     args.extra_body = maybe_enable_stage_metrics(
         getattr(args, "extra_body", None),

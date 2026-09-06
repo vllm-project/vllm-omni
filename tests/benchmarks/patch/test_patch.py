@@ -24,6 +24,8 @@ from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
     _apply_stage0_token_timings,
     _attach_seed_tts_to_request_func_input,
+    _build_benchmark_session,
+    _omni_request_timeout_s,
     async_request_openai_chat_omni_completions,
     async_request_openai_realtime_duplex,
     should_request_stage_metrics,
@@ -1194,6 +1196,37 @@ async def test_prompt_len_assigned_from_usage(mocker: MockerFixture):
     assert output.prompt_len == 4992, (
         "prompt_len should be overridden by usage.prompt_tokens to reflect the true multimodal input token count"
     )
+
+
+class TestOmniRequestTimeout:
+    """``--omni-request-timeout-s`` / ``OMNI_REQUEST_TIMEOUT_S`` plumbing."""
+
+    def test_default_timeout_is_900s(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("OMNI_REQUEST_TIMEOUT_S", raising=False)
+        assert _omni_request_timeout_s() == 900.0
+
+    def test_env_override_is_respected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OMNI_REQUEST_TIMEOUT_S", "123.5")
+        assert _omni_request_timeout_s() == 123.5
+
+    def test_non_positive_restores_legacy_6h_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OMNI_REQUEST_TIMEOUT_S", "0")
+        assert _omni_request_timeout_s() == 6 * 60 * 60.0
+
+    def test_invalid_env_value_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OMNI_REQUEST_TIMEOUT_S", "soon")
+        with pytest.raises(ValueError, match="OMNI_REQUEST_TIMEOUT_S"):
+            _omni_request_timeout_s()
+
+    async def test_benchmark_session_uses_configured_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OMNI_REQUEST_TIMEOUT_S", "42")
+        session = _build_benchmark_session(max_concurrency=8, ssl_setting=False)
+        try:
+            assert session.timeout.total == 42.0
+            assert session.connector.limit == 8
+            assert session.connector.limit_per_host == 8
+        finally:
+            await session.close()
 
 
 if __name__ == "__main__":

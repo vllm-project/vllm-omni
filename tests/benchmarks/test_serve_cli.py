@@ -358,3 +358,17 @@ def test_bench_serve_cli_mocks_http_request(tmp_path: Path):
     )
     assert bench_requests
     assert all(url == expected_url for url in bench_requests), f"Unexpected target URLs: {bench_requests}"
+
+
+def test_omni_request_timeout_s_flag_defaults_and_parses() -> None:
+    parser = TrackingArgumentParser()
+    add_omni_args(parser)
+
+    args = parser.parse_args([])
+    assert args.omni_request_timeout_s == 900.0
+
+    args = parser.parse_args(["--omni-request-timeout-s", "0"])
+    assert args.omni_request_timeout_s == 0.0
+
+    args = parser.parse_args(["--omni-request-timeout-s", "3600"])
+    assert args.omni_request_timeout_s == 3600.0
