@@ -795,6 +795,7 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
     have_multimodal_outputs: bool = True
     has_preprocess: bool = True
     has_postprocess: bool = True
+    uses_request_scoped_omni_generators: bool = True
 
     AUDIO_BOS = 1025
     AUDIO_EOS = 1026
@@ -1043,6 +1044,12 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
         info_dicts: list[dict[str, Any]] = (
             kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or []
         )
+        request_generators: Sequence[torch.Generator] = kwargs.get("request_generators") or []
+        if info_dicts and len(request_generators) != len(info_dicts):
+            raise RuntimeError(
+                "MOSS-TTS Realtime requires one request-scoped generator per request: "
+                f"got {len(request_generators)} generators for {len(info_dicts)} requests"
+            )
 
         # Defensive state init.
         for info in info_dicts:
@@ -1101,6 +1108,7 @@ class MossTTSRealtimeTalkerForGeneration(nn.Module):
                     do_sample=True,
                     repetition_penalty=1.1,
                     history_per_codebook=hist_per_cb,
+                    generator=request_generators[i],
                 ).squeeze(0)  # (n_vq,)
                 if int(state.get("step", 0)) < 5 or int(state.get("step", 0)) % 50 == 0:
                     logger.debug(
