@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""MiniMax H3 text and media conditioning contracts."""
-
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
@@ -10,27 +8,14 @@ from typing import Any
 
 import torch
 
-MINIMAX_H3_TEXT_CONDITIONING_SCHEMA = "minimax_h3.text_conditioning/v1"
 MINIMAX_H3_TEXT_HIDDEN_SIZE = 5120
 MINIMAX_H3_PRESENTATION_TASK_KEY = "_minimax_h3_presentation_task"
 MINIMAX_H3_CONDITION_LABELS_KEY = "_minimax_h3_condition_labels"
 
 
-def _validate_contiguous_strided_layout(name: str, tensor: torch.Tensor) -> None:
-    if tensor.layout != torch.strided:
-        raise ValueError(
-            f"{MINIMAX_H3_TEXT_CONDITIONING_SCHEMA}: {name} must use contiguous strided layout, got {tensor.layout}"
-        )
-    if not tensor.is_contiguous():
-        raise ValueError(
-            f"{MINIMAX_H3_TEXT_CONDITIONING_SCHEMA}: {name} must use contiguous "
-            f"strided layout, got stride={tuple(tensor.stride())}"
-        )
-
-
 @dataclass(frozen=True)
 class MiniMaxH3TextConditioning:
-    """``minimax_h3.text_conditioning/v1`` semantic payload."""
+    """Layer-50 Qwen3-VL hidden states and their H3 token roles."""
 
     hidden_states: torch.Tensor
     token_tags: torch.Tensor
@@ -40,81 +25,23 @@ class MiniMaxH3TextConditioning:
         cls,
         payload: Mapping[str, Any],
     ) -> MiniMaxH3TextConditioning:
-        """Validate the semantic payload consumed by the diffusion stage."""
         hidden_states = payload.get("hidden_states")
         token_tags = payload.get("token_tags")
         if not isinstance(hidden_states, torch.Tensor) or not isinstance(token_tags, torch.Tensor):
-            raise ValueError(
-                f"{MINIMAX_H3_TEXT_CONDITIONING_SCHEMA}: conditioning requires hidden_states and token_tags tensors"
-            )
+            raise ValueError("MiniMax H3 conditioning requires hidden_states and token_tags tensors")
         if hidden_states.ndim != 2 or hidden_states.shape[-1] != MINIMAX_H3_TEXT_HIDDEN_SIZE:
             raise ValueError(
-                f"{MINIMAX_H3_TEXT_CONDITIONING_SCHEMA}: hidden_states must have shape "
+                "MiniMax H3 hidden_states must have shape "
                 f"[tokens, {MINIMAX_H3_TEXT_HIDDEN_SIZE}], got {tuple(hidden_states.shape)}"
             )
-        if hidden_states.dtype != torch.bfloat16:
-            raise ValueError(
-                f"{MINIMAX_H3_TEXT_CONDITIONING_SCHEMA}: hidden_states must have dtype "
-                f"torch.bfloat16, got {hidden_states.dtype}"
-            )
-        _validate_contiguous_strided_layout("hidden_states", hidden_states)
         if token_tags.ndim != 1 or token_tags.shape[0] != hidden_states.shape[0]:
             raise ValueError(
-                f"{MINIMAX_H3_TEXT_CONDITIONING_SCHEMA}: token_tags must align with hidden_states, got "
+                "MiniMax H3 token_tags must align with hidden_states, got "
                 f"token_tags={tuple(token_tags.shape)} and hidden_states={tuple(hidden_states.shape)}"
             )
-        if token_tags.dtype != torch.int64:
-            raise ValueError(
-                f"{MINIMAX_H3_TEXT_CONDITIONING_SCHEMA}: token_tags must have dtype torch.int64, got {token_tags.dtype}"
-            )
-        _validate_contiguous_strided_layout("token_tags", token_tags)
         if not torch.all((token_tags == 0) | (token_tags == 1)):
-            raise ValueError(
-                f"{MINIMAX_H3_TEXT_CONDITIONING_SCHEMA}: text-encoder token_tags must contain only 0 and 1"
-            )
+            raise ValueError("MiniMax H3 text-encoder token_tags must contain only 0 and 1")
         return cls(hidden_states=hidden_states, token_tags=token_tags)
-
-    @classmethod
-    def from_omni_payload(
-        cls,
-        payload: Mapping[str, Any],
-    ) -> MiniMaxH3TextConditioning:
-        """Validate and adapt the existing ``OmniPayload`` stage-wire view."""
-        hidden_states = payload.get("hidden_states")
-        if not isinstance(hidden_states, Mapping):
-            raise ValueError(f"{MINIMAX_H3_TEXT_CONDITIONING_SCHEMA}: text encoder returned no hidden_states payload")
-        hidden = hidden_states.get("output")
-        if not isinstance(hidden, torch.Tensor):
-            raise ValueError(
-                f"{MINIMAX_H3_TEXT_CONDITIONING_SCHEMA}: text encoder returned no hidden_states.output tensor"
-            )
-
-        meta = payload.get("meta")
-        if not isinstance(meta, Mapping):
-            raise ValueError(f"{MINIMAX_H3_TEXT_CONDITIONING_SCHEMA}: text encoder returned no conditioning metadata")
-        token_role_ids = meta.get("token_role_ids")
-        if not isinstance(token_role_ids, torch.Tensor):
-            raise ValueError(f"{MINIMAX_H3_TEXT_CONDITIONING_SCHEMA}: text encoder returned no token_role_ids tensor")
-        if token_role_ids.ndim == 1:
-            token_role_ids = token_role_ids.unsqueeze(-1)
-        if token_role_ids.ndim != 2 or token_role_ids.shape[-1] != 1:
-            raise ValueError(
-                f"{MINIMAX_H3_TEXT_CONDITIONING_SCHEMA}: stage-wire token_role_ids must have shape "
-                f"[tokens, 1], got {tuple(token_role_ids.shape)}"
-            )
-        if token_role_ids.dtype != torch.int64:
-            raise ValueError(
-                f"{MINIMAX_H3_TEXT_CONDITIONING_SCHEMA}: stage-wire token_role_ids must have dtype "
-                f"torch.int64, got {token_role_ids.dtype}"
-            )
-        _validate_contiguous_strided_layout("stage-wire token_role_ids", token_role_ids)
-
-        return cls.from_payload(
-            {
-                "hidden_states": hidden,
-                "token_tags": token_role_ids.squeeze(-1),
-            }
-        )
 
     def to_payload(self) -> dict[str, torch.Tensor]:
         return {
@@ -471,12 +398,7 @@ class MiniMaxH3EncoderConditioning:
         media: MiniMaxH3EncoderMediaConditioning,
     ) -> MiniMaxH3EncoderConditioning:
         """Combine local encoder results without a stage-wire round trip."""
-        text = MiniMaxH3TextConditioning.from_payload(
-            {
-                "hidden_states": text.hidden_states.to(dtype=torch.bfloat16),
-                "token_tags": text.token_tags.to(dtype=torch.int64),
-            }
-        )
+        text = MiniMaxH3TextConditioning.from_payload(text.to_payload())
         _validate_condition_tensors(
             media.visual_condition,
             media.visual_condition_shapes,
@@ -504,12 +426,13 @@ class MiniMaxH3EncoderConditioning:
         assert isinstance(token_tags, torch.Tensor)
         assert isinstance(visual, torch.Tensor)
         assert isinstance(audio, torch.Tensor)
-        text_payload = dict(payload)
-        text_meta = dict(meta_payload)
-        if isinstance(token_tags, torch.Tensor) and token_tags.ndim == 1:
-            text_meta["token_role_ids"] = token_tags.unsqueeze(-1)
-        text_payload["meta"] = text_meta
-        text = MiniMaxH3TextConditioning.from_omni_payload(text_payload)
+        if token_tags.ndim == 2 and token_tags.shape[-1] == 1:
+            token_tags = token_tags.squeeze(-1)
+        text = MiniMaxH3TextConditioning.from_payload({"hidden_states": hidden_states, "token_tags": token_tags})
+        if not hidden_states.is_floating_point():
+            raise ValueError("MiniMax H3 hidden_states must use a floating-point dtype")
+        if token_tags.dtype != torch.int64:
+            raise ValueError("MiniMax H3 token_tags must use torch.int64")
         for name, value in (("visual", visual), ("audio", audio)):
             if value.numel() == 0 and (value.dtype != torch.float32 or tuple(value.shape) != (0,)):
                 raise ValueError(f"MiniMax H3 empty {name} condition slot must be FP32 with shape [0]")
