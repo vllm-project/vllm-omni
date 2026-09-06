@@ -225,7 +225,8 @@ def test_hwr_validation_rejects_unsupported_values(validation):
 
 
 @pytest.mark.parametrize("registration_mode", ["auto", "disabled"])
-def test_hwr_registration_policy_reaches_offloader(tmp_path: Path, registration_mode: str):
+@pytest.mark.parametrize("validation", ["manifest_and_metadata", "full_checksum"])
+def test_hwr_registration_policy_reaches_offloader(tmp_path: Path, registration_mode: str, validation: str):
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.offloader.base import OffloadConfig
 
@@ -235,12 +236,15 @@ def test_hwr_registration_policy_reaches_offloader(tmp_path: Path, registration_
         "host_weight_runtime_mode": "preferred",
         "host_weight_runtime_root": str(tmp_path / "unused-store"),
         "dlo_host_registration_mode": registration_mode,
+        "host_weight_runtime_validation": validation,
     }
     config = _from_pipeline_key("dreamzero", deploy_config_path="dreamzero_tp1_cfg2", cli_overrides=options)
     stage = config.stage_by_id(0)
     assert isinstance(stage, VllmOmniDiffusionStageConfig)
     assert stage.diffusion_config.dlo_host_registration_mode == registration_mode
+    assert stage.diffusion_config.host_weight_runtime_validation == validation
     offline = OmniDiffusionConfig(**options)
+    assert offline.host_weight_runtime_validation == validation
     transport = OffloadConfig.from_od_config(offline)
     assert transport.dlo_host_registration_mode == registration_mode
     assert transport.pin_cpu_memory
