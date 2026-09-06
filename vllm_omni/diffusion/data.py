@@ -966,6 +966,12 @@ class OmniDiffusionConfig:
     diffusion_kv_cache_skip_layers: str | None = None
     diffusion_kv_cache_skip_step_indices: set[int] | None = None
     diffusion_kv_cache_skip_layer_indices: set[int] | None = None
+    # Attention call chunking (power-envelope mitigation for specific machine
+    # types; see vllm_omni/diffusion/attention/chunking.py). Requires the fp8
+    # kv dtype — validated in __post_init__.
+    diffusion_attn_q_chunk: int = 1
+    diffusion_attn_head_chunk: int = 0
+    diffusion_attn_head_chunk_min_kv: int = 50000
 
     # Diffusion pipeline Profiling config
     enable_diffusion_pipeline_profiler: bool = False
@@ -1232,6 +1238,7 @@ class OmniDiffusionConfig:
         self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
+        self._validate_attn_chunking()
 
         if self.max_cpu_loras is None:
             self.max_cpu_loras = 1
@@ -1266,6 +1273,40 @@ class OmniDiffusionConfig:
                     model_id,
                     self.model,
                 )
+
+    def _validate_attn_chunking(self) -> None:
+        """Fail fast on chunking knobs that cannot take effect.
+
+        Non-default chunk knobs without the fp8 kv dtype are a config
+        mistake (chunking currently has exactly one consumer: the NPU FP8
+        FIA path), and typos like q_chunk=0 would otherwise silently
+        disable chunking at plan time. Mirrors the same check in
+        ``_DiffusionConfigProjection`` (omni_config.py).
+        """
+        from vllm_omni.diffusion.attention.chunking import (
+            DEFAULT_HEAD_CHUNK_MIN_KV,
+            AttnChunkingOptions,
+            validate_options,
+        )
+
+        non_default = (
+            self.diffusion_attn_q_chunk != 1
+            or self.diffusion_attn_head_chunk != 0
+            or self.diffusion_attn_head_chunk_min_kv != DEFAULT_HEAD_CHUNK_MIN_KV
+        )
+        if non_default and self.diffusion_kv_cache_dtype != "fp8":
+            raise ValueError(
+                "diffusion_attn_q_chunk/diffusion_attn_head_chunk require "
+                "diffusion_kv_cache_dtype='fp8': attention chunking is a mitigation "
+                "for the NPU FP8 FIA path, not a standalone feature."
+            )
+        validate_options(
+            AttnChunkingOptions(
+                q_chunk=self.diffusion_attn_q_chunk,
+                head_chunk=self.diffusion_attn_head_chunk,
+                head_chunk_min_kv=self.diffusion_attn_head_chunk_min_kv,
+            )
+        )
 
     def _propagate_quantization_from_tf_config(self, tf_config: "TransformerConfig") -> None:
         if tf_config.quant_config is None:

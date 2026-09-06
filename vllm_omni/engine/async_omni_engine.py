@@ -1176,6 +1176,9 @@ class AsyncOmniEngine:
             "diffusion_kv_cache_dtype": kwargs.get("diffusion_kv_cache_dtype", None),
             "diffusion_kv_cache_skip_steps": kwargs.get("diffusion_kv_cache_skip_steps", None),
             "diffusion_kv_cache_skip_layers": kwargs.get("diffusion_kv_cache_skip_layers", None),
+            "diffusion_attn_q_chunk": kwargs.get("diffusion_attn_q_chunk", 1),
+            "diffusion_attn_head_chunk": kwargs.get("diffusion_attn_head_chunk", 0),
+            "diffusion_attn_head_chunk_min_kv": kwargs.get("diffusion_attn_head_chunk_min_kv", 50000),
             **({"diffusion_attention_config": attention_config} if attention_config is not None else {}),
             "force_cutlass_fp8": bool(kwargs.get("force_cutlass_fp8", False)),
             "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
@@ -1404,6 +1407,17 @@ class AsyncOmniEngine:
                         or cfg.engine_args.diffusion_kv_cache_skip_layers is None
                     ):
                         cfg.engine_args.diffusion_kv_cache_skip_layers = diffusion_kv_cache_skip_layers
+                # Chunk knobs have non-None engine-arg defaults, so "inject"
+                # means: the orchestrator-level value is non-default AND the
+                # stage kept the default (an explicit stage value wins).
+                for chunk_field, default in (
+                    ("diffusion_attn_q_chunk", 1),
+                    ("diffusion_attn_head_chunk", 0),
+                    ("diffusion_attn_head_chunk_min_kv", 50000),
+                ):
+                    value = kwargs.get(chunk_field, default)
+                    if value != default and getattr(cfg.engine_args, chunk_field, default) == default:
+                        setattr(cfg.engine_args, chunk_field, value)
             except Exception as e:
                 logger.warning("Failed to inject LoRA config for stage: %s", e)
 

@@ -823,6 +823,35 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="Diffusion KV-cache quantization skip-layer selector, e.g. '0,1,4-8'.",
         )
+        # Attention call chunking: a power-envelope mitigation for specific
+        # machine types (e.g. NPU downclocking on wide attention bursts), not
+        # a general win. Currently takes effect only on the NPU FP8 FIA path,
+        # so the flags require --diffusion-kv-cache-dtype fp8.
+        omni_config_group.add_argument(
+            "--diffusion-attn-q-chunk",
+            type=int,
+            default=1,
+            help="Split each wide attention call into up to N smaller calls along the "
+            "query sequence axis (K/V kept whole, quantized once). 1 = off. Power-envelope "
+            "mitigation for specific machine types, not a general win. Requires "
+            "--diffusion-kv-cache-dtype fp8; currently only the NPU FP8 FIA path honors it.",
+        )
+        omni_config_group.add_argument(
+            "--diffusion-attn-head-chunk",
+            type=int,
+            default=0,
+            help="Call attention on H heads at a time (0 = off). Requires MHA. Engages only "
+            "when the valid kv length reaches --diffusion-attn-head-chunk-min-kv (short KV is "
+            "L2-resident already). Power-envelope mitigation for specific machine types. "
+            "Requires --diffusion-kv-cache-dtype fp8; currently only the NPU FP8 FIA path honors it.",
+        )
+        omni_config_group.add_argument(
+            "--diffusion-attn-head-chunk-min-kv",
+            type=int,
+            default=50000,
+            help="Minimum valid kv length for head chunking to engage (L2-residency gate). "
+            "Tuned on Ascend 950PR long-video workloads.",
+        )
         omni_config_group.add_argument(
             "--cfg-parallel-size",
             type=int,
