@@ -89,7 +89,12 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict[str, Any] | None = None,
     ) -> "OmniEngineCoreRequest":
-        """Clone an EngineCoreRequest into an OmniEngineCoreRequest with optional payload overrides."""
+        """Clone an EngineCoreRequest into an OmniEngineCoreRequest with optional payload overrides.
+
+        Every upstream ``EngineCoreRequest`` field must be copied explicitly.
+        Field parity is pinned by tests/engine/test_omni_engine_core_request_contract.py
+        so upstream vLLM field drift is caught at test time.
+        """
 
         if prompt_embeds is None:
             prompt_embeds = request.prompt_embeds
@@ -119,6 +124,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            session_id=request.session_id,
             additional_information=additional_information,
             model_intermediate_buffer=model_intermediate_buffer,
         )
