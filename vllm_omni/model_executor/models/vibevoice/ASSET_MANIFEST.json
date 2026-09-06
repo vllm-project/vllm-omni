@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "purpose": "Default reference audio for Microsoft VibeVoice-1.5B requests that omit both ref_audio and voice.",
+  "selection_policy": "Reuse canonical Apache-2.0 reference/default voice assets already distributed by vLLM-Omni and their source projects. Packaged files are byte-for-byte copies; no audio transformation is applied.",
+  "identity_policy": "vLLM-Omni does not assert or expose a speaker identity for any bundled reference. Source projects publish these clips specifically for default or voice-conditioning examples.",
+  "license_summary": "Each asset is distributed under Apache-2.0. The repository LICENSE supplies the license text; no source repository NOTICE file was present at the audited revision.",
+  "assets": [
+    {
+      "slot": 0,
+      "packaged_path": "assets/default_0.wav",
+      "sha256": "c7b31d6dbe7cc6a716dded00550db5b50940bf209e424e4ad207b12e657c8ff6",
+      "bytes": 334138,
+      "sample_rate_hz": 24000,
+      "channels": 1,
+      "duration_seconds": 3.48,
+      "encoding": "WAV IEEE float",
+      "canonical_vllm_omni_path": "tests/assets/cosyvoice3/zero_shot_prompt.wav",
+      "canonical_vllm_omni_commit": "b1ff69502920df1f65f2f62c7e661169eb2bca65",
+      "upstream_project": "QwenAudio/CosyVoice",
+      "upstream_revision": "074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc",
+      "upstream_path": "asset/zero_shot_prompt.wav",
+      "upstream_url": "https://github.com/QwenAudio/CosyVoice/blob/074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc/asset/zero_shot_prompt.wav",
+      "license": "Apache-2.0",
+      "license_url": "https://github.com/QwenAudio/CosyVoice/blob/074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc/LICENSE",
+      "attribution": "CosyVoice contributors",
+      "intended_use_evidence": "The source project publishes this file as its zero-shot reference prompt, and vLLM-Omni already vendors it for CosyVoice reference conditioning.",
+      "approved_uses": [
+        "source redistribution",
+        "wheel redistribution",
+        "cross-model reference conditioning"
+      ]
+    },
+    {
+      "slot": 1,
+      "packaged_path": "assets/default_1.wav",
+      "sha256": "5fc92ddcd9bc9af10437d9630642378777a98fc260f16508a9777db12c830a41",
+      "bytes": 868134,
+      "sample_rate_hz": 48000,
+      "channels": 1,
+      "duration_seconds": 9.04225,
+      "encoding": "WAV PCM 16-bit",
+      "canonical_vllm_omni_path": "vllm_omni/model_executor/models/step_audio2/assets/default_female.wav",
+      "canonical_vllm_omni_commit": "9bc8705c98788ca1429c55e512383b559afcec12",
+      "upstream_project": "stepfun-ai/Step-Audio2",
+      "upstream_revision": "76e272b56c3917a8d7188f18bbb5a65dfc8a0845",
+      "upstream_path": "assets/default_female.wav",
+      "upstream_url": "https://github.com/stepfun-ai/Step-Audio2/blob/76e272b56c3917a8d7188f18bbb5a65dfc8a0845/assets/default_female.wav",
+      "license": "Apache-2.0",
+      "license_url": "https://github.com/stepfun-ai/Step-Audio2/blob/76e272b56c3917a8d7188f18bbb5a65dfc8a0845/LICENSE",
+      "attribution": "Step-Audio2 contributors",
+      "intended_use_evidence": "The source project and vLLM-Omni distribute this file as the default female speaker prompt for reference conditioning.",
+      "approved_uses": [
+        "source redistribution",
+        "wheel redistribution",
+        "cross-model reference conditioning"
+      ]
+    },
+    {
+      "slot": 2,
+      "packaged_path": "assets/default_2.wav",
+      "sha256": "e33e6ee0107a1dd58e1d66dd90c13df3d55a8683047cc3d7ea206dad84ed3fc8",
+      "bytes": 478050,
+      "sample_rate_hz": 48000,
+      "channels": 1,
+      "duration_seconds": 2.438708333,
+      "encoding": "WAV IEEE float",
+      "canonical_vllm_omni_path": "tests/assets/indextts2/ref_audio.wav",
+      "canonical_vllm_omni_commit": "044240d8ebeae9c19a7be01db9d37a1cd1a57c8a",
+      "upstream_project": "IndexTeam/IndexTTS-2-Demo",
+      "upstream_revision": "b01840e8e4fd9753743a6d0466cd73ae1d634a68",
+      "upstream_path": "examples/voice_01.wav",
+      "upstream_url": "https://huggingface.co/spaces/IndexTeam/IndexTTS-2-Demo/blob/b01840e8e4fd9753743a6d0466cd73ae1d634a68/examples/voice_01.wav",
+      "license": "Apache-2.0",
+      "license_url": "https://huggingface.co/spaces/IndexTeam/IndexTTS-2-Demo/blob/b01840e8e4fd9753743a6d0466cd73ae1d634a68/LICENSE",
+      "attribution": "IndexTTS contributors",
+      "intended_use_evidence": "The Apache-2.0 source Space distributes this file as voice_01.wav for IndexTTS reference voice cloning, and vLLM-Omni already vendors the same bytes as its IndexTTS2 fixture.",
+      "approved_uses": [
+        "source redistribution",
+        "wheel redistribution",
+        "cross-model reference conditioning"
+      ]
+    },
+    {
+      "slot": 3,
+      "packaged_path": "assets/default_3.wav",
+      "sha256": "480f55f41c71c3d79c2a9acc48f0bfb3c5a46222e6e9ebf3e2888e93501a6b5c",
+      "bytes": 775738,
+      "sample_rate_hz": 24000,
+      "channels": 1,
+      "duration_seconds": 8.08,
+      "encoding": "WAV IEEE float",
+      "canonical_vllm_omni_path": "tests/assets/qwen3_tts/clone_2.wav",
+      "canonical_vllm_omni_commit": "b1ff69502920df1f65f2f62c7e661169eb2bca65",
+      "upstream_project": "QwenLM/Qwen3-TTS",
+      "upstream_revision": "022e286b98fbec7e1e916cb940cdf532cd9f488e",
+      "upstream_path": "official Qwen3-TTS object storage example clone_2.wav",
+      "upstream_url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav",
+      "license": "Apache-2.0",
+      "license_url": "https://github.com/QwenLM/Qwen3-TTS/blob/022e286b98fbec7e1e916cb940cdf532cd9f488e/LICENSE",
+      "attribution": "Qwen3-TTS contributors",
+      "intended_use_evidence": "Qwen publishes this clip as an official voice-cloning reference, and vLLM-Omni already vendors these exact bytes for Qwen3-TTS reference conditioning.",
+      "approved_uses": [
+        "source redistribution",
+        "wheel redistribution",
+        "cross-model reference conditioning"
+      ]
+    }
+  ],
+  "excluded_candidates": [
+    {
+      "path": "tests/assets/glm_tts/jiayan_zh.wav",
+      "reason": "The upstream prompt-audio license is CC-BY-NC-4.0 and explicitly prohibits commercial use, so it is not bundled as a general-purpose runtime default."
+    }
+  ]
+}

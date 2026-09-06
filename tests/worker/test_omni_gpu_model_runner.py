@@ -4,6 +4,7 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
@@ -90,6 +91,68 @@ def test_talker_mtp_uses_graph_for_legacy_or_explicit_safe_model(monkeypatch, ta
     assert runner.talker_mtp is wrapped
 
 
+def test_shutdown_clears_model_state_before_named_kv_branch(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+
+    class Model:
+        def clear_runtime_state(self) -> None:
+            events.append("model-clear")
+
+    class Branch:
+        name = "negative"
+
+        def close(self) -> None:
+            events.append("branch-close")
+
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = Model()
+    runner.named_kv_branches = {"negative": Branch()}
+    monkeypatch.setattr(
+        GPUModelRunner,
+        "shutdown",
+        lambda _runner: events.append("upstream-shutdown"),
+    )
+
+    OmniGPUModelRunner.shutdown(runner)
+
+    assert events == [
+        "model-clear",
+        "branch-close",
+        "upstream-shutdown",
+    ]
+    assert runner.named_kv_branches == {}
+
+
+def test_shutdown_continues_after_model_and_branch_cleanup_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+
+    class Model:
+        def clear_runtime_state(self) -> None:
+            events.append("model-clear")
+            raise RuntimeError("injected model cleanup failure")
+
+    class Branch:
+        name = "negative"
+
+        def close(self) -> None:
+            events.append("branch-close")
+            raise RuntimeError("injected branch cleanup failure")
+
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = Model()
+    runner.named_kv_branches = {"negative": Branch()}
+    monkeypatch.setattr(
+        GPUModelRunner,
+        "shutdown",
+        lambda _runner: events.append("upstream-shutdown"),
+    )
+
+    OmniGPUModelRunner.shutdown(runner)
+
+    assert events == ["model-clear", "branch-close", "upstream-shutdown"]
+    assert runner.named_kv_branches == {}
+
+
 class DummyBuffer:
     """A minimal buffer wrapper that exposes the `.gpu` attribute."""
 
@@ -108,7 +171,8 @@ class DummyInputBatch:
 class DummyReqState:
     """A minimal request state container."""
 
-    pass
+    mm_features: list[object]
+    additional_information_cpu: dict[str, object]
 
 
 def test_model_forward_passes_request_ids_to_decode_metadata(monkeypatch):
@@ -209,6 +273,192 @@ class FlexibleMRoPEModel:
 def _noop_forward_context(*args, **kwargs):
     """A no-op context manager to replace vLLM forward context in CPU tests."""
     yield
+
+
+def test_scheduled_input_token_ids_are_read_from_existing_cpu_batch() -> None:
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.input_batch = SimpleNamespace(
+        token_ids_cpu=np.array(
+            [
+                [10, 11, 12, 13, 14],
+                [20, 21, 22, 23, 24],
+            ],
+            dtype=np.int64,
+        )
+    )
+
+    assert runner._scheduled_input_token_ids_cpu(
+        req_id="request-1",
+        req_index=1,
+        start_token_index=1,
+        num_scheduled_tokens=3,
+    ) == (21, 22, 23)
+    assert (
+        runner._scheduled_input_token_ids_cpu(
+            req_id="request-0",
+            req_index=0,
+            start_token_index=5,
+            num_scheduled_tokens=0,
+        )
+        == ()
+    )
+
+
+def test_scheduled_input_token_ids_reject_incomplete_cpu_span() -> None:
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.input_batch = SimpleNamespace(token_ids_cpu=np.array([[1, 2]], dtype=np.int64))
+
+    with pytest.raises(RuntimeError, match="expected 2 CPU input token IDs, got 1"):
+        runner._scheduled_input_token_ids_cpu(
+            req_id="request",
+            req_index=0,
+            start_token_index=1,
+            num_scheduled_tokens=2,
+        )
+
+
+class _ReadyEvent:
+    def __init__(self) -> None:
+        self.synchronize_calls = 0
+
+    def synchronize(self) -> None:
+        self.synchronize_calls += 1
+
+
+def _remember_async_feedback(
+    runner: OmniGPUModelRunner,
+    *,
+    sampled_rows: list[list[int]],
+    req_id_to_index: dict[str, int],
+) -> _ReadyEvent:
+    event = _ReadyEvent()
+    runner.use_async_scheduling = True
+    runner._omni_requires_input_token_ids_cpu = True
+    runner._remember_async_sampled_token_feedback(
+        sampled_token_ids_cpu=torch.tensor(sampled_rows, dtype=torch.int64),
+        ready_event=event,
+        req_id_to_index=req_id_to_index,
+    )
+    return event
+
+
+def test_async_sampled_token_feedback_resolves_reordered_batch_once() -> None:
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.input_batch = SimpleNamespace(
+        token_ids_cpu=np.array(
+            [
+                [-1],
+                [123],
+                [-1],
+                [-1],
+                [-1],
+            ],
+            dtype=np.int64,
+        )
+    )
+    event = _remember_async_feedback(
+        runner,
+        sampled_rows=[[151654], [151653], [151652], [151643]],
+        req_id_to_index={
+            "request-a": 0,
+            "request-b": 1,
+            "request-c": 2,
+            "request-d": 3,
+        },
+    )
+
+    # A prompt token in the mixed batch must not wait on sampled-token D2H.
+    assert runner._scheduled_input_token_ids_cpu(
+        req_id="request-new",
+        req_index=1,
+        start_token_index=0,
+        num_scheduled_tokens=1,
+    ) == (123,)
+    assert event.synchronize_calls == 0
+
+    current_order = ["request-c", "request-a", "request-d", "request-b"]
+    expected = [151652, 151654, 151643, 151653]
+    for req_index, (req_id, token_id) in enumerate(zip(current_order, expected, strict=True)):
+        batch_index = req_index if req_index == 0 else req_index + 1
+        assert runner._scheduled_input_token_ids_cpu(
+            req_id=req_id,
+            req_index=batch_index,
+            start_token_index=0,
+            num_scheduled_tokens=1,
+        ) == (token_id,)
+
+    assert event.synchronize_calls == 1
+
+
+def test_async_sampled_token_feedback_is_capability_gated() -> None:
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.use_async_scheduling = True
+    runner._omni_requires_input_token_ids_cpu = False
+    event = _ReadyEvent()
+
+    runner._remember_async_sampled_token_feedback(
+        sampled_token_ids_cpu=torch.tensor([[151654]], dtype=torch.int64),
+        ready_event=event,
+        req_id_to_index={"request": 0},
+    )
+
+    assert runner._omni_async_sampled_token_feedback is None
+    assert event.synchronize_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("token_ids_cpu", "sampled_rows", "req_id_to_index", "error"),
+    [
+        ([-1], None, None, "missing async sampled-token feedback"),
+        ([-1], [[151654]], {"other": 0}, "cannot map async sampled-token feedback"),
+        ([-1], [[-1]], {"request": 0}, "exactly one valid async sampled token"),
+        ([-1], [[151654, 151653]], {"request": 0}, "exactly one valid async sampled token"),
+        ([-1, -1], [[151654]], {"request": 0}, "multiple async sampled-token sentinels"),
+    ],
+)
+def test_async_sampled_token_feedback_rejects_unresolvable_sentinel(
+    token_ids_cpu: list[int],
+    sampled_rows: list[list[int]] | None,
+    req_id_to_index: dict[str, int] | None,
+    error: str,
+) -> None:
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.input_batch = SimpleNamespace(token_ids_cpu=np.array([token_ids_cpu], dtype=np.int64))
+    if sampled_rows is not None and req_id_to_index is not None:
+        _remember_async_feedback(
+            runner,
+            sampled_rows=sampled_rows,
+            req_id_to_index=req_id_to_index,
+        )
+
+    with pytest.raises(RuntimeError, match=error):
+        runner._scheduled_input_token_ids_cpu(
+            req_id="request",
+            req_index=0,
+            start_token_index=0,
+            num_scheduled_tokens=len(token_ids_cpu),
+        )
+
+
+def test_async_sampled_token_feedback_zero_span_does_not_wait() -> None:
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.input_batch = SimpleNamespace(token_ids_cpu=np.array([[1]], dtype=np.int64))
+    event = _remember_async_feedback(
+        runner,
+        sampled_rows=[[151654]],
+        req_id_to_index={"request": 0},
+    )
+
+    assert (
+        runner._scheduled_input_token_ids_cpu(
+            req_id="request",
+            req_index=0,
+            start_token_index=1,
+            num_scheduled_tokens=0,
+        )
+        == ()
+    )
+    assert event.synchronize_calls == 0
 
 
 def test_filter_mrope_kwargs_for_strict_model_signature():

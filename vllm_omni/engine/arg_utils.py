@@ -11,6 +11,7 @@ from typing import Any, cast
 
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
+from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 
 from vllm_omni.config import OmniModelConfig
 from vllm_omni.outputs.output_modality import OutputModality
@@ -40,6 +41,7 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "NemotronVoiceChatThinkerForConditionalGeneration": "nemotron_voicechat",
     "NemotronVoiceChatTalkerForConditionalGeneration": "nemotron_voicechat",
     "NemotronVoiceChatCode2Wav": "nemotron_voicechat",
+    "VibeVoiceForConditionalGeneration": "vibevoice",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
 }
 
@@ -48,6 +50,44 @@ _TOKENIZER_SUBFOLDER_MAP: dict[str, str] = {
     "CosyVoice3Model": "CosyVoice-BlankEN",
     "GLMTTSForConditionalGeneration": "vq32k-phoneme-tokenizer",
 }
+
+
+def _resolve_vibevoice_tokenizer_contract(
+    model: str,
+    *,
+    revision: str | None = None,
+) -> str | None:
+    """Resolve the tokenizer named by VibeVoice preprocessor metadata.
+
+    Microsoft checkpoints intentionally keep the Qwen tokenizer out of the
+    checkpoint root. ``language_model_pretrained_name`` is the public contract
+    and must take precedence over a hard-coded model name.
+    """
+    try:
+        preprocessor_config = get_hf_file_to_dict(
+            "preprocessor_config.json",
+            model,
+            revision,
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid VibeVoice preprocessor config for {model}: {exc}") from exc
+    except Exception as exc:
+        logger.warning(
+            "Unable to resolve VibeVoice preprocessor_config.json from %s: %s",
+            model,
+            exc,
+        )
+        return None
+
+    if preprocessor_config is None:
+        return None
+    if not isinstance(preprocessor_config, dict):
+        raise ValueError("VibeVoice preprocessor_config.json must contain a JSON object.")
+
+    tokenizer = preprocessor_config.get("language_model_pretrained_name")
+    if not isinstance(tokenizer, str) or not tokenizer.strip():
+        raise ValueError("VibeVoice preprocessor_config.json must define a non-empty `language_model_pretrained_name`.")
+    return tokenizer.strip()
 
 
 def _register_omni_hf_configs() -> None:
@@ -78,6 +118,7 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
         from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
         from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
+        from vllm_omni.transformers_utils.configs.vibevoice import VibeVoiceConfig
         from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
@@ -104,6 +145,7 @@ def _register_omni_hf_configs() -> None:
         ("cosyvoice3", CosyVoice3Config),
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
+        ("vibevoice", VibeVoiceConfig),
         ("voxcpm2", VoxCPM2Config),
     ]:
         try:
@@ -364,11 +406,15 @@ class OmniEngineArgs(EngineArgs):
             tokenizer = self.tokenizer
             logger.info("NemotronVoiceChat: using text tokenizer from %s", tokenizer)
 
-        # Auto-detect tokenizer for models that store it in a subdirectory
-        # rather than the root (e.g. CosyVoice3 uses CosyVoice-BlankEN/).
+        # Auto-detect tokenizers kept outside the checkpoint root. Explicit
+        # --tokenizer always wins, and a tokenizer in the model root is left to
+        # vLLM's standard model-as-tokenizer behavior.
         if not tokenizer and self.model:
             model_path = self.model
-            if os.path.isdir(model_path) and not os.path.isfile(os.path.join(model_path, "tokenizer_config.json")):
+            has_root_tokenizer = os.path.isdir(model_path) and os.path.isfile(
+                os.path.join(model_path, "tokenizer_config.json")
+            )
+            if os.path.isdir(model_path) and not has_root_tokenizer:
                 for subfolder in sorted(os.listdir(model_path)):
                     candidate = os.path.join(model_path, subfolder)
                     if os.path.isdir(candidate) and os.path.isfile(os.path.join(candidate, "tokenizer_config.json")):
@@ -376,7 +422,21 @@ class OmniEngineArgs(EngineArgs):
                         tokenizer = candidate
                         logger.info("Auto-detected tokenizer at %s", candidate)
                         break
-            elif not os.path.isdir(model_path):
+
+            if not tokenizer and not has_root_tokenizer and self.model_arch == "VibeVoiceForConditionalGeneration":
+                resolved_tokenizer = _resolve_vibevoice_tokenizer_contract(
+                    model_path,
+                    revision=self.revision,
+                )
+                if resolved_tokenizer:
+                    self.tokenizer = resolved_tokenizer
+                    tokenizer = resolved_tokenizer
+                    logger.info(
+                        "Resolved VibeVoice tokenizer from preprocessor_config.json: %s",
+                        tokenizer,
+                    )
+
+            if not tokenizer and not os.path.isdir(model_path):
                 tokenizer_subfolder = _TOKENIZER_SUBFOLDER_MAP.get(self.model_arch or "")
                 if tokenizer_subfolder:
                     # Download just the tokenizer files from the subfolder

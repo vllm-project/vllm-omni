@@ -1,0 +1,106 @@
+# VibeVoice deploy: single-stage AR TTS with in-loop CFG diffusion and
+# stateful acoustic/semantic feedback.
+#
+# Unlike codec-based TTS pipelines, VibeVoice cannot split waveform decoding
+# into a second Code2Wav stage: every generated audio token is diffused,
+# decoded to waveform, semantically re-encoded, and fed back to the next Qwen2
+# decode step. The model therefore owns all per-request side state in stage 0.
+#
+# The Microsoft 1.5B checkpoint defaults to one GPU. Tensor parallelism adds
+# collective communication while duplicating the side modules, so TP=2 is
+# documented as an opt-in capability topology instead of being the
+# latency/throughput baseline. Diffusion and convolutional side-path
+# allocations are outside vLLM's paged-KV accounting, so both KV pools use
+# fixed budgets instead of consuming all memory allowed by
+# gpu_memory_utilization.
+async_chunk: false
+trust_remote_code: false
+# When --tokenizer is omitted, Omni reads
+# preprocessor_config.json.language_model_pretrained_name. Offline deployments
+# must pre-cache that tokenizer or pass a local --tokenizer path.
+dtype: bfloat16
+enable_prefix_caching: false
+enable_chunked_prefill: true
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    # Fixed safe concurrency: four complete positive and negative sequences
+    # must remain resident, so KV-pressure preemption is unreachable. At TP=1,
+    # each pool needs 4 x 65,536 tokens x 28 KiB/token = 7 GiB. The 8 GiB
+    # budgets below leave block-alignment headroom; startup guards re-verify
+    # both pools from the actual attention layout.
+    tensor_parallel_size: 1
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.9
+    # The processor/MM infrastructure reserves capacity for up to eight
+    # ordered audio items. This is not the speaker limit: serving accepts at
+    # most four speakers, with exactly one reference audio per speaker. At 60
+    # seconds each, the MM ceiling is 8 * 450 = 3600 placeholder tokens, plus
+    # text. Both the 65,536-token model limit and the 8,192-token per-iteration
+    # chunked-prefill
+    # budget can admit that worst-case reference prefill.
+    limit_mm_per_prompt:
+      audio: 8
+
+    # The 1.5B Qwen2 backbone has only two KV heads. Eight GiB is sufficient
+    # for four complete 64k positive sequences on one GPU while leaving ample
+    # H100 VRAM for the negative CFG branch and the acoustic/semantic modules.
+    # KV pool sizing (both pools MUST stay equal — CFG positive/negative
+    # trajectories are the same length):
+    #   bytes/token = 28 KiB (28L x 2 KV heads x 128 dim x bf16); block = 16 tokens.
+    #   floor per pool = max_num_seqs x max_model_len x 28 KiB.
+    # The pools are fixed budgets because KV-pressure preemption is unsafe for
+    # the stateful negative branch — never size below the residency floor.
+    # Profiles (floor -> suggested):
+    #   4 seqs x 64k (default): 7.0 GiB -> 8 GiB per pool  (~24 GiB total)
+    #   2 seqs x 64k:           3.5 GiB -> 4 GiB per pool  (~16 GiB total)
+    #   1 seq  x 64k:           1.75 GiB -> 2 GiB per pool (~12 GiB total)
+    #   1 seq  x 32k:           896 MiB -> 1 GiB per pool  (~10 GiB total, <=72 min audio)
+    # Lower-concurrency profiles also require max_num_seqs (and optionally
+    # max_model_len) below; diffusion graph warmup sizes follow max_num_seqs.
+    kv_cache_memory_bytes: 8589934592  # 8 GiB
+    engine_extras:
+      additional_config:
+        vibevoice_runtime_config:
+          negative_kv_cache_memory_bytes: 8589934592  # 8 GiB
+          negative_kv_activation_margin_bytes: 536870912  # 512 MiB
+          # Side-graph policy: explicitly on. These are independent of
+          # enforce_eager (which only controls vLLM's AR graph). See the
+          # enforce_eager comment below for the A/B rationale.
+          diffusion_cuda_graph: true
+          decode_cuda_graph: true
+
+    # The official backbone supports 64k positions and generation_config.json
+    # defaults to 40,500 new tokens. Chunked prefill bounds each scheduler
+    # iteration without reducing the accepted prompt/context length.
+    max_model_len: 65536
+    max_num_batched_tokens: 8192
+
+    # enforce_eager disables vLLM's AR (Qwen2) CUDA-graph capture. A/B on H100
+    # (vLLM 0.28.0) showed AR graph capture is harmful for this 1.5B model at
+    # both B1 and B4 (+12~18% TTFP/RTF), so the shipped default keeps it off.
+    # VibeVoice's side graphs (diffusion + decode) are independent: they are
+    # explicitly enabled above because they cut B4 RTF by ~50% vs full-eager.
+    # Decoupling from enforce_eager is intentional — tying them together would
+    # discard the side-graph optimisation that makes this model practical.
+    enforce_eager: true
+    async_scheduling: true
+    # The pinned v1 profiler first runs the dummy placeholder text without MM
+    # data, which intentionally trips VibeVoice's symmetric placeholder check.
+    # KV memory is fixed above and Processor limits are contract-tested, so
+    # skip that incompatible generic profiling pass.
+    skip_mm_profiling: true
+
+    default_sampling_params:
+      # VibeVoice's token gate is deterministic: the model constrains logits
+      # to audio BOS/audio/audio EOS/EOS and selects with argmax.
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      repetition_penalty: 1.0
+      max_tokens: 40500
+      extra_args:
+        # Match the official Transformers generation_config.json.
+        guidance_scale: 1.3
+        num_diffusion_steps: 10

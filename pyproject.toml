@@ -164,6 +164,7 @@ include = ["vllm_omni*"]
 
 [tool.setuptools.package-data]
 "vllm_omni" = ["_version.py", "py.typed"]
+"vllm_omni.model_executor.models.vibevoice" = ["ASSET_MANIFEST.json", "assets/*.wav"]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm

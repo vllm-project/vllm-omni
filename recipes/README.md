@@ -93,6 +93,7 @@ recipes/
 | [`zai-org/GLM-TTS.md`](./zai-org/GLM-TTS.md) | Online serving for Chinese/English zero-shot voice-cloned TTS | 1x A40 48GB / 2x non-standard RTX 4090 48GB (49,140 MiB each) |
 | [`GLM/GLM-Image.md`](./GLM/GLM-Image.md) | Online serving for image generation | 1x A800 80GB / 2x A800 80GB |
 | [`JD/JoyAI-VL-Interaction.md`](./JD/JoyAI-VL-Interaction.md) | Real-time streaming video-language interaction (proactive speak/silence/delegate) | 1x GPU 24GB+ |
+| [`Microsoft/VibeVoice.md`](./Microsoft/VibeVoice.md) | Zero-shot multi-speaker text-to-speech with reference audio cloning | 1x H100 80GB |
 
 Keep one accelerator model or platform per recipe file. Add a separately
 suffixed recipe and table row for another GPU, ROCm accelerator, or NPU.

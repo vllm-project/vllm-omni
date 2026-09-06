@@ -80,14 +80,16 @@ class TTSGenerationError(RuntimeError):
 
 @dataclass
 class OutputPolicy:
-    """How the orchestrator aggregates engine output for a model.
+    """How the orchestrator exposes and aggregates engine output for a model.
 
-    ``accumulate_nonstreaming`` enables MOSS-style cross-step accumulation in the
-    non-streaming path. Streaming cumulative/delta semantics stay engine-side,
-    keyed by request id, and are unaffected by this flag.
+    ``accumulate_nonstreaming`` enables MOSS-style cross-step accumulation in
+    the non-streaming path. Streaming cumulative/delta semantics stay
+    engine-side and are unaffected by this flag. ``expose_finish_reason`` opts
+    an adapter into terminal finish-reason metadata over HTTP and SSE.
     """
 
     accumulate_nonstreaming: bool = False
+    expose_finish_reason: bool = False
 
 
 @dataclass
@@ -96,13 +98,15 @@ class PreparedRequest:
 
     The fields mirror what ``_prepare_speech_generation`` assembled inline:
     ``prompt`` is the engine prompt dict, ``tts_params`` the per-model parameter
-    dict, ``model_type`` the discriminator used for logging, and
-    ``output_policy`` controls non-streaming aggregation.
+    dict, and ``model_type`` the discriminator used for logging. Model-wide
+    output behavior remains authoritative on the active adapter.
     """
 
     prompt: dict[str, Any]
     tts_params: dict[str, Any] = field(default_factory=dict)
     model_type: str = "generic"
+    # Retained for compatibility with existing out-of-tree adapters. Shared
+    # transports use the active adapter's class-level policy as authoritative.
     output_policy: OutputPolicy = field(default_factory=OutputPolicy)
     #: Cross-cutting per-request state the orchestrator still owns (e.g. the
     #: Qwen3-TTS ref-audio warmup artifact key tracked after ``generate()``).
@@ -166,6 +170,8 @@ class TTSModelAdapter(ABC):
     validates_generation: ClassVar[bool] = False
     #: Whether the model consumes ``request.speed`` in its native parameters.
     native_speed_control: ClassVar[bool] = False
+    #: Model-wide output behavior consumed by generic serving transports.
+    output_policy: ClassVar[OutputPolicy] = OutputPolicy()
     #: Target sample rates validated for this adapter's output path. An empty
     #: set means that the adapter does not expose per-request resampling.
     supported_output_sample_rates: ClassVar[frozenset[int]] = frozenset()
@@ -232,6 +238,14 @@ class TTSModelAdapter(ABC):
         Recomputing it here would misclassify uploaded voices as inline and drop
         the ``voice_name`` / ``voice_created_at`` metadata.
         """
+
+    def finalize_prepared_request(
+        self,
+        prepared: PreparedRequest,
+        request_id: str,
+    ) -> PreparedRequest:
+        """Finalize request-ID-dependent prompt metadata. Default: identity."""
+        return prepared
 
     def apply_sampling_overrides(
         self,

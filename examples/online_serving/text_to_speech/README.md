@@ -23,6 +23,7 @@ For the full list of supported architectures across all modalities, see
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✓ (`ref_audio` required) | ✓ (PCM stream) | — | ✓ |
 | OmniVoice | `k2-fsa/OmniVoice` | ✓ | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
+| VibeVoice | `microsoft/VibeVoice-1.5B` | ✓ (`ref_audio`, up to 4 speakers) | ✓ (raw PCM + SSE) | uploaded audio voice; [bundled defaults](../design/vibevoice/ASSET_PROVENANCE.md) | — |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
 | dots.tts | `dots-studio/dots.tts-soar` | — (text-only) | ✓ (PCM stream) | — (default placeholder only) | — |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
@@ -421,7 +422,7 @@ python examples/online_serving/text_to_speech/ming_flash_omni_tts/speech_client.
 
 - Server uses `use_zero_spk_emb=True` and the cookbook decode defaults (`max_decode_steps=200`, `cfg=2.0`, `sigma=0.25`, `temperature=0.0`). For other caption fields (`语速`, `基频`, `IP`, BGM, etc.) or overriding decode args, use the offline example where `additional_information` is set explicitly.
 - This is the online counterpart of [`examples/offline_inference/text_to_speech/ming_flash_omni_tts/`](../../offline_inference/text_to_speech/ming_flash_omni_tts/).
-- For multimodal Ming-flash-omni online serving, see [`examples/online_serving/ming_flash_omni/`](../../ming_flash_omni/).
+- For multimodal Ming-flash-omni online serving, see [`examples/online_serving/ming_flash_omni/`](../ming_flash_omni/).
 
 ---
 
@@ -746,6 +747,39 @@ reports the last-spoken word, useful for the voice-agent barge-in case.
 - Base voice cloning has uniproc-vs-mp tradeoffs depending on per-request reference audio cost; see the executor-backend section above.
 - With async chunking, Qwen3-TTS Base voice cloning sends the full reference context in the first Code2Wav packet, then caches that prefix on the Code2Wav stage for follow-up chunks in the same request.
 - `vllm_omni/deploy/qwen3_tts.yaml` is the default deploy config (loaded by HF `model_type`); per-stage runtime overrides are available via `--stage-N-<field> <value>`.
+
+---
+
+## VibeVoice
+
+VibeVoice-1.5B is a single-stage AR model with request-owned negative KV,
+diffusion, and waveform decode side paths. It emits mono signed int16 PCM at
+24 kHz. Supply one reference audio per speaker for reproducible validation;
+bundled defaults remain under provenance review.
+
+### Launch
+
+```bash
+vllm serve microsoft/VibeVoice-1.5B \
+  --omni \
+  --tokenizer Qwen/Qwen2.5-1.5B \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+### Manual acceptance
+
+1. With `max_new_tokens=2`, confirm two SSE `speech.audio.delta` events,
+   each containing exactly 3,200 samples, followed by one
+   `speech.audio.done` with `finish_reason="length"`.
+2. Confirm an SSE `speech.audio.error` or EOF before
+   `speech.audio.done` is treated as a failed request.
+3. Abort after the first SSE delta and immediately start another request;
+   confirm the server remains healthy (probe returns 200).
+4. Save server logs and one output capture per scenario.
+
+Model usage, request limits, and serving semantics are documented in the
+[VibeVoice model guide](../../../docs/models/vibevoice.md).
 
 ---
 

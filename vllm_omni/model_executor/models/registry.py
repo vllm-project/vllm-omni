@@ -304,6 +304,12 @@ _OMNI_MODELS = {
         "gepard_talker",
         "GepardTalkerForConditionalGeneration",
     ),
+    ## VibeVoice
+    "VibeVoiceForConditionalGeneration": (
+        "vibevoice",
+        "vibevoice",
+        "VibeVoiceForConditionalGeneration",
+    ),
     ## VoxCPM2
     "VoxCPM2TalkerForConditionalGeneration": (
         "voxcpm2",

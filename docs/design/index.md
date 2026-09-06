@@ -78,6 +78,7 @@ The design contracts separate selection mechanics from backend algorithms:
 
 - [Prometheus Metrics](metrics.md)
 - [Speech Generation Performance Optimizations](qwen3_omni_tts_performance_optimization.md)
+- [Runner-Owned Named Causal KV Branches](named_kv_branch.md)
 
 ## Module Design Documents
 

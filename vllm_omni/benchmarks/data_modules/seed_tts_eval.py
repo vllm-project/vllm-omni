@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Seed-TTS WER aligned with Bytedance ``seed-tts-eval`` / ``run_wer.py``.
 
 Matches the published protocol (see Hugging Face dataset card and

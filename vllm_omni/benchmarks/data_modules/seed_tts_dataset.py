@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Seed-TTS zero-shot evaluation-style prompts for ``vllm bench serve``.
 
 Loads rows from the `meta.lst` format used in `BytedanceSpeech/seed-tts-eval`_ (or any

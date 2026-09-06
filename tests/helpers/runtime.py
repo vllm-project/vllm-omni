@@ -850,19 +850,25 @@ class OmniRunner:
     def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
         return self.omni.stop_profile(stages=stages)
 
-    def _cleanup_process(self):
+    @staticmethod
+    def _is_engine_process(proc: psutil.Process) -> bool:
         try:
-            keywords = ["enginecore"]
-            matched = []
-            for proc in psutil.process_iter(["pid", "name", "cmdline", "username"]):
-                try:
-                    cmdline = " ".join(proc.cmdline()).lower() if proc.cmdline() else ""
-                    name = proc.name().lower()
-                    if any(k in cmdline for k in keywords) or any(k in name for k in keywords):
-                        print(f"Found vllm process: PID={proc.pid}, cmd={cmdline[:100]}")
-                        matched.append(proc)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
+            cmdline = " ".join(proc.cmdline()).lower()
+            return "enginecore" in cmdline or "enginecore" in proc.name().lower()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            return False
+
+    def _owned_engine_processes(self) -> list[psutil.Process]:
+        """Return EngineCore descendants owned by this test process only."""
+        try:
+            descendants = psutil.Process(os.getpid()).children(recursive=True)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            return []
+        return [proc for proc in descendants if self._is_engine_process(proc)]
+
+    def _cleanup_process(self, matched: list[psutil.Process]) -> None:
+        """Clean up the owned descendants captured before runner shutdown."""
+        try:
             for proc in matched:
                 try:
                     proc.terminate()
@@ -877,23 +883,26 @@ class OmniRunner:
             if still_alive:
                 _, stubborn = psutil.wait_procs(still_alive, timeout=3)
                 if stubborn:
-                    print(f"Warning: failed to kill residual vllm pids: {[p.pid for p in stubborn]}")
+                    print(f"Warning: failed to kill owned residual vllm pids: {[p.pid for p in stubborn]}")
                 else:
-                    print(f"Force-killed residual vllm pids: {[p.pid for p in still_alive]}")
+                    print(f"Force-killed owned residual vllm pids: {[p.pid for p in still_alive]}")
             elif matched:
-                print(f"Terminated vllm pids: {[p.pid for p in matched]}")
+                print(f"Terminated owned vllm pids: {[p.pid for p in matched]}")
         except Exception as e:
-            print(f"Error in psutil vllm cleanup: {e}")
+            print(f"Error in owned psutil vllm cleanup: {e}")
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        omni = getattr(self, "omni", None)
-        if omni is not None and hasattr(omni, "close"):
-            omni.close()
-        self._cleanup_process()
-        cleanup_test_environment()
+        owned_engine_processes = self._owned_engine_processes()
+        try:
+            omni = getattr(self, "omni", None)
+            if omni is not None and hasattr(omni, "close"):
+                omni.close()
+        finally:
+            self._cleanup_process(owned_engine_processes)
+            cleanup_test_environment()
 
 
 # ---------------------------------------------------------------------------

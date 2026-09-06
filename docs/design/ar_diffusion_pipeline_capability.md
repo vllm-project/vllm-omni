@@ -151,6 +151,15 @@ The model writes/reads named cross-attention KV through the bound state and uses
 the `"main"` KV branch for paged self-attention. Pipelines without a warmup
 provider are loaded normally and skip AR rollout warmup.
 
+## Relationship to runner-owned named KV branches
+
+[Runner-owned named causal KV branches](named_kv_branch.md) mirror one parent
+AR request inside the normal model runner and use fixed scheduler-bounded
+capacity. AR-Diffusion state instead owns longer-lived sessions, logical
+self-attention branches, cross-attention KV, and eviction policy in its
+dedicated runner. The interfaces share ownership terminology but are not
+interchangeable.
+
 ## Relationship to the multi-stage KV manager RFC
 
 [#5244](https://github.com/vllm-project/vllm-omni/issues/5244) describes a
