@@ -1146,6 +1146,7 @@ class AsyncOmniEngine:
             "host_weight_runtime_mode": kwargs.get("host_weight_runtime_mode", "disabled"),
             "host_weight_runtime_root": kwargs.get("host_weight_runtime_root"),
             "host_weight_runtime_validation": kwargs.get("host_weight_runtime_validation", "manifest_and_metadata"),
+            "dlo_host_registration_mode": kwargs.get("dlo_host_registration_mode", "auto"),
             "dlo_host_registration_limit_gib": kwargs.get("dlo_host_registration_limit_gib", 0.0),
             "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
             "diffusion_compile_granularity": (

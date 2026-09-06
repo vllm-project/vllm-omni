@@ -790,6 +790,17 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--dlo-host-registration-mode",
+            choices=("auto", "disabled"),
+            default="auto",
+            help=(
+                "HWR transport registration policy for eligible no-AllGather DLO. "
+                "auto attempts registered direct H2D under the existing pin-memory and budget policy; "
+                "disabled selects bounded staging without registering the HWR mappings. "
+                "This preserves the pin-memory policy for staging buffers."
+            ),
+        )
+        omni_config_group.add_argument(
             "--dlo-host-registration-limit-gib",
             type=float,
             default=0.0,

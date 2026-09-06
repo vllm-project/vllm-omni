@@ -96,7 +96,7 @@ class TestDistributedLayerwiseOffloadHook:
         hook.offload_layer()
         assert not hook.is_materialized
 
-    def test_initialize_failure_keeps_next_block_materialized(self, monkeypatch):
+    def test_initialize_failure_keeps_next_block_materialized(self, monkeypatch, patched_offload_runtime):
         current_block = nn.Linear(2, 2)
         next_block = nn.Linear(2, 2)
         expected = {name: tensor.detach().clone() for name, tensor in next_block.state_dict().items()}
@@ -1373,10 +1373,14 @@ class TestMmapWeightLoading:
 
         synchronize.assert_called()
 
-    def test_hwr_registration_failure_falls_back_to_bounded_staging(
+    @pytest.mark.parametrize("registration_mode", ["auto", "disabled"])
+    @pytest.mark.parametrize("limit_gib", [0.0, 1.5])
+    def test_hwr_registration_selection_uses_bounded_staging(
         self,
         monkeypatch,
         patched_offload_runtime,
+        registration_mode,
+        limit_gib,
     ):
         plan, carrier, lease = _fake_hwr_plan("hwr-registration-fallback")
         backend = DistributedLayerwiseOffloadBackend(
@@ -1385,6 +1389,8 @@ class TestMmapWeightLoading:
                 pin_cpu_memory=True,
                 dp_size=1,
                 dlo_use_allgather=False,
+                dlo_host_registration_mode=registration_mode,
+                dlo_host_registration_limit_gib=limit_gib,
             ),
             torch.device("cpu"),
             host_weight_plan=plan,
@@ -1394,12 +1400,14 @@ class TestMmapWeightLoading:
 
         def fail_registration(*args, **kwargs):
             del args, kwargs
+            assert registration_mode == "auto", "disabled mode entered platform registration"
             raise HostRegistrationError("registration unavailable in CPU test")
 
         def allocate_unpinned_staging(hooks, resident_group=None):
             # Registration selection still observes pin_cpu_memory=True. The
             # CPU-only test avoids asking the host for CUDA-pinned allocations.
             for hook in hooks:
+                assert hook.pin_memory, "registration policy disabled staging pinning"
                 hook.pin_memory = False
             return original_staging_allocator(hooks, resident_group)
 
@@ -1412,6 +1420,7 @@ class TestMmapWeightLoading:
         assert backend._using_rank_local_mmap
         assert not backend._using_registered_mmap
         assert backend._host_registration is None
+        assert backend.config.pin_cpu_memory
         assert all(len(hook.cpu_staging_buffers) == 2 for group in backend._all_hook_groups for hook in group)
         assert not lease.closed
 
@@ -2630,7 +2639,9 @@ class TestDistributedComponentSelection:
             assert registry is None or registry.get_hook("distributed_layerwise_offload") is None
             torch.testing.assert_close(block.weight, expected)
 
-    def test_multirank_enable_failure_cleanup_skips_restore_collective(self, monkeypatch, mocker):
+    def test_multirank_enable_failure_cleanup_skips_restore_collective(
+        self, monkeypatch, mocker, patched_offload_runtime
+    ):
         backend = DistributedLayerwiseOffloadBackend(
             OffloadConfig(
                 strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
@@ -2811,7 +2822,7 @@ class TestDistributedComponentSelection:
         with pytest.raises(ValueError, match="not declared replicated"):
             backend.enable(pipeline)
 
-    def test_encoder_allgather_rejects_stub_rank_before_block_discovery(self):
+    def test_encoder_allgather_rejects_stub_rank_before_block_discovery(self, patched_offload_runtime):
         """Every rank must reject an unsafe encoder group, including stub ranks."""
         backend = DistributedLayerwiseOffloadBackend(
             OffloadConfig(

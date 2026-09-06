@@ -123,8 +123,15 @@ def validate_dlo_host_registration_options(
     enable_dlo: bool,
     use_allgather: bool,
     hwr_mode: object,
+    mode: object = "auto",
 ) -> float:
     """Validate the optional transport budget without probing CUDA or HWR."""
+    if mode not in ("auto", "disabled"):
+        raise ValueError("dlo_host_registration_mode must be auto or disabled")
+    if mode == "disabled" and (not enable_dlo or use_allgather or hwr_mode == "disabled"):
+        raise ValueError(
+            "disabled dlo_host_registration_mode requires enabled no-AllGather DLO and Host Weight Runtime"
+        )
     if not isinstance(limit_gib, (int, float, str)):
         raise TypeError(f"dlo_host_registration_limit_gib must be a number; got {type(limit_gib).__name__}")
     value = float(limit_gib)
@@ -838,6 +845,7 @@ class OmniDiffusionConfig:
     host_weight_runtime_validation: str = "manifest_and_metadata"
     # Optional per-worker ceiling for registering final-layout HWR mappings.
     # Zero adds no ceiling; pin_cpu_memory controls whether registration is tried.
+    dlo_host_registration_mode: str = "auto"
     dlo_host_registration_limit_gib: float = 0.0
 
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
@@ -1250,6 +1258,7 @@ class OmniDiffusionConfig:
         )
         self.dlo_host_registration_limit_gib = validate_dlo_host_registration_options(
             limit_gib=self.dlo_host_registration_limit_gib,
+            mode=self.dlo_host_registration_mode,
             enable_dlo=self.enable_distributed_layerwise_offload,
             use_allgather=self.dlo_use_allgather,
             hwr_mode=self.host_weight_runtime_mode,
