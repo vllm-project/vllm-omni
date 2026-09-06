@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for MultiprocDiffusionExecutor async result pump and wait_output_ready."""
 
 import concurrent.futures
@@ -126,7 +126,7 @@ class TestWaitOutputReady:
     def test_returns_cached_future_when_already_completed(self):
         executor = _make_executor()
         output = DiffusionOutput(output="cached_data")
-        fut = concurrent.futures.Future()
+        fut: concurrent.futures.Future[DiffusionOutput] = concurrent.futures.Future()
         fut.set_result(output)
         with executor._futures_lock:
             executor._completed_outputs["abc123"] = fut
@@ -197,7 +197,7 @@ class TestResultPumpDispatch:
     def test_compute_done_routes_to_rpc_future(self):
         executor = _make_executor()
         rpc_id = "42"
-        fut = concurrent.futures.Future()
+        fut: concurrent.futures.Future[AsyncDiffusionOutput] = concurrent.futures.Future()
         with executor._futures_lock:
             executor._rpc_futures[rpc_id] = fut
 
@@ -216,7 +216,7 @@ class TestResultPumpDispatch:
         executor = _make_executor()
         async_output_id = "abc123"
         output = DiffusionOutput(output="final")
-        fut = concurrent.futures.Future()
+        fut: concurrent.futures.Future[DiffusionOutput] = concurrent.futures.Future()
         with executor._futures_lock:
             executor._output_futures[async_output_id] = fut
 
@@ -233,7 +233,7 @@ class TestResultPumpDispatch:
     def test_output_ready_with_error_routes_to_future_as_exception(self):
         executor = _make_executor()
         async_output_id = "abc123"
-        fut = concurrent.futures.Future()
+        fut: concurrent.futures.Future[DiffusionOutput] = concurrent.futures.Future()
         with executor._futures_lock:
             executor._output_futures[async_output_id] = fut
 
@@ -284,6 +284,24 @@ class TestResultPumpDispatch:
 
         assert fut.done()
         assert fut.result(timeout=1.0) is output
+        assert async_output_id not in executor._output_futures
+        assert async_output_id not in executor._completed_outputs
+
+    def test_output_ready_drops_result_after_waiter_cancelled(self):
+        """A late output must not recreate cache state for a cancelled waiter."""
+        executor = _make_executor()
+        async_output_id = "abc123"
+        fut = executor.wait_output_ready(async_output_id)
+        assert fut.cancel()
+
+        msg = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id=async_output_id,
+            output=DiffusionOutput(output="late"),
+        )
+        _feed_one_msg_to_pump(executor, msg)
+
+        assert fut.cancelled()
         assert async_output_id not in executor._output_futures
         assert async_output_id not in executor._completed_outputs
 
@@ -379,6 +397,36 @@ class TestBatchSplitDelivery:
             assert futures[rid].done(), f"request {rid} never resolved"
             assert futures[rid].result(timeout=1.0) is outputs[rid]
 
+    def test_batch_output_drops_cancelled_waiter_and_resolves_active_waiter(self):
+        executor = _make_executor()
+        batch_id = "batch-3"
+        cancelled_id = f"{batch_id}/cancelled"
+        active_id = f"{batch_id}/active"
+        with executor._futures_lock:
+            executor._batch_split_map[batch_id] = {
+                cancelled_id: "request-cancelled",
+                active_id: "request-active",
+            }
+        cancelled_fut = executor.wait_output_ready(cancelled_id)
+        active_fut = executor.wait_output_ready(active_id)
+        assert cancelled_fut.cancel()
+
+        outputs = {
+            "request-cancelled": DiffusionOutput(output="late"),
+            "request-active": DiffusionOutput(output="ready"),
+        }
+        msg = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id=batch_id,
+            output=_FakeBatchOutput(outputs),
+        )
+        _feed_one_msg_to_pump(executor, msg)
+
+        assert cancelled_fut.cancelled()
+        assert cancelled_id not in executor._output_futures
+        assert cancelled_id not in executor._completed_outputs
+        assert active_fut.result(timeout=1.0) is outputs["request-active"]
+
 
 class TestShutdownCleansUpFutures:
     """Test that shutdown cancels pending futures."""
@@ -400,8 +448,8 @@ class TestShutdownCleansUpFutures:
     def test_shutdown_sets_exception_on_pending_futures(self):
         executor = _make_executor()
 
-        rpc_fut = concurrent.futures.Future()
-        output_fut = concurrent.futures.Future()
+        rpc_fut: concurrent.futures.Future[AsyncDiffusionOutput] = concurrent.futures.Future()
+        output_fut: concurrent.futures.Future[DiffusionOutput] = concurrent.futures.Future()
         with executor._futures_lock:
             executor._rpc_futures["1"] = rpc_fut
             executor._output_futures["abc"] = output_fut
@@ -469,7 +517,7 @@ class TestResultPumpCancelledFutureRace:
     def test_batch_split_racing_cancel_does_not_crash_pump(self):
         executor = _make_executor()
         cancelled_fut = _racy_cancelled_future()
-        healthy_fut = concurrent.futures.Future()
+        healthy_fut: concurrent.futures.Future[DiffusionOutput] = concurrent.futures.Future()
         with executor._futures_lock:
             executor._output_futures["batch-1/r-aborted"] = cancelled_fut
             executor._output_futures["batch-1/r-healthy"] = healthy_fut
