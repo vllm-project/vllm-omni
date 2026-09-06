@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # ruff: noqa: E402, I001
 import argparse
 import math
@@ -45,9 +48,48 @@ from benchmarks.accuracy.text_to_image.gbench import (
 from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
     build_serve_common_argv,
     seed_tts_bench_argv,
+    videomme_bench_argv,
 )
 from tests.e2e.accuracy.qwen3_omni.run_qwen_omni_acc_benchmark import sync_dataset_env_from_ns
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import resolve_seed_tts_root
+
+
+def test_videomme_bench_argv_preserves_hf_repo_id_from_env(monkeypatch):
+    monkeypatch.setenv("VLLM_VIDEOMME_DATASET_PATH", "lmms-eval/Video-MME")
+    monkeypatch.delenv("VLLM_VIDEOMME_REPO", raising=False)
+    monkeypatch.delenv("VIDEOMME_ROOT", raising=False)
+
+    argv = videomme_bench_argv()
+
+    dataset_idx = argv.index("--dataset-path")
+    assert argv[argv.index("--dataset-name") + 1] == "videomme"
+    assert argv[dataset_idx + 1] == "lmms-eval/Video-MME"
+
+
+def test_videomme_bench_argv_uses_local_directory(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("VLLM_VIDEOMME_DATASET_PATH", str(tmp_path))
+    monkeypatch.delenv("VIDEOMME_ROOT", raising=False)
+
+    argv = videomme_bench_argv()
+
+    assert argv[argv.index("--dataset-path") + 1] == str(tmp_path.resolve())
+
+
+def test_sync_dataset_env_preserves_videomme_hf_repo_id(monkeypatch):
+    ns = argparse.Namespace(
+        daily_omni_repo=None,
+        daily_omni_qa_json=None,
+        daily_omni_video_dir=None,
+        videomme_repo=None,
+        videomme_dataset_path="lmms-eval/Video-MME",
+        seed_tts_dataset_path=None,
+        seed_tts_root=None,
+    )
+
+    monkeypatch.delenv("VLLM_VIDEOMME_DATASET_PATH", raising=False)
+    sync_dataset_env_from_ns(ns)
+
+    assert os.environ["VLLM_VIDEOMME_DATASET_PATH"] == "lmms-eval/Video-MME"
 
 
 def test_seed_tts_bench_argv_preserves_hf_repo_id_from_env(monkeypatch):

@@ -14,7 +14,7 @@ import time
 import traceback
 import uuid
 import wave
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -66,6 +66,18 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
 )
 from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDataset
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
+from vllm_omni.benchmarks.data_modules.videomme_dataset import (
+    VIDEOMME_DEFAULT_HF_REPO,
+    VideoMMEDataset,
+    VideoMMESampleRequest,
+    ensure_videomme_subtitles_extracted,
+    ensure_videomme_videos_extracted,
+    resolve_videomme_local_root,
+    resolve_videomme_root,
+    videomme_local_parquet,
+    videomme_local_subtitle_dir,
+    videomme_local_video_dir,
+)
 from vllm_omni.benchmarks.omniinteract import (
     VIDEO_FPS,
     OmniInteractBenchmarkConfig,
@@ -194,6 +206,7 @@ def _pcm_s16le_to_seed_tts_wer_bytes(
 get_samples_old = datasets.get_samples
 
 _DEFAULT_DAILY_OMNI_REPO = "liarliar/Daily-Omni"
+_DEFAULT_VIDEOMME_REPO = VIDEOMME_DEFAULT_HF_REPO
 
 
 def _seed_tts_capture_pcm_for_wer() -> bool:
@@ -221,9 +234,9 @@ def _merge_extra_body_mm_kwargs(base: dict | None, overlay: dict | None) -> dict
     return out
 
 
-def _attach_daily_omni_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
-    """Apply per-request OpenAI fields (``mm_processor_kwargs``, messages) for Daily-Omni."""
-    if not isinstance(sample, DailyOmniSampleRequest):
+def _attach_omni_chat_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
+    """Apply per-request OpenAI fields (``mm_processor_kwargs``, messages) for Daily-Omni / Video-MME."""
+    if not isinstance(sample, (DailyOmniSampleRequest, VideoMMESampleRequest)):
         return
     rfi.extra_body = _merge_extra_body_mm_kwargs(rfi.extra_body, sample.omni_extra_body)
     if sample.omni_chat_messages is not None:
@@ -270,6 +283,29 @@ def _attach_omniinteract_to_request_func_input(sample: SampleRequest, rfi: Reque
     setattr(rfi, "omniinteract_case", sample.omniinteract_case)
     setattr(rfi, "omniinteract_options", sample.omniinteract_options)
     setattr(rfi, "omniinteract_prepared_input", sample.omniinteract_prepared_input)
+
+
+def _async_limiter(max_concurrency: int | None) -> contextlib.AbstractAsyncContextManager[object]:
+    if max_concurrency:
+        return asyncio.Semaphore(max_concurrency)
+    return contextlib.nullcontext()
+
+
+def _as_float(value: object, default: float = 0.0) -> float:
+    """Coerce loosely-typed metric dict values to ``float`` for mypy.
+
+    Strings are parsed rather than dropped: JSON-sourced session metrics such as
+    ``audio_duration_ms`` may arrive quoted, and silently reporting ``0.0`` would
+    corrupt the derived TTFT / RTF numbers.
+    """
+    if isinstance(value, bool) or value is None:
+        return default
+    if isinstance(value, (int, float, str)):
+        try:
+            return float(value)
+        except ValueError:
+            return default
+    return default
 
 
 def _append_error(existing: str, message: str) -> str:
@@ -342,9 +378,13 @@ def _prepare_omniinteract_batch(input_requests: list[SampleRequest]) -> None:
     for sample in input_requests:
         if not isinstance(sample, OmniInteractSampleRequest):
             continue
-        root = sample.omniinteract_options.output_root.resolve()
+        options = sample.omniinteract_options
+        case = sample.omniinteract_case
+        if options is None or case is None:
+            raise RuntimeError("OmniInteract benchmark input lost its dataset identity")
+        root = options.output_root.resolve()
         roots.add(root)
-        clear_case_artifacts(sample.omniinteract_options.output_root, sample.omniinteract_case)
+        clear_case_artifacts(options.output_root, case)
     for root in roots:
         clear_batch_artifacts(root)
 
@@ -366,10 +406,26 @@ def _daily_omni_repo_from_args(args) -> str | None:
     return None
 
 
+def _videomme_repo_from_args(args) -> str | None:
+    """Resolve HuggingFace repo id for Video-MME from CLI args."""
+    dp = getattr(args, "dataset_path", None)
+    hn = getattr(args, "hf_name", None)
+    supported = {p.lower() for p in VideoMMEDataset.SUPPORTED_DATASET_PATHS}
+    supported.add(_DEFAULT_VIDEOMME_REPO.lower())
+    if isinstance(dp, str) and dp.strip().lower() in supported:
+        return dp.strip()
+    if isinstance(hn, str) and hn.strip().lower() in supported:
+        return hn.strip()
+    return None
+
+
 def get_samples(args, tokenizer):
     # Daily-Omni: explicit dataset name, or hf + matching path/hf-name
     is_daily_omni = args.dataset_name == "daily-omni" or (
         args.dataset_name == "hf" and _daily_omni_repo_from_args(args) is not None
+    )
+    is_videomme = args.dataset_name == "videomme" or (
+        args.dataset_name == "hf" and _videomme_repo_from_args(args) is not None
     )
     is_seed_tts = args.dataset_name in (
         "seed-tts",
@@ -387,7 +443,7 @@ def get_samples(args, tokenizer):
         "openai-realtime-duplex",
         "daily-omni",
     ]
-    is_omni_dataset = is_daily_omni or is_seed_tts or is_omniinteract or args.dataset_name == "random-mm"
+    is_omni_dataset = is_daily_omni or is_videomme or is_seed_tts or is_omniinteract or args.dataset_name == "random-mm"
 
     if not is_omni_backend and not is_omni_dataset:
         # Not an omni-related request, delegate to original implementation
@@ -563,6 +619,101 @@ def get_samples(args, tokenizer):
         )
         return input_requests
 
+    if is_videomme:
+        if args.backend not in ["openai-chat-omni", "daily-omni"]:
+            raise ValueError(
+                f"Video-MME dataset requires a multimodal backend that supports video. "
+                f"Got backend='{args.backend}'. Please use '--backend openai-chat-omni'"
+            )
+
+        video_dir = getattr(args, "videomme_video_dir", None)
+        subtitle_dir = getattr(args, "videomme_subtitle_dir", None)
+        parquet_path = getattr(args, "videomme_parquet", None)
+        if isinstance(parquet_path, str):
+            parquet_path = parquet_path.strip() or None
+        dataset_split = getattr(args, "hf_split", None) or "test"
+
+        # Local directory wins (absolute/relative existing path). Hub ids fall through to
+        # snapshot_download — same pattern as Seed-TTS / Daily-Omni.
+        local_root = resolve_videomme_local_root(getattr(args, "dataset_path", None)) or (
+            resolve_videomme_local_root(getattr(args, "hf_name", None))
+        )
+        # ``is_videomme`` only accepts --dataset-name hf once the path/name resolved to a
+        # known Video-MME repo, so ``repo_id`` is None only under --dataset-name videomme.
+        repo_id = _videomme_repo_from_args(args)
+        if local_root is None and video_dir is None and parquet_path is None:
+            # Default Hub mode: download parquet + video zips on demand.
+            repo_id = repo_id or _DEFAULT_VIDEOMME_REPO
+            local_root = resolve_videomme_root(repo_id)
+            logger.info("Using Hugging Face Video-MME snapshot: root=%s repo=%s", local_root, repo_id)
+        elif local_root is not None:
+            logger.info("Using local Video-MME mirror: root=%s", local_root)
+
+        if local_root is not None:
+            if parquet_path is None:
+                local_pq = videomme_local_parquet(local_root)
+                if local_pq is not None:
+                    parquet_path = str(local_pq)
+            if video_dir is None:
+                try:
+                    video_dir = str(ensure_videomme_videos_extracted(local_root))
+                except FileNotFoundError:
+                    found = videomme_local_video_dir(local_root)
+                    video_dir = str(found) if found is not None else None
+            if subtitle_dir is None:
+                found_sub = ensure_videomme_subtitles_extracted(local_root) or videomme_local_subtitle_dir(local_root)
+                subtitle_dir = str(found_sub) if found_sub is not None else None
+
+        if parquet_path is None:
+            # QA falls back to ``load_dataset``; prefer an on-disk root so offline runs work.
+            repo_id = repo_id or (str(local_root) if local_root is not None else _DEFAULT_VIDEOMME_REPO)
+
+        if video_dir is None:
+            raise ValueError(
+                "Video-MME requires --videomme-video-dir pointing at extracted videos "
+                "(directory of {videoID}.mp4), or a local/Hub dataset root containing video/ "
+                "or videos_chunked_*.zip."
+            )
+
+        logger.info(
+            "Loading Video-MME: parquet=%s, hf_repo=%s, video_dir=%s, pack_mode=%s",
+            parquet_path,
+            repo_id,
+            video_dir,
+            getattr(args, "videomme_pack_mode", "minicpm-frames"),
+        )
+        dataset = VideoMMEDataset(
+            parquet_path=parquet_path,
+            dataset_path=None if parquet_path is not None else repo_id,
+            dataset_split=dataset_split,
+            dataset_subset=getattr(args, "hf_subset", None),
+            random_seed=args.seed,
+            video_dir=video_dir,
+            subtitle_dir=subtitle_dir,
+            pack_mode=getattr(args, "videomme_pack_mode", "minicpm-frames"),
+            max_frames=getattr(args, "videomme_max_frames", None),
+            duration_filter=getattr(args, "videomme_duration", "all"),
+            use_subtitle=getattr(args, "videomme_use_subtitle", False),
+            inline_local_video=getattr(args, "videomme_inline_local_video", False),
+            trust_remote_code=getattr(args, "trust_remote_code", False),
+            no_stream=getattr(args, "no_stream", False),
+            disable_shuffle=getattr(args, "disable_shuffle", False),
+        )
+
+        out_len = getattr(args, "output_len", None)
+        if out_len is None:
+            out_len = getattr(args, "hf_output_len", None)
+        if out_len is None:
+            out_len = VideoMMEDataset.DEFAULT_OUTPUT_LEN
+
+        return dataset.sample(
+            tokenizer=tokenizer,
+            num_requests=args.num_prompts,
+            output_len=out_len,
+            request_id_prefix=args.request_id_prefix,
+            no_oversample=args.no_oversample,
+        )
+
     if is_seed_tts:
         if args.backend not in (
             "openai-audio-speech",
@@ -649,7 +800,7 @@ datasets.get_samples = get_samples
 
 _serve_mod = sys.modules.get("vllm.benchmarks.serve")
 if _serve_mod is not None:
-    _serve_mod.get_samples = get_samples
+    setattr(_serve_mod, "get_samples", get_samples)
 
 
 @dataclass
@@ -1654,9 +1805,9 @@ async def _async_request_omniinteract(
         output.audio_duration = case_result.audio_bytes / (24_000 * 2)
         output.audio_frames = case_result.audio_bytes // 2
         session_metrics = case_result.duplex_session_metrics
-        output.ttft = float(session_metrics.get("mean_ttft_ms") or 0.0) / 1000.0
-        output.audio_ttfp = float(session_metrics.get("mean_ttfp_ms") or 0.0) / 1000.0
-        output.audio_rtf = float(session_metrics.get("mean_rtf") or 0.0)
+        output.ttft = _as_float(session_metrics.get("mean_ttft_ms")) / 1000.0
+        output.audio_ttfp = _as_float(session_metrics.get("mean_ttfp_ms")) / 1000.0
+        output.audio_rtf = _as_float(session_metrics.get("mean_rtf"))
         token_timing_measured = _apply_stage0_token_timings(
             output,
             [request_metric.get("stage0_tokens") for request_metric in case_result.duplex_request_metrics],
@@ -1906,12 +2057,10 @@ async def async_request_openai_realtime_duplex(
             await client.close_session(timeout_s=30.0)
 
             output.generated_text = " ".join(filter(None, turn_transcripts))
-            output.ttft = float(session_metrics.get("mean_ttft_ms") or 0.0) / 1000.0
-            output.audio_ttfp = float(session_metrics.get("mean_ttfp_ms") or 0.0) / 1000.0
-            output.audio_rtf = float(session_metrics.get("mean_rtf") or 0.0)
-            output.audio_duration = (
-                sum(float(metric.get("audio_duration_ms") or 0.0) for metric in turn_metrics) / 1000.0
-            )
+            output.ttft = _as_float(session_metrics.get("mean_ttft_ms")) / 1000.0
+            output.audio_ttfp = _as_float(session_metrics.get("mean_ttfp_ms")) / 1000.0
+            output.audio_rtf = _as_float(session_metrics.get("mean_rtf"))
+            output.audio_duration = sum(_as_float(metric.get("audio_duration_ms")) for metric in turn_metrics) / 1000.0
             output.audio_frames = int(output.audio_duration * client.events.output_sample_rate_hz)
             output.latency = request_finished_at - output.start_time
             output.tts_turn_pcm_bytes = turn_pcm_bytes
@@ -2086,7 +2235,7 @@ async def benchmark(
         extra_body=test_extra_body,
         chat_messages=test_chat_messages,
     )
-    _attach_daily_omni_to_request_func_input(input_requests[0], test_input)
+    _attach_omni_chat_to_request_func_input(input_requests[0], test_input)
     _attach_seed_tts_to_request_func_input(input_requests[0], test_input)
     _attach_omniinteract_to_request_func_input(input_requests[0], test_input)
 
@@ -2111,7 +2260,7 @@ async def benchmark(
     if num_warmups > 0:
         print(f"Warming up with {num_warmups} requests...")
         warmup_pbar = None if disable_tqdm else tqdm(total=num_warmups)
-        warmup_semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
+        warmup_semaphore = _async_limiter(max_concurrency)
         warmup_tasks = []
 
         async def warmup_limited_request_func():
@@ -2129,12 +2278,13 @@ async def benchmark(
 
     print("Starting main benchmark run...")
 
+    lora_iter: Iterator[str] | None = None
     if lora_modules:
         lora_modules_list = list(lora_modules)
         if lora_assignment == "round-robin":
-            lora_modules = iter([lora_modules_list[i % len(lora_modules_list)] for i in range(len(input_requests))])
+            lora_iter = iter([lora_modules_list[i % len(lora_modules_list)] for i in range(len(input_requests))])
         else:
-            lora_modules = iter([random.choice(lora_modules_list) for _ in range(len(input_requests))])
+            lora_iter = iter([random.choice(lora_modules_list) for _ in range(len(input_requests))])
 
     if profile:
         print("Starting profiler...")
@@ -2152,7 +2302,7 @@ async def benchmark(
             extra_body=test_extra_body,
             chat_messages=test_chat_messages,
         )
-        _attach_daily_omni_to_request_func_input(input_requests[0], profile_input)
+        _attach_omni_chat_to_request_func_input(input_requests[0], profile_input)
         _attach_seed_tts_to_request_func_input(input_requests[0], profile_input)
         profile_output = await request_func(request_func_input=profile_input, session=session)
         if profile_output.success:
@@ -2173,7 +2323,7 @@ async def benchmark(
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
-    semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
+    semaphore = _async_limiter(max_concurrency)
 
     async def limited_request_func(request_func_input, session, pbar):
         async with semaphore:
@@ -2244,8 +2394,8 @@ async def benchmark(
         )
         per_request_extra_body = _merge_overrides(extra_body, request.request_overrides)
         req_model_id, req_model_name = model_id, model_name
-        if lora_modules:
-            req_lora_module = next(lora_modules)
+        if lora_iter is not None:
+            req_lora_module = next(lora_iter)
             req_model_id, req_model_name = req_lora_module, req_lora_module
 
         request_func_input = RequestFuncInput(
@@ -2263,7 +2413,7 @@ async def benchmark(
             request_id=request_id,
             chat_messages=request.chat_messages,
         )
-        _attach_daily_omni_to_request_func_input(request, request_func_input)
+        _attach_omni_chat_to_request_func_input(request, request_func_input)
         _attach_seed_tts_to_request_func_input(request, request_func_input)
         _attach_omniinteract_to_request_func_input(request, request_func_input)
         tasks.append(
@@ -2282,6 +2432,8 @@ async def benchmark(
 
     omniinteract_summary = _finalize_omniinteract_batch(input_requests, outputs)
 
+    metrics: Any
+    actual_output_lens: list[int] | int
     if task_type == TaskType.GENERATION:
         metrics, actual_output_lens = calculate_metrics(
             input_requests=input_requests,
@@ -2306,6 +2458,10 @@ async def benchmark(
         actual_output_lens = 0
 
     if isinstance(metrics, MultiModalsBenchmarkMetrics):
+        # ``make_dataclass`` types this class as ``type``, so isinstance()
+        # narrows to ``object`` and attribute access fails. Keep the runtime
+        # check and read fields through ``Any``.
+        mm_metrics: Any = metrics
 
         def measured_ttft(output: RequestFuncOutput) -> float | None:
             session_metrics = getattr(output, "duplex_session_metrics", None)
@@ -2315,21 +2471,21 @@ async def benchmark(
 
         result = {
             "duration": benchmark_duration,
-            "completed": metrics.completed,
-            "failed": metrics.failed,
-            "total_input_tokens": metrics.total_input,
-            "total_output_tokens": metrics.total_output,
-            "request_throughput": metrics.request_throughput,
-            "request_goodput": metrics.request_goodput if goodput_config_dict else None,
-            "output_throughput": metrics.output_throughput,
-            "total_token_throughput": metrics.total_token_throughput,
-            defs.TOTAL_AUDIO_DURATION_S: getattr(metrics, defs.TOTAL_AUDIO_DURATION_S),
-            defs.TOTAL_AUDIO_FRAMES: getattr(metrics, defs.TOTAL_AUDIO_FRAMES),
-            defs.AUDIO_THROUGHPUT: getattr(metrics, defs.AUDIO_THROUGHPUT),
-            defs.TOTAL_IMAGES: getattr(metrics, defs.TOTAL_IMAGES),
-            defs.IMAGE_THROUGHPUT: getattr(metrics, defs.IMAGE_THROUGHPUT),
-            defs.AVERAGE_PIXELS_PER_IMAGE: getattr(metrics, defs.AVERAGE_PIXELS_PER_IMAGE),
-            defs.MEAN_DENOISE_STEP_LATENCY_MS: getattr(metrics, defs.MEAN_DENOISE_STEP_LATENCY_MS),
+            "completed": mm_metrics.completed,
+            "failed": mm_metrics.failed,
+            "total_input_tokens": mm_metrics.total_input,
+            "total_output_tokens": mm_metrics.total_output,
+            "request_throughput": mm_metrics.request_throughput,
+            "request_goodput": mm_metrics.request_goodput if goodput_config_dict else None,
+            "output_throughput": mm_metrics.output_throughput,
+            "total_token_throughput": mm_metrics.total_token_throughput,
+            defs.TOTAL_AUDIO_DURATION_S: getattr(mm_metrics, defs.TOTAL_AUDIO_DURATION_S),
+            defs.TOTAL_AUDIO_FRAMES: getattr(mm_metrics, defs.TOTAL_AUDIO_FRAMES),
+            defs.AUDIO_THROUGHPUT: getattr(mm_metrics, defs.AUDIO_THROUGHPUT),
+            defs.TOTAL_IMAGES: getattr(mm_metrics, defs.TOTAL_IMAGES),
+            defs.IMAGE_THROUGHPUT: getattr(mm_metrics, defs.IMAGE_THROUGHPUT),
+            defs.AVERAGE_PIXELS_PER_IMAGE: getattr(mm_metrics, defs.AVERAGE_PIXELS_PER_IMAGE),
+            defs.MEAN_DENOISE_STEP_LATENCY_MS: getattr(mm_metrics, defs.MEAN_DENOISE_STEP_LATENCY_MS),
             "input_lens": [output.prompt_len for output in outputs],
             "start_times": [output.start_time for output in outputs],
             "output_lens": actual_output_lens,
@@ -2337,9 +2493,9 @@ async def benchmark(
             "itls": [output.itl for output in outputs],
             "generated_texts": [output.generated_text for output in outputs],
             "errors": [output.error for output in outputs],
-            "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
-            "max_concurrent_requests": metrics.max_concurrent_requests,
-            "rtfx": metrics.rtfx,
+            "max_output_tokens_per_s": mm_metrics.max_output_tokens_per_s,
+            "max_concurrent_requests": mm_metrics.max_concurrent_requests,
+            "rtfx": mm_metrics.rtfx,
         }
     else:
         result = {
@@ -2384,6 +2540,21 @@ async def benchmark(
     if _daily_acc is not None:
         result.update(_daily_acc)
         print_daily_omni_accuracy_summary(_daily_acc)
+
+    from vllm_omni.benchmarks.data_modules.videomme_eval import (
+        compute_videomme_accuracy_metrics,
+        print_videomme_accuracy_summary,
+    )
+
+    _save_vm = os.environ.get("VIDEOMME_SAVE_EVAL_ITEMS", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    _vm_acc = compute_videomme_accuracy_metrics(input_requests, outputs, include_per_item=_save_vm)
+    if _vm_acc is not None:
+        result.update(_vm_acc)
+        print_videomme_accuracy_summary(_vm_acc)
 
     if _seed_tts_capture_pcm_for_wer():
         from vllm_omni.benchmarks.data_modules.seed_tts_eval import (
