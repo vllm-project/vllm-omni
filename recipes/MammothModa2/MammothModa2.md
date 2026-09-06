@@ -48,10 +48,11 @@ present and non-null, those keys take precedence over the standard fields.
 
 ## Hardware Support
 
-The default deploy config runs both the AR and DiT stages on one NVIDIA A800
-80 GB (`devices: "0"`). Its committed `gpu_memory_utilization` split is 0.5
-for stage 0 and 0.3 for stage 1. The validation section below also shows a
-two-A800 placement with one stage per GPU for attributable timing and memory.
+The default deploy config places both the AR and DiT stages on one GPU
+(`devices: "0"`). Its committed `gpu_memory_utilization` split is 0.5 for
+stage 0 and 0.3 for stage 1. The A800 validation plan below also shows a
+two-GPU placement with one stage per GPU for attributable timing and memory;
+the results are pending.
 
 ## GPU
 
@@ -132,7 +133,7 @@ ls -lh mammoth_t2i.png
 python -c "from PIL import Image; print(Image.open('mammoth_t2i.png').size)"
 ```
 
-### 2x NVIDIA A800 80GB validation
+### 2x NVIDIA A800 80GB validation plan
 
 Use one A800 per stage so AR and DiT memory and timing are attributable. The
 per-stage override changes placement only; both stages remain single-rank.
