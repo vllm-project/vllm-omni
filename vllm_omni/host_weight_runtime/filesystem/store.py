@@ -1247,8 +1247,10 @@ class FilesystemHostWeightStore:
                     retryable=True,
                 )
             )
-        store_bytes = self._tree_bytes(self.root)
-        if policy.max_store_bytes is not None and store_bytes + additional_bytes > policy.max_store_bytes:
+        if (
+            policy.max_store_bytes is not None
+            and self._tree_bytes(self.root) + additional_bytes > policy.max_store_bytes
+        ):
             raise HostWeightError(
                 _failure(
                     ResolutionStage.CAPACITY,
