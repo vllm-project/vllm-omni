@@ -3796,11 +3796,17 @@ class MiniCPMOAudioFeatureInputs(TensorSchema):
 
     audio_feature_lens: Annotated[
         torch.Tensor | list[torch.Tensor],
-        TensorShape("bn", "s"),
+        TensorShape("bn", "s", dynamic_dims={"s"}),
     ]
     """
     This should be feature length of each audio slice,
     which equals to `audio_features.shape[-1]`
+
+    Each audio in the batch may be split into a different number of slices
+    (e.g. audio >30s splits into multiple slices while shorter audio doesn't),
+    so `s` must be dynamic: batching audios with different slice counts is a
+    normal, valid input and is already handled below via `hstack` + per-audio
+    iteration, not a schema violation.
     """
 
 
