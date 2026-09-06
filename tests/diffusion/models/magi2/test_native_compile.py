@@ -71,7 +71,7 @@ def test_pipeline_setup_compile_forwards_config_dynamic() -> None:
 
     pipeline.setup_compile()
 
-    assert calls == [{"fullgraph": True, "dynamic": False}]
+    assert calls == [{"fullgraph": True, "dynamic": False, "options": {"emulate_precision_casts": True}}]
 
 
 def test_compiled_graphs_are_shared_across_layers_of_one_kind() -> None:

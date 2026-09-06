@@ -50,7 +50,9 @@ def test_inductor_regions_match_eager_in_deterministic_mode(monkeypatch: pytest.
 
     torch._dynamo.reset()
     graphs_before = torch._dynamo.utils.counters["stats"]["unique_graphs"]
-    model.compile_regions(fullgraph=True, dynamic=True)
+    # The pipeline compiles with inductor emulating eager's intermediate
+    # low-precision casts, so fused bf16 chains keep eager's rounding.
+    model.compile_regions(fullgraph=True, dynamic=True, options={"emulate_precision_casts": True})
     steps = _cuda_steps(sampler, Magi2PackedLayout())
     first = sampler.forward(steps[0])
     with torch._dynamo.config.patch(error_on_recompile=True):
@@ -64,8 +66,8 @@ def test_inductor_regions_match_eager_in_deterministic_mode(monkeypatch: pytest.
         compiled_longer_text = sampler.forward(longer_text_step)
 
     for (video, audio), (video_ref, audio_ref) in zip(compiled, expected, strict=True):
-        torch.testing.assert_close(video, video_ref, atol=1e-3, rtol=1e-2)
-        torch.testing.assert_close(audio, audio_ref, atol=1e-3, rtol=1e-2)
+        assert torch.equal(video, video_ref)
+        torch.testing.assert_close(audio, audio_ref, atol=1e-6, rtol=0)
     for (video, audio), (video_again, audio_again) in zip(compiled, repeated, strict=True):
         assert torch.equal(video, video_again)
         assert torch.equal(audio, audio_again)
@@ -73,6 +75,6 @@ def test_inductor_regions_match_eager_in_deterministic_mode(monkeypatch: pytest.
         (compiled_new_layout, expected_new_layout),
         (compiled_longer_text, expected_longer_text),
     ):
-        torch.testing.assert_close(video, video_ref, atol=1e-3, rtol=1e-2)
-        torch.testing.assert_close(audio, audio_ref, atol=1e-3, rtol=1e-2)
+        assert torch.equal(video, video_ref)
+        torch.testing.assert_close(audio, audio_ref, atol=1e-6, rtol=0)
     assert torch._dynamo.utils.counters["stats"]["unique_graphs"] - graphs_before == 7
