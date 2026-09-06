@@ -168,18 +168,53 @@ quantization or offload. Ring, TP/PP/DP, HSDP, expert/CFG/VAE parallelism,
 step execution and Dev text-to-image are not supported with this SP path.
 The AR-only Preview/Dev understanding topology is unchanged.
 
-The following is a **full-checkpoint validation configuration, not a verified
-capacity or performance recipe**. It allocates GPU 0 to AR and GPUs 1 and 2
-to DiT. Two-rank DiT does not mean the entire pipeline fits on two GPUs.
-Choose devices with sufficient memory for their complete assigned stages;
-SP does not shard model weights or the replicated refiners/VAE.
+The following offline configuration completed a one-prompt Preview E2E smoke
+on two A100-SXM4-80GB GPUs with NVLink NV4. AR shares GPU 0 with DiT rank 0;
+DiT rank 1 uses GPU 1. This is not a general capacity or performance guarantee:
+SP does not shard model weights or the replicated refiners/VAE. Keep the
+default deploy config unchanged and save this opt-in config separately as
+`mammoth-sp2.yaml`:
+
+```yaml
+async_chunk: false
+pipeline: mammoth_moda2
+trust_remote_code: true
+distributed_executor_backend: mp
+dtype: bfloat16
+enable_prefix_caching: false
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    max_model_len: 8192
+    gpu_memory_utilization: 0.35
+    enforce_eager: true
+  - stage_id: 1
+    devices: "0,1"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.3
+    enforce_eager: true
+    ulysses_degree: 2
+    ulysses_mode: advanced_uaa
+    diffusion_attention_backend: TORCH_SDPA
+    engine_extras:
+      dtype: float32
+```
 
 ```bash
-VLLM_LOGGING_LEVEL=DEBUG vllm serve ./MammothModa2-Preview --omni \
-  --deploy-config vllm_omni/deploy/mammoth_moda2.yaml \
-  --stage-overrides '{"0":{"devices":"0"},"1":{"devices":"1,2","ulysses_degree":2,"ulysses_mode":"advanced_uaa","max_num_seqs":1,"enforce_eager":true,"diffusion_attention_backend":"TORCH_SDPA"}}' \
-  --host 127.0.0.1 --port 8099
+CUDA_VISIBLE_DEVICES=0,1 VLLM_WORKER_MULTIPROC_METHOD=spawn \
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model ./MammothModa2-Preview --deploy-config ./mammoth-sp2.yaml \
+  --ulysses-degree 2 --ulysses-mode advanced_uaa --enforce-eager \
+  --prompt "A red ceramic teapot on a wooden table beside a small green plant, soft morning light, detailed product photograph." \
+  --height 1024 --width 1024 --seed 42 --num-inference-steps 50 \
+  --guidance-scale 4.0 --extra-body '{"text_guidance_scale":4.0,"cfg_range":[0.0,1.0]}' \
+  --output ./mammoth-sp2.png
 ```
+
+Pass the Ulysses flags explicitly: the shared example's command-line defaults
+also enter config resolution. For the SP=1 control, change stage 1's devices
+to `"0"`, set its `ulysses_degree` to 1, and pass `--ulysses-degree 1`.
 
 The correctness control below uses two CUDA devices, real NCCL collectives,
 released 2520/21/7/120 head geometry with reduced depth, and FP32 SDPA math.
@@ -193,11 +228,18 @@ CUDA_VISIBLE_DEVICES=0,1 OMP_NUM_THREADS=4 python -m pytest -q \
   tests/diffusion/distributed/test_mammothmoda2_ulysses.py
 ```
 
-Full-checkpoint Preview T2I, understanding regressions, BF16 SP accuracy,
-peak-memory reduction and paired speedup measurements remain **NOT_RUN**.
-Do not interpret the reduced-model control as image-quality or performance
-qualification. For a meaningful comparison, keep SP=1 and SP=2 on the same
-code, weights, attention backend, dtype, prompts, seeds and sampling settings.
+The full-weight smoke used Preview revision
+`ef5a5e41dbf0de1ef6275586b7580f0d4248b4c6`, vLLM 0.28.0, Torch 2.13.0+cu130,
+Transformers 5.14.1, Diffusers 0.40.0, Python 3.12.3 and driver 580.159.03.
+Both SP=1 and SP=2 completed and saved 1024x1024 RGB PNG images. AR token IDs matched;
+the saved images differed by at most one 8-bit channel value (mean absolute
+difference 0.005415). This is a single-prompt smoke, not raw-latent parity or
+a broad image-quality/performance result.
+
+Understanding regressions, BF16 SP accuracy, peak-memory reduction and paired
+speedup measurements remain **NOT_RUN**. For a meaningful comparison, keep
+code, weights, attention backend, dtype, prompts, seeds and sampling settings
+fixed between SP=1 and SP=2.
 
 ### 1x AMD MI300X, MammothModa2 Preview (pre-migration baseline)
 
