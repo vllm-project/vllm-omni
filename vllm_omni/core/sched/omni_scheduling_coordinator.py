@@ -18,6 +18,7 @@ from vllm.logger import init_logger
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
+from vllm_omni.outputs import SchedulingMetadataUpdate
 
 logger = init_logger(__name__)
 
@@ -202,90 +203,38 @@ class OmniSchedulingCoordinator:
             waiting_queue.add_request(request)
         self._waiting_for_input = deque()
 
-    @staticmethod
-    def _flatten_prompt_token_ids(value: Any) -> list[int]:
-        """Normalize connector metadata into flat prompt token ids."""
-        if value is None:
-            return []
-        if hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "tolist"):
-            value = value.detach().cpu().tolist()
-        elif hasattr(value, "tolist") and not isinstance(value, (list, tuple)):
-            value = value.tolist()
-
-        if isinstance(value, (list, tuple)):
-            flattened: list[int] = []
-            for item in value:
-                if hasattr(item, "detach") and hasattr(item, "cpu") and hasattr(item, "tolist"):
-                    item = item.detach().cpu().tolist()
-                elif hasattr(item, "tolist") and not isinstance(item, (list, tuple)):
-                    item = item.tolist()
-                if isinstance(item, (list, tuple)):
-                    flattened.extend(int(token_id) for token_id in item)
-                else:
-                    flattened.append(int(item))
-            return flattened
-        return [int(value)]
-
     def update_request_metadata(
         self,
         requests: dict[str, Request],
-        request_metadata: dict[str, dict[str, Any]],
-        model_mode: str = "ar",
+        request_metadata: dict[str, SchedulingMetadataUpdate],
     ) -> None:
-        """Apply received scheduling metadata to request objects.
-
-        For AR mode: only scheduler-visible metadata is applied locally.
-        For Generation mode: updates ``request.prompt_token_ids``.
-
-        Additionally, if the payload contains ``next_stage_prompt_len``,
-        updates the request's ``prompt_token_ids`` to the correct length.
-        """
-        for req_id, metadata in request_metadata.items():
+        """Apply typed runner updates without interpreting payload metadata."""
+        for req_id, update in request_metadata.items():
             request = requests.get(req_id)
             if request is None:
                 continue
+            self._apply_scheduling_update(request, update)
 
-            # Handle next_stage_prompt_len if present (for models like Qwen3-Omni).
-            # Only apply when the request has not started decoding yet
-            # (no output tokens). Resetting a mid-decode request would
-            # destroy generated tokens and desync KV cache state.
-            if "next_stage_prompt_len" in metadata:
-                next_len = metadata["next_stage_prompt_len"]
-                if isinstance(next_len, int) and next_len > 0:
-                    output_token_ids = getattr(request, "_output_token_ids", None)
-                    has_decode_output = output_token_ids is not None and len(output_token_ids) > 0
-                    if has_decode_output:
-                        logger.debug(
-                            "[Coordinator stage-%s] Skipping prompt resize for req %s: "
-                            "request already has %s output tokens",
-                            self._stage_id,
-                            req_id,
-                            len(output_token_ids),
-                        )
-                    else:
-                        current_prompt_ids = getattr(request, "prompt_token_ids", []) or []
-                        current_prompt_len = len(current_prompt_ids)
-                        if current_prompt_len != next_len or getattr(request, "num_prompt_tokens", None) != next_len:
-                            new_prompt = [0] * next_len
-                            request.prompt_token_ids = new_prompt
-                            request.num_prompt_tokens = next_len
-                            request._all_token_ids.clear()
-                            request._all_token_ids.extend(new_prompt)
-                            request._output_token_ids.clear()
-                            request.num_computed_tokens = 0
-                            logger.debug(
-                                "[Coordinator stage-%s] Updated prompt_token_ids length to %s for req %s",
-                                self._stage_id,
-                                next_len,
-                                req_id,
-                            )
-
-            if model_mode != "ar":
-                new_ids = self._flatten_prompt_token_ids(metadata.get("code_predictor_codes"))
-                if new_ids:
-                    request.prompt_token_ids = new_ids
-                    request.num_prompt_tokens = len(new_ids)
+    def _apply_scheduling_update(self, request: Request, update: SchedulingMetadataUpdate) -> None:
+        if update.resize_prompt_to is not None:
+            output_token_ids = getattr(request, "_output_token_ids", None)
+            if output_token_ids is None or not output_token_ids:
+                next_len = update.resize_prompt_to
+                current_prompt_ids = getattr(request, "prompt_token_ids", ()) or ()
+                if len(current_prompt_ids) != next_len or getattr(request, "num_prompt_tokens", None) != next_len:
+                    new_prompt = [0] * next_len
+                    request.prompt_token_ids = new_prompt
+                    request.num_prompt_tokens = next_len
                     request._all_token_ids.clear()
-                    request._all_token_ids.extend(new_ids)
+                    request._all_token_ids.extend(new_prompt)
                     request._output_token_ids.clear()
                     request.num_computed_tokens = 0
+
+        if update.prompt_token_ids is not None:
+            prompt_token_ids = list(update.prompt_token_ids)
+            request.prompt_token_ids = prompt_token_ids
+            request.num_prompt_tokens = len(prompt_token_ids)
+            request._all_token_ids.clear()
+            request._all_token_ids.extend(prompt_token_ids)
+            request._output_token_ids.clear()
+            request.num_computed_tokens = 0

@@ -28,6 +28,21 @@ _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
 
+_RUNTIME_ONLY_OVERRIDE_FIELDS = frozenset(
+    {
+        "devices",
+        "max_batch_size",
+        "num_replicas",
+    }
+)
+
+_TOPOLOGY_OWNED_ENGINE_FIELDS = frozenset(
+    {
+        "requires_full_payload_input",
+        "scheduling_metadata_adapter",
+    }
+)
+
 
 def pipeline_cfg_resolver(config_type: type[PretrainedConfig]):
     """Wraps a resolver such that we return None if a hf_config of the wrong type is provided."""
@@ -274,6 +289,9 @@ class StagePipelineConfig:
     # Whether the non-async path waits for a complete upstream payload from
     # the model-runner connector before scheduling this stage.
     requires_full_payload_input: bool = False
+    # Optional model-owned adapter for runner payload metadata that affects
+    # scheduling. The scheduler only receives its typed effects.
+    scheduling_metadata_adapter: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -960,6 +978,7 @@ def _build_engine_args(
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
+    engine_args["scheduling_metadata_adapter"] = ps.scheduling_metadata_adapter
     return engine_args
 
 
@@ -1126,7 +1145,11 @@ class StageConfig:
 
         # CLI overrides take precedence over YAML defaults
         for key, value in runtime_overrides.items():
-            if value is not None and key not in ("devices", "max_batch_size", "num_replicas"):
+            if (
+                value is not None
+                and key not in _RUNTIME_ONLY_OVERRIDE_FIELDS
+                and key not in _TOPOLOGY_OWNED_ENGINE_FIELDS
+            ):
                 engine_args[key] = value
 
         # Build runtime config from YAML defaults + CLI overrides

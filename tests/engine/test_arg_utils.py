@@ -51,8 +51,8 @@ def test_default_stage_id_is_concrete_int():
     assert cfg.stage_id == 0
 
 
-def test_full_payload_capability_reaches_omni_model_config(monkeypatch):
-    """Keep the pipeline capability intact through the engine adapter."""
+def test_topology_owned_model_fields_reach_omni_model_config(monkeypatch):
+    """Keep pipeline-owned model fields intact through the engine adapter."""
     captured: dict[str, object] = {}
     baseline_config = Mock()
     worker_module = types.ModuleType("test_connector_worker")
@@ -83,10 +83,12 @@ def test_full_payload_capability_reaches_omni_model_config(monkeypatch):
     OmniEngineArgs(
         stage_id=1,
         requires_full_payload_input=True,
+        scheduling_metadata_adapter="pipeline.Adapter",
         worker_cls="test_connector_worker.ConnectorWorker",
     ).create_model_config()
 
     assert captured["requires_full_payload_input"] is True
+    assert captured["scheduling_metadata_adapter"] == "pipeline.Adapter"
 
 
 def test_stage_without_connector_configuration_accepts_plain_runner(monkeypatch):
