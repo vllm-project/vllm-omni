@@ -6,6 +6,11 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    QKVParallelLinear,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
@@ -462,3 +467,66 @@ class TestComponentResolve:
     def test_min_capability_empty(self):
         cqc = ComponentQuantizationConfig(component_configs={})
         assert cqc.get_min_capability() == 0
+
+
+# ===================================================================
+# 5. HunyuanImage3 FP8 experts-only routing (regression)
+# ===================================================================
+#
+# Reproduces the checkpoint layout that crashed at startup:
+#   {"default": null, "model.layers.*.mlp.experts": {"method": "fp8"}}
+# HunyuanImage3's WeightsMapper strips the "model." prefix, so runtime
+# layer prefixes are "layers.0...". These tests cover the three fixes:
+#   - wildcard key matching in resolve()
+#   - null-default LinearBase fallback to UnquantizedLinearMethod
+#   - apply_vllm_mapper() prefix remapping
+
+
+@pytest.mark.cpu
+class TestHunyuanImage3ExpertsOnly:
+    HUNYUAN_MAPPER = WeightsMapper(orig_to_new_prefix={"model.": ""})
+
+    def _build(self):
+        """Build the experts-only config and apply the HunyuanImage3 mapper."""
+        fp8 = _MockQuantConfig("fp8")
+        cqc = ComponentQuantizationConfig(
+            component_configs={"model.layers.*.mlp.experts": fp8},
+            default_config=None,
+        )
+        cqc.apply_vllm_mapper(self.HUNYUAN_MAPPER)
+        return cqc, fp8
+
+    def test_apply_vllm_mapper_strips_model_prefix(self):
+        """apply_vllm_mapper rewrites the component key to the runtime name."""
+        cqc, _ = self._build()
+        assert "layers.*.mlp.experts" in cqc.component_configs
+        assert "model.layers.*.mlp.experts" not in cqc.component_configs
+
+    def test_expert_prefix_resolves_to_fp8(self):
+        """The mapped wildcard key matches runtime expert prefixes -> FP8."""
+        cqc, fp8 = self._build()
+        assert cqc.resolve("layers.0.mlp.experts") is fp8
+        assert cqc.resolve("layers.11.mlp.experts") is fp8
+        # sub-modules of the experts subtree also match
+        assert cqc.resolve("layers.0.mlp.experts.gate_up_proj") is fp8
+
+    def test_expert_layer_gets_fp8_quant_method(self):
+        """get_quant_method delegates the expert layer to the FP8 config."""
+        cqc, _ = self._build()
+        result = cqc.get_quant_method(MagicMock(), "layers.0.mlp.experts")
+        assert result is not None  # delegated to fp8.get_quant_method
+
+    def test_non_expert_linear_gets_unquantized_method(self):
+        """A non-expert LinearBase (e.g. qkv_proj) must not crash and must
+        fall back to UnquantizedLinearMethod rather than returning None."""
+        cqc, _ = self._build()
+        # Bypass full __init__; we only exercise the routing decision.
+        layer = LinearBase.__new__(QKVParallelLinear)
+        method = cqc.get_quant_method(layer, "layers.0.self_attn.qkv_proj")
+        assert isinstance(method, UnquantizedLinearMethod)
+
+    def test_non_linear_unmatched_layer_still_returns_none(self):
+        """Non-Linear layers that match nothing keep the None contract
+        (embeddings / FusedMoE tolerate None themselves)."""
+        cqc, _ = self._build()
+        assert cqc.get_quant_method(MagicMock(), "embed_tokens") is None
