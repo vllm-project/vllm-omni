@@ -3774,6 +3774,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 total_ms,
             )
             raise  # Propagate to the global Omni exception handler
+        except torch.OutOfMemoryError as e:
+            total_ms = (time.perf_counter() - request_start_s) * 1000.0
+            logger.exception(
+                "[SpeechE2E] request_id=%s stream=%s status=out_of_memory total_ms=%.2f error=%s",
+                request_id,
+                bool(request.stream),
+                total_ms,
+                e,
+            )
+            return self.create_error_response(
+                f"Speech generation failed: {e}",
+                err_type="ServiceUnavailableError",
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
         except ValueError as e:
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
             logger.warning(
@@ -3803,8 +3817,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 total_ms,
                 e,
             )
-            logger.exception("Speech generation failed: %s", e)
-            return self.create_error_response(f"Speech generation failed: {e}")
+            return self.create_error_response(
+                f"Speech generation failed: {e}",
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     @staticmethod
     def _merge_batch_item(
