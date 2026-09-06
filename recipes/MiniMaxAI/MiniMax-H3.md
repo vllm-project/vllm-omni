@@ -541,6 +541,37 @@ them across ranks. DiT `rank-local` instead retains complete loader-produced
 tensors and avoids the synchronized request-wave contract. H3's TP-sharded
 text encoder uses `rank-local`.
 
+### GGUF DiT quantization
+
+The out-of-tree
+[vllm-gguf-plugin](https://github.com/vllm-project/vllm-gguf-plugin)
+can replace one MiniMax-H3 task-specific DiT with pre-quantized GGUF weights.
+Install a plugin version with MiniMax-H3 diffusion support, then start an
+FL2VA-only server with an explicit non-pruned GGUF file:
+
+```bash
+export MODEL=MiniMaxAI/MiniMax-H3
+
+CUDA_VISIBLE_DEVICES=0 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 \
+vllm serve "${MODEL}" \
+  --omni \
+  --trust-remote-code \
+  --task-type fl2va \
+  --num-gpus 1 \
+  --diffusion-quantization-config \
+  '{"method":"gguf","gguf_model":"leejet/MiniMax-H3-GGUF/minimax_h3_fl2va-Q4_K_M.gguf"}'
+```
+
+This recipe's GGUF validation scope is the non-pruned FL2VA Q4_K_M artifact
+shown above. The GGUF file replaces the selected DiT only; the text encoder and
+both VAEs stay on their base checkpoint weights. A single `gguf_model` cannot
+initialize the combined FL2VA and Ref2VA service, so run one partition per
+process. Ref2VA has not been end-to-end validated by this recipe. See the
+[GGUF quantization guide](../../docs/user_guide/quantization/gguf.md) for
+checkpoint constraints and installation details.
+
 ## AMD ROCm (gfx942 / gfx950)
 
 The sections above describe the NVIDIA CUDA path. This section covers the AMD
