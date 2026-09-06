@@ -220,7 +220,9 @@ def _load_mmap_transform_and_reconstruct(
         tensor_transforms=backend._mmap_transforms_by_tensor_id,
     )
     assert all(not shard.requires_grad for shard in cpu_shards.values())
-    assert all(parameter.numel() == 0 for parameter in target_block.parameters())
+    # Shard preparation is non-destructive; initialize_hook clears source
+    # storage only after every shard and metadata entry has been prepared.
+    assert all(parameter.numel() > 0 for parameter in target_block.parameters())
 
     for dtype, local_shard in cpu_shards.items():
         gathered = torch.empty(
