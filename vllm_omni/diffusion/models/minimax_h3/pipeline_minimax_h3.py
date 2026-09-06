@@ -154,7 +154,11 @@ from .time_request import (
     minimax_h3_align_frame_count,
     minimax_h3_time_shift_sigmas,
 )
-from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
+from .vae import (
+    MiniMaxH3AudioVAE,
+    MiniMaxH3VideoVAE,
+    resolve_minimax_h3_video_vae_fp8_layers,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -1052,6 +1056,7 @@ class MiniMaxH3Pipeline(
             os.path.join(model_path, "video_vae"),
             device=self.device,
             load_device=component_load_device,
+            fp8_layers=resolve_minimax_h3_video_vae_fp8_layers(od_config.quantization_config),
         )
         self.audio_vae = MiniMaxH3AudioVAE(
             os.path.join(model_path, "audio_vae"),
