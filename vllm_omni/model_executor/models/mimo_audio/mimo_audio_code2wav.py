@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2025 Xiaomi Corporation.
 import logging
 import os
@@ -13,7 +16,6 @@ from torchaudio.transforms import MelSpectrogram
 from transformers import AutoTokenizer, Qwen2Config
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.models import SupportsPP
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -425,7 +427,7 @@ def get_tokenizer_worker(
     return _TOKENIZER_WORKER_CACHE[key]
 
 
-class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
+class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module):
     """Decode MiMo audio codes to waveform for the code2wav stage."""
 
     have_multimodal_outputs = True
