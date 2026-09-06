@@ -147,6 +147,10 @@ class OmniConnectorModelRunnerMixin:
         # -- next stage ID (from connector config or default stage_id + 1) --
         self._next_stage_id: int = self._resolve_next_stage_id(model_config)
 
+        self._connector_info: dict | None = None
+        if self._omni_connector is not None and hasattr(self._omni_connector, "get_connection_info"):
+            self._connector_info = self._omni_connector.get_connection_info()
+
         # -- heterogeneous TP rank support --
         rank_cfg = self._parse_rank_mapping(model_config)
         if self._kv_transfer_manager is not None:
@@ -186,6 +190,7 @@ class OmniConnectorModelRunnerMixin:
         self._code_prompt_token_ids: dict[str, list[list[int]]] = defaultdict(list)
         self._cached_ic: dict[str, int] = {}
         self._request_ids_mapping: dict[str, str] = {}
+        self._per_request_sender: dict[str, dict] = {}
 
         # -- async I/O state (shared by chunk + full_payload_mode) --
         self._pending_load_reqs: dict[str, Any] = {}
@@ -374,6 +379,7 @@ class OmniConnectorModelRunnerMixin:
         self._async_chunk_updated_req_ids.discard(req_id)
         self._local_stage_payload_cache.pop(req_id, None)
         self._local_request_metadata.pop(req_id, None)
+        self._per_request_sender.pop(req_id, None)
 
     def prune_inactive_requests(self, active_req_ids: Any) -> set[str]:
         """Drop connector state for requests that no longer exist locally.
@@ -440,6 +446,7 @@ class OmniConnectorModelRunnerMixin:
             "_kv_active_transfers",
             "_kv_completed_transfers",
             "_kv_triggered_requests",
+            "_per_request_sender",
         ):
             state = getattr(self, attr_name, None)
             if isinstance(state, dict):
@@ -605,14 +612,15 @@ class OmniConnectorModelRunnerMixin:
         from_stage: str,
         to_stage: str,
         connector_get_key: str,
+        metadata: dict | None = None,
     ) -> Any:
         """Receive one ordinary non-KV stage payload on the local leader rank only."""
         tp_group = self._get_local_tp_group()
         if tp_group is None or getattr(tp_group, "world_size", 1) <= 1:
-            return connector.get(from_stage, to_stage, connector_get_key)
+            return connector.get(from_stage, to_stage, connector_get_key, metadata=metadata)
         if not self.is_data_transfer_rank():
             return None
-        return connector.get(from_stage, to_stage, connector_get_key)
+        return connector.get(from_stage, to_stage, connector_get_key, metadata=metadata)
 
     def _recv_full_payload_result(
         self,
@@ -620,6 +628,7 @@ class OmniConnectorModelRunnerMixin:
         from_stage: str,
         to_stage: str,
         connector_get_key: str,
+        metadata: dict | None = None,
     ) -> Any:
         """Receive one full-payload transfer on the local leader rank only."""
         return self._recv_ordinary_stage_result(
@@ -627,6 +636,7 @@ class OmniConnectorModelRunnerMixin:
             from_stage,
             to_stage,
             connector_get_key,
+            metadata=metadata,
         )
 
     def _recv_async_chunk_result(
@@ -635,6 +645,7 @@ class OmniConnectorModelRunnerMixin:
         from_stage: str,
         to_stage: str,
         connector_get_key: str,
+        metadata: dict | None = None,
     ) -> Any:
         """Receive one ordinary async chunk on the local leader rank only."""
         return self._recv_ordinary_stage_result(
@@ -642,6 +653,7 @@ class OmniConnectorModelRunnerMixin:
             from_stage,
             to_stage,
             connector_get_key,
+            metadata=metadata,
         )
 
     @staticmethod
@@ -1092,6 +1104,9 @@ class OmniConnectorModelRunnerMixin:
         # across requests.
         ext = getattr(request, "external_req_id", None)
         self._request_ids_mapping[request_id] = ext if ext is not None else request_id
+        kvtp = getattr(request, "kv_transfer_params", None)
+        if kvtp:
+            self._per_request_sender[request_id] = kvtp
         with self._lock:
             if request_id in self._stage_recv_req_ids:
                 return
@@ -1595,6 +1610,7 @@ class OmniConnectorModelRunnerMixin:
             kv_sent_req_ids=list(self._kv_sent_req_ids),
             stage_recv_req_ids=set(self._stage_recv_req_ids),
             has_pending_kv_work=self.has_pending_kv_work(),
+            connector_info=self._connector_info,
         )
         if output.stage_recv_req_ids or chunk_finished or newly_finished:
             logger.debug(
@@ -1787,12 +1803,15 @@ class OmniConnectorModelRunnerMixin:
         external_req_id = self._request_ids_mapping.get(req_id, req_id)
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
 
+        sender_meta = self._per_request_sender.get(req_id)
+
         if self._async_chunk:
             result = self._recv_async_chunk_result(
                 connector,
                 str(target_stage_id),
                 str(self._stage_id),
                 connector_get_key,
+                metadata=sender_meta,
             )
         else:
             result = self._recv_full_payload_result(
@@ -1800,6 +1819,7 @@ class OmniConnectorModelRunnerMixin:
                 str(target_stage_id),
                 str(self._stage_id),
                 connector_get_key,
+                metadata=sender_meta,
             )
 
         if result is None:

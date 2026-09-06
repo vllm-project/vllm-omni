@@ -3961,6 +3961,291 @@ async def omni_wakeup(request: OmniWakeupRequest, raw_request: Request):
     return {"status": "SUCCESS", "acks": [dataclasses.asdict(a) if dataclasses.is_dataclass(a) else a for a in acks]}
 
 
+@router.post("/v1/stage/run")
+@with_cancellation
+async def stage_run(raw_request: Request):
+    """Run a standalone stage. Two modes based on request body:
+    - Entry mode (no stage_output): accepts client request, returns stage_output
+    - Downstream mode (has stage_output): accepts upstream output, returns result
+    """
+    import uuid as _uuid
+
+    engine_client = raw_request.app.state.engine_client
+    engine = getattr(engine_client, "engine", engine_client)
+    if not getattr(engine, "_standalone", False):
+        return JSONResponse(
+            {"error": "This endpoint is only available in standalone mode"},
+            status_code=HTTPStatus.NOT_FOUND.value,
+        )
+
+    body = await raw_request.json()
+    request_id = body.get("request_id", f"stage-{_uuid.uuid4().hex[:8]}")
+
+    try:
+        if "stage_output" in body and body["stage_output"] is not None:
+            from vllm_omni.entrypoints.openai.serving_stage import (
+                run_downstream_audio,
+                run_downstream_intermediate,
+            )
+
+            output_mode = body.get("output_mode", "final")
+            if output_mode == "intermediate":
+                return await run_downstream_intermediate(raw_request, body, request_id)
+            return await run_downstream_audio(raw_request, body, request_id)
+
+        return await _stage_run_entry(raw_request, body, request_id)
+
+    except ValueError as e:
+        return JSONResponse(
+            {"error": str(e), "request_id": request_id},
+            status_code=HTTPStatus.BAD_REQUEST.value,
+        )
+    except Exception as e:
+        return JSONResponse(
+            {"error": str(e), "request_id": request_id},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
+
+
+async def _stage_run_entry(raw_request: Request, body: dict, request_id: str):
+    """Entry stage: accept client request, run generation, return raw stage_output.
+
+    Dispatches to the appropriate handler based on what the standalone stage
+    supports, then returns the raw multimodal_output as serialized JSON
+    instead of converting to a final format (WAV, image, etc.).
+    """
+    import torch
+
+    engine_client = raw_request.app.state.engine_client
+
+    handler = Omnispeech(raw_request)
+    if handler is None:
+        return JSONResponse(
+            {"error": "No handler available for this stage type"},
+            status_code=HTTPStatus.NOT_FOUND.value,
+        )
+
+    try:
+        from vllm_omni.entrypoints.openai.protocol.audio import (
+            OpenAICreateSpeechRequest,
+        )
+
+        speech_fields = {
+            "model",
+            "input",
+            "voice",
+            "speed",
+            "response_format",
+            "ref_audio",
+            "ref_text",
+            "audio_reference",
+            "language",
+        }
+        extra = {k: v for k, v in body.items() if k in speech_fields and k not in ("model", "input", "voice")}
+        speech_request = OpenAICreateSpeechRequest(
+            model=body.get("model", ""),
+            input=body.get("input", ""),
+            voice=body.get("voice", ""),
+            **extra,
+        )
+
+        # Uses the internal _prepare_speech_generation (stable, 4+ internal
+        # callers) to get the raw engine generator without WAV conversion.
+        _, generator, _ = await handler._prepare_speech_generation(
+            speech_request,
+            request_id=request_id,
+        )
+
+        final_output = None
+        try:
+            async for output in generator:
+                final_output = output
+        except asyncio.CancelledError:
+            await engine_client.abort(request_id)
+            raise
+
+        if final_output is None:
+            return JSONResponse(
+                {"error": "No output generated", "request_id": request_id},
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            )
+
+        mm_output = None
+        for co in getattr(final_output, "outputs", []):
+            mm = getattr(co, "multimodal_output", None)
+            if mm:
+                mm_output = mm
+                break
+
+        def _serialize(obj):
+            if isinstance(obj, torch.Tensor):
+                return obj.cpu().tolist()
+            if isinstance(obj, dict):
+                return {k: _serialize(v) for k, v in obj.items()}
+            if hasattr(obj, "items") and callable(obj.items):
+                return {k: _serialize(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_serialize(x) for x in obj]
+            if isinstance(obj, (int, float, str, bool, type(None))):
+                return obj
+            return str(obj)
+
+        return JSONResponse(
+            {
+                "request_id": request_id,
+                "stage_output": _serialize(mm_output) if mm_output else None,
+                "finished": getattr(final_output, "finished", True),
+            }
+        )
+
+    except ValueError as e:
+        return JSONResponse(
+            {"error": str(e), "request_id": request_id},
+            status_code=HTTPStatus.BAD_REQUEST.value,
+        )
+    except Exception as e:
+        return JSONResponse(
+            {"error": str(e), "request_id": request_id},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
+
+
+async def _stage_run_downstream(raw_request: Request, body: dict, request_id: str):
+    """Downstream stage: accept upstream stage_output, run engine, return result."""
+    import io
+    import wave
+
+    import numpy as np
+    import torch
+
+    engine_client = raw_request.app.state.engine_client
+    stage_output = body["stage_output"]
+
+    try:
+        codes = stage_output.get("codes", {})
+        codec_data = codes.get("audio") if isinstance(codes, dict) else None
+        if codec_data is None:
+            codec_data = stage_output.get("codes.audio")
+        if codec_data is None:
+            return JSONResponse(
+                {"error": "No codec data in stage_output", "request_id": request_id},
+                status_code=HTTPStatus.BAD_REQUEST.value,
+            )
+
+        if not codec_data:
+            return JSONResponse(
+                {"error": "Empty codec data in stage_output", "request_id": request_id},
+                status_code=HTTPStatus.BAD_REQUEST.value,
+            )
+
+        MAX_CODEC_ELEMENTS = 2 * 1024 * 1024
+        flat_len = sum(len(row) for row in codec_data) if isinstance(codec_data[0], list) else len(codec_data)
+        if flat_len > MAX_CODEC_ELEMENTS:
+            return JSONResponse(
+                {
+                    "error": f"Codec data too large ({flat_len} elements, max {MAX_CODEC_ELEMENTS})",
+                    "request_id": request_id,
+                },
+                status_code=HTTPStatus.BAD_REQUEST.value,
+            )
+
+        codec_tensor = torch.tensor(codec_data, dtype=torch.long)
+        if codec_tensor.ndim == 2:
+            prompt_token_ids = codec_tensor.transpose(0, 1).reshape(-1).tolist()
+        else:
+            prompt_token_ids = codec_tensor.tolist()
+
+        from vllm import SamplingParams
+
+        generator = engine_client.generate(
+            prompt={"prompt_token_ids": prompt_token_ids},
+            request_id=request_id,
+            output_modalities=["audio"],
+            sampling_params=SamplingParams(
+                max_tokens=65536,
+                detokenize=False,
+            ),
+        )
+
+        final_output = None
+        try:
+            async for output in generator:
+                final_output = output
+        except asyncio.CancelledError:
+            await engine_client.abort(request_id)
+            raise
+
+        if final_output is None:
+            return JSONResponse(
+                {"error": "No output generated", "request_id": request_id},
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            )
+
+        audio_data = None
+        sample_rate = 24000
+        for co in getattr(final_output, "outputs", []):
+            mm = getattr(co, "multimodal_output", None)
+            if mm is not None:
+                if isinstance(mm, dict):
+                    audio_data = mm.get("audio")
+                elif hasattr(mm, "get"):
+                    audio_data = mm.get("audio")
+                if audio_data is not None:
+                    sr_raw = mm.get("sr") if hasattr(mm, "get") else None
+                    if sr_raw is not None:
+                        sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+                        sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+                    break
+
+        if audio_data is None:
+            return JSONResponse(
+                {
+                    "request_id": request_id,
+                    "stage_output": None,
+                    "error": "No audio output",
+                },
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            )
+
+        if isinstance(audio_data, torch.Tensor):
+            audio_np = audio_data.cpu().float().numpy()
+        elif isinstance(audio_data, np.ndarray):
+            audio_np = audio_data.astype(np.float32)
+        else:
+            audio_np = np.array(audio_data, dtype=np.float32)
+
+        if audio_np.size > 0 and np.all(np.isfinite(audio_np)):
+            abs_max = np.abs(audio_np).max()
+            if abs_max <= 1.0:
+                audio_np = audio_np * 32767
+            elif abs_max <= 32768:
+                pass
+            else:
+                audio_np = audio_np * (32767 / abs_max)
+        audio_np = np.clip(audio_np, -32768, 32767)
+        audio_int16 = audio_np.astype(np.int16)
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(audio_int16.tobytes())
+        buf.seek(0)
+
+        return Response(
+            content=buf.read(),
+            media_type="audio/wav",
+            headers={"X-Request-Id": request_id},
+        )
+
+    except Exception as e:
+        return JSONResponse(
+            {"error": str(e), "request_id": request_id},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+        )
+
+
 if __name__ == "__main__":
     parser = TrackingArgumentParser(description="vLLM-Omni OpenAI-Compatible REST API server")
     parser = make_arg_parser(parser)

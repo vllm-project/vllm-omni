@@ -121,6 +121,7 @@ class OmniSchedulingCoordinator:
                     OmniChunkRecvHandle(
                         request_id=request.request_id,
                         external_req_id=getattr(request, "external_req_id", None),
+                        kv_transfer_params=getattr(request, "kv_transfer_params", None),
                     )
                 )
             elif request.status == RequestStatus.WAITING_FOR_INPUT:

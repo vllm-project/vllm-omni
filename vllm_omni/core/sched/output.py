@@ -105,6 +105,7 @@ class OmniChunkRecvHandle:
 
     request_id: str
     external_req_id: str | None = None
+    kv_transfer_params: dict | None = None
 
 
 @dataclass
