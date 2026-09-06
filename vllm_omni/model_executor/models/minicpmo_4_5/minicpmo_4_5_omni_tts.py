@@ -319,10 +319,26 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         if not recompute:
             if condition_seq > previous_seq:
-                raise ValueError(
-                    "a native duplex Talker condition advanced without its streaming recompute marker: "
-                    f"current={condition_seq}, previous={previous_seq}"
-                )
+                attention_type = getattr(self._tts_config, "attention_type", "full_attention")
+                if attention_type == "sliding_recompute":
+                    raise ValueError(
+                        "a native duplex Talker condition advanced without its streaming recompute marker: "
+                        f"current={condition_seq}, previous={previous_seq}"
+                    )
+                audio_state = self._request_audio_states.get(request_id)
+                recent_codes = audio_state.get("recent_codes") if isinstance(audio_state, dict) else None
+                if isinstance(recent_codes, list):
+                    base_recent_codes = tuple(int(code_id) for code_id in recent_codes[-_CODEC_PENALTY_WINDOW:])
+                else:
+                    base_recent_codes = state.get("base_recent_codes")
+                    if not isinstance(base_recent_codes, tuple):
+                        raise ValueError("streaming Talker condition lost its frozen codec history")
+                states[request_id] = {
+                    "condition_seq": condition_seq,
+                    "condition": current_condition.detach().clone(),
+                    "base_recent_codes": base_recent_codes,
+                }
+                return current_condition
             if "active_embeddings" in state:
                 raise ValueError("an active streaming recompute was replayed without its recompute marker")
             return current_condition
