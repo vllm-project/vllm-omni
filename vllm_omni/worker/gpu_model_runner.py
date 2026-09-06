@@ -181,6 +181,9 @@ class OmniGPUModelRunner(GPUModelRunner):
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
+        self._omni_post_load_model()
+
+    def _omni_post_load_model(self) -> None:
         model = getattr(self, "model", None)
         override_fn = None
         if bool(getattr(model, "supports_sampled_token_ids_cpu_override", False)):
@@ -221,7 +224,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         hidden_size = int(
             getattr(self.model, "mtp_hidden_size", 0) or getattr(self.model_config.hf_text_config, "hidden_size")
         )
-        max_batch_size = max(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
+        max_batch_size = max(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size or 0)
         self.talker_mtp_input_ids = self._make_buffer(max_batch_size, dtype=torch.int32)
         self.talker_mtp_inputs_embeds = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
         self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
