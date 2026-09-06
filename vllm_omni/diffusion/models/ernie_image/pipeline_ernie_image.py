@@ -26,6 +26,7 @@ from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.tensor_utils import expand_scalar_to_batch
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -506,12 +507,9 @@ class ErnieImagePipeline(
 
                 if self.do_classifier_free_guidance:
                     latent_model_input = torch.cat([latents, latents], dim=0)
-                    t_batch = torch.full(
-                        (batch_size * num_images_per_prompt * 2,), t.item(), device=device, dtype=dtype
-                    )
                 else:
                     latent_model_input = latents
-                    t_batch = torch.full((batch_size * num_images_per_prompt,), t.item(), device=device, dtype=dtype)
+                t_batch = expand_scalar_to_batch(t, latent_model_input.shape[0], dtype=dtype)
 
                 pred = self.transformer(
                     hidden_states=latent_model_input,
