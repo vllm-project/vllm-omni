@@ -14,11 +14,11 @@ import time
 import traceback
 import uuid
 import wave
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import aiohttp
 import numpy as np
@@ -342,9 +342,13 @@ def _prepare_omniinteract_batch(input_requests: list[SampleRequest]) -> None:
     for sample in input_requests:
         if not isinstance(sample, OmniInteractSampleRequest):
             continue
-        root = sample.omniinteract_options.output_root.resolve()
+        options = sample.omniinteract_options
+        case = sample.omniinteract_case
+        if options is None or case is None:
+            raise ValueError("OmniInteract samples require session options and a case")
+        root = options.output_root.resolve()
         roots.add(root)
-        clear_case_artifacts(sample.omniinteract_options.output_root, sample.omniinteract_case)
+        clear_case_artifacts(options.output_root, case)
     for root in roots:
         clear_batch_artifacts(root)
 
@@ -649,7 +653,7 @@ datasets.get_samples = get_samples
 
 _serve_mod = sys.modules.get("vllm.benchmarks.serve")
 if _serve_mod is not None:
-    _serve_mod.get_samples = get_samples
+    setattr(_serve_mod, "get_samples", get_samples)
 
 
 @dataclass
@@ -1654,9 +1658,9 @@ async def _async_request_omniinteract(
         output.audio_duration = case_result.audio_bytes / (24_000 * 2)
         output.audio_frames = case_result.audio_bytes // 2
         session_metrics = case_result.duplex_session_metrics
-        output.ttft = float(session_metrics.get("mean_ttft_ms") or 0.0) / 1000.0
-        output.audio_ttfp = float(session_metrics.get("mean_ttfp_ms") or 0.0) / 1000.0
-        output.audio_rtf = float(session_metrics.get("mean_rtf") or 0.0)
+        output.ttft = float(cast(float | None, session_metrics.get("mean_ttft_ms")) or 0.0) / 1000.0
+        output.audio_ttfp = float(cast(float | None, session_metrics.get("mean_ttfp_ms")) or 0.0) / 1000.0
+        output.audio_rtf = float(cast(float | None, session_metrics.get("mean_rtf")) or 0.0)
         token_timing_measured = _apply_stage0_token_timings(
             output,
             [request_metric.get("stage0_tokens") for request_metric in case_result.duplex_request_metrics],
@@ -1906,11 +1910,12 @@ async def async_request_openai_realtime_duplex(
             await client.close_session(timeout_s=30.0)
 
             output.generated_text = " ".join(filter(None, turn_transcripts))
-            output.ttft = float(session_metrics.get("mean_ttft_ms") or 0.0) / 1000.0
-            output.audio_ttfp = float(session_metrics.get("mean_ttfp_ms") or 0.0) / 1000.0
-            output.audio_rtf = float(session_metrics.get("mean_rtf") or 0.0)
+            output.ttft = float(cast(float | None, session_metrics.get("mean_ttft_ms")) or 0.0) / 1000.0
+            output.audio_ttfp = float(cast(float | None, session_metrics.get("mean_ttfp_ms")) or 0.0) / 1000.0
+            output.audio_rtf = float(cast(float | None, session_metrics.get("mean_rtf")) or 0.0)
             output.audio_duration = (
-                sum(float(metric.get("audio_duration_ms") or 0.0) for metric in turn_metrics) / 1000.0
+                sum(float(cast(float | None, metric.get("audio_duration_ms")) or 0.0) for metric in turn_metrics)
+                / 1000.0
             )
             output.audio_frames = int(output.audio_duration * client.events.output_sample_rate_hz)
             output.latency = request_finished_at - output.start_time
@@ -1976,7 +1981,7 @@ if "daily-omni" not in OPENAI_COMPATIBLE_BACKENDS:
 # Prevent import order from causing patch failures
 from vllm.benchmarks import serve
 from vllm.benchmarks.lib.ready_checker import wait_for_endpoint
-from vllm.benchmarks.serve import TaskType, calculate_metrics_for_embeddings, get_request
+from vllm.benchmarks.serve import BenchmarkMetrics, TaskType, calculate_metrics_for_embeddings, get_request
 
 from vllm_omni.benchmarks.metrics.metrics import (
     MultiModalsBenchmarkMetrics,
@@ -2111,7 +2116,9 @@ async def benchmark(
     if num_warmups > 0:
         print(f"Warming up with {num_warmups} requests...")
         warmup_pbar = None if disable_tqdm else tqdm(total=num_warmups)
-        warmup_semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
+        warmup_semaphore: asyncio.Semaphore | contextlib.nullcontext = (
+            asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
+        )
         warmup_tasks = []
 
         async def warmup_limited_request_func():
@@ -2129,12 +2136,13 @@ async def benchmark(
 
     print("Starting main benchmark run...")
 
+    lora_module_iter: Iterator[str] | None = None
     if lora_modules:
         lora_modules_list = list(lora_modules)
         if lora_assignment == "round-robin":
-            lora_modules = iter([lora_modules_list[i % len(lora_modules_list)] for i in range(len(input_requests))])
+            lora_module_iter = iter([lora_modules_list[i % len(lora_modules_list)] for i in range(len(input_requests))])
         else:
-            lora_modules = iter([random.choice(lora_modules_list) for _ in range(len(input_requests))])
+            lora_module_iter = iter([random.choice(lora_modules_list) for _ in range(len(input_requests))])
 
     if profile:
         print("Starting profiler...")
@@ -2173,7 +2181,9 @@ async def benchmark(
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
-    semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
+    semaphore: asyncio.Semaphore | contextlib.nullcontext = (
+        asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
+    )
 
     async def limited_request_func(request_func_input, session, pbar):
         async with semaphore:
@@ -2244,8 +2254,8 @@ async def benchmark(
         )
         per_request_extra_body = _merge_overrides(extra_body, request.request_overrides)
         req_model_id, req_model_name = model_id, model_name
-        if lora_modules:
-            req_lora_module = next(lora_modules)
+        if lora_module_iter is not None:
+            req_lora_module = next(lora_module_iter)
             req_model_id, req_model_name = req_lora_module, req_lora_module
 
         request_func_input = RequestFuncInput(
@@ -2282,6 +2292,7 @@ async def benchmark(
 
     omniinteract_summary = _finalize_omniinteract_batch(input_requests, outputs)
 
+    actual_output_lens: list[int] | int
     if task_type == TaskType.GENERATION:
         metrics, actual_output_lens = calculate_metrics(
             input_requests=input_requests,
@@ -2306,6 +2317,9 @@ async def benchmark(
         actual_output_lens = 0
 
     if isinstance(metrics, MultiModalsBenchmarkMetrics):
+        # make_dataclass builds this subclass dynamically; all direct field
+        # accesses below belong to its statically declared upstream base.
+        metrics = cast(BenchmarkMetrics, metrics)
 
         def measured_ttft(output: RequestFuncOutput) -> float | None:
             session_metrics = getattr(output, "duplex_session_metrics", None)
