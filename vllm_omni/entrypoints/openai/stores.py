@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 from typing import Any, Generic, TypeVar
 
@@ -30,6 +33,16 @@ class TaskRegistry:
 
         async with self._lock:
             self._tasks[key] = task
+
+    async def cancel_all(self) -> None:
+        async with self._lock:
+            tasks = tuple(self._tasks.values())
+            self._tasks.clear()
+
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 class AsyncDictStore(Generic[T]):
