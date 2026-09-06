@@ -4,6 +4,7 @@
 """Tests for data_entry_keys."""
 
 import msgspec
+import numpy as np
 import pytest
 import torch
 
@@ -408,6 +409,40 @@ class TestSerializeDeserializePayload:
         restored = deserialize_payload(wire)
         assert restored["hidden_states"]["output"].shape == (3, 4, 5)
         assert torch.allclose(restored["hidden_states"]["output"], t)
+
+    def test_audio_round_trip(self):
+        wav = np.random.randn(16000).astype(np.float32)
+        sr = 16000
+        original = {"ref_audio": [(wav, sr)]}
+        wire = serialize_payload(original)
+        assert isinstance(wire, AdditionalInformationPayload)
+        restored = deserialize_payload(wire)
+        assert isinstance(restored["ref_audio"], list)
+        assert len(restored["ref_audio"]) == 1
+        assert isinstance(restored["ref_audio"][0], tuple)
+        np.testing.assert_array_equal(restored["ref_audio"][0][0], wav)
+        assert restored["ref_audio"][0][1] == sr
+
+    def test_audio_dtype_preserved(self):
+        wav = np.zeros(100, dtype=np.float64)
+        original = {"audio": [(wav, 44100)]}
+        wire = serialize_payload(original)
+        restored = deserialize_payload(wire)
+        assert restored["audio"][0][0].dtype == np.float64
+
+    def test_audio_shape_preserved(self):
+        wav = np.zeros((2, 8000), dtype=np.float32)
+        original = {"audio": [(wav, 24000)]}
+        wire = serialize_payload(original)
+        restored = deserialize_payload(wire)
+        assert restored["audio"][0][0].shape == (2, 8000)
+
+    def test_audio_float_sr(self):
+        wav = np.zeros(100, dtype=np.float32)
+        original = {"audio": [(wav, 22050.0)]}
+        wire = serialize_payload(original)
+        restored = deserialize_payload(wire)
+        assert restored["audio"][0][1] == 22050.0
 
     def test_empty_payload_returns_none(self):
         assert serialize_payload({}) is None
