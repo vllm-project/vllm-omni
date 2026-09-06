@@ -467,6 +467,11 @@ def parse_args():
         help="Threshold for using shared memory in bytes (default: 65536)",
     )
     parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory for generated text and audio outputs.",
+    )
+    parser.add_argument(
         "--output-wav",
         default="output_audio",
         help="[Deprecated] Output wav directory (use --output-dir).",
