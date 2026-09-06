@@ -23,6 +23,7 @@ def test_eager_dispatch_uses_eager_without_cudagraph_manager():
         uniform_tok_count=8,
         num_active_loras=0,
         use_eager=True,
+        max_query_len=8,
     )
 
     assert batch_desc.cg_mode == CUDAGraphMode.NONE
@@ -49,6 +50,7 @@ def test_eager_dispatch_syncs_dp_padding(monkeypatch):
         dp_rank,
         *,
         num_active_loras,
+        max_query_len,
     ):
         calls.append(
             (
@@ -60,6 +62,7 @@ def test_eager_dispatch_syncs_dp_padding(monkeypatch):
                 dp_size,
                 dp_rank,
                 num_active_loras,
+                max_query_len,
             )
         )
         return batch_desc, expected_tokens_across_dp
@@ -74,20 +77,23 @@ def test_eager_dispatch_syncs_dp_padding(monkeypatch):
         uniform_tok_count=8,
         num_active_loras=0,
         use_eager=True,
+        max_query_len=8,
     )
 
     assert batch_desc.cg_mode == CUDAGraphMode.NONE
     assert batch_desc.num_tokens == 8
     assert batch_desc.num_reqs == 1
     assert num_tokens_across_dp is expected_tokens_across_dp
-    assert calls == [(None, batch_desc, 8, 1, 8, 2, 1, 0)]
+    assert calls == [(None, batch_desc, 8, 1, 8, 2, 1, 0, 8)]
 
 
 def test_non_eager_dispatch_uses_cudagraph_manager():
     runner = object.__new__(OmniGPUModelRunner)
     expected = SimpleNamespace(cg_mode=CUDAGraphMode.PIECEWISE, num_tokens=8, num_reqs=1)
     calls = []
-    runner.cudagraph_manager = SimpleNamespace(dispatch=lambda *args: calls.append(args) or expected)
+    runner.cudagraph_manager = SimpleNamespace(
+        dispatch=lambda *args, **kwargs: calls.append((args, kwargs)) or expected
+    )
     runner.dp_size = 1
     runner.dp_rank = 0
 
@@ -97,10 +103,11 @@ def test_non_eager_dispatch_uses_cudagraph_manager():
         uniform_tok_count=8,
         num_active_loras=0,
         use_eager=False,
+        max_query_len=8,
     )
 
     assert batch_desc is expected
-    assert calls == [(1, 8, 8, 0)]
+    assert calls == [((1, 8, 8), {"num_active_loras": 0, "max_query_len": 8})]
     assert num_tokens_across_dp is None
 
 

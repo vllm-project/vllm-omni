@@ -15,6 +15,8 @@ from vllm.forward_context import (
 )
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.input_batch import set_dummy_context
 from vllm.v1.worker.gpu.lora_utils import get_num_active_loras_for_dispatch
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_runner import (
@@ -24,7 +26,6 @@ from vllm.v1.worker.gpu.model_runner import (
     GPUModelRunner,
     IntermediateTensors,
     build_slot_mappings_by_layer,
-    get_uniform_token_count,
 )
 
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
@@ -146,12 +147,13 @@ class OmniGPUModelRunner(GPUModelRunner):
         input_batch: Any,
         *,
         dummy_run: bool,
-    ) -> tuple[Any, torch.Tensor | None]:
+    ) -> tuple[Any, torch.Tensor | None, Any]:
         """Prepare native vLLM multimodal model inputs."""
         input_ids = input_batch.input_ids
         inputs_embeds = None
+        ec_connector_output = None
         if not self.supports_mm_inputs or not self.is_first_pp_rank:
-            return input_ids, inputs_embeds
+            return input_ids, inputs_embeds, ec_connector_output
 
         if dummy_run:
             inputs_embeds = self.model_state.dummy_inputs_embeds(input_batch.num_tokens_after_padding)
@@ -166,13 +168,14 @@ class OmniGPUModelRunner(GPUModelRunner):
                     lora_state=self.lora_state,
                     scheduled_encoder_inputs=scheduled_encoder_inputs,
                 )
-            inputs_embeds = self._get_mm_embeddings(
-                scheduled_encoder_inputs,
-                input_batch,
-            )
+            with self.ec_connector.maybe_get_output(scheduler_output) as ec_connector_output:
+                inputs_embeds = self._get_mm_embeddings(
+                    scheduled_encoder_inputs,
+                    input_batch,
+                )
         if inputs_embeds is not None and not self.model.requires_raw_input_tokens:
             input_ids = None
-        return input_ids, inputs_embeds
+        return input_ids, inputs_embeds, ec_connector_output
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -418,37 +421,22 @@ class OmniGPUModelRunner(GPUModelRunner):
         *,
         num_reqs: int,
         num_toks: int,
-        uniform_tok_count: int,
+        uniform_tok_count: int | None,
         num_active_loras: int,
         use_eager: bool,
+        max_query_len: int,
     ):
-        if use_eager:
-            batch_desc = BatchExecutionDescriptor(
-                cg_mode=CUDAGraphMode.NONE,
-                num_tokens=num_toks,
-                num_reqs=num_reqs,
-            )
-        else:
-            batch_desc = self.cudagraph_manager.dispatch(
-                num_reqs,
-                num_toks,
-                uniform_tok_count,
-                num_active_loras,
-            )
-        if self.dp_size > 1:
-            from vllm.v1.worker.gpu.dp_utils import sync_cudagraph_and_dp_padding
-
-            return sync_cudagraph_and_dp_padding(
-                self.cudagraph_manager,
-                batch_desc,
-                num_toks,
-                num_reqs,
-                uniform_tok_count,
-                self.dp_size,
-                self.dp_rank,
-                num_active_loras=num_active_loras,
-            )
-        return batch_desc, None
+        return dispatch_cg_and_sync_dp(
+            self.cudagraph_manager,
+            num_reqs,
+            num_toks,
+            uniform_tok_count,
+            self.dp_size,
+            self.dp_rank,
+            max_query_len=max_query_len,
+            need_eager=use_eager,
+            num_active_loras=num_active_loras,
+        )
 
     @torch.inference_mode()
     def execute_model(
@@ -458,6 +446,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
+        context_len: int = 0,
     ) -> Any:
         if not dummy_run:
             self._prepare_native_data_plane(scheduler_output)
@@ -468,12 +457,17 @@ class OmniGPUModelRunner(GPUModelRunner):
             self._sync_native_data_plane_payloads(scheduler_output)
             self.block_tables.apply_staged_writes()
             if scheduler_output.total_num_scheduled_tokens == 0:
-                return self._attach_native_data_plane_signals(self.kv_connector.no_forward(scheduler_output))
+                empty_output = self.kv_connector.no_forward(scheduler_output)
+                return self._attach_native_data_plane_signals(
+                    self._merge_ec_connector_no_forward(scheduler_output, empty_output)
+                )
 
         num_reqs = len(scheduler_output.num_scheduled_tokens)
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
-        uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+        batch_req_state, uniform_tok_count = self.gather_batch_req_state(scheduler_output, dummy_run)
+        if batch_req_state is not None:
+            num_toks = batch_req_state.num_tokens
         num_active_loras = 0
         if self.lora_config:
             req_ids = list(scheduler_output.num_scheduled_tokens.keys())
@@ -492,13 +486,18 @@ class OmniGPUModelRunner(GPUModelRunner):
             uniform_tok_count=uniform_tok_count,
             num_active_loras=num_active_loras,
             use_eager=is_profile or skip_compiled,
+            max_query_len=max_query_len,
         )
 
         if batch_desc.num_tokens == 0:
-            return self._attach_native_data_plane_signals(self.kv_connector.no_forward(scheduler_output))
+            empty_output = self.kv_connector.no_forward(scheduler_output)
+            return self._attach_native_data_plane_signals(
+                self._merge_ec_connector_no_forward(scheduler_output, empty_output)
+            )
 
         if not dummy_run:
-            input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            assert batch_req_state is not None
+            input_batch = self.prepare_inputs(scheduler_output, batch_req_state, batch_desc)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             self.model_state.preprocess_state(
                 input_batch,
@@ -521,9 +520,18 @@ class OmniGPUModelRunner(GPUModelRunner):
                 batch_desc.num_reqs or num_reqs,
                 batch_desc.num_tokens,
                 self.input_buffers,
+                max_query_len=batch_desc.max_query_len,
             )
             if not skip_attn_for_dummy_run:
                 block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
+                if context_len:
+                    set_dummy_context(
+                        input_batch,
+                        self.block_tables,
+                        context_len,
+                        self.kv_cache_config.num_blocks,
+                        self.max_model_len,
+                    )
             else:
                 assert batch_desc.cg_mode != CUDAGraphMode.FULL, (
                     "Attention metadata is required for FULL CUDA graph dummy runs"
@@ -546,7 +554,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self.kv_cache_config,
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
-        input_ids, inputs_embeds = self._prepare_mm_inputs(
+        input_ids, inputs_embeds, ec_connector_output = self._prepare_mm_inputs(
             scheduler_output,
             input_batch,
             dummy_run=dummy_run,
@@ -635,6 +643,11 @@ class OmniGPUModelRunner(GPUModelRunner):
         if not dummy_run and isinstance(hidden_states, torch.Tensor):
             self.model_state.run_postprocess(hidden_states, input_batch)
 
+        routed_experts = None
+        if not dummy_run and (capturer := self.routed_experts_capturer) is not None:
+            assert slot_mappings is not None
+            routed_experts = capturer.get_routed_experts(slot_mappings, num_toks)
+
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=attn_metadata,
@@ -642,6 +655,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             hidden_states=hidden_states,
             aux_hidden_states=None,
             finished_req_ids=scheduler_output.finished_req_ids,
+            ec_connector_output=ec_connector_output,
+            routed_experts=routed_experts,
         )
 
         if not self.is_last_pp_rank:

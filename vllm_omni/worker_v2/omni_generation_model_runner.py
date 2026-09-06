@@ -25,7 +25,6 @@ from vllm.v1.worker.gpu.model_runner import (
     BatchDescriptor,
     ExecuteModelState,
     IntermediateTensors,
-    get_uniform_token_count,
 )
 
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
@@ -233,6 +232,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
+        context_len: int = 0,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
             self._prepare_native_data_plane(scheduler_output)
@@ -247,25 +247,35 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             self._sync_native_data_plane_payloads(scheduler_output)
             self._apply_block_table_staged_writes_if_available()
             if scheduler_output.total_num_scheduled_tokens == 0:
-                return self._attach_native_data_plane_signals(self.kv_connector.no_forward(scheduler_output))
+                empty_output = self.kv_connector.no_forward(scheduler_output)
+                return self._attach_native_data_plane_signals(
+                    self._merge_ec_connector_no_forward(scheduler_output, empty_output)
+                )
 
         num_reqs = len(scheduler_output.num_scheduled_tokens)
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
-        uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+        batch_req_state, uniform_tok_count = self.gather_batch_req_state(scheduler_output, dummy_run)
+        if batch_req_state is not None:
+            num_toks = batch_req_state.num_tokens
         batch_desc, _ = self._dispatch_batch_descriptor(
             num_reqs=num_reqs,
             num_toks=num_toks,
             uniform_tok_count=uniform_tok_count,
             num_active_loras=0,
             use_eager=is_profile,
+            max_query_len=max_query_len,
         )
 
         if batch_desc.num_tokens == 0:
-            return self._attach_native_data_plane_signals(self.kv_connector.no_forward(scheduler_output))
+            empty_output = self.kv_connector.no_forward(scheduler_output)
+            return self._attach_native_data_plane_signals(
+                self._merge_ec_connector_no_forward(scheduler_output, empty_output)
+            )
 
         if not dummy_run:
-            input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            assert batch_req_state is not None
+            input_batch = self.prepare_inputs(scheduler_output, batch_req_state, batch_desc)
         else:
             from vllm.v1.worker.gpu.input_batch import InputBatch
 
@@ -273,12 +283,13 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                 batch_desc.num_reqs or num_reqs,
                 batch_desc.num_tokens,
                 self.input_buffers,
+                max_query_len=batch_desc.max_query_len,
             )
 
         attn_metadata = None
         slot_mappings_by_layer = None
 
-        input_ids, inputs_embeds = self._prepare_mm_inputs(
+        input_ids, inputs_embeds, ec_connector_output = self._prepare_mm_inputs(
             scheduler_output,
             input_batch,
             dummy_run=dummy_run,
@@ -342,6 +353,8 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             hidden_states=self._dummy_hidden,
             aux_hidden_states=None,
             finished_req_ids=scheduler_output.finished_req_ids,
+            ec_connector_output=ec_connector_output,
+            routed_experts=None,
         )
         return None
 
@@ -400,6 +413,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             pooler_output=None,
             multimodal_outputs=None,
             kv_connector_output=kv_connector_output,
+            ec_connector_output=execute_model_state.ec_connector_output,
         )
 
         raw_multimodal_outputs = model_output.multimodal_outputs

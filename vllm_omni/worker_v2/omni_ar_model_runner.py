@@ -20,7 +20,7 @@ from vllm.model_executor.layers.fused_moe.all2all_utils import (
 )
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput, RoutedExpertsTensors
 from vllm.v1.worker.gpu.eplb_utils import step_eplb_after
 
 from vllm_omni.data_entry_keys import flatten_payload
@@ -119,6 +119,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
+        context_len: int = 0,
     ) -> Any:
         if not dummy_run:
             self._handle_kv_transfer_pre(scheduler_output)
@@ -128,6 +129,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             dummy_run=dummy_run,
             skip_attn_for_dummy_run=skip_attn_for_dummy_run,
             is_profile=is_profile,
+            context_len=context_len,
         )
 
     # ------------------------------------------------------------------
@@ -148,6 +150,8 @@ class OmniARModelRunner(OmniGPUModelRunner):
         hidden_states = self.execute_model_state.hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+        ec_connector_output = self.execute_model_state.ec_connector_output
+        routed_experts = self.execute_model_state.routed_experts
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -156,7 +160,8 @@ class OmniARModelRunner(OmniGPUModelRunner):
             self.postprocess_num_computed_tokens(input_batch)
             if not all_decode_next:
                 self.model_state.postprocess_state(input_batch.idx_mapping, 0)
-            return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
         # --- Omni: reconstruct raw model output and post-process ---
         aux = self._last_aux_output
@@ -232,6 +237,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             async_chunk=bool(getattr(self.model_config, "async_chunk", False)),
             finalize_output=self._finalize_native_data_plane_output,
             check_ep_fault=self.check_ep_fault,
+            routed_experts=routed_experts,
         )
         self._release_multimodal_snapshot(snapshot_slot, async_output.copy_event)
         _guard_graph_replay_for_pooler_copy(
@@ -251,6 +257,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             input_batch.query_start_loc,
         )
         model_runner_output.kv_connector_output = kv_connector_output
+        model_runner_output.ec_connector_output = ec_connector_output
 
         self._reserve_native_data_plane_outputs(list(model_runner_output.req_ids))
         return async_output
@@ -601,10 +608,12 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         async_chunk: bool = False,
         finalize_output: Any | None = None,
         check_ep_fault: bool = False,
+        routed_experts: RoutedExpertsTensors | None = None,
     ):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
+        self.routed_experts = routed_experts
         self.copy_event = copy_event if copy_event is not None else torch.cuda.Event(blocking=True)
         self._async_chunk = bool(async_chunk)
         self._finalize_output = finalize_output
@@ -654,6 +663,12 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 copy_stream=copy_stream,
                 pin_memory=pin_memory,
             )
+            self.sampling_mask_tensors = None
+            if sampler_output.sampling_mask_tensors is not None:
+                self.sampling_mask_tensors = sampler_output.sampling_mask_tensors.to_cpu_nonblocking()
+            self.routed_experts_cpu = None
+            if routed_experts is not None:
+                self.routed_experts_cpu = routed_experts.to_cpu_nonblocking()
 
             # Logprobs
             self.logprobs_tensors = None
@@ -717,6 +732,10 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         for token_ids, num_tokens in zip(sampled_token_ids, num_sampled_tokens):
             del token_ids[num_tokens:]
         self.model_runner_output.sampled_token_ids = sampled_token_ids
+        if self.sampling_mask_tensors is not None:
+            self.model_runner_output.sampling_masks = self.sampling_mask_tensors.tolists(self.num_sampled_tokens_np)
+        if self.routed_experts_cpu is not None:
+            self.model_runner_output.routed_experts = self.routed_experts_cpu.tolists()
 
         # Logprobs
         if self.num_nans is not None:

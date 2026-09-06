@@ -129,7 +129,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             self.model_runner = OmniARModelRunner(self.vllm_config, self.device)
         else:
             self.use_v2_model_runner = False
-            self.model_runner = GPUARModelRunner(self.vllm_config, self.device)
+            self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

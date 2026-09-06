@@ -1,5 +1,6 @@
 """Unit tests for OmniGPUModelRunner v2 overrides."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -99,7 +100,7 @@ def test_prepare_mm_inputs_uses_dummy_embeddings_without_encoder_cache():
         num_tokens_after_padding=8,
     )
 
-    result_ids, result_embeddings = runner._prepare_mm_inputs(
+    result_ids, result_embeddings, ec_output = runner._prepare_mm_inputs(
         SimpleNamespace(scheduled_encoder_inputs={"_dummy_req_0": [0]}),
         input_batch,
         dummy_run=True,
@@ -107,6 +108,7 @@ def test_prepare_mm_inputs_uses_dummy_embeddings_without_encoder_cache():
 
     assert result_ids is None
     assert result_embeddings is dummy_embeddings
+    assert ec_output is None
     runner.model_state.dummy_inputs_embeds.assert_called_once_with(8)
     runner.model_state.get_mm_embeddings.assert_not_called()
 
@@ -125,8 +127,10 @@ def test_prepare_mm_inputs_preserves_raw_tokens_for_real_request():
     )
     input_batch = SimpleNamespace(input_ids=input_ids)
     scheduled_encoder_inputs = {"r1": [0]}
+    expected_ec_output = object()
+    runner.ec_connector = SimpleNamespace(maybe_get_output=MagicMock(return_value=nullcontext(expected_ec_output)))
 
-    result_ids, result_embeddings = runner._prepare_mm_inputs(
+    result_ids, result_embeddings, ec_output = runner._prepare_mm_inputs(
         SimpleNamespace(scheduled_encoder_inputs=scheduled_encoder_inputs),
         input_batch,
         dummy_run=False,
@@ -134,6 +138,7 @@ def test_prepare_mm_inputs_preserves_raw_tokens_for_real_request():
 
     assert result_ids is input_ids
     assert result_embeddings is embeddings
+    assert ec_output is expected_ec_output
     runner.model_state.get_mm_embeddings.assert_called_once_with(
         scheduled_encoder_inputs,
         input_batch,
@@ -574,6 +579,7 @@ def test_dispatch_batch_descriptor_passes_lora_count_to_cudagraph_manager():
     batch_desc = SimpleNamespace(num_tokens=8, num_reqs=2)
     runner.cudagraph_manager = SimpleNamespace(dispatch=MagicMock(return_value=batch_desc))
     runner.dp_size = 1
+    runner.dp_rank = 0
 
     assert runner._dispatch_batch_descriptor(
         num_reqs=2,
@@ -581,9 +587,10 @@ def test_dispatch_batch_descriptor_passes_lora_count_to_cudagraph_manager():
         uniform_tok_count=4,
         num_active_loras=0,
         use_eager=False,
+        max_query_len=4,
     ) == (batch_desc, None)
 
-    runner.cudagraph_manager.dispatch.assert_called_once_with(2, 8, 4, 0)
+    runner.cudagraph_manager.dispatch.assert_called_once_with(2, 8, 4, num_active_loras=0, max_query_len=4)
 
 
 def test_dispatch_batch_descriptor_passes_lora_count_to_dp_sync():
@@ -603,9 +610,10 @@ def test_dispatch_batch_descriptor_passes_lora_count_to_dp_sync():
             uniform_tok_count=4,
             num_active_loras=3,
             use_eager=False,
+            max_query_len=4,
         ) == ("synced", "tokens")
 
-    runner.cudagraph_manager.dispatch.assert_called_once_with(2, 8, 4, 3)
+    runner.cudagraph_manager.dispatch.assert_called_once_with(2, 8, 4, num_active_loras=3, max_query_len=4)
     sync.assert_called_once_with(
         runner.cudagraph_manager,
         batch_desc,
@@ -615,6 +623,7 @@ def test_dispatch_batch_descriptor_passes_lora_count_to_dp_sync():
         2,
         1,
         num_active_loras=3,
+        max_query_len=4,
     )
 
 

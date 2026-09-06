@@ -55,7 +55,8 @@ def test_execute_model_propagates_make_omni_output_failure(monkeypatch):
         is_padding=False,
     )
     runner.prepare_inputs = MagicMock(return_value=input_batch)
-    runner._prepare_mm_inputs = MagicMock(return_value=(torch.zeros(1, dtype=torch.long), None))
+    runner.gather_batch_req_state = MagicMock(return_value=(SimpleNamespace(num_tokens=1), None))
+    runner._prepare_mm_inputs = MagicMock(return_value=(torch.zeros(1, dtype=torch.long), None, None))
     runner._add_legacy_forward_inputs = MagicMock()
     runner.model_state = SimpleNamespace(
         prepare_inputs=lambda *_args: {},
@@ -166,7 +167,7 @@ def _make_runner(
     input_batch = _FakeInputBatch(num_reqs)
     runner._gen_model_output = model_output
     runner._gen_input_batch = input_batch
-    runner.execute_model_state = SimpleNamespace(finished_req_ids={"finished"})
+    runner.execute_model_state = SimpleNamespace(finished_req_ids={"finished"}, ec_connector_output=None)
     runner.kv_connector = SimpleNamespace(post_forward=MagicMock(return_value=None))
     runner.check_ep_fault = False
 

@@ -20,6 +20,54 @@ from vllm_omni.worker_v2.omni_ar_model_runner import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_async_output_preserves_routing_and_sampling_masks(monkeypatch) -> None:
+    from vllm.v1.outputs import RoutedExpertsTensors
+    from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
+
+    class FakeStream:
+        def wait_stream(self, _stream) -> None:
+            pass
+
+    class FakeEvent:
+        def record(self, _stream) -> None:
+            pass
+
+        def synchronize(self) -> None:
+            pass
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    routing = RoutedExpertsTensors(torch.tensor([[[2, 3]], [[4, 5]]]), torch.tensor([7, 9]))
+    masks = SamplingMaskTensors(torch.tensor([[5], [0]], dtype=torch.uint8), torch.tensor([2, 0]), 4)
+    runner_output = omni_ar_model_runner.OmniModelRunnerOutput(
+        req_ids=["decode", "prefill"],
+        req_id_to_index={"decode": 0, "prefill": 1},
+        sampled_token_ids=None,
+        prompt_logprobs_dict={},
+    )
+    output = OmniAsyncOutput(
+        model_runner_output=runner_output,
+        sampler_output=SamplerOutput(
+            sampled_token_ids=torch.tensor([[2], [0]]),
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=torch.tensor([1, 0]),
+            sampling_mask_tensors=masks,
+        ),
+        num_sampled_tokens=torch.tensor([1, 0]),
+        main_stream=FakeStream(),
+        copy_stream=FakeStream(),
+        copy_event=FakeEvent(),
+        routed_experts=routing,
+    ).get_output()
+
+    assert output.sampled_token_ids == [[2], []]
+    np.testing.assert_array_equal(output.routed_experts.routing_data, [[[2, 3]], [[4, 5]]])
+    np.testing.assert_array_equal(output.routed_experts.slot_mapping, [7, 9])
+    np.testing.assert_array_equal(output.sampling_masks.token_ids, [0, 2])
+    np.testing.assert_array_equal(output.sampling_masks.offsets, [0, 2])
+    assert output.sampling_masks.cu_num_generated_tokens == [0, 1, 1]
+
+
 # ---------------------------------------------------------------
 # _build_pooler_output_from_cpu (was _build_pooler_output)
 # ---------------------------------------------------------------
@@ -72,6 +120,8 @@ def test_non_last_pp_rank_uses_vllm_027_pp_handler() -> None:
         input_batch=input_batch,
         hidden_states=None,
         finished_req_ids={"finished"},
+        ec_connector_output=None,
+        routed_experts=None,
     )
     runner.kv_connector = SimpleNamespace(
         post_forward=MagicMock(return_value=connector_output),
@@ -127,6 +177,7 @@ def test_async_output_uses_blocking_cuda_event_by_default(monkeypatch) -> None:
             sampled_token_ids=torch.tensor([[123]], dtype=torch.long),
             logprobs_tensors=None,
             num_nans=None,
+            sampling_mask_tensors=None,
         ),
         num_sampled_tokens=torch.tensor([1], dtype=torch.long),
         main_stream=FakeStream(),
@@ -337,6 +388,7 @@ def test_async_chunk_output_snapshots_mm_before_deferred_get_output(monkeypatch)
         sampled_token_ids=torch.tensor([[123]], dtype=torch.long),
         logprobs_tensors=None,
         num_nans=None,
+        sampling_mask_tensors=None,
     )
     input_batch = SimpleNamespace(
         query_start_loc_np=np.array([0, 1], dtype=np.int32),
@@ -401,6 +453,7 @@ def test_async_chunk_output_stages_mm_on_output_copy_stream(monkeypatch) -> None
             sampled_token_ids=torch.tensor([[123]], dtype=torch.long),
             logprobs_tensors=None,
             num_nans=None,
+            sampling_mask_tensors=None,
         ),
         num_sampled_tokens=torch.tensor([1], dtype=torch.long),
         main_stream=FakeStream(),
@@ -459,6 +512,7 @@ def test_async_output_reuses_copy_context_for_all_d2h_helpers(monkeypatch) -> No
             sampled_token_ids=torch.tensor([[123]], dtype=torch.long),
             logprobs_tensors=None,
             num_nans=None,
+            sampling_mask_tensors=None,
         ),
         num_sampled_tokens=torch.tensor([1], dtype=torch.long),
         main_stream=FakeStream(),
@@ -507,6 +561,7 @@ def test_async_output_does_not_probe_pin_memory_at_runtime(monkeypatch) -> None:
             sampled_token_ids=torch.tensor([[123]], dtype=torch.long),
             logprobs_tensors=None,
             num_nans=None,
+            sampling_mask_tensors=None,
         ),
         num_sampled_tokens=torch.tensor([1], dtype=torch.long),
         main_stream=FakeStream(),

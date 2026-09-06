@@ -116,7 +116,7 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             logger.info("Using MR v2 OmniGenerationModelRunner for generation stage.")
             self.model_runner = OmniGenerationModelRunner(self.vllm_config, self.device)
         else:
-            self.model_runner = GPUGenerationModelRunner(self.vllm_config, self.device)
+            self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

@@ -487,6 +487,7 @@ def test_no_detokenizer_process_outputs_returns_nonterminal_audio_chunk(monkeypa
         finish_reason=None,
         stop_reason=None,
         kv_transfer_params=None,
+        ec_transfer_params=None,
         routed_experts=None,
         num_cached_tokens=0,
     )
@@ -532,6 +533,7 @@ def _audio_engine_output(*, is_segment_finished: bool, is_last_chunk: bool):
         finish_reason=FinishReason.STOP,
         stop_reason=None,
         kv_transfer_params=None,
+        ec_transfer_params=None,
         routed_experts=None,
         num_cached_tokens=0,
         is_segment_finished=is_segment_finished,

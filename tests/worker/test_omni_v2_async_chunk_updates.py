@@ -103,7 +103,7 @@ def _make_runner_for_sample(async_chunk):
         idx_mapping_np=[0],
         req_ids=["r1"],
     )
-    runner.execute_model_state = SimpleNamespace(finished_req_ids=set())
+    runner.execute_model_state = SimpleNamespace(finished_req_ids=set(), ec_connector_output=None)
     runner.kv_connector = SimpleNamespace(post_forward=lambda _finished: None)
     runner.check_ep_fault = False
     runner.model_config = SimpleNamespace(async_chunk=async_chunk)

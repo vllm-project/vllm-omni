@@ -735,6 +735,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             finish_reason = eco.finish_reason
             stop_reason = eco.stop_reason
             kv_transfer_params = eco.kv_transfer_params
+            ec_transfer_params = eco.ec_transfer_params
             routed_experts = eco.routed_experts
             prefill_stats = getattr(eco, "prefill_stats", None)
             if prefill_stats is not None:
