@@ -1,17 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """VAE patch-parallel decode parity tests for diffusion models.
 
 Compares ``vae_patch_parallel_size=2`` against ``vae_patch_parallel_size=1`` on
-TP=2 with VAE tiling enabled. Covers one video model (Wan T2V) and one image
-model (Qwen-Image). CUDA/ROCm-only (>=2 devices).
+TP=2 with VAE tiling enabled and verifies that the requested distributed VAE
+state is active on every worker. Covers one video model (Wan 2.1 T2V 1.3B) and
+the shared Qwen-Image VAE path with a lightweight transformer fixture. Official
+Qwen-Image transformer loading/execution is covered by the existing official
+model E2E, online-serving, and accuracy suites. CUDA/ROCm-only (>=2 devices).
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -21,18 +25,18 @@ from PIL import Image
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
-from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 PROMPT = "A cat sitting on a table"
+WORKER_EXTENSION_CLASS = "tests.diffusion.distributed.test_vae_decode_parallelism.VaeParallelStateExtension"
 
 MODEL_CASES = [
     pytest.param(
         {
-            "model_name": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            "model_name": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
             "height": 512,
             "width": 512,
             "num_frames": 5,
@@ -41,22 +45,30 @@ MODEL_CASES = [
             "mean_threshold": 3e-2,
             "p99_threshold": 4e-2,
         },
-        id="wan22_t2v_a14b",
+        id="wan21_t2v_1_3b",
     ),
     pytest.param(
         {
-            "model_name": "Qwen/Qwen-Image",
-            "height": 1152,
-            "width": 1152,
+            "model_name": "riverclouds/qwen_image_random",
+            "height": 512,
+            "width": 512,
             "num_frames": 1,
             "needs_image": False,
             "is_moe": False,
             "mean_threshold": 5e-3,
             "p99_threshold": 1e-1,
         },
-        id="qwen_image",
+        id="qwen_image_random",
     ),
 ]
+
+
+class VaeParallelStateExtension:
+    def validate_vae_parallel_state(self, expected_parallel_size: int) -> bool:
+        vae = self.model_runner.pipeline.vae
+        actual_parallel_size = int(vae.distributed_executor.parallel_size)
+        distributed_enabled = bool(vae.is_distributed_enabled())
+        return actual_parallel_size == expected_parallel_size and distributed_enabled == (expected_parallel_size > 1)
 
 
 def _to_float_array(data: Any) -> np.ndarray:
@@ -74,6 +86,14 @@ def _to_float_array(data: Any) -> np.ndarray:
 def _extract_output_array(output: Any) -> np.ndarray:
     payload = output.images[0]
     return _to_float_array(payload)
+
+
+def test_extract_output_array_accepts_flat_omni_output():
+    payload = np.zeros((2, 2, 3), dtype=np.float32)
+
+    result = _extract_output_array(SimpleNamespace(images=[payload]))
+
+    np.testing.assert_array_equal(result, payload)
 
 
 def _diff_metrics(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
@@ -120,16 +140,22 @@ def _run_generate(
     seed: int,
 ) -> np.ndarray:
     current_omni_platform.empty_cache()
-    parallel_config = DiffusionParallelConfig(
-        tensor_parallel_size=2,
-        vae_patch_parallel_size=vae_patch_parallel_size,
-    )
     with OmniRunner(
         model_case["model_name"],
-        parallel_config=parallel_config,
+        tensor_parallel_size=2,
+        vae_patch_parallel_size=vae_patch_parallel_size,
         vae_use_tiling=True,
         enforce_eager=False,
+        worker_extension_cls=WORKER_EXTENSION_CLASS,
     ) as runner:
+        vae_state = runner.omni.engine.collective_rpc(
+            "validate_vae_parallel_state",
+            timeout=60,
+            args=(vae_patch_parallel_size,),
+        )
+        assert vae_state == [[True]], (
+            f"Expected every worker to use VAE patch parallel size {vae_patch_parallel_size}, got {vae_state}"
+        )
         request: dict[str, Any] = {"prompt": model_case.get("prompt", PROMPT)}
         if model_case["needs_image"]:
             request["multi_modal_data"] = {
