@@ -83,75 +83,6 @@ def _make_audio_omni_output(
     )
 
 
-def _mock_audio_choices(index: int = 0, role: str = "assistant"):
-    return [
-        ChatCompletionResponseStreamChoice(
-            index=index,
-            delta=DeltaMessage(role=role, content="dGVzdA=="),
-            logprobs=None,
-            finish_reason="stop",
-        )
-    ]
-
-
-def _build_serving_chat():
-    """Create a minimal OmniOpenAIServingChat for testing."""
-    mock_engine = MagicMock()
-    mock_engine.errored = False
-
-    models = OpenAIServingModels(
-        engine_client=mock_engine,
-        base_model_paths=[],
-    )
-    mock_render = MagicMock()
-
-    instance = OmniOpenAIServingChat(
-        engine_client=mock_engine,
-        models=models,
-        response_role="assistant",
-        online_renderer=mock_render,
-        request_logger=None,
-        chat_template=None,
-        chat_template_content_format="auto",
-    )
-    instance._create_audio_choice = MagicMock(
-        side_effect=lambda omni_res, role, request, stream=False: _mock_audio_choices(
-            index=omni_res.outputs[0].index,
-            role=role,
-        )
-    )
-    return instance
-
-
-def _make_request(modalities: list[str], n: int = 1) -> ChatCompletionRequest:
-    req = ChatCompletionRequest(
-        model="test-model",
-        messages=[{"role": "user", "content": "hello"}],
-        n=n,
-        stream=True,
-    )
-    req.modalities = modalities  # type: ignore[attr-defined]
-    return req
-
-
-def _parse_sse_chunks(lines: list[str]) -> list[dict]:
-    """Parse SSE lines into JSON dicts."""
-    prefix = "data: "
-    chunks = []
-    for line in lines:
-        line = line.strip()
-        if not line.startswith(prefix):
-            continue
-        payload = line[len(prefix) :].strip()
-        if payload == "[DONE]":
-            continue
-        try:
-            chunks.append(json.loads(payload))
-        except json.JSONDecodeError:
-            pass
-    return chunks
-
-
 def test_streaming_audio_choice_emits_empty_delta_for_metadata_only_chunk() -> None:
     serving_chat = object.__new__(OmniOpenAIServingChat)
     omni_output = SimpleNamespace(
@@ -177,13 +108,6 @@ def test_streaming_audio_choice_emits_empty_delta_for_metadata_only_chunk() -> N
     assert choices[0].index == 0
     assert choices[0].delta.content == ""
     assert choices[0].finish_reason == "stop"
-
-
-async def _collect_stream(gen):
-    result = []
-    async for item in gen:
-        result.append(item)
-    return result
 
 
 # ---------------------------------------------------------------------------

@@ -454,10 +454,11 @@ def test_request_seed_overrides_yaml_default(mock_engine_client, mock_request):
 
 
 def test_explicit_seed_propagates_to_talker_sampler_and_local_mtp(
-    serving_chat,
+    mock_engine_client,
     mock_request,
     mock_other_stage,
 ):
+    serving_chat = build_serving_chat(engine_client=mock_engine_client)
     mock_other_stage.model_stage = None
     mock_other_stage.engine_args = SimpleNamespace(model_stage="talker")
     mock_request.seed = 123
@@ -473,7 +474,7 @@ def test_explicit_seed_propagates_to_talker_sampler_and_local_mtp(
     assert talker_params.max_tokens == 4096
 
 
-def test_request_frequency_penalty_overrides(serving_chat, mock_request):
+def test_request_frequency_penalty_overrides(mock_engine_client, mock_request):
     """Test that request frequency_penalty is applied."""
     serving_chat = build_serving_chat(engine_client=mock_engine_client)
     mock_request.frequency_penalty = 0.5
