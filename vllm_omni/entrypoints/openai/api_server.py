@@ -641,111 +641,83 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             logger.warning("engine client has no endpoint restrictions attribute")
 
         # Start background processes
-        await STORAGE_MANAGER.start()
-
-        # Conditionally register profiler endpoints based on stage YAML configs
-        stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
-        if _should_enable_profiler_endpoints(stage_configs):
-            logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
-            remove_route_from_app(app, "/start_profile", frozenset({"POST"}))
-            remove_route_from_app(app, "/stop_profile", frozenset({"POST"}))
-            app.include_router(profiler_router)
-
-        vllm_config = await _get_vllm_config(engine_client)
-
-        # Check if pure diffusion mode (vllm_config will be None)
-        is_pure_diffusion = vllm_config is None
-        if is_pure_diffusion:
-            logger.info(
-                "Starting vLLM API server (pure diffusion mode) on %s",
-                listen_address,
-            )
-            # The vLLM 0.27 launcher's shutdown path reads
-            # engine_client.vllm_config.shutdown_timeout; AsyncOmni.vllm_config
-            # is None for pure diffusion (no comprehension stage), which would
-            # crash handle_shutdown and hang teardown. Wrap app.state.engine_client
-            # with a shim that only overrides vllm_config and forwards everything
-            # else (get_vllm_config still returns None for pure-diffusion detection).
-            app.state.engine_client = PureDiffusionLauncherAdapter(
-                engine_client,
-                shutdown_timeout=getattr(args, "shutdown_timeout", 0),
-            )
-        else:
-            logger.info(
-                "Starting vLLM API server %d on %s",
-                vllm_config.parallel_config._api_process_rank,
-                listen_address,
-            )
-
-        class _TimestampMiddleware:
-            """Pure-ASGI outermost wrapper that stamps HTTP request arrival time.
-
-            Wraps the fully-built Starlette app as an outer ASGI layer so no
-            Starlette internals (user_middleware, middleware_stack, etc.) are
-            touched. Websocket and lifespan scopes pass through unchanged.
-            """
-
-            def __init__(self, inner: ASGIApp) -> None:
-                self._inner = inner
-
-            def __getattr__(self, name: str) -> Any:
-                return getattr(self._inner, name)
-
-            async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-                if scope["type"] == "http":
-                    scope.setdefault("state", {})
-                    scope["state"]["request_timestamp"] = time.time()
-                await self._inner(scope, receive, send)
-
-        # Startup duplex warmup (duplex_session.warmup_frames in the deploy
-        # yaml): real /v1/realtime connections wait on this event so the
-        # first client never pays cold-start costs.
-        duplex_warmup_frames = 0
-        if getattr(app.state, "openai_serving_duplex", None) is not None:
-            duplex_cfg = getattr(engine_client, "duplex_session_config", None)
-            duplex_warmup_frames = int(getattr(duplex_cfg, "warmup_frames", 0) or 0)
-        app.state.duplex_warmup_done = asyncio.Event() if duplex_warmup_frames > 0 else None
-        warmup_task: asyncio.Task | None = None
-        if duplex_warmup_frames > 0:
-            # Scheduled before serve_http (which may not return until
-            # shutdown); the coroutine retries its self-connect until the
-            # server socket is accepting.
-            warmup_task = asyncio.create_task(_warmup_duplex_realtime(app, args, duplex_warmup_frames))
-
-        shutdown_task = await serve_http(
-            _TimestampMiddleware(app),
-            sock=sock,
-            enable_ssl_refresh=args.enable_ssl_refresh,
-            host=args.host,
-            port=args.port,
-            log_level=args.uvicorn_log_level,
-            # NOTE: When the 'disable_uvicorn_access_log' value is True,
-            # no access log will be output.
-            access_log=not args.disable_uvicorn_access_log,
-            timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
-            ssl_keyfile=args.ssl_keyfile,
-            ssl_certfile=args.ssl_certfile,
-            ssl_ca_certs=args.ssl_ca_certs,
-            ssl_cert_reqs=args.ssl_cert_reqs,
-            ssl_ciphers=args.ssl_ciphers,
-            h11_max_incomplete_event_size=args.h11_max_incomplete_event_size,
-            h11_max_header_count=args.h11_max_header_count,
-            **uvicorn_kwargs,
-        )
-
+        await STORAGE_MANAGER.start(expiration_callback=_remove_expired_video_metadata)
         try:
+            # Conditionally register profiler endpoints based on stage YAML configs
+            stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
+            if _should_enable_profiler_endpoints(stage_configs):
+                logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
+                app.include_router(profiler_router)
+
+            vllm_config = await _get_vllm_config(engine_client)
+
+            # Check if pure diffusion mode (vllm_config will be None)
+            is_pure_diffusion = vllm_config is None
+            if is_pure_diffusion:
+                logger.info(
+                    "Starting vLLM API server (pure diffusion mode) on %s",
+                    listen_address,
+                )
+            else:
+                logger.info(
+                    "Starting vLLM API server %d on %s",
+                    vllm_config.parallel_config._api_process_rank,
+                    listen_address,
+                )
+
+            class _TimestampMiddleware:
+                """Pure-ASGI outermost wrapper that stamps HTTP request arrival time.
+
+                Wraps the fully-built Starlette app as an outer ASGI layer so no
+                Starlette internals (user_middleware, middleware_stack, etc.) are
+                touched. Websocket and lifespan scopes pass through unchanged.
+                """
+
+                def __init__(self, inner: ASGIApp) -> None:
+                    self._inner = inner
+
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(self._inner, name)
+
+                async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+                    if scope["type"] == "http":
+                        scope.setdefault("state", {})
+                        scope["state"]["request_timestamp"] = time.time()
+                    await self._inner(scope, receive, send)
+
+            shutdown_task = await serve_http(
+                _TimestampMiddleware(app),
+                sock=sock,
+                enable_ssl_refresh=args.enable_ssl_refresh,
+                host=args.host,
+                port=args.port,
+                log_level=args.uvicorn_log_level,
+                # NOTE: When the 'disable_uvicorn_access_log' value is True,
+                # no access log will be output.
+                access_log=not args.disable_uvicorn_access_log,
+                timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
+                ssl_keyfile=args.ssl_keyfile,
+                ssl_certfile=args.ssl_certfile,
+                ssl_ca_certs=args.ssl_ca_certs,
+                ssl_cert_reqs=args.ssl_cert_reqs,
+                ssl_ciphers=args.ssl_ciphers,
+                h11_max_incomplete_event_size=args.h11_max_incomplete_event_size,
+                h11_max_header_count=args.h11_max_header_count,
+                **uvicorn_kwargs,
+            )
+
             await shutdown_task
         finally:
-            if warmup_task is not None:
-                warmup_task.cancel()
-            state = getattr(app, "state", None)
-            serving_video = getattr(state, "openai_serving_video", None) if state is not None else None
-            if serving_video is not None:
-                serving_video.shutdown()
-            serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
-            if serving_speech is not None:
-                serving_speech.shutdown()
-            sock.close()
+            try:
+                state = getattr(app, "state", None)
+                serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
+                if serving_speech is not None:
+                    serving_speech.shutdown()
+            finally:
+                try:
+                    await STORAGE_MANAGER.stop()
+                finally:
+                    sock.close()
 
 
 @asynccontextmanager
@@ -3070,6 +3042,8 @@ async def _cleanup_video(video_id: str):
         logger.warning("Failed to cleanup partial video file '%s'", video_id)
 
 
+async def _remove_expired_video_metadata(storage_keys: list[str]) -> None:
+    await VIDEO_STORE.pop_many(storage_keys)
 def _cleanup_video_references(
     reference_video: ReferenceVideo | None,
     reference_audio: ReferenceAudio | None,

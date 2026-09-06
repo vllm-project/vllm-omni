@@ -225,8 +225,12 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
 
         return asyncio.create_task(wait_for_shutdown())
 
-    async def fake_storage_start():
+    async def fake_storage_start(*, expiration_callback=None):
         events.append("storage_start")
+        assert expiration_callback is api_server._remove_expired_video_metadata
+
+    async def fake_storage_stop():
+        events.append("storage_stop")
 
     async def fake_get_vllm_config(engine_client):
         del engine_client
@@ -240,6 +244,7 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
     monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: FastAPI())
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
     monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "stop", fake_storage_stop)
     monkeypatch.setattr(api_server, "_get_vllm_config", fake_get_vllm_config)
     monkeypatch.setattr(api_server, "omni_init_app_state", fake_init_app_state)
     monkeypatch.setattr(api_server, "get_uvicorn_log_config", lambda args: None)
@@ -273,6 +278,86 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
 
     assert sock.closed
     assert events.index("http_shutdown") < events.index("engine_exit")
+    assert events.index("http_shutdown") < events.index("storage_stop")
+
+
+@pytest.mark.asyncio
+async def test_server_worker_cleans_up_when_serve_http_fails(monkeypatch, mocker: MockerFixture):
+    sock = mocker.Mock()
+
+    class FakeEngine:
+        stage_configs = []
+
+        async def get_supported_tasks(self):
+            return ("generate",)
+
+    @asynccontextmanager
+    async def fake_build_async_omni(*args, **kwargs):
+        del args, kwargs
+        yield FakeEngine()
+
+    async def fake_serve_http(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("failed to start HTTP server")
+
+    async def fake_get_vllm_config(engine_client):
+        del engine_client
+        return None
+
+    async def fake_init_app_state(engine_client, state, args):
+        del engine_client, state, args
+
+    storage_start = mocker.AsyncMock()
+    storage_stop = mocker.AsyncMock()
+    monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
+    monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: FastAPI())
+    monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", storage_start)
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "stop", storage_stop)
+    monkeypatch.setattr(api_server, "_get_vllm_config", fake_get_vllm_config)
+    monkeypatch.setattr(api_server, "omni_init_app_state", fake_init_app_state)
+    monkeypatch.setattr(api_server, "get_uvicorn_log_config", lambda args: None)
+
+    args = SimpleNamespace(
+        tool_parser_plugin="",
+        reasoning_parser_plugin="",
+        reasoning_parser=None,
+        structured_outputs_config=SimpleNamespace(reasoning_parser=None),
+        enable_ssl_refresh=False,
+        host="127.0.0.1",
+        port=0,
+        uvicorn_log_level="info",
+        disable_uvicorn_access_log=True,
+        ssl_keyfile=None,
+        ssl_certfile=None,
+        ssl_ca_certs=None,
+        ssl_cert_reqs=None,
+        ssl_ciphers=None,
+        h11_max_incomplete_event_size=None,
+        h11_max_header_count=None,
+    )
+
+    with pytest.raises(RuntimeError, match="failed to start HTTP server"):
+        await api_server.omni_run_server_worker("127.0.0.1:0", sock, args)
+
+    storage_start.assert_awaited_once_with(expiration_callback=api_server._remove_expired_video_metadata)
+    storage_stop.assert_awaited_once_with()
+    sock.close.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_expired_video_files_remove_matching_metadata(monkeypatch):
+    store: AsyncDictStore[VideoResponse] = AsyncDictStore()
+    expired = VideoResponse(model="test-model", prompt="expired")
+    retained = VideoResponse(model="test-model", prompt="retained")
+    await store.upsert(expired.id, expired)
+    await store.upsert(retained.id, retained)
+    monkeypatch.setattr(api_server, "VIDEO_STORE", store)
+
+    await api_server._remove_expired_video_metadata([expired.id, "unknown-storage-key"])
+
+    assert await store.get(expired.id) is None
+    assert await store.get(retained.id) is retained
 
 
 @pytest.fixture
