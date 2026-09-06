@@ -1,19 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any, ClassVar
+from dataclasses import dataclass
+from typing import ClassVar
 
 import torch
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
-from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
-from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
 
 from .mammothmoda2_dit_model import SimpleQFormerImageRefiner, Transformer2DModel
@@ -21,6 +27,42 @@ from .rope_real import RotaryPosEmbedReal
 from .schedulers import FlowMatchEulerDiscreteScheduler
 
 logger = init_logger(__name__)
+
+
+def _build_mammoth_config(od_config: OmniDiffusionConfig) -> Mammothmoda2Config:
+    raw_config = od_config.tf_model_config.to_dict()
+    if not raw_config:
+        raise ValueError("MammothModa2 diffusion stage requires the root checkpoint config")
+    return Mammothmoda2Config(**raw_config)
+
+
+def _root_weight_source(
+    od_config: OmniDiffusionConfig,
+) -> DiffusersPipelineLoader.ComponentSource:
+    if not od_config.model:
+        raise ValueError("MammothModa2 diffusion stage requires a model path")
+    return DiffusersPipelineLoader.ComponentSource(
+        model_or_path=od_config.model,
+        subfolder=None,
+        revision=od_config.revision,
+        prefix="",
+        fall_back_to_pt=True,
+    )
+
+
+@dataclass(frozen=True)
+class _MammothRequest:
+    request_id: str
+    full_hidden_states: torch.Tensor
+    full_token_ids: list[int]
+    answer_start_index: int
+    height: int
+    width: int
+    text_guidance_scale: float
+    cfg_range: tuple[float, float]
+    num_inference_steps: int
+    seed: int | None
+    generator: torch.Generator | list[torch.Generator] | None
 
 
 class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
@@ -36,7 +78,8 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
     _encoder_modules: ClassVar[list[str]] = ["gen_image_condition_refiner"]
     _vae_modules: ClassVar[list[str]] = ["gen_vae"]
 
-    have_multimodal_outputs = True
+    supports_request_batch = False
+    supports_step_execution = False
 
     # Load only gen_* weights; ignore llm_model.* to prevent loading the entire LLM backbone in the DiT stage.
     hf_to_vllm_mapper = WeightsMapper(
@@ -46,15 +89,13 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         }
     )
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
         del prefix
-
-        hf_config = vllm_config.model_config.hf_config
-        if not isinstance(hf_config, Mammothmoda2Config):
-            raise TypeError(f"Expected Mammothmoda2Config, got {type(hf_config)}")
-
-        self.config = hf_config
+        self.od_config = od_config
+        self.device = get_local_device()
+        self.config = _build_mammoth_config(od_config)
+        self.weights_sources = [_root_weight_source(od_config)]
 
         # --- Build DiT / VAE modules (names must match checkpoint keys) ---
         if self.config.gen_vae_config is None or self.config.gen_dit_config is None:
@@ -109,9 +150,6 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             theta=10000,
         )
 
-        # vLLM PP interface compatibility
-        self.make_empty_intermediate_tensors = lambda: None
-
         self._llm_hidden_size = llm_hidden_size
 
     def _reinit_caption_embedder(self, in_features: int) -> None:
@@ -123,39 +161,109 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             nn.Linear(in_features, out_features, bias=True),
         )
 
-    def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, object]]:
-        if num_reqs <= 0:
-            raise ValueError(f"num_reqs must be positive, got {num_reqs}")
-        if num_reqs > 1:
-            raise NotImplementedError(
-                f"get_dummy_runtime_additional_information does not support num_reqs > 1, got {num_reqs}"
-            )
-        text_prompt_embeds = torch.zeros((1, self._llm_hidden_size), dtype=torch.float32)
-        image_prompt_embeds = torch.zeros((1, self._llm_hidden_size), dtype=torch.float32)
-        negative_prompt_embeds = torch.zeros((0, self._llm_hidden_size), dtype=torch.float32)
-        info = {
-            "text_prompt_embeds": text_prompt_embeds,
-            "image_prompt_embeds": image_prompt_embeds,
-            "negative_prompt_embeds": negative_prompt_embeds,
-            "negative_prompt_attention_mask": [],
-            "image_height": [512],
-            "image_width": [512],
-            "text_guidance_scale": [1.0],
-            "cfg_range": [0.0, 1.0],
-            "num_inference_steps": [1],
-        }
-        return [info for _ in range(num_reqs)]
+    def _parse_request(self, req: DiffusionRequestBatch) -> _MammothRequest:
+        if req.num_reqs != 1:
+            raise ValueError("MammothModa2 diffusion requires exactly one request")
+        request_id = req.request_id
+        sampling = req.sampling_params
+        if sampling.num_outputs_per_prompt != 1:
+            raise ValueError(f"MammothModa2 requires num_outputs_per_prompt=1 for request {request_id}")
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        # DiT stage does not consume token embeddings; return a dummy tensor.
+        prompt = req.prompts[0]
+        prompt = prompt if isinstance(prompt, dict) else {}
+        info = prompt.get("additional_information")
+        if req.is_dummy_run():
+            full_hidden_states = torch.zeros((2, self._llm_hidden_size), dtype=torch.float32, device="cpu")
+            full_token_ids = [0, int(self.config.llm_config.gen_vocab_start_index)]
+            answer_start_index = 1
+        else:
+            if not isinstance(info, dict):
+                raise ValueError(f"Missing additional_information AR conditions for request {request_id}")
+            full_hidden_states = info.get("full_hidden_states")
+            full_token_ids = info.get("full_token_ids")
+            if not isinstance(full_hidden_states, torch.Tensor) or not isinstance(full_token_ids, list):
+                raise ValueError(f"Expected full_hidden_states tensor and full_token_ids list for request {request_id}")
+            try:
+                answer_start_index = int(info.get("answer_start_index"))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"Invalid answer_start_index for request {request_id}") from exc
+            if full_hidden_states.ndim != 2:
+                raise ValueError(f"Expected 2D full_hidden_states for request {request_id}")
+            if full_hidden_states.shape[0] != len(full_token_ids):
+                raise ValueError(f"AR hidden-state/token-count mismatch for request {request_id}")
+            if not 0 <= answer_start_index <= len(full_token_ids):
+                raise ValueError(f"answer_start_index outside token range for request {request_id}")
+            try:
+                full_token_ids = [int(token_id) for token_id in full_token_ids]
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"Invalid full_token_ids for request {request_id}") from exc
+
+        dimensions = []
+        for name in ("height", "width"):
+            value = DiffusionRequestBatch.get_prompt_field(prompt, name)
+            if value is None:
+                value = getattr(sampling, name)
+            if value is None:
+                value = 1024
+            try:
+                dimensions.append(int(value))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"Invalid image size {name}={value!r} for request {request_id}") from exc
+        height, width = dimensions
+        if height <= 0 or width <= 0:
+            raise ValueError(f"Invalid image size: {height}x{width} for request {request_id}")
+        if height % 16 != 0 or width % 16 != 0:
+            raise ValueError(f"Image size must be multiples of 16, got {height}x{width} for request {request_id}")
+
+        extra_args = sampling.extra_args or {}
+        guidance = extra_args.get("text_guidance_scale")
+        if guidance is None:
+            guidance = sampling.guidance_scale if sampling.guidance_scale_provided else 9.0
         try:
-            dtype = next(self.parameters()).dtype
-        except StopIteration:
-            dtype = torch.float32
-        return torch.zeros(
-            (input_ids.numel(), self._llm_hidden_size),
-            device=input_ids.device,
-            dtype=dtype,
+            text_guidance_scale = float(guidance)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid text_guidance_scale for request {request_id}") from exc
+        raw_num_inference_steps = extra_args.get("num_inference_steps")
+        if raw_num_inference_steps is None:
+            raw_num_inference_steps = sampling.num_inference_steps
+        if raw_num_inference_steps is None:
+            raw_num_inference_steps = 50
+        try:
+            num_inference_steps = int(raw_num_inference_steps)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid num_inference_steps for request {request_id}") from exc
+        if num_inference_steps <= 0:
+            raise ValueError(f"num_inference_steps must be positive for request {request_id}")
+        cfg_range = extra_args.get("cfg_range")
+        if cfg_range is None:
+            cfg_range = [0.0, 1.0]
+        if not isinstance(cfg_range, (list, tuple)) or len(cfg_range) != 2:
+            raise ValueError(f"cfg_range requires two values for request {request_id}")
+        try:
+            cfg_start, cfg_end = float(cfg_range[0]), float(cfg_range[1])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"cfg_range requires two values convertible to floats for request {request_id}") from exc
+        if not 0 <= cfg_start <= cfg_end <= 1:
+            raise ValueError(f"cfg_range must satisfy 0 <= start <= end <= 1 for request {request_id}")
+
+        generator = sampling.generator
+        if isinstance(generator, list) and len(generator) != 1:
+            raise ValueError(
+                f"MammothModa2 single-output request mode requires exactly one generator for request {request_id}"
+            )
+
+        return _MammothRequest(
+            request_id=request_id,
+            full_hidden_states=full_hidden_states,
+            full_token_ids=full_token_ids,
+            answer_start_index=answer_start_index,
+            height=height,
+            width=width,
+            text_guidance_scale=text_guidance_scale,
+            cfg_range=(cfg_start, cfg_end),
+            num_inference_steps=num_inference_steps,
+            seed=sampling.seed,
+            generator=generator,
         )
 
     def _split_ar_conditions(
@@ -196,42 +304,19 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         return text_cond, image_cond
 
     @torch.inference_mode()
-    def forward(
-        self,
-        *,
-        inputs_embeds: torch.Tensor | None = None,
-        **kwargs: Any,  # noqa: ARG002
-    ) -> OmniOutput:
-        runtime_addi = kwargs.get("runtime_additional_information", None)
-        info = runtime_addi[0]
-
-        # Sampling knobs are declared in vllm_omni/model_extras/mammothmodal2_preview.py
-        # and routed via extra_body -> sampling_params.extra_args (surfaced here as
-        # ``sampling_extra_args``). Fall back to runtime_additional_information for the
-        # legacy bespoke-example path during the transition.
-        extra_args_list = kwargs.get("sampling_extra_args") or []
-        extra_args = extra_args_list[0] if extra_args_list else {}
-        text_guidance_scale = float(extra_args.get("text_guidance_scale", info["text_guidance_scale"][0]))
-        cfg_range_val = extra_args.get("cfg_range", info["cfg_range"])
-        cfg_range = float(cfg_range_val[0]), float(cfg_range_val[1])
-        num_inference_steps = int(extra_args.get("num_inference_steps", info["num_inference_steps"][0]))
-
-        negative_cond = info.get("negative_prompt_embeds")
-        negative_attention_mask = info.get("negative_prompt_attention_mask")
-        image_hw = info["image_height"][0], info["image_width"][0]
-
-        # Split the AR hidden states into text / image conditions. The token ids that
-        # drive the split are sourced from the model config (see _split_ar_conditions),
-        # formerly supplied by the bespoke example via additional_information. Legacy
-        # fallback: ar2dit may have already produced the split conditions.
-        if "text_prompt_embeds" in info:
-            text_cond = info["text_prompt_embeds"]
-            image_cond = info["image_prompt_embeds"]
-        else:
-            text_cond, image_cond = self._split_ar_conditions(
-                full_hidden_states=info["full_hidden_states"],
-                full_token_ids=info["full_token_ids"],
-                answer_start_index=int(info["answer_start_index"][0]),
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+        request = self._parse_request(req)
+        text_cond, image_cond = self._split_ar_conditions(
+            full_hidden_states=request.full_hidden_states,
+            full_token_ids=request.full_token_ids,
+            answer_start_index=request.answer_start_index,
+        )
+        if image_cond.shape[0] == 0:
+            answer_token_ids = request.full_token_ids[request.answer_start_index :]
+            raise ValueError(
+                "MammothModa2 AR stage produced no visual-token hidden states for "
+                f"request {request.request_id}; the DiT stage requires at least one generated visual token. "
+                f"Generated token ids: {answer_token_ids[:32]}"
             )
 
         # Move to model device/dtype.
@@ -241,22 +326,6 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         else:
             target_dtype = next(self.gen_transformer.parameters()).dtype
 
-        def _ensure_2d(x: torch.Tensor, name: str) -> torch.Tensor:
-            if x.ndim == 3 and x.shape[0] == 1:
-                x = x[0]
-            if x.ndim != 2:
-                raise ValueError(f"Expected {name} to be 2D [T,H], got shape={tuple(x.shape)}")
-            return x
-
-        text_cond = _ensure_2d(text_cond, "text_prompt_embeds")
-        image_cond = _ensure_2d(image_cond, "image_prompt_embeds")
-        if image_cond.shape[0] == 0:
-            answer_token_ids = info.get("full_token_ids", [])[int(info.get("answer_start_index", [0])[0]) :]
-            raise ValueError(
-                "MammothModa2 AR stage produced no visual-token hidden states; "
-                "the DiT stage requires at least one generated visual token. "
-                f"Generated token ids: {answer_token_ids[:32]}"
-            )
         text_cond = text_cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
         image_cond = image_cond.to(device=model_device, dtype=target_dtype, non_blocking=True).contiguous()
 
@@ -295,63 +364,38 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             ar_image_embeds = image_embeds
             ar_image_attention_mask = image_attention_mask
 
-        # Prepare negative prompt (for CFG). If none provided, fall back to unconditional.
+        # Empty unconditional prompt for classifier-free guidance.
         negative_prompt_embeds = None
         negative_prompt_attention_mask = None
-        if text_guidance_scale > 1.0:
-            if negative_cond is not None:
-                negative_cond = _ensure_2d(negative_cond, "negative_prompt_embeds")
-                negative_prompt_embeds = (
-                    negative_cond.to(device=model_device, dtype=target_dtype, non_blocking=True)
-                    .contiguous()
-                    .unsqueeze(0)
-                )
-                if isinstance(negative_attention_mask, torch.Tensor):
-                    neg_mask = negative_attention_mask
-                elif isinstance(negative_attention_mask, list):
-                    neg_mask = torch.tensor(negative_attention_mask, dtype=torch.bool)
-                else:
-                    neg_mask = None
-                if neg_mask is None:
-                    negative_prompt_attention_mask = torch.ones(
-                        (1, negative_prompt_embeds.shape[1]),
-                        dtype=torch.bool,
-                        device=negative_prompt_embeds.device,
-                    )
-                else:
-                    neg_mask = neg_mask.to(device=negative_prompt_embeds.device, dtype=torch.bool)
-                    if neg_mask.ndim == 1:
-                        neg_mask = neg_mask.unsqueeze(0)
-                    negative_prompt_attention_mask = neg_mask
-            else:
-                hidden_size = int(prompt_embeds.shape[-1])
-                negative_prompt_embeds = torch.zeros(
-                    (1, 0, hidden_size),
-                    dtype=target_dtype,
-                    device=prompt_embeds.device,
-                )
-                negative_prompt_attention_mask = torch.zeros(
-                    (1, 0),
-                    dtype=torch.bool,
-                    device=prompt_embeds.device,
-                )
+        if request.text_guidance_scale > 1.0:
+            hidden_size = int(prompt_embeds.shape[-1])
+            negative_prompt_embeds = torch.zeros(
+                (1, 0, hidden_size),
+                dtype=target_dtype,
+                device=prompt_embeds.device,
+            )
+            negative_prompt_attention_mask = torch.zeros(
+                (1, 0),
+                dtype=torch.bool,
+                device=prompt_embeds.device,
+            )
+
+        generator = request.generator
+        if generator is None and request.seed is not None:
+            generator = torch.Generator(device=model_device).manual_seed(request.seed)
 
         # Output image size (px), passed from stage input processor.
-        height, width = image_hw
-        if height <= 0 or width <= 0:
-            raise ValueError(f"Invalid image size: {height}x{width}")
-        if height % 16 != 0 or width % 16 != 0:
-            raise ValueError(f"Image size must be multiples of 16, got {height}x{width}")
+        height, width = request.height, request.width
         vae_scale_factor = 16
 
         latent_channels = int(self.gen_transformer.config.in_channels)
         shape = (1, latent_channels, 2 * height // vae_scale_factor, 2 * width // vae_scale_factor)
-        latents = randn_tensor(shape, device=prompt_embeds.device, dtype=prompt_embeds.dtype)
+        latents = randn_tensor(shape, generator=generator, device=prompt_embeds.device, dtype=prompt_embeds.dtype)
 
         scheduler = FlowMatchEulerDiscreteScheduler()
 
         scheduler.set_timesteps(
-            num_inference_steps=num_inference_steps,
+            num_inference_steps=request.num_inference_steps,
             device=prompt_embeds.device,
             num_tokens=latents.shape[-2] * latents.shape[-1],
         )
@@ -370,7 +414,9 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
                 ar_image_attention_mask=ar_image_attention_mask,
                 freqs_cis=self.gen_freqs_cis,
             )
-            guidance_scale = text_guidance_scale if cfg_range[0] <= i / total_steps <= cfg_range[1] else 1.0
+            guidance_scale = (
+                request.text_guidance_scale if request.cfg_range[0] <= i / total_steps <= request.cfg_range[1] else 1.0
+            )
             if guidance_scale > 1.0 and negative_prompt_embeds is not None:
                 model_pred_uncond = self.gen_transformer(
                     hidden_states=latents,
@@ -391,14 +437,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             latents = latents + self.gen_vae.config.shift_factor
         image = self.gen_vae.decode(latents, return_dict=False)[0]
 
-        return OmniOutput(
-            text_hidden_states=inputs_embeds,  # placeholder, not used by runner
-            multimodal_outputs=image,
-            intermediate_tensors=None,
-        )
-
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:  # noqa: ARG002
-        return None
+        return DiffusionOutput(output=image)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

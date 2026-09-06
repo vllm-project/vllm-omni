@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 End-to-end test for MammothModa2 text-to-image generation.
 
@@ -25,6 +28,8 @@ from vllm.sampling_params import SamplingParams
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.outputs import OmniRequestOutput
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -95,17 +100,28 @@ def _sample_pixels(img_tensor: torch.Tensor) -> list[float]:
     return values
 
 
-# ---------------------------------------------------------------------------
-# End-to-end test
-# ---------------------------------------------------------------------------
-pytestmark = [
-    pytest.mark.slow,
-    pytest.mark.diffusion,
-    pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
-]
+def _iter_image_tensors(outputs: list[object]):
+    """Yield images from shared diffusion ``OmniRequestOutput`` objects."""
+    for out in outputs:
+        ro_list = out if isinstance(out, list) else [out]
+        for ro in ro_list:
+            images = getattr(ro, "images", None)
+            if isinstance(images, list):
+                yield from images
 
 
-@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/3201")
+@pytest.mark.cpu
+def test_diffusion_output_exposes_images_at_top_level():
+    image = torch.zeros((3, 16, 16))
+    output = OmniRequestOutput.from_diffusion(request_id="diffusion-test", images=[image])
+
+    assert output.outputs == []
+    assert list(_iter_image_tensors([output])) == [image]
+
+
+@pytest.mark.slow
+@pytest.mark.diffusion
+@pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True)
 @hardware_test(res={"cuda": "H100"})
 def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
     """
@@ -136,7 +152,14 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
         max_tokens=max(1, expected_grid_tokens + 1),
         detokenize=False,
     )
-    dit_sampling = SamplingParams(temperature=0.0, max_tokens=1, detokenize=False)
+    dit_sampling = OmniDiffusionSamplingParams(
+        height=height,
+        width=width,
+        seed=42,
+        guidance_scale=1.0,
+        num_inference_steps=2,
+        extra_args={"cfg_range": [0.0, 1.0]},
+    )
 
     outputs = list(
         omni.generate(
@@ -152,9 +175,6 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
                         "visual_token_end_id": [visual_end],
                         "image_height": [height],
                         "image_width": [width],
-                        "num_inference_steps": [2],
-                        "text_guidance_scale": [1.0],
-                        "cfg_range": [0.0, 1.0],
                         "visual_ids": [
                             _IMAGE_TOKEN_ID,
                             _VIDEO_TOKEN_ID,
@@ -171,34 +191,21 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
     assert len(outputs) > 0, "Pipeline produced no outputs"
 
     found_image = False
-    for out in outputs:
-        ro_list = out
-        if not isinstance(ro_list, list):
-            ro_list = [ro_list]
-        for ro in ro_list:
-            completion_outputs = getattr(ro, "outputs", None)
-            if not isinstance(completion_outputs, list):
-                continue
-            for completion in completion_outputs:
-                mm = getattr(completion, "multimodal_output", None)
-                if not (isinstance(mm, dict) and "image" in mm):
-                    continue
-                img_list = mm["image"] if isinstance(mm["image"], list) else [mm["image"]]
-                for img_tensor in img_list:
-                    assert isinstance(img_tensor, torch.Tensor), f"Expected image tensor, got {type(img_tensor)}"
-                    assert img_tensor.ndim in (3, 4), f"Expected 3D or 4D image tensor, got {img_tensor.ndim}D"
+    for img_tensor in _iter_image_tensors(outputs):
+        assert isinstance(img_tensor, torch.Tensor), f"Expected image tensor, got {type(img_tensor)}"
+        assert img_tensor.ndim in (3, 4), f"Expected 3D or 4D image tensor, got {img_tensor.ndim}D"
 
-                    sampled = _sample_pixels(img_tensor)
+        sampled = _sample_pixels(img_tensor)
 
-                    if os.environ.get("UPDATE_GOLDEN"):
-                        _GOLDEN_T2I_PATH.parent.mkdir(parents=True, exist_ok=True)
-                        _GOLDEN_T2I_PATH.write_text(json.dumps({"pixels": sampled}, indent=2))
-                        print(f"\nGolden file written to {_GOLDEN_T2I_PATH}")
-                    elif _GOLDEN_T2I_PATH.exists():
-                        golden = json.loads(_GOLDEN_T2I_PATH.read_text())["pixels"]
-                        for i, (got, exp) in enumerate(zip(sampled, golden)):
-                            assert abs(got - exp) < 1e-4, f"Pixel {i} mismatch: got {got}, expected {exp}"
+        if os.environ.get("UPDATE_GOLDEN"):
+            _GOLDEN_T2I_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _GOLDEN_T2I_PATH.write_text(json.dumps({"pixels": sampled}, indent=2))
+            print(f"\nGolden file written to {_GOLDEN_T2I_PATH}")
+        elif _GOLDEN_T2I_PATH.exists():
+            golden = json.loads(_GOLDEN_T2I_PATH.read_text())["pixels"]
+            for i, (got, exp) in enumerate(zip(sampled, golden)):
+                assert abs(got - exp) < 1e-4, f"Pixel {i} mismatch: got {got}, expected {exp}"
 
-                    found_image = True
+        found_image = True
 
     assert found_image, "No image tensor found in pipeline output"

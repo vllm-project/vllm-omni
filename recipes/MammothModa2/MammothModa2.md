@@ -18,11 +18,18 @@ The generic example formats the AR prompt, drives the AR → DiT stage pipeline,
 and forwards MammothModa2-specific generation parameters through the
 pipeline-declared `extra_body` contract.
 
-MammothModa2's DiT stage consumes its inputs through the multi-stage kwargs
-interface (not `OmniDiffusionRequest`), so its generation knobs
-(`text_guidance_scale`, `cfg_range`, `num_inference_steps`) are passed via
-`--extra-body` rather than the standard `--num-inference-steps` / `--cfg-scale`
-flags. Image size uses the standard `--height` / `--width` flags.
+MammothModa2's DiT stage runs in the shared diffusion runtime in request mode.
+The first integration intentionally supports one request and one image per
+forward only (`max_num_seqs: 1`, `num_outputs_per_prompt: 1`). Request-level
+batching, step execution, continuous batching, cache acceleration,
+compilation, quantization, parallelism, and offload are not enabled by this
+recipe.
+
+Image size, seed, guidance, and denoising steps use the standard diffusion
+request fields. `cfg_range` remains a MammothModa2-specific `extra_body`
+parameter. For compatibility, the runtime also accepts the former
+`text_guidance_scale` and `num_inference_steps` keys in `extra_body`; when
+present and non-null, those keys take precedence over the standard fields.
 
 ## References
 
@@ -41,28 +48,21 @@ flags. Image size uses the standard `--height` / `--width` flags.
 
 ## Hardware Support
 
-The default deploy config runs both the AR and DiT stages on a single GPU
-(`devices: "0"`). The committed `gpu_memory_utilization` split (stage-0 AR `0.5`,
-stage-1 DiT `0.3`) is sized for an ~80 GB GPU. The model also fits on a 48 GB GPU
-after rebalancing the split so the AR weights (~23 GB) leave room for the KV
-cache — see the note under *1x L40S 48GB*.
+The default deploy config places both the AR and DiT stages on one GPU
+(`devices: "0"`). Its committed `gpu_memory_utilization` split is 0.5 for
+stage 0 and 0.3 for stage 1. The A800 validation plan below also shows a
+two-GPU placement with one stage per GPU for attributable timing and memory;
+the results are pending.
 
 ## GPU
 
-### 1x L40S 48GB
-
-> **48 GB config adjustment:** the committed
-> `vllm_omni/deploy/mammoth_moda2.yaml` uses
-> `gpu_memory_utilization` 0.5 / 0.3 (sized for ~80 GB). To fit on a 48 GB L40S,
-> set the stage-0 (AR) value to `0.8` and the stage-1 (DiT) value to `0.16`
-> before running. (On an ~80 GB GPU, leave the defaults unchanged.)
+### 1x NVIDIA A800 80GB
 
 #### Environment
 
 - OS: Linux
 - Python: Match the repository requirements for your checkout
-- Driver / runtime: NVIDIA CUDA environment with one L40S 48 GB (verified) or an
-  ~80 GB GPU for the default config
+- Driver / runtime: NVIDIA CUDA environment with one A800 80 GB
 - vLLM version: Match the repository requirements for your checkout
 - vLLM-Omni version or commit: Use the commit you are deploying from
 
@@ -75,8 +75,7 @@ hf download bytedance-research/MammothModa2-Preview --local-dir ./MammothModa2-P
 ```
 
 Run text-to-image with the shared offline example from the repository root. The
-deploy config sets `trust_remote_code`, so no extra flag is needed. Forward the
-MammothModa2 generation parameters as a JSON object through `--extra-body`:
+deploy config sets `trust_remote_code`, so no extra flag is needed:
 
 ```bash
 python examples/offline_inference/text_to_image/text_to_image.py \
@@ -85,23 +84,25 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --prompt "A stylish woman riding a motorcycle in NYC, movie poster style" \
   --height 1024 \
   --width 1024 \
-  --extra-body '{"text_guidance_scale": 4.0, "cfg_range": [0.0, 1.0], "num_inference_steps": 50}' \
+  --seed 42 \
+  --guidance-scale 4.0 \
+  --num-inference-steps 50 \
+  --extra-body '{"cfg_range": [0.0, 1.0]}' \
   --output mammoth_t2i.png
 ```
 
-The `--extra-body` JSON forwards MammothModa2-specific parameters into
-`OmniDiffusionSamplingParams.extra_args`. Keys are filtered against the model's
-declared `extra_body_params` (see
+The standard diffusion request fields are `height`, `width`, `seed`,
+`guidance_scale`, and `num_inference_steps`; use their corresponding CLI flags
+shown above. `--height` and `--width` must be multiples of 16.
+
+`cfg_range` is the only recommended MammothModa2 field in `--extra-body`; it
+sets the relative step range `[start, end]` over which CFG is applied (default
+`[0.0, 1.0]`). For compatibility, `text_guidance_scale` and
+`num_inference_steps` remain accepted `extra_body` aliases and, when non-null,
+take precedence over the standard request fields. Model extras are filtered
+against the declared `extra_body_params` (see
 [`vllm_omni/model_extras/mammothmodal2_preview.py`](../../vllm_omni/model_extras/mammothmodal2_preview.py)),
-so unknown keys for MammothModa2 are silently dropped:
-
-- `text_guidance_scale` — classifier-free guidance scale for the DiT stage
-  (default `9.0`; CFG is active only when `> 1.0`).
-- `cfg_range` — relative step range `[start, end]` over which CFG is applied
-  (default `[0.0, 1.0]`).
-- `num_inference_steps` — number of DiT denoising steps (default `50`).
-
-`--height` and `--width` must be multiples of 16.
+so unknown MammothModa2 extras may be dropped.
 
 Run text-to-text through the shared understanding example. It recognizes the
 MammothModa2 checkpoint and automatically selects `mammoth_moda2_ar.yaml`:
@@ -132,7 +133,26 @@ ls -lh mammoth_t2i.png
 python -c "from PIL import Image; print(Image.open('mammoth_t2i.png').size)"
 ```
 
-### 1x AMD MI300X, MammothModa2 Preview
+### 2x NVIDIA A800 80GB validation plan
+
+Use one A800 per stage so AR and DiT memory and timing are attributable. The
+per-stage override changes placement only; both stages remain single-rank.
+
+```bash
+VLLM_LOGGING_LEVEL=DEBUG vllm serve ./MammothModa2-Preview --omni \
+  --deploy-config vllm_omni/deploy/mammoth_moda2.yaml \
+  --stage-overrides '{"0":{"devices":"0"},"1":{"devices":"1"}}' \
+  --port 8099 \
+  --log-stats
+```
+
+Startup logs should identify stage 1 as `StageDiffusionClient` and resolve it
+to `MammothModa2DiTPipeline`. `DiffusionEngine` step timing is a DEBUG-level,
+per-request message, so it appears only after sending a text-to-image request
+with `VLLM_LOGGING_LEVEL=DEBUG`; it is not a startup marker. Seeing the legacy
+generation model runner for stage 1 is a failed migration.
+
+### 1x AMD MI300X, MammothModa2 Preview (pre-migration baseline)
 
 #### Environment
 
