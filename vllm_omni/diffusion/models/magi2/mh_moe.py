@@ -505,7 +505,12 @@ class Magi2MultiHeadMoE(nn.Module):
             )
         return torch_mh_moe_forward(x_heads, gather_ids, sorted_probs, offsets, self.W_gate, self.W_up, self.W_down)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        sequence_split_sizes: list[int] | None = None,
+    ) -> torch.Tensor:
         if self.ep_group.world_size > 1 and self.ep_group.replicated_sequence:
             # TP column-parallel ``split_linear`` already emits exactly this
             # rank's contiguous MoE-head slice.  Compute it once and leave it
@@ -522,12 +527,15 @@ class Magi2MultiHeadMoE(nn.Module):
         if self.ep_pad_heads:
             padding = x_heads.new_zeros((x_heads.shape[0], self.ep_pad_heads, self.d_head))
             x_heads = torch.cat((x_heads, padding), dim=1)
-        sequence_split_sizes: list[int] | None = None
         if self.ep_group.world_size > 1:
-            local_size = torch.tensor([x_heads.shape[0]], dtype=torch.int64, device=x_heads.device)
-            gathered_sizes = [torch.empty_like(local_size) for _ in range(self.ep_group.world_size)]
-            torch.distributed.all_gather(gathered_sizes, local_size, group=self.ep_group.group)
-            sequence_split_sizes = [int(size.item()) for size in gathered_sizes]
+            if sequence_split_sizes is None:
+                # Direct callers do not have the transformer's request-scoped
+                # Ulysses split. Preserve their compatibility while the
+                # production transformer avoids this per-layer collective.
+                local_size = torch.tensor([x_heads.shape[0]], dtype=torch.int64, device=x_heads.device)
+                gathered_sizes = [torch.empty_like(local_size) for _ in range(self.ep_group.world_size)]
+                torch.distributed.all_gather(gathered_sizes, local_size, group=self.ep_group.group)
+                sequence_split_sizes = [int(size.item()) for size in gathered_sizes]
             x_heads = ep_dispatch(x_heads, self.ep_group, sequence_split_sizes)
         output = self._local_forward(x_heads) if self.has_real_moe_heads else torch.zeros_like(x_heads)
         if self.ep_group.world_size > 1:
