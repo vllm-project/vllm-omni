@@ -27,6 +27,13 @@ from vllm_omni.platforms import current_omni_platform
 
 from .parallel import Magi2ParallelGroup, ep_dispatch, ep_undispatch, get_magi2_ep_group
 
+try:  # Triton's precise exp; ``tl.exp`` lowers to the 29-ULP ex2 approximation.
+    from triton.language.extra import libdevice as _tl_libdevice
+except ImportError:  # pragma: no cover - non-CUDA Triton builds
+    _tl_libdevice = None
+
+_HAS_PRECISE_EXP = _tl_libdevice is not None and hasattr(_tl_libdevice, "exp")
+
 RoutingScore = Literal["softmax", "sigmoid"]
 
 
@@ -39,7 +46,7 @@ def swiglu7_pair(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     return (gate * torch.sigmoid(1.702 * gate) * (up + 1.0)).to(dtype)
 
 
-def compute_topk_probs_and_indices(
+def _reference_topk_probs_and_indices(
     router_logits: torch.Tensor,
     top_k: int,
     *,
@@ -48,16 +55,8 @@ def compute_topk_probs_and_indices(
     route_norm: bool = True,
     norm_eps: float = 1e-12,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Route independently for every ``[head, token]`` pair.
+    """Unfused reference routing.  Also the oracle the fused path is tested against."""
 
-    The auxiliary-free bias affects expert selection but deliberately does not
-    affect the returned routing probability, matching the training recipe.
-    """
-
-    if router_logits.ndim != 3:
-        raise ValueError("router_logits must be [heads,tokens,experts]")
-    if not 0 < top_k <= router_logits.shape[-1]:
-        raise ValueError("top_k must be in [1, num_experts]")
     if score_func == "sigmoid":
         router_scores = torch.sigmoid(router_logits)
     elif score_func == "softmax":
@@ -77,15 +76,226 @@ def compute_topk_probs_and_indices(
     return topk_probs, topk_indices
 
 
-def global_sort_routes(
+@triton.jit
+def _routing_topk_kernel(
+    logits_ptr,
+    bias_ptr,
+    probs_ptr,
+    indices_ptr,
+    num_tokens,
+    stride_logits_h,
+    stride_logits_s,
+    tiles_per_head,
+    top_k: tl.constexpr,
+    top_k_pad: tl.constexpr,
+    num_experts: tl.constexpr,
+    experts_pad: tl.constexpr,
+    block_t: tl.constexpr,
+    has_bias: tl.constexpr,
+    route_norm: tl.constexpr,
+    norm_eps: tl.constexpr,
+    precise_exp: tl.constexpr,
+):
+    """Sigmoid, selection bias, top-k, probability gather and L1 norm in one pass.
+
+    One program owns ``block_t`` ``[head, token]`` rows and keeps the whole
+    expert bank in registers, so the ``[heads,tokens,experts]`` logits are read
+    exactly once instead of once per routing stage.
+    """
+
+    tile = tl.program_id(0)
+    head = tile // tiles_per_head
+    token_tile = tile % tiles_per_head
+    token_offsets = token_tile * block_t + tl.arange(0, block_t)
+    expert_offsets = tl.arange(0, experts_pad)
+    token_mask = token_offsets < num_tokens
+    expert_mask = expert_offsets < num_experts
+    live = token_mask[:, None] & expert_mask[None, :]
+
+    # Head and token indices fit in int32, but scaling them by the per-head
+    # logit stride does not once the packed sequence gets long.  Promote before
+    # computing element offsets, as the expert kernel does.
+    logits_base = head.to(tl.int64) * stride_logits_h + token_offsets.to(tl.int64) * stride_logits_s
+    logits = tl.load(
+        logits_ptr + logits_base[:, None] + expert_offsets[None, :],
+        mask=live,
+        other=0.0,
+    )
+    # tl.sigmoid and tl.exp lower to the ex2 approximation, which drifts up to
+    # 29 ULP from torch.sigmoid and can reorder near-equal selection scores.
+    # libdevice's exp keeps the fused route within one ULP of the reference.
+    if precise_exp:
+        router_scores = 1.0 / (1.0 + _tl_libdevice.exp(-logits))
+    else:
+        router_scores = 1.0 / (1.0 + tl.exp(-logits))
+    if has_bias:
+        bias = tl.load(bias_ptr + head * num_experts + expert_offsets, mask=expert_mask, other=0.0)
+        selection_scores = router_scores + bias[None, :]
+    else:
+        selection_scores = router_scores
+    selection_scores = tl.where(live, selection_scores, float("-inf"))
+
+    route_offsets = tl.arange(0, top_k_pad)
+    topk_probs = tl.zeros([block_t, top_k_pad], dtype=tl.float32)
+    topk_indices = tl.zeros([block_t, top_k_pad], dtype=tl.int32)
+    l1_norm = tl.zeros([block_t], dtype=tl.float32)
+    for route in tl.static_range(top_k):
+        best_score = tl.max(selection_scores, axis=1)
+        # tl.argmax is several times more expensive than a plain max on this
+        # shape, so recover the winner with a second reduction.  Ties resolve to
+        # the lowest expert id, which torch.topk leaves unspecified.
+        best_expert = tl.min(tl.where(selection_scores == best_score[:, None], expert_offsets, experts_pad), axis=1)
+        selected = expert_offsets[None, :] == best_expert[:, None]
+        # The bias steers selection only; the route weight is the unbiased score.
+        probability = tl.sum(tl.where(selected, router_scores, 0.0), axis=1)
+        is_route = route_offsets == route
+        topk_probs += tl.where(is_route[None, :], probability[:, None], 0.0)
+        topk_indices += tl.where(is_route[None, :], best_expert[:, None].to(tl.int32), 0)
+        selection_scores = tl.where(selected, float("-inf"), selection_scores)
+        l1_norm += tl.abs(probability)
+    if route_norm:
+        topk_probs = topk_probs / tl.maximum(l1_norm, norm_eps)[:, None]
+
+    store_mask = token_mask[:, None] & (route_offsets[None, :] < top_k)
+    store_base = (head.to(tl.int64) * num_tokens + token_offsets.to(tl.int64)) * top_k
+    store_offsets = store_base[:, None] + route_offsets[None, :]
+    tl.store(probs_ptr + store_offsets, topk_probs, mask=store_mask)
+    tl.store(indices_ptr + store_offsets, topk_indices.to(tl.int64), mask=store_mask)
+
+
+# Above this the [block_t, experts_pad] score tiles no longer fit in registers
+# and the fused kernel loses to the unfused reference.
+_MAX_FUSED_EXPERTS_PAD = 1024
+
+
+def _fused_routing_config(experts_pad: int) -> tuple[int, int]:
+    """Return ``(block_t, num_warps)`` for a padded expert-bank width."""
+
+    # Two fp32 [block_t, experts_pad] tiles per program; one warp per 256-wide
+    # slice keeps the six top-k reductions inside warp shuffles.
+    num_warps = max(1, min(8, experts_pad // 256))
+    block_t = max(1, 256 // experts_pad)
+    return block_t, num_warps
+
+
+def _fused_routing_supported(
+    router_logits: torch.Tensor,
+    score_func: RoutingScore,
+    expert_bias: torch.Tensor | None,
+) -> bool:
+    if not router_logits.is_cuda or score_func != "sigmoid":
+        return False
+    # fp32 only: the reference evaluates sigmoid and the L1 norm in the logit
+    # dtype, and reproducing narrow-dtype rounding is not worth a second kernel.
+    if router_logits.dtype != torch.float32:
+        return False
+    if router_logits.stride(-1) != 1 or router_logits.shape[1] == 0:
+        return False
+    if triton.next_power_of_2(router_logits.shape[-1]) > _MAX_FUSED_EXPERTS_PAD:
+        return False
+    if expert_bias is not None and (expert_bias.dtype != torch.float32 or not expert_bias.is_contiguous()):
+        return False
+    return True
+
+
+def compute_topk_probs_and_indices(
+    router_logits: torch.Tensor,
+    top_k: int,
+    *,
+    score_func: RoutingScore = "sigmoid",
+    expert_bias: torch.Tensor | None = None,
+    route_norm: bool = True,
+    norm_eps: float = 1e-12,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Route independently for every ``[head, token]`` pair.
+
+    The auxiliary-free bias affects expert selection but deliberately does not
+    affect the returned routing probability, matching the training recipe.
+
+    Supported CUDA inputs run as a single fused kernel; other devices, dtypes,
+    score functions and shapes fall back to
+    :func:`_reference_topk_probs_and_indices`.  The two pick the same experts in
+    the same order whenever the top ``top_k + 1`` selection scores of a row are
+    separated by more than a few ULP, and the returned weights then agree to
+    about 1e-6 relative: the fused sigmoid is within one ULP of
+    ``torch.sigmoid`` and the folded L1 normalization sums in a different order.
+    Under an exact tie the fused kernel selects the lowest expert id, an order
+    ``torch.topk`` leaves unspecified.
+    """
+
+    if router_logits.ndim != 3:
+        raise ValueError("router_logits must be [heads,tokens,experts]")
+    if not 0 < top_k <= router_logits.shape[-1]:
+        raise ValueError("top_k must be in [1, num_experts]")
+    if not _fused_routing_supported(router_logits, score_func, expert_bias):
+        return _reference_topk_probs_and_indices(
+            router_logits,
+            top_k,
+            score_func=score_func,
+            expert_bias=expert_bias,
+            route_norm=route_norm,
+            norm_eps=norm_eps,
+        )
+
+    heads, num_tokens, num_experts = router_logits.shape
+    experts_pad = triton.next_power_of_2(num_experts)
+    block_t, num_warps = _fused_routing_config(experts_pad)
+    tiles_per_head = triton.cdiv(num_tokens, block_t)
+    topk_probs = torch.empty((heads, num_tokens, top_k), device=router_logits.device, dtype=torch.float32)
+    topk_indices = torch.empty((heads, num_tokens, top_k), device=router_logits.device, dtype=torch.int64)
+    _routing_topk_kernel[(heads * tiles_per_head,)](
+        router_logits,
+        expert_bias,
+        topk_probs,
+        topk_indices,
+        num_tokens,
+        router_logits.stride(0),
+        router_logits.stride(1),
+        tiles_per_head,
+        top_k,
+        triton.next_power_of_2(top_k),
+        num_experts,
+        experts_pad,
+        block_t,
+        expert_bias is not None,
+        route_norm,
+        norm_eps,
+        _HAS_PRECISE_EXP,
+        num_warps=num_warps,
+        num_stages=1,
+    )
+    return topk_probs, topk_indices
+
+
+@triton.jit
+def _route_gather_kernel(
+    order_ptr,
+    probs_ptr,
+    gather_ids_ptr,
+    sorted_probs_ptr,
+    num_routes,
+    routes_per_head,
+    top_k,
+    block: tl.constexpr,
+):
+    """Materialize the CSR payload from a permutation without a token index buffer."""
+
+    offsets = tl.program_id(0) * block + tl.arange(0, block)
+    mask = offsets < num_routes
+    source = tl.load(order_ptr + offsets, mask=mask, other=0)
+    # The pre-sort layout is [head, token, route], so the token id of a flat
+    # position is implied by the position itself.
+    tl.store(gather_ids_ptr + offsets, ((source % routes_per_head) // top_k).to(tl.int32), mask=mask)
+    tl.store(sorted_probs_ptr + offsets, tl.load(probs_ptr + source, mask=mask, other=0.0), mask=mask)
+
+
+def _reference_global_sort_routes(
     topk_probs: torch.Tensor,
     topk_indices: torch.Tensor,
     num_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert per-head routes into a stable flattened-expert CSR layout."""
+    """Unfused reference layout builder.  Kept as the oracle for the fast path."""
 
-    if topk_probs.shape != topk_indices.shape or topk_indices.ndim != 3:
-        raise ValueError("top-k probabilities and indices must have the same [H,S,K] shape")
     heads, sequence, top_k = topk_indices.shape
     device = topk_indices.device
     head_offset = torch.arange(heads, device=device).view(heads, 1, 1) * num_experts
@@ -98,6 +308,54 @@ def global_sort_routes(
     counts = torch.bincount(flattened_experts, minlength=heads * num_experts)
     offsets = torch.zeros(heads * num_experts + 1, device=device, dtype=torch.long)
     offsets[1:] = counts.cumsum(0)
+    return gather_ids, sorted_probs, offsets
+
+
+def global_sort_routes(
+    topk_probs: torch.Tensor,
+    topk_indices: torch.Tensor,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Convert per-head routes into a stable flattened-expert CSR layout.
+
+    Bit-identical to :func:`_reference_global_sort_routes`, but the flattened
+    expert keys are sorted in the narrowest integer type that holds them, the
+    token ids are derived from the permutation instead of being gathered from a
+    materialized index tensor, and the CSR offsets come from a binary search
+    over the sorted keys rather than from ``torch.bincount``, which synchronizes.
+    """
+
+    if topk_probs.shape != topk_indices.shape or topk_indices.ndim != 3:
+        raise ValueError("top-k probabilities and indices must have the same [H,S,K] shape")
+    heads, sequence, top_k = topk_indices.shape
+    device = topk_indices.device
+    flat_experts = heads * num_experts
+    if not topk_indices.is_cuda or sequence == 0:
+        return _reference_global_sort_routes(topk_probs, topk_indices, num_experts)
+
+    # int16 halves the radix-sort key traffic and is exact while the largest
+    # flattened expert id stays inside a signed 16-bit value.
+    key_dtype = torch.int16 if flat_experts <= torch.iinfo(torch.int16).max else torch.int32
+    head_offset = torch.arange(heads, device=device, dtype=key_dtype).view(heads, 1, 1) * num_experts
+    keys = (topk_indices.to(key_dtype) + head_offset).reshape(-1)
+    sorted_keys, order = torch.sort(keys, stable=True)
+
+    num_routes = order.numel()
+    gather_ids = torch.empty(num_routes, device=device, dtype=torch.int32)
+    sorted_probs = torch.empty(num_routes, device=device, dtype=torch.float32)
+    block = 1024
+    _route_gather_kernel[(triton.cdiv(num_routes, block),)](
+        order,
+        topk_probs.reshape(-1).contiguous(),
+        gather_ids,
+        sorted_probs,
+        num_routes,
+        sequence * top_k,
+        top_k,
+        block,
+    )
+    bounds = torch.arange(flat_experts + 1, device=device, dtype=key_dtype)
+    offsets = torch.searchsorted(sorted_keys, bounds)
     return gather_ids, sorted_probs, offsets
 
 
