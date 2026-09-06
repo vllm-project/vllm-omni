@@ -34,6 +34,7 @@ implementation contract; it is not, by itself, a general support claim.
 - [Mooncake Store Connector](feature/omni_connectors/mooncake_store_connector.md)
 - [Mooncake Transfer Engine Connector](feature/omni_connectors/mooncake_transfer_engine_connector.md)
 - [Mori Transfer Engine Connector](feature/omni_connectors/mori_transfer_engine_connector.md)
+- [NIXL Connector](feature/omni_connectors/nixl_connector.md)
 - [Shared Memory Connector](feature/omni_connectors/shared_memory_connector.md)
 - [Yuanrong Store Connector](feature/omni_connectors/yuanrong_connector.md)
 - [Yuanrong Transfer Engine Connector](feature/omni_connectors/yuanrong_transfer_engine_connector.md)

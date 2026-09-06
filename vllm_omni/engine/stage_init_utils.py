@@ -51,6 +51,9 @@ from vllm_omni.config.omni_config import (
 )
 from vllm_omni.config.stage_config import StageType
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.distributed.omni_connectors.utils.config import (
+    TRANSFER_ENGINE_CONNECTOR_NAMES,
+)
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
@@ -1842,17 +1845,26 @@ def get_stage_connector_spec(
 
     stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
     for cfg in stage_connectors_cfg.values():
-        return dict(cfg.get("spec", {}))
+        connector_spec = dict(cfg.get("spec", {}))
+        if connector_spec.get("name") not in TRANSFER_ENGINE_CONNECTOR_NAMES:
+            extra = dict(connector_spec.get("extra", {}))
+            extra.pop("from_stage", None)
+            extra.pop("to_stage", None)
+            connector_spec["extra"] = extra
+        return connector_spec
 
     # A producer does not consume connector data itself. Keep its connector
     # for both async-chunk and terminal full-payload sends, but mark it
     # sender-only so the scheduler does not park orchestrator-provided inputs
     # waiting for an upstream payload.
     target_stage = str(stage_id)
-    for (from_stage, _to_stage), spec in getattr(omni_transfer_config, "connectors", {}).items():
+    for (from_stage, to_stage), spec in getattr(omni_transfer_config, "connectors", {}).items():
         if from_stage == target_stage:
             extra = dict(spec.extra or {})
             extra.setdefault("role", "sender")
+            if spec.name in TRANSFER_ENGINE_CONNECTOR_NAMES:
+                extra["from_stage"] = int(from_stage)
+                extra["to_stage"] = int(to_stage)
             return {"name": spec.name, "extra": extra}
     return {}
 

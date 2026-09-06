@@ -4,9 +4,10 @@
 """Utilities for OmniConnector configuration and validation."""
 
 import json
+import os
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from ..factory import OmniConnectorFactory
 from .config import TRANSFER_ENGINE_CONNECTOR_NAMES, ConnectorSpec, OmniTransferConfig
@@ -37,6 +38,81 @@ KV_RANK_PORT_STRIDE = 16
 # Port stride between Omni replicas of the same stage.  This reserves a
 # comfortably sized block per replica for TP-rank and stage offsets.
 KV_REPLICA_PORT_STRIDE = 1024
+
+REQUEST_FORWARDING_PORT_OFFSET = 0
+ORCHESTRATOR_PORT_OFFSET = 200
+
+ConnectorPurpose = Literal["request_forwarding", "kv_transfer", "orchestrator"]
+
+
+def connector_zmq_port(
+    base_port: int,
+    *,
+    purpose: ConnectorPurpose,
+    from_stage: int,
+    local_rank: int = 0,
+    replica_id: int = 0,
+) -> int:
+    """Return a collision-free connector endpoint for an edge and worker."""
+    purpose_offsets = {
+        "request_forwarding": REQUEST_FORWARDING_PORT_OFFSET,
+        "kv_transfer": KV_TRANSFER_PORT_OFFSET,
+        "orchestrator": ORCHESTRATOR_PORT_OFFSET,
+    }
+    if purpose not in purpose_offsets:
+        raise ValueError(f"Unsupported connector purpose: {purpose}")
+    if not 0 <= from_stage < KV_RANK_PORT_STRIDE:
+        raise ValueError(f"from_stage must be in [0, {KV_RANK_PORT_STRIDE}), got {from_stage}")
+    if local_rank < 0:
+        raise ValueError(f"local_rank must be non-negative, got {local_rank}")
+    if replica_id < 0:
+        raise ValueError(f"replica_id must be non-negative, got {replica_id}")
+
+    port = (
+        base_port
+        + purpose_offsets[purpose]
+        + replica_id * KV_REPLICA_PORT_STRIDE
+        + local_rank * KV_RANK_PORT_STRIDE
+        + from_stage
+    )
+    if not 1 <= port <= 65535:
+        raise ValueError(f"Resolved connector port must be in [1, 65535], got {port}")
+    return port
+
+
+def resolve_connector_spec(
+    spec: ConnectorSpec,
+    *,
+    stage_id: int,
+    role: str | None,
+    purpose: ConnectorPurpose = "request_forwarding",
+    local_rank: int = 0,
+    replica_id: int = 0,
+) -> ConnectorSpec:
+    """Copy and resolve a connector spec for one stage worker."""
+    extra = dict(spec.extra or {})
+    extra["stage_id"] = stage_id
+    if role is not None:
+        extra["role"] = role
+    if spec.name not in TRANSFER_ENGINE_CONNECTOR_NAMES:
+        return ConnectorSpec(name=spec.name, extra=extra)
+
+    base_port = expand_env_int(extra.get("zmq_port", 50051), "zmq_port")
+    from_stage = int(extra.get("from_stage", stage_id))
+    resolved_port = connector_zmq_port(
+        base_port,
+        purpose=purpose,
+        from_stage=from_stage,
+        local_rank=local_rank,
+        replica_id=replica_id,
+    )
+    if role == "receiver":
+        extra.setdefault("sender_host", extra.get("host", "127.0.0.1"))
+        extra["sender_zmq_port"] = resolved_port
+        extra.pop("zmq_port", None)
+    else:
+        extra["zmq_port"] = resolved_port
+    return ConnectorSpec(name=spec.name, extra=extra)
 
 
 def initialize_connectors_from_config(
@@ -82,52 +158,40 @@ def create_connectors_from_config(
     Returns:
         A dictionary of connectors.
     """
-    purpose_port_offsets = {
-        "request_forwarding": 0,
-        "kv_transfer": KV_TRANSFER_PORT_OFFSET,
-    }
-    port_offset = purpose_port_offsets.get(purpose, 0)
-    orchestrator_port_offset = 200
-
     connectors = {}
     for edge_key, connector_spec in connectors_config.items():
         from_stage, to_stage = edge_key
         try:
             if connector_spec.name in TRANSFER_ENGINE_CONNECTOR_NAMES:
                 extra = dict(connector_spec.extra) if connector_spec.extra else {}
-                base_port = expand_env_int(extra.get("zmq_port", 50051), "zmq_port")
                 try:
-                    stage_offset = int(from_stage)
-                except (TypeError, ValueError):
-                    stage_offset = 0
+                    from_stage_id = int(from_stage)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Transfer-engine stage id must be an integer, got {from_stage!r}") from exc
 
-                local_rank = 0 if str(caller_stage_id) == "orchestrator" else get_connector_local_rank()
-                if str(caller_stage_id) == "orchestrator":
-                    rank0_port = base_port + orchestrator_port_offset + stage_offset
-                else:
-                    rank0_port = base_port + port_offset + stage_offset
-                adjusted_port = rank0_port + local_rank * KV_RANK_PORT_STRIDE
-                extra["zmq_port"] = adjusted_port
-
+                is_orchestrator = str(caller_stage_id) == "orchestrator"
+                local_rank = 0 if is_orchestrator else get_connector_local_rank()
+                resolved_purpose: ConnectorPurpose = "orchestrator" if is_orchestrator else purpose  # type: ignore[assignment]
                 if is_sender is not None:
-                    extra["role"] = "sender" if is_sender else "receiver"
-                    if not is_sender:
-                        extra.setdefault("sender_host", extra.get("host", "127.0.0.1"))
-                        extra.setdefault("sender_zmq_port", adjusted_port)
-                elif caller_stage_id is not None:
-                    caller_str = str(caller_stage_id)
-                    if caller_str == from_stage:
-                        extra["role"] = "sender"
-                    elif caller_str == to_stage:
-                        extra["role"] = "receiver"
-                        extra.setdefault("sender_host", extra.get("host", "127.0.0.1"))
-                        extra.setdefault("sender_zmq_port", adjusted_port)
-                    else:
-                        extra["role"] = "sender"
+                    role = "sender" if is_sender else "receiver"
+                elif caller_stage_id is not None and str(caller_stage_id) == to_stage:
+                    role = "receiver"
+                elif caller_stage_id is not None and str(caller_stage_id) == from_stage:
+                    role = "sender"
                 else:
-                    extra["role"] = extra.get("role", "auto")
-
-                connector = OmniConnectorFactory.create_connector(ConnectorSpec(name=connector_spec.name, extra=extra))
+                    role = str(extra.get("role", "auto"))
+                extra["from_stage"] = from_stage_id
+                extra["to_stage"] = int(to_stage)
+                replica_id = max(int(os.environ.get("VLLM_OMNI_REPLICA_ID", "0")), 0)
+                resolved_spec = resolve_connector_spec(
+                    ConnectorSpec(name=connector_spec.name, extra=extra),
+                    stage_id=int(caller_stage_id) if str(caller_stage_id).isdigit() else from_stage_id,
+                    role=role,
+                    purpose=resolved_purpose,
+                    local_rank=local_rank,
+                    replica_id=replica_id,
+                )
+                connector = OmniConnectorFactory.create_connector(resolved_spec)
             else:
                 connector = OmniConnectorFactory.create_connector(connector_spec)
             connectors[edge_key] = connector
@@ -174,12 +238,16 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
             # Incoming edge → this stage is the receiver
             extra = dict(spec.extra) if spec.extra else {}
             extra.setdefault("role", "receiver")
+            extra["from_stage"] = int(from_stage)
+            extra["to_stage"] = int(to_stage)
             stage_connectors_config[f"from_stage_{from_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
         elif from_stage == target_stage and target_stage == "0":
             # Outgoing edge for stage 0 — included for async_chunk spec
             # extraction (omni_stage.py), NOT for connector instantiation.
             extra = dict(spec.extra) if spec.extra else {}
             extra.setdefault("role", "sender")
+            extra["from_stage"] = int(from_stage)
+            extra["to_stage"] = int(to_stage)
             stage_connectors_config[f"to_stage_{to_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
 
     return stage_connectors_config
