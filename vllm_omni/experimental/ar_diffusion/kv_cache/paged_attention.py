@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Paged self-attention helpers for AR-Diffusion KV reuse."""
 
 from __future__ import annotations
@@ -580,7 +581,22 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
 def paged_write_attn(
     inputs: ARDiffusionPagedLayerInputs, query, k_curr, v_curr, k_act, v_act, softmax_scale: float
 ) -> torch.Tensor:
-    """Model-facing entry: routes through the custom op (traceable in fullgraph)."""
+    """Model-facing entry: routes through the custom op (traceable in fullgraph).
+
+    ``max_query_len`` is deliberately not read off ``inputs``. It equals the live query
+    length -- 880 for the first prefill chunk, 1760 for later prefill, 1785 for diffuse
+    (2x880 video + 24 action + 1 state) -- and a plain Python int is a Dynamo *value*
+    guard, so passing it re-specializes the graph per length even when the query
+    tensor's own sequence dim is marked dynamic. Measured on torch 2.12.0+xpu: three
+    lengths gave three compilations either way.
+
+    ``query.shape[0]`` is the same number as a *symbolic* int tied to the already-dynamic
+    dim, which lets one graph serve all three. The equality is structural rather than
+    incidental: ``query`` is the flattened ``(T, H, D)`` query for one batch-1 sequence,
+    so ``T == query_len == max_query_len``.
+    """
+    # (T, H, D) for batch 1 -> T is exactly the varlen max_seqlen_q bound.
+    max_query_len = query.shape[0]
     return torch.ops.vllm_omni.ar_diffusion_paged_write_attn(
         query,
         k_curr,
@@ -595,7 +611,7 @@ def paged_write_attn(
         inputs.block_table,
         inputs.query_start_loc,
         inputs.seq_lens,
-        inputs.max_query_len,
+        max_query_len,
         inputs.max_seq_len,
         softmax_scale,
     )
