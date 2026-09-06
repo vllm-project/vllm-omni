@@ -3310,7 +3310,7 @@ class MiniCPMOAudioEmbeddingItems(DictEmbeddingItems):
     ) -> None:
         super().__init__(
             data,
-            modality="image",
+            modality="audio",
             required_fields={"audio_embeds"},
             fields_factory=fields_factory,
         )
@@ -3733,7 +3733,8 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
 
             if isinstance(audios, MiniCPMOAudioEmbeddingItems):
                 single_audio_embeds = audios.get(item_idx)["audio_embeds"]
-                audio_len = self.info.get_audio_len_by_num_chunks(sum(map(len, single_audio_embeds)))
+                # One item is ``(s, h)``, so its leading dim is the audio embedding count.
+                audio_len = self.info.get_audio_len_by_num_chunks(len(single_audio_embeds))
             else:
                 audio_len = audios.get_audio_length(item_idx)
 
