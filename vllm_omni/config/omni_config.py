@@ -1694,7 +1694,7 @@ def _build_model_config(
         kwargs["dtype"] = _copy_value(deploy.dtype)
     if "active_stream_window" not in kwargs:
         kwargs["active_stream_window"] = _copy_value(deploy.active_stream_window)
-    kwargs.setdefault("final_output", topology.final_output)
+    kwargs["final_output"] = topology.final_output
     if "custom_voice_dir" not in kwargs and deploy.custom_voice_dir is not None:
         kwargs["custom_voice_dir"] = _copy_value(deploy.custom_voice_dir)
     kwargs.setdefault("use_v2_model_runner", deploy.model_runner == "v2")

@@ -46,6 +46,7 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageDeployConfig,
     StageExecutionType,
+    StagePipelineConfig,
     _apply_platform_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
@@ -1203,6 +1204,25 @@ def test_from_pipeline_config_accepts_pre_resolved_pipeline():
     omni_config = VllmOmniConfig.from_pipeline_config(resolved_pipeline)
 
     assert omni_config.pipeline_config is resolved_pipeline
+
+
+def test_final_output_projection_keeps_topology_authoritative():
+    pipeline = PipelineConfig(
+        model_type="terminal_projection",
+        stages=(StagePipelineConfig(stage_id=0, model_stage="a", final_output=True),),
+    )
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, engine_extras={"final_output": False})])
+    typed = VllmOmniConfig.from_pipeline_config(
+        pipeline, user_deploy_config=deploy, cli_overrides={"final_output": False}
+    ).stage_by_id(0)
+    legacy = merge_pipeline_deploy(pipeline, deploy)[0]
+    legacy.runtime_overrides["final_output"] = False
+    omega = legacy.to_omegaconf()
+
+    assert typed.final_output is True
+    assert typed.model_config.final_output is True
+    assert omega.final_output is True
+    assert omega.engine_args.final_output is True
 
 
 def test_from_pipeline_config_prefers_loaded_user_deploy_config(monkeypatch):

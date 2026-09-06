@@ -251,6 +251,10 @@ class StagePipelineConfig:
     async_chunk_process_next_stage_input_func: str | None = None
     sync_process_input_func: str | None = None
     supports_native_mrv2_data_plane: bool = False
+    # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
+    # The callable receives ``(prompt, sampling_params_list)``; downstream
+    # stages continue to receive the original prompt.
+    prompt_transform_func: str | None = None
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
     omni_kv_config: dict[str, Any] | None = None
@@ -1136,7 +1140,6 @@ class StageConfig:
 
         # Overlay topology-level fields
         engine_args["model_stage"] = self.model_stage
-        engine_args["final_output"] = self.final_output
         if self.worker_type:
             engine_args["worker_type"] = self.worker_type
         if self.scheduler_cls:
@@ -1152,6 +1155,9 @@ class StageConfig:
         for key, value in runtime_overrides.items():
             if value is not None and key not in ("devices", "max_batch_size", "num_replicas"):
                 engine_args[key] = value
+
+        # Terminal-stage ownership comes from topology, not engine overrides.
+        engine_args["final_output"] = self.final_output
 
         # Build runtime config from YAML defaults + CLI overrides
         runtime: dict[str, Any] = dict(self.yaml_runtime)
