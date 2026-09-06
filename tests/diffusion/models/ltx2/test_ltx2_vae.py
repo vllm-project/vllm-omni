@@ -38,6 +38,63 @@ def test_ltx_base_vocoder_keeps_native_dtype(monkeypatch):
 
 
 class TestLTXDiffusionDecoder:
+    def test_diffusion_decoder_installs_all_optimized_behavior_once(self):
+        from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder import (
+            LTX2VideoDiffusionDecoderModel,
+        )
+        from vllm_omni.diffusion.models.ltx2.ops.diffvae.modules import (
+            LTX2VideoVaeDiffusionNABlock,
+            LTX2VideoVaeNeighborhoodAttention,
+            LTX2VideoVaeSwiGLU,
+            install_ltx2_diffvae_ops,
+        )
+
+        with torch.device("meta"):
+            model = LTX2VideoDiffusionDecoderModel()
+
+        modules = tuple(model.decoder.modules())
+        expected_blocks = sum(model.config.decoder_stage_depths)
+        assert sum(isinstance(module, LTX2VideoVaeNeighborhoodAttention) for module in modules) == expected_blocks
+        assert sum(isinstance(module, LTX2VideoVaeSwiGLU) for module in modules) == expected_blocks
+        assert (
+            sum(isinstance(module, LTX2VideoVaeDiffusionNABlock) for module in modules)
+            == model.config.decoder_stage_depths[-1]
+        )
+
+        installed_types = tuple(type(module) for module in modules)
+        install_ltx2_diffvae_ops(model.decoder)
+        assert tuple(type(module) for module in model.decoder.modules()) == installed_types
+
+    def test_diffusion_decoder_noneligible_block_uses_upstream_forward(self, monkeypatch):
+        from vllm_omni.diffusion.models.ltx2.ops.diffvae import modules as diffvae_modules
+
+        block = object.__new__(diffvae_modules.LTX2VideoVaeDiffusionNABlock)
+        torch.nn.Module.__init__(block)
+        expected = torch.randn(1, 1, 1, 1, 1)
+        calls = []
+
+        def upstream_forward(_self, hidden_states, latent_context, modulation, block_mask=None):
+            calls.append((hidden_states, latent_context, modulation, block_mask))
+            return expected
+
+        monkeypatch.setattr(
+            diffvae_modules.DiffusersLTX2VideoVaeDiffusionNABlock,
+            "forward",
+            upstream_forward,
+        )
+        hidden_states = torch.randn(1, 1, 1, 1, 1)
+        latent_context = torch.randn_like(hidden_states)
+        modulation = (torch.randn_like(hidden_states),)
+        block_mask = object()
+
+        assert block.forward(hidden_states, latent_context, modulation, block_mask) is expected
+        assert len(calls) == 1
+        actual_hidden_states, actual_latent_context, actual_modulation, actual_block_mask = calls[0]
+        assert actual_hidden_states is hidden_states
+        assert actual_latent_context is latent_context
+        assert actual_modulation is modulation
+        assert actual_block_mask is block_mask
+
     @pytest.mark.parametrize("mode", ["spatial_shard_height", "spatial_shard_width"])
     def test_distributed_diffusion_decoder_rejects_non_tile_parallel_modes(self, mode):
         from vllm_omni.diffusion.models.ltx2.ltx2_diffusion_decoder_distributed import (

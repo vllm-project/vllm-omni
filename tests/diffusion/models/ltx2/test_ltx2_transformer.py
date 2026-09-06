@@ -18,8 +18,61 @@ from vllm_omni.diffusion.models.ltx2.ltx2_transformer import (
     apply_keyframes_absolute_embedding,
     apply_split_rotary_emb,
 )
+from vllm_omni.diffusion.models.ltx2.ops.denoise import integration as denoise_integration
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+def test_rms_path_uses_exact_candidate(monkeypatch):
+    expected = torch.randn(1, 2, 4)
+    monkeypatch.setattr(
+        denoise_integration,
+        "try_rms_norm_modulate_exact",
+        lambda *_args: expected,
+    )
+
+    actual = denoise_integration.rms_norm_modulate(
+        nn.RMSNorm(4, eps=1e-6, elementwise_affine=False),
+        torch.randn(1, 2, 4),
+        torch.randn(1, 1, 4),
+        torch.randn(1, 1, 4),
+    )
+
+    assert actual is expected
+
+
+def test_rms_path_falls_back_when_exact_candidate_is_unavailable(monkeypatch):
+    monkeypatch.setattr(
+        denoise_integration,
+        "try_rms_norm_modulate_exact",
+        lambda *_args: None,
+    )
+    norm = nn.RMSNorm(4, eps=1e-6, elementwise_affine=False)
+    states = torch.randn(1, 2, 4)
+    scale = torch.randn(1, 1, 4)
+    shift = torch.randn(1, 1, 4)
+
+    actual = denoise_integration.rms_norm_modulate(norm, states, scale, shift)
+    expected = norm(states) * (1 + scale) + shift
+
+    assert torch.equal(actual, expected)
+
+
+def test_rms_path_preserves_affine_norm_weight(monkeypatch):
+    monkeypatch.setattr(
+        denoise_integration,
+        "try_rms_norm_modulate_exact",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("affine RMSNorm is unsupported")),
+    )
+    norm = nn.RMSNorm(4, eps=1e-6, elementwise_affine=True)
+    states = torch.randn(1, 2, 4)
+    scale = torch.randn(1, 1, 4)
+    shift = torch.randn(1, 1, 4)
+
+    actual = denoise_integration.rms_norm_modulate(norm, states, scale, shift)
+    expected = norm(states) * (1 + scale) + shift
+
+    assert torch.equal(actual, expected)
 
 
 def test_ltx_interleaved_rope_matches_official_model_dtype_arithmetic():

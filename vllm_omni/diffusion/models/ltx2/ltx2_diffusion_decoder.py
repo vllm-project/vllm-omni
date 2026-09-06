@@ -20,6 +20,8 @@ from diffusers.models.autoencoders.ltx2_diffusion_decoder import (
 from diffusers.models.autoencoders.vae import DecoderOutput
 from safetensors import safe_open
 
+from .ops.diffvae.modules import install_ltx2_diffvae_ops
+
 LTX25_NATIVE_DIFFUSION_DECODER_REPO_ID = "Lightricks/LTX-2.5"
 LTX25_NATIVE_ARTIFACT_REVISION = "8a4ff96f581e72bedc1b44367581c49d544a05f1"
 LTX25_NATIVE_DIFFUSION_DECODER_FILENAME = "vae/ltx-2.5-video-vae-bf16.safetensors"
@@ -200,6 +202,7 @@ class LTX2VideoDiffusionDecoderModel(DiffusersLTX2VideoDiffusionDecoderModel):
         # to this behavior-only subclass preserves parameters and state-dict keys.
         self.decoder.__class__ = LTX2VideoDiffusionDecoder3d
         self.decoder.stage5_kernel = tuple(decoder_stage5_kernel)
+        install_ltx2_diffvae_ops(self.decoder)
 
     @classmethod
     def from_ltx25_native_checkpoint(
