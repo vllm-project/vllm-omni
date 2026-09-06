@@ -617,6 +617,76 @@ class ARDiffusionKVCache:
         )
         _log.debug("AR-Diffusion commit: req=%s after=%d", adapter.request_id, adapter.completed_chunks)
 
+    # -- session fork (copy-on-write) ----------------------------------------
+
+    def fork_at_last_commit(
+        self,
+        parent: ARDiffusionRequestAdapter,
+        child_request_id: str,
+    ) -> ARDiffusionRequestAdapter:
+        """Fork a session's KV state at its last committed chunk.
+
+        Copy-on-write over the paged pool: the child gets a copy of the
+        parent's block table with reference counts incremented
+        (``BlockPool.touch``), so both sessions read the same physical
+        blocks and zero KV bytes move. Divergence is automatic: committed
+        chunks are never rewritten (the commit-once discipline), and each
+        session's next ``allocate_chunk`` appends fresh blocks visible only
+        to that session. Window eviction stays per-request (null-block
+        placeholders in each table); a physical block returns to the free
+        queue only when the last holder releases it, exactly as in vLLM's
+        prefix-caching path.
+
+        Fork is only legal at a chunk-commit boundary: an in-flight chunk's
+        slots are still being written, and sharing them would let two
+        sessions write the same physical slots. Raises if the parent has
+        allocated-but-uncommitted blocks.
+
+        Scope notes (the completeness invariant is the caller's): the
+        cross-attention pools are conditioning state, not session history,
+        and are shared as-is (rewrite them if the branch changes prompt or
+        conditioning image); RNG streams live in the pipeline and must be
+        snapshotted alongside the fork for deterministic re-denoise.
+        """
+        if child_request_id in self._adapters:
+            raise ValueError(f"fork target request_id already exists: {child_request_id}")
+
+        st_manager = self.manager.coordinator.single_type_managers[0]
+        parent_blocks = st_manager.req_to_blocks.get(parent.request_id)
+        if parent_blocks is None:
+            raise ValueError(f"unknown parent request: {parent.request_id}")
+
+        committed_logical_blocks = (parent.num_computed_tokens + self.block_size - 1) // self.block_size
+        if len(parent_blocks) != committed_logical_blocks:
+            raise RuntimeError(
+                "fork_at_last_commit requires a chunk-commit boundary: "
+                f"parent has {len(parent_blocks)} allocated logical blocks but only "
+                f"{committed_logical_blocks} committed ones (in-flight chunk pending)"
+            )
+
+        child = ARDiffusionRequestAdapter(
+            child_request_id,
+            chunk_size=self.spec.chunk_size,
+            prefill_prefix_tokens=parent._prefill,
+        )
+        child._completed_chunks = parent.completed_chunks
+
+        shared = list(parent_blocks)
+        # Symmetric with free_blocks: touch every table entry (including null
+        # placeholders, whose refcount is unused but kept balanced).
+        self.manager.block_pool.touch(shared)
+        st_manager.req_to_blocks[child_request_id] = type(parent_blocks)(shared)
+        self._adapters[child_request_id] = child
+
+        _log.debug(
+            "AR-Diffusion fork: parent=%s child=%s shared_blocks=%d free=%d",
+            parent.request_id,
+            child_request_id,
+            len(shared),
+            self.manager.block_pool.get_num_free_blocks(),
+        )
+        return child
+
     # -- pool-backed K/V access --------------------------------------------
 
     def write_chunk_kv(
