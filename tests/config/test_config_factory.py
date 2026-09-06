@@ -937,6 +937,44 @@ class TestPipelineRegistration:
         assert isinstance(omni_config, VllmOmniConfig)
         assert omni_config.stage_by_id(0).diffusion_config.model == "fake/model"
 
+    def test_cosyvoice3_deploy_resolves_hash_snapshot_without_hf_metadata(self, tmp_path):
+        snapshot = tmp_path / "models--FunAudioLLM--Fun-CosyVoice3-0.5B-2512" / "snapshots" / ("a" * 40)
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_text("{}\n", encoding="utf-8")
+        model = str(snapshot)
+        deploy_path = get_deploy_config_path("cosyvoice3.yaml")
+
+        assert StageConfigFactory.try_infer_model_type(model, trust_remote_code=False) is None
+        assert StageConfigFactory.get_pipeline_config(model, trust_remote_code=False) is None
+
+        omni_config = StageConfigFactory.create_from_model(
+            model,
+            trust_remote_code=False,
+            cli_overrides={},
+            deploy_config_path=deploy_path,
+        )
+        legacy_configs, _ = StageConfigFactory.create_legacy_stage_configs_from_model(
+            model,
+            trust_remote_code=False,
+            cli_overrides={},
+            deploy_config_path=deploy_path,
+        )
+
+        assert omni_config is not None
+        assert omni_config.pipeline_config.model_type == "cosyvoice3"
+        assert [
+            (stage.stage_id, stage.stage_type, stage.worker_type, stage.model_stage)
+            for stage in omni_config.stage_configs
+        ] == [
+            (0, StageType.LLM, "ar", "cosyvoice3_talker"),
+            (1, StageType.LLM, "generation", "cosyvoice3_code2wav"),
+        ]
+        assert all(stage.model_config.model == model for stage in omni_config.stage_configs)
+        assert all(stage.stage_type is not StageType.DIFFUSION for stage in omni_config.stage_configs)
+
+        assert legacy_configs is not None
+        assert [stage.stage_type for stage in legacy_configs] == [StageType.LLM, StageType.LLM]
+
     def test_pipeline_registration(self, clean_pipeline_registry):
         """Ensure that we can register and create a custom pipeline config."""
         new_model_type = "new_model_type"
