@@ -481,3 +481,101 @@ def test_realtime_client_sends_each_units_composite_beside_its_base_frame():
     # A composite belongs to the unit it was captured in, so it rides the same
     # append as that unit's base frame; a unit without one sends the base alone.
     assert [event["video_frames"] for event in sent if "video_frames" in event] == [["f0", "s0"], ["f1"]]
+
+
+def _stage_event(response_id: str, stage_metrics: dict, *, event_type: str = "response.done") -> dict:
+    """Build a realtime event carrying a server-side stage snapshot."""
+    return {
+        "type": event_type,
+        "response": {"id": response_id},
+        "vllm_omni": {"stage_metrics": stage_metrics},
+    }
+
+
+def test_timing_summary_keeps_every_stage_snapshot_not_just_stage_zero():
+    """``--print-stage`` needs all stages, and needs the server's own key names."""
+    collector = RealtimeEventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+    # An early, partial snapshot for stage 0 only.
+    collector.add(
+        _stage_event("resp-a", {"0": {"num_tokens_out": 5, "stage_name": "llm"}}, event_type="response.text.delta"),
+        received_at_s=10.1,
+    )
+    # A later snapshot supersedes stage 0 and adds stage 1.
+    collector.add(
+        _stage_event(
+            "resp-a",
+            {
+                "0": {"num_tokens_out": 20, "vllm_ttft_ms": 100.0, "stage_name": "llm"},
+                "1": {"output_unit_count": 3, "stage_name": "token2wav"},
+            },
+        ),
+        received_at_s=10.2,
+    )
+
+    timing = collector.timing_summary(after_s=10.0, response_id="resp-a")
+
+    # Cumulative snapshots replace, never accumulate: 20, not 5 + 20.
+    assert timing["stage_metrics"] == {
+        "0": {"num_tokens_out": 20, "vllm_ttft_ms": 100.0, "stage_name": "llm"},
+        "1": {"output_unit_count": 3, "stage_name": "token2wav"},
+    }
+    # The reshaped stage-0 view is unchanged for existing callers.
+    assert timing["stage0_tokens"]["output_token_count"] == 20
+    assert timing["stage0_tokens"]["ttft_ms"] == 100.0
+
+
+def test_timing_summary_keeps_stages_absent_from_later_events():
+    collector = RealtimeEventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+    collector.add(
+        _stage_event(
+            "resp-a",
+            {"0": {"num_tokens_out": 4}, "1": {"output_unit_count": 2}},
+            event_type="response.text.delta",
+        ),
+        received_at_s=10.1,
+    )
+    # This event only reports stage 0; stage 1 must survive.
+    collector.add(_stage_event("resp-a", {"0": {"num_tokens_out": 9}}), received_at_s=10.2)
+
+    timing = collector.timing_summary(after_s=10.0, response_id="resp-a")
+
+    assert timing["stage_metrics"] == {"0": {"num_tokens_out": 9}, "1": {"output_unit_count": 2}}
+
+
+def test_timing_summary_stage_snapshots_are_scoped_to_one_response():
+    collector = RealtimeEventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+    collector.add(_stage_event("resp-a", {"0": {"num_tokens_out": 20}}), received_at_s=10.1)
+    collector.add({"type": "response.created", "response": {"id": "resp-b"}}, received_at_s=11.0)
+    collector.add(_stage_event("resp-b", {"0": {"num_tokens_out": 30}}), received_at_s=11.1)
+
+    assert collector.response_ids == ["resp-a", "resp-b"]
+    first = collector.timing_summary(after_s=10.0, response_id="resp-a")
+    second = collector.timing_summary(after_s=10.0, response_id="resp-b")
+
+    assert first["stage_metrics"] == {"0": {"num_tokens_out": 20}}
+    assert second["stage_metrics"] == {"0": {"num_tokens_out": 30}}
+
+
+def test_timing_summary_does_not_hand_out_the_stored_event_snapshot():
+    collector = RealtimeEventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+    collector.add(_stage_event("resp-a", {"0": {"num_tokens_out": 20}}), received_at_s=10.1)
+
+    timing = collector.timing_summary(after_s=10.0, response_id="resp-a")
+    timing["stage_metrics"]["0"]["num_tokens_out"] = 999
+
+    assert collector.events[-1]["vllm_omni"]["stage_metrics"]["0"]["num_tokens_out"] == 20
+
+
+def test_timing_summary_omits_stage_metrics_when_the_server_sent_none():
+    collector = RealtimeEventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+    collector.add({"type": "response.done", "response": {"id": "resp-a"}}, received_at_s=10.1)
+
+    timing = collector.timing_summary(after_s=10.0, response_id="resp-a")
+
+    assert "stage_metrics" not in timing
+    assert "stage0_tokens" not in timing
