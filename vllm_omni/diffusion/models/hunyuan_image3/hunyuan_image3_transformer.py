@@ -112,6 +112,33 @@ def _get_cla_factor(config: PretrainedConfig) -> int:
     return getattr(config, "cla_share_factor", 1)
 
 
+def _hunyuan_image3_unpack_packed_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_experts: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unpack pre-computed ``(topk_weights, topk_indices)`` packed by
+    :class:`HunYuanSparseMoeBlock` into ``gating_output``.
+
+    Used as ``custom_routing_function`` for the underlying ``FusedMoE``,
+    bypassing the bf16 ``topk_softmax`` CUDA op (``_moe_C.topk_softmax``)
+    which is not available on Ascend NPU. The routing decision is instead
+    made in fp32 inside :meth:`HunYuanSparseMoeBlock.forward`, matching the
+    reference implementation.
+
+    Layout of ``gating_output`` (shape ``[num_tokens, top_k * 2]``)::
+
+        [:, :top_k]  -> topk_weights (already softmax'd + renormalized in fp32,
+                                      stored as fp32 for transport)
+        [:, top_k:]  -> topk_indices (cast to fp32 for transport, restored to int32)
+    """
+    topk_weights = gating_output[:, :topk].contiguous()
+    topk_indices = gating_output[:, topk:]
+    return topk_weights.to(torch.float32), topk_indices.to(torch.int32)
+
+
 def retrieve_timesteps(
     scheduler,
     num_inference_steps: int | None = None,
@@ -1670,6 +1697,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             top_k = config.moe_topk[layer_id]
         else:
             top_k = config.moe_topk
+        self.top_k = top_k
 
         # If it is moe, moe_intermediate_size is preferred
         intermediate_size = config.intermediate_size
@@ -1684,11 +1712,19 @@ class HunYuanSparseMoeBlock(nn.Module):
         self.n_logical_experts = self.n_routed_experts
         self.n_redundant_experts = 0
 
+        # FP32 router gate. The HF reference (``modeling_hunyuan_image_3.py``)
+        # constructs ``HunyuanTopKGate.wg`` as an ``nn.Linear(..., dtype=torch.float32)``
+        # and runs the router in fp32 (``with torch.autocast('cuda', enabled=False)``).
+        # Keeping the gate fp32 (and casting the input below) lets
+        # :meth:`forward` compute softmax + topk + clamp-divide renormalization
+        # in fp32, which both matches the reference and lets us bypass vLLM's
+        # bf16 ``topk_softmax`` CUDA op (unavailable on Ascend NPU).
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None,
+            params_dtype=torch.float32,
             prefix=f"{prefix}.gate",
         )
         if config.use_mixed_mlp_moe > 0:
@@ -1713,18 +1749,25 @@ class HunYuanSparseMoeBlock(nn.Module):
             self.shared_mlp = None
 
         enable_expert_parallel = get_current_vllm_config().parallel_config.enable_expert_parallel
+        # Experts with our ``_hunyuan_image3_unpack_packed_topk`` custom
+        # routing — :meth:`forward` feeds (topk_weights, topk_indices) packed
+        # into ``router_logits`` so the bf16 ``topk_softmax`` CUDA op is
+        # bypassed entirely (it does not exist on Ascend NPU, see #6216).
+        # ``renormalize=False`` because we already did clamp+divide in fp32 to
+        # match HF's ``topk_weight = topk_weight_1 / clamp(sum, min=1e-8)``.
         self.experts = FusedMoE(
             shared_experts=self.shared_mlp,
             num_experts=self.n_routed_experts,
             top_k=top_k,
             hidden_size=config.hidden_size,
             intermediate_size=intermediate_size,
-            renormalize=top_k > 1,
+            renormalize=False,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             pcp_size=None if enable_expert_parallel else 1,
+            custom_routing_function=_hunyuan_image3_unpack_packed_topk,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1733,9 +1776,30 @@ class HunYuanSparseMoeBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+        # FP32 router (HF: `with torch.autocast('cuda', enabled=False): ...`
+        # plus `if self.wg.weight.dtype == torch.float32: hidden_states.float()`).
+        # ``self.gate.weight`` is fp32 (params_dtype=torch.float32), so the
+        # ReplicatedLinear matmul runs in fp32 once we cast the input.
+        router_logits, _ = self.gate(hidden_states.float())
+
+        # softmax + topk + clamp-divide renormalization, all in fp32 — matches
+        # ``HunyuanTopKGate.easy_topk`` exactly.
+        gates = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+        topk_weights, topk_indices = torch.topk(gates, self.top_k, dim=-1)
+        weight_sums = topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights / weight_sums.clamp(min=1e-8)
+
+        # Cast topk weights to model dtype for the expert MLP combine.
+        # HF: ``topk_weights = topk_weights.to(hidden_states.dtype)``.
+        topk_weights = topk_weights.to(hidden_states.dtype)
+
+        # Pack (weights, indices) into the ``router_logits`` slot so
+        # ``_hunyuan_image3_unpack_packed_topk`` can pull them back out
+        # inside ``FusedMoE``. Both halves are stored as fp32 for transport —
+        # the indices get cast back to int32 on unpack.
+        packed_routing = torch.cat([topk_weights.float(), topk_indices.to(torch.float32)], dim=-1)
+
+        final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=packed_routing)
 
         return final_hidden_states.view(orig_shape)
 
