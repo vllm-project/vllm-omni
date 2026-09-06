@@ -13,6 +13,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_omni.quantization import build_quantization_config, resolve_component_quant_config
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 _ItemT = TypeVar("_ItemT")
@@ -1229,19 +1231,15 @@ def test_text_encoder_stub_constructs_without_group_or_weights():
 
 
 def test_global_quant_config_is_shared_by_dit_and_encoder():
-    from vllm_omni.quantization import build_quant_config, resolve_component_quant_config
-
-    global_config = build_quant_config("fp8")
+    global_config = build_quantization_config("fp8")
 
     assert resolve_component_quant_config(global_config, "transformer") is global_config
     assert resolve_component_quant_config(global_config, "text_encoder") is global_config
 
 
 def test_minimax_h3_fp8_component_selection():
-    from vllm_omni.quantization import build_quant_config, resolve_component_quant_config
-
-    dit_only = build_quant_config({"transformer": {"method": "fp8"}})
-    encoder_only = build_quant_config({"text_encoder": {"method": "fp8"}})
+    dit_only = build_quantization_config({"transformer": {"method": "fp8"}})
+    encoder_only = build_quantization_config({"text_encoder": {"method": "fp8"}})
 
     assert resolve_component_quant_config(dit_only, "transformer").get_name() == "fp8"
     assert resolve_component_quant_config(dit_only, "text_encoder") is None

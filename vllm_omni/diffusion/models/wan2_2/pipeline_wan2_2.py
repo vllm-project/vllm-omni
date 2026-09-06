@@ -207,9 +207,9 @@ def create_transformer_from_config(
         kwargs["pos_embed_seq_len"] = config["pos_embed_seq_len"]
 
     if "quantization_config" in config:
-        from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+        from vllm_omni.quantization.factory import resolve_quantization_config_from_disk
 
-        quant_config = resolve_quant_config_from_disk(quant_config, config["quantization_config"])
+        quant_config = resolve_quantization_config_from_disk(quant_config, config["quantization_config"])
 
     if quant_config is not None:
         kwargs["quant_config"] = quant_config

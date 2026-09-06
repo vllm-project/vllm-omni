@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 End-to-end tests for the unified quantization framework (PR #1764).
 
@@ -189,7 +189,7 @@ def _generate_single_stage_video(
 
 
 def _generate_bagel_image(
-    diffusion_quantization_config: str | None = None,
+    quantization: str | None = None,
     num_inference_steps: int = 15,
 ) -> tuple[Any, float]:
     """Generate an image with BAGEL (multi-stage: LLM + Diffusion).
@@ -202,8 +202,8 @@ def _generate_bagel_image(
         "deploy_config": config_path,
         "stage_init_timeout": 300,
     }
-    if diffusion_quantization_config:
-        omni_kwargs["diffusion_quantization_config"] = diffusion_quantization_config
+    if quantization:
+        omni_kwargs["quantization"] = quantization
 
     model_name = omni_kwargs.pop("model")
     with OmniRunner(model_name, **omni_kwargs) as runner:
@@ -387,14 +387,14 @@ def test_bagel_fp8_generates_image():
       1. Image is generated successfully
       2. LLM stage finish_reason is 'stop' (not 'length' from garbled output)
     """
-    image, _ = _generate_bagel_image(diffusion_quantization_config="fp8")
+    image, _ = _generate_bagel_image(quantization="fp8")
     image.save("test_bagel_fp8.png")
 
 
 @hardware_test(res={"cuda": "H100"})
 def test_bagel_bf16_generates_image():
     """BAGEL without quantization generates a valid image (baseline)."""
-    image, _ = _generate_bagel_image(diffusion_quantization_config=None)
+    image, _ = _generate_bagel_image(quantization=None)
     image.save("test_bagel_bf16.png")
 
 

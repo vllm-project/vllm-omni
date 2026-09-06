@@ -9,6 +9,7 @@ from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any, get_args, get_origin
 
+from omegaconf import DictConfig, OmegaConf
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
@@ -16,13 +17,13 @@ from vllm.transformers_utils.repo_utils import file_or_path_exists
 
 from vllm_omni.config.config_factory import (
     StageConfigFactory,
-    _materialize_object_storage_configs,
     _name_match_candidate,
     with_trust_remote_code_override,
 )
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
 from vllm_omni.config.stage_config import _DEPLOY_DIR
 from vllm_omni.config.yaml_util import create_config, load_yaml_config
+from vllm_omni.diffusion.data import normalize_omni_kwargs, parse_attention_config
 from vllm_omni.diffusion.utils.hf_utils import (
     _looks_like_dreamzero,
     get_diffusion_model_index,
@@ -31,6 +32,7 @@ from vllm_omni.diffusion.utils.hf_utils import (
 from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils.model_source import materialize_object_storage_configs
 
 # Get the project root directory (2 levels up from this file)
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -288,7 +290,7 @@ def resolve_model_config_path(model: str) -> str | None:
     # each stage builds its ModelConfig, so config resolution here reads the
     # local copy that vLLM-Omni materializes for such URIs. Name-based
     # fallbacks keep the original string (the materialized path is a hash).
-    config_source = _materialize_object_storage_configs(model)
+    config_source = materialize_object_storage_configs(model)
     # Try to get config from standard transformers format first
     try:
         hf_config = get_config(config_source, trust_remote_code=True)
@@ -373,7 +375,7 @@ def load_stage_configs_from_model(
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
     strategy_config_path: str | None = None,
-) -> tuple[list, str | None]:
+) -> tuple[list[DictConfig], str | None]:
     """Load stage configurations from model's default config file.
 
     For models registered in the pipeline registry, uses
@@ -615,7 +617,7 @@ def load_and_resolve_stage_configs(
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
     strategy_config_path: str | None = None,
-) -> tuple[str, list, str | None]:
+) -> tuple[str, list[DictConfig], str | None]:
     """Load stage configurations from a deploy YAML or model defaults.
 
     Args:
@@ -667,6 +669,63 @@ def load_and_resolve_stage_configs(
     logger.debug(f"stage_configs: {stage_configs}")
 
     return config_path, stage_configs, omni_lb_policy
+
+
+# Kwargs for diffusion to directly copy over into the engine args;
+# Note that this excludes kwargs that have any kind of builder utils,
+# e.g., for attention.
+_DIFFUSION_KWARG_NAMES = [
+    "lora_path",
+    "lora_backend",
+    "additional_config",
+    "diffusion_kv_cache_dtype",
+    "diffusion_kv_cache_skip_steps",
+    "diffusion_kv_cache_skip_layers",
+    "enable_diffusion_pipeline_profiler",
+    "enable_ar_profiler",
+]
+
+
+def _apply_stage_engine_arg_overrides(
+    stage_config: DictConfig,
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply diffusion-specific CLI kwargs to a stage's engine_args (set-if-absent).
+
+    NOTE: quantization / quantization config are handled separately, and this code
+    is being actively refactored. We build the quantization configs as early as possible,
+    since we already have the HF config from resolving the PipelineConfig, and just pass the
+    quant config per type to the engine args.
+    """
+    is_diffusion = stage_config.stage_type == "diffusion"
+
+    if is_diffusion:
+        if stage_config.engine_args is None:
+            stage_config.engine_args = OmegaConf.create({})
+
+        diff_attn_config = getattr(stage_config.engine_args, "diffusion_attention_config", None)
+        diff_attn_backend = getattr(stage_config.engine_args, "diffusion_attention_backend", None)
+        has_stage_attention = diff_attn_config is not None or diff_attn_backend is not None
+        if not has_stage_attention:
+            stage_config.engine_args.diffusion_attention_config = parse_attention_config(
+                kwargs.get("diffusion_attention_config"),
+                attention_backend=kwargs.get("diffusion_attention_backend"),
+                fastvideo_vsa_topk=kwargs.get("fastvideo_vsa_topk"),
+            )
+
+        for name in _DIFFUSION_KWARG_NAMES:
+            val = kwargs.get(name)
+            if val is not None and getattr(stage_config.engine_args, name, None) is None:
+                stage_config.engine_args[name] = val
+
+        # TODO (Alex) deprecate static_lora_scale alias
+        lora_scale = kwargs.get("lora_scale") or kwargs.get("static_lora_scale")
+        if lora_scale is not None and getattr(stage_config.engine_args, "lora_scale", None) is None:
+            stage_config.engine_args.lora_scale = lora_scale
+
+    # Normalize the STAGE's own engine args (quantization -> quantization_config) and convert to dict.
+    engine_args = _to_dict(stage_config.engine_args) if stage_config.engine_args is not None else {}
+    return normalize_omni_kwargs(engine_args, is_diffusion=is_diffusion)
 
 
 def get_final_stage_id_for_e2e(

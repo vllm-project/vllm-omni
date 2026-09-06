@@ -19,8 +19,10 @@ from typing import Any
 import msgspec
 import zmq
 from omegaconf import OmegaConf
+from transformers import PretrainedConfig
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.utils.network_utils import get_open_ports_list, zmq_socket_ctx
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.utils import (
@@ -1492,6 +1494,7 @@ def launch_headless_replica_group(
 def launch_headless_diffusion_replicas(
     *,
     model: str,
+    hf_config: PretrainedConfig | None,
     stage_cfg: Any,
     stage_configs: list[Any],
     stage_id: int,
@@ -1519,7 +1522,7 @@ def launch_headless_diffusion_replicas(
     # from the loaded deploy config so heterogeneous KV routing keys match the
     # head process (e.g. from_tp=2, to_tp=1).
     stage_init_utils.inject_kv_stage_info(stage_cfg, stage_id, stage_configs)
-    od_config = stage_init_utils.build_diffusion_config(model, stage_cfg, metadata)
+    od_config = stage_init_utils.build_diffusion_config(model, hf_config, stage_cfg, metadata)
 
     logger.info(
         "[Headless] Launching %d diffusion replica(s) for stage %d via OmniMasterServer at %s:%d",
@@ -1559,13 +1562,15 @@ def launch_headless_diffusion_replicas(
 def launch_diffusion_stage_replica(
     *,
     model: str,
+    hf_config: PretrainedConfig | None,
     stage_config: Any,
     metadata: Any,
     stage_init_timeout: int,
     use_inline: bool,
     replica_id: int = 0,
-    omni_master_server: OmniMasterServer | None = None,
-    omni_coordinator_address: str | None = None,
+    omni_master_server: OmniMasterServer | None,
+    omni_coordinator_address: str | None,
+    quantization_config: QuantizationConfig | None,
 ) -> tuple[Any, StageReplicaResources]:
     """Launch a local diffusion stage replica.
 
@@ -1577,17 +1582,19 @@ def launch_diffusion_stage_replica(
         client = initialize_diffusion_stage(
             metadata.stage_id,
             model,
+            hf_config,
             stage_config,
             metadata,
             stage_init_timeout=stage_init_timeout,
             use_inline=use_inline,
+            quantization_config=quantization_config,
         )
         return client, StageReplicaResources()
 
     from vllm_omni.diffusion import stage_diffusion_proc
     from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 
-    od_config = build_diffusion_config(model, stage_config, metadata)
+    od_config = build_diffusion_config(model, hf_config, stage_config, metadata, quantization_config)
     parallel_config = getattr(od_config, "parallel_config", None)
     world_size = getattr(parallel_config, "world_size", 1)
     try:

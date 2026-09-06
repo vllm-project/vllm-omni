@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for Int8 quantization config."""
 
 import pytest
@@ -9,10 +9,10 @@ from torch.nn import Module, Parameter
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
 from vllm_omni.platforms import current_omni_platform
-from vllm_omni.quantization import build_quant_config
+from vllm_omni.quantization import build_quantization_config
 from vllm_omni.quantization.factory import SUPPORTED_QUANTIZATION_METHODS
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 npu_available = pytest.mark.skipif(not current_omni_platform.is_npu(), reason="NPU platform not available.")
 
@@ -21,33 +21,43 @@ cuda_available = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason=
 
 def test_int8_config_creation():
     """Test that Int8 config can be created."""
-    config = build_quant_config("int8")
+    config = build_quantization_config("int8")
     assert config is not None
     assert config.get_name() == "int8"
 
 
 def test_none_quantization():
     """Test that None quantization returns None config."""
-    config = build_quant_config(None)
+    config = build_quantization_config(None)
     assert config is None
 
 
 def test_invalid_quantization():
     """Test that invalid quantization method raises error."""
     with pytest.raises(ValueError, match="Unknown quantization method"):
-        build_quant_config("invalid_method")
+        build_quantization_config("invalid_method")
 
 
 def test_int8_config_with_custom_params():
     """Test Int8 config with custom parameters."""
-    config = build_quant_config(
-        "int8",
-        activation_scheme="dynamic",
-        ignored_layers=["proj_out"],
+    config = build_quantization_config(
+        {"method": "int8", "activation_scheme": "dynamic", "ignored_layers": ["proj_out"]}
     )
     assert config is not None
     assert config.activation_scheme == "dynamic"
     assert "proj_out" in config.ignored_layers
+
+
+def test_no_quantization_config_is_not_serialized():
+    """Ensure that if we have no loaded config for quantization, it's not serialized."""
+    config = build_quantization_config("int8")
+    assert config is not None and not config.is_checkpoint_int8_serialized
+
+
+def test_with_quantization_config_is_serialized():
+    """Ensure that if we have a loaded config for quantization, it's serialized."""
+    config = build_quantization_config("int8", {"quant_method": "int8"})
+    assert config is not None and config.is_checkpoint_int8_serialized
 
 
 def test_supported_methods():
@@ -55,56 +65,27 @@ def test_supported_methods():
     assert "int8" in SUPPORTED_QUANTIZATION_METHODS
 
 
-def test_quantization_integration():
-    """Test end-to-end quantization flow through OmniDiffusionConfig."""
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-
-    # Test with quantization_config string
-    config = OmniDiffusionConfig(model="test", quantization_config="int8")
-    assert config.quantization_config is not None
-    assert config.quantization_config.get_name() == "int8"
-
-    # Test with quantization_config dict
-    config2 = OmniDiffusionConfig(
-        model="test",
-        quantization_config={"method": "int8", "activation_scheme": "dynamic"},
-    )
-    assert config2.quantization_config is not None
-    assert config2.quantization_config.get_name() == "int8"
-    assert config2.quantization_config.activation_scheme == "dynamic"
-
-
-def test_quantization_dict_not_mutated():
+def test_build_quantization_config_dict_not_mutated():
     """Test that passing a dict to quantization_config doesn't mutate it."""
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-
     original_dict = {"method": "int8", "activation_scheme": "dynamic"}
     dict_copy = original_dict.copy()
-
-    OmniDiffusionConfig(model="test", quantization_config=original_dict)
-
-    # Original dict should be unchanged
+    build_quantization_config(original_dict)
     assert original_dict == dict_copy
 
 
 def test_quantization_config_string_and_dict_equivalent():
-    """Test that string and dict forms produce equivalent configs."""
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-
-    config_str = OmniDiffusionConfig(model="test", quantization_config="int8")
-    config_dict = OmniDiffusionConfig(
-        model="test",
-        quantization_config={"method": "int8", "activation_scheme": "dynamic"},
-    )
-    assert config_str.quantization_config.get_name() == config_dict.quantization_config.get_name()
-    assert config_str.quantization_config.activation_scheme == config_dict.quantization_config.activation_scheme
+    """String and dict forms should produce equivalent configs."""
+    config_str = build_quantization_config("int8")
+    config_dict = build_quantization_config({"method": "int8", "activation_scheme": "dynamic"})
+    assert config_str.get_name() == config_dict.get_name()
+    assert config_str.activation_scheme == config_dict.activation_scheme
 
 
 def test_get_quant_method(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     """Test for get_quant_method method for GPU"""
     from vllm_omni.quantization.int8_config import Int8OnlineLinearMethod
 
-    config = build_quant_config("int8")
+    config = build_quantization_config("int8")
 
     def _fake_init(self, quant_config):
         pass
@@ -130,7 +111,7 @@ def test_get_npu_quant_method(mocker: MockerFixture, monkeypatch: pytest.MonkeyP
     """Test for get_quant_method method for NPU"""
     from vllm_omni.quantization.int8_config import NPUInt8OnlineLinearMethod
 
-    config = build_quant_config("int8")
+    config = build_quantization_config("int8")
 
     layer = mocker.Mock(spec=LinearBase)
     prefix = "test_layer"
@@ -157,7 +138,7 @@ def test_fused_layer_can_be_ignored_by_its_prefix(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
-    config = build_quant_config("int8", ignored_layers=["blocks.0.attn.qkv_proj"])
+    config = build_quantization_config({"method": "int8", "ignored_layers": ["blocks.0.attn.qkv_proj"]})
     layer = mocker.Mock(spec=LinearBase)
 
     assert isinstance(config.get_quant_method(layer, "blocks.0.attn.qkv_proj"), UnquantizedLinearMethod)

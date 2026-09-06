@@ -17,6 +17,7 @@ from typing import Any, cast
 
 import janus
 from omegaconf import OmegaConf
+from transformers import PretrainedConfig
 from vllm.logger import init_logger
 
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
@@ -66,6 +67,7 @@ from vllm_omni.entrypoints.stage_utils import resolve_stage_physical_devices
 from vllm_omni.entrypoints.utils import inject_omni_kv_config
 from vllm_omni.outputs.output_metadata import FinalOutputModalityType
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization.factory import build_quantization_config, read_checkpoint_quantization_config
 
 logger = init_logger(__name__)
 
@@ -123,6 +125,7 @@ class StageRuntime:
         model: str,
         config_path: str,
         *,
+        hf_config: PretrainedConfig | None,
         stage_init_timeout: int,
         async_chunk: bool,
         tokenizer: str | None = None,
@@ -132,6 +135,7 @@ class StageRuntime:
         self._stage_configs = stage_configs
         self._model = model
         self._config_path = config_path
+        self._hf_config = hf_config
         self._stage_init_timeout = stage_init_timeout
         self._async_chunk = async_chunk
         self._tokenizer = tokenizer
@@ -370,6 +374,17 @@ class StageRuntime:
             num_replicas = replicas_per_stage[stage_idx]
             launch_mode = self._get_launch_mode(stage_id)
 
+            # TODO: (Alex) This should be folded into the VllmOmniConfig.
+            # Build the quantization config early so both the LLM and diffusion
+            # init paths share one instance. Quantization is already normalized
+            # to `quantization_config` for all engine types before this point.
+            quantization_config = build_quantization_config(
+                quantization=stage_cfg.engine_args.get("quantization_config", None),
+                quant_config=read_checkpoint_quantization_config(self._model),
+            )
+            if quantization_config is not None:
+                logger.info("created quantization config of type: %s", type(quantization_config).__name__)
+
             replicas: list[ReplicaInitPlan] = []
             stage_vllm_config = None
             executor_class = None
@@ -397,8 +412,10 @@ class StageRuntime:
                 stage_vllm_config, executor_class = build_vllm_config(
                     stage_cfg,
                     self._model,
+                    self._hf_config,
                     stage_connector_spec=stage_connector_spec,
                     engine_args_dict=engine_args_dict,
+                    quantization_config=quantization_config,
                 )
 
             for replica_id in range(num_replicas):
@@ -422,6 +439,7 @@ class StageRuntime:
                         stage_vllm_config=stage_vllm_config,
                         executor_class=executor_class,
                         engine_args_dict=copy.deepcopy(engine_args_dict) if engine_args_dict is not None else None,
+                        quantization_config=quantization_config,
                     )
                 )
 
@@ -723,6 +741,12 @@ class StageRuntime:
         stage_init_timeout: int,
     ) -> StagePoolClient:
         """Initialize one local LLM replica using vLLM's launch/attach pattern."""
+        # This should not happen because build_vllm_config .replace()s the plan's
+        # quantization_config onto the vLLM config, so they must be identical.
+        if plan.stage_vllm_config is not None and plan.stage_vllm_config.quant_config is not plan.quantization_config:
+            logger.warning(
+                "LLM replica vLLM config's quantization config does not match the plan's quantization config"
+            )
         resources: StageReplicaResources | None = None
         stage_client = None
         lock_fds: list[int] = []
@@ -893,6 +917,7 @@ class StageRuntime:
                 )
                 client, resources = launch_diffusion_stage_replica(
                     model=self._model,
+                    hf_config=self._hf_config,
                     stage_config=plan.stage_cfg,
                     metadata=plan.metadata,
                     stage_init_timeout=stage_init_timeout,
@@ -901,6 +926,7 @@ class StageRuntime:
                     replica_id=plan.replica_id,
                     omni_master_server=self._get_omni_master_server(),
                     omni_coordinator_address=self._get_coordinator_address(),
+                    quantization_config=plan.quantization_config,
                 )
 
             logger.info(
@@ -989,6 +1015,7 @@ class DistStageRuntime(StageRuntime):
         model: str,
         config_path: str,
         *,
+        hf_config: PretrainedConfig | None,
         stage_init_timeout: int,
         async_chunk: bool,
         single_stage_id_filter: int | None,
@@ -1006,6 +1033,7 @@ class DistStageRuntime(StageRuntime):
             stage_configs=stage_configs,
             model=model,
             config_path=config_path,
+            hf_config=hf_config,
             stage_init_timeout=stage_init_timeout,
             async_chunk=async_chunk,
             tokenizer=tokenizer,
@@ -1326,6 +1354,7 @@ def create_stage_runtime(
     model: str,
     config_path: str,
     *,
+    hf_config: PretrainedConfig | None,
     single_stage_mode: bool,
     stage_init_timeout: int,
     async_chunk: bool,
@@ -1349,6 +1378,7 @@ def create_stage_runtime(
             stage_configs=stage_configs,
             model=model,
             config_path=config_path,
+            hf_config=hf_config,
             stage_init_timeout=stage_init_timeout,
             async_chunk=async_chunk,
             tokenizer=tokenizer,
@@ -1366,6 +1396,7 @@ def create_stage_runtime(
         stage_configs=stage_configs,
         model=model,
         config_path=config_path,
+        hf_config=hf_config,
         stage_init_timeout=stage_init_timeout,
         async_chunk=async_chunk,
         tokenizer=tokenizer,

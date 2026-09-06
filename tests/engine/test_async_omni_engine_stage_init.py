@@ -11,7 +11,7 @@ import types
 
 import pytest
 
-from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, normalize_omni_diffusion_kwargs
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, normalize_omni_kwargs
 from vllm_omni.engine import async_omni_engine as async_omni_engine_module
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_init_utils import (
@@ -1827,7 +1827,7 @@ def test_resolve_stage_configs_does_not_inject_over_stage_diffusion_attention_ba
     engine_args = stage_configs[0].engine_args
     assert engine_args.diffusion_attention_backend == "TORCH_SDPA"
     assert engine_args.diffusion_attention_config is None
-    normalized = normalize_omni_diffusion_kwargs(vars(engine_args))
+    normalized = normalize_omni_kwargs(vars(engine_args), is_diffusion=True)
     assert normalized["diffusion_attention_config"].default.backend == "TORCH_SDPA"
 
 

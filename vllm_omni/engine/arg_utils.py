@@ -11,11 +11,15 @@ from typing import Any, cast
 
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
+from vllm.model_executor.models import ModelRegistry
 
 from vllm_omni.config import OmniModelConfig
+from vllm_omni.model_executor.models.registry import _OMNI_MODELS
 from vllm_omni.outputs.output_modality import OutputModality
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.plugins import load_omni_general_plugins
+from vllm_omni.quantization.factory import register_omni_quantization_configs
+from vllm_omni.reasoning import register_omni_reasoning_parsers
 from vllm_omni.worker.omni_connector_validation import validate_worker_omni_connector
 
 logger = init_logger(__name__)
@@ -116,10 +120,6 @@ def _register_omni_hf_configs() -> None:
 
 
 def register_omni_models_to_vllm():
-    from vllm.model_executor.models import ModelRegistry
-
-    from vllm_omni.model_executor.models.registry import _OMNI_MODELS
-
     _register_omni_hf_configs()
 
     # Unconditionally (re)register every omni arch into the upstream global
@@ -133,8 +133,14 @@ def register_omni_models_to_vllm():
     for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
         ModelRegistry.register_model(arch, f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}")
 
-    # Register omni-specific reasoning parsers (e.g., step_audio).
-    import vllm_omni.reasoning  # noqa: F401
+    # Register any custom reasoning parsers specific to vLLM Omni
+    register_omni_reasoning_parsers()
+
+    # Register any custom quantization implementations specific to vLLM Omni;
+    # This is done to ensure that routing through vLLM has the same quantization
+    # lookup behavior as paths that build the quantization config directly, e.g.,
+    # diffusion.
+    register_omni_quantization_configs()
 
 
 @dataclass
@@ -555,7 +561,6 @@ class OrchestratorArgs:
     ulysses_a2a_permute: bool | None = None
     ring_degree: int | None = None
     allgather_degree: int | None = None
-    diffusion_quantization_config: str | None = None
     use_hsdp: bool = False
     hsdp_shard_size: int = -1
     hsdp_replicate_size: int = 1

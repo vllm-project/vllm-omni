@@ -397,7 +397,7 @@ class TestResolveModelConfigPath:
         )
         uri = "s3://qwen3-tts-models/Qwen3-Omni-30B-A3B-Instruct"
         materialize = mocker.patch(
-            "vllm_omni.entrypoints.utils._materialize_object_storage_configs",
+            "vllm_omni.entrypoints.utils.materialize_object_storage_configs",
             return_value=str(tmp_path),
         )
         get_config = mocker.patch(

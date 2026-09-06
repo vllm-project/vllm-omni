@@ -1376,35 +1376,6 @@ def test_diffusion_config_field_classification_covers_current_fields():
     assert "prompt_file_path" in omni_config_module._DIFFUSION_RUNTIME_CONFIG_FIELDS
 
 
-def test_diffusion_config_projection_keeps_mapping_quantization_config_serializable():
-    quantization_config = {
-        "method": "example_quant",
-        "weights": "weights.bin",
-    }
-
-    cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(quantization_config=quantization_config)
-
-    assert cfg.quantization_config == quantization_config
-
-
-def test_diffusion_quantization_mapping_reaches_terminal_config(monkeypatch):
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-
-    quantization_config = {"method": "int8", "activation_scheme": "dynamic"}
-    cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(
-        quantization_config=quantization_config,
-    )
-
-    # Exercise the terminal construction performed by the future typed startup
-    # path without probing ports or loading remote model metadata.
-    monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda _self: 29500)
-    monkeypatch.setattr(OmniDiffusionConfig, "enrich_config", lambda _self: None)
-    cfg.enrich_config()
-
-    assert cfg.quantization_config is not None
-    assert cfg.quantization_config.get_name() == "int8"
-
-
 def test_compact_offload_config_reaches_terminal_config(monkeypatch):
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy

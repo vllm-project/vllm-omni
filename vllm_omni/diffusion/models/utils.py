@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ from vllm.model_executor.models.transformers.utils import init_on_device_without
 from vllm.model_executor.models.utils import maybe_prefix
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.quantization import build_quant_config
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig, PreTrainedModel
@@ -78,7 +77,7 @@ def recursive_replace_linear(model: nn.Module, od_config: OmniDiffusionConfig):
     - `nn.Linear` with vLLM's tensor parallel linear classes
     """
     # Prefix the patterns because we always start from `self.model`
-    quant_config = build_quant_config(od_config.quantization_config)
+    quant_config = od_config.quantization_config
 
     def _recursive_replace(module: nn.Module, prefix: str):
         for child_name, child_module in module.named_children():

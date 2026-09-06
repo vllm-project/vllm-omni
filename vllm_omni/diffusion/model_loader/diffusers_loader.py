@@ -16,7 +16,7 @@ import torch
 from torch import nn
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig, QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
     filter_files_not_needed_for_inference,
@@ -54,39 +54,7 @@ from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.offloader.offload_plan import get_offload_plan
 from vllm_omni.diffusion.registry import initialize_model
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
-
-
-# download_gguf was removed from upstream vLLM (commit 6635279d8).
-# Inlined from the last upstream version before the GGUF plugin migration.
-def download_gguf(
-    repo_id: str,
-    quant_type: str,
-    cache_dir: str | None = None,
-    revision: str | None = None,
-    ignore_patterns: str | list[str] | None = None,
-) -> str:
-    allow_patterns = [
-        f"*-{quant_type}.gguf",
-        f"*-{quant_type}-*.gguf",
-        f"*/*-{quant_type}.gguf",
-        f"*/*-{quant_type}-*.gguf",
-    ]
-    folder = download_weights_from_hf(
-        model_name_or_path=repo_id,
-        cache_dir=cache_dir,
-        allow_patterns=allow_patterns,
-        revision=revision,
-        ignore_patterns=ignore_patterns,
-    )
-    local_files: list[str] = []
-    for pattern in allow_patterns:
-        glob_pattern = os.path.join(folder, pattern)
-        local_files.extend(glob.glob(glob_pattern))
-    if not local_files:
-        raise ValueError(f"Downloaded GGUF files not found in {folder} for quant_type {quant_type}")
-    local_files.sort(key=lambda x: (x.count("-"), x))
-    return local_files[0]
-
+from vllm_omni.quantization import resolve_component_quant_config
 
 logger = init_logger(__name__)
 
@@ -388,12 +356,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 return checkpoint_adapter.adapt(prefixed_weights_iterator)
         return prefixed_weights_iterator
 
-    def _get_source_quant_config(self, source: "ComponentSource") -> object | None:
-        quant_config = self.quant_config
-        resolve = getattr(quant_config, "resolve", None)
-        if resolve is not None:
-            return resolve(source.prefix.rstrip("."))
-        return quant_config
+    def _get_source_quant_config(self, source: "ComponentSource") -> QuantizationConfig | None:
+        return resolve_component_quant_config(self.quant_config, source.prefix.rstrip("."))
 
     def _get_checkpoint_adapter(
         self,
@@ -556,9 +520,10 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         offload_after_quant = False
         if load_device == "cpu" and self.quant_config is not None and device is not None:
             quant_cfg = self.quant_config
-            is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(
-                quant_cfg, "is_checkpoint_quantized", False
-            )
+            # TODO: Check if we need to handle FP8 / NVFP4 here, since is_checkpoint_*_serialized
+            # isn't handled, but these would also be offline checkpoints
+            is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp"
+
             if not is_offline:
                 load_device = device.type
                 offload_after_quant = True

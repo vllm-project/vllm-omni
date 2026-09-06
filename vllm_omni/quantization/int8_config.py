@@ -21,7 +21,10 @@ from vllm.model_executor.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
-from vllm.model_executor.layers.quantization import QuantizationMethods
+from vllm.model_executor.layers.quantization import (
+    QuantizationMethods,
+    register_quantization_config,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -125,6 +128,7 @@ def create_weight_parameter(
     )
 
 
+@register_quantization_config("int8")
 class DiffusionInt8Config(QuantizationConfig):
     """INT8 quantization config for diffusion transformers.
 

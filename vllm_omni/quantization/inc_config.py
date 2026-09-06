@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Extended INC/AutoRound config for multi-stage omni models."""
 
 from __future__ import annotations
@@ -10,10 +10,13 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch.nn import Module
 from vllm.model_executor.layers.linear import LinearMethodBase
+from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.inc import INCConfig
 from vllm.model_executor.models.utils import WeightsMapper
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import replace_parameter
+
+from vllm_omni.quantization.factory import get_quantization_method
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -49,6 +52,10 @@ def _map_with_stage_prefix(
     return result
 
 
+# Register Intel Neural Compressor quantization under "inc" only to match vLLM;
+# Then AutoRound is handled in override_quantization_method below rather than
+# as aliases in the registry.
+@register_quantization_config("inc")
 class OmniINCConfig(INCConfig):
     """INCConfig extended with multi-stage prefix remapping and MXFP8 support.
 
@@ -65,6 +72,30 @@ class OmniINCConfig(INCConfig):
     # Extend supported data types and formats to include MXFP8
     SUPPORTED_DTYPES = {"int", "mx_fp"}
     SUPPORTED_FORMATS = {"auto_round:auto_gptq", "auto_round:auto_awq", "auto_round:llm_compressor"}
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # bits and weight_bits are aliases; we should consider getting rid of this unless
+        # there is a concrete need for it, but for now porting to keep the behavior in the
+        # original builder pattern.
+        if "bits" in kwargs:
+            bits = kwargs.pop("bits")
+            if kwargs.setdefault("weight_bits", bits) != bits:
+                raise ValueError(f"Conflicting bit widths: bits={bits}, weight_bits={kwargs['weight_bits']}.")
+        super().__init__(*args, **kwargs)
+
+    @classmethod
+    def override_quantization_method(cls, hf_quant_cfg, user_quant, hf_config=None):
+        """Claim AutoRound checkpoints for INC, accepting both name spellings.
+
+        NOTE: vLLM's INCConfig only matches "auto-round"; we also accept the
+        "auto_round" underscore variant so either spelling resolves to inc.
+
+        Ref: https://github.com/vllm-project/vllm/blob/v0.28.0/vllm/model_executor/layers/quantization/inc/inc.py#L253
+        """
+        if get_quantization_method(hf_quant_cfg) == "auto_round":
+            return cls.get_name()
+        # Canonical "auto-round" (and anything else) is delegated to the parent.
+        return super().override_quantization_method(hf_quant_cfg, user_quant, hf_config)
 
     # ------------------------------------------------------------------
     # Core integration: called by vLLM's configure_quant_config()

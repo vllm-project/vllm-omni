@@ -6,6 +6,12 @@ from dataclasses import dataclass, field
 import torch
 from torch import nn
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptFp8Config,
+    ModelOptMixedPrecisionConfig,
+    ModelOptNvFp4Config,
+)
 from vllm.model_executor.models.utils import WeightsMapper
 from vllm.model_executor.utils import get_packed_modules_mapping
 
@@ -53,7 +59,7 @@ class ModelOptFp8CheckpointAdapter:
     def is_compatible(
         cls,
         source: object,
-        quant_config: object | None,
+        quant_config: QuantizationConfig | None,
         use_safetensors: bool,
     ) -> bool:
         return use_safetensors and cls._is_transformer_source(source) and cls._is_checkpoint_quant_config(quant_config)
@@ -65,13 +71,10 @@ class ModelOptFp8CheckpointAdapter:
         return str(getattr(source, "prefix", "")).startswith("transformer.")
 
     @staticmethod
-    def _is_checkpoint_quant_config(quant_config: object | None) -> bool:
-        return (
-            quant_config is not None
-            and hasattr(quant_config, "get_name")
-            and quant_config.get_name() == "modelopt"
-            and bool(getattr(quant_config, "is_checkpoint_fp8_serialized", False))
-        )
+    def _is_checkpoint_quant_config(quant_config: QuantizationConfig | None) -> bool:
+        if quant_config is not None and isinstance(quant_config, ModelOptFp8Config):
+            return quant_config.is_checkpoint_fp8_serialized
+        return False
 
     @staticmethod
     def _get_model_loadable_tensors(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -274,13 +277,10 @@ class ModelOptNvFp4CheckpointAdapter(ModelOptFp8CheckpointAdapter):
     _PRE_QUANT_SCALE_SUFFIX = ".pre_quant_scale"
 
     @staticmethod
-    def _is_checkpoint_quant_config(quant_config: object | None) -> bool:
-        return (
-            quant_config is not None
-            and hasattr(quant_config, "get_name")
-            and quant_config.get_name() == "modelopt_fp4"
-            and bool(getattr(quant_config, "is_checkpoint_nvfp4_serialized", False))
-        )
+    def _is_checkpoint_quant_config(quant_config: QuantizationConfig | None) -> bool:
+        if quant_config is not None and isinstance(quant_config, ModelOptNvFp4Config):
+            return quant_config.is_checkpoint_nvfp4_serialized
+        return False
 
     def adapt(
         self,
@@ -301,9 +301,5 @@ class ModelOptNvFp4CheckpointAdapter(ModelOptFp8CheckpointAdapter):
 
 class ModelOptMixedPrecisionCheckpointAdapter(ModelOptFp8CheckpointAdapter):
     @staticmethod
-    def _is_checkpoint_quant_config(quant_config: object | None) -> bool:
-        return (
-            quant_config is not None
-            and hasattr(quant_config, "get_name")
-            and quant_config.get_name() == "modelopt_mixed"
-        )
+    def _is_checkpoint_quant_config(quant_config: QuantizationConfig | None) -> bool:
+        return quant_config is not None and isinstance(quant_config, ModelOptMixedPrecisionConfig)

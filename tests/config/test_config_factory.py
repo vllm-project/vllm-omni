@@ -14,8 +14,7 @@ import pytest
 from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 
 from tests.helpers.stage_config import get_deploy_config_path, get_deploy_config_stage
-from vllm_omni.config import config_factory as config_factory_module
-from vllm_omni.config.config_factory import StageConfigFactory, _materialize_object_storage_configs
+from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
 from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline, resolve_pipeline_config
@@ -38,6 +37,7 @@ from vllm_omni.config.stage_config import (
     pipeline_cfg_resolver,
 )
 from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
+from vllm_omni.utils.model_source import materialize_object_storage_configs
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -62,7 +62,7 @@ def clear_config_factory_caches():
     yield
     StageConfigFactory.get_hf_config.cache_clear()
     StageConfigFactory.try_infer_model_type.cache_clear()
-    _materialize_object_storage_configs.cache_clear()
+    materialize_object_storage_configs.cache_clear()
 
 
 Q3_OMNI_ALL_STAGES_HF_CONFIG = Qwen3OmniMoeConfig(enable_audio_output=True)
@@ -691,6 +691,12 @@ class TestPipelineConfigNew:
 
 
 class TestPipelineRegistration:
+    @pytest.fixture(autouse=True)
+    def stub_checkpoint_quant_read(self):
+        """Ensure read_checkpoint_quantization_config is a stub to keep tests runnable offline."""
+        with patch("vllm_omni.config.omni_config.read_checkpoint_quantization_config", return_value=None):
+            yield
+
     def test_resolve_pipeline_prefers_deploy_pipeline_key(self, clean_pipeline_registry, tmp_path):
         deploy_key = "deploy_selected_pipeline"
         model_type_key = "hf_model_type_pipeline"
@@ -3164,7 +3170,7 @@ class TestObjectStorageConfigResolution:
                 for name, content in materialized_files:
                     (tmp_path / name).write_text(content)
 
-        monkeypatch.setattr(config_factory_module, "ObjectStorageModel", FakeObjectStorageModel)
+        monkeypatch.setattr("vllm_omni.utils.model_source.ObjectStorageModel", FakeObjectStorageModel)
 
         class Recorder:
             def __init__(self) -> None:
@@ -3177,15 +3183,15 @@ class TestObjectStorageConfigResolution:
         return Recorder()
 
     def test_passthrough_for_non_uri(self, fake_object_storage):
-        assert _materialize_object_storage_configs("org/model") == "org/model"
-        assert _materialize_object_storage_configs("/local/model") == "/local/model"
+        assert materialize_object_storage_configs("org/model") == "org/model"
+        assert materialize_object_storage_configs("/local/model") == "/local/model"
         assert fake_object_storage.pulls == []
 
     def test_materialize_pulls_configs_once_per_uri(self, fake_object_storage):
         uri = "s3://bucket/model"
 
-        first = _materialize_object_storage_configs(uri)
-        second = _materialize_object_storage_configs(uri)
+        first = materialize_object_storage_configs(uri)
+        second = materialize_object_storage_configs(uri)
 
         assert first == second
         assert len(fake_object_storage.pulls) == 1

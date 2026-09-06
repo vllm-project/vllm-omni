@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from types import SimpleNamespace
-
 import pytest
+from omegaconf import OmegaConf
 
 from vllm_omni.diffusion.data import AttentionConfig
 from vllm_omni.engine import stage_init_utils
@@ -88,7 +87,7 @@ def test_stage_override_preserves_model_extras_for_default_diffusion_stage(mocke
     """Local/unregistered Diffusers checkpoints still honor stage-0 extras."""
 
     def resolve_with_default(*_args, default_stage_cfg_factory, **_kwargs):
-        return None, default_stage_cfg_factory(), None
+        return None, OmegaConf.create(default_stage_cfg_factory()), None
 
     mocker.patch(
         "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
@@ -482,9 +481,12 @@ def test_invalid_diffusion_offload_config_fails_before_model_loading(monkeypatch
         stage_init_utils.initialize_diffusion_stage(
             stage_id=0,
             model="test",
+            hf_config=None,
             stage_cfg=object(),
             metadata=mocker.Mock(),
             stage_init_timeout=30,
+            use_inline=False,
+            quantization_config=None,
         )
 
     create_client.assert_not_called()
@@ -650,9 +652,9 @@ def test_default_stage_resolves_video_output_from_checkpoint(mocker):
 
     def resolve_with_default(*args, default_stage_cfg_factory, **kwargs):
         del args, kwargs
-        captured.update(default_stage_cfg_factory()[0])
-        stage = SimpleNamespace(stage_type="diffusion", engine_args=SimpleNamespace())
-        return ("", [stage], None)
+        stage_configs = default_stage_cfg_factory()
+        captured.update(stage_configs[0])
+        return "", OmegaConf.create(stage_configs), None
 
     resolver = mocker.patch(
         "vllm_omni.engine.async_omni_engine.resolve_model_class_name",
@@ -680,9 +682,9 @@ def test_default_diffusers_stage_preserves_video_model_identity(mocker):
 
     def resolve_with_default(*args, default_stage_cfg_factory, **kwargs):
         del args, kwargs
-        captured.update(default_stage_cfg_factory()[0])
-        stage = SimpleNamespace(stage_type="diffusion", engine_args=SimpleNamespace())
-        return ("", [stage], None)
+        stage_configs = default_stage_cfg_factory()
+        captured.update(stage_configs[0])
+        return "", OmegaConf.create(stage_configs), None
 
     mocker.patch(
         "vllm_omni.diffusion.utils.hf_utils.get_diffusion_model_index",
@@ -707,14 +709,8 @@ def test_default_diffusers_stage_preserves_video_model_identity(mocker):
 
 def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mocker):
     """Ensure YAML/deploy stage resolution forwards top-level additional_config."""
-    fake_diffusion_stage = SimpleNamespace(
-        stage_type="diffusion",
-        engine_args=SimpleNamespace(),
-    )
-    fake_llm_stage = SimpleNamespace(
-        stage_type="llm",
-        engine_args=SimpleNamespace(),
-    )
+    fake_diffusion_stage = OmegaConf.create({"stage_type": "diffusion", "engine_args": {}})
+    fake_llm_stage = OmegaConf.create({"stage_type": "llm", "engine_args": {}})
     mocker.patch(
         "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
         return_value=("dummy.yaml", [fake_llm_stage, fake_diffusion_stage], None),
@@ -731,8 +727,8 @@ def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mo
         trust_remote_code=False,
     )
 
-    assert not hasattr(stage_configs[0].engine_args, "additional_config")
-    assert stage_configs[1].engine_args.additional_config == {"torchair_graph_config": {"enabled": True}}
+    assert "additional_config" not in stage_configs[0]["engine_args"]
+    assert stage_configs[1]["engine_args"]["additional_config"] == {"torchair_graph_config": {"enabled": True}}
 
 
 @pytest.mark.parametrize(
@@ -763,27 +759,3 @@ def test_default_stage_config_includes_quantization_config():
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg({"quantization_config": quantization_config})[0]
 
     assert stage_cfg["engine_args"]["quantization_config"] == quantization_config
-
-
-def test_resolve_stage_configs_injects_quantization_config_into_diffusion_stage(mocker):
-    fake_diffusion_stage = SimpleNamespace(
-        stage_type="diffusion",
-        engine_args=SimpleNamespace(quantization_config=None),
-    )
-    mocker.patch(
-        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
-        return_value=("dummy.yaml", [fake_diffusion_stage], None),
-    )
-
-    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
-
-    _, stage_configs = engine._resolve_stage_configs(
-        "dummy-model",
-        {
-            "deploy_config": "dummy.yaml",
-            "quantization_config": {"method": "bitsandbytes"},
-        },
-        trust_remote_code=False,
-    )
-
-    assert stage_configs[0].engine_args.quantization_config == {"method": "bitsandbytes"}

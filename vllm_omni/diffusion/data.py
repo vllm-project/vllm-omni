@@ -31,7 +31,11 @@ from vllm_omni.diffusion.lora.manager import LoRABackend
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.errors import client_error_metadata
-from vllm_omni.quantization import build_quant_config
+from vllm_omni.quantization.factory import (
+    build_quantization_config,
+    get_quantization_method,
+    should_adopt_checkpoint_quant_config,
+)
 
 if TYPE_CHECKING:
     from vllm.config import KVTransferConfig, ProfilerConfig
@@ -42,23 +46,31 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
-    """Normalize legacy diffusion kwargs before config construction."""
+def normalize_omni_kwargs(kwargs: dict[str, Any], is_diffusion: bool) -> dict[str, Any]:
+    """Normalize legacy diffusion kwargs before config construction and return a handle to the
+    normalized kwargs.
+
+    NOTE: This should be the only place we handle kwarg fallbacks/aliases so that we can
+    easily deprecate them for removal in future releases if needed.
+    """
     normalized = dict(kwargs)
 
+    # For quantization, map quantization -> quantization_config, regardless of type,
+    # so that we can build out of the same field later.
+    if "quantization" in normalized and normalized.get("quantization_config", None) is None:
+        normalized["quantization_config"] = normalized.pop("quantization")
+    else:
+        normalized.pop("quantization", None)
+    if not is_diffusion:
+        return normalized
+
+    ### Diffusion specific
     # Backwards-compatibility: older callers may use a diffusion-specific
     # "static_lora_scale" kwarg. Normalize it to the canonical "lora_scale".
     if "static_lora_scale" in normalized:
         if "lora_scale" not in normalized:
             normalized["lora_scale"] = normalized["static_lora_scale"]
         normalized.pop("static_lora_scale", None)
-
-    # Backwards-compatibility: map "quantization" to "quantization_config"
-    # so callers using the old field name still work.
-    if "quantization" in normalized and normalized.get("quantization_config", None) is None:
-        normalized["quantization_config"] = normalized.pop("quantization")
-    else:
-        normalized.pop("quantization", None)
 
     # Renamed from kv_cache_* to avoid clashing with vLLM's --kv-cache-dtype.
     if normalized.get("diffusion_kv_cache_dtype") is None and "kv_cache_dtype" in normalized:
@@ -453,8 +465,8 @@ class TransformerConfig:
         quant_config: QuantizationConfig | None = None
         disk_qc = params.get("quantization_config")
         if isinstance(disk_qc, dict):
-            raw_quant_method = disk_qc.get("quant_method", disk_qc.get("method"))
-            quant_config = build_quant_config(disk_qc)
+            raw_quant_method = get_quantization_method(disk_qc)
+            quant_config = build_quantization_config(disk_qc)
             if quant_config is not None:
                 quant_method = raw_quant_method if raw_quant_method is not None else quant_config.get_name()
 
@@ -945,10 +957,7 @@ class OmniDiffusionConfig:
     # Model-specific function for collecting CFG KV caches (set at runtime)
     cfg_kv_collect_func: Any | None = None
 
-    # Quantization: str method name, dict config, QuantizationConfig, or None.
-    # str is resolved to {"method": <str>} internally.
-    # Per-component: {"transformer": {"method": "fp8"}, "vae": None}
-    quantization_config: str | QuantizationConfig | dict[str, Any] | None = None
+    quantization_config: QuantizationConfig | None = None
     # Explicit runtime override for ModelOpt FP8 diffusion checkpoints. This
     # does not enable FP8 by itself; it only selects CUTLASS once the checkpoint
     # has already resolved to vLLM's ModelOpt FP8 linear method.
@@ -1207,25 +1216,19 @@ class OmniDiffusionConfig:
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
 
+        # Normalize the incoming quant spec (legacy "quantization" str / dict)
+        # into a real QuantizationConfig so the field matches its declared type,
+        # which ensure sthat we actually have a quantization config here.
+        # FIXME - this is probably not the best way to do this; i.e., we should prebuild
+        # the config directly on the common path, which if true, makes this a no-op.
+        # We should remove this and also the tf propagation once types are safe everywhere.
+        self.quantization_config = build_quantization_config(self.quantization_config)
+
         # Auto-detect quantization from TransformerConfig if not explicitly set.
         # This covers the case where tf_model_config is passed at construction
         # time. For late (post-construction) assignment, callers should use
         # set_tf_model_config() which propagates quant_config automatically.
         self._propagate_quantization_from_tf_config(self.tf_model_config)
-
-        # Resolve quantization_config: str/dict -> QuantizationConfig via build_quant_config.
-        if self.quantization_config is not None:
-            if isinstance(self.quantization_config, QuantizationConfig):
-                pass  # Already built
-            elif isinstance(self.quantization_config, str):
-                self.quantization_config = build_quant_config(self.quantization_config)
-            elif isinstance(self.quantization_config, Mapping):
-                self.quantization_config = build_quant_config(dict(self.quantization_config))
-            else:
-                raise TypeError(
-                    f"quantization_config must be str, dict, QuantizationConfig, or None, "
-                    f"got {type(self.quantization_config)!r}"
-                )
 
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
@@ -1268,44 +1271,15 @@ class OmniDiffusionConfig:
                 )
 
     def _propagate_quantization_from_tf_config(self, tf_config: "TransformerConfig") -> None:
-        if tf_config.quant_config is None:
+        checkpoint = tf_config.quant_config
+        if checkpoint is None:
             return
-
-        is_checkpoint_fp8 = bool(getattr(tf_config.quant_config, "is_checkpoint_fp8_serialized", False))
-        is_checkpoint_nvfp4 = bool(getattr(tf_config.quant_config, "is_checkpoint_nvfp4_serialized", False))
-        should_use_checkpoint_config = (
-            self.quantization_config is None
-            or (is_checkpoint_fp8 and self._is_generic_fp8_quant_config(self.quantization_config))
-            or (is_checkpoint_nvfp4 and self._is_generic_nvfp4_quant_config(self.quantization_config))
-        )
-        if should_use_checkpoint_config:
-            self.quantization_config = tf_config.quant_config
+        if should_adopt_checkpoint_quant_config(self.quantization_config, checkpoint):
+            self.quantization_config = checkpoint
             logger.info(
                 "Auto-detected quantization '%s' from model config",
                 tf_config.quant_method,
             )
-
-    @staticmethod
-    def _is_generic_fp8_quant_config(quant_config: object) -> bool:
-        if isinstance(quant_config, str):
-            return quant_config.lower() == "fp8"
-        if isinstance(quant_config, Mapping):
-            method = quant_config.get("method", quant_config.get("quant_method"))
-            return isinstance(method, str) and method.lower() == "fp8"
-        if hasattr(quant_config, "get_name"):
-            return quant_config.get_name() == "fp8"
-        return False
-
-    @staticmethod
-    def _is_generic_nvfp4_quant_config(quant_config: object) -> bool:
-        if isinstance(quant_config, str):
-            return quant_config.lower() in {"fp4", "nvfp4", "modelopt_fp4"}
-        if isinstance(quant_config, Mapping):
-            method = quant_config.get("method", quant_config.get("quant_method"))
-            return isinstance(method, str) and method.lower() in {"fp4", "nvfp4", "modelopt_fp4"}
-        if hasattr(quant_config, "get_name"):
-            return quant_config.get_name() == "modelopt_fp4"
-        return False
 
     def set_tf_model_config(self, tf_config: "TransformerConfig") -> None:
         """Assign `tf_model_config` and propagate quantization if detected.
@@ -1546,7 +1520,7 @@ class OmniDiffusionConfig:
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
-        kwargs = normalize_omni_diffusion_kwargs(kwargs)
+        kwargs = normalize_omni_kwargs(kwargs, is_diffusion=True)
 
         # Filter kwargs to only include valid fields
         valid_fields = {f.name for f in fields(cls)}

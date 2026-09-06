@@ -381,11 +381,10 @@ def _prepare_diffusion_quant_config(
     model_class: type[nn.Module],
 ) -> None:
     """Prepare diffusion quant config using vLLM-style model bindings."""
-    quant_config = getattr(od_config, "quantization_config", None)
+    quant_config = od_config.quantization_config
     if quant_config is None:
         return
-    if hasattr(quant_config, "maybe_update_config"):
-        quant_config.maybe_update_config(od_config.model)
+    quant_config.maybe_update_config(od_config.model)
     diffusion_packed_modules_mapping = current_omni_platform.get_diffusion_packed_modules_mapping(model_class)
     if diffusion_packed_modules_mapping is not None:
         model_class.packed_modules_mapping = diffusion_packed_modules_mapping
