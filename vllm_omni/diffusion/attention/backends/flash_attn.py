@@ -90,14 +90,12 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         prefix: str = "",
         qkv_layout: str | None = None,
         backend_kwargs: dict | None = None,
-        role: str = "self",
         **extra_impl_args,
     ) -> None:
         self.num_heads = num_heads
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.qkv_layout = qkv_layout
-        self.is_cross_attn = role == "cross"
         cfg = get_current_diffusion_config_or_none()
         self.fa_deterministic = bool(getattr(cfg, "fa_deterministic", False)) if cfg is not None else False
         if backend_kwargs:
@@ -151,7 +149,6 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
         from vllm_omni.diffusion.attention.backends.utils.fa import (
-            _index_first_axis,
             _pad_input,
             _unpad_input,
             _upad_input,
@@ -161,21 +158,10 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         if flash_attn_varlen_func is None:
             raise ImportError("Masked variable-length attention requires flash_attn_varlen_func")
         assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
-        batch_size, query_length = query.shape[:2]
-        if not self.is_cross_attn and query_length == key.size(1):
-            q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
-                query, key, value, attention_mask, query_length, _unpad_input
-            )
-        else:
-            # Cross-attention: the mask covers keys only, so keep every query row.
-            k, indices_k, cu_seq_lens_k, max_length_k, _ = _unpad_input(key, attention_mask)
-            v = _index_first_axis(value, indices_k)
-            q = query.flatten(0, 1)
-            cu_seq_lens_q = torch.arange(
-                0, (batch_size + 1) * query_length, query_length, dtype=torch.int32, device=query.device
-            )
-            max_length_q = query_length
-            indices_q = None
+        query_length = query.size(1)
+        q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
+            query, key, value, attention_mask, query_length, _unpad_input
+        )
 
         out_unpad = flash_attn_varlen_func(
             q,
@@ -191,9 +177,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             },
         )
         out_unpad = self._unwrap_flash_output(out_unpad)
-        if indices_q is None:
-            return out_unpad.reshape(batch_size, query_length, *out_unpad.shape[1:])
-        return _pad_input(out_unpad, indices_q, batch_size, query_length)
+        return _pad_input(out_unpad, indices_q, query.size(0), query_length)
 
     def _forward_varlen_packed(
         self,
@@ -518,8 +502,33 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         """NPU attention implementation using mindiesd."""
 
         kv_cache_dtype = attn_metadata.extra.get("kv_cache_dtype") if attn_metadata else None
-        if kv_cache_dtype is not None:
+        if kv_cache_dtype is None:
+            return self.forward_fa_npu(query, key, value, attn_metadata)
+        extra = attn_metadata.extra if attn_metadata else {}
+        if not extra.get("npu_attn_varlen", False):
+            # Non-packed FP8 (dense layouts) has no chunking support: the
+            # chunk knobs ride along in extra but do nothing here.
+            if extra.get("attn_chunking") is not None:
+                logger.warning_once(
+                    "Attention chunking applies only to the packed FP8 kv-slice "
+                    "path; ignoring the chunking options for this non-packed layer."
+                )
             return self.forward_fa_quant_npu(query, key, value, attn_metadata)
+        # Packed inputs: the kv-slice path is the DEFAULT for FP8 — K/V are
+        # sliced to the valid prefix outside the operator instead of
+        # attending over the padding document. (The legacy MINDIESD_FP8_KV_SLICE
+        # opt-in env is obsolete and ignored; drop --diffusion-kv-cache-dtype
+        # fp8 to run unquantized.)
+        out = self._forward_prefix_kv_slice_quant_npu(query, key, value, extra)
+        if out is not None:
+            return out
+        # Packed contract failed. Dense FP8 would ignore document boundaries,
+        # so run unquantized to keep varlen semantics.
+        logger.warning_once(
+            "kv_cache_dtype='fp8' is ignored for this attention layer: "
+            "the packed varlen contract did not hold, so attention runs "
+            "unquantized instead of crossing document boundaries."
+        )
         return self.forward_fa_npu(query, key, value, attn_metadata)
 
     def forward_fa_quant_npu(
@@ -541,6 +550,91 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             softmax_scale=self.softmax_scale,
         )
         return out.transpose(1, 2)
+
+    def _forward_prefix_kv_slice_quant_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        extra: dict,
+    ) -> torch.Tensor | None:
+        """Packed FP8 attention on NPU: slice K/V to the valid prefix, then a
+        dense (non-varlen) FIA call via fp8_rotate_quant_kv_slice.
+
+        FP8 counterpart of _forward_prefix_kv_slice_npu and the default packed
+        FP8 path. Same numerical contract as the unquantized prefix-K/V-slice
+        path: the padding document is a strict suffix, so dropping it from K/V
+        before quantization is identical to masking it out. Query keeps full
+        length; outputs on padding rows are never consumed downstream. Returns
+        None (caller falls back to the unquantized path) when the packed
+        contract does not hold; see _resolve_packed_seq_npu.
+
+        When the layer injected chunking options (``extra["attn_chunking"]``,
+        from --diffusion-attn-q-chunk/--diffusion-attn-head-chunk), a chunk
+        plan is built here — the call site already knows every plan input
+        (seq/heads from the packed shapes, kv_len from the resolved contract)
+        — and handed to the quant wrapper, which executes it against one
+        shared quantization.
+        """
+        resolved = self._resolve_packed_seq_npu(query, key, extra)
+        if resolved is None:
+            return None
+        _, seq_k = resolved
+        used_k = seq_k[0]  # real document length (first cumulative end)
+
+        from vllm_omni.platforms.npu.quant import kv_quant_npu
+        from vllm_omni.platforms.npu.quant.kv_quant_npu import fp8_rotate_quant_kv_slice
+
+        plan = None
+        options = extra.get("attn_chunking")
+        if options is not None:
+            from vllm_omni.diffusion.attention.chunking import build_chunk_plan
+
+            # The packed contract guarantees [1, T, N, D] == BSND.
+            num_heads = query.shape[2]
+            plan = build_chunk_plan(
+                seq_len=query.shape[1],
+                num_heads=num_heads,
+                num_kv_heads=key.shape[2],
+                kv_len=used_k,
+                options=options,
+                # Row boundaries must land on the Q block-quant grid so
+                # per-chunk dequant scales are exact slices of the one-shot
+                # full-length quantization.
+                row_align=kv_quant_npu._Q_BLOCK_SIZE,
+            )
+            if options.head_chunk > 0 and plan and plan[0].h1 - plan[0].h0 == num_heads:
+                logger.warning_once(
+                    "Attention head chunking is inactive for this layer/request "
+                    "(requires MHA and kv_len >= --diffusion-attn-head-chunk-min-kv); "
+                    "running with full heads."
+                )
+            # One activation line per attention layer per distinct schedule
+            # (q-chunk count x heads per call) so operators can confirm the
+            # chunking is live; short requests collapse to the single-call
+            # schedule, and the line re-fires when the shape changes.
+            head_width = plan[0].h1 - plan[0].h0 if plan else num_heads
+            schedule = (len({(c.row0, c.row1) for c in plan}), head_width)
+            if getattr(self, "_chunking_last_schedule", None) != schedule:
+                self._chunking_last_schedule = schedule
+                logger.info(
+                    "Attention chunking active: %d q chunks x %d/%d heads per FIA call, row_align=%d.",
+                    schedule[0],
+                    head_width,
+                    num_heads,
+                    kv_quant_npu._Q_BLOCK_SIZE,
+                )
+
+        # The quant wrapper slices K/V on the seq axis itself.
+        return fp8_rotate_quant_kv_slice(
+            query,
+            key,
+            value,
+            used_k,
+            layout="BSND",
+            softmax_scale=self.softmax_scale,
+            plan=plan,
+        )
 
     def forward_fa_npu(
         self,
