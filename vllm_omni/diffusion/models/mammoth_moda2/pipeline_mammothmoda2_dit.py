@@ -213,9 +213,9 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             raise ValueError(f"Image size must be multiples of 16, got {height}x{width} for request {request_id}")
 
         extra_args = sampling.extra_args or {}
-        guidance = extra_args.get(
-            "text_guidance_scale", sampling.guidance_scale if sampling.guidance_scale_provided else 9.0
-        )
+        guidance = extra_args.get("text_guidance_scale")
+        if guidance is None:
+            guidance = sampling.guidance_scale if sampling.guidance_scale_provided else 9.0
         try:
             text_guidance_scale = float(guidance)
         except (TypeError, ValueError, OverflowError) as exc:
@@ -231,7 +231,9 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             raise ValueError(f"Invalid num_inference_steps for request {request_id}") from exc
         if num_inference_steps <= 0:
             raise ValueError(f"num_inference_steps must be positive for request {request_id}")
-        cfg_range = extra_args.get("cfg_range", [0.0, 1.0])
+        cfg_range = extra_args.get("cfg_range")
+        if cfg_range is None:
+            cfg_range = [0.0, 1.0]
         if not isinstance(cfg_range, (list, tuple)) or len(cfg_range) != 2:
             raise ValueError(f"cfg_range requires two values for request {request_id}")
         try:
@@ -240,6 +242,12 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             raise ValueError(f"cfg_range requires two values convertible to floats for request {request_id}") from exc
         if not 0 <= cfg_start <= cfg_end <= 1:
             raise ValueError(f"cfg_range must satisfy 0 <= start <= end <= 1 for request {request_id}")
+
+        generator = sampling.generator
+        if isinstance(generator, list) and len(generator) != 1:
+            raise ValueError(
+                f"MammothModa2 single-output request mode requires exactly one generator for request {request_id}"
+            )
 
         return _MammothRequest(
             request_id=request_id,
@@ -252,7 +260,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             cfg_range=(cfg_start, cfg_end),
             num_inference_steps=num_inference_steps,
             seed=sampling.seed,
-            generator=sampling.generator,
+            generator=generator,
         )
 
     def _split_ar_conditions(

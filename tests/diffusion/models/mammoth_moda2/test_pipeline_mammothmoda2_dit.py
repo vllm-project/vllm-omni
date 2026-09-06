@@ -213,20 +213,36 @@ def test_parse_request_rejects_explicit_zero_steps() -> None:
 
 @pytest.mark.parametrize(("standard_steps", "expected_steps"), [(7, 7), (None, 50)])
 def test_parse_request_falls_through_null_legacy_step_count(standard_steps, expected_steps) -> None:
-    sampling = OmniDiffusionSamplingParams(
-        num_inference_steps=standard_steps, extra_args={"num_inference_steps": None}
-    )
+    sampling = OmniDiffusionSamplingParams(num_inference_steps=standard_steps, extra_args={"num_inference_steps": None})
     parsed = _pipeline_shell()._parse_request(_batch(sampling=sampling))
     assert parsed.num_inference_steps == expected_steps
+
+
+@pytest.mark.parametrize(("standard_guidance", "expected_guidance"), [(4.0, 4.0), (None, 9.0)])
+def test_parse_request_falls_through_null_legacy_guidance(standard_guidance, expected_guidance) -> None:
+    sampling = OmniDiffusionSamplingParams(guidance_scale=standard_guidance, extra_args={"text_guidance_scale": None})
+    parsed = _pipeline_shell()._parse_request(_batch(sampling=sampling))
+    assert parsed.text_guidance_scale == expected_guidance
+
+
+def test_parse_request_defaults_null_cfg_range() -> None:
+    sampling = OmniDiffusionSamplingParams(extra_args={"cfg_range": None})
+    parsed = _pipeline_shell()._parse_request(_batch(sampling=sampling))
+    assert parsed.cfg_range == (0.0, 1.0)
+
+
+@pytest.mark.parametrize("generators", [[], [torch.Generator(), torch.Generator()]])
+def test_parse_request_rejects_invalid_generator_list_cardinality(generators) -> None:
+    sampling = OmniDiffusionSamplingParams(generator=generators)
+    with pytest.raises(ValueError, match="exactly one generator.*req-generators"):
+        _pipeline_shell()._parse_request(_batch(request_id="req-generators", sampling=sampling))
 
 
 def test_parse_request_synthesizes_dummy_ar_conditions() -> None:
     batch = _batch(
         request_id="dummy_req_id",
         prompt={"prompt": "dummy run"},
-        sampling=OmniDiffusionSamplingParams(
-            height=512, width=512, seed=1, guidance_scale=0.0, num_inference_steps=2
-        ),
+        sampling=OmniDiffusionSamplingParams(height=512, width=512, seed=1, guidance_scale=0.0, num_inference_steps=2),
     )
     parsed = _pipeline_shell()._parse_request(batch)
     assert parsed.full_hidden_states.shape == (2, 8)
