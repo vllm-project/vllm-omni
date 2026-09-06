@@ -9,6 +9,7 @@ import queue
 import threading
 import time
 import weakref
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from multiprocessing.synchronize import Event
@@ -43,6 +44,24 @@ _DLO_DP_WAVE_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_DLO_DP_WAVE_TIMEOUT", 6
 _WORKER_SHUTDOWN_GRACE_S = 15.0
 _WORKER_TERMINATE_GRACE_S = 5.0
 _RESULT_PUMP_JOIN_TIMEOUT_S = 2.0
+# Upper bound on remembered dropped async_output_ids (see drop_output).
+_DROPPED_OUTPUT_IDS_MAX = 4096
+
+
+class _DropPlaceholder(concurrent.futures.Future):
+    """Placeholder registered by :meth:`MultiprocDiffusionExecutor.drop_output`.
+
+    Distinguishes "abort said nobody wants this output" from a genuine
+    ``wait_output_ready`` waiter, so the result pump can discard the tensors
+    for the former while still resolving the latter directly.
+    """
+
+
+def _dropped_output_error(async_output_id: str) -> RuntimeError:
+    return RuntimeError(
+        f"async output {async_output_id} was dropped: the request was aborted "
+        "before its output was claimed; retry with a new request."
+    )
 
 
 def _is_empty_dp_prompt(prompt: object) -> bool:
@@ -158,6 +177,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._output_futures: dict[str, concurrent.futures.Future[DiffusionOutput]] = {}
         self._completed_outputs: dict[str, concurrent.futures.Future[DiffusionOutput]] = {}
         self._batch_split_map: dict[str, dict[str, str]] = {}  # batch_id -> {per_req_id: request_id}
+        # Bounded memory of ids drained by drop_output() so a late
+        # wait_output_ready() fails fast instead of hanging on a new Future.
+        self._dropped_output_ids: OrderedDict[str, None] = OrderedDict()
         self._futures_lock = threading.RLock()
         self._pump_running = False
         self._pump_stop = threading.Event()
@@ -890,6 +912,16 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 self._sync_result_buffer.put(msg)
                 continue
 
+            # If shutdown started while we were dequeuing, drop this delivery
+            # so it cannot repopulate _completed_outputs after shutdown()
+            # cleared it (issue #6413 / #6439 review). OUTPUT_READY must still
+            # flow through the dispatch below: unpack_diffusion_output_shm()
+            # is the only receive-side path that unlinks named SHM segments,
+            # and the closed-time re-checks under _futures_lock already
+            # prevent any cache write after unpack.
+            if self._closed and msg.kind != AsyncOutputKind.OUTPUT_READY:
+                continue
+
             if msg.kind in (AsyncOutputKind.RPC_RESULT, AsyncOutputKind.COMPUTE_DONE):
                 with self._futures_lock:
                     fut = self._rpc_futures.pop(msg.rpc_id, None) if msg.rpc_id else None
@@ -925,19 +957,51 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
                     if batch_id:
                         with self._futures_lock:
-                            pending = self._output_futures.pop(batch_id, None)
-                            if pending is not None and not pending.done():
-                                if exc is not None:
-                                    try_set_exception(pending, exc)
-                                else:
-                                    try_set_result(pending, output_result)
-                            else:
-                                fut = concurrent.futures.Future()
-                                if exc is not None:
-                                    fut.set_exception(exc)
-                                else:
-                                    fut.set_result(output_result)
-                                self._completed_outputs[batch_id] = fut
+                            if self._closed:
+                                # shutdown() cleared _completed_outputs while
+                                # we were unpacking; drop this delivery.
+                                continue
+                            self._finish_output(batch_id, output_result, exc)
+
+    def _finish_output(
+        self,
+        async_output_id: str,
+        result: DiffusionOutput | None,
+        exc: BaseException | None,
+    ) -> None:
+        """Hand one delivered async output to its waiter. Caller holds ``_futures_lock``.
+
+        * no waiter registered -> cache for a later ``wait_output_ready()``;
+        * :class:`_DropPlaceholder` (request aborted) -> discard the tensors:
+          terminate the placeholder with an error so a caller that already
+          reused it via ``wait_output_ready()`` wakes up, and remember the id
+          (bounded) so a later wait fails fast instead of hanging;
+        * genuine pending waiter -> resolve it directly, never cache;
+        * waiter already cancelled/done -> discard, do not re-cache.
+        """
+        pending = self._output_futures.pop(async_output_id, None)
+        if pending is None:
+            fut: concurrent.futures.Future = concurrent.futures.Future()
+            if exc is not None:
+                fut.set_exception(exc)
+            else:
+                fut.set_result(result)
+            self._completed_outputs[async_output_id] = fut
+        elif isinstance(pending, _DropPlaceholder):
+            try_set_exception(pending, _dropped_output_error(async_output_id))
+            self._remember_dropped(async_output_id)
+        elif not pending.done():
+            if exc is not None:
+                try_set_exception(pending, exc)
+            else:
+                try_set_result(pending, result)
+
+    def _remember_dropped(self, async_output_id: str) -> None:
+        dropped = self._dropped_output_ids
+        dropped[async_output_id] = None
+        dropped.move_to_end(async_output_id)
+        while len(dropped) > _DROPPED_OUTPUT_IDS_MAX:
+            dropped.popitem(last=False)
 
     def _deliver_batch_split(
         self,
@@ -946,6 +1010,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         error: str | None = None,
     ) -> None:
         """Resolve per-request futures from one batch-level output."""
+        if self._closed:
+            # shutdown() has taken over; do not touch _completed_outputs.
+            return
         for per_req_id, req_id in per_req_map.items():
             req_output = batch_output.get_request_output(req_id) if batch_output is not None else None
             per_req_result: DiffusionOutput
@@ -956,13 +1023,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             else:
                 per_req_result = DiffusionOutput(error="No output result for batch request")
             with self._futures_lock:
-                pending = self._output_futures.pop(per_req_id, None)
-                if pending is not None and not pending.done():
-                    try_set_result(pending, per_req_result)
-                else:
-                    fut: concurrent.futures.Future = concurrent.futures.Future()
-                    fut.set_result(per_req_result)
-                    self._completed_outputs[per_req_id] = fut
+                if self._closed:
+                    # Belt-and-braces: re-check under the lock so a shutdown
+                    # that started mid-loop cannot repopulate the cleared dict.
+                    return
+                self._finish_output(per_req_id, per_req_result, None)
 
     def describe_pending_state(self, async_output_id: str | None = None) -> str:
         """Summarize async-output bookkeeping for diagnosing stuck waits."""
@@ -985,14 +1050,58 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             return str(self._rpc_id_counter)
 
     def wait_output_ready(self, async_output_id: str) -> concurrent.futures.Future[DiffusionOutput]:
-        """Return a Future that resolves when the async output is ready."""
+        """Return a Future that resolves when the async output is ready.
+
+        After :meth:`drop_output` has drained an id, the output is gone for
+        good: a wait on that id returns an already-failed Future instead of a
+        fresh one that would never complete.
+        """
         with self._futures_lock:
             cached = self._completed_outputs.pop(async_output_id, None)
             if cached is not None:
                 return cached
+            # Share an already-registered Future (a genuine waiter or a
+            # drop_output placeholder) rather than clobbering it.
+            existing = self._output_futures.get(async_output_id)
+            if existing is not None:
+                return existing
+            if async_output_id in self._dropped_output_ids:
+                del self._dropped_output_ids[async_output_id]
+                dropped: concurrent.futures.Future = concurrent.futures.Future()
+                dropped.set_exception(_dropped_output_error(async_output_id))
+                return dropped
             fut: concurrent.futures.Future = concurrent.futures.Future()
             self._output_futures[async_output_id] = fut
         return fut
+
+    def drop_output(self, async_output_id: str) -> None:
+        """Discard an async output that will never be waited on.
+
+        An aborted request never calls :meth:`wait_output_ready`, so a late
+        ``OUTPUT_READY`` would be unpacked and cached in ``_completed_outputs``
+        forever (issue #6413). Draining it here keeps engine-process memory
+        bounded under abort traffic. Handles both arrival orderings:
+
+        * result already arrived -> pop and drop the cached future;
+        * result not yet arrived -> register a :class:`_DropPlaceholder` so the
+          pump discards the tensors instead of caching them.
+
+        Either way the id is remembered (bounded) so a late
+        :meth:`wait_output_ready` fails fast rather than hanging. A genuine
+        waiter that is already registered is left untouched so it can drain
+        through the normal path.
+        """
+        with self._futures_lock:
+            if self._closed:
+                # Executor is torn down; abort path must not repopulate the
+                # cleared state (issue #6413 / #6439 review).
+                return
+            if self._completed_outputs.pop(async_output_id, None) is not None:
+                self._remember_dropped(async_output_id)
+                return
+            if async_output_id in self._output_futures:
+                return
+            self._output_futures[async_output_id] = _DropPlaceholder()
 
     def check_health(self) -> None:
         if self._is_failed:
@@ -1031,5 +1140,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 self._rpc_futures.clear()
                 self._output_futures.clear()
                 self._batch_split_map.clear()
+                # Cached async outputs hold unpacked tensors; drop them so they
+                # do not survive shutdown (issue #6413).
+                self._completed_outputs.clear()
+                self._dropped_output_ids.clear()
             self._shutdown_cleaner = None
             self._processes = []

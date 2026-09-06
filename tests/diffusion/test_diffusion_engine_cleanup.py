@@ -379,3 +379,36 @@ def test_close_defers_resource_shutdown_until_worker_thread_stops() -> None:
     engine.executor.shutdown.assert_called_once()
     assert engine._shutdown_complete is True
     assert engine._loop_started is False
+
+
+def test_finalize_aborted_request_drops_pending_async_output() -> None:
+    """An aborted request with a pending async output must be drained (#6413).
+
+    The aborted branch of _finalize_finished_request returns before the
+    async_output_id branch, so without draining, the worker's late OUTPUT_READY
+    is cached in the executor's _completed_outputs forever. The engine must tell
+    the executor to drop that output id.
+    """
+    engine = _make_engine()
+    engine.executor = SimpleNamespace(drop_output=Mock())
+    request_id = engine.scheduler.add_request(_make_request("aborted-async"))
+    engine.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+
+    runner_output = SimpleNamespace(result=None, async_output_id="aid-async-1")
+    output = engine._finalize_finished_request(request_id, runner_output)
+
+    assert output.aborted is True
+    engine.executor.drop_output.assert_called_once_with("aid-async-1")
+
+
+def test_finalize_aborted_request_without_async_output_skips_drop() -> None:
+    """No async output pending -> nothing to drop; drop_output not called."""
+    engine = _make_engine()
+    engine.executor = SimpleNamespace(drop_output=Mock())
+    request_id = engine.scheduler.add_request(_make_request("aborted-plain"))
+    engine.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+
+    output = engine._finalize_finished_request(request_id)
+
+    assert output.aborted is True
+    engine.executor.drop_output.assert_not_called()
