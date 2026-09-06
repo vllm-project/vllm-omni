@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
@@ -37,6 +37,22 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 logger = init_logger(__name__)
+
+
+def _gather_valid_encoder_hidden_states(
+    image: torch.Tensor,
+    text_2: torch.Tensor,
+    text: torch.Tensor,
+    indices: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    return torch.cat(
+        (
+            image.index_select(1, indices[0]),
+            text_2.index_select(1, indices[1]),
+            text.index_select(1, indices[2]),
+        ),
+        dim=1,
+    )
 
 
 class HunyuanVideo15PatchEmbed(nn.Module):
@@ -697,6 +713,7 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
         image_embeds_mask: torch.Tensor | None = None,
         attention_kwargs: dict[str, Any] | None = None,
         return_dict: bool = True,
+        encoder_hidden_states_indices: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor | Transformer2DModelOutput:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.patch_size_t, self.patch_size, self.patch_size
@@ -760,57 +777,66 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
         )
         encoder_hidden_states_3 = encoder_hidden_states_3 + encoder_hidden_states_3_cond_emb
 
-        # Token reordering: [valid_image, valid_byte5, valid_mllm, padding]
-        encoder_attention_mask = encoder_attention_mask.bool()
-        encoder_attention_mask_2 = encoder_attention_mask_2.bool()
-        encoder_attention_mask_3 = encoder_attention_mask_3.bool()
-        new_encoder_hidden_states = []
-        new_encoder_attention_mask = []
-
-        for text, text_mask, text_2, text_mask_2, image, image_mask in zip(
-            encoder_hidden_states,
-            encoder_attention_mask,
-            encoder_hidden_states_2,
-            encoder_attention_mask_2,
-            encoder_hidden_states_3,
-            encoder_attention_mask_3,
-        ):
-            new_encoder_hidden_states.append(
-                torch.cat(
-                    [
-                        image[image_mask],
-                        text_2[text_mask_2],
-                        text[text_mask],
-                        image[~image_mask],
-                        torch.zeros_like(text_2[~text_mask_2]),
-                        torch.zeros_like(text[~text_mask]),
-                    ],
-                    dim=0,
-                )
+        if encoder_hidden_states_indices is not None and batch_size == 1:
+            encoder_hidden_states = _gather_valid_encoder_hidden_states(
+                encoder_hidden_states_3,
+                encoder_hidden_states_2,
+                encoder_hidden_states,
+                encoder_hidden_states_indices,
             )
-            new_encoder_attention_mask.append(
-                torch.cat(
-                    [
-                        image_mask[image_mask],
-                        text_mask_2[text_mask_2],
-                        text_mask[text_mask],
-                        image_mask[~image_mask],
-                        text_mask_2[~text_mask_2],
-                        text_mask[~text_mask],
-                    ],
-                    dim=0,
-                )
-            )
-
-        encoder_hidden_states = torch.stack(new_encoder_hidden_states)
-        encoder_attention_mask = torch.stack(new_encoder_attention_mask)
-
-        max_valid_encoder_tokens = int(encoder_attention_mask.sum(dim=1).max().item())
-        if max_valid_encoder_tokens < encoder_attention_mask.shape[1]:
-            encoder_hidden_states = encoder_hidden_states[:, :max_valid_encoder_tokens]
-            encoder_attention_mask = encoder_attention_mask[:, :max_valid_encoder_tokens]
-        if encoder_attention_mask.all():
             encoder_attention_mask = None
+        else:
+            # Token reordering: [valid_image, valid_byte5, valid_mllm, padding]
+            encoder_attention_mask = encoder_attention_mask.bool()
+            encoder_attention_mask_2 = encoder_attention_mask_2.bool()
+            encoder_attention_mask_3 = encoder_attention_mask_3.bool()
+            new_encoder_hidden_states = []
+            new_encoder_attention_mask = []
+
+            for text, text_mask, text_2, text_mask_2, image, image_mask in zip(
+                encoder_hidden_states,
+                encoder_attention_mask,
+                encoder_hidden_states_2,
+                encoder_attention_mask_2,
+                encoder_hidden_states_3,
+                encoder_attention_mask_3,
+            ):
+                new_encoder_hidden_states.append(
+                    torch.cat(
+                        [
+                            image[image_mask],
+                            text_2[text_mask_2],
+                            text[text_mask],
+                            image[~image_mask],
+                            torch.zeros_like(text_2[~text_mask_2]),
+                            torch.zeros_like(text[~text_mask]),
+                        ],
+                        dim=0,
+                    )
+                )
+                new_encoder_attention_mask.append(
+                    torch.cat(
+                        [
+                            image_mask[image_mask],
+                            text_mask_2[text_mask_2],
+                            text_mask[text_mask],
+                            image_mask[~image_mask],
+                            text_mask_2[~text_mask_2],
+                            text_mask[~text_mask],
+                        ],
+                        dim=0,
+                    )
+                )
+
+            encoder_hidden_states = torch.stack(new_encoder_hidden_states)
+            encoder_attention_mask = torch.stack(new_encoder_attention_mask)
+
+            max_valid_encoder_tokens = int(encoder_attention_mask.sum(dim=1).max().item())
+            if max_valid_encoder_tokens < encoder_attention_mask.shape[1]:
+                encoder_hidden_states = encoder_hidden_states[:, :max_valid_encoder_tokens]
+                encoder_attention_mask = encoder_attention_mask[:, :max_valid_encoder_tokens]
+            if encoder_attention_mask.all():
+                encoder_attention_mask = None
 
         ctx = get_forward_context()
         hidden_states_mask = None
