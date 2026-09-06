@@ -8,6 +8,7 @@ stages:
   - stage_id: 0
     devices: "0,1"
     max_num_seqs: 1
+    gpu_memory_utilization: 0.6
     tensor_parallel_size: 2
     hf_overrides:
       minimax_h3_encoder_components:
