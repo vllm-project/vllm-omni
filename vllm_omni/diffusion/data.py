@@ -840,6 +840,10 @@ class OmniDiffusionConfig:
     # VAE memory optimization parameters
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    vae_tile_sample_min_height: int | None = 256
+    vae_tile_sample_min_width: int | None = 256
+    vae_tile_sample_stride_height: int | None = 192
+    vae_tile_sample_stride_width: int | None = 192
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None

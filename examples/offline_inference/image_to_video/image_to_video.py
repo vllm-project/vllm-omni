@@ -223,6 +223,30 @@ def parse_args() -> argparse.Namespace:
         help="Enable VAE tiling for memory optimization.",
     )
     parser.add_argument(
+        "--vae-tile-sample-min-height",
+        type=int,
+        default=256,
+        help="VAE tile min height (default: 256).",
+    )
+    parser.add_argument(
+        "--vae-tile-sample-min-width",
+        type=int,
+        default=256,
+        help="VAE tile min width (default: 256).",
+    )
+    parser.add_argument(
+        "--vae-tile-sample-stride-height",
+        type=int,
+        default=192,
+        help="VAE tile stride height (default: 192).",
+    )
+    parser.add_argument(
+        "--vae-tile-sample-stride-width",
+        type=int,
+        default=192,
+        help="VAE tile stride width (default: 192).",
+    )
+    parser.add_argument(
         "--enable-cpu-offload",
         action="store_true",
         help="Enable CPU offloading for diffusion models.",

@@ -438,6 +438,32 @@ def initialize_model(
             model.vae.use_slicing = od_config.vae_use_slicing
         if hasattr(model, "vae") and hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
+        if hasattr(model, "vae"):
+            for attr, val in [
+                ("tile_sample_min_height", od_config.vae_tile_sample_min_height),
+                ("tile_sample_min_width", od_config.vae_tile_sample_min_width),
+                ("tile_sample_stride_height", od_config.vae_tile_sample_stride_height),
+                ("tile_sample_stride_width", od_config.vae_tile_sample_stride_width),
+            ]:
+                if val is not None and hasattr(model.vae, attr):
+                    setattr(model.vae, attr, val)
+        if hasattr(model, "vae"):
+            min_h = getattr(model.vae, "tile_sample_min_height", None)
+            min_w = getattr(model.vae, "tile_sample_min_width", None)
+            str_h = getattr(model.vae, "tile_sample_stride_height", None)
+            str_w = getattr(model.vae, "tile_sample_stride_width", None)
+            if min_h and str_h and str_h > min_h:
+                raise ValueError(
+                    f"vae_tile_sample_stride_height ({str_h}) must be <="
+                    f" vae_tile_sample_min_height ({min_h});"
+                    " output would have gaps. Set min_height >= stride_height."
+                )
+            if min_w and str_w and str_w > min_w:
+                raise ValueError(
+                    f"vae_tile_sample_stride_width ({str_w}) must be <="
+                    f" vae_tile_sample_min_width ({min_w});"
+                    " output would have gaps. Set min_width >= stride_width."
+                )
 
         if is_distributed_vae:
             model.vae.set_parallel_size(vae_pp_size, mode=od_config.parallel_config.vae_parallel_mode)

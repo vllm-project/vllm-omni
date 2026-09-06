@@ -686,6 +686,30 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable VAE tiling for memory optimization (useful for mitigating OOM issues).",
         )
+        omni_config_group.add_argument(
+            "--vae-tile-sample-min-height",
+            type=int,
+            default=256,
+            help="VAE tile min height (default: 256).",
+        )
+        omni_config_group.add_argument(
+            "--vae-tile-sample-min-width",
+            type=int,
+            default=256,
+            help="VAE tile min width (default: 256).",
+        )
+        omni_config_group.add_argument(
+            "--vae-tile-sample-stride-height",
+            type=int,
+            default=192,
+            help="VAE tile stride height (default: 192).",
+        )
+        omni_config_group.add_argument(
+            "--vae-tile-sample-stride-width",
+            type=int,
+            default=192,
+            help="VAE tile stride width (default: 192).",
+        )
 
         # Parallel weight loading (faster diffusion startup)
         omni_config_group.add_argument(
