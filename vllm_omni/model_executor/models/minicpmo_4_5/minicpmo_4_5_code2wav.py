@@ -49,6 +49,14 @@ def _batch_error(reason: str, **details: Any) -> RuntimeError:
     return RuntimeError(f"MiniCPMO45Code2WavBatchError {json.dumps(payload, sort_keys=True)}")
 
 
+def _config_bool(value: object, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def _scalar(value: Any, default: Any = None) -> Any:
     if isinstance(value, torch.Tensor):
         return value.reshape(-1)[0].item() if value.numel() else default
@@ -185,11 +193,6 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
-        self._initial_batch_size = int(extra.get("code2wav_initial_batch_size", 0))
-        if self._initial_batch_size < 0:
-            raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be >= 0")
-        if self._initial_batch_size and self._initial_batch_size < self._min_batch_size:
-            raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be 0 or >= code2wav_min_batch_size")
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._prompt_wav_override = extra.get("prompt_wav")
 
@@ -497,59 +500,6 @@ class MiniCPMO45Code2Wav(nn.Module):
             item.cache_epoch,
         )
 
-    def _iter_limited_batches(
-        self,
-        buckets: Iterable[list[_WorkItem]],
-        *,
-        maximum: int,
-    ) -> Iterable[list[_WorkItem]]:
-        for bucket in buckets:
-            if not bucket:
-                continue
-            if not maximum:
-                yield bucket
-                continue
-            batch_count = (len(bucket) + maximum - 1) // maximum
-            if len(bucket) < batch_count * self._min_batch_size:
-                raise _batch_error(
-                    "initial_batch_partition_below_minimum",
-                    size=len(bucket),
-                    minimum=self._min_batch_size,
-                    maximum=maximum,
-                )
-            batch_size, larger_batches = divmod(len(bucket), batch_count)
-            start = 0
-            for batch_index in range(batch_count):
-                stop = start + batch_size + (batch_index < larger_batches)
-                yield bucket[start:stop]
-                start = stop
-
-    def _iter_decode_batches(
-        self,
-        buckets: Iterable[list[_WorkItem]],
-    ) -> Iterable[list[_WorkItem]]:
-        for bucket in buckets:
-            if not self._initial_batch_size:
-                yield bucket
-                continue
-            initial = [item for item in bucket if item.chunk_seq <= 1]
-            steady = [item for item in bucket if item.chunk_seq > 1]
-
-            undersized = [
-                {"wave": wave, "size": len(items)}
-                for wave, items in (("initial", initial), ("steady", steady))
-                if items and len(items) < self._min_batch_size
-            ]
-            if undersized:
-                raise _batch_error(
-                    "decode_wave_below_minimum",
-                    minimum=self._min_batch_size,
-                    waves=undersized,
-                )
-            yield from self._iter_limited_batches([initial], maximum=self._initial_batch_size)
-            if steady:
-                yield steady
-
     @torch.inference_mode()
     def forward(
         self,
@@ -685,10 +635,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                     (item.prompt_cache_id, item.prompt_wav),
                     [],
                 ).append(item)
-        for bucket in self._iter_limited_batches(
-            initial_marker_buckets.values(),
-            maximum=self._initial_batch_size,
-        ):
+        for bucket in initial_marker_buckets.values():
             try:
                 features = self.backend.prepare_prompt(
                     bucket[0].prompt_cache_id,
@@ -720,7 +667,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                     prompt_wav=item.prompt_wav,
                     token2wav=state,
                 )
-        for bucket in self._iter_decode_batches(buckets.values()):
+        for bucket in buckets.values():
             batch_size = len(bucket)
             try:
                 features = self.backend.prepare_prompt(
@@ -896,5 +843,5 @@ class MiniCPMO45Code2Wav(nn.Module):
             connector_config=self._connector_config,
             hift_graph_config=self._hift_graph_config,
             cfm_graph_config=self._cfm_graph_config,
-            bfloat16_attention_cache=bool(extra.get("code2wav_bfloat16_attention_cache", False)),
+            bfloat16_attention_cache=_config_bool(extra.get("code2wav_bfloat16_attention_cache")),
         )

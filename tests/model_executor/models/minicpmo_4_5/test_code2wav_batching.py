@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 
 import vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav as batched_token2wav_module
+import vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav as code2wav_module
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
     _token2wav_sdpa_context,
@@ -153,14 +154,13 @@ class _FakeToken2Wav:
         raise AssertionError("sequential __call__ fallback must never be called")
 
 
-def _config(minimum: int = 1, initial: int = 0):
+def _config(minimum: int = 1):
     return SimpleNamespace(
         model_config=SimpleNamespace(
             model="/fake/model",
             stage_connector_config={
                 "extra": {
                     "code2wav_min_batch_size": minimum,
-                    "code2wav_initial_batch_size": initial,
                     "prompt_cache_id": "shared",
                     "prompt_wav": "/fake/prompt.wav",
                 }
@@ -169,13 +169,50 @@ def _config(minimum: int = 1, initial: int = 0):
     )
 
 
-def _model(initial: int = 0, minimum: int = 1):
+def _model(minimum: int = 1):
     token2wav = _FakeToken2Wav()
     backend = BatchedToken2Wav(token2wav)
     _enable_fake_ragged_kernel(backend)
-    model = MiniCPMO45Code2Wav(vllm_config=_config(minimum=minimum, initial=initial))
+    model = MiniCPMO45Code2Wav(vllm_config=_config(minimum=minimum))
     model.backend = backend
     return model, token2wav
+
+
+@pytest.mark.parametrize("value", ["false", "0", "off", "no"])
+def test_build_backend_treats_false_like_bfloat16_cache_values_as_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    value: str,
+):
+    from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_token2wav as token2wav_module
+
+    config = _config()
+    config.model_config.stage_connector_config["extra"]["code2wav_bfloat16_attention_cache"] = value
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+
+    token2wav_dir = tmp_path / "assets" / "token2wav"
+    token2wav_dir.mkdir(parents=True)
+    prompt_wav = tmp_path / "prompt.wav"
+    prompt_wav.touch()
+    model.model_path = str(tmp_path)
+    model._prompt_wav_override = str(prompt_wav)
+
+    captured: dict[str, object] = {}
+
+    class _BackendToken2Wav:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    def _capture_backend(token2wav, **kwargs):
+        captured.update(kwargs)
+        return token2wav
+
+    monkeypatch.setattr(token2wav_module, "MiniCPMO45Token2wav", _BackendToken2Wav)
+    monkeypatch.setattr(code2wav_module, "BatchedToken2Wav", _capture_backend)
+
+    model._build_backend()
+
+    assert captured["bfloat16_attention_cache"] is False
 
 
 def _enable_fake_ragged_kernel(adapter: BatchedToken2Wav) -> None:
@@ -888,28 +925,6 @@ def test_initial_empty_segment_marker_initializes_stream_without_audio():
     assert "duplex" in model._states
 
 
-def test_initial_empty_segment_markers_respect_initial_batch_limit():
-    model, token2wav = _model(initial=2)
-    names = ["a", "b", "c", "d", "e"]
-    boundaries = []
-    for name in names:
-        boundary = _info(name, 0, [])
-        boundary["meta"].update(
-            {
-                "code_flat_numel": 0,
-                "tts_is_last_chunk": True,
-                "turn_end": False,
-            }
-        )
-        boundaries.append(boundary)
-
-    output = _forward(model, boundaries)
-
-    assert token2wav.flow.encoder.calls == [2, 2, 1]
-    assert [audio.numel() for audio in output.multimodal_outputs["model_outputs"]] == [0] * len(names)
-    assert set(model._states) == set(names)
-
-
 def test_shared_runtime_prompt_recreates_missing_file_before_second_owner(tmp_path, monkeypatch):
     monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
     model, _ = _model()
@@ -1166,49 +1181,9 @@ def test_singleton_and_mixed_shape_buckets_use_same_batched_backend_without_fall
     output = _forward(model, [_info("a", 1, [5, 6]), _info("b", 1, [7, 8, 9])])
 
     assert len(output.multimodal_outputs["model_outputs"]) == 2
-    # Exact-shape buckets execute independently but both use the same vectorized
-    # adapter; there is no Token2wav.stream/__call__ fallback.
+    # Mixed token lengths share ragged diffusion while HiFT keeps compatible
+    # encoder groups; neither path falls back to Token2wav.stream/__call__.
     assert token2wav.hift.calls[-2:] == [1, 1]
-
-
-def test_initial_batch_limit_allows_later_full_batch():
-    model, token2wav = _model(initial=4)
-    names = [f"request-{index}" for index in range(8)]
-
-    for chunk_seq in (0, 1):
-        infos = [_info(name, chunk_seq, [1, 2]) for name in names]
-        _forward(model, infos)
-        assert token2wav.hift.calls[-2:] == [4, 4]
-
-    token2wav.hift.calls.clear()
-    _forward(model, [_info(name, 2, [1, 2]) for name in names])
-    assert token2wav.hift.calls == [8]
-
-
-def test_initial_batch_partition_preserves_minimum():
-    model, token2wav = _model(initial=4, minimum=3)
-    names = [f"request-{index}" for index in range(6)]
-
-    _forward(model, [_info(name, 0, [1, 2]) for name in names])
-
-    assert token2wav.hift.calls == [3, 3]
-
-
-def test_initial_batch_partition_rejects_impossible_remainder():
-    model, _ = _model(initial=4, minimum=3)
-    names = [f"request-{index}" for index in range(5)]
-
-    with pytest.raises(RuntimeError, match="initial_batch_partition_below_minimum"):
-        _forward(model, [_info(name, 0, [1, 2]) for name in names])
-
-
-@pytest.mark.parametrize("chunk_seqs", [[0, 2, 2, 2], [0, 0, 0, 2]])
-def test_initial_steady_partition_rejects_undersized_wave(chunk_seqs):
-    model, _ = _model(initial=4, minimum=3)
-    bucket = [SimpleNamespace(chunk_seq=chunk_seq) for chunk_seq in chunk_seqs]
-
-    with pytest.raises(RuntimeError, match="decode_wave_below_minimum"):
-        list(model._iter_decode_batches([bucket]))
 
 
 def test_backend_failure_does_not_commit_any_request_state(monkeypatch):
