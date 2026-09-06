@@ -492,16 +492,23 @@ def test_prepare_lora_delta_unchanged_for_existing_fused_layouts(fused, shards):
     assert len(used_keys) == 2 * len(shards)
 
 
-def test_lora_loader_mixin_lora_is_fused_property():
-    pipe = DummyPipeline(num_layers=2, d_model=HEAD_DIM)
-    assert not pipe.lora_is_fused
-    pipe.lora_is_fused = True
-    assert pipe.lora_is_fused
+def test_lora_loader_mixin_lora_is_fused_property(mocker: MockerFixture):
+    pipeline = DummyQwenImagePipeline(1, HEAD_DIM)
+    assert pipeline.lora_is_fused is False
 
-    pipe2 = DummyPipeline(num_layers=2, d_model=HEAD_DIM)
-    assert not pipe2.lora_is_fused
-    pipe2.lora_loaded = {"default": {"some_key": torch.zeros(1)}}
-    assert pipe2.lora_is_fused
+    lora_state_dict = make_lora_state_dict_for_module(pipeline.transformer)
+    mocker.patch(
+        "vllm_omni.diffusion.lora.loader.get_converter_by_pipeline",
+        return_value=_convert_non_diffusers_qwen_lora_to_diffusers,
+    )
+    pipeline.load_lora_weights(lora_state_dict, "adapter0")
+    assert pipeline.lora_is_fused is True
+
+    # Test explicit setter
+    pipeline2 = DummyQwenImagePipeline(1, HEAD_DIM)
+    assert pipeline2.lora_is_fused is False
+    pipeline2.lora_is_fused = True
+    assert pipeline2.lora_is_fused is True
 
 
 def test_prepare_lora_delta_with_compute_device():

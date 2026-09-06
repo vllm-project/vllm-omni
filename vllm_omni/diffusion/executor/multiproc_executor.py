@@ -23,6 +23,11 @@ from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
+from vllm_omni.diffusion.offloader.config import (
+    TEXT_ENCODER_COMPONENT,
+    any_selected_component_uses_allgather,
+    resolve_offload,
+)
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
 from vllm_omni.diffusion.worker import WorkerProc
@@ -44,11 +49,28 @@ def _is_empty_dp_prompt(prompt: object) -> bool:
     """Return whether a DP request has no usable text prompt."""
     if prompt is None:
         return True
-    if isinstance(prompt, str):
+    if isinstance(prompt, (str, list, tuple)):
         return not prompt
-    if isinstance(prompt, dict) and "prompt" in prompt:
-        return not prompt["prompt"]
+    if isinstance(prompt, dict):
+        return (
+            not prompt.get("prompt")
+            and not prompt.get("prompt_token_ids")
+            and not prompt.get("prompt_ids")
+            and prompt.get("prompt_embeds") is None
+        )
     return False
+
+
+def _text_encoder_input_signature(prompt: object) -> tuple[bool, bool]:
+    """Describe precomputed embeddings that change encoder forward counts."""
+    if not isinstance(prompt, dict):
+        return False, False
+    return prompt.get("prompt_embeds") is not None, prompt.get("negative_prompt_embeds") is not None
+
+
+def _uses_text_encoder_allgather(config: object) -> bool:
+    resolved = resolve_offload(config)
+    return resolved.offloads(TEXT_ENCODER_COMPONENT) and resolved.uses_allgather(TEXT_ENCODER_COMPONENT)
 
 
 @dataclass
@@ -471,16 +493,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # request and Diffusion KV metadata inseparable.
         # All ranks reply (unique_reply_rank=None) so we collect dp_size
         # responses and match by dp_rank.
-        if (
-            len(new_reqs) > 1
-            and getattr(self.od_config, "enable_distributed_layerwise_offload", False)
-            and getattr(self.od_config, "dlo_use_allgather", True)
-        ):
+        if len(new_reqs) > 1 and any_selected_component_uses_allgather(self.od_config):
             # Reuse the request scheduler's complete compatibility key. DLO
             # AllGather requires every DP rank to execute the same collective
             # schedule, including shape, CFG, denoise steps, output count,
-            # and LoRA settings. Two default (None) step counts are valid and
-            # resolve identically inside the same pipeline.
+            # and LoRA settings.
             compatibility_keys = [build_request_batch_sampling_params_key(nr.req) for nr in new_reqs]
             if any(key != compatibility_keys[0] for key in compatibility_keys[1:]):
                 raise ValueError(
@@ -498,6 +515,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     "share identical extra_args. Different extra_args can change "
                     "the forward schedule and cause AllGather deadlock."
                 )
+            if _uses_text_encoder_allgather(self.od_config):
+                encoder_signatures = {_text_encoder_input_signature(nr.req.prompt) for nr in new_reqs}
+                if len(encoder_signatures) > 1:
+                    raise ValueError(
+                        "DLO text_encoder AllGather requires every concurrent request "
+                        "to provide the same positive/negative prompt embedding fields."
+                    )
             empty_prompt_ids = [nr.request_id for nr in new_reqs if _is_empty_dp_prompt(nr.req.prompt)]
             if empty_prompt_ids:
                 raise ValueError(
@@ -547,11 +571,16 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 args: tuple = (req, self.od_config, scheduler_output.kv_prefetch_job)
                 if new_req.diffusion_kv_metadata is not None:
                     args += (new_req.diffusion_kv_metadata,)
+                allgather_active = any_selected_component_uses_allgather(self.od_config)
+                timeout_options: dict[str, Any] = {}
+                if allgather_active:
+                    timeout_options["timeout"] = _DLO_DP_WAVE_TIMEOUT_S
                 result = self.collective_rpc(
                     "execute_model",
                     args=args,
                     unique_reply_rank=0,
                     exec_all_ranks=True,
+                    **timeout_options,
                 )
                 if isinstance(result, AsyncDiffusionOutput) and result.kind == AsyncOutputKind.COMPUTE_DONE:
                     runner_outputs.append(
@@ -575,6 +604,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 else:
                     raise RuntimeError(f"Unexpected response type: {type(result)!r}")
             except Exception as exc:
+                if isinstance(exc, TimeoutError):
+                    self._fail_closed_on_dp_wave_timeout(exc)
                 runner_outputs.append(
                     RunnerOutput(
                         request_id=new_req.request_id,
@@ -605,11 +636,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         parallel_config = getattr(self.od_config, "parallel_config", None)
         dp_size = getattr(parallel_config, "data_parallel_size", 1)
-        if (
-            dp_size > 1
-            and getattr(self.od_config, "enable_distributed_layerwise_offload", False)
-            and getattr(self.od_config, "dlo_use_allgather", True)
-        ):
+        if dp_size > 1 and any_selected_component_uses_allgather(self.od_config):
             # DLO DP uses one independent request per DP replica.  It is not a
             # fused pipeline request batch, so models such as MiniMax-H3 do not
             # need to advertise supports_request_batch=True.

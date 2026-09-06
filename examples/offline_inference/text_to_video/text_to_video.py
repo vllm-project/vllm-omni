@@ -338,6 +338,12 @@ def parse_args() -> argparse.Namespace:
         help="Enable layerwise (blockwise) offloading on DiT modules.",
     )
     parser.add_argument(
+        "--diffusion-offload-config",
+        type=json.loads,
+        default=None,
+        help="Component-selective diffusion offload config as JSON.",
+    )
+    parser.add_argument(
         "--enable-distributed-layerwise-offload",
         action="store_true",
         help="Enable distributed layerwise offloading with overlapped host-to-device weight streaming.",
@@ -534,6 +540,7 @@ def main():
     omni_kwargs = dict(
         model=args.model,
         enable_layerwise_offload=args.enable_layerwise_offload,
+        diffusion_offload_config=args.diffusion_offload_config,
         vae_use_slicing=args.vae_use_slicing,
         vae_use_tiling=args.vae_use_tiling,
         enable_cpu_offload=args.enable_cpu_offload,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -57,6 +57,7 @@ class BaseScheduler(ABC):
         self.max_num_running_reqs: int = 1
         self._prefetch_enabled: bool = False
         self._diffusion_kv_manager: DiffusionKVCacheManager | None = None
+        self._kv_connector = None
 
     def initialize(
         self,
@@ -111,7 +112,16 @@ class BaseScheduler(ABC):
             ):
                 raise ValueError("dense_legacy Scheduler received unexpected Diffusion KV cache initialization state")
             self._diffusion_kv_manager = None
+        from vllm_omni.diffusion.diffusion_kv.kv_connector import create_scheduler_kv_connector
+
+        self._kv_connector = create_scheduler_kv_connector(od_config)
         self._reset_scheduler_state()
+
+    @property
+    def kv_connector(self):
+        """Upstream vLLM Scheduler-role connector, when configured."""
+
+        return self._kv_connector
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
         return self._add_request_with_request_id(request.request_id, request)
@@ -288,6 +298,10 @@ class BaseScheduler(ABC):
         if self._diffusion_kv_manager is not None:
             self._diffusion_kv_manager.close()
             self._diffusion_kv_manager = None
+        from vllm_omni.diffusion.diffusion_kv.kv_connector import shutdown_kv_connector
+
+        shutdown_kv_connector(scheduler_connector=self._kv_connector)
+        self._kv_connector = None
         self._request_states.clear()
         self._waiting.clear()
         self._running.clear()
@@ -376,6 +390,14 @@ class BaseScheduler(ABC):
                 raise ValueError("paged_scheduler request preprocessing did not produce DiffusionKVRequest state")
         elif kv_requests:
             raise ValueError("dense_legacy request unexpectedly contains Scheduler Diffusion KV requests")
+
+        # Keep the request-scoped native connector bag on each Scheduler-owned
+        # sequence without interpreting its contents or creating page state.
+        kv_transfer_params = getattr(request, "kv_transfer_params", None)
+        if kv_transfer_params is not None:
+            for kv_request in kv_requests:
+                if kv_request.kv_transfer_params is None:
+                    kv_request.kv_transfer_params = dict(kv_transfer_params)
 
         # DiffusionKVRequest objects are mutable Scheduler/native-KVCacheManager
         # state and must never ride the normal request payload to a Worker.

@@ -27,10 +27,24 @@ from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import (
     CoreEngine,
-    CoreEngineLaunch,
     EngineZmqAddresses,
     wait_for_engine_startup,
 )
+
+try:
+    from vllm.v1.engine.utils import CoreEngineLaunch
+except ImportError:
+    from dataclasses import dataclass
+
+    @dataclass
+    class CoreEngineLaunch:  # type: ignore[no-redef]
+        engine_manager: Any = None
+        coordinator: Any = None
+        addresses: Any = None
+        tensor_queue: Any = None
+        processes: Any = None
+
+
 from vllm.v1.utils import shutdown
 
 from vllm_omni.diffusion.data import DiffusionRequestAbortedError
@@ -163,6 +177,7 @@ class StageDiffusionProc:
         prompt: Any,
         sampling_params_dict: dict,
         kv_sender_info: dict[str, Any] | None = None,
+        kv_transfer_params: dict[str, Any] | None = None,
     ) -> OmniRequestOutput:
         """Build a diffusion request and consume DiffusionEngine.step_streaming() to completion."""
         sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
@@ -172,6 +187,7 @@ class StageDiffusionProc:
             sampling_params=sampling_params,
             request_id=request_id,
             kv_sender_info=kv_sender_info,
+            kv_transfer_params=kv_transfer_params,
         )
 
         # Non-streaming callers share the streaming engine path but only
@@ -191,6 +207,7 @@ class StageDiffusionProc:
         prompt: Any,
         sampling_params_dict: dict,
         kv_sender_info: dict[str, Any] | None = None,
+        kv_transfer_params: dict[str, Any] | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Process a streaming diffusion request and yield the results from DiffusionEngine.step_streaming()."""
         sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
@@ -200,6 +217,7 @@ class StageDiffusionProc:
             sampling_params=sampling_params,
             request_id=request_id,
             kv_sender_info=kv_sender_info,
+            kv_transfer_params=kv_transfer_params,
         )
 
         async for results in self._engine.step_streaming(request):  # pyright: ignore[reportOptionalMemberAccess]
@@ -345,6 +363,7 @@ class StageDiffusionProc:
             prompt: Any,
             sampling_params_dict: dict,
             kv_sender_info: dict[str, Any] | None = None,
+            kv_transfer_params: dict[str, Any] | None = None,
         ) -> None:
             """Process a single diffusion request and send the response."""
             try:
@@ -354,6 +373,7 @@ class StageDiffusionProc:
                         prompt,
                         sampling_params_dict,
                         kv_sender_info=kv_sender_info,
+                        kv_transfer_params=kv_transfer_params,
                     )
                     await response_socket.send(encoder.encode({"type": "result", "output": result}))
                 else:
@@ -362,6 +382,7 @@ class StageDiffusionProc:
                         prompt,
                         sampling_params_dict,
                         kv_sender_info=kv_sender_info,
+                        kv_transfer_params=kv_transfer_params,
                     ):
                         await response_socket.send(encoder.encode({"type": "result", "output": result}))
             except DiffusionRequestAbortedError as e:
@@ -440,6 +461,7 @@ class StageDiffusionProc:
                             msg["prompt"],
                             msg["sampling_params"],
                             msg.get("kv_sender_info"),
+                            msg.get("kv_transfer_params"),
                         )
                     )
                     tasks[request_id] = task

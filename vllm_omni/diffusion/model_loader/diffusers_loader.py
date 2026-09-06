@@ -22,6 +22,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     filter_files_not_needed_for_inference,
     maybe_download_from_modelscope,
     multi_thread_safetensors_weights_iterator,
+    pt_weights_iterator,
     safetensors_weights_iterator,
 )
 from vllm.transformers_utils.repo_utils import hf_api
@@ -42,7 +43,15 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
     has_online_quantization,
 )
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
+from vllm_omni.diffusion.offloader.component_utils import encoder_component_type
+from vllm_omni.diffusion.offloader.config import (
+    DIT_COMPONENT,
+    TEXT_ENCODER_COMPONENT,
+    OffloadStrategy,
+    resolve_offload,
+)
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+from vllm_omni.diffusion.offloader.offload_plan import get_offload_plan
 from vllm_omni.diffusion.registry import initialize_model
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
@@ -90,7 +99,9 @@ def _natural_sort_key(filepath: str) -> list:
 
 DIFFUSION_MODEL_WEIGHTS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
 TRANSFORMER_WEIGHTS_INDEX = "model.safetensors.index.json"
-INDEX_FILES = [DIFFUSION_MODEL_WEIGHTS_INDEX, TRANSFORMER_WEIGHTS_INDEX]
+DIFFUSION_MODEL_BIN_WEIGHTS_INDEX = "diffusion_pytorch_model.bin.index.json"
+SAFETENSORS_INDEX_FILES = [DIFFUSION_MODEL_WEIGHTS_INDEX, TRANSFORMER_WEIGHTS_INDEX]
+PT_INDEX_FILES = [DIFFUSION_MODEL_BIN_WEIGHTS_INDEX]
 SHARDED_SAFETENSORS_PATTERN = re.compile(r"^(?P<family>.+)-\d+-of-(?P<count>\d+)\.safetensors$")
 
 
@@ -183,11 +194,12 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         model_name_or_path: Path | str,
         subfolder: str | None,
         revision: str | None,
+        index_files: Sequence[str],
     ) -> list[str] | None:
         """Resolve an index and return its authoritative shard manifest."""
         is_local = os.path.isdir(model_name_or_path)
         index_paths: list[tuple[str, Path]] = []
-        for index_file in INDEX_FILES:
+        for index_file in index_files:
             repo_index_path = self._repo_relative_path(subfolder, index_file)
             if is_local:
                 index_path = Path(model_name_or_path) / repo_index_path
@@ -241,11 +253,17 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         is_local = os.path.isdir(model_name_or_path)
         load_format = self.load_config.load_format
         use_safetensors = False
-        indexed_weight_files = (
-            self._resolve_weight_index(model_name_or_path, subfolder, revision)
-            if allow_patterns_overrides is None
-            else None
-        )
+        indexed_weight_files = None
+        if allow_patterns_overrides is None:
+            for index_files in (SAFETENSORS_INDEX_FILES, PT_INDEX_FILES):
+                indexed_weight_files = self._resolve_weight_index(
+                    model_name_or_path,
+                    subfolder,
+                    revision,
+                    index_files,
+                )
+                if indexed_weight_files is not None:
+                    break
 
         # only hf is supported currently
         if load_format == "auto":
@@ -324,11 +342,18 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
         )
-
+        quant_config = self._get_source_quant_config(source)
         use_multithread = (
             use_safetensors
             and getattr(self.od_config, "enable_multithread_weight_load", False)
             and self.load_config.safetensors_load_strategy != "torchao"
+        )
+        use_torchao = (
+            not use_safetensors
+            and quant_config is not None
+            and hasattr(quant_config, "get_name")
+            and quant_config.get_name() == "torchao"
+            and getattr(quant_config, "is_checkpoint_torchao_serialized", False)
         )
         if use_multithread:
             num_threads = getattr(self.od_config, "num_weight_load_threads", 4)
@@ -338,6 +363,13 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 sorted_hf_weights_files,
                 self.load_config.use_tqdm_on_load,
                 max_workers=num_threads,
+            )
+        elif use_torchao:
+            sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
+            weights_iterator = pt_weights_iterator(
+                sorted_hf_weights_files,
+                self.load_config.use_tqdm_on_load,
+                self.load_config.pt_load_map_location,
             )
         else:
             weights_iterator = safetensors_weights_iterator(
@@ -475,11 +507,6 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             return
 
         if getattr(model, "lora_is_fused", False):
-            return
-
-        # A warm HWR restore already brings back the fused final-layout weights.
-        if self._hwr_state is not None and self._hwr_state.get("warm_snapshot") is not None:
-            setattr(model, "lora_is_fused", True)
             return
 
         lora_path = getattr(self.od_config, "lora_path", None)
@@ -651,14 +678,51 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             else:
                 model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=False)
 
-                _dist_offload = getattr(self.od_config, "enable_distributed_layerwise_offload", False)
-                _use_ag = getattr(self.od_config, "dlo_use_allgather", True)
-                _has_online_quant = self._has_online_quant(model)
-                _tp_size = int(getattr(self.parallel_config, "tensor_parallel_size", 1))
-                _use_hsdp = bool(getattr(self.parallel_config, "use_hsdp", False))
-                _dp_size = int(getattr(self.parallel_config, "data_parallel_size", 1))
-                _sp_size = int(getattr(self.parallel_config, "sequence_parallel_size", 1))
-                _dlo_group_size = _dp_size if _dp_size > 1 else _sp_size
+                resolved_offload = resolve_offload(self.od_config)
+                distributed_offload = resolved_offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+                dit_distributed_offload = distributed_offload and resolved_offload.offloads(DIT_COMPONENT)
+                dit_uses_allgather = dit_distributed_offload and resolved_offload.uses_allgather(DIT_COMPONENT)
+                tensor_parallel_size = int(getattr(self.parallel_config, "tensor_parallel_size", 1))
+                use_hsdp = bool(getattr(self.parallel_config, "use_hsdp", False))
+                data_parallel_size = int(getattr(self.parallel_config, "data_parallel_size", 1))
+                sequence_parallel_size = int(getattr(self.parallel_config, "sequence_parallel_size", 1))
+                dlo_group_size = data_parallel_size if data_parallel_size > 1 else sequence_parallel_size
+                modules = ModuleDiscovery.discover(model)
+                plan = get_offload_plan(model)
+                selected_encoders = [
+                    encoder
+                    for name, encoder in zip(modules.encoder_names, modules.encoders)
+                    if resolved_offload.offloads(TEXT_ENCODER_COMPONENT)
+                    and encoder_component_type(name, plan) == TEXT_ENCODER_COMPONENT
+                ]
+                allgather_modules: list[nn.Module] = []
+                if dlo_group_size > 1:
+                    if dit_uses_allgather:
+                        allgather_modules.extend(modules.dits)
+                    if (
+                        distributed_offload
+                        and resolved_offload.offloads(TEXT_ENCODER_COMPONENT)
+                        and resolved_offload.uses_allgather(TEXT_ENCODER_COMPONENT)
+                    ):
+                        allgather_modules.extend(selected_encoders)
+                allgather_online_quant = any(self._has_online_quant(module) for module in allgather_modules)
+                if allgather_online_quant:
+                    unsupported_methods = {
+                        method
+                        for module in allgather_modules
+                        for method in self._unsupported_dlo_allgather_online_quant_methods(module)
+                    }
+                    if unsupported_methods:
+                        raise ValueError(
+                            "DLO+AllGather supports online quantization only for "
+                            "per-tensor FP8, INT8, and MXFP8 linears; unsupported "
+                            f"online methods: {', '.join(sorted(unsupported_methods))}. "
+                            "Use rank-local transfer for the affected component or "
+                            "disable online quantization."
+                        )
+                    logger.info(
+                        "Validated online methods (per-tensor FP8, INT8, MXFP8) for every component using DLO+AllGather"
+                    )
 
                 plan_result = None
                 weight_sources = self._get_weight_sources(model)
@@ -667,9 +731,9 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     try:
                         hwr_state = self._resolve_hwr(
                             model,
-                            ModuleDiscovery.discover(model),
-                            dist_offload=_dist_offload,
-                            use_allgather=_use_ag,
+                            modules,
+                            dist_offload=dit_distributed_offload,
+                            use_allgather=dit_uses_allgather,
                             load_format=load_format,
                             sources=weight_sources,
                         )
@@ -689,16 +753,15 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 hwr_active = hwr_state is not None
                 if hwr_active and hwr_state is not None:
                     self.host_weight_plan = cast(HostWeightPlan | None, hwr_state.get("plan"))
-                if _dist_offload and not hwr_active and not self._force_canonical_load:
-                    modules = ModuleDiscovery.discover(model)
+                if dit_distributed_offload and not hwr_active and not self._force_canonical_load:
                     plan_result = build_checkpoint_mmap_plan(
                         model,
                         dit_modules=tuple(zip(modules.dit_names, modules.dits)),
                         sources=weight_sources,
                         model_path=str(getattr(self.od_config, "model", "")) or None,
-                        tensor_parallel_size=_tp_size,
-                        use_hsdp=_use_hsdp,
-                        online_quantization=_has_online_quant,
+                        tensor_parallel_size=tensor_parallel_size,
+                        use_hsdp=use_hsdp,
+                        online_quantization=any(self._has_online_quant(dit) for dit in modules.dits),
                     )
                     self.host_weight_plan = plan_result.plan
 
@@ -707,7 +770,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 if host_weight_plan is not None:
                     logger.info(
                         "DLO host-weight plan active (%s, %s): skipping ordinary materialization for %s",
-                        "AllGather" if _use_ag and _dlo_group_size > 1 else "rank-local",
+                        "AllGather" if dit_uses_allgather and dlo_group_size > 1 else "rank-local",
                         host_weight_plan.backing_kind,
                         sorted(host_weight_plan.planned_source_prefixes) or "legacy DiT sources",
                     )
@@ -726,26 +789,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                             sources=ordinary_sources,
                             planned_weights=host_weight_plan.bindings,
                         )
-                    self._maybe_fuse_distilled_lora(model)
                 else:
-                    if _dist_offload and _use_ag and _dlo_group_size > 1 and _has_online_quant:
-                        # An effective DLO group size of one performs no weight
-                        # collective, so the AllGather layout allowlist does not
-                        # apply there even with dlo_use_allgather=True.
-                        unsupported_methods = self._unsupported_dlo_allgather_online_quant_methods(model)
-                        if unsupported_methods:
-                            raise ValueError(
-                                "DLO+AllGather supports online quantization only for "
-                                "per-tensor FP8, INT8, and MXFP8 linears; unsupported online "
-                                f"methods: {', '.join(unsupported_methods)}. Please use "
-                                "--dlo-no-use-allgather or disable online quantization."
-                            )
-                        logger.info(
-                            "Validated online methods (per-tensor FP8, INT8, MXFP8) with "
-                            "DLO+AllGather: using the ordinary loader before sharding "
-                            "finalized weights and scales"
-                        )
-                    if _dist_offload and plan_result is not None:
+                    if dit_distributed_offload and plan_result is not None:
                         logger.info(
                             "DLO direct checkpoint mmap unavailable; using ordinary loader: %s",
                             plan_result.fallback_reason,
@@ -951,14 +996,6 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 continue
 
             if has_online_quant:
-                # finalize_layerwise_processing() and the synchronous online
-                # loader already processed these layers.  Avoid moving their
-                # quantized CPU weights back to the accelerator merely to call
-                # an idempotent no-op; doing so rebuilds a large CUDA allocator
-                # cache and defeats streaming CPU offload's startup-memory bound.
-                if getattr(module, "_already_called_process_weights_after_loading", False):
-                    continue
-
                 # Online quant may leave straggler params on the ``meta`` device.
                 # Move only real (non-meta) params onto the target device for
                 # processing and restore them afterward, mirroring upstream vLLM's
@@ -1159,21 +1196,25 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         if load_format == "diffusers":
             raise ValueError("HSDP is not supported with the diffusers adapter load format")
         model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=True)
-
         world_size = 1
         rank = 0
         if torch.distributed.is_initialized():
             world_size = torch.distributed.get_world_size()
             rank = torch.distributed.get_rank()
 
-        enable_broadcast = bool(getattr(self.od_config, "enable_broadcast_weight_load", True)) and world_size > 1
+        enable_broadcast = bool(getattr(self.od_config, "enable_broadcast_weight_load", False)) and world_size > 1
 
         if enable_broadcast:
             if rank == 0:
                 self.load_weights(model)
                 self._maybe_fuse_distilled_lora(model)
             self._broadcast_model_weights(model, target_device=target_device, src_rank=0)
-            if rank != 0 and getattr(self.od_config, "lora_backend", None) in (LoRABackend.DISTILL, "distill"):
+            if (
+                rank != 0
+                and getattr(self.od_config, "lora_backend", None) in (LoRABackend.DISTILL, "distill")
+                and getattr(self.od_config, "lora_path", None)
+                and hasattr(model, "load_lora_weights")
+            ):
                 setattr(model, "lora_is_fused", True)
         else:
             self.load_weights(model)
