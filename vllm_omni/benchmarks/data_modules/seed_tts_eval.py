@@ -22,13 +22,19 @@ https://github.com/zhaochenyang20/seed-tts-eval):
   (Sarulab-style demo export). Uses ``torch`` + ``huggingface_hub`` only. Aggregate metrics
   are over **all requests with captured PCM** (independent of ASR/WER). Non-finite scores are
   dropped and counted as failures. Override repo/file via ``SEED_TTS_UTMOS_HF_REPO`` /
-  ``SEED_TTS_UTMOS_JIT_FILE``. **Device**: defaults to **CPU** when ``SEED_TTS_UTMOS_DEVICE``
-  is unset; set ``SEED_TTS_UTMOS_DEVICE=cuda:0`` (or ``cuda:1`` etc.) to run on GPU. The JIT
-  model is loaded directly onto the target device via ``map_location`` to avoid cross-device
-  issues (some PyTorch builds/Windows have problems moving TorchScript modules after load).
-  Forward uses **float32** waveform in ``[-1, 1]`` (same as the WER resampled array) so
-  tensor dtypes match JIT weights; using int16 triggers
-  ``RuntimeError: input type and weight type should be same`` on common exports. Disable
+  ``SEED_TTS_UTMOS_JIT_FILE``. **Device**: ``SEED_TTS_UTMOS_DEVICE`` selects it; when unset,
+  ``cuda:0`` if CUDA is available and ``cpu`` otherwise. The JIT model is loaded directly onto
+  the target device via ``map_location`` (some PyTorch builds/Windows have problems moving
+  TorchScript modules after load), and device constants **baked into the traced graph** are
+  retargeted to match: the published ``balacoon/utmos`` archive was traced on CUDA and
+  hard-codes ``cuda:0`` in 14 places, which otherwise makes it unusable on any build without
+  CUDA. Forward uses a **float32** waveform rescaled to the amplitude the export expects —
+  these archives normalize internally (``balacoon`` divides by 32768, i.e. it wants
+  int16-valued samples), so the ``[-1, 1]`` array the WER path produces must be scaled back
+  up or the model sees near-silence and returns the same MOS for every input. Only that
+  divisor is recognised, so an export that normalizes differently is fed unchanged. The
+  tensor stays float32; passing an int16 *tensor* would still trigger
+  ``RuntimeError: input type and weight type should be same``. Disable
   with ``SEED_TTS_UTMOS_EVAL=0``.
 
 Enable with ``SEED_TTS_WER_EVAL=1`` or ``--seed-tts-wer-eval``. Install optional deps::
@@ -81,6 +87,10 @@ _wavlm_processor = None
 _wavlm_device: str | None = None
 _utmos_jit_model = None
 _utmos_jit_device: str | None = None
+_utmos_jit_input_scale: float = 1.0
+#: Divisor ``balacoon/utmos`` applies inside its own ``forward``; an export
+#: carrying it is telling us it wants int16-valued samples.
+_UTMOS_INT16_INPUT_SCALE: float = 32768.0
 _utmos_jit_load_failed = False
 _utmos_forward_warned = False
 
@@ -319,9 +329,101 @@ def _cosine_similarity_unit_vectors(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b))
 
 
+def _utmos_resolve_device(torch: Any) -> str:
+    """Device for the UTMOS archive: ``SEED_TTS_UTMOS_DEVICE``, else CUDA if present."""
+    explicit = os.environ.get("SEED_TTS_UTMOS_DEVICE", "").strip()
+    if explicit:
+        return explicit
+    return "cuda:0" if torch.cuda.is_available() else "cpu"
+
+
+def _utmos_retarget_device_constants(model: Any, target: str) -> int:
+    """Rewrite Device constants baked into a traced graph, returning how many.
+
+    ``balacoon/utmos`` was traced on CUDA, so its methods carry literal ``cuda:0``
+    Device constants (root ``forward``, each ``self_attn.forward``, the decoder
+    RNN). ``map_location`` relocates the *weights* but cannot touch those, so on a
+    build without CUDA the first ``aten::to`` in ``forward`` raises
+    ``NotImplementedError`` and every utterance is counted as a UTMOS failure.
+
+    Must run before the module is first called: TorchScript caches an execution
+    plan on the first forward, and a later rewrite of the graph would not be
+    picked up.
+    """
+    rewritten = 0
+    seen: set[int] = set()
+    for _, module in model.named_modules():
+        cpp_module = getattr(module, "_c", None)
+        if cpp_module is None or id(cpp_module) in seen:
+            continue
+        seen.add(id(cpp_module))
+        for method_name in cpp_module._method_names():
+            graph = cpp_module._get_method(method_name).graph
+            for node in graph.nodes():
+                if node.kind() != "prim::Constant":
+                    continue
+                if "value" not in node.attributeNames() or node.kindOf("value") != "s":
+                    continue
+                value = node.s("value")
+                if value != "cuda" and not value.startswith("cuda:"):
+                    continue
+                if value == target:
+                    continue
+                node.s_("value", target)
+                rewritten += 1
+    return rewritten
+
+
+def _utmos_detect_input_scale(model: Any) -> float:
+    """Amplitude the export expects: 32768 if it normalizes by that, else 1.0.
+
+    ``balacoon/utmos`` divides the waveform by 32768 inside its root ``forward``,
+    i.e. it wants int16-valued samples. Handing it the ``[-1, 1]`` array the WER
+    path already has therefore attenuates every waveform by that factor, and the
+    model answers with the same MOS for clean speech as for noise.
+
+    Only that one divisor is recognised. ``SEED_TTS_UTMOS_HF_REPO`` /
+    ``SEED_TTS_UTMOS_JIT_FILE`` let anyone point this at a different export, and
+    rescaling one that normalizes by something else -- or not at all -- would be a
+    new bug of the same shape, so anything unrecognised keeps today's behaviour of
+    feeding the waveform through unchanged.
+    """
+    try:
+        graph = model.graph
+    except Exception:  # a module without a scripted ``forward``
+        return 1.0
+    for node in graph.nodes():
+        if node.kind() != "aten::div":
+            continue
+        inputs = list(node.inputs())
+        if len(inputs) < 2:
+            continue
+        producer = inputs[1].node()
+        if producer.kind() != "prim::Constant" or "value" not in producer.attributeNames():
+            continue
+        kind = producer.kindOf("value")
+        try:
+            if kind == "t":
+                tensor = producer.t("value")
+                if tensor.numel() != 1:
+                    continue
+                divisor = float(tensor.reshape(-1)[0].item())
+            elif kind == "f":
+                divisor = float(producer.f("value"))
+            elif kind == "i":
+                divisor = float(producer.i("value"))
+            else:
+                continue
+        except Exception:
+            continue
+        if divisor == _UTMOS_INT16_INPUT_SCALE:
+            return _UTMOS_INT16_INPUT_SCALE
+    return 1.0
+
+
 def _ensure_utmos_jit_model() -> Any | None:
     """Load UTMOS as TorchScript (``balacoon/utmos`` style): no ``import utmos`` / fairseq."""
-    global _utmos_jit_model, _utmos_jit_device, _utmos_jit_load_failed
+    global _utmos_jit_model, _utmos_jit_device, _utmos_jit_input_scale, _utmos_jit_load_failed
     with _lock:
         if _utmos_jit_load_failed:
             return None
@@ -340,30 +442,29 @@ def _ensure_utmos_jit_model() -> Any | None:
             )
             path = hf_hub_download(repo_id=repo, filename=fname, repo_type="model")
 
-            # TODO The model weights in UTMOS must be loaded in cuda:0; otherwise, the model execution will fail.
-            want = "cuda:0"
-            if want.startswith("cuda") and torch.cuda.is_available():
-                idx = want.split(":")[-1] if ":" in want else "0"
-                target_dev = f"cuda:{idx}"
-            else:
-                target_dev = "cpu"
-
+            target_dev = _utmos_resolve_device(torch)
             try:
                 m = torch.jit.load(path, map_location=target_dev)
-                m.eval()
-                _utmos_jit_device = target_dev
             except Exception as load_e:
-                if target_dev.startswith("cuda"):
-                    logger.warning(
-                        "UTMOS JIT load on %s failed (%s), retrying on CPU...",
-                        target_dev,
-                        load_e,
-                    )
-                    m = torch.jit.load(path, map_location="cpu")
-                    m.eval()
-                    _utmos_jit_device = "cpu"
-                else:
+                if target_dev == "cpu":
                     raise
+                logger.warning(
+                    "UTMOS JIT load on %s failed (%s), retrying on CPU...",
+                    target_dev,
+                    load_e,
+                )
+                m = torch.jit.load(path, map_location="cpu")
+                target_dev = "cpu"
+            retargeted = _utmos_retarget_device_constants(m, target_dev)
+            m.eval()
+            _utmos_jit_device = target_dev
+            _utmos_jit_input_scale = _utmos_detect_input_scale(m)
+            logger.info(
+                "UTMOS JIT ready on %s (%d baked device constants retargeted, input scale %g).",
+                target_dev,
+                retargeted,
+                _utmos_jit_input_scale,
+            )
             _utmos_jit_model = m
         except Exception as e:
             logger.warning(
@@ -378,9 +479,12 @@ def _ensure_utmos_jit_model() -> Any | None:
 def _utmos_predict_f32_16k(wav_f32: np.ndarray) -> float | None:
     """MOS from JIT model; input is float32 mono @ 16 kHz in ``[-1, 1]`` (WER pipeline).
 
-    ``balacoon/utmos`` demos sometimes use int16 numpy, but the exported ``.jit`` weights are
-    float32; passing int16 tensors causes: "RuntimeError: ... input type and weight type
-    should be same".
+    The tensor handed to the model stays float32 — ``balacoon/utmos`` demos use int16
+    numpy, but the exported ``.jit`` weights are float32 and an int16 tensor causes
+    "RuntimeError: ... input type and weight type should be same". Its *amplitude*,
+    however, must match what the export normalizes by (see
+    ``_utmos_detect_input_scale``): the archive divides by 32768, so a ``[-1, 1]``
+    array has to be scaled back up to int16 range first.
     """
     import torch
 
@@ -398,6 +502,8 @@ def _utmos_predict_f32_16k(wav_f32: np.ndarray) -> float | None:
         except StopIteration:
             model_dev = torch.device("cpu")
     w = np.ascontiguousarray(wav_f32, dtype=np.float32)
+    if _utmos_jit_input_scale != 1.0:
+        w = np.ascontiguousarray(w * _utmos_jit_input_scale, dtype=np.float32)
     x = torch.from_numpy(w).unsqueeze(0).to(device=model_dev, dtype=torch.float32)
     with torch.no_grad():
         out = model(x)
