@@ -25,6 +25,7 @@ from vllm.sampling_params import SamplingParams
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -105,7 +106,6 @@ pytestmark = [
 ]
 
 
-@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/3201")
 @hardware_test(res={"cuda": "H100"})
 def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
     """
@@ -136,7 +136,14 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
         max_tokens=max(1, expected_grid_tokens + 1),
         detokenize=False,
     )
-    dit_sampling = SamplingParams(temperature=0.0, max_tokens=1, detokenize=False)
+    dit_sampling = OmniDiffusionSamplingParams(
+        height=height,
+        width=width,
+        seed=42,
+        guidance_scale=1.0,
+        num_inference_steps=2,
+        extra_args={"cfg_range": [0.0, 1.0]},
+    )
 
     outputs = list(
         omni.generate(
@@ -152,9 +159,6 @@ def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
                         "visual_token_end_id": [visual_end],
                         "image_height": [height],
                         "image_width": [width],
-                        "num_inference_steps": [2],
-                        "text_guidance_scale": [1.0],
-                        "cfg_range": [0.0, 1.0],
                         "visual_ids": [
                             _IMAGE_TOKEN_ID,
                             _VIDEO_TOKEN_ID,
