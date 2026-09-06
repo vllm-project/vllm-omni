@@ -396,35 +396,53 @@ class StageEngineCoreClientBase(StageClientBase):
         and the original prompt.
         """
         if self.custom_process_input_func is not None:
-            signature = inspect.signature(self.custom_process_input_func)
-            extra_kwargs: dict[str, Any] = {}
-            if "next_stage_hf_config" in signature.parameters:
-                # Let a processor size the next stage's prompt from that
-                # stage's model config (e.g. a talker whose engine positions
-                # must cover a speaker-prompt prefill).
-                extra_kwargs["next_stage_hf_config"] = self._stage_hf_config
-            # Match the context parameter by name, including the
-            # underscore-prefixed spelling some processors use (e.g.
-            # MiniCPM-o's ``llm2tts(..., _streaming_context)``), so bridge
-            # state keeps flowing to them.
-            if "streaming_context" in signature.parameters or "_streaming_context" in signature.parameters:
-                return self.custom_process_input_func(
-                    source_outputs,
-                    prompt,
-                    self.requires_multimodal_data,
-                    streaming_context,
-                    **extra_kwargs,
-                )
-            return self.custom_process_input_func(
-                source_outputs,
-                prompt,
-                self.requires_multimodal_data,
-                **extra_kwargs,
-            )
+            return self._call_custom_process_input(source_outputs, prompt, streaming_context)
 
         if not self.engine_input_source:
             raise ValueError(f"engine_input_source empty for stage {self.stage_id}")
         return _default_process_engine_inputs(source_outputs, prompt, self.requires_multimodal_data)
+
+    def _call_custom_process_input(
+        self,
+        source_outputs: list[Any],
+        prompt: Any,
+        streaming_context: Any | None,
+    ) -> list[OmniTokensPrompt]:
+        """Call a stage input processor with its explicitly requested context."""
+        processor = self.custom_process_input_func
+        assert processor is not None
+        signature = inspect.signature(processor)
+        extra_kwargs: dict[str, Any] = {}
+        if "next_stage_hf_config" in signature.parameters:
+            # Let a processor size the next stage's prompt from that
+            # stage's model config (e.g. a talker whose engine positions
+            # must cover a speaker-prompt prefill).
+            extra_kwargs["next_stage_hf_config"] = self._stage_hf_config
+        target_model_config = signature.parameters.get("target_model_config")
+        if target_model_config is not None:
+            # The JoyAI bridge needs the Talker tokenizer and model config
+            # to calculate the exact prompt length.
+            if target_model_config.kind is not inspect.Parameter.KEYWORD_ONLY:
+                raise TypeError("target_model_config must be a keyword-only parameter")
+            extra_kwargs["target_model_config"] = self.vllm_config.model_config
+        # Match the context parameter by name, including the
+        # underscore-prefixed spelling some processors use (e.g.
+        # MiniCPM-o's ``llm2tts(..., _streaming_context)``), so bridge
+        # state keeps flowing to them.
+        if "streaming_context" in signature.parameters or "_streaming_context" in signature.parameters:
+            return processor(
+                source_outputs,
+                prompt,
+                self.requires_multimodal_data,
+                streaming_context,
+                **extra_kwargs,
+            )
+        return processor(
+            source_outputs,
+            prompt,
+            self.requires_multimodal_data,
+            **extra_kwargs,
+        )
 
     async def collective_rpc_async(
         self,
