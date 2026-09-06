@@ -4,7 +4,7 @@ import math
 from typing import Annotated, Any, Literal
 
 import numpy as np
-from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Bound int request fields to avoid overflow issues.
 _INT64_MIN = -(2**63)
@@ -399,15 +399,14 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
 
 
 class CreateAudio(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     audio_tensor: np.ndarray
     sample_rate: int = 24000
     output_sample_rate: int | None = None
     response_format: str = "wav"
     speed: float = 1.0
     base64_encode: bool = True
-
-    class Config:
-        arbitrary_types_allowed = True
 
 
 class AudioResponse(BaseModel):
