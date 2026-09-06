@@ -586,7 +586,10 @@ def test_component_discovery_uses_official_checkpoint_contract() -> None:
     assert pipeline.weights_sources == [
         module.DiffusersPipelineLoader.ComponentSource("checkpoint", "transformer", None, "transformer.", True)
     ]
-    assert _FakeTransformerFactory.last_call[1:] == (None, "transformer")
+    # The weight-loader prefix ("transformer.") addresses ``self.transformer``
+    # from the pipeline; the transformer's own quantization prefix is rooted at
+    # its module tree so it lines up with checkpoint exclusion lists.
+    assert _FakeTransformerFactory.last_call[1:] == (None, "")
     assert pipeline.scheduler.config.shift == 5.0
     assert pipeline.scheduler.config.num_train_timesteps == 1000
     assert module._loader_state.prefetch_calls == [("checkpoint", ("tokenizer", "text_encoder", "vae"), False)]
@@ -614,13 +617,13 @@ def test_unsupported_parallel_modes_fail_before_component_loading(field: str, va
     assert module._loader_state.prefetch_calls == []
 
 
-def test_unsupported_quantization_fails_before_component_loading() -> None:
+def test_quantization_config_is_forwarded_to_the_transformer() -> None:
     module = _load_pipeline_module()
+    quant_config = object()
 
-    with pytest.raises(NotImplementedError, match="quantization"):
-        module.LingBotWorldCausalDMDPipeline(od_config=_od_config(quantization_config=object()))
+    module.LingBotWorldCausalDMDPipeline(od_config=_od_config(quantization_config=quant_config))
 
-    assert module._loader_state.prefetch_calls == []
+    assert _FakeTransformerFactory.last_call[1:] == (quant_config, "")
 
 
 def test_official_scheduler_config_matches_fixed_dmd_contract() -> None:

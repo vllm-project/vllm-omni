@@ -78,7 +78,12 @@ def _install_vllm_stubs() -> None:
             **kwargs,
         ) -> None:
             super().__init__()
-            del kwargs
+            # Record what the model hands the quantization dispatch. The stub
+            # cannot resolve a quant method, so tests assert on the plumbing:
+            # every quantizable projection must receive the config and a
+            # prefix rooted the way checkpoint exclusion lists are.
+            self.quant_config = kwargs.get("quant_config")
+            self.quant_prefix = kwargs.get("prefix", "")
             self.return_bias = return_bias
             self.weight = nn.Parameter(torch.empty(output_size, input_size))
             self.bias = nn.Parameter(torch.empty(output_size)) if bias else None
@@ -108,7 +113,8 @@ def _install_vllm_stubs() -> None:
             **kwargs,
         ) -> None:
             super().__init__()
-            del kwargs
+            self.quant_config = kwargs.get("quant_config")
+            self.quant_prefix = kwargs.get("prefix", "")
             self.num_heads = total_num_heads
             self.num_kv_heads = total_num_kv_heads or total_num_heads
             output_size = (self.num_heads + 2 * self.num_kv_heads) * head_size
