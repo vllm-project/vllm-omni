@@ -124,13 +124,20 @@ def x0_from_velocity(sample: torch.Tensor, velocity: torch.Tensor, sigma: torch.
     return (sample.to(torch.float32) - velocity.to(torch.float32) * sigma).to(sample.dtype)
 
 
-def velocity_from_x0(sample: torch.Tensor, x0: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+def velocity_from_x0(
+    sample: torch.Tensor,
+    x0: torch.Tensor,
+    sigma: torch.Tensor,
+    *,
+    sigma_scalar: float | None = None,
+) -> torch.Tensor:
     """Convert x0 back to velocity using the official fp32 arithmetic order."""
     # Official LTX materializes the scalar schedule value on the host before
     # dividing. CUDA tensor-scalar division can cross bfloat16 rounding bounds
     # even when the scalar has the same float32 value.
-    sigma = sigma.to(torch.float32).item()
-    return ((sample.to(torch.float32) - x0.to(torch.float32)) / sigma).to(sample.dtype)
+    if sigma_scalar is None:
+        sigma_scalar = sigma.to(torch.float32).item()
+    return ((sample.to(torch.float32) - x0.to(torch.float32)) / sigma_scalar).to(sample.dtype)
 
 
 def euler_step_from_velocity(
@@ -349,6 +356,7 @@ class LTXGuidanceExecutor:
         guidance: LTXModalityGuidance,
         *,
         model_sigma: torch.Tensor | None = None,
+        sigma_scalar: float | None = None,
         preserve_positive_velocity: bool = False,
         rescale_token_count: int | None = None,
     ) -> torch.Tensor:
@@ -367,7 +375,7 @@ class LTXGuidanceExecutor:
             guidance=guidance,
             rescale_token_count=rescale_token_count,
         )
-        return velocity_from_x0(sample, guided, sigma)
+        return velocity_from_x0(sample, guided, sigma, sigma_scalar=sigma_scalar)
 
     def predict_parallel_guidance(
         self,

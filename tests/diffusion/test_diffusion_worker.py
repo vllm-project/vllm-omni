@@ -90,12 +90,12 @@ class TestDiffusionWorkerSleep:
         mock_allocator_class.get_instance = mocker.Mock(return_value=mock_allocator)
         mock_allocator.sleep = mocker.Mock()
         mock_allocator.get_current_usage.return_value = initial_usage
-
         # Call sleep with level 1
         result = mock_gpu_worker.sleep(level=1)
 
         # Verify sleep was called with correct tags
         mock_allocator.sleep.assert_called_once_with(offload_tags=("weights",))
+        mock_gpu_worker.model_runner.release_captured_graphs.assert_not_called()
         assert bool(result) is True
         # Verify buffers were NOT saved (level 1 doesn't save buffers)
         assert len(mock_gpu_worker._sleep_saved_buffers) == 0
@@ -130,12 +130,17 @@ class TestDiffusionWorkerSleep:
                 ("buffer2", mock_buffer2),
             ]
         )
+        events = []
+        mock_gpu_worker.model_runner.release_captured_graphs.side_effect = lambda: events.append("graphs")
+        mock_allocator.sleep.side_effect = lambda **_kwargs: events.append("allocator")
 
         # Call sleep with level 2
         result = mock_gpu_worker.sleep(level=2)
 
         # Verify sleep was called with empty tags (offload all)
         mock_allocator.sleep.assert_called_once_with(offload_tags=tuple())
+        mock_gpu_worker.model_runner.release_captured_graphs.assert_called_once_with()
+        assert events == ["graphs", "allocator"]
         assert bool(result) is True
 
         # Verify buffers were saved
@@ -227,6 +232,7 @@ class TestDiffusionWorkerWakeUp:
 
         # Verify allocator.wake_up was called
         mock_allocator.wake_up.assert_called_once_with(["weights"])
+        mock_gpu_worker.model_runner.release_captured_graphs.assert_not_called()
         assert bool(result) is True
 
     def test_wake_up_with_buffers(self, mocker: MockerFixture, mock_gpu_worker):
@@ -350,3 +356,22 @@ class TestDiffusionWorkerInitLoraManager:
 
         pipeline.load_lora_weights.assert_called_once_with("/path/to/lora.safetensors")
         assert pipeline.lora_is_fused is True
+
+
+def test_shutdown_releases_captured_graphs_before_other_teardown(mocker: MockerFixture):
+    worker = object.__new__(DiffusionWorker)
+    worker.rank = 0
+    events = []
+    manager = mocker.Mock()
+    manager.shutdown_prefetch.side_effect = lambda: events.append("kv")
+    worker.model_runner = mocker.Mock(kv_transfer_manager=manager)
+    worker.model_runner.release_captured_graphs.side_effect = lambda: events.append("graphs")
+    destroy = mocker.patch(
+        "vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env",
+        side_effect=lambda: events.append("distributed"),
+    )
+
+    worker.shutdown()
+
+    assert events == ["graphs", "kv", "distributed"]
+    destroy.assert_called_once_with()

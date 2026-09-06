@@ -303,3 +303,12 @@ def test_clear_audio_padding_keeps_padding_outside_sampler_state():
 
     torch.testing.assert_close(actual[:, :2], updated[:, :2])
     torch.testing.assert_close(actual[:, 2:], torch.zeros_like(actual[:, 2:]))
+
+
+def test_clear_audio_padding_in_place_reuses_storage():
+    updated = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [99.0, -99.0]]])
+
+    actual = latent_ops.clear_audio_padding_(updated, 2)
+
+    assert actual.data_ptr() == updated.data_ptr()
+    torch.testing.assert_close(actual, torch.tensor([[[1.0, 2.0], [3.0, 4.0], [0.0, 0.0]]]))

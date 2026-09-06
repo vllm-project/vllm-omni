@@ -574,6 +574,173 @@ class Wan22S2VCachedAdapter(CachedAdapter):
         return total_cached_blocks
 
 
+class LTX2AudioCachedBlocks(CachedBlocks_Pattern_0_1_2):
+    """Cache-DiT blocks wrapper that preserves LTX2's per-layer STG mask.
+
+    This follows :class:`Wan22S2VCachedBlocks` above: run model-specific
+    per-layer logic inside the cache wrapper using each block's global index.
+    """
+
+    _routes_ltx2_audio_perturbation = True
+
+    @staticmethod
+    def _block_kwargs(block_id: int, kwargs: dict[str, Any]) -> dict[str, Any]:
+        block_kwargs = dict(kwargs)
+        perturbation_blocks = block_kwargs.pop("audio_self_attention_perturbation_blocks", None)
+        if perturbation_blocks is not None and block_id not in perturbation_blocks:
+            block_kwargs["audio_self_attention_perturbation_mask"] = None
+        return block_kwargs
+
+    def _run_block(
+        self,
+        block_id: int,
+        block: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        *args,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        hidden_states = block(
+            hidden_states,
+            encoder_hidden_states,
+            *args,
+            **self._block_kwargs(block_id, kwargs),
+        )
+        return self._process_block_outputs(hidden_states, encoder_hidden_states)
+
+    def call_blocks(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        *args,
+        **kwargs,
+    ):
+        for block_id, block in enumerate(self.transformer_blocks):
+            hidden_states, encoder_hidden_states = self._run_block(
+                block_id,
+                block,
+                hidden_states,
+                encoder_hidden_states,
+                *args,
+                **kwargs,
+            )
+        return hidden_states, encoder_hidden_states
+
+    def call_Fn_blocks(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        *args,
+        **kwargs,
+    ):
+        for block_id, block in enumerate(self._Fn_blocks()):
+            hidden_states, encoder_hidden_states = self._run_block(
+                block_id,
+                block,
+                hidden_states,
+                encoder_hidden_states,
+                *args,
+                **kwargs,
+            )
+        return hidden_states, encoder_hidden_states
+
+    def call_Mn_blocks(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        *args,
+        **kwargs,
+    ):
+        original_hidden_states = hidden_states
+        original_encoder_hidden_states = encoder_hidden_states
+        start_idx = self.context_manager.Fn_compute_blocks()
+        for block_id, block in enumerate(self._Mn_blocks(), start=start_idx):
+            hidden_states, encoder_hidden_states = self._run_block(
+                block_id,
+                block,
+                hidden_states,
+                encoder_hidden_states,
+                *args,
+                **kwargs,
+            )
+
+        hidden_states = hidden_states.contiguous()
+        hidden_states_residual = hidden_states - original_hidden_states
+        if encoder_hidden_states is not None and original_encoder_hidden_states is not None:
+            encoder_hidden_states = encoder_hidden_states.contiguous()
+            encoder_hidden_states_residual = encoder_hidden_states - original_encoder_hidden_states
+        else:
+            encoder_hidden_states_residual = None
+
+        return (
+            hidden_states,
+            encoder_hidden_states,
+            hidden_states_residual,
+            encoder_hidden_states_residual,
+        )
+
+    def call_Bn_blocks(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        *args,
+        **kwargs,
+    ):
+        if self.context_manager.Bn_compute_blocks() == 0:
+            return hidden_states, encoder_hidden_states
+
+        start_idx = len(self.transformer_blocks) - self.context_manager.Bn_compute_blocks()
+        for block_id, block in enumerate(self._Bn_blocks(), start=start_idx):
+            hidden_states, encoder_hidden_states = self._run_block(
+                block_id,
+                block,
+                hidden_states,
+                encoder_hidden_states,
+                *args,
+                **kwargs,
+            )
+        return hidden_states, encoder_hidden_states
+
+
+class LTX2AudioCachedAdapter(CachedAdapter):
+    """Cache-DiT adapter that keeps LTX2 audio STG selection layer-aware."""
+
+    @classmethod
+    def collect_unified_blocks(
+        cls,
+        block_adapter: BlockAdapter,
+        contexts_kwargs: list[dict],
+    ) -> list[dict[str, torch.nn.ModuleList]]:
+        BlockAdapter.assert_normalized(block_adapter)
+
+        total_cached_blocks: list[dict[str, torch.nn.ModuleList]] = []
+        assert hasattr(block_adapter.pipe, "_context_manager")
+
+        for i in range(len(block_adapter.transformer)):
+            unified_blocks_bind_context = {}
+            for j in range(len(block_adapter.blocks[i])):
+                cache_config: BasicCacheConfig = contexts_kwargs[i * len(block_adapter.blocks[i]) + j]["cache_config"]
+                unified_blocks_bind_context[block_adapter.unique_blocks_name[i][j]] = torch.nn.ModuleList(
+                    [
+                        LTX2AudioCachedBlocks(
+                            block_adapter.blocks[i][j],
+                            transformer=block_adapter.transformer[i],
+                            forward_pattern=block_adapter.forward_pattern[i][j],
+                            check_forward_pattern=block_adapter.check_forward_pattern,
+                            check_num_outputs=block_adapter.check_num_outputs,
+                            cache_prefix=block_adapter.blocks_name[i][j],
+                            cache_context=block_adapter.unique_blocks_name[i][j],
+                            context_manager=block_adapter.pipe._context_manager,
+                            cache_type=cache_config.cache_type,
+                        )
+                    ]
+                )
+
+            total_cached_blocks.append(unified_blocks_bind_context)
+
+        return total_cached_blocks
+
+
 class BagelCachedAdapter(CachedAdapter):
     """
     Custom CachedAdapter for Bagel that uses BagelCachedContextManager and BagelCachedBlocks.
@@ -891,5 +1058,6 @@ def register_custom_dit_enablers() -> None:
 
 __all__ = [
     "BagelCachedAdapter",
+    "LTX2AudioCachedAdapter",
     "SensenovaCachedAdapter",
 ]

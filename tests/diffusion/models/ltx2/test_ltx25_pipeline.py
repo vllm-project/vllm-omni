@@ -690,6 +690,53 @@ def test_ltx_velocity_from_x0_materializes_official_scalar_sigma():
     assert item_calls == [True]
 
 
+def test_ltx_velocity_from_x0_explicit_scalar_skips_item_and_is_bit_exact():
+    item_calls = []
+
+    class TrackingTensor(torch.Tensor):
+        @staticmethod
+        def __new__(cls):
+            return torch.Tensor._make_subclass(cls, torch.tensor(0.725, dtype=torch.float32), False)
+
+        def item(self):
+            item_calls.append(True)
+            return super().item()
+
+    sample = torch.tensor([[1.0, -0.25, 0.0078125]], dtype=torch.bfloat16)
+    x0 = torch.tensor([[0.5, -0.5, -0.0078125]], dtype=torch.bfloat16)
+    sigma = torch.tensor(0.725, dtype=torch.float32)
+    expected = velocity_from_x0(sample, x0, sigma)
+    actual = velocity_from_x0(sample, x0, TrackingTensor(), sigma_scalar=sigma.item())
+
+    assert item_calls == []
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize(
+    ("guidance", "split_names"),
+    [
+        (LTXModalityGuidance(), ("cond",)),
+        (LTXModalityGuidance(cfg_scale=4.0), ("cond", "uncond")),
+        (LTXModalityGuidance(stg_scale=1.0, stg_blocks=(28,)), ("cond", "ptb")),
+    ],
+)
+def test_ltx_guidance_explicit_sigma_scalar_matches_fallback(guidance, split_names):
+    sample = torch.tensor([[[1.0, -0.5], [0.25, 2.0]]], dtype=torch.bfloat16)
+    velocities = {name: torch.full_like(sample, 0.125 * (index + 1)) for index, name in enumerate(split_names)}
+    sigma = torch.tensor(0.725, dtype=torch.float32)
+
+    expected = LTX_GUIDANCE_EXECUTOR._guide_modality(sample, velocities, sigma, guidance)
+    actual = LTX_GUIDANCE_EXECUTOR._guide_modality(
+        sample,
+        velocities,
+        sigma,
+        guidance,
+        sigma_scalar=sigma.item(),
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
 def test_ltx_ancestral_positive_only_guidance_preserves_raw_velocity():
     sample = torch.full((1, 1), 1e8, dtype=torch.float32)
     velocity = torch.ones((1, 1), dtype=torch.bfloat16)

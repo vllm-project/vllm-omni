@@ -550,6 +550,27 @@ def test_serve_cli_accepts_diffusion_compile_controls():
     assert stage_cfg["engine_args"]["diffusion_compile_dynamic"] is False
 
 
+def test_serve_cli_forwards_ltx2_audio_cuda_graph_additional_config():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Lightricks/LTX-2.5-Diffusers",
+            "--omni",
+            "--additional-config",
+            '{"ltx2_audio_cuda_graph":{"enabled":true,"max_entries":8}}',
+        ]
+    )
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(args.get_explicit_kwargs_dict())[0]
+
+    assert stage_cfg["engine_args"]["additional_config"] == {
+        "ltx2_audio_cuda_graph": {"enabled": True, "max_entries": 8}
+    }
+
+
 def test_serve_cli_accepts_diffusion_attention_backend():
     """Ensure diffusion serve CLI exposes the shorthand backend flag."""
     parser = TrackingArgumentParser()

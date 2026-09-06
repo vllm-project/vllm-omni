@@ -13,6 +13,8 @@ from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
+from vllm_omni.diffusion.models.ltx2.ltx2_audio_cuda_graph import LTX2AudioCUDAGraphConfig
+from vllm_omni.diffusion.models.ltx2.ltx2_audio_runtime import LTXAudioRuntime
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -132,6 +134,161 @@ class _CompileTrackingModel:
     def compile(self, *args, **kwargs):
         self.compile_calls.append((args, kwargs))
         return self
+
+
+def _make_ltx2_graph_pipeline(**overrides):
+    config = {
+        "enforce_eager": True,
+        "diffusion_compile_dynamic": True,
+        "dtype": torch.bfloat16,
+        "parallel_config": SimpleNamespace(tensor_parallel_size=1, sequence_parallel_size=1),
+        "enable_cpu_offload": False,
+        "enable_layerwise_offload": False,
+        "enable_distributed_layerwise_offload": False,
+        "quantization_config": None,
+        "lora_path": None,
+    }
+    config.update(overrides)
+    return SimpleNamespace(
+        _audio_cuda_graph_config=LTX2AudioCUDAGraphConfig(enabled=True, max_entries=4),
+        od_config=SimpleNamespace(**config),
+        transformer=object(),
+        device=torch.device("cuda"),
+        audio_graph_runner=SimpleNamespace(transformer=None, clear=Mock()),
+    )
+
+
+def test_ltx2_audio_graph_compile_preserves_bf16_precision_boundaries(monkeypatch):
+    prepare_compile = Mock()
+    original = SimpleNamespace(prepare_audio_cuda_graph_compile=prepare_compile)
+    pipeline = _make_ltx2_graph_pipeline(enforce_eager=False)
+    pipeline.transformer = original
+    compiled = object()
+    compile_calls = []
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.ltx2.ltx2_audio_runtime.regionally_compile",
+        lambda transformer, **kwargs: compile_calls.append((transformer, kwargs)) or compiled,
+    )
+
+    LTXAudioRuntime.setup_audio_cuda_graph_compile(pipeline)
+
+    prepare_compile.assert_called_once_with()
+    assert compile_calls == [
+        (
+            original,
+            {
+                "dynamic": True,
+                "options": {
+                    "emulate_precision_casts": True,
+                    "triton.cudagraphs": False,
+                    "triton.cudagraph_trees": False,
+                },
+            },
+        )
+    ]
+    assert pipeline.transformer is compiled
+    assert pipeline.audio_graph_runner.transformer is compiled
+
+
+def test_ltx2_audio_graph_compile_failure_keeps_eager_transformer(monkeypatch, caplog):
+    original = SimpleNamespace(prepare_audio_cuda_graph_compile=Mock())
+    pipeline = _make_ltx2_graph_pipeline(enforce_eager=False)
+    pipeline.transformer = original
+    pipeline.audio_graph_runner.transformer = original
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.ltx2.ltx2_audio_runtime.regionally_compile",
+        Mock(side_effect=RuntimeError("compile failed")),
+    )
+
+    LTXAudioRuntime.setup_audio_cuda_graph_compile(pipeline)
+
+    assert pipeline.transformer is original
+    assert pipeline.audio_graph_runner.transformer is original
+    assert "LTX2 audio compile failed; using eager CUDA Graph" in caplog.text
+    assert "LTX2 audio CUDA Graph enabled (compiled" not in caplog.text
+
+
+def test_ltx2_audio_graph_release_is_model_local_and_keeps_runner():
+    pipeline = _make_ltx2_graph_pipeline()
+    runner = pipeline.audio_graph_runner
+
+    LTXAudioRuntime.release_captured_graphs(pipeline)
+
+    runner.clear.assert_called_once_with()
+    assert pipeline.audio_graph_runner is runner
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"dtype": torch.float16}, "dtype must be bfloat16"),
+        (
+            {
+                "parallel_config": SimpleNamespace(
+                    tensor_parallel_size=1,
+                    sequence_parallel_size=2,
+                    ulysses_degree=1,
+                    ring_degree=2,
+                    allgather_degree=1,
+                    ulysses_mode="strict",
+                )
+            },
+            "pure Ulysses",
+        ),
+        (
+            {
+                "parallel_config": SimpleNamespace(
+                    tensor_parallel_size=1,
+                    sequence_parallel_size=2,
+                    ulysses_degree=2,
+                    ring_degree=1,
+                    allgather_degree=1,
+                    ulysses_mode="advanced_uaa",
+                )
+            },
+            "ulysses_mode='strict'",
+        ),
+        ({"enable_cpu_offload": True}, "CPU offload is unsupported"),
+        ({"enable_layerwise_offload": True}, "layerwise offload is unsupported"),
+        ({"enable_distributed_layerwise_offload": True}, "distributed layerwise offload is unsupported"),
+        ({"quantization_config": object()}, "quantization is unsupported"),
+        ({"lora_path": "adapter"}, "LoRA is unsupported"),
+    ],
+)
+def test_ltx2_audio_graph_rejects_unvalidated_configurations(override, message):
+    pipeline = _make_ltx2_graph_pipeline(**override)
+    with pytest.raises(ValueError, match=message):
+        LTXAudioRuntime._validate_audio_cuda_graph_support(pipeline.od_config, pipeline.device)
+
+
+def test_ltx2_audio_graph_rejects_non_cuda_device():
+    pipeline = _make_ltx2_graph_pipeline()
+    with pytest.raises(ValueError, match="device must be CUDA"):
+        LTXAudioRuntime._validate_audio_cuda_graph_support(pipeline.od_config, torch.device("cpu"))
+
+
+def test_ltx2_audio_graph_accepts_tensor_parallelism():
+    pipeline = _make_ltx2_graph_pipeline(
+        parallel_config=SimpleNamespace(tensor_parallel_size=2, sequence_parallel_size=1)
+    )
+
+    LTXAudioRuntime._validate_audio_cuda_graph_support(pipeline.od_config, pipeline.device)
+
+
+def test_ltx2_audio_graph_accepts_strict_ulysses_sequence_parallelism():
+    pipeline = _make_ltx2_graph_pipeline(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            sequence_parallel_size=2,
+            ulysses_degree=2,
+            ring_degree=1,
+            allgather_degree=1,
+            ulysses_mode="strict",
+        )
+    )
+
+    LTXAudioRuntime._validate_audio_cuda_graph_support(pipeline.od_config, pipeline.device)
 
 
 def _make_request():
@@ -1000,7 +1157,14 @@ def test_execute_model_runs_forward_after_kv_receive(monkeypatch):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
+@pytest.mark.parametrize(
+    ("model_class_name", "cache_backend_enabled"),
+    [
+        ("NextStep11Pipeline", False),
+        ("LTX2TextToAudioPipeline", True),
+    ],
+)
+def test_load_model_applies_pipeline_cache_support_policy(monkeypatch, model_class_name, cache_backend_enabled):
     class _DummyLoader:
         def __init__(self, load_config, od_config=None):
             del load_config, od_config
@@ -1040,7 +1204,7 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
         enable_layerwise_offload=False,
         cache_backend="cache_dit",
         cache_config={},
-        model_class_name="NextStep11Pipeline",
+        model_class_name=model_class_name,
         enforce_eager=True,
         streaming_output=False,
     )
@@ -1059,9 +1223,13 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
 
     DiffusionModelRunner.load_model(runner)
 
-    assert runner.cache_backend is None
-    assert runner.od_config.cache_backend is None
-    assert dummy_cache_backend.enabled is False
+    if cache_backend_enabled:
+        assert runner.cache_backend is dummy_cache_backend
+        assert runner.od_config.cache_backend == "cache_dit"
+    else:
+        assert runner.cache_backend is None
+        assert runner.od_config.cache_backend is None
+    assert dummy_cache_backend.enabled is cache_backend_enabled
 
 
 @pytest.mark.core_model
