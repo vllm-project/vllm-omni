@@ -754,7 +754,8 @@ class MossTTSCodecDecoder(nn.Module):
         )
 
         codec.eval()
-        if device.type != "cpu":
+        # The v1 quantizer emits FP32 tensors, so its decoder must remain FP32.
+        if device.type != "cpu" and isinstance(codec, MossAudioTokenizerV2Model):
             codec.decoder.to(dtype=torch.bfloat16)
         build_decode_lut = getattr(codec.quantizer, "build_decode_lut", None)
         if callable(build_decode_lut):
