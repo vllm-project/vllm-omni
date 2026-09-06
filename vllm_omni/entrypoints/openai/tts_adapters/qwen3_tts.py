@@ -226,7 +226,16 @@ class Qwen3TTSAdapter(ARTTSAdapter):
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
-        prompt, tts_params, warmup_key = await self.ctx.server._build_qwen3_tts_request(request)
+        effective_request = request
+        # Inline Base cloning derives its voice from ref_audio, not the
+        # OpenAI-compatible voice label.
+        if has_inline_ref_audio and request.task_type == "Base" and request.voice is not None:
+            logger.info(
+                "Ignoring voice=%r for Qwen3-TTS Base request because inline ref_audio takes precedence",
+                request.voice,
+            )
+            effective_request = request.model_copy(update={"voice": None})
+        prompt, tts_params, warmup_key = await self.ctx.server._build_qwen3_tts_request(effective_request)
         return PreparedRequest(
             prompt=prompt,
             tts_params=tts_params,
