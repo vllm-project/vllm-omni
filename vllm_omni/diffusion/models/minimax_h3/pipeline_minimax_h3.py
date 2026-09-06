@@ -689,6 +689,8 @@ class MiniMaxH3Pipeline(
         "prepare_encode",
         "denoise_step",
         "post_decode",
+        "video_vae.decode_latent",
+        "audio_vae.decode_latent",
     ]
     dummy_run_num_frames: ClassVar[int] = 0
     # Only distilled releases pin a schedule, so the default keeps the legacy

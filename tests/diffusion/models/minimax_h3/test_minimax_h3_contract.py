@@ -148,6 +148,25 @@ def test_encoder_free_stage_skips_missing_component_during_dlo_registration():
     audio_vae.set_omni_component_cache.assert_called_once_with(cache)
 
 
+def test_h3_profiler_records_video_and_audio_vae_decode(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.profiler import diffusion_pipeline_profiler as profiler_module
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.video_vae = SimpleNamespace(decode_latent=lambda latent: latent + 1)
+    pipeline.audio_vae = SimpleNamespace(decode_latent=lambda latent: latent + 2)
+    monkeypatch.setattr(profiler_module.current_omni_platform, "is_available", lambda: False)
+
+    pipeline.setup_diffusion_pipeline_profiler(enable_diffusion_pipeline_profiler=True)
+
+    assert pipeline.video_vae.decode_latent(1) == 2
+    assert pipeline.audio_vae.decode_latent(1) == 3
+    assert pipeline.stage_durations["MiniMaxH3Pipeline.video_vae.decode_latent"] >= 0
+    assert pipeline.stage_durations["MiniMaxH3Pipeline.audio_vae.decode_latent"] >= 0
+    assert "decode" in MiniMaxH3Pipeline._PROFILER_TARGETS
+
+
 def _write_partition_index(path, *, partition, tasks):
     path.mkdir(parents=True)
     (path / "model_index.json").write_text(
