@@ -136,6 +136,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
     # sample_tokens: OmniOutput handling + pooler_output + async D2H
     # ------------------------------------------------------------------
 
+    @torch.inference_mode()
     @step_eplb_after()
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
@@ -149,7 +150,6 @@ class OmniARModelRunner(OmniGPUModelRunner):
         input_batch = self.execute_model_state.input_batch
         hidden_states = self.execute_model_state.hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
-        kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         ec_connector_output = self.execute_model_state.ec_connector_output
         routed_experts = self.execute_model_state.routed_experts
         self.execute_model_state = None
@@ -160,6 +160,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             self.postprocess_num_computed_tokens(input_batch)
             if not all_decode_next:
                 self.model_state.postprocess_state(input_batch.idx_mapping, 0)
+            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
             output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
@@ -256,7 +257,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             num_rejected,
             input_batch.query_start_loc,
         )
-        model_runner_output.kv_connector_output = kv_connector_output
+        model_runner_output.kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.ec_connector_output = ec_connector_output
 
         self._reserve_native_data_plane_outputs(list(model_runner_output.req_ids))

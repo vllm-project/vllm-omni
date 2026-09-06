@@ -8,7 +8,7 @@ buffer and lifecycle hooks.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -187,7 +187,12 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             updated = True
 
         if released_chunks:
-            self.add_requests(SimpleNamespace(scheduled_new_reqs=released_chunks))
+            self.add_requests(
+                replace(
+                    scheduler_output,
+                    scheduled_new_reqs=released_chunks,
+                )
+            )
         if updated:
             self.req_states.apply_staged_writes()
 
@@ -377,7 +382,6 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         if model_output is None or input_batch is None or execute_model_state is None:
             return None
 
-        kv_connector_output = self.kv_connector.post_forward(execute_model_state.finished_req_ids)
         num_reqs = input_batch.num_reqs
 
         # Mark all scheduled tokens as computed so the scheduler does
@@ -391,6 +395,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             prompt_len = int(self.req_states.prompt_len.np[req_idx])
             self.req_states.num_computed_tokens.stage_write_elem(req_idx, prompt_len)
         self.req_states.num_computed_tokens.apply_write()
+        kv_connector_output = self.kv_connector.post_forward(execute_model_state.finished_req_ids)
 
         # Async finalization can run after the input batch is reused for the
         # next scheduler step, so output metadata must not alias the batch.

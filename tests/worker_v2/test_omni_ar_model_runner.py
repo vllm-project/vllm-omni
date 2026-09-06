@@ -130,6 +130,7 @@ def test_non_last_pp_rank_uses_vllm_027_pp_handler() -> None:
 
     def receive(batch):
         assert batch is input_batch
+        assert torch.is_inference_mode_enabled()
         return False
 
     runner.pp_handler = SimpleNamespace(receive=MagicMock(side_effect=receive))
@@ -144,6 +145,75 @@ def test_non_last_pp_rank_uses_vllm_027_pp_handler() -> None:
     runner.model_state.postprocess_state.assert_called_once_with(input_batch.idx_mapping, 0)
     runner.kv_connector.post_forward.assert_called_once_with({"finished"})
     assert output.kv_connector_output is connector_output
+
+
+def test_last_pp_rank_runs_connector_after_sampling_state_is_finalized(monkeypatch) -> None:
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    input_batch = SimpleNamespace(
+        req_ids=["req"],
+        idx_mapping=torch.tensor([0]),
+        query_start_loc=torch.tensor([0, 1]),
+        num_reqs=1,
+        seq_lens=torch.tensor([3]),
+    )
+    runner._kv_extracted_req_ids = None
+    runner.execute_model_state = SimpleNamespace(
+        input_batch=input_batch,
+        hidden_states=torch.zeros(1, 2),
+        finished_req_ids={"finished"},
+        ec_connector_output=None,
+        routed_experts=None,
+    )
+    runner._last_aux_output = None
+    runner._last_multimodal_outputs = None
+    runner._last_multimodal_snapshot_slot = None
+    runner.is_last_pp_rank = True
+    runner.pp_handler = None
+    runner.model_config = SimpleNamespace(async_chunk=False)
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type="text"))
+    runner.model_state = SimpleNamespace(postprocess_model_output=MagicMock(return_value=(torch.zeros(1, 2), None)))
+    runner.req_states = SimpleNamespace(
+        all_token_ids=SimpleNamespace(gpu=torch.tensor([[1]])),
+        num_computed_tokens=SimpleNamespace(gpu=torch.tensor([0])),
+        prompt_len=SimpleNamespace(np=np.array([1]), gpu=torch.tensor([1])),
+    )
+    runner.sample = MagicMock(
+        return_value=(
+            SimpleNamespace(sampled_token_ids=torch.tensor([[2]])),
+            torch.tensor([1]),
+            torch.tensor([0]),
+        )
+    )
+    runner.model = SimpleNamespace(compute_logits=MagicMock())
+    runner.prompt_logprobs_worker = SimpleNamespace(compute_prompt_logprobs=MagicMock(return_value={}))
+    runner.postprocess_sampled = MagicMock()
+    connector_output = object()
+
+    def post_forward(finished_req_ids):
+        runner.postprocess_sampled.assert_called_once()
+        assert finished_req_ids == {"finished"}
+        return connector_output
+
+    runner.kv_connector = SimpleNamespace(post_forward=MagicMock(side_effect=post_forward))
+    runner.main_stream = MagicMock()
+    runner.output_copy_stream = MagicMock()
+    runner._finalize_native_data_plane_output = MagicMock()
+    runner.check_ep_fault = False
+    runner._reserve_native_data_plane_outputs = MagicMock()
+    runner.eplb = SimpleNamespace(step=MagicMock())
+
+    async_output = SimpleNamespace(copy_event=None)
+    monkeypatch.setattr(
+        omni_ar_model_runner,
+        "OmniAsyncOutput",
+        MagicMock(return_value=async_output),
+    )
+
+    output = runner.sample_tokens(None)
+
+    assert output is async_output
+    model_runner_output = omni_ar_model_runner.OmniAsyncOutput.call_args.kwargs["model_runner_output"]
+    assert model_runner_output.kv_connector_output is connector_output
 
 
 def test_async_output_uses_blocking_cuda_event_by_default(monkeypatch) -> None:
