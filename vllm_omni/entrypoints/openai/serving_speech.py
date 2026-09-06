@@ -959,6 +959,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if self._tts_model_type in (
                 "cosyvoice3",
                 "fish_tts",
+                "audio8_tts",
                 "omnivoice",
                 "moss_tts_nano",
                 "glm_tts",
@@ -968,6 +969,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 label = {
                     "cosyvoice3": "CosyVoice3",
                     "fish_tts": "Fish Speech",
+                    "audio8_tts": "Audio8 TTS",
                     "omnivoice": "OmniVoice",
                     "moss_tts_nano": "MOSS-TTS-Nano",
                     "higgs_audio_v2": "Higgs-Audio V2",

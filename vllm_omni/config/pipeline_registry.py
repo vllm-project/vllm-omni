@@ -40,6 +40,7 @@ from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_TTA_PIPELINE,
     AUDEX_TTS_PIPELINE,
 )
+from vllm_omni.model_executor.models.audio8_tts.pipeline import resolve_arktts_pipeline
 from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_OMNI_PIPELINE
 from vllm_omni.model_executor.models.bagel.pipeline import (
     BAGEL_PIPELINE,
@@ -167,6 +168,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "voxtral_tts": VOXTRAL_TTS_PIPELINE,
     "glm_tts": GLM_TTS_PIPELINE,
     "fish_qwen3_omni": FISH_SPEECH_PIPELINE,
+    "arktts": resolve_arktts_pipeline,
     "ming_flash_omni": MING_FLASH_OMNI_PIPELINE,
     "ming_flash_omni_tts": MING_FLASH_OMNI_TTS_PIPELINE,
     "ming_flash_omni_thinker_only": MING_FLASH_OMNI_THINKER_ONLY_PIPELINE,

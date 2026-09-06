@@ -304,6 +304,23 @@ _OMNI_MODELS = {
         "gepard_talker",
         "GepardTalkerForConditionalGeneration",
     ),
+    ## audio8_tts (Audio8 TTS Preview 0.6B)
+    "Audio8TTSSlowARForConditionalGeneration": (
+        "audio8_tts",
+        "audio8_tts_slow_ar",
+        "Audio8TTSSlowARForConditionalGeneration",
+    ),
+    ## audio8_tts (Audio8 TTS Preview 0.1B; Falcon-H1 hybrid Slow AR, shared codec)
+    "Audio8TTS01BSlowARForConditionalGeneration": (
+        "audio8_tts",
+        "audio8_tts_falcon_slow_ar",
+        "Audio8TTS01BSlowARForConditionalGeneration",
+    ),
+    "Audio8TTSCodecDecoder": (
+        "audio8_tts",
+        "audio8_tts_codec_decoder",
+        "Audio8TTSCodecDecoder",
+    ),
     ## VoxCPM2
     "VoxCPM2TalkerForConditionalGeneration": (
         "voxcpm2",
