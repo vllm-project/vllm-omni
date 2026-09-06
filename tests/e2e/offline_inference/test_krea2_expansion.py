@@ -91,8 +91,8 @@ def test_krea2_cache_dit(offline_client: OfflineOmniClient) -> None:
 def test_krea2_hsdp(offline_client: OfflineOmniClient) -> None:
     """Exercise Hybrid Sharded Data Parallel (HSDP) weight sharding on the DiT across 2 GPUs.
 
-    Validates the docs' HSDP-support claim for Krea 2. Scheduled on the multi-GPU (distributed_cuda)
-    shard by ``num_cards=2``; skipped automatically on boxes with fewer than 2 CUDA devices.
+    Validates the docs' HSDP-support claim for Krea 2. Scheduled on the multi-GPU
+    shard by ``num_cards=2`` (``not cards_1``); skipped automatically on boxes with fewer than 2 CUDA devices.
     """
     offline_client.send_diffusion_request({"model": MODEL, "prompt": PROMPT, "sampling_params": _sampling()})
 
@@ -111,7 +111,7 @@ def test_krea2_vae_patch_parallel(offline_client: OfflineOmniClient) -> None:
     """Exercise VAE patch-parallel (decode) across 2 GPUs.
 
     Validates the docs' VAE-patch-parallel (decode) support claim for Krea 2. Scheduled on the
-    multi-GPU (distributed_cuda) shard by ``num_cards=2``; skipped automatically on boxes with
+    multi-GPU shard by ``num_cards=2`` (``not cards_1``); skipped automatically on boxes with
     fewer than 2 CUDA devices.
     """
     offline_client.send_diffusion_request({"model": MODEL, "prompt": PROMPT, "sampling_params": _sampling()})

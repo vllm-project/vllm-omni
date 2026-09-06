@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """MembershipController: distributed replica lifecycle management.
 
@@ -60,6 +60,7 @@ class MembershipController:
         self._watcher_task: asyncio.Task[None] | None = None
         self._output_queue: asyncio.Queue[EngineQueueMessage] | None = None
         self._cleanup_callback: Callable[[list[str]], Awaitable[None]] | None = None
+        self._replica_removed_callback: Callable[[int, int], None] | None = None
 
         self._hub = OmniCoordClientForHub(coordinator_pub_address)
         factory = load_balancer_factory
@@ -118,8 +119,12 @@ class MembershipController:
             return
         effective_output_queue = output_queue if output_queue is not None else self._output_queue
         effective_cleanup_callback = cleanup_callback if cleanup_callback is not None else self._cleanup_callback
+        replica_id = pool.get_replica_id_by_addr(input_addr)
+        client = pool.get_client_by_addr(input_addr)
         affected = pool.invalidate_addr(input_addr)
         self._detach_replica(stage_id, input_addr)
+        if client is not None and replica_id is not None and self._replica_removed_callback is not None:
+            self._replica_removed_callback(stage_id, replica_id)
         if affected and effective_cleanup_callback is not None:
             await effective_cleanup_callback(affected)
         if affected and effective_output_queue is not None:
@@ -283,10 +288,12 @@ class MembershipController:
         *,
         output_queue: asyncio.Queue[EngineQueueMessage],
         cleanup_callback: Callable[[list[str]], Awaitable[None]],
+        replica_removed_callback: Callable[[int, int], None] | None = None,
     ) -> None:
         """Install shared cleanup sinks for watcher-driven unregister events."""
         self._output_queue = output_queue
         self._cleanup_callback = cleanup_callback
+        self._replica_removed_callback = replica_removed_callback
 
     def _pool_for_stage_id(self, stage_id: int) -> StagePool | None:
         if not (0 <= stage_id < len(self._stage_pools)):

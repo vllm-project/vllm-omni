@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for OmniPlatform.record_device_event implementations."""
 
 import pytest
@@ -122,8 +122,8 @@ class TestNPUOmniPlatformRecordDeviceEvent:
         result = NPUOmniPlatform.record_device_event()
         assert result is None
 
-    def test_synchronizes_stream_then_records_event(self, mocker):
-        """NPU should sync stream first, then create and record an Event."""
+    def test_synchronizes_stream_then_records_generic_event(self, mocker):
+        """NPU should return an event consumable by the generic torch.Stream."""
         try:
             from vllm_omni.platforms.npu.platform import NPUOmniPlatform
         except ModuleNotFoundError:
@@ -133,14 +133,16 @@ class TestNPUOmniPlatformRecordDeviceEvent:
         mock_stream = mocker.MagicMock()
         mock_torch = mocker.MagicMock()
         mock_torch.npu.current_stream.return_value = mock_stream
-        mock_torch.npu.Event.return_value = mock_event
+        mock_torch.Event.return_value = mock_event
         mocker.patch("vllm_omni.platforms.npu.platform.torch", mock_torch)
 
         result = NPUOmniPlatform.record_device_event()
 
         # Stream should be synced first (HCCL ordering)
         mock_stream.synchronize.assert_called_once()
-        # Then event should be created and recorded
-        mock_torch.npu.Event.assert_called_once()
+        # Then a backend-neutral event should be created and recorded.  The
+        # worker waits on it through the public torch.Stream wrapper.
+        mock_torch.Event.assert_called_once()
+        mock_torch.npu.Event.assert_not_called()
         mock_event.record.assert_called_once()
         assert result is mock_event

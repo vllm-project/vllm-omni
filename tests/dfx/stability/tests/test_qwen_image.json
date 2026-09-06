@@ -1,6 +1,18 @@
 [
     {
         "test_name": "test_qwen_image_stability",
+        "mark": [
+            {
+                "hardware_marks": {
+                    "res": {
+                        "cuda": "H800"
+                    },
+                    "num_cards": 1
+                }
+            },
+            "local_model",
+            "diffusion"
+        ],
         "server_params": {
             "model": "Qwen/Qwen-Image"
         },

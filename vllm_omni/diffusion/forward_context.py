@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -26,14 +29,23 @@ class ForwardContext:
     vllm_config: VllmConfig | None = None
     omni_diffusion_config: OmniDiffusionConfig | None = None
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None
+    # Runner-owned paged execution metadata/runtime. Attention resolves the
+    # active Worker adapter from it; model code must not construct BlockTable
+    # rows or activate the runtime directly.
+    paged_kv_runtime: object | None = None
     # Active Worker-side paged KV adapter.  The adapter is installed only for
     # the duration of a paged forward; dense forwards leave this as ``None``.
     # Keep the field opaque here to avoid coupling the common context module to
     # the diffusion_kv implementation.
     paged_kv_adapter: Any | None = None
+    # Startup-only memory profiling runs before Scheduler-owned pages exist.
+    # Attention layers use this explicit scope to distinguish that probe from
+    # a malformed paged request whose Worker adapter was not activated.
+    in_diffusion_kv_memory_profile: bool = False
     split_text_embed_in_sp: bool = False
     denoise_step_idx: int | None = None
     denoise_timestep: float | None = None
+    total_denoise_steps: int | None = None
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
@@ -150,6 +162,8 @@ def create_forward_context(
     vllm_config: VllmConfig | None = None,
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
+    paged_kv_runtime: object | None = None,
+    in_diffusion_kv_memory_profile: bool = False,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
 ):
@@ -157,6 +171,8 @@ def create_forward_context(
         vllm_config=vllm_config,
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
+        paged_kv_runtime=paged_kv_runtime,
+        in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
     )
@@ -182,6 +198,8 @@ def set_forward_context(
     vllm_config: VllmConfig | None = None,
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
+    paged_kv_runtime: object | None = None,
+    in_diffusion_kv_memory_profile: bool = False,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
 ):
@@ -193,6 +211,8 @@ def set_forward_context(
         vllm_config=vllm_config,
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
+        paged_kv_runtime=paged_kv_runtime,
+        in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
     )
@@ -242,6 +262,11 @@ def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
     """Set the current diffusion denoise step on the active ForwardContext."""
     if _forward_context is not None:
         _forward_context.denoise_step_idx = step_idx
+        if step_idx is not None:
+            paged_kv_runtime = getattr(_forward_context, "paged_kv_runtime", None)
+            ensure_active = getattr(paged_kv_runtime, "ensure_active", None)
+            if callable(ensure_active):
+                ensure_active(step_idx)
 
 
 def set_forward_context_denoise_timestep(timestep: float | None) -> None:
@@ -255,6 +280,16 @@ def set_forward_context_denoise_timestep(timestep: float | None) -> None:
         _forward_context.denoise_timestep = None if timestep is None else float(timestep)
 
 
+def set_forward_context_denoise_total_steps(total_steps: int | None) -> None:
+    """Set the total denoise step count on the active ForwardContext.
+
+    Denoise loops publish it so tail-fallback gates (e.g. ``end_step`` in
+    RAINFUSION_ATTN) know when the final denoise steps begin.
+    """
+    if _forward_context is not None:
+        _forward_context.total_denoise_steps = total_steps
+
+
 class DenoiseProgressMixin:
     def record_denoise_step(
         self,
@@ -262,8 +297,11 @@ class DenoiseProgressMixin:
         timestep=None,
         scheduler=None,
         normalized_timestep: float | None = None,
+        total_steps: int | None = None,
     ) -> None:
         set_forward_context_denoise_step_idx(step_idx)
+        if _forward_context is not None:
+            _forward_context.total_denoise_steps = total_steps
         if _forward_context is None:
             return
         if normalized_timestep is not None:

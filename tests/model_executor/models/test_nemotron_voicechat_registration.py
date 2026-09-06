@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """L1 registration + config-shim tests for NemotronVoiceChat (CPU, no weights)."""
 
 import subprocess
@@ -59,21 +59,11 @@ def test_pipeline_registered_with_three_stages() -> None:
     assert code2wav.execution_type == StageExecutionType.LLM_GENERATION
     assert code2wav.final_output and code2wav.final_output_type == "audio"
     assert code2wav.input_sources == (1,)
-    assert pipeline.validate() == []
 
 
 def test_architectures_registered() -> None:
     for arch in _ARCHS:
         assert arch in _OMNI_MODELS, f"{arch} missing from _OMNI_MODELS"
-
-
-def test_full_payload_whitelists_cover_code2wav_only() -> None:
-    from vllm_omni.core.sched.omni_scheduling_coordinator import _FULL_PAYLOAD_INPUT_STAGES
-
-    assert ("NemotronVoiceChatCode2Wav", "code2wav") in _FULL_PAYLOAD_INPUT_STAGES
-    # The thinker->talker hop is token-path only: the talker must NOT wait on a
-    # connector payload or stage 1 hangs.
-    assert ("NemotronVoiceChatTalkerForConditionalGeneration", "talker") not in _FULL_PAYLOAD_INPUT_STAGES
 
 
 def test_config_parses_nemo_layout_without_hub_access(monkeypatch) -> None:

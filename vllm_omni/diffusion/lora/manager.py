@@ -68,6 +68,12 @@ class DiffusionLoRAManager:
         self.pipeline = pipeline
         self.device = device
         self.dtype = dtype
+        od_config = getattr(pipeline, "od_config", None)
+        # DLO owns the base-weight lifecycle. Keep request-switchable LoRA
+        # sidecars resident instead of rebuilding DLO host shards per request.
+        self._resident_lora_device = (
+            device if getattr(od_config, "enable_distributed_layerwise_offload", False) is True else None
+        )
 
         # Cache supported/expected module suffixes once, before any layer
         # replacement happens. After LoRA layers are injected, the original
@@ -450,6 +456,13 @@ class DiffusionLoRAManager:
                 )
 
                 if lora_layer is not module and isinstance(lora_layer, BaseLayerWithLoRA):
+                    if self._resident_lora_device is not None:
+                        set_buffer_device = getattr(lora_layer, "_set_diffusion_lora_buffer_device", None)
+                        if not callable(set_buffer_device):
+                            raise RuntimeError(
+                                f"{type(lora_layer).__name__} cannot keep dynamic LoRA buffers resident for DLO"
+                            )
+                        set_buffer_device(self._resident_lora_device)
                     replace_submodule(component, module_name, lora_layer)
                     self._lora_modules[full_module_name] = lora_layer
                     logger.debug("Replaced layer: %s -> %s", full_module_name, type(lora_layer).__name__)

@@ -27,6 +27,8 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
     ``execution_type=StageExecutionType.LLM_GENERATION``.
     """
 
+    model_runner_cls = GPUGenerationModelRunner
+
     @instrument(span_name="Init device")
     def init_device(self):
         if self.device_config.device_type in ("cuda", "musa"):
@@ -99,7 +101,7 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
             logger.warning("OMNI GPUGenerationWorker forces v1 model runner for omni hooks.")
             self.use_v2_model_runner = False
 
-        self.model_runner = GPUGenerationModelRunner(self.vllm_config, self.device)
+        self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

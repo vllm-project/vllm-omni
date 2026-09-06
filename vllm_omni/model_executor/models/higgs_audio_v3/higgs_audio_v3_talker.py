@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage-0 talker for higgs-audio v3 (Qwen3 backbone, fused multi-codebook).
 
 Architecture:
@@ -344,6 +344,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         positions: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         omni_query_start_loc: torch.Tensor | None = None,
+        req_ids: list[str] | None = None,
         **_: Any,
     ) -> None:
         """Update per-step metadata before runner forward or CUDA graph replay."""
@@ -354,6 +355,91 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 self._ensure_decode_state_capacity(int(input_ids.shape[0]), input_ids.device)
         self._set_last_step_query_start_loc(omni_query_start_loc)
         self._decode_step_metadata_from_runner = True
+
+        if req_ids is not None:
+            self._sync_decode_state_with_batch(req_ids)
+
+    def _ensure_state_pool_capacity(self, num_rows: int, device: torch.device) -> None:
+        if not hasattr(self, "_state_pool_indices"):
+            self._state_pool_indices: dict[str, int] = {}
+            self._free_state_pool_indices: set[int] = set()
+            self._state_pool_has_codes = torch.empty(0, dtype=torch.bool, device=device)
+            self._state_pool_last_codes = torch.empty((0, self.num_codebooks), dtype=torch.long, device=device)
+            self._state_pool_delay_count = torch.empty(0, dtype=torch.long, device=device)
+            self._state_pool_eoc_countdown = torch.empty(0, dtype=torch.long, device=device)
+            self._state_pool_generation_done = torch.empty(0, dtype=torch.bool, device=device)
+
+        current_rows = self._state_pool_has_codes.shape[0]
+        if current_rows >= num_rows:
+            return
+
+        new_rows = max(current_rows * 2, num_rows, 64)
+
+        def resize(tensor: torch.Tensor, fill_value: int | bool) -> torch.Tensor:
+            result = torch.empty((new_rows, *tensor.shape[1:]), dtype=tensor.dtype, device=device)
+            result[:current_rows] = tensor
+            result[current_rows:] = fill_value
+            return result
+
+        self._state_pool_has_codes = resize(self._state_pool_has_codes, False)
+        self._state_pool_last_codes = resize(self._state_pool_last_codes, 0)
+        self._state_pool_delay_count = resize(self._state_pool_delay_count, 0)
+        self._state_pool_eoc_countdown = resize(self._state_pool_eoc_countdown, -1)
+        self._state_pool_generation_done = resize(self._state_pool_generation_done, False)
+
+    def _sync_decode_state_with_batch(self, req_ids: list[str]) -> None:
+        device = self._decode_has_codes.device
+        self._ensure_state_pool_capacity(len(req_ids), device)
+        previous_req_ids = getattr(self, "_last_batch_req_ids", [])
+
+        if previous_req_ids != req_ids or any(req_id not in self._state_pool_indices for req_id in req_ids):
+            previous_rows = [row for row, req_id in enumerate(previous_req_ids) if req_id in self._state_pool_indices]
+            if previous_rows:
+                pool_rows = [self._state_pool_indices[previous_req_ids[row]] for row in previous_rows]
+                src = torch.tensor(previous_rows, dtype=torch.long, device=device)
+                dst = torch.tensor(pool_rows, dtype=torch.long, device=device)
+                self._state_pool_has_codes[dst] = self._decode_has_codes[src]
+                self._state_pool_last_codes[dst] = self._decode_last_codes[src]
+                self._state_pool_delay_count[dst] = self._decode_delay_count[src]
+                self._state_pool_eoc_countdown[dst] = self._decode_eoc_countdown[src]
+                self._state_pool_generation_done[dst] = self._decode_generation_done[src]
+
+            for req_id in req_ids:
+                if req_id in self._state_pool_indices:
+                    continue
+                if self._free_state_pool_indices:
+                    pool_row = self._free_state_pool_indices.pop()
+                else:
+                    pool_row = len(self._state_pool_indices)
+                    self._ensure_state_pool_capacity(pool_row + 1, device)
+                self._state_pool_indices[req_id] = pool_row
+                self._state_pool_has_codes[pool_row] = False
+                self._state_pool_last_codes[pool_row] = 0
+                self._state_pool_delay_count[pool_row] = 0
+                self._state_pool_eoc_countdown[pool_row] = -1
+                self._state_pool_generation_done[pool_row] = False
+
+            self._ensure_decode_state_capacity(len(req_ids), device)
+            pool_rows = torch.tensor(
+                [self._state_pool_indices[req_id] for req_id in req_ids],
+                dtype=torch.long,
+                device=device,
+            )
+            self._decode_has_codes[: len(req_ids)] = self._state_pool_has_codes[pool_rows]
+            self._decode_last_codes[: len(req_ids)] = self._state_pool_last_codes[pool_rows]
+            self._decode_delay_count[: len(req_ids)] = self._state_pool_delay_count[pool_rows]
+            self._decode_eoc_countdown[: len(req_ids)] = self._state_pool_eoc_countdown[pool_rows]
+            self._decode_generation_done[: len(req_ids)] = self._state_pool_generation_done[pool_rows]
+
+        self._last_batch_req_ids = list(req_ids)
+
+    def on_requests_finished(self, finished_req_ids: set[str]) -> None:
+        if not hasattr(self, "_state_pool_indices"):
+            return
+        for req_id in finished_req_ids:
+            pool_row = self._state_pool_indices.pop(req_id, None)
+            if pool_row is not None:
+                self._free_state_pool_indices.add(pool_row)
 
     # ------------------------------------------------------------------ forward
     def forward(
@@ -372,8 +458,8 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             info_dicts = kwargs.get("runtime_additional_information")
 
         if inputs_embeds is None:
-            # Mask -100 placeholders to 0 before embedding. Use torch.where
-            # (no Python data-dependent branch) so this is CUDA-graph safe.
+            # Keep legacy/offline negative sentinels safe before embedding.
+            # Online serving submits vocab-valid IDs plus explicit positions.
             safe_ids = torch.where(input_ids < 0, torch.zeros_like(input_ids), input_ids)
             hidden_states = self.model.embed_tokens(safe_ids)
         else:
@@ -416,8 +502,8 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 and not self._is_single_token_decode_step(int(hidden_states.shape[0]))
             )
         if is_prefill and info_dicts:
-            # Voice clone: replace -100 placeholder positions with ref audio embeddings
-            hidden_states = self._apply_ref_audio_substitution(hidden_states, input_ids, info_dicts)
+            # Voice clone: replace marked prompt positions with ref audio embeddings.
+            hidden_states = self._apply_ref_audio_substitution(hidden_states, input_ids, positions, info_dicts)
 
         # Audio feedback at decode: replace continuation token embeddings
         if input_ids is not None and inputs_embeds is None:
@@ -558,24 +644,24 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
+        positions: torch.Tensor,
         info_dicts: list[dict[str, Any]] | None,
     ) -> torch.Tensor:
-        """Replace -100 placeholder positions with fused multi-codebook embeddings
-        of the delay-pattern-encoded reference audio codes.
+        """Inject fused reference-audio embeddings at marked prompt positions.
 
         Called at prefill to inject voice clone reference. ``info_dicts`` is a
         list of per-request dicts from ``model_intermediate_buffer``, each
         containing ``audio_input_ids`` ([T, N] delayed codes) and
-            ``audio_input_ids_mask`` ([T] bool mask).
+        ``audio_input_ids_mask`` ([T] bool mask). New callers also provide
+        ``audio_placeholder_positions`` ([T] absolute prompt positions). Legacy
+        callers that still submit -100 token IDs remain supported.
         """
         if not info_dicts:
             return hidden_states
 
-        PLACEHOLDER = -100
         flat_ids = input_ids.reshape(-1)
-        placeholder_mask = flat_ids == PLACEHOLDER
-        if not placeholder_mask.any():
-            return hidden_states
+        flat_positions = positions.reshape(-1)
+        legacy_placeholder_mask = flat_ids == -100
 
         # Use query_start_loc to map placeholders to per-request spans
         q_start = self._last_step_query_start_loc
@@ -595,12 +681,15 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
 
             codes = info.get("audio_input_ids")
             mask = info.get("audio_input_ids_mask")
+            placeholder_positions = info.get("audio_placeholder_positions")
 
             # Handle msgspec serialization (may be list-wrapped)
             if isinstance(codes, list):
                 codes = codes[0] if codes else None
             if isinstance(mask, list):
                 mask = mask[0] if mask else None
+            if isinstance(placeholder_positions, list):
+                placeholder_positions = placeholder_positions[0] if placeholder_positions else None
             if not isinstance(codes, torch.Tensor):
                 continue
 
@@ -610,29 +699,54 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             if codes.ndim != 2:
                 continue
 
+            if isinstance(placeholder_positions, torch.Tensor):
+                if placeholder_positions.ndim == 2:
+                    placeholder_positions = placeholder_positions[0]
+                placeholder_positions = placeholder_positions.reshape(-1)
+
             if isinstance(mask, torch.Tensor):
                 if mask.ndim == 2:
                     mask = mask[0]
-                codes = codes[mask.to(dtype=torch.bool)]
+                mask = mask.reshape(-1).to(dtype=torch.bool)
+                codes = codes[mask.to(device=codes.device)]
+                if isinstance(placeholder_positions, torch.Tensor) and placeholder_positions.numel() == mask.numel():
+                    placeholder_positions = placeholder_positions[mask.to(device=placeholder_positions.device)]
 
             if codes.numel() == 0:
                 continue
 
-            # Find placeholder positions in this request's span
             s = int(q_start_list[i])
             e = int(q_start_list[i + 1])
-            if e - s <= 1:
-                continue  # Decode step, skip
+            if e <= s:
+                continue
 
-            span_mask = placeholder_mask[s:e]
-            placeholders = span_mask.nonzero(as_tuple=True)[0]
-            n_codes = int(codes.shape[0])
-
-            if int(placeholders.numel()) < n_codes:
-                continue  # Mismatch
+            if isinstance(placeholder_positions, torch.Tensor):
+                if placeholder_positions.numel() == 0 or placeholder_positions.numel() != codes.shape[0]:
+                    continue
+                request_positions = flat_positions[s:e]
+                ref_positions = placeholder_positions.to(
+                    device=request_positions.device,
+                    dtype=request_positions.dtype,
+                )
+                code_rows = torch.searchsorted(ref_positions, request_positions)
+                in_range = code_rows < ref_positions.numel()
+                bounded_rows = code_rows.clamp(max=ref_positions.numel() - 1)
+                matches = in_range & (ref_positions[bounded_rows] == request_positions)
+                if not matches.any():
+                    continue
+                target = matches.nonzero(as_tuple=True)[0] + s
+                codes = codes.index_select(0, code_rows[matches].to(device=codes.device))
+            else:
+                if e - s <= 1:
+                    continue  # Legacy decode step, skip
+                span_mask = legacy_placeholder_mask[s:e]
+                placeholders = span_mask.nonzero(as_tuple=True)[0]
+                n_codes = int(codes.shape[0])
+                if int(placeholders.numel()) < n_codes:
+                    continue
+                target = placeholders[:n_codes] + s
 
             # Embed delayed codes via fused multi-codebook embedding
-            target = placeholders[:n_codes] + s
             codes_device = codes.to(device=hidden_states.device, dtype=torch.long)
             embeds = self.multimodal_embedding(codes_device)  # [n_codes, hidden]
 
@@ -1386,7 +1500,19 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         fallback = x.argmax(dim=-1)
         safe_x = torch.where(all_masked.unsqueeze(-1), torch.zeros_like(x), x)
         probs = safe_x.softmax(dim=-1)
-        sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        if sampling_metadata.generators:
+            sampled = torch.cat(
+                [
+                    torch.multinomial(
+                        probs[req_idx * num_codebooks : (req_idx + 1) * num_codebooks],
+                        num_samples=1,
+                        generator=sampling_metadata.generators.get(req_idx),
+                    )
+                    for req_idx in range(int(probs.shape[0]) // num_codebooks)
+                ]
+            ).squeeze(-1)
+        else:
+            sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)
         sampled = torch.where(all_masked, fallback, sampled)
         return torch.where(greedy, logits_2d.argmax(dim=-1), sampled)
 

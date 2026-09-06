@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import fields
@@ -33,10 +34,12 @@ logger = init_logger(__name__)
 
 BatchSamplingParamsKey = StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey
 
-# LoRA identity is derived from `sampling.lora_request`, not a same-named field
-# on sampling params, so it must be resolved separately from the bulk lookup.
+# LoRA identity and execution mode are request-owned rather than same-named
+# sampling-param fields, so they must be resolved separately from the bulk lookup.
 _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in fields(StepBatchSamplingParamsKey)) - {
-    "lora_int_id"
+    "condition_key",
+    "lora_int_id",
+    "use_step_execution",
 }
 
 
@@ -54,6 +57,7 @@ class BaseScheduler(ABC):
         self.max_num_running_reqs: int = 1
         self._prefetch_enabled: bool = False
         self._diffusion_kv_manager: DiffusionKVCacheManager | None = None
+        self._kv_connector = None
 
     def initialize(
         self,
@@ -108,7 +112,16 @@ class BaseScheduler(ABC):
             ):
                 raise ValueError("dense_legacy Scheduler received unexpected Diffusion KV cache initialization state")
             self._diffusion_kv_manager = None
+        from vllm_omni.diffusion.diffusion_kv.kv_connector import create_scheduler_kv_connector
+
+        self._kv_connector = create_scheduler_kv_connector(od_config)
         self._reset_scheduler_state()
+
+    @property
+    def kv_connector(self):
+        """Upstream vLLM Scheduler-role connector, when configured."""
+
+        return self._kv_connector
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
         return self._add_request_with_request_id(request.request_id, request)
@@ -117,6 +130,7 @@ class BaseScheduler(ABC):
         if request_id in self._request_states:
             raise ValueError(f"request_id {request_id!r} is already active.")
         state = self._make_request_state(request_id, request)
+        state.queued_at = time.perf_counter()
         self._request_states[request_id] = state
         self._waiting.append(request_id)
         logger.debug("%s add_request: %s (waiting=%d)", self.__class__.__name__, request_id, len(self._waiting))
@@ -178,6 +192,7 @@ class BaseScheduler(ABC):
             state.status = DiffusionRequestStatus.RUNNING
             self._running.append(request_id)
             if was_new_request:
+                state.req.scheduler_queue_wait_ms = max((time.perf_counter() - state.queued_at) * 1000.0, 0.0)
                 scheduled_new_reqs.append(
                     NewRequestData.from_state(
                         state,
@@ -283,6 +298,10 @@ class BaseScheduler(ABC):
         if self._diffusion_kv_manager is not None:
             self._diffusion_kv_manager.close()
             self._diffusion_kv_manager = None
+        from vllm_omni.diffusion.diffusion_kv.kv_connector import shutdown_kv_connector
+
+        shutdown_kv_connector(scheduler_connector=self._kv_connector)
+        self._kv_connector = None
         self._request_states.clear()
         self._waiting.clear()
         self._running.clear()
@@ -372,6 +391,14 @@ class BaseScheduler(ABC):
         elif kv_requests:
             raise ValueError("dense_legacy request unexpectedly contains Scheduler Diffusion KV requests")
 
+        # Keep the request-scoped native connector bag on each Scheduler-owned
+        # sequence without interpreting its contents or creating page state.
+        kv_transfer_params = getattr(request, "kv_transfer_params", None)
+        if kv_transfer_params is not None:
+            for kv_request in kv_requests:
+                if kv_request.kv_transfer_params is None:
+                    kv_request.kv_transfer_params = dict(kv_transfer_params)
+
         # DiffusionKVRequest objects are mutable Scheduler/native-KVCacheManager
         # state and must never ride the normal request payload to a Worker.
         request.diffusion_kv_requests = None
@@ -423,7 +450,9 @@ class BaseScheduler(ABC):
         # LoRA identity is optional on sampling params (and on test stubs).
         lora_request = getattr(sampling, "lora_request", None)
         return StepBatchSamplingParamsKey(
+            condition_key=getattr(request, "batch_compatibility_key", None),
             lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
+            use_step_execution=getattr(request, "use_step_execution", True),
             **{name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES},
         )
 

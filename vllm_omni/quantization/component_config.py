@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Per-component quantization routing for multi-stage models.
 
 Routes get_quant_method() to different configs based on longest-prefix match:
@@ -26,10 +26,11 @@ if TYPE_CHECKING:
     )
 
 
-# Pre-quantized checkpoints (modelopt FP8/FP4/MXFP8/mixed) only quantize the
-# Thinker LM.  Vision and audio encoder weights remain in BF16 with no
-# corresponding scale tensors in the checkpoint.
-PRE_QUANTIZED_METHODS: frozenset[str] = frozenset({"modelopt", "modelopt_fp4", "modelopt_mxfp8", "modelopt_mixed"})
+# These pre-quantized formats require serialized scale or correction tensors
+# that the vision and audio encoder checkpoints do not provide.
+PRE_QUANTIZED_METHODS: frozenset[str] = frozenset(
+    {"modelopt", "modelopt_fp4", "modelopt_mxfp8", "modelopt_mixed", "svdquant"}
+)
 
 
 def resolve_component_quant_config(

@@ -18,7 +18,7 @@
       "model": "openbmb/MiniCPM-o-4_5",
       "extra_cli_args": [
         "--deploy-config",
-        "vllm_omni/deploy/minicpmo_4_5_duplex.yaml",
+        "vllm_omni/deploy/minicpmo_4_5.yaml",
         "--trust-remote-code"
       ]
     },
@@ -43,7 +43,7 @@
         "extra_body": {
           "save_duplex_request_metrics": true
         },
-        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration",
         "baseline": {
           "H100": {
             "request_throughput": [

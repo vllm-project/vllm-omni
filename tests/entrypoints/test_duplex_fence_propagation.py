@@ -1,10 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 
 from tests.entrypoints.openai_api.test_duplex_handler import FakeChatService, TimedWebSocket
+from vllm_omni.engine.duplex.messages import DuplexFence
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
-from vllm_omni.experimental.fullduplex.openai.protocol import DuplexSession, DuplexSessionConfig
-from vllm_omni.experimental.fullduplex.openai.serving import OmniDuplexSessionHandler
+from vllm_omni.entrypoints.duplex.protocol import DuplexSession, DuplexSessionConfig
+from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 

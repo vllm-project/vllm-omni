@@ -72,6 +72,9 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
         body["top_logprobs"] = 5
     elif case_id == "speaker_unknown":
         body["speaker"] = "zz_invalid_qwen3_omni_chat_speaker_xyz"
+    elif case_id == "audio_format_unsupported":
+        body["modalities"] = ["text", "audio"]
+        body["audio"] = {"voice": "alloy", "format": "aac"}
     else:
         raise AssertionError(f"unknown chat completions invalid case_id {case_id!r}")
     return {"json": body, "timeout": 120}
@@ -119,7 +122,7 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
         pytest.param(
             "response_format_json_schema_incomplete",
             400,
-            ("response_format", "value_error", "json_schema"),
+            ("response_format", "BadRequestError", "json_schema"),
             id="invalid_response_format_json_schema",
         ),
         pytest.param("logprobs_wrong_type", 400, "logprobs", id="logprobs_wrong_type", marks=_SKIP_ISSUE_3649),
@@ -134,6 +137,12 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
             400,
             ("Invalid speaker", "Supported"),
             id="speaker_unknown_preset",
+        ),
+        pytest.param(
+            "audio_format_unsupported",
+            400,
+            ("Invalid audio format", "aac", "Supported formats"),
+            id="unsupported_audio_format",
         ),
     ],
 )

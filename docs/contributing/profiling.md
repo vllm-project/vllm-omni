@@ -322,6 +322,15 @@ Each 1-second window records:
 
 On shutdown the server also logs a short summary (`loop_active_pct`, per-replica queue averages/maxima).
 
+`loop_idle` and `loop_active` count loop iterations, so their absolute scale is
+tied to which orchestration loop is running. Under the default poll loop an idle
+orchestrator records roughly one iteration per millisecond. Under the
+event-driven loop (`VLLM_OMNI_EVENT_DRIVEN_ORCH=1`, see
+[Speech API](../serving/speech_api.md#orchestration-loop-experimental)) an idle
+orchestrator wakes only once per 0.5 s reconcile timeout, while a busy one still
+records one iteration per routed output. Window counts and the `loop_active_pct`
+summary are therefore not comparable across the two modes.
+
 ### Relationship to other diagnostics
 
 This monitor is intentionally separate from the existing profiling tools:

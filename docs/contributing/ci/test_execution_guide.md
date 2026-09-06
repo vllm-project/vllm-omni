@@ -88,7 +88,7 @@ Failed jobs: 1/2
     ```bash
     cd tests
     pytest -s -v test_xxxx.py --run-level=core_model
-    pytest -s -v -m "core_model and distributed_cuda and L4" --run-level=core_model
+    pytest -s -v -m "core_model and L4 and not cards_1" --run-level=core_model
     ```
 
 === "L3 level"
@@ -119,7 +119,7 @@ Failed jobs: 1/2
 
     ```bash
     pytest -s -v test_xxxx.py --run-level=advanced_model
-    pytest -s -v -m "advanced_model and distributed_cuda and L4" --run-level=advanced_model
+    pytest -s -v -m "advanced_model and L4 and not cards_1" --run-level=advanced_model
     ```
 
 === "L4 level"
@@ -153,12 +153,12 @@ Failed jobs: 1/2
     ```bash
     cd tests
     pytest -s -v test_xxxx.py --run-level=full_model
-    pytest -s -v -m "full_model and distributed_cuda and L4" --run-level=full_model
+    pytest -s -v -m "full_model and L4 and not cards_1" --run-level=full_model
     pytest -s -v -m "full_model and (omni or tts) and H100" --run-level=full_model
     ```
     If you only want to run specific test cases on a particular platform, you can use:
     ```bash
-    pytest -s -v -m "full_model and distributed_cuda and L4"  --run-level=full_model
+    pytest -s -v -m "full_model and L4 and not cards_1"  --run-level=full_model
     ```
     Note: ``run_benchmark.py`` and ``run_diffusion_benchmark.py`` accept an optional ``--test-config-file``. If omitted, each loads every ``*.json`` under ``tests/dfx/perf/tests/`` (omni/tts vs diffusion split by ``is_diffusion_perf_config``) and pytest ``-m`` filters by each case's JSON ``mark``:
     ```bash

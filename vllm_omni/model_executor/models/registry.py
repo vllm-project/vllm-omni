@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from vllm.model_executor.models.registry import (
     _VLLM_MODELS,
     _LazyRegisteredModel,
@@ -113,6 +116,41 @@ _OMNI_MODELS = {
         "omnivoice",
         "omnivoice",
         "OmniVoiceModel",
+    ),
+    "MammothModa2Qwen2ForCausalLM": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2Qwen2ForCausalLM",
+    ),
+    "MammothModa2ARForConditionalGeneration": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2ARForConditionalGeneration",
+    ),
+    "MammothModa2Qwen3ARForConditionalGeneration": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2Qwen3ARForConditionalGeneration",
+    ),
+    "MammothModa2Qwen3ForCausalLM": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2Qwen3ForCausalLM",
+    ),
+    "MammothModa2DiTPipeline": (
+        "mammoth_moda2",
+        "pipeline_mammothmoda2_dit",
+        "MammothModa2DiTPipeline",
+    ),
+    "MammothModa2ForConditionalGeneration": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2ForConditionalGeneration",
+    ),
+    "Mammothmoda2Model": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2ForConditionalGeneration",
     ),
     "Qwen3TTSForConditionalGeneration": (
         "qwen3_tts",
@@ -421,6 +459,11 @@ _OMNI_MODELS = {
         "aura_omni",
         "qwen3_vl",
         "AuraQwen3VLForConditionalGeneration",
+    ),
+    "MiniMaxH3TextEncoder": (
+        "minimax_h3",
+        "text_encoder",
+        "MiniMaxH3TextEncoder",
     ),
     ## MiniMax-Music3 (text-to-music; AR talker -> flow-matching acoustic decoder)
     "MiniMaxMusic3TalkerForConditionalGeneration": (

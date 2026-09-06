@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -47,6 +47,7 @@ class FakePool:
         self.invalidated = []
         self.hub = None
         self.lb = None
+        self.replica_ids = {}
 
     def attach_hub(self, hub):
         self.hub = hub
@@ -57,7 +58,9 @@ class FakePool:
     def add_client(self, input_addr, client, *, replica_id=None):
         self.added.append((input_addr, client, replica_id))
         self.clients.append(client)
-        return len(self.clients) - 1 if replica_id is None else replica_id
+        resolved_replica_id = len(self.clients) - 1 if replica_id is None else replica_id
+        self.replica_ids[input_addr] = resolved_replica_id
+        return resolved_replica_id
 
     def invalidate_addr(self, input_addr):
         self.invalidated.append(input_addr)
@@ -66,6 +69,12 @@ class FakePool:
     def remove_client(self, input_addr):
         self.removed.append(input_addr)
         return SimpleNamespace(shutdown=lambda: self.removed.append("shutdown"))
+
+    def get_client_by_addr(self, input_addr):
+        return SimpleNamespace() if input_addr in self.replica_ids else None
+
+    def get_replica_id_by_addr(self, input_addr):
+        return self.replica_ids.get(input_addr)
 
 
 def _snapshot(*replicas):
@@ -209,6 +218,16 @@ async def test_unregister_then_register_restores_coordinator_replica_slot(monkey
         return replacement
 
     controller = _controller(monkeypatch, pool, FakeHub(), remote_replica_factory=factory)
+    removed_replicas = []
+
+    async def cleanup(_request_ids):
+        return None
+
+    controller.install_unregister_handlers(
+        output_queue=asyncio.Queue(),
+        cleanup_callback=cleanup,
+        replica_removed_callback=lambda stage_id, replica_id: removed_replicas.append((stage_id, replica_id)),
+    )
     await controller.handle_unregister(0, "tcp://old-0")
     await controller.handle_unregister(0, "tcp://old-1")
 
@@ -219,6 +238,7 @@ async def test_unregister_then_register_restores_coordinator_replica_slot(monkey
     assert pool.get_replica_id_by_addr("tcp://new-1") == 1
     assert pool.get_replica_id_by_addr("tcp://old-1") is None
     assert pool.available_replica_ids() == [1]
+    assert removed_replicas == [(0, 0), (0, 1)]
 
 
 @pytest.mark.asyncio

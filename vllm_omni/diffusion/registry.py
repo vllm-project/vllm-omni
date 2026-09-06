@@ -9,7 +9,7 @@ from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
 
 from vllm_omni.diffusion.config import set_current_diffusion_config
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig, uses_diffusers_adapter
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
 from vllm_omni.diffusion.forward_context import get_forward_context
@@ -266,11 +266,6 @@ _DIFFUSION_MODELS = {
         "pipeline_flux2",
         "Flux2Pipeline",
     ),
-    "DreamIDOmniPipeline": (
-        "dreamid_omni",
-        "pipeline_dreamid_omni",
-        "DreamIDOmniPipeline",
-    ),
     "SenseNovaU1Pipeline": (
         "sensenova_u1",
         "pipeline_sensenova_u1",
@@ -301,10 +296,10 @@ _DIFFUSION_MODELS = {
         "pipeline_sana_video_i2v",
         "SanaImageToVideoPipeline",
     ),
-    "MagiHumanPipeline": (
-        "magi_human",
-        "pipeline_magi_human",
-        "MagiHumanPipeline",
+    "Magi2Pipeline": (
+        "magi2",
+        "pipeline_magi2",
+        "Magi2Pipeline",
     ),
     "OmniVoicePipeline": (
         "omnivoice",
@@ -598,9 +593,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LingBotVideoPipeline": "get_lingbot_video_post_process_func",
     "SanaVideoPipeline": "get_sana_video_post_process_func",
     "SanaImageToVideoPipeline": "get_sana_video_i2v_post_process_func",
-    "MagiHumanPipeline": "get_magi_human_post_process_func",
+    "Magi2Pipeline": "get_magi2_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
-    "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
@@ -623,6 +617,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     # arch: pre_process_func
     # `pre_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
+    "BagelPipeline": "get_bagel_pre_process_func",
     "GlmImagePipeline": "get_glm_image_pre_process_func",
     "BooguImagePipeline": "get_boogu_image_pre_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
@@ -645,7 +640,6 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "LingBotVideoPipeline": "get_lingbot_video_pre_process_func",
     "SanaImageToVideoPipeline": "get_sana_video_i2v_pre_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_pre_process_func",
-    "MagiHumanPipeline": "get_magi_human_pre_process_func",
     "SanaWmPipeline": "get_sana_wm_pre_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
@@ -738,6 +732,10 @@ def _load_process_func(od_config: OmniDiffusionConfig, func_name: str):
 
 
 def get_diffusion_post_process_func(od_config: OmniDiffusionConfig):
+    # Keep the checkpoint's native class name for modality/capability metadata,
+    # but do not run its tensor postprocessor on Diffusers' decoded outputs.
+    if uses_diffusers_adapter(od_config):
+        return None
     if od_config.model_class_name not in _DIFFUSION_POST_PROCESS_FUNCS:
         return None
     func_name = _DIFFUSION_POST_PROCESS_FUNCS[od_config.model_class_name]
@@ -752,6 +750,9 @@ def get_diffusion_ir_op_priority_func(od_config: OmniDiffusionConfig):
 
 
 def get_diffusion_pre_process_func(od_config: OmniDiffusionConfig):
+    # The adapter translates requests to Diffusers call arguments itself.
+    if uses_diffusers_adapter(od_config):
+        return None
     if od_config.model_class_name not in _DIFFUSION_PRE_PROCESS_FUNCS:
         return None  # Return None if no pre-processing function is registered (for backward compatibility)
     func_name = _DIFFUSION_PRE_PROCESS_FUNCS[od_config.model_class_name]

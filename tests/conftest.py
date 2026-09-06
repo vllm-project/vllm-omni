@@ -25,9 +25,9 @@ pytest_plugins = (
     "tests.helpers.fixtures.clean",
     "tests.helpers.fixtures.log",
     "tests.helpers.fixtures.media",
-    "tests.helpers.fixtures.run_args",
+    "tests.helpers.fixtures.pytest_collection",
+    "tests.helpers.fixtures.pytest_run_args",
     "tests.helpers.fixtures.runtime",
-    "tests.helpers.fixtures.xdist",
 )
 
 

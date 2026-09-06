@@ -72,7 +72,7 @@ def _stage_config():
 quant_params = [(QUANTIZED_MODEL, _stage_config())]
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_marlin_fallback_no_nan_collapse(omni_runner, offline_client):
     """H100 Marlin FP4 fallback: text in -> coherent text out.

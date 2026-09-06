@@ -45,6 +45,16 @@ def supports_audio_output(model_class_name: str) -> bool:
     return bool(getattr(model_cls, "support_audio_output", False))
 
 
+def get_diffusion_output_type(model_class_name: str | None) -> str:
+    """Return the declared final modality for a diffusion model."""
+    declared_output_type = get_diffusion_model_metadata(model_class_name).final_output_type
+    if declared_output_type is not None:
+        return declared_output_type
+    if model_class_name and supports_audio_output(model_class_name):
+        return "audio"
+    return "image"
+
+
 def get_dummy_run_num_frames(model_class_name: str, supports_audio_input: bool) -> int:
     """Get num_frames for the dummy warmup run. Returns 0 to skip warmup."""
 

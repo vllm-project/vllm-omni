@@ -109,7 +109,7 @@ def get_dynamic_devices(stage_idx: int, num_stages: int, tp_size: int) -> str:
 
 
 async def _ensure_awake(engine: AsyncOmni, stage_ids: list[int]) -> None:
-    """Best-effort full wake so the next shared-engine test starts active."""
+    """Best-effort full wake + resume so the next shared-engine test starts active."""
     try:
         await engine.wake_up(stage_ids=stage_ids)
     except Exception as e:
@@ -532,6 +532,7 @@ async def test_pure_diffusion_sleep_wake():
     try:
         await engine.sleep(level=1)
         await engine.wake_up()
+        await engine.resume_generation()
         async for _ in engine.generate(
             "test",
             sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, height=256, width=256),

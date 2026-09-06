@@ -143,6 +143,7 @@ class MiniCPMO45Code2Wav(nn.Module):
     replace_runtime_additional_information = True
     requires_raw_input_tokens = True
     requires_request_ids = True
+    requires_exact_input_shape = True
     has_preprocess = False
     has_postprocess = False
 
@@ -271,6 +272,11 @@ class MiniCPMO45Code2Wav(nn.Module):
             cache_key, entry = self._materialize_runtime_prompt(
                 ref_audio,
                 meta.get("ref_audio_sr"),
+            )
+            logger.debug(
+                "MiniCPM-o Code2Wav selected runtime reference prompt_cache_id=%s prompt_wav=%s",
+                entry.cache_id,
+                entry.path,
             )
             return entry.cache_id, entry.path, cache_key
 

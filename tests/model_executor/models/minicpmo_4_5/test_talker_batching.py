@@ -102,6 +102,7 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._pending_force_eos_rows = None
     talker._penalty_histories = None
     talker._request_audio_states = {}
+    talker._request_condition_states = {}
     talker._deferred_cleanup_ids = set()
     talker._tts_config = ConditionalChatTTSConfig()
     talker.head_code = nn.ModuleList([nn.Linear(2, 8, bias=False)])
@@ -833,11 +834,164 @@ def test_native_duplex_condition_matches_official_text_plus_audio_bos() -> None:
     assert condition.shape[0] == token_ids.shape[0] + 1
 
 
+def test_native_duplex_rollover_matches_official_sliding_recompute(mocker) -> None:
+    talker = _make_talker()
+    talker.emb_text = nn.Embedding(1, 2)
+    talker.emb_code = nn.ModuleList([nn.Embedding(8, 2)])
+    with torch.no_grad():
+        talker.emb_code[0].weight.copy_(torch.arange(16, dtype=torch.float32).reshape(8, 2))
+
+    previous_condition = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    current_condition = torch.tensor([[5.0, 6.0], [7.0, 8.0], [9.0, 10.0]])
+    build_condition = mocker.patch.object(
+        talker,
+        "_build_condition_embeddings",
+        side_effect=[previous_condition, current_condition, current_condition],
+    )
+
+    talker.preprocess(
+        torch.zeros(2, dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        _omni_prompt_len=2,
+        request_id="req-window",
+        native_duplex=True,
+        meta={"turn_start": True, "streaming_condition_seq": 7},
+        tts_token_ids=torch.tensor([1]),
+        tts_hidden_states=torch.ones(1, 2),
+    )
+
+    older_codes = [3, 4, 5]
+    talker._request_condition_states["req-window"]["base_recent_codes"] = tuple(older_codes)
+    previous_codes = [1, 2]
+    recompute_meta = {
+        "streaming_condition_seq": 8,
+        "streaming_prompt_recompute": True,
+    }
+    expected = torch.cat(
+        [
+            previous_condition,
+            talker.emb_code[0](torch.tensor(previous_codes)),
+            current_condition,
+        ],
+        dim=0,
+    )
+    _, full_embeds, _ = talker.preprocess(
+        torch.zeros(expected.shape[0], dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        _omni_prompt_len=expected.shape[0],
+        request_id="req-window",
+        native_duplex=True,
+        ids={"streaming_prompt_previous_codes": previous_codes},
+        meta=recompute_meta,
+        tts_token_ids=torch.tensor([2]),
+        tts_hidden_states=torch.ones(1, 2),
+    )
+
+    assert torch.equal(full_embeds, expected)
+    assert talker._request_audio_states["req-window"]["recent_codes"] == older_codes + previous_codes
+
+    # Chunked-prefill/preemption retries reuse the immutable recipe for the
+    # same condition instead of advancing the one-chunk window twice.
+    _, retry_slice, _ = talker.preprocess(
+        torch.zeros(3, dtype=torch.long),
+        None,
+        _omni_is_prefill=True,
+        _omni_num_computed_tokens=2,
+        _omni_prompt_len=expected.shape[0],
+        request_id="req-window",
+        native_duplex=True,
+        ids={"streaming_prompt_previous_codes": previous_codes},
+        meta=recompute_meta,
+        tts_token_ids=torch.tensor([2]),
+        tts_hidden_states=torch.ones(1, 2),
+    )
+    assert torch.equal(retry_slice, expected[2:5])
+    assert talker._request_audio_states["req-window"]["recent_codes"] == older_codes + previous_codes
+    assert build_condition.call_count == 3
+
+
+def test_native_duplex_condition_advance_requires_recompute_marker(mocker) -> None:
+    talker = _make_talker()
+    condition = torch.ones(2, 2)
+    mocker.patch.object(talker, "_build_condition_embeddings", return_value=condition)
+    common = {
+        "_omni_is_prefill": True,
+        "_omni_prompt_len": 2,
+        "request_id": "req-history",
+        "native_duplex": True,
+        "tts_token_ids": torch.tensor([1]),
+        "tts_hidden_states": torch.ones(1, 2),
+    }
+
+    talker.preprocess(torch.zeros(2, dtype=torch.long), None, meta={"streaming_condition_seq": 0}, **common)
+    with pytest.raises(ValueError, match="advanced without its streaming recompute marker"):
+        talker.preprocess(torch.zeros(2, dtype=torch.long), None, meta={"streaming_condition_seq": 1}, **common)
+
+
+@pytest.mark.parametrize(
+    ("state", "previous_codes", "error"),
+    [
+        (None, [1], "missing the previous Talker condition"),
+        (
+            {"condition_seq": 0, "condition": torch.ones(2, 2), "base_recent_codes": ()},
+            [7],
+            "invalid or terminal token",
+        ),
+    ],
+)
+def test_native_duplex_rollover_rejects_unverifiable_history(state, previous_codes, error) -> None:
+    talker = _make_talker()
+    talker.emb_code = nn.ModuleList([nn.Embedding(8, 2)])
+    if state is not None:
+        talker._request_condition_states["req-invalid-window"] = state
+
+    with pytest.raises(ValueError, match=error):
+        talker._build_streaming_recompute_embeddings(
+            torch.ones(3, 2),
+            request_id="req-invalid-window",
+            info_dict={"ids": {"streaming_prompt_previous_codes": previous_codes}},
+            meta={
+                "streaming_condition_seq": 1,
+                "streaming_prompt_recompute": True,
+            },
+        )
+
+
+def test_native_duplex_turn_start_resets_rollover_history() -> None:
+    talker = _make_talker()
+    talker._request_condition_states["req-turn"] = {
+        "condition_seq": 4,
+        "condition": torch.full((2, 2), 9.0),
+        "active_embeddings": torch.full((5, 2), 9.0),
+    }
+    current = torch.ones(3, 2)
+
+    result = talker._build_streaming_recompute_embeddings(
+        current,
+        request_id="req-turn",
+        info_dict={},
+        meta={"turn_start": True, "streaming_condition_seq": 5},
+    )
+
+    assert torch.equal(result, current)
+    state = talker._request_condition_states["req-turn"]
+    assert state["condition_seq"] == 5
+    assert torch.equal(state["condition"], current)
+    assert "active_embeddings" not in state
+
+
 def test_request_cleanup_evicts_decode_state() -> None:
     talker = _make_talker()
     talker._request_audio_states["req-done"] = {"finished": False}
+    talker._request_condition_states["req-done"] = {
+        "condition_seq": 1,
+        "condition": torch.ones(2, 2),
+    }
 
     talker.on_requests_finished(["req-done"])
     talker._flush_deferred_cleanup()
 
     assert "req-done" not in talker._request_audio_states
+    assert "req-done" not in talker._request_condition_states

@@ -537,7 +537,7 @@ def api_server(server_case: ServerCase, mock_async_omni, tmp_path):
     cmd = OmniServeCommand()
     cmd.subparser_init(subparsers)
 
-    port = get_open_port()
+    port = get_open_port(host="0.0.0.0")
     args = parser.parse_args(["serve", server_case.served_model, "--omni", "--port", str(port)])
 
     def run_server():
@@ -814,7 +814,7 @@ async def test_tts_nodes(api_server: str, node_cls, call_kwargs: dict, sampling_
             ServerCase(
                 served_model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
                 stage_list=["diffusion"],
-                stage_configs=[{"stage_type": "diffusion"}],
+                stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
                 outputs=[_build_diffusion_video_output()],
             ),
             "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
@@ -825,7 +825,7 @@ async def test_tts_nodes(api_server: str, node_cls, call_kwargs: dict, sampling_
             ServerCase(
                 served_model="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
                 stage_list=["diffusion"],
-                stage_configs=[{"stage_type": "diffusion"}],
+                stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
                 outputs=[_build_diffusion_video_output()],
             ),
             "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
@@ -886,7 +886,7 @@ async def test_video_generation_node(api_server: str, model: str, image_input: b
             ServerCase(
                 served_model="MiniMaxAI/MiniMax-H3",
                 stage_list=["diffusion"],
-                stage_configs=[{"stage_type": "diffusion"}],
+                stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
                 outputs=[_build_diffusion_video_output()],
             ),
             SamplingCase(kind=SamplingKind.VIDEO_REF2VA_IMAGE_AUDIO, sampling_params=None),
@@ -897,7 +897,7 @@ async def test_video_generation_node(api_server: str, model: str, image_input: b
             ServerCase(
                 served_model="MiniMaxAI/MiniMax-H3",
                 stage_list=["diffusion"],
-                stage_configs=[{"stage_type": "diffusion"}],
+                stage_configs=[{"stage_type": "diffusion", "final_output": True, "final_output_type": "video"}],
                 outputs=[_build_diffusion_video_output()],
             ),
             SamplingCase(kind=SamplingKind.VIDEO_REF2VA_MULTI_VIDEO, sampling_params=None),

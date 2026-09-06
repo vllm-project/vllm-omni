@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -50,9 +50,22 @@ from vllm_omni.model_extras.ltx2 import (
     ltx_preserves_reference_image_size,
     ltx_transformer_config_subfolder,
 )
-from vllm_omni.model_extras.magi_human import (
-    MAGI_HUMAN_EXTRA_BODY_PARAMS,
-    MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
+from vllm_omni.model_extras.magi2 import (
+    MAGI2_EXTRA_BODY_PARAMS,
+    MAGI2_EXTRA_OUTPUT_PARAMS,
+    get_magi2_video_generation_defaults,
+    magi2_preserves_reference_image_size,
+)
+from vllm_omni.model_extras.mammothmodal2_preview import (
+    MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS,
+    MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS,
+    MAMMOTHMODA2_PREVIEW_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+)
+from vllm_omni.model_extras.mammothmodal2_preview import (
+    build_text_to_image_prompt as build_mammothmoda2_text_to_image_prompt,
+)
+from vllm_omni.model_extras.mammothmodal2_preview import (
+    build_x_to_text_prompt as build_mammothmoda2_x_to_text_prompt,
 )
 from vllm_omni.model_extras.ming_flash_omni import (
     MING_FLASH_OMNI_EXTRA_BODY_PARAMS,
@@ -77,6 +90,7 @@ from vllm_omni.model_extras.vace import (
 from vllm_omni.model_extras.vace import (
     build_image_to_video_prompt as build_vace_image_to_video_prompt,
 )
+from vllm_omni.model_extras.video_generation import VideoGenerationDefaults
 
 TextToImagePromptBuilder = Callable[
     [str, str | None, int | None, int | None],
@@ -131,6 +145,7 @@ def default_x_to_text_prompt(
 _X_TO_TEXT_SPECS: dict[str, XToTextPromptBuilder] = {
     "bagel": build_bagel_x_to_text_prompt,
     "hunyuan_image3": build_hunyuan_x_to_text_prompt,
+    "mammoth_moda2": build_mammothmoda2_x_to_text_prompt,
 }
 
 
@@ -145,6 +160,8 @@ def get_x_to_text_model_family(model: str) -> str:
         return "bagel"
     if model_type == "hunyuan_image_3_moe" or any("hunyuanimage3" in value for value in architectures):
         return "hunyuan_image3"
+    if "mammoth" in model_type or any("mammothmoda2" in value for value in architectures):
+        return "mammoth_moda2"
     return "generic"
 
 
@@ -196,9 +213,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
     },
-    "MagiHumanPipeline": {
-        "extra_body_params": MAGI_HUMAN_EXTRA_BODY_PARAMS,
-        "extra_output_params": MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
+    "Magi2Pipeline": {
+        "extra_body_params": MAGI2_EXTRA_BODY_PARAMS,
+        "extra_output_params": MAGI2_EXTRA_OUTPUT_PARAMS,
+        "video_generation_defaults_builder": get_magi2_video_generation_defaults,
+        "reference_image_size_resolver": magi2_preserves_reference_image_size,
     },
     "HeliosPipeline": {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
@@ -252,6 +271,12 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_output_params": VACE_EXTRA_OUTPUT_PARAMS,
         "image_to_video_prompt_builder": build_vace_image_to_video_prompt,
     },
+    "MammothModa2DiTPipeline": {
+        "extra_body_params": MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS,
+        "extra_output_params": MAMMOTHMODA2_PREVIEW_EXTRA_OUTPUT_PARAMS,
+        "init_extra_args_for_non_diffusion_stages": MAMMOTHMODA2_PREVIEW_INIT_EXTRA_ARGS_FOR_NON_DIFFUSION_STAGES,
+        "text_to_image_prompt_builder": build_mammothmoda2_text_to_image_prompt,
+    },
     "MingImagePipeline": {
         "extra_body_params": MING_FLASH_OMNI_EXTRA_BODY_PARAMS,
         "extra_output_params": MING_FLASH_OMNI_EXTRA_OUTPUT_PARAMS,
@@ -268,6 +293,11 @@ for model_class_name in ("LTX2Pipeline", "LTX2TwoStagePipeline"):
 # Alias: some code paths surface HunyuanImage3's pipeline class name rather than
 # the architecture name; point both at the same spec.
 _EXTRA_SPECS["HunyuanImage3Pipeline"] = _EXTRA_SPECS["HunyuanImage3ForCausalMM"]
+
+# Multi-stage discovery reports the top-level wrapper rather than its DiT
+# submodule, so both names must resolve to the same request builders.
+_EXTRA_SPECS["MammothModa2ForConditionalGeneration"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
+_EXTRA_SPECS["Mammothmoda2Model"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
 
 
 def _get_spec(model_class_name: str | None) -> dict[str, Any] | None:
@@ -298,6 +328,18 @@ def get_extra_body_params(model_class_name: str | None) -> frozenset[str]:
 def get_extra_output_params(model_class_name: str | None) -> frozenset[str]:
     spec = _get_spec(model_class_name)
     return spec.get("extra_output_params", frozenset()) if spec is not None else frozenset()
+
+
+def get_video_generation_defaults(
+    model_class_name: str | None,
+    extra_body: Mapping[str, Any] | None = None,
+) -> VideoGenerationDefaults | None:
+    """Return model-owned defaults for the shared video examples, if declared."""
+    spec = _get_spec(model_class_name)
+    if spec is None:
+        return None
+    builder = spec.get("video_generation_defaults_builder")
+    return builder(extra_body) if builder is not None else None
 
 
 def get_output_tensor_range(model_class_name: str | None) -> OutputTensorRange:

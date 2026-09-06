@@ -157,8 +157,14 @@ def test_speech_missing_required_fields(omni_server: OmniServer, online_client: 
                 "ref_audio": None,
                 "ref_text": None,
             },
-            ("CustomVoice", "does not support"),
-            id="customvoice_task_not_supported",
+            # NOTE: This is delegating down the TTS adapter, so the message is both specific
+            # to the Qwen3TTS adapter and dependent on whether or not the model has any speakers
+            # (as opposed to having valida speakers, but getting an invalid speaker). it would
+            # be more ideal to validate that this is landing on `.validate()` on the adapter
+            # and ensuring that the returned message matches what we would get from calling the
+            # adapter validate directly.
+            ("no speakers configured",),
+            id="customvoice_invalid_voice",
         ),
         pytest.param(
             {"task_type": "InvalidEnum"}, ("task_type", "literal_error", "CustomVoice"), id="task_type_invalid"
@@ -181,13 +187,17 @@ def test_speech_missing_required_fields(omni_server: OmniServer, online_client: 
             ("mutually exclusive", "speaker_embedding", "ref_audio"),
             id="speaker_embedding_with_ref_audio_mutually_exclusive",
         ),
-        pytest.param({"max_new_tokens": 0}, ("max_new_tokens", "least 1"), id="max_new_tokens_below_min"),
+        pytest.param({"max_new_tokens": 0}, ("max_new_tokens", "greater_than_equal"), id="max_new_tokens_below_min"),
         pytest.param(
             {"max_new_tokens": _SPEECH_API_MAX_NEW_TOKENS + 1},
             ("max_new_tokens", "exceed 4096"),
             id="max_new_tokens_above_max",
         ),
-        pytest.param({"seed": -1}, ("seed", "greater_than_equal", "0"), id="seed_negative"),
+        pytest.param(
+            {"seed": -(2**63) - 1},
+            ("seed", "greater_than_equal", "-9223372036854775808"),
+            id="seed_below_min",
+        ),
         pytest.param({"seed": 2**63}, ("seed", "less_than_equal", "9223372036854775807"), id="seed_above_max"),
         pytest.param(
             {"initial_codec_chunk_frames": -1},
@@ -275,7 +285,9 @@ def test_speech_invalid_field_values(
         pytest.param({"input": "", "response_format": "wav"}, ("input", "empty"), id="input_empty"),
         pytest.param({"input": "   ", "response_format": "wav"}, ("input", "empty"), id="input_whitespace_only"),
         pytest.param(
-            {"input": "Hello world.", "max_new_tokens": 0}, ("max_new_tokens", "least 1"), id="max_new_tokens_below_min"
+            {"input": "Hello world.", "max_new_tokens": 0},
+            ("max_new_tokens", "greater_than_equal"),
+            id="max_new_tokens_below_min",
         ),
         pytest.param(
             {
@@ -554,14 +566,14 @@ def test_speech_batch_missing_items(omni_server: OmniServer, online_client: Onli
         pytest.param(
             "batch",
             {"max_new_tokens": 0},
-            ("max_new_tokens", "least 1"),
+            ("max_new_tokens", "greater_than_equal"),
             id="batch_max_new_tokens_below_min",
             marks=_SKIP_ISSUE_3649,
         ),
         pytest.param(
             "item",
             {"max_new_tokens": 0},
-            ("max_new_tokens", "least 1"),
+            ("max_new_tokens", "greater_than_equal"),
             id="item_max_new_tokens_below_min",
             marks=_SKIP_ISSUE_3649,
         ),

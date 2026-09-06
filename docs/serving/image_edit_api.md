@@ -30,7 +30,6 @@ curl -s -D >(grep -i x-request-id >&2) \
   -F "output_format=png"
 ```
 
-
 **Using OpenAI SDK:**
 
 ```python
@@ -72,7 +71,7 @@ with open("edit_out_http.jpeg", "wb") as f:
 
 ### Endpoint
 
-```
+```text
 POST /v1/images/edits
 Content-Type: multipart/form-data
 ```
@@ -82,7 +81,7 @@ Content-Type: multipart/form-data
 #### OpenAI Standard Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `prompt` | string | **required** | A text description of the desired image |
 | `model` | string | server's model | Model to use (optional, should match server if specified) |
 | `image` | string or array | **required** | The image(s) to edit. |
@@ -98,7 +97,7 @@ Content-Type: multipart/form-data
 #### vllm-omni Extension Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `url` | string or array | None | The image(s) to edit. |
 | `negative_prompt` | string | null | Text describing what to avoid in the image |
 | `num_inference_steps` | integer | model defaults | Number of diffusion steps |
@@ -212,7 +211,6 @@ Use the `ar_delta` events for progressive display of the AR-generated
 recaption. Decode the `b64_json` field from the final `image` event to get the
 edited image.
 
-
 ## Parameter Handling
 
 The API passes parameters directly to the diffusion pipeline without model-specific transformation:
@@ -266,6 +264,7 @@ curl http://localhost:8000/v1/images/edits \
 ### Out of Memory
 
 If you encounter OOM errors:
+
 1. Reduce image size: `"size": "512x512"`
 2. Reduce inference steps: `"num_inference_steps": 25`
 
