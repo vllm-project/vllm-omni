@@ -4,26 +4,57 @@ This guide explains how to calculate GPU memory requirements and properly config
 
 ## Overview
 
-`gpu_memory_utilization` is a critical parameter that controls how much GPU memory each stage can use. It's specified as a fraction between 0.0 and 1.0, where:
-- `0.8` means 80% of the GPU's total memory
-- `1.0` means 100% of the GPU's total memory (not recommended, leaves no buffer)
+`gpu_memory_utilization` is a cache-sizing budget, not an instruction to reserve
+that fraction of VRAM at startup or a hard runtime memory limit. Its effect
+depends on the stage:
+
+- Autoregressive and LLM-generation workers calculate a requested memory
+  budget. Only stages that expose KV-cache specifications use the remaining
+  budget for automatic cache sizing.
+- Diffusion stages use it for KV-cache sizing only with
+  `diffusion_kv_mode: paged_scheduler`.
+- Diffusion stages using the default `dense_legacy` mode do not use it to size
+  or pre-allocate memory.
+
+Paged-scheduler diffusion is a model integration capability, not a reservation
+mode that can be enabled for every pipeline. It currently supports HunyuanImage3;
+OmniVoice does not support it and cannot use it to reserve or cap VRAM.
+
+For example, `0.8` represents an 80% cache-sizing budget on a stage that
+supports automatic sizing. It does not guarantee that `nvidia-smi` will show
+80% usage after startup, or prevent visible runtime usage from growing or
+falling as allocations and caches change.
 
 ## How Memory is Calculated
 
 ### Memory Allocation Formula
 
-For each stage, vLLM-Omni calculates the requested memory as:
+For stages that support automatic KV-cache sizing, vLLM-Omni calculates the
+requested memory as:
 
-```
+```text
 requested_memory = total_gpu_memory × gpu_memory_utilization
 ```
 
-The system checks that:
-```
+This value is a budget from which model weights, activation peaks, and other
+non-cache allocations are subtracted. The remaining memory is available to the
+KV cache; the full requested amount is not allocated as an idle reservation.
+
+Paged-scheduler diffusion requires:
+
+```text
 free_memory ≥ requested_memory
 ```
 
-If this condition is not met, the stage will fail to initialize with an error message showing the memory requirements.
+If this condition is not met, paged-scheduler diffusion fails to initialize.
+On CUDA, ROCm, and MUSA, autoregressive and LLM-generation workers instead cap
+their requested budget at the available free memory and log a warning. Other
+platform workers may enforce a strict startup check. Diffusion stages in
+`dense_legacy` mode skip this calculation.
+
+Setting `kv_cache_memory_bytes` explicitly overrides automatic KV-cache sizing
+from `gpu_memory_utilization`. It does not bypass the startup memory checks
+described above; paged-scheduler diffusion still runs its profile warmup.
 
 ### Memory Components
 
@@ -31,16 +62,17 @@ The total memory used by a stage includes:
 
 1. **Model Weights**: The size of the model parameters loaded on the GPU
 2. **KV Cache**: Memory for storing key-value cache during generation
-3. **Activation Memory**: Temporary memory for intermediate computations
-4. **System Overhead**: Memory used by CUDA, PyTorch, and other system components
-5. **Non-Torch Memory**: Memory allocated outside of PyTorch (e.g., CUDA graphs)
+3. **Activation and Workspace Memory**: Temporary memory for intermediate computations
+4. **Allocator and CUDA Graph Pools**: Cached PyTorch allocations and captured graph memory
+5. **Non-Torch Memory**: Memory allocated by CUDA libraries and other system components
 
 ### Example Calculation
 
-For a GPU with 80GB total memory:
-- `gpu_memory_utilization: 0.8` → 64GB available for the stage
-- `gpu_memory_utilization: 0.6` → 48GB available for the stage
-- `gpu_memory_utilization: 0.15` → 12GB available for the stage
+For a GPU with 80GB total memory on a stage that supports automatic sizing:
+
+- `gpu_memory_utilization: 0.8` → 64GB memory budget
+- `gpu_memory_utilization: 0.6` → 48GB memory budget
+- `gpu_memory_utilization: 0.15` → 12GB memory budget
 
 ## Setting Up `gpu_memory_utilization`
 
@@ -60,51 +92,67 @@ python -c "import torch; print(f'{torch.cuda.get_device_properties(0).total_memo
 
 #### For Autoregressive (AR) Stages
 
-AR stages typically need more memory due to:
+AR stage memory commonly includes:
+
 - Large model weights
 - KV cache for attention
 - Activation buffers
 
-#### For Diffusion/Generation Stages
+#### For Diffusion Stages
 
-Diffusion stages (like code2wav) typically need less memory:
-- Smaller model components
-- Different memory access patterns
+Diffusion stages have a different runtime memory profile from autoregressive
+stages. Model weights, shape-dependent activations and workspaces, and CUDA
+graph or allocator caches all contribute to their observed usage.
 
-**Typical values:**
-- `0.1 - 0.3` for most diffusion stages
+Diffusion pipelines that keep the default `dense_legacy` mode, including
+OmniVoice, should size capacity from measured peak usage after representative
+warmup and inference rather than `gpu_memory_utilization`.
 
 ### Step 3: Consider Multi-Stage Scenarios
 
-When multiple stages share the same GPU, you must ensure the sum of their `gpu_memory_utilization` values doesn't exceed 1.0.
+When multiple cache-sized stages share the same GPU, keeping the sum of their
+`gpu_memory_utilization` values below 1.0 is a useful starting point. It is not
+an isolation guarantee: lazy CUDA graph captures, runtime workspaces, and the
+PyTorch caching allocator can increase visible memory after startup, while
+`dense_legacy` diffusion stages do not use this value at all. Leave headroom
+and use GPU-level isolation such as
+[NVIDIA MIG](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/) when
+workloads must not contend for memory.
 
-**Example: Two stages on GPU 0**
+#### Example: Two stages on GPU 0
+
 ```yaml
 stages:
   - stage_id: 0
     devices: "0"
-    gpu_memory_utilization: 0.6  # Uses 60% of GPU 0
+    gpu_memory_utilization: 0.6  # 60% cache-sizing budget on GPU 0
 
   - stage_id: 1
     devices: "0"
-    gpu_memory_utilization: 0.3  # Uses 30% of GPU 0
-    # Total: 90% of GPU 0 (safe, leaves 10% buffer)
+    gpu_memory_utilization: 0.3  # 30% cache-sizing budget on GPU 0
+    # Total cache-sizing budget: 90% of GPU 0
 ```
 
-**Important:** If stages run on different GPUs, each can use up to 1.0 independently.
+**Important:** If stages run on different GPUs, each cache-sized stage can use
+an independent budget. A value of `1.0` leaves no margin outside the profiled
+budget for unprofiled runtime growth or co-resident workloads.
 
 ### Step 4: Account for Tensor Parallelism
 
-When using `tensor_parallel_size > 1`, the model is split across multiple GPUs, so each GPU needs less memory.
+For models that implement tensor-parallel weight sharding, setting
+`tensor_parallel_size > 1` splits supported tensors across multiple GPUs and
+usually reduces per-GPU weight memory. Not every stage implementation shards
+all weights, and the reduction is not necessarily linear, so measure per-GPU
+usage for the selected model.
 
-**Example: 2-way tensor parallelism**
+#### Example: 2-way tensor parallelism
+
 ```yaml
 stages:
   - stage_id: 0
     devices: "0,1"  # Uses both GPUs
     tensor_parallel_size: 2
-    gpu_memory_utilization: 0.6  # 60% per GPU
-    # Model is split, so each GPU uses ~30% of model memory
+    gpu_memory_utilization: 0.6  # 60% cache-sizing budget per GPU
 ```
 
 ## Examples
@@ -118,27 +166,33 @@ stages:
   - stage_id: 0  # Thinker stage with TP=2
     devices: "0,1"
     tensor_parallel_size: 2
-    gpu_memory_utilization: 0.6  # 48GB per GPU
+    gpu_memory_utilization: 0.6
 
   - stage_id: 1  # Talker stage
     devices: "1"
-    gpu_memory_utilization: 0.3  # 24GB on GPU 1
+    gpu_memory_utilization: 0.3
 
   - stage_id: 2  # Code2Wav stage
     devices: "0"
-    gpu_memory_utilization: 0.1  # 8GB on GPU 0
+    gpu_memory_utilization: 0.1
 ```
-**Note:** Stage 0 uses GPUs 0 and 1, so the combined utilization is `0.7` on
-GPU 0 and `0.9` on GPU 1. Keep the sum of all resident stages below `1.0` on
-each device.
+
+**Note:** These values are stage inputs, not reservations of 48GB, 24GB, and
+8GB. Do not add them to predict physical usage or treat them as hard device
+quotas. The Code2Wav stage does not expose a KV cache, so its value does not
+create an 8GB cache or reservation.
 
 ## Troubleshooting
 
-### Error: "Free memory is less than desired GPU memory utilization"
+### Warning or error about insufficient free memory
 
-This means the GPU doesn't have enough free memory when the stage starts.
+This means the GPU has less free memory than the configured cache-sizing
+budget. CUDA, ROCm, and MUSA autoregressive or LLM-generation workers cap their
+budget to the available memory and warn; other platform workers may fail the
+startup check. Paged-scheduler diffusion fails initialization.
 
 **Solutions:**
+
 1. Free up memory by closing other processes
 2. Reduce `gpu_memory_utilization` for this stage
 3. Use a GPU with more memory
@@ -149,51 +203,76 @@ This means the GPU doesn't have enough free memory when the stage starts.
 The stage initialized but ran out of memory during processing.
 
 **Solutions:**
-1. Reduce `max_num_batched_tokens`
-2. Reduce `max_num_seqs` in engine_args
-3. Lower `gpu_memory_utilization` slightly
-4. Enable quantization if supported
+
+1. For AR and LLM-generation stages, reduce `max_num_batched_tokens` or
+   `max_num_seqs`
+2. For cache-sized stages, lower `gpu_memory_utilization` to reduce the KV cache
+3. For dense diffusion, reduce model- or workload-specific memory such as
+   batch size, request shapes, or CUDA graph captures
+4. Enable quantization or offloading if supported
 
 ### Memory Not Fully Utilized
 
-If you see low memory usage, you can:
-1. Increase `gpu_memory_utilization` to allow larger KV cache
+Low startup usage is expected when a stage has no automatically sized KV cache.
+For cache-sized stages, you can:
+
+1. Increase `gpu_memory_utilization` to allow a larger KV cache
 2. Increase `max_num_batched_tokens` for better batching
 3. Check if other stages are limiting throughput
+
+Do not treat low startup usage as capacity that another unisolated workload can
+safely consume. Measure representative peak usage, including warmup and varied
+request shapes.
 
 ## Useful formula for Memory Calculation
 
 ### KV Cache Memory
 
 The KV cache size depends on:
-- Number of sequences in batch
-- Sequence length (prompt + generation)
-- Model hidden size
-- Number of attention heads
-- Number of layers
 
-approximate Formula:
+- Number of cached tokens across sequences
+- Number of layers
+- Number of key-value heads per rank and head dimension
+- Cache data type
+- Tensor-parallel sharding or replication
+- Cache block size and allocation rounding
+
+For conventional attention with equal key and value head widths, an approximate
+per-rank formula before block rounding is:
+
+```text
+kv_cache_memory ≈ cached_tokens × num_layers × 2 × kv_heads_per_rank × head_dim × cache_dtype_size
 ```
-kv_cache_memory ≈ batch_size × seq_len × hidden_size × num_layers × 2 × dtype_size
-```
-2 for k & v
+
+The factor of 2 accounts for keys and values. Other layouts, such as MLA, store
+different state, and backends may override head slots or add padding. Use the
+reported cache specifications, page sizes, and allocation logs for capacity
+planning.
 
 ### Model Weight Memory
 
-```
+Approximate raw parameter storage before tensor-parallel sharding and
+quantization metadata is:
+
+```text
 model_memory ≈ num_parameters × dtype_size
 ```
 
 For example:
+
 - 7B parameters in FP16: ~14GB
 - 7B parameters in FP32: ~28GB
 - 7B parameters in INT8: ~7GB
 
 ### Activation Memory
 
-Activation memory is typically smaller but varies with:
+Activation memory varies with:
+
 - Batch size
 - Sequence length
 - Model architecture
+- CUDA graph capture shapes and backend workspaces
 
-It's usually 10-30% of model weight memory during inference.
+Measure activation and workspace peaks with representative batch sizes, input
+shapes, and output lengths; there is no reliable fixed percentage across AR,
+audio, image, and video pipelines.
