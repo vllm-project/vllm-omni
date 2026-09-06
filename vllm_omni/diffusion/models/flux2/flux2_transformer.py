@@ -33,6 +33,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
+from vllm_omni.diffusion.distributed.sp_sharding import sp_shard
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 
@@ -908,8 +909,6 @@ class Flux2Transformer2DModel(nn.Module):
 
         num_txt_tokens = encoder_hidden_states.shape[1]
         sp_size = self.parallel_config.sequence_parallel_size
-        if sp_size and sp_size > 1 and is_forward_context_available():
-            get_forward_context().split_text_embed_in_sp = False
 
         timestep = timestep.to(hidden_states.dtype) * 1000
         if guidance is not None:
@@ -937,6 +936,20 @@ class Flux2Transformer2DModel(nn.Module):
             img_freqs_sin = img_freqs_sin.npu()
         else:
             txt_freqs_cos, txt_freqs_sin, img_freqs_cos, img_freqs_sin = self.rope_prepare(img_ids, txt_ids)
+
+        split_text_embed_in_sp = False
+        if sp_size and sp_size > 1 and is_forward_context_available():
+            fwd_ctx = get_forward_context()
+            split_text_embed_in_sp = (num_txt_tokens % sp_size == 0) and fwd_ctx.sp_padding_size == 0
+            fwd_ctx.split_text_embed_in_sp = split_text_embed_in_sp
+
+        if split_text_embed_in_sp:
+            encoder_hidden_states = sp_shard(encoder_hidden_states, dim=1, validate=False)
+            txt_freqs_cos = sp_shard(txt_freqs_cos, dim=0, validate=False)
+            txt_freqs_sin = sp_shard(txt_freqs_sin, dim=0, validate=False)
+
+        local_txt_len = encoder_hidden_states.shape[1]
+
         concat_rotary_emb = (
             torch.cat([txt_freqs_cos, img_freqs_cos], dim=0),
             torch.cat([txt_freqs_sin, img_freqs_sin], dim=0),
@@ -1008,10 +1021,10 @@ class Flux2Transformer2DModel(nn.Module):
                 temb_mod_params=single_stream_mod,
                 image_rotary_emb=concat_rotary_emb,
                 joint_attention_kwargs=joint_attention_kwargs,
-                text_seq_len=num_txt_tokens,
+                text_seq_len=local_txt_len,
             )
 
-        hidden_states = hidden_states[:, num_txt_tokens:, ...]
+        hidden_states = hidden_states[:, local_txt_len:, ...]
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
 
