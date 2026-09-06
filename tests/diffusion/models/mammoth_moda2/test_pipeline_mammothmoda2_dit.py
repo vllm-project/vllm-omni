@@ -45,12 +45,24 @@ def test_build_mammoth_config_uses_shared_transformer_projection() -> None:
     assert config.gen_dit_config == {"hidden_size": 8, "in_channels": 4}
 
 
+def test_build_mammoth_config_rejects_empty_shared_projection() -> None:
+    config = _od_config()
+    config.tf_model_config = TransformerConfig()
+    with pytest.raises(ValueError, match="root checkpoint config"):
+        _build_mammoth_config(config)
+
+
 def test_root_weight_source_loads_combined_checkpoint_once() -> None:
     source = _root_weight_source(_od_config())
     assert source.model_or_path == "/models/MammothModa2-Preview"
     assert source.subfolder is None
     assert source.prefix == ""
     assert source.fall_back_to_pt is True
+
+
+def test_root_weight_source_forwards_revision() -> None:
+    config = SimpleNamespace(model="/models/MammothModa2-Preview", revision="rev-7")
+    assert _root_weight_source(config).revision == "rev-7"
 
 
 def test_pipeline_declares_native_components_and_single_request_mode_only() -> None:
