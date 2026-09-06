@@ -68,16 +68,24 @@ The `/v1/videos` request schema and `extra_params.task` values (`t2va`,
 
 ## Turbo LoRA
 
-MiniMax-H3 Turbo uses five sigma points, `flow_shift=6`, and
-`audio_flow_shift=3`. Start Turbo deployments with the dedicated defaults so
-requests that omit sampling controls do not inherit the 50-step base schedule:
+The deploy config below carries the four-step 768p contract -- five sigma
+points, `flow_shift=6`, `audio_flow_shift=3` -- so requests that omit sampling
+controls do not inherit the 50-step base schedule:
 
 ```bash
 vllm-omni serve MiniMaxAI/MiniMax-H3 \
   --omni \
-  --lora-path /path/to/MiniMax-H3-Turbo \
+  --lora-path /path/to/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors \
   --deploy-config vllm_omni/deploy/minimax_h3_disaggregated_turbo.yaml
 ```
 
+`--lora-path` must name one artifact, or a directory holding exactly one; the
+Turbo repository holds several and a directory of them is rejected as
+ambiguous. Serving a different artifact means overriding those defaults with
+that artifact's own contract -- see the
+[Turbo LoRA table](MiniMax-H3.md#turbo-lora) for every published row.
+
 The base deployment intentionally retains 50 inference steps for non-LoRA
-quality. Turbo LoRA supports T2VA and FL2VA requests, not Ref2VA.
+quality. This disaggregated topology is validated on the `fl2v` artifacts,
+which serve T2VA and FL2VA; the `ref2v` artifacts need a `--task-type ref2va`
+server.
