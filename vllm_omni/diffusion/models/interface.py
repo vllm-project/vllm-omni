@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -9,6 +10,7 @@ from typing import (
     ClassVar,
     Literal,
     Protocol,
+    TypeGuard,
     runtime_checkable,
 )
 
@@ -43,6 +45,34 @@ class SupportAudioInput(Protocol):
 @runtime_checkable
 class SupportAudioOutput(Protocol):
     support_audio_output: ClassVar[bool] = True
+
+
+DecodedChunkConsumer = Callable[["torch.Tensor"], None]
+
+
+@runtime_checkable
+class SupportsChunkedVAEDecode(Protocol):
+    """Optional capability for VAEs that stream decoded temporal chunks.
+
+    Implementations must drain decoding before surfacing callback errors. In a
+    distributed VAE, every rank invokes the method so collectives stay in
+    lockstep, while ``on_chunk`` is called only on the rank that owns output.
+    """
+
+    def decode_with_chunks(
+        self,
+        z: torch.Tensor,
+        *,
+        on_chunk: DecodedChunkConsumer,
+    ) -> None:
+        """Decode ``z`` and synchronously deliver committed chunks in order."""
+        ...
+
+
+def supports_chunked_vae_decode(vae: object) -> TypeGuard[SupportsChunkedVAEDecode]:
+    """Return whether ``vae`` exposes the optional chunked decode capability."""
+
+    return isinstance(vae, SupportsChunkedVAEDecode)
 
 
 @runtime_checkable
