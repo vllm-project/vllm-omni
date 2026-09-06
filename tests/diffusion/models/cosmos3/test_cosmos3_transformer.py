@@ -383,6 +383,117 @@ def test_transformer_sharding_offload_and_patch_round_trip_contracts() -> None:
         )
 
 
+def test_gen_sp_plan_auto_pads_hidden_states_and_rope_together() -> None:
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    prepare_plan = Cosmos3VFMTransformer._sp_plan["gen_sp_prepare"]
+    assert set(prepare_plan) == {0, 1, 2}
+    assert all(spec.auto_pad for spec in prepare_plan.values())
+    assert [prepare_plan[index].split_dim for index in range(3)] == [1, 1, 1]
+
+
+def test_gen_sp_prepare_resets_branch_local_padding_metadata() -> None:
+    from vllm_omni.diffusion.forward_context import ForwardContext, override_forward_context
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3GenSPPrepare
+
+    ctx = ForwardContext(sp_padding_size=1, sp_original_seq_len=12121)
+    hidden = torch.zeros(1, 4, 8)
+    rope = torch.zeros(1, 4, 1, 2)
+    with override_forward_context(ctx):
+        output = Cosmos3GenSPPrepare()(hidden, rope, rope)
+
+    assert output[0] is hidden
+    assert output[1] is rope
+    assert output[2] is rope
+    assert ctx.sp_padding_size == 0
+    assert ctx.sp_original_seq_len is None
+
+
+def test_sp_attention_masks_padded_gen_and_joint_und_keys() -> None:
+    from vllm_omni.diffusion.forward_context import ForwardContext, override_forward_context
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3CrossAttention
+
+    class RecordingAttention(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.metadata: Any | None = None
+
+        def forward(self, query, key, value, metadata):
+            del key, value
+            self.metadata = metadata
+            return query
+
+    module = object.__new__(Cosmos3CrossAttention)
+    nn.Module.__init__(module)
+    module.num_heads_local = 2
+    module.head_dim = 4
+    recording_attention = RecordingAttention()
+    module.attn = recording_attention
+
+    q = torch.zeros(1, 2, 2, 4)
+    k = torch.zeros_like(q)
+    v = torch.zeros_like(q)
+    k_und = torch.zeros(1, 3, 2, 4)
+    v_und = torch.zeros_like(k_und)
+    ctx = ForwardContext(sp_padding_size=1, sp_original_seq_len=3)
+    with override_forward_context(ctx):
+        output = module._forward_sp(q, k, v, k_und, v_und)
+
+    assert output.shape == (1, 2, 8)
+    assert recording_attention.metadata is not None
+    assert recording_attention.metadata.attn_mask.tolist() == [[True, True, True, False]]
+    assert recording_attention.metadata.joint_attn_mask.tolist() == [[True, True, True]]
+
+
+def test_ulysses_2d_mask_uses_key_length_with_kv_only_joint_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+    from vllm_omni.diffusion.attention.parallel import ulysses
+
+    def fake_all_to_all(
+        _group: object,
+        tensor: torch.Tensor,
+        _scatter_idx: int,
+        _gather_idx: int,
+        _use_sync: bool,
+    ) -> torch.Tensor:
+        return torch.cat([tensor, tensor], dim=1)[:, :, :1]
+
+    monkeypatch.setattr(ulysses.SeqAllToAll4D, "apply", staticmethod(fake_all_to_all))
+    strategy = ulysses.UlyssesParallelAttention(
+        sp_group=SimpleNamespace(
+            ulysses_group=object(),
+            ulysses_world_size=2,
+            ulysses_rank=0,
+            ring_world_size=1,
+        ),
+        scatter_idx=2,
+        gather_idx=1,
+        use_sync=False,
+    )
+    query = torch.zeros(1, 2, 2, 4)
+    key = torch.zeros_like(query)
+    value = torch.zeros_like(query)
+    joint_query = torch.zeros(1, 0, 2, 4)
+    joint_key = torch.zeros(1, 3, 2, 4)
+    metadata = AttentionMetadata(
+        attn_mask=torch.tensor([[True, True, True, False]]),
+        joint_attn_mask=torch.ones(1, 3, dtype=torch.bool),
+        joint_query=joint_query,
+        joint_key=joint_key,
+        joint_value=torch.zeros_like(joint_key),
+        joint_strategy="front",
+    )
+
+    query_out, key_out, _, metadata_out, _ = strategy.pre_attention(query, key, value, metadata)
+
+    assert query_out.shape[1] == 4
+    assert key_out.shape[1] == 7
+    assert metadata_out is not None
+    assert metadata_out.attn_mask.tolist() == [[True, True, True, True, True, True, False]]
+
+
 def test_forward_returns_video_prediction(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
 
@@ -721,7 +832,7 @@ def test_forward_returns_video_plus_optional_modality_predictions(
     assert [tuple(tensor.shape) for tensor in output] == expected_shapes
 
 
-def test_forward_with_sound_ulysses_error_mentions_combined_sequence(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_forward_with_sound_odd_sequence_uses_auto_padding_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     import vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 as cosmos3_module
 
     model = cosmos3_module.Cosmos3VFMTransformer(
@@ -732,16 +843,17 @@ def test_forward_with_sound_ulysses_error_mentions_combined_sequence(monkeypatch
     )
     monkeypatch.setattr(cosmos3_module, "_get_ulysses_state", lambda: (2, 0, None))
 
-    with pytest.raises(ValueError, match=r"GEN sequence length \(3 = video tokens 2 \+ sound tokens 1\)"):
-        model(
-            hidden_states=torch.zeros(1, 2, 1, 1, 2),
-            timestep=torch.tensor([1.0]),
-            text_ids=torch.tensor([[1, 2]], dtype=torch.long),
-            text_mask=torch.ones(1, 2, dtype=torch.long),
-            video_shape=(1, 1, 2),
-            fps=24.0,
-            sound_latents=torch.zeros(1, 3, 1),
-        )
+    output = model(
+        hidden_states=torch.zeros(1, 2, 1, 1, 2),
+        timestep=torch.tensor([1.0]),
+        text_ids=torch.tensor([[1, 2]], dtype=torch.long),
+        text_mask=torch.ones(1, 2, dtype=torch.long),
+        video_shape=(1, 1, 2),
+        fps=24.0,
+        sound_latents=torch.zeros(1, 3, 1),
+    )
+
+    assert [tuple(tensor.shape) for tensor in output] == [(1, 2, 1, 1, 2), (1, 3, 1)]
 
 
 def test_sound_latent_frames_padded_for_sequence_parallel(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -591,15 +591,15 @@ class UlyssesParallelAttention:
                     if attn_metadata.attn_mask is None:
                         assert attn_metadata.joint_attn_mask is not None
                         attn_metadata.attn_mask = torch.ones(
-                            [query.shape[0], query.shape[1] - attn_metadata.joint_attn_mask.shape[1]],
+                            [key.shape[0], key.shape[1] - attn_metadata.joint_attn_mask.shape[1]],
                             dtype=torch.bool,
-                            device=query.device,
+                            device=key.device,
                         )
                     elif attn_metadata.joint_attn_mask is None:
                         attn_metadata.joint_attn_mask = torch.ones(
-                            [query.shape[0], query.shape[1] - attn_metadata.attn_mask.shape[1]],
+                            [key.shape[0], key.shape[1] - attn_metadata.attn_mask.shape[1]],
                             dtype=torch.bool,
-                            device=query.device,
+                            device=key.device,
                         )
                     attn_metadata.attn_mask = (
                         torch.cat([attn_metadata.joint_attn_mask, attn_metadata.attn_mask], dim=1)
@@ -608,9 +608,10 @@ class UlyssesParallelAttention:
                     )
 
             if attn_metadata.attn_mask is not None:
-                # the final attn_mask is ready, the length should be aligedn with query length
-                assert attn_metadata.attn_mask.shape[1] == query.shape[1], (
-                    f"attn_mask length: {attn_metadata.attn_mask.shape[1]} != query length: {query.shape[1]}"
+                # A 2D mask describes keys. Joint attention may provide K/V-only
+                # context, so key and query lengths are not necessarily equal.
+                assert attn_metadata.attn_mask.shape[1] == key.shape[1], (
+                    f"attn_mask length: {attn_metadata.attn_mask.shape[1]} != key length: {key.shape[1]}"
                 )
                 attn_metadata.attn_mask = attn_metadata.attn_mask.bool().contiguous()
         return query, key, value, attn_metadata, ctx
