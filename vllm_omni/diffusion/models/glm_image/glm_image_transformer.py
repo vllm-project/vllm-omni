@@ -20,6 +20,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.utils import maybe_prefix
 
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 
@@ -973,6 +974,7 @@ class GlmImageTransformer2DModel(CachedTransformer):
         self,
         od_config: OmniDiffusionConfig,
         quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -1031,7 +1033,7 @@ class GlmImageTransformer2DModel(CachedTransformer):
             inner_dim=inner_dim,
             activation_fn="gelu",
             quant_config=quant_config,
-            prefix="glyph_projector",
+            prefix=maybe_prefix(prefix, "glyph_projector"),
         )
         self.prior_token_embedding = nn.Embedding(prior_vq_quantizer_codebook_size, inner_dim)
         self.prior_projector = GlmImageFeedForward(
@@ -1040,7 +1042,7 @@ class GlmImageTransformer2DModel(CachedTransformer):
             inner_dim=inner_dim,
             activation_fn="linear-silu",
             quant_config=quant_config,
-            prefix="prior_projector",
+            prefix=maybe_prefix(prefix, "prior_projector"),
         )
 
         # Prepare module for SP (encapsulates patch embedding and RoPE for _sp_plan)
@@ -1064,7 +1066,7 @@ class GlmImageTransformer2DModel(CachedTransformer):
                     ffn_hidden_dim=ffn_hidden_dim,
                     parallel_config=self.parallel_config,
                     quant_config=quant_config,
-                    prefix=f"transformer_blocks.{i}",
+                    prefix=maybe_prefix(prefix, f"transformer_blocks.{i}"),
                 )
                 for i in range(num_layers)
             ]
@@ -1074,7 +1076,11 @@ class GlmImageTransformer2DModel(CachedTransformer):
         # Final modulation feeds proj_out; quant_config is NOT applied here
         # to avoid precision degradation in the final projection layer.
         self.norm_out = GlmImageAdaLayerNormContinuous(
-            inner_dim, time_embed_dim, elementwise_affine=False, quant_config=None, prefix="norm_out"
+            inner_dim,
+            time_embed_dim,
+            elementwise_affine=False,
+            quant_config=None,
+            prefix=maybe_prefix(prefix, "norm_out"),
         )
         self.proj_out = nn.Linear(inner_dim, patch_size * patch_size * out_channels, bias=True)
 
