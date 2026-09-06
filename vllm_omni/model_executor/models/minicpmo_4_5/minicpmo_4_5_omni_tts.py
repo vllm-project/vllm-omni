@@ -49,6 +49,12 @@ _OFFLINE_CODEC_MAX_NEW_TOKENS = 2048
 # until codec EOS / 4096 and Thinker never starts the next model turn.
 _DUPLEX_CODEC_TOKENS_PER_CHUNK = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
 
+# Buffer keys ``preprocess`` writes that must stay on the accelerator: the
+# same-step codes travel through make_omni_output from the previous sampled id
+# (decode preprocess embeds that id via emb_code), so a host round-trip here
+# would sit on the decode path.
+_GPU_RESIDENT_BUFFER_KEYS: frozenset[tuple[str, str]] = frozenset({("codes", "audio")})
+
 
 def _native_duplex_chunk_budget(meta: Mapping[str, Any] | None) -> tuple[int, int]:
     """Return ``(max_tokens, min_tokens)`` for one native-duplex Talker request."""
@@ -77,6 +83,45 @@ def _restore_weight_norm_weight(weight_g: torch.Tensor, weight_v: torch.Tensor) 
     return torch._weight_norm(weight_v, weight_g, dim=0)
 
 
+def _as_recent_codec_history(value: Any, *, device: torch.device) -> torch.Tensor:
+    """Return the last ``_CODEC_PENALTY_WINDOW`` codec ids on ``device``.
+
+    The window used to be a Python ``list`` filled by ``Tensor.tolist()`` after
+    every decode forward. That D2H is a compute-stream sync — the profiler
+    shows it as ``aten::copy_`` / ``cudaMemcpyAsync`` on the Stage-1
+    ``make_omni_output`` path — and the next sample() then copied the list
+    back with ``torch.tensor(...)``.
+    """
+    if isinstance(value, torch.Tensor):
+        recent = value.reshape(-1).to(device=device, dtype=torch.long)
+    elif isinstance(value, (list, tuple)) and value:
+        recent = torch.as_tensor(value, dtype=torch.long, device=device)
+    else:
+        return torch.empty(0, dtype=torch.long, device=device)
+    return recent[-_CODEC_PENALTY_WINDOW:]
+
+
+def _extend_recent_codec_history(
+    state: dict[str, Any],
+    new_ids: torch.Tensor,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Append ``new_ids`` to the on-device penalty window and store it."""
+    incoming = new_ids.reshape(-1).to(device=device, dtype=torch.long)
+    previous = _as_recent_codec_history(state.get("recent_codes"), device=device)
+    if previous.numel() == 0:
+        # Clone so the window does not alias ``codes.audio``; that buffer
+        # is overwritten in-place on the next decode.
+        recent = incoming[-_CODEC_PENALTY_WINDOW:].clone()
+    elif incoming.numel() == 0:
+        recent = previous
+    else:
+        recent = torch.cat((previous, incoming))[-_CODEC_PENALTY_WINDOW:]
+    state["recent_codes"] = recent
+    return recent
+
+
 def _apply_batched_repetition_penalty(
     logits: torch.Tensor,
     histories: Sequence[torch.Tensor],
@@ -102,7 +147,11 @@ def _apply_batched_repetition_penalty(
         penalties = penalties.expand(batch_size)
     elif penalties.numel() != batch_size:
         raise ValueError(f"expected 1 or {batch_size} codec repetition penalties, got {penalties.numel()}")
-    if not bool((penalties != 1.0).any()):
+    # ``penalty == 1`` is a no-op (``1 ** freq == 1``). Do not read the
+    # values back to host: ``.any()`` is a compute-stream sync on every
+    # sample. Skip the kernel only when every row's history is empty —
+    # ``numel()`` is a shape query, not a D2H.
+    if all(history.numel() == 0 for history in histories):
         return logits
 
     penalized = logits.clone()
@@ -181,9 +230,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         self.has_preprocess = True
         self.has_postprocess = False
-        # Same-step codes travel through make_omni_output from the previous
-        # sampled id (decode preprocess embeds that id via emb_code).
-        self.gpu_resident_buffer_keys: set[tuple[str, str]] = {("codes", "audio")}
+        # Codec sampling mutates request-local state inside make_omni_output,
+        # which runs on the execute_model path before the async snapshot.
+        self.use_async_omni_output = True
+        self.omni_pooler_payload_include_hidden = False
+        self.gpu_resident_buffer_keys: set[tuple[str, str]] = set(_GPU_RESIDENT_BUFFER_KEYS)
         self._init_native_talker(prefix)
 
     def _init_native_talker(self, prefix: str) -> None:
@@ -520,6 +571,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # hand the same id to make_omni_output so Code2Wav sees it this step.
         code = input_ids.to(device=self.emb_code[0].weight.device, dtype=torch.long).reshape(-1)[-1:]
         embeds = self.emb_code[0](code)
+        # Scalar latch for the leftover-decode path. This is one id, and it
+        # runs *before* forward; do not move the equivalent ``.tolist()``
+        # into ``make_omni_output`` (that stalls the compute stream).
         code_id = int(code.item())
         if code_id == int(self._codec_eos_id):
             if isinstance(state, dict):
@@ -616,12 +670,18 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 state["step"] = int(state.get("step", 0)) + 1
                 # ``audio`` is the id sampled last step, i.e. exactly upstream's
                 # ``new_tokens[:, 0:t]`` history for the logits computed below.
-                recent = state.get("recent_codes")
-                recent = (recent if isinstance(recent, list) else []) + codec_deltas[index].reshape(-1).tolist()
-                state["recent_codes"] = recent[-_CODEC_PENALTY_WINDOW:]
-            recent_codes = state.get("recent_codes")
-            if recent_codes:
-                penalty_histories[index] = torch.tensor(recent_codes, dtype=torch.long, device=hidden.device)
+                # Keep the window on-device; ``.tolist()`` here is the Stage-1
+                # D2H the profiler attributes to ``make_omni_output``.
+                penalty_histories[index] = _extend_recent_codec_history(
+                    state,
+                    codec_deltas[index],
+                    device=hidden.device,
+                )
+            else:
+                recent_codes = _as_recent_codec_history(state.get("recent_codes"), device=hidden.device)
+                if recent_codes.numel() > 0:
+                    state["recent_codes"] = recent_codes
+                    penalty_histories[index] = recent_codes
             max_tokens = state.get("max_tokens")
             min_tokens = state.get("min_tokens")
             step = int(state.get("step", 0))
