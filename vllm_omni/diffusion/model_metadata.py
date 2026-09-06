@@ -55,6 +55,11 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_mixed_reference_inputs=True,
         final_output_type="video",
     ),
+    "Magi2Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        final_output_type="video",
+    ),
     "WanPipeline": DiffusionModelMetadata(
         attention_mask_free=True,
         final_output_type="video",
