@@ -168,7 +168,7 @@ quantization or offload. Ring, TP/PP/DP, HSDP, expert/CFG/VAE parallelism,
 step execution and Dev text-to-image are not supported with this SP path.
 The AR-only Preview/Dev understanding topology is unchanged.
 
-The following offline configuration completed a one-prompt Preview E2E smoke
+The following BF16 offline configuration completed a one-prompt Preview E2E smoke
 on two A100-SXM4-80GB GPUs with NVLink NV4. AR shares GPU 0 with DiT rank 0;
 DiT rank 1 uses GPU 1. This is not a general capacity or performance guarantee:
 SP does not shard model weights or the replicated refiners/VAE. Keep the
@@ -198,7 +198,7 @@ stages:
     ulysses_mode: advanced_uaa
     diffusion_attention_backend: TORCH_SDPA
     engine_extras:
-      dtype: float32
+      dtype: bfloat16
 ```
 
 ```bash
@@ -215,9 +215,14 @@ python examples/offline_inference/text_to_image/text_to_image.py \
 Pass the Ulysses flags explicitly: the shared example's command-line defaults
 also enter config resolution. For the SP=1 control, change stage 1's devices
 to `"0"`, set its `ulysses_degree` to 1, and pass `--ulysses-degree 1`.
+For the FP32 DiT control, keep AR in BF16 and change only stage 1's
+`engine_extras.dtype` to `float32`. BF16 `FLASH_ATTN` is a separately tested
+backend; compare SP=1 and SP=2 with the same backend.
 
 The correctness control below uses two CUDA devices, real NCCL collectives,
-released 2520/21/7/120 head geometry with reduced depth, and FP32 SDPA math.
+released 2520/21/7/120 head geometry with reduced depth, FP32 SDPA math,
+BF16 SDPA and BF16 FlashAttention. The BF16 controls also compare against
+FP32 computation with the same quantized weights and inputs.
 A separate tiny native pipeline replay exercises the constructor, registry
 hooks, Q-Former, DiT, sequential CFG, request-level seed handling, scheduler and
 VAE with synthetic AR conditioning. It tests explicit/default-seed A/B/A
@@ -228,18 +233,34 @@ CUDA_VISIBLE_DEVICES=0,1 OMP_NUM_THREADS=4 python -m pytest -q \
   tests/diffusion/distributed/test_mammothmoda2_ulysses.py
 ```
 
-The full-weight smoke used Preview revision
+The full-weight qualification used Preview revision
 `ef5a5e41dbf0de1ef6275586b7580f0d4248b4c6`, vLLM 0.28.0, Torch 2.13.0+cu130,
 Transformers 5.14.1, Diffusers 0.40.0, Python 3.12.3 and driver 580.159.03.
-Both SP=1 and SP=2 completed and saved 1024x1024 RGB PNG images. AR token IDs matched;
-the saved images differed by at most one 8-bit channel value (mean absolute
-difference 0.005415). This is a single-prompt smoke, not raw-latent parity or
-a broad image-quality/performance result.
+An earlier FP32 DiT control completed both SP=1 and SP=2 and saved 1024x1024
+RGB PNG images. AR token IDs matched; saved channel values differed by at
+most one 8-bit level (mean absolute difference 0.005415).
 
-Understanding regressions, BF16 SP accuracy, peak-memory reduction and paired
-speedup measurements remain **NOT_RUN**. For a meaningful comparison, keep
-code, weights, attention backend, dtype, prompts, seeds and sampling settings
-fixed between SP=1 and SP=2.
+The BF16 fixed-conditioning replay uses one real AR payload, identical
+initial noise, conditions and masks, 50 steps, seed 42 and guidance 4. Each
+configuration runs one observed warmup and three uninstrumented measured
+requests. Both SDPA and FlashAttention preserve exact self-repeat and
+cross-rank output agreement. SP=1 and SP=2 are not bit-identical: normalized
+RGB mean absolute error is 0.001682 for SDPA and 0.001817 for FlashAttention;
+PSNR is 51.03/47.57 dB and SSIM is 0.9961/0.9950 respectively. These are
+single-prompt numerical/visual controls, not broad image-quality certification.
+Selected late-step predictions differ more than the final decoded image;
+the benchmark preserves those tensors instead of claiming trajectory equality.
+
+Preview and Dev text/image-understanding A/B/A controls produced identical
+text, token IDs and stop reasons before and after the SP changes (12 requests
+per revision). This preserves existing Dev end-marker formatting; it is not
+an understanding-accuracy benchmark or Dev text-to-image validation.
+
+For exact capture, replay and understanding commands, see
+[the qualification tools](../../benchmarks/mammoth_moda2/README.md).
+Keep code, weights, backend, dtype, inputs and sampling fixed in paired runs.
+SP replicates weights and VAE, so do not infer peak-memory or GPU-cost savings
+from a reduction in DiT latency.
 
 ### 1x AMD MI300X, MammothModa2 Preview (pre-migration baseline)
 
