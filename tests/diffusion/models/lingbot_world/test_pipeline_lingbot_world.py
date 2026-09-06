@@ -1506,7 +1506,7 @@ def test_typed_ticks_generate_one_global_block_and_return_standard_metadata(
         "applied_event_ids": [1],
     }
     assert pipeline._ar_sessions["world-1"].next_chunk_index == 2
-    assert pipeline._ar_sessions["world-1"].prompt == "enter the snowy valley"
+    assert pipeline._ar_sessions["world-1"].prompt_embeds_prompt == "enter the snowy valley"
     assert pipeline._ar_sessions["world-1"].camera_tail is not None
     assert pipeline._ar_sessions["world-1"].camera_tail.poses.shape == (1, 4, 4)
     expected_generator = torch.Generator(device="cpu").manual_seed(17)
@@ -1763,3 +1763,97 @@ def test_registry_and_model_exports_resolve_official_pipeline_class_name() -> No
     assert "from .pipeline import" in lingbot_init
     assert '"LingBotWorldCausalDMDPipeline"' in lingbot_init
     assert '"CausalLingBotWorldTransformer3DModel"' in lingbot_init
+
+
+# ---------------------------------------------------------------------------
+# the session prompt is encoded once, not once per tick
+# ---------------------------------------------------------------------------
+def _tick_pipeline(module, monkeypatch: pytest.MonkeyPatch, cross_calls: list[bool]):
+    """A pipeline whose ticks run without a transformer or a text encoder."""
+    pipeline = _pipeline(module)
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+    pipeline._ar_diffusion_kv_state = object()
+
+    def ar_text_caches(prompt_embeds, *, invalidate):
+        del prompt_embeds
+        cross_calls.append(invalidate)
+        return [SimpleNamespace()]
+
+    monkeypatch.setattr(pipeline, "_ar_text_caches", ar_text_caches)
+    monkeypatch.setattr(
+        pipeline,
+        "_generate_block",
+        lambda **kwargs: torch.randn((1, 16, 3, 2, 2), generator=kwargs["generator"]),
+    )
+    return pipeline
+
+
+def test_a_session_encodes_its_prompt_once_across_many_ticks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_pipeline_module()
+    cross_calls: list[bool] = []
+    pipeline = _tick_pipeline(module, monkeypatch, cross_calls)
+    encodes: list[str] = []
+    original = pipeline.encode_prompt
+
+    def counting_encode_prompt(prompt, **kwargs):
+        encodes.append(prompt)
+        return original(prompt, **kwargs)
+
+    monkeypatch.setattr(pipeline, "encode_prompt", counting_encode_prompt)
+
+    for chunk_index in range(4):
+        pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=chunk_index))))
+
+    assert encodes == ["a bright room"]
+    assert cross_calls == [False, False, False, False]
+
+
+def test_changing_the_prompt_re_encodes_and_invalidates_the_cross_attention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_pipeline_module()
+    cross_calls: list[bool] = []
+    pipeline = _tick_pipeline(module, monkeypatch, cross_calls)
+    encodes: list[str] = []
+    original = pipeline.encode_prompt
+    monkeypatch.setattr(
+        pipeline,
+        "encode_prompt",
+        lambda prompt, **kwargs: (encodes.append(prompt), original(prompt, **kwargs))[1],
+    )
+
+    pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=0))))
+    switched = _prompt()
+    switched["prompt"] = "enter the snowy valley"
+    pipeline(
+        _request(
+            sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=1, prompt=switched["prompt"])),
+            prompt=switched,
+        )
+    )
+
+    assert encodes == ["a bright room", "enter the snowy valley"]
+    assert cross_calls == [False, True]
+
+
+def test_the_direct_path_still_encodes_every_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only sessions get the reuse: a direct request has nowhere to cache."""
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    encodes: list[str] = []
+    original = pipeline.encode_prompt
+    monkeypatch.setattr(
+        pipeline,
+        "encode_prompt",
+        lambda prompt, **kwargs: (encodes.append(prompt), original(prompt, **kwargs))[1],
+    )
+
+    pipeline(_request())
+    pipeline(_request())
+
+    assert len(encodes) == 2
