@@ -19,6 +19,7 @@ Key invariants tested:
 import time
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.outputs import CompletionOutput, RequestOutput
@@ -30,6 +31,7 @@ from tests.helpers.serving_chat import (
     make_text_omni_output,
     parse_sse_chunks,
 )
+from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -152,6 +154,54 @@ async def test_multi_modal_text_audio_only_last_stop():
         for ch in c.get("choices", []):
             if c.get("modality") == "text" and ch.get("delta", {}).get("content") == "lo":
                 assert ch["finish_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_audio_stream_exposes_output_sample_rate():
+    serving_chat = build_serving_chat()
+    serving_chat._create_audio_choice = OmniOpenAIServingChat._create_audio_choice.__get__(serving_chat)
+    request = make_request(modalities=["audio"])
+    audio_tensor = MagicMock()
+    audio_tensor.ndim = 1
+    audio_tensor.numel.return_value = 16_000
+    audio_tensor.detach.return_value = audio_tensor
+    audio_tensor.cpu.return_value = audio_tensor
+    audio_tensor.float.return_value = audio_tensor
+    audio_tensor.numpy.return_value = np.zeros(16_000, dtype=np.float32)
+    encoded_audio = []
+
+    def create_audio(audio):
+        encoded_audio.append(audio)
+        return AudioResponse(audio_data="dGVzdA==", media_type="audio/pcm")
+
+    serving_chat.create_audio = create_audio
+
+    async def result_generator():
+        output = _make_audio_omni_output(audio_samples=16_000)
+        output.outputs[0].multimodal_output = {
+            "audio": [audio_tensor],
+            "audio_sample_rate": 16_000,
+        }
+        yield output
+
+    raw_lines = await collect_stream(
+        serving_chat.chat_completion_stream_generator(
+            request=request,
+            result_generator=result_generator(),
+            request_id="test-req",
+            model_name="test-model",
+            conversation=[],
+            tokenizer=MagicMock(),
+            request_metadata=MagicMock(),
+        )
+    )
+
+    chunks = parse_sse_chunks(raw_lines)
+    audio_chunks = [chunk for chunk in chunks if chunk.get("modality") == "audio" and chunk.get("choices")]
+
+    assert audio_chunks
+    assert audio_chunks[0]["sample_rate_hz"] == 16_000
+    assert encoded_audio[0].sample_rate == 16_000
 
 
 @pytest.mark.asyncio

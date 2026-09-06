@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import wave
 from collections.abc import AsyncGenerator
 from typing import Any
 
+import pybase64 as base64
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.logger import init_logger
 
+from vllm_omni.entrypoints.duplex.audio import wav_payload_to_pcm16
 from vllm_omni.entrypoints.duplex.protocol import DuplexSession
 
 logger = init_logger(__name__)
@@ -37,10 +40,21 @@ class ChatFallbackProjectorMixin:
         try:
             request = self._build_chat_request(session, request_id)
             result = await self._chat_service.create_chat_completion(request, raw_request=None)
-            if isinstance(result, ErrorResponse):
-                await send_json({"type": "error", "error": result.message, "code": result.type or "chat_error"})
+            error_info = getattr(result, "error", None)
+            if isinstance(result, ErrorResponse) or error_info is not None:
+                await send_json(
+                    {
+                        "type": "error",
+                        "error": getattr(error_info, "message", None) or str(result),
+                        "code": getattr(error_info, "type", None) or "chat_error",
+                    }
+                )
                 session.end_response(commit_text=False)
                 return
+            adapter = getattr(self, "_serving_runtime_adapter", None)
+            request_issued = getattr(adapter, "on_turn_request_issued", None)
+            if callable(request_issued):
+                request_issued(session.session_id, adapter.session_state(session.session_id))
             if hasattr(result, "__aiter__"):
                 await self._drain_streaming_response(session, result, epoch, response_id, send_json)
             else:
@@ -80,6 +94,14 @@ class ChatFallbackProjectorMixin:
     def _build_chat_request(self, session: DuplexSession, request_id: str) -> ChatCompletionRequest:
         response_config = session.response_config
         messages: list[dict[str, object]] = []
+        adapter = getattr(self, "_serving_runtime_adapter", None)
+        if adapter is not None:
+            policy_messages_factory = getattr(adapter, "turn_policy_messages", None)
+        else:
+            policy_messages_factory = None
+        if callable(policy_messages_factory):
+            policy_messages = policy_messages_factory(adapter.session_state(session.session_id))
+            messages.extend(policy_messages)
         if response_config.instructions:
             messages.append({"role": "system", "content": response_config.instructions})
         messages.extend(session.history)
@@ -115,6 +137,11 @@ class ChatFallbackProjectorMixin:
 
         request = ChatCompletionRequest(**kwargs)
         object.__setattr__(request, "modalities", response_config.modalities)
+        if "audio" in response_config.modalities:
+            audio_format = response_config.response_format.lower()
+            if audio_format == "pcm16":
+                audio_format = "pcm"
+            object.__setattr__(request, "audio", {"format": audio_format})
         object.__setattr__(request, "request_id", request_id)
         object.__setattr__(
             request,
@@ -227,17 +254,31 @@ class ChatFallbackProjectorMixin:
 
             if isinstance(content, str) and content:
                 if modality == "audio":
-                    session.mark_audio_sent()
-                    await send_json(
-                        {
-                            "type": "response.output_audio.delta",
-                            "session_id": session.session_id,
-                            "response_id": response_id,
-                            "epoch": epoch,
-                            "audio": content,
-                            "format": session.response_config.response_format,
-                        }
+                    output_format = _normalized_audio_format(session.response_config.response_format)
+                    sample_rate_hint = _audio_sample_rate_hint(payload, choice)
+                    duration_ms, output_sample_rate_hz = _audio_metadata(
+                        content,
+                        fmt=output_format,
+                        sample_rate_hz=sample_rate_hint,
                     )
+                    cumulative_duration_ms = session.playback.sent_ms + duration_ms
+                    session.mark_audio_sent(cumulative_duration_ms)
+                    audio_event = {
+                        "type": "response.output_audio.delta",
+                        "session_id": session.session_id,
+                        "response_id": response_id,
+                        "epoch": epoch,
+                        "audio": content,
+                        "format": output_format,
+                    }
+                    if duration_ms > 0:
+                        audio_event.update(
+                            {
+                                "sample_rate_hz": output_sample_rate_hz,
+                                "audio_duration_ms": cumulative_duration_ms,
+                            }
+                        )
+                    await send_json(audio_event)
                 else:
                     session.append_assistant_text(content)
                     await send_json(
@@ -262,3 +303,41 @@ class ChatFallbackProjectorMixin:
                         "modality": modality,
                     }
                 )
+
+
+def _audio_metadata(
+    audio_base64: str,
+    *,
+    fmt: str,
+    sample_rate_hz: int | None = None,
+) -> tuple[int, int | None]:
+    """Return streamed audio duration and sample rate without failing the response."""
+    try:
+        raw = base64.b64decode(audio_base64, validate=False)
+        normalized = fmt.lower()
+        if normalized == "wav":
+            pcm16, wav_rate = wav_payload_to_pcm16(raw)
+            if pcm16 is None or not wav_rate:
+                return 0, sample_rate_hz
+            return round(len(pcm16) * 1000 / (2 * wav_rate)), int(wav_rate)
+        if normalized in {"pcm", "pcm16", "pcm_s16le", "s16le"} and sample_rate_hz is not None:
+            return round(len(raw) * 1000 / (2 * sample_rate_hz)), sample_rate_hz
+    except (ValueError, wave.Error):
+        return 0, sample_rate_hz
+    return 0, sample_rate_hz
+
+
+def _normalized_audio_format(response_format: str) -> str:
+    normalized = response_format.lower()
+    return "pcm" if normalized == "pcm16" else normalized
+
+
+def _audio_sample_rate_hint(payload: dict[str, object], choice: dict[str, object]) -> int | None:
+    for source in (choice, payload, payload.get("metrics")):
+        if not isinstance(source, dict):
+            continue
+        for key in ("sample_rate_hz", "audio_sample_rate", "sample_rate", "sr"):
+            value = source.get(key)
+            if isinstance(value, int | float) and int(value) > 0:
+                return int(value)
+    return None

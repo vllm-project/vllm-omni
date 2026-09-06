@@ -32,6 +32,50 @@ vllm-omni serve openbmb/MiniCPM-o-4_5 \
 PersonaPlex and Nemotron VoiceChat use `vllm_omni/deploy/personaplex.yaml` and
 `vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml` in the same way.
 
+### Qwen3-Omni (turn-based chat fallback)
+
+Qwen3-Omni has no model-native listen/speak tokens, so it uses the
+turn-based chat-fallback path instead of the native duplex control plane.
+User audio is committed into `DuplexSession.history` and served through the
+standard chat completions API with `modalities=["audio", "text"]`; the
+response is projected back into Realtime events.
+
+```bash
+vllm-omni serve Qwen/Qwen3-Omni-MoE \
+    --omni \
+    --deploy-config vllm_omni/deploy/qwen3_omni_duplex.yaml \
+    --trust-remote-code \
+    --host 0.0.0.0 --port 8099
+```
+
+`vllm_omni/deploy/qwen3_omni_duplex.yaml` overlays `qwen3_omni_moe.yaml` with
+`session_mode: duplex`, `async_chunk: false`, and `max_sessions: 1`. The
+duplex serving adapter is selected automatically by the `qwen3_omni_moe`
+pipeline (`PipelineConfig.duplex_serving_adapter`); no `--preset` or
+`ref_audio` is needed.
+
+Connect with the model-neutral `SessionConfig` (no `native_duplex` flag):
+
+```python
+from vllm_omni.clients.duplex import DuplexClient, SessionConfig, read_pcm16_wav
+
+config = SessionConfig(modalities=["audio", "text"])
+async with DuplexClient("ws://127.0.0.1:8099/v1/realtime", model="Qwen/Qwen3-Omni-MoE", config=config) as client:
+    question = read_pcm16_wav(Path("question_16k.wav"))
+    await client.stream_pcm(question, chunk_ms=100)
+    await client.commit(create_response=True)  # auto-respond on commit (adapter default)
+    async for response in client.responses():
+        for chunk in response.audio_chunks:
+            ...  # PCM16 bytes
+```
+
+Input WAVs must be mono 16 kHz PCM16. Barge-in is supported: sending
+`input.cancel` or new audio while a response is active marks the turn as
+interrupted and injects an interruption note into the next turn's system
+prompt. The `auto_respond_on_commit` hook defaults to `True` for Qwen3-Omni,
+so `commit()` without `create_response=False` starts a response
+automatically.
+
 ### Run the Example Client
 
 `examples/online_serving/barge_in_client.py` asks a question, interrupts the
@@ -107,8 +151,8 @@ client does not expose.
 from vllm_omni.clients.duplex import read_pcm16_wav
 
 question = read_pcm16_wav(Path("question_16k.wav"))
-await client.stream_pcm(question, chunk_ms=100)      # paced 100 ms appends
-await client.commit(create_response=False)           # the model decides listen/speak
+await client.stream_pcm(question, chunk_ms=100)  # paced 100 ms appends
+await client.commit(create_response=False)  # the model decides listen/speak
 ```
 
 `stream_pcm` slices PCM into `chunk_ms` appends and paces them in real time
@@ -138,8 +182,8 @@ handle with `decision == "listen"`.
 ```python
 async for response in client.responses():
     if response.decision == "listen":
-        continue                                   # the model kept listening
-    async for chunk in response.audio():           # decoded PCM16 at 24 kHz
+        continue  # the model kept listening
+    async for chunk in response.audio():  # decoded PCM16 at 24 kHz
         play(chunk)
         await client.ack_playback(response.played_ms, response_id=response.response_id)
     await response.wait()
@@ -162,8 +206,8 @@ what the example and the benchmarks do at the end of a turn.
 ### Interrupt
 
 ```python
-await client.cancel_response()        # cancel the active response (epoch advances)
-await client.clear_input()            # drop un-committed input audio
+await client.cancel_response()  # cancel the active response (epoch advances)
+await client.clear_input()  # drop un-committed input audio
 ```
 
 In the model-native lane you usually do not need either: keep streaming

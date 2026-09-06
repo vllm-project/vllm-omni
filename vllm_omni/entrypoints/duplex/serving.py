@@ -932,6 +932,7 @@ class OmniDuplexSessionHandler(
         runtime_config: dict[str, object] = {}
         if use_native_runtime:
             try:
+                self._serving_runtime_adapter.validate_client_extra_body(config.extra_body)
                 runtime_config = await self._serving_runtime_adapter.prepare_runtime_config(
                     config,
                     model_config=getattr(self._chat_service, "model_config", None),
@@ -1158,8 +1159,6 @@ class OmniDuplexSessionHandler(
         session: DuplexSession,
         payload: dict[str, object],
     ) -> dict[str, object] | None:
-        if not self._uses_native_input_append(session):
-            return None
         try:
             self._serving_runtime_adapter.validate_client_extra_body(payload.get("extra_body"))
         except ServingRuntimeConfigError as exc:
@@ -1176,7 +1175,7 @@ class OmniDuplexSessionHandler(
         session: DuplexSession,
         candidate_config: DuplexSessionConfig,
     ) -> dict[str, object]:
-        if not self._uses_native_input_append(session):
+        if not self._uses_serving_runtime_adapter(candidate_config):
             return dict(session.runtime_config)
         return self._serving_runtime_adapter.runtime_config_for_update(
             candidate_config,

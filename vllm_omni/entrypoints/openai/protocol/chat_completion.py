@@ -5,6 +5,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRespo
 
 class OmniChatCompletionStreamResponse(ChatCompletionStreamResponse):
     modality: str | None = "text"
+    sample_rate_hz: int | None = None
     metrics: dict[str, Any] | None = None
 
 

@@ -14,7 +14,10 @@ from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.messages import DuplexFence
-from vllm_omni.entrypoints.duplex.audio import convert_input_audio_with_rate
+from vllm_omni.entrypoints.duplex.audio import (
+    convert_input_audio_with_rate,
+    pcm_f32le_payload_to_wav,
+)
 from vllm_omni.entrypoints.duplex.commit_policy import (
     CommitAction,
     CommitSnapshot,
@@ -970,6 +973,10 @@ class DuplexSessionRunnerMixin:
                         native.input_since_commit = False
                         native.speech_since_commit = False
                         native.clear_committed_audio()
+                        if session.active_response_id is not None:
+                            on_barge_in = getattr(self._serving_runtime_adapter, "on_barge_in", None)
+                            if callable(on_barge_in):
+                                on_barge_in(session.session_id, native)
                     had_native_append = await actor.cancel_append_tasks(
                         response_bound_only=event_type in {"response.cancel", "output_audio_buffer.clear"},
                     )
@@ -1342,7 +1349,9 @@ class DuplexSessionRunnerMixin:
                                 "cancel",
                             }:
                                 event.pop(key, None)
-                    fmt = event.get("format") if isinstance(event.get("format"), str) else "pcm16"
+                    fmt = event.get("format") or event.get("input_audio_format") or event.get("audio_format") or "pcm16"
+                    if not isinstance(fmt, str):
+                        fmt = "pcm16"
                     default_sample_rate_hz = 16000
                     sr_raw = event.get("sample_rate_hz") or event.get("sample_rate")
                     sample_rate_hz = sr_raw if isinstance(sr_raw, int | float) else default_sample_rate_hz
@@ -1355,6 +1364,20 @@ class DuplexSessionRunnerMixin:
                     except ValueError as exc:
                         await emit_event({"type": "error", "error": str(exc), "code": "bad_event"})
                         continue
+                    if (
+                        not self._uses_native_input_append(session)
+                        and isinstance(audio, str)
+                        and isinstance(fmt, str)
+                        and fmt.lower() == "pcm_f32le"
+                    ):
+                        try:
+                            audio, fmt, sample_rate_hz = pcm_f32le_payload_to_wav(
+                                audio,
+                                sample_rate_hz if isinstance(sample_rate_hz, int | float) else 16_000,
+                            )
+                        except ValueError as exc:
+                            await emit_event({"type": "error", "error": str(exc), "code": "bad_audio"})
+                            continue
                     if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:
                         await emit_event(
                             {
@@ -1625,7 +1648,10 @@ class DuplexSessionRunnerMixin:
                     should_create_response = (
                         event_type == "response.create"
                         or bool(event.get("response_create", event_type == "input.commit"))
-                        or (event_type == "input_audio_buffer.commit" and self._session_auto_responds(session))
+                        or (
+                            event_type == "input_audio_buffer.commit"
+                            and self._serving_adapter_auto_respond_on_commit(session)
+                        )
                     )
                     precreate_response_requested = event_type == "response.create" or bool(
                         event.get("response_create", event_type == "input.commit")

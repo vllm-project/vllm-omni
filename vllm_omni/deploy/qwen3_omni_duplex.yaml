@@ -1,0 +1,40 @@
+# Qwen3-Omni duplex deployment profile (turn-based, chat fallback path).
+#
+# Overlay of qwen3_omni_moe.yaml. The generic chat fallback
+# (ChatFallbackProjectorMixin) is the response path: user audio commits into
+# session.history as audio_url data-URI parts, the chat service runs with
+# modalities=["audio", "text"], and output is projected to the Realtime
+# contract. No model-native turn policy (no <|listen|>/<|speak|> tokens).
+#
+# Realtime/duplex requires async_chunk disabled (recipes/Qwen/Qwen3-Omni.md).
+# The duplex serving adapter is selected by the qwen3_omni_moe pipeline
+# (PipelineConfig.duplex_serving_adapter).
+base_config: qwen3_omni_moe.yaml
+pipeline: qwen3_omni_moe
+session_mode: duplex
+async_chunk: false
+active_stream_window: 1
+
+duplex_session:
+  idle_ttl_s: 300
+  disconnect_grace_s: 30
+  reaper_interval_s: 5
+  resume_replay_ttl_s: 60
+  resume_replay_max_bytes_per_session: 8388608
+  max_pending_input_bytes_per_session: 16777216
+  max_pending_turns_per_session: 4
+  max_sessions: 1
+  completed_append_cache_size: 256
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    async_scheduling: false
+
+  - stage_id: 1
+    max_num_seqs: 4
+    async_scheduling: false
+
+  - stage_id: 2
+    max_num_seqs: 4
+    async_scheduling: false

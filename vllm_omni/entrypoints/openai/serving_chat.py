@@ -2158,6 +2158,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             choices_data.error.message,
                         )
                         continue
+                    sample_rate_hz = audio_chunk_sample_rate(omni_res)
                     # Only emit finish_reason on the last modality to
                     # comply with OpenAI streaming spec.
                     for choice in choices_data:
@@ -2177,7 +2178,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             req_state.audio_chunk_arrivals_s.append(max(now_ts - req_state.request_arrival_ts, 0.0))
                             req_state.audio_chunk_bytes.append(chunk_bytes)
                             if req_state.audio_sample_rate is None:
-                                req_state.audio_sample_rate = audio_chunk_sample_rate(omni_res)
+                                req_state.audio_sample_rate = sample_rate_hz
                     chunk = OmniChatCompletionStreamResponse(
                         id=request_id,
                         object=chunk_object_type,
@@ -2185,6 +2186,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         choices=choices_data,
                         model=model_name,
                         modality=final_output_type,
+                        sample_rate_hz=sample_rate_hz,
                         metrics=self._filter_stage_metrics_detail(omni_res.metrics, request),
                     )
                     chunk.usage = UsageInfo(
@@ -2814,18 +2816,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if audio_tensor.ndim > 1:
             audio_tensor = audio_tensor.flatten()
 
-        # Prefer the talker-reported sample rate when present. Qwen3-Omni
-        # omits "sr" and runs at 24kHz; Ming-flash-omni surfaces a 44.1kHz
-        # AudioVAE rate via multimodal_output["sr"].
-        sr_raw = mm_output.get("sr")
-        if isinstance(sr_raw, (list, tuple)):
-            sr_raw = next((item for item in sr_raw if item is not None), None)
-        if sr_raw is None:
-            sample_rate = 24000
-        elif hasattr(sr_raw, "item"):
-            sample_rate = int(sr_raw.item())
-        else:
-            sample_rate = int(sr_raw)
+        sample_rate = audio_chunk_sample_rate(omni_outputs)
 
         audio_format = self._resolve_audio_format(request)
         if isinstance(audio_format, ErrorResponse):

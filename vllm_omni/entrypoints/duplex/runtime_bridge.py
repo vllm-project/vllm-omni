@@ -39,6 +39,8 @@ class NativeRuntimeBridgeMixin:
     }
 
     async def _open_runtime_session(self, session: DuplexSession, send_json) -> dict[str, object] | bool:
+        if not self._serving_adapter_uses_runtime_control():
+            return True
         contract_error = self._native_runtime_contract_error(session)
         if contract_error is not None:
             await send_json(
@@ -535,6 +537,8 @@ class NativeRuntimeBridgeMixin:
         session_config: dict[str, object] | None = None,
         runtime_config: dict[str, object] | None = None,
     ) -> bool:
+        if not self._serving_adapter_uses_runtime_control():
+            return True
         signal_turn = getattr(self._chat_service.engine_client, "signal_duplex_turn_async", None)
         if not callable(signal_turn):
             return True
@@ -582,6 +586,8 @@ class NativeRuntimeBridgeMixin:
         return True
 
     async def _close_runtime_session(self, session: DuplexSession, *, reason: str, send_json=None) -> bool:
+        if not self._serving_adapter_uses_runtime_control():
+            return True
         close_session = getattr(self._chat_service.engine_client, "close_duplex_session_async", None)
         if not callable(close_session):
             return True
@@ -615,6 +621,17 @@ class NativeRuntimeBridgeMixin:
             return False
         await self._send_runtime_control_if_needed(send_json, result, session=session)
         return True
+
+    def _serving_adapter_uses_runtime_control(self) -> bool:
+        adapter = getattr(self, "_serving_runtime_adapter", None)
+        return getattr(adapter, "supports_runtime_control", True) is not False
+
+    def _serving_adapter_auto_respond_on_commit(self, session: DuplexSession) -> bool:
+        adapter = getattr(self, "_serving_runtime_adapter", None)
+        hook = getattr(adapter, "auto_respond_on_commit", False)
+        if callable(hook):
+            return hook(session.session_id, adapter.session_state(session.session_id)) is True
+        return hook is True
 
     @staticmethod
     def _runtime_control_timeout_s(session: DuplexSession) -> float:

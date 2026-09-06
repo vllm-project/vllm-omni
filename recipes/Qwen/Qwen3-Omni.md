@@ -53,6 +53,30 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
   --deploy-config /path/to/your_qwen3_omni_overrides.yaml
 ```
 
+### Turn-Based Duplex
+
+Use the bundled duplex overlay to expose the turn-based WebSocket endpoint:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+  --deploy-config vllm_omni/deploy/qwen3_omni_duplex.yaml
+```
+
+Connect clients to `ws://<host>:8091/v1/duplex`. Send
+`input_audio_buffer.append` events followed by `input_audio_buffer.commit`, or
+send `input.text.append` followed by `input.commit`. Qwen3-Omni returns text
+deltas and `response.output_audio.delta` events through the chat fallback path.
+The Qwen3 adapter starts a response after a committed turn; clients do not
+need to repeat the server-side `session_mode` in `extra_body`.
+
+Qwen3 duplex is turn-based rather than model-native: it does not use the
+MiniCPM/PersonaPlex engine control plane or native listen/speak tokens. To
+interrupt an active response, send `input.cancel` (or use the client-side VAD
+policy) before committing the next turn.
+
+The Qwen3 serving adapter is selected by the registered Qwen3 pipeline and
+must not be copied into another model pipeline.
+
 #### Runtime tuning
 
 Prefer CLI overrides for day-to-day tuning:

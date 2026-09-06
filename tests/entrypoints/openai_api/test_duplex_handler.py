@@ -1532,6 +1532,46 @@ def test_native_audio_text_marks_are_normalized_to_session_cumulative_offsets():
     assert marks == [{"text_chars": 8, "audio_end_ms": 1000}]
 
 
+@pytest.mark.asyncio
+async def test_duplex_chat_audio_stream_accumulates_audio_durations():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    session = DuplexSession(
+        session_id="sid-chat-audio-duration",
+        config=DuplexSessionConfig(response_format="pcm16"),
+    )
+    response_id = session.begin_response()
+    sent: list[dict[str, Any]] = []
+
+    async def send_json(data: dict[str, Any]) -> None:
+        sent.append(data)
+
+    def pcm_base64(duration_ms: int) -> str:
+        frames = 16_000 * duration_ms // 1000
+        return base64.b64encode(b"\0\0" * frames).decode("ascii")
+
+    for audio in (pcm_base64(500), pcm_base64(500)):
+        await handler._emit_chat_payload(
+            session,
+            {
+                "modality": "audio",
+                "sample_rate_hz": 16_000,
+                "choices": [{"delta": {"content": audio}}],
+            },
+            session.epoch,
+            response_id,
+            send_json,
+        )
+
+    assert session.playback.generated_ms == 1000
+    assert session.playback.sent_ms == 1000
+    assert sent[0]["audio_duration_ms"] == 500
+    assert sent[1]["audio_duration_ms"] == 1000
+
+
 def test_duplex_session_playback_commit_uses_multi_delta_audio_text_marks():
     session = DuplexSession(
         session_id="sid-marks",
@@ -1548,6 +1588,32 @@ def test_duplex_session_playback_commit_uses_multi_delta_audio_text_marks():
 
     assert committed == {"role": "assistant", "content": "hello wo"}
     assert session.history == (committed,)
+
+
+def test_serving_adapter_auto_respond_on_commit_supports_callable_and_boolean():
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(FakeEngineClient()),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+        serving_runtime_adapter=PersonaPlexServingRuntimeAdapter(lambda *_: None),
+    )
+    session = DuplexSession(session_id="sid-commit-hook", config=DuplexSessionConfig())
+    state = object()
+    calls: list[tuple[str, object]] = []
+
+    def hook(session_id: str, session_state: object) -> bool:
+        calls.append((session_id, session_state))
+        return False
+
+    handler._serving_runtime_adapter = SimpleNamespace(
+        auto_respond_on_commit=hook,
+        session_state=lambda session_id: state,
+    )
+    assert handler._serving_adapter_auto_respond_on_commit(session) is False
+    assert calls == [(session.session_id, state)]
+
+    handler._serving_runtime_adapter = SimpleNamespace(auto_respond_on_commit=True)
+    assert handler._serving_adapter_auto_respond_on_commit(session) is True
 
 
 @pytest.mark.asyncio

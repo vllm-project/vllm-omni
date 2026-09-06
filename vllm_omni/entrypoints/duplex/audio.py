@@ -154,6 +154,33 @@ def convert_input_audio_with_rate(
     return encoded, "pcm_f32le", sample_rate_hz
 
 
+def pcm_f32le_payload_to_wav(
+    audio: str,
+    sample_rate_hz: int | float,
+) -> tuple[str, str, int]:
+    """Wrap base64 little-endian float32 PCM in a mono PCM16 WAV container."""
+    rate = validate_input_sample_rate_hz(sample_rate_hz)
+    try:
+        raw = base64.b64decode(audio.strip(), validate=False)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("audio payload is not valid base64") from exc
+    if not raw or len(raw) % 4:
+        raise ValueError("pcm_f32le audio payload must contain complete samples")
+
+    samples = np.frombuffer(raw, dtype="<f4")
+    if not np.isfinite(samples).all():
+        raise ValueError("pcm_f32le audio payload contains non-finite samples")
+    pcm16 = np.clip(samples, -1.0, 1.0)
+    pcm16 = (pcm16 * 32767.0).astype("<i2", copy=False).tobytes()
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(rate)
+        wav_file.writeframes(pcm16)
+    return base64.b64encode(output.getvalue()).decode("ascii"), "wav", rate
+
+
 def convert_output_audio(
     audio: str,
     *,
