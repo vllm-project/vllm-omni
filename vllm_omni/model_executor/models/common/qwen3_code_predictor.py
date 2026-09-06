@@ -677,11 +677,14 @@ class CodePredictorWrapper(nn.Module):
         prefix_graph_cfg = self._stage_connector_extra_config(vllm_config)
         prefix_graphs_requested = self._parse_bool_config(prefix_graph_cfg.get("code_predictor_prefix_graphs"))
         is_npu = current_omni_platform.is_npu()
-        self._prefix_graphs_enabled = prefix_graphs_requested and wrapper_config.use_cuda_graphs and not is_npu
-        if prefix_graphs_requested and not self._prefix_graphs_enabled:
+        # MRv2 captures the whole Talker MTP call. It can therefore capture
+        # shorter compiled re-prefill forwards without nesting predictor-owned
+        # CUDA graphs inside the outer graph.
+        self._prefix_reprefill_enabled = prefix_graphs_requested and not is_npu
+        self._prefix_graphs_enabled = self._prefix_reprefill_enabled and wrapper_config.use_cuda_graphs
+        if prefix_graphs_requested and not self._prefix_reprefill_enabled:
             logger.info_once(
-                "code_predictor: prefix CUDA graphs requested but disabled because use_cuda_graphs=%s is_npu=%s",
-                wrapper_config.use_cuda_graphs,
+                "code_predictor: prefix re-prefill requested but disabled because is_npu=%s",
                 is_npu,
             )
         self._prefix_graph_buckets = self._parse_positive_int_set(
@@ -690,6 +693,7 @@ class CodePredictorWrapper(nn.Module):
         self._prefix_graph_seq_lens = self._parse_positive_int_set(
             prefix_graph_cfg.get("code_predictor_prefix_graph_seq_lens")
         )
+        self._prefix_reprefill_seq_lens = tuple(self._prefix_seq_lens(self._num_groups + 1))
 
     def get_input_embeddings(self) -> nn.ModuleList:
         return self.model.get_input_embeddings()
@@ -753,7 +757,8 @@ class CodePredictorWrapper(nn.Module):
             dynamic=False,
             options={"epilogue_fusion": False},
         )
-        self._warmup_buckets()
+        with torch._dynamo.config.patch(cache_size_limit=self._compile_cache_size_limit()):
+            self._warmup_buckets()
 
         if self._wrapper_config.use_cuda_graphs:
             self._capture_cuda_graphs()
@@ -762,7 +767,7 @@ class CodePredictorWrapper(nn.Module):
             logger.info("code_predictor: torch.compile (dynamic=False, no epilogue fusion)")
 
     def _padded_bsz(self, bsz: int) -> int:
-        """Round batch size up to nearest power-of-2 bucket."""
+        """Round batch size up to the nearest warmed bucket."""
         for bucket in self._bucket_sizes:
             if bsz <= bucket:
                 return bucket
@@ -842,13 +847,35 @@ class CodePredictorWrapper(nn.Module):
         allowed = set(all_seq_lens)
         return sorted(seq_len for seq_len in self._prefix_graph_seq_lens if seq_len in allowed)
 
-    def _warmup_buckets(self) -> None:
-        """Warmup power-of-2 batch-size buckets to front-load Inductor compilation."""
+    @staticmethod
+    def _synchronize_warmup(device: torch.device) -> None:
+        if device.type != "cpu":
+            current_omni_platform.synchronize()
+
+    def _batch_bucket_sizes(self) -> list[int]:
         max_bsz = self._vllm_config.scheduler_config.max_num_seqs
         bucket_sizes = [1 << i for i in range(max_bsz.bit_length()) if (1 << i) <= max_bsz]
-        if max_bsz not in bucket_sizes:
-            bucket_sizes.append(max_bsz)
-        self._bucket_sizes = sorted(bucket_sizes)
+        bucket_sizes.extend(bucket for bucket in self._prefix_graph_buckets if bucket <= max_bsz)
+        bucket_sizes.append(max_bsz)
+        return sorted(set(bucket_sizes))
+
+    def _compile_cache_size_limit(self) -> int:
+        bucket_sizes = self._batch_bucket_sizes()
+        if not self._prefix_reprefill_enabled:
+            required_entries = len(bucket_sizes)
+        else:
+            prefix_buckets = self._prefix_graph_buckets.intersection(bucket_sizes)
+            prefix_seq_lens = self._prefix_reprefill_seq_lens
+            needs_full_graph = set(prefix_seq_lens) != set(range(2, self._num_groups + 1))
+            full_graph_entries = len(bucket_sizes) - len(prefix_buckets)
+            if needs_full_graph:
+                full_graph_entries += len(prefix_buckets)
+            required_entries = full_graph_entries + len(prefix_buckets) * len(prefix_seq_lens)
+        return max(torch._dynamo.config.cache_size_limit, required_entries)
+
+    def _warmup_buckets(self) -> None:
+        """Warm up batch-size buckets to front-load Inductor compilation."""
+        self._bucket_sizes = self._batch_bucket_sizes()
 
         max_seq = self._num_groups + 1
         device = next(self.model.parameters()).device
@@ -858,8 +885,8 @@ class CodePredictorWrapper(nn.Module):
         self._ensure_buffers(device, self._model_dtype, max(self._bucket_sizes))
         proj_buf = self._proj_buf
 
-        if self._prefix_graphs_enabled:
-            prefix_seq_lens = self._prefix_seq_lens(max_seq)
+        if self._prefix_reprefill_enabled:
+            prefix_seq_lens = self._prefix_reprefill_seq_lens
             needs_full_graph = set(prefix_seq_lens) != set(range(2, max_seq))
             for bsz in self._bucket_sizes:
                 capture_prefixes = not self._prefix_graph_buckets or bsz in self._prefix_graph_buckets
@@ -897,6 +924,10 @@ class CodePredictorWrapper(nn.Module):
                     self._compiled_model_fwd(proj_buf[:bsz, :max_seq, :], pos_ids)
             logger.info("code_predictor: warmup done for buckets %s", self._bucket_sizes)
 
+        # Compiled attention warmup is asynchronous. Complete it before graph
+        # capture and serving reuse the same static buffers.
+        self._synchronize_warmup(device)
+
     def _capture_cuda_graphs(self) -> None:
         """Capture a CUDA graph per bucket using vLLM's global graph pool."""
         from vllm.platforms import current_platform
@@ -906,7 +937,7 @@ class CodePredictorWrapper(nn.Module):
         proj_buf = self._proj_buf
 
         if self._prefix_graphs_enabled:
-            prefix_seq_lens = self._prefix_seq_lens(max_seq)
+            prefix_seq_lens = self._prefix_reprefill_seq_lens
             needs_full_graph = set(prefix_seq_lens) != set(range(2, max_seq))
             for bsz in self._bucket_sizes:
                 capture_prefixes = not self._prefix_graph_buckets or bsz in self._prefix_graph_buckets
@@ -1061,11 +1092,16 @@ class CodePredictorWrapper(nn.Module):
         for step in range(1, num_groups):
             graph_key: int | tuple[int, int] = padded_bsz
             seq_len = max_seq
-            if self._prefix_graphs_enabled:
-                prefix_key = (padded_bsz, step + 1)
-                if prefix_key in self._device_graphs:
-                    graph_key = prefix_key
-                    seq_len = step + 1
+            if self._prefix_reprefill_enabled:
+                actual_seq_len = step + 1
+                for prefix_seq_len in self._prefix_reprefill_seq_lens:
+                    if prefix_seq_len < actual_seq_len:
+                        continue
+                    prefix_key = (padded_bsz, prefix_seq_len)
+                    if prefix_key in self._bucket_pos_ids:
+                        graph_key = prefix_key
+                        seq_len = prefix_seq_len
+                        break
             pos_ids = self._bucket_pos_ids.get(graph_key)
             if pos_ids is None:
                 pos_ids = (

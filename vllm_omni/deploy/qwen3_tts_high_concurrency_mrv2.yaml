@@ -1,0 +1,20 @@
+# Experimental high-concurrency native Model Runner V2 profile for Qwen3-TTS.
+base_config: qwen3_tts_high_concurrency.yaml
+model_runner: v2
+
+connectors:
+  connector_of_shared_memory:
+    extra:
+      # MRv2 keeps these artifacts on GPU and reuses them across the c64 set.
+      ref_audio_artifact_cache_max_entries: 1024
+      # Sparse even predictor spans cover the measured MRv2 steady-state cohorts.
+      code_predictor_prefix_graph_seq_lens: [2, 4, 6, 8, 10, 12, 14]
+      # MRv2 releases generation slots between chunks, so eager B=2 can group
+      # terminal windows without reducing request admission capacity.
+      decode_batch_max_size: 2
+      decode_batch_bucket_frames: [73, 98, 123, 148, 169]
+
+stages:
+  - stage_id: 0
+    compilation_config:
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 60, 64]

@@ -140,6 +140,10 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
     def enable_cudagraph(
         self,
         device: torch.device | None = None,
+        capture_sizes: list[int] | None = None,
+        capture_batch_sizes: list[int] | None = None,
+        extra_capture_shapes: list[tuple[int, int]] | None = None,
+        compile_shapes: list[tuple[int, int]] | None = None,
         codec_chunk_frames: int = 0,
         codec_left_context_frames: int = 0,
     ):
@@ -156,6 +160,10 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
 
         wrapper = CUDAGraphDecoderWrapper(
             decoder=self,
+            capture_sizes=capture_sizes,
+            capture_batch_sizes=capture_batch_sizes,
+            extra_capture_shapes=extra_capture_shapes,
+            compile_shapes=compile_shapes,
             num_quantizers=self.config.num_quantizers,
             enabled=True,
         )

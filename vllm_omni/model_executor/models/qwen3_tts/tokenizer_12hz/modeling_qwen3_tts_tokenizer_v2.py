@@ -28,7 +28,7 @@ from transformers import MimiConfig, MimiModel
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.integrations import use_kernel_forward_from_hub
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+from transformers.masking_utils import create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast
@@ -521,14 +521,63 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
         self.norm = Qwen3TTSTokenizerV2DecoderRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3TTSTokenizerV2DecoderRotatoryEmbedding(config=config)
         self.gradient_checkpointing = False
-        self.has_sliding_layers = "sliding_attention" in self.config.layer_types
         self.window_size = config.sliding_window
 
         self.input_proj = nn.Linear(config.latent_dim, config.hidden_size)
         self.output_proj = nn.Linear(config.hidden_size, config.latent_dim)
+        # Code2Wav is cache-free and every decoder layer uses sliding attention.
+        # Cache one broadcastable mask per warmup shape instead of rebuilding
+        # it for every request batch.
+        self._sliding_attention_mask_cache: dict[tuple[int, torch.dtype, torch.device, str], torch.Tensor | None] = {}
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def _apply(self, fn, recurse=True):
+        # A placement or dtype change invalidates every cached mask.
+        self._sliding_attention_mask_cache.clear()
+        return super()._apply(fn, recurse=recurse)
+
+    def _get_sliding_attention_mask(
+        self,
+        inputs_embeds: torch.Tensor,
+    ) -> torch.Tensor | None:
+        sequence_length = int(inputs_embeds.shape[1])
+        max_position_embeddings = int(self.config.max_position_embeddings)
+        if sequence_length > max_position_embeddings:
+            raise ValueError(
+                f"Input length {sequence_length} exceeds max_position_embeddings {max_position_embeddings}"
+            )
+
+        cache_key = (
+            sequence_length,
+            inputs_embeds.dtype,
+            inputs_embeds.device,
+            str(self.config._attn_implementation),
+        )
+        if cache_key not in self._sliding_attention_mask_cache:
+            mask_inputs = inputs_embeds[:1]
+            mask_kwargs = {
+                "config": self.config,
+                "attention_mask": None,
+                "past_key_values": None,
+                "position_ids": None,
+            }
+            sig = inspect.signature(create_sliding_window_causal_mask)
+            if "input_embeds" in sig.parameters:
+                mask_kwargs["input_embeds"] = mask_inputs
+                mask_kwargs["cache_position"] = torch.arange(
+                    sequence_length,
+                    device=inputs_embeds.device,
+                )
+            else:
+                mask_kwargs["inputs_embeds"] = mask_inputs
+            sliding_attention_mask = create_sliding_window_causal_mask(**mask_kwargs)
+            if sliding_attention_mask is not None:
+                sliding_attention_mask = sliding_attention_mask.contiguous()
+            self._sliding_attention_mask_cache[cache_key] = sliding_attention_mask
+
+        return self._sliding_attention_mask_cache[cache_key]
 
     # Note: @check_model_inputs decorator removed for vLLM compatibility
     # The decorator causes "unexpected keyword argument 'inputs_embeds'" error
@@ -558,6 +607,7 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
 
         inputs_embeds = self.input_proj(inputs_embeds)
 
+        sequence_length = inputs_embeds.shape[1]
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
@@ -565,31 +615,62 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
                 past_seen_tokens,
-                past_seen_tokens + inputs_embeds.shape[1],
+                past_seen_tokens + sequence_length,
                 device=inputs_embeds.device,
             )
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
+        uses_prepared_or_incremental_mask = (
+            isinstance(attention_mask, dict)
+            or bool(use_cache)
+            or past_key_values is not None
+            or attention_mask is not None
+        )
+        if not uses_prepared_or_incremental_mask:
+            expected_cache_position = torch.arange(
+                sequence_length,
+                device=inputs_embeds.device,
+            )
+            expected_position_ids = expected_cache_position.unsqueeze(0)
+            if (
+                cache_position.shape != expected_cache_position.shape
+                or cache_position.device != expected_cache_position.device
+                or not torch.equal(cache_position, expected_cache_position)
+            ):
+                raise ValueError("Cached Code2Wav masks require contiguous zero-based cache_position")
+            if (
+                position_ids.ndim != 2
+                or position_ids.shape[-1] != sequence_length
+                or position_ids.device != expected_position_ids.device
+                or not torch.equal(
+                    position_ids,
+                    expected_position_ids.expand_as(position_ids),
+                )
+            ):
+                raise ValueError("Cached Code2Wav masks require contiguous zero-based position_ids")
+
         hidden_states = inputs_embeds
 
-        if not isinstance(causal_mask_mapping := attention_mask, dict):
+        if isinstance(attention_mask, dict):
+            sliding_attention_mask = attention_mask["sliding_attention"]
+        elif uses_prepared_or_incremental_mask:
             mask_kwargs = {
                 "config": self.config,
                 "attention_mask": attention_mask,
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }
-            sig = inspect.signature(create_causal_mask)
+            sig = inspect.signature(create_sliding_window_causal_mask)
             if "input_embeds" in sig.parameters:
                 mask_kwargs["input_embeds"] = inputs_embeds
                 mask_kwargs["cache_position"] = cache_position
             else:
                 mask_kwargs["inputs_embeds"] = inputs_embeds
-            causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
-            if self.has_sliding_layers:
-                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+            sliding_attention_mask = create_sliding_window_causal_mask(**mask_kwargs)
+        else:
+            sliding_attention_mask = self._get_sliding_attention_mask(inputs_embeds)
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -597,7 +678,7 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             hidden_states = decoder_layer(
                 hidden_states,
-                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                attention_mask=sliding_attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,

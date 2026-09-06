@@ -24,7 +24,11 @@ _examples_dir = str(
     Path(__file__).parent.parent.parent.parent / "examples" / "offline_inference" / "text_to_speech" / "qwen3_tts"
 )
 sys.path.insert(0, _examples_dir)
-from end2end import _estimate_prompt_len  # noqa: E402
+from end2end import (  # noqa: E402
+    _estimate_prompt_len,
+    _StreamingAudioAccumulator,
+    parse_args,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -33,6 +37,36 @@ TEST_SR = 16000
 TEST_DURATION_S = 3
 CODEC_FRAME_RATE = 12
 EXPECTED_REF_CODE_LEN = TEST_DURATION_S * CODEC_FRAME_RATE  # 36, distinct from fallback 2048
+
+
+def test_parse_args_accepts_structured_deploy_config(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["end2end.py", "--deploy-config", "qwen3_tts_mrv2.yaml"],
+    )
+
+    args = parse_args()
+
+    assert args.deploy_config == "qwen3_tts_mrv2.yaml"
+
+
+def test_streaming_audio_accumulator_keeps_every_delta():
+    import torch
+
+    accumulator = _StreamingAudioAccumulator()
+    accumulator.add({"audio": torch.tensor([1.0, 2.0]), "sr": torch.tensor(16000)})
+    accumulator.add(
+        {
+            "audio": [torch.tensor([3.0]), torch.tensor([4.0, 5.0])],
+            "sr": [torch.tensor(22050), torch.tensor(24000)],
+        }
+    )
+
+    output = accumulator.as_multimodal_output()
+
+    assert [chunk.tolist() for chunk in output["audio"]] == [[1.0, 2.0], [3.0], [4.0, 5.0]]
+    assert output["sr"] == 24000
 
 
 def _wav_bytes() -> bytes:

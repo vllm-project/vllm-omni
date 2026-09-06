@@ -29,9 +29,6 @@ from typing import NamedTuple
 import numpy as np
 import soundfile as sf
 import torch
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-
 from PIL import Image
 from vllm import SamplingParams
 from vllm.assets.audio import AudioAsset
@@ -203,6 +200,17 @@ def _default_deploy_config_path() -> str | None:
     return candidate if os.path.exists(candidate) else None
 
 
+def _extract_multimodal_output(omni_output, request_output) -> dict | None:
+    mm_out = getattr(omni_output, "multimodal_output", None)
+    if mm_out:
+        return mm_out
+    for output in getattr(request_output, "outputs", []):
+        mm_out = getattr(output, "multimodal_output", None)
+        if mm_out:
+            return mm_out
+    return getattr(request_output, "multimodal_output", None)
+
+
 async def run_single_request(
     async_omni: AsyncOmni,
     prompt: dict,
@@ -244,7 +252,9 @@ async def run_single_request(
                 text_output = output.outputs[0].text
                 text_parts.append(text_output)
             elif omni_output.final_output_type == "audio":
-                mm_out = output.outputs[0].multimodal_output
+                mm_out = _extract_multimodal_output(omni_output, output)
+                if mm_out and "audio" not in mm_out and "model_outputs" in mm_out:
+                    mm_out = {**mm_out, "audio": mm_out["model_outputs"]}
                 if mm_out and "audio" in mm_out:
                     if first_audio_ts is None:
                         first_audio_ts = time.perf_counter()
@@ -257,8 +267,11 @@ async def run_single_request(
                         new_chunks = audio_data[audio_list_consumed:]
                         audio_list_consumed = len(audio_data)
                     elif isinstance(audio_data, torch.Tensor):
-                        new_chunks = [audio_data]
-                        audio_last_tensor = audio_data
+                        if audio_data is not audio_last_tensor:
+                            new_chunks = [audio_data]
+                            audio_last_tensor = audio_data
+                        else:
+                            new_chunks = []
                     else:
                         new_chunks = []
 

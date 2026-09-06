@@ -33,6 +33,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import (
+    Qwen3OmniMoeForConditionalGeneration,
+)
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_code2wav import (
     Qwen3OmniMoeCode2Wav,
 )
@@ -77,6 +80,46 @@ class _ShortTrimDecoder:
         return self._decode(codes)
 
 
+def test_talker_make_omni_output_keeps_codes_per_request() -> None:
+    model = Qwen3OmniMoeForConditionalGeneration.__new__(Qwen3OmniMoeForConditionalGeneration)
+    model.model_stage = "talker"
+    hidden = torch.arange(48, dtype=torch.float32).reshape(4, 12)
+    req0 = torch.arange(16, dtype=torch.long).reshape(1, 16)
+    req1 = torch.arange(16, 32, dtype=torch.long).reshape(1, 16)
+
+    out = model.make_omni_output(
+        hidden,
+        model_intermediate_buffer=[
+            {
+                "codes": {"audio": req0},
+                "meta": {"codec_frame_valid": torch.tensor(False)},
+            },
+            {
+                "codes": {"audio": req1},
+                "meta": {"codec_frame_valid": torch.tensor(True)},
+            },
+        ],
+    )
+
+    assert torch.equal(out.text_hidden_states, hidden)
+    assert out.multimodal_outputs["codes"]["audio"] == [req0, req1]
+    validity = out.multimodal_outputs["meta"]["codec_frame_valid"]
+    assert len(validity) == 2
+    assert validity[0].item() is False
+    assert validity[1].item() is True
+
+
+def test_talker_make_omni_output_rejects_missing_validity_for_real_payload() -> None:
+    model = Qwen3OmniMoeForConditionalGeneration.__new__(Qwen3OmniMoeForConditionalGeneration)
+    model.model_stage = "talker"
+
+    with pytest.raises(RuntimeError, match="missing meta.codec_frame_valid"):
+        model.make_omni_output(
+            torch.zeros((1, 4)),
+            model_intermediate_buffer=[{"req_id": "real-request"}],
+        )
+
+
 class _FakeWrapper:
     """Models ``CUDAGraphDecoderWrapper.decode`` after #4466: returns the
     eager-equivalent short length (``actual * up - C``), values correct."""
@@ -86,6 +129,46 @@ class _FakeWrapper:
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         return self.decoder._decode(codes)
+
+
+def test_qwen3_omni_code2wav_graph_shapes_can_be_configured():
+    class _FakeCode2Wav:
+        def __init__(self):
+            self.calls = []
+
+        def enable_cudagraph(self, **kwargs):
+            self.calls.append(kwargs)
+
+    code2wav = _FakeCode2Wav()
+    model = Qwen3OmniMoeForConditionalGeneration.__new__(Qwen3OmniMoeForConditionalGeneration)
+    model.code2wav = code2wav
+    model.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            enforce_eager=False,
+            stage_connector_config={
+                "extra": {
+                    "codec_chunk_frames": 25,
+                    "codec_left_context_frames": 25,
+                    "decode_cudagraph_batch_sizes": [1, 2, 4, 8],
+                    "decode_cudagraph_capture_sizes": "25,50",
+                    "decode_cudagraph_extra_capture_shapes": ["3:50", [5, 50]],
+                }
+            },
+        )
+    )
+
+    model._maybe_enable_code2wav_cudagraph()
+
+    assert code2wav.calls == [
+        {
+            "codec_chunk_frames": 25,
+            "codec_left_context_frames": 25,
+            "capture_sizes": [25, 50],
+            "capture_batch_sizes": [1, 2, 4, 8],
+            "extra_capture_shapes": [(3, 50), (5, 50)],
+            "compile_shapes": None,
+        }
+    ]
 
 
 def _make_codes(frames: int, q: int = _Q) -> torch.Tensor:

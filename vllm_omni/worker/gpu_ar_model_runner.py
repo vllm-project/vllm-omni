@@ -1157,7 +1157,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 for_cudagraph_capture=runner_assisted_full_attn_capture,
             )
-
             (
                 input_ids,
                 inputs_embeds,

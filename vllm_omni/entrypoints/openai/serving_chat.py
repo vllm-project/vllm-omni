@@ -146,12 +146,18 @@ from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.output_metadata import DiffusionMetadataMapping, DiffusionMetadataValue
 from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
+from vllm_omni.worker.sampling_utils import apply_fixed_seed_to_sampling_params
 
 logger = init_logger(__name__)
 
 
 async def _identity_async(value: Any) -> Any:
     return value
+
+
+def _stage_model_stage(stage: Any) -> str | None:
+    engine_args = getattr(stage, "engine_args", None)
+    return getattr(engine_args, "model_stage", None) or getattr(stage, "model_stage", None)
 
 
 class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
@@ -776,7 +782,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if self.enable_prompt_tokens_details:
                     mm_token_counts = _get_mm_token_counts(engine_prompt)
                 if hasattr(request, "sampling_params_list"):
-                    sampling_params_list = self._to_sampling_params_list(request.sampling_params_list)
+                    explicit_fields = getattr(request, "model_fields_set", None)
+                    if explicit_fields is None:
+                        explicit_fields = getattr(request, "__fields_set__", set())
+                    explicit_seed = request.seed if "seed" in explicit_fields else None
+                    sampling_params_list = self._to_sampling_params_list(
+                        request.sampling_params_list,
+                        explicit_seed=explicit_seed,
+                    )
                 else:
                     # Use standard OpenAI API parameters for comprehension stage
                     sampling_params_list = self._build_sampling_params_list_from_request(request)
@@ -1041,7 +1054,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if explicit:
             return {str(modality) for modality in as_list(explicit)}
 
-        model_stage = str(getattr(engine_args, "model_stage", None) or getattr(stage, "model_stage", "")).lower()
+        model_stage = str(_stage_model_stage(stage) or "").lower()
         if model_stage in {"asr", "stt"} or model_stage.endswith("_asr"):
             return {"audio"}
         if any(name in model_stage for name in ("vision", "vl", "aura")):
@@ -1244,7 +1257,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return new_messages
 
-    def _to_sampling_params_list(self, sampling_params_list: list[dict]) -> list[Any]:
+    def _to_sampling_params_list(
+        self,
+        sampling_params_list: list[dict],
+        *,
+        explicit_seed: int | None = None,
+    ) -> list[Any]:
         """Convert request dicts to stage-typed sampling params objects.
 
         For diffusion stages, build ``OmniDiffusionSamplingParams`` so
@@ -1280,7 +1298,28 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 final_sampling_params_list.append(clone_sampling_params(default_params_list[idx]))
             else:
                 final_sampling_params_list.append(SamplingParams())
-        return final_sampling_params_list
+        return self._finalize_stage_sampling_seeds(final_sampling_params_list, explicit_seed=explicit_seed)
+
+    def _finalize_stage_sampling_seeds(
+        self,
+        sampling_params_list: list[Any],
+        *,
+        explicit_seed: int | None = None,
+    ) -> list[Any]:
+        """Keep layer-0 and residual Talker sampling on one request seed."""
+        stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
+        for idx, sampling_params in enumerate(sampling_params_list):
+            stage_config = stage_configs[idx] if idx < len(stage_configs) else None
+            is_talker = _stage_model_stage(stage_config) == "talker"
+            seed = explicit_seed if explicit_seed is not None else getattr(sampling_params, "seed", None)
+            if seed is None or (explicit_seed is None and not is_talker):
+                continue
+            apply_fixed_seed_to_sampling_params(
+                sampling_params,
+                seed,
+                seed_talker_mtp=is_talker,
+            )
+        return sampling_params_list
 
     def _get_comprehension_stage_index(self) -> int:
         for idx, stage in enumerate(self.engine_client.stage_configs):
@@ -1392,6 +1431,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         default_params_list = self.engine_client.default_sampling_params_list
         comprehension_idx = self._get_comprehension_stage_index()
 
+        explicit_fields = getattr(request, "model_fields_set", None)
+        if explicit_fields is None:
+            explicit_fields = getattr(request, "__fields_set__", set())
+        explicit_seed = request.seed if "seed" in explicit_fields else None
+
         sampling_params_list = []
         for idx, default_params in enumerate(default_params_list):
             if isinstance(default_params, dict):
@@ -1401,9 +1445,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 sampling_params_list.append(params)
             else:
                 # For other stages, clone default params
-                sampling_params_list.append(default_params.clone())
+                params = default_params.clone()
+                sampling_params_list.append(params)
 
-        return sampling_params_list
+        return self._finalize_stage_sampling_seeds(
+            sampling_params_list,
+            explicit_seed=explicit_seed,
+        )
 
     def _log_inputs(
         self,

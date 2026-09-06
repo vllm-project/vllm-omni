@@ -424,12 +424,9 @@ class Qwen3TTSCode2Wav(nn.Module):
             try:
                 _, c = valid_codes_qf[0]
                 logger.info(
-                    "Code2Wav codec: frames=%d q=%d uniq=%d range=[%d,%d] batch=%d",
+                    "Code2Wav codec: frames=%d q=%d batch=%d",
                     c.shape[1],
                     q,
-                    int(torch.unique(c).numel()),
-                    int(c.min().item()),
-                    int(c.max().item()),
                     len(valid_codes_qf),
                 )
             except Exception:

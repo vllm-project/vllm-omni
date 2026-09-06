@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 import numpy as np
@@ -39,6 +40,80 @@ from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2E
 logger = init_logger(__name__)
 
 _TRAILING_TEXT_COMPACT_MIN_FRAMES = 64
+_ASYNC_REF_CODES_PUBLISHED_KEY = "_qwen3_tts_ref_codes_published"
+
+
+def _qwen3_tts_gpu_resident_buffer_keys(
+    use_v2_model_runner: bool,
+) -> set[tuple[str, str]]:
+    keys = {
+        ("codes", "audio"),
+        ("hidden_states", "last"),
+        ("hidden_states", "trailing_text"),
+    }
+    if use_v2_model_runner:
+        keys.update(
+            {
+                ("codes", "ref"),
+                ("embed", "prefill"),
+                ("meta", "codec_frame_valid"),
+            }
+        )
+    return keys
+
+
+def _materialize_span_scalars(
+    values: Sequence[int],
+    span_lengths: Sequence[int],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Expand a uniform scalar cohort with one GPU allocation."""
+    if len(values) != len(span_lengths):
+        raise ValueError(
+            f"values and span_lengths must have the same length, got {len(values)} and {len(span_lengths)}"
+        )
+    total = sum(int(length) for length in span_lengths)
+    if not values:
+        return torch.empty((0,), dtype=dtype, device=device)
+    first = int(values[0])
+    if not all(int(value) == first for value in values[1:]):
+        return None
+    return torch.full((total,), first, dtype=dtype, device=device)
+
+
+def _should_publish_async_ref_codes(info: dict[str, Any]) -> bool:
+    """Publish ref codes exactly once, including after a KV-resumed prefill."""
+    meta = info.get("meta")
+    return not (isinstance(meta, dict) and bool(meta.get(_ASYNC_REF_CODES_PUBLISHED_KEY)))
+
+
+def _mark_async_ref_codes_published(info: dict[str, Any]) -> None:
+    meta = info.setdefault("meta", {})
+    if not isinstance(meta, dict):
+        raise TypeError("Qwen3-TTS payload meta must be a dict")
+    meta[_ASYNC_REF_CODES_PUBLISHED_KEY] = True
+
+
+def _ref_audio_artifact_cache_capacity(vllm_config: VllmConfig) -> int:
+    model_cfg = getattr(vllm_config, "model_config", None)
+    connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+    connector_extra = (
+        connector_cfg.get("extra", connector_cfg)
+        if isinstance(connector_cfg, dict)
+        else getattr(connector_cfg, "extra", None)
+    )
+    if not isinstance(connector_extra, dict):
+        connector_extra = {}
+    raw_capacity = connector_extra.get("ref_audio_artifact_cache_max_entries", 256)
+    try:
+        capacity = int(raw_capacity)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid ref_audio_artifact_cache_max_entries={raw_capacity!r}") from exc
+    if capacity < 0:
+        raise ValueError(f"ref_audio_artifact_cache_max_entries must be non-negative, got {capacity}")
+    return capacity
 
 
 def _has_tts_text_conditioning(info_dict: dict[str, Any], hidden_states: Any | None = None) -> bool:
@@ -264,8 +339,7 @@ class Qwen3TTSSpeakerEncoder(torch.nn.Module):
 
 
 class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
-    """vLLM-AR talker: step-wise layer-0 codec decoding.
-    Predicts residual codebooks (1..Q-1) into `audio_codes` and streams text via `tailing_text_hidden`."""
+    """vLLM-AR talker with step-wise layer-0 codec decoding."""
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -326,29 +400,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # per-request additional_information.
         self.talker_mtp_output_key = ("codes", "audio")
         self.talker_mtp_graph_safe = True
-        # talker_mtp samples with per-row generators, so explicitly-seeded
-        # requests stay batched instead of one scalar forward per row (#4883).
-        # This is only valid while talker_mtp receives the *unpadded* active
-        # batch, i.e. when it is NOT graph-wrapped. The runner wraps talker_mtp
-        # (padded batches + a single captured RNG stream) whenever full
-        # cudagraphs are enabled, so disable per-row generators in that case.
-        # Consequence: under full cudagraphs, per-request ``tts_local_seed`` is
-        # not reproducible (matching Qwen3-Omni, which has no per-row seeding);
-        # eager mode keeps the per-row generator fast-path.
-        # TODO(#4923): the model should not read ``cudagraph_mode`` — it is an
-        # upstream (runner) concern, and the runner already re-derives the same
-        # wrap decision in ``_init_talker_mtp``. Once all TTS models declare
-        # ``talker_mtp_graph_safe`` we should move this gating into the model
-        # runner (models only expose the static capability flag, and users can
-        # then configure ``cudagraph_mode`` freely). This also means mtp seeding
-        # is silently dropped when the decode batch > 1 under full cudagraphs;
-        # the follow-up should refactor the per-row generator in the runner to
-        # be cudagraph-safe so seeded batches stay reproducible.
-        cudagraph_mode = getattr(vllm_config.compilation_config, "cudagraph_mode", None)
-        talker_mtp_graph_wrapped = (
-            self.talker_mtp_graph_safe and cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
-        )
-        self.talker_mtp_accepts_per_row_generators = not talker_mtp_graph_wrapped
+        # The runners bypass only the outer whole-MTP graph when explicit
+        # generators are present, so seeded requests can still share one raw
+        # batched MTP call with independent per-row streams.
+        self.talker_mtp_accepts_per_row_generators = True
         self.use_async_omni_output = True
         self.eager_omni_postprocess_before_async_output = True
         self.omni_pooler_payload_include_hidden = False
@@ -442,14 +497,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # the same req_id ordering that indexes sampling_metadata.
         self._req_x_vector_only: dict[str, bool | None] = {}
         self._batch_req_ids: list[str] = []
+        self._mrv2_silence_ban_mask: torch.Tensor | None = None
 
         # Keys that should stay on GPU in model_intermediate_buffer to avoid
         # CPU-to-GPU round-trips on every decode step.
-        self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
-            ("codes", "audio"),
-            ("hidden_states", "last"),
-            ("hidden_states", "trailing_text"),
-        }
+        self._use_v2_model_runner = bool(getattr(vllm_config.model_config, "use_v2_model_runner", False))
+        self.gpu_resident_buffer_keys = _qwen3_tts_gpu_resident_buffer_keys(self._use_v2_model_runner)
 
         # ``text_proj(text_emb(tts_pad_token_id))`` is request-independent —
         # it depends only on frozen ``text_embedding`` / ``text_projection``
@@ -511,6 +564,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             tts_pad_embed=self._tts_pad_embed,
             encode_ref_audio_batch=self._encode_ref_audio_batch,
             speaker_cache=self._speaker_cache,
+            ref_audio_artifact_cache_max_entries=_ref_audio_artifact_cache_capacity(vllm_config),
         )
         self._load_custom_voice_profiles()
 
@@ -589,6 +643,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Suppress silence-region tokens for the first N decode frames (#4966). The
         # per-request decode step is the length of its generated-token history.
         ban_n = self._silence_ban_frames
+        if ban_n > 0 and sampling_metadata is None and self._mrv2_silence_ban_mask is not None:
+            if self._mrv2_silence_ban_mask.shape[0] != logits.shape[0]:
+                raise ValueError("MRV2 silence-ban batch must match the sampled logits rows")
+            return logits.masked_fill(self._mrv2_silence_ban_mask & self._silence_mask, float("-inf"))
         if ban_n > 0 and sampling_metadata is not None:
             output_token_ids = getattr(sampling_metadata, "output_token_ids", None)
             if output_token_ids is None or len(output_token_ids) != logits.shape[0]:
@@ -642,11 +700,17 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             info_dicts = kwargs.get("runtime_additional_information") or []
         if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
             logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
+        model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        async_chunk = bool(getattr(model_config, "async_chunk", False))
         audio_codes_list: list[torch.Tensor] = []
-        ref_code_len_list: list[torch.Tensor] = []
+        ref_code_len_segments: list[tuple[int | torch.Tensor, int, torch.device]] = []
         ref_code_list: list[torch.Tensor] = []
         has_ref_code = False
-        codec_streaming_list: list[torch.Tensor] = []
+        codec_streaming_values: list[int] = []
+        codec_streaming_span_lengths: list[int] = []
+        codec_streaming_device: torch.device | None = None
+        codec_frame_valid_device: torch.device | None = None
+        codec_frame_valid_parts: list[torch.Tensor] = []
         for info in info_dicts:
             if not isinstance(info, dict):
                 ref_code_list.append(torch.empty(0, dtype=torch.long))
@@ -656,17 +720,44 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             ac = codes.get("audio")
             if isinstance(ac, torch.Tensor):
                 audio_codes_list.append(ac)
-                cs = meta.get("codec_streaming")
-                if isinstance(cs, bool):
-                    codec_streaming_list.append(
-                        torch.full((int(ac.shape[0]),), int(cs), dtype=torch.int8, device=ac.device)
+                frame_valid = meta.get("codec_frame_valid")
+                if isinstance(frame_valid, bool):
+                    codec_frame_valid_device = ac.device
+                    codec_frame_valid_parts.append(
+                        torch.full(
+                            (int(ac.shape[0]),),
+                            int(frame_valid),
+                            dtype=torch.int8,
+                            device=ac.device,
+                        )
                     )
+                elif isinstance(frame_valid, torch.Tensor):
+                    if frame_valid.numel() != 1:
+                        raise ValueError("codec_frame_valid must be scalar per request")
+                    codec_frame_valid_device = ac.device
+                    codec_frame_valid_parts.append(
+                        frame_valid.to(device=ac.device, dtype=torch.int8).reshape(1).expand(int(ac.shape[0]))
+                    )
+                cs = meta.get("codec_streaming")
+                if not async_chunk and isinstance(cs, bool):
+                    codec_streaming_values.append(int(cs))
+                    codec_streaming_span_lengths.append(int(ac.shape[0]))
+                    codec_streaming_device = ac.device
             ref_code = codes.get("ref")
-            if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
+            publish_ref_code = not async_chunk or _should_publish_async_ref_codes(info)
+            if publish_ref_code and isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
                 ref_code_list.append(ref_code)
                 has_ref_code = True
+                if async_chunk:
+                    _mark_async_ref_codes_published(info)
             else:
                 ref_code_list.append(torch.empty(0, dtype=torch.long))
+            if async_chunk:
+                # The streaming consumer uses codes.ref.shape[0] directly and
+                # does not read ref_code_len or codec_streaming. Avoid creating
+                # GPU control tensors that would only be snapshotted and copied
+                # back to the CPU on every decode step.
+                continue
             ref_len = meta.get("ref_code_len")
             if ref_len is None:
                 continue
@@ -677,7 +768,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 if ref_len.numel() == 0:
                     raise ValueError("ref_code_len is an empty tensor")
                 ref_len_tail = ref_len.reshape(-1)[-1:].to(dtype=torch.int32, device=ac.device)
-                ref_code_len_list.append(ref_len_tail.expand(span_len).contiguous())
+                ref_code_len_segments.append((ref_len_tail, span_len, ac.device))
                 continue
             if isinstance(ref_len, list):
                 if len(ref_len) != 1:
@@ -685,7 +776,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 ref_len_val = int(ref_len[0])
             else:
                 ref_len_val = int(ref_len)
-            ref_code_len_list.append(torch.full((span_len,), ref_len_val, dtype=torch.int32, device=ac.device))
+            ref_code_len_segments.append((ref_len_val, span_len, ac.device))
 
         if not audio_codes_list:
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
@@ -693,15 +784,61 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         audio_codes = torch.cat(audio_codes_list, dim=0)
         span_len = int(audio_codes.shape[0])
         mm: OmniPayload = {"codes": {"audio": audio_codes}}
-        if ref_code_len_list:
-            mm.setdefault("meta", {})["ref_code_len"] = torch.cat(ref_code_len_list, dim=0)[:span_len]
+        if ref_code_len_segments:
+            if all(isinstance(value, int) for value, _length, _device in ref_code_len_segments):
+                ref_code_len = _materialize_span_scalars(
+                    [int(value) for value, _length, _device in ref_code_len_segments],
+                    [length for _value, length, _device in ref_code_len_segments],
+                    dtype=torch.int32,
+                    device=ref_code_len_segments[0][2],
+                )
+                if ref_code_len is None:
+                    ref_code_len = torch.cat(
+                        [
+                            torch.full((length,), int(value), dtype=torch.int32, device=device)
+                            for value, length, device in ref_code_len_segments
+                        ],
+                        dim=0,
+                    )
+            else:
+                ref_code_len_parts = [
+                    value.expand(length)
+                    if isinstance(value, torch.Tensor)
+                    else torch.full((length,), value, dtype=torch.int32, device=device)
+                    for value, length, device in ref_code_len_segments
+                ]
+                ref_code_len = torch.cat(ref_code_len_parts, dim=0)
+            mm.setdefault("meta", {})["ref_code_len"] = ref_code_len[:span_len]
         if has_ref_code:
             # Batch-aligned, one entry per request: ``to_payload_element``
             # indexes ``element[idx]`` per request, and a shorter list would
             # silently broadcast one request's reference codes to the others.
             mm.setdefault("codes", {})["ref"] = ref_code_list
-        if codec_streaming_list:
-            mm.setdefault("meta", {})["codec_streaming"] = torch.cat(codec_streaming_list, dim=0)[:span_len]
+        if codec_streaming_values:
+            assert codec_streaming_device is not None
+            codec_streaming = _materialize_span_scalars(
+                codec_streaming_values,
+                codec_streaming_span_lengths,
+                dtype=torch.int8,
+                device=codec_streaming_device,
+            )
+            if codec_streaming is None:
+                codec_streaming = torch.cat(
+                    [
+                        torch.full((length,), value, dtype=torch.int8, device=codec_streaming_device)
+                        for value, length in zip(
+                            codec_streaming_values,
+                            codec_streaming_span_lengths,
+                            strict=True,
+                        )
+                    ],
+                    dim=0,
+                )
+            mm.setdefault("meta", {})["codec_streaming"] = codec_streaming[:span_len]
+        if codec_frame_valid_parts:
+            assert codec_frame_valid_device is not None
+            codec_frame_valid = torch.cat(codec_frame_valid_parts, dim=0)
+            mm.setdefault("meta", {})["codec_frame_valid"] = codec_frame_valid[:span_len]
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)
 
     # -------------------- preprocess / postprocess --------------------
@@ -760,27 +897,32 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         if is_prefill:
             # Prefill (prompt embeddings)
-            prompt_embeds_cpu = embed.get("prefill")
-            # First prefill round: prompt_embeds_cpu is not yet populated.
-            # Subsequent prefill rounds (multi-chunk): prompt_embeds_cpu is a Tensor stored by the first round.
-            is_first_prefill = not isinstance(prompt_embeds_cpu, torch.Tensor) or prompt_embeds_cpu.ndim != 2
+            prompt_embeds_buffer = embed.get("prefill")
+            # First prefill round: the retained prompt buffer is not populated.
+            # Subsequent chunks slice the buffer stored by the first round.
+            is_first_prefill = not isinstance(prompt_embeds_buffer, torch.Tensor) or prompt_embeds_buffer.ndim != 2
             if is_first_prefill:
                 full_prompt_embeds, tailing_text_hidden, ref_code_len, ref_code = (
                     self._prompt_builder.build_prompt_embeds(task_type=task_type, info_dict=info_dict)
                 )
-                # Store full prompt embeddings on CPU (large, prefill-only).
-                # tailing_text_hidden stays on GPU (gpu_resident_buffer_keys).
-                prompt_embeds_cpu = full_prompt_embeds.detach().to("cpu").contiguous()
+                prompt_embeds_buffer = full_prompt_embeds.detach()
+                if not bool(getattr(self, "_use_v2_model_runner", False)):
+                    prompt_embeds_buffer = prompt_embeds_buffer.to("cpu")
+                prompt_embeds_buffer = prompt_embeds_buffer.contiguous()
                 info_update: OmniPayload = {
-                    "embed": {"prefill": prompt_embeds_cpu},
+                    "embed": {"prefill": prompt_embeds_buffer},
                     "hidden_states": {"trailing_text": tailing_text_hidden.detach()},
                     "meta": {
                         "talker_text_offset": 0,
                         "codec_streaming": codec_streaming,
+                        "codec_frame_valid": torch.zeros((), dtype=torch.bool, device=input_ids.device),
                     },
                 }
                 if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-                    info_update.setdefault("codes", {})["ref"] = ref_code.detach().to("cpu").contiguous()
+                    ref_code_buffer = ref_code.detach()
+                    if not bool(getattr(self, "_use_v2_model_runner", False)):
+                        ref_code_buffer = ref_code_buffer.to("cpu")
+                    info_update.setdefault("codes", {})["ref"] = ref_code_buffer.contiguous()
                 if ref_code_len is not None:
                     info_update["meta"]["ref_code_len"] = int(ref_code_len)
                 # First prefill: source the slice offset from `_omni_num_computed_tokens`
@@ -791,16 +933,21 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             else:
                 # Subsequent prefill chunk: slice from stored embeddings at running offset.
                 offset = max(0, int(meta.get("talker_prefill_offset", 0) or 0))
-                info_update = {"meta": {"codec_streaming": codec_streaming}}
+                info_update = {
+                    "meta": {
+                        "codec_streaming": codec_streaming,
+                        "codec_frame_valid": torch.zeros((), dtype=torch.bool, device=input_ids.device),
+                    }
+                }
 
             # Always return a span_len slice; if the scheduled placeholder is longer than what
             # the prompt actually fills, pad with tts_pad_embed (preserves placeholder/embedding alignment).
-            s = max(0, min(offset, int(prompt_embeds_cpu.shape[0])))
-            e = max(0, min(offset + span_len, int(prompt_embeds_cpu.shape[0])))
-            take = prompt_embeds_cpu[s:e]
+            s = max(0, min(offset, int(prompt_embeds_buffer.shape[0])))
+            e = max(0, min(offset + span_len, int(prompt_embeds_buffer.shape[0])))
+            take = prompt_embeds_buffer[s:e]
             if int(take.shape[0]) < span_len:
                 pad_n = int(span_len - int(take.shape[0]))
-                pad_rows = tts_pad_embed.reshape(1, -1).to("cpu").expand(pad_n, -1)
+                pad_rows = tts_pad_embed.to(device=take.device).reshape(1, -1).expand(pad_n, -1)
                 take = torch.cat([take, pad_rows], dim=0)
             prompt_embeds = take.to(device=input_ids.device, dtype=dtype)
             info_update["meta"]["talker_prefill_offset"] = int(offset + span_len)
@@ -823,7 +970,16 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 .to(device=input_ids.device, dtype=dtype)
                 .reshape(span_len, -1)
             )
-            return input_ids, inputs_embeds_out, {"meta": {"codec_streaming": codec_streaming}}
+            return (
+                input_ids,
+                inputs_embeds_out,
+                {
+                    "meta": {
+                        "codec_streaming": codec_streaming,
+                        "codec_frame_valid": torch.zeros((), dtype=torch.bool, device=input_ids.device),
+                    }
+                },
+            )
 
         # Decode: span_len == 1
         # Pop one text-step vector from tailing_text_hidden queue.
@@ -881,6 +1037,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             "meta": {
                 "talker_text_offset": int(next_text_offset),
                 "codec_streaming": codec_streaming,
+                "codec_frame_valid": (
+                    (input_ids.reshape(-1)[-1] >= 0) & (input_ids.reshape(-1)[-1] < self._codebook_vocab_size)
+                ).reshape(()),
             },
         }
         if trailing_text_update is not None:
@@ -976,6 +1135,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 "meta": {
                     "talker_text_offset": int(next_text_offset),
                     "codec_streaming": codec_streaming,
+                    "codec_frame_valid": (
+                        (input_ids_flat[len(updates)] >= 0) & (input_ids_flat[len(updates)] < self._codebook_vocab_size)
+                    ).reshape(()),
                 },
             }
             if trailing_text_update is not None:
@@ -995,6 +1157,16 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             updates,
         )
 
+    def preprocess_decode_batch_mrv2(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor,
+        req_infos: list[dict[str, Any]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+        """Expose the existing TTS decode batcher through the MRv2 contract."""
+        return self.preprocess_decode_batch(input_ids=input_ids, req_infos=req_infos)
+
     def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
         # Keep the last token hidden for the next decode step's code predictor.
         # Stays on GPU - gpu_resident_buffer_keys avoids the CPU round-trip.
@@ -1002,6 +1174,18 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             return {}
         last = hidden_states[-1, :].detach()
         return {"hidden_states": {"last": last}}
+
+    def postprocess_batch_mrv2(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        last_token_indices: torch.Tensor,
+    ) -> tuple[tuple[str, str], torch.Tensor]:
+        """Gather every request's Talker tail in one GPU operation."""
+        return (
+            ("hidden_states", "last"),
+            hidden_states.index_select(0, last_token_indices),
+        )
 
     @torch.inference_mode()
     def preprocess_batch(
@@ -1022,6 +1206,39 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             model_intermediate_buffer=model_intermediate_buffer,
             device=device,
         )
+
+    @torch.inference_mode()
+    def preprocess_batch_mrv2(
+        self,
+        *,
+        req_infos: list[dict[str, Any]],
+        device: torch.device,
+    ) -> None:
+        """Batch new MRv2 prefill slots without rebuilding a req-id map."""
+        if self._silence_ban_frames > 0:
+            for info in req_infos:
+                self._req_x_vector_only[info["req_id"]] = resolve_x_vector_only(info)
+        self._prompt_builder.preprocess_infos_batch(
+            req_infos=req_infos,
+            device=device,
+        )
+
+    @contextmanager
+    def mrv2_sampling_context(self, *, req_ids: list[str], num_output_tokens: torch.Tensor) -> Iterator[None]:
+        """Scope the silence gate to sampling, never prompt-logprob computation."""
+        self.set_batch_req_ids(req_ids)
+        self._mrv2_silence_ban_mask = None
+        if self._silence_ban_frames > 0:
+            in_scope = torch.tensor(
+                [self._req_x_vector_only.get(req_id) is True for req_id in req_ids],
+                device=num_output_tokens.device,
+                dtype=torch.bool,
+            )
+            self._mrv2_silence_ban_mask = (in_scope & (num_output_tokens < self._silence_ban_frames)).unsqueeze(1)
+        try:
+            yield
+        finally:
+            self._mrv2_silence_ban_mask = None
 
     def set_batch_req_ids(self, req_ids: Sequence[str]) -> None:
         """Record the current batch's req_ids, in the order that indexes logits.
@@ -1048,10 +1265,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             sampling_rate=target_sr,
             return_tensors="pt",
         )
-        inputs = inputs.to(device).to(torch.bfloat16)
-
-        input_values = inputs["input_values"].squeeze(1)
-        padding_mask = inputs["padding_mask"].squeeze(1)
+        input_values = inputs["input_values"].squeeze(1).to(device=device, dtype=torch.bfloat16)
+        downsample = self._encoder_downsample_rate
+        valid_code_lengths = [(int(wav.size) + downsample - 1) // downsample for wav in wavs]
 
         with torch.inference_mode():
             encoded = self.encoder.encode(
@@ -1060,10 +1276,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             )
 
         audio_codes = encoded.audio_codes[:, : self._encoder_valid_num_quantizers]
-        downsample = self._encoder_downsample_rate
         return [
-            code[..., : -(-mask.sum() // downsample)].transpose(0, 1).to(device=device, dtype=torch.long)
-            for code, mask in zip(audio_codes, padding_mask)
+            code[:, : int(valid_len)].transpose(0, 1).to(dtype=torch.long).contiguous()
+            for code, valid_len in zip(audio_codes, valid_code_lengths, strict=True)
         ]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

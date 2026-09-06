@@ -74,6 +74,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 logger = logging.getLogger(__name__)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_speaker_samples_dir(monkeypatch, tmp_path):
+    monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
+
+
 class TestAudioMixin:
     @pytest.fixture
     def audio_mixin(self):
@@ -799,8 +804,8 @@ class TestTTSMethods:
     """Unit tests for TTS validation and parameter building."""
 
     @pytest.fixture
-    def speech_server(self, mocker, tmp_path, monkeypatch):
-        monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
+    def speech_server(self, mocker: MockerFixture, monkeypatch, tmp_path):
+        monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
         mock_engine_client = mocker.MagicMock()
         mock_engine_client.errored = False
         mock_engine_client.stage_configs = []
@@ -4999,12 +5004,17 @@ class TestTTSAsyncOffloading:
         qwen3_tts_server._build_tts_params.assert_called_once()
         qwen3_tts_server._estimate_prompt_len_async.assert_awaited_once()
 
-    def test_prepare_speech_generation_qwen3_default_seed_sets_tts_local_seed(
+    def test_prepare_speech_generation_qwen3_default_seed_reaches_both_samplers(
         self, qwen3_tts_server, mocker: MockerFixture
     ):
-        """Deploy default seed should seed Qwen3 TTS residual MTP sampling."""
+        """A deploy seed must cover layer-0 and residual codec sampling."""
         qwen3_tts_server.engine_client.default_sampling_params_list = [
-            SimpleNamespace(max_tokens=2048, seed=42, extra_args=None)
+            SimpleNamespace(
+                max_tokens=2048,
+                seed=42,
+                stop_token_ids=[2150],
+                extra_args={"tts_local_seed": 42, "voice": "Vivian"},
+            )
         ]
         qwen3_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
         qwen3_tts_server._build_tts_params = mocker.MagicMock(
@@ -5017,8 +5027,60 @@ class TestTTSAsyncOffloading:
 
         stage0_params = qwen3_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
         assert stage0_params.seed == 42
-        assert stage0_params.extra_args["tts_local_seed"] == 42
-        assert qwen3_tts_server.engine_client.default_sampling_params_list[0].extra_args is None
+        assert stage0_params.stop_token_ids == [2150]
+        assert stage0_params.extra_args == {"tts_local_seed": 42, "voice": "Vivian"}
+        assert qwen3_tts_server.engine_client.default_sampling_params_list[0].extra_args == {
+            "tts_local_seed": 42,
+            "voice": "Vivian",
+        }
+        assert qwen3_tts_server.engine_client.default_sampling_params_list[0].seed == 42
+
+    def test_prepare_speech_generation_adds_missing_talker_seed_from_default(
+        self, qwen3_tts_server, mocker: MockerFixture
+    ):
+        qwen3_tts_server.engine_client.default_sampling_params_list = [
+            SimpleNamespace(
+                max_tokens=2048,
+                seed=42,
+                stop_token_ids=[2150],
+                extra_args={"voice": "Vivian"},
+            )
+        ]
+        qwen3_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._build_tts_params = mocker.MagicMock(
+            return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
+        )
+        qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+
+        asyncio.run(qwen3_tts_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="hello")))
+
+        stage0_params = qwen3_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+        assert stage0_params.extra_args == {"voice": "Vivian", "tts_local_seed": 42}
+        assert qwen3_tts_server.engine_client.default_sampling_params_list[0].extra_args == {"voice": "Vivian"}
+
+    def test_prepare_speech_generation_qwen3_request_seed_reaches_both_samplers(
+        self, qwen3_tts_server, mocker: MockerFixture
+    ):
+        qwen3_tts_server.engine_client.default_sampling_params_list = [
+            SimpleNamespace(max_tokens=4096, seed=None, stop_token_ids=[2150], extra_args=None)
+        ]
+        qwen3_tts_server._adapter.validate = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._build_tts_params = mocker.MagicMock(
+            return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
+        )
+        qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+        request = OpenAICreateSpeechRequest(
+            input="The weather is nice today, perfect for a walk in the park.",
+            seed=123,
+        )
+
+        asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+
+        stage0_params = qwen3_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+        assert stage0_params.seed == 123
+        assert stage0_params.stop_token_ids == [2150]
+        assert stage0_params.max_tokens == 4096
+        assert stage0_params.extra_args == {"tts_local_seed": 123}
 
     def test_prepare_speech_generation_uses_adapter_model_type_label(
         self,

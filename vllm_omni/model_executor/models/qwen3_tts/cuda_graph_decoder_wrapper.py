@@ -8,10 +8,8 @@ reducing kernel launch overhead during inference.
 """
 
 import bisect
-import os
 import time
-from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 
 import torch
 from torch.cuda import CUDAGraph
@@ -187,22 +185,6 @@ class CUDAGraphDecoderWrapper:
 
         self._warmed_up = False
         self._device = None
-        self._stats_enabled = os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_CUDAGRAPH_STATS", "").lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-        self._stats_log_every = int(os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_CUDAGRAPH_STATS_LOG_EVERY", "0") or 0)
-        self._stats_total = 0
-        self._stats_hits = 0
-        self._stats_compiled_hits = 0
-        self._stats_fallbacks = 0
-        self._stats_stream_capture_fallbacks = 0
-        self._stats_requests: Counter[tuple[int, int]] = Counter()
-        self._stats_hit_shapes: Counter[tuple[int, int, int]] = Counter()
-        self._stats_compiled_shapes: Counter[tuple[int, int]] = Counter()
-        self._stats_fallback_shapes: Counter[tuple[int, int, int]] = Counter()
 
     @staticmethod
     def compute_capture_sizes(
@@ -244,57 +226,19 @@ class CUDAGraphDecoderWrapper:
         shapes.update(self.extra_capture_shapes)
         return sorted(shapes)
 
-    def _record_decode_stats(
-        self,
-        *,
-        hit: bool,
-        batch_size: int,
+    @staticmethod
+    def _select_replay_shape(
+        actual_batch_size: int,
         actual_size: int,
-        padded_size: int | None,
-        stream_capture: bool = False,
-        compiled: bool = False,
-    ) -> None:
-        if not self._stats_enabled:
-            return
-
-        padded_key = int(padded_size) if padded_size is not None else -1
-        self._stats_total += 1
-        self._stats_requests[(batch_size, actual_size)] += 1
-        if hit:
-            self._stats_hits += 1
-            if compiled:
-                self._stats_compiled_hits += 1
-                self._stats_compiled_shapes[(batch_size, actual_size)] += 1
-            else:
-                self._stats_hit_shapes[(batch_size, actual_size, padded_key)] += 1
-        else:
-            self._stats_fallbacks += 1
-            self._stats_fallback_shapes[(batch_size, actual_size, padded_key)] += 1
-            if stream_capture:
-                self._stats_stream_capture_fallbacks += 1
-
-        if self._stats_log_every > 0 and self._stats_total % self._stats_log_every == 0:
-            self.log_decode_stats()
-
-    def log_decode_stats(self) -> None:
-        if not self._stats_enabled or self._stats_total == 0:
-            return
-        hit_rate = 100.0 * self._stats_hits / self._stats_total
-        logger.info(
-            "Code2Wav CUDA Graph stats: total=%d hits=%d fallbacks=%d "
-            "compiled_hits=%d stream_capture_fallbacks=%d hit_rate=%.2f%% "
-            "top_requests=%s top_compiled=%s top_hits=%s top_fallbacks=%s",
-            self._stats_total,
-            self._stats_hits,
-            self._stats_fallbacks,
-            self._stats_compiled_hits,
-            self._stats_stream_capture_fallbacks,
-            hit_rate,
-            self._stats_requests.most_common(12),
-            self._stats_compiled_shapes.most_common(12),
-            self._stats_hit_shapes.most_common(12),
-            self._stats_fallback_shapes.most_common(12),
+        available_shapes: Collection[tuple[int, int]],
+    ) -> tuple[int, int] | None:
+        """Select the lowest-cost captured shape that contains the request."""
+        candidates = (
+            (batch_size, size)
+            for batch_size, size in available_shapes
+            if batch_size >= actual_batch_size and size >= actual_size
         )
+        return min(candidates, key=lambda shape: (shape[0] * shape[1], shape[0], shape[1]), default=None)
 
     def warmup(
         self,
@@ -486,68 +430,42 @@ class CUDAGraphDecoderWrapper:
         # outside the startup capture window, so normal inference still hits
         # the graph fast path.
         if torch.cuda.is_current_stream_capturing():
-            self._record_decode_stats(
-                hit=False,
-                batch_size=int(codes.shape[0]),
-                actual_size=int(codes.shape[-1]),
-                padded_size=None,
-                stream_capture=True,
-            )
             return self.decoder(codes)
 
         batch_size = int(codes.shape[0])
         actual_size = int(codes.shape[-1])
-        padded_size = self._get_padded_size(actual_size)
-        compile_key = (batch_size, actual_size)
-        if compile_key not in self._compiled_shapes and padded_size is not None:
-            compile_key = (batch_size, padded_size)
-        if compile_key in self._compiled_shapes:
+        compile_key = self._select_replay_shape(batch_size, actual_size, self._compiled_shapes)
+        if compile_key is not None:
             compiled_size = compile_key[1]
-            self._record_decode_stats(
-                hit=True,
-                batch_size=batch_size,
-                actual_size=actual_size,
-                padded_size=compiled_size,
-                compiled=True,
-            )
             static_input = self._compiled_static_inputs[compile_key]
-            if actual_size == compiled_size:
+            if actual_size == compiled_size and batch_size == compile_key[0]:
                 static_input.copy_(codes)
             else:
                 static_input.zero_()
-                static_input[:, :, :actual_size] = codes
+                static_input[:batch_size, :, :actual_size] = codes
             self._compiled_graphs[compile_key].replay()
             output = self._trim_replay_output(self._compiled_static_outputs[compile_key], actual_size, compiled_size)
+            output = output[:batch_size]
             if clone_graph_output:
                 return output.clone()
             return output
 
-        graph_key = (batch_size, padded_size) if padded_size is not None else None
+        graph_key = self._select_replay_shape(batch_size, actual_size, self.graphs)
 
-        if graph_key is None or graph_key not in self.graphs:
-            self._record_decode_stats(
-                hit=False,
-                batch_size=batch_size,
-                actual_size=actual_size,
-                padded_size=padded_size,
-            )
+        if graph_key is None:
             return self.decoder(codes)
 
-        self._record_decode_stats(
-            hit=True,
-            batch_size=batch_size,
-            actual_size=actual_size,
-            padded_size=padded_size,
-        )
         static_input = self.static_inputs[graph_key]
-        if actual_size == padded_size:
+        graph_size = graph_key[1]
+        if actual_size == graph_size and batch_size == graph_key[0]:
             static_input.copy_(codes)
         else:
             static_input.zero_()
-            static_input[:, :, :actual_size] = codes
+            static_input[:batch_size, :, :actual_size] = codes
         self.graphs[graph_key].replay()
 
-        output = self._trim_replay_output(self.static_outputs[graph_key], actual_size, padded_size)
+        output = self._trim_replay_output(self.static_outputs[graph_key], actual_size, graph_size)
+        output = output[:batch_size]
         if clone_graph_output:
             return output.clone()
         return output

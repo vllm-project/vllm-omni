@@ -376,6 +376,7 @@ def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker
         extra_args={"tts_local_seed": 42},
     )
     runner.talker_mtp = CaptureTalkerMTP()
+    runner.model.talker_mtp = runner.talker_mtp
     runner.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
             subtalker_sampling_params={
@@ -425,6 +426,7 @@ def test_talker_mtp_forward_keeps_explicit_seeded_requests_scalar(monkeypatch):
         extra_args={"tts_local_seed": 22},
     )
     runner.talker_mtp = CaptureTalkerMTP()
+    runner.model.talker_mtp = runner.talker_mtp
     runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
 
     def fake_determine(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn):
@@ -466,6 +468,7 @@ def test_talker_mtp_forward_batches_seeded_requests_for_opted_in_models(monkeypa
     )
     runner.talker_mtp = CaptureTalkerMTP()
     runner.model = SimpleNamespace(
+        talker_mtp=runner.talker_mtp,
         talker_mtp_output_key=("codes", "audio"),
         talker_mtp_accepts_per_row_generators=True,
     )
@@ -498,6 +501,39 @@ def test_talker_mtp_forward_batches_seeded_requests_for_opted_in_models(monkeypa
     OmniGPUModelRunner._talker_mtp_forward(runner, ["r1"], inputs_embeds)
     assert set(runner._talker_mtp_generators) == {"r1"}
     assert runner.talker_mtp.calls[2]["generator"] is row_generators[0]
+
+
+def test_talker_mtp_forward_bypasses_outer_graph_for_seeded_batch(monkeypatch):
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
+
+    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+    for req_id, seed in (("r1", 11), ("r2", 22)):
+        runner.requests[req_id].sampling_params = SimpleNamespace(
+            seed=seed,
+            extra_args={"tts_local_seed": seed},
+        )
+    graph_runner = CaptureTalkerMTP()
+    raw_runner = CaptureTalkerMTP()
+    runner.talker_mtp = graph_runner
+    runner.model = SimpleNamespace(
+        talker_mtp=raw_runner,
+        talker_mtp_output_key=("codes", "audio"),
+        talker_mtp_accepts_per_row_generators=True,
+    )
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
+
+    def fake_determine(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn):
+        return (True, SimpleNamespace(num_tokens=4), None, None, None)
+
+    monkeypatch.setattr(runner, "_determine_batch_execution_and_padding", fake_determine.__get__(runner, type(runner)))
+
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1", "r2"], torch.zeros((4, 4)))
+
+    assert graph_runner.calls == []
+    assert [call["batch_size"] for call in raw_runner.calls] == [2]
+    assert len(raw_runner.calls[0]["generators"]) == 2
 
 
 def test_update_intermediate_buffer_writes_to_buffer_and_setattr(monkeypatch):

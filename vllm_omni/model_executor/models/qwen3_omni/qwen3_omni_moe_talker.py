@@ -131,6 +131,12 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         inputs_embeds: torch.Tensor | None = None,
         *,
         last_talker_hidden: torch.Tensor | None = None,
+        do_sample: bool = True,
+        temperature: float = 0.9,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        generator: torch.Generator | None = None,
+        generators: list[torch.Generator | None] | None = None,
         **_: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate full RVQ codes + summed embeddings (single-loop, no KV cache).
@@ -149,7 +155,6 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
             raise ValueError("`input_ids` (layer-0 codes) must be provided.")
         if inputs_embeds is None:
             raise ValueError("`inputs_embeds` (talker hidden states) must be provided.")
-
         if inputs_embeds.ndim == 2:
             inputs_embeds = inputs_embeds.unsqueeze(0)
         if input_ids.ndim == 1:
@@ -183,6 +188,12 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
                 layer0_code,
                 layer0_embed,
                 last_talker_hidden,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                generator=generator,
+                generators=generators,
             )
 
             result_codes[:, :, pos : pos + 1] = pos_all_layers

@@ -778,6 +778,37 @@ def test_save_async_uses_confirmed_tokens_for_async_scheduler_watermark(build_ad
     assert len(adapter._pending_save_reqs) == 1
 
 
+def test_rejected_stale_chunk_does_not_mutate_prepared_codec_buffer(build_adapter):
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("stale", RequestStatus.RUNNING, external_req_id="stale")
+    request.num_computed_tokens = 2
+    adapter.requests_num_chunks_sent["stale"] = 3
+    prepare = Mock(side_effect=AssertionError("stale codec rows must not be appended"))
+    adapter.custom_prepare_next_stage_input_func = prepare
+
+    adapter.save_async(request=request)
+
+    prepare.assert_not_called()
+    assert not adapter._pending_save_reqs
+
+
+def test_prepared_payload_is_flushed_once_on_terminal_send(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("terminal", RequestStatus.FINISHED_STOPPED, external_req_id="terminal")
+    payload = OmniPayloadStruct(codes=CodesStruct(audio=torch.tensor([1, 2])))
+    adapter.custom_prepare_next_stage_input_func = Mock(return_value=payload)
+    adapter.custom_process_next_stage_input_func = Mock(side_effect=AssertionError("payload already prepared"))
+
+    adapter.save_async(request=request, is_segment_finished=False)
+    task = adapter._pending_save_reqs.popleft()
+    adapter._send_single_request(task)
+
+    assert adapter.custom_prepare_next_stage_input_func.call_args.kwargs["is_finished"] is True
+    adapter.custom_process_next_stage_input_func.assert_not_called()
+    assert connector.put.call_args.kwargs["data"] is payload
+    assert bool(payload.meta.finished.item()) is True
+
+
 def test_segment_boundary_starts_new_send_watermark_before_background_flush(build_adapter):
     """A queued boundary owns the end of its deduplication generation.
 
@@ -927,6 +958,43 @@ def test_send_single_request_terminal_chunk_still_flushes_processor(build_adapte
     sent_payload = connector.put.call_args.kwargs["data"]
     assert bool(sent_payload.meta.finished.item()) is True
     assert bool(sent_payload.meta.is_segment_finished.item()) is False
+
+
+def test_save_async_snapshots_request_token_history_for_background_processor(build_adapter):
+    adapter, _ = build_adapter(stage_id=0)
+    request = Request(
+        request_id="req-snapshot",
+        prompt_token_ids=[10, 11],
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+    )
+    request.external_req_id = "external-snapshot"
+    request.append_output_token_ids([20, 21, 22])
+    observed = {}
+
+    def capture_request(*, request, **_kwargs):
+        observed["prompt"] = list(request.prompt_token_ids)
+        observed["output"] = list(request.output_token_ids)
+        observed["all"] = list(request.all_token_ids)
+        observed["output_token_count"] = request.output_token_count
+        observed["finished"] = request.is_finished()
+        return OmniPayloadStruct()
+
+    adapter.custom_process_next_stage_input_func = capture_request
+    adapter.save_async(multimodal_output={"step": 1}, request=request)
+
+    request.prompt_token_ids.append(12)
+    request.append_output_token_ids([23])
+    request.status = RequestStatus.FINISHED_STOPPED
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    assert observed == {
+        "prompt": [10, 11],
+        "output": [20, 21, 22],
+        "all": [10, 11, 20, 21, 22],
+        "output_token_count": 3,
+        "finished": False,
+    }
 
 
 def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, monkeypatch):

@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from transformers import PretrainedConfig
 from vllm.logger import init_logger
@@ -250,6 +250,7 @@ class StagePipelineConfig:
     # Alternates picked by ``merge_pipeline_deploy`` based on ``deploy.async_chunk``.
     async_chunk_process_next_stage_input_func: str | None = None
     sync_process_input_func: str | None = None
+    supports_native_mrv2_data_plane: bool = False
     # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
     # The callable receives ``(prompt, sampling_params_list)``; downstream
     # stages continue to receive the original prompt.
@@ -547,6 +548,7 @@ class DeployConfig:
 
     async_chunk: bool = True
     session_mode: str = "turn"
+    model_runner: Literal["v1", "v2"] = "v1"
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
     duplex_session: DuplexSessionRuntimeConfig = field(default_factory=DuplexSessionRuntimeConfig)
@@ -715,6 +717,16 @@ def _merge_platforms(
     return merged
 
 
+def _merge_connectors(
+    base: dict[str, Any] | None,
+    overlay: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Deep-merge named connector definitions from a deploy overlay."""
+    if not base and not overlay:
+        return None
+    return _get_recursively_merged_dict(base or {}, overlay or {})
+
+
 def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
     """Load a deploy YAML with optional ``base_config`` inheritance."""
     raw_dict = to_dict(load_yaml_config(path))
@@ -727,12 +739,15 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
     base_path = Path(path).parent / base_path
     base_dict = resolve_deploy_yaml(base_path)
 
-    # Merge top-level scalars: overlay wins. ``stages:`` and ``platforms:``
-    # are deep-merged below so an overlay can layer on top of the base.
+    # Merge top-level scalars: overlay wins. Structured sections are merged
+    # below so a thin overlay does not discard inherited runtime contracts.
     merged = {
         **base_dict,
-        **{k: v for k, v in raw_dict.items() if k not in ("stages", "platforms")},
+        **{k: v for k, v in raw_dict.items() if k not in ("connectors", "stages", "platforms")},
     }
+    merged_connectors = _merge_connectors(base_dict.get("connectors"), raw_dict.get("connectors"))
+    if merged_connectors is not None:
+        merged["connectors"] = merged_connectors
     merged["stages"] = _merge_stage_lists(base_dict.get("stages"), raw_dict.get("stages"))
     merged_platforms = _merge_platforms(base_dict.get("platforms"), raw_dict.get("platforms"))
     if merged_platforms is not None:
@@ -752,9 +767,14 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
 
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
 
+    model_runner = raw_dict.get("model_runner", "v1")
+    if model_runner not in ("v1", "v2"):
+        raise ValueError(f"model_runner must be one of ('v1', 'v2'), got {model_runner!r}")
+
     kwargs: dict[str, Any] = {
         "async_chunk": raw_dict.get("async_chunk", True),
         "session_mode": raw_dict.get("session_mode", "turn"),
+        "model_runner": model_runner,
         "active_stream_window": int(raw_dict.get("active_stream_window", 0) or 0),
         "duplex_session": DuplexSessionRuntimeConfig(**(raw_dict.get("duplex_session") or {})),
         "connectors": raw_dict.get("connectors", None),
@@ -813,6 +833,11 @@ def _apply_platform_overrides(
 
         device_name = current_omni_platform.device_name
         platform = device_name.lower() if device_name is not None else None
+    if deploy.model_runner == "v2" and platform in {"npu", "xpu"}:
+        raise NotImplementedError(
+            f"Model Runner V2 is not supported on {platform.upper()}: "
+            "the platform worker still uses the legacy chunk-transfer data plane."
+        )
     if platform is None or deploy.platforms is None:
         return deploy
     platform_section = deploy.platforms.get(platform)
@@ -957,6 +982,8 @@ def _build_engine_args(
         # model-owned streaming state. Propagate it to every stage instead of
         # making individual models duplicate the value in connector extras.
         engine_args["duplex_max_sessions"] = deploy.duplex_session.max_sessions
+    engine_args.setdefault("use_v2_model_runner", deploy.model_runner == "v2")
+    engine_args["supports_native_mrv2_data_plane"] = bool(ps.supports_native_mrv2_data_plane)
     if ps.omni_kv_config:
         engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
@@ -1128,6 +1155,9 @@ class StageConfig:
         for key, value in runtime_overrides.items():
             if value is not None and key not in ("devices", "max_batch_size", "num_replicas"):
                 engine_args[key] = value
+
+        # Terminal-stage ownership comes from topology, not engine overrides.
+        engine_args["final_output"] = self.final_output
 
         # Build runtime config from YAML defaults + CLI overrides
         runtime: dict[str, Any] = dict(self.yaml_runtime)

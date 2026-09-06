@@ -16,6 +16,7 @@ import pytest
 import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
@@ -636,3 +637,98 @@ def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
     assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
     sched.skipped_waiting.remove_requests.assert_not_called()
     sched._enqueue_waiting_request.assert_not_called()
+
+
+def test_async_chunk_reserved_running_slots_counts_parked_live_requests_once() -> None:
+    sched = _make_scheduler(stage_id=1)
+    r1 = SimpleNamespace(request_id="r1")
+    r2 = SimpleNamespace(request_id="r2")
+    stale = SimpleNamespace(request_id="stale")
+    sched.requests = {"r1": object(), "r2": object()}
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        waiting_for_chunk_running_requests=[r1, r1, stale],
+        _held_non_active=[r2, stale],
+    )
+
+    assert sched._get_async_chunk_reserved_running_slots() == 2
+
+
+def test_async_chunk_reserved_running_slots_counts_native_parked_requests() -> None:
+    sched = _make_scheduler(stage_id=1)
+    parked = SimpleNamespace(request_id="parked")
+    stale = SimpleNamespace(request_id="stale")
+    sched.requests = {"parked": object()}
+    sched.input_coordinator = SimpleNamespace(
+        _waiting_for_chunk_running=[parked, parked, stale],
+    )
+
+    assert sched._get_async_chunk_reserved_running_slots() == 1
+
+
+def test_native_async_chunk_reserves_parked_slots_during_ar_admission(monkeypatch) -> None:
+    sched = _make_scheduler(stage_id=1)
+    parked = SimpleNamespace(request_id="parked")
+    sched.requests = {"parked": parked}
+    sched.waiting = []
+    sched.running = []
+    sched._native_data_plane = True
+    sched.use_v2_model_runner = True
+    sched.max_num_running_reqs = 8
+    sched.input_coordinator = SimpleNamespace(
+        _waiting_for_chunk_running=[parked],
+        restore_queues=lambda _waiting, _running: None,
+    )
+    sched._consume_pending_connector_output = lambda model_mode: None
+    sched._process_pending_input_timeouts = lambda: None
+    sched._should_defer_waiting_admission = lambda: False
+    sched.get_finished_requests_needing_kv_transfer = lambda: {}
+    sched._wrap_omni_scheduler_output = lambda output, **_kwargs: output
+
+    observed_limits: list[int] = []
+
+    def fake_schedule(self, _throttle_prefills=False):
+        observed_limits.append(self.max_num_running_reqs)
+        return SimpleNamespace(scheduled_new_reqs=[])
+
+    monkeypatch.setattr(VLLMScheduler, "schedule", fake_schedule)
+
+    sched.schedule()
+
+    assert observed_limits == [7]
+    assert sched.max_num_running_reqs == 8
+
+
+def test_mrv1_async_chunk_does_not_reserve_parked_slots_during_ar_admission(monkeypatch) -> None:
+    sched = _make_scheduler(stage_id=1)
+    parked = SimpleNamespace(request_id="parked")
+    sched.requests = {"parked": parked}
+    sched.waiting = []
+    sched.running = []
+    sched._native_data_plane = False
+    sched.use_v2_model_runner = False
+    sched.max_num_running_reqs = 8
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        waiting_for_chunk_running_requests=[parked],
+        _held_non_active=[],
+        process_pending_chunks=lambda *_args, **_kwargs: None,
+        collect_failed_send_request_ids=lambda: {},
+        restore_queues=lambda *_args, **_kwargs: None,
+        postprocess_scheduler_output=lambda *_args, **_kwargs: None,
+    )
+    sched.input_coordinator = None
+    sched._consume_pending_connector_output = lambda model_mode: None
+    sched._process_pending_input_timeouts = lambda: None
+    sched._should_defer_waiting_admission = lambda: False
+    sched.get_finished_requests_needing_kv_transfer = lambda: {}
+    sched._wrap_omni_scheduler_output = lambda output, **_kwargs: output
+    observed_limits: list[int] = []
+
+    def fake_schedule(self, _throttle_prefills=False):
+        observed_limits.append(self.max_num_running_reqs)
+        return SimpleNamespace(scheduled_new_reqs=[])
+
+    monkeypatch.setattr(VLLMScheduler, "schedule", fake_schedule)
+
+    sched.schedule()
+
+    assert observed_limits == [8]

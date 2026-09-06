@@ -152,7 +152,10 @@ class _ModelEngineOverrides(TypedDict, total=False):
     limit_mm_per_prompt: dict[str, Any]
     interleave_mm_strings: bool
     media_io_kwargs: dict[str, Any]
+    final_output: bool
     active_stream_window: int
+    use_v2_model_runner: bool
+    supports_native_mrv2_data_plane: bool
     enable_sleep_mode: bool
     subtalker_sampling_params: dict[str, Any]
     silence_ban_frames: int
@@ -418,9 +421,12 @@ class OmniStageModelConfig:
     # MiniCPM interleaved AV packing and media decode knobs (Daily-Omni).
     interleave_mm_strings: bool | None = None
     media_io_kwargs: dict[str, Any] | None = None
+    final_output: bool = False
     active_stream_window: int = Field(default=0, ge=0)
     session_mode: str = "turn"
     duplex_max_sessions: int = Field(default=1, ge=1)
+    use_v2_model_runner: bool = False
+    supports_native_mrv2_data_plane: bool = False
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
@@ -1688,8 +1694,14 @@ def _build_model_config(
         kwargs["dtype"] = _copy_value(deploy.dtype)
     if "active_stream_window" not in kwargs:
         kwargs["active_stream_window"] = _copy_value(deploy.active_stream_window)
+    kwargs["final_output"] = topology.final_output
     if "custom_voice_dir" not in kwargs and deploy.custom_voice_dir is not None:
         kwargs["custom_voice_dir"] = _copy_value(deploy.custom_voice_dir)
+    kwargs.setdefault("use_v2_model_runner", deploy.model_runner == "v2")
+    kwargs.setdefault(
+        "supports_native_mrv2_data_plane",
+        topology.supports_native_mrv2_data_plane,
+    )
     if "has_sampling_extra_args" not in kwargs:
         kwargs["has_sampling_extra_args"] = bool((default_sampling_params or {}).get("extra_args"))
     if "model_subdir" not in kwargs and topology.model_subdir is not None:

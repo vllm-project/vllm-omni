@@ -115,7 +115,7 @@ def test_schedule_lifecycle_helpers_process_and_restore_both_input_paths():
         collect_failed_send_request_ids=_collect_failed_sends,
     )
     scheduler.input_coordinator = SimpleNamespace(
-        restore_queues=lambda waiting: calls.append(("restore-full", waiting))
+        restore_queues=lambda waiting, running: calls.append(("restore-full", waiting, running))
     )
 
     scheduler._process_pending_omni_inputs("ar")
@@ -130,7 +130,7 @@ def test_schedule_lifecycle_helpers_process_and_restore_both_input_paths():
         ("chunk-timeouts", omni_scheduler_mixin.DEFAULT_INPUT_WAIT_TIMEOUT_S),
         ("failed-sends",),
         ("restore-chunks", scheduler.waiting, scheduler.running, scheduler.requests),
-        ("restore-full", scheduler.waiting),
+        ("restore-full", scheduler.waiting, scheduler.running),
     ]
 
 

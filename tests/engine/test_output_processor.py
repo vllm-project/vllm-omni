@@ -487,6 +487,7 @@ def test_no_detokenizer_process_outputs_returns_nonterminal_audio_chunk(monkeypa
         finish_reason=None,
         stop_reason=None,
         kv_transfer_params=None,
+        ec_transfer_params=None,
         routed_experts=None,
         num_cached_tokens=0,
     )
@@ -502,6 +503,7 @@ def _make_mm_only_output_processor(monkeypatch):
     processor = object.__new__(MultimodalOutputProcessor)
     processor.output_modality = OutputModality.AUDIO
     processor.request_states = {"r": _make_no_detok_state(RequestOutputKind.DELTA)}
+    processor.tracing_enabled = False
     monkeypatch.setattr(
         VLLMOutputProcessor,
         "process_outputs",
@@ -531,6 +533,7 @@ def _audio_engine_output(*, is_segment_finished: bool, is_last_chunk: bool):
         finish_reason=FinishReason.STOP,
         stop_reason=None,
         kv_transfer_params=None,
+        ec_transfer_params=None,
         routed_experts=None,
         num_cached_tokens=0,
         is_segment_finished=is_segment_finished,

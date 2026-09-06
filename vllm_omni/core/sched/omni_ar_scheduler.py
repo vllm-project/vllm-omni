@@ -29,6 +29,21 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 logger = init_logger(__name__)
 
 
+def _should_emit_engine_output(
+    model_config: Any,
+    *,
+    stopped: bool,
+    has_control: bool,
+) -> bool:
+    if stopped or has_control:
+        return True
+    return not (
+        bool(getattr(model_config, "use_v2_model_runner", False))
+        and bool(getattr(model_config, "async_chunk", False))
+        and not bool(getattr(model_config, "final_output", False))
+    )
+
+
 class SampledLogprobContractError(RuntimeError):
     """The model runner returned unusable sampled-token logprobs."""
 
@@ -300,15 +315,22 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._process_pending_omni_inputs(model_mode="ar")
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
-
         original_waiting = None
         if self._should_defer_waiting_admission():
             original_waiting = waiting
             self.waiting = create_request_queue(self.policy)
 
+        original_max_num_running_reqs = self.max_num_running_reqs
+        async_chunk_transport = self._async_chunk_transport_enabled()
+        reserved_running_slots = (
+            self._get_async_chunk_reserved_running_slots() if async_chunk_transport and self.use_v2_model_runner else 0
+        )
+        if reserved_running_slots:
+            self.max_num_running_reqs = max(0, original_max_num_running_reqs - reserved_running_slots)
         try:
             scheduler_output = super().schedule(throttle_prefills)
         finally:
+            self.max_num_running_reqs = original_max_num_running_reqs
             if original_waiting is not None:
                 deferred_waiting = list(self.waiting)
                 if deferred_waiting:
@@ -412,7 +434,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
             if request is not None:
-                # vLLM 0.26: settle the in-flight tokens counted in schedule().
+                # Settle the in-flight tokens counted in schedule().
                 # Must happen before the skips below — failed-KV-load and
                 # already-finished requests were incremented too, and the two
                 # readers (allocate_slots, _connector_finished) clamp with
@@ -598,6 +620,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 is_segment_finished = not finished
                 if finished:
                     request.resumable = False
+                    if self._native_data_plane:
+                        self._pending_data_plane_terminal_req_ids.add(req_id)
                 if not finished:
                     # for streaming input request only
                     if self.chunk_transfer_adapter:
@@ -654,7 +678,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
+            has_stage_output = (
+                bool(new_token_ids)
+                or mm_output is not None
+                or pooler_output is not None
+                or kv_transfer_params
+                or stopped
+            )
+            if has_stage_output and _should_emit_engine_output(
+                self.vllm_config.model_config,
+                stopped=stopped,
+                has_control=kv_transfer_params is not None,
+            ):
                 OmniSchedulerMixin._append_request_output(
                     self,
                     outputs,

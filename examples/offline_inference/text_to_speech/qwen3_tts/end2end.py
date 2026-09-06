@@ -135,17 +135,18 @@ def _estimate_prompt_len(
         return 2048
 
 
-def get_custom_voice_query(use_batch_sample: bool = False) -> QueryResult:
+def get_custom_voice_query(use_batch_sample: bool = False, model_name: str | None = None) -> QueryResult:
     """Build CustomVoice sample inputs.
 
     Args:
         use_batch_sample: When True, return a batch of prompts; otherwise a single prompt.
+        model_name: Override the default HF model path (e.g. with a local path).
 
     Returns:
         QueryResult with Omni inputs and the CustomVoice model path.
     """
     task_type = "CustomVoice"
-    model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    model_name = model_name or "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
     if use_batch_sample:
         texts = [
             "其实我真的有发现，我是一个特别善于观察别人情绪的人。",
@@ -196,17 +197,18 @@ def get_custom_voice_query(use_batch_sample: bool = False) -> QueryResult:
     )
 
 
-def get_voice_design_query(use_batch_sample: bool = False) -> QueryResult:
+def get_voice_design_query(use_batch_sample: bool = False, model_name: str | None = None) -> QueryResult:
     """Build VoiceDesign sample inputs.
 
     Args:
         use_batch_sample: When True, return a batch of prompts; otherwise a single prompt.
+        model_name: Override the default HF model path (e.g. with a local path).
 
     Returns:
         QueryResult with Omni inputs and the VoiceDesign model path.
     """
     task_type = "VoiceDesign"
-    model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+    model_name = model_name or "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
     if use_batch_sample:
         texts = [
             "哥哥，你回来啦，人家等了你好久好久了，要抱抱！",
@@ -255,18 +257,19 @@ def get_voice_design_query(use_batch_sample: bool = False) -> QueryResult:
     )
 
 
-def get_base_query(use_batch_sample: bool = False, mode_tag: str = "icl") -> QueryResult:
+def get_base_query(use_batch_sample: bool = False, mode_tag: str = "icl", model_name: str | None = None) -> QueryResult:
     """Build Base (voice clone) sample inputs.
 
     Args:
         use_batch_sample: When True, return a batch of prompts (Case 2).
         mode_tag: "icl" or "xvec_only" to control x_vector_only_mode behavior.
+        model_name: Override the default HF model path (e.g. with a local path).
 
     Returns:
         QueryResult with Omni inputs and the Base model path.
     """
     task_type = "Base"
-    model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+    model_name = model_name or "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
     ref_audio_path_1 = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
     ref_audio_single = ref_audio_path_1
     ref_text_single = (
@@ -335,14 +338,17 @@ def _build_inputs(args) -> tuple[str, list]:
         )
 
     query_func = query_map[args.query_type]
+    model_override = args.model if args.model else None
     if args.query_type in {"CustomVoice", "VoiceDesign"}:
-        query_result = query_func(use_batch_sample=args.use_batch_sample)
+        query_result = query_func(use_batch_sample=args.use_batch_sample, model_name=model_override)
     elif args.query_type == "Base":
-        query_result = query_func(use_batch_sample=args.use_batch_sample, mode_tag=args.mode_tag)
+        query_result = query_func(
+            use_batch_sample=args.use_batch_sample, mode_tag=args.mode_tag, model_name=model_override
+        )
     else:
         query_result = query_func()
 
-    model_name = query_result.model_name
+    model_name = args.model if args.model else query_result.model_name
 
     if args.txt_prompts:
         with open(args.txt_prompts) as f:
@@ -359,7 +365,10 @@ def _build_inputs(args) -> tuple[str, list]:
             for t in lines
         ]
     else:
-        inputs = query_result.inputs if isinstance(query_result.inputs, list) else [query_result.inputs]
+        if isinstance(query_result.inputs, list):
+            inputs = query_result.inputs * args.num_prompts
+        else:
+            inputs = [query_result.inputs] * args.num_prompts
 
     return model_name, inputs
 
@@ -374,6 +383,31 @@ def _save_wav(output_dir: str, request_id: str, mm: dict) -> None:
     out_wav = os.path.join(output_dir, f"output_{request_id}.wav")
     sf.write(out_wav, audio_tensor.float().cpu().numpy().flatten(), samplerate=sr, format="WAV")
     logger.info(f"Request ID: {request_id}, Saved audio to {out_wav}")
+
+
+class _StreamingAudioAccumulator:
+    """Collect DELTA-mode audio outputs before writing a complete WAV."""
+
+    def __init__(self) -> None:
+        self._chunks: list[torch.Tensor] = []
+        self._sample_rate: int | None = None
+
+    def add(self, mm: dict) -> None:
+        audio = mm.get("audio")
+        if audio is not None:
+            chunks = audio if isinstance(audio, list) else [audio]
+            self._chunks.extend(chunk.detach().cpu() for chunk in chunks)
+
+        sample_rate = mm.get("sr")
+        if isinstance(sample_rate, list) and sample_rate:
+            sample_rate = sample_rate[-1]
+        if sample_rate is not None:
+            self._sample_rate = int(sample_rate.item() if hasattr(sample_rate, "item") else sample_rate)
+
+    def as_multimodal_output(self) -> dict:
+        if not self._chunks or self._sample_rate is None:
+            raise RuntimeError("Streaming Qwen3-TTS request completed without audio output")
+        return {"audio": self._chunks, "sr": self._sample_rate}
 
 
 def main(args):
@@ -411,8 +445,10 @@ async def main_streaming(args):
         t_start = time.perf_counter()
         t_prev = t_start
         chunk_idx = 0
+        audio_accumulator = _StreamingAudioAccumulator()
         async for stage_output in omni.generate(prompt, request_id=request_id):
             mm = stage_output.outputs[0].multimodal_output
+            audio_accumulator.add(mm)
             if not stage_output.finished:
                 t_now = time.perf_counter()
                 audio = mm.get("audio")
@@ -429,11 +465,17 @@ async def main_streaming(args):
                 t_end = time.perf_counter()
                 total_ms = (t_end - t_start) * 1000
                 logger.info(f"Request {request_id}: done total={total_ms:.1f}ms chunks={chunk_idx}")
-                _save_wav(output_dir, request_id, mm)
+                _save_wav(output_dir, request_id, audio_accumulator.as_multimodal_output())
 
 
 def parse_args():
     parser = TrackingArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Override the default model path for the selected query type.",
+    )
     parser.add_argument(
         "--query-type",
         "-q",

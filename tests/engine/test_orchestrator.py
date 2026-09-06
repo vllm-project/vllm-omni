@@ -324,7 +324,94 @@ def _engine_core_outputs(tag: str, timestamp: float) -> SimpleNamespace:
     return SimpleNamespace(outputs=[tag], timestamp=timestamp, scheduler_stats=None, finished_requests=None)
 
 
-def _terminal_engine_core_outputs(request_id: str) -> EngineCoreOutputs:
+@pytest.mark.asyncio
+async def test_async_chunk_terminal_stage_waits_for_late_frontend_output(orchestrator_factory) -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True)
+    processors = [
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-late-text", token_ids=[7], finished=True)]),
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-late-text", token_ids=[9], finished=True)]),
+    ]
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=processors,
+        async_chunk=True,
+    )
+    request = SimpleNamespace(request_id="req-late-text", prompt_token_ids=[1, 2, 3])
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-late-text",
+            prompt=request,
+            original_prompt={"prompt": "late text"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+            final_output_stage_ids=[0, 1],
+        )
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+
+        stage1.push_engine_core_outputs(_engine_core_outputs("stage1-terminal", 1.0))
+        audio_msg = await _get_output_message(orchestrator_fixture)
+        assert audio_msg.stage_id == 1
+        assert audio_msg.finished is False
+        assert "req-late-text" in orchestrator_fixture.orchestrator.request_states
+
+        stage0.push_engine_core_outputs(_engine_core_outputs("stage0-late-final", 2.0))
+        text_msg = await _get_output_message(orchestrator_fixture)
+        assert text_msg.stage_id == 0
+        assert text_msg.finished is True
+        await _wait_for(lambda: "req-late-text" not in orchestrator_fixture.orchestrator.request_states)
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_async_chunk_late_swallowed_raw_terminal_completes_request(orchestrator_factory) -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="text")
+    stage1 = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    processors = [
+        FakeOutputProcessor(request_outputs=[]),
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-raw-terminal", token_ids=[9], finished=True)]),
+    ]
+    orchestrator_fixture = orchestrator_factory(
+        [stage0, stage1],
+        output_processors=processors,
+        async_chunk=True,
+    )
+    request = SimpleNamespace(request_id="req-raw-terminal", prompt_token_ids=[1, 2, 3])
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-raw-terminal",
+            prompt=request,
+            original_prompt={"prompt": "late raw terminal"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+            final_output_stage_ids=[0, 1],
+        )
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+
+        stage1.push_engine_core_outputs(_engine_core_outputs("stage1-terminal", 1.0))
+        audio_msg = await _get_output_message(orchestrator_fixture)
+        assert audio_msg.stage_id == 1
+        assert audio_msg.finished is False
+        assert "req-raw-terminal" in orchestrator_fixture.orchestrator.request_states
+
+        stage0.push_engine_core_outputs(_terminal_engine_core_outputs("req-raw-terminal", 2.0))
+        terminal_msg = await _get_output_message(orchestrator_fixture)
+        assert terminal_msg.stage_id == 0
+        assert terminal_msg.finished is True
+        assert terminal_msg.engine_outputs.finished is True
+        await _wait_for(lambda: "req-raw-terminal" not in orchestrator_fixture.orchestrator.request_states)
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+def _terminal_engine_core_outputs(request_id: str, timestamp: float = 1.0) -> EngineCoreOutputs:
     return EngineCoreOutputs(
         outputs=[
             EngineCoreOutput(
@@ -333,7 +420,7 @@ def _terminal_engine_core_outputs(request_id: str) -> EngineCoreOutputs:
                 finish_reason=FinishReason.STOP,
             )
         ],
-        timestamp=1.0,
+        timestamp=timestamp,
         finished_requests={request_id},
     )
 
@@ -533,6 +620,7 @@ async def _enqueue_add_request(
     original_prompt,
     sampling_params_list,
     final_stage_id: int,
+    final_output_stage_ids: list[int] | None = None,
 ) -> None:
     orchestrator_fixture.request_sync_q.put_nowait(
         StageSubmissionMessage(
@@ -543,6 +631,7 @@ async def _enqueue_add_request(
             output_prompt_text=None,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            final_output_stage_ids=final_output_stage_ids,
             preprocess_ms=0.0,
             request_timestamp=time.time(),
             enqueue_ts=time.perf_counter(),

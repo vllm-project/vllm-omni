@@ -8,7 +8,10 @@ from vllm.tracing import instrument
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.utils import report_usage_stats
-from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
+from vllm.v1.worker.gpu_worker import (
+    CompilationTimes,
+    init_worker_distributed_environment,
+)
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from vllm_omni.platforms import current_omni_platform
@@ -18,6 +21,14 @@ from vllm_omni.worker.memory_utils import request_memory_tolerant
 from vllm_omni.worker.mixins import OmniWorkerMixin
 
 logger = init_logger(__name__)
+
+
+def _supports_generation_device_type(device_type: str) -> bool:
+    return device_type in ("cuda", "musa")
+
+
+def _make_compilation_times(language_model_time: float) -> CompilationTimes:
+    return CompilationTimes(language_model=language_model_time, encoder=0.0)
 
 
 class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
@@ -31,7 +42,7 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self):
-        if self.device_config.device_type in ("cuda", "musa"):
+        if _supports_generation_device_type(self.device_config.device_type):
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             parallel_config = self.parallel_config
@@ -96,13 +107,28 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
 
+        self.use_v2_model_runner = bool(getattr(self.model_config, "use_v2_model_runner", False))
         if self.use_v2_model_runner:
-            # OMNI: v2 model runner does not yet include omni hooks.
-            logger.warning("OMNI GPUGenerationWorker forces v1 model runner for omni hooks.")
-            self.use_v2_model_runner = False
+            from vllm_omni.worker_v2.omni_generation_model_runner import (
+                OmniGenerationModelRunner,
+            )
 
-        self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
+            logger.info("Using MR v2 OmniGenerationModelRunner for generation stage.")
+            self.model_runner = OmniGenerationModelRunner(self.vllm_config, self.device)
+        else:
+            self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+
+    @instrument(span_name="Compile/warmup")
+    def compile_or_warm_up_model(self) -> float:
+        """Generation stages have no KV cache or sampler — skip warmup_kernels."""
+        if not self.use_v2_model_runner:
+            return super().compile_or_warm_up_model()
+        import time
+
+        start = time.perf_counter()
+        self.model_runner.profile_run()
+        return _make_compilation_times(time.perf_counter() - start)

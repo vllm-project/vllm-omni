@@ -68,6 +68,7 @@ def test_schedule_sweeps_skipped_waiting_before_upstream_selection(
     aborted = _StubRequest("req-aborted", RequestStatus.FINISHED_ABORTED)
     scheduler = _make_scheduler(policy, skipped_waiting=[aborted])
     scheduler.chunk_transfer_adapter = None
+    scheduler.max_num_running_reqs = 8
     scheduler.input_coordinator = None
     scheduler.num_waiting_for_streaming_input = 0
     scheduler._process_pending_omni_inputs = lambda model_mode: None

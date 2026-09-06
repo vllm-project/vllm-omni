@@ -19,13 +19,22 @@ from vllm.v1.sample.logits_processor import (
     MinTokensLogitsProcessor,
 )
 
-from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
+from vllm_omni.worker.sampling_utils import (
+    sanitize_min_tokens_stop_ids,
+    sanitize_sampling_params_min_tokens_stop_ids,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 TALKER_VOCAB = 3072
 CODEC_EOS = 2150
 TEXT_EOS = 151645
+
+
+@pytest.fixture(autouse=True)
+def _disable_vllm_pin_memory_for_cpu(monkeypatch: pytest.MonkeyPatch):
+    """Keep the module-level H2D helper in CPU-only mode."""
+    monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
 
 
 def _make_min_tokens_proc(stop_token_ids: list[int], eos_token_id: int | None) -> MinTokensLogitsProcessor:
@@ -113,3 +122,14 @@ def test_guard_handles_multiple_requests():
     assert out[0, CODEC_EOS] == -float("inf")
     assert out[1, 7] == -float("inf")
     assert int((out == -float("inf")).sum()) == 2
+
+
+def test_sampling_params_guard_filters_only_unreachable_min_tokens_ids():
+    params = SamplingParams(min_tokens=2, stop_token_ids=[CODEC_EOS])
+    params.update_from_generation_config({}, TEXT_EOS)
+
+    sanitize_sampling_params_min_tokens_stop_ids(params, TALKER_VOCAB)
+
+    assert params.all_stop_token_ids == {CODEC_EOS}
+    assert params.stop_token_ids == [CODEC_EOS]
+    assert params.eos_token_id == TEXT_EOS

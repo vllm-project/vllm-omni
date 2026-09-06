@@ -143,6 +143,28 @@ def test_padded_output_shape_and_length(decoder, wrapper, seq_len):
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_padded_batch_size_uses_larger_capture_bucket(decoder):
+    """Non-exact batch sizes should replay the next captured batch bucket."""
+    w = CUDAGraphDecoderWrapper(
+        decoder=decoder,
+        capture_sizes=[25],
+        capture_batch_sizes=[1, 4],
+        num_quantizers=NUM_QUANTIZERS,
+        enabled=True,
+    )
+    w.warmup(DEVICE)
+    codes = _random_codes(25, batch_size=3)
+
+    with torch.no_grad():
+        eager_out = decoder(codes)
+        graph_out = w.decode(codes)
+
+    assert (4, 25) in w.graphs
+    assert graph_out.shape == eager_out.shape
+    torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("seq_len", [10, 30, 47, 73, 99])
 def test_padded_interior_positions_close(decoder, wrapper, seq_len):
     """Interior positions (away from padding boundary) should be very close.
@@ -460,6 +482,24 @@ def test_extra_capture_shape_uses_sparse_graph(decoder):
         eager_out = decoder(codes)
         graph_out = sparse_wrapper.decode(codes)
     torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_sparse_capture_shapes_select_smallest_fitting_graph(decoder):
+    """Sparse shapes must be selected as pairs, not as independent axes."""
+    sparse_wrapper = CUDAGraphDecoderWrapper(
+        decoder=decoder,
+        capture_sizes=[25],
+        capture_batch_sizes=[1],
+        extra_capture_shapes=[(16, 50), (64, 32)],
+        num_quantizers=NUM_QUANTIZERS,
+        enabled=True,
+    )
+    sparse_wrapper.warmup(DEVICE)
+
+    assert sparse_wrapper._select_replay_shape(5, 29, sparse_wrapper.graphs) == (16, 50)
+    assert sparse_wrapper._select_replay_shape(33, 29, sparse_wrapper.graphs) == (64, 32)
+    assert sparse_wrapper._select_replay_shape(33, 40, sparse_wrapper.graphs) is None
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)

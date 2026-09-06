@@ -1,0 +1,3 @@
+# Experimental native Model Runner V2 profile for Qwen3-TTS.
+base_config: qwen3_tts.yaml
+model_runner: v2

@@ -667,10 +667,18 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
 
             # Accumulate multimodal tensors regardless of path.
             if isinstance(req_state, OmniRequestState):
+                mm_type = getattr(eco, "output_type", None) or default_mm_type
+
                 mm_output = getattr(eco, "multimodal_output", None)
                 if mm_output is not None:
-                    mm_type = getattr(eco, "output_type", None) or default_mm_type
                     req_state.add_multimodal_tensor(mm_output, mm_type)
+
+                # Omni AR stages carry model payloads alongside text tokens in
+                # pooling_output. Preserve the payload, then clear the field so
+                # upstream still runs the normal detokenization path.
+                if eco.pooling_output is not None and req_state.detokenizer is not None:
+                    req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
+                    eco.pooling_output = None
 
             # Route: if no detokenizer and no pooling output, handle locally
             # to avoid upstream's assert on detokenizer.
@@ -680,20 +688,22 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 upstream_outputs.append(eco)
 
         # Handle multimodal-only outputs (generation stages) locally.
-        mm_request_outputs = self._process_mm_only_outputs(
+        mm_request_outputs, mm_reqs_to_abort = self._process_mm_only_outputs(
             mm_only_outputs,
             engine_core_timestamp=engine_core_timestamp,
             iteration_stats=iteration_stats,
         )
 
         # Delegate text/pooling outputs to upstream.
-        processed = super().process_outputs(
+        upstream_processed = super().process_outputs(
             upstream_outputs,
             engine_core_timestamp=engine_core_timestamp,
             iteration_stats=iteration_stats,
         )
-        processed.request_outputs.extend(mm_request_outputs)
-        return processed
+        return OutputProcessorOutput(
+            request_outputs=mm_request_outputs + upstream_processed.request_outputs,
+            reqs_to_abort=mm_reqs_to_abort + upstream_processed.reqs_to_abort,
+        )
 
     def _process_mm_only_outputs(
         self,
@@ -701,30 +711,32 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         *,
         engine_core_timestamp: float | None = None,
         iteration_stats: IterationStats | None = None,
-    ) -> list[OmniRequestOutput | PoolingRequestOutput]:
+    ) -> tuple[list[OmniRequestOutput | PoolingRequestOutput], list[str]]:
         """Handle outputs from generation stages that have no detokenizer.
 
         These cannot go through upstream process_outputs because it asserts
         detokenizer is not None when pooling_output is None.
         """
         request_outputs: list[OmniRequestOutput | PoolingRequestOutput] = []
+        reqs_to_abort: list[str] = []
         for eco in engine_core_outputs:
             req_state = self.request_states.get(eco.request_id)
             if req_state is None or not isinstance(req_state, OmniRequestState):
                 continue
 
-            new_token_ids = eco.new_token_ids
-            finish_reason = eco.finish_reason
-            stop_reason = eco.stop_reason
-            kv_transfer_params = eco.kv_transfer_params
-            ec_transfer_params = getattr(eco, "ec_transfer_params", None)
-            routed_experts = eco.routed_experts
             self._update_stats_from_output(
                 req_state,
                 eco,
                 engine_core_timestamp,
                 iteration_stats,
             )
+
+            new_token_ids = eco.new_token_ids
+            finish_reason = eco.finish_reason
+            stop_reason = eco.stop_reason
+            kv_transfer_params = eco.kv_transfer_params
+            ec_transfer_params = eco.ec_transfer_params
+            routed_experts = eco.routed_experts
             prefill_stats = getattr(eco, "prefill_stats", None)
             if prefill_stats is not None:
                 req_state.num_cached_tokens = prefill_stats.num_cached_tokens
@@ -753,12 +765,17 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             is_segment_finished = bool(getattr(eco, "is_segment_finished", False))
             if finish_reason is not None and not is_segment_finished and not is_non_final_audio_chunk:
                 self._finish_request(req_state)
+                if not getattr(eco, "finished", True):
+                    reqs_to_abort.append(eco.request_id)
                 self._update_stats_from_finished(
                     req_state,
                     finish_reason,
                     iteration_stats,
                 )
-        return request_outputs
+                if self.tracing_enabled:
+                    self.do_tracing(eco, req_state, iteration_stats)
+
+        return request_outputs, reqs_to_abort
 
     def _update_stats_from_output(
         self,

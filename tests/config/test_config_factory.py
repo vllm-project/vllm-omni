@@ -1317,6 +1317,9 @@ stages:
         assert deploy.async_chunk is True
         assert deploy.connectors is not None
         assert deploy.platforms is not None
+        connector = deploy.connectors["connector_of_shared_memory"]
+        assert "async_chunk_batch_min_size" not in connector["extra"]
+        assert "async_chunk_batch_max_wait_ms" not in connector["extra"]
 
     @pytest.mark.parametrize(
         ("hf_config", "model"),
@@ -2098,6 +2101,42 @@ class TestQwen3TTSPipeline:
         assert stages[0].yaml_engine_args["model_arch"] == "Qwen3TTSTalkerForConditionalGeneration"
         # Stage 1 uses its per-stage override
         assert stages[1].yaml_engine_args["model_arch"] == "Qwen3TTSCode2Wav"
+
+    def test_qwen3_tts_default_connector_uses_standard_polling(self):
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_tts.yaml"
+        if not deploy_path.exists():
+            pytest.skip("qwen3_tts deploy yaml not found")
+
+        deploy = load_deploy_config(deploy_path)
+        connector = deploy.connectors["connector_of_shared_memory"]
+        extra = connector["extra"]
+
+        assert extra["connector_get_sleep_s"] == 0.01
+        assert "code_predictor_prefix_graphs" not in extra
+
+    def test_qwen3_tts_default_deploy_does_not_seed_sampling(self):
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_tts.yaml"
+        if not deploy_path.exists():
+            pytest.skip("qwen3_tts deploy yaml not found")
+
+        deploy = load_deploy_config(deploy_path)
+
+        for stage in deploy.stages:
+            assert "seed" not in stage.default_sampling_params
+        assert "stop_token_ids" not in deploy.stages[0].default_sampling_params
+        assert "extra_args" not in deploy.stages[0].default_sampling_params
+
+    def test_qwen3_tts_default_deploy_disables_prefix_caching(self):
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_tts.yaml"
+        if not deploy_path.exists():
+            pytest.skip("qwen3_tts deploy yaml not found")
+
+        deploy = load_deploy_config(deploy_path)
+        pipeline = OMNI_PIPELINES["qwen3_tts"]
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert stages[0].yaml_engine_args["enable_prefix_caching"] is False
+        assert stages[1].yaml_engine_args["enable_prefix_caching"] is False
 
     def test_subtalker_sampling_params_deep_merge_preserves_base_keys(self):
         """Verify subtalker sampling params participate in stage deep-merge."""

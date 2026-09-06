@@ -16,7 +16,7 @@ import vllm.v1.engine as _vllm_engine_module
 import vllm.v1.engine.core_client as _vllm_core_client_module
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
-from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
+from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient, MPClient
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.distributed.omni_connectors.utils.config import (
@@ -227,6 +227,9 @@ class StageEngineCoreClientBase(StageClientBase):
         """
         if self.resources.engine_dead:
             raise EngineDeadError(f"Stage-{self.stage_id} engine core is dead")
+
+    def _apply_ready_response(self, payload: bytes) -> None:
+        MPClient._apply_ready_response(self, payload)
 
     # ==================== Overrides ====================
 

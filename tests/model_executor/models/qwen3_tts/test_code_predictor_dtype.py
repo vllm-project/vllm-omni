@@ -265,6 +265,27 @@ class TestCodePredictorDtypeAlignment:
 
         assert predictor._proj_buf.dtype == torch.float16
 
+    def test_warmup_completes_device_work_before_returning(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+    ) -> None:
+        _, _, code_predictor_wrapper, _, _ = loaded_target_classes
+        cp_config, talker_config = _make_tiny_config(loaded_target_classes)
+        vllm_config = _make_vllm_config(mocker, max_num_seqs=2)
+        predictor = code_predictor_wrapper(
+            vllm_config=vllm_config,
+            config=cp_config,
+            talker_config=talker_config,
+        )
+        predictor._model_dtype = next(predictor.model.parameters()).dtype
+        predictor._compiled_model_fwd = predictor.model.forward
+        synchronize_warmup = mocker.patch.object(predictor, "_synchronize_warmup")
+
+        predictor._warmup_buckets()
+
+        synchronize_warmup.assert_called_once_with(torch.device("cpu"))
+
     def test_setup_compile_caches_model_dtype(self, mocker: MockerFixture, loaded_target_classes) -> None:
         """_setup_compile should cache model parameter dtype."""
         _, _, code_predictor_wrapper, _, _ = loaded_target_classes
@@ -573,12 +594,12 @@ class TestCodePredictorWrapperConfig:
         wrapper._prefix_graph_seq_lens = {1, 2, 4, 8, 99}
         assert wrapper._prefix_seq_lens(6) == [2, 4]
 
-    def test_prefix_graph_env_requires_cuda_graphs(
+    def test_prefix_reprefill_does_not_require_nested_cuda_graphs(
         self,
         mocker: MockerFixture,
         loaded_target_classes,
     ) -> None:
-        """Avoid prefix warmup on shared code-predictor users that disable CUDA graphs."""
+        """Outer MRv2 graphs can capture prefix re-prefill without inner graphs."""
         _ = loaded_target_classes
         common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
         mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
@@ -598,6 +619,7 @@ class TestCodePredictorWrapperConfig:
             cp_config=cp_config,
             wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=False),
         )
+        assert no_graph_wrapper._prefix_reprefill_enabled is True
         assert no_graph_wrapper._prefix_graphs_enabled is False
         assert no_graph_wrapper._prefix_graph_buckets == {2}
         assert no_graph_wrapper._prefix_graph_seq_lens == {2, 3}
@@ -607,7 +629,188 @@ class TestCodePredictorWrapperConfig:
             cp_config=cp_config,
             wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=True),
         )
+        assert graph_wrapper._prefix_reprefill_enabled is True
         assert graph_wrapper._prefix_graphs_enabled is True
+
+    def test_prefix_reprefill_uses_configured_batch_buckets(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+    ) -> None:
+        """Outer MRv2 graph buckets must also bound predictor padding."""
+        _ = loaded_target_classes
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
+
+        cp_config, _ = _make_tiny_config(loaded_target_classes)
+        vllm_config = _make_vllm_config(mocker, max_num_seqs=4)
+        vllm_config.model_config.stage_connector_config = {
+            "extra": {
+                "code_predictor_prefix_graphs": True,
+                "code_predictor_prefix_graph_buckets": [3, 4],
+                "code_predictor_prefix_graph_seq_lens": [2, 3],
+            }
+        }
+        wrapper = common_mod.CodePredictorWrapper(
+            vllm_config=vllm_config,
+            cp_config=cp_config,
+            wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=False),
+            talker_hidden_size=cp_config.hidden_size,
+        )
+        wrapper._model_dtype = next(wrapper.model.parameters()).dtype
+        wrapper._compiled_model_fwd = wrapper.model.forward
+
+        wrapper._warmup_buckets()
+
+        assert wrapper._bucket_sizes == [1, 2, 3, 4]
+        assert wrapper._padded_bsz(3) == 3
+        assert (3, 2) in wrapper._bucket_pos_ids
+
+    def test_non_power_of_two_prefix_bucket_uses_static_compile_cache(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+    ) -> None:
+        """Exact buckets keep static kernels without hitting Dynamo's cache limit."""
+        _ = loaded_target_classes
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
+        mocker.patch.object(common_mod.current_omni_platform, "supports_torch_inductor", return_value=True)
+        compile_mock = mocker.patch.object(torch, "compile", side_effect=lambda fn, **_kwargs: fn)
+
+        cp_config, _ = _make_tiny_config(loaded_target_classes)
+        vllm_config = _make_vllm_config(mocker, max_num_seqs=4)
+        vllm_config.model_config.stage_connector_config = {
+            "extra": {
+                "code_predictor_prefix_graphs": True,
+                "code_predictor_prefix_graph_buckets": [3, 4],
+                "code_predictor_prefix_graph_seq_lens": [2, 3],
+            }
+        }
+        wrapper = common_mod.CodePredictorWrapper(
+            vllm_config=vllm_config,
+            cp_config=cp_config,
+            wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=False),
+            talker_hidden_size=cp_config.hidden_size,
+        )
+        observed_cache_limits: list[int] = []
+        mocker.patch.object(
+            wrapper,
+            "_warmup_buckets",
+            side_effect=lambda: observed_cache_limits.append(torch._dynamo.config.cache_size_limit),
+        )
+
+        with torch._dynamo.config.patch(cache_size_limit=2):
+            wrapper._setup_compile()
+            assert torch._dynamo.config.cache_size_limit == 2
+
+        assert compile_mock.call_args.kwargs["dynamic"] is False
+        assert wrapper._compile_cache_size_limit() == 8
+        assert observed_cache_limits == [8]
+
+    def test_prefix_reprefill_uses_configured_sequence_lengths_without_inner_graphs(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+    ) -> None:
+        _ = loaded_target_classes
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
+
+        cp_config, _ = _make_tiny_config(loaded_target_classes)
+        vllm_config = _make_vllm_config(mocker, max_num_seqs=2)
+        vllm_config.model_config.stage_connector_config = {
+            "extra": {
+                "code_predictor_prefix_graphs": True,
+                "code_predictor_prefix_graph_buckets": [2],
+                "code_predictor_prefix_graph_seq_lens": [2, 3],
+            }
+        }
+        wrapper = common_mod.CodePredictorWrapper(
+            vllm_config=vllm_config,
+            cp_config=cp_config,
+            wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=False),
+            talker_hidden_size=cp_config.hidden_size,
+        )
+        wrapper._model_dtype = torch.float32
+        wrapper._bucket_sizes = [2]
+        wrapper._bucket_pos_ids = {
+            2: torch.arange(5).unsqueeze(0).expand(2, -1),
+            (2, 2): torch.arange(2).unsqueeze(0).expand(2, -1),
+            (2, 3): torch.arange(3).unsqueeze(0).expand(2, -1),
+        }
+        wrapper._lm_heads_list = list(wrapper.lm_head)
+        wrapper._codec_embeds_list = list(wrapper.model.codec_embedding)
+        wrapper._ensure_buffers(torch.device("cpu"), torch.float32, 2)
+        observed_seq_lens: list[int] = []
+
+        def compiled_forward(hidden_states: torch.Tensor, _positions: torch.Tensor) -> torch.Tensor:
+            observed_seq_lens.append(hidden_states.shape[1])
+            return torch.zeros_like(hidden_states)
+
+        wrapper._compiled_model_fwd = compiled_forward
+        wrapper._setup_compile = lambda: None
+
+        wrapper(
+            layer0_code=torch.tensor([1, 2]),
+            layer0_embed=torch.zeros(2, cp_config.hidden_size),
+            last_talker_hidden=torch.zeros(2, 1, cp_config.hidden_size),
+            do_sample=False,
+        )
+
+        assert observed_seq_lens == [2, 3, 5]
+
+    def test_prefix_reprefill_pads_to_next_configured_sequence_length(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+    ) -> None:
+        """Sparse prefix buckets should avoid falling straight back to max_seq."""
+        _ = loaded_target_classes
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
+
+        cp_config, _ = _make_tiny_config(loaded_target_classes)
+        vllm_config = _make_vllm_config(mocker, max_num_seqs=2)
+        vllm_config.model_config.stage_connector_config = {
+            "extra": {
+                "code_predictor_prefix_graphs": True,
+                "code_predictor_prefix_graph_buckets": [2],
+                "code_predictor_prefix_graph_seq_lens": [3],
+            }
+        }
+        wrapper = common_mod.CodePredictorWrapper(
+            vllm_config=vllm_config,
+            cp_config=cp_config,
+            wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=False),
+            talker_hidden_size=cp_config.hidden_size,
+        )
+        wrapper._model_dtype = torch.float32
+        wrapper._bucket_sizes = [2]
+        wrapper._bucket_pos_ids = {
+            2: torch.arange(5).unsqueeze(0).expand(2, -1),
+            (2, 3): torch.arange(3).unsqueeze(0).expand(2, -1),
+        }
+        wrapper._lm_heads_list = list(wrapper.lm_head)
+        wrapper._codec_embeds_list = list(wrapper.model.codec_embedding)
+        wrapper._ensure_buffers(torch.device("cpu"), torch.float32, 2)
+        observed_seq_lens: list[int] = []
+
+        def compiled_forward(hidden_states: torch.Tensor, _positions: torch.Tensor) -> torch.Tensor:
+            observed_seq_lens.append(hidden_states.shape[1])
+            return torch.zeros_like(hidden_states)
+
+        wrapper._compiled_model_fwd = compiled_forward
+        wrapper._setup_compile = lambda: None
+
+        wrapper(
+            layer0_code=torch.tensor([1, 2]),
+            layer0_embed=torch.zeros(2, cp_config.hidden_size),
+            last_talker_hidden=torch.zeros(2, 1, cp_config.hidden_size),
+            do_sample=False,
+        )
+
+        assert observed_seq_lens == [3, 3, 5]
 
 
 class TestGumbelMaxSampling:

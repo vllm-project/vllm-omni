@@ -1120,20 +1120,21 @@ class Orchestrator:
                     float(kv_wait_s),
                 )
             req_state = self.request_states.get(getattr(eco, "request_id", None))
-            if req_state is None or not req_state.streaming.enabled:
+            if req_state is None:
                 continue
-            segment_finished = bool(getattr(eco, "is_segment_finished", False))
-            raw_mm = self._completion_multimodal_output(eco, None)
-            req_state.streaming.segments[stage_id] = StreamingSegmentState(
-                finished=segment_finished,
-                token_ids=(self._coerce_int_list(getattr(eco, "new_token_ids", None)) if segment_finished else []),
-                output_metadata=(dict(raw_mm) if segment_finished and isinstance(raw_mm, dict) else {}),
-            )
-            req_state.streaming.new_prompt_len_snapshot = getattr(
-                eco,
-                "new_prompt_len_snapshot",
-                None,
-            )
+            if req_state.streaming.enabled:
+                segment_finished = bool(getattr(eco, "is_segment_finished", False))
+                raw_mm = self._completion_multimodal_output(eco, None)
+                req_state.streaming.segments[stage_id] = StreamingSegmentState(
+                    finished=segment_finished,
+                    token_ids=(self._coerce_int_list(getattr(eco, "new_token_ids", None)) if segment_finished else []),
+                    output_metadata=(dict(raw_mm) if segment_finished and isinstance(raw_mm, dict) else {}),
+                )
+                req_state.streaming.new_prompt_len_snapshot = getattr(
+                    eco,
+                    "new_prompt_len_snapshot",
+                    None,
+                )
             if await self._apply_raw_terminal_stage_finish(stage_id, eco, req_state):
                 raw_terminal_request_ids.add(req_state.request_id)
         iteration_stats = IterationStats() if (self._stat_logger is not None and raw_outputs.outputs) else None
@@ -1855,9 +1856,9 @@ class Orchestrator:
         ``is_segment_finished=False``, but vLLM's output processor may remove the
         request state before that EngineCoreOutput is processed.
 
-        Only update ``finished_final_output_stage_ids`` here. Request cleanup stays
-        in ``_route_output`` so downstream async-chunk stages can still deliver
-        outputs after stage-0 session end.
+        Only update ``finished_final_output_stage_ids`` here. Completion is
+        resolved after this raw batch passes through the output processor, so a
+        real processed output wins over the swallowed-terminal fallback.
         """
         if getattr(eco, "finish_reason", None) is None:
             return False
@@ -1876,7 +1877,7 @@ class Orchestrator:
         replica_id: int,
         request_ids: set[str],
     ) -> None:
-        """Finish streaming requests whose raw terminal had no processed output."""
+        """Finish requests whose raw terminal had no processed output."""
         pool = self.stage_pools[stage_id]
         if not pool.final_output:
             return
@@ -1885,7 +1886,6 @@ class Orchestrator:
             req_state = self.request_states.get(request_id)
             if req_state is None or self._is_duplex_session_request(req_state):
                 continue
-
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
             if not final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids):
                 continue

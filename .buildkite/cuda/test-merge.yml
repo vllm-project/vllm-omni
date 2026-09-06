@@ -129,6 +129,29 @@ steps:
               -- -m 'advanced_model and cuda' --run-level 'advanced_model'
         mirror_hardwares: l4_1
 
+      - label: "TTS · Qwen3-TTS MRv2 Test"
+        source_file_dependencies:
+          - tests/examples/offline_inference/test_qwen3_tts_mr_v2.py
+          - examples/offline_inference/text_to_speech/qwen3_tts/
+          - vllm_omni/config/
+          - vllm_omni/core/sched/
+          - vllm_omni/engine/
+          - vllm_omni/outputs/
+          - vllm_omni/worker/omni_connector_model_runner_mixin.py
+          - vllm_omni/worker/gpu_generation_worker.py
+          - vllm_omni/worker_v2/
+          - vllm_omni/model_executor/models/qwen3_tts/
+          - vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
+          - vllm_omni/deploy/qwen3_tts.yaml
+          - vllm_omni/deploy/qwen3_tts_mrv2.yaml
+        timeout_in_minutes: 60
+        commands:
+          - |
+            export VLLM_LOGGING_LEVEL=DEBUG
+            export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+            pytest -s -v tests/examples/offline_inference/test_qwen3_tts_mr_v2.py -m 'advanced_model and cuda and H100' --run-level 'advanced_model'
+        mirror_hardwares: h100_1
+
       - label: "Omni · Qwen3-Omni Test"
         source_file_dependencies:
           - tests/e2e/offline_inference/test_qwen3_omni.py

@@ -54,7 +54,9 @@ connectors:
       # decode_cudagraph_capture_sizes. Keep B>1
       # captures opt-in; c64 e2e validation did not show a stable win.
       decode_cudagraph_batch_sizes: [1]
+      decode_compile_shapes: []
       decode_batch_max_size: 1
+      decode_batch_bucket_frames: []
       decode_enable_tf32: false
 
 stages:
