@@ -313,6 +313,16 @@ One process per exact identity owns a build; other workers wait and then acquire
 leases for the published artifact. Publication is invisible until all payloads
 and metadata are validated, hashed, fsynced, and atomically renamed.
 
+By default, different identities may build concurrently. A domain configured
+with `CapacityPolicy(build_admission="serialized", max_store_bytes=...)` admits
+only one producer/publication operation at a time. Warm hits remain concurrent,
+and admission uses the existing coordination deadline. All workers must agree
+on the serialized domain's schema-2 capacity policy; use a new root when opting
+in, since in-place migration of an active domain is unsupported. This prevents
+competing producers from racing allocation checks but does not provide a
+filesystem-wide byte quota or automatic stale-data reclamation. See the
+[module capacity contract](../module/host_weight_runtime.md#validation-and-capacity).
+
 `coordination_timeout_seconds` bounds domain-initialization and lookup/build
 lock acquisition. Store construction and each later resolution or publication
 operation have separate budgets from the same wait policy, rather than one

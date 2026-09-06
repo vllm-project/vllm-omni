@@ -629,7 +629,7 @@ class FilesystemHostWeightStore:
                 self.policy_version = 1
 
     def _capacity_document(self, *, policy_version: int) -> dict[str, object]:
-        return {
+        document: dict[str, object] = {
             "schema_version": 1,
             "policy_version": policy_version,
             "max_artifact_bytes": self.capacity_policy.max_artifact_bytes,
@@ -637,6 +637,9 @@ class FilesystemHostWeightStore:
             "min_free_bytes": self.capacity_policy.min_free_bytes,
             "eviction": self.capacity_policy.eviction,
         }
+        if self.capacity_policy.build_admission == "serialized":
+            document.update(schema_version=2, build_admission="serialized")
+        return document
 
     def _build_lock_path(self, key: str) -> Path:
         return self.locks_dir / f"{key}.build.lock"
@@ -1015,6 +1018,40 @@ class FilesystemHostWeightStore:
         if initial.status in {StoreStatus.TIMEOUT, StoreStatus.FAILED}:
             return initial
 
+        if self.capacity_policy.build_admission == "concurrent":
+            return self._build_after_miss(identity, producer, validation=validation, deadline=deadline)
+        try:
+            admission = FileLock(self.locks_dir / "domain-build.lock", exclusive=True, deadline=deadline)
+        except FileLockTimeoutError as exc:
+            return StoreResult(
+                StoreStatus.TIMEOUT,
+                failure=_failure(
+                    ResolutionStage.PRODUCTION, FailureCode.ACTIVE_BUILD_TIMEOUT, str(exc), retryable=True
+                ),
+            )
+        except OSError as exc:
+            return StoreResult(
+                StoreStatus.FAILED,
+                failure=_failure(ResolutionStage.DOMAIN, FailureCode.DOMAIN_UNAVAILABLE, str(exc), retryable=True),
+            )
+        try:
+            return self._build_after_miss(identity, producer, validation=validation, deadline=deadline)
+        finally:
+            try:
+                admission.close()
+            except OSError:
+                # Releasing coordination must not revise the completed build's
+                # publication outcome or replace its primary failure.
+                logger.warning("Failed to release domain build admission under %s", self.root, exc_info=True)
+
+    def _build_after_miss(
+        self,
+        identity: WeightArtifactIdentity,
+        producer: WeightProducer,
+        *,
+        validation: ValidationLevel,
+        deadline: float,
+    ) -> StoreResult:
         try:
             build_lock = FileLock(self._build_lock_path(identity.key), exclusive=True, deadline=deadline)
         except FileLockTimeoutError as exc:
