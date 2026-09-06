@@ -50,6 +50,11 @@ steps:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_ready.json -m 'core_model and npu and A3 and omni'
 
+      - label: ":test_tube: NPU · MXFP8 Routed Experts Test"
+        mirror_hardwares: a3_npu_2
+        commands:
+          - pytest -s -v tests/platforms/npu/test_mxfp8_routed_experts.py -m 'core_model and npu' --run-level 'core_model'
+
   - group: ":card_index_dividers: TTS Model Test"
     key: ready-tts-group
     depends_on: upload-ready-pipeline
