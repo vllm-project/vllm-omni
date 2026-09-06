@@ -1,8 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from typing import Any
 
 from vllm_omni.diffusion.cache.base import CacheBackend
 from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend
 from vllm_omni.diffusion.cache.magcache import MagCacheBackend
+from vllm_omni.diffusion.cache.seacache import SeaCacheBackend
 from vllm_omni.diffusion.cache.stepcache import StepCacheBackend
 from vllm_omni.diffusion.cache.teacache import TeaCacheBackend
 from vllm_omni.diffusion.data import DiffusionCacheConfig
@@ -16,10 +20,11 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
     - tea_cache: Uses TeaCacheBackend with enable()/refresh() interface
     - mag_cache: Uses MagCacheBackend with enable()/refresh() interface
     - step_cache: Uses StepCacheBackend for DreamZero velocity step skip
+    - sea_cache: Uses SeaCacheBackend with enable()/refresh() interface
 
     Args:
         cache_backend: Cache backend name ("cache_dit", "tea_cache",
-            "mag_cache", "step_cache", or None).
+            "mag_cache", "step_cache", "sea_cache", or None).
         cache_config: Cache configuration (dict or DiffusionCacheConfig instance).
 
     Returns:
@@ -40,10 +45,12 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
         return TeaCacheBackend(cache_config)
     elif cache_backend == "mag_cache":
         return MagCacheBackend(cache_config)
+    elif cache_backend in ("sea_cache", "seacache"):
+        return SeaCacheBackend(cache_config)
     elif cache_backend in ("step_cache", "stepcache", "step_cache_dit"):
         return StepCacheBackend(cache_config)
     else:
         raise ValueError(
             f"Unsupported cache backend: {cache_backend}. "
-            "Supported: 'cache_dit', 'tea_cache', 'mag_cache', 'step_cache'"
+            "Supported: 'cache_dit', 'tea_cache', 'mag_cache', 'step_cache', 'sea_cache'"
         )
