@@ -26,7 +26,9 @@ NORM_EPS = 1e-5
 def _init_distributed(request):
     """Initialize the minimal single-rank distributed environment required by
     the vLLM parallel linear layers (tensor-parallel group must exist)."""
-    if request.node.name.startswith("test_real_rotary_"):
+    if request.node.name.startswith(
+        ("test_real_rotary_", "test_packed_rope_table", "test_fused_qk_norm_rope", "test_fallback_with_no")
+    ):
         yield
         return
 
@@ -600,3 +602,131 @@ def test_transformer_forward_ti2i_shape():
 
     assert out.shape == (batch_size, model.out_channels, latent_h, latent_w)
     assert torch.isfinite(out).all()
+
+
+# ---------------------------------------------------------------------------
+# The three tests below are for the fused qk-norm+RoPE kernel's wiring into
+# this transformer: the packed-table layout conversion, the fused path against
+# the previous eager chain, and the fallback when no packed table is present.
+# They need CUDA (the module-level marks are CPU; these add the cuda mark and
+# skip on CPU-only runners) and real Boogu geometry rather than the mock dims
+# above.
+# ---------------------------------------------------------------------------
+
+_FUSED_HEAD_DIM = 120
+_FUSED_Q_HEADS = 28
+_FUSED_KV_HEADS = 7
+_FUSED_EPS = 1e-5
+
+
+def _fused_rotary_pair(tokens: int):
+    theta = torch.randn(1, tokens, _FUSED_HEAD_DIM // 2, device="cuda", dtype=torch.float32)
+    return (
+        torch.cos(theta).repeat_interleave(2, dim=-1),
+        torch.sin(theta).repeat_interleave(2, dim=-1),
+    )
+
+
+def _fused_norms():
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.layernorm import RMSNorm
+
+    with set_current_vllm_config(VllmConfig()):
+        norm_q = RMSNorm(_FUSED_HEAD_DIM, eps=_FUSED_EPS).cuda().to(torch.bfloat16)
+        norm_k = RMSNorm(_FUSED_HEAD_DIM, eps=_FUSED_EPS).cuda().to(torch.bfloat16)
+    with torch.no_grad():
+        norm_q.weight.copy_(torch.randn(_FUSED_HEAD_DIM))
+        norm_k.weight.copy_(torch.randn(_FUSED_HEAD_DIM))
+    return norm_q, norm_k
+
+
+def _operand_ulp_bound(x, weight, cos, sin):
+    """One bf16 rounding of a normalized operand, propagated through RoPE."""
+    import torch.nn.functional as F
+
+    n = F.rms_norm(x, (_FUSED_HEAD_DIM,), weight, _FUSED_EPS).float().abs()
+    c = cos[..., ::2].float().abs().unsqueeze(2)
+    s = sin[..., ::2].float().abs().unsqueeze(2)
+    even_mag = n[..., ::2] * c + n[..., 1::2] * s
+    odd_mag = n[..., ::2] * s + n[..., 1::2] * c
+    return 2.0**-6 * torch.stack((even_mag, odd_mag), dim=-1).flatten(-2) + 1e-6
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_packed_rope_table_layout():
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        _with_packed_rope_table,
+    )
+
+    torch.manual_seed(0)
+    tokens = 2311  # above _FUSED_MIN_TOKENS
+    cos, sin = _fused_rotary_pair(tokens)
+    out = _with_packed_rope_table((cos, sin))
+    assert len(out) == 3
+    assert out[0] is cos and out[1] is sin
+    packed = out[2]
+    assert packed.shape == (tokens, _FUSED_HEAD_DIM)
+    assert packed.dtype == torch.float32 and packed.is_contiguous()
+    half = _FUSED_HEAD_DIM // 2
+    assert torch.equal(packed[:, :half], cos[0, :, ::2])
+    assert torch.equal(packed[:, half:], sin[0, :, ::2])
+    # Below _FUSED_MIN_TOKENS the tuple passes through unchanged (host-bound
+    # regime: the fused path would cost more than it saves).
+    short = _with_packed_rope_table(_fused_rotary_pair(17))
+    assert len(short) == 2
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_fused_qk_norm_rope_matches_eager_chain():
+    """The fused path vs the previous eager chain at real Boogu shapes.
+
+    Every element must sit within one bf16 ulp of a normalized operand
+    propagated through the rotation (the two paths legitimately differ by
+    single- vs double-rounding of the norm's weight multiply).
+    """
+    from vllm.triton_utils import HAS_TRITON
+
+    if not HAS_TRITON:
+        pytest.skip("Triton required")
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        _qk_norm_rope,
+        _with_packed_rope_table,
+    )
+
+    torch.manual_seed(0)
+    norm_q, norm_k = _fused_norms()
+    q = torch.randn(1, 4139, _FUSED_Q_HEADS, _FUSED_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 4139, _FUSED_KV_HEADS, _FUSED_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    cos, sin = _fused_rotary_pair(4139)
+    with_table = _with_packed_rope_table((cos, sin))
+
+    fused = _qk_norm_rope(q, k, norm_q, norm_k, with_table, torch.bfloat16)
+    eager = _qk_norm_rope(q, k, norm_q, norm_k, (cos, sin), torch.bfloat16)
+    for fused_t, eager_t, x, w in zip(fused, eager, (q, k), (norm_q.weight, norm_k.weight)):
+        bound = _operand_ulp_bound(x, w, cos, sin)
+        diff = (fused_t.float() - eager_t.float()).abs()
+        assert (diff <= bound).all(), "fused path beyond one operand ulp of the eager chain"
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_fallback_with_no_packed_table():
+    """Without a packed table the helper is bit-exact to the old chain."""
+    from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
+        _qk_norm_rope,
+        apply_rotary_emb,
+    )
+
+    torch.manual_seed(0)
+    norm_q, norm_k = _fused_norms()
+    q = torch.randn(1, 64, _FUSED_Q_HEADS, _FUSED_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 64, _FUSED_KV_HEADS, _FUSED_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    cos, sin = _fused_rotary_pair(64)
+
+    out_q, out_k = _qk_norm_rope(q, k, norm_q, norm_k, (cos, sin), torch.bfloat16)
+    ref_q = apply_rotary_emb(norm_q(q), (cos, sin)).to(torch.bfloat16)
+    ref_k = apply_rotary_emb(norm_k(k), (cos, sin)).to(torch.bfloat16)
+    assert torch.equal(out_q, ref_q)
+    assert torch.equal(out_k, ref_k)
