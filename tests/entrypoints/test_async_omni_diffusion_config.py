@@ -507,6 +507,8 @@ def test_serve_cli_forwards_hwr_policy_for_no_allgather_dlo():
             "preferred",
             "--host-weight-runtime-root",
             "/var/cache/vllm-omni/hwr",
+            "--dlo-host-registration-mode",
+            "disabled",
             "--dlo-host-registration-limit-gib",
             "80",
         ]
@@ -522,6 +524,8 @@ def test_serve_cli_forwards_hwr_policy_for_no_allgather_dlo():
     assert engine_args["host_weight_runtime_mode"] == "preferred"
     assert engine_args["host_weight_runtime_root"] == "/var/cache/vllm-omni/hwr"
     assert engine_args["dlo_host_registration_limit_gib"] == 80
+    assert explicit_kwargs["dlo_host_registration_mode"] == "disabled"
+    assert engine_args["dlo_host_registration_mode"] == "disabled"
 
 
 def test_serve_cli_accepts_diffusion_compile_controls():
