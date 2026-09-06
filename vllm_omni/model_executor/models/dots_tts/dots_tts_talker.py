@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """dots.tts talker — vLLM-native AR base LM + audio side path.
 
 Mirrors upstream rednote-hilab/dots.tts (pinned @ a393d2e):
@@ -948,7 +948,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
         Manual Euler loop (upstream uses torchdyn.odeint; we manualize to
         avoid the dep and keep control flow explicit).  Each step:
           1. z_proj = _coordinate_proj(z), placed into the last
-             _LATENT_PATCH_SIZE positions of input_sequence / cfg_sequence.
+             _LATENT_PATCH_SIZE positions of the batched CFG workspace.
           2. Batch [conditional, unconditional] → DiT velocity field.
           3. CFG blend: v_c + guidance_scale * (v_c - v_u).
           4. Euler: z += v * dt.
@@ -963,11 +963,10 @@ class DotsTTSForConditionalGeneration(nn.Module):
         dtype = state.fm_sequence.dtype
         total_len = state.fm_seq_len + _LATENT_PATCH_SIZE
 
-        # Workspace: committed history + 4 noise slots (overwritten per step).
-        input_sequence = torch.zeros((1, total_len, _FM_HIDDEN), device=device, dtype=dtype)
-        input_sequence[:, : state.fm_seq_len] = state.fm_sequence[:, : state.fm_seq_len]
-        cfg_sequence = torch.zeros((1, total_len, _FM_HIDDEN), device=device, dtype=dtype)
-        cfg_sequence[:, : state.fm_seq_len] = state.fm_cfg_sequence[:, : state.fm_seq_len]
+        # Workspace: committed histories + 4 noise slots (overwritten per step).
+        z_batched = torch.zeros((2, total_len, _FM_HIDDEN), device=device, dtype=dtype)
+        z_batched[0:1, : state.fm_seq_len] = state.fm_sequence[:, : state.fm_seq_len]
+        z_batched[1:2, : state.fm_seq_len] = state.fm_cfg_sequence[:, : state.fm_seq_len]
 
         attn_mask = self._build_fm_attn_mask(state, total_len, device)
         pos_ids = self._build_fm_pos_ids(state, total_len, device)
@@ -1016,11 +1015,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
             for step in range(num_steps):
                 t = times[step].reshape(1)
                 z_proj = self._coordinate_proj(z)
-                z_c = input_sequence.clone()
-                z_c[:, latent_start:] = z_proj
-                z_u = cfg_sequence.clone()
-                z_u[:, latent_start:] = z_proj
-                z_batched = torch.cat([z_c, z_u], dim=0)
+                z_batched[:, latent_start:] = z_proj
                 t_batched = t.repeat(2)
                 vt = self._head(
                     x=z_batched,
