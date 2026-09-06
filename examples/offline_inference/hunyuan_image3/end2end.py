@@ -233,11 +233,12 @@ def main():
         ar_image_size = f"{args.width}x{args.height}"
     else:
         ar_image_size = None
-    ar_stop_token_ids = resolve_stop_token_ids(
+    autoregressive_stop_token_ids = resolve_stop_token_ids(
         task=task, bot_task=bot_task, tokenizer=tokenizer, image_size=ar_image_size
     )
     print(
-        f"[AR Config] task={task}, bot_task={bot_task}, image_size={ar_image_size}, stop_token_ids={ar_stop_token_ids}"
+        f"[AR Config] task={task}, bot_task={bot_task}, "
+        f"image_size={ar_image_size}, stop_token_ids={autoregressive_stop_token_ids}"
     )
     for sp in params_list:
         if isinstance(sp, OmniDiffusionSamplingParams):
@@ -250,7 +251,7 @@ def main():
                 sp.height = args.height
                 sp.width = args.width
         elif hasattr(sp, "stop_token_ids"):
-            sp.stop_token_ids = ar_stop_token_ids
+            sp.stop_token_ids = autoregressive_stop_token_ids
             # When --stream is set, request DELTA output from the AR stage
             # so we can display CoT text token-by-token in real time.
             if args.stream and hasattr(sp, "output_kind"):

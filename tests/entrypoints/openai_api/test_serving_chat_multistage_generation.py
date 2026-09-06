@@ -439,7 +439,7 @@ def test_build_multistage_generation_inputs_custom_system_prompt(serving_chat):
     )
 
 
-def test_build_multistage_generation_inputs_sets_ar_stop_token_ids_with_explicit_size(serving_chat):
+def test_build_multistage_generation_inputs_sets_autoregressive_stop_token_ids_with_explicit_size(serving_chat):
     """When height+width are provided with bot_task, the AR (llm) stage
     must receive stop_token_ids from resolve_stop_token_ids so AR stops
     at the correct terminator instead of generating until max_tokens.
@@ -504,7 +504,7 @@ def test_build_multistage_generation_inputs_no_stop_token_ids_without_size(servi
     This still assigns stop_token_ids, but the set is the ratio range,
     not the terminator.
 
-    Without bot_task at all, ar_stop_token_ids stays None and
+    Without bot_task at all, autoregressive_stop_token_ids stays None and
     stop_token_ids is not set on any stage.
     """
     from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
@@ -521,7 +521,7 @@ def test_build_multistage_generation_inputs_no_stop_token_ids_without_size(servi
     )
     images = [Image.new("RGB", (32, 32), color="red")]
 
-    # No height/width, no bot_task -> ar_stop_token_ids=None ->
+    # No height/width, no bot_task -> autoregressive_stop_token_ids=None ->
     # stop_token_ids not set on any stage.
     _, sampling_params_list = OmniOpenAIServingChat._build_multistage_generation_inputs(
         serving_chat,
