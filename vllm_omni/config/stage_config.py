@@ -472,6 +472,9 @@ class StageDeployConfig:
     # Runtime optimizations used by diffusion loading/execution.
     enable_multithread_weight_load: bool | None = None
     num_weight_load_threads: int | None = None
+    diffusion_offload_config: dict[str, Any] | None = None
+    # Compatibility aliases for existing callers and model-specific stage
+    # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool | None = None
     enable_layerwise_offload: bool | None = None
 
@@ -506,6 +509,11 @@ class DuplexSessionRuntimeConfig:
     max_pending_turns_per_session: int = 4
     max_sessions: int = 1
     completed_append_cache_size: int = 256
+    # Startup warmup: run this many silent 80 ms-style frames through a
+    # throwaway realtime session before real clients are admitted, so
+    # one-time costs (kernel JIT, first prefill/decode paths, codec caches)
+    # never land on the first user. 0 disables the warmup.
+    warmup_frames: int = 0
 
     def __post_init__(self) -> None:
         positive = {

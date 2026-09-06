@@ -2,7 +2,7 @@
 
 ## Multiple API frontends
 
-For local multi-stage EngineCore deployments, `--api-server-count` starts
+For local EngineCore pipelines with one or more stages, `--api-server-count` starts
 multiple API frontend processes that share one parent-owned set of stage
 engines:
 
@@ -24,6 +24,43 @@ built-in voices, inline reference audio, and voices restored at startup remain
 available. The `/v1/omni/sleep` and `/v1/omni/wakeup` control routes return HTTP
 409 for the same reason: their bookkeeping is process-local while stage engines
 are shared.
+
+A single-stage model pipeline is supported through the normal launch command;
+this is distinct from the distributed `--stage-id` / `--headless` launch mode.
+Every stage in the pipeline must be an EngineCore stage. Mixed AR-to-DiT
+pipelines, including MiniMax-H3, remain unsupported even when their first
+stage is an EngineCore stage. Diffusion support requires per-frontend channels
+and shared-engine lifecycle handling in the diffusion backend.
+
+### Workloads and performance validation
+
+Each API process owns its frontend processor, Orchestrator, request state,
+and per-replica EngineCore channels. Requests return through the channel of
+the originating API process; model weights and GPU stage engines are shared.
+This distributes frontend and orchestration work across CPU processes.
+
+| Workload | Potential benefit | Limitation |
+| ---------- | ------------------- | ------------ |
+| Concurrent cold image/video inputs on supported EngineCore pipelines | Parallel frontend processing when one API process is CPU-limited | A single cold request and GPU computation may be unchanged |
+| Many replicas producing frequent text/audio outputs | Less API/Orchestrator work and GIL contention per process | Routing remains serial within each Orchestrator |
+| Warm inputs or low-concurrency, GPU-limited generation | Additional frontend capacity | More API processes may add overhead without improving throughput |
+
+Here, a cold input means media or preprocessing caches miss, not that model
+weights must be loaded or GPU kernels compiled. Each frontend has its own
+processor/cache state, so cache duplication, CPU thread contention, and memory
+usage also matter. Multi-API serving does not itself change the output queue,
+move response encoding to an executor, or change the model's numerical scheduler.
+
+Compare `--api-server-count 1`, `2`, and higher counts with the same hardware,
+model/stage configuration, media, sampling parameters, output lengths, and
+offered load. Keep cold-cache and warmed-cache runs separate and report repeated
+measurements. Record CPU and request counts for every API worker, input and
+output queue delay, GPU utilization, first-output latency, and end-to-end latency.
+Confirm requests reach every worker: connection reuse can concentrate traffic
+on one process. Queue-only or single-API experiments do not establish a
+multi-API throughput gain. The multi-replica workload in
+[#4680](https://github.com/vllm-project/vllm-omni/issues/4680) remains a relevant
+validation target.
 
 ## Stage-based CLI quickstart
 

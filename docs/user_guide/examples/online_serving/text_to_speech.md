@@ -382,7 +382,7 @@ The bundled `qwen3_tts.yaml` ships stage 1 (Code2Wav) at `max_num_seqs: 10`, tun
 CustomVoice / VoiceDesign have much shorter stage-1 lifetimes (~50–200 ms) and are TTFA-optimal at `max_num_seqs: 1`. Override the default when serving those task types:
 
 ```bash
-vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni \
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni \
     --stage-overrides '{"1": {"max_num_seqs": 1}}'
 ```
 
@@ -393,7 +393,7 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni \
 python qwen3_tts/openai_speech_client.py \
     --model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --text "今天天气真好" \
-    --voice ryan \
+    --speaker ryan \
     --instructions "用开心的语气说"
 
 # VoiceDesign with a style description
@@ -429,14 +429,20 @@ curl -X POST http://localhost:8091/v1/audio/voices \
     -F "speaker_description=warm narrator"
 ```
 
-Uploaded voices are then usable as `voice="custom_voice_1"` on subsequent requests.
+For Qwen3-TTS, uploaded voices are Base voice-cloning inputs and require a Base
+checkpoint. When a request names an uploaded voice, the server infers
+`task_type="Base"`. Built-in presets such as `vivian` and `ryan` remain
+CustomVoice speakers and require a CustomVoice checkpoint.
+
 The runtime upload and delete routes require a single API frontend; with
 `--api-server-count > 1`, use inline `ref_audio` or restore precomputed voices
 from `custom_voice_dir` at startup.
 
 ### Precomputed custom voices
 
-For reused Base voice-cloning speakers, precompute the reference artifacts once and load them at server startup:
+For reused Base voice-cloning speakers, precompute the reference artifacts once
+and load them at server startup. Precomputed voices use the same Base task and
+checkpoint-matching rules as uploaded voices:
 
 ```bash
 python qwen3_tts/precompute_custom_voice.py \

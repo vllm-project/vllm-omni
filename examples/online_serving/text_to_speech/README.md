@@ -24,6 +24,7 @@ For the full list of supported architectures across all modalities, see
 | OmniVoice | `k2-fsa/OmniVoice` | ✓ | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
+| dots.tts | `dots-studio/dots.tts-soar` | — (text-only) | ✓ (PCM stream) | — (default placeholder only) | — |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
 
 CosyVoice3 is intentionally absent: no online example exists for it yet. See its [offline section](../../offline_inference/text_to_speech/README.md#cosyvoice3) instead.
@@ -96,6 +97,44 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 22.05 kHz for IndexTTS-2, and 24 kHz for many others).
 
 For full request-shape documentation (all parameters, response formats, error codes), see the [Speech API reference](../../../docs/serving/speech_api.md).
+
+---
+
+## dots.tts
+
+Single-stage, text-only TTS at 48 kHz. The current integration supports
+no-reference synthesis; voice cloning, reference audio, named voices, and
+precomputed speaker embeddings are not supported yet.
+
+### Launch
+
+```bash
+vllm serve dots-studio/dots.tts-soar --omni --trust-remote-code --port 8091
+```
+
+### Sending requests
+
+```bash
+# Non-streaming WAV
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, this is a dots TTS online-serving test.",
+        "voice": "default",
+        "response_format": "wav"
+    }' --output output.wav
+
+# Streaming 48 kHz mono PCM
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, this is a streaming dots TTS test.",
+        "voice": "default",
+        "stream": true,
+        "stream_format": "audio",
+        "response_format": "pcm"
+    }' --no-buffer | play -t raw -r 48000 -e signed -b 16 -c 1 -
+```
 
 ---
 
@@ -586,14 +625,20 @@ curl -X POST http://localhost:8091/v1/audio/voices \
     -F "speaker_description=warm narrator"
 ```
 
-Uploaded voices are then usable as `voice="custom_voice_1"` on subsequent requests.
+For Qwen3-TTS, uploaded voices are Base voice-cloning inputs and require a Base
+checkpoint. When a request names an uploaded voice, the server infers
+`task_type="Base"`. Built-in presets such as `vivian` and `ryan` remain
+CustomVoice speakers and require a CustomVoice checkpoint.
+
 The runtime upload and delete routes require a single API frontend; with
 `--api-server-count > 1`, use inline `ref_audio` or restore precomputed voices
 from `custom_voice_dir` at startup.
 
 ### Precomputed custom voices
 
-For reused Base voice-cloning speakers, precompute the reference artifacts once and load them at server startup:
+For reused Base voice-cloning speakers, precompute the reference artifacts once
+and load them at server startup. Precomputed voices use the same Base task and
+checkpoint-matching rules as uploaded voices:
 
 ```bash
 python qwen3_tts/precompute_custom_voice.py \

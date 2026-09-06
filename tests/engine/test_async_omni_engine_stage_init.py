@@ -234,6 +234,7 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_to_runtime(monkeyp
     engine._omni_lb_policy = "random"
     engine.request_queue = types.SimpleNamespace()
     engine._log_stats = True
+    engine._parallel_stage_init = False
 
     captured: dict[str, object] = {}
     runtime = types.SimpleNamespace(stage_pools=[], initialize=lambda: None)
@@ -849,12 +850,13 @@ def test_stage_runtime_attaches_external_llm_client_without_launching_engine(mon
     assert not hasattr(parallel_config, "_api_process_rank")
 
 
-def test_stage_runtime_launches_shared_engines_with_per_client_addresses(monkeypatch):
+@pytest.mark.parametrize("stage_ids", [(0,), (0, 1)], ids=["single-stage", "multi-stage"])
+def test_stage_runtime_launches_shared_engines_with_per_client_addresses(monkeypatch, stage_ids):
     import vllm_omni.engine.stage_runtime as runtime_mod
 
     runtime = _make_stage_runtime()
     stage_plans = []
-    for stage_id in (0, 1):
+    for stage_id in stage_ids:
         parallel_config = _FakeParallelConfig()
         plan = _make_llm_plan(
             stage_id,
@@ -890,24 +892,51 @@ def test_stage_runtime_launches_shared_engines_with_per_client_addresses(monkeyp
     monkeypatch.setattr(runtime_mod, "launch_stage_replica", _fake_launch_stage_replica)
 
     with runtime.launch_stage_engines(2) as launch:
-        assert events == [("enter", 0), ("enter", 1)]
-        assert launch.client_configs[0]["stage_addresses"][0][0] == {
-            "input_address": "ipc://stage0-input-0",
-            "output_address": "ipc://stage0-output-0",
-        }
-        assert launch.client_configs[1]["stage_addresses"][1][0] == {
-            "input_address": "ipc://stage1-input-1",
-            "output_address": "ipc://stage1-output-1",
-        }
+        assert events == [("enter", stage_id) for stage_id in stage_ids]
+        for client_index, config in enumerate(launch.client_configs):
+            assert config["client_count"] == 2
+            assert config["client_index"] == client_index
+            for stage_id in stage_ids:
+                assert config["stage_addresses"][stage_id][0] == {
+                    "input_address": f"ipc://stage{stage_id}-input-{client_index}",
+                    "output_address": f"ipc://stage{stage_id}-output-{client_index}",
+                }
 
-    assert events == [("enter", 0), ("enter", 1), ("exit", 0), ("exit", 1)]
+    assert events == [(event, stage_id) for event in ("enter", "exit") for stage_id in stage_ids]
     assert not hasattr(stage_plans[0].replicas[0].stage_vllm_config.parallel_config, "_api_process_count")
     assert not hasattr(stage_plans[0].replicas[0].stage_vllm_config.parallel_config, "_api_process_rank")
     assert all(
         kwargs["watched_frontend_processes"] is launch.watched_frontend_processes for kwargs in captured_launch_kwargs
     )
-    assert captured_launch_env == ["enabled", None]
+    assert captured_launch_env == ["enabled" if stage_id == 0 else None for stage_id in stage_ids]
     assert os.environ.get("VLLM_OMNI_TEST_STAGE_RUNTIME_ENV") is None
+
+
+@pytest.mark.parametrize("diffusion_stage_id", [0, 1], ids=["diffusion-only", "enginecore-to-diffusion"])
+def test_stage_runtime_multi_api_rejects_diffusion_before_launch(monkeypatch, diffusion_stage_id):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    runtime = _make_stage_runtime()
+    stage_plans = [
+        _make_llm_plan(stage_id, stage_id=stage_id, vllm_config=_FakeVllmConfig())
+        for stage_id in range(diffusion_stage_id)
+    ]
+    stage_plans.append(_make_diffusion_plan(diffusion_stage_id, stage_id=diffusion_stage_id))
+    monkeypatch.setattr(runtime, "_prepare_stage_plans", lambda: stage_plans)
+    monkeypatch.setattr(
+        runtime_mod,
+        "acquire_device_locks",
+        lambda *_args: pytest.fail("unsupported topology must fail before acquiring devices"),
+    )
+    monkeypatch.setattr(
+        runtime_mod,
+        "launch_stage_replica",
+        lambda **_kwargs: pytest.fail("unsupported topology must not partially launch EngineCore stages"),
+    )
+
+    with pytest.raises(ValueError, match="diffusion stage\\(s\\) are not supported"):
+        with runtime.launch_stage_engines(2):
+            pytest.fail("unsupported topology must not yield a launch handle")
 
 
 def test_stage_runtime_multi_api_maps_stage_devices_from_launcher_visibility(monkeypatch):

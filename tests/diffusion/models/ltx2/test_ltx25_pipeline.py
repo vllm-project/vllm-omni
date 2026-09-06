@@ -386,7 +386,7 @@ def test_ltx25_natten_failure_has_actionable_omni_remedy(monkeypatch):
         MissingNattenProcessor,
     )
 
-    with pytest.raises(RuntimeError, match=r"kernels==0\.14\.1.*supported GPU.*allow Hub access"):
+    with pytest.raises(RuntimeError, match=r"kernels==0\.15\.2.*supported GPU.*allow Hub access"):
         ltx2_components._create_ltx25_natten_processor()
 
 

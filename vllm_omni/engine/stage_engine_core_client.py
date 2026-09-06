@@ -150,6 +150,7 @@ class StageEngineCoreClientBase(StageClientBase):
         self.engine_outputs: Any = None
         self.client_addresses = dict(client_addresses or {})
         self._omni_kv_config = getattr(getattr(vllm_config, "model_config", None), "omni_kv_config", None)
+        self._stage_hf_config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
         self._kv_sender_host = self._resolve_contact_host()
         self._kv_sender_info: dict[str, Any] | None = None
         self._kv_sender_initialized = False
@@ -396,17 +397,29 @@ class StageEngineCoreClientBase(StageClientBase):
         """
         if self.custom_process_input_func is not None:
             signature = inspect.signature(self.custom_process_input_func)
-            if len(signature.parameters) >= 4:
+            extra_kwargs: dict[str, Any] = {}
+            if "next_stage_hf_config" in signature.parameters:
+                # Let a processor size the next stage's prompt from that
+                # stage's model config (e.g. a talker whose engine positions
+                # must cover a speaker-prompt prefill).
+                extra_kwargs["next_stage_hf_config"] = self._stage_hf_config
+            # Match the context parameter by name, including the
+            # underscore-prefixed spelling some processors use (e.g.
+            # MiniCPM-o's ``llm2tts(..., _streaming_context)``), so bridge
+            # state keeps flowing to them.
+            if "streaming_context" in signature.parameters or "_streaming_context" in signature.parameters:
                 return self.custom_process_input_func(
                     source_outputs,
                     prompt,
                     self.requires_multimodal_data,
                     streaming_context,
+                    **extra_kwargs,
                 )
             return self.custom_process_input_func(
                 source_outputs,
                 prompt,
                 self.requires_multimodal_data,
+                **extra_kwargs,
             )
 
         if not self.engine_input_source:
