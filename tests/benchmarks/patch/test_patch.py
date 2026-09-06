@@ -23,6 +23,7 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
     _apply_stage0_token_timings,
+    _apply_video_metrics_from_payload,
     _attach_seed_tts_to_request_func_input,
     async_request_openai_chat_omni_completions,
     async_request_openai_realtime_duplex,
@@ -1194,6 +1195,43 @@ async def test_prompt_len_assigned_from_usage(mocker: MockerFixture):
     assert output.prompt_len == 4992, (
         "prompt_len should be overridden by usage.prompt_tokens to reflect the true multimodal input token count"
     )
+
+
+def test_video_rtf_prefers_generation_time_over_poll_latency():
+    """RTF must not grow with client poll_interval overshoot in output.latency."""
+    payload = {
+        "duration_s": 2.0,
+        "num_frames": 48,
+        "fps": 24.0,
+        "stage_durations": {"stage_0_gen_ms": 4000.0},
+    }
+    request_body: dict[str, object] = {}
+
+    short_poll = MixRequestFuncOutput()
+    short_poll.latency = 4.2  # ~generation + small poll overshoot
+    _apply_video_metrics_from_payload(short_poll, payload, request_body)
+
+    long_poll = MixRequestFuncOutput()
+    long_poll.latency = 8.0  # same job, larger poll_interval_s overshoot
+    _apply_video_metrics_from_payload(long_poll, payload, request_body)
+
+    assert short_poll.video_generation_time_ms == pytest.approx(4000.0)
+    assert long_poll.video_generation_time_ms == pytest.approx(4000.0)
+    assert short_poll.video_rtf == pytest.approx(2.0)
+    assert long_poll.video_rtf == pytest.approx(2.0)
+    assert short_poll.video_rtf == long_poll.video_rtf
+
+
+def test_video_rtf_falls_back_to_e2e_latency_without_generation_time():
+    output = MixRequestFuncOutput()
+    output.latency = 6.0
+    _apply_video_metrics_from_payload(
+        output,
+        {"duration_s": 2.0, "num_frames": 48, "fps": 24.0},
+        {},
+    )
+    assert output.video_generation_time_ms == 0.0
+    assert output.video_rtf == pytest.approx(3.0)
 
 
 if __name__ == "__main__":

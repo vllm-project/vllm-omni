@@ -37,6 +37,7 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
     encode_video_base64,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.metrics import count_video_frames
 from vllm_omni.model_extras import get_video_generation_defaults, should_preserve_reference_image_size
 from vllm_omni.model_extras.video_generation import VideoGenerationDefaults
 from vllm_omni.outputs.output_metadata import (
@@ -87,6 +88,27 @@ class VideoGenerationArtifacts:
     output_fps: float
     stage_durations: dict[str, float]
     peak_memory_mb: float
+    metrics: dict[str, object] | None = None
+
+
+def _video_metadata_from_artifacts(artifacts: VideoGenerationArtifacts) -> dict[str, object]:
+    metadata: dict[str, object] = {}
+    if artifacts.output_fps > 0:
+        metadata["fps"] = artifacts.output_fps
+
+    if not artifacts.videos:
+        return metadata
+
+    num_frames = count_video_frames(artifacts.videos[0])
+    if num_frames is not None and num_frames > 0:
+        metadata["num_frames"] = num_frames
+        if artifacts.output_fps > 0:
+            metadata["duration_s"] = num_frames / artifacts.output_fps
+
+    if artifacts.metrics:
+        metadata["metrics"] = artifacts.metrics
+
+    return metadata
 
 
 class OmniOpenAIServingVideo:
@@ -393,6 +415,8 @@ class OmniOpenAIServingVideo:
         model_fps = self._resolve_fps(result)
         output_fps_base = (vp.fps if fps_provided else None) or model_fps or vp.fps or 24
         output_fps = output_fps_base * self._resolve_video_fps_multiplier(result)
+        raw_metrics = getattr(result, "metrics", None) if request.return_stage_metrics else None
+        metrics = {str(key): value for key, value in raw_metrics.items()} if isinstance(raw_metrics, Mapping) else None
         return VideoGenerationArtifacts(
             videos=videos,
             audios=audios,
@@ -401,6 +425,7 @@ class OmniOpenAIServingVideo:
             output_fps=output_fps,
             stage_durations=self._extract_stage_durations(result),
             peak_memory_mb=self._extract_peak_memory_mb(result),
+            metrics=metrics,
         )
 
     async def generate_videos(
@@ -466,7 +491,7 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
-    ) -> tuple[bytes, dict[str, float], float, VideoAction | None]:
+    ) -> tuple[bytes, dict[str, float], float, VideoAction | None, dict[str, object]]:
         """Generate a video and return raw MP4 bytes, bypassing base64 encoding."""
         artifacts = await self._run_and_extract(
             request,
@@ -489,9 +514,10 @@ class OmniOpenAIServingVideo:
                 video_codec_options = request.extra_params["video_codec_options"]
 
         action = artifacts.actions[0]
+        video_metadata = _video_metadata_from_artifacts(artifacts)
         if action is not None and isinstance(artifacts.videos[0], dict):
             logger.info("Action-only video request %s completed; skipping MP4 encoding.", reference_id)
-            return b"", artifacts.stage_durations, artifacts.peak_memory_mb, action
+            return b"", artifacts.stage_durations, artifacts.peak_memory_mb, action, video_metadata
 
         _t_encode_start = time.perf_counter()
         video_bytes = _encode_video_bytes(
@@ -503,7 +529,7 @@ class OmniOpenAIServingVideo:
         )
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)
-        return video_bytes, artifacts.stage_durations, artifacts.peak_memory_mb, artifacts.actions[0]
+        return video_bytes, artifacts.stage_durations, artifacts.peak_memory_mb, artifacts.actions[0], video_metadata
 
     @staticmethod
     def _resolve_video_fps_multiplier(result: object) -> int:

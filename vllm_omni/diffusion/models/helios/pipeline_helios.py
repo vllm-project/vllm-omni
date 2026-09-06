@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from Helios (https://github.com/BestWishYsh/Helios)
 
 from __future__ import annotations
@@ -1352,6 +1352,8 @@ class HeliosPipeline(
         """Single-stage denoising loop for one chunk."""
         batch_size = latents.shape[0]
         do_true_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
+        # Distilled (DMD) needs the chunk-start noise for renoise; mirror step_scheduler.
+        stage1_start_latents = latents
 
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
@@ -1414,7 +1416,20 @@ class HeliosPipeline(
                         cfg_normalize=False,
                     )
 
-                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                if self.is_distilled:
+                    latents = self.scheduler.step(
+                        noise_pred,
+                        t,
+                        latents,
+                        return_dict=False,
+                        cur_sampling_step=i,
+                        dmd_noisy_tensor=stage1_start_latents,
+                        dmd_sigmas=self.scheduler.sigmas,
+                        dmd_timesteps=self.scheduler.timesteps,
+                        all_timesteps=timesteps,
+                    )[0]
+                else:
+                    latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
                 pbar.update()
 

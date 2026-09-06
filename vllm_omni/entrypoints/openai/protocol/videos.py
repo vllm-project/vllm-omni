@@ -290,6 +290,10 @@ class VideoGenerationRequest(BaseModel):
         default=None,
         description=("Optional model-specific parameters passed directly to the model's extra_args. "),
     )
+    return_stage_metrics: bool | None = Field(
+        default=None,
+        description="Whether to include server-side stage metrics in async video metadata.",
+    )
 
     def resolve_video_params(
         self,
@@ -407,6 +411,13 @@ class VideoResponse(BaseModel):
         description="Filename of the saved output video files for this job.",
     )
     inference_time_s: float | None = Field(default=None, description="End-to-end inference time in seconds.")
+    fps: int | None = Field(default=None, description="Resolved output video frames per second, if known.")
+    num_frames: int | None = Field(default=None, description="Resolved number of output video frames, if known.")
+    duration_s: float | None = Field(default=None, description="Resolved output video duration in seconds, if known.")
+    metrics: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional profiler and stage metrics for benchmark clients.",
+    )
     stage_durations: dict[str, float] = Field(
         default_factory=dict,
         description="Profiler stage durations reported by the diffusion pipeline.",

@@ -175,6 +175,10 @@ class ImageGenerationRequest(BaseModel):
         default=None,
         description="Output image format: 'png', 'jpeg', or 'webp'. Defaults to 'png'.",
     )
+    return_stage_metrics: bool | None = Field(
+        default=None,
+        description="Return stage metrics for benchmark clients.",
+    )
 
 
 class ImageData(BaseModel):

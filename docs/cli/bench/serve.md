@@ -436,6 +436,34 @@ This should be seen as an edge case, and if this behavior can be avoided by sett
 
 </details>
 
+### Image / video generation endpoints
+
+For `/v1/images/generations`, `/v1/images/edits`, and `/v1/videos`, set `--endpoint` to that path and omit `--backend`. The endpoint path is registered as the bench request adapter, so a separate named backend is not required.
+
+Example (`/v1/images/generations`):
+
+```bash
+vllm bench serve --omni \
+  --endpoint /v1/images/generations \
+  --dataset-name random \
+  --model ~/models/Qwen/Qwen-Image \
+  --tokenizer ~/models/Qwen/Qwen-Image/tokenizer \
+  --max-concurrency 1 \
+  --num-warmups 2 \
+  --num-prompts 10 \
+  --random-input-len 64 \
+  --random-output-len 1 \
+  --ignore-eos \
+  --percentile-metrics e2el \
+  --extra-body '{
+    "num_inference_steps": 20,
+    "seed": 42,
+    "true_cfg_scale": 4.0
+  }'
+```
+
+Use the same pattern with `--endpoint /v1/images/edits` or `--endpoint /v1/videos` (and model-specific `--extra-body` as needed). Pure image/video runs omit the Text Result section when there is no generated text.
+
 ### Multi-Stage Benchmark
 
 <details class="admonition abstract" markdown="1">
