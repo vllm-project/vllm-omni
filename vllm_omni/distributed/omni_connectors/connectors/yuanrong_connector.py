@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
 from typing import Any
 
 from ..utils.logging import get_connector_logger
@@ -9,7 +10,7 @@ from .base import OmniConnectorBase
 logger = get_connector_logger(__name__)
 
 try:
-    from datasystem.kv_client import KVClient, SetParam, WriteMode
+    from yr.datasystem.kv_client import KVClient, SetParam, WriteMode
 except ImportError:
     KVClient = None
     SetParam = None
@@ -17,12 +18,12 @@ except ImportError:
 
 
 class YuanrongConnector(OmniConnectorBase):
-    """Datasystem-based distributed connector for OmniConnector."""
+    """Yuanrong-based distributed connector for OmniConnector."""
 
     def __init__(self, config: dict[str, Any]):
         if KVClient is None or SetParam is None or WriteMode is None:
             raise ImportError(
-                "Datasystem components (KVClient/SetParam/WriteMode) are not available. "
+                "Yuanrong components (KVClient/SetParam/WriteMode) are not available. "
                 "Please ensure the 'datasystem' package is installed in your environment."
             )
 
@@ -42,9 +43,10 @@ class YuanrongConnector(OmniConnectorBase):
 
         self._init_client()
 
-    def _make_key(self, rid: str, from_stage: str, to_stage: str) -> str:
-        """Generate key for request between stages."""
-        return f"{rid}:{from_stage}_{to_stage}"
+    @staticmethod
+    def _make_key(key: str, from_stage: str, to_stage: str) -> str:
+        """Generate a Datasystem-compatible key for request routing."""
+        return f"{key}:{from_stage}_{to_stage}"
 
     def _init_client(self):
         """Initialize Datasystem client."""
@@ -67,7 +69,24 @@ class YuanrongConnector(OmniConnectorBase):
         try:
             serialized_data = self.serialize_obj(data)
             key = self._make_key(put_key, from_stage, to_stage)
-            self.client.set(key, serialized_data, self.set_param.write_mode)
+            put_rc = self.client.set(key, serialized_data, self.set_param.write_mode)
+
+            if isinstance(put_rc, bool):
+                put_ok = put_rc
+            else:
+                put_ok = put_rc is None or put_rc == 0
+
+            if not put_ok:
+                self._metrics["errors"] += 1
+                logger.error(
+                    "YuanrongConnector put failed for %s (%s -> %s), rc=%r, %d bytes",
+                    key,
+                    from_stage,
+                    to_stage,
+                    put_rc,
+                    len(serialized_data),
+                )
+                return False, 0, None
 
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += len(serialized_data)
@@ -81,9 +100,9 @@ class YuanrongConnector(OmniConnectorBase):
             )
             return True, len(serialized_data), None
 
-        except Exception as exc:
+        except Exception as e:
             self._metrics["errors"] += 1
-            logger.error("YuanrongConnector put failed: %s", exc)
+            logger.error("YuanrongConnector put failed: %s", e)
             return False, 0, None
 
     def get(
@@ -93,40 +112,60 @@ class YuanrongConnector(OmniConnectorBase):
             logger.error("Datasystem client not initialized")
             return None
 
+        _t0 = time.perf_counter()
+
         key = self._make_key(get_key, from_stage, to_stage)
         try:
+            _t_fetch_start = time.perf_counter()
             raw_list = self.client.get([key], False, self.get_sub_timeout_ms)
+            _t_fetch_end = time.perf_counter()
+
             raw_data = raw_list[0] if raw_list else None
-            if raw_data is not None:
+            if raw_data:
+                _fetch_ms = (_t_fetch_end - _t_fetch_start) * 1000
+
+                _t_deser_start = time.perf_counter()
                 data = self.deserialize_obj(raw_data)
+                _t_deser_end = time.perf_counter()
+                _deser_ms = (_t_deser_end - _t_deser_start) * 1000
+
                 self._metrics["gets"] += 1
                 payload_size = len(raw_data)
-                logger.debug(
-                    "YuanrongConnector: retrieved %s (%s -> %s) %d bytes",
-                    key,
-                    from_stage,
-                    to_stage,
-                    payload_size,
+
+                _total_ms = (_t_deser_end - _t0) * 1000
+                _mbps = (payload_size / 1024 / 1024) / (_total_ms / 1000) if _total_ms > 0 else 0
+                logger.info(
+                    f"[TCP GET] {get_key}: fetch={_fetch_ms:.1f}ms, deser={_deser_ms:.1f}ms, "
+                    f"total={_total_ms:.1f}ms, {payload_size} bytes, {_mbps:.1f} MB/s"
                 )
                 return data, payload_size
 
-        except Exception as exc:
+        except Exception as e:
             self._metrics["timeouts"] += 1
-            logger.error("YuanrongConnector get failed: %s", exc)
+            logger.error("YuanrongConnector get failed: %s", e)
             return None
+
+        return None
 
     def cleanup(self, request_id: str) -> None:
         if not self.client:
             return
 
-        # Note: Datasystem doesn't have explicit delete, data will be garbage collected
         logger.debug("YuanrongConnector: cleanup requested for %s (no-op)", request_id)
 
     def health(self) -> dict[str, Any]:
         if not self.client:
             return {"status": "unhealthy", "error": "Datasystem client not initialized"}
 
-        return {"status": "healthy", "host": self.host, "port": self.port, **self._metrics}
+        return {
+            "status": "healthy",
+            "host": self.host,
+            "port": self.port,
+            "protocol": None,
+            "pool_device": None,
+            "pool_size": 0,
+            **self._metrics,
+        }
 
     def close(self) -> None:
         if not self.client:
