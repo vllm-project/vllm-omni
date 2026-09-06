@@ -647,21 +647,28 @@ class QwenImageCrossAttention(nn.Module):
         txt_cos = torch.real(txt_freqs).to(txt_query.dtype)
         txt_sin = torch.imag(txt_freqs).to(txt_query.dtype)
 
-        img_query = self.rope(img_query, img_cos, img_sin)
-        img_key = self.rope(img_key, img_cos, img_sin)
-        txt_query = self.rope(txt_query, txt_cos, txt_sin)
-        txt_key = self.rope(txt_key, txt_cos, txt_sin)
-
         seq_len_txt = encoder_hidden_states.shape[1]
         joint_query = torch.cat([txt_query, img_query], dim=1)
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
+
+        # This leverages the same dtype used by txt_qkv and img_qkv,
+        # since the value tensors can be concatenated.
+        joint_qk = torch.cat([joint_query, joint_key], dim=0)
+        joint_cos = torch.cat([txt_cos, img_cos], dim=0)
+        joint_sin = torch.cat([txt_sin, img_sin], dim=0)
+        joint_qk = self.rope(joint_qk, joint_cos, joint_sin)
+        joint_query, joint_key = torch.chunk(joint_qk, 2, dim=0)
 
         if (
             self.parallel_config is not None
             and self.parallel_config.sequence_parallel_size > 1
             and not get_forward_context().split_text_embed_in_sp
         ):
+            txt_query = joint_query[:, :seq_len_txt, :, :]
+            img_query = joint_query[:, seq_len_txt:, :, :]
+            txt_key = joint_key[:, :seq_len_txt, :, :]
+            img_key = joint_key[:, seq_len_txt:, :, :]
             attn_metadata = AttentionMetadata(
                 joint_query=txt_query,
                 joint_key=txt_key,
