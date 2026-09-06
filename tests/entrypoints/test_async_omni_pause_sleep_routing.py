@@ -121,6 +121,80 @@ def test_resume_generation_resumes_ar_then_clears_frontend_pause():
 
 
 @pytest.mark.cpu
+def test_reset_prefix_cache_forwards_to_ar_stages():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "diffusion"])
+
+        result = await omni.reset_prefix_cache(reset_running_requests=True, reset_connector=True)
+
+        assert result is True
+        omni.collective_rpc.assert_awaited_once_with(
+            method="reset_prefix_cache",
+            args=(True, True),
+            kwargs=None,
+            stage_ids=[0],
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_reset_prefix_cache_diffusion_only_skips_rpc():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion"])
+
+        result = await omni.reset_prefix_cache()
+
+        assert result is True
+        omni.collective_rpc.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_reset_encoder_cache_forwards_to_ar_stages():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "diffusion"])
+
+        await omni.reset_encoder_cache()
+
+        omni.collective_rpc.assert_awaited_once_with(
+            method="reset_encoder_cache",
+            args=(),
+            kwargs=None,
+            stage_ids=[0],
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_reset_mm_cache_clears_frontend_then_forwards_to_ar_stages():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "diffusion"])
+        cleared: list[str] = []
+        omni.engine.input_processor = SimpleNamespace(
+            mm_processor_cache=SimpleNamespace(
+                clear=lambda: cleared.append("clear"),
+                reset=lambda: cleared.append("reset"),
+            )
+        )
+        del omni.reset_mm_cache  # exercise the real implementation
+
+        await omni.reset_mm_cache()
+
+        assert cleared == ["clear"]
+        omni.collective_rpc.assert_awaited_once_with(
+            method="reset_mm_cache",
+            args=(),
+            kwargs=None,
+            stage_ids=[0],
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_sleep_routes_ar_via_collective_rpc_and_diffusion_to_worker_rpc():
     async def run() -> None:
         omni = _make_omni(stage_types=["llm", "diffusion"])

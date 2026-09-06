@@ -105,6 +105,9 @@ class StagePool:
             "resume_scheduler",
             "sleep",
             "wake_up",
+            "reset_prefix_cache",
+            "reset_encoder_cache",
+            "reset_mm_cache",
         }
     )
 
