@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import hashlib
@@ -7,6 +10,7 @@ import sys
 import threading
 import types
 from collections.abc import Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import IntEnum
 from functools import lru_cache
@@ -152,6 +156,25 @@ _DYNIN_REMOTE_ALLOW_PATTERNS = ("*.py", "*.json", "*.yaml", "*.yml")
 _DYNIN_REMOTE_CACHE_LOCK = threading.Lock()
 _DYNIN_REMOTE_PACKAGE_BY_SNAPSHOT: dict[str, str] = {}
 _DYNIN_REMOTE_ATTR_CACHE: dict[tuple[str, str, str, str | None, bool], Any] = {}
+_DYNIN_MAGVIT_IMPORT_LOCK = threading.RLock()
+_DIFFUSERS_FLAX_WEIGHTS_NAME = "diffusion_flax_model.msgpack"
+
+
+@contextmanager
+def _dynin_magvit_diffusers_compat():
+    """Temporarily restore the diffusers export required by MAGVIT remote code."""
+    from diffusers import utils as diffusers_utils
+
+    with _DYNIN_MAGVIT_IMPORT_LOCK:
+        attributes = vars(diffusers_utils)
+        injected = "FLAX_WEIGHTS_NAME" not in attributes
+        if injected:
+            attributes["FLAX_WEIGHTS_NAME"] = _DIFFUSERS_FLAX_WEIGHTS_NAME
+        try:
+            yield
+        finally:
+            if injected:
+                attributes.pop("FLAX_WEIGHTS_NAME", None)
 
 
 @dataclass(frozen=True)
@@ -965,6 +988,7 @@ def get_dynin_config_resolver_attr(
     )
 
 
+@_dynin_magvit_diffusers_compat()
 def get_dynin_magvit_attr(
     name: str,
     *,
