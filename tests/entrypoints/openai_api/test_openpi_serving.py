@@ -218,6 +218,46 @@ def test_build_request_uses_unique_engine_request_id_per_inference():
     assert request_a.request_id != request_b.request_id
 
 
+# Per-request inference parameters live in a strict namespace so robot feature
+# names remain open-ended without making engine option typos silent.
+def test_build_request_forwards_num_inference_steps():
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+
+    request = serving._build_request(
+        {"prompt": "pick up the object", "sampling_params": {"num_inference_steps": 4}},
+        session_id="session-a",
+        reset=True,
+    )
+
+    assert request.sampling_params.num_inference_steps == 4
+    # The namespace is an engine concern; the pipeline must not see it as a feature.
+    assert "sampling_params" not in request.sampling_params.extra_args["robot_obs"]
+
+
+def test_build_request_omits_num_inference_steps_when_not_sent():
+    """Absent must stay absent: the pipeline reads None as "use the configured
+    default", so materialising a null here would be a different request."""
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+
+    request = serving._build_request({"prompt": "x"}, session_id="s", reset=True)
+
+    assert request.sampling_params.num_inference_steps is None
+
+
+def test_build_request_does_not_forward_arbitrary_observation_keys():
+    """A robot observation may carry any feature name; none of them become
+    engine parameters."""
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
+
+    request = serving._build_request(
+        {"prompt": "x", "state": np.zeros(32), "guidance_scale": 7.5}, session_id="s", reset=True
+    )
+
+    extra_args = request.sampling_params.extra_args
+    assert set(extra_args) == {"reset", "session_id", "robot_obs"}
+    assert extra_args["robot_obs"]["guidance_scale"] == 7.5
+
+
 def test_infer_keeps_session_state_but_uses_unique_engine_request_ids():
     engine = RecordingEngine()
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)

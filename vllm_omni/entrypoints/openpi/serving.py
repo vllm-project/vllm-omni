@@ -150,14 +150,19 @@ class ServingRealtimeRobotOpenPI:
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
+        # Nested so engine knobs cannot collide with robot-defined obs keys.
+        sampling = obs.get("sampling_params") or {}
+        robot_obs = {key: value for key, value in obs.items() if key != "sampling_params"}
         extra_args = {
             "reset": reset,
             "session_id": session_id,
-            "robot_obs": obs,
+            "robot_obs": robot_obs,
         }
-
         prompt = obs.get("prompt", "")
-        sampling_params = OmniDiffusionSamplingParams(extra_args=extra_args)
+        sampling_params = OmniDiffusionSamplingParams(
+            num_inference_steps=sampling.get("num_inference_steps"),
+            extra_args=extra_args,
+        )
         return OmniDiffusionRequest(
             prompt=prompt,
             sampling_params=sampling_params,
