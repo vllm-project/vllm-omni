@@ -311,6 +311,56 @@ def test_h3_turbo_allows_distributed_layerwise_offload(monkeypatch):
     assert pipeline._turbo_lora_specs == {1: spec}
 
 
+@pytest.mark.parametrize(
+    ("mode", "components", "expected_mode"),
+    [
+        ("module", ["text_encoder"], None),
+        ("layer", ["text_encoder"], None),
+        ("module", ["dit"], "model-level CPU offload"),
+        ("layer", ["dit"], "layerwise offload"),
+    ],
+)
+def test_h3_turbo_offload_compatibility_follows_dit_selection(
+    monkeypatch,
+    mode,
+    components,
+    expected_mode,
+):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.partition = "fl2va"
+    pipeline._turbo_lora_specs = {}
+    pipeline._native_lora_adapter_ids = set()
+    pipeline._lora_sigma_schedules = {}
+    pipeline.od_config = SimpleNamespace(
+        diffusion_offload_config={"mode": mode, "components": components},
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=False,
+        dlo_use_allgather=True,
+        dlo_resident_layers=0,
+        pin_cpu_memory=True,
+    )
+    captured = {}
+    spec = _spec()
+
+    def load_turbo(**kwargs):
+        captured.update(kwargs)
+        return object(), object(), spec
+
+    monkeypatch.setattr(pipeline_module, "load_minimax_h3_turbo_lora", load_turbo)
+
+    assert pipeline._load_diffusion_lora_adapter(
+        lora_request=_request("turbo"),
+        lora_path="turbo",
+        dtype=torch.bfloat16,
+    )
+    assert captured["unsupported_offload_mode"] == expected_mode
+
+
 def test_h3_turbo_uses_the_reference_alpha_when_the_artifact_declares_none(tmp_path):
     """``4step_v0.1`` ships no alpha. LightX2V's reference script applies
     ``scale * alpha / rank`` with alpha defaulting to 8, so the fallback must be

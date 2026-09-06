@@ -51,6 +51,7 @@ from vllm_omni.diffusion.models.interface import (
     supports_step_execution,
 )
 from vllm_omni.diffusion.offloader import enable_offload_backend
+from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT, resolve_offload
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -279,6 +280,26 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if load_format == "dummy":
             return
 
+        # Resolve environment overrides before model loading. Rank-local
+        # prompt-cache hits cannot safely skip text-encoder collectives.
+        enable_pec, pec_size = resolve_prompt_embed_cache_config(
+            enable=getattr(self.od_config, "enable_prompt_embed_cache", False),
+            max_size=getattr(self.od_config, "prompt_embed_cache_size", 32),
+        )
+        resolved_offload = resolve_offload(self.od_config)
+        dp_size = int(getattr(getattr(self.od_config, "parallel_config", None), "data_parallel_size", 1))
+        if (
+            enable_pec
+            and dp_size > 1
+            and resolved_offload.offloads(TEXT_ENCODER_COMPONENT)
+            and resolved_offload.uses_allgather(TEXT_ENCODER_COMPONENT)
+        ):
+            raise ValueError(
+                "Prompt embedding cache cannot be combined with text_encoder "
+                "AllGather across data-parallel ranks; disable the cache or use "
+                "rank-local text_encoder transfer."
+            )
+
         current_omni_platform.init_diffusion_model_runner_runtime(
             vllm_config=self.vllm_config,
             od_config=self.od_config,
@@ -398,10 +419,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Install prompt-embedding cache (transparent wrapper around
         # ``pipeline.encode_prompt``). Enabled via config or env var; a no-op
         # when the pipeline does not expose ``encode_prompt``.
-        enable_pec, pec_size = resolve_prompt_embed_cache_config(
-            enable=getattr(self.od_config, "enable_prompt_embed_cache", False),
-            max_size=getattr(self.od_config, "prompt_embed_cache_size", 32),
-        )
         if enable_pec:
             self.prompt_embed_cache = install_prompt_embed_cache(
                 self.pipeline,

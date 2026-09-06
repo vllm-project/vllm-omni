@@ -42,7 +42,8 @@ encoder's BF16 configuration and the video/audio VAEs' FP32 precision. Select
 one offload strategy per deployment:
 
 ```bash
-# Stage 1 model-level CPU offload.
+# Stage 1 full-topology model offload, including MiniMax-H3's VAEs. Keep the
+# compatibility alias because the compact selector covers only DiT/text encoder.
 --stage-overrides '{"1":{"enable_cpu_offload":true}}'
 
 # Stage 1 distributed layerwise offload. Tune resident layers for available RAM.
