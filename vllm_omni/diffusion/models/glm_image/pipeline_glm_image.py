@@ -512,6 +512,8 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
         # Enable CFG-parallel: rank0 computes positive, rank1 computes negative
         cfg_parallel_ready = do_classifier_free_guidance and get_classifier_free_guidance_world_size() > 1
 
+        self.transformer.do_true_cfg = do_classifier_free_guidance
+
         for i, t in enumerate(timesteps):
             latent_model_input = latents.to(transformer_dtype)
             timestep = t.expand(latents.shape[0]) - 1
@@ -667,6 +669,12 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
                 kv_cache=kv_caches,
                 return_dict=False,
             )
+
+        if hasattr(self.transformer, "_hook_registry"):
+            from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
+
+            if self.transformer._hook_registry.get_hook(TeaCacheHook._HOOK_NAME) is not None:
+                self.transformer._hook_registry.reset_hook(TeaCacheHook._HOOK_NAME)
 
         return kv_caches
 

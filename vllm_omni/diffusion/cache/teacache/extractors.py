@@ -392,6 +392,143 @@ def extract_bagel_context(
     )
 
 
+def extract_glmimage_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    prior_token_id: torch.Tensor,
+    prior_token_drop: torch.Tensor,
+    timestep: torch.Tensor,
+    target_size: torch.Tensor,
+    crop_coords: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+    kv_cache=None,
+    attention_kwargs: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> CacheContext:
+    from diffusers.models.modeling_outputs import Transformer2DModelOutput
+
+    if not hasattr(module, "transformer_blocks") or len(module.transformer_blocks) == 0:
+        raise ValueError("Module must contain transformer_blocks.")
+
+    device = hidden_states.device
+    return_dict = kwargs.get("return_dict", True)
+
+    orig_batch = hidden_states.shape[0]
+    encoder_hidden_states = module.glyph_projector(encoder_hidden_states)
+
+    prior_embedding = module.prior_token_embedding(prior_token_id).clone()
+    prior_embedding[prior_token_drop] *= 0.0
+    prior_hidden_states = module.prior_projector(prior_embedding)
+
+    hidden_states, rope_cos, rope_sin, post_patch_height_t, post_patch_width_t = module.prepare(
+        hidden_states,
+        prior_hidden_states,
+    )
+    if image_rotary_emb is None:
+        image_rotary_emb = (rope_cos, rope_sin)
+    dtype = hidden_states.dtype
+
+    target_size = target_size.to(device)
+    crop_coords = crop_coords.to(device)
+
+    timestep = timestep.to(device)
+    temb = module.time_condition_embed(
+        timestep,
+        target_size,
+        crop_coords,
+        dtype,
+    )
+
+    hidden_states_mask = None
+    sp_size = getattr(getattr(module, "parallel_config", None), "sequence_parallel_size", None)
+    if sp_size is not None and sp_size > 1:
+        from vllm_omni.diffusion.forward_context import is_forward_context_available
+
+        if is_forward_context_available():
+            ctx = get_forward_context()
+            if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+                padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+                hidden_states_mask = torch.ones(
+                    orig_batch,
+                    padded_seq_len,
+                    dtype=torch.bool,
+                    device=hidden_states.device,
+                )
+                hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+                if hidden_states_mask.all():
+                    hidden_states_mask = None
+
+    first_block = module.transformer_blocks[0]
+
+    (
+        norm_hidden_states,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+    ) = first_block.norm1(hidden_states, encoder_hidden_states, temb)
+
+    # Use image stream after AdaLayerNormZero as similarity signal.
+    # This is the dominant diffusion signal across timesteps.
+    modulated_input = norm_hidden_states
+
+    def run_transformer_blocks() -> tuple[torch.Tensor, torch.Tensor]:
+        h = hidden_states
+        e = encoder_hidden_states
+        kv_cache_mode = kv_cache.mode if kv_cache is not None else None
+
+        for layer_idx, block in enumerate(module.transformer_blocks):
+            layer_kv_cache = kv_cache[layer_idx] if kv_cache is not None else None
+
+            h, e = block(
+                hidden_states=h,
+                encoder_hidden_states=e,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+                attention_mask=attention_mask,
+                attention_kwargs=attention_kwargs,
+                kv_cache=layer_kv_cache,
+                kv_cache_mode=kv_cache_mode,
+                hidden_states_mask=hidden_states_mask,
+            )
+
+        return (h, e)
+
+    def postprocess(h: torch.Tensor):
+        h = module.norm_out(h, temb)
+        h = module.proj_out(h)
+
+        # Reconstruct spatial layout from patch tokens using the prepare() shape.
+        # Mirrors GlmImageTransformer2DModel.forward() unpatchify logic.
+        p = module.patch_size
+        post_patch_height = int(post_patch_height_t.item())
+        post_patch_width = int(post_patch_width_t.item())
+
+        h = h.reshape(orig_batch, post_patch_height, post_patch_width, -1, p, p)
+        output = h.permute(0, 3, 1, 4, 2, 5).flatten(4, 5).flatten(2, 3)
+
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
+
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=hidden_states,
+        encoder_hidden_states=encoder_hidden_states,
+        temb=temb,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+        extra_states=None,
+    )
+
+
 def extract_zimage_context(
     module: nn.Module,
     x: list[torch.Tensor],
@@ -1478,6 +1615,7 @@ EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "ZImageTransformer2DModel": extract_zimage_context,
     "Flux2Klein": extract_flux2_klein_context,
     "StableAudioDiTModel": extract_stable_audio_context,
+    "GlmImageTransformer2DModel": extract_glmimage_context,
     "Flux2Transformer2DModel": extract_flux2_context,
     "LongCatImageTransformer2DModel": extract_longcat_context,
     "FluxTransformer2DModel": extract_flux_context,
