@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import importlib.util
+from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import soundfile as sf
 import torch
 
 from vllm_omni.model_executor.models.breeze_tts_2.prompt_builder import (
@@ -11,6 +15,15 @@ from vllm_omni.model_executor.models.breeze_tts_2.prompt_builder import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+_EXAMPLE_PATH = (
+    Path(__file__).resolve().parents[4]
+    / "examples"
+    / "offline_inference"
+    / "text_to_speech"
+    / "breeze_tts_2"
+    / "end2end.py"
+)
 
 
 class _Tokenizer:
@@ -128,3 +141,47 @@ def test_reference_plus_instruction_composes_voice_direction_prompt():
     assert tuple(info["input_values"].shape) == (2, 16)
     assert info["prompt_ids"].tolist().count(262144) == 2
     assert info["text_ids_len"].numel() == 2
+
+
+def test_offline_example_reference_payload_feeds_prompt_builder(tmp_path):
+    """Smoke: the offline example's payload keys flow into the real builder.
+
+    Loads ``end2end.py`` (voxtral-style importlib), reads a real stereo wav
+    through its ``reference_payload`` helper, and feeds the result into the
+    real ``BreezeTTS2PromptBuilder`` — guarding the example↔builder field
+    contract that previously broke via an unread ``ref_audio_path`` key.
+    """
+    spec = importlib.util.spec_from_file_location("breeze_tts_2_end2end", _EXAMPLE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    sample_rate = 16_000
+    t = np.arange(sample_rate, dtype=np.float32) / sample_rate
+    tone = np.sin(2 * np.pi * 220.0 * t)
+    ref_path = tmp_path / "reference.wav"
+    sf.write(str(ref_path), np.stack([tone, tone], axis=1), sample_rate)
+
+    payload = module.reference_payload(str(ref_path))
+
+    # The helper emits exactly the keys the prompt builder consumes.
+    assert set(payload) == {"ref_audio", "ref_audio_sample_rate"}
+    assert payload["ref_audio_sample_rate"] == sample_rate
+    assert payload["ref_audio"].ndim == 1  # stereo down-mixed to one clip
+
+    builder, encoder = _builder()
+    prompt = builder.build(
+        {
+            "template": "ref_clone_tata",
+            "speaker": "S0",
+            "ref_text": "exact reference transcript",
+            "text": "new target text",
+            **payload,
+        }
+    )
+
+    info = prompt["additional_information"]
+    assert tuple(info["input_values"].shape) == (2, 16)
+    assert info["ref_code_len"] == 2
+    assert info["prompt_ids"].tolist().count(262144) == 2
+    # The builder received the example's waveform and sample rate verbatim.
+    assert encoder.calls == [(payload["ref_audio"], sample_rate)]

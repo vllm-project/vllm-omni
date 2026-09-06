@@ -12,13 +12,15 @@ Mimi fallback remains available for checkpoints that omit ``audio_tokenizer``.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
 from vllm.config import VllmConfig
 
+from vllm_omni.model_executor.models.breeze_tts_2.audio_tokenizer import (
+    resolve_audio_tokenizer_path,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 
@@ -51,8 +53,11 @@ class BreezeTTS2MimiCodec(nn.Module):
         self.config = vllm_config.model_config.hf_config
         self.model_path = vllm_config.model_config.model
         self._async_chunk = bool(getattr(vllm_config.model_config, "async_chunk", False))
-        self._tokenizer_path = Path(self.model_path) / "audio_tokenizer"
-        if self._async_chunk and not self._tokenizer_path.is_dir():
+        # Resolve once: a local directory works directly, an HF repo id
+        # resolves to its cached snapshot. ``None`` means the checkpoint has
+        # no bundled tokenizer and the Mimi fallback applies.
+        self._tokenizer_path = resolve_audio_tokenizer_path(self.model_path)
+        if self._async_chunk and self._tokenizer_path is None:
             raise RuntimeError(
                 "Breeze-TTS-2 async_chunk requires the bundled Qwen3-TTS audio_tokenizer; "
                 "the stateless Mimi fallback cannot preserve chunk decoder state"
@@ -73,7 +78,7 @@ class BreezeTTS2MimiCodec(nn.Module):
         # subdirectory.  Avoid constructing a second, unused Mimi network in
         # that case; this saves both startup time and worker memory.
         self._codec = None
-        if not self._tokenizer_path.is_dir():
+        if self._tokenizer_path is None:
             # Import lazily: stage 0 does not need the Mimi implementation.
             from transformers import MimiConfig, MimiModel
 
@@ -206,7 +211,12 @@ class BreezeTTS2MimiCodec(nn.Module):
                 else {}
             )
             state_id = request_ids[index]
-            finished = self._meta_bool(runtime_info, "finished")
+            # The connector receiver strips ``meta.finished`` while merging
+            # runtime metadata, so the stream-terminated signal arrives on
+            # the model-visible ``stream_finished`` field (the same contract
+            # CosyVoice3 / Audex use). Fall back to ``finished`` for direct
+            # in-process callers that still set only the transport flag.
+            finished = self._meta_bool(runtime_info, "stream_finished") or self._meta_bool(runtime_info, "finished")
             flat = self._payload_codes(request_ids_tensor, runtime_info)
             if flat.numel() == 0:
                 # Terminal marker: the stage-0 processor sends an empty
@@ -327,8 +337,7 @@ class BreezeTTS2MimiCodec(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load Breeze's bundled Qwen3-TTS codec, or fallback Mimi weights."""
-        tokenizer_path = Path(self.model_path) / "audio_tokenizer"
-        if tokenizer_path.is_dir():
+        if self._tokenizer_path is not None:
             # The root checkpoint contains both the talker weights and a Mimi
             # ``codec_model.*`` fallback.  When the bundled Qwen3-TTS tokenizer
             # is present, it owns decoding; consume the root iterator without
@@ -340,7 +349,7 @@ class BreezeTTS2MimiCodec(nn.Module):
 
                 device = self.vllm_config.device_config.device
                 self._audio_tokenizer = Qwen3TTSTokenizer.from_pretrained(
-                    str(tokenizer_path),
+                    str(self._tokenizer_path),
                     device_map=str(device),
                 )
                 self._sample_rate = int(self._audio_tokenizer.model.get_output_sample_rate())

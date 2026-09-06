@@ -84,3 +84,50 @@ def test_talker2codec_full_payload_accepts_runner_pooling_output():
 
     assert payload is not None
     assert torch.equal(payload.codes.audio, torch.tensor([9, 8]))
+
+
+def test_full_payload_zero_frame_finish_sends_explicit_terminal_marker():
+    payload = talker2codec_full_payload(
+        pooling_output={"codes.audio": torch.empty(0, 16, dtype=torch.long)},
+        request=None,
+        is_finished=True,
+    )
+
+    assert payload is not None
+    assert payload.codes.audio.numel() == 0
+    assert payload.meta.code_flat_numel == 0
+    assert bool(payload.meta.finished.item()) is True
+
+
+def test_full_payload_missing_codes_finish_sends_explicit_terminal_marker():
+    payload = talker2codec_full_payload(
+        pooling_output={},
+        request=None,
+        is_finished=True,
+    )
+
+    assert payload is not None
+    assert payload.codes.audio.numel() == 0
+    assert bool(payload.meta.finished.item()) is True
+
+
+def test_full_payload_empty_without_finish_stays_silent():
+    payload = talker2codec_full_payload(
+        pooling_output={"codes.audio": torch.empty(0, 16, dtype=torch.long)},
+        request=None,
+        is_finished=False,
+    )
+
+    assert payload is None
+
+
+def test_full_payload_carries_finished_flag_on_nonempty_frames():
+    payload = talker2codec_full_payload(
+        pooling_output={"codes.audio": torch.tensor([[1, 2], [3, 4]], dtype=torch.long)},
+        request=None,
+        is_finished=True,
+    )
+
+    assert payload is not None
+    assert payload.codes.audio.numel() == 4
+    assert bool(payload.meta.finished.item()) is True

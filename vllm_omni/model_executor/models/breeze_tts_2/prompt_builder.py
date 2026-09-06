@@ -74,8 +74,16 @@ class BreezeTTS2PromptBuilder:
                 f"{self.scheduler_token_id} >= {scheduler_vocab_size}"
             )
         self.num_codebooks = int(config.num_codebooks)
-        # 2048 is the Breeze codec default when the checkpoint omits the key.
-        self.codebook_size = int(config.codec_config.get("codebook_size", 2048))
+        codec_config = getattr(config, "codec_config", None)
+        if isinstance(codec_config, Mapping):
+            self.codebook_size = int(codec_config.get("codebook_size", 2048))
+        elif codec_config is not None:
+            self.codebook_size = int(getattr(codec_config, "codebook_size", 2048))
+        else:
+            # ``codec_config`` is optional in BreezeTTS2Config; a minimal
+            # checkpoint may omit it. Breeze's codec uses 2048-entry
+            # codebooks, the same fallback the talker and codec stages apply.
+            self.codebook_size = 2048
         if self.num_codebooks <= 0 or self.codebook_size <= 0:
             raise ValueError("num_codebooks and codec codebook_size must be positive")
         self._validate_audio_special_tokens()

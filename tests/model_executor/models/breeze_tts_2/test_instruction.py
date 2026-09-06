@@ -61,16 +61,21 @@ def test_instruction_prompt_remains_one_independent_text_segment():
     assert info["text_ids_len"].tolist() == [len(info["prompt_ids"])]
 
 
-def _request(extra_params=None):
-    return SimpleNamespace(
+def _request(extra_params=None, **overrides):
+    base = dict(
         input="Hello.",
         ref_text=None,
         ref_audio=None,
         task_type=None,
         speed=1.0,
         max_new_tokens=None,
+        language=None,
+        speaker_embedding=None,
+        x_vector_only_mode=None,
         extra_params=extra_params or {},
     )
+    base.update(overrides)
+    return SimpleNamespace(**base)
 
 
 def _adapter() -> BreezeTTS2Adapter:
@@ -91,3 +96,25 @@ def test_non_unit_cfg_is_rejected_until_negative_branch_exists():
 
     assert "guidance_scale=1.0" in adapter.validate(_request({"guidance_scale": 2.0}))
     assert "guidance_scale=1.0" in adapter.validate(_request({"cfg_scale": 0.5}))
+
+
+def test_unsupported_conditioning_fields_are_rejected_not_ignored():
+    adapter = _adapter()
+
+    assert "language" in adapter.validate(_request(language="en"))
+    assert "speaker_embedding" in adapter.validate(_request(speaker_embedding=[0.1, 0.2]))
+    assert "x_vector_only_mode" in adapter.validate(_request(x_vector_only_mode=True))
+    # Absent fields must keep the request valid.
+    assert adapter.validate(_request()) is None
+    assert adapter.validate(_request(x_vector_only_mode=False)) is None
+
+
+def test_multiple_reference_clips_are_rejected_not_silently_truncated():
+    adapter = _adapter()
+    adapter.ctx.server._validate_ref_audio_format = lambda _uri: None
+
+    error = adapter.validate(_request(ref_audio=["a.wav", "b.wav"], ref_text="hello"))
+    assert "exactly one reference clip" in error
+    assert "2" in error
+    # A single-element list stays valid and reaches format validation.
+    assert adapter.validate(_request(ref_audio=["a.wav"], ref_text="hello")) is None

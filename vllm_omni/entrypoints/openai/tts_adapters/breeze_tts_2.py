@@ -66,12 +66,22 @@ class BreezeTTS2Adapter(ARTTSAdapter):
             return "Breeze-TTS-2 ref_text requires ref_audio"
         if request.ref_audio is not None and (request.ref_text is None or not request.ref_text.strip()):
             return "Breeze-TTS-2 ref_audio requires ref_text"
+        if isinstance(request.ref_audio, list) and len(request.ref_audio) != 1:
+            # The prompt path conditions on exactly one reference waveform;
+            # extra clips would be silently discarded otherwise.
+            return f"Breeze-TTS-2 supports exactly one reference clip, got {len(request.ref_audio)}"
         if request.task_type == "Base" and request.ref_audio is None:
             return "Breeze-TTS-2 Base task requires ref_audio and ref_text"
         if request.task_type == "VoiceDesign":
             return "Breeze-TTS-2 does not support task_type=VoiceDesign"
         if request.speed is not None and request.speed != 1.0:
             return "Breeze-TTS-2 does not support speed adjustment"
+        if request.language is not None:
+            return "Breeze-TTS-2 does not support 'language'; the prompt language follows the input text"
+        if request.speaker_embedding is not None:
+            return "Breeze-TTS-2 does not support 'speaker_embedding' (voice-cloning helper field)"
+        if request.x_vector_only_mode:
+            return "Breeze-TTS-2 does not support 'x_vector_only_mode' (voice-cloning helper field)"
         extra_params = request.extra_params or {}
         guidance_scale = extra_params.get("guidance_scale", extra_params.get("cfg_scale", 1.0))
         try:

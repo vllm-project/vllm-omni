@@ -27,10 +27,13 @@ class _BundledTokenizer:
 
 
 def test_bundled_qwen_tokenizer_consumes_unused_root_fallback_weights(tmp_path):
-    (tmp_path / "audio_tokenizer").mkdir()
+    bundled = tmp_path / "audio_tokenizer"
+    bundled.mkdir()
     codec = object.__new__(BreezeTTS2MimiCodec)
     codec.model_path = str(tmp_path)
     codec.vllm_config = None
+    # load_weights reuses the path resolved once in __init__.
+    codec._tokenizer_path = bundled
     codec._codec = None
     codec._audio_tokenizer = _BundledTokenizer()
     codec._loaded_local_weights = False

@@ -92,6 +92,20 @@ def resolve_template(args) -> str:
     return "tts_instruction" if args.instruction else "tts_plain"
 
 
+def reference_payload(ref_audio_path: str | None) -> dict:
+    """Load the reference clip into the payload keys the prompt builder reads.
+
+    ``BreezeTTS2PromptBuilder`` consumes ``ref_audio`` (a waveform) plus
+    ``ref_audio_sample_rate``; a bare path field is not read.
+    """
+    if ref_audio_path is None:
+        return {}
+    waveform, sample_rate = sf.read(ref_audio_path, dtype="float32", always_2d=True)
+    # Down-mix to the single 1-D clip the reference encoder expects.
+    waveform = waveform.mean(axis=1)
+    return {"ref_audio": waveform, "ref_audio_sample_rate": int(sample_rate)}
+
+
 def build_prompt(args) -> dict:
     config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
     reference_encoder = None
@@ -113,7 +127,7 @@ def build_prompt(args) -> dict:
     payload = {
         "text": args.text,
         "speaker": args.voice,
-        "ref_audio_path": args.ref_audio,
+        **reference_payload(args.ref_audio),
     }
     if args.instruction:
         payload["instruction"] = args.instruction

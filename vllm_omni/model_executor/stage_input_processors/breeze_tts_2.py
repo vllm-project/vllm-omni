@@ -126,17 +126,31 @@ def talker2codec_full_payload(
 
     ``pooling_output`` is the AR runner's flattened per-request payload. Mimi
     consumes codebook-major IDs, so the frame-major talker matrix is transposed
-    before flattening.
+    before flattening. A request that finishes without any codec frame still
+    gets an explicit empty payload with ``finished=True``: returning ``None``
+    would leave Stage 1 without a terminal marker, and the connector receiver
+    requeues marker-less empty chunks forever.
     """
-    del transfer_manager, request, is_finished
-    if not isinstance(pooling_output, Mapping):
-        return None
-    audio = pooling_output.get("codes.audio")
-    if audio is None:
-        return None
-    codes = torch.as_tensor(audio, dtype=torch.long)
+    del transfer_manager, request
+    audio = None
+    if isinstance(pooling_output, Mapping):
+        audio = pooling_output.get("codes.audio")
+        if audio is None:
+            nested = pooling_output.get("codes")
+            if isinstance(nested, Mapping):
+                audio = nested.get("audio")
+
+    codes = torch.empty(0, dtype=torch.long) if audio is None else torch.as_tensor(audio, dtype=torch.long)
     if codes.numel() == 0:
-        return None
+        if not is_finished:
+            return None
+        return OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+            meta=MetaStruct(
+                code_flat_numel=0,
+                finished=torch.tensor(True, dtype=torch.bool),
+            ),
+        )
     if codes.ndim == 2:
         flat = codes.transpose(0, 1).contiguous().reshape(-1)
     elif codes.ndim == 1:
@@ -145,7 +159,10 @@ def talker2codec_full_payload(
         raise ValueError(f"Breeze audio codes must be rank 1 or 2, got {tuple(codes.shape)}")
     return OmniPayloadStruct(
         codes=CodesStruct(audio=flat),
-        meta=MetaStruct(code_flat_numel=int(flat.numel())),
+        meta=MetaStruct(
+            code_flat_numel=int(flat.numel()),
+            finished=torch.tensor(bool(is_finished), dtype=torch.bool),
+        ),
     )
 
 
@@ -216,6 +233,10 @@ def talker2codec_async_chunk(
             code_flat_numel=int(flat.numel()),
             codec_streaming=True,
             finished=torch.tensor(finished, dtype=torch.bool),
+            # The chunk adapter strips ``meta.finished`` before it reaches the
+            # stage-1 model; ``stream_finished`` survives and is what the
+            # codec uses to release per-request decoder state.
+            stream_finished=torch.tensor(finished, dtype=torch.bool),
         ),
     )
 

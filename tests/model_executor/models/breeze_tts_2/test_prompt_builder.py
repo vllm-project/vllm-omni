@@ -97,6 +97,15 @@ def _config():
     )
 
 
+def test_builder_accepts_missing_codec_config():
+    config = _config()
+    config.codec_config = None
+
+    builder = BreezeTTS2PromptBuilder(_Tokenizer(), config)
+
+    assert builder.codebook_size == 2048
+
+
 def test_build_instruction_prompt():
     builder = BreezeTTS2PromptBuilder(_Tokenizer(), _config())
 

@@ -18,6 +18,28 @@ import numpy as np
 import torch
 
 
+def resolve_audio_tokenizer_path(model_path: str) -> Path | None:
+    """Resolve the bundled ``audio_tokenizer`` dir for a local path or HF repo id.
+
+    Local directories (dev checkouts) resolve directly: present returns the
+    subdirectory, absent returns ``None`` so callers can fall back.  Repo ids
+    resolve against the HF snapshot cache via ``snapshot_download`` with a
+    narrow allow-pattern, so an already-cached snapshot is not re-downloaded.
+    Returns ``None`` when the checkpoint carries no ``audio_tokenizer``
+    subdirectory.
+    """
+    root = Path(model_path)
+    if root.is_dir():
+        bundled = root / "audio_tokenizer"
+        return bundled if bundled.is_dir() else None
+
+    from huggingface_hub import snapshot_download
+
+    snapshot_root = Path(snapshot_download(model_path, allow_patterns=["audio_tokenizer/*"]))
+    bundled = snapshot_root / "audio_tokenizer"
+    return bundled if bundled.is_dir() else None
+
+
 class BreezeReferenceAudioTokenizer:
     """Small adapter that normalizes Qwen3-TTS encoder output to ``(T, Q)``.
 
@@ -48,10 +70,13 @@ class BreezeReferenceAudioTokenizer:
             Qwen3TTSTokenizer,
         )
 
-        local_path = Path(model_path) / "audio_tokenizer"
-        if not local_path.is_dir():
-            raise FileNotFoundError(f"Breeze reference audio tokenizer was not found at {local_path}")
-        tokenizer = Qwen3TTSTokenizer.from_pretrained(str(local_path), **kwargs)
+        resolved = resolve_audio_tokenizer_path(model_path)
+        if resolved is None:
+            raise FileNotFoundError(
+                "Breeze reference audio tokenizer was not found for "
+                f"{model_path} (expected an audio_tokenizer/ subdirectory)"
+            )
+        tokenizer = Qwen3TTSTokenizer.from_pretrained(str(resolved), **kwargs)
         return cls(tokenizer, num_codebooks=num_codebooks, codebook_size=codebook_size)
 
     @torch.inference_mode()

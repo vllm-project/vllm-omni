@@ -54,6 +54,7 @@ def test_async_processor_sends_only_unemitted_tail_and_flushes_finish():
     payload = talker2codec_async_chunk(manager, None, _Request("req-1", finished=True))
     assert payload.codes.audio.tolist() == [0, 1, 2, 3]
     assert bool(payload.meta.finished.item()) is True
+    assert bool(payload.meta.stream_finished.item()) is True
     assert payload.meta.codec_streaming is True
 
 
@@ -80,8 +81,10 @@ def test_stateful_codec_batches_request_chunks_and_releases_finished_state():
     output = codec.forward(
         input_ids,
         runtime_additional_information=[
-            {"meta": {"request_id": "live", "finished": False}},
-            {"meta": {"request_id": "done", "finished": True}},
+            # ``stream_finished`` is the model-visible flag: the connector
+            # receiver strips ``meta.finished`` while merging runtime info.
+            {"meta": {"request_id": "live", "stream_finished": False}},
+            {"meta": {"request_id": "done", "stream_finished": True}},
         ],
         seq_token_counts=[4, 4],
         request_ids=["scheduler-live", "scheduler-done"],
@@ -130,6 +133,8 @@ def test_stateful_codec_terminal_marker_pops_state_without_decoding():
     output = codec.forward(
         torch.tensor([0, 1, 2, 3], dtype=torch.long),
         runtime_additional_information=[
+            # Plain ``finished`` covers the fallback for direct in-process
+            # callers that do not go through the connector receiver.
             {"meta": {"request_id": "live", "finished": False}},
             {"meta": {"request_id": "done", "finished": True}},
         ],
