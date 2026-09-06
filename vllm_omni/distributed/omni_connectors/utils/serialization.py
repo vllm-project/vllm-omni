@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections.abc import Mapping
 from dataclasses import asdict, fields, is_dataclass
@@ -12,10 +12,39 @@ from msgspec import msgpack
 from PIL import Image
 from vllm.outputs import CompletionOutput, RequestOutput
 
+
+def _chunk_bytes(raw: bytes) -> bytes | list[bytes]:
+    """Return *raw* directly if small enough, else split into chunks.
+
+    msgpack's bin32 format cannot encode a single bytes object larger than
+    2**32-1 bytes.  When the payload exceeds the threshold we return a list
+    of sub-4GB chunks.  The decoder reassembles them via
+    :func:`_unchunk_bytes`.
+    """
+    if len(raw) <= _CHUNK_SIZE:
+        return raw
+    return [raw[i : i + _CHUNK_SIZE] for i in range(0, len(raw), _CHUNK_SIZE)]
+
+
+def _unchunk_bytes(data: Any) -> bytes:
+    """Reassemble bytes from a plain bytes or chunked list."""
+    if isinstance(data, list):
+        return b"".join(data)
+    return data
+
+
 # Type markers for custom serialization
 _TENSOR_MARKER = "__tensor__"
 _NDARRAY_MARKER = "__ndarray__"
 _PIL_IMAGE_MARKER = "__pil_image__"
+
+# msgpack bin32 format limits a single bytes object to 2**32 - 1 bytes.
+# Diffusion outputs (e.g. 724-frame H3 videos) can exceed this when raw
+# frame data is serialized through the IPC channel.  When a raw bytes
+# payload exceeds this threshold we split it into chunks so the encoder
+# never sees a single bytes object larger than the limit.
+_MSGPACK_BIN32_LIMIT = 2**32 - 1
+_CHUNK_SIZE = _MSGPACK_BIN32_LIMIT - 1024  # safety margin
 
 # Keys that identify a RequestOutput dict (for reconstruction)
 _REQUEST_OUTPUT_KEYS = frozenset({"request_id", "prompt", "prompt_token_ids", "outputs", "finished"})
@@ -93,22 +122,24 @@ class OmniMsgpackEncoder:
         if not t.is_contiguous():
             t = t.contiguous()
         t = t.view(torch.uint8)
+        raw = t.numpy().tobytes()
         return {
             _TENSOR_MARKER: True,
             "dtype": str(tensor.dtype).removeprefix("torch."),
             "shape": list(tensor.shape),
-            "data": t.numpy().tobytes(),
+            "data": _chunk_bytes(raw),
         }
 
     def _encode_ndarray(self, arr: np.ndarray) -> dict[str, Any]:
         """Encode numpy.ndarray to dict."""
         if not arr.flags.c_contiguous:
             arr = np.ascontiguousarray(arr)
+        raw = arr.tobytes()
         return {
             _NDARRAY_MARKER: True,
             "dtype": arr.dtype.str,
             "shape": list(arr.shape),
-            "data": arr.tobytes(),
+            "data": _chunk_bytes(raw),
         }
 
     def _encode_pil_image(self, img: Image.Image) -> dict[str, Any]:
@@ -116,11 +147,12 @@ class OmniMsgpackEncoder:
         arr = np.asarray(img, dtype=np.uint8)
         if not arr.flags.c_contiguous:
             arr = np.ascontiguousarray(arr)
+        raw = arr.tobytes()
         return {
             _PIL_IMAGE_MARKER: True,
             "mode": img.mode,
             "shape": list(arr.shape),
-            "data": arr.tobytes(),
+            "data": _chunk_bytes(raw),
         }
 
     def _encode_request_output(self, obj: RequestOutput) -> dict[str, Any]:
@@ -280,7 +312,7 @@ class OmniMsgpackDecoder:
         """Decode dict to torch.Tensor."""
         dtype_str = obj["dtype"]
         shape = obj["shape"]
-        data = obj["data"]
+        data = _unchunk_bytes(obj["data"])
 
         torch_dtype = getattr(torch, dtype_str)
         if not data:
@@ -294,14 +326,14 @@ class OmniMsgpackDecoder:
         """Decode dict to numpy.ndarray."""
         dtype = obj["dtype"]
         shape = obj["shape"]
-        data = obj["data"]
+        data = _unchunk_bytes(obj["data"])
         return np.frombuffer(data, dtype=dtype).reshape(shape)
 
     def _decode_pil_image(self, obj: dict[str, Any]) -> Image.Image:
         """Decode dict to PIL.Image."""
         mode = obj["mode"]
         shape = obj["shape"]
-        data = obj["data"]
+        data = _unchunk_bytes(obj["data"])
         arr = np.frombuffer(data, dtype=np.uint8).reshape(shape)
         return Image.fromarray(arr, mode=mode)
 

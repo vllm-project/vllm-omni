@@ -830,6 +830,69 @@ default. `short_edge` controls the 768-pixel canvas and must be `768`.
 outputs; the synchronous raw-MP4 endpoint returns the first output when more
 than one is requested.
 
+### Videos longer than 15 seconds (sliding window)
+
+Outputs longer than the native 4–15 s contract are produced by server-side
+sliding-window generation: every window is denoised inside the native contract
+and decoded on its own. For t2va and fl2va, each continuation window is a
+first-frame fl2va request of its own: the frame the new window starts on is
+taken from the decoded previous window and conditions the window as a still
+keyframe at frame 0 (with the prompt re-encoded around that picture, exactly
+as a user-supplied first frame is), and the first latents of the shared span
+(video, and half a second of audio) are held on the previous window's tail
+while noise is high so the new window starts with the real motion and sound
+rather than fading in from a still and silence. Both windows render
+the shared overlap span; on concatenation the previous window is kept through
+the held frames, video and audio cross-fade to the new window for up to half a
+second (as far as the span allows), and the rest of the span is the new
+window's rendering. A freshly generated window fades its audio in from near
+silence over a few seconds, so the new window's audio onset is lifted towards
+the previous window's level (a capped gain that never attenuates: in full for
+two seconds, fading out by four). For ref2va the tail of
+the previous window (video and audio) conditions the next window as a frozen
+`video_audio` history block instead. Set `duration > 15` in `extra_params`
+(windowing auto-activates) or pass `extra_params.num_segments` explicitly:
+
+```bash
+curl -X POST http://localhost:8000/v1/videos/sync \
+  -F 'model=MiniMaxAI/MiniMax-H3' \
+  -F 'prompt="A drone shot over a coastal cliff at sunrise"' \
+  -F 'extra_params={"task":"t2va","duration":30,"audio_flow_shift":3.0}' \
+  --output cliff_30s.mp4
+```
+
+Windowing keys (all optional, passed in `extra_params` or
+`extra_params.target`):
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `num_segments` | unset | `int >= 2` to fix the window count, or `"auto"` to derive it from `duration` (also the default when `duration > 15`) |
+| `overlap_frames` | `58` | Snapped to the nearest valid value on the latent grid, at most half the window (a continuation must contribute at least the span it is spliced into) |
+| `window_duration` | `15.0` | Per-window duration in seconds; must be in `[4, 15]` |
+
+Geometry: a 15 s window is 362 frames (the native ceiling). The overlap lives
+on the latent grid: the default `overlap_frames` of 58 resolves to 17 latents
+(56 frames, ~2.3 s rendered by both windows), and a valid overlap
+satisfies `(window_latent_t - overlap_latent_t) % 15 == 0` so that each
+continuation window adds a whole number of frames and audio latents; requests
+snap to the nearest valid value. For the default window each continuation
+contributes 306 new frames, so the output has 668 frames (~27.8 s) for two
+windows, 974 (~40.6 s) for three, 1280 (~53.3 s) for four. The audio overlap
+covers the same wall-clock span as the video overlap, so every continuation
+window adds exactly 12.75 s of both video and audio (306 frames / 510 audio
+latents) and A/V sync does not drift across windows. A larger `overlap_frames` gives the
+new window a longer run-in before it is used (and shortens each window's
+contribution); the smallest valid value (5 frames) hands over at the still.
+The actual output duration may differ slightly from the requested `duration`
+because it is quantized to the window grid.
+Sliding-window generation runs in request mode and is not available under
+`--step-execution` or `--streaming-output`; incremental per-window streaming is
+planned as a follow-up. For t2va and fl2va it also needs the text encoder in
+the diffusion stage (the default co-located layout), because every
+continuation window re-encodes the prompt around its handoff frame; a
+disaggregated stage with `model_loaded.text_encoder: false` rejects such
+requests with a clear error rather than producing a discontinuous video.
+
 ## Request-scoped quality
 
 Add one of these fields to any HTTP request above. No Cache-DiT startup option
@@ -1049,7 +1112,10 @@ against 85.8 s without.
 | `quality` | omitted or `lossless` | Request-level quality intent; `high` dynamically installs H3's conservative Cache-DiT profile |
 | `extra_params.force_refresh_step_hint` | omitted | Optional positive 1-based denoising-step hint for an active Cache-DiT request; pair with `extra_params.force_refresh_step_policy`=`once` or `repeat` |
 | `task` | `t2va`, `fl2va`, or `ref2va` | Passed in `extra_params`; selects the task-specific DiT |
-| `duration` | Workload-specific | Decimal seconds in `extra_params`; converted to H3-compatible frame count |
+| `duration` | Workload-specific | Decimal seconds in `extra_params`; converted to H3-compatible frame count. Values > 15 trigger sliding-window generation |
+| `num_segments` | unset | `int >= 2` or `"auto"` in `extra_params`; controls the sliding-window count for videos longer than 15 s |
+| `overlap_frames` | `58` | Sliding-window overlap in `extra_params`; snapped to the latent grid |
+| `window_duration` | `15.0` | Per-window duration in seconds for sliding-window generation; must be in `[4, 15]` |
 | `fps` | `24` | H3 output FPS is fixed |
 | `num_inference_steps` | `50` | Matches the reference accuracy workloads |
 | `flow_shift` | `12` | Video sigma shift |
