@@ -105,10 +105,12 @@ local = [
     "FlagEmbedding",
 ]
 
-# LongCat-Video-Avatar A2V/AI2V runtime dependencies for vocal
-# separation and loudness normalization.
+# audio-separator 0.44.2 imports audioread and still uses the
+# librosa 0.10 get_duration(filename=...) API during vocal separation.
 longcat-video-avatar = [
     "audio-separator==0.44.2",
+    "audioread>=3.0.0",
+    "librosa>=0.10,<0.11",
     "pyloudnorm==0.1.1",
     "soundfile>=0.13.1",
 ]

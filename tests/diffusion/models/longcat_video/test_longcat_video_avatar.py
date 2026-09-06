@@ -11,6 +11,7 @@ import torch
 from PIL import Image
 
 from vllm_omni.diffusion.models.longcat_video.longcat_video_avatar_transformer import (
+    Attention,
     LongCatVideoAvatarTransformer3DModel,
     _read_config,
     replace_linear_with_quantized,
@@ -172,6 +173,34 @@ def test_longcat_video_avatar_load_weights_supports_int8_buffers():
 
     assert buffer_name in loaded_params
     assert torch.equal(dict(model.named_buffers())[buffer_name], loaded_weight)
+
+
+def test_longcat_video_avatar_bsa_toggle_is_opt_in():
+    model = LongCatVideoAvatarTransformer3DModel(
+        hidden_size=8,
+        depth=1,
+        num_heads=1,
+        caption_channels=8,
+        intermediate_dim=8,
+        output_dim=8,
+        audio_channel=8,
+        context_tokens=1,
+        enable_bsa=False,
+    )
+
+    assert not model.blocks[0].attn.enable_bsa
+    model.enable_bsa()
+    assert model.blocks[0].attn.enable_bsa
+    model.disable_bsa()
+    assert not model.blocks[0].attn.enable_bsa
+
+
+def test_longcat_video_avatar_bsa_skips_cpu_and_incompatible_shapes():
+    attention = Attention(dim=8, num_heads=1, enable_bsa=True)
+    q = torch.randn(1, 1, 16, 8)
+    k = torch.randn(1, 1, 16, 8)
+
+    assert attention._bsa_latent_shapes(q, k, (4, 2, 2)) is None
 
 
 def test_longcat_video_avatar_multi_speaker_para_audio_arrays_are_aligned():
