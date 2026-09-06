@@ -313,8 +313,15 @@ One process per exact identity owns a build; other workers wait and then acquire
 leases for the published artifact. Publication is invisible until all payloads
 and metadata are validated, hashed, fsynced, and atomically renamed.
 
-`coordination_timeout_seconds` bounds filesystem lock acquisition. It does not
-cancel synchronous validation, a producer that has already started, or atomic
+`coordination_timeout_seconds` bounds domain-initialization and lookup/build
+lock acquisition. Store construction and each later resolution or publication
+operation have separate budgets from the same wait policy, rather than one
+end-to-end startup deadline. A domain-init timeout follows the retryable domain
+failure policy below. After contention ends, a fresh runtime construction can
+retry initialization; the timed-out runtime retains its original failure.
+
+The coordination budget does not cancel filesystem I/O, synchronous validation,
+a producer that has already started, or atomic
 publication. A hung in-process producer therefore blocks its owning process and
 must be handled by external process supervision. Enforceable producer
 cancellation requires a future process-isolated producer contract.
