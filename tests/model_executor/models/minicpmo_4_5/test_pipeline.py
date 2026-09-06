@@ -172,7 +172,7 @@ class TestDeployTopology:
             assert "hf_overrides" not in stages[1].yaml_engine_args
         if filename == "minicpmo_4_5.yaml":
             assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [4, 4, 4]
-            assert stages[1].yaml_engine_args["hf_overrides"] == {"tts_config": {"attention_type": "sliding_recompute"}}
+            assert stages[1].yaml_engine_args["hf_overrides"] == {"tts_config": {"attention_type": "full_attention"}}
             memory_utilizations = [stage.yaml_engine_args["gpu_memory_utilization"] for stage in stages]
             assert memory_utilizations == [
                 0.55,
@@ -198,12 +198,12 @@ class TestDeployTopology:
         stages = merge_pipeline_deploy(OMNI_PIPELINES[deploy.pipeline], deploy)
         overrides = stages[1].yaml_engine_args["hf_overrides"]
         hf_config = PretrainedConfig()
-        hf_config.tts_config = PretrainedConfig(attention_type="full_attention")
+        hf_config.tts_config = PretrainedConfig(attention_type="sliding_recompute")
 
         model_config = object.__new__(ModelConfig)
         model_config._apply_dict_overrides(hf_config, overrides)
 
-        assert hf_config.tts_config.attention_type == "sliding_recompute"
+        assert hf_config.tts_config.attention_type == "full_attention"
 
     @pytest.mark.parametrize(
         "filename",
