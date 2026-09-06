@@ -65,6 +65,9 @@ Before proposing changes, ask for the optimization scene if it is not already kn
      - `VAE patch parallel value`: compare the best DiT strategy with VAE patch parallel enabled and disabled.
      - `HSDP cost`: compare HSDP on/off only when both configurations fit memory.
      - `Ulysses vs Ring`: test a Ring/Ulysses hybrid only after long-sequence `diffuse` is confirmed dominant.
+       Work out the legal set and the cheaper strategy from the attention shape first --
+       see `references/sp-strategy-selection.md`. AllGather-KV is often the one to beat
+       on GQA/MQA models and is missing from most hand-run A/B sweeps.
    - For each configuration, create or record a stable config id, for example `A_cfg2_usp4_vaepp8_hsdp_tiling`.
    - For each config id, capture:
      - exact server command and environment variables,
@@ -498,6 +501,12 @@ Use `ops_rankN.xlsx` or PyTorch key averages for shape analysis, and re-test any
 optimization with non-profiler baseline commands.
 
 Read `references/optimization-playbook.md` when drafting the optimization table or comparing candidate techniques.
+
+Read `references/sp-strategy-selection.md` before comparing Ulysses, Ring and
+AllGather-KV. Which one is cheapest follows from the attention shape, so
+compute it from `num_heads`, `num_kv_heads` and `sp_degree` first and measure
+only to confirm; the decision rule is `num_heads / num_kv_heads > sp_degree - 1`
+favours AllGather-KV.
 
 ## vLLM Omni Heuristics
 
