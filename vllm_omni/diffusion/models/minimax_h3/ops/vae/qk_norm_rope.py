@@ -11,18 +11,26 @@ if HAS_TRITON:
 
     @triton.jit
     def _qk_rms_norm_rope_exact_kernel(
-        x_ptr,
+        q_ptr,
+        k_ptr,
         cos_ptr,
         sin_ptr,
-        output_ptr,
-        x_stride_token,
-        x_stride_head,
-        x_stride_dim,
+        q_output_ptr,
+        k_output_ptr,
+        q_stride_token,
+        q_stride_head,
+        q_stride_dim,
+        k_stride_token,
+        k_stride_head,
+        k_stride_dim,
         rope_stride_token,
         rope_stride_dim,
-        output_stride_token,
-        output_stride_head,
-        output_stride_dim,
+        q_output_stride_token,
+        q_output_stride_head,
+        q_output_stride_dim,
+        k_output_stride_token,
+        k_output_stride_head,
+        k_output_stride_dim,
         num_heads: tl.constexpr,
         head_dim: tl.constexpr,
         rotary_dim: tl.constexpr,
@@ -31,12 +39,15 @@ if HAS_TRITON:
     ):
         token = tl.program_id(0)
         head_group = tl.program_id(1)
+        qk_domain = tl.program_id(2)
         heads = head_group * heads_per_program + tl.arange(0, heads_per_program)
         dims = tl.arange(0, head_dim)
         mask = heads[:, None] < num_heads
 
-        offsets = token * x_stride_token + heads[:, None] * x_stride_head + dims[None, :] * x_stride_dim
-        x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        q_offsets = token * q_stride_token + heads[:, None] * q_stride_head + dims[None, :] * q_stride_dim
+        k_offsets = token * k_stride_token + heads[:, None] * k_stride_head + dims[None, :] * k_stride_dim
+        x_ptrs = tl.where(qk_domain == 0, q_ptr + q_offsets, k_ptr + k_offsets)
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
         inv_rms = tl.rsqrt(tl.sum(x * x, axis=1) / head_dim + eps)
         normalized = (x * inv_rms[:, None]).to(tl.float16)
 
@@ -46,8 +57,10 @@ if HAS_TRITON:
             dims + rotary_half,
             tl.where(dims < rotary_dim, dims - rotary_half, dims),
         )
-        pair_offsets = token * x_stride_token + heads[:, None] * x_stride_head + pair_dims[None, :] * x_stride_dim
-        pair_x = tl.load(x_ptr + pair_offsets, mask=mask, other=0.0).to(tl.float32)
+        q_pair_offsets = token * q_stride_token + heads[:, None] * q_stride_head + pair_dims[None, :] * q_stride_dim
+        k_pair_offsets = token * k_stride_token + heads[:, None] * k_stride_head + pair_dims[None, :] * k_stride_dim
+        pair_x_ptrs = tl.where(qk_domain == 0, q_ptr + q_pair_offsets, k_ptr + k_pair_offsets)
+        pair_x = tl.load(pair_x_ptrs, mask=mask, other=0.0).to(tl.float32)
         pair_normalized = (pair_x * inv_rms[:, None]).to(tl.float16)
 
         rope_mask = dims < rotary_dim
@@ -79,10 +92,18 @@ if HAS_TRITON:
         )
         output = tl.where(rope_mask[None, :], rotated, normalized)
 
-        output_offsets = (
-            token * output_stride_token + heads[:, None] * output_stride_head + dims[None, :] * output_stride_dim
+        q_output_offsets = (
+            token * q_output_stride_token + heads[:, None] * q_output_stride_head + dims[None, :] * q_output_stride_dim
         )
-        tl.store(output_ptr + output_offsets, output, mask=mask)
+        k_output_offsets = (
+            token * k_output_stride_token + heads[:, None] * k_output_stride_head + dims[None, :] * k_output_stride_dim
+        )
+        output_ptrs = tl.where(
+            qk_domain == 0,
+            q_output_ptr + q_output_offsets,
+            k_output_ptr + k_output_offsets,
+        )
+        tl.store(output_ptrs, output, mask=mask)
 
 
 def _supported_inputs(
@@ -143,11 +164,11 @@ def try_qk_norm_rope_exact(
     sin = sin.reshape(tokens, sin.shape[-1])
     q_output = torch.empty_like(q)
     k_output = torch.empty_like(k)
-    # This launch layout is part of the exactness contract on the validated
-    # SM90 and SM103 targets: changing the warp-to-row mapping changes the
-    # FP32 RMS reduction order.
+    # The first two launch dimensions are part of the exactness contract on
+    # the validated SM90 and SM103 targets: changing the warp-to-row mapping
+    # changes the FP32 RMS reduction order.
     heads_per_program = 8
-    grid = (tokens, triton.cdiv(heads, heads_per_program))
+    grid = (tokens, triton.cdiv(heads, heads_per_program), 2)
     launch_args = {
         "num_heads": heads,
         "head_dim": head_dim,
@@ -158,29 +179,22 @@ def try_qk_norm_rope_exact(
     }
     _qk_rms_norm_rope_exact_kernel[grid](
         q,
-        cos,
-        sin,
-        q_output,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        cos.stride(0),
-        cos.stride(1),
-        q_output.stride(0),
-        q_output.stride(1),
-        q_output.stride(2),
-        **launch_args,
-    )
-    _qk_rms_norm_rope_exact_kernel[grid](
         k,
         cos,
         sin,
+        q_output,
         k_output,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
         k.stride(0),
         k.stride(1),
         k.stride(2),
         cos.stride(0),
         cos.stride(1),
+        q_output.stride(0),
+        q_output.stride(1),
+        q_output.stride(2),
         k_output.stride(0),
         k_output.stride(1),
         k_output.stride(2),
