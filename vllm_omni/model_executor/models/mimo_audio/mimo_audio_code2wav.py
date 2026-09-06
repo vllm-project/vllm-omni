@@ -180,18 +180,20 @@ class MiMoAudioTokenizerWorker:
         return torch.log(torch.clip(spec, min=1e-7)).squeeze()
 
     def group_by_length(self, features: torch.Tensor, lengths: torch.Tensor, max_length: int):
-        if features.size(0) != lengths.sum().item():
-            raise ValueError(f"Feature size mismatch: {features.size(0)} vs {lengths.sum().item()}")
+        length_values = lengths.tolist()
+        total_length = sum(length_values)
+        if features.size(0) != total_length:
+            raise ValueError(f"Feature size mismatch: {features.size(0)} vs {total_length}")
 
         split_points = []
         current_sum = 0
 
-        for i, seq_len in enumerate(lengths):
+        for i, seq_len in enumerate(length_values):
             if current_sum + seq_len > max_length and current_sum > 0:
                 split_points.append(i)
-                current_sum = seq_len.item()
+                current_sum = seq_len
             else:
-                current_sum += seq_len.item()
+                current_sum += seq_len
 
         # Convert split points to group sizes
         group_sizes = []
@@ -203,7 +205,11 @@ class MiMoAudioTokenizerWorker:
             group_sizes.append(len(lengths) - prev)
 
         len_groups = torch.split(lengths, group_sizes)
-        feature_sizes = [group.sum().item() for group in len_groups]
+        feature_sizes = []
+        offset = 0
+        for group_size in group_sizes:
+            feature_sizes.append(sum(length_values[offset : offset + group_size]))
+            offset += group_size
         feature_groups = torch.split(features, feature_sizes)
 
         return feature_groups, len_groups
