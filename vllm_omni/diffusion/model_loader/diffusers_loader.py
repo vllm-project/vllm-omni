@@ -509,11 +509,6 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         if getattr(model, "lora_is_fused", False):
             return
 
-        # A warm HWR restore already brings back the fused final-layout weights.
-        if self._hwr_state is not None and self._hwr_state.get("warm_snapshot") is not None:
-            setattr(model, "lora_is_fused", True)
-            return
-
         lora_path = getattr(self.od_config, "lora_path", None)
         if not lora_path:
             return
@@ -530,6 +525,111 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             setattr(model, "lora_is_fused", True)
         else:
             logger.warning("Pipeline %s does not support loading distilled LoRA weights.", model.__class__.__name__)
+
+    def _broadcast_model_weights(
+        self,
+        model: nn.Module,
+        target_device: torch.device,
+        src_rank: int = 0,
+        bucket_cap_bytes: int = 256 * 1024 * 1024,
+    ) -> None:
+        """Broadcast model parameters and buffers from src_rank to all other ranks using coalesced bucketing."""
+        if not torch.distributed.is_initialized() or torch.distributed.get_world_size() <= 1:
+            return
+
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        backend = torch.distributed.get_backend()
+        is_cpu_backend = backend == "gloo"
+
+        logger.info(
+            "Worker %d: %s full model weights via %s across %d ranks",
+            rank,
+            "Broadcasting" if rank == src_rank else "Receiving",
+            backend,
+            world_size,
+        )
+        t0 = time.perf_counter()
+
+        all_tensors = [p.data for _, p in model.named_parameters() if p.numel() > 0] + [
+            b.data for _, b in model.named_buffers() if b.numel() > 0
+        ]
+        if not all_tensors:
+            return
+
+        count = len(all_tensors)
+        total_bytes = sum(t.numel() * t.element_size() for t in all_tensors)
+
+        # Group tensors into buckets by dtype and maximum byte size
+        buckets: list[list[torch.Tensor]] = []
+        curr_bucket: list[torch.Tensor] = []
+        curr_bytes = 0
+
+        for tensor in all_tensors:
+            t_bytes = tensor.numel() * tensor.element_size()
+            if curr_bucket and (curr_bucket[0].dtype != tensor.dtype or curr_bytes + t_bytes > bucket_cap_bytes):
+                buckets.append(curr_bucket)
+                curr_bucket = []
+                curr_bytes = 0
+            curr_bucket.append(tensor)
+            curr_bytes += t_bytes
+
+        if curr_bucket:
+            buckets.append(curr_bucket)
+
+        for bucket in buckets:
+            tot_numel = sum(t.numel() for t in bucket)
+            dtype = bucket[0].dtype
+
+            if is_cpu_backend:
+                if rank == src_rank:
+                    flat_cpu = torch.cat([t.reshape(-1) for t in bucket])
+                else:
+                    flat_cpu = torch.empty(tot_numel, dtype=dtype)
+                torch.distributed.broadcast(flat_cpu, src=src_rank)
+                if rank != src_rank:
+                    offset = 0
+                    for t in bucket:
+                        n = t.numel()
+                        t.copy_(flat_cpu[offset : offset + n].view_as(t))
+                        offset += n
+                del flat_cpu
+            else:
+                if rank == src_rank:
+                    flat_cpu = torch.cat([t.reshape(-1) for t in bucket])
+                    dev_flat = flat_cpu.to(target_device, non_blocking=False)
+                    del flat_cpu
+                    torch.distributed.broadcast(dev_flat, src=src_rank)
+                    del dev_flat
+                else:
+                    dev_flat = torch.empty(tot_numel, dtype=dtype, device=target_device)
+                    torch.distributed.broadcast(dev_flat, src=src_rank)
+                    flat_cpu = dev_flat.to("cpu", non_blocking=False)
+                    del dev_flat
+                    offset = 0
+                    for t in bucket:
+                        n = t.numel()
+                        t.copy_(flat_cpu[offset : offset + n].view_as(t), non_blocking=False)
+                        offset += n
+                    del flat_cpu
+
+        if not is_cpu_backend and target_device.type != "cpu":
+            from vllm_omni.platforms import current_omni_platform
+
+            current_omni_platform.synchronize()
+        torch.distributed.barrier()
+
+        elapsed = time.perf_counter() - t0
+        gb = total_bytes / 1e9
+        logger.info(
+            "Worker %d: Shared weight broadcast complete (%d tensors, %d buckets, %.2f GB) in %.2fs (%.2f GB/s)",
+            rank,
+            count,
+            len(buckets),
+            gb,
+            elapsed,
+            gb / max(elapsed, 1e-6),
+        )
 
     def load_model(
         self,
@@ -689,7 +789,6 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                             sources=ordinary_sources,
                             planned_weights=host_weight_plan.bindings,
                         )
-                    self._maybe_fuse_distilled_lora(model)
                 else:
                     if dit_distributed_offload and plan_result is not None:
                         logger.info(
@@ -1097,8 +1196,29 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         if load_format == "diffusers":
             raise ValueError("HSDP is not supported with the diffusers adapter load format")
         model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=True)
-        self.load_weights(model)
-        self._maybe_fuse_distilled_lora(model)
+        world_size = 1
+        rank = 0
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            rank = torch.distributed.get_rank()
+
+        enable_broadcast = bool(getattr(self.od_config, "enable_broadcast_weight_load", False)) and world_size > 1
+
+        if enable_broadcast:
+            if rank == 0:
+                self.load_weights(model)
+                self._maybe_fuse_distilled_lora(model)
+            self._broadcast_model_weights(model, target_device=target_device, src_rank=0)
+            if (
+                rank != 0
+                and getattr(self.od_config, "lora_backend", None) in (LoRABackend.DISTILL, "distill")
+                and getattr(self.od_config, "lora_path", None)
+                and hasattr(model, "load_lora_weights")
+            ):
+                setattr(model, "lora_is_fused", True)
+        else:
+            self.load_weights(model)
+            self._maybe_fuse_distilled_lora(model)
 
         # Quantization methods must finish while parameters are ordinary local
         # tensors. Some post-load transforms use operations (for example,

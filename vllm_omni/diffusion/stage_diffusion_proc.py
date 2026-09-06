@@ -27,10 +27,24 @@ from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import (
     CoreEngine,
-    CoreEngineLaunch,
     EngineZmqAddresses,
     wait_for_engine_startup,
 )
+
+try:
+    from vllm.v1.engine.utils import CoreEngineLaunch
+except ImportError:
+    from dataclasses import dataclass
+
+    @dataclass
+    class CoreEngineLaunch:  # type: ignore[no-redef]
+        engine_manager: Any = None
+        coordinator: Any = None
+        addresses: Any = None
+        tensor_queue: Any = None
+        processes: Any = None
+
+
 from vllm.v1.utils import shutdown
 
 from vllm_omni.diffusion.data import DiffusionRequestAbortedError

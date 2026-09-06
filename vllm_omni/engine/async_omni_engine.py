@@ -1170,6 +1170,7 @@ class AsyncOmniEngine:
             "enable_prompt_embed_cache": kwargs.get("enable_prompt_embed_cache", False),
             "prompt_embed_cache_size": kwargs.get("prompt_embed_cache_size", 32),
             "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
+            "enable_broadcast_weight_load": kwargs.get("enable_broadcast_weight_load", False),
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
             "quantization": kwargs.get("quantization", None),
             "quantization_config": kwargs.get("quantization_config", None),
@@ -1933,7 +1934,7 @@ class AsyncOmniEngine:
             tokens generated before abort (empty for diffusion / no OP state).
         """
         if not request_ids or getattr(self, "_shutdown_called", False):
-            return
+            return []
         if self.request_queue is None:
             raise RuntimeError("request_queue is not initialized")
         transport = self._correlated_rpc_client
@@ -1960,7 +1961,7 @@ class AsyncOmniEngine:
             result_msg = await loop.run_in_executor(None, _wait)
         except Exception as exc:
             if getattr(self, "_shutdown_called", False) and is_abort_transport_shutdown(exc):
-                return
+                return []
             raise
         if not result_msg.success:
             raise RuntimeError(result_msg.error or "abort failed")

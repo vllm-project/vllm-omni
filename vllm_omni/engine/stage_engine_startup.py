@@ -25,12 +25,26 @@ from vllm.utils.network_utils import get_open_ports_list, zmq_socket_ctx
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.utils import (
     CoreEngine,
-    CoreEngineLaunch,
     CoreEngineProcManager,
     EngineZmqAddresses,
     get_engine_zmq_addresses,
     wait_for_engine_startup,
 )
+
+try:
+    from vllm.v1.engine.utils import CoreEngineLaunch
+except ImportError:
+    from dataclasses import dataclass
+
+    @dataclass
+    class CoreEngineLaunch:  # type: ignore[no-redef]
+        engine_manager: Any = None
+        coordinator: Any = None
+        addresses: Any = None
+        tensor_queue: Any = None
+        processes: Any = None
+
+
 from vllm.v1.executor import Executor
 
 from vllm_omni.distributed.omni_connectors.utils import initialization

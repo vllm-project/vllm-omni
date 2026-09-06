@@ -858,6 +858,7 @@ class OmniDiffusionConfig:
 
     # Parallel weight loading (for faster diffusion model startup)
     enable_multithread_weight_load: bool = True
+    enable_broadcast_weight_load: bool = False
     num_weight_load_threads: int = 4
 
     # Enable sleep mode
