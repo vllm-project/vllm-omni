@@ -541,3 +541,41 @@ Explanation:
   name ITL in text stage for easier mapping.
 
 </details>
+
+### Stage metrics on `openai-audio-speech`
+
+`POST /v1/audio/speech` cannot mix JSON metrics into a raw PCM body. The
+`openai-audio-speech` backend therefore changes transport when stage metrics
+are requested:
+
+- Default: `stream=true`, `stream_format=audio`, `response_format=pcm` (raw PCM,
+  used for audio TTFP).
+- With `--print-stage`: the client sets `return_stage_metrics=true` and switches
+  to `stream_format=sse`, then reads stage metrics from the SSE stream. See
+  the speech API [SSE stream](../../serving/speech_api.md#response-format)
+  contract. Diffusion TTS (for example OmniVoice) still returns a single audio
+  body; the client records e2e audio metrics from that body instead.
+
+Limitations:
+
+- The same API rule applies: `return_stage_metrics` requires SSE. A request that
+  stays on `stream_format=audio` or non-streaming cannot return stage metrics.
+- `--print-stage` takes precedence over Seed-TTS WER's raw-PCM override. WER can
+  still decode PCM from `speech.audio.delta` base64 chunks, but the wire format
+  is no longer `stream_format=audio`.
+- Audio TTFP is then the time to the first SSE `speech.audio.delta`, not the
+  first raw PCM byte. For diffusion TTS the response is not SSE, so AUDIO_TTFP
+  is close to end-to-end latency.
+- If the server has no per-stage data, the speech request still succeeds.
+  Diffusion TTS does not print a Stage Benchmark Result section; after
+  Serving Benchmark Result the client prints
+  `Stage Benchmark Result of diffusion TTS omitted.`
+
+```bash
+vllm bench serve --omni \
+    --backend openai-audio-speech \
+    --endpoint /v1/audio/speech \
+    --dataset-name seed-tts-text \
+    --percentile-metrics e2el,audio_ttfp,audio_rtf,audio_duration \
+    --print-stage
+```

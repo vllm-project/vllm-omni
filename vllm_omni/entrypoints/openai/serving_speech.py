@@ -12,6 +12,7 @@ import re
 import struct
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from pathlib import Path
@@ -2226,6 +2227,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         tts_params: dict[str, Any] | None = None,
         collect: dict | None = None,
         target_sample_rate: int | None = None,
+        on_final_metrics: Callable[[dict[str, object]], None] | None = None,
     ):
         """Generate audio chunks for streaming response.
 
@@ -2265,6 +2267,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 # off the final output; a cheap early-return on every other res).
                 if usage_acc is not None:
                     usage_acc.observe(res)
+                if on_final_metrics is not None:
+                    metrics = getattr(res, "metrics", None)
+                    if isinstance(metrics, dict) and metrics:
+                        on_final_metrics(metrics)
                 audio_output, audio_key = self._extract_audio_output(res)
                 if audio_key is None:
                     # Stash the aligner's timestamps output for streaming callers.
@@ -2447,6 +2453,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_start_s: float | None = None,
         request: OpenAICreateSpeechRequest | None = None,
         tts_params: dict[str, Any] | None = None,
+        return_stage_metrics: bool = False,
     ):
         """Generate OpenAI-style SSE events with base64 audio deltas.
 
@@ -2464,8 +2471,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """
         usage_acc = SpeechOutputTokenCounter()
         emitted_audio = False
+        final_metrics: dict[str, object] = {}
+
+        def capture_final_metrics(metrics: dict[str, object]) -> None:
+            stage_metrics = metrics.get("stage_metrics")
+            if isinstance(stage_metrics, dict):
+                accumulated_stage_metrics = final_metrics.setdefault("stage_metrics", {})
+                if isinstance(accumulated_stage_metrics, dict):
+                    accumulated_stage_metrics.update(stage_metrics)
+            final_metrics.update({key: value for key, value in metrics.items() if key != "stage_metrics"})
+
         try:
-            async for chunk in self._generate_audio_chunks(
+            async for item in self._generate_audio_chunks(
                 generator,
                 request_id,
                 response_format,
@@ -2474,15 +2491,35 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 usage_acc=usage_acc,
                 tts_params=tts_params,
                 target_sample_rate=request.sample_rate if request is not None else None,
+                include_sample_rate=True,
+                on_final_metrics=capture_final_metrics if return_stage_metrics else None,
             ):
+                if isinstance(item, tuple):
+                    chunk, sample_rate = item
+                else:
+                    chunk, sample_rate = item, None
                 payload = {
                     "type": "speech.audio.delta",
                     "audio": base64.b64encode(chunk).decode("ascii"),
                     "response_format": response_format,
                 }
+                if sample_rate is not None:
+                    payload["sample_rate"] = sample_rate
                 data = json.dumps(payload, separators=(",", ":"))
                 emitted_audio = True
                 yield f"event: speech.audio.delta\ndata: {data}\n\n"
+            if return_stage_metrics and final_metrics:
+                metrics_payload = {
+                    "type": "speech.metrics",
+                    "metrics": final_metrics,
+                }
+                data = json.dumps(metrics_payload, separators=(",", ":"))
+                yield f"event: speech.metrics\ndata: {data}\n\n"
+            elif return_stage_metrics:
+                logger.warning(
+                    "Stage metrics were requested but unavailable for speech request %s",
+                    request_id,
+                )
             done_payload: dict[str, Any] = {"type": "speech.audio.done"}
             if request is not None:
                 # Streaming path: output_tokens = sum of stage-0 deltas.
@@ -3444,12 +3481,27 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self,
         request: OpenAICreateSpeechRequest,
     ) -> Response:
-        """Handle speech generation for pure diffusion TTS models (e.g. OmniVoice)."""
+        """Handle speech generation for pure diffusion TTS models (e.g. OmniVoice).
+
+        OmniVoice is request-mode (one ``forward()``), so this path never emits
+        ``speech.audio.*`` SSE or ``speech.metrics``. Streaming / stage-metric
+        flags are ignored and a single audio body is returned so ``--print-stage``
+        benches still collect e2e audio metrics instead of failing with HTTP 400.
+        """
         from vllm_omni.outputs import OmniRequestOutput
 
         try:
             if not request.input or not request.input.strip():
                 raise ValueError("Input text cannot be empty")
+
+            if request.is_sse_stream() or request.return_stage_metrics:
+                logger.warning(
+                    "Diffusion TTS does not emit speech SSE events or stage metrics; "
+                    "ignoring stream_format=%r return_stage_metrics=%s and returning "
+                    "a single audio body",
+                    request.stream_format,
+                    request.return_stage_metrics,
+                )
 
             if request.ref_audio is not None:
                 fmt_err = self._validate_ref_audio_format(request.ref_audio)
@@ -3629,6 +3681,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self.create_error_response(sample_rate_error)
 
         if self._diffusion_mode:
+            # Soft-reject SSE / return_stage_metrics: still 200 + audio.
             return await self._create_diffusion_speech(request)
 
         error_check_ret = await self._check_model(request)
@@ -3697,6 +3750,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         request_start_s=request_start_s,
                         request=request,
                         tts_params=sse_tts_params,
+                        return_stage_metrics=request.return_stage_metrics,
                     ),
                     media_type="text/event-stream",
                 )

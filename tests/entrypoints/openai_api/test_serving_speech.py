@@ -794,6 +794,51 @@ class TestSpeechAPI:
         assert passed_params is not mock_engine.default_sampling_params_list
         assert passed_params[0].extra_args == {"existing_arg": "new_value", "new_arg": 123}
 
+    @pytest.mark.asyncio
+    async def test_create_diffusion_speech_ignores_sse_and_stage_metrics(
+        self, mocker: MockerFixture, caplog: pytest.LogCaptureFixture
+    ):
+        """Diffusion TTS soft-rejects SSE/metrics and still returns audio."""
+        mock_engine = mocker.MagicMock()
+        mock_sampling_param = mocker.MagicMock()
+        mock_sampling_param.extra_args = {}
+        mock_engine.default_sampling_params_list = [mock_sampling_param]
+
+        async def mock_generate(*args, **kwargs):
+            yield create_mock_audio_output_for_test()
+
+        mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
+
+        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        mocker.patch.object(
+            server, "create_audio", return_value=mocker.MagicMock(audio_data=b"dummy-pcm", media_type="audio/pcm")
+        )
+
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            stream=True,
+            stream_format="sse",
+            response_format="pcm",
+            return_stage_metrics=True,
+        )
+
+        target_logger = logging.getLogger("vllm_omni.entrypoints.openai.serving_speech")
+        target_logger.addHandler(caplog.handler)
+        prev_level = target_logger.level
+        target_logger.setLevel(logging.WARNING)
+        try:
+            with caplog.at_level(logging.WARNING, logger="vllm_omni.entrypoints.openai.serving_speech"):
+                response = await server.create_speech(req)
+        finally:
+            target_logger.removeHandler(caplog.handler)
+            target_logger.setLevel(prev_level)
+
+        assert response.status_code == 200
+        assert response.media_type == "audio/pcm"
+        assert response.body == b"dummy-pcm"
+        mock_engine.generate.assert_called_once()
+        assert any("does not emit speech SSE" in record.message for record in caplog.records)
+
 
 class TestTTSMethods:
     """Unit tests for TTS validation and parameter building."""

@@ -21,9 +21,13 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SeedTTSTextSampleRequest,
 )
 from vllm_omni.benchmarks.patch.patch import (
+    DIFFUSION_TTS_STAGE_OMITTED_MSG,
     MixRequestFuncOutput,
     _apply_stage0_token_timings,
     _attach_seed_tts_to_request_func_input,
+    _print_diffusion_stage_omitted,
+    _should_print_diffusion_stage_omitted,
+    async_request_openai_audio_speech,
     async_request_openai_chat_omni_completions,
     async_request_openai_realtime_duplex,
     should_request_stage_metrics,
@@ -104,11 +108,12 @@ def test_seed_tts_text_chat_messages_do_not_add_reference_audio() -> None:
 class MockResponse:
     """Mock aiohttp response for testing"""
 
-    def __init__(self, status, chunks, delay_between_chunks=0):
+    def __init__(self, status, chunks, delay_between_chunks=0, headers=None):
         self.status = status
         self.reason = "OK" if status == 200 else "Error"
         self._chunks = chunks
         self._delay = delay_between_chunks
+        self.headers = headers or {}
         self.content = self
 
     async def iter_any(self):
@@ -1194,6 +1199,90 @@ async def test_prompt_len_assigned_from_usage(mocker: MockerFixture):
     assert output.prompt_len == 4992, (
         "prompt_len should be overridden by usage.prompt_tokens to reflect the true multimodal input token count"
     )
+
+
+def _speech_stage_metrics_request() -> RequestFuncInput:
+    return RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="hello",
+        api_url="http://test.com/v1/audio/speech",
+        prompt_len=2,
+        output_len=20,
+        extra_body={"return_stage_metrics": True},
+    )
+
+
+@pytest.mark.asyncio
+async def test_speech_print_stage_parses_audio_body_from_diffusion(mocker: MockerFixture):
+    """OmniVoice ignores SSE and returns audio/*; client must not json.loads PCM."""
+    pcm = b"\x00\x00" * 2400
+    mock_response = MockResponse(200, [pcm], headers={"Content-Type": "audio/pcm"})
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_audio_speech(_speech_stage_metrics_request(), mock_session)
+
+    posted = mock_session.post.call_args.kwargs["json"]
+    assert posted["stream_format"] == "sse"
+    assert posted["return_stage_metrics"] is True
+    assert output.success is True
+    assert output.error == ""
+    assert output.audio_frames == 2400
+    assert output.audio_duration == pytest.approx(0.1)
+    assert output.audio_ttfp > 0
+    assert output.stage_metrics is None
+    assert output.audio_body_without_stage_metrics is True
+
+
+@pytest.mark.asyncio
+async def test_speech_print_stage_still_parses_sse_metrics(mocker: MockerFixture):
+    """AR TTS SSE path with speech.metrics is unchanged."""
+    pcm = b"\x00\x00" * 2400
+    chunks = [
+        create_sse_chunk(
+            {
+                "type": "speech.audio.delta",
+                "audio": base64.b64encode(pcm).decode("ascii"),
+                "sample_rate": 24000,
+            }
+        ),
+        create_sse_chunk(
+            {
+                "type": "speech.metrics",
+                "metrics": {"stage_metrics": {"0": {"num_tokens_out": 0}}},
+            }
+        ),
+        create_sse_chunk({"type": "speech.audio.done"}),
+    ]
+    mock_response = MockResponse(200, chunks, headers={"Content-Type": "text/event-stream"})
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_audio_speech(_speech_stage_metrics_request(), mock_session)
+
+    assert output.success is True
+    assert output.audio_frames == 2400
+    assert output.audio_duration == pytest.approx(0.1)
+    assert output.stage_metrics == {"0": {"num_tokens_out": 0}}
+    assert output.audio_body_without_stage_metrics is False
+
+
+def test_should_print_diffusion_stage_omitted_only_for_audio_body_fallback():
+    omitted = MixRequestFuncOutput()
+    omitted.audio_body_without_stage_metrics = True
+    with_stage = MixRequestFuncOutput()
+    with_stage.stage_metrics = {"0": {"num_tokens_out": 0}}
+
+    assert _should_print_diffusion_stage_omitted(True, [omitted]) is True
+    assert _should_print_diffusion_stage_omitted(False, [omitted]) is False
+    assert _should_print_diffusion_stage_omitted(True, [with_stage]) is False
+    assert _should_print_diffusion_stage_omitted(True, [MixRequestFuncOutput()]) is False
+
+
+def test_print_diffusion_stage_omitted_after_serving_report(capsys):
+    _print_diffusion_stage_omitted()
+    assert DIFFUSION_TTS_STAGE_OMITTED_MSG in capsys.readouterr().out
 
 
 if __name__ == "__main__":
