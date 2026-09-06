@@ -178,6 +178,15 @@ For LingBot World v2:
 - `lingbot_world/pipeline.py` constructs conditioning, owns small non-KV session state, and
   produces one block plus the standard metadata envelope.
 
+## Ulysses sequence parallelism
+
+LingBot supports pure Ulysses sequence parallelism for both direct and
+AR-Diffusion execution. Hidden tokens, camera features, token-expanded timestep
+modulation, and RoPE tables are sharded together. Self-attention performs the
+sequence-to-head all-to-all before reading or writing paged KV, while static
+text K/V uses the same local head shard. Ring and AllGather-KV modes remain
+unsupported for this model.
+
 ## Non-goals
 
 This contract does not currently provide:

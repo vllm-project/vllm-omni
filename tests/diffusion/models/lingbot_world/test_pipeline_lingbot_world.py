@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from torch import nn
 
 import vllm_omni.diffusion.models.lingbot_world.pipeline as lingbot_pipeline
 from tests.diffusion.models.wan2_2.conftest import noop_progress_bar
+from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
 from vllm_omni.diffusion.models.lingbot_world.actions import (
     integrate_lingbot_camera_actions,
 )
@@ -24,6 +25,7 @@ from vllm_omni.diffusion.models.lingbot_world.camera import CameraTrajectory as 
 from vllm_omni.diffusion.models.lingbot_world.camera import (
     build_plucker_embedding as _real_build_plucker_embedding,
 )
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.experimental.ar_diffusion.tick_protocol import (
     ARDiffusionControlInput,
     ARDiffusionTickRequest,
@@ -123,7 +125,7 @@ class _RecordingTransformer(nn.Module):
         )
         self.blocks = nn.ModuleList([nn.Identity(), nn.Identity()])
         for block in self.blocks:
-            block.self_attn = SimpleNamespace(num_local_heads=2, head_dim=4)
+            block.self_attn = SimpleNamespace(num_local_heads=2, num_sp_heads=2, head_dim=4)
         self.calls: list[dict] = []
         self.cache_allocations: list[dict] = []
         self.raise_on_call = raise_on_call
@@ -253,6 +255,8 @@ class _SamplingParams:
         if extra_args is not None:
             self.extra_args.update(extra_args)
         self.latents = None
+        self.guidance_scale = None
+        self.guidance_scale_2 = None
 
 
 class _RequestBatch:
@@ -379,6 +383,9 @@ def _od_config(**overrides):
         "parallel_config": SimpleNamespace(
             pipeline_parallel_size=1,
             sequence_parallel_size=1,
+            ulysses_degree=1,
+            ring_degree=1,
+            allgather_degree=1,
             cfg_parallel_size=1,
             vae_patch_parallel_size=1,
             use_hsdp=False,
@@ -596,7 +603,6 @@ def test_component_discovery_uses_official_checkpoint_contract() -> None:
     ("field", "value", "feature"),
     [
         ("pipeline_parallel_size", 2, "pipeline parallelism"),
-        ("sequence_parallel_size", 2, "sequence parallelism"),
         ("cfg_parallel_size", 2, "CFG parallelism"),
         ("vae_patch_parallel_size", 2, "VAE parallelism"),
         ("use_hsdp", True, "HSDP"),
@@ -612,6 +618,27 @@ def test_unsupported_parallel_modes_fail_before_component_loading(field: str, va
         module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=parallel_config))
 
     assert module._loader_state.prefetch_calls == []
+
+
+def test_pure_ulysses_parallel_config_is_supported() -> None:
+    module = _load_pipeline_module()
+    parallel_config = _od_config().parallel_config
+    parallel_config.sequence_parallel_size = 2
+    parallel_config.ulysses_degree = 2
+
+    pipeline = module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=parallel_config))
+
+    assert pipeline.transformer is not None
+
+
+def test_non_ulysses_sequence_parallelism_is_rejected() -> None:
+    module = _load_pipeline_module()
+    parallel_config = _od_config().parallel_config
+    parallel_config.sequence_parallel_size = 2
+    parallel_config.ring_degree = 2
+
+    with pytest.raises(NotImplementedError, match="pure Ulysses"):
+        module.LingBotWorldCausalDMDPipeline(od_config=_od_config(parallel_config=parallel_config))
 
 
 def test_unsupported_quantization_fails_before_component_loading() -> None:
@@ -1743,6 +1770,167 @@ def test_request_cache_becomes_unreachable_after_transformer_error() -> None:
     assert cache_refs[0]() is None
     assert not hasattr(pipeline, "cache")
     assert not hasattr(pipeline, "transformer_cache")
+
+
+class _FakeARState:
+    def __init__(self, session_id: str = "req-1") -> None:
+        self.session_id = session_id
+        self.commits: list[str] = []
+
+    def get_kv_caches(self, branch, *, seq_len, commit_current):
+        del branch, seq_len, commit_current
+        return [SimpleNamespace()]
+
+    def commit_paged_context(self, branch):
+        self.commits.append(branch)
+
+    def clear_cross_attention(self):
+        return None
+
+    def is_cross_attention_populated(self, branch, name):
+        del branch, name
+        return True
+
+    def get_cross_attention_kv(self, branch, name):
+        del branch, name
+        zeros = torch.zeros(1, 1, 2, 4)
+        return [{"k": zeros, "v": zeros} for _ in range(2)]
+
+
+def _empty_action_script(num_chunks: int):
+    return tuple(((), (), ()) for _ in range(num_chunks))
+
+
+def _stepwise_state(
+    *,
+    request_id: str = "req-1",
+    num_frames: int = 21,
+    script=None,
+    seed: int = 17,
+):
+    num_chunks = ((num_frames - 1) // 4 + 1) // 3
+    sampling = _SamplingParams(num_frames=num_frames, seed=seed)
+    sampling.extra_args["_lingbot_camera_trajectory"] = None
+    sampling.extra_args["_lingbot_camera_actions"] = None
+    sampling.extra_args["_lingbot_camera_action_script"] = (
+        script if script is not None else _empty_action_script(num_chunks)
+    )
+    return StepRequestState(
+        request_id=request_id,
+        sampling=sampling,
+        prompt=_prompt(),
+    )
+
+
+def _run_stepwise(pipeline, state):
+    outputs = []
+    pipeline.prepare_encode(state)
+    while not state.request_denoise_completed:
+        noise = pipeline.denoise_step(None, states=[state])
+        pipeline.step_scheduler(state, noise)
+        if state.chunk_denoise_completed:
+            outputs.append(pipeline.post_decode(state))
+    return outputs
+
+
+def test_pipeline_declares_step_execution_support() -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+
+    assert pipeline.supports_step_execution is True
+    assert isinstance(pipeline, SupportsStepExecution)
+    assert supports_step_execution(pipeline) is True
+
+
+def test_preprocess_materializes_camera_action_script_without_action_path() -> None:
+    module = _load_pipeline_module()
+    sampling = _SamplingParams(include_action=False)
+    sampling.extra_args["camera_action_script"] = [[["w"], ["w"], ["w"]], [["a"], [], []]]
+    request = SimpleNamespace(prompt=_prompt(), sampling_params=sampling)
+
+    result = module.get_lingbot_world_pre_process_func(_od_config())(request)
+
+    assert result.sampling_params.extra_args["_lingbot_camera_trajectory"] is None
+    assert result.sampling_params.extra_args["_lingbot_camera_actions"] is None
+    assert result.sampling_params.extra_args["_lingbot_camera_action_script"] == (
+        (("w",), ("w",), ("w",)),
+        (("a",), (), ()),
+    )
+
+
+def test_stepwise_progress_metadata_and_commit_trace() -> None:
+    module = _load_pipeline_module()
+    transformer = _RecordingTransformer()
+    pipeline = _pipeline(module, transformer=transformer)
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+    state = _stepwise_state(num_frames=21)
+    fake = _FakeARState(state.request_id)
+
+    with pipeline.bind_ar_diffusion_state(state.request_id, fake):
+        outputs = _run_stepwise(pipeline, state)
+
+    assert pipeline._ar_diffusion_kv_state is None
+    assert len(outputs) == 2
+    assert [output.chunk_index for output in outputs] == [0, 1]
+    assert all(output.total_chunks == 2 for output in outputs)
+    assert outputs[-1].finished is True
+    assert [call["update_cache"] for call in transformer.calls] == [False, False, False, False, True] * 2
+    assert [call["start_frame"] for call in transformer.calls] == [0] * 5 + [3] * 5
+    assert fake.commits == ["main", "main"]
+    for chunk_index, output in enumerate(outputs):
+        metadata = output.output["metadata"]["ar_diffusion"]
+        assert metadata == {
+            "session_id": "req-1",
+            "request_id": "req-1",
+            "chunk_index": chunk_index,
+            "applied_event_ids": [],
+        }
+        assert output.output["payload"]["latents"].shape == (1, 16, 3, 2, 2)
+
+
+def test_stepwise_matches_tick_transformer_trace_and_latents() -> None:
+    module = _load_pipeline_module()
+    transformer = _RecordingTransformer()
+    pipeline = _pipeline(module, transformer=transformer)
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+    script = ((("w",), ("w",), ("w",)), (("d",), ("d",), ("d",)))
+    fake = _FakeARState("world-1")
+
+    with pipeline.bind_ar_diffusion_state("world-1", fake):
+        tick_latents = []
+        for chunk_index, frames in enumerate(script):
+            tick = ARDiffusionTickRequest(
+                session_id="world-1",
+                request_id="legacy-lingbot-request",
+                chunk_index=chunk_index,
+                controls=(
+                    ARDiffusionControlInput(
+                        track="camera",
+                        schema="lingbot.camera_actions.v1",
+                        data={"mode": "frames", "frames": [list(frame) for frame in frames]},
+                    ),
+                ),
+            )
+            sampling = _SamplingParams(extra_args=tick.to_extra_args(), seed=17)
+            sampling.extra_args["_lingbot_camera_trajectory"] = None
+            sampling.extra_args["_lingbot_camera_actions"] = frames
+            result = pipeline(_request(sampling=sampling))
+            tick_latents.append(result.output["payload"]["latents"].clone())
+    tick_calls = list(transformer.calls)
+    transformer.calls.clear()
+    pipeline.close_ar_diffusion_session("world-1")
+
+    stepwise_state = _stepwise_state(request_id="req-1", num_frames=21, script=script, seed=17)
+    stepwise_fake = _FakeARState(stepwise_state.request_id)
+    with pipeline.bind_ar_diffusion_state(stepwise_state.request_id, stepwise_fake):
+        stepwise_outputs = _run_stepwise(pipeline, stepwise_state)
+
+    assert [call["update_cache"] for call in transformer.calls] == [call["update_cache"] for call in tick_calls]
+    assert [call["start_frame"] for call in transformer.calls] == [call["start_frame"] for call in tick_calls]
+    for tick_latent, output in zip(tick_latents, stepwise_outputs, strict=True):
+        torch.testing.assert_close(output.output["payload"]["latents"], tick_latent)
 
 
 def test_registry_and_model_exports_resolve_official_pipeline_class_name() -> None:
