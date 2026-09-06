@@ -1,6 +1,8 @@
 """Stage input processor for MammothModa2 (AR -> DiT)."""
 
+import os
 from collections.abc import Mapping
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -10,6 +12,20 @@ from vllm.logger import init_logger
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 logger = init_logger(__name__)
+
+
+@contextmanager
+def _mammoth_nvtx_range(name: str):
+    """Emit an opt-in Nsight range without changing the payload path."""
+    enabled = os.getenv("VLLM_OMNI_MAMMOTH_MODA2_NVTX") == "1" and torch.cuda.is_available()
+    if not enabled:
+        yield
+        return
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 def _as_dict(prompt: Any) -> dict[str, Any]:
@@ -247,7 +263,10 @@ def ar2dit_full_payload(
     # Single D2H + float32 materialization for the whole request. float32 so the
     # tensor crosses the stage boundary (the serializer uses numpy, which has no
     # bf16); the DiT re-casts to the model dtype.
-    full_hidden_states = hidden.detach().to("cpu").float().contiguous()
+    # Disabled by default. It identifies this request-end D2H in Nsight without
+    # adding instrumentation to the generic connector path.
+    with _mammoth_nvtx_range("mammoth_moda2:ar2dit_full_payload_d2h"):
+        full_hidden_states = hidden.detach().to("cpu").float().contiguous()
     hidden_total = int(full_hidden_states.shape[0])
     generated_hidden_len = hidden_total - len(prompt_token_ids)
 
