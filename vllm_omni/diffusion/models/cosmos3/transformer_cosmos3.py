@@ -543,6 +543,7 @@ class Cosmos3CausalAttention(nn.Module):
             softmax_scale=1.0 / (self.head_dim**0.5),
             num_kv_heads=self.num_kv_heads,
             skip_sequence_parallel=True,
+            role="self",
         )
 
     def forward(
@@ -650,6 +651,7 @@ class Cosmos3CrossAttention(nn.Module):
             causal=False,
             softmax_scale=1.0 / (self.head_dim**0.5),
             num_kv_heads=self.num_kv_heads,
+            role="cross"
         )
         # Multi-control attention operates on one full [control_i, target]
         # sequence at a time. Keep those sequences replicated when Ulysses is
