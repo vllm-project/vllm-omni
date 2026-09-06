@@ -122,6 +122,10 @@ class DiffusionResponse:
     #: End-to-end wall time in **seconds** (``perf_counter`` delta), from just before
     #: ``chat.completions.create`` through local image / audio decode.
     e2e_latency: float | None = None
+    #: Peak GPU memory (MB) measured inside the diffusion stage worker, from the
+    #: engine-reported ``peak_memory_mb`` on the output. 0.0 when unavailable
+    #: (e.g. online/HTTP paths where the engine does not report it).
+    peak_memory_mb: float = 0.0
     success: bool = False
 
 
@@ -1968,6 +1972,7 @@ class OfflineOmniClient:
             # Returning actual images
             result.images = output.images
         # [TODO] Add audio processing when tests are introduced
+        result.peak_memory_mb = float(getattr(output, "peak_memory_mb", 0.0) or 0.0)
         result.success = True
         return result
 
