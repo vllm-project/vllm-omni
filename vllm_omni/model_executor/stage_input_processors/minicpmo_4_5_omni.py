@@ -637,6 +637,7 @@ def _native_duplex_segment_output_ids(
         state["request_id"] = request_id
         state["sent_output_len"] = 0
         state["sent_output_ids"] = []
+        state["condition_seq"] = -1
     previous_turn_id = state.get("turn_id")
     sent_len = state.get("sent_output_len", 0)
     prev_output_ids = state.get("sent_output_ids", [])
@@ -1000,6 +1001,8 @@ def llm2tts(
         if native_turn_end_handoff:
             model_intermediate_buffer.setdefault("meta", {})["turn_end"] = True
 
+        condition_sequence_state = None
+        condition_sequence_value = None
         if handoff_ids is not None and handoff_hidden is not None:
             condition_suffix_length = 1 if is_native_duplex_handoff else 2
             condition_length = max(len(handoff_ids), len(handoff_hidden)) + condition_suffix_length
@@ -1011,6 +1014,20 @@ def llm2tts(
             handoff_meta["next_stage_prompt_len"] = condition_length
             if is_native_duplex_handoff:
                 handoff_meta["next_stage_generation_tokens"] = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
+                bridge_states = getattr(_streaming_context, "bridge_states", None)
+                handoff_state = bridge_states.get("minicpmo45_tts_handoff") if isinstance(bridge_states, dict) else None
+                if not isinstance(handoff_state, dict) or handoff_state.get("request_id") != str(llm_output.request_id):
+                    raise ValueError("native duplex Talker handoff is missing request-local streaming state")
+                previous_condition_seq = handoff_state.get("condition_seq", -1)
+                if (
+                    not isinstance(previous_condition_seq, int)
+                    or isinstance(previous_condition_seq, bool)
+                    or previous_condition_seq < -1
+                ):
+                    raise ValueError("native duplex Talker condition sequence state is invalid")
+                condition_sequence_state = handoff_state
+                condition_sequence_value = previous_condition_seq + 1
+                handoff_meta["streaming_condition_seq"] = condition_sequence_value
             # Native duplex resumes one Talker request within a turn, but a new
             # assistant turn must discard the previous turn's prompt and KV.
             if not is_native_duplex_handoff or native_turn_start:
@@ -1033,6 +1050,8 @@ def llm2tts(
                 mm_processor_kwargs=None,
             )
         )
+        if condition_sequence_state is not None:
+            condition_sequence_state["condition_seq"] = condition_sequence_value
         if native_turn_end_handoff:
             bridge_states = getattr(_streaming_context, "bridge_states", None)
             duplex_state = bridge_states.get("duplex") if isinstance(bridge_states, dict) else None

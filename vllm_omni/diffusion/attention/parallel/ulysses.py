@@ -14,7 +14,11 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
-from vllm_omni.diffusion.forward_context import get_ulysses_mode
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    get_ulysses_mode,
+    is_forward_context_available,
+)
 
 logger = init_logger(__name__)
 
@@ -142,7 +146,7 @@ def _ulysses_all_to_all_any_qkv(
 
     input_split_sizes = [s_local] * world_size
     output_split_sizes = seq_lens
-    s_global = int(sum(output_split_sizes))
+    s_global = sum(output_split_sizes)
 
     out = torch.empty((s_global, bsz, head_cnt_local, head_dim), device=x.device, dtype=x.dtype)
     dist.all_to_all_single(
@@ -177,7 +181,7 @@ def _ulysses_all_to_all_any_o(
         return x
 
     bsz, s_global, head_cnt_local, head_dim = x.shape
-    s_local = int(local_seq_len)
+    s_local = local_seq_len
 
     # (B, S_global, H_local, D) -> (S_global, B, H_local, D)
     x_t = x.permute(1, 0, 2, 3).contiguous()
@@ -411,9 +415,22 @@ class UlyssesParallelAttention:
                     f"(got scatter_idx={self._scatter_idx}, gather_idx={self._gather_idx})."
                 )
 
-            local_seq_len = int(query.shape[1])
-            seq_lens = _all_gather_int(self._ulysses_pg, local_seq_len, device=query.device)
-            s_global = int(sum(seq_lens))
+            if is_forward_context_available() and get_forward_context().sp_rank_local_seq_lens_equal:
+                # auto_pad already made every rank's shard the same length, so
+                # the lengths are known without a collective. Keep local_seq_len
+                # as a SymInt (no int()) so torch.compile(dynamic=True) does not
+                # specialize on it, and skip the host sync + graph break that
+                # _all_gather_int would introduce in every attention call.
+                local_seq_len = query.shape[1]
+                seq_lens = [local_seq_len] * ulysses_world_size
+            else:
+                local_seq_len = int(query.shape[1])
+                seq_lens = _all_gather_int(
+                    self._ulysses_pg,
+                    local_seq_len,
+                    device=query.device,
+                )
+            s_global = sum(seq_lens)
 
             # In hybrid Ulysses+Ring, Ring attention uses P2P send/recv with fixed-shape
             # buffers. This requires all ring ranks to have the same seq_len after the
@@ -571,8 +588,8 @@ class UlyssesParallelAttention:
             joint_len=joint_len,
             joint_strategy=joint_strategy,
             use_uaa=(mode == "advanced_uaa"),
-            uaa_seq_lens=tuple(int(x) for x in seq_lens) if mode == "advanced_uaa" else (),
-            uaa_local_seq_len=int(local_seq_len) if mode == "advanced_uaa" else 0,
+            uaa_seq_lens=tuple(seq_lens) if mode == "advanced_uaa" else (),
+            uaa_local_seq_len=local_seq_len if mode == "advanced_uaa" else 0,
             orig_head_cnt=int(orig_head_cnt) if mode == "advanced_uaa" else 0,
             joint_orig_head_cnt=int(joint_orig_head_cnt) if mode == "advanced_uaa" else 0,
         )
