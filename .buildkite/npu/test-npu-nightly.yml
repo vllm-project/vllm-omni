@@ -259,3 +259,23 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
             exit $$EXIT
+      - label: ":full_moon: Diffusion X2V · Perf Test · MiniMax H3"
+        key: nightly-diffusion-x2v-performance-minimax-h3
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_8
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          VLLM_OMNI_VIDEO_SYNC_TIMEOUT: "1800"
+          PYTHONDONTWRITEBYTECODE: "1"
+          HF_TOKEN: "${HF_TOKEN}"
+          DIFFUSION_ATTENTION_BACKEND: FLASH_ATTN
+        commands:
+          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py -m 'npu and A3' --test-config-file tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
+            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            exit $$EXIT
