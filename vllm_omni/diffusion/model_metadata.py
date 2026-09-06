@@ -107,6 +107,7 @@ _DIFFUSION_MODEL_METADATA_ALIASES = {
     "LTX2DistilledOneStagePipeline": "LTX2DistilledPipeline",
     "LTX2DistilledTwoStagePipeline": "LTX2DistilledPipeline",
     "LingBotWorldCausalDMDPipeline": "LingBotVideoPipeline",
+    "BooguImageTurboPipeline": "BooguImagePipeline",
 }
 
 

@@ -64,6 +64,7 @@ th {
 | `LongCatImageEditPipeline` | LongCat-Image-Edit | `meituan-longcat/LongCat-Image-Edit` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `LongCatVideoAvatarPipeline` | LongCat-Video-Avatar-1.5 A2V/AI2V (native single-speaker and multi-speaker AI2V/AVC) | `meituan-longcat/LongCat-Video-Avatar-1.5` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/meituan-longcat/LongCat-Video-Avatar-1.5.md) |
 | `BooguImagePipeline` | Boogu-Image | `Boogu/Boogu-Image-0.1-Base`, `Boogu/Boogu-Image-0.1-Edit`, `Boogu/Boogu-Image-0.1-Edit-Turbo` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Boogu/Boogu-Image.md) |
+| `BooguImageTurboPipeline` | Boogu-Image Turbo distilled T2I | `Boogu/Boogu-Image-0.1-Turbo` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Boogu/Boogu-Image.md) |
 | `StableDiffusionXLPipeline` | Stable-Diffusion-XL | `stabilityai/stable-diffusion-xl-base-1.0` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `StableDiffusion3Pipeline` | Stable-Diffusion-3 | `stabilityai/stable-diffusion-3.5-medium` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `CosyVoice3Model` | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | ✅︎ | ✅︎ | | ✅︎ | — |
