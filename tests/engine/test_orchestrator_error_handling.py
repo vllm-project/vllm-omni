@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import janus
 import pytest
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.serial_utils import MsgpackEncoder
 
@@ -33,6 +33,7 @@ from vllm_omni.engine.orchestrator import (
     cleanup_request_artifact_dirs,
 )
 from vllm_omni.engine.stage_pool import StageUnavailableError
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.stage_input_processors import (
     joyai_vl_interaction as joyai_bridge,
@@ -41,6 +42,7 @@ from vllm_omni.outputs import OmniRequestOutput
 
 from .test_orchestrator import (
     FakeOutputProcessor,
+    FakeRunningCounter,
     FakeStageClient,
     OrchestratorFixture,
     _build_harness,
@@ -940,56 +942,41 @@ async def test_diffusion_client_error_output_propagates_status_code(orchestrator
 
 
 @pytest.mark.asyncio
-async def test_unsupported_joyai_tts_task_type_does_not_stop_orchestrator(
+@pytest.mark.parametrize("event_driven", [False, True], ids=["legacy", "event-driven"])
+@pytest.mark.parametrize("first_speaker", ["Ryan", "not-a-real-speaker"])
+async def test_joyai_tts_request_validation_keeps_orchestrator_running(
     orchestrator_factory,
     monkeypatch: pytest.MonkeyPatch,
+    first_speaker: str,
+    event_driven: bool,
 ) -> None:
+    """Check that the same orchestrator can handle the next valid request."""
+    monkeypatch.setenv("VLLM_OMNI_EVENT_DRIVEN_ORCH", "1" if event_driven else "0")
+
+    # Use a fixed token count so the test does not need tokenizer files.
     class FakeTokenizer:
         def encode(self, _text: str, *, add_special_tokens: bool) -> list[int]:
-            assert add_special_tokens is True
             return list(range(12))
 
     talker_model_config = SimpleNamespace(
         max_model_len=64,
         hf_config=SimpleNamespace(
-            talker_config=SimpleNamespace(
-                codec_language_id={},
-                spk_is_dialect={},
-            )
+            talker_config=SimpleNamespace(spk_id={"vivian": 0, "ryan": 1}, codec_language_id={}, spk_is_dialect={})
         ),
     )
-    fake_tokenizer = FakeTokenizer()
+    monkeypatch.setattr(joyai_bridge, "cached_tokenizer_from_config", lambda _: FakeTokenizer())
 
-    def get_tokenizer(model_config):
-        assert model_config is talker_model_config
-        return fake_tokenizer
-
-    monkeypatch.setattr(
-        joyai_bridge,
-        "cached_tokenizer_from_config",
-        get_tokenizer,
-    )
-
+    # Use the real bridge so speaker validation is part of the test.
     class JoyAITalkerStage(FakeStageClient):
-        def __init__(self) -> None:
-            super().__init__(stage_type="llm", final_output=True)
-            self.bridge_inputs: dict[str, list[dict]] = {}
-
         def process_engine_inputs(self, source_outputs, prompt=None, streaming_context=None):
-            del streaming_context
-            next_inputs = joyai_bridge.joyai_action_to_tts(
-                source_outputs,
-                prompt,
-                self.requires_multimodal_data,
-                target_model_config=talker_model_config,
+            self.bridge_inputs = joyai_bridge.joyai_action_to_tts(
+                source_outputs, prompt, self.requires_multimodal_data, target_model_config=talker_model_config
             )
-            self.bridge_inputs[source_outputs[0].request_id] = next_inputs
-            return next_inputs
+            return self.bridge_inputs
 
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
-    stage1 = JoyAITalkerStage()
-    stage0_processor = FakeOutputProcessor()
-    stage1_processor = FakeOutputProcessor()
+    stage1 = JoyAITalkerStage(stage_type="llm", final_output=True)
+    stage0_processor, stage1_processor = FakeOutputProcessor(), FakeOutputProcessor()
     fixture = orchestrator_factory(
         [stage0, stage1],
         output_processors=[stage0_processor, stage1_processor],
@@ -998,83 +985,93 @@ async def test_unsupported_joyai_tts_task_type_does_not_stop_orchestrator(
             SimpleNamespace(model_config=talker_model_config),
         ],
     )
-
-    async def submit_and_finish_stage0(
-        request_id: str,
-        additional_information: dict,
-        spoken_text: str,
-        expected_count: int,
-    ) -> None:
+    counter = FakeRunningCounter()
+    fixture.orchestrator._running_counter = counter
+    # With a valid speaker, task_type should be changed from Base to CustomVoice.
+    # An unknown speaker should cause a request error.
+    first_info = {"tts_task_type": "Base", "speaker": "Vivian", "tts_speaker": first_speaker}
+    talker_submissions = 0
+    # Send both requests to the same orchestrator. The second uses the default Vivian voice.
+    for index, (request_id, info) in enumerate((("first", first_info), ("good", {})), start=1):
         await _enqueue_add_request(
             fixture,
             request_id=request_id,
             prompt=SimpleNamespace(request_id=request_id, prompt_token_ids=[1, 2]),
-            original_prompt={"additional_information": additional_information},
+            original_prompt={"additional_information": info},
             sampling_params_list=[_sampling_params(), _sampling_params()],
             final_stage_id=1,
         )
-        await _wait_for(lambda: len(stage0.add_request_calls) == expected_count)
+        await _wait_for(lambda: len(stage0.add_request_calls) == index and counter.value == 1)
+        stage0_processor.request_outputs = [_build_request_output(request_id, text="</response> Hello.")]
+        stage0.push_engine_core_outputs(_engine_core_outputs(f"{request_id}-raw", float(index)))
 
-        stage0_processor.request_outputs = [
-            _build_request_output(
-                request_id,
-                text=f"</response> {spoken_text}",
-            )
-        ]
-        stage0.push_engine_core_outputs(_engine_core_outputs(f"{request_id}-raw", float(expected_count)))
-        await _wait_for(lambda: len(stage1.add_request_calls) == expected_count or fixture.result_future.done())
-        assert not fixture.result_future.done()
-        assert fixture.thread.is_alive()
+        if request_id == "first" and first_speaker == "not-a-real-speaker":
+            # Reject this request before Talker runs, while keeping the engine alive.
+            error = await _wait_for_error_message(fixture, request_id=request_id)
+            assert error.status_code == 400 and error.error_type == "BadRequestError"
+            assert error.fatal is False and error.stage_id == 1
+            assert "not-a-real-speaker" in error.error
+            assert stage1.add_request_calls == []
+        else:
+            talker_submissions += 1
+            await _wait_for(lambda: len(stage1.add_request_calls) == talker_submissions or fixture.result_future.done())
+            assert not fixture.result_future.done()
+            assert stage1.add_request_calls[-1][0].request_id == request_id
+            metadata = stage1.bridge_inputs[0]["additional_information"]
+            assert metadata["task_type"] == ["CustomVoice"]
+            assert metadata["speaker"] == [first_speaker if request_id == "first" else "Vivian"]
+            # Finish the valid request and check its final output.
+            stage1_processor.request_outputs = [_build_request_output(request_id, text="Completed.")]
+            stage1.push_engine_core_outputs(_engine_core_outputs(f"{request_id}-talker", float(index)))
+            output = await _get_output_message(fixture)
+            assert output.request_id == request_id and output.stage_id == 1
+            assert output.finished is True
+            assert output.engine_outputs.outputs[0].text == "Completed."
 
+        # Wait for full cleanup before sending the next request.
+        await _wait_for(lambda: request_id not in fixture.orchestrator.request_states and counter.value == 0)
+        assert all(pool.get_bound_replica_id(request_id) is None for pool in fixture.orchestrator.stage_pools)
+        assert fixture.thread.is_alive() and not fixture.result_future.done()
+
+
+@pytest.mark.asyncio
+async def test_streaming_input_processor_client_error_does_not_forward_terminal_update() -> None:
+    """Do not send a second update after the first one fails and clears the request."""
+    processor_calls = []
+
+    class FailingStage(FakeStageClient):
+        def process_engine_inputs(self, *args, **kwargs):
+            processor_calls.append((args, kwargs))
+            raise OmniClientError("Input rejected")
+
+    orchestrator, queues = _build_bare_orchestrator(
+        _build_stage_pools([[FakeStageClient()], [FailingStage(final_output=True)]])
+    )
+    state = OrchestratorRequestState(
+        request_id="bad-stream",
+        prompt={"prompt_token_ids": [1]},
+        sampling_params_list=[SamplingParams(output_kind=RequestOutputKind.CUMULATIVE), _sampling_params()],
+        final_stage_id=1,
+    )
+    state.streaming.enabled = True
+    assert state.duplex_identity is None
+    orchestrator.request_states[state.request_id] = state
     try:
-        await submit_and_finish_stage0(
-            "bad",
-            {
-                "tts_task_type": "Base",
-                "tts_language": "English",
-                "tts_speaker": "Ryan",
-                "tts_instruct": "Calm",
-            },
-            "First request.",
-            1,
-        )
-        await submit_and_finish_stage0(
-            "good",
-            {"tts_task_type": "CustomVoice"},
-            "Second request.",
-            2,
-        )
+        await orchestrator._route_output(0, 0, _build_request_output(state.request_id), state, stage_metrics=None)
 
-        assert [call[0].request_id for call in stage1.add_request_calls] == [
-            "bad",
-            "good",
-        ]
-        assert {
-            request_id: inputs[0]["additional_information"]["task_type"]
-            for request_id, inputs in stage1.bridge_inputs.items()
-        } == {
-            "bad": ["CustomVoice"],
-            "good": ["CustomVoice"],
-        }
-        assert stage1.bridge_inputs["bad"][0]["additional_information"] == {
-            "task_type": ["CustomVoice"],
-            "language": ["English"],
-            "speaker": ["Ryan"],
-            "instruct": ["Calm"],
-            "text": ["First request."],
-        }
-
-        stage1_processor.request_outputs = [_build_request_output("good", text="Second request completed.")]
-        stage1.push_engine_core_outputs(_engine_core_outputs("good-stage1-raw", 3.0))
-        output_msg = await _get_output_message(fixture)
-        assert output_msg.request_id == "good"
-        assert output_msg.stage_id == 1
-        assert output_msg.finished is True
-        assert fixture.thread.is_alive()
+        assert len(processor_calls) == 1
+        error = queues[1].sync_q.get_nowait()
+        assert isinstance(error, ErrorMessage)
+        assert error.request_id == state.request_id
+        assert error.stage_id == 1
+        assert error.status_code == 400
+        assert error.fatal is False
+        assert queues[1].sync_q.empty()
+        assert state.request_id not in orchestrator.request_states
+        assert all(pool.get_bound_replica_id(state.request_id) is None for pool in orchestrator.stage_pools)
     finally:
-        if fixture.thread.is_alive():
-            fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
-            fixture.thread.join(timeout=5)
+        for q in queues:
+            q.close()
 
 
 @pytest.mark.asyncio

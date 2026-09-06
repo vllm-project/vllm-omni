@@ -16,7 +16,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def test_joyai_action_to_tts_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
     """Convert each JoyAI action through the real stage-client entry point."""
-    target_model_config = object()
+    target_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(talker_config=SimpleNamespace(spk_id={"vivian": 1, "ryan": 2}))
+    )
     prompt_length_calls: list[tuple[dict[str, list[str]], object]] = []
     prompt_lengths = {
         "Colored squares are visible.": 12,

@@ -7,6 +7,7 @@ from typing import Any
 from vllm.outputs import RequestOutput
 from vllm.tokenizers import cached_tokenizer_from_config
 
+from vllm_omni.errors import OmniClientError
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import (
     parse_action,
 )
@@ -51,6 +52,19 @@ def _build_tts_metadata(request_prompt: object, spoken_text: str) -> dict[str, l
         "instruct": [str(instruction)],
         "text": [spoken_text],
     }
+
+
+def _validate_talker_speaker(tts_metadata: dict[str, list[str]], talker_model_config: Any) -> None:
+    """Validate the selected voice using the destination Talker's speaker table."""
+    talker_config = getattr(talker_model_config.hf_config, "talker_config", None)
+    if talker_config is None:
+        raise ValueError("The target stage is not a Qwen3-TTS Talker.")
+
+    # Match CustomVoice prompt construction, including case and whitespace.
+    speaker = str(first_value(tts_metadata.get("speaker"), "")).lower().strip()
+    speakers = {name.lower() for name in (getattr(talker_config, "spk_id", None) or {})}
+    if not speaker or speaker not in speakers:
+        raise OmniClientError(f"Unsupported speaker: {speaker!r}")
 
 
 def _compute_talker_prompt_length(
@@ -101,6 +115,7 @@ def joyai_action_to_tts(
 
         request_prompt = request_prompts[request_index] if request_index < len(request_prompts) else None
         tts_metadata = _build_tts_metadata(request_prompt, parsed_action.text)
+        _validate_talker_speaker(tts_metadata, target_model_config)
         talker_prompt_length = _compute_talker_prompt_length(tts_metadata, target_model_config)
         talker_inputs.append(
             OmniTokensPrompt(

@@ -537,13 +537,9 @@ def test_joyai_code2wav_waits_for_full_payload():
     talker = config.stage_by_id(1)
     code2wav = config.stage_by_id(2)
 
-    assert talker.custom_process_next_stage_input_func.endswith(
-        "talker2code2wav_full_payload"
-    )
-    assert code2wav.custom_process_input_func.endswith(
-        "talker2code2wav_token_only"
-    )
-    assert code2wav.model_config.async_chunk is False
+    assert talker.custom_process_next_stage_input_func.endswith("talker2code2wav_full_payload")
+    assert code2wav.custom_process_input_func.endswith("talker2code2wav_token_only")
+    assert code2wav.connector_config.async_chunk is False
     assert code2wav.model_config.requires_full_payload_input is True
 
 
