@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from: https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/transformers/transformer_ernie_image.py
 
 from collections.abc import Iterable
@@ -599,17 +599,12 @@ class ErnieImageTransformer2DModel(nn.Module):
         hidden_states, freqs_cos, freqs_sin, attention_mask = self.unified_prepare(hidden_states, text_bth, text_lens)
         attention_mask = self._slice_attention_mask_for_ring(attention_mask)
         rotary_pos_emb = (freqs_cos, freqs_sin)
-        S = hidden_states.shape[0]
-
         sample = self.time_proj(timestep)
         sample = sample.to(dtype=dtype)
         c = self.time_embedding(sample)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = [
-            t.unsqueeze(0).expand(S, -1, -1).contiguous() for t in self.adaLN_modulation(c).chunk(6, dim=-1)
-        ]
+        temb = self.adaLN_modulation(c).chunk(6, dim=-1)
 
         for layer in self.layers:
-            temb = [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp]
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states = self._gradient_checkpointing_func(
                     layer,
