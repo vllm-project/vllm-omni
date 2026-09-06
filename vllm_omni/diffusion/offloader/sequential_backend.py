@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections.abc import Collection, Iterator
 from contextlib import contextmanager
@@ -114,7 +114,14 @@ class SequentialOffloadHook(ModelHook):
             non_blocking=non_blocking,
             pin_memory=self.pin_memory,
         )
-        if moved:
+        # Skip the eviction ``empty_cache`` on XPU for the same reason it is
+        # skipped in ``PinnedModuleStager.offload``: handing the segments back
+        # to the driver is not needed for the freed HBM to be reusable, but it
+        # churns the addresses of the collective receive buffers allocated after
+        # it, and the XPU collective backend keeps a non-reclaimable driver
+        # registration per distinct receive-buffer address. See that method for
+        # the rationale.
+        if moved and not current_omni_platform.is_xpu():
             current_omni_platform.empty_cache()
 
     def _to_gpu(self, module: nn.Module) -> None:
