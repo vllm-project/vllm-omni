@@ -98,7 +98,7 @@ def encoder2diffusion(
     requires_multimodal_data: bool = False,
     streaming_context: Any | None = None,
 ) -> dict[str, Any] | None:
-    """Reuse the text-encoder handoff for all three H3 encoders."""
+    """Reuse the encoder handoff for all three H3 encoder components."""
     del requires_multimodal_data, streaming_context
     if not source_outputs:
         return None
@@ -141,7 +141,7 @@ def encoder2diffusion(
         additional_information["meta"] = meta
     else:
         additional_information.pop("meta", None)
-    additional_information["text_encoder_output"] = conditioning.to_omni_payload()
+    additional_information["encoder_output"] = conditioning.to_omni_payload()
     diffusion_prompt["additional_information"] = additional_information
     diffusion_prompt["multi_modal_data"] = None
     diffusion_prompt.pop("model_intermediate_buffer", None)

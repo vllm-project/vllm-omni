@@ -1498,15 +1498,15 @@ class MiniMaxH3Pipeline(
         if isinstance(raw_prompt, str):
             return None
         additional_information = raw_prompt.get("additional_information") or {}
-        text_encoder_output = additional_information.get("text_encoder_output")
-        if text_encoder_output is None:
+        encoder_output = additional_information.get("encoder_output")
+        if encoder_output is None:
             return None
-        if not isinstance(text_encoder_output, Mapping):
-            raise OmniClientError("text_encoder_output must be a mapping")
+        if not isinstance(encoder_output, Mapping):
+            raise OmniClientError("MiniMax H3 encoder output must be a mapping")
         try:
-            if "hidden_states" in text_encoder_output and "token_tags" in text_encoder_output:
-                return MiniMaxH3TextConditioning.from_payload(text_encoder_output)
-            conditioning = MiniMaxH3EncoderConditioning.from_omni_payload(text_encoder_output)
+            if "hidden_states" in encoder_output and "token_tags" in encoder_output:
+                return MiniMaxH3TextConditioning.from_payload(encoder_output)
+            conditioning = MiniMaxH3EncoderConditioning.from_omni_payload(encoder_output)
             return MiniMaxH3TextConditioning(conditioning.hidden_states, conditioning.token_tags)
         except ValueError as exc:
             raise OmniClientError(str(exc)) from exc
@@ -1733,9 +1733,7 @@ class MiniMaxH3Pipeline(
         if isinstance(prompt, list):
             prompt = prompt[0] if prompt else None
         additional_information = prompt.get("additional_information") if isinstance(prompt, Mapping) else None
-        payload = (
-            additional_information.get("text_encoder_output") if isinstance(additional_information, Mapping) else None
-        )
+        payload = additional_information.get("encoder_output") if isinstance(additional_information, Mapping) else None
         if not isinstance(payload, Mapping) or not payload:
             raise OmniClientError("MiniMax H3 diffusion stage requires encoder conditioning from the encoder stage")
         try:

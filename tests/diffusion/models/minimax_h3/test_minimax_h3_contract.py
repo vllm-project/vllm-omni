@@ -50,7 +50,7 @@ def _encoder_payload(
 def _encoder_prompt(text: str = "test") -> dict[str, Any]:
     return {
         "prompt": text,
-        "additional_information": {"text_encoder_output": _encoder_payload()},
+        "additional_information": {"encoder_output": _encoder_payload()},
     }
 
 

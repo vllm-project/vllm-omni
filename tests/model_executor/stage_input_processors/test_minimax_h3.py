@@ -175,7 +175,7 @@ def _encoder_output() -> dict:
     ).to_omni_payload()
 
 
-def test_encoder2diffusion_reuses_text_encoder_handoff() -> None:
+def test_encoder2diffusion_reuses_encoder_handoff() -> None:
     prompt = {
         "prompt": "test prompt",
         "multi_modal_data": {"image": object()},
@@ -201,7 +201,7 @@ def test_encoder2diffusion_reuses_text_encoder_handoff() -> None:
     assert additional_information["private"] == "preserved"
     assert "hidden_states" not in additional_information
     assert "meta" not in additional_information
-    parsed = MiniMaxH3EncoderConditioning.from_omni_payload(additional_information["text_encoder_output"])
+    parsed = MiniMaxH3EncoderConditioning.from_omni_payload(additional_information["encoder_output"])
     assert parsed.task == "t2va"
 
 

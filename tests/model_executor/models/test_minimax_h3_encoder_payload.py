@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -204,7 +205,7 @@ def test_encoder_runs_video_and_audio_components_on_ar_model() -> None:
     assert conditioning.ref_blocks[1]["kind"] == "video_audio"
 
 
-def test_encoder_output_reuses_text_encoder_handoff_and_round_trips() -> None:
+def test_encoder_output_reuses_encoder_handoff_and_round_trips() -> None:
     expected = MiniMaxH3EncoderConditioning(
         hidden_states=torch.randn(3, 5120, dtype=torch.bfloat16),
         token_tags=torch.tensor([1, 0, 1], dtype=torch.int64),
@@ -229,7 +230,7 @@ def test_encoder_output_reuses_text_encoder_handoff_and_round_trips() -> None:
     result = encoder2diffusion([source], prompt)
 
     assert result is not None
-    payload = result["additional_information"]["text_encoder_output"]
+    payload = result["additional_information"]["encoder_output"]
     actual = MiniMaxH3EncoderConditioning.from_omni_payload(payload)
     torch.testing.assert_close(actual.hidden_states, expected.hidden_states)
     torch.testing.assert_close(actual.token_tags, expected.token_tags)
