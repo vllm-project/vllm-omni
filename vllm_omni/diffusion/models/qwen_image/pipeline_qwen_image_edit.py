@@ -13,9 +13,6 @@ import numpy as np
 import PIL.Image
 import torch
 from diffusers.image_processor import VaeImageProcessor
-from diffusers.models.autoencoders.autoencoder_kl_qwenimage import (
-    AutoencoderKLQwenImage,
-)
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -25,6 +22,9 @@ from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwe
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import (
+    DistributedAutoencoderKLQwenImage,
+)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
@@ -274,7 +274,7 @@ class QwenImageEditPipeline(
         ).to(self.device)
 
         self.vae = from_pretrained_with_prefetch(
-            AutoencoderKLQwenImage.from_pretrained,
+            DistributedAutoencoderKLQwenImage.from_pretrained,
             model,
             subfolder="vae",
             prefetch_list=qwen_subfolders,
