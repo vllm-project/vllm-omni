@@ -12,7 +12,8 @@ The optimized path is:
 ```text
 AR hidden states
   -> device-resident request-end accumulator
-  -> ar2dit_full_payload() one-time D2H + float32 materialization
+  -> ar2dit_full_payload() GPU token-mask selection
+  -> selected text/image conditions, one-time BF16 D2H
   -> existing OmniPayload / transfer manager / SharedMemoryConnector
   -> DiT
 ```
@@ -29,9 +30,10 @@ the AR-runner hook that owns request-end hidden accumulation:
 - `mammoth_moda2.py`: AR stages opt into request-end payload accumulation.
 - `pipeline.py`: stage 0 uses `ar2dit_full_payload`; stage 1 declares the
   existing full-payload input contract.
-- `stage_input_processors/mammoth_moda2.py`: adapts request-end hidden states,
-  token ids, image metadata, and T2I placeholder ids to the legacy DiT input
-  schema. The legacy `ar2dit()` entry point remains available.
+- `stage_input_processors/mammoth_moda2.py`: resolves T2I placeholder ids,
+  selects the DiT text/image conditions on the AR GPU, and sends the selected
+  tensors with their producer dtype. The legacy `ar2dit()` entry point remains
+  available.
 - `gpu_ar_model_runner.py`: request-end mode snapshots scheduled hidden slices
   on GPU instead of calling per-step CPU materialization.
 - Focused unit/regression tests cover the adapter contract and both deferred and
@@ -57,18 +59,61 @@ general 1024x1024 deployment setting.
 
 ## Functional Results
 
+The results in this section validate the request-end accumulation path. The
+current producer-side condition selection and BF16 wire payload were exercised
+in the single-request A/B run recorded below.
+
 | Check | Result |
 | --- | --- |
-| Focused local tests | `133 passed, 17 warnings` |
+| Focused local tests before the producer-side payload follow-up | `133 passed, 17 warnings` |
 | AR stage startup | Passed; 11.72 GiB KV cache available |
 | DiT stage startup | Passed |
 | End-to-end output | PNG produced successfully |
 | Baseline vs optimized output | Exact SHA-256 match for all captured profile PNGs |
-| Runtime errors in captured runs | None |
+| Current producer-side helper checks | Python AST parsing and CPU BF16 selection check passed |
 
 The exact image hash is meaningful here because the same prompt, dimensions,
 sampling parameters, and seed were used. It demonstrates that the request-end
-payload adaptation preserves the generated result for this workload.
+payload adaptation preserves the generated result for this workload. It does
+not replace lifecycle coverage for cancellation or preemption/resume.
+
+### Single-request A/B result
+
+The following reproducible A/B smoke result was collected on 2026-09-06. It
+compares the pinned baseline `44d3ae10` with optimized server checkout
+`469b733a` using the same model revision, two A100 40GB devices (AR on GPU 0,
+DiT on GPU 1), `SharedMemoryConnector`, 512x512 output, 20 DiT steps, seed 42,
+one request, eager mode, and disabled prefix caching.
+
+| Check | Baseline | Optimized |
+| --- | ---: | ---: |
+| Output PNG SHA-256 | `A4F3AD...CA9FAED2` | `A4F3AD...CA9FAED2` |
+| Total generation time, one profiled sample | 27.9765 s | 26.5668 s |
+| AR stage time, one profiled sample | 25.8807 s | 24.4465 s |
+| DiT stage time, one profiled sample | 1.9955 s | 2.0496 s |
+
+These wall-clock values are recorded for transparency only. They are one
+sample per variant and the requested CUDA-profiler RPC was not enabled in the
+per-stage deploy YAML of that run, so they are **not** a latency, throughput,
+or regression claim.
+
+The optimized producer reported the following payload facts for this workload:
+
+| Payload property | Value |
+| --- | ---: |
+| Full AR trajectory | 1,094 BF16 rows, 7,841,792 bytes |
+| Text condition | 36 rows |
+| Image condition | 1,056 rows |
+| Selected BF16 conditions | 1,092 rows, 7,827,456 bytes |
+| Selected/full BF16 ratio | 0.998172 |
+| Prior full FP32 wire payload | 15,683,584 bytes |
+
+Consequently, producer-side selection itself removes only two rows (about
+0.18%) for this Preview workload. The material reduction comes from preserving
+BF16 across the existing host-mediated wire path, which halves the payload
+relative to the previous full FP32 materialization. The exact output hash
+confirms that this representation change did not alter this deterministic
+workload.
 
 ## Profiling Results
 
@@ -126,6 +171,11 @@ PROFILE_BACKEND=nsys \
 bash benchmarks/mammoth_moda2/compare_phase1_payload.sh
 ```
 
+The script refuses to start by default when `nvidia-smi` reports an existing
+compute process. This prevents a previous failed worker from consuming GPU
+memory during the baseline/head comparison. Inspect the reported PID before
+stopping it; set `REQUIRE_IDLE_GPUS=0` only for an intentionally shared host.
+
 This mode deliberately does not enable the PyTorch profiler. It uses the
 existing CUDA-profiler backend to delimit spawned-worker GPU activity and sets
 `VLLM_OMNI_MAMMOTH_MODA2_NVTX=1` for a MammothModa2-only request-end D2H range.
@@ -148,9 +198,10 @@ MammothModa2 request-end AR to DiT payload` against the current checkout. Set
 
 ## Remaining Work
 
-Phase 1 implementation and functional correctness are complete for the tested
-path. Before publishing a quantitative performance claim, collect a worker-aware
-Nsight trace with equivalent baseline/optimized process coverage and attribute:
+Phase 1 implementation and single-request functional correctness are complete
+for the tested path. Before publishing a quantitative performance claim,
+collect a worker-aware Nsight trace with equivalent baseline/optimized process
+coverage and attribute:
 
 1. AR hidden D2H count, bytes, and duration.
 2. Request-end full-payload D2H count, bytes, and duration.
@@ -161,3 +212,23 @@ The script uses an opt-in MammothModa2-only NVTX range around
 to collect this evidence. Actual D2D
 transport (NCCL, UCX, CUDA IPC, or equivalent) is a separate Phase 2 design
 question and is out of scope for this change.
+
+Within the current connector architecture, the meaningful model-specific work
+is intentionally exhausted by request-end batching, producer-side condition
+selection, and BF16 payload preservation. Additional clone/cat allocator work
+may change small local overheads but cannot reduce the remaining transport
+bytes; it is deferred until measurements show that it matters. Meaningful
+further transfer reduction requires a GPU-aware connector/transport capability,
+which is not supplied by the current generic interface.
+
+For `PROFILE_BACKEND=nsys`, the generated profile deploy YAML declares
+`profiler_config: {profiler: cuda}` on both stages. The top-level CLI option
+only starts/stops profiling; without the per-stage declaration, Omni rejects
+the profiling RPC and Nsight has no valid capture. The script also checks that
+`analyze_nsys_transfer.py` exists before it starts either workload.
+
+Set `VLLM_OMNI_MAMMOTH_MODA2_PAYLOAD_STATS=1` on the optimized checkout to
+emit one producer-side line per request with the full hidden-state bytes, the
+selected condition bytes, and `retained_ratio`. This establishes how much of
+the AR trajectory remains after the canonical DiT token masks before drawing
+any transport-performance conclusion.

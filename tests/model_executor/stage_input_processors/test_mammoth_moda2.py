@@ -6,6 +6,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.mammoth_moda2.conditioning import (
+    conditioning_spec_from_config,
+    select_ar_conditions,
+)
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import MAMMOTH_MODA2_PIPELINE
 from vllm_omni.model_executor.stage_input_processors.mammoth_moda2 import (
     ar2dit,
@@ -18,6 +22,37 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _transfer_manager() -> SimpleNamespace:
+    """Minimal runner shape matching the full-payload callback owner."""
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                llm_config=SimpleNamespace(gen_vocab_start_index=10),
+                image_token_id=4,
+                video_token_id=5,
+                vision_start_token_id=6,
+                vision_end_token_id=7,
+            )
+        )
+    )
+
+
+def test_select_ar_conditions_matches_mammoth_token_categories():
+    config = _transfer_manager().model_config.hf_config
+    hidden = torch.arange(30, dtype=torch.bfloat16).reshape(5, 6)
+    text_cond, image_cond = select_ar_conditions(
+        hidden,
+        # The image placeholder in the question is discarded; only generated
+        # vocabulary ids after answer_start_index become image conditions.
+        [1, config.image_token_id, 2, 10, 11],
+        answer_start_index=3,
+        spec=conditioning_spec_from_config(config),
+    )
+
+    assert torch.equal(text_cond, hidden[[0, 2]])
+    assert torch.equal(image_cond, hidden[[3, 4]])
 
 
 def _accumulate_hidden_slices(slices: list[torch.Tensor]) -> torch.Tensor:
@@ -36,8 +71,8 @@ def _accumulate_hidden_slices(slices: list[torch.Tensor]) -> torch.Tensor:
     return output["hidden"]
 
 
-def test_ar2dit_full_payload_materializes_cpu_float_payload_once():
-    """Device-resident slices -> accumulator -> one CPU/float32 payload at request end."""
+def test_ar2dit_full_payload_selects_bf16_conditions_before_one_time_d2h():
+    """Device-resident slices -> selected BF16 conditions -> one request-end D2H."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     prompt_token_ids = [1, 2, 3]
     output_token_ids = [10, 11, 12, 13, 14, 15, 16]  # final look-ahead token has no hidden state
@@ -57,15 +92,25 @@ def test_ar2dit_full_payload_materializes_cpu_float_payload_once():
         output_token_ids=output_token_ids,
         additional_information_cpu={"image_height": [512], "image_width": [768]},
     )
-    payload = ar2dit_full_payload(transfer_manager=None, pooling_output={"hidden": hidden}, request=request)
+    payload = ar2dit_full_payload(
+        transfer_manager=_transfer_manager(),
+        pooling_output={"hidden": hidden},
+        request=request,
+    )
 
     assert payload is not None
-    full_hidden = payload["full_hidden_states"]
-    assert full_hidden.device.type == "cpu"
-    assert full_hidden.dtype == torch.float32
-    assert full_hidden.shape == (len(prompt_token_ids) + len(output_token_ids) - 1, 6)
-    assert full_hidden.is_contiguous()
-    assert torch.equal(full_hidden, torch.cat([prefill, decode], dim=0).float().cpu())
+    text_cond = payload["text_prompt_embeds"]
+    image_cond = payload["image_prompt_embeds"]
+    assert text_cond.device.type == "cpu"
+    assert image_cond.device.type == "cpu"
+    assert text_cond.dtype == torch.bfloat16
+    assert image_cond.dtype == torch.bfloat16
+    assert text_cond.shape == (len(prompt_token_ids), 6)
+    assert image_cond.shape == (len(output_token_ids) - 1, 6)
+    assert text_cond.is_contiguous()
+    assert image_cond.is_contiguous()
+    assert torch.equal(text_cond, prefill.cpu())
+    assert torch.equal(image_cond, decode.cpu())
 
     assert payload["full_token_ids"] == prompt_token_ids + output_token_ids[:-1]
     assert payload["answer_start_index"] == [len(prompt_token_ids)]
@@ -76,11 +121,11 @@ def test_ar2dit_full_payload_materializes_cpu_float_payload_once():
     assert payload["num_inference_steps"] == [50]
 
 
-def test_ar2dit_full_payload_matches_legacy_ar2dit_schema():
-    """The request-end payload must match the legacy ar2dit bridge schema/values."""
+def test_ar2dit_full_payload_emits_direct_dit_condition_schema():
+    """The request-end payload uses the DiT's direct-condition input branch."""
     prompt_token_ids = [1, 2, 3]
     gen_token_ids = [10, 11, 12, 13]
-    full_hidden = torch.arange(36, dtype=torch.bfloat16).reshape(6, 6).float()
+    full_hidden = torch.arange(36, dtype=torch.bfloat16).reshape(6, 6)
     addi_info = {
         "image_height": [512],
         "image_width": [768],
@@ -88,6 +133,29 @@ def test_ar2dit_full_payload_matches_legacy_ar2dit_schema():
         "cfg_range": [0.0, 1.0],
         "num_inference_steps": [25],
     }
+
+    request_end = ar2dit_full_payload(
+        transfer_manager=_transfer_manager(),
+        pooling_output={"hidden": full_hidden},
+        request=SimpleNamespace(
+            request_id="r1",
+            prompt_token_ids=prompt_token_ids,
+            output_token_ids=gen_token_ids,
+            additional_information_cpu=addi_info,
+        ),
+    )
+
+    assert request_end is not None
+    assert "full_hidden_states" not in request_end
+    assert torch.equal(request_end["text_prompt_embeds"], full_hidden[:3])
+    assert torch.equal(request_end["image_prompt_embeds"], full_hidden[3:])
+    assert request_end["full_token_ids"] == prompt_token_ids + gen_token_ids[:-1]
+    assert request_end["answer_start_index"] == [len(prompt_token_ids)]
+    assert request_end["image_height"] == [512]
+    assert request_end["image_width"] == [768]
+    assert request_end["text_guidance_scale"] == [4.0]
+    assert request_end["cfg_range"] == [0.0, 1.0]
+    assert request_end["num_inference_steps"] == [25]
 
     legacy = ar2dit(
         [
@@ -102,25 +170,9 @@ def test_ar2dit_full_payload_matches_legacy_ar2dit_schema():
             )
         ],
         prompts=[{"additional_information": addi_info}],
-    )[0]
-    request_end = ar2dit_full_payload(
-        transfer_manager=None,
-        pooling_output={"hidden": full_hidden},
-        request=SimpleNamespace(
-            request_id="r1",
-            prompt_token_ids=prompt_token_ids,
-            output_token_ids=gen_token_ids,
-            additional_information_cpu=addi_info,
-        ),
-    )
-
-    assert request_end is not None
-    assert set(request_end) == set(legacy["additional_information"])
-    for key, value in legacy["additional_information"].items():
-        if isinstance(value, torch.Tensor):
-            assert torch.equal(request_end[key], value)
-        else:
-            assert request_end[key] == value
+    )[0]["additional_information"]
+    assert torch.equal(request_end["text_prompt_embeds"].float(), legacy["full_hidden_states"][:3])
+    assert torch.equal(request_end["image_prompt_embeds"].float(), legacy["full_hidden_states"][3:])
 
 
 def test_ar2dit_full_payload_rejects_hidden_token_id_mismatch():
@@ -132,7 +184,7 @@ def test_ar2dit_full_payload_rejects_hidden_token_id_mismatch():
     )
     with pytest.raises(ValueError, match="length mismatch"):
         ar2dit_full_payload(
-            transfer_manager=None,
+            transfer_manager=_transfer_manager(),
             pooling_output={"hidden": torch.zeros((5, 6))},
             request=request,
         )
@@ -162,7 +214,7 @@ def test_ar2dit_full_payload_synthesizes_t2i_ids_from_placeholder_outputs():
     )
 
     payload = ar2dit_full_payload(
-        transfer_manager=None,
+        transfer_manager=_transfer_manager(),
         pooling_output={"hidden": torch.zeros((len(prompt_token_ids) + generated_hidden_len, 6))},
         request=request,
     )
@@ -195,7 +247,7 @@ def test_ar2dit_full_payload_fills_partial_t2i_placeholders():
     )
 
     payload = ar2dit_full_payload(
-        transfer_manager=None,
+        transfer_manager=_transfer_manager(),
         pooling_output={"hidden": torch.zeros((9, 6))},
         request=request,
     )
@@ -230,7 +282,7 @@ def test_ar2dit_full_payload_rejects_t2i_grid_hidden_mismatch():
 
     with pytest.raises(ValueError, match="expected 9 from AR grid 2x3, got 6"):
         ar2dit_full_payload(
-            transfer_manager=None,
+            transfer_manager=_transfer_manager(),
             pooling_output={"hidden": torch.zeros((9, 6))},
             request=request,
         )
@@ -245,7 +297,7 @@ def test_ar2dit_full_payload_does_not_synthesize_non_t2i_placeholders():
     )
     with pytest.raises(ValueError, match="unresolved output token placeholders"):
         ar2dit_full_payload(
-            transfer_manager=None,
+            transfer_manager=_transfer_manager(),
             pooling_output={"hidden": torch.zeros((6, 6))},
             request=request,
         )

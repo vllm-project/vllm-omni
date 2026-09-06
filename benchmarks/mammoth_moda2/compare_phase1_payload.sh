@@ -20,6 +20,8 @@ BASE_COMMIT="${BASE_COMMIT:-${PHASE1_COMMIT}^}"
 RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/results/mammoth_moda2_phase1_$(date +%Y%m%d_%H%M%S)}"
 PROMPT="${PROMPT:-A small red cabin beside a quiet mountain lake at sunrise}"
 PROFILE_BACKEND="${PROFILE_BACKEND:-torch}"
+PAYLOAD_STATS="${VLLM_OMNI_MAMMOTH_MODA2_PAYLOAD_STATS:-0}"
+REQUIRE_IDLE_GPUS="${REQUIRE_IDLE_GPUS:-1}"
 
 if [[ ! -x "$PYTHON_BIN" ]]; then
     echo "Python executable not found: $PYTHON_BIN" >&2
@@ -30,6 +32,29 @@ if [[ "$PROFILE_BACKEND" != "torch" && "$PROFILE_BACKEND" != "nsys" ]]; then
     echo "PROFILE_BACKEND must be 'torch' or 'nsys', got: $PROFILE_BACKEND" >&2
     exit 1
 fi
+
+require_idle_gpus() {
+    if [[ "$REQUIRE_IDLE_GPUS" != "1" ]]; then
+        return
+    fi
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo "nvidia-smi is required for the idle-GPU safety check." >&2
+        exit 1
+    fi
+
+    local active_processes
+    active_processes="$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory \
+        --format=csv,noheader 2>/dev/null | grep -v 'No running processes found' || true)"
+    if [[ -n "$active_processes" ]]; then
+        echo "Refusing to start the benchmark because compute processes already own GPU memory:" >&2
+        echo "$active_processes" >&2
+        echo "Inspect and stop only the verified stale process, then rerun." >&2
+        echo "Set REQUIRE_IDLE_GPUS=0 only when intentionally sharing the GPUs." >&2
+        exit 1
+    fi
+}
+
+require_idle_gpus
 
 mkdir -p "$RESULTS_DIR"
 BASE_WORKTREE="$(mktemp -d /tmp/vllm-omni-mammoth-baseline.XXXXXX)"
@@ -44,7 +69,12 @@ git -C "$REPO_ROOT" diff --check
 git -C "$REPO_ROOT" rev-parse --verify "$BASE_COMMIT^{commit}" >/dev/null
 git -C "$REPO_ROOT" worktree add --detach "$BASE_WORKTREE" "$BASE_COMMIT"
 
-cat > "$RESULTS_DIR/deploy.yaml" <<'YAML'
+write_deploy_config() {
+    local deploy_path="$1"
+    local profiler_backend="$2"
+    local label="$3"
+
+    cat > "$deploy_path" <<'YAML'
 async_chunk: false
 pipeline: mammoth_moda2
 
@@ -57,6 +87,25 @@ stages:
     gpu_memory_utilization: 0.85
     enforce_eager: true
     trust_remote_code: true
+YAML
+
+    if [[ "$profiler_backend" == "torch" ]]; then
+        cat >> "$deploy_path" <<YAML
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: $RESULTS_DIR/torch_${label}_stage0
+      torch_profiler_record_shapes: false
+      torch_profiler_with_memory: false
+      torch_profiler_with_stack: false
+YAML
+    elif [[ "$profiler_backend" == "nsys" ]]; then
+        cat >> "$deploy_path" <<'YAML'
+    profiler_config:
+      profiler: cuda
+YAML
+    fi
+
+    cat >> "$deploy_path" <<'YAML'
     enable_prefix_caching: false
 
   - stage_id: 1
@@ -65,6 +114,25 @@ stages:
     gpu_memory_utilization: 0.3
     enforce_eager: true
     trust_remote_code: true
+YAML
+
+    if [[ "$profiler_backend" == "torch" ]]; then
+        cat >> "$deploy_path" <<YAML
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: $RESULTS_DIR/torch_${label}_stage1
+      torch_profiler_record_shapes: false
+      torch_profiler_with_memory: false
+      torch_profiler_with_stack: false
+YAML
+    elif [[ "$profiler_backend" == "nsys" ]]; then
+        cat >> "$deploy_path" <<'YAML'
+    profiler_config:
+      profiler: cuda
+YAML
+    fi
+
+    cat >> "$deploy_path" <<'YAML'
     enable_prefix_caching: false
     default_sampling_params:
       extra_args:
@@ -72,6 +140,9 @@ stages:
         cfg_range: [0.0, 1.0]
         num_inference_steps: 20
 YAML
+}
+
+write_deploy_config "$RESULTS_DIR/deploy.yaml" "none" ""
 
 TORCH_PROFILER_JSON_TEMPLATE='{"profiler":"torch","torch_profiler_dir":"%s","torch_profiler_record_shapes":false,"torch_profiler_with_memory":false,"torch_profiler_with_stack":false}'
 
@@ -81,11 +152,17 @@ run_case() {
     local mode="$3"
     local output="$RESULTS_DIR/${label}_${mode}.png"
     local log="$RESULTS_DIR/${label}_${mode}.log"
+    local deploy_config="$RESULTS_DIR/deploy.yaml"
+    if [[ "$mode" == "profile" ]]; then
+        deploy_config="$RESULTS_DIR/deploy_${label}_${mode}.yaml"
+        write_deploy_config "$deploy_config" "$PROFILE_BACKEND" "$label"
+    fi
     local -a command=(
-        env "CUDA_VISIBLE_DEVICES=0,1" "PYTHONPATH=$checkout" "$PYTHON_BIN"
+        env "CUDA_VISIBLE_DEVICES=0,1" "PYTHONPATH=$checkout" \
+        "VLLM_OMNI_MAMMOTH_MODA2_PAYLOAD_STATS=$PAYLOAD_STATS" "$PYTHON_BIN"
         "$checkout/examples/offline_inference/text_to_image/text_to_image.py"
         --model "$MODEL"
-        --deploy-config "$RESULTS_DIR/deploy.yaml"
+        --deploy-config "$deploy_config"
         --prompt "$PROMPT"
         --width 512 --height 512
         --num-inference-steps 20
@@ -126,8 +203,15 @@ run_case() {
 if [[ "$PROFILE_BACKEND" == "nsys" ]] && command -v nsys >/dev/null 2>&1; then
     NSYS_BIN="$(command -v nsys)"
     "$NSYS_BIN" --version | tee "$RESULTS_DIR/nsys_version.txt"
+    NSYS_ANALYZER="$REPO_ROOT/benchmarks/mammoth_moda2/analyze_nsys_transfer.py"
+    if [[ ! -f "$NSYS_ANALYZER" ]]; then
+        echo "Nsight analyzer is missing: $NSYS_ANALYZER" >&2
+        echo "Restore benchmarks/mammoth_moda2/analyze_nsys_transfer.py before starting a costly run." >&2
+        exit 1
+    fi
 else
     NSYS_BIN=""
+    NSYS_ANALYZER=""
     if [[ "$PROFILE_BACKEND" == "nsys" ]]; then
         echo "PROFILE_BACKEND=nsys requires an nsys executable on PATH." >&2
         exit 1
@@ -161,7 +245,7 @@ print(f"pixel_mean_abs_diff={sum(stats.mean) / len(stats.mean):.6f}")
 PY
 
 for label in baseline optimized; do
-    grep -E 'Total generation time|stage_0_gen_ms|stage_1_gen_ms|hidden_(d2h|snapshot)' \
+    grep -E 'Total generation time|stage_0_gen_ms|stage_1_gen_ms|hidden_(d2h|snapshot)|mammoth_moda2 payload stats' \
         "$RESULTS_DIR/${label}_profile.log" > "$RESULTS_DIR/${label}_summary.txt" || true
     if [[ "$PROFILE_BACKEND" == "nsys" && -f "$RESULTS_DIR/nsys_${label}.nsys-rep" ]]; then
         "$NSYS_BIN" export --type sqlite --force-overwrite true \
@@ -203,7 +287,7 @@ for label in ("baseline", "optimized"):
     print(f"[{label}] " + ", ".join(lines))
 PY
 else
-"$PYTHON_BIN" "$REPO_ROOT/benchmarks/mammoth_moda2/analyze_nsys_transfer.py" "$RESULTS_DIR"
+"$PYTHON_BIN" "$NSYS_ANALYZER" "$RESULTS_DIR"
 fi
 
 find "$RESULTS_DIR" -maxdepth 3 -type f -printf '%p\n' | sort

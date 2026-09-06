@@ -54,11 +54,13 @@ def _stage_summary(con: sqlite3.Connection, pids: set[int]) -> dict[str, Any]:
     pid_filter, params = _pid_filter("globalPid", pids)
     copies = con.execute(
         "SELECT globalPid, deviceId, start, end, bytes, srcKind, dstKind "
-        f"FROM CUPTI_ACTIVITY_KIND_MEMCPY WHERE {pid_filter}", params
+        f"FROM CUPTI_ACTIVITY_KIND_MEMCPY WHERE {pid_filter}",
+        params,
     ).fetchall()
     kernels = con.execute(
         "SELECT globalPid, deviceId, COUNT(*) FROM CUPTI_ACTIVITY_KIND_KERNEL "
-        f"WHERE {pid_filter} GROUP BY globalPid, deviceId", params
+        f"WHERE {pid_filter} GROUP BY globalPid, deviceId",
+        params,
     ).fetchall()
     groups: dict[str, dict[str, int]] = defaultdict(lambda: {"count": 0, "bytes": 0, "duration_ns": 0})
     largest: dict[str, list[dict[str, int | None]]] = defaultdict(list)
@@ -68,7 +70,9 @@ def _stage_summary(con: sqlite3.Connection, pids: set[int]) -> dict[str, Any]:
         groups[name]["count"] += 1
         groups[name]["bytes"] += int(size)
         groups[name]["duration_ns"] += duration
-        largest[name].append({"pid": _os_pid(global_pid), "device": int(device), "bytes": int(size), "duration_ns": duration})
+        largest[name].append(
+            {"pid": _os_pid(global_pid), "device": int(device), "bytes": int(size), "duration_ns": duration}
+        )
 
     tid_filter, tid_params = _pid_filter("r.globalTid", pids)
     apis = con.execute(
@@ -76,7 +80,8 @@ def _stage_summary(con: sqlite3.Connection, pids: set[int]) -> dict[str, Any]:
         "FROM CUPTI_ACTIVITY_KIND_RUNTIME r JOIN StringIds s ON r.nameId = s.id "
         f"WHERE {tid_filter} AND (s.value LIKE 'cudaMemcpy%' OR "
         "s.value LIKE 'cuda%Synchronize%' OR s.value LIKE 'cudaStreamWait%') "
-        "GROUP BY r.globalTid, s.value ORDER BY s.value", tid_params
+        "GROUP BY r.globalTid, s.value ORDER BY s.value",
+        tid_params,
     ).fetchall()
     return {
         "captured_pids": sorted({_os_pid(row[0]) for row in copies} | {_os_pid(row[0]) for row in kernels}),
@@ -100,7 +105,8 @@ def _request_end_d2h(con: sqlite3.Connection, pids: set[int]) -> dict[str, int]:
         "SELECT start, end FROM NVTX_EVENTS WHERE "
         "COALESCE(text, (SELECT value FROM StringIds WHERE id = textId)) "
         "= 'mammoth_moda2:ar2dit_full_payload_d2h' "
-        f"AND {tid_filter} AND end IS NOT NULL", tid_params
+        f"AND {tid_filter} AND end IS NOT NULL",
+        tid_params,
     ).fetchall()
     pid_filter, pid_params = _pid_filter("globalPid", pids)
     result = {"range_count": len(ranges), "copy_count": 0, "bytes": 0, "duration_ns": 0}
@@ -157,7 +163,10 @@ def main() -> int:
     print(json.dumps(output, indent=2, sort_keys=True))
     print(f"Wrote {path}")
     if not valid:
-        print("Nsight worker coverage is incomplete or GPU mapping is wrong. Do not compare transfer totals.", file=sys.stderr)
+        print(
+            "Nsight worker coverage is incomplete or GPU mapping is wrong. Do not compare transfer totals.",
+            file=sys.stderr,
+        )
         return 2
     return 0
 

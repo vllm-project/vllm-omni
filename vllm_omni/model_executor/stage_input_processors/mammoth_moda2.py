@@ -10,6 +10,10 @@ from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.mammoth_moda2.conditioning import (
+    conditioning_spec_from_config,
+    select_ar_conditions,
+)
 
 logger = init_logger(__name__)
 
@@ -58,6 +62,50 @@ def _first_int(values: Any) -> int | None:
         return int(values)
     except (TypeError, ValueError):
         return None
+
+
+def _conditioning_spec_from_transfer_manager(transfer_manager: Any):
+    """Resolve the producer's Mammoth token contract without hard-coded ids."""
+    model_config = getattr(transfer_manager, "model_config", None)
+    if model_config is None:
+        model_config = getattr(getattr(transfer_manager, "vllm_config", None), "model_config", None)
+    if model_config is None:
+        # Keep compatibility with direct calls through a transfer adapter.
+        model_config = getattr(transfer_manager, "config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    if hf_config is None:
+        raise ValueError("MammothModa2 full-payload producer is missing its Hugging Face config")
+    return conditioning_spec_from_config(hf_config)
+
+
+def _payload_stats_enabled() -> bool:
+    return os.getenv("VLLM_OMNI_MAMMOTH_MODA2_PAYLOAD_STATS") == "1"
+
+
+def _log_conditioning_payload_stats(
+    request_id: str,
+    full_hidden_states: torch.Tensor,
+    text_cond: torch.Tensor,
+    image_cond: torch.Tensor,
+) -> None:
+    if not _payload_stats_enabled():
+        return
+
+    full_bytes = full_hidden_states.numel() * full_hidden_states.element_size()
+    selected_bytes = (text_cond.numel() + image_cond.numel()) * full_hidden_states.element_size()
+    retained_ratio = selected_bytes / full_bytes if full_bytes else 0.0
+    logger.info(
+        "mammoth_moda2 payload stats req=%s dtype=%s full_rows=%d text_rows=%d "
+        "image_rows=%d full_bytes=%d selected_bytes=%d retained_ratio=%.6f",
+        request_id,
+        full_hidden_states.dtype,
+        full_hidden_states.shape[0],
+        text_cond.shape[0],
+        image_cond.shape[0],
+        full_bytes,
+        selected_bytes,
+        retained_ratio,
+    )
 
 
 def _maybe_synthesize_t2i_token_ids(
@@ -238,12 +286,12 @@ def ar2dit_full_payload(
     the full-payload accumulator, so by the time this builder fires at request
     end, ``pooling_output["hidden"]`` is the full prefill+decode hidden-state
     trajectory of size ``len(prompt_token_ids) + len(output_token_ids) - 1``
-    (the final look-ahead token has no hidden state). This is the single place
-    where the GPU -> CPU + float32 materialization happens. This function only
-    adapts the payload; the transfer manager/connector owns serialization and
-    transport. The emitted schema matches the legacy ``ar2dit`` bridge.
+    (the final look-ahead token has no hidden state). At request completion it
+    applies the same model-defined masks used by the DiT fallback, then copies
+    only the required text/image rows to CPU in the producer dtype. This
+    function only adapts the payload; the transfer manager/connector owns
+    serialization and transport.
     """
-    del transfer_manager
     rid = getattr(request, "external_req_id", None) or getattr(request, "request_id", "?")
     if not isinstance(pooling_output, dict) or not isinstance(pooling_output.get("hidden"), torch.Tensor):
         logger.error(
@@ -260,14 +308,7 @@ def ar2dit_full_payload(
     # Exclude the final look-ahead token: it has no corresponding hidden state.
     gen_token_ids = list(getattr(request, "output_token_ids", None) or [])[:-1]
 
-    # Single D2H + float32 materialization for the whole request. float32 so the
-    # tensor crosses the stage boundary (the serializer uses numpy, which has no
-    # bf16); the DiT re-casts to the model dtype.
-    # Disabled by default. It identifies this request-end D2H in Nsight without
-    # adding instrumentation to the generic connector path.
-    with _mammoth_nvtx_range("mammoth_moda2:ar2dit_full_payload_d2h"):
-        full_hidden_states = hidden.detach().to("cpu").float().contiguous()
-    hidden_total = int(full_hidden_states.shape[0])
+    hidden_total = int(hidden.shape[0])
     generated_hidden_len = hidden_total - len(prompt_token_ids)
 
     # Image size / sampling knobs come from the AR prompt metadata carried on
@@ -293,13 +334,26 @@ def ar2dit_full_payload(
     cfg_range = addi_info.get("cfg_range") or [0.0, 1.0]
     num_inference_steps = (addi_info.get("num_inference_steps") or [50])[0]
 
-    # The text/image condition split is performed in the DiT pipeline, which
-    # sources the distinguishing token ids from the model config. Pass through
-    # the raw AR hidden states + token ids and the question/answer boundary.
+    text_cond, image_cond = select_ar_conditions(
+        hidden.detach(),
+        full_token_ids,
+        len(prompt_token_ids),
+        _conditioning_spec_from_transfer_manager(transfer_manager),
+    )
+    _log_conditioning_payload_stats(rid, hidden, text_cond, image_cond)
+
+    # Keep the source dtype on the host/SHM path. Mammoth runs this trajectory
+    # in BF16 on the target deployment, and the connector serializes its raw
+    # tensor bytes plus dtype without requiring an FP32 CPU expansion.
+    # This range identifies the two selected request-end D2H copies in Nsight
+    # without instrumenting the generic connector path.
+    with _mammoth_nvtx_range("mammoth_moda2:ar2dit_full_payload_d2h"):
+        text_prompt_embeds = text_cond.to("cpu").contiguous()
+        image_prompt_embeds = image_cond.to("cpu").contiguous()
+
     return {
-        # float32 so the tensor crosses the stage boundary (the serializer uses
-        # numpy, which has no bf16); the DiT re-casts to the model dtype.
-        "full_hidden_states": full_hidden_states,
+        "text_prompt_embeds": text_prompt_embeds,
+        "image_prompt_embeds": image_prompt_embeds,
         "full_token_ids": full_token_ids,
         "answer_start_index": [len(prompt_token_ids)],
         "image_height": [int(image_height)],
