@@ -439,7 +439,8 @@ def _normalize_frames(frames: list[Any]) -> list[np.ndarray]:
     normalized: list[np.ndarray] = []
     for frame in frames:
         if isinstance(frame, torch.Tensor):
-            frame_array = frame.detach().cpu().numpy()
+            frame = frame.detach().cpu()
+            frame_array = frame.float().numpy() if frame.is_floating_point() else frame.numpy()
         elif isinstance(frame, Image.Image):
             frame_array = np.array(frame)
         elif isinstance(frame, np.ndarray):
