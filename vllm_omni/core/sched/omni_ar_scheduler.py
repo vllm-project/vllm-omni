@@ -903,7 +903,27 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         getattr(self, "_inflight_prefills", set()).discard(request)
 
         # 1. Standard cleanup parts from base _free_request
-        connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+        status = getattr(request, "status", None)
+        transfer_params = getattr(request, "kv_transfer_params", None)
+        native_transfer = (
+            transfer_params
+            and transfer_params.get("do_remote_decode")
+            and getattr(getattr(self.vllm_config, "kv_transfer_config", None), "kv_connector", None)
+            == "MooncakeConnector"
+        )
+        if native_transfer and status == RequestStatus.FINISHED_STOPPED:
+            request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        try:
+            connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+        finally:
+            if status is not None:
+                request.status = status
+        if native_transfer and connector_delay_free_blocks:
+            kv_xfer_params = {
+                **(kv_xfer_params or {}),
+                "transfer_id": transfer_params["transfer_id"],
+                "num_transfer_tokens": self._get_confirmed_num_computed_tokens(request),
+            }
 
         # EC Connector: mirror the KV hook (upstream v0.28 _free_request).
         # The contract requires firing before the encoder cache is freed so

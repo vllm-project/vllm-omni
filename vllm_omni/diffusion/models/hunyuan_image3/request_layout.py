@@ -374,6 +374,14 @@ def build_hunyuan_diffusion_kv_requests(
     assert prefix_positions is not None and real_pos is not None
 
     target_len = hunyuan_num_image_tokens(prepared_layout.generated_image_info)
+    reusable_lens = [0] * cfg_factor
+    if tokenizer_output.think_recaption_end_pos:
+        reusable_lens[0] = tokenizer_output.think_recaption_end_pos[0][0] or 0
+    if tokenizer_output.uncond_cfg_start_pos:
+        for sequence_id in range(1, cfg_factor):
+            reusable_lens[sequence_id] = min(
+                reusable_lens[0], tokenizer_output.uncond_cfg_start_pos[sequence_id][0] or 0
+            )
     return tuple(
         DiffusionKVRequest(
             f"{request.request_id}/diffusion-kv/{sequence_id}",
@@ -383,6 +391,7 @@ def build_hunyuan_diffusion_kv_requests(
             prefix_len=int(prefix_row[-1].item()),
             target_len=target_len,
             seq_len=int(valid_row[-1].item()),
+            prompt_token_ids=tokenizer_output.tokens[sequence_id, : reusable_lens[sequence_id]].tolist(),
             # Prompt and reference-image tokens are already embedded in this
             # row's primary self-attention sequence. Hunyuan therefore has no
             # independently projected cross/joint-attention KV context.
