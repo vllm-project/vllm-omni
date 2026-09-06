@@ -650,6 +650,21 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             remove_route_from_app(app, "/start_profile", frozenset({"POST"}))
             remove_route_from_app(app, "/stop_profile", frozenset({"POST"}))
             app.include_router(profiler_router)
+        elif os.environ.get("VLLM_TORCH_PROFILER_DIR"):
+            # Migration diagnostic, not a compatibility path. Profiling moved to
+            # ProfilerConfig in vllm-project/vllm#29912 and this variable was
+            # removed in vllm-project/vllm#33536 (vLLM v0.16.0), so nothing reads
+            # it any more. A stale value in an environment or script is silently
+            # inert; point the operator at the setting that replaced it.
+            logger.warning(
+                "VLLM_TORCH_PROFILER_DIR is set but is ignored: it was removed in "
+                "vLLM v0.16.0 when profiling moved to ProfilerConfig. Profiler "
+                "endpoints are registered from engine_args.profiler_config.profiler, "
+                "and no stage declares it, so /start_profile and /stop_profile were "
+                'NOT registered. Use --profiler-config \'{"profiler": "torch", '
+                '"torch_profiler_dir": "..."}\' or add a profiler_config block to a '
+                "stage in your deploy YAML. See docs/contributing/profiling.md."
+            )
 
         vllm_config = await _get_vllm_config(engine_client)
 
