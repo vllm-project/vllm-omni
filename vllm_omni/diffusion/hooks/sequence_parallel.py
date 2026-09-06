@@ -372,7 +372,7 @@ class SequenceParallelSplitHook(ModelHook):
         if isinstance(sp_input, SequenceParallelInput):
             # Full split with optional auto-padding
             if sp_input.auto_pad:
-                return self._shard_with_auto_pad(x, sp_input.split_dim)
+                return self._shard_with_auto_pad(x, sp_input)
             _maybe_validate_strict_divisibility(dim=sp_input.split_dim, seq_len=x.size(sp_input.split_dim))
             return sp_shard(x, sp_input.split_dim, validate=False)
         elif isinstance(sp_input, SequenceParallelPartialInput):
@@ -393,7 +393,7 @@ class SequenceParallelSplitHook(ModelHook):
         else:
             raise ValueError(f"Unsupported input config type: {type(sp_input).__name__}")
 
-    def _shard_with_auto_pad(self, x: torch.Tensor, dim: int) -> torch.Tensor:
+    def _shard_with_auto_pad(self, x: torch.Tensor, sp_input: SequenceParallelInput) -> torch.Tensor:
         """Shard tensor with automatic padding and attention mask creation.
 
         When sequence length is not divisible by SP world size, this method:
@@ -413,6 +413,7 @@ class SequenceParallelSplitHook(ModelHook):
         if world_size == 1:
             return x
 
+        dim = sp_input.split_dim
         seq_len = x.size(dim)
         remainder = seq_len % world_size
 
@@ -463,10 +464,17 @@ class SequenceParallelSplitHook(ModelHook):
         # Attention layers will create masks dynamically using this info
         if is_forward_context_available():
             ctx = get_forward_context()
+
+            if sp_input.pad_key:
+                if ctx.sp_pad_info is None:
+                    ctx.sp_pad_info = {}
+                ctx.sp_pad_info[sp_input.pad_key] = (seq_len, pad_size)
+
             # Only set if not already set (first auto_pad tensor wins)
             if ctx.sp_original_seq_len is None:
                 ctx.sp_padding_size = pad_size
                 ctx.sp_original_seq_len = seq_len
+
                 logger.debug(
                     f"Auto-padded sequence from {seq_len} to {padded_seq_len} "
                     f"(pad_size={pad_size}, world_size={world_size}, dim={dim})"
@@ -521,6 +529,7 @@ class SequenceParallelGatherHook(ModelHook):
 
         # Check if padding was applied during split
         original_seq_len = None
+        ctx = None
         if is_forward_context_available():
             ctx = get_forward_context()
             original_seq_len = ctx.sp_original_seq_len
@@ -540,6 +549,11 @@ class SequenceParallelGatherHook(ModelHook):
 
             # Gather from all ranks
             gathered = sp_gather(x, spm.gather_dim, validate=False)
+
+            if ctx is not None:
+                if spm.pad_key is not None:
+                    if ctx.sp_pad_info is not None and spm.pad_key in ctx.sp_pad_info:
+                        original_seq_len, _ = ctx.sp_pad_info[spm.pad_key]
 
             # Remove padding if it was applied
             if original_seq_len is not None and gathered.size(spm.gather_dim) > original_seq_len:
