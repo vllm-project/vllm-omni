@@ -8,6 +8,7 @@ import math
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from typing import Literal
 
 
 class RuntimeMode(str, Enum):
@@ -66,6 +67,7 @@ class CapacityPolicy:
     max_store_bytes: int | None = None
     min_free_bytes: int = 0
     eviction: str = "none"
+    build_admission: Literal["concurrent", "serialized"] = "concurrent"
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -78,6 +80,10 @@ class CapacityPolicy:
             raise ValueError("min_free_bytes must not be negative")
         if not isinstance(self.eviction, str) or self.eviction != "none":
             raise ValueError("automatic host weight eviction is not implemented")
+        if self.build_admission not in ("concurrent", "serialized"):
+            raise ValueError("build_admission must be concurrent or serialized")
+        if self.build_admission == "serialized" and self.max_store_bytes is None:
+            raise ValueError("serialized build admission requires max_store_bytes")
 
 
 @dataclass(frozen=True)
