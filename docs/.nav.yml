@@ -66,6 +66,7 @@ nav:
       - ModelOpt: user_guide/quantization/modelopt.md
       - AutoRound: user_guide/quantization/autoround.md
       - msModelSlim: user_guide/quantization/msmodelslim.md
+      - TorchAO: user_guide/quantization/torchao.md
     - Diffusion Acceleration:
       - Overview and Compatibility:
         - Overview: user_guide/diffusion_features.md

@@ -22,6 +22,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     filter_files_not_needed_for_inference,
     maybe_download_from_modelscope,
     multi_thread_safetensors_weights_iterator,
+    pt_weights_iterator,
     safetensors_weights_iterator,
 )
 from vllm.transformers_utils.repo_utils import hf_api
@@ -98,7 +99,9 @@ def _natural_sort_key(filepath: str) -> list:
 
 DIFFUSION_MODEL_WEIGHTS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
 TRANSFORMER_WEIGHTS_INDEX = "model.safetensors.index.json"
-INDEX_FILES = [DIFFUSION_MODEL_WEIGHTS_INDEX, TRANSFORMER_WEIGHTS_INDEX]
+DIFFUSION_MODEL_BIN_WEIGHTS_INDEX = "diffusion_pytorch_model.bin.index.json"
+SAFETENSORS_INDEX_FILES = [DIFFUSION_MODEL_WEIGHTS_INDEX, TRANSFORMER_WEIGHTS_INDEX]
+PT_INDEX_FILES = [DIFFUSION_MODEL_BIN_WEIGHTS_INDEX]
 SHARDED_SAFETENSORS_PATTERN = re.compile(r"^(?P<family>.+)-\d+-of-(?P<count>\d+)\.safetensors$")
 
 
@@ -191,11 +194,12 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         model_name_or_path: Path | str,
         subfolder: str | None,
         revision: str | None,
+        index_files: Sequence[str],
     ) -> list[str] | None:
         """Resolve an index and return its authoritative shard manifest."""
         is_local = os.path.isdir(model_name_or_path)
         index_paths: list[tuple[str, Path]] = []
-        for index_file in INDEX_FILES:
+        for index_file in index_files:
             repo_index_path = self._repo_relative_path(subfolder, index_file)
             if is_local:
                 index_path = Path(model_name_or_path) / repo_index_path
@@ -249,11 +253,17 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         is_local = os.path.isdir(model_name_or_path)
         load_format = self.load_config.load_format
         use_safetensors = False
-        indexed_weight_files = (
-            self._resolve_weight_index(model_name_or_path, subfolder, revision)
-            if allow_patterns_overrides is None
-            else None
-        )
+        indexed_weight_files = None
+        if allow_patterns_overrides is None:
+            for index_files in (SAFETENSORS_INDEX_FILES, PT_INDEX_FILES):
+                indexed_weight_files = self._resolve_weight_index(
+                    model_name_or_path,
+                    subfolder,
+                    revision,
+                    index_files,
+                )
+                if indexed_weight_files is not None:
+                    break
 
         # only hf is supported currently
         if load_format == "auto":
@@ -332,11 +342,18 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
         )
-
+        quant_config = self._get_source_quant_config(source)
         use_multithread = (
             use_safetensors
             and getattr(self.od_config, "enable_multithread_weight_load", False)
             and self.load_config.safetensors_load_strategy != "torchao"
+        )
+        use_torchao = (
+            not use_safetensors
+            and quant_config is not None
+            and hasattr(quant_config, "get_name")
+            and quant_config.get_name() == "torchao"
+            and getattr(quant_config, "is_checkpoint_torchao_serialized", False)
         )
         if use_multithread:
             num_threads = getattr(self.od_config, "num_weight_load_threads", 4)
@@ -346,6 +363,13 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 sorted_hf_weights_files,
                 self.load_config.use_tqdm_on_load,
                 max_workers=num_threads,
+            )
+        elif use_torchao:
+            sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
+            weights_iterator = pt_weights_iterator(
+                sorted_hf_weights_files,
+                self.load_config.use_tqdm_on_load,
+                self.load_config.pt_load_map_location,
             )
         else:
             weights_iterator = safetensors_weights_iterator(
