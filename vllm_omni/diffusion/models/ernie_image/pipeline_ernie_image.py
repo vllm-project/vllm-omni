@@ -197,6 +197,7 @@ class ErnieImagePipeline(
         height: int = 1024,
         temperature: float = 0.6,
         top_p: float = 0.95,
+        generator: torch.Generator | None = None,
     ) -> str:
         if not self.use_pe or self.pe_model is None:
             return prompt
@@ -230,6 +231,7 @@ class ErnieImagePipeline(
                 top_p=top_p,
                 pad_token_id=self.pe_tokenizer.pad_token_id,
                 eos_token_id=self.pe_tokenizer.eos_token_id,
+                generator=generator,
             )
             output_ids = output_ids[0][inputs.input_ids.shape[1] :]
             result = self.pe_tokenizer.decode(output_ids, skip_special_tokens=True).strip()
@@ -268,6 +270,7 @@ class ErnieImagePipeline(
         width: int = 1024,
         height: int = 1024,
         apply_pe: bool = True,
+        generator: torch.Generator | None = None,
     ) -> list[torch.Tensor]:
         if isinstance(prompt, str):
             prompt = [prompt]
@@ -276,7 +279,7 @@ class ErnieImagePipeline(
 
         for p in prompt:
             if apply_pe and self.use_pe and self.pe_model is not None:
-                enhanced = self._enhance_prompt(p, device, width=width, height=height)
+                enhanced = self._enhance_prompt(p, device, width=width, height=height, generator=generator)
                 logger.info("PE: original='%s...' enhanced='%s...'", p[:50], enhanced[:50])
                 p = enhanced
             ids = self.tokenizer(
@@ -459,6 +462,7 @@ class ErnieImagePipeline(
                 width=width,
                 height=height,
                 apply_pe=self._should_apply_pe(req),
+                generator=generator,
             )
 
         if self.do_classifier_free_guidance:

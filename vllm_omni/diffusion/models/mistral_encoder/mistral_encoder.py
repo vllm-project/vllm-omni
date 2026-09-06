@@ -477,12 +477,13 @@ class MistralEncoderModel(nn.Module):
         logits: torch.Tensor,
         do_sample: bool,
         temperature: float,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """Sample or greedily select the next token from logits. Returns (batch, 1)."""
         if do_sample:
             logits = logits / max(temperature, 1e-7)
             probs = F.softmax(logits, dim=-1)
-            return torch.multinomial(probs, num_samples=1)
+            return torch.multinomial(probs, num_samples=1, generator=generator)
         return logits.argmax(dim=-1, keepdim=True)
 
     # TODO make common. Potentially with HF mixin
@@ -495,6 +496,7 @@ class MistralEncoderModel(nn.Module):
         do_sample: bool = True,
         temperature: float = 1.0,
         eos_token_id: int | list[int] | None = None,
+        generator: torch.Generator | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Autoregressive text generation with KV caching.
@@ -526,7 +528,7 @@ class MistralEncoderModel(nn.Module):
         past_key_values = output.past_key_values
 
         logits = self._compute_logits(output.last_hidden_state[:, -1:, :])
-        next_token = self._sample(logits.squeeze(1), do_sample, temperature)
+        next_token = self._sample(logits.squeeze(1), do_sample, temperature, generator=generator)
         if get_tensor_model_parallel_world_size() > 1:
             torch.distributed.broadcast(next_token, src=0)
         generated = torch.cat([generated, next_token], dim=1)
@@ -556,7 +558,7 @@ class MistralEncoderModel(nn.Module):
             past_key_values = output.past_key_values
 
             logits = self._compute_logits(output.last_hidden_state)
-            next_token = self._sample(logits.squeeze(1), do_sample, temperature)
+            next_token = self._sample(logits.squeeze(1), do_sample, temperature, generator=generator)
             if get_tensor_model_parallel_world_size() > 1:
                 torch.distributed.broadcast(next_token, src=0)
             generated = torch.cat([generated, next_token], dim=1)
@@ -591,6 +593,7 @@ class MistralEncoderModel(nn.Module):
         device: torch.device | None = None,
         max_new_tokens: int = 512,
         max_length: int = 2048,
+        generator: torch.Generator | None = None,
     ) -> list[str]:
         if self._processor is None:
             raise RuntimeError("upsample_prompt() requires a processor; call set_processor() first")
@@ -627,6 +630,7 @@ class MistralEncoderModel(nn.Module):
             do_sample=True,
             temperature=temperature,
             use_cache=True,
+            generator=generator,
         )
 
         input_length = inputs["input_ids"].shape[1]
