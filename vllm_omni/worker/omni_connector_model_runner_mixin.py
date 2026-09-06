@@ -2114,6 +2114,41 @@ class OmniConnectorModelRunnerMixin:
     # ------------------------------------------------------------------ #
 
     @staticmethod
+    def _maybe_update_extra_args(name: str, extra: dict):
+        from vllm_omni.distributed.omni_connectors.utils.config import TRANSFER_ENGINE_CONNECTOR_NAMES
+        from vllm_omni.distributed.omni_connectors.utils.kv_utils import (
+            KV_RANK_PORT_STRIDE,
+            KV_REPLICA_PORT_STRIDE,
+            get_omni_replica_id,
+        )
+        from vllm_omni.distributed.omni_connectors.utils.local_rank import get_connector_local_rank
+
+        if name in TRANSFER_ENGINE_CONNECTOR_NAMES:
+            role = extra.get("role", "")
+            if role == "sender":
+                base_port = int(extra.get("zmq_port", 50051))
+                from_stage = extra.get("stage_id", 0)
+                local_rank = get_connector_local_rank()
+                replica_id = get_omni_replica_id()
+                port = base_port + replica_id * KV_REPLICA_PORT_STRIDE + local_rank * KV_RANK_PORT_STRIDE + from_stage
+                extra["zmq_port"] = port
+                logger.info(
+                    "Stage connector %s (sender) zmq_port=%d (base=%d stage=%d rank=%d replica=%d)",
+                    name,
+                    port,
+                    base_port,
+                    from_stage,
+                    local_rank,
+                    replica_id,
+                )
+            elif role == "receiver":
+                extra.setdefault("sender_zmq_port", extra.get("zmq_port", 50051))
+            else:
+                raise ValueError(f"Invalid role:{role} from connector_config.")
+        else:
+            raise NotImplementedError(f"{name} engine connector not supported.")
+
+    @staticmethod
     def _create_connector(model_config: Any) -> OmniConnectorBase | None:
         """Create a connector from model_config, or None if unconfigured."""
         connector_config = getattr(model_config, "stage_connector_config", None)
@@ -2137,6 +2172,9 @@ class OmniConnectorModelRunnerMixin:
         elif not isinstance(extra, dict):
             raise RuntimeError(f"Invalid extra config for connector {name}: expected dict, got {type(extra).__name__}")
 
+        OmniConnectorModelRunnerMixin._maybe_update_extra_args(name, extra)
+
+        # TODO: refine connector_spec
         spec = ConnectorSpec(name=name, extra=extra)
         try:
             return OmniConnectorFactory.create_connector(spec)
