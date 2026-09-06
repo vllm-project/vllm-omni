@@ -1,5 +1,9 @@
 # Production Metrics
 
+> ℹ️ **User guide.** For the design rationale, see
+> [Prometheus Metrics Design](../design/metrics.md). For the `--log-stats`
+> console output (a different feature), see [Console Log Stats](../contributing/log_stats.md).
+
 vLLM-Omni exposes Prometheus metrics via the `/metrics` endpoint on the OpenAI-compatible API server.
 
 ```bash

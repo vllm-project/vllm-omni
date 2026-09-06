@@ -1,5 +1,8 @@
 # Pipeline Parallel
 
+> 🔧 **Design doc.** For end-user enablement, configuration, and Quick Start,
+> see [Pipeline Parallelism Guide](../../user_guide/diffusion/parallelism/pipeline_parallel.md).
+
 This section describes how to add Pipeline Parallelism (PP) to a diffusion pipeline. We use the Wan2.2 text-to-video and
 image-to-video pipelines as the reference implementations.
 

@@ -1,5 +1,8 @@
 # Sequence Parallelism Guide
 
+> 📖 **End-user guide.** For implementation details, internal APIs, and architecture,
+> see [Sequence Parallel](../../../design/feature/sequence_parallel.md).
+
 
 ## Table of Content
 

@@ -1,5 +1,8 @@
 # HSDP Guide
 
+> 📖 **End-user guide.** For implementation details, internal APIs, and architecture,
+> see [HSDP](../../../design/feature/hsdp.md).
+
 
 ## Table of Content
 

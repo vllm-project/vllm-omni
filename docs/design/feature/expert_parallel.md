@@ -1,5 +1,8 @@
 # Expert Parallel
 
+> 🔧 **Design doc.** For end-user enablement, configuration, and Quick Start,
+> see [Expert Parallelism Guide](../../user_guide/diffusion/parallelism/expert_parallel.md).
+
 This section describes how to add Expert Parallel (EP) to a diffusion transformer that uses Mixture-of-Experts (MoE) layers.
 We use **HunyuanImage3.0** as the reference implementation.
 

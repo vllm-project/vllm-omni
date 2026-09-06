@@ -86,7 +86,8 @@ nav:
         - Hybrid Sharded Data Parallel: user_guide/diffusion/parallelism/hsdp.md
         - Sequence Parallel: user_guide/diffusion/parallelism/sequence_parallel.md
         - Tensor Parallel: user_guide/diffusion/parallelism/tensor_parallel.md
-        - VAE Parallelism: user_guide/diffusion/parallelism/vae_parallelism.md
+        - Pipeline Parallel: user_guide/diffusion/parallelism/pipeline_parallel.md
+        - VAE Parallelism: user_guide/diffusion/parallelism/vae_parallel.md
       - Attention Backends:
         - Overview: user_guide/diffusion/attention_backends.md
         - Dense Backends: user_guide/diffusion/attention_backends/dense_backends.md
@@ -98,6 +99,7 @@ nav:
       - Frame Interpolation: user_guide/diffusion/frame_interpolation.md
       - Startup and Loading: user_guide/diffusion/startup_and_loading.md
       - LoRA: user_guide/diffusion/lora.md
+      - MoT Kernel Configs: user_guide/diffusion/mot_config.md
     - Experimental:
       - Session State Manager: features/session_state_manager.md
   - Integrations:
@@ -110,6 +112,9 @@ nav:
     - contributing/README.md
     - glob: contributing/*
       flatten_single_child_sections: true
+      ignore:
+        - README.md
+        - DOCS_GUIDE.md
   - Model Implementation:
     - contributing/model/README.md
     - contributing/model/adding_omni_model.md
@@ -120,6 +125,7 @@ nav:
     - design/index.md
     - Architecture Documents:
       - Architecture Overview: design/architecture_overview.md
+    - World Action Model Analysis: design/world_action_model_analysis.md
     - Feature Design:
       - Runtime and Stage Execution:
         - Disaggregated Inference: design/feature/disaggregated_inference.md

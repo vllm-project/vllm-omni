@@ -1,5 +1,8 @@
 # HSDP
 
+> 🔧 **Design doc.** For end-user enablement, configuration, and Quick Start,
+> see [HSDP Guide](../../user_guide/diffusion/parallelism/hsdp.md).
+
 This section describes how to add HSDP (Hybrid Sharded Data Parallel) support to a diffusion transformer model. We use the Wan2.2 transformer as the reference implementation.
 
 ---

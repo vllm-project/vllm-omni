@@ -1,5 +1,8 @@
 # TeaCache Guide
 
+> 📖 **End-user guide.** For implementation details, internal APIs, and architecture,
+> see [TeaCache](../../../design/feature/teacache.md).
+
 
 ## Table of Content
 

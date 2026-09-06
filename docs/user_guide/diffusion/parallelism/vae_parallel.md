@@ -1,5 +1,8 @@
 # VAE Parallelism Guide
 
+> 📖 **End-user guide.** For implementation details, internal APIs, and architecture,
+> see [VAE Patch Parallelism](../../../design/feature/vae_parallel.md).
+
 
 ## Table of Content
 

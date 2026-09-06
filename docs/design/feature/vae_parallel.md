@@ -1,5 +1,8 @@
 # VAE Patch Parallelism
 
+> 🔧 **Design doc.** For end-user enablement, configuration, and Quick Start,
+> see [VAE Parallelism Guide](../../user_guide/diffusion/parallelism/vae_parallel.md).
+
 This document describes how to add **VAE Patch Parallelism** support to a diffusion model.
 We use **Qwen-Image** as the reference implementation for decode parallel, and **Wan2.2** for encode parallel.
 

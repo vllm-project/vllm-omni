@@ -1,5 +1,8 @@
 # Tensor Parallelism Guide
 
+> 📖 **End-user guide.** For implementation details, internal APIs, and architecture,
+> see [Tensor Parallel](../../../design/feature/tensor_parallel.md).
+
 
 ## Table of Content
 

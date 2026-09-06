@@ -1,5 +1,8 @@
 # CFG-Parallel
 
+> 🔧 **Design doc.** For end-user enablement, configuration, and Quick Start,
+> see [CFG-Parallel Guide](../../user_guide/diffusion/parallelism/cfg_parallel.md).
+
 This section describes how to add CFG-Parallel (Classifier-Free Guidance Parallel) to a diffusion pipeline. We use the Qwen-Image pipeline as the reference implementation.
 
 ---

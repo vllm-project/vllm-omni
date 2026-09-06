@@ -1,5 +1,9 @@
+# Console Log Stats (`--log-stats`)
 
-# Metrics
+> ℹ️ **Not the Prometheus metrics page.** This page documents the `--log-stats`
+> console output (Overall Summary, RequestE2EStats, etc.). For the Prometheus
+> `/metrics` endpoint, see [Production Metrics](../usage/metrics.md) and the
+> [Prometheus Metrics Design](../design/metrics.md).
 
 You can use these metrics in production to monitor the health and performance of the vLLM-omni system. Typical scenarios include:
 

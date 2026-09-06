@@ -1,4 +1,6 @@
-This directory contains auto-tuned Triton kernel configurations for the
+# MoT Kernel Configs
+
+This page documents the auto-tuned Triton kernel configurations for the
 MoT (Mixture-of-Tokens) GEMM and RMSNorm operators used by BAGEL and other
 MoT-architecture diffusion models.
 

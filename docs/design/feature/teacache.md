@@ -1,5 +1,8 @@
 # TeaCache
 
+> 🔧 **Design doc.** For end-user enablement, configuration, and Quick Start,
+> see [TeaCache Guide](../../user_guide/diffusion/cache_acceleration/teacache.md).
+
 This section describes how to add TeaCache to a diffusion transformer model. We use the Qwen-Image transformer as the reference implementation.
 
 ---

@@ -1,5 +1,8 @@
 # Sequence Parallel
 
+> 🔧 **Design doc.** For end-user enablement, configuration, and Quick Start,
+> see [Sequence Parallelism Guide](../../user_guide/diffusion/parallelism/sequence_parallel.md).
+
 This section describes how to add Sequence Parallel (SP) to a diffusion transformer model. We use the Qwen-Image transformer and Wan2.2 transformer as reference implementations.
 
 ---

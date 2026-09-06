@@ -1,5 +1,9 @@
 # Prometheus Metrics Design
 
+> ℹ️ **Design doc.** For the end-user Prometheus metrics reference, see
+> [Production Metrics](../usage/metrics.md). For the `--log-stats` console
+> output (a different feature), see [Console Log Stats](../contributing/log_stats.md).
+
 This document describes how vLLM-Omni exposes Prometheus metrics for multi-stage pipelines, the constraints that shaped the design, and how the pipeline-level metrics coexist with upstream vLLM per-engine metrics.
 
 ## Objectives

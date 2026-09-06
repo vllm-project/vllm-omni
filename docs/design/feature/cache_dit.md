@@ -1,5 +1,8 @@
 # Cache-DiT
 
+> 🔧 **Design doc.** For end-user enablement, configuration, and Quick Start,
+> see [Cache-DiT Guide](../../user_guide/diffusion/cache_acceleration/cache_dit.md).
+
 This section describes how to add cache-dit acceleration to a new diffusion pipeline. We use the Qwen-Image pipeline and LongCat-Image pipeline as reference implementations.
 
 ---

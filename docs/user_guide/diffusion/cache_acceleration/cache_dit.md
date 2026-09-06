@@ -1,5 +1,8 @@
 # Cache-DiT Guide
 
+> 📖 **End-user guide.** For implementation details, internal APIs, and architecture,
+> see [Cache-DiT](../../../design/feature/cache_dit.md).
+
 
 ## Table of Content
 

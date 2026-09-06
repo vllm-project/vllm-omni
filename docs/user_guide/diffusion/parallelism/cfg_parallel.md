@@ -1,5 +1,8 @@
 # CFG-Parallel Guide
 
+> 📖 **End-user guide.** For implementation details, internal APIs, and architecture,
+> see [CFG-Parallel](../../../design/feature/cfg_parallel.md).
+
 
 ## Table of Content
 

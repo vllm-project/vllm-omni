@@ -1,5 +1,8 @@
 # Expert Parallelism Guide
 
+> 📖 **End-user guide.** For implementation details, internal APIs, and architecture,
+> see [Expert Parallel](../../../design/feature/expert_parallel.md).
+
 
 ## Table of Content
 

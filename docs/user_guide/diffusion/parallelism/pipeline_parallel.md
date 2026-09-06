@@ -1,5 +1,8 @@
 # Pipeline Parallelism Guide
 
+> 📖 **End-user guide.** For implementation details, internal APIs, and architecture,
+> see [Pipeline Parallel](../../../design/feature/pipeline_parallel.md).
+
 ## Table of Content
 
 - [Overview](#overview)
