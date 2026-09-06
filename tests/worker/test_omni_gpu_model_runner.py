@@ -918,6 +918,7 @@ def _make_phase_runner(monkeypatch, rows, *, batched_decode):
         }
     runner.query_start_loc.cpu = torch.tensor(offsets, dtype=torch.int32)
     calls = []
+    batch_calls = []
 
     def preprocess(input_ids, input_embeds, **info):
         calls.append(("normal", dict(info)))
@@ -928,6 +929,7 @@ def _make_phase_runner(monkeypatch, rows, *, batched_decode):
         return input_ids, embeds, updates
 
     def preprocess_decode_batch(input_ids, req_infos):
+        batch_calls.append([info["request_id"] for info in req_infos])
         calls.extend(("batch", dict(info)) for info in req_infos)
         embeds = input_ids.float().view(-1, 1).expand(-1, 4).clone()
         return input_ids, embeds, torch.zeros_like(embeds), torch.zeros_like(embeds), [{} for _ in req_infos]
@@ -950,12 +952,12 @@ def _make_phase_runner(monkeypatch, rows, *, batched_decode):
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
     )
-    return runner, output, calls
+    return runner, output, calls, batch_calls
 
 
 @pytest.mark.parametrize("batched_decode", [False, True], ids=["normal", "batch"])
-@pytest.mark.parametrize("reverse", [False, True], ids=["forward-order", "reordered"])
-def test_preprocess_phase_contract_mixed_batch(monkeypatch, batched_decode, reverse):
+@pytest.mark.parametrize("order", ["interleaved", "reversed", "adjacent"])
+def test_preprocess_phase_contract_mixed_batch(monkeypatch, batched_decode, order):
     rows = [
         ("decode-before", 5, 5, 1),
         ("tail", 5, 4, 1),
@@ -964,13 +966,22 @@ def test_preprocess_phase_contract_mixed_batch(monkeypatch, batched_decode, reve
         ("cached-prefill", 8, 4, 3),
         ("multi-token-decode", 5, 5, 2),
     ]
-    if reverse:
+    if order == "reversed":
         rows.reverse()
-    runner, scheduled, calls = _make_phase_runner(monkeypatch, rows, batched_decode=batched_decode)
+    elif order == "adjacent":
+        rows = [rows[1], rows[0], rows[2], *rows[3:]]
+    runner, scheduled, calls, batch_calls = _make_phase_runner(monkeypatch, rows, batched_decode=batched_decode)
     _, embeds, *_ = runner._preprocess(scheduled, scheduled.total_num_scheduled_tokens)
 
+    if batched_decode:
+        decode_order = [rid for rid, _, _, _ in rows if rid.startswith("decode-")]
+        expected_batches = [decode_order] if order == "adjacent" else [[rid] for rid in decode_order]
+        assert batch_calls == expected_batches
+    else:
+        assert batch_calls == []
     assert len(calls) == len(rows)
     offset = 0
+    code_index = 0
     for (route, info), (rid, prompt_len, computed, span) in zip(calls, rows, strict=True):
         assert info["request_id"] == rid
         assert type(info["_omni_prompt_len"]) is int
@@ -984,13 +995,21 @@ def test_preprocess_phase_contract_mixed_batch(monkeypatch, batched_decode, reve
         expected = torch.arange(offset, offset + span).float().view(-1, 1).expand(-1, 4)
         torch.testing.assert_close(embeds[offset : offset + span], expected + int(mtp_eligible))
         assert ("codes" in runner.model_intermediate_buffer[rid]) == mtp_eligible
+        if mtp_eligible:
+            torch.testing.assert_close(
+                runner.model_intermediate_buffer[rid]["codes"]["audio"],
+                torch.tensor([[code_index]], dtype=torch.int64),
+                rtol=0,
+                atol=0,
+            )
+            code_index += 1
         offset += span
 
 
 @pytest.mark.parametrize("batched_decode", [False, True], ids=["normal", "batch"])
 def test_preprocess_one_token_chunked_prefill_tail_then_decode(monkeypatch, batched_decode):
     # Replay a five-token prompt split at a four-token scheduling budget.
-    runner, scheduled, calls = _make_phase_runner(monkeypatch, [("r", 5, 0, 4)], batched_decode=batched_decode)
+    runner, scheduled, calls, _ = _make_phase_runner(monkeypatch, [("r", 5, 0, 4)], batched_decode=batched_decode)
     runner._preprocess(scheduled, 4)
     assert calls[-1][1]["_omni_is_prefill"] is True
     assert "codes" not in runner.model_intermediate_buffer["r"]

@@ -138,6 +138,7 @@ with CPU buffers and a deterministic MTP model. They inspect kwargs at the model
 boundary, resulting embeddings, and per-request generated codes. Coverage must
 include a multi-step prompt split with a one-token tail followed by decode,
 mixed prefill/decode batches in different orders, normal/batched decode hooks,
+adjacent decode requests in the same hook call with exact per-request codes,
 single-token prompts, cached progress, and decode spans longer than one token.
 No test should pass merely because MTP was disabled for every row.
 
@@ -145,7 +146,12 @@ Real-weight validation uses Qwen3-TTS CustomVoice through the full talker and
 code2wav pipeline. Record the actual scheduled prompt progress, assert that at
 least one one-token prefill tail was observed, check its hook metadata and MTP
 exclusion, and require finite non-empty output audio. Compare to an unchunked
-run with the same real input and deterministic sampling. GPU tests belong under
+run with the same real input, greedy sampling, and `VLLM_BATCH_INVARIANT=1`.
+Greedy sampling alone does not guarantee identical codes across different
+prefill shapes: floating-point reduction differences can change an argmax and
+diverge in subsequent autoregressive steps. Invariant kernels keep this exact
+comparison focused on the phase contract. The two engines must be initialized
+separately because their chunking settings and token budgets differ. GPU tests belong under
 `tests/e2e/features/`; existing model tests remain useful adjacent regression
 coverage. Functional audio checks do not establish throughput or all-model
 semantic parity; this change makes no performance claim.

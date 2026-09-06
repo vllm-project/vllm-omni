@@ -23,7 +23,10 @@ pytestmark = [pytest.mark.advanced_model, pytest.mark.tts]
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.asyncio
-async def test_one_token_prefill_tail_matches_unchunked_audio(tmp_path):
+async def test_one_token_prefill_tail_matches_unchunked_audio(tmp_path, monkeypatch):
+    # Greedy sampling alone does not make different prefill shapes numerically
+    # identical. Use invariant kernels for the exact codes/waveform comparison.
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     model = str(Path(os.environ.get("MODEL_PREFIX", "")) / "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
     tokenizer = AutoTokenizer.from_pretrained(model)
     config = Qwen3TTSConfig.from_pretrained(model)
@@ -95,18 +98,23 @@ async def test_one_token_prefill_tail_matches_unchunked_audio(tmp_path):
             engine.shutdown()
 
     baseline, chunked_probe = observations
+    evidence = {
+        "prompt_len": prompt_len,
+        "observations": observations,
+        "audio_samples": audios[0].numel(),
+        "chunked_audio_samples": audios[1].numel(),
+        "max_audio_difference": (
+            float((audios[1] - audios[0]).abs().max()) if audios[1].shape == audios[0].shape else None
+        ),
+    }
+    evidence_path = tmp_path / "phase_contract.json"
+    evidence_path.write_text(json.dumps(evidence, indent=2))
+    print(f"Phase contract evidence: {evidence_path}")
+
+    # Preserve both observations even when a parity assertion fails in CI.
     assert [prompt_len, 0, prompt_len, True] in baseline["events"]
     assert [prompt_len, 0, prompt_len - 1, True] in chunked_probe["events"]
     assert [prompt_len, prompt_len - 1, 1, True] in chunked_probe["events"]
     assert baseline["codes"] and chunked_probe["codes"]
     assert chunked_probe["codes"] == baseline["codes"]
     torch.testing.assert_close(audios[1], audios[0], rtol=1e-4, atol=1e-5)
-    evidence = {
-        "prompt_len": prompt_len,
-        "observations": observations,
-        "audio_samples": audios[0].numel(),
-        "max_audio_difference": float((audios[1] - audios[0]).abs().max()),
-    }
-    evidence_path = tmp_path / "phase_contract.json"
-    evidence_path.write_text(json.dumps(evidence, indent=2))
-    print(f"Phase contract evidence: {evidence_path}")
