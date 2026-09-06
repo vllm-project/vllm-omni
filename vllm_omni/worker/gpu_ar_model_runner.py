@@ -53,6 +53,7 @@ from vllm_omni.utils.mm_outputs import (
     snapshot_mm_payload,
 )
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.lmcache_model_runner_mixin import LMCacheHiddenStateMixin
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
@@ -312,7 +313,9 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None
 
 
-class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, DuplexSamplingRunnerMixin):
+class GPUARModelRunner(
+    LMCacheHiddenStateMixin, OmniGPUModelRunner, OmniConnectorModelRunnerMixin, DuplexSamplingRunnerMixin
+):
     """Autoregressive GPU model runner that returns hidden states per request.
 
     Follows the v0.12 two-phase execute/sample flow from GPUModelRunner, and
@@ -830,8 +833,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         sparse_mm_index: dict[str, int],
         hidden_seq_len: int,
         scheduled_seq_len: int,
+        restored_mm: dict[str, dict[str, torch.Tensor]] | None = None,
     ) -> dict[str, object]:
         payload: dict[str, object] = {}
+        req_hidden_states = None
         if not audio_sparse_output:
             if req_hidden_states_cpu is not None and combined_hidden_states is None:
                 req_hidden_states = req_hidden_states_cpu[rid]
@@ -843,8 +848,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     start,
                     end,
                 )
-            if req_hidden_states is not None:
-                payload["hidden"] = req_hidden_states
 
         mm_payload = build_omni_mm_payload(
             combined_multimodal_outputs=combined_multimodal_outputs,
@@ -858,6 +861,30 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             hidden_seq_len=hidden_seq_len,
             scheduled_seq_len=scheduled_seq_len,
         )
+
+        # Prepend per-layer HS restored from LMCache on a KV-cache hit so the
+        # talker sees the full prefix. Audio-sparse outputs skip the hidden tap
+        # entirely, so the prepend is gated on the same flag.
+        if not audio_sparse_output and restored_mm and rid in restored_mm:
+            for layer_key, prefix_tensor in restored_mm.pop(rid).items():
+                if layer_key == "hidden":
+                    if req_hidden_states is not None:
+                        prefix_tensor = prefix_tensor.to(device=req_hidden_states.device, dtype=req_hidden_states.dtype)
+                        req_hidden_states = torch.cat([prefix_tensor, req_hidden_states], dim=0)
+                else:
+                    current = mm_payload.get(layer_key)
+                    if current is not None and isinstance(current, torch.Tensor):
+                        prefix_tensor = prefix_tensor.to(device=current.device, dtype=current.dtype)
+                        mm_payload[layer_key] = torch.cat([prefix_tensor, current], dim=0)
+                    elif req_hidden_states is not None:
+                        mm_payload[layer_key] = prefix_tensor.to(
+                            device=req_hidden_states.device, dtype=req_hidden_states.dtype
+                        )
+                    else:
+                        mm_payload[layer_key] = prefix_tensor
+
+        if not audio_sparse_output and req_hidden_states is not None:
+            payload["hidden"] = req_hidden_states
         payload.update(mm_payload)
         return payload
 
@@ -1213,6 +1240,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     defer_finalize=defer_kv_connector_finalize,
                 ) as kv_connector_output,
             ):
+                # Restore HS from LMCache after KV load (start_load_kv already ran)
+                if get_pp_group().is_last_rank:
+                    self._maybe_restore_hs_from_lmcache(scheduler_output)
+
                 model_output = self._model_forward(
                     input_ids=input_ids,
                     positions=positions,
@@ -1280,6 +1311,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     num_tokens_unpadded=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded,
                     skip_mm_cache_keys=self._deferred_prefix_cache_mm_keys(),
+                )
+
+            # Store multimodal HS (layers "0", "24") + last layer to LMCache
+            if get_pp_group().is_last_rank:
+                self._maybe_store_hs_to_lmcache(
+                    hidden_states,
+                    multimodal_outputs,
+                    num_tokens_unpadded,
+                    scheduler_output,
                 )
 
             if not self.broadcast_pp_output:
@@ -1817,6 +1857,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         num_scheduled_tokens_np: np.ndarray,
         query_start_loc_cpu: Any,
         postprocess_already_applied: bool = False,
+        restored_mm: dict[str, dict[str, torch.Tensor]] | None = None,
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
         combined_multimodal_outputs = None
@@ -1932,6 +1973,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         sparse_mm_index=sparse_mm_index,
                         hidden_seq_len=hidden_seq_len,
                         scheduled_seq_len=scheduled_seq_len,
+                        restored_mm=restored_mm,
                     )
                     pooler_output.append(flatten_payload(payload))
 
@@ -2188,6 +2230,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             multimodal_outputs=multimodal_outputs,
         )
 
+        # Taken here rather than read inside the builder: the builder can run
+        # after a later step has already restored this request again, and it
+        # would then consume the wrong step's prefix.
+        restored_mm_snapshot = self._take_restored_mm(req_ids_output_snapshot)
+
         def output_builder() -> OmniModelRunnerOutput:
             if output_tensor_snapshot.async_payload is not None:
                 with record_function_or_nullcontext("omni_async_output:wait_cpu_payload"):
@@ -2211,6 +2258,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     query_start_loc_cpu=query_start_loc_cpu,
                     postprocess_already_applied=omni_postprocess_already_applied,
+                    restored_mm=restored_mm_snapshot,
                 )
 
         if not use_async_omni_output:

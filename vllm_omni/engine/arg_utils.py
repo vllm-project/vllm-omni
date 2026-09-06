@@ -137,6 +137,89 @@ def register_omni_models_to_vllm():
     import vllm_omni.reasoning  # noqa: F401
 
 
+def _build_lmcache_connector_config(lmcache_config: dict) -> dict:
+    """Build a single LMCacheConnectorV1 config from omni_kv_config."""
+    lmcache_extra: dict = {}
+    if isinstance(lmcache_config, dict):
+        for key, value in lmcache_config.items():
+            prefixed = key if key.startswith("lmcache.") else f"lmcache.{key}"
+            lmcache_extra[prefixed] = value
+    # Omni stages need hidden states alongside KV; enable by default so the
+    # HiddenStateStore is created. User can override via lmcache_config.
+    lmcache_extra.setdefault("lmcache.enable_hidden_state_cache", True)
+    _warn_if_hidden_state_pool_undersized(lmcache_extra)
+    return {
+        "kv_connector": "LMCacheConnectorV1",
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": lmcache_extra,
+    }
+
+
+def _warn_if_hidden_state_pool_undersized(lmcache_extra: dict) -> None:
+    """Warn when hidden states will be evicted before the KV they belong to.
+
+    The two pools evict independently, so a smaller hidden-state pool drops rows
+    whose KV is still resident. The engine then skips a prefill it cannot supply
+    conditioning for, and the request silently degrades.
+    """
+    hs_size = lmcache_extra.get("lmcache.max_hidden_state_cpu_size")
+    kv_size = lmcache_extra.get("lmcache.max_local_cpu_size")
+    if hs_size is None or kv_size is None:
+        return
+    try:
+        if float(hs_size) >= float(kv_size):
+            return
+    except (TypeError, ValueError):
+        return
+    logger.warning(
+        "max_hidden_state_cpu_size (%s GB) is smaller than max_local_cpu_size "
+        "(%s GB): hidden states will be evicted while their KV survives, and "
+        "those requests fall back to a partial restore.",
+        hs_size,
+        kv_size,
+    )
+
+
+def _set_lmcache_env(args: "OmniEngineArgs") -> None:
+    """Set LMCACHE_CONFIG_FILE env var from omni_kv_config if present."""
+    if not args.omni_kv_config:
+        return
+    kv_store = args.omni_kv_config.get("kv_store_config", {}) if isinstance(args.omni_kv_config, dict) else {}
+    lmcache_config = kv_store.get("lmcache_config")
+    if isinstance(lmcache_config, dict):
+        config_file = lmcache_config.get("config_file")
+        if config_file and isinstance(config_file, str) and config_file.strip():
+            os.environ["LMCACHE_CONFIG_FILE"] = config_file.strip()
+
+
+def _map_offload_config(args: "OmniEngineArgs") -> None:
+    """Map omni_kv_config to vLLM's KV transfer infrastructure."""
+    if not args.omni_kv_config:
+        return
+    kv_store = args.omni_kv_config.get("kv_store_config", {}) if isinstance(args.omni_kv_config, dict) else {}
+
+    lmcache_config = kv_store.get("lmcache_config")
+
+    if lmcache_config:
+        # LMCacheConnectorV1 only (OffloadingConnector removed due to
+        # per-step CPU overhead; LMCache handles CPU KV offloading).
+        entry = _build_lmcache_connector_config(lmcache_config)
+
+        from vllm.config.kv_transfer import KVTransferConfig
+
+        kv_role = kv_store.get("kv_role", "kv_both")
+        args.kv_transfer_config = KVTransferConfig(
+            kv_connector=entry["kv_connector"],
+            kv_connector_extra_config=entry.get("kv_connector_extra_config", {}),
+            kv_role=kv_role,
+        )
+
+        logger.info(
+            "[Omni] kv_transfer_config: kv_connector=%s",
+            args.kv_transfer_config.kv_connector,
+        )
+
+
 @dataclass
 class OmniEngineArgs(EngineArgs):
     """Engine arguments for omni models, extending base EngineArgs.
@@ -257,6 +340,8 @@ class OmniEngineArgs(EngineArgs):
             self.requires_full_payload_input or self.custom_process_next_stage_input_func or connector_role is not None
         )
         validate_worker_omni_connector(self.worker_cls, needs_connector)
+        _map_offload_config(self)
+        _set_lmcache_env(self)
         super().__post_init__()
 
     def _ensure_omni_models_registered(self):

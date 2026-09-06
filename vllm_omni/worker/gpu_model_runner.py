@@ -178,6 +178,15 @@ class OmniGPUModelRunner(GPUModelRunner):
                 hs_dtype=self.dtype,
             )
 
+        self._setup_lmcache_hidden_state_offload()
+
+    def _setup_lmcache_hidden_state_offload(self) -> None:
+        """No-op hook; overridden by LMCacheHiddenStateMixin on the AR runner."""
+        self._has_lmcache = False
+
+    def _drop_hs_pending_state(self, req_id: str) -> None:
+        """No-op hook; overridden by LMCacheHiddenStateMixin on the AR runner."""
+
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
@@ -493,6 +502,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self._talker_mtp_generators.pop(req_id, None)
             if cleanup_finished_request is not None:
                 cleanup_finished_request(req_id)
+            self._drop_hs_pending_state(req_id)
 
         self.late_interaction_runner.on_requests_finished(scheduler_output.finished_req_ids)
         # Remove the finished requests from the persistent batch.

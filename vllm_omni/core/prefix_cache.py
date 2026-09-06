@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Utilities for Prefix Caching in Omni models.
 """
@@ -574,6 +577,37 @@ class OmniTensorPrefixCache:
         block_ids = block_table[req_idx, block_offsets].to(torch.long)
         return block_ids * self.block_size + (token_positions % self.block_size)
 
+    def write_restored_hidden_states(
+        self,
+        req_idx: int,
+        input_batch: InputBatch,
+        layer_key: str,
+        hs: torch.Tensor,
+        token_start: int = 0,
+    ) -> None:
+        """Scatter a single request's restored prefix HS into its own KV slots.
+
+        ``layer_key`` is ``"hidden"`` for the final hidden-state cache or an mm
+        key present in ``mm_outputs_cache``. Slots are resolved per request via
+        ``_get_slot_ids_for_token_range`` (not the whole-batch slot_mapping), and
+        value dtype/device are coerced to the cache's.
+        """
+        if layer_key == "hidden":
+            cache = self.hidden_states_cache
+        else:
+            cache = self.mm_outputs_cache.get(layer_key)
+        if cache is None or hs is None:
+            return
+        n = int(hs.shape[0])
+        slots = self._get_slot_ids_for_token_range(req_idx, input_batch, token_start, n)
+        m = min(n, int(slots.shape[0]))
+        if m <= 0:
+            return
+        flat = cache.view(-1, cache.shape[-1])
+        slot_idx = slots[:m].to(device=flat.device, dtype=torch.int64)
+        src = hs[:m].to(device=flat.device, dtype=flat.dtype)
+        flat.index_copy_(0, slot_idx, src)
+
     def _coerce_to_payload_dict(
         self,
         element: object,
@@ -709,8 +743,12 @@ class OmniTensorPrefixCache:
             req_idx = input_batch.req_id_to_index[req_id]
 
             if req_id in self._new_req_cache_hit_ids:
-                block_ids = self._get_cached_block_ids(req_idx, input_batch)
-                cached_hs = cache[block_ids].reshape(-1, cache.shape[-1])
+                # Resolved per token, not per block: the write side scatters by
+                # slot, and an external connector can report a num_computed that
+                # is not block-aligned, whose tail would otherwise be dropped.
+                num_computed = int(input_batch.num_computed_tokens_cpu[req_idx])
+                slots = self._get_slot_ids_for_token_range(req_idx, input_batch, 0, num_computed)
+                cached_hs = cache.view(-1, cache.shape[-1])[slots]
 
                 # Slice the hidden states corresponding to this request;
                 # we do this by using the query start
@@ -724,14 +762,3 @@ class OmniTensorPrefixCache:
                 combined_hidden_states[req_id] = new_hs
 
         return combined_hidden_states
-
-    def _get_cached_block_ids(self, req_idx: int, input_batch: InputBatch) -> torch.Tensor:
-        """Given an input batch and request index in the batch (not ID), get the
-        block IDs corresponding to the cache hit.
-        """
-        num_computed = input_batch.num_computed_tokens_cpu[req_idx]
-        # NOTE: vLLM only caches full blocks
-        num_cached_blocks = num_computed // self.block_size
-        # Get the block IDs attached to this cache hit and reindex into
-        # the flattened cached hidden states (i.e., 1 row per token).
-        return input_batch.block_table[0].block_table.cpu[req_idx, :num_cached_blocks]

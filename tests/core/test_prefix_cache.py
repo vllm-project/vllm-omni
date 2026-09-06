@@ -1,4 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import math
+from types import SimpleNamespace
 from typing import NamedTuple
 
 import pytest
@@ -454,8 +458,8 @@ def test_deferred_multimodal_cache_can_be_merged_on_full_block_hit():
 
 
 ### Tests for Merging
-def fake_get_cached_block_ids(self, req_idx, *args, **kwargs):
-    """Fake block table lookup.
+def fake_get_slot_ids(self, req_idx, input_batch, token_start, num_tokens):
+    """Fake slot lookup.
 
     Assumption:
         req_idx 0 is a cache hit with slots 8, 9, ..., 15
@@ -463,10 +467,8 @@ def fake_get_cached_block_ids(self, req_idx, *args, **kwargs):
     """
     assert req_idx < 2
     if req_idx == 0:
-        # With the slot offset we provided (8), the corresponding
-        # blocks IDs are 2 & 3 because the block size is 4.
-        return torch.tensor([2, 3], dtype=torch.long)
-    return torch.tensor([], dtype=torch.long)
+        return torch.arange(8, 8 + num_tokens, dtype=torch.long)
+    return torch.empty((0,), dtype=torch.long)
 
 
 @pytest.mark.parametrize("num_tokens_padded", [None, 16])
@@ -506,8 +508,8 @@ def test_get_merged_hidden_states(num_tokens_padded, mocker):
     input_batch = MockInputBatch(num_computed_tokens_cpu=torch.Tensor([orig_num_tokens_unpadded, 0]))
 
     mocker.patch(
-        "vllm_omni.core.prefix_cache.OmniTensorPrefixCache._get_cached_block_ids",
-        new=fake_get_cached_block_ids,
+        "vllm_omni.core.prefix_cache.OmniTensorPrefixCache._get_slot_ids_for_token_range",
+        new=fake_get_slot_ids,
     )
     merged_states = cache.get_merged_hidden_states(
         query_start_loc=[0, num_new_toks_req1],
@@ -563,8 +565,8 @@ def test_get_merged_hidden_states_uses_precomputed_hidden_states_cpu(mocker):
     input_batch = MockInputBatch(num_computed_tokens_cpu=torch.Tensor([orig_num_tokens_unpadded, 0]))
 
     mocker.patch(
-        "vllm_omni.core.prefix_cache.OmniTensorPrefixCache._get_cached_block_ids",
-        new=fake_get_cached_block_ids,
+        "vllm_omni.core.prefix_cache.OmniTensorPrefixCache._get_slot_ids_for_token_range",
+        new=fake_get_slot_ids,
     )
     merged_states = cache.get_merged_hidden_states(
         query_start_loc=[0, num_new_toks_req1],
@@ -588,8 +590,8 @@ def test_get_merged_hidden_states_rejects_short_hidden_states_cpu(mocker):
     input_batch = MockInputBatch(num_computed_tokens_cpu=torch.Tensor([0, 0]))
 
     mocker.patch(
-        "vllm_omni.core.prefix_cache.OmniTensorPrefixCache._get_cached_block_ids",
-        new=fake_get_cached_block_ids,
+        "vllm_omni.core.prefix_cache.OmniTensorPrefixCache._get_slot_ids_for_token_range",
+        new=fake_get_slot_ids,
     )
     with pytest.raises(RuntimeError):
         cache.get_merged_hidden_states(
@@ -653,8 +655,8 @@ def test_get_merged_multimodal_outputs(feat_dims, num_tokens_padded, mocker):
     input_batch = MockInputBatch(num_computed_tokens_cpu=torch.Tensor([orig_num_tokens_unpadded, 0]))
 
     mocker.patch(
-        "vllm_omni.core.prefix_cache.OmniTensorPrefixCache._get_cached_block_ids",
-        new=fake_get_cached_block_ids,
+        "vllm_omni.core.prefix_cache.OmniTensorPrefixCache._get_slot_ids_for_token_range",
+        new=fake_get_slot_ids,
     )
     merged_mm_outputs = cache.get_merged_multimodal_states(
         query_start_loc=[0, num_new_toks_req1],
@@ -761,8 +763,8 @@ def test_get_merged_multimodal_outputs_slices_passthrough_tensor_per_request(pas
     input_batch = MockInputBatch(num_computed_tokens_cpu=torch.Tensor([orig_num_tokens_unpadded, 0]))
 
     mocker.patch(
-        "vllm_omni.core.prefix_cache.OmniTensorPrefixCache._get_cached_block_ids",
-        new=fake_get_cached_block_ids,
+        "vllm_omni.core.prefix_cache.OmniTensorPrefixCache._get_slot_ids_for_token_range",
+        new=fake_get_slot_ids,
     )
     merged_mm_outputs = cache.get_merged_multimodal_states(
         query_start_loc=[0, num_new_toks_req1],
@@ -816,8 +818,8 @@ def build_mixed_hit_miss_harness(mocker, num_new_toks_req1: int = 3, num_new_tok
 
     total_scheduled_tokens = num_new_toks_req1 + num_new_toks_req2
     mocker.patch(
-        "vllm_omni.core.prefix_cache.OmniTensorPrefixCache._get_cached_block_ids",
-        new=fake_get_cached_block_ids,
+        "vllm_omni.core.prefix_cache.OmniTensorPrefixCache._get_slot_ids_for_token_range",
+        new=fake_get_slot_ids,
     )
     return MergeHarness(
         cache=cache,
@@ -915,3 +917,36 @@ def test_get_merged_multimodal_outputs_broadcasts_non_token_aligned_passthrough(
     out["req1"] += 100
     assert torch.equal(out["req2"], expected)
     assert torch.equal(passthrough, expected)
+
+
+def test_merged_tensors_keep_a_block_unaligned_hit_whole():
+    """An external connector can report a num_computed that is not block-aligned."""
+    block_size = 16
+    hidden_size = 4
+    cache = OmniTensorPrefixCache(num_blocks=8, block_size=block_size, hidden_size=hidden_size, hs_dtype=torch.float32)
+    cache.add_prefix_cached_new_req_id("r1")
+
+    num_computed = 33  # two whole blocks plus one token
+    block_table = torch.zeros((1, 8), dtype=torch.int32)
+    block_table[0, :3] = torch.tensor([1, 2, 3], dtype=torch.int32)
+
+    class _BlockTables(list):
+        block_tables = [None]
+
+    input_batch = SimpleNamespace(
+        req_ids=["r1"],
+        req_id_to_index={"r1": 0},
+        num_computed_tokens_cpu=torch.tensor([num_computed]),
+        block_table=_BlockTables([SimpleNamespace(block_table=SimpleNamespace(cpu=block_table))]),
+    )
+
+    merged = cache._get_merged_tensors(
+        query_start_loc=torch.tensor([0]),
+        input_batch=input_batch,
+        cache=cache.hidden_states_cache,
+        hidden_states=torch.ones(4, hidden_size),
+        num_scheduled_tokens={"r1": 4},
+    )
+
+    # One row per computed token, not per whole block: the 33rd row is kept.
+    assert merged["r1"].shape[0] == num_computed + 4
