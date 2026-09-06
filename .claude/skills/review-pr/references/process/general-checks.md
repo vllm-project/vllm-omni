@@ -121,6 +121,13 @@ Search bounded callers and sibling implementations before reporting dead code,
 duplication, or a missed consumer. Keep new abstractions only when they have a
 distinct live caller, invariant, or compatibility need.
 
+Verify absence and equality claims with whole-file evidence. A line window, a
+grep for one symbol, or a commit message proves presence, never absence: to
+assert that a file matches another version or lacks a change, diff or hash the
+full files (for example `git diff <sha1>:<path> <sha2>:<path>` or the contents
+API's size and SHA fields) before anchoring the finding. A verification
+shortcut that would itself be wrong to run is not evidence.
+
 ## Finding bar
 
 Anchor each finding to a changed `path:line`; name the trigger or call path,
