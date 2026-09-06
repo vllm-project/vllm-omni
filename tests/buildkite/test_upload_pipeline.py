@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".buildkite" / "com
 
 from skip_ci import resolve_ci_decision  # noqa: E402
 from upload_pipeline import (  # noqa: E402
+    CUDA_HF_TOKEN_EXPORT,
     _expand_mirror_hardwares,
     _get_mirror_hw_selector,
     _load_bootstrap_steps,
@@ -143,6 +144,10 @@ def test_mirror_hardwares_l4_1_expands_to_agents_and_plugins(monkeypatch: pytest
     container = step["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]
     assert container["image"].endswith("$BUILDKITE_COMMIT")
     assert container["resources"]["limits"]["nvidia.com/gpu"] == 1
+    env_names = {item["name"] for item in container["env"]}
+    assert "VLLM_CI_HF_TOKEN" in env_names
+    assert "HF_TOKEN" not in env_names
+    assert step["commands"] == [CUDA_HF_TOKEN_EXPORT, "pytest -sv tests/example"]
 
 
 def test_mirror_hardwares_l4_preserves_explicit_retry() -> None:
@@ -182,6 +187,33 @@ def test_mirror_hardwares_a2b3_npu_4_expands_agents_image_and_plugins() -> None:
     assert step["plugins"][0]["kubernetes"]["podSpecPatch"]["imagePullSecrets"] == [
         {"name": "swr-secret"},
     ]
+    assert step["commands"] == ["pytest -sv tests/example"]
+
+
+def test_all_cuda_mirror_hardwares_restore_hf_token_at_runtime() -> None:
+    for name in (
+        "l4_1",
+        "l4_2",
+        "l4_3",
+        "l4_4",
+        "h100_1",
+        "h100_2",
+        "h100_3",
+        "h100_4",
+        "b200_1",
+        "b200_2",
+        "b200_3",
+        "b200_4",
+    ):
+        step = _expand_mirror_hardwares(
+            {"label": name, "mirror_hardwares": name, "commands": ["pytest -sv tests/example"]},
+        )
+        assert step is not None
+        container = step["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]
+        env_names = {item["name"] for item in container["env"]}
+        assert "VLLM_CI_HF_TOKEN" in env_names
+        assert "HF_TOKEN" not in env_names
+        assert step["commands"][0] == CUDA_HF_TOKEN_EXPORT
 
 
 def _gpu_limit(step: dict) -> int:
