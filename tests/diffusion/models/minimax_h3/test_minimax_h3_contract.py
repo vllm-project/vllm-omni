@@ -13,6 +13,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_omni.diffusion.models.minimax_h3.lora import TurboSpec, parse_turbo_filename
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 _ItemT = TypeVar("_ItemT")
@@ -22,6 +24,13 @@ _ResultT = TypeVar("_ResultT")
 def _append_and_return(items: list[_ItemT], item: _ItemT, result: _ResultT) -> _ResultT:
     items.append(item)
     return result
+
+
+def _turbo_spec(filename: str) -> TurboSpec:
+    """Build the spec a loaded artifact of this name would carry."""
+    spec = parse_turbo_filename(filename)
+    assert spec is not None
+    return spec
 
 
 def test_h3_prepares_resolved_cache_state_immediately_before_denoise():
@@ -244,9 +253,12 @@ def test_combined_task_inference_and_transformer_routing():
     assert pipeline._resolve_task(None, {"image": object()}) == "fl2va"
     assert pipeline._resolve_task(None, {"audio": object()}) == "ref2va"
     assert pipeline._resolve_task(None, {"video": object()}) == "ref2va"
-    assert pipeline._resolve_task("fl2va", {"image": object()}, has_turbo_lora=True) == "fl2va"
-    with pytest.raises(OmniClientError, match="supports T2VA/FL2VA requests only"):
-        pipeline._resolve_task("ref2va", {}, has_turbo_lora=True)
+    fl2v_spec = _turbo_spec("minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors")
+    ref2v_spec = _turbo_spec("minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors")
+    assert pipeline._resolve_task("fl2va", {"image": object()}, turbo_spec=fl2v_spec) == "fl2va"
+    with pytest.raises(OmniClientError, match="serves"):
+        pipeline._resolve_task("ref2va", {}, turbo_spec=fl2v_spec)
+    assert pipeline._resolve_task("ref2va", {"image": object()}, turbo_spec=ref2v_spec) == "ref2va"
     pipeline.partition = "ref2va"
     pipeline.supported_tasks = frozenset({"ref2va"})
     assert pipeline._resolve_task(None, {"image": object()}) == "ref2va"
