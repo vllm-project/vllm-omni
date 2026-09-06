@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Video/audio muxing utilities using PyAV (no ffmpeg binary dependency)."""
 
 from __future__ import annotations
 
+import functools
 import io
 from collections.abc import Iterable
 from fractions import Fraction
@@ -11,6 +12,121 @@ from typing import Any, cast
 
 import av
 import numpy as np
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+DEFAULT_VIDEO_CODEC = "h264"
+DEFAULT_OUTPUT_FORMAT = "mp4"
+
+_FORMAT_DEFAULTS: dict[str, dict[str, str]] = {
+    "mp4": {"video_codec": "h264", "audio_codec": "aac", "media_type": "video/mp4"},
+    "webm": {"video_codec": "libvpx-vp9", "audio_codec": "libopus", "media_type": "video/webm"},
+}
+
+_FORMAT_VIDEO_CODECS: dict[str, frozenset[str]] = {
+    "mp4": frozenset(
+        {"h264", "libx264", "hevc", "libx265", "h264_nvenc", "hevc_nvenc", "av1", "libaom-av1", "libsvtav1"}
+    ),
+    "webm": frozenset({"vp8", "libvpx", "vp9", "libvpx-vp9", "av1", "libaom-av1", "libsvtav1"}),
+}
+
+_FAST_CODEC_OPTIONS: dict[str, dict[str, str]] = {
+    "h264": {"preset": "ultrafast", "threads": "0"},
+    "libx264": {"preset": "ultrafast", "threads": "0"},
+    "hevc": {"preset": "ultrafast", "threads": "0"},
+    "libx265": {"preset": "ultrafast", "threads": "0"},
+    "h264_nvenc": {"preset": "p1", "tune": "ull"},
+    "hevc_nvenc": {"preset": "p1", "tune": "ull"},
+}
+
+_LOW_LATENCY_OPTIONS: dict[str, dict[str, str]] = {
+    "h264": {"tune": "zerolatency"},
+    "libx264": {"tune": "zerolatency"},
+    "hevc": {"tune": "zerolatency"},
+    "libx265": {"tune": "zerolatency"},
+}
+
+
+def _format_defaults(output_format: str | None) -> dict[str, str]:
+    resolved_format = output_format or DEFAULT_OUTPUT_FORMAT
+    try:
+        return _FORMAT_DEFAULTS[resolved_format]
+    except KeyError:
+        raise ValueError(
+            f"Unsupported video output format {resolved_format!r}; expected one of {sorted(_FORMAT_DEFAULTS)}"
+        ) from None
+
+
+def default_video_codec_for_format(output_format: str | None) -> str:
+    return _format_defaults(output_format)["video_codec"]
+
+
+def default_audio_codec_for_format(output_format: str | None) -> str:
+    return _format_defaults(output_format)["audio_codec"]
+
+
+def media_type_for_format(output_format: str | None) -> str:
+    return _format_defaults(output_format)["media_type"]
+
+
+@functools.cache
+def _encoder_is_usable(codec: str) -> bool:
+    try:
+        context = av.codec.CodecContext.create(codec, "w")
+        context.width = 64
+        context.height = 64
+        context.pix_fmt = "yuv420p"
+        context.open()
+    except (ValueError, av.error.FFmpegError) as exc:
+        logger.debug("Encoder %s is not usable on this host: %s", codec, exc)
+        return False
+    return True
+
+
+def default_video_codec_options(codec: str, *, low_latency: bool = False) -> dict[str, str]:
+    options = dict(_FAST_CODEC_OPTIONS.get(codec, {}))
+    if low_latency:
+        options.update(_LOW_LATENCY_OPTIONS.get(codec, {}))
+    return options
+
+
+def resolve_encoder_settings(
+    codec: str | None,
+    codec_options: dict[str, str] | None = None,
+    *,
+    low_latency: bool = False,
+    fallback: str | None = None,
+    output_format: str | None = None,
+) -> tuple[str, dict[str, str]]:
+    resolved_format = output_format or DEFAULT_OUTPUT_FORMAT
+    _format_defaults(resolved_format)
+    fallback_codec = fallback or default_video_codec_for_format(resolved_format)
+    requested_codec = codec or fallback_codec
+
+    compatible_codecs = _FORMAT_VIDEO_CODECS[resolved_format]
+    if fallback_codec not in compatible_codecs:
+        raise ValueError(
+            f"Fallback video codec {fallback_codec!r} is incompatible with {resolved_format!r}; "
+            f"expected one of {sorted(compatible_codecs)}"
+        )
+    if requested_codec not in compatible_codecs:
+        raise ValueError(
+            f"Video codec {requested_codec!r} is incompatible with {resolved_format!r}; "
+            f"expected one of {sorted(compatible_codecs)}"
+        )
+
+    if requested_codec != fallback_codec and not _encoder_is_usable(requested_codec):
+        logger.warning(
+            "Video encoder %r cannot be opened on this host; falling back to %r.",
+            requested_codec,
+            fallback_codec,
+        )
+        requested_codec = fallback_codec
+        codec_options = None
+    if codec_options:
+        return requested_codec, dict(codec_options)
+    return requested_codec, default_video_codec_options(requested_codec, low_latency=low_latency)
 
 
 class FragmentedMP4Muxer:
@@ -131,10 +247,11 @@ def mux_video_audio_bytes(
     *,
     fps: float = 25.0,
     audio_sample_rate: int = 44100,
-    video_codec: str = "h264",
-    audio_codec: str = "aac",
+    video_codec: str | None = None,
+    audio_codec: str | None = None,
     crf: str = "18",
     video_codec_options: dict[str, str] | None = None,
+    output_format: str | None = None,
 ) -> bytes:
     """Mux video frames and optional audio waveform into MP4 bytes.
 
@@ -150,10 +267,17 @@ def mux_video_audio_bytes(
     Returns:
         Raw MP4 bytes ready to be written to disk or streamed.
     """
+    container_format = output_format or DEFAULT_OUTPUT_FORMAT
     buf = io.BytesIO()
-    container = av.open(buf, mode="w", format="mp4")
+    container = av.open(buf, mode="w", format=container_format)
 
-    v_stream = cast(av.VideoStream, container.add_stream(video_codec, rate=Fraction(fps).limit_denominator(10000)))
+    v_stream = cast(
+        av.VideoStream,
+        container.add_stream(
+            video_codec or default_video_codec_for_format(container_format),
+            rate=Fraction(fps).limit_denominator(10000),
+        ),
+    )
     v_stream.width = video_frames.shape[2]
     v_stream.height = video_frames.shape[1]
     v_stream.pix_fmt = "yuv420p"
@@ -174,7 +298,13 @@ def mux_video_audio_bytes(
             samples = np.ascontiguousarray(samples.T)
         num_channels = samples.shape[0]
         layout = "stereo" if num_channels >= 2 else "mono"
-        a_stream = cast(av.AudioStream, container.add_stream(audio_codec, rate=audio_sample_rate))
+        a_stream = cast(
+            av.AudioStream,
+            container.add_stream(
+                audio_codec or default_audio_codec_for_format(container_format),
+                rate=audio_sample_rate,
+            ),
+        )
         a_stream.layout = layout
 
     for frame_data in video_frames:
@@ -211,17 +341,22 @@ def mux_av_video_audio_bytes(
     *,
     fps: float = 25.0,
     audio_sample_rate: int | None = None,
-    video_codec: str = "h264",
-    audio_codec: str = "aac",
+    video_codec: str | None = None,
+    audio_codec: str | None = None,
     crf: str = "18",
     video_codec_options: dict[str, str] | None = None,
+    output_format: str | None = None,
 ) -> bytes:
-    """Mux preconstructed video frames and optional audio into MP4 bytes."""
+    """Mux preconstructed video frames and optional audio into container bytes."""
+    container_format = output_format or DEFAULT_OUTPUT_FORMAT
     buf = io.BytesIO()
-    with cast(Any, av.open(buf, mode="w", format="mp4")) as container:
+    with cast(Any, av.open(buf, mode="w", format=container_format)) as container:
         v_stream = cast(
             av.VideoStream,
-            container.add_stream(video_codec, rate=Fraction(fps).limit_denominator(10000)),
+            container.add_stream(
+                video_codec or default_video_codec_for_format(container_format),
+                rate=Fraction(fps).limit_denominator(10000),
+            ),
         )
         v_stream.width = width
         v_stream.height = height
@@ -244,7 +379,13 @@ def mux_av_video_audio_bytes(
                 samples = np.ascontiguousarray(samples.T)
             num_channels = samples.shape[0]
             layout = "stereo" if num_channels >= 2 else "mono"
-            a_stream = cast(av.AudioStream, container.add_stream(audio_codec, rate=effective_audio_sample_rate))
+            a_stream = cast(
+                av.AudioStream,
+                container.add_stream(
+                    audio_codec or default_audio_codec_for_format(container_format),
+                    rate=effective_audio_sample_rate,
+                ),
+            )
             a_stream.layout = layout
 
         for frame in video_frames:

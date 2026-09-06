@@ -43,10 +43,11 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 | Endpoint | Method | Description |
 | ---------- | -------- | ------------- |
 | `/v1/videos` | `POST` | Create an asynchronous video generation job |
-| `/v1/videos/sync` | `POST` | Generate a video synchronously and return raw video bytes |
+| `/v1/videos/sync` | `POST` | Generate synchronously and return bytes or configured immediate-response JSON |
 | `/v1/videos/{video_id}` | `GET` | Retrieve job status and metadata |
 | `/v1/videos` | `GET` | List stored video jobs |
 | `/v1/videos/{video_id}/content` | `GET` | Download generated video content |
+| `/v1/videos/artifacts/{storage_key}` | `GET` | Download an expiring synchronous URL artifact |
 | `/v1/videos/{video_id}` | `DELETE` | Delete a video job and stored output |
 
 ### Request Parameters
@@ -109,9 +110,9 @@ job status becomes `completed`.
 
 ### Synchronous Response
 
-`POST /v1/videos/sync` blocks until generation finishes and returns raw video
-bytes. It is useful for benchmarks and simple scripts that do not need job
-storage or polling.
+`POST /v1/videos/sync` blocks until generation finishes. It returns raw video
+bytes by default; configured immediate-response modes return JSON instead. It is
+useful for benchmarks and simple scripts that do not need job polling.
 
 ## Examples
 
@@ -205,6 +206,10 @@ curl -s http://localhost:8091/v1/videos \
 
 ### Synchronous Generation
 
+The default transport returns raw MP4 bytes. The same endpoint can return
+base64 JSON, an expiring artifact URL, or a same-host shared-memory handle; see
+[Video output transport](../user_guide/diffusion/video_output_transport.md).
+
 ```bash
 curl -X POST http://localhost:8091/v1/videos/sync \
   -F "prompt=A small robot walking through a neon city" \
@@ -217,8 +222,8 @@ curl -X POST http://localhost:8091/v1/videos/sync \
 
 ## Storage
 
-Set `VLLM_OMNI_SERVER_STORAGE__PATH` to control where asynchronous video outputs are
-stored:
+Set `VLLM_OMNI_SERVER_STORAGE__PATH` to control where asynchronous video outputs and
+expiring URL artifacts are stored:
 
 ```bash
 export VLLM_OMNI_SERVER_STORAGE__PATH=/var/tmp/vllm-omni-videos

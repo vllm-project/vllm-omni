@@ -295,24 +295,40 @@ class AsyncOmniEngine:
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
 
     def get_diffusion_od_config(self) -> Any:
-        """Expose the diffusion ``model_class_name`` to client-side model-extras.
+        """Expose the client-side view of the output diffusion stage.
 
-        The worker holds the full config; here we just resolve the pipeline class
-        name from the model config (cached). ``model_class_name`` may be ``None``.
+        The worker holds the full config. This cached view carries model
+        capabilities plus API-owned video output policy from the resolved stage.
+        ``model_class_name`` may be ``None``.
         """
         if self._diffusion_od_config_view is None:
             from types import SimpleNamespace
 
-            from vllm_omni.diffusion.data import resolve_model_class_name
+            from vllm_omni.diffusion.data import VideoOutputTransportConfig, resolve_model_class_name
             from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
             model_class_name = resolve_model_class_name(self.model)
             metadata = get_diffusion_model_metadata(model_class_name)
+            diffusion_stages = [
+                stage for stage in self.stage_configs if getattr(stage, "stage_type", None) == "diffusion"
+            ]
+            output_stage = next(
+                (stage for stage in diffusion_stages if getattr(stage, "final_output", False)),
+                diffusion_stages[0] if diffusion_stages else None,
+            )
+            engine_args = getattr(output_stage, "engine_args", None)
+            raw_transport = (
+                engine_args.get("video_output_transport")
+                if isinstance(engine_args, Mapping)
+                else getattr(engine_args, "video_output_transport", None)
+            )
+            video_output_transport = VideoOutputTransportConfig.from_value(raw_transport)
             self._diffusion_od_config_view = SimpleNamespace(
                 model_class_name=model_class_name,
                 supports_multimodal_inputs=metadata.supports_multimodal_inputs,
                 max_multimodal_image_inputs=metadata.max_multimodal_image_inputs,
                 supports_mixed_reference_inputs=metadata.supports_mixed_reference_inputs,
+                video_output_transport=video_output_transport,
             )
         return self._diffusion_od_config_view
 
@@ -1132,6 +1148,7 @@ class AsyncOmniEngine:
             "additional_config": kwargs.get("additional_config", None),
             "step_execution": kwargs.get("step_execution", False),
             "request_batch_max_wait_ms": kwargs.get("request_batch_max_wait_ms", 0.0),
+            "video_output_transport": kwargs.get("video_output_transport", None),
             "vae_use_slicing": kwargs.get("vae_use_slicing", False),
             "vae_use_tiling": kwargs.get("vae_use_tiling", False),
             "cache_backend": cache_backend,

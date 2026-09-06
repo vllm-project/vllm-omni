@@ -337,6 +337,12 @@ steps:
           - pytest -s -v tests/e2e/online_serving/test_wan22_expansion.py -k "i2v" -m "full_model and cuda and H100 and cards_2" --run-level "full_model"
         mirror_hardwares: h100_2
 
+      - label: ":full_moon: Diffusion X2V · Video Transport Startup Test · 2-GPU"
+        timeout_in_minutes: 30
+        commands:
+          - pytest -s -v tests/e2e/online_serving/test_video_output_transport_startup.py -m "full_model and cuda and H100 and cards_2" --run-level "full_model"
+        mirror_hardwares: h100_2
+
       - label: ":full_moon: Diffusion X2V · HunyuanVideo-1.5 Function Test"
         timeout_in_minutes: 90
         commands:
@@ -360,6 +366,14 @@ steps:
         commands:
           - pytest -s -v tests/e2e/offline_inference/test_wan22_autoround_w4a16_expansion.py -m "full_model and cuda" --run-level "full_model"
         mirror_hardwares: h100_2
+
+      - label: ":full_moon: Diffusion X2V · Wan2.2 Device-Postprocess Equivalence Test"
+        timeout_in_minutes: 90
+        commands:
+          - |
+            VLLM_OMNI_DEVICE_POSTPROCESS_MODEL=Wan-AI/Wan2.2-TI2V-5B-Diffusers \
+              pytest -s -v tests/e2e/offline_inference/test_device_postprocess_equivalence.py -m "full_model and cuda" --run-level "full_model"
+        mirror_hardwares: h100_1
 
       - label: ":full_moon: Diffusion X2V · Wan2.2 Accuracy Test"
         timeout_in_minutes: 180

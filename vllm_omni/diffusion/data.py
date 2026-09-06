@@ -8,7 +8,7 @@ import random
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import diffusers
 import huggingface_hub
@@ -28,6 +28,7 @@ from vllm_omni.diffusion.diffusion_kv.config import (
     parse_diffusion_kv_cache_mode,
 )
 from vllm_omni.diffusion.lora.manager import LoRABackend
+from vllm_omni.diffusion.media import DiffusionMediaOutput
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.errors import client_error_metadata
@@ -708,6 +709,55 @@ def uses_diffusers_adapter(od_config: object) -> bool:
 
 
 @dataclass
+class VideoOutputTransportConfig:
+    enable_device_postprocess: bool = False
+    transport_mode: Literal["bytes", "base64", "url", "shared_memory"] = "bytes"
+    shared_memory_ttl_seconds: int = 300
+    output_format: Literal["mp4", "webm"] = "mp4"
+    video_codec: str | None = None
+    video_codec_options: dict[str, str] = field(default_factory=dict)
+
+    VALID_TRANSPORT_MODES: ClassVar[frozenset[str]] = frozenset({"bytes", "base64", "url", "shared_memory"})
+    VALID_OUTPUT_FORMATS: ClassVar[frozenset[str]] = frozenset({"mp4", "webm"})
+
+    @classmethod
+    def from_value(cls, value: object) -> Self:
+        if value is None:
+            return cls()
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, Mapping):
+            raise TypeError("video_output_transport must be a VideoOutputTransportConfig or mapping")
+        values = dict(value)
+        codec_options = values.get("video_codec_options")
+        if isinstance(codec_options, Mapping):
+            values["video_codec_options"] = dict(codec_options)
+        return cls(**values)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enable_device_postprocess, bool):
+            raise TypeError("enable_device_postprocess must be a bool")
+        if not isinstance(self.transport_mode, str) or self.transport_mode not in self.VALID_TRANSPORT_MODES:
+            raise ValueError(
+                f"transport_mode must be one of {sorted(self.VALID_TRANSPORT_MODES)}, got {self.transport_mode!r}"
+            )
+        if type(self.shared_memory_ttl_seconds) is not int or self.shared_memory_ttl_seconds <= 0:
+            raise ValueError(
+                f"shared_memory_ttl_seconds must be a positive integer, got {self.shared_memory_ttl_seconds!r}"
+            )
+        if not isinstance(self.output_format, str) or self.output_format not in self.VALID_OUTPUT_FORMATS:
+            raise ValueError(
+                f"output_format must be one of {sorted(self.VALID_OUTPUT_FORMATS)}, got {self.output_format!r}"
+            )
+        if self.video_codec is not None and (not isinstance(self.video_codec, str) or not self.video_codec):
+            raise TypeError("video_codec must be a non-empty string or None")
+        if not isinstance(self.video_codec_options, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str) for key, value in self.video_codec_options.items()
+        ):
+            raise TypeError("video_codec_options must be a dict[str, str]")
+
+
+@dataclass
 class OmniDiffusionConfig:
     # Model and path configuration (for convenience)
     stage_id: int = 0
@@ -742,6 +792,7 @@ class OmniDiffusionConfig:
     # Cache backend configuration (NEW)
     cache_backend: str = "none"  # "tea_cache", "deep_cache", etc.
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
+    video_output_transport: VideoOutputTransportConfig = field(default_factory=VideoOutputTransportConfig)
     enable_cache_dit_summary: bool = False
 
     # Prompt-embedding cache. When enabled, ``DiffusionModelRunner`` wraps the
@@ -1207,6 +1258,8 @@ class OmniDiffusionConfig:
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
 
+        self.video_output_transport = VideoOutputTransportConfig.from_value(self.video_output_transport)
+
         # Auto-detect quantization from TransformerConfig if not explicitly set.
         # This covers the case where tf_model_config is passed at construction
         # time. For late (post-construction) assignment, callers should use
@@ -1564,8 +1617,8 @@ class DiffusionOutput:
 
     output: torch.Tensor | tuple[Any, ...] | dict[str, Any] | None = None
 
-    # Legacy compatibility fields. New pipeline-specific payloads should be
-    # carried by output["payload"] instead.
+    # Legacy compatibility fields. Decoded video uses ``media``; other new
+    # payloads should be carried by output["payload"] instead.
     trajectory_timesteps: torch.Tensor | dict[str, Any] | None = None
     trajectory_latents: torch.Tensor | dict[str, Any] | None = None
     trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
@@ -1604,7 +1657,18 @@ class DiffusionOutput:
     # mode) and the receiving side must not initialise a stray CUDA context.
     to_cpu: bool = False
 
+    # Typed video-media contract. Declared last so the pre-existing positional
+    # constructor order (output, trajectory_timesteps, ...) that out-of-tree
+    # pipelines rely on is preserved. Mutually exclusive with ``output``.
+    media: DiffusionMediaOutput | None = None
+
     def __post_init__(self) -> None:
+        if self.media is not None and not isinstance(self.media, DiffusionMediaOutput):
+            raise TypeError(f"media must be DiffusionMediaOutput, got {type(self.media).__name__}")
+        if self.media is not None and self.output is not None:
+            raise ValueError("DiffusionOutput cannot contain both media and legacy output")
+        if self.media is not None and self.post_process_func is not None:
+            raise ValueError("Typed diffusion media cannot carry a model-specific post_process_func")
         if not self.to_cpu:
             return
 
@@ -1620,6 +1684,10 @@ class DiffusionOutput:
             return value
 
         self.output = _maybe_to_cpu(self.output)
+        if self.media is not None:
+            if not self.media.prepared_for_transport:
+                raise ValueError("Diffusion media must be prepared before to_cpu=True")
+            self.media = self.media.to_cpu()
         self.trajectory_timesteps = _maybe_to_cpu(self.trajectory_timesteps)
         self.trajectory_latents = _maybe_to_cpu(self.trajectory_latents)
         self.trajectory_log_probs = _maybe_to_cpu(self.trajectory_log_probs)

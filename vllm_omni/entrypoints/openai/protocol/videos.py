@@ -8,6 +8,7 @@ mirrors the OpenAI Images API shape, with vllm-omni extensions for diffusion
 video models (e.g., Wan2.2).
 """
 
+import math
 import mimetypes
 import time
 import uuid
@@ -15,7 +16,8 @@ from enum import Enum
 from functools import lru_cache
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
+from typing_extensions import Self
 
 from vllm_omni.entrypoints.openai.image_api_utils import parse_size
 from vllm_omni.inputs.data import DIFFUSION_QUALITY_LEVELS
@@ -336,13 +338,44 @@ class VideoAction(BaseModel):
     domain_id: int | None = Field(default=None, description="Action embodiment domain id")
 
 
+class VideoSharedMemoryHandle(BaseModel):
+    """Same-host handle for one uint8 video in shared memory."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[1] = 1
+    name: str = Field(min_length=1)
+    shape: tuple[int, int, int, int]
+    dtype: Literal["uint8"] = "uint8"
+    nbytes: int = Field(gt=0)
+    expires_at: float = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _validate_shape_and_size(self) -> Self:
+        if any(dimension <= 0 for dimension in self.shape) or self.shape[-1] != 3:
+            raise ValueError("shape must be positive (frames, height, width, 3)")
+        if math.prod(self.shape) != self.nbytes:
+            raise ValueError("nbytes must match the uint8 video shape")
+        return self
+
+
 class VideoData(BaseModel):
     """Single generated video data."""
 
-    b64_json: str | None = Field(default=None, description="Base64-encoded MP4 video")
-    url: str | None = Field(default=None, description="Video URL (not implemented)")
+    b64_json: str | None = Field(default=None, description="Base64-encoded video artifact")
+    url: str | None = Field(default=None, description="URL of the stored video artifact")
+    shm_handle: VideoSharedMemoryHandle | None = Field(
+        default=None,
+        description="Same-host shared-memory handle for raw uint8 frames.",
+    )
     revised_prompt: str | None = Field(default=None, description="Revised prompt (OpenAI compatibility, always null)")
     action: VideoAction | None = Field(default=None, description="Generated action sequence metadata, if any")
+
+    @model_validator(mode="after")
+    def _validate_single_transport_payload(self) -> Self:
+        if sum(value is not None for value in (self.b64_json, self.url, self.shm_handle)) > 1:
+            raise ValueError("only one video transport payload may be set")
+        return self
 
 
 class VideoGenerationResponse(BaseModel):
@@ -399,7 +432,10 @@ class VideoResponse(BaseModel):
     )
 
     # vLLM specific fields
-    media_type: Literal["video/mp4"] = Field(default="video/mp4", description="MIME type of the generated artifact.")
+    media_type: Literal["video/mp4", "video/webm"] = Field(
+        default="video/mp4",
+        description="MIME type of the generated artifact.",
+    )
 
     expires_at: int | None = Field(default=None, description="Unix timestamp when this record is considered expired.")
     file_name: str | None = Field(

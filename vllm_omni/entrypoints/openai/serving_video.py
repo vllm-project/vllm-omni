@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
+import ipaddress
 import math
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
@@ -25,6 +28,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoData,
     VideoGenerationRequest,
     VideoGenerationResponse,
+    VideoSharedMemoryHandle,
 )
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
@@ -32,10 +36,15 @@ from vllm_omni.entrypoints.openai.stage_params import (
 )
 from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import (
+    ResolvedVideoOutputSettings,
+    _coerce_video_to_uint8_frames,
     _encode_video_bytes,
     _PlanarFrameConverter,
     encode_video_base64,
+    resolve_video_output_settings,
+    without_video_output_overrides,
 )
+from vllm_omni.entrypoints.openai.video_output_shm import export_video_frames_to_shm, release_video_frames
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.model_extras import get_video_generation_defaults, should_preserve_reference_image_size
 from vllm_omni.model_extras.video_generation import VideoGenerationDefaults
@@ -48,6 +57,45 @@ from vllm_omni.outputs.output_metadata import (
 logger = init_logger(__name__)
 
 _VIDEO_RESPONSE_FRAME_CONVERSION_WORKERS = 8
+
+
+def _publish_shared_memory_video(video: object, ttl_seconds: int) -> VideoSharedMemoryHandle:
+    frames = _coerce_video_to_uint8_frames(video)
+    return export_video_frames_to_shm(frames, ttl_seconds=ttl_seconds)
+
+
+async def _release_published_video_handles(handles: list[VideoSharedMemoryHandle]) -> None:
+    results = await asyncio.gather(
+        *(asyncio.to_thread(release_video_frames, handle) for handle in handles),
+        return_exceptions=True,
+    )
+    for handle, result in zip(handles, results):
+        if isinstance(result, BaseException):
+            logger.warning("Failed to release video shared memory %s: %s", handle.name, result)
+
+
+async def _delete_video_artifacts(storage_keys: list[str]) -> None:
+    from vllm_omni.entrypoints.openai import storage
+
+    results = await asyncio.gather(
+        *(storage.STORAGE_MANAGER.delete(storage_key) for storage_key in storage_keys),
+        return_exceptions=True,
+    )
+    for storage_key, result in zip(storage_keys, results):
+        if isinstance(result, BaseException):
+            logger.warning("Failed to delete partial video artifact %s: %s", storage_key, result)
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    if host is None:
+        return False
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -97,10 +145,12 @@ class OmniOpenAIServingVideo:
         engine_client: EngineClient,
         model_name: str | None = None,
         stage_configs: list[Any] | None = None,
+        allow_shared_memory: bool = False,
     ) -> None:
         self._engine_client = engine_client
         self._model_name = model_name
         self._stage_configs = stage_configs
+        self._allow_shared_memory = allow_shared_memory
         self._video_frame_converter = _PlanarFrameConverter(max_workers=_VIDEO_RESPONSE_FRAME_CONVERSION_WORKERS)
         logger.info(
             "Video response frame conversion pool configured: workers=%d",
@@ -188,11 +238,13 @@ class OmniOpenAIServingVideo:
         diffusion_engine: EngineClient,
         model_name: str,
         stage_configs: list[Any] | None = None,
+        allow_shared_memory: bool = False,
     ) -> OmniOpenAIServingVideo:
         return cls(
             diffusion_engine,
             model_name=model_name,
             stage_configs=stage_configs,
+            allow_shared_memory=allow_shared_memory,
         )
 
     def shutdown(self) -> None:
@@ -351,8 +403,7 @@ class OmniOpenAIServingVideo:
                     status_code=HTTPStatus.BAD_REQUEST.value,
                     detail="extra_params must be a JSON object/dict.",
                 )
-            # Merge extra_params into extra_args
-            gen_params.extra_args.update(request.extra_params)
+            gen_params.extra_args.update(without_video_output_overrides(request.extra_params))
 
             # Redact inline arrays when logging so RoboLab policy requests do
             # not flood the server log with image/state payloads.
@@ -403,6 +454,59 @@ class OmniOpenAIServingVideo:
             peak_memory_mb=self._extract_peak_memory_mb(result),
         )
 
+    def _resolve_video_output_settings(self, request: VideoGenerationRequest) -> ResolvedVideoOutputSettings:
+        try:
+            return resolve_video_output_settings(self._engine_client, request.extra_params)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(exc)) from exc
+
+    def _validate_immediate_transport(
+        self,
+        settings: ResolvedVideoOutputSettings,
+        request: VideoGenerationRequest,
+    ) -> None:
+        if settings.transport_mode == "shared_memory":
+            if not self._allow_shared_memory:
+                raise HTTPException(
+                    status_code=HTTPStatus.FORBIDDEN,
+                    detail="transport_mode='shared_memory' requires the API server to bind to a loopback host",
+                )
+            if request.generate_sound:
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    detail="transport_mode='shared_memory' does not support audio-bearing video output",
+                )
+        if settings.transport_mode == "url":
+            from vllm_omni.entrypoints.openai import storage
+
+            if not storage.STORAGE_MANAGER.has_expiration_policy:
+                raise HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    detail=(
+                        "transport_mode='url' requires storage expiration; configure "
+                        "VLLM_OMNI_SERVER_STORAGE__FILE_TTL for the file backend"
+                    ),
+                )
+
+    async def _store_video_artifact(self, video_bytes: bytes, output_format: str) -> tuple[str, str]:
+        from vllm_omni.entrypoints.openai import storage
+
+        if not storage.STORAGE_MANAGER.has_expiration_policy:
+            raise HTTPException(
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                detail="transport_mode='url' requires storage expiration",
+            )
+        storage_key = f"{uuid.uuid4().hex}.{output_format}"
+        committed = False
+        try:
+            await storage.STORAGE_MANAGER.save(video_bytes, storage_key)
+            url = storage.STORAGE_MANAGER.public_url(storage_key) or f"/v1/videos/artifacts/{storage_key}"
+            committed = True
+            return storage_key, url
+        finally:
+            if not committed:
+                await _delete_video_artifacts([storage_key])
+
     async def generate_videos(
         self,
         request: VideoGenerationRequest,
@@ -412,6 +516,8 @@ class OmniOpenAIServingVideo:
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
     ) -> VideoGenerationResponse:
+        settings = self._resolve_video_output_settings(request)
+        self._validate_immediate_transport(settings, request)
         artifacts = await self._run_and_extract(
             request,
             reference_id,
@@ -420,43 +526,98 @@ class OmniOpenAIServingVideo:
             reference_audio=reference_audio,
         )
 
-        video_codec_options = {"preset": "ultrafast", "threads": "0"}
-        if request.extra_params is not None and isinstance(request.extra_params, dict):
-            if "video_codec_options" in request.extra_params:
-                video_codec_options = request.extra_params["video_codec_options"]
-
-        _t_encode_start = time.perf_counter()
-        video_data = [
-            VideoData(
-                b64_json=(
-                    encode_video_base64(
-                        video,
-                        fps=artifacts.output_fps,
-                        video_codec_options=video_codec_options,
-                        frame_converter=self._video_frame_converter,
-                    )
-                    if artifacts.audios[idx] is None
-                    else encode_video_base64(
-                        video,
-                        fps=artifacts.output_fps,
-                        audio=artifacts.audios[idx],
-                        audio_sample_rate=artifacts.audio_sample_rate,
-                        video_codec_options=video_codec_options,
-                        frame_converter=self._video_frame_converter,
-                    )
-                ),
-                action=artifacts.actions[idx],
+        if artifacts.videos and all(
+            isinstance(video, Mapping) and video.get("action_only_output") is True for video in artifacts.videos
+        ):
+            return VideoGenerationResponse(
+                created=int(time.time()),
+                data=[VideoData(action=action) for action in artifacts.actions],
+                stage_durations=artifacts.stage_durations,
+                peak_memory_mb=artifacts.peak_memory_mb,
             )
-            for idx, video in enumerate(artifacts.videos)
-        ]
-        _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
-        logger.info("Video response encoding (MP4+base64): %.2f ms", _t_encode_ms)
-        return VideoGenerationResponse(
-            created=int(time.time()),
-            data=video_data,
-            stage_durations=artifacts.stage_durations,
-            peak_memory_mb=artifacts.peak_memory_mb,
-        )
+
+        if settings.transport_mode == "shared_memory":
+            if any(audio is not None for audio in artifacts.audios):
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST,
+                    detail="transport_mode='shared_memory' does not support audio-bearing video output",
+                )
+            handles: list[VideoSharedMemoryHandle] = []
+            committed = False
+            try:
+                video_data = []
+                for index, video in enumerate(artifacts.videos):
+                    handle = await asyncio.to_thread(
+                        _publish_shared_memory_video,
+                        video,
+                        settings.shared_memory_ttl_seconds,
+                    )
+                    handles.append(handle)
+                    video_data.append(VideoData(shm_handle=handle, action=artifacts.actions[index]))
+                response = VideoGenerationResponse(
+                    created=int(time.time()),
+                    data=video_data,
+                    stage_durations=artifacts.stage_durations,
+                    peak_memory_mb=artifacts.peak_memory_mb,
+                )
+                committed = True
+                return response
+            finally:
+                if not committed:
+                    await _release_published_video_handles(handles)
+
+        started_at = time.perf_counter()
+        video_data = []
+        storage_keys: list[str] = []
+        committed = False
+        try:
+            for index, video in enumerate(artifacts.videos):
+                audio = artifacts.audios[index]
+                if settings.transport_mode == "url":
+                    video_bytes = await asyncio.to_thread(
+                        _encode_video_bytes,
+                        video,
+                        fps=artifacts.output_fps,
+                        audio=audio,
+                        audio_sample_rate=artifacts.audio_sample_rate if audio is not None else None,
+                        video_codec=settings.codec,
+                        video_codec_options=settings.codec_options,
+                        output_format=settings.output_format,
+                        frame_converter=self._video_frame_converter,
+                    )
+                    storage_key, url = await self._store_video_artifact(video_bytes, settings.output_format)
+                    storage_keys.append(storage_key)
+                    video_data.append(VideoData(url=url, action=artifacts.actions[index]))
+                else:
+                    encoded = await asyncio.to_thread(
+                        encode_video_base64,
+                        video,
+                        fps=artifacts.output_fps,
+                        audio=audio,
+                        audio_sample_rate=artifacts.audio_sample_rate if audio is not None else None,
+                        video_codec=settings.codec,
+                        video_codec_options=settings.codec_options,
+                        output_format=settings.output_format,
+                        frame_converter=self._video_frame_converter,
+                    )
+                    video_data.append(VideoData(b64_json=encoded, action=artifacts.actions[index]))
+            response = VideoGenerationResponse(
+                created=int(time.time()),
+                data=video_data,
+                stage_durations=artifacts.stage_durations,
+                peak_memory_mb=artifacts.peak_memory_mb,
+            )
+            logger.info(
+                "Video response encoding (%s, %s): %.2f ms",
+                settings.output_format,
+                settings.transport_mode,
+                (time.perf_counter() - started_at) * 1000,
+            )
+            committed = True
+            return response
+        finally:
+            if not committed:
+                await _delete_video_artifacts(storage_keys)
 
     async def generate_video_bytes(
         self,
@@ -467,7 +628,8 @@ class OmniOpenAIServingVideo:
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
     ) -> tuple[bytes, dict[str, float], float, VideoAction | None]:
-        """Generate a video and return raw MP4 bytes, bypassing base64 encoding."""
+        """Generate a video and return encoded bytes without base64."""
+        settings = self._resolve_video_output_settings(request)
         artifacts = await self._run_and_extract(
             request,
             reference_id,
@@ -483,27 +645,29 @@ class OmniOpenAIServingVideo:
             )
         audio = artifacts.audios[0]
 
-        video_codec_options = {"preset": "ultrafast", "threads": "0"}
-        if request.extra_params is not None and isinstance(request.extra_params, dict):
-            if "video_codec_options" in request.extra_params:
-                video_codec_options = request.extra_params["video_codec_options"]
-
         action = artifacts.actions[0]
         if action is not None and isinstance(artifacts.videos[0], dict):
-            logger.info("Action-only video request %s completed; skipping MP4 encoding.", reference_id)
+            logger.info("Action-only video request %s completed; skipping video encoding.", reference_id)
             return b"", artifacts.stage_durations, artifacts.peak_memory_mb, action
 
-        _t_encode_start = time.perf_counter()
-        video_bytes = _encode_video_bytes(
+        started_at = time.perf_counter()
+        video_bytes = await asyncio.to_thread(
+            _encode_video_bytes,
             artifacts.videos[0],
             fps=artifacts.output_fps,
-            **({"audio": audio, "audio_sample_rate": artifacts.audio_sample_rate} if audio is not None else {}),
-            video_codec_options=video_codec_options,
+            audio=audio,
+            audio_sample_rate=artifacts.audio_sample_rate if audio is not None else None,
+            video_codec=settings.codec,
+            video_codec_options=settings.codec_options,
+            output_format=settings.output_format,
             frame_converter=self._video_frame_converter,
         )
-        _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
-        logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)
-        return video_bytes, artifacts.stage_durations, artifacts.peak_memory_mb, artifacts.actions[0]
+        logger.info(
+            "Video response encoding (%s bytes): %.2f ms",
+            settings.output_format,
+            (time.perf_counter() - started_at) * 1000,
+        )
+        return video_bytes, artifacts.stage_durations, artifacts.peak_memory_mb, action
 
     @staticmethod
     def _resolve_video_fps_multiplier(result: object) -> int:

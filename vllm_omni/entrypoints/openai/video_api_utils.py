@@ -12,10 +12,11 @@ import os
 import tempfile
 import threading
 from collections import deque
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, Literal, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, cast
 
 import httpx
 import numpy as np
@@ -48,11 +49,18 @@ logger = init_logger(__name__)
 
 
 DEFAULT_AUDIO_SAMPLE_RATE = 24_000
+VIDEO_OUTPUT_REQUEST_OVERRIDE_KEYS = frozenset({"video_codec", "video_codec_options", "output_format"})
+VIDEO_OUTPUT_DEPLOYMENT_ONLY_KEYS = frozenset({"transport_mode", "shared_memory_ttl_seconds"})
+VIDEO_OUTPUT_EXTRA_PARAM_KEYS = VIDEO_OUTPUT_REQUEST_OVERRIDE_KEYS | VIDEO_OUTPUT_DEPLOYMENT_ONLY_KEYS
 
 
 VideoInput: TypeAlias = torch.Tensor | np.ndarray | list[torch.Tensor | np.ndarray | Image.Image]
 AudioSample = int | float
 AudioInput: TypeAlias = torch.Tensor | np.ndarray | list[AudioSample] | list[list[AudioSample]]
+
+
+def without_video_output_overrides(extra_params: Mapping[str, object]) -> dict[str, object]:
+    return {key: value for key, value in extra_params.items() if key not in VIDEO_OUTPUT_EXTRA_PARAM_KEYS}
 
 
 class VideoFrames(list[Image.Image]):
@@ -558,16 +566,15 @@ def _coerce_prepared_video_to_uint8_frames(
     return frames_u8
 
 
+def _already_uint8_frames(video: object) -> bool:
+    return isinstance(video, np.ndarray) and video.dtype == np.uint8 and video.ndim == 4 and video.shape[-1] in (3, 4)
+
+
 def _coerce_video_to_uint8_frames(video: Any) -> np.ndarray:
     """Convert a video payload into contiguous uint8 frames shaped (F, H, W, 3)."""
-    if (
-        isinstance(video, np.ndarray)
-        and video.dtype == np.uint8
-        and video.ndim == 4
-        and video.shape[-1] == 3
-        and video.flags.c_contiguous
-    ):
-        return video
+    if _already_uint8_frames(video):
+        frames_u8 = video[..., :3] if video.shape[-1] == 4 else video
+        return np.ascontiguousarray(frames_u8)
     frames, frame_shape, common_dtype = _prepare_video_frames(video)
     return _coerce_prepared_video_to_uint8_frames(frames, frame_shape, common_dtype)
 
@@ -742,6 +749,86 @@ def _resolve_audio_sample_rate(audio: AudioInput | None, audio_sample_rate: int 
     return audio_sample_rate or DEFAULT_AUDIO_SAMPLE_RATE
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedVideoOutputSettings:
+    codec: str
+    codec_options: dict[str, str]
+    output_format: Literal["mp4", "webm"]
+    media_type: Literal["video/mp4", "video/webm"]
+    transport_mode: Literal["bytes", "base64", "url", "shared_memory"]
+    shared_memory_ttl_seconds: int
+
+
+def resolve_video_output_settings(
+    engine_client: object,
+    extra_params: object = None,
+    *,
+    low_latency: bool = False,
+    force_output_format: str | None = None,
+) -> ResolvedVideoOutputSettings:
+    from vllm_omni.diffusion.data import VideoOutputTransportConfig
+    from vllm_omni.diffusion.utils.media_utils import (
+        DEFAULT_OUTPUT_FORMAT,
+        media_type_for_format,
+        resolve_encoder_settings,
+    )
+    from vllm_omni.entrypoints.openai.utils import resolve_diffusion_od_config
+
+    try:
+        od_config = resolve_diffusion_od_config(engine_client) or getattr(engine_client, "od_config", None)
+    except AttributeError:
+        logger.debug("The engine client does not expose a diffusion config view.", exc_info=True)
+        od_config = getattr(engine_client, "od_config", None)
+    configured_transport = getattr(od_config, "video_output_transport", None) if od_config is not None else None
+    transport = configured_transport if isinstance(configured_transport, VideoOutputTransportConfig) else None
+
+    codec = getattr(transport, "video_codec", None)
+    configured_options = getattr(transport, "video_codec_options", None)
+    codec_options = dict(configured_options) if isinstance(configured_options, dict) else None
+    output_format = getattr(transport, "output_format", None) or DEFAULT_OUTPUT_FORMAT
+    transport_mode = getattr(transport, "transport_mode", None) or "bytes"
+    shared_memory_ttl_seconds = getattr(transport, "shared_memory_ttl_seconds", 300)
+
+    overrides = extra_params if isinstance(extra_params, dict) else {}
+    deployment_overrides = VIDEO_OUTPUT_DEPLOYMENT_ONLY_KEYS.intersection(overrides)
+    if deployment_overrides:
+        names = ", ".join(sorted(deployment_overrides))
+        raise ValueError(f"Video output setting(s) {names} may only be configured at deployment time")
+    if "video_codec" in overrides:
+        codec = overrides["video_codec"]
+    if "video_codec_options" in overrides:
+        codec_options = overrides["video_codec_options"]
+    if "output_format" in overrides:
+        output_format = overrides["output_format"]
+    if force_output_format is not None:
+        output_format = force_output_format
+
+    if codec is not None and (not isinstance(codec, str) or not codec):
+        raise TypeError("video_codec must be a non-empty string or None")
+    if codec_options is not None and (
+        not isinstance(codec_options, dict)
+        or any(not isinstance(key, str) or not isinstance(value, str) for key, value in codec_options.items())
+    ):
+        raise TypeError("video_codec_options must be a dict[str, str]")
+    if not isinstance(output_format, str) or not output_format:
+        raise TypeError("output_format must be a non-empty string")
+
+    resolved_codec, resolved_options = resolve_encoder_settings(
+        codec,
+        codec_options,
+        low_latency=low_latency,
+        output_format=output_format,
+    )
+    return ResolvedVideoOutputSettings(
+        codec=resolved_codec,
+        codec_options=resolved_options,
+        output_format=cast(Literal["mp4", "webm"], output_format),
+        media_type=cast(Literal["video/mp4", "video/webm"], media_type_for_format(output_format)),
+        transport_mode=cast(Literal["bytes", "base64", "url", "shared_memory"], transport_mode),
+        shared_memory_ttl_seconds=shared_memory_ttl_seconds,
+    )
+
+
 def _encode_prepared_video_bytes_legacy(
     frames: list[np.ndarray],
     frame_shape: tuple[int, ...],
@@ -750,6 +837,8 @@ def _encode_prepared_video_bytes_legacy(
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
+    video_codec: str | None = None,
+    output_format: str | None = None,
 ) -> bytes:
     """Encode validated frames through the compatibility path used before planar encoding."""
     from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
@@ -761,6 +850,8 @@ def _encode_prepared_video_bytes_legacy(
         fps=float(fps),
         audio_sample_rate=audio_sample_rate or DEFAULT_AUDIO_SAMPLE_RATE,
         video_codec_options=video_codec_options,
+        video_codec=video_codec,
+        output_format=output_format,
     )
 
 
@@ -770,6 +861,8 @@ def _encode_video_bytes_legacy(
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
+    video_codec: str | None = None,
+    output_format: str | None = None,
 ) -> bytes:
     """Encode through the compatibility path used before planar encoding."""
     frames, frame_shape, common_dtype = _prepare_video_frames(video)
@@ -781,6 +874,8 @@ def _encode_video_bytes_legacy(
         audio=audio,
         audio_sample_rate=_resolve_audio_sample_rate(audio, audio_sample_rate),
         video_codec_options=video_codec_options,
+        video_codec=video_codec,
+        output_format=output_format,
     )
 
 
@@ -790,13 +885,13 @@ def _encode_video_bytes(
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
+    video_codec: str | None = None,
+    output_format: str | None = None,
     frame_converter: _PlanarFrameConverter | None = None,
 ) -> bytes:
     """Encode a video payload through the direct planar or legacy path."""
     from vllm_omni.diffusion.utils.media_utils import mux_av_video_audio_bytes
 
-    # Prepare once so validation is shared by both paths and malformed common
-    # input is reported before any muxer is opened.
     frames, frame_shape, common_dtype = _prepare_video_frames(video)
     effective_audio_sample_rate = _resolve_audio_sample_rate(audio, audio_sample_rate) if audio is not None else None
     fallback_reason = _direct_planar_fallback_reason(
@@ -825,6 +920,8 @@ def _encode_video_bytes(
             audio=audio,
             audio_sample_rate=effective_audio_sample_rate,
             video_codec_options=video_codec_options,
+            video_codec=video_codec,
+            output_format=output_format,
         )
 
     owns_frame_converter = frame_converter is None
@@ -850,6 +947,8 @@ def _encode_video_bytes(
             fps=float(fps),
             audio_sample_rate=effective_audio_sample_rate,
             video_codec_options=video_codec_options,
+            video_codec=video_codec,
+            output_format=output_format,
         )
     finally:
         video_frames.close()
@@ -865,14 +964,16 @@ class FragmentedMP4VideoEncoder:
         *,
         fps: int | float,
         video_codec_options: dict[str, str] | None = None,
+        video_codec: str | None = None,
     ) -> None:
         self._fps = float(fps)
         self._video_codec_options = video_codec_options
+        self._video_codec = video_codec
         self._muxer: Any | None = None
 
     def encode(self, video: Any) -> bytes:
         """Encode one generated video chunk and return newly emitted fMP4 bytes."""
-        from vllm_omni.diffusion.utils.media_utils import FragmentedMP4Muxer
+        from vllm_omni.diffusion.utils.media_utils import DEFAULT_VIDEO_CODEC, FragmentedMP4Muxer
 
         frames_u8 = _coerce_video_to_uint8_frames(video)
         if self._muxer is None:
@@ -880,6 +981,7 @@ class FragmentedMP4VideoEncoder:
                 width=frames_u8.shape[2],
                 height=frames_u8.shape[1],
                 fps=self._fps,
+                video_codec=self._video_codec or DEFAULT_VIDEO_CODEC,
                 video_codec_options=self._video_codec_options,
             )
         return self._muxer.mux_video_frames(frames_u8)
@@ -899,10 +1001,15 @@ def create_streaming_video_encoder(
     output_format: StreamingVideoFormat,
     fps: int | float,
     video_codec_options: dict[str, str] | None = None,
+    video_codec: str | None = None,
 ) -> FragmentedMP4VideoEncoder:
     """Create an incremental encoder for the requested WebSocket video format."""
     if output_format == "m4s":
-        return FragmentedMP4VideoEncoder(fps=fps, video_codec_options=video_codec_options)
+        return FragmentedMP4VideoEncoder(
+            fps=fps,
+            video_codec_options=video_codec_options,
+            video_codec=video_codec,
+        )
     raise ValueError(f"Unsupported streaming video format: {output_format}")
 
 
@@ -912,15 +1019,19 @@ def encode_video_base64(
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
+    video_codec: str | None = None,
+    output_format: str | None = None,
     frame_converter: _PlanarFrameConverter | None = None,
 ) -> str:
-    """Encode a video (frames/array/tensor) to base64 MP4."""
+    """Encode a video payload and return its base64 representation."""
     video_bytes = _encode_video_bytes(
         video,
         fps=fps,
         audio=audio,
         audio_sample_rate=audio_sample_rate,
         video_codec_options=video_codec_options,
+        video_codec=video_codec,
+        output_format=output_format,
         frame_converter=frame_converter,
     )
     return base64.b64encode(video_bytes).decode("utf-8")

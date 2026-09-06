@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Unit tests for the OpenAI video storage managers.
 """
@@ -10,8 +10,15 @@ import time
 
 import pytest
 
+from vllm_omni.config.server_settings import FileBackend
 from vllm_omni.entrypoints.openai import storage as storage_module
-from vllm_omni.entrypoints.openai.storage import FileStorageHandle, LocalStorageManager, LocalStorageTTLManager
+from vllm_omni.entrypoints.openai.storage import (
+    FileStorageHandle,
+    LocalStorageManager,
+    LocalStorageTTLManager,
+    UrlStorageHandle,
+    get_storage_manager,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -77,6 +84,23 @@ def test_local_storage_ttl_sweeper_removes_expired_file(tmp_path):
     assert asyncio.run(storage.open(storage_key)) is None
 
 
+def test_local_storage_ttl_manager_stops_its_background_task(tmp_path):
+    storage = LocalStorageTTLManager(
+        storage_path=str(tmp_path / "storage"),
+        max_concurrency=1,
+        ttl_seconds=60,
+        sweep_interval_seconds=60,
+    )
+
+    async def run() -> None:
+        await storage.start()
+        assert storage._sweeper_task is not None
+        await storage.stop()
+        assert storage._sweeper_task is None
+
+    asyncio.run(run())
+
+
 def test_local_storage_ttl_sweeper_keeps_files_when_path_missing(tmp_path):
     storage = LocalStorageTTLManager(
         storage_path=str(tmp_path / "storage"),
@@ -92,3 +116,41 @@ def test_local_storage_ttl_sweeper_keeps_files_when_path_missing(tmp_path):
 
     assert deleted == 0
     assert not os.path.exists(missing_path)
+
+
+def test_published_local_storage_returns_url_handle(tmp_path):
+    storage = LocalStorageManager(
+        storage_path=str(tmp_path / "storage"),
+        public_base_url="https://cdn.example.com/videos/",
+    )
+    asyncio.run(storage.save(b"video-bytes", "clip.mp4"))
+
+    handle = asyncio.run(storage.open("clip.mp4"))
+
+    assert isinstance(handle, UrlStorageHandle)
+    assert handle.url == "https://cdn.example.com/videos/clip.mp4"
+
+
+def test_public_url_rejects_path_escape(tmp_path):
+    storage = LocalStorageManager(
+        storage_path=str(tmp_path / "storage"),
+        public_base_url="https://cdn.example.com/videos",
+    )
+
+    with pytest.raises(ValueError, match="Illegal storage key"):
+        storage.public_url("../../etc/passwd")
+
+
+def test_file_backend_factory_preserves_ttl_and_public_url(tmp_path):
+    storage = get_storage_manager(
+        FileBackend(
+            path=str(tmp_path / "storage"),
+            file_ttl=60,
+            ttl_sweep_interval=10,
+            public_base_url="https://cdn.example.com/videos",
+        )
+    )
+
+    assert isinstance(storage, LocalStorageTTLManager)
+    assert storage.has_expiration_policy is True
+    assert storage.public_url("clip.webm") == "https://cdn.example.com/videos/clip.webm"

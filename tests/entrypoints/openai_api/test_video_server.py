@@ -4,6 +4,7 @@
 Unit tests for OpenAI-compatible video generation endpoints.
 """
 
+import argparse
 import asyncio
 import base64
 import io
@@ -12,6 +13,7 @@ import os
 import threading
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,20 +27,25 @@ from PIL import Image
 from pytest_mock import MockerFixture
 from vllm import envs
 
+from vllm_omni.diffusion.data import VideoOutputTransportConfig
 from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 from vllm_omni.entrypoints.openai import api_server, video_api_utils
+from vllm_omni.entrypoints.openai import storage as storage_module
 from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoGenerationRequest,
     VideoGenerationStatus,
     VideoParams,
     VideoResponse,
+    VideoSharedMemoryHandle,
 )
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
-from vllm_omni.entrypoints.openai.storage import LocalStorageManager
+from vllm_omni.entrypoints.openai.storage import LocalStorageManager, LocalStorageTTLManager
 from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
+from vllm_omni.entrypoints.openai.video_output_shm import borrowed_video_frames, export_video_frames_to_shm
 from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.utils.tracking_parser import TrackingNamespace
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -62,6 +69,12 @@ class MockVideoResult:
         self.peak_memory_mb = peak_memory_mb
 
 
+@dataclass
+class FakeDiffusionConfig:
+    model_class_name: str
+    video_output_transport: VideoOutputTransportConfig
+
+
 class FakeAsyncOmni:
     def __init__(self):
         self.stage_configs = [
@@ -73,12 +86,16 @@ class FakeAsyncOmni:
         ]
         self.default_sampling_params_list = [OmniDiffusionSamplingParams()]
         self.model_class_name = "WanPipeline"
+        self.video_output_transport = VideoOutputTransportConfig()
         self.captured_prompt = None
         self.captured_reference_video_bytes = None
         self.captured_sampling_params_list = None
 
     def get_diffusion_od_config(self):
-        return SimpleNamespace(model_class_name=self.model_class_name)
+        return FakeDiffusionConfig(
+            model_class_name=self.model_class_name,
+            video_output_transport=self.video_output_transport,
+        )
 
     async def generate(self, prompt, request_id, sampling_params_list):
         self.captured_prompt = prompt
@@ -97,6 +114,7 @@ class FakeAsyncOmni:
 
 def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixture):
     engine = FakeAsyncOmni()
+    engine.video_output_transport = VideoOutputTransportConfig(transport_mode="base64")
     handler = OmniOpenAIServingVideo.for_diffusion(
         engine,
         model_name="test-model",
@@ -108,8 +126,9 @@ def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixt
     )
     base64_encoder = mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
-        return_value="encoded-video",
+        return_value="encoded-video-base64",
     )
+    to_thread = mocker.spy(asyncio, "to_thread")
 
     async def _generate_both_response_types():
         request = VideoGenerationRequest(prompt="test prompt")
@@ -118,8 +137,14 @@ def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixt
 
     asyncio.run(_generate_both_response_types())
 
-    assert raw_encoder.call_args.kwargs["frame_converter"] is handler._video_frame_converter
-    assert base64_encoder.call_args.kwargs["frame_converter"] is handler._video_frame_converter
+    raw_encoder.assert_called_once()
+    base64_encoder.assert_called_once()
+    assert to_thread.call_count == 2
+    assert to_thread.call_args_list[0].args[0] is raw_encoder
+    assert to_thread.call_args_list[1].args[0] is base64_encoder
+    for encoder in (raw_encoder, base64_encoder):
+        assert encoder.call_args.kwargs["frame_converter"] is handler._video_frame_converter
+        assert "encoding_config" not in encoder.call_args.kwargs
     handler.shutdown()
 
 
@@ -158,6 +183,17 @@ class BlockingVideoHandler:
         if self.stage_configs is None:
             self.stage_configs = stage_configs
 
+    def _resolve_video_output_settings(self, request):
+        del request
+        return video_api_utils.ResolvedVideoOutputSettings(
+            codec="h264",
+            codec_options={},
+            output_format="mp4",
+            media_type="video/mp4",
+            transport_mode="bytes",
+            shared_memory_ttl_seconds=300,
+        )
+
     async def generate_video_bytes(
         self, request, reference_id, *, reference_image=None, reference_video=None, reference_audio=None
     ):
@@ -176,6 +212,28 @@ class FakeServerSocket:
 
     def close(self):
         self.closed = True
+
+
+def _server_worker_args() -> TrackingNamespace:
+    namespace = argparse.Namespace(
+        tool_parser_plugin="",
+        reasoning_parser_plugin="",
+        reasoning_parser=None,
+        structured_outputs_config=argparse.Namespace(reasoning_parser=None),
+        enable_ssl_refresh=False,
+        host="127.0.0.1",
+        port=0,
+        uvicorn_log_level="info",
+        disable_uvicorn_access_log=True,
+        ssl_keyfile=None,
+        ssl_certfile=None,
+        ssl_ca_certs=None,
+        ssl_cert_reqs=None,
+        ssl_ciphers=None,
+        h11_max_incomplete_event_size=None,
+        h11_max_header_count=None,
+    )
+    return TrackingNamespace(namespace, frozenset())
 
 
 @pytest.fixture(autouse=True)
@@ -228,6 +286,9 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
     async def fake_storage_start():
         events.append("storage_start")
 
+    async def fake_storage_stop():
+        events.append("storage_stop")
+
     async def fake_get_vllm_config(engine_client):
         del engine_client
         return None
@@ -240,30 +301,12 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
     monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: FastAPI())
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
     monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "stop", fake_storage_stop)
     monkeypatch.setattr(api_server, "_get_vllm_config", fake_get_vllm_config)
     monkeypatch.setattr(api_server, "omni_init_app_state", fake_init_app_state)
     monkeypatch.setattr(api_server, "get_uvicorn_log_config", lambda args: None)
 
-    args = SimpleNamespace(
-        tool_parser_plugin="",
-        reasoning_parser_plugin="",
-        reasoning_parser=None,
-        structured_outputs_config=SimpleNamespace(reasoning_parser=None),
-        enable_ssl_refresh=False,
-        host="127.0.0.1",
-        port=0,
-        uvicorn_log_level="info",
-        disable_uvicorn_access_log=True,
-        ssl_keyfile=None,
-        ssl_certfile=None,
-        ssl_ca_certs=None,
-        ssl_cert_reqs=None,
-        ssl_ciphers=None,
-        h11_max_incomplete_event_size=None,
-        h11_max_header_count=None,
-    )
-
-    worker_task = asyncio.create_task(api_server.omni_run_server_worker("127.0.0.1:0", sock, args))
+    worker_task = asyncio.create_task(api_server.omni_run_server_worker("127.0.0.1:0", sock, _server_worker_args()))
     await asyncio.wait_for(serve_started.wait(), timeout=2)
 
     assert not engine_context_exited.is_set()
@@ -272,7 +315,116 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch)
     await asyncio.wait_for(worker_task, timeout=2)
 
     assert sock.closed
-    assert events.index("http_shutdown") < events.index("engine_exit")
+    assert events.index("http_shutdown") < events.index("storage_stop") < events.index("engine_exit")
+
+
+@pytest.mark.asyncio
+async def test_server_worker_stops_storage_when_http_startup_fails(monkeypatch):
+    events: list[str] = []
+    sock = FakeServerSocket()
+
+    class FakeEngine:
+        stage_configs = []
+
+        async def get_supported_tasks(self):
+            return ("generate",)
+
+    @asynccontextmanager
+    async def fake_build_async_omni(*args, **kwargs):
+        del args, kwargs
+        events.append("engine_enter")
+        try:
+            yield FakeEngine()
+        finally:
+            events.append("engine_exit")
+
+    async def fake_serve_http(*args, **kwargs):
+        del args, kwargs
+        events.append("serve_http")
+        raise RuntimeError("HTTP startup failed")
+
+    async def fake_storage_start():
+        events.append("storage_start")
+
+    async def fake_storage_stop():
+        events.append("storage_stop")
+
+    async def fake_get_vllm_config(engine_client):
+        del engine_client
+        return None
+
+    async def fake_init_app_state(engine_client, state, args):
+        del engine_client, state, args
+
+    monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
+    monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: FastAPI())
+    monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "stop", fake_storage_stop)
+    monkeypatch.setattr(api_server, "_get_vllm_config", fake_get_vllm_config)
+    monkeypatch.setattr(api_server, "omni_init_app_state", fake_init_app_state)
+    monkeypatch.setattr(api_server, "get_uvicorn_log_config", lambda args: None)
+
+    with pytest.raises(RuntimeError, match="HTTP startup failed"):
+        await api_server.omni_run_server_worker("127.0.0.1:0", sock, _server_worker_args())
+
+    assert sock.closed
+    assert events.index("storage_start") < events.index("serve_http") < events.index("storage_stop")
+    assert events.index("storage_stop") < events.index("engine_exit")
+
+
+@pytest.mark.asyncio
+async def test_server_worker_stops_partially_started_storage(monkeypatch):
+    events: list[str] = []
+    sock = FakeServerSocket()
+
+    class FakeEngine:
+        stage_configs = []
+
+        async def get_supported_tasks(self):
+            return ("generate",)
+
+    @asynccontextmanager
+    async def fake_build_async_omni(*args, **kwargs):
+        del args, kwargs
+        events.append("engine_enter")
+        try:
+            yield FakeEngine()
+        finally:
+            events.append("engine_exit")
+
+    async def fake_storage_start():
+        events.append("storage_start")
+        raise RuntimeError("storage startup failed after partial initialization")
+
+    async def fake_storage_stop():
+        events.append("storage_stop")
+
+    async def fail_serve_http(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("HTTP server must not start")
+
+    async def fake_get_vllm_config(engine_client):
+        del engine_client
+        return None
+
+    async def fake_init_app_state(engine_client, state, args):
+        del engine_client, state, args
+
+    monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
+    monkeypatch.setattr(api_server, "build_openai_app", lambda args, supported_tasks: FastAPI())
+    monkeypatch.setattr(api_server, "serve_http", fail_serve_http)
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "stop", fake_storage_stop)
+    monkeypatch.setattr(api_server, "_get_vllm_config", fake_get_vllm_config)
+    monkeypatch.setattr(api_server, "omni_init_app_state", fake_init_app_state)
+    monkeypatch.setattr(api_server, "get_uvicorn_log_config", lambda args: None)
+
+    with pytest.raises(RuntimeError, match="storage startup failed"):
+        await api_server.omni_run_server_worker("127.0.0.1:0", sock, _server_worker_args())
+
+    assert sock.closed
+    assert events == ["engine_enter", "storage_start", "storage_stop", "engine_exit"]
 
 
 @pytest.fixture
@@ -282,9 +434,15 @@ def test_client():
     app.state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
         diffusion_engine=FakeAsyncOmni(),
         model_name="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+        allow_shared_memory=True,
     )
     with TestClient(app) as client:
         yield client
+
+
+def _set_video_output_transport(test_client: TestClient, config: VideoOutputTransportConfig) -> None:
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.video_output_transport = config
 
 
 def _make_test_image_bytes(size=(64, 64)) -> bytes:
@@ -373,7 +531,6 @@ def test_async_video_generation_bypasses_base64(test_client, mocker: MockerFixtu
         return_value=b"raw-mp4-bytes",
     )
 
-    # We assert that encode_video_base64 is never called
     mock_base64 = mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
         side_effect=RuntimeError("Regression: async video path should not base64 encode"),
@@ -389,6 +546,51 @@ def test_async_video_generation_bypasses_base64(test_client, mocker: MockerFixtu
     # Wait for completion. If it used base64, the RuntimeError would fail the task
     _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
     mock_base64.assert_not_called()
+
+
+def test_async_video_generation_records_webm_artifact(test_client, mocker: MockerFixture):
+    _set_video_output_transport(test_client, VideoOutputTransportConfig(output_format="webm"))
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"encoded-webm",
+    )
+
+    response = test_client.post("/v1/videos", data={"prompt": "async webm"})
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    completed = _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    assert completed["media_type"] == "video/webm"
+    assert completed["file_name"] == f"{video_id}.webm"
+    content = test_client.get(f"/v1/videos/{video_id}/content")
+    assert content.status_code == 200
+    assert content.headers["content-type"] == "video/webm"
+    assert content.content == b"encoded-webm"
+
+
+def test_async_published_storage_redirect_keeps_artifact_suffix(test_client, tmp_path, mocker: MockerFixture):
+    manager = LocalStorageTTLManager(
+        storage_path=str(tmp_path / "published-storage"),
+        ttl_seconds=60,
+        sweep_interval_seconds=10,
+        public_base_url="https://cdn.example.com/videos",
+    )
+    mocker.patch.object(api_server, "STORAGE_MANAGER", manager)
+    _set_video_output_transport(test_client, VideoOutputTransportConfig(output_format="webm"))
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"encoded-webm",
+    )
+
+    response = test_client.post("/v1/videos", data={"prompt": "published webm"})
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    completed = _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+    assert completed["file_name"] == f"{video_id}.webm"
+    content = test_client.get(f"/v1/videos/{video_id}/content", follow_redirects=False)
+    assert content.status_code == 307
+    assert content.headers["location"] == f"https://cdn.example.com/videos/{video_id}.webm"
 
 
 def test_async_video_generation_with_audio_bypasses_base64(test_client, mocker: MockerFixture):
@@ -1304,9 +1506,11 @@ def test_audio_sample_rate_comes_from_model_config(test_client, mocker: MockerFi
         audio=None,
         audio_sample_rate=None,
         video_codec_options=None,
+        video_codec=None,
+        output_format=None,
         frame_converter=None,
     ):
-        del video, fps, audio, video_codec_options, frame_converter
+        del video, fps, audio, video_codec_options, video_codec, output_format, frame_converter
         audio_sample_rates.append(audio_sample_rate)
         return b"fake-video"
 
@@ -1712,7 +1916,7 @@ def test_failed_generation_awaits_storage_cleanup(test_client, isolated_video_ba
     failed = _wait_for_status(test_client, video_id, VideoGenerationStatus.FAILED.value)
     assert failed["error"]["code"] == 500
     assert "GPU exploded" in failed["error"]["message"]
-    delete_spy.assert_called_once_with(video_id)
+    delete_spy.assert_called_once_with(f"{video_id}.mp4")
 
 
 def test_async_guardrail_error_returns_400_on_retrieve(test_client, mocker: MockerFixture):
@@ -1881,7 +2085,7 @@ def test_delete_completed_job_removes_file_and_metadata(test_client, mocker: Moc
     final = _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
     file_name = final["file_name"]
     assert file_name is not None
-    file_path = os.path.join(api_server.STORAGE_MANAGER.storage_path, video_id)
+    file_path = os.path.join(api_server.STORAGE_MANAGER.storage_path, file_name)
     assert os.path.exists(file_path)
 
     delete_resp = test_client.delete(f"/v1/videos/{video_id}")
@@ -1906,7 +2110,7 @@ def test_download_completed_job_uses_storage_open_and_download_name(test_client,
     file_name = final["file_name"]
     assert file_name == f"{video_id}.mp4"
 
-    storage_path = os.path.join(api_server.STORAGE_MANAGER.storage_path, video_id)
+    storage_path = os.path.join(api_server.STORAGE_MANAGER.storage_path, file_name)
     assert os.path.exists(storage_path)
 
     response = test_client.get(f"/v1/videos/{video_id}/content")
@@ -1950,8 +2154,9 @@ def test_video_response_file_extension_is_robust():
     )
     assert with_params.file_extension == "mp4"
 
-    webm = VideoResponse.model_construct(
+    webm = VideoResponse(
         model="test-model",
+        prompt="Make a WebM video",
         media_type="video/webm",
     )
     assert webm.file_extension == "webm"
@@ -2445,3 +2650,370 @@ def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: 
     assert response.status_code == 200
     assert response.content == b"fps-multiplied"
     assert fps_values == [16]
+
+
+def test_sync_base64_transport_preserves_multiple_outputs(test_client, mocker: MockerFixture):
+    _set_video_output_transport(test_client, VideoOutputTransportConfig(transport_mode="base64"))
+    expected = [base64.b64encode(value).decode() for value in (b"encoded-video-1", b"encoded-video-2")]
+    encode_base64 = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
+        side_effect=expected,
+    )
+    to_thread = mocker.spy(asyncio, "to_thread")
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "base64 output", "num_outputs_per_prompt": "2"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert [item["b64_json"] for item in response.json()["data"]] == expected
+    assert sum(call.args[0] is encode_base64 for call in to_thread.call_args_list) == 2
+
+
+def test_async_endpoint_rejects_immediate_transport_before_generation(test_client, mocker: MockerFixture):
+    _set_video_output_transport(test_client, VideoOutputTransportConfig(transport_mode="base64"))
+    run = mocker.patch.object(OmniOpenAIServingVideo, "_run_and_extract", new=mocker.AsyncMock())
+
+    response = test_client.post("/v1/videos", data={"prompt": "invalid async transport"})
+
+    assert response.status_code == 400
+    assert "only supported by POST /v1/videos/sync" in response.json()["detail"]
+    run.assert_not_awaited()
+
+
+@pytest.mark.parametrize("field", ["transport_mode", "shared_memory_ttl_seconds"])
+def test_request_rejects_deployment_only_transport_overrides_before_generation(
+    test_client,
+    mocker: MockerFixture,
+    field: str,
+):
+    run = mocker.patch.object(OmniOpenAIServingVideo, "_run_and_extract", new=mocker.AsyncMock())
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "invalid request override", "extra_params": json.dumps({field: "invalid"})},
+    )
+
+    assert response.status_code == 400
+    assert f"{field} may only be configured at deployment time" in response.json()["detail"]
+    run.assert_not_awaited()
+
+
+def test_sync_rejects_incompatible_codec_before_generation(test_client, mocker: MockerFixture):
+    run = mocker.patch.object(OmniOpenAIServingVideo, "_run_and_extract", new=mocker.AsyncMock())
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "invalid codec",
+            "extra_params": json.dumps({"output_format": "webm", "video_codec": "h264"}),
+        },
+    )
+
+    assert response.status_code == 400
+    assert "incompatible with 'webm'" in response.json()["detail"]
+    run.assert_not_awaited()
+
+
+def test_sync_url_transport_requires_expiring_storage_before_generation(
+    test_client,
+    isolated_video_backends,
+    mocker: MockerFixture,
+):
+    _set_video_output_transport(test_client, VideoOutputTransportConfig(transport_mode="url"))
+    _store, _tasks, storage = isolated_video_backends
+    mocker.patch.object(storage_module, "STORAGE_MANAGER", storage)
+    run = mocker.patch.object(OmniOpenAIServingVideo, "_run_and_extract", new=mocker.AsyncMock())
+
+    response = test_client.post("/v1/videos/sync", data={"prompt": "unsafe url output"})
+
+    assert response.status_code == 503
+    assert "requires storage expiration" in response.json()["detail"]
+    run.assert_not_awaited()
+    assert not list(Path(storage.storage_path).iterdir())
+
+
+def test_sync_url_transport_returns_retrievable_artifact(test_client, tmp_path, mocker: MockerFixture):
+    manager = LocalStorageTTLManager(
+        storage_path=str(tmp_path / "url-storage"),
+        ttl_seconds=60,
+        sweep_interval_seconds=10,
+    )
+    mocker.patch.object(api_server, "STORAGE_MANAGER", manager)
+    mocker.patch.object(storage_module, "STORAGE_MANAGER", manager)
+    _set_video_output_transport(
+        test_client,
+        VideoOutputTransportConfig(transport_mode="url", output_format="webm"),
+    )
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"encoded-webm",
+    )
+
+    response = test_client.post("/v1/videos/sync", data={"prompt": "url output"})
+
+    assert response.status_code == 200
+    url = response.json()["data"][0]["url"]
+    assert url.startswith("/v1/videos/artifacts/")
+    assert url.endswith(".webm")
+    artifact = test_client.get(url)
+    assert artifact.status_code == 200
+    assert artifact.headers["content-type"] == "video/webm"
+    assert artifact.content == b"encoded-webm"
+
+
+def test_sync_url_second_output_failure_removes_all_artifacts(test_client, tmp_path, mocker: MockerFixture):
+    manager = LocalStorageTTLManager(
+        storage_path=str(tmp_path / "url-storage"),
+        ttl_seconds=60,
+        sweep_interval_seconds=10,
+    )
+    mocker.patch.object(api_server, "STORAGE_MANAGER", manager)
+    mocker.patch.object(storage_module, "STORAGE_MANAGER", manager)
+    _set_video_output_transport(test_client, VideoOutputTransportConfig(transport_mode="url"))
+    engine = test_client.app.state.openai_serving_video._engine_client
+
+    async def _generate(prompt, request_id, sampling_params_list):
+        del prompt, request_id, sampling_params_list
+        yield MockVideoResult([object(), object()])
+
+    engine.generate = _generate
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        side_effect=[b"first", b"second"],
+    )
+    real_save = manager.save
+    save_count = 0
+
+    async def save_then_fail(data, storage_key):
+        nonlocal save_count
+        save_count += 1
+        result = await real_save(data, storage_key)
+        if save_count == 2:
+            raise RuntimeError("second storage publication failed")
+        return result
+
+    mocker.patch.object(manager, "save", side_effect=save_then_fail)
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "two URL outputs", "num_outputs_per_prompt": "2"},
+    )
+
+    assert response.status_code == 500
+    assert save_count == 2
+    assert not list(Path(manager.storage_path).iterdir())
+
+
+@pytest.mark.asyncio
+async def test_url_transport_cancellation_removes_partially_published_artifacts(
+    test_client,
+    tmp_path,
+    mocker: MockerFixture,
+):
+    manager = LocalStorageTTLManager(
+        storage_path=str(tmp_path / "url-storage"),
+        ttl_seconds=60,
+        sweep_interval_seconds=10,
+    )
+    mocker.patch.object(storage_module, "STORAGE_MANAGER", manager)
+    handler = test_client.app.state.openai_serving_video
+    handler._engine_client.video_output_transport = VideoOutputTransportConfig(transport_mode="url")
+
+    async def _generate(prompt, request_id, sampling_params_list):
+        del prompt, request_id, sampling_params_list
+        yield MockVideoResult([object(), object()])
+
+    handler._engine_client.generate = _generate
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        side_effect=[b"first", b"second"],
+    )
+    real_save = manager.save
+    second_save_started = asyncio.Event()
+    save_count = 0
+
+    async def save_then_block(data, storage_key):
+        nonlocal save_count
+        save_count += 1
+        result = await real_save(data, storage_key)
+        if save_count == 2:
+            second_save_started.set()
+            await asyncio.Future()
+        return result
+
+    mocker.patch.object(manager, "save", side_effect=save_then_block)
+    task = asyncio.create_task(
+        handler.generate_videos(
+            VideoGenerationRequest(prompt="cancel URL output", num_outputs_per_prompt=2),
+            "cancel-url",
+        )
+    )
+
+    await asyncio.wait_for(second_save_started.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert not list(Path(manager.storage_path).iterdir())
+
+
+def test_sync_shared_memory_transport_returns_releasable_frames(test_client, mocker: MockerFixture):
+    frames = np.arange(4 * 8 * 8 * 3, dtype=np.uint8).reshape(4, 8, 8, 3)
+    _set_video_output_transport(
+        test_client,
+        VideoOutputTransportConfig(transport_mode="shared_memory", shared_memory_ttl_seconds=30),
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+
+    async def _generate(prompt, request_id, sampling_params_list):
+        del prompt, request_id, sampling_params_list
+        yield MockVideoResult([frames])
+
+    engine.generate = _generate
+    to_thread = mocker.spy(asyncio, "to_thread")
+    response = test_client.post("/v1/videos/sync", data={"prompt": "shared output"})
+
+    assert response.status_code == 200
+    assert any(call.args[0].__name__ == "_publish_shared_memory_video" for call in to_thread.call_args_list)
+    payload = response.json()["data"][0]
+    assert payload["b64_json"] is None
+    assert payload["url"] is None
+    handle = payload["shm_handle"]
+    assert handle["schema_version"] == 1
+    with borrowed_video_frames(handle) as borrowed:
+        np.testing.assert_array_equal(borrowed, frames)
+
+
+def test_sync_shared_memory_second_output_failure_releases_first_handle(test_client, mocker: MockerFixture):
+    _set_video_output_transport(
+        test_client,
+        VideoOutputTransportConfig(transport_mode="shared_memory", shared_memory_ttl_seconds=30),
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+    frames = np.zeros((2, 8, 8, 3), dtype=np.uint8)
+
+    async def _generate(prompt, request_id, sampling_params_list):
+        del prompt, request_id, sampling_params_list
+        yield MockVideoResult([frames, frames])
+
+    engine.generate = _generate
+    created: list[VideoSharedMemoryHandle] = []
+
+    def fail_second_publish(video, ttl_seconds):
+        del video
+        if created:
+            raise RuntimeError("second publish failed")
+        handle = export_video_frames_to_shm(frames, ttl_seconds=ttl_seconds)
+        created.append(handle)
+        return handle
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._publish_shared_memory_video",
+        side_effect=fail_second_publish,
+    )
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "two shared outputs", "num_outputs_per_prompt": "2"},
+    )
+
+    assert response.status_code == 500
+    assert len(created) == 1
+    with pytest.raises(FileNotFoundError):
+        with borrowed_video_frames(created[0]):
+            pass
+
+
+def test_sync_shared_memory_rejects_requested_audio_before_generation(test_client, mocker: MockerFixture):
+    _set_video_output_transport(test_client, VideoOutputTransportConfig(transport_mode="shared_memory"))
+    run = mocker.patch.object(OmniOpenAIServingVideo, "_run_and_extract", new=mocker.AsyncMock())
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "audio and shared frames", "generate_sound": "true"},
+    )
+
+    assert response.status_code == 400
+    assert "does not support audio-bearing" in response.json()["detail"]
+    run.assert_not_awaited()
+
+
+def test_sync_shared_memory_transport_rejects_audio_without_publishing_handle(test_client, mocker: MockerFixture):
+    _set_video_output_transport(test_client, VideoOutputTransportConfig(transport_mode="shared_memory"))
+    engine = test_client.app.state.openai_serving_video._engine_client
+    frames = np.zeros((2, 8, 8, 3), dtype=np.uint8)
+
+    async def _generate(prompt, request_id, sampling_params_list):
+        del prompt, request_id, sampling_params_list
+        yield MockVideoResult([frames], audios=[np.zeros(160, dtype=np.float32)])
+
+    engine.generate = _generate
+    publish = mocker.patch("vllm_omni.entrypoints.openai.serving_video.export_video_frames_to_shm")
+
+    response = test_client.post("/v1/videos/sync", data={"prompt": "audio and shared frames"})
+
+    assert response.status_code == 400
+    assert "does not support audio-bearing" in response.json()["detail"]
+    publish.assert_not_called()
+
+
+def test_sync_shared_memory_transport_rejects_remote_binding_before_generation(
+    test_client,
+    mocker: MockerFixture,
+):
+    _set_video_output_transport(test_client, VideoOutputTransportConfig(transport_mode="shared_memory"))
+    handler = test_client.app.state.openai_serving_video
+    handler._allow_shared_memory = False
+    run = mocker.patch.object(handler, "_run_and_extract", new=mocker.AsyncMock())
+
+    response = test_client.post("/v1/videos/sync", data={"prompt": "remote shared output"})
+
+    assert response.status_code == 403
+    assert "loopback host" in response.json()["detail"]
+    run.assert_not_awaited()
+
+
+def test_sync_webm_bytes_uses_webm_media_type(test_client, mocker: MockerFixture):
+    _set_video_output_transport(test_client, VideoOutputTransportConfig(output_format="webm"))
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"encoded-webm",
+    )
+
+    response = test_client.post("/v1/videos/sync", data={"prompt": "webm bytes"})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "video/webm"
+    assert response.content == b"encoded-webm"
+
+
+def test_request_output_overrides_do_not_reach_model_extra_args(test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"encoded-webm",
+    )
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "separate transport policy",
+            "extra_params": json.dumps(
+                {
+                    "output_format": "webm",
+                    "video_codec": "libvpx-vp9",
+                    "video_codec_options": {"deadline": "realtime"},
+                    "model_option": 7,
+                }
+            ),
+        },
+    )
+
+    assert response.status_code == 200
+    captured = test_client.app.state.openai_serving_video._engine_client.captured_sampling_params_list[0]
+    assert captured.extra_args["model_option"] == 7
+    assert "output_format" not in captured.extra_args
+    assert "video_codec" not in captured.extra_args
+    assert "video_codec_options" not in captured.extra_args
