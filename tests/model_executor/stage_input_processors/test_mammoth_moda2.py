@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -11,11 +12,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _source_output(*, include_latent: bool = True):
-    multimodal_output = (
-        {"latent": torch.arange(32, dtype=torch.float32).reshape(4, 8)}
-        if include_latent
-        else {}
-    )
+    multimodal_output = {"latent": torch.arange(32, dtype=torch.float32).reshape(4, 8)} if include_latent else {}
     completion = SimpleNamespace(
         cumulative_token_ids=[100, 101, 102],
         multimodal_output=multimodal_output,

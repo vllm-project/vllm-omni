@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Stage input processor for MammothModa2 (AR -> diffusion)."""
 
 from collections.abc import Mapping
@@ -30,8 +33,7 @@ def ar2diffusion(
     del requires_multimodal_data
     if len(source_outputs) != 1:
         raise ValueError(
-            "MammothModa2 request-mode diffusion expects exactly one AR output, "
-            f"got {len(source_outputs)}"
+            f"MammothModa2 request-mode diffusion expects exactly one AR output, got {len(source_outputs)}"
         )
 
     ar_output = source_outputs[0]
