@@ -982,14 +982,23 @@ export FASTH3_LORA="${FASTH3_DIR}/dense-datafree/adapter_model.safetensors"
 
 Add `--task-type fl2va --lora-path "${FASTH3_LORA}"` to a server command. For a
 single GPU, the Dense / Data-Free variant may be combined with model-level CPU
-offload:
+offload. New configurations should use the component-selective API:
 
 ```bash
 --num-gpus 1 \
 --task-type fl2va \
---enable-cpu-offload \
+--diffusion-offload-config \
+'{"mode":"module","components":["dit","text_encoder"]}' \
 --lora-path "${FASTH3_LORA}"
 ```
+
+This compact configuration swaps the active DiT and text encoder while keeping
+the VAEs resident. The compatibility alias `--enable-cpu-offload` remains
+supported, but MiniMax-H3 uses it as a full-topology lifecycle that also stages
+the VAEs. The controlled single-A100 measurements below used that compatibility
+path, so they do not establish the compact selector's peak-HBM requirement.
+Choose the compatibility alias when the additional VAE staging is required for
+capacity; the two forms are not residency-equivalent.
 
 T2VA is served by the FL2VA partition, so `--task-type fl2va` is correct even
 though FastH3 preview v1 distills T2VA only. Because the adapter is fused,
@@ -1014,11 +1023,11 @@ is then held to its own metadata: one that misdeclares its tensor counts or
 leaves a transformer block unedited is refused at startup instead of serving
 mostly base H3 weights on a four-step schedule. Model-level CPU offload remains
 compatible because it uses the ordinary checkpoint loader, completes FastH3
-fusion and validation, and only then installs the offloader. Standard
-`--enable-layerwise-offload` and `--enable-distributed-layerwise-offload` can
-bypass that loading path, so they continue to fail fast. VSA plus model-level
-CPU offload is also rejected until that combination receives its own
-device-level validation.
+fusion and validation, and only then installs the offloader. Layer-mode
+configurations, including the legacy `--enable-layerwise-offload` and
+`--enable-distributed-layerwise-offload` aliases, continue to fail fast because
+their loading paths can bypass the fusion. VSA plus model-level CPU offload is
+also rejected until that combination receives its own device-level validation.
 
 When model-level CPU offload loads the base parameters on CPU, FastH3 computes
 each delta on the accelerator and copies the fused result back to the CPU

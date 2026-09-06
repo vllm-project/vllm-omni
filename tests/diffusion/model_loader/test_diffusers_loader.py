@@ -734,7 +734,7 @@ def test_dlo_transfers_loader_plan_and_skips_ordinary_weight_loading(monkeypatch
     assert loader.take_host_weight_plan() is None
 
 
-def test_model_cpu_offload_uses_ordinary_loader_without_host_weight_plan():
+def test_compact_model_cpu_offload_uses_ordinary_loader_without_host_weight_plan():
     od_config = OmniDiffusionConfig(
         model="",
         dtype=torch.float32,
@@ -743,7 +743,10 @@ def test_model_cpu_offload_uses_ordinary_loader_without_host_weight_plan():
             sequence_parallel_size=1,
             tensor_parallel_size=1,
         ),
-        enable_cpu_offload=True,
+        diffusion_offload_config={
+            "mode": "module",
+            "components": ["dit", "text_encoder"],
+        },
     )
     loader = DiffusersPipelineLoader(LoadConfig(), od_config)
     model = nn.Module()
