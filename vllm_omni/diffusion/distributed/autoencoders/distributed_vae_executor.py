@@ -181,6 +181,7 @@ class DistributedVaeMixin:
             self.distributed_executor.parallel_size <= 1
             or not dist.is_initialized()
             or not getattr(self, "use_tiling", False)
+            or self.distributed_executor.group is None
         ):
             return False
         world_size = dist.get_world_size(group=self.distributed_executor.group)

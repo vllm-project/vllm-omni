@@ -403,6 +403,16 @@ def load_stage_configs_from_model(
         base_engine_args = {}
 
     cli_overrides = _convert_dataclasses_to_dict(dict(base_engine_args))
+
+    # Flatten parallel_config into individual fields so they can override YAML values
+    if "parallel_config" in cli_overrides and cli_overrides["parallel_config"] is not None:
+        parallel_config_dict = cli_overrides.pop("parallel_config")
+        if isinstance(parallel_config_dict, dict):
+            # Add each parallel_config field as a top-level override
+            for key, value in parallel_config_dict.items():
+                if value is not None:
+                    cli_overrides[key] = value
+
     # A False inherited from the engine-args dump is the store_true flag's
     # default, not an explicit choice — drop it so only the tri-state
     # parameter below decides (see with_trust_remote_code_override).

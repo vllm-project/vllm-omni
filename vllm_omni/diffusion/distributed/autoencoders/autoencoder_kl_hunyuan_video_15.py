@@ -20,9 +20,25 @@ logger = init_logger(__name__)
 class DistributedAutoencoderKLHunyuanVideo15(AutoencoderKLHunyuanVideo15, DistributedVaeMixin):
     @classmethod
     def from_pretrained(cls, *args: Any, **kwargs: Any):
-        model = super().from_pretrained(*args, **kwargs)
+        # Load the base model first
+        # ruff: noqa: UP008
+        base_model = super(DistributedAutoencoderKLHunyuanVideo15, cls).from_pretrained(*args, **kwargs)
+        # Convert to our distributed class by copying state
+        model = cls.__new__(cls)
+        model.__dict__.update(base_model.__dict__)
+        # Initialize distributed executor
         model.init_distributed()
         return model
+
+    @property
+    def use_tiling(self) -> bool:
+        """Compatibility property for vLLM's distributed VAE executor."""
+        return getattr(self, "_use_tiling", False)
+
+    @use_tiling.setter
+    def use_tiling(self, value: bool) -> None:
+        """Compatibility property for vLLM's distributed VAE executor."""
+        self._use_tiling = value
 
     def tile_split(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
         _, _, _, height, width = z.shape
@@ -148,3 +164,19 @@ class DistributedAutoencoderKLHunyuanVideo15(AutoencoderKLHunyuanVideo15, Distri
             DistributedOperator(split=self.tile_split, exec=self.tile_exec, merge=self.tile_merge),
             broadcast_result=True,
         )
+
+    def decode(self, z: torch.Tensor, return_dict: bool = True) -> Any:
+        """Override decode to force distributed tiled decode when enabled."""
+        is_enabled = self.is_distributed_enabled()
+        if not is_enabled:
+            return super().decode(z, return_dict=return_dict)
+
+        # Force tiled decode when distributed is enabled
+        decoded = self.tiled_decode(z)
+
+        if not return_dict:
+            return (decoded,)
+
+        from diffusers.models.autoencoders.vae import DecoderOutput
+
+        return DecoderOutput(sample=decoded)

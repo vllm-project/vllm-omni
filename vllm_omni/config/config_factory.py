@@ -603,8 +603,22 @@ class StageConfigFactory:
         devices = "0"
         if "parallel_config" in kwargs:
             num_devices = kwargs["parallel_config"].world_size
-            for i in range(1, num_devices):
-                devices += f",{i}"
+            # Use actual device IDs from environment if available
+            import os
+
+            visible_devices_env = os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or os.environ.get("CUDA_VISIBLE_DEVICES")
+            if visible_devices_env and num_devices > 1:
+                # Parse comma-separated device IDs
+                available_device_ids = [d.strip() for d in visible_devices_env.split(",") if d.strip()]
+                if len(available_device_ids) >= num_devices:
+                    devices = ",".join(available_device_ids[:num_devices])
+                else:
+                    # Fallback to 0-indexed
+                    for i in range(1, num_devices):
+                        devices += f",{i}"
+            else:
+                for i in range(1, num_devices):
+                    devices += f",{i}"
 
         engine_args: dict[str, Any] = {}
         for key, value in kwargs.items():
