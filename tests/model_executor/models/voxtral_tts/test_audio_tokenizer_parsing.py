@@ -185,3 +185,77 @@ def test_cut_all_frames_returns_empty():
     result = apply_ctx_frames_cutting([audio], [ctx_frames], downsample_factor)
 
     assert result[0].numel() == 0
+
+
+# ──────────────────────────────────────────────────────────────────
+# decode_helper_batch_async dtype regression test (#4838)
+# ──────────────────────────────────────────────────────────────────
+
+
+@functools.lru_cache(maxsize=1)
+def _voxtral_tts_audio_tokenizer_cls():
+    from tests.model_executor.helpers import bootstrap_vllm_layer_custom_op_modules
+
+    bootstrap_vllm_layer_custom_op_modules()
+    import vllm.model_executor.models.utils  # noqa: F401
+
+    from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_tokenizer import (
+        VoxtralTTSAudioTokenizer,
+    )
+
+    return VoxtralTTSAudioTokenizer
+
+
+def _make_bare_audio_tokenizer(param_dtype: torch.dtype):
+    """Build a VoxtralTTSAudioTokenizer without running __init__.
+
+    __init__ requires a full VllmConfig + checkpoint, which is too heavy
+    for a CPU unit test. Instead we bypass it and set only the state
+    needed to exercise decode_helper_batch_async.
+    """
+    cls = _voxtral_tts_audio_tokenizer_cls()
+    tokenizer = cls.__new__(cls)
+    torch.nn.Module.__init__(tokenizer)
+    tokenizer.register_parameter("_dummy_param", torch.nn.Parameter(torch.zeros(1, dtype=param_dtype)))
+    tokenizer._sampling_rate = 24000
+    tokenizer._frame_rate = 24000 / 240  # -> downsample_factor == 240
+    return tokenizer
+
+
+def test_dtype_property_reflects_param_dtype():
+    """VoxtralTTSAudioTokenizer.dtype reflects the actual loaded parameter dtype."""
+    tokenizer = _make_bare_audio_tokenizer(torch.float16)
+    assert tokenizer.dtype == torch.float16
+
+
+def test_decode_helper_batch_async_uses_resolved_dtype_not_hardcoded(monkeypatch):
+    """Regression test for #4838.
+
+    decode_helper_batch_async previously hardcoded dtype=torch.bfloat16
+    when calling self.decode(...). This mismatched the tokenizer's actual
+    (e.g. float16) parameter dtype on GPUs without bfloat16 support, such
+    as Tesla T4, causing:
+        RuntimeError: expected scalar type BFloat16 but found Half
+
+    This verifies decode_helper_batch_async passes the tokenizer's
+    resolved `dtype` property to decode(), instead of a hardcoded value.
+    """
+    tokenizer = _make_bare_audio_tokenizer(torch.float16)
+    seen_dtypes = []
+
+    def fake_decode(codes, dtype=torch.float32):
+        seen_dtypes.append(dtype)
+        b, _, t = codes.shape
+        return torch.zeros(b, 1, t * tokenizer.downsample_factor)
+
+    monkeypatch.setattr(tokenizer, "decode", fake_decode)
+
+    num_codebooks = 4
+    non_eoa_row = torch.zeros(num_codebooks, dtype=torch.long)
+    eoa_row = torch.zeros(num_codebooks, dtype=torch.long)
+    eoa_row[0] = 1
+    codes = torch.stack([non_eoa_row, eoa_row])  # [T=2, K]
+
+    tokenizer.decode_helper_batch_async([codes])
+
+    assert seen_dtypes == [torch.float16]
