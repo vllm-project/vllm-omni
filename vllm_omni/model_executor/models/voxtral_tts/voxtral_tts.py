@@ -126,6 +126,7 @@ class VoxtralTTSForConditionalGeneration(
             self.audio_tokenizer = None
             self._cudagraph_acoustic_transformer = None
             self._vllm_config = vllm_config
+            self._cfg_alpha_cache: dict[tuple, torch.Tensor] = {}
             tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
             self._audio_token_id = tokenizer.instruct.audio_encoder.special_ids.audio
             speaker_id = config.audio_config.get("speaker_id", None)
@@ -316,6 +317,10 @@ class VoxtralTTSForConditionalGeneration(
             )
 
     _DEFAULT_CFG_ALPHA = 1.2
+    # Memoized tensors are keyed by (device, dtype, B, values). The values only
+    # change when the batch composition changes, so a small bound suffices;
+    # cleared wholesale once full to stay bounded.
+    _CFG_ALPHA_CACHE_LIMIT = 64
 
     def _extract_cfg_alpha(self, input_hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
         """Extract per-request cfg_alpha from sampling_extra_args.
@@ -324,20 +329,30 @@ class VoxtralTTSForConditionalGeneration(
         Falls back to default if sampling_extra_args is missing or incomplete.
         """
         B = input_hidden_states.shape[0]
+        device = input_hidden_states.device
+        dtype = input_hidden_states.dtype
         sampling_extra_args = kwargs.get("sampling_extra_args")
         if sampling_extra_args is None:
-            return torch.full(
-                (B,),
-                self._DEFAULT_CFG_ALPHA,
-                device=input_hidden_states.device,
-                dtype=input_hidden_states.dtype,
-            )
-        cfg_alpha_values = [ea.get("cfg_alpha", self._DEFAULT_CFG_ALPHA) for ea in sampling_extra_args]
-        return torch.tensor(
-            cfg_alpha_values,
-            device=input_hidden_states.device,
-            dtype=input_hidden_states.dtype,
-        )
+            cfg_alpha_values: tuple[float, ...] = ()
+        else:
+            cfg_alpha_values = tuple(ea.get("cfg_alpha", self._DEFAULT_CFG_ALPHA) for ea in sampling_extra_args)
+
+        # make_omni_output runs on every AR step; rebuilding the tensor there
+        # would issue an H2D copy per step for values that only change when the
+        # batch composition changes. Consumers only read the tensor
+        # (decode_one_frame broadcasts it; the CUDA graph wrapper copies it
+        # into a static buffer), so handing out the cached one is safe.
+        key = (device, dtype, B, cfg_alpha_values)
+        cfg_alpha = self._cfg_alpha_cache.get(key)
+        if cfg_alpha is None:
+            if len(self._cfg_alpha_cache) >= self._CFG_ALPHA_CACHE_LIMIT:
+                self._cfg_alpha_cache.clear()
+            if cfg_alpha_values:
+                cfg_alpha = torch.tensor(cfg_alpha_values, device=device, dtype=dtype)
+            else:
+                cfg_alpha = torch.full((B,), self._DEFAULT_CFG_ALPHA, device=device, dtype=dtype)
+            self._cfg_alpha_cache[key] = cfg_alpha
+        return cfg_alpha
 
     def make_omni_output(
         self, model_outputs: torch.Tensor | OmniOutput | tuple, logits_index: int | None = None, **kwargs
