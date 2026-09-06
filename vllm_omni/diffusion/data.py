@@ -100,7 +100,9 @@ def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]
     return normalized
 
 
-def validate_host_weight_runtime_options(*, mode: object, root: object) -> None:
+def validate_host_weight_runtime_options(
+    *, mode: object, root: object, validation: object = "manifest_and_metadata"
+) -> None:
     """Validate HWR policy without touching the configured storage domain.
 
     Filesystem locality and store construction belong to the eligible loader
@@ -109,6 +111,8 @@ def validate_host_weight_runtime_options(*, mode: object, root: object) -> None:
     """
     if mode not in {"disabled", "preferred", "required"}:
         raise ValueError("host_weight_runtime_mode must be disabled, preferred, or required")
+    if validation not in ("manifest_and_metadata", "full_checksum"):
+        raise ValueError("host_weight_runtime_validation must be manifest_and_metadata or full_checksum")
     if mode != "disabled" and (not isinstance(root, str) or not root.strip()):
         raise ValueError("enabled Host Weight Runtime requires host_weight_runtime_root")
 
@@ -831,6 +835,7 @@ class OmniDiffusionConfig:
     # existing loader/storage path.
     host_weight_runtime_mode: str = "disabled"
     host_weight_runtime_root: str | None = None
+    host_weight_runtime_validation: str = "manifest_and_metadata"
     # Optional per-worker ceiling for registering final-layout HWR mappings.
     # Zero adds no ceiling; pin_cpu_memory controls whether registration is tried.
     dlo_host_registration_limit_gib: float = 0.0
@@ -1241,6 +1246,7 @@ class OmniDiffusionConfig:
         validate_host_weight_runtime_options(
             mode=self.host_weight_runtime_mode,
             root=self.host_weight_runtime_root,
+            validation=self.host_weight_runtime_validation,
         )
         self.dlo_host_registration_limit_gib = validate_dlo_host_registration_options(
             limit_gib=self.dlo_host_registration_limit_gib,
