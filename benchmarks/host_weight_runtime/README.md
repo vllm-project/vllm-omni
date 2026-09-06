@@ -2,7 +2,11 @@
 
 `safetensors_retention.py` isolates repeated CPU `get_tensor()` calls from
 access to one cached tensor view. It imports neither vLLM nor HWR and uses a
-synthetic 16-element float32 payload. HWR itself calls `get_tensor()` when
+synthetic float32 payload controlled by `--tensor-elements` (default: 64).
+Tensor size can affect retention: a negative result for 16 elements does not
+rule out growth for 64 elements. The selected size is recorded in the JSON
+arguments and used for both file creation and the correctness check.
+HWR itself calls `get_tensor()` when
 acquiring a lease, then exposes cached views; this probe does not measure HWR
 requests or repeated lease acquisition.
 
@@ -18,14 +22,18 @@ CUDA_VISIBLE_DEVICES='' taskset -c 0 timeout 120s python \
   --mode get_tensor --iterations 10000 --sample-every 5000 > feasibility.json
 ```
 
-For a comparison, run each mode twice in fresh processes with the same controls:
+For a size comparison, run 16 and 64 elements twice each in fresh processes,
+with cached reuse as a control at both sizes:
 
 ```bash
 for repetition in 1 2; do
-  for mode in get_tensor reuse; do
-    CUDA_VISIBLE_DEVICES='' taskset -c 0 timeout 120s python \
-      benchmarks/host_weight_runtime/safetensors_retention.py \
-      --mode "$mode" > "$mode-$repetition.json"
+  for elements in 16 64; do
+    for mode in get_tensor reuse; do
+      CUDA_VISIBLE_DEVICES='' taskset -c 0 timeout 120s python \
+        benchmarks/host_weight_runtime/safetensors_retention.py \
+        --mode "$mode" --tensor-elements "$elements" \
+        > "$mode-$elements-$repetition.json"
+    done
   done
 done
 ```
