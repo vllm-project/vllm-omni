@@ -136,3 +136,7 @@ platforms:
       - stage_id: 1
         compilation_config:
           cudagraph_mode: PIECEWISE
+        additional_config:
+          # Qwen3-TTS Code2Wav decoder compute dtype on NPU.
+          # Supported values: fp32, bf16, fp16. Defaults to fp16.
+          code2wav_dtype: fp16
