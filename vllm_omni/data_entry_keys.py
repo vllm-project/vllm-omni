@@ -86,6 +86,9 @@ class OmniPayloadMeta(TypedDict, total=False):
     next_stage_generation_tokens: int
     replace_streaming_prompt: bool
     next_stage_prompt_ids: list[int]
+    streaming_prompt_recompute: bool
+    streaming_condition_seq: int
+    replace_runtime_additional_information: bool
     ar_width: int
     eol_token_id: int
     visual_token_start_id: int
@@ -196,6 +199,9 @@ class MetaStruct(_StructBase):
     next_stage_generation_tokens: int | None = None
     replace_streaming_prompt: bool | None = None
     next_stage_prompt_ids: list[int] | None = None
+    streaming_prompt_recompute: bool | None = None
+    streaming_condition_seq: int | None = None
+    replace_runtime_additional_information: bool | None = None
     ar_width: int | None = None
     eol_token_id: int | None = None
     visual_token_start_id: int | None = None
@@ -388,31 +394,26 @@ def _serialize_tensor(t: torch.Tensor) -> AdditionalInformationEntry:
     from vllm_omni.engine import AdditionalInformationEntry
 
     t_cpu = t.detach().to("cpu").contiguous()
-    try:
-        tensor_data = t_cpu.numpy().tobytes()
-    except TypeError:
-        # numpy has no equivalent for some torch dtypes (bfloat16, float8_*).
-        # Fall back to a raw byte view; _deserialize_tensor reconstructs via torch.
-        tensor_data = t_cpu.view(torch.uint8).numpy().tobytes()
     return AdditionalInformationEntry(
-        tensor_data=tensor_data,
+        tensor_data=t_cpu.flatten().view(torch.uint8).numpy().tobytes(),
         tensor_shape=list(t_cpu.shape),
         tensor_dtype=_dtype_to_name(t_cpu.dtype),
     )
 
 
 def _deserialize_tensor(entry: AdditionalInformationEntry) -> torch.Tensor:
-    name = entry.tensor_dtype or "float32"
-    try:
-        dt = np.dtype(name)
-        arr = np.frombuffer(entry.tensor_data, dtype=dt)  # type: ignore[arg-type]
-        return torch.from_numpy(arr.copy().reshape(entry.tensor_shape))
-    except TypeError:
-        # numpy can't represent this dtype (bfloat16, float8_*): reconstruct from
-        # the raw byte view written by _serialize_tensor.
-        torch_dtype = getattr(torch, name)
-        flat = torch.frombuffer(bytearray(entry.tensor_data), dtype=torch_dtype)
-        return flat.reshape(entry.tensor_shape).clone()
+    dtype_name = entry.tensor_dtype or "float32"
+    dtype = getattr(torch, dtype_name, None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"Unsupported tensor dtype: {dtype_name}")
+
+    if entry.tensor_shape is None:
+        raise ValueError("Tensor shape is required")
+    if not entry.tensor_data:
+        return torch.empty(0, dtype=dtype).reshape(entry.tensor_shape)
+
+    data = torch.frombuffer(bytearray(entry.tensor_data), dtype=torch.uint8)
+    return data.view(dtype).reshape(entry.tensor_shape)
 
 
 def serialize_payload(

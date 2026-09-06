@@ -364,6 +364,7 @@ class OmniConnectorModelRunnerMixin:
                 emitted_frames = getattr(self, "_qwen3_omni_emitted_frames", None)
                 if emitted_frames is not None:
                     emitted_frames.pop(k, None)
+                self._adaptive_states.pop(k, None)
             self._kv_pending_transfers.pop(req_id, None)
             self._kv_active_transfers.discard(req_id)
             self._kv_completed_transfers.discard(req_id)

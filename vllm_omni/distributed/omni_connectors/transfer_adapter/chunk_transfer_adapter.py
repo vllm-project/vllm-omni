@@ -7,8 +7,7 @@ import inspect
 import threading
 import time
 from collections import defaultdict, deque
-from collections.abc import Callable, Mapping
-from copy import copy
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 import torch
@@ -143,7 +142,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             module_path, func_name = custom_process_next_stage_input_func.rsplit(".", 1)
             module = importlib.import_module(module_path)
             self.custom_process_next_stage_input_func = getattr(module, func_name)
-            self.custom_prepare_next_stage_input_func = getattr(module, f"{func_name}_prepare", None)
+        self._processor_accepts_step_tokens: dict[Callable[..., Any], bool] = {}
         # mapping for request id and chunk id
         self.put_req_chunk: dict[str, int] = defaultdict(int)
         self.get_req_chunk: dict[str, int] = defaultdict(int)
@@ -237,6 +236,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 frozen_ids = token_ids.copy()
                 setattr(snapshot, private_name, frozen_ids)
                 setattr(snapshot, public_name, ConstantList(frozen_ids))
+                if public_name == "output_token_ids":
+                    snapshot.output_token_count = len(frozen_ids)
         return snapshot
 
     @staticmethod
@@ -362,60 +363,78 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
         self._segment_generation[external_req_id] = generation
 
-        prepared_payload = None
-        if self.custom_prepare_next_stage_input_func is not None:
-            try:
-                prepared_payload = self.custom_prepare_next_stage_input_func(
-                    transfer_manager=self,
-                    multimodal_output=unflatten_payload(multimodal_output)
-                    if isinstance(multimodal_output, Mapping)
-                    else multimodal_output,
-                    request=request,
-                    is_finished=is_segment_finished,
-                )
-            except Exception as e:
-                logger.error(f"Failed to use custom_prepare_input_func for payload extraction: {e}")
-            if prepared_payload is None and not (is_segment_finished or is_finished):
-                return
-
-        self.requests_num_chunks_sent[request.external_req_id] = confirmed_num_computed_tokens
+        if confirmed_num_computed_tokens is None:
+            confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
+        processor_request = (
+            self._snapshot_processor_request(request) if self.custom_process_next_stage_input_func else request
+        )
         task = {
             "multimodal_output": multimodal_output,
-            "request": self._snapshot_request_for_background_send(request),
+            "request": processor_request,
             "is_finished": is_finished,
             "is_segment_finished": is_segment_finished,
-            "prepared_payload": prepared_payload,
-            "confirmed_num_computed_tokens": confirmed_num_computed_tokens,
+            "new_token_ids": tuple(int(token_id) for token_id in (new_token_ids or ())),
+            "segment_generation": generation,
+            "prepared_payload": None,
         }
-        self._enqueue_save_task(task)
 
-    @staticmethod
-    def _snapshot_request_for_background_send(request: Request) -> Request:
-        """Freeze request state paired with one deferred model output.
+        reject_reason = None
+        with self._sender_state_lock:
+            sender_token = self._sender_tokens.get(external_req_id)
+            if sender_token is not None and sender_token.cancelled:
+                reject_reason = "previous sender generation is still draining"
+            # If the request is preempted, skip the already saved chunks.
+            elif not is_segment_finished and confirmed_num_computed_tokens < self.requests_num_chunks_sent.get(
+                external_req_id, 0
+            ):
+                logger.warning(
+                    f"Enqueue save_async for request {external_req_id}, "
+                    f"request.num_computed_tokens={request.num_computed_tokens}, "
+                    f"request.num_output_placeholders={getattr(request, 'num_output_placeholders', 0)}, "
+                    f"previous_chunks_sent={self.requests_num_chunks_sent.get(external_req_id, 0)}"
+                )
+                return
 
-        The scheduler may advance the live request before the save thread builds
-        its payload. Keep identity/configuration by shallow copy, but detach the
-        mutable token histories used to align model-output rows.
-        """
-        snapshot = copy(request)
-        for public_name, private_name in (
-            ("prompt_token_ids", None),
-            ("output_token_ids", "_output_token_ids"),
-            ("all_token_ids", "_all_token_ids"),
-        ):
-            values = getattr(request, public_name, None)
-            if values is None:
-                continue
-            frozen_values = list(values)
-            setattr(snapshot, public_name, frozen_values)
-            if private_name is not None and hasattr(snapshot, private_name):
-                setattr(snapshot, private_name, frozen_values)
-
-        snapshot.output_token_count = len(getattr(snapshot, "output_token_ids", ()) or ())
-        return snapshot
-
-    def _enqueue_save_task(self, task: dict[str, Any]) -> None:
-        self._pending_save_reqs.append(task)
+            else:
+                prepared_payload = None
+                if self.custom_prepare_next_stage_input_func is not None:
+                    try:
+                        prepared_payload = self.custom_prepare_next_stage_input_func(
+                            transfer_manager=self,
+                            multimodal_output=unflatten_payload(multimodal_output)
+                            if isinstance(multimodal_output, Mapping)
+                            else multimodal_output,
+                            request=request,
+                            is_finished=is_segment_finished or is_finished,
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to use custom_prepare_input_func for payload extraction: {e}")
+                    if prepared_payload is None and not (is_segment_finished or is_finished):
+                        return
+                task["prepared_payload"] = prepared_payload
+                self.requests_num_chunks_sent[external_req_id] = confirmed_num_computed_tokens
+                if sender_token is None:
+                    sender_token = _SenderGeneration()
+                    self._sender_tokens[external_req_id] = sender_token
+                task["sender_token"] = sender_token
+                self._pending_save_reqs.append(task)
+                if is_segment_finished:
+                    # The queued FIFO item now owns the old segment. Start the next
+                    # segment's deduplication watermark before the worker sends it.
+                    # Only advance past the current generation when the producer
+                    # maintains a request-side counter that can catch up. On paths
+                    # where the request carries no `_omni_segment_generation`, a
+                    # speculative +1 makes every subsequent frame look stale and
+                    # starves the stream permanently (see #6816).
+                    if getattr(request, "_omni_segment_generation", None) is not None:
+                        self._segment_generation[external_req_id] = generation + 1
+                    else:
+                        self._segment_generation[external_req_id] = generation
+                    self.requests_num_chunks_sent.pop(external_req_id, None)
+        if reject_reason is not None:
+            logger.error("Cannot enqueue %s: %s", external_req_id, reject_reason)
+            self.record_send_failure(request.request_id, reject_reason)
+            return
         with self._save_cond:
             self._save_cond.notify()
 
@@ -655,15 +674,23 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if self.custom_process_next_stage_input_func:
             try:
                 if payload_data is None:
-                    payload_data = self.custom_process_next_stage_input_func(
-                        transfer_manager=self,
-                        multimodal_output=multimodal_output,
-                        request=request,
+                    processor = self.custom_process_next_stage_input_func
+                    processor_kwargs = {
+                        "transfer_manager": self,
+                        "multimodal_output": multimodal_output,
+                        "request": request,
                         # Existing processors use is_finished as a flush signal.
-                        # Terminal stops no longer count as segment boundaries,
-                        # but processors must still flush their accumulated tail.
-                        is_finished=is_segment_finished or is_finished,
-                    )
+                        # Terminal stops no longer count as segment boundaries
+                        # (is_segment_finished is False when the request finishes,
+                        # see #5383), but the processor must still flush its
+                        # accumulated tail on the terminal chunk — otherwise the
+                        # downstream stage receives the finished marker without
+                        # the final payload (#5413).
+                        "is_finished": is_segment_finished or is_finished,
+                    }
+                    if self._accepts_new_token_ids(processor):
+                        processor_kwargs["new_token_ids"] = task.get("new_token_ids", ())
+                    payload_data = processor(**processor_kwargs)
 
             except Exception as e:
                 logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
@@ -688,12 +715,23 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
         if payload_data.meta.is_segment_finished is None:
             payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
+
+        if sender_token is not None and not self._sender_generation_is_active(external_req_id, sender_token):
+            logger.debug("Skipping cancelled chunk for request %s before connector put", external_req_id)
+            return
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
             put_key=connector_put_key,
             data=payload_data,
         )
+
+        if sender_token is not None and not self._sender_generation_is_active(external_req_id, sender_token):
+            # cleanup_sender() may cancel this generation while put() is
+            # blocked. Do not let that stale completion recreate state for a
+            # request whose cleanup is already in progress.
+            logger.debug("Ignoring completed put for cancelled request %s", external_req_id)
+            return
         if success:
             self.put_req_chunk[external_req_id] += 1
             self.ramp_chunk_count[external_req_id] += 1
@@ -741,7 +779,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             emitted_frames = getattr(self, "_qwen3_omni_emitted_frames", None)
             if emitted_frames is not None:
                 emitted_frames.pop(external_req_id, None)
-            self.requests_num_chunks_sent.pop(external_req_id, None)
             self.ramp_chunk_count.pop(external_req_id, None)
             self._adaptive_states.pop(external_req_id, None)
             cached_ic = getattr(self, "_cached_ic", None)
@@ -850,6 +887,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         emitted_frames = getattr(self, "_qwen3_omni_emitted_frames", None)
         if emitted_frames is not None:
             emitted_frames.pop(external_req_id, None)
+        self._adaptive_states.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
 
         cached_ic = getattr(self, "_cached_ic", None)
