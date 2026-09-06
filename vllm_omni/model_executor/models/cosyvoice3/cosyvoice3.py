@@ -484,6 +484,10 @@ class CosyVoice3Model(
             # KV cache is now managed externally by vLLM's PagedAttention
             # No need for self.llm_cache
             self.model = self.talker
+            # The talker consumes only llm.pt; without this override the
+            # default loader streams every *.pt in the model dir (flow.pt,
+            # hift.pt) into load_weights, whose keys belong to other stages.
+            self.allow_patterns_overrides = ["llm.pt"]
         elif self.model_stage == "cosyvoice3_code2wav":
             # Initialize code2wav stage (flow matching + vocoder)
             from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
@@ -1148,44 +1152,60 @@ class CosyVoice3Model(
         else:
             raise ValueError(f"Unsupported model_stage: {self.model_stage}")
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str] | None:
         if self.model_stage == "cosyvoice3_talker":
-            # Load weights for text to speech LM stage using vLLM's weight loading
-            llm_weight_path = os.path.join(self.model_dir, "llm.pt")
-            device = next(self.parameters()).device
-            checkpoint = torch.load(llm_weight_path, map_location=device)
-
-            # 1. Load Qwen2 model weights into vLLM's Qwen2Model
-            # The checkpoint has prefix "llm.model.model." for the transformer weights
-            # vLLM's Qwen2Model expects just the model structure without extra prefixes
-            qwen_weights = []
-            for name, weight in checkpoint.items():
-                if name.startswith("llm.model.model."):
-                    # Strip prefix: llm.model.model.X -> X (for vLLM's Qwen2Model)
-                    vllm_name = name.replace("llm.model.model.", "")
-                    qwen_weights.append((vllm_name, weight))
-
-            # Use vLLM's built-in load_weights which handles stacked params
-            # (q_proj+k_proj+v_proj -> qkv_proj, gate_proj+up_proj -> gate_up_proj)
-            self.model.llm.model.load_weights(iter(qwen_weights))
-
-            # 2. Load CosyVoice3LM-specific weights (speech_embedding, llm_decoder)
-            speech_emb_state = {
-                k.replace("speech_embedding.", ""): v
-                for k, v in checkpoint.items()
-                if k.startswith("speech_embedding.")
-            }
-            self.model.speech_embedding.load_state_dict(speech_emb_state)
-
-            llm_decoder_state = {
-                k.replace("llm_decoder.", ""): v for k, v in checkpoint.items() if k.startswith("llm_decoder.")
-            }
-            self.model.llm_decoder.load_state_dict(llm_decoder_state)
-
-            self.model.to(device).eval()
+            # Consume the provided iterator when it yields tensors; fall back
+            # to reading llm.pt from the model dir when it is empty (e.g. the
+            # dummy load format). Previously the iterator was silently
+            # discarded and the file was re-read on every call, so runtime
+            # weight updates (RL training loops, in-place reloads) were
+            # reverted to the on-disk checkpoint without any error.
+            weights = list(weights)
+            if weights:
+                self._load_talker_weights(weights)
+            elif not getattr(self, "_talker_weights_loaded", False):
+                llm_weight_path = os.path.join(self.model_dir, "llm.pt")
+                device = next(self.parameters()).device
+                checkpoint = torch.load(llm_weight_path, map_location=device)
+                self._load_talker_weights(checkpoint.items())
+                self.model.to(device)
+            self._talker_weights_loaded = True
+            self.model.eval()
         elif self.model_stage == "cosyvoice3_code2wav":
             # Load weights for code2wav stage (flow + hift)
             device = next(self.parameters()).device
             self.code2wav.load_weights(self.model_dir, device)
         else:
             raise ValueError(f"{self.model_stage} not supported yet!")
+        # None keeps the loader's strict loaded-weights tracking off: the
+        # tracker compares module-path parameter names, while this model
+        # consumes checkpoint-schema names (and deliberately leaves the
+        # unused text lm_head uninitialized on the talker stage).
+        return None
+
+    def _load_talker_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        """Load checkpoint-schema tensors into the live talker modules.
+
+        Names follow the native ``llm.pt`` layout: ``llm.model.model.*`` for
+        the transformer (loaded via vLLM's Qwen2 loader, which handles the
+        qkv_proj/gate_up_proj stacked params), ``speech_embedding.*`` and
+        ``llm_decoder.*`` for the talker-specific modules, and
+        ``llm.model.lm_head.*`` (the text head), which the talker never uses
+        and is skipped. Accepts the full checkpoint or any subset, e.g.
+        buckets streamed by a weight-update loop, and loads in place so
+        CUDA graphs stay valid.
+        """
+        qwen_weights: list[tuple[str, torch.Tensor]] = []
+        for name, tensor in weights:
+            if name.startswith("llm.model.model."):
+                qwen_weights.append((name[len("llm.model.model.") :], tensor))
+            elif name.startswith("speech_embedding.") or name.startswith("llm_decoder."):
+                module_name, _, attr = name.partition(".")
+                param = getattr(getattr(self.model, module_name), attr)
+                param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
+            elif name.startswith("llm.model.lm_head."):
+                continue
+            else:
+                raise ValueError(f"unexpected CosyVoice3 talker checkpoint tensor {name!r}")
+        if qwen_weights:
+            self.model.llm.model.load_weights(iter(qwen_weights))
