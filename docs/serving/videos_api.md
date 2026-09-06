@@ -107,6 +107,16 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 The final content is available from `/v1/videos/{video_id}/content` after the
 job status becomes `completed`.
 
+`queued` means the request is still waiting for diffusion scheduler admission.
+The status changes to `in_progress` when the scheduler first selects the
+request for execution.
+
+`DELETE /v1/videos/{video_id}` issues a bounded engine abort
+(`VLLM_OMNI_ABORT_TIMEOUT`, default 2s), then cancels the frontend
+task. Cancellation cleanup is also bounded and best-effort: it confirms
+the abort was queued, and the current request batch may still drain.
+The job is then re-read so a completed save is not orphaned.
+
 ### Synchronous Response
 
 `POST /v1/videos/sync` blocks until generation finishes and returns raw video

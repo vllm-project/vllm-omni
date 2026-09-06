@@ -6,7 +6,7 @@ from __future__ import annotations
 import copy
 import math
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from functools import cached_property
 from http import HTTPStatus
@@ -18,8 +18,9 @@ from PIL import Image
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
-from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.async_omni import ABORT_TIMEOUT_S, AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoAction,
     VideoData,
@@ -198,6 +199,9 @@ class OmniOpenAIServingVideo:
     def shutdown(self) -> None:
         self._video_frame_converter.shutdown()
 
+    async def abort_request(self, request_id: str) -> None:
+        await self._engine_client.abort(request_id, timeout=ABORT_TIMEOUT_S)
+
     async def _run_and_extract(
         self,
         request: VideoGenerationRequest,
@@ -206,6 +210,7 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
+        on_started: Callable[[], Awaitable[None]] | None = None,
     ) -> VideoGenerationArtifacts:
         """Run the generation pipeline and extract video/audio/profiler outputs."""
         prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt, modalities=["video"])
@@ -381,7 +386,12 @@ class OmniOpenAIServingVideo:
             gen_params.seed,
         )
 
-        result = await self._run_generation(prompt, gen_params, reference_id)
+        result = await self._run_generation(
+            prompt,
+            gen_params,
+            reference_id,
+            on_started=on_started,
+        )
         multimodal_output = self._extract_multimodal_output(result)
         metadata = multimodal_output.get("metadata") if isinstance(multimodal_output, dict) else {}
         common_metadata = metadata.get("common") if isinstance(metadata, dict) else {}
@@ -466,6 +476,7 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
+        on_started: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[bytes, dict[str, float], float, VideoAction | None]:
         """Generate a video and return raw MP4 bytes, bypassing base64 encoding."""
         artifacts = await self._run_and_extract(
@@ -474,6 +485,7 @@ class OmniOpenAIServingVideo:
             reference_image=reference_image,
             reference_video=reference_video,
             reference_audio=reference_audio,
+            on_started=on_started,
         )
         if len(artifacts.videos) > 1:
             logger.warning(
@@ -567,6 +579,8 @@ class OmniOpenAIServingVideo:
         prompt: OmniTextPrompt,
         gen_params: OmniDiffusionSamplingParams,
         request_id: str,
+        *,
+        on_started: Callable[[], Awaitable[None]] | None = None,
     ) -> object:
         stage_configs = self._stage_configs or getattr(self._engine_client, "stage_configs", None)
 
@@ -586,6 +600,7 @@ class OmniOpenAIServingVideo:
 
         # Common generation logic for both paths
         engine_client = cast(AsyncOmni, self._engine_client)
+        gen_params.emit_request_lifecycle = on_started is not None
         sampling_params_list = build_stage_sampling_params_list(
             list(stage_configs),
             get_default_sampling_params_list(engine_client),
@@ -594,11 +609,17 @@ class OmniOpenAIServingVideo:
         )
 
         result = None
+        started_notified = False
         async for output in engine_client.generate(
             prompt=prompt,
             request_id=request_id,
             sampling_params_list=sampling_params_list,
         ):
+            if is_diffusion_request_started_output(output):
+                if on_started is not None and not started_notified:
+                    await on_started()
+                    started_notified = True
+                continue
             result = output
 
         if result is None:

@@ -346,6 +346,11 @@ class OmniDiffusionSamplingParams:
     # results
     output: torch.Tensor | None = None
 
+    # Internal control-plane event used by asynchronous APIs. When enabled,
+    # the diffusion engine emits a non-terminal output when the scheduler
+    # first admits this request for execution.
+    emit_request_lifecycle: bool = False
+
     def __post_init__(self) -> None:
         if self.quality is not None and self.quality not in DIFFUSION_QUALITY_LEVELS:
             raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {self.quality!r}")

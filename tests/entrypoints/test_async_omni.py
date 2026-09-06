@@ -12,6 +12,7 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from tests.helpers.mark import hardware_test
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.entrypoints import async_omni as async_omni_mod
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -38,7 +39,8 @@ def get_fake_add_request(submitted_request_ids, submitted_lora_requests=None):
 
 
 def get_fake_abort(aborted_request_batches):
-    async def fake_abort_async(request_ids):
+    async def fake_abort_async(request_ids, timeout=None):
+        del timeout
         aborted_request_batches.append(list(request_ids))
 
     return fake_abort_async
@@ -196,8 +198,8 @@ def test_abort_keeps_request_states_until_generate_cleanup():
         release = asyncio.Event()
         seen_during_wait: list[int] = []
 
-        async def slow_abort_async(request_ids):
-            del request_ids
+        async def slow_abort_async(request_ids, timeout=None):
+            del request_ids, timeout
             seen_during_wait.append(len(omni.request_states))
             await release.wait()
 
@@ -224,8 +226,8 @@ def test_abort_keeps_request_states_until_generate_cleanup():
 @pytest.mark.cpu
 def test_abort_propagates_engine_errors_without_popping_state():
     async def run():
-        async def failing_abort_async(request_ids):
-            del request_ids
+        async def failing_abort_async(request_ids, timeout=None):
+            del request_ids, timeout
             raise RuntimeError("orchestrator abort failed")
 
         omni = get_async_omni_instance(fake_abort_request=failing_abort_async)
@@ -253,7 +255,8 @@ def test_abort_enqueues_prefix_tokens_from_engine():
 
         queue: asyncio.Queue = asyncio.Queue()
 
-        async def abort_with_prefix(request_ids):
+        async def abort_with_prefix(request_ids, timeout=None):
+            del timeout
             rid = request_ids[0]
             engine_output = OmniRequestOutput(
                 request_id=rid,
@@ -308,8 +311,8 @@ def test_abort_enqueues_synthetic_finished_when_engine_returns_empty():
     async def run():
         queue: asyncio.Queue = asyncio.Queue()
 
-        async def empty_abort_async(request_ids):
-            del request_ids
+        async def empty_abort_async(request_ids, timeout=None):
+            del request_ids, timeout
             return []
 
         omni = get_async_omni_instance(fake_abort_request=empty_abort_async)
@@ -376,6 +379,42 @@ def test_generate_accepts_request_after_repeated_cancellations():
             assert batch[0].startswith(prefix)
 
     asyncio.run(run_test())
+
+
+@pytest.mark.cpu
+def test_generate_cancel_bounds_cleanup_abort(monkeypatch):
+    """Cancelled generate() must not wait forever on a wedged orchestrator abort."""
+    monkeypatch.setattr(async_omni_mod, "ABORT_TIMEOUT_S", 0.05)
+
+    async def run():
+        seen_timeouts: list[float | None] = []
+
+        async def hanging_abort_async(request_ids, timeout=None):
+            del request_ids
+            seen_timeouts.append(timeout)
+            await asyncio.Event().wait()
+
+        omni = get_async_omni_instance(fake_abort_request=hanging_abort_async)
+
+        async def collect():
+            async for _ in omni.generate(
+                prompt={"prompt": "prompt"},
+                request_id="cancel-hang-abort",
+                sampling_params_list=[SimpleNamespace()],
+                output_modalities=["image"],
+            ):
+                pass
+
+        task = asyncio.create_task(collect())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+        assert seen_timeouts
+        assert seen_timeouts[-1] == 0.05
+        assert omni.request_states == {}
+
+    asyncio.run(run())
 
 
 @pytest.mark.cpu

@@ -11,6 +11,7 @@ StageEngineCoreClient instances) instead of OmniStage with worker processes.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
@@ -64,6 +65,8 @@ _FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
 # the janus queue's condition variable; this timeout only bounds how often the
 # orchestrator liveness check runs while the pipeline is idle.
 _FINAL_OUTPUT_BLOCKING_WAIT_S = 1.0
+# Shared DELETE / generate() cleanup abort bound. Env is the documented knob.
+ABORT_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_ABORT_TIMEOUT", 2.0))
 
 
 class AsyncEventResolver:
@@ -661,12 +664,12 @@ class AsyncOmni(EngineClient, OmniBase):
 
         except (asyncio.CancelledError, GeneratorExit):
             self._record_request_failure_once(request_id, reason="client_disconnect")
-            await self._abort_internal_requests(request_id)
+            await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
         except Exception as e:
             self._record_request_failure_once(request_id, reason="stage_error")
-            await self._abort_internal_requests(request_id)
+            await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
         finally:
@@ -1120,14 +1123,14 @@ class AsyncOmni(EngineClient, OmniBase):
             return all(bool(item) for item in result)
         return bool(result)
 
-    async def abort(self, request_id: str | Iterable[str]) -> None:
+    async def abort(self, request_id: str | Iterable[str], *, timeout: float | None = None) -> None:
         """Abort request(s) via the Orchestrator."""
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
         # Map the external user request IDs to internal IDs used by the Orchestrator.
         # NOTE: If the user request_id matches multiple requests, all of them will be
         # aborted. This is also what happens in this case in vLLM's output processor.
         internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id in request_ids]
-        await self._abort(internal_ids)
+        await self._abort(internal_ids, timeout=timeout)
 
     async def submit_interaction_async(
         self,
@@ -1169,16 +1172,32 @@ class AsyncOmni(EngineClient, OmniBase):
         if self.log_stats:
             logger.info("[AsyncOmni] Queued interaction for request %s", request_id)
 
-    async def _abort_internal_requests(self, request_id: str | Iterable[str]):
+    async def _abort_internal_requests(
+        self,
+        request_id: str | Iterable[str],
+        *,
+        timeout: float = ABORT_TIMEOUT_S,
+    ):
         """Abort request(s) via the Orchestrator given internal request IDs,
         which take the format <external_request_id>-<UUID>.
         """
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
         # Request IDs are already internal, so we just need to get the matching states.
         internal_req_ids = [rid for rid in request_ids if rid in self.request_states]
-        await self._abort(internal_req_ids)
+        try:
+            # Unbind generate() if abort_async blocks in the executor.
+            await asyncio.wait_for(self._abort(internal_req_ids, timeout=timeout), timeout=timeout)
+        except TimeoutError:
+            logger.warning(
+                "[AsyncOmni] Timed out aborting %s after %.1fs; "
+                "engine abort is best-effort until the current batch drains",
+                ",".join(internal_req_ids),
+                timeout,
+            )
+        except Exception:
+            logger.exception("[AsyncOmni] Cleanup abort failed for %s", ",".join(internal_req_ids))
 
-    async def _abort(self, request_ids: list[str]) -> None:
+    async def _abort(self, request_ids: list[str], *, timeout: float | None = None) -> None:
         """Abort request IDs via the engine and enqueue terminal abort outputs.
 
         Waits for orchestrator abort acknowledgment, enqueues any AR terminal
@@ -1191,7 +1210,7 @@ class AsyncOmni(EngineClient, OmniBase):
         registered yet, unbound replica, or orchestrator id drop), enqueue a
         synthetic finished abort so ``generate()`` cannot hang on ``queue.get``.
         """
-        abort_outputs = await self.engine.abort_async(request_ids) or []
+        abort_outputs = await self.engine.abort_async(request_ids, timeout=timeout) or []
         delivered: set[str] = set()
         for output_msg in abort_outputs:
             req_id = getattr(output_msg, "request_id", None)

@@ -26,6 +26,8 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_omni.diffusion.data import (
+    DIFFUSION_REQUEST_LIFECYCLE_KEY,
+    DIFFUSION_REQUEST_STARTED,
     DiffusionOutput,
     DiffusionRequestAbortedError,
     OmniDiffusionConfig,
@@ -54,7 +56,7 @@ from vllm_omni.diffusion.registry import (
 )
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
-from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
+from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus, DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -526,11 +528,18 @@ class DiffusionEngine:
                     error_type=output.error_type,
                 )
             raise RuntimeError(output.error)
-        logger.debug("Generation completed successfully.")
+        if output.request_started:
+            return format_empty_diffusion_outputs(
+                request,
+                finished=False,
+                custom_output={DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED},
+            )
 
         if output.output is None:
             logger.warning("Output is None, returning empty OmniRequestOutput")
             return format_empty_diffusion_outputs(request, finished=output.finished)
+
+        logger.debug("Generation completed successfully.")
 
         # When CPU offload is enabled, move output to CPU before
         # post-processing to avoid device OOM — model weights may still
@@ -585,6 +594,8 @@ class DiffusionEngine:
                 sched_output = self.scheduler.schedule()
                 self._scheduler_num_waiting_reqs = max(int(sched_output.num_waiting_reqs), 0)
 
+            self._emit_request_started_outputs(sched_output)
+
             if sched_output.is_empty:
                 self._emit_finished_outputs(sched_output.finished_req_ids, None)
                 continue
@@ -614,6 +625,17 @@ class DiffusionEngine:
 
         # Engine is stopping: fail any RPCs still queued so callers don't hang.
         self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
+
+    def _emit_request_started_outputs(self, sched_output: DiffusionSchedulerOutput) -> None:
+        """Notify opted-in callers when requests leave the scheduler queue."""
+        for new_req in sched_output.scheduled_new_reqs:
+            request = getattr(new_req, "req", None)
+            sampling_params = getattr(request, "sampling_params", None)
+            if getattr(sampling_params, "emit_request_lifecycle", False):
+                self._put_output(
+                    new_req.request_id,
+                    DiffusionOutput(finished=False, request_started=True),
+                )
 
     def _wait_for_admission_if_needed_locked(self) -> None:
         """Apply scheduler admission policy while holding the engine condition.

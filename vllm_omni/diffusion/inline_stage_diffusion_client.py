@@ -19,7 +19,10 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError
 
-from vllm_omni.diffusion.data import DiffusionRequestAbortedError
+from vllm_omni.diffusion.data import (
+    DiffusionRequestAbortedError,
+    is_diffusion_request_started_output,
+)
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.engine.stage_client import StageClientBase
@@ -158,7 +161,13 @@ class InlineStageDiffusionClient(StageClientBase):
                 # only publish the final output.
                 result = None
                 async for results in self._engine.step_streaming(request):
-                    result = results[0]
+                    output = results[0]
+                    if is_diffusion_request_started_output(output):
+                        if not output.request_id:
+                            output.request_id = request_id
+                        self._output_queue.put_nowait(output)
+                        continue
+                    result = output
                 if result is None:
                     raise RuntimeError("Diffusion execution finished without output.")
                 if not result.request_id:
