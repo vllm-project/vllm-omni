@@ -504,6 +504,10 @@ class OrchestratorArgs:
     # === Lifecycle ===
     stage_init_timeout: int = 300
     init_timeout: int = 600
+    # Initialize stages sharing a physical GPU concurrently, guarded by
+    # pre-launch admission + engine-core SH/EX device locks. Off by default;
+    # enable only when the GPU is dedicated to this deployment.
+    parallel_stage_init: bool = False
 
     # === Cross-stage Communication ===
     batch_timeout: int = 10
@@ -568,6 +572,9 @@ class OrchestratorArgs:
     vae_use_tiling: bool = False
     enable_multithread_weight_load: bool = True
     num_weight_load_threads: int = 4
+    diffusion_offload_config: dict[str, Any] | None = None
+    # Compatibility aliases for existing callers and model-specific stage
+    # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False

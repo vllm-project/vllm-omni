@@ -678,7 +678,7 @@ TTS_PERF_JSON_HINTS = ("test_tts", "voxcpm", "higgs_audio")
 def perf_json_model_family(json_basename: str) -> str:
     """Classify a perf JSON config as omni, tts, or diffusion (mirrors nightly YAML runners)."""
     name = json_basename.lower()
-    if name.startswith("test_qwen3_omni"):
+    if name.startswith(("test_qwen3_omni", "test_minicpmo_")):
         return "omni"
     if any(hint in name for hint in TTS_PERF_JSON_HINTS):
         return "tts"

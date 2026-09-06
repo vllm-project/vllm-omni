@@ -68,6 +68,7 @@ from vllm_omni.diffusion.models.schedulers.scheduling_flow_match_euler_discrete 
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
 )
+from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -934,6 +935,12 @@ class Cosmos3OmniDiffusersPipeline(
     ) -> None:
         super().__init__()
         self.od_config = od_config
+        resolved_offload = resolve_offload(od_config)
+        if resolved_offload.public is not None and resolved_offload.strategy is OffloadStrategy.MODEL_LEVEL:
+            raise ValueError(
+                "Cosmos3 model offload uses reasoner/generator topology and does "
+                "not support the dit/text_encoder component selector"
+            )
         self.device = get_local_device()
         self.dtype = od_config.dtype
 
@@ -1086,6 +1093,7 @@ class Cosmos3OmniDiffusersPipeline(
         device: torch.device,
         pin_memory: bool = True,
         use_hsdp: bool = False,
+        offload_components: frozenset[str] | None = None,
     ) -> None:
         """Enable Cosmos3 component-level model offload.
 
@@ -1094,6 +1102,11 @@ class Cosmos3OmniDiffusersPipeline(
         mutual-exclusion swaps.  The VAE stays resident on GPU like the generic
         model-level offloader.
         """
+        if offload_components is not None:
+            raise ValueError(
+                "Cosmos3 model offload uses reasoner/generator topology and does not support "
+                "the dit/text_encoder offload_components selector"
+            )
         self.vae.to(device, non_blocking=True)
         if isinstance(self._sound_tokenizer, nn.Module):
             self._sound_tokenizer.to(device)
