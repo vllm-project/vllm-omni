@@ -70,7 +70,15 @@ from tests.helpers.mark import (  # noqa: E402
 
 LOG = "upload_pipeline"
 BOOTSTRAP_STEPS_FILENAME = "bootstrap-upload-steps.yml"
-BOOTSTRAP_IMAGE_BUILD_KEYS = frozenset({"image-build", "image-build-a2", "image-build-a3"})
+BOOTSTRAP_IMAGE_BUILD_KEYS = frozenset(
+    {
+        "image-build",
+        "image-build-a2",
+        "image-build-a3",
+        "image-build-a5",
+        "image-build-310p",
+    }
+)
 BOOTSTRAP_UPLOAD_IF_KEYS = {
     "upload-ready-pipeline": "ready",
     "upload-merge-pipeline": "merge",
