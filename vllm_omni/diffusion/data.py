@@ -804,6 +804,11 @@ class OmniDiffusionConfig:
 
     output_type: str = "pil"
 
+    # PiD (Pixel Diffusion) super-resolution decoder. When this config
+    # (or dict) with ``enabled=True``, the pipeline decodes the LDM x_0
+    # latent via PiD instead of the VAE, producing a higher-resolution RGB
+    # image. ``None`` keeps the standard VAE path.
+    pid_decode: dict[str, Any] | None = None
     # CPU offload parameters. Keep the public mapping raw so stage configs can
     # serialize it across processes; __post_init__ validates it once and caches
     # the internal typed resolution used at runtime.

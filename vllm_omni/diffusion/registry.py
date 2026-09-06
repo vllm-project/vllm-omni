@@ -14,6 +14,7 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
+from vllm_omni.diffusion.pid.runner_integration import init_pid_decoder_on
 from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr
 from vllm_omni.platforms import current_omni_platform
 
@@ -442,6 +443,12 @@ def initialize_model(
         if is_distributed_vae:
             model.vae.set_parallel_size(vae_pp_size, mode=od_config.parallel_config.vae_parallel_mode)
 
+        # Mount the PiD decoder (Plan B: Runner-layer latent passthrough). Eager
+        # weight load + resident declaration; no-op unless PiD is enabled and
+        # the pipeline family is registered in LATENT_FORMS. Must run before SP
+        # so the pid_net receives the same SP hooks as the main DiT.
+        init_pid_decoder_on(model, od_config)
+
         # Apply sequence parallelism if enabled
         # This follows diffusers' pattern where enable_parallelism() is called
         # at model loading time, not inside individual model files
@@ -478,6 +485,11 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
         transformer_attrs = getattr(model, "_dit_modules", None)
         if not transformer_attrs:
             transformer_attrs = ("transformer", "transformer_2", "dit", "unet")
+
+        # PiD super-resolution net (PidNet): its patch/pixel token streams are
+        # SP-sharded like the main DiT.
+        pid_net = getattr(getattr(getattr(model, "_pid_decoder", None), "_model", None), "net", None)
+
         applied_count = 0
 
         for attr in transformer_attrs:
@@ -522,6 +534,27 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
             )
             apply_sequence_parallel(transformer, sp_config, plan)
             applied_count += 1
+
+        # PiD net is not a pipeline transformer attr, so it is handled in a
+        # self-contained block below; the main-DiT loop above is untouched.
+        if pid_net is not None:
+            plan = get_sp_plan_from_model(pid_net)
+            if plan is not None:
+                allgather_degree = getattr(od_config.parallel_config, "allgather_degree", 1)
+                sp_config = (
+                    SequenceParallelConfig(allgather_degree=allgather_degree)
+                    if allgather_degree > 1
+                    else SequenceParallelConfig(
+                        ulysses_degree=od_config.parallel_config.ulysses_degree,
+                        ring_degree=od_config.parallel_config.ring_degree,
+                    )
+                )
+                logger.info(
+                    f"Applying sequence parallelism to {pid_net.__class__.__name__} (pid_net) "
+                    f"(sp_size={sp_size}, ulysses={sp_config.ulysses_degree}, ring={sp_config.ring_degree})"
+                )
+                apply_sequence_parallel(pid_net, sp_config, plan)
+                applied_count += 1
 
         # update forward context sp_plan_hooks_applied
         ctx = get_forward_context()

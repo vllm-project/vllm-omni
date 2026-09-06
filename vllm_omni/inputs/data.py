@@ -315,6 +315,9 @@ class OmniDiffusionSamplingParams:
     # Extra parameters that might be needed by specific pipeline implementations
     extra_args: dict[str, Any] = field(default_factory=dict)
 
+    # PiD (Pixel Diffusion) super-resolution override.
+    pid_decode: dict[str, Any] | None = None
+
     # Misc
     save_output: bool = True
     return_frames: bool = False

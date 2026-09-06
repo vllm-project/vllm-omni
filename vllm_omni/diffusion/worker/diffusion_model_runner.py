@@ -52,6 +52,11 @@ from vllm_omni.diffusion.models.interface import (
 )
 from vllm_omni.diffusion.offloader import enable_offload_backend
 from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT, resolve_offload
+from vllm_omni.diffusion.pid import (
+    decode_stepwise_output,
+    maybe_pid_passthrough,
+    stepwise_pid_active,
+)
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -734,6 +739,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
             self._refresh_cache_for_requests(reqs, od_config=od_config)
 
+            pid_passthrough = maybe_pid_passthrough(self.pipeline, reqs, od_config)
+            if pid_passthrough is not None:
+                pid_passthrough.force_latent_output(reqs)
+
             batch = DiffusionRequestBatch(requests=reqs)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if is_primary and record_output_peak_memory:
@@ -761,13 +770,21 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 paged_kv_context,
             ):
                 with record_function(record_name):
-                    raw_outputs = self.pipeline.forward(batch)
-                    outputs = _normalize_pipeline_outputs(
-                        raw_outputs,
-                        expected_count=len(reqs),
-                        allow_single_output=allow_single_output,
-                        pipeline_name=type(self.pipeline).__name__,
-                    )
+                    try:
+                        raw_outputs = self.pipeline.forward(batch)
+                        outputs = _normalize_pipeline_outputs(
+                            raw_outputs,
+                            expected_count=len(reqs),
+                            allow_single_output=allow_single_output,
+                            pipeline_name=type(self.pipeline).__name__,
+                        )
+                    finally:
+                        if pid_passthrough is not None:
+                            pid_passthrough.restore_output_type(reqs)
+
+            if pid_passthrough is not None:
+                with record_function(f"{record_name}_pid_decode"):
+                    outputs = pid_passthrough.decode_outputs(outputs, reqs)
 
             if is_primary and outputs and record_output_peak_memory:
                 batch_peak_memory_mb = self._sample_peak_memory_mb()
@@ -1273,7 +1290,14 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
                             if should_decode:
                                 clear_pipeline_stage_durations(self.pipeline)
-                                result = self.pipeline.post_decode(req)
+                                if stepwise_pid_active(self.pipeline, req):
+                                    # PiD: fetch raw latents from the pipeline's
+                                    # latent branch, then super-resolve with PiD.
+                                    result = self.pipeline.post_decode(req, output_type="latent")
+                                    if result is not None:
+                                        result = decode_stepwise_output(self.pipeline, req, result)
+                                else:
+                                    result = self.pipeline.post_decode(req)
                                 if result is not None:
                                     self._attach_stepwise_metrics(
                                         req,
