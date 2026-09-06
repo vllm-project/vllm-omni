@@ -21,6 +21,7 @@ from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
@@ -331,23 +332,38 @@ class LTXAudioRuntime(
         if errors:
             raise ValueError("LTX2 audio CUDA Graph configuration is unsupported: " + "; ".join(errors))
 
-    def setup_audio_cuda_graph_runtime(self) -> None:
-        """Keep the manual graph runner bound to the eager Transformer.
-
-        Regional ``torch.compile`` and the runtime-owned whole-Transformer
-        CUDA Graph are each valid independently, but nesting the compiled
-        blocks inside the manual capture produces run-to-run numerical drift
-        on real LTX-2.5 text-to-audio workloads.  The manual graph already
-        removes Python and launch overhead across the complete Transformer, so
-        prefer the stable eager module as its capture target.
-        """
+    def setup_audio_cuda_graph_compile(self) -> None:
+        """Regionally compile the Transformer with eager-compatible BF16 numerics."""
         runner = self.audio_graph_runner
         if runner is None:
             return
-        runner.transformer = self.transformer
+
+        try:
+            prepare_compile = getattr(self.transformer, "prepare_audio_cuda_graph_compile", None)
+            if callable(prepare_compile):
+                prepare_compile()
+            else:
+                raise TypeError("LTX2 audio Transformer does not provide graph compile preparation")
+            self.transformer = regionally_compile(
+                self.transformer,
+                dynamic=self.od_config.diffusion_compile_dynamic,
+                options={
+                    "emulate_precision_casts": True,
+                    "triton.cudagraphs": False,
+                    "triton.cudagraph_trees": False,
+                },
+            )
+            runner.transformer = self.transformer
+        except Exception as exc:
+            runner.transformer = self.transformer
+            logger.warning(
+                "LTX2 audio compile failed; using eager CUDA Graph: %s",
+                exc,
+            )
+            return
+
         logger.info(
-            "LTX2 audio runtime-owned CUDA Graph replay enabled (max_entries=%d); "
-            "regional and compiler-managed Transformer graphing are bypassed.",
+            "LTX2 audio CUDA Graph enabled (compiled, max_entries=%d)",
             self._audio_cuda_graph_config.max_entries,
         )
 
@@ -393,6 +409,44 @@ class LTXAudioRuntime(
         if supplied:
             names = ", ".join(sorted(set(supplied)))
             raise ValueError(f"LTX text-to-audio does not accept video-only option(s): {names}.")
+
+    def _run_text_connectors(
+        self,
+        prompt_embeds: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        *,
+        padding_side: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run only the audio projection and connector for LTX-2.5 T2A."""
+        connectors = self.connectors
+        if not connectors.config.per_modality_projections:
+            return super()._run_text_connectors(
+                prompt_embeds,
+                prompt_attention_mask,
+                padding_side=padding_side,
+            )
+        if prompt_embeds.ndim == 3:
+            prompt_embeds = prompt_embeds.unflatten(2, (connectors.config.caption_channels, -1))
+
+        variance = torch.mean(prompt_embeds**2, dim=2, keepdim=True)
+        normalized = prompt_embeds * torch.rsqrt(variance + 1e-6)
+        normalized = normalized.flatten(2, 3)
+        bool_mask = prompt_attention_mask.bool().unsqueeze(-1)
+        normalized = torch.where(bool_mask, normalized, torch.zeros_like(normalized))
+        audio_scale = math.sqrt(connectors.config.audio_hidden_dim / connectors.config.caption_channels)
+        audio_embedding = connectors.audio_text_proj_in(normalized * audio_scale)
+
+        additive_mask = (prompt_attention_mask.to(torch.int64) - 1).to(audio_embedding.dtype)
+        additive_mask = additive_mask.reshape(additive_mask.shape[0], 1, -1, additive_mask.shape[-1])
+        additive_mask = additive_mask * torch.finfo(audio_embedding.dtype).max
+        audio_embedding, audio_attention_mask = connectors.audio_connector(audio_embedding, additive_mask)
+        binary_mask = (audio_attention_mask < 1e-6).to(torch.int64)
+        binary_mask = binary_mask.reshape(audio_embedding.shape[0], audio_embedding.shape[1])
+
+        # The shared prompt context requires video fields, but the audio-only
+        # runtime consumes only their dtype. Reuse the audio tensors without
+        # executing the unused video projection and eight-layer connector.
+        return audio_embedding, audio_embedding, binary_mask
 
     def _resolve_audio_request_inputs(self, req: DiffusionRequestBatch):
         if len(req.sampling_params_list) != 1:

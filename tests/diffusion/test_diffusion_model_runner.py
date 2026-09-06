@@ -158,16 +158,55 @@ def _make_ltx2_graph_pipeline(**overrides):
     )
 
 
-def test_ltx2_audio_graph_keeps_eager_transformer_as_capture_target(caplog):
+def test_ltx2_audio_graph_compile_preserves_bf16_precision_boundaries(monkeypatch):
+    prepare_compile = Mock()
+    original = SimpleNamespace(prepare_audio_cuda_graph_compile=prepare_compile)
     pipeline = _make_ltx2_graph_pipeline(enforce_eager=False)
-    original = pipeline.transformer
-    pipeline.audio_graph_runner.transformer = object()
+    pipeline.transformer = original
+    compiled = object()
+    compile_calls = []
 
-    LTXAudioRuntime.setup_audio_cuda_graph_runtime(pipeline)
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.ltx2.ltx2_audio_runtime.regionally_compile",
+        lambda transformer, **kwargs: compile_calls.append((transformer, kwargs)) or compiled,
+    )
+
+    LTXAudioRuntime.setup_audio_cuda_graph_compile(pipeline)
+
+    prepare_compile.assert_called_once_with()
+    assert compile_calls == [
+        (
+            original,
+            {
+                "dynamic": True,
+                "options": {
+                    "emulate_precision_casts": True,
+                    "triton.cudagraphs": False,
+                    "triton.cudagraph_trees": False,
+                },
+            },
+        )
+    ]
+    assert pipeline.transformer is compiled
+    assert pipeline.audio_graph_runner.transformer is compiled
+
+
+def test_ltx2_audio_graph_compile_failure_keeps_eager_transformer(monkeypatch, caplog):
+    original = SimpleNamespace(prepare_audio_cuda_graph_compile=Mock())
+    pipeline = _make_ltx2_graph_pipeline(enforce_eager=False)
+    pipeline.transformer = original
+    pipeline.audio_graph_runner.transformer = original
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.ltx2.ltx2_audio_runtime.regionally_compile",
+        Mock(side_effect=RuntimeError("compile failed")),
+    )
+
+    LTXAudioRuntime.setup_audio_cuda_graph_compile(pipeline)
 
     assert pipeline.transformer is original
     assert pipeline.audio_graph_runner.transformer is original
-    assert "regional and compiler-managed Transformer graphing are bypassed" in caplog.text
+    assert "LTX2 audio compile failed; using eager CUDA Graph" in caplog.text
+    assert "LTX2 audio CUDA Graph enabled (compiled" not in caplog.text
 
 
 def test_ltx2_audio_graph_release_is_model_local_and_keeps_runner():

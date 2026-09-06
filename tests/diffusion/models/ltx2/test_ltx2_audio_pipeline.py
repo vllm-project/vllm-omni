@@ -4,6 +4,7 @@
 """Unit tests for the unified LTX text-to-audio pipeline."""
 
 import json
+import math
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -63,6 +64,48 @@ def test_ltx_t2a_public_contract_is_audio_only():
     assert not LTX2TextToAudioPipeline.support_image_input
     assert not hasattr(LTX2TextToAudioPipeline, "support_video_output")
     assert LTX2TextToAudioPipeline.dummy_run_num_frames == 0
+
+
+def test_ltx_t2a_runs_only_audio_connector_for_per_modality_projection():
+    class AudioConnector:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, hidden_states, attention_mask):
+            self.calls.append((hidden_states, attention_mask))
+            return hidden_states + 1, torch.zeros_like(attention_mask)
+
+    audio_connector = AudioConnector()
+    connectors = SimpleNamespace(
+        config=SimpleNamespace(
+            per_modality_projections=True,
+            caption_channels=2,
+            audio_hidden_dim=4,
+        ),
+        audio_text_proj_in=torch.nn.Linear(6, 4, bias=True),
+        audio_connector=audio_connector,
+    )
+    pipe = object.__new__(LTXAudioRuntime)
+    torch.nn.Module.__init__(pipe)
+    object.__setattr__(pipe, "connectors", connectors)
+    prompt_embeds = torch.arange(24, dtype=torch.float32).reshape(2, 2, 2, 3)
+    attention_mask = torch.tensor([[0, 1], [1, 1]])
+
+    video, audio, output_mask = pipe._run_text_connectors(
+        prompt_embeds,
+        attention_mask,
+        padding_side="left",
+    )
+
+    variance = torch.mean(prompt_embeds**2, dim=2, keepdim=True)
+    normalized = prompt_embeds * torch.rsqrt(variance + 1e-6)
+    normalized = normalized.flatten(2, 3)
+    normalized = torch.where(attention_mask.bool().unsqueeze(-1), normalized, torch.zeros_like(normalized))
+    expected_projection = connectors.audio_text_proj_in(normalized * math.sqrt(2))
+    torch.testing.assert_close(audio_connector.calls[0][0], expected_projection)
+    torch.testing.assert_close(video, expected_projection + 1)
+    torch.testing.assert_close(audio, expected_projection + 1)
+    torch.testing.assert_close(output_mask, torch.ones_like(attention_mask))
 
 
 @pytest.mark.parametrize(

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import torch
+import torch.nn.functional as F
 from cache_dit import ForwardPattern
 from diffusers.models.embeddings import PixArtAlphaTextProjection
 from torch import nn
@@ -31,6 +32,41 @@ from .ltx2_transformer import (
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+
+@torch.library.custom_op("vllm_omni::ltx2_native_rms_norm", mutates_args=())
+def _ltx2_native_rms_norm(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor | None,
+    eps: float,
+) -> torch.Tensor:
+    """Keep eager RMSNorm arithmetic opaque to Inductor decomposition."""
+    return F.rms_norm(hidden_states, (hidden_states.shape[-1],), weight, eps)
+
+
+@_ltx2_native_rms_norm.register_fake
+def _ltx2_native_rms_norm_fake(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor | None,
+    eps: float,
+) -> torch.Tensor:
+    del weight, eps
+    return torch.empty_like(hidden_states)
+
+
+def _prepare_rms_norm_for_compile(norm: nn.Module) -> None:
+    forward = norm.forward
+    if getattr(forward, "_ltx2_native_rms_norm", False) or getattr(forward, "_torchdynamo_disable", False):
+        return
+    if not isinstance(norm, nn.RMSNorm):
+        norm.forward = torch.compiler.disable(forward)
+        return
+
+    def native_forward(hidden_states: torch.Tensor) -> torch.Tensor:
+        return _ltx2_native_rms_norm(hidden_states, norm.weight, norm.eps)
+
+    native_forward._ltx2_native_rms_norm = True  # type: ignore[attr-defined]
+    norm.forward = native_forward
 
 
 @dataclass(frozen=True)
@@ -363,6 +399,21 @@ class LTX2AudioTransformerModel(nn.Module):
             encoder_hidden_states=audio_encoder_hidden_states,
             rotary_emb=audio_rotary_emb,
         )
+
+    def prepare_audio_cuda_graph_compile(self) -> None:
+        """Keep eager RMSNorm numerics without splitting the compiled graph."""
+        for block in self.transformer_blocks:
+            norms = (
+                block.audio_norm1,
+                block.audio_norm2,
+                block.audio_norm3,
+                block.audio_attn1.norm_q,
+                block.audio_attn1.norm_k,
+                block.audio_attn2.norm_q,
+                block.audio_attn2.norm_k,
+            )
+            for norm in norms:
+                _prepare_rms_norm_for_compile(norm)
 
     def forward(
         self,
