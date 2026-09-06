@@ -337,6 +337,10 @@ class DuplexSessionRunnerMixin:
             if append_turn_id is None:
                 append_turn_id = session.turn_id
             request_id = self._native_stage0_request_id(session, append_epoch)
+            engine_client = getattr(self._chat_service, "engine_client", None)
+            mark_arrival = getattr(engine_client, "mark_duplex_turn_arrival", None)
+            if callable(mark_arrival):
+                mark_arrival(request_id)
             if final or precreate_response:
                 session.bind_request(request_id)
             if precreate_response:
@@ -390,7 +394,7 @@ class DuplexSessionRunnerMixin:
                         and precreated_response_id is not None
                         and session.active_response_id == precreated_response_id
                     ):
-                        session.end_response(commit_text=False)
+                        session.end_response(commit_text=False, finished_reason="error")
                         await emit_event(
                             {
                                 "type": "response.done",
@@ -916,13 +920,14 @@ class DuplexSessionRunnerMixin:
                     continue
 
                 if event_type in {"input.cancel", "response.cancel", "barge_in", "output_audio_buffer.clear"}:
-                    cancel_reason = (
-                        "output_audio_buffer_clear"
-                        if event_type == "output_audio_buffer.clear"
-                        else "client_cancelled"
-                        if event_type == "response.cancel"
-                        else "barge_in"
-                    )
+                    if event_type == "barge_in":
+                        cancel_reason = "barge_in"
+                    elif event_type == "output_audio_buffer.clear":
+                        cancel_reason = "output_audio_buffer_clear"
+                    elif event_type == "response.cancel":
+                        cancel_reason = "client_cancelled"
+                    else:
+                        cancel_reason = "cancel"
                     cancelled_fence = DuplexFence(
                         session.session_id,
                         epoch=session.epoch,

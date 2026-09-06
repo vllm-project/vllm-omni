@@ -174,6 +174,8 @@ class OrchestratorAggregator:
         # by the orchestrator's cleanup path (e.g. final-stage cleanup races
         # the omni_base finalize emit).
         self._replica_cache: dict[tuple[int, str], int] = {}
+        self.timing_identity: dict[str, Any] | None = None
+        self.omit_serving_time_to_first_output: bool = False
 
     def init_run_state(self, wall_start_ts: float) -> None:
         # Per-run aggregates and timing state
@@ -465,6 +467,15 @@ class OrchestratorAggregator:
                 req_id,
             )
 
+    _TPOT_WEIGHTED_MS = "_vllm_tpot_weighted_ms"
+    _TPOT_WEIGHT = "_vllm_tpot_weight"
+
+    @staticmethod
+    def _tpot_segment_weight(num_tokens_out: int, tpot_ms: float) -> int:
+        if tpot_ms <= 0:
+            return 0
+        return max(int(num_tokens_out) - 1, 1)
+
     @staticmethod
     def _merge_stage_metric_event(
         current: dict[str, Any] | None,
@@ -497,6 +508,10 @@ class OrchestratorAggregator:
                 defs.VLLM_ITL_MS: float(evt.vllm_itl_ms),
                 defs.VLLM_ITLS_MS: list(evt.vllm_itls_ms or []),
             }
+            tpot_ms = float(evt.vllm_tpot_ms)
+            tpot_weight = OrchestratorAggregator._tpot_segment_weight(int(evt.num_tokens_out), tpot_ms)
+            current[OrchestratorAggregator._TPOT_WEIGHT] = tpot_weight
+            current[OrchestratorAggregator._TPOT_WEIGHTED_MS] = tpot_ms * tpot_weight
             return current
 
         current[defs.NUM_TOKENS_IN] = int(current.get(defs.NUM_TOKENS_IN, 0)) + int(evt.num_tokens_in)
@@ -546,8 +561,21 @@ class OrchestratorAggregator:
         if current_vllm_ttft_ms <= 0 < vllm_ttft_ms:
             current[defs.VLLM_TTFT_MS] = vllm_ttft_ms
         vllm_tpot_ms = float(evt.vllm_tpot_ms)
-        if vllm_tpot_ms > 0:
-            current[defs.VLLM_TPOT_MS] = vllm_tpot_ms
+        evt_weight = OrchestratorAggregator._tpot_segment_weight(int(evt.num_tokens_out), vllm_tpot_ms)
+        if evt_weight > 0:
+            prev_weight = int(current.get(OrchestratorAggregator._TPOT_WEIGHT, 0) or 0)
+            prev_weighted = float(current.get(OrchestratorAggregator._TPOT_WEIGHTED_MS, 0.0) or 0.0)
+            if prev_weight <= 0:
+                prev_tpot = float(current.get(defs.VLLM_TPOT_MS, 0.0) or 0.0)
+                if prev_tpot > 0:
+                    prev_tokens = int(current.get(defs.NUM_TOKENS_OUT, 0)) - int(evt.num_tokens_out)
+                    prev_weight = OrchestratorAggregator._tpot_segment_weight(prev_tokens, prev_tpot)
+                    prev_weighted = prev_tpot * prev_weight
+            new_weight = prev_weight + evt_weight
+            new_weighted = prev_weighted + vllm_tpot_ms * evt_weight
+            current[OrchestratorAggregator._TPOT_WEIGHT] = new_weight
+            current[OrchestratorAggregator._TPOT_WEIGHTED_MS] = new_weighted
+            current[defs.VLLM_TPOT_MS] = new_weighted / float(new_weight)
         vllm_itls = list(current.get(defs.VLLM_ITLS_MS) or [])
         vllm_itls.extend(list(evt.vllm_itls_ms or []))
         current[defs.VLLM_ITLS_MS] = vllm_itls
@@ -761,6 +789,19 @@ class OrchestratorAggregator:
             for cached_key in [k for k in self._replica_cache if k[1] == rid_key]:
                 self._replica_cache.pop(cached_key, None)
 
+    def _format_request_table_title(self, kind: str, rid: str) -> str:
+        identity = self.timing_identity
+        if not identity:
+            return f"{kind} [request_id={rid}]"
+        parts = [f"request_id={identity.get('req') or rid}"]
+        if identity.get("response") is not None:
+            parts.append(f"response={identity['response']}")
+        if identity.get("turn") is not None:
+            parts.append(f"turn={identity['turn']}")
+        if identity.get("reason") is not None:
+            parts.append(f"reason={identity['reason']}")
+        return f"{kind} [{' '.join(parts)}]"
+
     def build_and_log_summary(self) -> dict[str, Any]:
         if not self.log_stats:
             return {}
@@ -837,7 +878,7 @@ class OrchestratorAggregator:
                     logger.info(
                         "\n%s",
                         _format_table(
-                            f"RequestE2EStats [request_id={rid}]",
+                            self._format_request_table_title("RequestE2EStats", rid),
                             e2e_data,
                             value_fields=value_fields_e2e,
                         ),
@@ -852,12 +893,27 @@ class OrchestratorAggregator:
             if stage_evts:
                 pt = stage_evts[-1].pipeline_timings or {}
             if pt or e2e_evt:
-                parts = [f"req={rid}"]
-                if e2e_evt:
+                identity = self.timing_identity
+                req_label = rid
+                extra_parts: list[str] = []
+                if identity:
+                    req_override = identity.get("req")
+                    if req_override:
+                        req_label = str(req_override)
+                    if identity.get("response") is not None:
+                        extra_parts.append(f"response={identity['response']}")
+                    if identity.get("turn") is not None:
+                        extra_parts.append(f"turn={identity['turn']}")
+                    if identity.get("reason") is not None:
+                        extra_parts.append(f"reason={identity['reason']}")
+                parts = [f"req={req_label}", *extra_parts]
+                has_preprocess = "preprocess_ms" in pt
+                skip_total_engine = bool(identity) and not has_preprocess
+                if e2e_evt and not skip_total_engine:
                     parts.append(f"total={e2e_evt.e2e_total_ms / 1000.0:.2f}s")
-                if "preprocess_ms" in pt:
+                if has_preprocess:
                     parts.append(f"preprocess={pt['preprocess_ms'] / 1000.0:.2f}s")
-                if e2e_evt:
+                if e2e_evt and not skip_total_engine:
                     engine_ms = e2e_evt.e2e_total_ms - pt.get("preprocess_ms", 0.0)
                     parts.append(f"engine={engine_ms / 1000.0:.2f}s")
                 stage_parts = []
@@ -884,6 +940,8 @@ class OrchestratorAggregator:
             has_diffusion_metrics = any(getattr(evt, "diffusion_metrics", None) for evt in stage_evts)
             if has_diffusion_metrics:
                 local_exclude.add("postprocess_time_ms")
+            if self.omit_serving_time_to_first_output:
+                local_exclude.add("serving_time_to_first_output_ms")
             local_stage_fields = _build_field_defs(StageRequestStats, local_exclude, FIELD_TRANSFORMS)
 
             # if diffusion_metrics is present, expand it into multiple columns
@@ -920,7 +978,7 @@ class OrchestratorAggregator:
                     logger.info(
                         "\n%s",
                         _format_table(
-                            f"StageRequestStats [request_id={rid}]",
+                            self._format_request_table_title("StageRequestStats", rid),
                             stage_rows,
                             column_key="stage_id",
                             value_fields=value_fields_list,
@@ -960,7 +1018,7 @@ class OrchestratorAggregator:
                     logger.info(
                         "\n%s",
                         _format_table(
-                            f"TransferEdgeStats [request_id={rid}]",
+                            self._format_request_table_title("TransferEdgeStats", rid),
                             transfer_rows,
                             column_key="edge",
                             value_fields=value_fields_list,
