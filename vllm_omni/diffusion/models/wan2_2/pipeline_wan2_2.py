@@ -14,7 +14,7 @@ import PIL.Image
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import AutoTokenizer, UMT5EncoderModel
+from transformers import AutoConfig, AutoTokenizer, UMT5EncoderModel
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
@@ -430,6 +430,15 @@ class Wan22Pipeline(
             prefetch_list=component_subfolders,
             local_files_only=local_files_only,
         )
+        # Wan2.2 checkpoints store embed_tokens under ``shared.weight`` only,
+        # but the published config may set ``tie_word_embeddings=False``. When
+        # transformers sees ``tie=False`` it creates a separate
+        # ``encoder.embed_tokens.weight`` that is never loaded from the
+        # checkpoint, leaving it as all-zeros. This silently destroys prompt
+        # encoding and produces output disconnected from the prompt. Force
+        # tying so that ``embed_tokens`` shares ``shared.weight`` as intended.
+        text_enc_cfg = AutoConfig.from_pretrained(model, subfolder="text_encoder", local_files_only=local_files_only)
+        text_enc_cfg.tie_word_embeddings = True
         self.text_encoder = from_pretrained_with_prefetch(
             UMT5EncoderModel.from_pretrained,
             model,
@@ -437,6 +446,7 @@ class Wan22Pipeline(
             prefetch_list=component_subfolders,
             local_files_only=local_files_only,
             torch_dtype=dtype,
+            config=text_enc_cfg,
         ).to(self.device)
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKLWan.from_pretrained,
