@@ -12,6 +12,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVCacheSpec,
     SupportsARDiffusionPipeline,
     SupportsARDiffusionWarmup,
+    cfg_kv_branches,
 )
 from vllm_omni.experimental.ar_diffusion.consumer import ARDiffusionOmniTickConsumer
 from vllm_omni.experimental.ar_diffusion.engine import ARDiffusionEngine
@@ -42,4 +43,5 @@ __all__ = [
     "ARDiffusionKVCacheSpec",
     "SupportsARDiffusionPipeline",
     "SupportsARDiffusionWarmup",
+    "cfg_kv_branches",
 ]

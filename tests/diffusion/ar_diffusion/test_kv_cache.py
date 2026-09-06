@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the AR-Diffusion KV cache helpers (Phase 1, PR-2).
 
 Covers the request adapter, the chunk-window spec/manager (registration + the
@@ -207,10 +208,13 @@ def test_cross_attn_pool_deducted_from_self_attn_budget():
     page_bytes = kv.spec.page_size_bytes * 2
     scratch_bytes = kv.scratch_num_blocks * page_bytes
     expected = (int(avail * 0.5) - cross_bytes - scratch_bytes) // page_bytes
-    assert kv.num_blocks == expected
+    assert kv.budget_limited_blocks == expected
     assert kv.cross_attention_reserved_bytes == cross_bytes
     assert (kv.num_blocks_total * page_bytes) + cross_bytes <= int(avail * 0.5)
-    assert expected > 1 * (2 + 1) + 2  # above the local-slot minimum, so the cross deduction is what's tested
+    # The pool tracks reachable demand, so the surplus this budget could afford
+    # stays unallocated; the cross deduction is visible in budget_limited_blocks.
+    assert kv.num_blocks == 1 * (2 + 1) + 2
+    assert expected > kv.num_blocks  # above the local-slot minimum, so the cross deduction is what's tested
 
 
 def _make_tiny_capacity_kv(
@@ -353,7 +357,9 @@ def _make_kv(
     num_frame_per_block=2,
     window_chunks=9,
     max_scratch_tokens_per_branch=0,
+    available_bytes=None,
 ):
+    """DreamZero-like CFG geometry. ``available_bytes`` defaults to an exact fit."""
     kv_branches = (
         (ARDiffusionKVBranchSpec("positive", 0), ARDiffusionKVBranchSpec("negative", 0))
         if local_branches == 1
@@ -363,6 +369,8 @@ def _make_kv(
     declared_scratch_blocks = (max_scratch_tokens_per_branch + BLOCK - 1) // BLOCK
     scratch_blocks = local_branches * (num_frame_per_block + declared_scratch_blocks)
     managed_blocks = local_branches * (window_chunks + num_frame_per_block) + 2
+    if available_bytes is None:
+        available_bytes = (managed_blocks + scratch_blocks) * page_bytes
     return ARDiffusionKVCache(
         ARDiffusionKVConfig(
             enable=True,
@@ -376,7 +384,7 @@ def _make_kv(
         dtype=torch.float32,
         block_size=BLOCK,
         max_model_len=4096,
-        available_bytes=(managed_blocks + scratch_blocks) * page_bytes,
+        available_bytes=available_bytes,
         device=torch.device("cpu"),
         kv_branches=kv_branches,
         session_capacity=1,
@@ -397,6 +405,51 @@ def test_pool_floor_is_branch_aware():
     assert two.scratch_num_blocks == 2 * two.scratch_blocks_per_kv_branch
     assert one.scratch_blocks_per_kv_branch == 2
     assert one.num_blocks_total == 13 + one.scratch_blocks_per_kv_branch
+
+
+ROOMY = 1 << 24  # ~32x the exact fit for the _make_kv geometry
+
+
+def test_surplus_budget_does_not_enlarge_the_managed_pool():
+    """The pool tracks reachable demand, so a bigger budget buys no extra blocks."""
+    tight = _make_kv(local_branches=1)
+    roomy = _make_kv(local_branches=1, available_bytes=ROOMY)
+
+    assert tight.managed_num_blocks == roomy.managed_num_blocks == 1 * (9 + 2) + 2
+    assert tight.session_capacity == roomy.session_capacity == 1
+    # The surplus the budget could afford is reported, not allocated.
+    assert tight.budget_limited_blocks == tight.managed_num_blocks
+    assert roomy.budget_limited_blocks > roomy.managed_num_blocks
+
+
+def test_fewer_local_branches_shrink_the_managed_pool_at_equal_budget():
+    """A model declaring fewer active branches allocates a smaller pool."""
+    one = _make_kv(local_branches=1, available_bytes=ROOMY)
+    two = _make_kv(local_branches=2, available_bytes=ROOMY)
+
+    assert one.managed_num_blocks == 1 * (9 + 2) + 2
+    assert two.managed_num_blocks == 2 * (9 + 2) + 2
+    assert one.num_blocks_total < two.num_blocks_total
+    # Shrinking the managed pool moves the scratch region down with it; the two
+    # must stay adjacent and disjoint.
+    for kv in (one, two):
+        assert kv.scratch_block_ids("positive", 0, 1) == [kv.managed_num_blocks]
+        assert max(kv.scratch_block_ids("positive", 0, kv.scratch_blocks_per_kv_branch)) < kv.num_blocks_total
+    # Same budget, and both leave surplus: branch count is what sized the pool.
+    assert one.memory_budget_bytes == two.memory_budget_bytes
+    assert one.budget_limited_blocks > one.managed_num_blocks
+    assert two.budget_limited_blocks > two.managed_num_blocks
+
+
+def test_resident_capacity_still_scales_the_managed_pool():
+    """Clamping must not collapse the pool to a single session's requirement."""
+    one = _make_tiny_capacity_kv(requested_capacity=1, available_bytes=1 << 13)
+    three = _make_tiny_capacity_kv(requested_capacity=3, available_bytes=1 << 13)
+
+    assert one.session_capacity == 1
+    assert three.session_capacity == 3
+    assert one.managed_num_blocks == 1 * (1 * 6 + 3) + 2
+    assert three.managed_num_blocks == 1 * (3 * 6 + 3) + 2
 
 
 def test_scratch_capacity_is_derived_from_declared_geometry(monkeypatch):

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Engine-level KV cache orchestration for AR-Diffusion models.
 
 This is the *body* of AR-Diffusion's KV management: it owns a vLLM ``KVCacheManager`` (a
@@ -182,6 +183,13 @@ class ARDiffusionKVCache:
             raise ValueError("Phase 1 requires a bounded window (window_chunks)")
         if config.chunk_size <= 0:
             raise ValueError("ARDiffusionKVConfig.chunk_size must be set (> 0)")
+        if block_size != config.chunk_size:
+            # The managed-block requirement counts resident *chunks* as pool
+            # *blocks*, and ChunkWindowManager indexes the sink in chunks too.
+            raise ValueError(
+                "ARDiffusionKVCache requires block_size == chunk_size, got "
+                f"block_size={block_size}, chunk_size={config.chunk_size}"
+            )
         if not kv_branches:
             raise ValueError("ARDiffusionKVCache requires at least one KV branch")
         if session_capacity <= 0:
@@ -254,9 +262,11 @@ class ARDiffusionKVCache:
 
         # The self-attention pool, scratch pool, and lazily materialized
         # cross-attention caches share one hard memory budget. Select the largest
-        # feasible resident-session count rather than raising a block-count floor
-        # past that budget. All resident sessions need a complete sink + window;
-        # only one request can be in flight, so frames_per_block is counted once.
+        # feasible resident-session count, then allocate exactly the managed
+        # blocks that count can address. All resident sessions need a complete
+        # sink + window; the in-flight frames_per_block span is counted once per
+        # worker-local branch, since sequential CFG runs every local branch
+        # within one forward.
         page_size_bytes = self.spec.page_size_bytes * num_layers
         self.available_memory_bytes = available_bytes
         self.configured_memory_budget_bytes = int(available_bytes * config.gpu_memory_fraction)
@@ -273,6 +283,13 @@ class ARDiffusionKVCache:
         )
 
         def _required_managed_blocks(capacity: int) -> int:
+            """Managed blocks the selected capacity can address — the pool size.
+
+            Any new managed-allocation site must be accounted for here. ``+ 2``
+            pays for ``BlockPool``'s null block, which permanently leaves the
+            free queue, plus one spare; with a single worker-local branch that
+            spare is the only slack over peak demand, so do not shrink it.
+            """
             resident_per_session = config.sink_chunks + config.window_chunks
             return self.num_local_kv_branches * (capacity * resident_per_session + self.frames_per_block) + 2
 
@@ -319,8 +336,26 @@ class ARDiffusionKVCache:
             - self.cross_attention_reserved_bytes
             - self.model_owned_state_reserved_bytes
         )
-        num_blocks = self_attn_budget_bytes // page_size_bytes
-        assert num_blocks >= required_managed_blocks
+        # The budget bounds the pool from above, but nothing above
+        # ``_required_managed_blocks`` is addressable: per-branch residency is
+        # capped at sink + window by chunk-window eviction and only one request
+        # is in flight, so surplus blocks would sit in the free queue forever.
+        # Allocate the reachable demand for the capacity just selected.
+        budget_limited_blocks = self_attn_budget_bytes // page_size_bytes
+        assert budget_limited_blocks >= required_managed_blocks
+        self.budget_limited_blocks = budget_limited_blocks
+        num_blocks = required_managed_blocks
+        _log.info(
+            "AR-Diffusion managed KV: required=%d budget_limit=%d allocated=%d "
+            "local_kv_branches=%d resident_capacity=%d page=%d B pool=%.1f MiB",
+            required_managed_blocks,
+            budget_limited_blocks,
+            num_blocks,
+            self.num_local_kv_branches,
+            effective_capacity,
+            page_size_bytes,
+            (num_blocks + self.scratch_num_blocks) * page_size_bytes / (1024 * 1024),
+        )
         if effective_capacity < session_capacity:
             _log.warning(
                 "AR-Diffusion resident session capacity reduced from %d to %d by the KV memory budget",
@@ -513,6 +548,14 @@ class ARDiffusionKVCache:
     # -- request lifecycle ---------------------------------------------------
 
     def begin_request(self, request_id: str, *, prefill_prefix_tokens: int = 0) -> ARDiffusionRequestAdapter:
+        if prefill_prefix_tokens % self.spec.chunk_size:
+            # Chunk-window eviction snaps the skip count down to a chunk
+            # boundary, so an unaligned prefix leaves one extra resident block
+            # per adapter — beyond what the pool is sized for.
+            raise ValueError(
+                f"AR-Diffusion prefill_prefix_tokens must be chunk-aligned (chunk_size="
+                f"{self.spec.chunk_size}), got {prefill_prefix_tokens}"
+            )
         adapter = ARDiffusionRequestAdapter(
             request_id,
             chunk_size=self.spec.chunk_size,
@@ -558,6 +601,15 @@ class ARDiffusionKVCache:
         """Allocate managed blocks for an in-flight video span without committing it."""
         if num_tokens <= 0:
             raise ValueError(f"num_tokens must be positive, got {num_tokens}")
+        max_in_flight_tokens = self.frames_per_block * self.block_size
+        if num_tokens > max_in_flight_tokens:
+            # The pool holds exactly one frames_per_block span per branch, so a
+            # wider span would exhaust it instead of silently borrowing surplus.
+            raise ValueError(
+                f"AR-Diffusion in-flight span of {num_tokens} tokens exceeds the pooled bound "
+                f"frames_per_block * block_size = {max_in_flight_tokens}; the model's declared "
+                "frames_per_block no longer matches its request geometry"
+            )
         blocks = self.manager.allocate_slots(adapter, num_new_tokens=num_tokens)
         if blocks is None:
             raise RuntimeError("AR-Diffusion KV pool exhausted while allocating paged attention slots")
