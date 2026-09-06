@@ -656,6 +656,7 @@ class OrchestratorAggregator:
     _MS_TO_S: dict[str, str] = {
         "preprocess_time_ms": "preprocess_time_s",
         "diffusion_engine_exec_time_ms": "diffusion_engine_exec_time_s",
+        "output_ready_wait_time_ms": "output_ready_wait_time_s",
         "postprocess_time_ms": "postprocess_time_s",
         "vae_decode_time_ms": "vae_decode_time_s",
         "forward_time_ms": "forward_time_s",

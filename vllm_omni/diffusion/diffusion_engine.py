@@ -439,8 +439,10 @@ class DiffusionEngine:
         generator = self.get_output_stream(request_id)
         async for output in generator:
             exec_total_time = time.perf_counter() - exec_start_time
+            output_ready_wait_time = 0.0
             # Async mode: wait for background D2H/SHM to complete.
             if output.async_output_id:
+                output_ready_wait_start_time = time.perf_counter()
                 fut = self.executor.wait_output_ready(output.async_output_id)
                 timeout = _async_output_timeout()
                 try:
@@ -455,6 +457,7 @@ class DiffusionEngine:
                         describe(output.async_output_id) if describe else "unavailable",
                     )
                     raise
+                output_ready_wait_time = time.perf_counter() - output_ready_wait_start_time
             postprocess_start_time = time.perf_counter()
             scheduler_metrics = diffusion_scheduler_waiting_metrics(getattr(self, "_scheduler_num_waiting_reqs", 0))
             try:
@@ -468,9 +471,11 @@ class DiffusionEngine:
             step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
             logger.debug(
                 "DiffusionEngine.step_streaming breakdown: preprocess=%.2f ms, "
-                "add_req_and_wait=%.2f ms, postprocess=%.2f ms, total=%.2f ms",
+                "add_req_and_wait=%.2f ms, output_ready_wait=%.2f ms, "
+                "postprocess=%.2f ms, total=%.2f ms",
                 preprocess_time * 1000,
                 exec_total_time * 1000,
+                output_ready_wait_time * 1000,
                 postprocess_time * 1000,
                 step_total_ms,
             )
@@ -478,6 +483,7 @@ class DiffusionEngine:
                 metrics_update = {
                     "preprocess_time_ms": preprocess_time * 1000,
                     "diffusion_engine_exec_time_ms": exec_total_time * 1000,
+                    "output_ready_wait_time_ms": output_ready_wait_time * 1000,
                     "postprocess_time_ms": postprocess_time * 1000,
                     **scheduler_metrics,
                 }
