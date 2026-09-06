@@ -641,6 +641,68 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
     return pre_process_func
 
 
+# Bound the temporary float32 conversion immediately after VAE decode.
+_DISPLAY_CHUNK_BYTES = 64 << 20
+
+
+def _display_chunk_frame_count(video: torch.Tensor, chunk_bytes: int | None = None) -> int:
+    """Return the max frames per slice that stay within the intermediate-byte budget (always >= 1)."""
+    if video.ndim != 5:
+        raise ValueError(f"Expected decoded video with shape [B, C, T, H, W], got {tuple(video.shape)}.")
+    if chunk_bytes is None:
+        chunk_bytes = _DISPLAY_CHUNK_BYTES
+    batch, channels, _, height, width = video.shape
+    # Non-float32 inputs briefly coexist with their float32 form during the
+    # cast that precedes scaling to display bytes.
+    bytes_per_value = 4 if video.dtype == torch.float32 else video.element_size() + 4
+    intermediate_bytes_per_frame = batch * height * width * channels * bytes_per_value
+    return max(1, chunk_bytes // intermediate_bytes_per_frame)
+
+
+def to_display_uint8(video: torch.Tensor) -> torch.Tensor:
+    """Convert a decoded video from VAE range to display-ready uint8 frames.
+
+    The VAE emits ``[B, C, T, H, W]`` in ``[-1, 1]``; every consumer ultimately
+    wants ``[B, T, H, W, C]`` uint8 in ``[0, 255]``. Narrowing before IPC
+    reduces the device-to-host and shared-memory payload.
+
+    The arithmetic runs in float32 and matches the old two-step path exactly —
+    ``postprocess_video`` produced ``(x / 2 + 0.5).clamp(0, 1)`` and the encoders
+    then scaled and rounded — so output is bit-identical to what callers saw, and
+    slicing does not change that because frames convert independently.
+    """
+    video = video.detach()
+    batch, channels, frames, height, width = video.shape
+    out = torch.empty(
+        (batch, frames, height, width, channels),
+        dtype=torch.uint8,
+        device=video.device,
+    )
+
+    step = _display_chunk_frame_count(video)
+    for start in range(0, frames, step):
+        stop = min(start + step, frames)
+        # Preserve the input dtype for denormalization to match the historical
+        # VideoProcessor path, which performed this arithmetic before casting
+        # to float32 for NumPy.
+        chunk = video[:, :, start:stop].permute(0, 2, 3, 4, 1).to(video.dtype, copy=True)
+        chunk = chunk.mul_(0.5).add_(0.5).clamp_(0, 1)
+        if chunk.dtype != torch.float32:
+            chunk = chunk.float()
+        out[:, start:stop] = chunk.mul_(255).round_().to(torch.uint8)
+    return out
+
+
+def _should_narrow_video_output(
+    *,
+    is_output_rank: bool,
+    is_t2i: bool,
+    enable_cpu_offload: bool,
+) -> bool:
+    """Narrow only when GPU post-decode headroom is expected."""
+    return is_output_rank and not is_t2i and not enable_cpu_offload
+
+
 def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
     """Build the postprocessor for Cosmos3 image, video, and video+audio output.
 
@@ -762,7 +824,20 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
         guardrails_enabled = is_guardrails_enabled(od_config, sampling_params)
         if guardrails_enabled:
             video = check_video_safety(video)
-        processed_video = video_processor.postprocess_video(video, output_type=output_type)
+        if video.dtype == torch.uint8:
+            # Display-ready output intentionally remains uint8 for ``np`` and
+            # ``pt`` so serving does not widen it only to encode it as bytes.
+            if output_type == "pt":
+                processed_video = video
+            elif output_type == "np":
+                processed_video = video.detach().cpu().numpy()
+            elif output_type == "pil":
+                vae_video = video.detach().cpu().permute(0, 4, 1, 2, 3).float().div_(127.5).sub_(1.0)
+                processed_video = video_processor.postprocess_video(vae_video, output_type="pil")
+            else:
+                raise ValueError(f"Unsupported Cosmos3 video output_type: {output_type!r}.")
+        else:
+            processed_video = video_processor.postprocess_video(video, output_type=output_type)
         if audio is None:
             if pending_action is not None:
                 return {
@@ -3969,6 +4044,15 @@ class Cosmos3OmniDiffusersPipeline(
             logger.info("Decoding video...")
         decode_start = time.time()
         video = self._decode_latents(latents)
+        if _should_narrow_video_output(
+            is_output_rank=_is_rank_zero(),
+            is_t2i=is_t2i,
+            enable_cpu_offload=bool(getattr(self.od_config, "enable_cpu_offload", False)),
+        ):
+            # T2I keeps the VAE range because its postprocess hands back PIL
+            # images. CPU offload keeps conversion on the host to preserve the
+            # post-decode memory headroom it was enabled to provide.
+            video = to_display_uint8(video)
         if _is_rank_zero():
             logger.info("Video decoded in %.2fs", time.time() - decode_start)
             if not sound_enabled:

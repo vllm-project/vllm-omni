@@ -1328,6 +1328,144 @@ def test_postprocess_handles_image_video_audio_and_validation() -> None:
         func({"image": video, "video": video})
 
 
+def test_to_display_uint8_matches_the_float_path_it_replaces() -> None:
+    """The conversion moved to the GPU must not change a single pixel.
+
+    Callers used to get float32 in [0, 1] from ``postprocess_video`` and the
+    encoders scaled and rounded it themselves; doing both at once earlier has to
+    land on the same bytes.
+    """
+    from diffusers.video_processor import VideoProcessor
+
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import to_display_uint8
+
+    torch.manual_seed(0)
+    # Include out-of-range values: the old path clamped after the affine, not before.
+    video = torch.empty(1, 3, 5, 8, 6).uniform_(-1.4, 1.4)
+
+    reference = VideoProcessor(vae_scale_factor=16).postprocess_video(video, output_type="np")
+    expected = np.round(np.clip(reference, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+    assert np.array_equal(to_display_uint8(video).numpy(), expected)
+
+
+def test_to_display_uint8_matches_bfloat16_postprocess_bytes() -> None:
+    from diffusers.video_processor import VideoProcessor
+
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import to_display_uint8
+
+    torch.manual_seed(0)
+    video = torch.empty(1, 3, 5, 8, 6).uniform_(-1, 1).to(torch.bfloat16)
+    reference = VideoProcessor(vae_scale_factor=16).postprocess_video(video, output_type="np")
+    expected = np.round(np.clip(reference, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+    assert np.array_equal(to_display_uint8(video).numpy(), expected)
+
+
+def test_to_display_uint8_emits_channel_last_frames_at_half_the_width() -> None:
+    video = torch.zeros(1, 3, 5, 8, 6, dtype=torch.bfloat16)
+
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import to_display_uint8
+
+    frames = to_display_uint8(video)
+
+    assert frames.shape == (1, 5, 8, 6, 3)
+    assert frames.dtype == torch.uint8
+    assert frames.is_contiguous()
+    # Halving the payload is the whole point: this is what crosses every hop.
+    assert frames.numel() * frames.element_size() * 2 == video.numel() * video.element_size()
+
+
+def test_to_display_uint8_is_unchanged_by_how_many_slices_it_takes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Slicing exists only to cap memory, so it must not touch the result.
+
+    Frames convert independently, so a one-frame-at-a-time pass and a
+    whole-tensor pass have to agree exactly.
+    """
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    torch.manual_seed(0)
+    video = torch.empty(2, 3, 7, 8, 6).uniform_(-1.4, 1.4)
+
+    whole = pipeline_cosmos3.to_display_uint8(video)
+    monkeypatch.setattr(pipeline_cosmos3, "_DISPLAY_CHUNK_BYTES", 1)
+    sliced = pipeline_cosmos3.to_display_uint8(video)
+
+    assert torch.equal(whole, sliced)
+
+
+def test_display_chunk_frame_count_bounds_the_float32_intermediate() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import _display_chunk_frame_count
+
+    # Two frames' worth of float32: 2 * 4 * 6 * 3 * 4 bytes.
+    video = torch.zeros(1, 3, 7, 4, 6)
+
+    assert _display_chunk_frame_count(video, chunk_bytes=2 * 4 * 6 * 3 * 4) == 2
+
+
+def test_display_chunk_frame_count_rejects_wrong_layout() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import _display_chunk_frame_count
+
+    with pytest.raises(ValueError, match=r"shape \[B, C, T, H, W\]"):
+        _display_chunk_frame_count(torch.zeros(3, 4, 6))
+
+
+def test_to_display_uint8_does_not_mutate_a_float32_caller_tensor() -> None:
+    """A float32 input must not be aliased by the in-place conversion chain."""
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import to_display_uint8
+
+    video = torch.full((1, 3, 2, 4, 6), 0.5, dtype=torch.float32)
+    original = video.clone()
+
+    to_display_uint8(video)
+
+    assert torch.equal(video, original)
+
+
+def test_postprocess_passes_display_frames_through_without_widening() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_post_process_func
+
+    func = get_cosmos3_post_process_func(SimpleNamespace())
+    frames = torch.arange(1 * 5 * 8 * 6 * 3, dtype=torch.uint8).reshape(1, 5, 8, 6, 3)
+
+    processed = func({"video": frames})
+
+    assert isinstance(processed, np.ndarray)
+    assert processed.dtype == np.uint8
+    assert np.array_equal(processed, frames.numpy())
+    assert func({"video": frames}, output_type="pt") is frames
+    pil_frames = func({"video": frames}, output_type="pil")
+    assert isinstance(pil_frames, list)
+    assert isinstance(pil_frames[0][0], Image.Image)
+    with pytest.raises(ValueError, match="Unsupported Cosmos3 video output_type"):
+        func({"video": frames}, output_type="jpeg")
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_postprocess_moves_small_display_frames_to_cpu_for_numpy() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_post_process_func
+
+    func = get_cosmos3_post_process_func(SimpleNamespace())
+    frames = torch.arange(1 * 2 * 8 * 6 * 3, dtype=torch.uint8, device="cuda").reshape(1, 2, 8, 6, 3)
+
+    processed = func({"video": frames})
+
+    assert isinstance(processed, np.ndarray)
+    assert np.array_equal(processed, frames.cpu().numpy())
+
+
+def test_video_narrowing_preserves_cpu_offload_headroom() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import _should_narrow_video_output
+
+    assert _should_narrow_video_output(is_output_rank=True, is_t2i=False, enable_cpu_offload=False)
+    assert not _should_narrow_video_output(is_output_rank=False, is_t2i=False, enable_cpu_offload=False)
+    assert not _should_narrow_video_output(is_output_rank=True, is_t2i=False, enable_cpu_offload=True)
+    assert not _should_narrow_video_output(is_output_rank=True, is_t2i=True, enable_cpu_offload=False)
+
+
 def test_action_postprocess_handles_robolab_policy_outputs() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
         RoboLabPolicyInputs,
