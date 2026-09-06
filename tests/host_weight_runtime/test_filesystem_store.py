@@ -440,6 +440,22 @@ def _corrupt_test_payload(artifact: Path) -> None:
     os.chmod(artifact, 0o555)
 
 
+def _quarantine_and_rebuild(store: FilesystemHostWeightStore, identity: WeightArtifactIdentity) -> Path:
+    before = set(store.quarantine_dir.iterdir())
+    _corrupt_test_payload(store.artifacts_dir / identity.key)
+    result = store.get_or_build(
+        BuildRequest(identity),
+        FakeProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+    assert result.status is StoreStatus.BUILT
+    assert result.lease is not None
+    result.lease.close()
+    (quarantined,) = set(store.quarantine_dir.iterdir()) - before
+    return quarantined
+
+
 def _build_process(root: str, counter: str, initial_lookup_barrier: object, result_queue: object) -> None:
     try:
         identity = _identity()
@@ -2494,6 +2510,199 @@ def test_store_and_free_space_capacity_limits_fail_before_publication(tmp_path: 
     assert free_result.status is StoreStatus.FAILED
     assert free_result.failure is not None and free_result.failure.code is FailureCode.INSUFFICIENT_CAPACITY
     assert not list(free_limited.artifacts_dir.iterdir())
+
+
+def test_cleanup_quarantined_preserves_current_artifact_other_entries_and_deny(tmp_path: Path) -> None:
+    store = _make_store(tmp_path / "store")
+    identity, artifact = _publish_test_artifact(store)
+    first = _quarantine_and_rebuild(store, identity)
+    second = _quarantine_and_rebuild(store, identity)
+    ready_inode = artifact.stat().st_ino
+    lock_inodes = {path.name: path.stat().st_ino for path in store.locks_dir.iterdir()}
+
+    assert store.cleanup_quarantined(first.name) is None
+    assert set(store.quarantine_dir.iterdir()) == {second}
+    assert artifact.stat().st_ino == ready_inode
+    hit = store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM)
+    assert hit.lease is not None
+    assert torch.equal(hit.lease.tensors["layer.weight"], _weight())
+    hit.lease.close()
+
+    _corrupt_test_payload(artifact)
+    assert store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM).status is StoreStatus.INVALID
+    deny = store.deny_dir / f"{identity.key}.json"
+    deny_bytes = deny.read_bytes()
+    assert store.cleanup_quarantined(second.name) is None
+    assert deny.read_bytes() == deny_bytes
+    assert artifact.stat().st_ino == ready_inode
+    assert {path.name: path.stat().st_ino for path in store.locks_dir.iterdir()} == lock_inodes
+    assert store.cleanup_quarantined(first.name) is None
+
+
+@pytest.mark.parametrize("active", ["build", "lease"])
+def test_cleanup_quarantined_refuses_active_key(tmp_path: Path, active: str) -> None:
+    store = _make_store(tmp_path / "store")
+    identity, _ = _publish_test_artifact(store)
+    quarantined = _quarantine_and_rebuild(store, identity)
+    owner: FileLock | HostWeightLease
+    if active == "build":
+        owner = FileLock(store._build_lock_path(identity.key), exclusive=True, deadline=None)
+        expected = FailureCode.ACTIVE_BUILD_TIMEOUT
+    else:
+        lease = store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM).lease
+        assert lease is not None
+        owner = lease
+        expected = FailureCode.ACTIVE_LEASE
+    try:
+        failure = store.cleanup_quarantined(quarantined.name)
+        assert failure is not None and failure.code is expected and failure.retryable
+        assert quarantined.is_dir()
+    finally:
+        owner.close()
+    assert store.cleanup_quarantined(quarantined.name) is None
+
+
+@pytest.mark.parametrize("recovery", ["cleanup", "build"])
+def test_cleanup_quarantined_retries_post_move_removal_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recovery: str
+) -> None:
+    store = _make_store(tmp_path / "store")
+    identity, artifact = _publish_test_artifact(store)
+    quarantined = _quarantine_and_rebuild(store, identity)
+    original_rmtree = shutil.rmtree
+
+    def fail_removal(path: str | os.PathLike[str]) -> None:
+        if Path(path).parent == store.quarantine_dir:
+            raise OSError(errno.EIO, "injected removal failure")
+        original_rmtree(path)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(shutil, "rmtree", fail_removal)
+        failure = store.cleanup_quarantined(quarantined.name)
+    assert failure is not None and failure.code is FailureCode.QUARANTINE_FAILED and failure.retryable
+    assert not quarantined.exists()
+    assert len(list(store.quarantine_dir.glob(f"{identity.key}.cleanup.*"))) == 1
+
+    if recovery == "cleanup":
+        assert store.cleanup_quarantined(quarantined.name) is None
+    else:
+        # A real build (not a warm hit) reconciles the same tombstone protocol.
+        _corrupt_test_payload(artifact)
+        result = store.get_or_build(
+            BuildRequest(identity),
+            FakeProducer(identity),
+            validation=ValidationLevel.FULL_CHECKSUM,
+            deadline=time.monotonic() + 10,
+        )
+        assert result.status is StoreStatus.BUILT
+        assert result.lease is not None
+        assert torch.equal(result.lease.tensors["layer.weight"], _weight())
+        result.lease.close()
+    assert not list(store.quarantine_dir.glob(f"{identity.key}.cleanup.*"))
+
+
+@pytest.mark.parametrize("after_removal", [False, True])
+def test_cleanup_quarantined_retries_parent_sync_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, after_removal: bool
+) -> None:
+    store = _make_store(tmp_path / "store")
+    identity, _ = _publish_test_artifact(store)
+    quarantined = _quarantine_and_rebuild(store, identity)
+    original_sync = filesystem_store_module._fsync_directory
+
+    def fail_sync(path: Path) -> None:
+        if path == store.quarantine_dir and (
+            not after_removal or not list(store.quarantine_dir.glob(f"{identity.key}.cleanup.*"))
+        ):
+            raise OSError(errno.EIO, "injected quarantine sync failure")
+        original_sync(path)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(filesystem_store_module, "_fsync_directory", fail_sync)
+        failure = store.cleanup_quarantined(quarantined.name)
+    assert failure is not None and failure.code is FailureCode.QUARANTINE_FAILED and failure.retryable
+    assert not quarantined.exists()
+    assert bool(list(store.quarantine_dir.glob(f"{identity.key}.cleanup.*"))) is not after_removal
+
+    # An already absent selection must still retry the failed durability step.
+    with monkeypatch.context() as fault:
+        fault.setattr(filesystem_store_module, "_fsync_directory", fail_sync)
+        assert store.cleanup_quarantined(quarantined.name) is not None
+    assert store.cleanup_quarantined(quarantined.name) is None
+    assert not list(store.quarantine_dir.glob(f"{identity.key}.cleanup.*"))
+
+
+@pytest.mark.parametrize("entry_kind", ["symlink", "file"])
+def test_cleanup_quarantined_rejects_non_directory_entry(tmp_path: Path, entry_kind: str) -> None:
+    store = _make_store(tmp_path / "store")
+    identity, artifact = _publish_test_artifact(store)
+    entry = store.quarantine_dir / f"{identity.key}.validation_failure.test"
+    if entry_kind == "symlink":
+        entry.symlink_to(artifact, target_is_directory=True)
+    else:
+        entry.write_text("not an artifact directory")
+    failure = store.cleanup_quarantined(entry.name)
+    assert failure is not None and failure.code is FailureCode.QUARANTINE_FAILED
+    assert not failure.retryable
+    assert entry.exists()
+    hit = store.lookup(identity, validation=ValidationLevel.FULL_CHECKSUM)
+    assert hit.lease is not None
+    assert torch.equal(hit.lease.tensors["layer.weight"], _weight())
+    hit.lease.close()
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["../escape", "/tmp/escape", "f" * 64, "g" * 64 + ".x", "f" * 64 + ".", "f" * 64 + ".x/../y", "f" * 64 + ".x\0"],
+)
+def test_cleanup_quarantined_rejects_invalid_selection_before_mutation(tmp_path: Path, name: str) -> None:
+    store = _make_store(tmp_path / "store")
+    locks = set(store.locks_dir.iterdir())
+    with pytest.raises(ValueError, match="inventory basename"):
+        store.cleanup_quarantined(name)
+    assert set(store.locks_dir.iterdir()) == locks
+
+
+def test_cleanup_quarantined_restores_bounded_store_recovery_headroom(tmp_path: Path) -> None:
+    store = _make_store(tmp_path / "store", capacity=CapacityPolicy(max_store_bytes=16384))
+    identity = _identity()
+    for _ in range(32):
+        result = store.get_or_build(
+            BuildRequest(identity),
+            FakeProducer(identity),
+            validation=ValidationLevel.FULL_CHECKSUM,
+            deadline=time.monotonic() + 10,
+        )
+        if result.status is StoreStatus.FAILED:
+            break
+        assert result.lease is not None
+        result.lease.close()
+        _corrupt_test_payload(store.artifacts_dir / identity.key)
+    assert result.failure is not None and result.failure.code is FailureCode.STORE_LIMIT_EXCEEDED
+    quarantined = [
+        entry for entry in store.inspect_domain().inventory if entry.state is ArtifactInventoryState.QUARANTINED
+    ]
+    assert len(quarantined) > 1
+    assert store.cleanup(identity) is None
+    still_full = store.get_or_build(
+        BuildRequest(identity),
+        FakeProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+    assert still_full.failure is not None and still_full.failure.code is FailureCode.STORE_LIMIT_EXCEEDED
+
+    assert store.cleanup_quarantined(quarantined[0].storage_name) is None
+    recovered = store.get_or_build(
+        BuildRequest(identity),
+        FakeProducer(identity),
+        validation=ValidationLevel.FULL_CHECKSUM,
+        deadline=time.monotonic() + 10,
+    )
+    assert recovered.status is StoreStatus.BUILT
+    assert recovered.lease is not None
+    assert torch.equal(recovered.lease.tensors["layer.weight"], _weight())
+    recovered.lease.close()
 
 
 def test_domain_capacity_policy_is_authoritative(tmp_path: Path) -> None:
