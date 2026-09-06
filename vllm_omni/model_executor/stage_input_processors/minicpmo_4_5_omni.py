@@ -10,7 +10,7 @@ import torch
 from vllm.inputs import TextPrompt
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
-from vllm_omni.experimental.fullduplex.engine.intermediate import (
+from vllm_omni.engine.duplex.intermediate import (
     build_duplex_intermediate_buffer,
     set_ref_audio,
     set_tts_handoff,
@@ -95,7 +95,7 @@ def _extract_native_runtime_ref_audio(data_plane_metadata):
     runtime_config = data_plane_metadata.get("runtime_config")
     if not isinstance(runtime_config, dict):
         return None
-    from vllm_omni.experimental.fullduplex.minicpmo45.input import decode_native_ref_audio_from_config
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input import decode_native_ref_audio_from_config
 
     waveform = decode_native_ref_audio_from_config({"extra_body": runtime_config})
     if waveform is None:

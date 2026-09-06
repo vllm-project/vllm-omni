@@ -18,4 +18,4 @@ A: AWQ is available through the inherited vLLM quantization registry, and vLLM-O
 
 > Q: Does vLLM-Omni support multimodal streaming input and output?
 
-A: Yes, for specific models and serving paths. Current capabilities include [streaming video input](../serving/video_stream_api.md), [streaming diffusion output](../user_guide/diffusion/execution_modes.md#streaming-output), and experimental full-duplex real-time audio described in the [project overview](../README.md). Check the model and API documentation because input and output support is model-specific.
+A: Yes, for specific models and serving paths. Current capabilities include [streaming video input](../serving/video_stream_api.md), [streaming diffusion output](../user_guide/diffusion/execution_modes.md#streaming-output), and [full-duplex realtime audio](../serving/realtime_duplex_api.md). Check the model and API documentation because input and output support is model-specific.
