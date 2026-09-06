@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Diffusion input-batch structures following the MRV2-style vLLM layout.
 
 Request states remain the only persistent source of truth. Static tensors are
@@ -62,24 +62,46 @@ def _pad_mask(x: torch.Tensor, target_seq_len: int) -> torch.Tensor:
 def _select_states(
     states: Sequence[StepRequestState],
     idx_mapping: torch.Tensor | None,
+    cached_batch: InputBatch | None = None,
 ) -> tuple[list[StepRequestState], torch.Tensor, np.ndarray]:
     if not states:
         raise ValueError("Cannot build InputBatch from empty states.")
 
     if idx_mapping is None:
+        identity_states = list(states)
         device = states[0].latents.device if states[0].latents is not None else None
+        expected_device = torch.device("cpu") if device is None else device
+
+        # The common stepwise path uses an identity mapping. Avoid reading a
+        # device arange back to the host, and reuse the cached device tensor
+        # across denoising steps when its device contract still matches.
+        if cached_batch is not None and cached_batch._owns_identity_mapping:
+            cached_mapping = cached_batch.idx_mapping
+            if (
+                cached_mapping.dtype == torch.int32
+                and cached_mapping.device == expected_device
+                and cached_mapping.numel() == len(states)
+            ):
+                return identity_states, cached_mapping, cached_batch.idx_mapping_np
+
         idx_mapping = torch.arange(len(states), dtype=torch.int32, device=device)
-    else:
-        if idx_mapping.ndim != 1:
-            raise ValueError("idx_mapping must be a 1D tensor.")
-        idx_mapping = idx_mapping.to(dtype=torch.int32)
+        idx_mapping_np = np.arange(len(states), dtype=np.int32)
+        return identity_states, idx_mapping, idx_mapping_np
+
+    if idx_mapping.ndim != 1:
+        raise ValueError("idx_mapping must be a 1D tensor.")
+    idx_mapping = idx_mapping.to(dtype=torch.int32)
+    idx_mapping_np = idx_mapping.detach().cpu().numpy()
 
     selected_states: list[StepRequestState] = []
-    for batch_idx, state_idx in enumerate(idx_mapping.tolist()):
+    # Materialize Python ints from the host array. Unlike calling tolist() on
+    # the device tensor, this does not introduce another device sync and is
+    # faster than iterating NumPy scalar objects for larger batches.
+    for batch_idx, state_idx in enumerate(idx_mapping_np.tolist()):
         if state_idx < 0 or state_idx >= len(states):
             raise ValueError(f"idx_mapping[{batch_idx}]={state_idx} is out of range for states.")
         selected_states.append(states[state_idx])
-    return selected_states, idx_mapping, idx_mapping.detach().cpu().numpy()
+    return selected_states, idx_mapping, idx_mapping_np
 
 
 def _prepare_request_ids(states: Sequence[StepRequestState]) -> list[str]:
@@ -542,7 +564,10 @@ def _same_composition(
         return False
     if cached_batch.request_ids != request_ids:
         return False
-    if not np.array_equal(cached_batch.idx_mapping_np, idx_mapping_np):
+    if cached_batch.idx_mapping_np is not idx_mapping_np and not np.array_equal(
+        cached_batch.idx_mapping_np,
+        idx_mapping_np,
+    ):
         return False
     # Midway prompt updates (typically for video generation) can change prompt_embeds without changing ids/mapping.
     # In this case, each request state manages the embedding's "version". Use it to determine if cache is still valid.
@@ -621,6 +646,10 @@ class InputBatch:
     negative_txt_seq_lens: list[int] | None = None
     states: Sequence[StepRequestState] = field(default_factory=tuple)
 
+    # True only when InputBatch created the identity mapping itself, making
+    # the device tensor safe to reuse across steps without external mutation.
+    _owns_identity_mapping: bool = field(default=False, init=False, repr=False)
+
     # For midway prompt updates (typically for video generation) that changes embeddings without changing ids,
     # Keep a snapshot of the current per-request versions of prompt embeddings for later runtime comparison
     _prompt_update_versions: tuple[int, ...] = ()
@@ -680,12 +709,14 @@ class InputBatch:
         idx_mapping: torch.Tensor,
         idx_mapping_np: np.ndarray,
         request_ids: list[str],
+        owns_identity_mapping: bool,
     ) -> InputBatch:
         self.request_ids = request_ids
         self.num_reqs = len(request_ids)
         self.num_reqs_after_padding = len(request_ids)
         self.idx_mapping = idx_mapping
         self.idx_mapping_np = idx_mapping_np
+        self._owns_identity_mapping = owns_identity_mapping
         self.states = tuple(selected_states)
         self.latents = _prepare_latents(selected_states, out=self.latents)
         self.timesteps = _prepare_timesteps(selected_states, out=self.timesteps)
@@ -701,11 +732,16 @@ class InputBatch:
         cached_batch: InputBatch | None = None,
     ) -> InputBatch:
         """Build a temporary step-local batch view from request states."""
-        selected_states, idx_mapping, idx_mapping_np = _select_states(states, idx_mapping)
+        owns_identity_mapping = idx_mapping is None
+        selected_states, idx_mapping, idx_mapping_np = _select_states(states, idx_mapping, cached_batch)
         request_ids = _prepare_request_ids(selected_states)
 
         if _same_composition(cached_batch, request_ids, idx_mapping_np, selected_states):
             assert cached_batch is not None
+            if owns_identity_mapping and cached_batch.idx_mapping is not idx_mapping:
+                cached_batch.idx_mapping = idx_mapping
+                cached_batch.idx_mapping_np = idx_mapping_np
+                cached_batch._owns_identity_mapping = True
             cached_batch._repack_dynamic_fields(selected_states)
             return cached_batch
 
@@ -715,12 +751,13 @@ class InputBatch:
                 idx_mapping,
                 idx_mapping_np,
                 request_ids,
+                owns_identity_mapping,
             )
 
         prompt_embeds, prompt_embeds_mask = _prepare_prompt_embeds(selected_states)
         negative_prompt_embeds, negative_prompt_embeds_mask = _prepare_negative_prompt_embeds(selected_states)
         do_true_cfg, true_cfg_scale, cfg_normalize = _prepare_cfg_scalars(selected_states)
-        return cls(
+        batch = cls(
             request_ids=request_ids,
             num_reqs=len(selected_states),
             num_reqs_after_padding=len(selected_states),
@@ -746,6 +783,8 @@ class InputBatch:
             states=tuple(selected_states),
             _prompt_update_versions=prompt_update_versions(selected_states),
         )
+        batch._owns_identity_mapping = owns_identity_mapping
+        return batch
 
 
 def scatter_latents(
