@@ -216,6 +216,11 @@ class OmniModelConfig(ModelConfig):
         # transformers' get_text_config method is used to get the text config from thinker_config.
         # to handle the case that each model stage has their own text config,
         # we need to draw the text config from the corresponding model stage.
+        if self.model_arch == "MingFlashOmniTalkerForConditionalGeneration" and self.hf_config_name == "talker_config":
+            ming_talker_text_config = self._draw_ming_talker_text_config()
+            if ming_talker_text_config is not None:
+                return ming_talker_text_config
+
         if self.hf_config_name is None:
             return get_hf_text_config(self.hf_config)
         try:
@@ -229,6 +234,17 @@ class OmniModelConfig(ModelConfig):
                 "falling back to default get_hf_text_config"
             )
             return get_hf_text_config(self.hf_config)
+
+    def _draw_ming_talker_text_config(self):
+        """Resolve the Ming talker Qwen2 config before model construction."""
+        try:
+            from vllm_omni.transformers_utils.configs.ming_flash_omni import (
+                resolve_ming_talker_text_config,
+            )
+        except Exception:
+            return None
+
+        return resolve_ming_talker_text_config(self.hf_config, getattr(self, "model", None))
 
     def _validate_startup_task_type(self) -> None:
         """Validate startup-only task selectors owned by an AR model."""

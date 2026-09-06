@@ -16,13 +16,14 @@ from unittest.mock import Mock
 import pytest
 from omegaconf import OmegaConf
 from pydantic import ValidationError
-from transformers import PretrainedConfig, Qwen3OmniMoeConfig
+from transformers import PretrainedConfig, Qwen2Config, Qwen3OmniMoeConfig
 from vllm.engine.arg_utils import EngineArgs
 
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.transformers_utils.configs.ming_flash_omni import MingFlashOmniTalkerConfig
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -505,6 +506,120 @@ def test_stage_specific_text_config_override():
     assert omni_config.get_num_attention_heads(parallel_config) == talker_num_heads
     assert omni_config.get_num_kv_heads(parallel_config) == talker_num_kv_heads
     assert omni_config.get_head_size() == talker_head_dim
+
+
+def test_ming_talker_text_config_uses_nested_qwen2_llm_config(monkeypatch):
+    """Ming talker stage sizing must come from talker_config.llm_config."""
+    original_mac = SimpleNamespace(
+        vocab_size=151936,
+        total_num_attention_heads=32,
+        total_num_kv_heads=8,
+        head_size=128,
+    )
+    vllm_config = SimpleNamespace(
+        model="dummy-ming",
+        hf_config=SimpleNamespace(
+            architectures=["MingFlashOmniTalkerForConditionalGeneration"],
+            model_type="ming_flash_omni",
+        ),
+        hf_text_config=SimpleNamespace(),
+        model_arch_config=original_mac,
+        disable_sliding_window=False,
+        original_max_model_len=None,
+        max_model_len=None,
+    )
+    monkeypatch.setattr(
+        OmniModelConfig,
+        "get_and_verify_max_len",
+        lambda self, _original_max_model_len: self.hf_text_config.max_position_embeddings,
+    )
+
+    talker_llm_config = {
+        "vocab_size": original_mac.vocab_size,
+        "hidden_size": 512,
+        "intermediate_size": 1024,
+        "num_hidden_layers": 6,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "head_dim": 64,
+        "max_position_embeddings": 4096,
+        "sliding_window": 2048,
+    }
+    vllm_config.hf_text_config = SimpleNamespace()
+    vllm_config.hf_config.talker_config = MingFlashOmniTalkerConfig(llm_config=talker_llm_config)
+
+    omni_config = OmniModelConfig.from_vllm_model_config(
+        vllm_config,
+        hf_config_name="talker_config",
+        model_arch="MingFlashOmniTalkerForConditionalGeneration",
+    )
+
+    assert isinstance(omni_config.hf_text_config, Qwen2Config)
+    assert omni_config.hf_text_config.hidden_size == 512
+    assert omni_config.hf_text_config.num_hidden_layers == 6
+    assert omni_config.max_model_len == 4096
+    assert omni_config.omni_kv_config is None
+
+    stage_mac = omni_config.model_arch_config
+    assert stage_mac is not original_mac
+    assert stage_mac.total_num_attention_heads == 8
+    assert stage_mac.total_num_kv_heads == 2
+    assert stage_mac.head_size == 64
+
+
+def test_ming_talker_text_config_loads_local_talker_llm_config(tmp_path, monkeypatch):
+    """Standalone Ming TTS checkpoints may only expose talker/llm/config.json."""
+    original_mac = SimpleNamespace(
+        vocab_size=151936,
+        total_num_attention_heads=32,
+        total_num_kv_heads=8,
+        head_size=128,
+    )
+    vllm_config = SimpleNamespace(
+        model=str(tmp_path),
+        hf_config=SimpleNamespace(
+            architectures=["MingFlashOmniTalkerForConditionalGeneration"],
+            model_type="ming_flash_omni",
+        ),
+        hf_text_config=SimpleNamespace(hidden_size=4096),
+        model_arch_config=original_mac,
+        disable_sliding_window=False,
+        original_max_model_len=None,
+        max_model_len=None,
+    )
+    monkeypatch.setattr(
+        OmniModelConfig,
+        "get_and_verify_max_len",
+        lambda self, _original_max_model_len: self.hf_text_config.max_position_embeddings,
+    )
+
+    llm_dir = tmp_path / "talker" / "llm"
+    llm_dir.mkdir(parents=True)
+    Qwen2Config(
+        vocab_size=original_mac.vocab_size,
+        hidden_size=896,
+        intermediate_size=4864,
+        num_hidden_layers=24,
+        num_attention_heads=14,
+        num_key_value_heads=2,
+        max_position_embeddings=32768,
+    ).to_json_file(llm_dir / "config.json")
+
+    omni_config = OmniModelConfig.from_vllm_model_config(
+        vllm_config,
+        hf_config_name="talker_config",
+        model_arch="MingFlashOmniTalkerForConditionalGeneration",
+    )
+
+    assert isinstance(omni_config.hf_text_config, Qwen2Config)
+    assert omni_config.hf_text_config.hidden_size == 896
+    assert omni_config.max_model_len == 32768
+
+    stage_mac = omni_config.model_arch_config
+    assert stage_mac is not original_mac
+    assert stage_mac.total_num_attention_heads == 14
+    assert stage_mac.total_num_kv_heads == 2
+    assert stage_mac.head_size == 64
 
 
 def test_non_override_ar_stage_inputs_embeds_size_matches_hidden_size():
