@@ -350,6 +350,7 @@ extend-ignore-re = [
     "\\+g[0-9a-f]{7,}",
 ]
 [tool.typos.default.extend-words]
+PNG = "PNG"
 ue = "ue"
 # Einstein-summation index tuple for head/expert/dimension axes.
 hed = "hed"

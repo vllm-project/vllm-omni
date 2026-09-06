@@ -31,6 +31,11 @@ MAMMOTH_MODA2_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             requires_multimodal_data=True,
             engine_output_type="latent",
+            # Use the existing full-payload connector path:
+            # per-step slices remain device-resident in the request-end
+            # accumulator, while ar2dit_full_payload selects the DiT conditions
+            # on the producer GPU before the connector's normal transport.
+            custom_process_next_stage_input_func=f"{_PROC}.ar2dit_full_payload",
         ),
         StagePipelineConfig(
             stage_id=1,
@@ -42,7 +47,8 @@ MAMMOTH_MODA2_PIPELINE = PipelineConfig(
             owns_tokenizer=False,
             requires_multimodal_data=False,
             engine_output_type="image",
-            custom_process_input_func=f"{_PROC}.ar2dit",
+            sync_process_input_func=f"{_PROC}.ar2dit_token_only",
+            requires_full_payload_input=True,
         ),
     ),
 )

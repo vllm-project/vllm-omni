@@ -22,6 +22,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechReques
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.worker import gpu_ar_model_runner as gpu_ar_model_runner_module
 from vllm_omni.worker import sparse_audio
 from vllm_omni.worker.gpu_ar_model_runner import (
     ExecuteModelState,
@@ -542,6 +543,11 @@ def test_build_omni_output_uses_snapshots_and_connector_after_accumulation(monke
 
 def test_build_omni_output_copies_hidden_for_partial_downstream_batch(monkeypatch):
     runner = _make_async_output_runner(engine_output_type="latent")
+    d2h_slices: list[torch.Tensor] = []
+
+    def _record_d2h(tensor: torch.Tensor) -> torch.Tensor:
+        d2h_slices.append(tensor.clone())
+        return tensor.detach().to("cpu").contiguous()
 
     monkeypatch.setattr(
         GPUARModelRunner,
@@ -549,6 +555,7 @@ def test_build_omni_output_copies_hidden_for_partial_downstream_batch(monkeypatc
         lambda self, req_ids: ("latent", ["r2"]),
     )
     monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(gpu_ar_model_runner_module, "_to_cpu_contiguous", _record_d2h)
     monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
 
@@ -580,6 +587,8 @@ def test_build_omni_output_copies_hidden_for_partial_downstream_batch(monkeypatc
     assert torch.equal(output.inter_stage_outputs[1]["hidden"], torch.tensor([[2.0], [3.0]]))
     assert output.inter_stage_outputs[2] is None
     assert output.multimodal_outputs is None
+    assert len(d2h_slices) == 1
+    assert torch.equal(d2h_slices[0], torch.tensor([[2.0], [3.0]]))
 
 
 def test_process_additional_information_uses_snapshot_request_order(monkeypatch):
@@ -631,6 +640,76 @@ def test_process_additional_information_uses_snapshot_request_order(monkeypatch)
     assert len(seen) == 2
     assert torch.equal(seen[0], torch.tensor([[1.0]]))
     assert torch.equal(seen[1], torch.tensor([[2.0], [3.0]]))
+
+
+def test_request_end_hidden_snapshot_keeps_device_tensor_in_accumulator(monkeypatch):
+    """Request-end mode retains hidden slices on the producing device.
+
+    The per-step host materialization must be skipped while the retained slice
+    stays independent of the reused hidden_states buffer.
+    """
+    runner = _make_async_output_runner(engine_output_type="latent")
+    runner.model = SimpleNamespace(has_postprocess=False, omni_payload_at_request_end=True)
+    accumulated: dict[str, dict[str, torch.Tensor]] = {}
+
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "_resolve_pooler_payload_req_ids",
+        lambda self, req_ids: ("latent", req_ids),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: True)
+    monkeypatch.setattr(GPUARModelRunner, "_should_defer_full_payload_d2h", lambda self: True)
+    monkeypatch.setattr(
+        gpu_ar_model_runner_module,
+        "_to_cpu_contiguous",
+        lambda tensor: pytest.fail("request-end hidden path must not perform per-step D2H"),
+    )
+    monkeypatch.setattr(
+        GPUARModelRunner,
+        "accumulate_full_payload_output",
+        lambda self, rid, payload, request: accumulated.__setitem__(rid, payload),
+    )
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+
+    hidden_buffer = torch.tensor([[1.0], [2.0], [3.0]])
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(
+            total_num_scheduled_tokens=3,
+            num_scheduled_tokens={"r1": 1, "r2": 2},
+        ),
+        hidden_states=hidden_buffer,
+        staged_hidden_states_cpu=None,
+        multimodal_outputs={},
+        req_ids_output_copy=["r1", "r2"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1},
+        valid_sampled_token_ids=[[], []],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=torch.tensor([1, 2], dtype=torch.int32).numpy(),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.long),
+    )
+
+    # Nothing may cross the worker/core boundary per step.
+    assert output.inter_stage_outputs is None
+    assert output.multimodal_outputs is None
+    # The accumulator received the per-request hidden slices on the input device.
+    assert accumulated["r1"]["hidden"].device == hidden_buffer.device
+    assert accumulated["r2"]["hidden"].device == hidden_buffer.device
+    assert torch.equal(accumulated["r1"]["hidden"], torch.tensor([[1.0]]))
+    assert torch.equal(accumulated["r2"]["hidden"], torch.tensor([[2.0], [3.0]]))
+    if hidden_buffer.device.type == "cuda":
+        # The runner's hidden_states buffer is reused by the next forward step;
+        # the snapshot must be a copy, not a view into the buffer.
+        hidden_buffer[1:, 0] = 99.0
+        assert torch.equal(accumulated["r1"]["hidden"], torch.tensor([[1.0]]))
+        assert torch.equal(accumulated["r2"]["hidden"], torch.tensor([[2.0], [3.0]]))
 
 
 def test_async_omni_output_guard_requires_safe_conditions():

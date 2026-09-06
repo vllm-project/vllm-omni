@@ -13,6 +13,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.model_executor.models.mammoth_moda2.conditioning import (
+    conditioning_spec_from_config,
+    select_ar_conditions,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
 
@@ -173,26 +177,14 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         caller no longer needs to pass them. Mirrors the masking the bespoke
         MammothModa2 example performed via ar2dit.
         """
-        gen_vocab_start_index = int(self.config.llm_config.gen_vocab_start_index)
-        visual_ids = [
-            int(self.config.image_token_id),
-            int(self.config.video_token_id),
-            int(self.config.vision_start_token_id),
-            int(self.config.vision_end_token_id),
-        ]
-
-        device = full_hidden_states.device
-        token_ids = torch.tensor(full_token_ids, dtype=torch.long, device=device)
-        positions = torch.arange(token_ids.shape[0], device=device)
-        questions_mask = positions < answer_start_index
-        answers_mask = ~questions_mask
-        gen_token_mask = token_ids >= gen_vocab_start_index
-        visual_token_mask = torch.isin(token_ids, torch.tensor(visual_ids, dtype=torch.long, device=device))
-        text_mask = questions_mask & ~(visual_token_mask | gen_token_mask)
-        image_mask = answers_mask & gen_token_mask
-
-        text_cond = full_hidden_states[text_mask].to(dtype=torch.float32).contiguous()
-        image_cond = full_hidden_states[image_mask].to(dtype=torch.float32).contiguous()
+        text_cond, image_cond = select_ar_conditions(
+            full_hidden_states,
+            full_token_ids,
+            answer_start_index,
+            conditioning_spec_from_config(self.config),
+        )
+        text_cond = text_cond.to(dtype=torch.float32).contiguous()
+        image_cond = image_cond.to(dtype=torch.float32).contiguous()
         return text_cond, image_cond
 
     @torch.inference_mode()
