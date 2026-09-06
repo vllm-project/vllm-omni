@@ -17,6 +17,7 @@ nav:
       - Streaming and Realtime:
         - Realtime Audio: serving/realtime_api.md
         - Full Duplex: serving/full_duplex_api.md
+        - Realtime Duplex Reference: serving/realtime_duplex_api.md
         - Streaming Video Input: serving/video_stream_api.md
         - Streaming Video Output: serving/streaming_video_output_api.md
         - OpenPI Robot Policy: serving/openpi_api.md
@@ -65,13 +66,14 @@ nav:
       - ModelOpt: user_guide/quantization/modelopt.md
       - AutoRound: user_guide/quantization/autoround.md
       - msModelSlim: user_guide/quantization/msmodelslim.md
+      - TorchAO: user_guide/quantization/torchao.md
     - Diffusion Acceleration:
       - Overview and Compatibility:
         - Overview: user_guide/diffusion_features.md
         - Feature Compatibility: user_guide/feature_compatibility.md
       - CPU Offloading:
         - Overview: user_guide/diffusion/cpu_offload.md
-        - Model-Level: user_guide/diffusion/offloader/cpu_offload.md
+        - Model-Level: user_guide/diffusion/offloader/module_offload.md
         - Layerwise: user_guide/diffusion/offloader/layerwise_offload.md
         - Distributed Layerwise: user_guide/diffusion/offloader/distributed_layerwise_offload.md
       - Cache Acceleration:
@@ -150,7 +152,7 @@ nav:
           - Skip-Softmax: design/feature/skip_softmax.md
         - CPU Offloading:
           - Overview: design/feature/offloader/README.md
-          - Model-Level: design/feature/offloader/cpu_offload.md
+          - Model-Level: design/feature/offloader/module_offload.md
           - Layerwise: design/feature/offloader/layerwise_offload.md
           - Distributed Layerwise: design/feature/offloader/distributed_layerwise_offload.md
         - Cache-DiT: design/feature/cache_dit.md

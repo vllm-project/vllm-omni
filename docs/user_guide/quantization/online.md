@@ -7,11 +7,11 @@ loading the model. Use it when you want memory savings without preparing a
 separate quantized checkpoint.
 
 This mode is different from pre-quantized checkpoint formats such as GGUF,
-AutoRound, msModelSlim, or serialized Int8 checkpoints. Those formats are
-prepared before serving and are documented in their method-specific guides.
-For MXFP8 and MXFP4, use this page for load-time quantization from BF16
-checkpoints, and use the method-specific pages for offline checkpoints produced
-by msModelSlim and the merge tools.
+AutoRound, msModelSlim, serialized TorchAO checkpoints, or serialized Int8
+checkpoints. Those formats are prepared before serving and are documented in
+their method-specific guides. For MXFP8 and MXFP4, use this page for load-time
+quantization from BF16 checkpoints, and use the method-specific pages for
+offline checkpoints produced by msModelSlim and the merge tools.
 
 ## Hardware Support
 

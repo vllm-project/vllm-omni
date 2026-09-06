@@ -128,6 +128,109 @@ with `guidance_scale=1.0` remain valid on the same server: every rank evaluates
 only the positive branch, no negative embeddings are built, and no guidance is
 applied.
 
+### 1 x RTX 4090 48 GB (FP8)
+
+Boogu-Image supports two ways to quantize or load the DiT transformer:
+
+| Path               | Base model                       | Edit model                       | Method                       | Scheme                  |
+| ------------------ | -------------------------------- | -------------------------------- | ---------------------------- | ----------------------- |
+| Serialized TorchAO | `Boogu/Boogu-Image-0.1-Base-fp8` | `Boogu/Boogu-Image-0.1-Edit-fp8` | `torchao_float8_weight_only` | FP8 weight-only (W8A16) |
+| Native online FP8  | `Boogu/Boogu-Image-0.1-Base`     | `Boogu/Boogu-Image-0.1-Edit`     | `fp8`                        | Dynamic W8A8            |
+
+#### Environment
+
+The following configuration was validated:
+
+- OS: Linux
+- Python: 3.12
+- Driver / runtime: NVIDIA CUDA environment with one RTX 4090 48 GB GPU
+- vLLM version: Match the vLLM-Omni checkout used for deployment
+- vLLM-Omni version or commit: Use a commit that contains TorchAO FP8
+  checkpoint loading for diffusion models
+- TorchAO version: 0.17.0
+- `kernels` / `kernels-data`: 0.15.2 / 0.16.1
+
+#### Command
+
+Serve the official Base FP8 checkpoint using its pre-quantized TorchAO FP8
+weight-only transformer weights:
+
+```bash
+vllm serve Boogu/Boogu-Image-0.1-Base-fp8 \
+  --omni \
+  --port 8091 \
+  --diffusion-quantization-config \
+  '{"transformer":{"method":"torchao_float8_weight_only"}}'
+```
+
+Native online FP8 (currently applied only to eligible vLLM-quantizable linear
+layers in the DiT transformer):
+
+```bash
+vllm serve Boogu/Boogu-Image-0.1-Base \
+  --omni \
+  --port 8091 \
+  --diffusion-quantization-config \
+  '{"transformer":{"method":"fp8"}}'
+```
+
+For image editing, use the matching Edit model ID from the table and keep the
+corresponding quantization configuration.
+
+#### Verification
+
+The request format is shared by both FP8 paths. Set `<MODEL_ID>` to the model
+ID passed to `vllm serve`. For example, use
+`Boogu/Boogu-Image-0.1-Base-fp8` for serialized TorchAO FP8 or
+`Boogu/Boogu-Image-0.1-Base` for native online FP8. For image editing, use the
+corresponding Edit model.
+
+Base text-to-image:
+
+```bash
+curl -X POST http://localhost:8091/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "<MODEL_ID>",
+    "prompt": "A mountain lake at sunset, photorealistic, cinematic lighting",
+    "size": "1024x1024",
+    "num_inference_steps": 28,
+    "guidance_scale": 4.0,
+    "seed": 42
+  }' | jq -r '.data[0].b64_json' | base64 -d > output_fp8.png
+```
+
+Image editing:
+
+```bash
+curl -X POST http://localhost:8091/v1/images/edits \
+  -F model="<MODEL_ID>" \
+  -F image="@input.png" \
+  -F prompt="Change the style to a colored pencil drawing." \
+  -F num_inference_steps=28 \
+  -F guidance_scale=4.0 \
+  -F guidance_scale_2=1.0 \
+  -F seed=42 \
+  | jq -r '.data[0].b64_json' | base64 -d > edited_fp8.png
+```
+
+#### Notes
+
+- **Memory usage:**
+    - The serialized TorchAO FP8 path uses approximately 21.1 GiB at 512x512
+      and 24.2-24.6 GiB at 1024x1024.
+    - The native online FP8 path uses approximately 31.5 GiB for Base and
+      30.7 GiB for Edit at 1024x1024. It uses more memory because only eligible
+      DiT linear layers are quantized online, while the MLLM from the regular
+      Base/Edit checkpoint remains in BF16. Most of the observed difference
+      comes from the MLLM precision, although differences in the two DiT FP8
+      representations and kernels may also contribute.
+- **Quantization scope:** The transformer-scoped configuration applies to the
+  DiT. With the serialized `-fp8` checkpoints, the MLLM follows its own
+  checkpoint-declared FP8 configuration. With the regular checkpoints used for
+  online FP8, the MLLM remains in BF16. The VAE and scheduler are outside this
+  quantization routing.
+
 ## Image editing (Boogu-Image-0.1-Edit)
 
 The Edit checkpoint is served by the same native pipeline (`BooguImagePipeline`);

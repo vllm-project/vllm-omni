@@ -61,7 +61,7 @@ class TestRegistryDeclaration:
         pipeline = OMNI_PIPELINES[_PIPELINE_KEY]
         assert pipeline.duplex_control_enabled is True
         assert pipeline.duplex_serving_adapter == (
-            "vllm_omni.experimental.fullduplex.minicpmo45.serving_adapter.MiniCPMO45ServingRuntimeAdapter"
+            "vllm_omni.model_executor.models.minicpmo_4_5.duplex.serving_adapter.MiniCPMO45ServingRuntimeAdapter"
         )
         assert not hasattr(pipeline, "max_native_duplex_sessions")
 
