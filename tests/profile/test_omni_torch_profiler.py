@@ -36,6 +36,9 @@ class DummyProfilerConfig:
     torch_profiler_with_stack: bool = True
     torch_profiler_with_flops: bool = False
     torch_profiler_dump_cuda_time_total: bool = False
+    wait_iterations: int = 0
+    warmup_iterations: int = 0
+    active_iterations: int = 5
 
 
 class FakeEvent:
@@ -100,9 +103,13 @@ class FakeTorchProfiler:
         self.on_trace_ready = on_trace_ready
         self.exported_traces = []
         self.exported_stacks = []
+        self.step_calls = 0
 
     def start(self):
         self.started = True
+
+    def step(self):
+        self.step_calls += 1
 
     def stop(self):
         self.stopped = True
@@ -582,3 +589,96 @@ def test_event_list_to_rows_contains_expected_fields(wrapper):
     assert row["self_cuda_memory_usage_bytes"] == 1024
     assert "[[8, 16], [16, 32]]" == row["input_shapes"]
     assert row["stack"] == "f1\nf2"
+
+
+def test_schedule_disabled_by_default(wrapper):
+    assert wrapper._uses_schedule is False
+    assert wrapper._warmup_steps_remaining == 0
+    assert wrapper._build_schedule(lambda **kw: kw) is None
+
+
+def test_schedule_enabled_when_wait_or_warmup_configured(fake_config, fake_profiler_factory):
+    fake_config.warmup_iterations = 1
+    fake_config.wait_iterations = 1
+    fake_config.active_iterations = 2
+
+    wrapper = OmniTorchProfilerWrapper(
+        profiler_config=fake_config,
+        worker_name="worker0",
+        local_rank=0,
+        activities=["CPU", "CUDA"],
+    )
+
+    assert wrapper._uses_schedule is True
+    # start() consumes step 0, so wait + warmup - 1 warmup steps remain.
+    assert wrapper._warmup_steps_remaining == 1
+
+    built = wrapper._build_schedule(lambda **kw: kw)
+    assert built["wait"] == 1
+    assert built["warmup"] == 1
+    assert built["active"] == 2
+    assert built["repeat"] == 1
+
+
+def test_profiler_step_advances_schedule_and_tracks_warmup(fake_config, fake_profiler_factory):
+    fake_config.warmup_iterations = 1
+    fake_config.wait_iterations = 1
+    fake_config.active_iterations = 2
+
+    wrapper = OmniTorchProfilerWrapper(
+        profiler_config=fake_config,
+        worker_name="worker0",
+        local_rank=0,
+        activities=["CPU", "CUDA"],
+    )
+
+    # Warmup step is forwarded to the profiler but not counted as profiling.
+    assert wrapper._profiler_step() is False
+    assert wrapper.profiler.step_calls == 1
+    assert wrapper._warmup_steps_remaining == 0
+
+    # Remaining steps are active (RECORD) profiling steps.
+    assert wrapper._profiler_step() is True
+    assert wrapper.profiler.step_calls == 2
+
+
+def test_profiler_step_noop_without_schedule(wrapper):
+    assert wrapper._profiler_step() is True
+    assert wrapper.profiler.step_calls == 0
+
+
+def test_stop_drains_schedule_before_stopping(fake_config, fake_profiler_factory):
+    fake_config.warmup_iterations = 1
+    fake_config.wait_iterations = 1
+    fake_config.active_iterations = 2
+    fake_config.torch_profiler_with_memory = False
+
+    wrapper = OmniTorchProfilerWrapper(
+        profiler_config=fake_config,
+        worker_name="worker0",
+        local_rank=0,
+        activities=["CPU", "CUDA"],
+    )
+    wrapper.set_trace_filename("case_drain")
+
+    # Advance into the active capture window.
+    wrapper._start()
+    for _ in range(3):
+        wrapper._profiler_step()
+    step_before = wrapper.profiler.step_calls
+    assert step_before > 0
+
+    wrapper._stop()
+
+    # The schedule was drained (extra step() calls) before stop(), so trace
+    # export never runs while the profiler is mid-RECORD.
+    assert wrapper.profiler.step_calls > step_before
+    assert wrapper.profiler.stopped is True
+
+
+def test_stop_does_not_drain_without_schedule(wrapper):
+    wrapper.set_trace_filename("case_no_drain")
+    wrapper._stop()
+
+    assert wrapper.profiler.stopped is True
+    assert wrapper.profiler.step_calls == 0

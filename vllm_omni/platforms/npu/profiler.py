@@ -67,8 +67,22 @@ class NPUTorchProfilerWrapper(OmniTorchProfilerWrapper):
         os.makedirs(npu_trace_dir, exist_ok=True)
         self._trace_path = npu_trace_dir
 
+        # Schedule-based profiling (wait/warmup/active). torch_npu mirrors
+        # torch's schedule factory; if the installed version lacks it, fall
+        # back to always-recording profiling rather than breaking startup.
+        npu_schedule = None
+        try:
+            npu_schedule = self._build_schedule(torch_npu.profiler.schedule)
+        except Exception as e:
+            logger.warning(
+                "torch_npu schedule unavailable, schedule-based profiling disabled: %s",
+                e,
+            )
+            npu_schedule = None
+
         return torch_npu.profiler.profile(
             activities=npu_activities,
+            schedule=npu_schedule,
             with_stack=False,
             profile_memory=profiler_config.torch_profiler_with_memory,
             # NOTE: torch_npu.profiler.with_modules is equivalent to
