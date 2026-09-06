@@ -48,6 +48,40 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
         with self._execution_context():
             return super().decode(z, return_dict=return_dict)
 
+    def blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+        blend_extent = min(a.shape[-2], b.shape[-2], blend_extent)
+        if blend_extent <= 0:
+            return b
+
+        y = torch.arange(blend_extent, device=a.device, dtype=a.dtype)
+        weight_a = 1.0 - y / blend_extent
+        weight_b = y / blend_extent
+
+        a_region = a[..., -blend_extent:, :]
+        b_region = b[..., :blend_extent, :]
+
+        b[..., :blend_extent, :] = (
+            a_region * weight_a[None, None, None, :, None] + b_region * weight_b[None, None, None, :, None]
+        )
+        return b
+
+    def blend_h(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+        blend_extent = min(a.shape[-1], b.shape[-1], blend_extent)
+        if blend_extent <= 0:
+            return b
+
+        x = torch.arange(blend_extent, device=a.device, dtype=a.dtype)
+        weight_a = 1.0 - x / blend_extent
+        weight_b = x / blend_extent
+
+        a_region = a[..., -blend_extent:]
+        b_region = b[..., :blend_extent]
+
+        b[..., :blend_extent] = (
+            a_region * weight_a[None, None, None, None, :] + b_region * weight_b[None, None, None, None, :]
+        )
+        return b
+
 
 class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
     @classmethod
