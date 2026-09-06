@@ -282,8 +282,16 @@ def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
         "hidden_states.layer_24": torch.full((3, 2), 2.0),
         "embed.tts_bos": torch.zeros(1, 2),
     }
+    # Mock transfer_manager with model config
+    transfer_manager = SimpleNamespace(
+        _get_model_config=lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(
+                talker_config=SimpleNamespace(accept_hidden_layer=24)
+            )
+        )
+    )
 
-    payload = q3.thinker2talker_full_payload(None, pooling_output, request)
+    payload = q3.thinker2talker_full_payload(transfer_manager, pooling_output, request)
 
     assert payload is not None
     assert payload["ids"]["all"] == [151644, 872, 3]
