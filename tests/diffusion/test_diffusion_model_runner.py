@@ -484,20 +484,23 @@ def test_compile_transformer_uses_full_granularity(monkeypatch):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_compile_transformer_falls_back_after_synchronous_setup_failure(monkeypatch, caplog):
+def test_compile_transformer_falls_back_after_synchronous_setup_failure(monkeypatch):
     model = _CompileTrackingModel()
     runner = _make_compile_runner(model)
+    warning = Mock()
 
     def _regionally_compile(*args, **kwargs):
         raise RuntimeError("compile setup failed")
 
     monkeypatch.setattr(model_runner_module, "regionally_compile", _regionally_compile)
+    monkeypatch.setattr(model_runner_module.logger, "warning", warning)
 
     DiffusionModelRunner._compile_transformer(runner, "transformer")
 
     assert runner.pipeline.transformer is model
-    assert "failed before activation" in caplog.text
-    assert "lazy compilation errors" in caplog.text
+    warning.assert_called_once()
+    assert "failed before activation" in warning.call_args.args[0]
+    assert "lazy compilation errors" in warning.call_args.args[0]
 
 
 @pytest.mark.core_model
@@ -1059,6 +1062,51 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     assert runner.cache_backend is None
     assert runner.od_config.cache_backend is None
     assert dummy_cache_backend.enabled is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_load_model_rejects_env_prompt_cache_before_text_encoder_allgather(monkeypatch):
+    runner = object.__new__(DiffusionModelRunner)
+    runner.vllm_config = object()
+    runner.device = torch.device("cpu")
+    runner.pipeline = None
+    runner.offload_backend = None
+    runner.od_config = SimpleNamespace(
+        diffusion_offload_config={
+            "mode": "layer",
+            "components": ["text_encoder"],
+            "layer_options": {"text_encoder": {"weight_transfer": "allgather"}},
+        },
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=True,
+        dlo_use_allgather=True,
+        dlo_resident_layers=0,
+        pin_cpu_memory=True,
+        parallel_config=SimpleNamespace(data_parallel_size=2),
+        enable_prompt_embed_cache=False,
+        prompt_embed_cache_size=32,
+        cache_backend="none",
+        model_class_name="Wan22Pipeline",
+        enforce_eager=True,
+        streaming_output=False,
+        step_execution=False,
+    )
+    monkeypatch.setenv("OMNI_DIFFUSION_PROMPT_EMBED_CACHE", "1")
+    runtime_init = Mock(side_effect=pytest.fail)
+    loader = Mock(side_effect=pytest.fail)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "init_diffusion_model_runner_runtime", runtime_init)
+    monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", loader)
+    enable_offload = Mock(side_effect=pytest.fail)
+    monkeypatch.setattr(model_runner_module, "enable_offload_backend", enable_offload)
+
+    with pytest.raises(ValueError, match="Prompt embedding cache cannot be combined"):
+        DiffusionModelRunner.load_model(runner)
+
+    runtime_init.assert_not_called()
+    loader.assert_not_called()
+    enable_offload.assert_not_called()
 
 
 def test_set_forward_context_enters_vllm_config_contexts(monkeypatch):

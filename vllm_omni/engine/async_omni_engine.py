@@ -1137,6 +1137,7 @@ class AsyncOmniEngine:
             "cache_backend": cache_backend,
             "cache_config": cache_config,
             "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
+            "diffusion_offload_config": kwargs.get("diffusion_offload_config", None),
             "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
             "enable_distributed_layerwise_offload": kwargs.get("enable_distributed_layerwise_offload", False),

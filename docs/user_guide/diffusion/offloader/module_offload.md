@@ -2,14 +2,14 @@
 
 Model-level, or sequential, offloading keeps only the pipeline component group
 currently executing on the accelerator. It is the simplest offload strategy
-and is selected with `--enable-cpu-offload`.
+and is selected with `diffusion_offload_config.mode="module"`.
 
 ## How it works
 
 Pre-forward hooks enforce mutual exclusion between DiT and encoder modules:
 
-- before an encoder runs, the DiT moves to CPU;
-- before a DiT runs, encoders and other DiTs move to CPU; and
+- before an encoder runs, selected DiTs move to CPU;
+- before a DiT runs, selected encoders and other selected DiTs move to CPU; and
 - VAE modules remain on the accelerator.
 
 Pinned host memory reduces transfer overhead. Transfers occur at phase
@@ -22,14 +22,27 @@ from vllm_omni import Omni
 
 omni = Omni(
     model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-    enable_cpu_offload=True,
+    diffusion_offload_config={
+        "mode": "module",
+        "components": ["dit", "text_encoder"],
+    },
 )
 ```
 
 ```bash
 vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --omni --enable-cpu-offload
+  --omni \
+  --diffusion-offload-config \
+  '{"mode":"module","components":["dit","text_encoder"]}'
 ```
+
+List a component to select it for offload. Module mode rejects `layer_options`
+such as `weight_transfer` and `resident_layers`. The
+`enable_cpu_offload=True` compatibility entry point remains supported. New
+integrations should prefer the explicit config; existing model-specific stage
+lifecycles do not need to migrate until equivalent component coverage exists.
+For example, MiniMax-H3's compatibility lifecycle also stages its VAEs, while
+the compact selector intentionally covers only `dit` and `text_encoder`.
 
 ## Model integration
 
@@ -73,9 +86,10 @@ while reusing sequential `.to()` movers.
 
 ## Limitations
 
-- Single device only.
+- Transfers are rank-local; module mode does not shard host payloads or add a
+  weight AllGather across ranks.
 - Higher cold-start latency.
 - Transfers between encoder and denoising phases add latency.
 
-See the [model-level design](../../../design/feature/offloader/cpu_offload.md)
+See the [model-level design](../../../design/feature/offloader/module_offload.md)
 for lifecycle and extension invariants.
