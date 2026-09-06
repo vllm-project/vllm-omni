@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
@@ -129,7 +130,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         self.model_path = str(vllm_config.model_config.model)
         self.backend: BatchedToken2Wav | None = None
         self._states: dict[str, _RequestState] = {}
-        self._runtime_prompts: dict[str, _RuntimePrompt] = {}
+        self._runtime_prompts: OrderedDict[str, _RuntimePrompt] = OrderedDict()
         self._request_prompt_keys: dict[str, str] = {}
         self._runtime_prompt_dir = tempfile.TemporaryDirectory(
             prefix="minicpmo45-runtime-prompts-",
@@ -138,6 +139,12 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
+        self._runtime_prompt_cache_size = int(extra.get("token2wav_runtime_prompt_cache_size", 4))
+        self._setup_cache_size = int(extra.get("token2wav_setup_cache_size", 1))
+        if self._runtime_prompt_cache_size < 0:
+            raise ValueError("MiniCPM-o Code2Wav token2wav_runtime_prompt_cache_size must be >= 0")
+        if self._setup_cache_size < 0:
+            raise ValueError("MiniCPM-o Code2Wav token2wav_setup_cache_size must be >= 0")
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._prompt_wav_explicit = "prompt_wav" in extra
         self._default_prompt_wav = str(
@@ -214,6 +221,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         if entry is None:
             entry = _RuntimePrompt(cache_id=cache_id, path=path, owners=set())
             self._runtime_prompts[cache_key] = entry
+        else:
+            self._runtime_prompts.move_to_end(cache_key)
         prompt_path = Path(entry.path)
         if not prompt_path.is_file():
             with tempfile.NamedTemporaryFile(
@@ -271,8 +280,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         if entry is None:
             return
         entry.owners.discard(state_id)
-        if entry.owners:
-            return
+        self._trim_runtime_prompts()
+
+    def _evict_runtime_prompt(self, cache_key: str, entry: _RuntimePrompt) -> None:
         if self.backend is not None:
             self.backend.evict_prompt(entry.cache_id, entry.path)
         Path(entry.path).unlink(missing_ok=True)
@@ -284,21 +294,29 @@ class MiniCPMO45Code2Wav(nn.Module):
             if cache_key is None:
                 continue
             previous_key = self._request_prompt_keys.get(item.state_id)
-            if previous_key != cache_key:
-                self._release_request_prompt(item.state_id)
             entry = self._runtime_prompts.get(cache_key)
-            if entry is not None:
-                entry.owners.add(item.state_id)
-                self._request_prompt_keys[item.state_id] = cache_key
-
-    def _prune_unowned_runtime_prompts(self) -> None:
-        for cache_key, entry in list(self._runtime_prompts.items()):
-            if entry.owners:
+            if entry is None:
                 continue
-            if self.backend is not None:
-                self.backend.evict_prompt(entry.cache_id, entry.path)
-            Path(entry.path).unlink(missing_ok=True)
-            self._runtime_prompts.pop(cache_key, None)
+            if previous_key != cache_key:
+                previous = self._runtime_prompts.get(previous_key) if previous_key is not None else None
+                if previous is not None:
+                    previous.owners.discard(item.state_id)
+            entry.owners.add(item.state_id)
+            self._request_prompt_keys[item.state_id] = cache_key
+            self._runtime_prompts.move_to_end(cache_key)
+        self._trim_runtime_prompts()
+
+    def _trim_runtime_prompts(self) -> None:
+        """Evict least-recent unowned prompts until the cache is in bounds."""
+        while len(self._runtime_prompts) > self._runtime_prompt_cache_size:
+            victim = next(
+                ((cache_key, entry) for cache_key, entry in self._runtime_prompts.items() if not entry.owners),
+                None,
+            )
+            if victim is None:
+                # Active requests may temporarily exceed the configured bound.
+                return
+            self._evict_runtime_prompt(*victim)
 
     @staticmethod
     def _split_segments(input_ids: torch.Tensor, counts: Any) -> list[torch.Tensor]:
@@ -544,11 +562,11 @@ class MiniCPMO45Code2Wav(nn.Module):
                     )
                 items.append(self._parse_item(index, str(state_id), segment, info))
         except Exception:
-            self._prune_unowned_runtime_prompts()
+            self._trim_runtime_prompts()
             raise
         state_ids = [item.state_id for item in items]
         if len(state_ids) != len(set(state_ids)):
-            self._prune_unowned_runtime_prompts()
+            self._trim_runtime_prompts()
             raise _batch_error("duplicate_request_in_forward", request_ids=state_ids)
         outputs = [empty for _ in segments]
         sentinels = [item for item in items if item.last_chunk and item.tokens.numel() == 0]
@@ -562,7 +580,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             if item.has_payload and not item.last_chunk and not item.tts_is_last_chunk and item.tokens.numel() == 0
         ]
         if invalid_empty:
-            self._prune_unowned_runtime_prompts()
+            self._trim_runtime_prompts()
             raise _batch_error("empty_nonfinal_chunk", request_ids=invalid_empty)
 
         buckets: dict[tuple[Any, ...], list[_WorkItem]] = {}
@@ -578,7 +596,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             if len(bucket) < self._min_batch_size
         ]
         if undersized:
-            self._prune_unowned_runtime_prompts()
+            self._trim_runtime_prompts()
             raise _batch_error(
                 "exact_shape_bucket_below_minimum",
                 minimum=self._min_batch_size,
@@ -614,7 +632,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
                 states = self.backend.setup_batch(features, len(bucket))
             except Exception as exc:
-                self._prune_unowned_runtime_prompts()
+                self._trim_runtime_prompts()
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
                     raise
                 raise _batch_error(
@@ -624,7 +642,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                     error=str(exc),
                 ) from exc
             if len(states) != len(bucket):
-                self._prune_unowned_runtime_prompts()
+                self._trim_runtime_prompts()
                 raise _batch_error(
                     "backend_result_size_mismatch",
                     expected=len(bucket),
@@ -657,7 +675,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                     last_chunk=bucket[0].last_chunk,
                 )
             except Exception as exc:
-                self._prune_unowned_runtime_prompts()
+                self._trim_runtime_prompts()
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
                     raise
                 raise _batch_error(
@@ -667,7 +685,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                     error=str(exc),
                 ) from exc
             if len(audios) != batch_size or len(next_states) != batch_size:
-                self._prune_unowned_runtime_prompts()
+                self._trim_runtime_prompts()
                 raise _batch_error(
                     "backend_result_size_mismatch",
                     expected=batch_size,
@@ -775,4 +793,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
         finally:
             torch.set_default_dtype(previous_dtype)
-        self.backend = BatchedToken2Wav(token2wav)
+        self.backend = BatchedToken2Wav(
+            token2wav,
+            setup_cache_size=self._setup_cache_size,
+        )
