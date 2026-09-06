@@ -1000,6 +1000,71 @@ path, so they do not establish the compact selector's peak-HBM requirement.
 Choose the compatibility alias when the additional VAE staging is required for
 capacity; the two forms are not residency-equivalent.
 
+#### Single NVIDIA A100 80GB recipe
+
+The following standalone recipe reproduces the validated Dense / Data-Free
+FastH3 path on one NVIDIA A100 80GB. It pins the model and adapter revisions
+used for the measurement and downloads only the FL2VA partition:
+
+```bash
+export MODEL_DIR=/path/to/MiniMax-H3
+export FASTH3_DIR=/path/to/FastH3-Dense-DataFree
+export PORT=8091
+
+hf download MiniMaxAI/MiniMax-H3 \
+  --revision 42ed227ee7df40d41602854ae760620d6eb651fe \
+  --include 'FL2VA/**' \
+  --local-dir "${MODEL_DIR}"
+hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA \
+  dense-datafree/adapter_model.safetensors \
+  --revision bcf40ca6f457ed66f8badf13514943e390205fca \
+  --local-dir "${FASTH3_DIR}"
+
+export FASTH3_LORA="${FASTH3_DIR}/dense-datafree/adapter_model.safetensors"
+```
+
+Start the FL2VA server with the full-topology compatibility offload used by the
+A100 run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 \
+vllm serve "${MODEL_DIR}/FL2VA" \
+  --omni \
+  --host 127.0.0.1 \
+  --port "${PORT}" \
+  --trust-remote-code \
+  --task-type fl2va \
+  --num-gpus 1 \
+  --enable-cpu-offload \
+  --enable-diffusion-pipeline-profiler \
+  --diffusion-attention-backend FLASH_ATTN \
+  --lora-path "${FASTH3_LORA}"
+```
+
+After `/health` returns HTTP 200, submit the four-step T2VA request:
+
+```bash
+curl -sS -X POST "http://127.0.0.1:${PORT}/v1/videos/sync" \
+  -F 'prompt=A cinematic live-action scene with a clear subject moving naturally; the atmosphere includes synchronized environmental sound.' \
+  -F 'width=672' \
+  -F 'height=384' \
+  -F 'fps=24' \
+  -F 'num_inference_steps=4' \
+  -F 'seed=3101' \
+  -F 'extra_params={"task":"t2va","duration":4.4,"aspect_ratio":"16:9"}' \
+  -o fasth3-a100.mp4
+```
+
+This request produces 107 video frames at 24 FPS. In the controlled run, one
+warmup followed by three measured requests had a 25.362-second median client
+latency and a 14.094-second median denoise time, with 65,989 MiB sampled peak
+HBM. Those numbers describe one A100 80GB PCIe, concurrency one, the pinned
+artifacts above, and the compatibility offload path; they are not throughput or
+production-performance guarantees. Allow additional host RAM and startup time
+for the offloaded checkpoint and the one-time adapter fusion.
+
 T2VA is served by the FL2VA partition, so `--task-type fl2va` is correct even
 though FastH3 preview v1 distills T2VA only. Because the adapter is fused,
 `--lora-backend` does not apply and a request carrying a `lora=` field is
