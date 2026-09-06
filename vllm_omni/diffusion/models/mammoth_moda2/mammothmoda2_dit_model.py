@@ -13,6 +13,8 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as OmniAttention
+from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 
 from .rope_real import RotaryPosEmbedReal, apply_real_rotary_emb
 
@@ -282,6 +284,7 @@ class AttnProcessor:
         encoder_hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb: torch.Tensor | None = None,
+        query_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, sequence_length, _ = hidden_states.shape
 
@@ -325,10 +328,14 @@ class AttnProcessor:
 
         hidden_states = attn.omni_attn(query, key, value, attn_metadata)
 
-        if attention_mask is not None:
+        if query_attention_mask is None:
+            query_attention_mask = attention_mask
+        if query_attention_mask is not None:
             # Padded rows carry nothing downstream; keep them at zero as the
             # previous varlen path did, since the SDPA backend leaves them populated.
-            hidden_states = hidden_states * attention_mask[:, :, None, None]
+            # Ulysses has already restored rank-local queries here, whereas
+            # attention_mask describes the global keys seen by the kernel.
+            hidden_states = hidden_states * query_attention_mask[:, :, None, None]
 
         hidden_states = hidden_states.reshape(batch_size, sequence_length, attn.heads * head_dim).type_as(query)
 
@@ -348,6 +355,7 @@ class TransformerBlock(nn.Module):
         ffn_dim_multiplier: float,
         norm_eps: float,
         modulation: bool = True,
+        skip_sequence_parallel: bool = False,
     ) -> None:
         """Initialize the transformer block."""
         super().__init__()
@@ -382,6 +390,7 @@ class TransformerBlock(nn.Module):
             causal=False,
             softmax_scale=self.attn.scale,
             num_kv_heads=num_kv_heads,
+            skip_sequence_parallel=skip_sequence_parallel,
         )
 
         # Initialize feed-forward network
@@ -405,6 +414,7 @@ class TransformerBlock(nn.Module):
         attention_mask: torch.Tensor,
         image_rotary_emb: torch.Tensor,
         temb: torch.Tensor | None = None,
+        query_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.modulation:
             if temb is None:
@@ -416,6 +426,7 @@ class TransformerBlock(nn.Module):
                 encoder_hidden_states=norm_hidden_states,
                 attention_mask=attention_mask,
                 image_rotary_emb=image_rotary_emb,
+                query_attention_mask=query_attention_mask,
             )
             hidden_states = hidden_states + gate_msa.unsqueeze(1).tanh() * self.norm2(attn_output)
             mlp_output = self.feed_forward(self.ffn_norm1(hidden_states) * (1 + scale_mlp.unsqueeze(1)))
@@ -427,6 +438,7 @@ class TransformerBlock(nn.Module):
                 encoder_hidden_states=norm_hidden_states,
                 attention_mask=attention_mask,
                 image_rotary_emb=image_rotary_emb,
+                query_attention_mask=query_attention_mask,
             )
             hidden_states = hidden_states + self.norm2(attn_output)
             mlp_output = self.feed_forward(self.ffn_norm1(hidden_states))
@@ -435,8 +447,41 @@ class TransformerBlock(nn.Module):
         return hidden_states
 
 
+class _MammothModa2SPInputBoundary(nn.Module):
+    """Shard only the joint main-transformer stream, after the refiners.
+
+    RoPE is computed globally first, then sliced with the corresponding tokens.
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_cos: torch.Tensor,
+        rotary_sin: torch.Tensor,
+        query_attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return hidden_states, rotary_cos, rotary_sin, query_attention_mask
+
+
+class _MammothModa2SPOutputBoundary(nn.Module):
+    """Restore the original joint sequence before output norm/image extraction."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states
+
+
 class Transformer2DModel(ModelMixin, ConfigMixin):
     """MammothModa2 DiT transformer"""
+
+    _sp_plan = {
+        "sp_input_boundary": {
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            2: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            3: SequenceParallelInput(split_dim=1, expected_dims=2, split_output=True, auto_pad=True),
+        },
+        "sp_output_boundary": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
 
     @register_to_config
     def __init__(
@@ -460,6 +505,8 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         """Initialize the  transformer model."""
         super().__init__()
         self.hidden_size = hidden_size
+        self.sp_input_boundary = _MammothModa2SPInputBoundary()
+        self.sp_output_boundary = _MammothModa2SPOutputBoundary()
 
         # Validate configuration
         if (hidden_size // num_attention_heads) != sum(axes_dim_rope):
@@ -505,6 +552,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     ffn_dim_multiplier,
                     norm_eps,
                     modulation=True,
+                    skip_sequence_parallel=True,
                 )
                 for _ in range(num_refiner_layers)
             ]
@@ -520,6 +568,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     ffn_dim_multiplier,
                     norm_eps,
                     modulation=True,
+                    skip_sequence_parallel=True,
                 )
                 for _ in range(num_refiner_layers)
             ]
@@ -535,6 +584,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
                     ffn_dim_multiplier,
                     norm_eps,
                     modulation=False,
+                    skip_sequence_parallel=True,
                 )
                 for _ in range(num_refiner_layers)
             ]
@@ -694,10 +744,94 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
 
         return text_hidden_states, img_tokens
 
-    def _apply_transformer_layers(self, hidden_states, attention_mask, rotary_emb, temb):
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask, rotary_emb, temb)
-        return hidden_states
+    def _validate_sequence_parallel(self) -> None:
+        """Fail before computation if runtime configuration did not reach SP.
+
+        Applying a config or starting two ranks alone is insufficient: the
+        runtime must construct shared attention in an initialized SP context
+        and install both model-boundary hooks.
+        """
+        ctx = get_forward_context() if is_forward_context_available() else None
+        cfg = ctx.omni_diffusion_config if ctx is not None else None
+        strategies = [layer.attn.omni_attn.parallel_strategy for layer in self.layers]
+        boundary_hooks = []
+        for boundary, hook_name in (
+            (self.sp_input_boundary, "sp_input---sp_input_boundary"),
+            (self.sp_output_boundary, "sp_output---sp_output_boundary"),
+        ):
+            registry = getattr(boundary, "_hook_registry", None)
+            boundary_hooks.append(registry.get_hook(hook_name) if registry is not None else None)
+        if cfg is None or cfg.parallel_config.sequence_parallel_size == 1:
+            if any(strategy.enabled for strategy in strategies) or any(hook is not None for hook in boundary_hooks):
+                raise RuntimeError("MammothModa2 SP requires its diffusion ForwardContext on every forward.")
+            return
+
+        parallel = cfg.parallel_config
+        if (
+            parallel.ulysses_degree != 2
+            or parallel.ring_degree != 1
+            or parallel.allgather_degree != 1
+            or parallel.cfg_parallel_size != 1
+            or parallel.tensor_parallel_size != 1
+            or parallel.pipeline_parallel_size != 1
+            or parallel.data_parallel_size not in (None, 1)
+            or parallel.vae_patch_parallel_size != 1
+            or parallel.use_hsdp
+            or parallel.enable_expert_parallel
+        ):
+            raise ValueError(
+                "MammothModa2 SP currently supports only two-rank Ulysses with replicated refiners/VAE "
+                "and without Ring, TP, PP, DP, HSDP, EP or CFG parallelism."
+            )
+        if parallel.ulysses_mode == "strict" and (self.config.num_attention_heads % 2 or self.config.num_kv_heads % 2):
+            raise ValueError("MammothModa2's uneven Q/KV heads require ulysses_mode='advanced_uaa' for two-rank SP.")
+
+        for hook in boundary_hooks:
+            if hook is None:
+                raise RuntimeError(
+                    "MammothModa2 SP requires the runtime to apply the complete Transformer2DModel._sp_plan."
+                )
+            if (hook.config.ulysses_degree, hook.config.ring_degree, hook.config.allgather_degree) != (2, 1, 1):
+                raise RuntimeError("MammothModa2 SP boundary hooks must use the same two-rank Ulysses configuration.")
+        if any(strategy.name != "ulysses" for strategy in strategies):
+            raise RuntimeError("Construct MammothModa2 attention inside the initialized Ulysses ForwardContext.")
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_sequence_parallel_world_size,
+            get_ulysses_parallel_world_size,
+        )
+
+        if (get_sequence_parallel_world_size(), get_ulysses_parallel_world_size()) != (2, 2):
+            raise RuntimeError("MammothModa2 SP requires initialized sequence/Ulysses groups of size two.")
+
+    def _apply_transformer_layers(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        temb: torch.Tensor | None,
+    ) -> torch.Tensor:
+        ctx = get_forward_context() if is_forward_context_available() else None
+        if ctx is not None:
+            previous = (ctx.sp_original_seq_len, ctx.sp_padding_size, ctx._sp_shard_depth)
+            # Sequential CFG branches can have different joint sequence lengths.
+            # The shared auto-pad hook records only the first length it sees.
+            ctx.sp_original_seq_len = None
+            ctx.sp_padding_size = 0
+        try:
+            hidden_states, rotary_cos, rotary_sin, query_mask = self.sp_input_boundary(
+                hidden_states, rotary_emb[0], rotary_emb[1], attention_mask
+            )
+            if ctx is not None and ctx.sp_padding_size:
+                # Ulysses sees global keys; output queries are rank-local again.
+                attention_mask = F.pad(attention_mask, (0, ctx.sp_padding_size), value=False)
+            for layer in self.layers:
+                hidden_states = layer(hidden_states, attention_mask, (rotary_cos, rotary_sin), temb, query_mask)
+            return self.sp_output_boundary(hidden_states)
+        finally:
+            if ctx is not None:
+                # Also unwind a split whose block/gather raised, so the next
+                # branch/request cannot inherit a stale sharded-region depth.
+                ctx.sp_original_seq_len, ctx.sp_padding_size, ctx._sp_shard_depth = previous
 
     def forward(
         self,
@@ -711,6 +845,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
         ar_image_attention_mask: torch.Tensor | None = None,
         return_dict: bool = False,
     ) -> torch.Tensor:
+        self._validate_sequence_parallel()
         batch_size, height, width = self._validate_inputs(
             hidden_states, text_hidden_states, text_attention_mask, ref_image_hidden_states, return_dict
         )

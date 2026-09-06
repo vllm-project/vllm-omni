@@ -23,7 +23,8 @@ The first integration intentionally supports one request and one image per
 forward only (`max_num_seqs: 1`, `num_outputs_per_prompt: 1`). Request-level
 batching, step execution, continuous batching, cache acceleration,
 compilation, quantization, parallelism, and offload are not enabled by this
-recipe.
+recipe by default. An experimental two-rank Preview DiT Ulysses configuration
+is described below; it does not change the single-rank default.
 
 Image size, seed, guidance, and denoising steps use the standard diffusion
 request fields. `cfg_range` remains a MammothModa2-specific `extra_body`
@@ -151,6 +152,52 @@ to `MammothModa2DiTPipeline`. `DiffusionEngine` step timing is a DEBUG-level,
 per-request message, so it appears only after sending a text-to-image request
 with `VLLM_LOGGING_LEVEL=DEBUG`; it is not a startup marker. Seeing the legacy
 generation model runner for stage 1 is a failed migration.
+
+### Experimental Preview DiT Ulysses SP=2
+
+This opt-in path splits only the main joint-transformer sequence. Q-Former,
+text/noise refiners, sequential CFG, scheduler and VAE remain replicated.
+Preview has 21 query heads and 7 KV heads with head dimension 120, so degree
+two requires `ulysses_mode: advanced_uaa`; strict even-head partitioning is
+not valid. Shared Ulysses temporarily pads the head groups and restores the
+original output heads. Sequence padding is removed before image extraction.
+
+The initial scope is Preview text-to-image, request mode, one request and
+one output image, with eager execution and no cache acceleration,
+quantization or offload. Ring, TP/PP/DP, HSDP, expert/CFG/VAE parallelism,
+step execution and Dev text-to-image are not supported with this SP path.
+The AR-only Preview/Dev understanding topology is unchanged.
+
+The following is a **full-checkpoint validation configuration, not a verified
+capacity or performance recipe**. It allocates GPU 0 to AR and GPUs 1 and 2
+to DiT. Two-rank DiT does not mean the entire pipeline fits on two GPUs.
+Choose devices with sufficient memory for their complete assigned stages;
+SP does not shard model weights or the replicated refiners/VAE.
+
+```bash
+VLLM_LOGGING_LEVEL=DEBUG vllm serve ./MammothModa2-Preview --omni \
+  --deploy-config vllm_omni/deploy/mammoth_moda2.yaml \
+  --stage-overrides '{"0":{"devices":"0"},"1":{"devices":"1,2","ulysses_degree":2,"ulysses_mode":"advanced_uaa","max_num_seqs":1,"enforce_eager":true,"diffusion_attention_backend":"TORCH_SDPA"}}' \
+  --host 127.0.0.1 --port 8099
+```
+
+The correctness control below uses two CUDA devices, real NCCL collectives,
+released 2520/21/7/120 head geometry with reduced depth, and FP32 SDPA math.
+A separate tiny native pipeline replay exercises the constructor, registry
+hooks, Q-Former, DiT, sequential CFG, request-level seed handling, scheduler and
+VAE with synthetic AR conditioning. It tests explicit/default-seed A/B/A
+requests; it is not a released-conditioning or full-checkpoint E2E test.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 OMP_NUM_THREADS=4 python -m pytest -q \
+  tests/diffusion/distributed/test_mammothmoda2_ulysses.py
+```
+
+Full-checkpoint Preview T2I, understanding regressions, BF16 SP accuracy,
+peak-memory reduction and paired speedup measurements remain **NOT_RUN**.
+Do not interpret the reduced-model control as image-quality or performance
+qualification. For a meaningful comparison, keep SP=1 and SP=2 on the same
+code, weights, attention backend, dtype, prompts, seeds and sampling settings.
 
 ### 1x AMD MI300X, MammothModa2 Preview (pre-migration baseline)
 

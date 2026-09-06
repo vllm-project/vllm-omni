@@ -19,6 +19,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
 
@@ -48,6 +49,24 @@ def _root_weight_source(
         prefix="",
         fall_back_to_pt=True,
     )
+
+
+def _validate_sequence_parallel_runtime(od_config: OmniDiffusionConfig, config: Mammothmoda2Config) -> None:
+    if od_config.parallel_config.sequence_parallel_size == 1:
+        return
+    if getattr(config.llm_config, "model_type", "") != "mammothmoda2_qwen2_5_vl":
+        raise ValueError("MammothModa2 sequence parallelism is limited to Preview text-to-image, not Dev.")
+    if od_config.step_execution or od_config.max_num_seqs != 1:
+        raise ValueError("MammothModa2 SP requires request mode with max_num_seqs=1.")
+    if (
+        not od_config.enforce_eager
+        or od_config.cache_backend != "none"
+        or od_config.quantization_config is not None
+        or resolve_offload_strategy(od_config) is not OffloadStrategy.NONE
+    ):
+        raise ValueError(
+            "MammothModa2 SP requires eager execution without cache acceleration, quantization or offload."
+        )
 
 
 @dataclass(frozen=True)
@@ -95,6 +114,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         self.od_config = od_config
         self.device = get_local_device()
         self.config = _build_mammoth_config(od_config)
+        _validate_sequence_parallel_runtime(od_config, self.config)
         self.weights_sources = [_root_weight_source(od_config)]
 
         # --- Build DiT / VAE modules (names must match checkpoint keys) ---
