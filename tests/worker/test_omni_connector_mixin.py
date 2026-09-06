@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for OmniConnectorModelRunnerMixin.
 
 These tests use a mock connector (in-memory dict store) and do not require
@@ -376,6 +376,19 @@ class TestFinishedLoadReqsDrain(unittest.TestCase):
 
 
 class TestLoadCustomFuncSelection(unittest.TestCase):
+    def test_uses_validator_override_from_public_mixin(self):
+        config = SimpleNamespace(
+            async_chunk=True,
+            custom_process_next_stage_input_func=f"{__name__}._make_request",
+        )
+
+        with patch.object(MixinHost, "_is_connector_payload_builder", return_value=False) as validator:
+            selected_path, func = MixinHost._load_custom_func(config)
+
+        validator.assert_called_once_with(_make_request)
+        assert selected_path is None
+        assert func is None
+
     def test_skips_non_payload_stage_input_processors_for_full_payload_mode(self):
         incompatible_paths = [
             "vllm_omni.model_executor.stage_input_processors.mimo_audio.llm2code2wav",
@@ -861,7 +874,7 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
         host._omni_connector.get.return_value = connector_result
         tp_group = _FakeTPGroup(world_size=2, rank_in_group=0)
 
-        with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
+        with patch.object(host, "_get_local_tp_group", return_value=tp_group):
             made_progress = host._poll_single_request("r1")
 
         self.assertTrue(made_progress)
@@ -882,7 +895,7 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
         host._get_req_chunk["r1"] = 0
         tp_group = _FakeTPGroup(world_size=2, rank_in_group=1)
 
-        with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
+        with patch.object(host, "_get_local_tp_group", return_value=tp_group):
             made_progress = host._poll_single_request("r1")
 
         self.assertFalse(made_progress)
@@ -900,7 +913,7 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
         payload = {"tok": [10], "finished": torch.tensor(True)}
         tp_group = _FakeTPGroup(world_size=2, rank_in_group=1, follower_result={"r1": payload})
 
-        with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
+        with patch.object(host, "_get_local_tp_group", return_value=tp_group):
             results = host.recv_full_payload_inputs(scheduler_output=None)
 
         self.assertEqual(results, {"r1": payload})
@@ -936,7 +949,7 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
         host._omni_connector.get.return_value = (payload, 123)
         tp_group = _FakeTPGroup(world_size=2, rank_in_group=0)
 
-        with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
+        with patch.object(host, "_get_local_tp_group", return_value=tp_group):
             made_progress = host._poll_single_request("r1")
 
         self.assertTrue(made_progress)
@@ -951,7 +964,7 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
         host = self._make_host(rank=1)
         tp_group = _FakeTPGroup(world_size=2, rank_in_group=1)
 
-        with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
+        with patch.object(host, "_get_local_tp_group", return_value=tp_group):
             made_progress = host._poll_single_request("r1")
 
         self.assertFalse(made_progress)
@@ -976,7 +989,7 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
         }
         tp_group = _FakeTPGroup(world_size=2, rank_in_group=1, follower_result=packet)
 
-        with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
+        with patch.object(host, "_get_local_tp_group", return_value=tp_group):
             output = host.get_omni_connector_output()
 
         self.assertEqual(output.chunk_ready_req_ids, {"r1"})
