@@ -814,6 +814,35 @@ def test_dlo_transfers_loader_plan_and_skips_ordinary_weight_loading(monkeypatch
     assert loader.take_host_weight_plan() is None
 
 
+def test_compact_model_cpu_offload_uses_ordinary_loader_without_host_weight_plan():
+    od_config = OmniDiffusionConfig(
+        model="",
+        dtype=torch.float32,
+        parallel_config=DiffusionParallelConfig(
+            data_parallel_size=1,
+            sequence_parallel_size=1,
+            tensor_parallel_size=1,
+        ),
+        diffusion_offload_config={
+            "mode": "module",
+            "components": ["dit", "text_encoder"],
+        },
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    calls: list[str] = []
+
+    loader._init_from_load_format = lambda *_args, **_kwargs: model  # type: ignore[method-assign]
+    loader.load_weights = lambda _model: calls.append("load")  # type: ignore[method-assign]
+    loader._process_weights_after_loading = lambda *_args: calls.append("process")  # type: ignore[method-assign]
+    loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
+
+    assert loader.load_model(load_device="cpu") is model
+    assert calls == ["load", "process"]
+    assert loader.take_host_weight_plan() is None
+
+
 def test_compact_rank_local_layer_offload_skips_dlo_mmap_planning(monkeypatch):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
     from vllm_omni.diffusion.offloader.config import materialize_legacy_offload_flags

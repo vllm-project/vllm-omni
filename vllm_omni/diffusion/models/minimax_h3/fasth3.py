@@ -607,17 +607,22 @@ class FastH3WeightFusion:
             raise ValueError("FastH3 preview v1 distills T2VA only, so it cannot serve a Ref2VA partition")
         offloads = [
             flag
-            for flag in ("enable_cpu_offload", "enable_layerwise_offload", "enable_distributed_layerwise_offload")
+            for flag in ("enable_layerwise_offload", "enable_distributed_layerwise_offload")
             if getattr(od_config, flag, False)
         ]
         if offloads:
-            # A host-weight plan installs the transformer without going through
-            # load_weights(), which is where the fusion and its completeness
-            # check live. Serving base H3 weights under a four-step schedule
-            # would otherwise degrade output with nothing to signal it.
+            # Layerwise host-weight paths can install the transformer without
+            # going through load_weights(), which is where the fusion and its
+            # completeness check live. Model-level CPU offload is installed
+            # only after ordinary loading and is therefore compatible.
             raise ValueError(
                 f"FastH3 is fused while the checkpoint streams in, so it cannot be combined with "
-                f"{sorted(offloads)}. Serve it without offload."
+                f"{sorted(offloads)}. Use model-level CPU offload or serve it without offload."
+            )
+        if self.requires_vsa and getattr(od_config, "enable_cpu_offload", False):
+            raise ValueError(
+                "FastH3 model-level CPU offload currently supports only the Dense / Data-Free variant; "
+                "serve VSA without offload."
             )
         if self.requires_vsa:
             backend = _resolve_dit_attention_backend(od_config)
