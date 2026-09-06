@@ -8,11 +8,13 @@ from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
-from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
 
@@ -21,6 +23,27 @@ from .rope_real import RotaryPosEmbedReal
 from .schedulers import FlowMatchEulerDiscreteScheduler
 
 logger = init_logger(__name__)
+
+
+def _build_mammoth_config(od_config: OmniDiffusionConfig) -> Mammothmoda2Config:
+    raw_config = od_config.tf_model_config.to_dict()
+    if not raw_config:
+        raise ValueError("MammothModa2 diffusion stage requires the root checkpoint config")
+    return Mammothmoda2Config(**raw_config)
+
+
+def _root_weight_source(
+    od_config: OmniDiffusionConfig,
+) -> DiffusersPipelineLoader.ComponentSource:
+    if not od_config.model:
+        raise ValueError("MammothModa2 diffusion stage requires a model path")
+    return DiffusersPipelineLoader.ComponentSource(
+        model_or_path=od_config.model,
+        subfolder=None,
+        revision=od_config.revision,
+        prefix="",
+        fall_back_to_pt=True,
+    )
 
 
 class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
@@ -37,6 +60,8 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
     _vae_modules: ClassVar[list[str]] = ["gen_vae"]
 
     have_multimodal_outputs = True
+    supports_request_batch = False
+    supports_step_execution = False
 
     # Load only gen_* weights; ignore llm_model.* to prevent loading the entire LLM backbone in the DiT stage.
     hf_to_vllm_mapper = WeightsMapper(
@@ -46,15 +71,13 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         }
     )
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
         del prefix
-
-        hf_config = vllm_config.model_config.hf_config
-        if not isinstance(hf_config, Mammothmoda2Config):
-            raise TypeError(f"Expected Mammothmoda2Config, got {type(hf_config)}")
-
-        self.config = hf_config
+        self.od_config = od_config
+        self.device = get_local_device()
+        self.config = _build_mammoth_config(od_config)
+        self.weights_sources = [_root_weight_source(od_config)]
 
         # --- Build DiT / VAE modules (names must match checkpoint keys) ---
         if self.config.gen_vae_config is None or self.config.gen_dit_config is None:
