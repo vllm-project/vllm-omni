@@ -190,17 +190,32 @@ class ChunkWindowManager(SlidingWindowManager):
         total_computed_tokens: int,
         num_prompt_tokens: int | None = None,
     ) -> None:
-        """Free the middle gap while preserving the leading attention sink."""
+        """Free the middle gap while preserving the leading attention sink.
+
+        ``sink_chunks`` counts frames while the block table is indexed in
+        blocks, so the sink is converted before it is used as an index. The two
+        were interchangeable while a frame was a block; this commit is what
+        separates them.
+
+        Neither boundary is guaranteed to land on a block edge -- 832x480 is
+        1560 tokens per frame against a 16-token block -- so a block can hold
+        the end of one frame and the start of the next. The sink end rounds up
+        so a straddling block stays protected, and the freed range ends on a
+        rounded-down boundary so only wholly-skipped blocks are released. Both
+        are exact when the sizes divide, which is every geometry that paged one
+        frame per block before.
+        """
         del num_prompt_tokens
         num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
         if num_skipped_tokens <= 0:
             return
-        sink_blocks = self.kv_cache_spec.sink_chunks
-        num_skipped_blocks = num_skipped_tokens // self.block_size
+        sink_tokens = self.kv_cache_spec.sink_chunks * self.kv_cache_spec.chunk_size
+        first_live_block = -(-sink_tokens // self.block_size)
+        last_freed_block = (sink_tokens + num_skipped_tokens) // self.block_size
         self._remove_blocks_in_range(
             request_id,
-            sink_blocks,
-            sink_blocks + num_skipped_blocks,
+            first_live_block,
+            last_freed_block,
         )
 
 

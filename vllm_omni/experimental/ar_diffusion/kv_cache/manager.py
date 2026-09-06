@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Engine-level KV cache orchestration for AR-Diffusion models.
 
 This is the *body* of AR-Diffusion's KV management: it owns a vLLM ``KVCacheManager`` (a
@@ -243,14 +244,29 @@ class ARDiffusionKVCache:
         # forward needs one block per current frame plus space for any
         # model-declared action/state tokens that coexist with video KV.
         declared_scratch_blocks = (max_scratch_tokens_per_branch + block_size - 1) // block_size
-        minimum_scratch_blocks = self.frames_per_block + declared_scratch_blocks
+        # frames_per_block counts *frames*; convert to blocks rather than
+        # assuming one block per frame. A frame spans ceil(chunk_size /
+        # block_size) blocks once the two sizes are allowed to differ.
+        blocks_per_frame = -(-config.chunk_size // block_size)
+        self.blocks_per_frame = blocks_per_frame
+        minimum_scratch_blocks = self.frames_per_block * blocks_per_frame + declared_scratch_blocks
         override = os.environ.get("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH")
         override_blocks = int(override) if override is not None else 0
         if override_blocks < 0:
             raise ValueError("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH must be non-negative")
         scratch_per_kv_branch = max(minimum_scratch_blocks, override_blocks)
-        self.scratch_blocks_per_kv_branch = scratch_per_kv_branch
-        self.scratch_num_blocks = self.num_local_kv_branches * scratch_per_kv_branch
+        # One independent region per slot. Scratch is where a non-committing
+        # forward writes its current chunk, so sessions that may be in flight
+        # together need regions of their own or they overwrite each other --
+        # silently, since the shapes stay right. Slots default to 1, which is
+        # a single region per branch and costs exactly what it did before.
+        scratch_slots = int(getattr(config, "scratch_slots", 1) or 1)
+        if scratch_slots < 1:
+            raise ValueError(f"ARDiffusionKVConfig.scratch_slots must be at least 1, got {scratch_slots}")
+        self.scratch_slots = scratch_slots
+        self.scratch_blocks_per_slot = scratch_per_kv_branch
+        self.scratch_blocks_per_kv_branch = scratch_per_kv_branch * scratch_slots
+        self.scratch_num_blocks = self.num_local_kv_branches * self.scratch_blocks_per_kv_branch
 
         # The self-attention pool, scratch pool, and lazily materialized
         # cross-attention caches share one hard memory budget. Select the largest
@@ -273,8 +289,23 @@ class ARDiffusionKVCache:
         )
 
         def _required_managed_blocks(capacity: int) -> int:
-            resident_per_session = config.sink_chunks + config.window_chunks
-            return self.num_local_kv_branches * (capacity * resident_per_session + self.frames_per_block) + 2
+            """Managed blocks needed to hold ``capacity`` resident sessions.
+
+            Every term here counts *frames*, so each is converted to blocks.
+            Before block size and frame size were allowed to differ this
+            conversion was the identity and the frame counts could be used
+            directly; they cannot once a frame spans several blocks.
+
+            Converting rather than rewriting keeps the budget the same number
+            of *tokens* it always was, so a finer block size does not inflate
+            the requirement -- it only stops the final block of each term from
+            rounding up a whole frame's worth of memory.
+            """
+            resident_frames = config.sink_chunks + config.window_chunks
+            per_session_blocks = resident_frames * self.blocks_per_frame
+            in_flight_blocks = self.frames_per_block * self.blocks_per_frame
+            headroom_blocks = 2 * self.blocks_per_frame
+            return self.num_local_kv_branches * (capacity * per_session_blocks + in_flight_blocks) + headroom_blocks
 
         def _required_bytes(capacity: int) -> int:
             return (
@@ -575,19 +606,25 @@ class ARDiffusionKVCache:
             self.block_size,
         )
 
-    def scratch_block_ids(self, kv_branch: str, start: int, count: int) -> list[int]:
-        """Return KV-branch-local scratch block ids outside manager ownership."""
+    def scratch_block_ids(self, kv_branch: str, start: int, count: int, *, slot: int = 0) -> list[int]:
+        """Return scratch block ids for one (KV branch, slot) region.
+
+        Regions are disjoint by construction, which is what lets two sessions
+        prepare uncommitted chunks in the same coalesced forward.
+        """
         if count < 0 or start < 0:
             raise ValueError(f"scratch start/count must be non-negative, got start={start}, count={count}")
-        if start + count > self.scratch_blocks_per_kv_branch:
+        if not 0 <= slot < self.scratch_slots:
+            raise ValueError(f"scratch slot must be in [0, {self.scratch_slots}), got {slot}")
+        if start + count > self.scratch_blocks_per_slot:
             raise RuntimeError(
                 "AR-Diffusion paged attention scratch blocks exhausted: "
-                f"need [{start}, {start + count}) of {self.scratch_blocks_per_kv_branch}. "
+                f"need [{start}, {start + count}) of {self.scratch_blocks_per_slot}. "
                 "Declare max_scratch_tokens_per_branch in the pipeline capability "
                 "or increase AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH."
             )
-        kv_branch_offset = self.scratch_blocks_per_kv_branch * self._kv_branch_index(kv_branch)
-        base = self.managed_num_blocks + kv_branch_offset + start
+        region = self._kv_branch_index(kv_branch) * self.scratch_slots + slot
+        base = self.managed_num_blocks + region * self.scratch_blocks_per_slot + start
         return list(range(base, base + count))
 
     def key_cache(self, layer_idx: int) -> torch.Tensor:

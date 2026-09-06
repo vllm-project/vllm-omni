@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Model-facing session state backed by paged AR-Diffusion KV storage."""
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ class ARDiffusionKVState:
         adapters: Mapping[str, ARDiffusionRequestAdapter],
         *,
         num_layers: int,
+        scratch_slot: int = 0,
     ) -> None:
         expected = tuple(kv_branch.name for kv_branch in kv_cache.kv_branches)
         if set(adapters) != set(expected):
@@ -46,10 +48,17 @@ class ARDiffusionKVState:
                 "AR-Diffusion session adapters must match the configured KV branches; "
                 f"expected {expected}, got {tuple(adapters)}"
             )
+        slots = getattr(kv_cache, "scratch_slots", 1)
+        if not 0 <= scratch_slot < slots:
+            raise ValueError(
+                f"scratch_slot must be in [0, {slots}) for this KV cache, got {scratch_slot}. "
+                "Raise ARDiffusionKVConfig.scratch_slots to run more sessions in one forward."
+            )
         self.kv_cache = kv_cache
         self.session_id = session_id
         self.adapters = dict(adapters)
         self.num_layers = num_layers
+        self.scratch_slot = int(scratch_slot)
         self._committed: dict[str, int] = dict.fromkeys(expected, 0)
         self._paged_pending: dict[str, ARDiffusionPagedForwardContext | None] = dict.fromkeys(expected)
         self._closed = False
@@ -109,6 +118,7 @@ class ARDiffusionKVState:
             max_video_tokens=int(
                 self.kv_cache.spec.sliding_window + self.kv_cache.spec.sink_chunks * self.kv_cache.spec.chunk_size
             ),
+            scratch_slot=self.scratch_slot,
         )
         self._paged_pending[kv_branch] = forward_ctx
         _log.debug(

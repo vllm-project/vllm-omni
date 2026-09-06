@@ -450,3 +450,72 @@ def test_non_contiguous_branch_indices_rejected():
             kv_branches=(ARDiffusionKVBranchSpec("main", 1),),
             session_capacity=1,
         )
+
+
+# --- eviction against the block table ---------------------------------------
+
+
+class _RecordingManager(ChunkWindowManager):
+    """Capture the block range eviction asks for, without a real block pool.
+
+    ``remove_skipped_blocks`` reads three attributes and calls one method. A
+    pool would add nothing: the bug under test is the conversion from the
+    spec's units into the block table's, and that is entirely visible here.
+    """
+
+    def __init__(self, spec):
+        self.kv_cache_spec = spec
+        self.sliding_window = spec.sliding_window
+        self.block_size = spec.block_size
+        self.freed: tuple[int, int] | None = None
+
+    def _remove_blocks_in_range(self, request_id, first_block, last_block):
+        self.freed = (first_block, last_block)
+
+
+def test_sink_is_preserved_when_a_frame_spans_many_blocks():
+    # The shipped geometry: 832x480 is 1560 tokens per frame, 1560 % 16 == 8 is
+    # not a legal block size, so paging falls back to 16 and a frame spans 98
+    # blocks. Every other eviction test uses chunk_size == BLOCK, where a frame
+    # is a block and a sink counted in frames indexes the block table correctly
+    # by accident -- which is why this went unnoticed.
+    chunk_size, sink_chunks, window_chunks = 1560, 9, 9
+    spec = ChunkWindowSpec(
+        block_size=16,
+        num_kv_heads=4,
+        head_size=64,
+        dtype=torch.float16,
+        sliding_window=window_chunks * chunk_size,
+        chunk_size=chunk_size,
+        window_chunks=window_chunks,
+        sink_chunks=sink_chunks,
+    )
+    manager = _RecordingManager(spec)
+
+    # Far enough past sink + window that eviction has definitely started.
+    manager.remove_skipped_blocks("req", total_computed_tokens=30 * chunk_size)
+    assert manager.freed is not None
+    first_freed, last_freed = manager.freed
+
+    # The assertion is on the token boundary rather than a block count, so it
+    # stays meaningful if the paging unit changes again.
+    sink_tokens = sink_chunks * chunk_size
+    assert first_freed * spec.block_size >= sink_tokens, (
+        f"eviction starts at token {first_freed * spec.block_size}, inside the "
+        f"{sink_tokens}-token sink"
+    )
+    # And it must not over-protect: at most one straddling block beyond the sink.
+    assert (first_freed - 1) * spec.block_size < sink_tokens
+    # Only wholly-skipped blocks are released.
+    skipped = manager.get_num_skipped_tokens(30 * chunk_size)
+    assert last_freed * spec.block_size <= sink_tokens + skipped
+
+
+def test_sink_conversion_is_identity_when_a_frame_is_a_block():
+    # Every geometry that paged one frame per block must be untouched.
+    spec = make_spec(chunk_size=BLOCK, window_chunks=2, sink_chunks=1)
+    manager = _RecordingManager(spec)
+    manager.remove_skipped_blocks("req", total_computed_tokens=8 * BLOCK)
+    assert manager.freed is not None
+    first_freed, _ = manager.freed
+    assert first_freed == spec.sink_chunks
