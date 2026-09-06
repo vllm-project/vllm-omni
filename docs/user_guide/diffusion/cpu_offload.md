@@ -11,7 +11,7 @@ For the shared factory, discovery, and lifecycle contract, see the
 
 | Strategy | Device residency | Parallel scope | Guide |
 | --- | --- | --- | --- |
-| Model-level (sequential) | One pipeline component group at a time | Single device | [Model-Level Offloading](offloader/cpu_offload.md) |
+| Model-level (sequential) | One pipeline component group at a time | Single device | [Model-Level Offloading](offloader/module_offload.md) |
 | Layerwise (blockwise) | One transformer block, with next-block prefetch | Single device | [Layerwise Offloading](offloader/layerwise_offload.md) |
 | Distributed layerwise | Fixed two-block device buffer; optional host-weight sharding and AllGather | Multiple GPU/NPU ranks | [Distributed Layerwise Offloading](offloader/distributed_layerwise_offload.md) |
 
@@ -27,7 +27,7 @@ higher-priority strategy is selected.
 
 ## Quick selection
 
-- Use [model-level offloading](offloader/cpu_offload.md) when swapping whole
+- Use [model-level offloading](offloader/module_offload.md) when swapping whole
   encoders and DiTs is enough to fit and phase-boundary transfers are
   acceptable.
 - Use [layerwise offloading](offloader/layerwise_offload.md) for compute-heavy video
@@ -63,7 +63,7 @@ These headings preserve links to sections that moved into dedicated guides.
 
 ## Model-level (Sequential) Offloading
 
-See [Model-Level Offloading](offloader/cpu_offload.md).
+See [Model-Level Offloading](offloader/module_offload.md).
 
 ## Layerwise (Blockwise) Offloading
 

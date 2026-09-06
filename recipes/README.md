@@ -10,7 +10,8 @@ keep naming and layout consistent, organize recipes by model vendor in a way
 that is aligned with
 [`vllm-project/recipes`](https://github.com/vllm-project/recipes), but treat
 that external repository as a reference for structure rather than the place to
-add files for this repo. Use one Markdown file per model family by default.
+add files for this repo. Use one Markdown file per model and hardware profile,
+named `<model>-<hardware>.md`.
 
 > **Note:** The vLLM-Omni TTS recipes (12 models across 8 providers) are also
 > published on the rendered recipes site at
@@ -29,16 +30,16 @@ Example layout:
 ```text
 recipes/
   Qwen/
-    Qwen3-Omni.md
-    Qwen3-TTS.md
+    Qwen3-Omni-H100.md
+    Qwen3-TTS-A100.md
   Tencent/
-    Covo-Audio-Chat.md
+    Covo-Audio-Chat-L40S.md
 ```
 
 ## Available Recipes
 
 | Recipe | Task | Hardware |
-|--------|------|----------|
+| -------- | ------ | ---------- |
 | [`Baidu/ERNIE-Image.md`](./Baidu/ERNIE-Image.md) | Text-to-image online serving (ERNIE-Image 8B) | 1x or 2x RTX 4090 24GB |
 | [`Bagel/BAGEL-7B-MoT.md`](./Bagel/BAGEL-7B-MoT.md) | Text-to-image with shared online/offline examples | 1x A100 80GB / 2x CUDA GPUs |
 | [`Boogu/Boogu-Image.md`](./Boogu/Boogu-Image.md) | Text-to-image online serving (Boogu-Image-0.1-Base) | 1x A100/H100 40GB+ |
@@ -62,6 +63,7 @@ recipes/
 | [`meituan-longcat/LongCat-Video-Avatar-1.5.md`](./meituan-longcat/LongCat-Video-Avatar-1.5.md) | Audio-driven avatar video generation (AT2V / AI2V, single- and multi-speaker, AVC continuation) | 1x H100 80GB |
 | [`mistralai/Voxtral-TTS.md`](./mistralai/Voxtral-TTS.md) | Online serving for TTS | 1x RTX 4090 24GB |
 | [`Robbyant/LingBot-Video.md`](./Robbyant/LingBot-Video.md) | Native dense and MoE text-to-video serving | Dense: 1x L20X; MoE: 1x L20X (~67.7 GiB peak) |
+| [`SandAI/MAGI-2-preview-L20X.md`](./SandAI/MAGI-2-preview-L20X.md) | Native Preview-stage text/image-to-video-and-audio generation | 1x/4x NVIDIA L20X 140 GiB qualified |
 | [`Robbyant/LingBot-World-2.0.md`](./Robbyant/LingBot-World-2.0.md) | Offline and experimental realtime interactive world generation | 1x H200/B200 or 2x B200 for TP=2 |
 | [`cosmos3/Cosmos3-Nano.md`](./cosmos3/Cosmos3-Nano.md) | Text-to-image, text-to-video, image-to-video, video-to-video generation, text to video with sound, action policy | 1x H200 141GB / B300 |
 | [`cosmos3/Cosmos3-Edge.md`](./cosmos3/Cosmos3-Edge.md) | T2I / T2V / I2V + action (Physical-AI) generation on the Nemotron-based Edge transformer | 1x GPU (~8 GiB) |
@@ -92,8 +94,7 @@ recipes/
 | [`GLM/GLM-Image.md`](./GLM/GLM-Image.md) | Online serving for image generation | 1x A800 80GB / 2x A800 80GB |
 | [`JD/JoyAI-VL-Interaction.md`](./JD/JoyAI-VL-Interaction.md) | Real-time streaming video-language interaction (proactive speak/silence/delegate) | 1x GPU 24GB+ |
 
-Within a single recipe file, include different hardware support sections such
-as `GPU`, `ROCm`, and `NPU`, and add concrete tested configurations like
-`1x A100 80GB` or `2x L40S` inside those sections when applicable.
+Keep one accelerator model or platform per recipe file. Add a separately
+suffixed recipe and table row for another GPU, ROCm accelerator, or NPU.
 
 See [TEMPLATE.md](./TEMPLATE.md) for the recommended format.

@@ -1674,43 +1674,53 @@ class TestTTSMethods:
 
     @pytest.mark.asyncio
     async def test_higgs_v3_cache_salt_changes_with_ref_audio_cache_key(self, speech_server, mocker):
-        """Higgs v3 voice clone uses placeholder prompt ids + prefix caching.
+        """Higgs v3 voice clone uses position-marked prompt ids + prefix caching.
         The salt must move when the resolve key moves, or a same-path rewrite
         reuses KV from the previous reference."""
-        from unittest.mock import AsyncMock, MagicMock
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_tokenizer import (
+            HiggsAudioV3TokenizerAdapter,
+        )
 
-        adapter = MagicMock()
-        adapter.build_prompt.return_value = [1, 1, 1, 1]
-        speech_server._resolve_higgs_audio_v3_adapter = AsyncMock(return_value=adapter)
-        codes = torch.arange(8, dtype=torch.long).view(8, 1)
-        speech_server._resolve_higgs_audio_v3_ref_codes = AsyncMock(return_value=(codes, False, False))
-        speech_server._get_resolved_ref_audio_artifact_key = MagicMock(return_value="art")
+        tokenizer = mocker.MagicMock()
+        tokenizer.get_added_vocab.return_value = {
+            "<|tts|>": 151700,
+            "<|text|>": 151701,
+            "<|audio|>": 151702,
+        }
+        adapter = HiggsAudioV3TokenizerAdapter(tokenizer)
+        mocker.patch.object(adapter, "build_prompt", return_value=[1, -100, -100, 2])
+        speech_server._resolve_higgs_audio_v3_adapter = mocker.AsyncMock(return_value=adapter)
+        codes = torch.arange(16, dtype=torch.long).view(2, 8)
+        speech_server._resolve_higgs_audio_v3_ref_codes = mocker.AsyncMock(return_value=(codes, False, False))
+        speech_server._get_resolved_ref_audio_artifact_key = mocker.MagicMock(return_value="art")
 
         req = OpenAICreateSpeechRequest(
             input="hello",
             ref_audio="file:///data/spk.wav",
             ref_text="transcript",
         )
-        speech_server._resolve_ref_audio = AsyncMock(return_value=([0.1] * 48000, 24000, "key_aaa"))
+        speech_server._resolve_ref_audio = mocker.AsyncMock(return_value=([0.1] * 48000, 24000, "key_aaa"))
         prompt_a = await speech_server._build_higgs_audio_v3_params(req)
-        speech_server._resolve_ref_audio = AsyncMock(return_value=([0.9] * 48000, 24000, "key_bbb"))
+        speech_server._resolve_ref_audio = mocker.AsyncMock(return_value=([0.9] * 48000, 24000, "key_bbb"))
         prompt_b = await speech_server._build_higgs_audio_v3_params(req)
 
+        assert prompt_a["prompt_token_ids"] == [1, 151700, 151700, 2]
         assert prompt_a["prompt_token_ids"] == prompt_b["prompt_token_ids"]
+        assert prompt_a["additional_information"]["audio_placeholder_positions"].tolist() == [1, 2]
         assert prompt_a["cache_salt"] != prompt_b["cache_salt"]
         assert prompt_a["additional_information"]["ref_audio_cache_key"] == "key_aaa"
         assert prompt_b["additional_information"]["ref_audio_cache_key"] == "key_bbb"
 
-    # ── encode_reference_codes: speaker cache invalidation ──
+    # ── MossReferenceEncoder: speaker cache invalidation ──
 
     @pytest.mark.asyncio
-    async def test_encode_reference_codes_reencodes_on_key_change(self):
+    async def test_moss_ref_encoder_reencodes_on_key_change(self):
         """Changing the resolve_cache_key must trigger a fresh encode, not serve
         the stale cached tensor.  This is the user-visible fix for delay-family
         voice clones that were reproducing the old speaker."""
         from unittest.mock import MagicMock
 
-        from vllm_omni.model_executor.models.moss_tts.reference_encoder import encode_reference_codes
+        from vllm_omni.model_executor.models.moss_tts.reference_encoder import MossReferenceEncoder
         from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
 
         speaker_cache = SpeakerEmbeddingCache(max_bytes=64 * 1024 * 1024)
@@ -1735,38 +1745,42 @@ class TestTTSMethods:
         async def mock_resolve(ref_str):
             return ([0.1, 0.2, 0.3], 24000, next(resolve_keys))
 
-        # First call: cold miss, encodes and stores
-        result1 = await encode_reference_codes(
-            "data:audio/wav;base64,fake",
-            processor=processor,
-            resolve_ref_audio=mock_resolve,
-            speaker_cache=speaker_cache,
+        encoder = MossReferenceEncoder(
+            processor,
             variant="tts",
             n_vq=32,
             sr_target=24000,
+            speaker_cache=speaker_cache,
         )
-        assert call_count == 1
-        assert torch.equal(result1, codes_v1)
+        try:
+            # First call: cold miss, encodes and stores
+            result1, key1 = await encoder.encode(
+                "data:audio/wav;base64,fake",
+                resolve_ref_audio=mock_resolve,
+                get_artifact_key=lambda cache_key: None,
+            )
+            assert call_count == 1
+            assert torch.equal(result1, codes_v1)
+            assert key1 == "key_aaa"
 
-        # Second call: different resolve key → must re-encode, not serve cached
-        result2 = await encode_reference_codes(
-            "data:audio/wav;base64,fake",
-            processor=processor,
-            resolve_ref_audio=mock_resolve,
-            speaker_cache=speaker_cache,
-            variant="tts",
-            n_vq=32,
-            sr_target=24000,
-        )
-        assert call_count == 2, "Different resolve key should trigger re-encode"
-        assert torch.equal(result2, codes_v2)
+            # Second call: different resolve key → must re-encode, not serve cached
+            result2, key2 = await encoder.encode(
+                "data:audio/wav;base64,fake",
+                resolve_ref_audio=mock_resolve,
+                get_artifact_key=lambda cache_key: None,
+            )
+            assert call_count == 2, "Different resolve key should trigger re-encode"
+            assert torch.equal(result2, codes_v2)
+            assert key2 == "key_bbb"
+        finally:
+            await encoder.aclose()
 
     @pytest.mark.asyncio
-    async def test_encode_reference_codes_named_voice_skips_resolve_on_hit(self):
+    async def test_moss_ref_encoder_named_voice_skips_resolve_on_hit(self):
         """Named-voice cache hit must NOT call resolve_ref_audio."""
         from unittest.mock import MagicMock
 
-        from vllm_omni.model_executor.models.moss_tts.reference_encoder import encode_reference_codes
+        from vllm_omni.model_executor.models.moss_tts.reference_encoder import MossReferenceEncoder
         from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
 
         speaker_cache = SpeakerEmbeddingCache(max_bytes=64 * 1024 * 1024)
@@ -1781,33 +1795,37 @@ class TestTTSMethods:
             resolve_called += 1
             return ([0.1], 24000, "some_key")
 
-        # First call: cold miss, resolves + encodes
-        await encode_reference_codes(
-            "data:audio/wav;base64,fake",
-            processor=processor,
-            resolve_ref_audio=mock_resolve,
-            speaker_cache=speaker_cache,
+        encoder = MossReferenceEncoder(
+            processor,
             variant="tts",
             n_vq=32,
             sr_target=24000,
-            voice_name="alice",
-            voice_created_at=100,
+            speaker_cache=speaker_cache,
         )
-        assert resolve_called == 1
+        try:
+            # First call: cold miss, resolves + encodes
+            _, key1 = await encoder.encode(
+                "data:audio/wav;base64,fake",
+                resolve_ref_audio=mock_resolve,
+                get_artifact_key=lambda cache_key: None,
+                voice_name="alice",
+                voice_created_at=100,
+            )
+            assert resolve_called == 1
+            assert key1 == "some_key"
 
-        # Second call: warm hit, must NOT resolve
-        await encode_reference_codes(
-            "data:audio/wav;base64,fake",
-            processor=processor,
-            resolve_ref_audio=mock_resolve,
-            speaker_cache=speaker_cache,
-            variant="tts",
-            n_vq=32,
-            sr_target=24000,
-            voice_name="alice",
-            voice_created_at=100,
-        )
-        assert resolve_called == 1, "Named-voice cache hit should skip resolve_ref_audio"
+            # Second call: warm hit, must NOT resolve
+            _, key2 = await encoder.encode(
+                "data:audio/wav;base64,fake",
+                resolve_ref_audio=mock_resolve,
+                get_artifact_key=lambda cache_key: None,
+                voice_name="alice",
+                voice_created_at=100,
+            )
+            assert resolve_called == 1, "Named-voice cache hit should skip resolve_ref_audio"
+            assert key2 is None  # no resolve happened; salted by voice_created_at
+        finally:
+            await encoder.aclose()
 
     @pytest.mark.asyncio
     async def test_ttsd_second_reference_does_not_use_named_voice(self, speech_server, mocker):
@@ -1825,14 +1843,12 @@ class TestTTSMethods:
 
         seen: list[tuple[str, str | None]] = []
 
-        async def fake_encode(ref_str, **kwargs):
-            seen.append((ref_str, kwargs.get("voice_name")))
-            return torch.zeros(3, dtype=torch.int64)
+        class _FakeEncoder:
+            async def encode(self, ref_str, **kwargs):
+                seen.append((ref_str, kwargs.get("voice_name")))
+                return torch.zeros(3, dtype=torch.int64), f"rk:{ref_str}"
 
-        mocker.patch(
-            "vllm_omni.model_executor.models.moss_tts.reference_encoder.encode_reference_codes",
-            fake_encode,
-        )
+        mocker.patch.object(speech_server, "_get_moss_ref_encoder", return_value=_FakeEncoder())
 
         req = OpenAICreateSpeechRequest(
             input="hello",
@@ -1840,11 +1856,14 @@ class TestTTSMethods:
             ref_audio="data:audio/wav;base64,aaa",
             ref_audio_2="data:audio/wav;base64,bbb",
         )
-        await speech_server._build_moss_tts_params(req, has_inline_ref_audio=False)
-        assert seen == [
+        params = await speech_server._build_moss_tts_params(req, has_inline_ref_audio=False)
+        assert sorted(seen) == [
             ("data:audio/wav;base64,aaa", "alice"),
             ("data:audio/wav;base64,bbb", None),
         ]
+        # Per-slot salt keys survive the concurrent (gather) encode order.
+        assert params["ref_audio_cache_key"] == "rk:data:audio/wav;base64,aaa"
+        assert params["ref_audio_2_cache_key"] == "rk:data:audio/wav;base64,bbb"
 
     def test_precomputed_qwen3_voice_infers_base_without_ref_audio(self, speech_server):
         """Precomputed Qwen3 voices are reusable by name without per-request ref_audio."""
@@ -4773,6 +4792,89 @@ class TestMingFlashOmniTTSServing:
         request = OpenAICreateSpeechRequest(input="Hello", voice="test")
         asyncio.run(ming_flash_omni_tts_server._prepare_speech_generation(request))
         ming_flash_omni_tts_server._build_ming_flash_omni_prompt.assert_called_once()
+
+
+@pytest.fixture
+def dots_tts_server(mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.tts_adapters.base.load_supported_speakers",
+        return_value=set(),
+    )
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.tts_adapters.base.load_codec_frame_rate",
+        return_value=None,
+    )
+
+    mock_engine_client = mocker.MagicMock()
+    mock_engine_client.errored = False
+    mock_engine_client.model_config = mocker.MagicMock(
+        model="dots-studio/dots.tts-soar",
+    )
+    mock_engine_client.default_sampling_params_list = [
+        SimpleNamespace(max_tokens=2048, min_tokens=None, extra_args=None)
+    ]
+    mock_engine_client.tts_batch_max_items = 32
+    mock_engine_client.generate = mocker.MagicMock(return_value="generator")
+    mock_engine_client.stage_configs = [
+        SimpleNamespace(
+            engine_args=SimpleNamespace(model_stage="latent_generator", model_arch="DotsTTSForConditionalGeneration"),
+            tts_args={},
+        )
+    ]
+
+    mock_models = mocker.MagicMock()
+    mock_models.is_base_model.return_value = True
+
+    return OmniOpenAIServingSpeech(
+        engine_client=mock_engine_client,
+        models=mock_models,
+        request_logger=mocker.MagicMock(),
+    )
+
+
+class TestDotsTTSServing:
+    def test_dots_tts_prompt_validation(self, dots_tts_server):
+        request = OpenAICreateSpeechRequest(input="Hello", ref_text="Reference transcript")
+        error = dots_tts_server._validate_tts_request(request)
+        assert error is not None
+        assert "ref_text" in error
+
+        request = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
+        error = dots_tts_server._validate_tts_request(request)
+        assert error is not None
+        assert "ref_audio" in error
+
+        request = OpenAICreateSpeechRequest(input="Hello", voice="test")
+        error = dots_tts_server._validate_tts_request(request)
+        assert error is not None
+        assert "voice" in error
+
+        request = OpenAICreateSpeechRequest(input="Hello", speaker_embedding=[1, 2, 3])
+        error = dots_tts_server._validate_tts_request(request)
+        assert error is not None
+        assert "speaker_embedding" in error
+
+        request = OpenAICreateSpeechRequest(input="Hello", x_vector_only_mode=True)
+        error = dots_tts_server._validate_tts_request(request)
+        assert error is not None
+        assert "x_vector_only_mode" in error
+
+    def test_dots_tts_adapter_awaits_async_prompt_builder(self, dots_tts_server, mocker: MockerFixture):
+        build_prompt_async = mocker.patch.object(
+            dots_tts_server._adapter,
+            "_build_prompt_async",
+            new=mocker.AsyncMock(return_value={"prompt_token_ids": [1, 2, 3]}),
+        )
+        request = OpenAICreateSpeechRequest(input="Hello")
+        asyncio.run(dots_tts_server._prepare_speech_generation(request))
+        build_prompt_async.assert_awaited_once_with("Hello")
+
+    def test_dots_tts_adapter_apply_sampling_overrides(self, dots_tts_server, mocker: MockerFixture):
+        mocker.patch.object(dots_tts_server._adapter, "build", return_value=PreparedRequest(prompt="Hello"))
+        request = OpenAICreateSpeechRequest(input="Hello", max_new_tokens=10)
+        asyncio.run(dots_tts_server._prepare_speech_generation(request))
+        sampling_params_list = dots_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"]
+        assert sampling_params_list[0].max_tokens == 10
 
 
 class TestTTSAsyncOffloading:
