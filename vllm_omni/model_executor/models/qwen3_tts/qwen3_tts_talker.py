@@ -830,6 +830,21 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # ``tts_pad_embed`` was materialized above from :attr:`_tts_pad_embed`
         # (request-independent buffer) — no per-request fetch needed.
 
+        # Preemption->resume (or prefix-cache reconstruction) replays already-
+        # generated codec tokens as a multi-token span with is_prefill False; the
+        # stock reshape(1, 1) below crashes the EngineCore on it. Decode state is
+        # preserved across preemption in model_intermediate_buffer (cleared only on
+        # request finish), so rebuild only the main-transformer KV: embed every
+        # replayed codec token, mutate no decode state, emit no mtp_inputs (the
+        # talker_mtp fast-path is span_len==1 gated and never pops it for this span).
+        if span_len > 1:
+            inputs_embeds_out = (
+                self.embed_input_ids(input_ids.reshape(-1, 1).to(torch.long))
+                .to(device=input_ids.device, dtype=dtype)
+                .reshape(span_len, -1)
+            )
+            return input_ids, inputs_embeds_out, {"meta": {"codec_streaming": codec_streaming}}
+
         tail = hs.get("trailing_text")
         text_offset = max(0, int(meta.get("talker_text_offset", 0) or 0))
         trailing_text_update = None

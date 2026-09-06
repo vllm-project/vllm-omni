@@ -747,3 +747,55 @@ def test_ref_audio_artifact_only_cache_miss_fails_fast():
                 REF_AUDIO_CACHE_KEY: ["missing-ref"],
             },
         )
+
+
+def test_decode_multi_token_span_replays_kv_on_preempt_resume():
+    # When a running talker request is preempted and resumed, vLLM replays the
+    # already-generated codec tokens as a single decode-side span (is_prefill
+    # False, span_len > 1). The pre-fix decode path assumed span_len == 1 and
+    # reshape(1, 1) crashed Stage-0's EngineCore on it. The resume branch must
+    # instead embed every replayed token (one row each), return the span ids
+    # unchanged, and leave the decode state untouched — the preserved
+    # talker_text_offset / trailing_text live in model_intermediate_buffer and
+    # must not be advanced or popped while only rebuilding KV.
+    model = _make_minimal_talker(tts_pad_embed=torch.full((1, 4), -1.0, dtype=torch.bfloat16))
+    # preprocess reads ``self._embedding_dtype``; the __new__ construction in
+    # _make_minimal_talker skips __init__, so set it explicitly.
+    model._embedding_dtype = torch.bfloat16
+
+    def fake_embed_input_ids(ids):
+        flat = ids.reshape(-1).to(torch.float32)
+        return flat.reshape(-1, 1, 1).expand(flat.shape[0], 1, 4)
+
+    model.embed_input_ids = fake_embed_input_ids
+
+    input_ids = torch.tensor([11, 22, 33], dtype=torch.long)
+    out_ids, out_embeds, update = model.preprocess(
+        input_ids=input_ids,
+        input_embeds=None,
+        text=["hello"],
+        task_type=["CustomVoice"],
+        # Decode-side state that the normal span_len == 1 path would consume;
+        # the resume replay must ignore it (no offset advance, no tail rewrite).
+        hidden_states={
+            "trailing_text": torch.arange(12, dtype=torch.float32).reshape(3, 4),
+            "last": torch.ones(4, dtype=torch.float32),
+        },
+        meta={"talker_text_offset": 1, "codec_streaming": True},
+        _omni_is_prefill=False,
+        _omni_num_computed_tokens=5,
+        _omni_prompt_len=2,
+    )
+
+    # Span ids returned unchanged (token ids stay in-vocab for vLLM bookkeeping).
+    assert torch.equal(out_ids, input_ids)
+    # One embedding row per replayed token — not a single decode step.
+    assert out_embeds.shape == (3, 4)
+    expected = input_ids.to(torch.float32).reshape(3, 1).expand(3, 4).to(torch.bfloat16)
+    assert torch.equal(out_embeds.cpu(), expected)
+    # No decode-state mutation: no mtp fast-path inputs, no trailing_text rewrite,
+    # and the text offset is not advanced. codec_streaming is carried through from
+    # the per-request meta (not re-derived from task_type, which would be False here).
+    assert "mtp_inputs" not in update
+    assert "hidden_states" not in update
+    assert update["meta"] == {"codec_streaming": True}
