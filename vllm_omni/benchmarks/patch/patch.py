@@ -101,7 +101,15 @@ logger = init_logger(__name__)
 _AUDIO_CONTINUITY_THRESHOLD_ENV = "VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S"
 RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
 _IMAGE_STAGE_METRICS_BACKENDS = frozenset({"openai-image-edits-omni"})
+_STAGE_METRICS_BACKENDS = frozenset(
+    {
+        "daily-omni",
+        "openai-chat-omni",
+        *_IMAGE_STAGE_METRICS_BACKENDS,
+    }
+)
 _PRINT_STAGE = False
+_SAVE_DETAILED = False
 
 
 def maybe_enable_stage_metrics(extra_body: dict[str, Any] | None, *, enabled: bool) -> dict[str, Any] | None:
@@ -119,6 +127,8 @@ def should_request_stage_metrics(args: Any) -> bool:
         return True
 
     backend = getattr(args, "backend", None)
+    if getattr(args, "save_detailed", False) and backend in _STAGE_METRICS_BACKENDS:
+        return True
     if backend in _IMAGE_STAGE_METRICS_BACKENDS:
         return True
 
@@ -142,6 +152,12 @@ def set_print_stage(enabled: bool) -> None:
     """Set whether this benchmark run prints the stage benchmark section."""
     global _PRINT_STAGE
     _PRINT_STAGE = bool(enabled)
+
+
+def set_save_detailed(enabled: bool) -> None:
+    """Set whether this benchmark run retains per-request detail."""
+    global _SAVE_DETAILED
+    _SAVE_DETAILED = bool(enabled)
 
 
 def _audio_continuity_threshold_s() -> float:
@@ -685,6 +701,20 @@ class MixRequestFuncOutput(RequestFuncOutput):
     final_output_type: str | None = None
     duplex_request_metrics: list[dict[str, object]] | None = None
     duplex_session_metrics: dict[str, object] | None = None
+
+
+def _request_stage_metrics(outputs: Iterable[object]) -> list[dict[str, dict]]:
+    """Return one stage snapshot per request while preserving alignment."""
+    return [dict(getattr(output, "stage_metrics", None) or {}) for output in outputs]
+
+
+def _add_detailed_stage_metrics(
+    result: dict[str, Any],
+    outputs: Iterable[object],
+) -> None:
+    """Attach request-scoped stage snapshots only to detailed results."""
+    if _SAVE_DETAILED:
+        result["stage_metrics"] = _request_stage_metrics(outputs)
 
 
 _IMAGE_EDITS_EXTRA_BODY_FORM_FIELDS = (
@@ -2351,6 +2381,7 @@ async def benchmark(
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
         }
+    _add_detailed_stage_metrics(result, outputs)
     # Plain-vLLM backends (e.g. the vLLM-text perf config) return upstream
     # RequestFuncOutput objects without the Mix duplex fields; read them
     # tolerantly or the whole benchmark result is discarded ("fallback to

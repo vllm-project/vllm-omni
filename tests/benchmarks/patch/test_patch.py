@@ -20,6 +20,7 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SeedTTSSampleRequest,
     SeedTTSTextSampleRequest,
 )
+from vllm_omni.benchmarks.patch import patch as benchmark_patch
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
     _apply_stage0_token_timings,
@@ -122,6 +123,72 @@ class MockResponse:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         pass
+
+
+def test_request_stage_metrics_preserve_request_alignment():
+    first = MixRequestFuncOutput(
+        stage_metrics={
+            "0": {
+                "stage_id": 0,
+                "stage_gen_time_ms": 12.5,
+            }
+        }
+    )
+    missing = MixRequestFuncOutput(stage_metrics=None)
+    multiple = MixRequestFuncOutput(
+        stage_metrics={
+            "0": {"stage_id": 0},
+            "1": {"stage_id": 1},
+        }
+    )
+
+    assert benchmark_patch._request_stage_metrics([first, missing, multiple]) == [
+        {
+            "0": {
+                "stage_id": 0,
+                "stage_gen_time_ms": 12.5,
+            }
+        },
+        {},
+        {
+            "0": {"stage_id": 0},
+            "1": {"stage_id": 1},
+        },
+    ]
+
+
+def test_save_detailed_requests_stage_metrics():
+    args = SimpleNamespace(
+        print_stage=False,
+        save_detailed=True,
+        backend="openai-chat-omni",
+        extra_body={},
+    )
+
+    assert benchmark_patch.should_request_stage_metrics(args) is True
+
+
+def test_detailed_stage_metrics_are_opt_in():
+    outputs = [
+        MixRequestFuncOutput(stage_metrics={"0": {"stage_id": 0}}),
+        MixRequestFuncOutput(stage_metrics=None),
+    ]
+
+    result: dict[str, object] = {}
+    benchmark_patch.set_save_detailed(False)
+    benchmark_patch._add_detailed_stage_metrics(result, outputs)
+    assert "stage_metrics" not in result
+
+    benchmark_patch.set_save_detailed(True)
+    try:
+        benchmark_patch._add_detailed_stage_metrics(result, outputs)
+    finally:
+        benchmark_patch.set_save_detailed(False)
+
+    assert result["stage_metrics"] == [
+        {"0": {"stage_id": 0}},
+        {},
+    ]
 
 
 @pytest.mark.asyncio
