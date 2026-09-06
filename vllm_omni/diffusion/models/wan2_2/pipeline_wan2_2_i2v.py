@@ -31,6 +31,7 @@ from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.utils import _load_json
+from vllm_omni.diffusion.models.wan2_2.device_cache import release_request_cache
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     _WAN_TEXT_ENCODER_OFFLOAD_PLAN,
     build_wan_scheduler,
@@ -717,8 +718,7 @@ class Wan22I2VPipeline(
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
         # so we empty the cache here to avoid OOM before vae decoding.
-        if current_omni_platform.is_available():
-            current_omni_platform.empty_cache()
+        release_request_cache(current_omni_platform)
         self._current_timestep = None
 
         if DEBUG_PERF:
