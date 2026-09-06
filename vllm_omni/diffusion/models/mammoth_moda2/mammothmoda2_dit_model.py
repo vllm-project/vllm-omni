@@ -324,7 +324,10 @@ class AttnProcessor:
         if attention_mask is not None:
             attention_mask = attention_mask.to(torch.bool)
 
-        if dtype in (torch.float16, torch.bfloat16) or not hidden_states.is_cuda:
+        # SP must keep its collectives, including FP32 inputs configured for
+        # SDPA. The local fallback is only safe without SP.
+        use_sp = not attn.omni_attn.skip_sequence_parallel and attn.omni_attn.parallel_strategy.enabled
+        if dtype in (torch.float16, torch.bfloat16) or not hidden_states.is_cuda or use_sp:
             attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
             hidden_states = attn.omni_attn(query, key, value, attn_metadata)
         else:
