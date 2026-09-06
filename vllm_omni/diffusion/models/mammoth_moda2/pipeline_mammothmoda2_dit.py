@@ -3,11 +3,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
+from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
@@ -21,6 +22,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.outputs.output_metadata import DiffusionPostprocessRawOutput
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
 
 from .mammothmoda2_dit_model import SimpleQFormerImageRefiner, Transformer2DModel
@@ -28,6 +30,21 @@ from .rope_real import RotaryPosEmbedReal
 from .schedulers import FlowMatchEulerDiscreteScheduler
 
 logger = init_logger(__name__)
+
+
+def get_mammothmoda2_post_process_func(
+    od_config: OmniDiffusionConfig,
+) -> Callable[[torch.Tensor], DiffusionPostprocessRawOutput]:
+    if od_config.output_type not in ("pil", "np", "pt"):
+        raise ValueError("MammothModa2 returns decoded images; output_type must be pil, np or pt.")
+    image_processor = VaeImageProcessor()
+
+    def post_process_func(images: torch.Tensor) -> DiffusionPostprocessRawOutput:
+        # The VAE returns BCHW in [-1, 1]. Convert once at the shared runtime's
+        # postprocess boundary, not in each distributed worker or the example.
+        return image_processor.postprocess(images, output_type=od_config.output_type)
+
+    return post_process_func
 
 
 def _build_mammoth_config(od_config: OmniDiffusionConfig) -> Mammothmoda2Config:

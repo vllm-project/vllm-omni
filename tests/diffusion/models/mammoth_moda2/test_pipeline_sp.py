@@ -7,20 +7,24 @@ request parsing, Q-Former, DiT, CFG, scheduler and VAE arithmetic are real.
 """
 
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
+from PIL import Image
 
 from vllm_omni.diffusion.config import set_current_diffusion_config
-from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig, TransformerConfig
+from vllm_omni.diffusion.data import DiffusionOutput, DiffusionParallelConfig, OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
 from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import (
     MammothModa2DiTPipeline,
     _build_mammoth_config,
     _validate_sequence_parallel_runtime,
 )
-from vllm_omni.diffusion.registry import _apply_sequence_parallel_if_enabled
+from vllm_omni.diffusion.output_formatter import format_diffusion_outputs, normalize_diffusion_postprocess_output
+from vllm_omni.diffusion.registry import _apply_sequence_parallel_if_enabled, get_diffusion_post_process_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -194,3 +198,46 @@ def test_single_rank_runtime_matches_pre_boundary_pipeline_and_replays_requests(
     for positive in (5, 4, 5):
         expected_lengths.extend(([positive, 0] if guidance > 1 else [positive]) * 2)
     assert observed_lengths == expected_lengths
+
+    # Follow the real engine postprocess/format path through a savable image,
+    # not merely a finite raw VAE tensor.
+    postprocess = get_diffusion_post_process_func(config)
+    assert postprocess is not None
+    result = DiffusionOutput(output=outputs[0])
+    formatted = format_diffusion_outputs(
+        request=_request(3, guidance).requests[0],
+        od_config=config,
+        diffusion_output=result,
+        output_data=result.output,
+        postprocess_output=normalize_diffusion_postprocess_output(postprocess(result.output)),
+    )
+    image = formatted[0].images[0]
+    assert isinstance(image, Image.Image) and image.size == (48, 32)
+    with BytesIO() as buffer:
+        image.save(buffer, format="PNG")
+        assert buffer.getvalue().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+@pytest.mark.parametrize("output_type", ["pil", "np", "pt"])
+def test_registered_postprocess_denormalizes_decoded_images(output_type):
+    config = replace(_config(), output_type=output_type)
+    postprocess = get_diffusion_post_process_func(config)
+    assert postprocess is not None
+    # Positive-only values still need VAE denormalization; range guessing is
+    # not equivalent to the released [-1, 1] image contract.
+    decoded = torch.full((1, 3, 2, 4), 0.5)
+    result = postprocess(decoded)
+    if output_type == "pil":
+        assert isinstance(result[0], Image.Image) and result[0].size == (4, 2)
+        assert result[0].getpixel((0, 0)) == (191, 191, 191)
+    elif output_type == "np":
+        assert isinstance(result, np.ndarray) and result.shape == (1, 2, 4, 3)
+        np.testing.assert_array_equal(result, np.full((1, 2, 4, 3), 0.75))
+    else:
+        assert isinstance(result, torch.Tensor)
+        torch.testing.assert_close(result, torch.full_like(decoded, 0.75))
+
+
+def test_decoded_output_does_not_claim_to_be_latents():
+    with pytest.raises(ValueError, match="decoded images"):
+        get_diffusion_post_process_func(replace(_config(), output_type="latent"))
