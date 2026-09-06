@@ -318,16 +318,26 @@ class AttnProcessor:
 
         query, key = query.to(dtype), key.to(dtype)
 
-        attn_metadata = None
         if attention_mask is not None:
             attention_mask = attention_mask.to(torch.bool)
-            attn_metadata = AttentionMetadata(attn_mask=attention_mask)
 
-        hidden_states = attn.omni_attn(query, key, value, attn_metadata)
+        if dtype in (torch.float16, torch.bfloat16) or not hidden_states.is_cuda:
+            attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
+            hidden_states = attn.omni_attn(query, key, value, attn_metadata)
+        else:
+            # FlashAttention supports only fp16/bf16 and raises on fp32 (which the
+            # previous SDPA arithmetic served); the CPU path already resolves to
+            # SDPA and handles fp32. Keep fp32 on CUDA on SDPA with native
+            # grouped-query attention (no KV-head replication).
+            q, k, v = query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
+            attn_mask = attention_mask[:, None, None, :] if attention_mask is not None else None
+            hidden_states = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, scale=attn.scale, enable_gqa=kv_heads < attn.heads
+            ).transpose(1, 2)
 
         if attention_mask is not None:
             # Padded rows carry nothing downstream; keep them at zero as the
-            # previous varlen path did, since the SDPA backend leaves them populated.
+            # previous varlen path did, since neither backend does it for us.
             hidden_states = hidden_states * attention_mask[:, :, None, None]
 
         hidden_states = hidden_states.reshape(batch_size, sequence_length, attn.heads * head_dim).type_as(query)
