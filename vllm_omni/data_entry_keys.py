@@ -325,6 +325,9 @@ _DTYPE_TO_NAME: dict[torch.dtype, str] = {
     torch.bool: "bool",
 }
 
+# NumPy has no bfloat16 — these dtypes are serialized via a float32 proxy.
+_NUMPY_UNSUPPORTED_DTYPES = frozenset({torch.bfloat16})
+
 
 def _dtype_to_name(dtype: torch.dtype) -> str:
     return _DTYPE_TO_NAME.get(dtype, str(dtype).replace("torch.", ""))
@@ -384,26 +387,38 @@ def _serialize_tensor(t: torch.Tensor) -> AdditionalInformationEntry:
     from vllm_omni.engine import AdditionalInformationEntry
 
     t_cpu = t.detach().to("cpu").contiguous()
+    original_dtype = t_cpu.dtype
+    if original_dtype in _NUMPY_UNSUPPORTED_DTYPES:
+        t_cpu = t_cpu.float()
     return AdditionalInformationEntry(
         tensor_data=t_cpu.flatten().view(torch.uint8).numpy().tobytes(),
         tensor_shape=list(t_cpu.shape),
-        tensor_dtype=_dtype_to_name(t_cpu.dtype),
+        tensor_dtype=_dtype_to_name(original_dtype),
     )
+
+
+_NAME_TO_TORCH_DTYPE: dict[str, torch.dtype] = {v: k for k, v in _DTYPE_TO_NAME.items()}
 
 
 def _deserialize_tensor(entry: AdditionalInformationEntry) -> torch.Tensor:
     dtype_name = entry.tensor_dtype or "float32"
-    dtype = getattr(torch, dtype_name, None)
-    if not isinstance(dtype, torch.dtype):
+    target_dtype = _NAME_TO_TORCH_DTYPE.get(dtype_name)
+    if target_dtype is None:
         raise ValueError(f"Unsupported tensor dtype: {dtype_name}")
 
     if entry.tensor_shape is None:
         raise ValueError("Tensor shape is required")
     if not entry.tensor_data:
-        return torch.empty(0, dtype=dtype).reshape(entry.tensor_shape)
+        return torch.empty(0, dtype=target_dtype).reshape(entry.tensor_shape)
 
-    data = torch.frombuffer(bytearray(entry.tensor_data), dtype=torch.uint8)
-    return data.view(dtype).reshape(entry.tensor_shape)
+    # BFloat16 is serialized via float32 proxy since NumPy doesn't support it
+    if target_dtype == torch.bfloat16:
+        data = torch.frombuffer(bytearray(entry.tensor_data), dtype=torch.uint8)
+        result = data.view(torch.float32).reshape(entry.tensor_shape)
+        return result.to(torch.bfloat16)
+    else:
+        data = torch.frombuffer(bytearray(entry.tensor_data), dtype=torch.uint8)
+        return data.view(target_dtype).reshape(entry.tensor_shape)
 
 
 def serialize_payload(
