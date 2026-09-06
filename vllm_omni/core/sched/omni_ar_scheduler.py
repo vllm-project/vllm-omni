@@ -313,6 +313,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         waiting = getattr(self, "waiting")
         self._drop_aborted_queued_requests()
         self._process_pending_omni_inputs(model_mode="ar")
+        self._drop_aborted_queued_requests()
+        self._resync_streaming_input_counter()
         original_waiting = None
         if self._should_defer_waiting_admission():
             original_waiting = waiting

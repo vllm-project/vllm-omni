@@ -534,6 +534,109 @@ def test_explicit_model_intermediate_prompt_replacement_releases_cache_and_water
     assert session.additional_information is None
     assert session.model_intermediate_buffer == update.model_intermediate_buffer
     assert session.status == RequestStatus.WAITING
+    assert sched.chunk_transfer_adapter.requests_num_chunks_sent == {}
+    sched._free_request_blocks.assert_called_once_with(session)
+    sched.encoder_cache_manager.free.assert_called_once_with(session)
+
+
+def test_ready_async_chunk_prompt_replacement_releases_stale_kv_once() -> None:
+    sched = _make_scheduler(stage_id=1)
+    session = _make_request()
+    session.external_req_id = "external-ar-streaming-test"
+    session.num_in_flight_tokens = 2
+    # _update_request_as_session() may have already fenced this frame before
+    # the connector marks the explicit replacement ready.
+    session.num_stale_output_tokens = 2
+    session.num_output_placeholders = 2
+    session.spec_token_ids = [-1, -1]
+    sched.requests = {session.request_id: session}
+    sched._inflight_prefills.add(session)
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        replaced_streaming_prompt_ids={session.request_id},
+        requests_with_ready_chunks={session.request_id},
+        requests_num_chunks_sent={session.external_req_id: 4090},
+    )
+
+    sched._reset_ready_async_chunk_replacements()
+    sched._reset_ready_async_chunk_replacements()
+
+    sched._free_request_blocks.assert_called_once_with(session)
+    sched.encoder_cache_manager.free.assert_called_once_with(session)
+    assert session not in sched._inflight_prefills
+    assert session.num_stale_output_tokens == 2
+    assert session.num_output_placeholders == 0
+    assert session.spec_token_ids == []
+    assert sched.chunk_transfer_adapter.replaced_streaming_prompt_ids == set()
+    assert sched.chunk_transfer_adapter.requests_with_ready_chunks == {session.request_id}
+    assert sched.chunk_transfer_adapter.requests_num_chunks_sent == {}
+
+
+def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
+    """A WAITING_FOR_CHUNK stop must not delete its newly parked session."""
+    session = _make_request()
+    session.resumable = True
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    def queue(*requests):
+        result = MagicMock()
+        result.requests = set(requests)
+        result.add_request.side_effect = result.requests.add
+        result.remove_requests.side_effect = result.requests.difference_update
+        return result
+
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(session_mode="duplex"))
+    sched.running = []
+    sched.waiting = queue()
+    sched.skipped_waiting = queue(session)
+    sched.num_waiting_for_streaming_input = 1
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        receives_chunks=True,
+        segment_finished_requests={session.request_id},
+    )
+
+    sched._resume_downstream_chunk_receiver(session)
+    sched._remove_stopped_requests_from_queues(set(), {session})
+
+    assert session.status == RequestStatus.WAITING
+    assert session in sched.waiting.requests
+    assert session not in sched.skipped_waiting.requests
+    assert sched.num_waiting_for_streaming_input == 0
+    assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
+
+
+@pytest.mark.parametrize(
+    ("receives_chunks", "session_mode"),
+    [
+        (False, "duplex"),
+        (True, "turn"),
+    ],
+)
+def test_chunk_segment_cleanup_keeps_explicit_update_stage_parked(
+    receives_chunks: bool,
+    session_mode: str,
+) -> None:
+    """Only duplex connector-driven receivers resume without an update."""
+    session = _make_request()
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(session_mode=session_mode))
+    sched.num_waiting_for_streaming_input = 1
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        receives_chunks=receives_chunks,
+        segment_finished_requests={session.request_id},
+    )
+    sched.skipped_waiting = MagicMock()
+    sched._enqueue_waiting_request = MagicMock()
+
+    sched._resume_downstream_chunk_receiver(session)
+
+    assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert sched.num_waiting_for_streaming_input == 1
+    assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
+    sched.skipped_waiting.remove_requests.assert_not_called()
+    sched._enqueue_waiting_request.assert_not_called()
 
 
 def test_async_chunk_reserved_running_slots_counts_parked_live_requests_once() -> None:
@@ -608,6 +711,7 @@ def test_mrv1_async_chunk_does_not_reserve_parked_slots_during_ar_admission(monk
         waiting_for_chunk_running_requests=[parked],
         _held_non_active=[],
         process_pending_chunks=lambda *_args, **_kwargs: None,
+        collect_failed_send_request_ids=lambda: {},
         restore_queues=lambda *_args, **_kwargs: None,
         postprocess_scheduler_output=lambda *_args, **_kwargs: None,
     )

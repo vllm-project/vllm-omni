@@ -49,6 +49,9 @@ class FakeAdapter:
     def is_done_receiving_chunks(self, request_id):
         return request_id in self.done_request_ids
 
+    def collect_failed_send_request_ids(self):
+        return {}
+
     def restore_queues(self, waiting, running, scheduler_requests=None):
         """Put requests back."""
         self.restore_called = True
@@ -65,6 +68,9 @@ class _FakeQueue:
 
     def __bool__(self):
         return bool(self._requests)
+
+    def __iter__(self):
+        return iter(self._requests)
 
     def peek_request(self):
         return self._requests[0]
@@ -125,6 +131,7 @@ def _scheduler_with_parked_generation_request(
     )
     scheduler.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
     scheduler.use_v2_model_runner = use_v2_model_runner
+    scheduler.skipped_waiting = _FakeQueue([])
     scheduler.needs_kv_cache_zeroing = False
     scheduler.finished_req_ids = set()
     scheduler.encoder_cache_manager = SimpleNamespace(get_freed_mm_hashes=lambda: [])
@@ -231,6 +238,7 @@ def test_generation_scheduler_schedules_terminal_empty_prompt_chunk_once(monkeyp
     scheduler._pause_state = PauseState.UNPAUSED
     scheduler.running = []
     scheduler.waiting = _FakeQueue([waiting])
+    scheduler.skipped_waiting = _FakeQueue([])
     scheduler.requests = {"terminal": waiting}
     scheduler.policy = "fcfs"
     scheduler.chunk_transfer_adapter = adapter

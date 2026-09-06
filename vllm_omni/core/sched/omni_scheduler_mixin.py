@@ -250,6 +250,43 @@ class OmniSchedulerMixin:
     # ------------------------------------------------------------------ #
     #  Shared scheduler/output helpers (lift the AR / generation duplicates)
     # ------------------------------------------------------------------ #
+    def _release_replaced_streaming_prompt_cache(self, session: Request) -> None:
+        """Discard cache state that belongs to a replaced prompt."""
+        # A prompt replacement is not a normal streaming extension: none of
+        # the old KV blocks or encoder state is valid for the new prompt. Use
+        # the scheduler's block-free path so an in-flight GPU step is fenced
+        # correctly before the blocks return to the pool.
+        self._free_request_blocks(session)
+        self.encoder_cache_manager.free(session)
+        getattr(self, "_inflight_prefills", set()).discard(session)
+
+    def _reset_ready_async_chunk_replacements(self) -> None:
+        """Release stale cache state after an async-chunk prompt rollover."""
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        if adapter is None:
+            return
+        replaced_ids = getattr(adapter, "replaced_streaming_prompt_ids", None)
+        ready_ids = getattr(adapter, "requests_with_ready_chunks", None)
+        if not replaced_ids or not ready_ids:
+            return
+
+        for request_id in tuple(replaced_ids & ready_ids):
+            request = self.requests.get(request_id)
+            if request is None:
+                replaced_ids.discard(request_id)
+                continue
+            # The streaming update may already have fenced this same in-flight
+            # frame. Seed idempotently so the replacement does not count it twice.
+            request.num_stale_output_tokens = int(getattr(request, "num_in_flight_tokens", 0) or 0)
+            request.num_output_placeholders = 0
+            request.spec_token_ids = []
+            self._release_replaced_streaming_prompt_cache(request)
+            watermark = getattr(adapter, "requests_num_chunks_sent", None)
+            if watermark is not None:
+                watermark.pop(request.external_req_id, None)
+            # Consume this marker after the one-time cache reset. The separate
+            # ready-chunk marker remains until scheduler admission succeeds.
+            replaced_ids.discard(request_id)
 
     def _consume_pending_connector_output(self, model_mode: str) -> None:
         """Drain ``self._latest_omni_connector_output`` into the coordinator.
@@ -954,10 +991,10 @@ class OmniSchedulerMixin:
         self.running[:] = [req for req in self.running if keep_running(req)]
 
     def _drop_aborted_queued_requests(self) -> None:
-        for queue in (self.waiting, self.skipped_waiting):
-            aborted = [req for req in queue if req.status == RequestStatus.FINISHED_ABORTED]
+        for request_queue in (self.waiting, self.skipped_waiting):
+            aborted = [req for req in request_queue if req.status == RequestStatus.FINISHED_ABORTED]
             if aborted:
-                queue.remove_requests(aborted)
+                request_queue.remove_requests(aborted)
         self.running[:] = [req for req in self.running if req.status != RequestStatus.FINISHED_ABORTED]
 
     def _resync_streaming_input_counter(self) -> None:

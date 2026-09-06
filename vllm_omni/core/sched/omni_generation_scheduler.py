@@ -133,6 +133,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         req_index = 0
         self._drop_aborted_queued_requests()
         self._process_pending_omni_inputs(model_mode="generation")
+        self._drop_aborted_queued_requests()
+        self._resync_streaming_input_counter()
         async_chunk_transport = self._async_chunk_transport_enabled()
         # Generation runners execute only requests with ready chunks. Parked
         # request lifetimes do not consume a model batch slot in either runner,
