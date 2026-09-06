@@ -1631,6 +1631,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         if finish_reason_sent[i]:
                             continue
 
+                        output.token_ids = output.token_ids[previous_num_tokens[i] :]
                         if request.logprobs and request.top_logprobs is not None:
                             assert output.logprobs is not None, "Did not output logprobs"
                             logprobs = self._create_chat_logprobs(
