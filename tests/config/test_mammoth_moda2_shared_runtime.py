@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import pytest
+
 from vllm_omni.config.stage_config import StageExecutionType
 from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
@@ -8,6 +10,8 @@ from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
     MAMMOTH_MODA2_PIPELINE,
 )
 from vllm_omni.model_executor.models.registry import _OMNI_MODELS
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_mammothmoda2_generation_stage_uses_shared_diffusion_runtime() -> None:
