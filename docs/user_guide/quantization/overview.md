@@ -18,14 +18,14 @@ For the internal architecture and backend extension points, see the
 
 ## Hardware Support
 
-| Device | FP8 W8A8 | Int8 W8A8 | BitsAndBytes W4 | ModelOpt | MXFP8 W8A8 | MXFP4 W4A4 | AutoRound | msModelSlim | TorchAO FP8 weight-only |
-| -------- | ---------- | ----------- | ------------------ | ---------- | ------------ | ------------ | ----------- | ------------- | --------- |
-| NVIDIA Blackwell GPU (SM 100+) | ✅ | ✅ | ✅ | ✅ | ⭕ | ⭕ | ✅ | ❌ | ⭕ |
-| NVIDIA Ada/Hopper GPU (SM 89+) | ✅ | ✅ | ✅ | ✅ | ⭕ | ⭕ | ✅ | ❌ | ✅ |
-| NVIDIA Ampere GPU (SM 80+) | ✅ | ✅ | ✅ | ⭕ | ⭕ | ⭕ | ✅ | ❌ | ⭕ |
-| AMD ROCm | ⭕ | ⭕ | ❌ | ⭕ | ⭕ | ✅ | ⭕ | ❌ | ⭕ |
-| Intel XPU | ⭕ | ⭕ | ❌ | ⭕ | ⭕ | ⭕ | ✅ | ❌ | ⭕ |
-| Ascend NPU | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ | ⭕ |
+| Device | FP8 W8A8 | Int8 W8A8 | BitsAndBytes W4 | ModelOpt | MXFP8 W8A8 | MXFP4 W4A4 | AutoRound | msModelSlim |
+| -------- | ---------- | ----------- | ------------------ | ---------- | ------------ | ------------ | ----------- | ------------- |
+| NVIDIA Blackwell GPU (SM 100+) | ✅ | ✅ | ✅ | ✅ | ⭕ | ⭕ | ✅ | ❌ |
+| NVIDIA Ada/Hopper GPU (SM 89+) | ✅ | ✅ | ✅ | ✅ | ⭕ | ⭕ | ✅ | ❌ |
+| NVIDIA Ampere GPU (SM 80+) | ✅ | ✅ | ✅ | ⭕ | ⭕ | ⭕ | ✅ | ❌ |
+| AMD ROCm | ⭕ | ⭕ | ❌ | ⭕ | ⭕ | ✅ | ⭕ | ❌ |
+| Intel XPU | ⭕ | ⭕ | ❌ | ⭕ | ⭕ | ⭕ | ✅ | ❌ |
+| Ascend NPU | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ |
 
 Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this
 guide. FP8 on Ampere may use a weight-only path where available.
@@ -76,7 +76,7 @@ attached to the intended stage rather than applied globally.
 
 | Method | Guide | Scope | Example models | Status |
 | -------- | ------- | ------- | ---------------- | -------- |
-| FP8 | [FP8](fp8.md) | Stage-specific DiT or transformer module | BAGEL, GLM-Image | Requires model-specific validation |
+| FP8 | [FP8](fp8.md) | Diffusion-stage MoT / DiT module | BAGEL, GLM-Image | BAGEL online FP8 validated; GLM-Image still needs model-specific validation |
 | Int8 | [Int8](int8.md) | Stage-specific DiT or transformer module | BAGEL, GLM-Image | Requires model-specific validation |
 | BitsAndBytes | [BitsAndBytes](bitsandbytes.md) | Stage-specific transformer or DiT module | BAGEL, GLM-Image | Not validated |
 | ModelOpt | [ModelOpt](modelopt.md) | Checkpoint-defined diffusion stage | BAGEL, GLM-Image | Requires model-specific validation |
@@ -109,7 +109,7 @@ config = build_quant_config({
 
 | Component | Default quantized? | Notes |
 | ----------- | -------------------- | ------- |
-| Diffusion transformer | Yes | Primary target for FP8, Int8, BitsAndBytes, ModelOpt, MXFP8, MXFP4, AutoRound, TorchAO, and msModelSlim |
+| Diffusion transformer | Yes | Primary target for FP8, Int8, BitsAndBytes, ModelOpt, MXFP8, MXFP4, AutoRound, and msModelSlim |
 | Text encoder | No | Keep BF16 unless a method-specific guide documents support |
 | VAE | No | Keep BF16; storage-only paths are method-specific |
 | Scheduler/tokenizer | No | Loaded from the base model repository |
