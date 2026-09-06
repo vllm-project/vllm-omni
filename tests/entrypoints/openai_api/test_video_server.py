@@ -1612,7 +1612,8 @@ def test_generic_video_model_rejects_mixed_image_and_video_references(test_clien
     assert "does not support mixed image and video" in response.json()["detail"].lower()
 
 
-def test_h3_multipart_rejects_bmp_image_reference(test_client):
+def test_h3_multipart_rejects_bmp_image_reference(test_client, monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 100)
     image = Image.new("RGB", (64, 64), color="blue")
     image_buffer = io.BytesIO()
     image.save(image_buffer, format="BMP")
@@ -1626,6 +1627,37 @@ def test_h3_multipart_rejects_bmp_image_reference(test_client):
 
     assert response.status_code == 400
     assert "must use jpg" in response.json()["detail"].lower()
+
+
+@pytest.mark.parametrize("field", ["input_reference", "input_references"])
+def test_h3_multipart_rejects_image_over_pixel_limit(field, test_client, monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 100)
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "reject oversized image", "extra_params": '{"task":"ref2va"}'},
+        files=[(field, ("reference.png", _make_test_image_bytes((20, 20)), "image/png"))],
+    )
+
+    assert response.status_code == 400
+    assert "VLLM_MAX_IMAGE_PIXELS" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("field", ["input_reference", "input_references"])
+def test_h3_multipart_maps_pillow_pixel_limit_error(field, test_client, monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 0)
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 100)
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "reject decoder bomb", "extra_params": '{"task":"ref2va"}'},
+        files=[(field, ("reference.png", _make_test_image_bytes((20, 20)), "image/png"))],
+    )
+
+    assert response.status_code == 400
+    assert "decoder pixel limit" in response.json()["detail"]
 
 
 @pytest.mark.asyncio
