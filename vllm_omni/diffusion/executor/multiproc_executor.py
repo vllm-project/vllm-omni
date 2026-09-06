@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import concurrent.futures
@@ -10,7 +13,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from multiprocessing.synchronize import Event
 from typing import TYPE_CHECKING, Any, cast
 
@@ -42,6 +45,7 @@ _DEQUEUE_TIMEOUT_S = 5.0
 _DLO_DP_WAVE_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_DLO_DP_WAVE_TIMEOUT", 600.0))
 _WORKER_SHUTDOWN_GRACE_S = 15.0
 _WORKER_TERMINATE_GRACE_S = 5.0
+_WORKER_KILL_GRACE_S = 5.0
 _RESULT_PUMP_JOIN_TIMEOUT_S = 2.0
 
 
@@ -80,33 +84,61 @@ class _ExecutorShutdownCleaner:
     broadcast_mq: MessageQueue | None = None
     num_workers: int = 0
     processes: list[mp.Process] | None = None
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __call__(self) -> None:
         """Clean up background resources."""
+        # The worker monitor and an explicit shutdown may race. A retry must
+        # not signal/join the same Process objects while cleanup is in flight.
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            self._cleanup()
+        finally:
+            self._lock.release()
+
+    def _cleanup(self) -> None:
         if self.broadcast_mq is not None:
             try:
                 for _ in range(self.num_workers):
                     self.broadcast_mq.enqueue(SHUTDOWN_MESSAGE, timeout=1.0)
 
-                self.broadcast_mq = None
             except Exception as exc:
                 logger.warning("Failed to send shutdown signal: %s", exc)
+            finally:
+                self.broadcast_mq = None
 
         if self.processes:
-            join_deadline = time.monotonic() + _WORKER_SHUTDOWN_GRACE_S
-            for proc in self.processes:
-                if not proc.is_alive():
-                    continue
-                proc.join(max(0.0, join_deadline - time.monotonic()))
-
             alive = [proc for proc in self.processes if proc.is_alive()]
-            for proc in alive:
-                logger.warning("Terminating diffusion worker %s after timeout", proc.name)
-                proc.terminate()
+            for action, grace in (
+                (None, _WORKER_SHUTDOWN_GRACE_S),
+                ("terminate", _WORKER_TERMINATE_GRACE_S),
+                ("kill", _WORKER_KILL_GRACE_S),
+            ):
+                if not alive:
+                    break
+                if action is not None:
+                    for proc in alive:
+                        try:
+                            logger.warning("Calling %s on diffusion worker %s (pid=%s)", action, proc.name, proc.pid)
+                            getattr(proc, action)()
+                        except OSError:
+                            logger.exception("Failed to %s diffusion worker %s (pid=%s)", action, proc.name, proc.pid)
 
-            terminate_deadline = time.monotonic() + _WORKER_TERMINATE_GRACE_S
-            for proc in alive:
-                proc.join(max(0.0, terminate_deadline - time.monotonic()))
+                deadline = time.monotonic() + grace
+                for proc in alive:
+                    try:
+                        proc.join(max(0.0, deadline - time.monotonic()))
+                    except OSError:
+                        logger.exception("Failed to join diffusion worker %s (pid=%s)", proc.name, proc.pid)
+                alive = [proc for proc in alive if proc.is_alive()]
+
+            self.processes = alive
+            if alive:
+                logger.error(
+                    "Diffusion worker cleanup incomplete after kill: %s; retaining processes for shutdown retry",
+                    [(proc.name, proc.pid) for proc in alive],
+                )
 
 
 class MultiprocDiffusionExecutor(DiffusionExecutor):
@@ -1006,8 +1038,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     def shutdown(self) -> None:
         self._closed = True
         self._pump_stop.set()
+        cleaner = self._shutdown_cleaner
         try:
-            self._finalizer()
+            if self._finalizer.alive:
+                self._finalizer()
+            elif cleaner is not None:
+                cleaner()
         finally:
             pump_threads = getattr(self, "_result_pump_threads", [])
             for thread in pump_threads:
@@ -1031,5 +1067,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 self._rpc_futures.clear()
                 self._output_futures.clear()
                 self._batch_split_map.clear()
-            self._shutdown_cleaner = None
-            self._processes = []
+            self._processes = (cleaner.processes or []) if cleaner is not None else []
+            if not self._processes:
+                self._shutdown_cleaner = None
