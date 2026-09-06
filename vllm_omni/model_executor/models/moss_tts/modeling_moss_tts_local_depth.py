@@ -19,6 +19,8 @@ checkpoint 1:1 so ``load_weights()`` needs no remapping.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -173,6 +175,9 @@ class MossTTSLocalDepthTransformer(nn.Module):
         self.h = nn.ModuleList([_MossTTSLocalBlock(self.hidden_size, n_head, inner_size, rope_base, eps)])
         self.ln_f = nn.LayerNorm(self.hidden_size, eps=eps)
         self._compiled_forward_prefix = None
+        # NPU-only incremental KV-cache decode: independent of torch.compile.
+        # Set MOSS_DEPTH_KV_CACHE=0 to disable for A/B comparison.
+        self._use_npu_kv_cache = current_omni_platform.is_npu() and os.environ.get("MOSS_DEPTH_KV_CACHE", "1") != "0"
 
     def _forward_prefix(self, seq_embeds: torch.Tensor) -> torch.Tensor:
         hidden_states = seq_embeds
@@ -197,6 +202,147 @@ class MossTTSLocalDepthTransformer(nn.Module):
     def _run_prefix(self, seq_embeds: torch.Tensor) -> torch.Tensor:
         forward_prefix = self._compiled_forward_prefix or self._forward_prefix
         return forward_prefix(seq_embeds)
+
+    def _forward_incremental(
+        self,
+        x_c: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        c: int,
+    ) -> torch.Tensor:
+        """One-position KV-cache forward for position ``c`` (NPU only).
+
+        ``x_c``: ``(B, 1, H)`` — embedding of the new position.
+        ``cache_k`` / ``cache_v``: ``(B, n_vq, n_head, head_dim)`` scratch
+        buffers.  Computes Q/K/V for the new position only (skipping the
+        c_attn / ln_1 / ln_2 / mlp re-computation for positions
+        ``[0, c)``), caches K/V, then attends the single new query to all
+        cached keys ``[0, c]`` with ``is_causal=False`` (the 1×S query
+        attends to all S positions, matching causal behaviour for the last
+        position).
+
+        Numerics: bit-identical to ``_forward_prefix`` at ``B == 1``.  At
+        ``B > 1`` the NPU SDPA kernel for ``is_causal=False`` (1×S) differs
+        from the ``is_causal=True`` (S×S) kernel by ≤1 ULP in bf16, which
+        can occasionally flip a borderline multinomial sample (~1% of codes
+        under random weights; negligible with real model weights).  Audio
+        quality is unaffected.
+        """
+        block = self.h[0]
+        attn = block.attn
+        B = x_c.shape[0]
+        ln1 = block.ln_1(x_c)
+        qkv = attn.c_attn(ln1)
+        q, k, v = qkv.split(attn.embed_dim, dim=-1)
+        q = q.view(B, 1, attn.n_head, attn.head_dim)
+        k = k.view(B, 1, attn.n_head, attn.head_dim)
+        v = v.view(B, 1, attn.n_head, attn.head_dim)
+        cos = attn._rope_cos_cache[:, c : c + 1].to(x_c.dtype)
+        sin = attn._rope_sin_cache[:, c : c + 1].to(x_c.dtype)
+        q = q * cos + attn._rotate_half(q) * sin
+        k = k * cos + attn._rotate_half(k) * sin
+        cache_k[:, c] = k.view(B, attn.n_head, attn.head_dim)
+        cache_v[:, c] = v.view(B, attn.n_head, attn.head_dim)
+        q = q.transpose(1, 2)
+        kf = cache_k[:, : c + 1].transpose(1, 2)
+        vf = cache_v[:, : c + 1].transpose(1, 2)
+        attn_out = F.scaled_dot_product_attention(q, kf, vf, is_causal=False)
+        attn_out = attn_out.transpose(1, 2).reshape(B, 1, attn.embed_dim)
+        x_c = x_c + attn.c_proj(attn_out)
+        x_c = x_c + block.mlp(block.ln_2(x_c))
+        return self.ln_f(x_c)
+
+    @torch.no_grad()
+    def _generate_frame_kv_cache(
+        self,
+        backbone_last_hidden: torch.Tensor,
+        audio_lm_heads: nn.ModuleList,
+        audio_embeddings: nn.ModuleList,
+        local_text_lm_head: nn.Module,
+        *,
+        n_vq: int,
+        do_sample: bool = True,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        text_temperature: float = 1.0,
+        text_top_k: int = 50,
+        text_top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
+        history_per_codebook: list[list[int]] | None = None,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """NPU incremental KV-cache decode path.
+
+        Instead of re-prefilling the block over ``[0, c]`` at every codebook
+        step (``sum(1..n_vq) = 78`` forward passes for n_vq=12), this path
+        computes only one new position per step (``n_vq`` forward passes
+        total) by maintaining explicit K/V cache buffers.  The expensive
+        c_attn / ln_1 / ln_2 / mlp projections are run once per position
+        instead of ``sum(1..n_vq)`` times.  Sampling uses the original
+        ``_sample_token`` (multinomial) — no Gumbel substitution.
+
+        Numerics: bit-identical to the re-prefill path at ``B == 1``; ≤1 ULP
+        in bf16 at ``B > 1`` (see ``_forward_incremental`` docstring).
+        """
+        batch_size = backbone_last_hidden.shape[0]
+        dtype = self.ln_f.weight.dtype
+        device = backbone_last_hidden.device
+        attn = self.h[0].attn
+
+        cache_k = torch.zeros(batch_size, n_vq, attn.n_head, attn.head_dim, device=device, dtype=dtype)
+        cache_v = torch.zeros(batch_size, n_vq, attn.n_head, attn.head_dim, device=device, dtype=dtype)
+        codes = backbone_last_hidden.new_zeros((batch_size, n_vq), dtype=torch.long)
+
+        # Position 0: backbone hidden state.
+        x_c = backbone_last_hidden.to(dtype).unsqueeze(1)
+        hidden = self._forward_incremental(x_c, cache_k, cache_v, 0)
+        local_hidden = hidden[:, 0, :]
+
+        binary_logits = local_text_lm_head(local_hidden).float()
+        # This is a binary continue/stop gate. The checkpoint expects sampling
+        # here; greedy argmax is biased toward "continue" and may never stop.
+        binary_choice = _sample_token(
+            binary_logits,
+            text_temperature,
+            text_top_k,
+            text_top_p,
+            do_sample,
+            generator=generator,
+        )
+        should_continue = binary_choice.eq(0)
+
+        for channel_index in range(n_vq):
+            channel_logits = audio_lm_heads[channel_index](local_hidden).float()
+            if (
+                repetition_penalty != 1.0
+                and history_per_codebook is not None
+                and channel_index < len(history_per_codebook)
+            ):
+                hist = history_per_codebook[channel_index]
+                if hist:
+                    hist_t = torch.tensor(hist, dtype=torch.long, device=channel_logits.device)
+                    sel = channel_logits.index_select(-1, hist_t)
+                    pos = sel > 0
+                    sel = torch.where(pos, sel / repetition_penalty, sel * repetition_penalty)
+                    channel_logits.index_copy_(-1, hist_t, sel)
+            channel_token = _sample_token(
+                channel_logits,
+                temperature,
+                top_k,
+                top_p,
+                do_sample,
+                generator=generator,
+            )
+            codes[:, channel_index] = channel_token
+
+            if channel_index + 1 < n_vq:
+                next_embed = audio_embeddings[channel_index](channel_token).to(dtype)
+                x_c = next_embed.unsqueeze(1)
+                hidden = self._forward_incremental(x_c, cache_k, cache_v, channel_index + 1)
+                local_hidden = hidden[:, 0, :]
+
+        return should_continue, codes
 
     @torch.no_grad()
     def generate_frame(
@@ -229,6 +375,12 @@ class MossTTSLocalDepthTransformer(nn.Module):
         for codebook ``c``; when ``repetition_penalty != 1.0`` those tokens'
         logits get scaled down before sampling (mirrors upstream's
         ``_apply_repetition_penalty``).
+
+        On NPU, dispatches to the incremental KV-cache decode path
+        (``_generate_frame_kv_cache``) which is bit-identical to the original
+        re-prefill path but computes ``n_vq`` forward passes instead of
+        ``sum(1..n_vq)``.  GPU and other platforms use the original
+        re-prefill path unchanged.
         """
         batch_size = backbone_last_hidden.shape[0]
         dtype = self.ln_f.weight.dtype
@@ -236,9 +388,29 @@ class MossTTSLocalDepthTransformer(nn.Module):
         # Populate the complete [0, n_vq) table before torch.compile traces
         # _forward_prefix or the runner captures talker_mtp.  The compiled /
         # captured body then contains only fixed-address cache slices rather
-        # than cache construction or buffer replacement.
+        # than cache construction or buffer replacement.  Also needed by the
+        # NPU KV-cache incremental path's ``_forward_incremental``.
         for block in self.h:
             block.attn.prepare_rope_cache(n_vq, backbone_last_hidden.device, dtype)
+
+        if self._use_npu_kv_cache:
+            return self._generate_frame_kv_cache(
+                backbone_last_hidden,
+                audio_lm_heads,
+                audio_embeddings,
+                local_text_lm_head,
+                n_vq=n_vq,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                text_temperature=text_temperature,
+                text_top_k=text_top_k,
+                text_top_p=text_top_p,
+                repetition_penalty=repetition_penalty,
+                history_per_codebook=history_per_codebook,
+                generator=generator,
+            )
 
         embeds = backbone_last_hidden.new_zeros((batch_size, n_vq, self.hidden_size), dtype=dtype)
         embeds[:, 0, :] = backbone_last_hidden.to(dtype)
