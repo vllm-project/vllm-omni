@@ -14,6 +14,7 @@ logger = init_logger(__name__)
 __all__ = [
     "apply_fixed_seed_to_sampling_params",
     "get_tts_local_seed",
+    "clamp_prompt_ids_to_penalty_padding",
     "sanitize_min_tokens_stop_ids",
     "sanitize_sampling_params_min_tokens_stop_ids",
 ]
@@ -67,6 +68,20 @@ def sanitize_sampling_params_min_tokens_stop_ids(
         str(sorted(unreachable)),
         logits_vocab,
     )
+
+
+def clamp_prompt_ids_to_penalty_padding(prompt_token_ids: torch.Tensor, logits_vocab: int) -> torch.Tensor:
+    """Clamp batch-level pad ids down to ``logits_vocab`` — upstream's
+    designed penalty padding value.
+
+    ``max=logits_vocab`` (NOT ``logits_vocab - 1``) is deliberate: upstream
+    penalty computation allocates ``vocab_size + 1`` bins and drops the last
+    column, so ``vocab_size`` is the padding value that never affects
+    penalties (vllm/model_executor/layers/utils.py::
+    get_token_bin_counts_and_mask). Clamping one lower would count padding
+    as real occurrences of the last vocab token.
+    """
+    return prompt_token_ids.clamp(max=logits_vocab)
 
 
 def sanitize_min_tokens_stop_ids(logitsprocs: LogitsProcessors, logits_vocab: int) -> None:
