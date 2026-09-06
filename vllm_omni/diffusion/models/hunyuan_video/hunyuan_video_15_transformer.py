@@ -17,7 +17,6 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero
 from torch import nn
 from vllm.logger import init_logger
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
@@ -26,6 +25,7 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
+from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.distributed.sp_sharding import sp_shard_with_padding
