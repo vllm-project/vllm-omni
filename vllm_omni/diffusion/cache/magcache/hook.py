@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Hook-based MagCache implementation for vLLM-Omni.
@@ -21,6 +21,8 @@ Architecture:
 """
 
 from __future__ import annotations
+
+import logging
 
 import torch
 import torch.nn.functional as F
@@ -287,6 +289,9 @@ class MagCacheHeadHook(ModelHook):
         return ret if ret is not None else output
 
     def log_cache_miss(self, state: MagCacheState, output):
+        if not logger.isEnabledFor(logging.DEBUG):
+            return output
+
         step = state.step_index
         residual_norm = 0.0
         if state.previous_residual is not None:
@@ -433,6 +438,9 @@ class MagCacheBlockHook(ModelHook):
         state: MagCacheState,
         residual: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     ) -> None:
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+
         step = state.step_index
         if residual is None:
             residual_norm = 0.0
