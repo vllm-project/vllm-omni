@@ -46,7 +46,7 @@ def _request(task, *, payload=None):
     if task != "t2va":
         prompt["multi_modal_data"] = {"image": Image.new("RGB", (256, 256))}
     if payload is not None:
-        prompt["additional_information"] = {"text_encoder_output": payload}
+        prompt["additional_information"] = {"encoder_output": payload}
     sampling = OmniDiffusionSamplingParams(
         height=32, width=32, num_frames=96, num_inference_steps=2, extra_args={"task": task, "aspect_ratio": "1:1"}
     )
@@ -101,7 +101,7 @@ def test_prepare_encode_uses_the_same_mode_and_conditioning(pipeline, task, load
     request = _request(task)
     if not load_text_encoder:
         conditioning = pipeline._prepare_local_conditioning(request.prompts[0], request.sampling_params)
-        request.prompts[0] = {"additional_information": {"text_encoder_output": conditioning.to_omni_payload()}}
+        request.prompts[0] = {"additional_information": {"encoder_output": conditioning.to_omni_payload()}}
         pipeline.encode_prompt.reset_mock()
         pipeline.video_vae.encode_image.reset_mock()
     pipeline.load_text_encoder = load_text_encoder
