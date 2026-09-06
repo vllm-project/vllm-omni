@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
+import anyio
 import numpy as np
 import soundfile as sf
 import torch
@@ -2437,6 +2438,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         finally:
             if not artifact_ready:
                 self._discard_ref_audio_artifact_warmup(request_id)
+            # A disconnect can arrive while this generator is suspended at
+            # yield, outside the engine iterator's __anext__. Explicitly close
+            # it so its abort/finally path releases active stage requests.
+            # Starlette cancels an AnyIO scope; cleanup must survive that scope.
+            with anyio.CancelScope(shield=True):
+                await generator.aclose()
 
     async def _generate_audio_sse_events(
         self,

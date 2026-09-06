@@ -1433,6 +1433,7 @@ class OnlineOmniClient:
           - task_type, ref_text, ref_audio: TTS-specific extras (optional, passed via extra_body)
           - min_audio_bytes: optional minimum ``len(audio_bytes)`` checked in ``assert_audio_speech_response``
           - transcript_expected_text: local expected spoken text; defaults to ``input``
+          - transcript_model: primary Whisper model for content checks; defaults to ``small``
           - timeout: request timeout in seconds (float, optional, default 120.0)
           - stream: whether to use streaming API (bool, optional, default False)
 
@@ -1456,6 +1457,7 @@ class OnlineOmniClient:
             "task_type",
             "ref_text",
             "ref_audio",
+            "extra_params",
             "language",
             "max_new_tokens",
             "seed",

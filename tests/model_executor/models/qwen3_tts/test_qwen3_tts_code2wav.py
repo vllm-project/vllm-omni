@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -23,7 +23,7 @@ class _FakeDecoder(nn.Module):
     def __init__(self, total_upsample: int = _TOTAL_UPSAMPLE):
         super().__init__()
         self.total_upsample = total_upsample
-        self.decode_calls: list[dict[str, int]] = []
+        self.decode_calls: list[dict[str, object]] = []
         self.batched_decode_calls: list[dict[str, object]] = []
         self.decode_codes: list[torch.Tensor] = []
         self.cudagraph_calls: list[dict[str, int | torch.device]] = []
@@ -91,8 +91,8 @@ class _FakeDecoder(nn.Module):
         wav_len = frames * self.total_upsample + 6
         wav = torch.arange(wav_len, dtype=torch.float32).view(1, 1, -1)
         offsets = torch.arange(batch, dtype=torch.float32).view(batch, 1, 1) * 1000
-        outputs = wav.expand(batch, 1, wav_len) + offsets
-        return [outputs[row, :, : lengths[row] * self.total_upsample] for row in range(batch)]
+        batched_outputs = wav.expand(batch, 1, wav_len) + offsets
+        return [batched_outputs[row, :, : lengths[row] * self.total_upsample] for row in range(batch)]
 
     def enable_cudagraph(self, **kwargs):
         self.cudagraph_calls.append(kwargs)
@@ -573,6 +573,7 @@ def test_decode_chunking_override_is_passed_to_cudagraph():
     _load_weights_noop(model)
 
     assert model.decoder.cudagraph_calls[-1] == {
+        "capture_modes": ("icl", "xvec"),
         "capture_batch_sizes": None,
         "stateless_capture_sizes": None,
         "device": torch.device("cuda"),
@@ -601,6 +602,13 @@ def test_cudagraph_batch_config_is_preserved():
 
     call = model.decoder.cudagraph_calls[-1]
     assert call["capture_batch_sizes"] == [1, 2, 4, 8]
+
+
+def test_cudagraph_captures_only_modes_used_by_the_model():
+    model = _make_model(async_chunk=True, device=torch.device("cuda"))
+    model.decoder_cudagraph_modes = ("xvec",)
+    _load_weights_noop(model)
+    assert model.decoder.cudagraph_calls[-1]["capture_modes"] == ("xvec",)
 
 
 def test_stateless_cudagraph_capture_sizes_are_passed_from_config():

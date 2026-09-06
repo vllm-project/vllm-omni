@@ -9,6 +9,8 @@ from vllm.model_executor.models.registry import (
 )
 
 _OMNI_MODELS = {
+    "BreezeForConditionalGeneration": ("breeze_tts", "modeling_breeze", "BreezeForConditionalGeneration"),
+    "BreezeCode2Wav": ("breeze_tts", "code2wav", "BreezeCode2Wav"),
     "Qwen2_5OmniForConditionalGeneration": (
         "qwen2_5_omni",
         "qwen2_5_omni",

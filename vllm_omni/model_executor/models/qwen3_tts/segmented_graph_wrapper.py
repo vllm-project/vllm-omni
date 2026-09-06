@@ -1,5 +1,6 @@
 # Copyright 2026 The Alibaba Qwen team.
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 CUDA Graph wrapper for Qwen3TTSTokenizerV2Decoder.
 
@@ -38,6 +39,7 @@ class CUDAGraphDecoderWrapper:
     def __init__(
         self,
         decoder: torch.nn.Module,
+        capture_modes: tuple[str, ...] = ("icl", "xvec"),
         capture_batch_sizes: list[int] | None = None,
         stateless_capture_sizes: list[int] | None = None,
         num_quantizers: int = 8,
@@ -50,6 +52,9 @@ class CUDAGraphDecoderWrapper:
         decode_left_context: int = 25,
     ):
         self.decoder = decoder
+        if not capture_modes or set(capture_modes) - {"icl", "xvec"}:
+            raise ValueError("capture_modes must contain icl and/or xvec")
+        self.capture_modes = capture_modes
         self.capture_batch_sizes = sorted(set(capture_batch_sizes or [1]))
         self.num_quantizers = num_quantizers
         self.enabled = enabled
@@ -321,16 +326,18 @@ class CUDAGraphDecoderWrapper:
         icl_capture_shapes = self._get_icl_capture_shapes()
 
         for batch_size in self.capture_batch_sizes:
-            try:
-                self._capture_icl_prefix(batch_size, device, dtype)
-                logger.info("Captured ICL prefix CUDA Graph for batch=%d", batch_size)
-            except Exception:
-                logger.warning("Failed to capture ICL prefix CUDA Graph for batch=%d", batch_size, exc_info=True)
-            try:
-                self._capture_xvec_prefix(batch_size, device, dtype)
-                logger.info("Captured xvec prefix CUDA Graph for batch=%d", batch_size)
-            except Exception:
-                logger.warning("Failed to capture xvec prefix CUDA Graph for batch=%d", batch_size, exc_info=True)
+            if "icl" in self.capture_modes:
+                try:
+                    self._capture_icl_prefix(batch_size, device, dtype)
+                    logger.info("Captured ICL prefix CUDA Graph for batch=%d", batch_size)
+                except Exception:
+                    logger.warning("Failed to capture ICL prefix CUDA Graph for batch=%d", batch_size, exc_info=True)
+            if "xvec" in self.capture_modes:
+                try:
+                    self._capture_xvec_prefix(batch_size, device, dtype)
+                    logger.info("Captured xvec prefix CUDA Graph for batch=%d", batch_size)
+                except Exception:
+                    logger.warning("Failed to capture xvec prefix CUDA Graph for batch=%d", batch_size, exc_info=True)
 
         logger.info(
             "Starting CUDA Graph warmup for %d shapes: batch_sizes=%s seq_lens=%s",
@@ -339,7 +346,7 @@ class CUDAGraphDecoderWrapper:
             self.icl_capture_sizes,
         )
 
-        for batch_size, size in icl_capture_shapes:
+        for batch_size, size in icl_capture_shapes if "icl" in self.capture_modes else ():
             try:
                 caches = self._make_dummy_icl_cache(batch_size, device, next(self.decoder.parameters()).dtype)
                 self._capture_combined_suffix("icl", batch_size, size, caches, device, dtype)
@@ -353,7 +360,7 @@ class CUDAGraphDecoderWrapper:
                 )
 
         model_dtype = next(self.decoder.parameters()).dtype
-        for batch_size in self.capture_batch_sizes:
+        for batch_size in self.capture_batch_sizes if "xvec" in self.capture_modes else ():
             for size, previous_frames in self._xvec_previous_frames_by_target.items():
                 try:
                     caches = self._make_dummy_xvec_cache(batch_size, device, model_dtype)

@@ -19,6 +19,8 @@ kernels==0.15.2
 safetensors>=0.8.0
 accelerate==1.12.0
 soundfile>=0.13.1
+# Breeze reference conditioning must use the released codec's soxr resampling.
+soxr>=0.5.0.post1
 cache-dit==1.5.0
 tqdm>=4.66.0
 torchsde>=0.2.6

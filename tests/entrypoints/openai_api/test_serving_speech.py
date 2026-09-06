@@ -16,6 +16,7 @@ from inspect import Signature, signature
 from pathlib import Path
 from types import SimpleNamespace
 
+import anyio
 import numpy as np
 import pytest
 import torch
@@ -5457,21 +5458,32 @@ class TestTTSAsyncOffloading:
 
     @pytest.mark.asyncio
     async def test_generate_audio_chunks_discards_ref_audio_artifact_warmup_on_close(self, qwen3_tts_server):
+        closed = asyncio.Event()
+
         async def pcm_generator():
-            yield SimpleNamespace(
-                multimodal_output={
-                    "audio": torch.zeros(16, dtype=torch.float32),
-                    "sr": 24000,
-                }
-            )
-            await asyncio.sleep(0)
+            try:
+                yield SimpleNamespace(
+                    multimodal_output={
+                        "audio": torch.zeros(16, dtype=torch.float32),
+                        "sr": 24000,
+                    }
+                )
+            finally:
+                # Engine abort waits for stage acknowledgments. Retain an
+                # actual cancellation checkpoint to cover ASGI cancel scopes.
+                await anyio.sleep(0)
+                closed.set()
 
         qwen3_tts_server._request_ref_audio_artifact_keys["req-close"] = ("artifact-close", False)
 
-        stream = qwen3_tts_server._generate_audio_chunks(pcm_generator(), "req-close")
+        engine_stream = pcm_generator()
+        stream = qwen3_tts_server._generate_audio_chunks(engine_stream, "req-close")
         assert await anext(stream)
-        await stream.aclose()
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            await stream.aclose()
 
+        assert closed.is_set()
         assert "req-close" not in qwen3_tts_server._request_ref_audio_artifact_keys
         assert ("artifact-close", False) not in qwen3_tts_server._ref_audio_model_artifact_ready
 
