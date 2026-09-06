@@ -3,6 +3,7 @@
 
 import pytest
 import torch
+from vllm.triton_utils import HAS_TRITON
 
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.attention.ops.minimax_h3_modulation import (
@@ -149,12 +150,7 @@ def test_modulation_wrappers_match_reference_above_grid_limit(device):
         (actual_modulated, expected_modulated),
     ):
         torch.testing.assert_close(actual.cpu(), expected, atol=2e-2, rtol=2e-2)
-from vllm.triton_utils import HAS_TRITON
 
-from vllm_omni.diffusion.attention.ops.minimax_h3_modulation import (
-    indexed_gate_rms_norm_scale_shift,
-    rms_norm_indexed_scale_shift,
-)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cuda]
 
