@@ -103,9 +103,10 @@ def boogu_pipeline(mock_dependencies):
 
 
 def test_boogu_image_pipeline_import():
-    from vllm_omni.diffusion.models.boogu_image import BooguImagePipeline
+    from vllm_omni.diffusion.models.boogu_image import BooguImagePipeline, BooguImageTurboPipeline
 
     assert BooguImagePipeline is not None
+    assert issubclass(BooguImageTurboPipeline, BooguImagePipeline)
 
 
 def test_component_discovery_declarations():
@@ -492,10 +493,16 @@ class _FakeTransformer:
 
 
 class _FakeScheduler:
+    def __init__(self):
+        self.set_calls = 0
+        self.step_calls = 0
+
     def set_timesteps(self, num_inference_steps, device=None, num_tokens=None):
+        self.set_calls += 1
         self.timesteps = torch.linspace(0, 1, num_inference_steps + 1)[:-1]
 
     def step(self, model_output, t, latents, return_dict=False):
+        self.step_calls += 1
         return (latents,)
 
 
@@ -510,8 +517,15 @@ class _FakeDecodeVAE:
         return (torch.zeros(batch, 3, 16, 16),)
 
 
-def _make_forward_pipeline():
-    pipeline = _make_encode_pipeline()
+def _make_forward_pipeline(pipeline_cls=None):
+    if pipeline_cls is None:
+        from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
+
+        pipeline_cls = BooguImagePipeline
+    base_pipeline = _make_encode_pipeline()
+    pipeline = object.__new__(pipeline_cls)
+    nn.Module.__init__(pipeline)
+    pipeline.__dict__.update(base_pipeline.__dict__)
     pipeline.transformer = _FakeTransformer()
     pipeline.scheduler = _FakeScheduler()
     pipeline.vae = _FakeDecodeVAE()
@@ -558,6 +572,8 @@ def test_forward_returns_diffusion_output():
     assert torch.isfinite(out.output).all()
     # CFG default is on (text guidance 4.0), so the encoder ran twice (pos + neg).
     assert len(pipeline.processor.calls) == 2
+    assert pipeline.scheduler.set_calls == 1
+    assert pipeline.scheduler.step_calls == 2
 
 
 def test_forward_cfg_off_when_guidance_one():
@@ -603,6 +619,218 @@ def test_double_guidance_combine_matches_legacy_formula():
     )
 
     torch.testing.assert_close(actual, legacy, rtol=0, atol=1e-5)
+
+
+class _RecordingDMDTransformer(_FakeTransformer):
+    def __init__(self, velocity=0.0):
+        self.timesteps = []
+        self.refs = []
+        self.freqs_real_calls = []
+        self.velocity = velocity
+
+    def __call__(self, latents, timestep, instruction_embeds, freqs_real, instruction_attention_mask, **kwargs):
+        self.timesteps.append(float(timestep[0]))
+        self.refs.append(kwargs.get("ref_image_hidden_states"))
+        self.freqs_real_calls.append(freqs_real)
+        return torch.full_like(latents, self.velocity)
+
+
+def _make_turbo_forward_pipeline():
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImageTurboPipeline
+
+    pipeline = _make_forward_pipeline(BooguImageTurboPipeline)
+    pipeline.transformer = _RecordingDMDTransformer(velocity=0.125)
+    return pipeline
+
+
+def test_turbo_dmd_uses_four_steps_with_real_rope_without_regular_scheduler():
+    pipeline = _make_turbo_forward_pipeline()
+    renoise_calls = []
+    original_renoise = pipeline._renoise_dmd_latents
+
+    def recording_renoise(latents, sigma, generator=None):
+        renoise_calls.append(sigma)
+        return original_renoise(latents, sigma, generator)
+
+    pipeline._renoise_dmd_latents = recording_renoise
+    req = _make_request_batch(
+        "a cat",
+        height=64,
+        width=64,
+        output_type="latent",
+        generator=torch.Generator(device="cpu").manual_seed(7),
+    )
+
+    out = pipeline.forward(req)[0]
+
+    assert out.output.shape[0] == 1
+    assert len(pipeline.transformer.timesteps) == 4
+    assert len(pipeline.transformer.freqs_real_calls) == 4
+    assert all(
+        not freq.is_complex()
+        for freqs_real in pipeline.transformer.freqs_real_calls
+        for pair in freqs_real
+        for freq in pair
+    )
+    expected_sigmas = torch.linspace(0.001, 1.0, 5, dtype=torch.bfloat16)[:-1].float().tolist()
+    assert pipeline.transformer.timesteps == pytest.approx(expected_sigmas)
+    assert pipeline.scheduler.set_calls == 0
+    assert pipeline.scheduler.step_calls == 0
+    assert len(renoise_calls) == 3  # The final x0 must not be re-noised.
+    assert len(pipeline.processor.calls) == 1  # DMD has no negative/CFG encoding.
+
+
+def test_turbo_dmd_decode_uses_vae_attention_context():
+    pipeline = _make_turbo_forward_pipeline()
+    events = []
+
+    class _RecordingContext:
+        def __init__(self, device):
+            self.device = device
+
+        def __enter__(self):
+            events.append(("enter", self.device.type))
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            events.append(("exit", self.device.type))
+
+    pipeline._vae_attention_context = lambda device: _RecordingContext(device)
+    original_decode = pipeline.vae.decode
+
+    def recording_decode(latents, return_dict=False):
+        events.append(("decode", latents.device.type))
+        return original_decode(latents, return_dict=return_dict)
+
+    pipeline.vae.decode = recording_decode
+    req = _make_request_batch(
+        "a cat",
+        height=64,
+        width=64,
+        output_type="pt",
+        generator=torch.Generator(device="cpu").manual_seed(7),
+    )
+
+    pipeline.forward(req)
+
+    assert events == [("enter", "cpu"), ("decode", "cpu"), ("exit", "cpu")]
+
+
+def test_turbo_dmd_step_and_renoise_match_upstream_equations():
+    from diffusers.utils.torch_utils import randn_tensor
+
+    pipeline = _make_turbo_forward_pipeline()
+    latents = torch.full((2, 4, 3, 3), 2.0)
+    embeds = torch.zeros(2, _SEQ_LEN, _EMBED_DIM)
+    mask = torch.ones(2, _SEQ_LEN, dtype=torch.long)
+
+    x0 = pipeline._predict_dmd_student_step(latents, torch.tensor(0.25), embeds, None, mask)
+    assert torch.allclose(x0, latents + 0.75 * 0.125)
+
+    expected_generator = torch.Generator(device="cpu").manual_seed(13)
+    expected_noise = randn_tensor(x0.shape, generator=expected_generator, device=x0.device, dtype=x0.dtype)
+    expected = 0.4 * expected_noise + 0.6 * x0
+
+    actual_generator = torch.Generator(device="cpu").manual_seed(13)
+    actual = pipeline._renoise_dmd_latents(x0, torch.tensor(0.6), actual_generator)
+    assert torch.allclose(actual, expected, rtol=1e-6, atol=1e-7)
+
+
+def test_turbo_dmd_seeded_renoise_is_deterministic():
+    def run_once():
+        pipeline = _make_turbo_forward_pipeline()
+        req = _make_request_batch(
+            "a cat",
+            height=64,
+            width=64,
+            output_type="latent",
+            generator=torch.Generator(device="cpu").manual_seed(11),
+        )
+        return pipeline.forward(req)[0].output
+
+    assert torch.equal(run_once(), run_once())
+
+
+def test_turbo_dmd_custom_timesteps_and_validation():
+    pipeline = _make_turbo_forward_pipeline()
+    sigmas = pipeline._build_dmd_student_sigmas(99, torch.device("cpu"), torch.float32, 0.001, [1000, 500, 0])
+    assert torch.equal(sigmas, torch.tensor([1.0, 0.5, 0.0]))
+
+    with pytest.raises(ValueError, match="non-empty 1D"):
+        pipeline._build_dmd_student_sigmas(4, torch.device("cpu"), torch.float32, 0.001, [])
+    with pytest.raises(ValueError, match="non-empty 1D"):
+        pipeline._build_dmd_student_sigmas(4, torch.device("cpu"), torch.float32, 0.001, [[0.1]])
+    with pytest.raises(ValueError, match="finite values"):
+        pipeline._build_dmd_student_sigmas(4, torch.device("cpu"), torch.float32, 0.001, [0.0, 1001.0])
+
+
+def test_turbo_dmd_conditioning_sigma_override_reaches_forward_loop():
+    pipeline = _make_turbo_forward_pipeline()
+    req = _make_request_batch(
+        "a cat",
+        height=64,
+        width=64,
+        output_type="latent",
+        extra_args={"dmd_conditioning_sigma": 0.125},
+    )
+
+    pipeline.forward(req)
+
+    assert pipeline.transformer.timesteps[0] == pytest.approx(0.125)
+
+
+def test_turbo_dmd_rejects_timesteps_and_sigmas_together():
+    pipeline = _make_turbo_forward_pipeline()
+    req = _make_request_batch(
+        "a cat",
+        height=64,
+        width=64,
+        timesteps=torch.tensor([0.0, 0.5]),
+        sigmas=[0.0, 0.5],
+    )
+    with pytest.raises(ValueError, match="only one of timesteps or sigmas"):
+        pipeline.forward(req)
+
+
+def test_turbo_dmd_rejects_zero_steps():
+    pipeline = _make_turbo_forward_pipeline()
+    req = _make_request_batch("a cat", height=64, width=64, num_inference_steps=0)
+    with pytest.raises(ValueError, match="num_inference_steps must be >= 1"):
+        pipeline.forward(req)
+
+
+def test_turbo_dmd_normalizes_internal_dummy_guidance_only():
+    pipeline = _make_turbo_forward_pipeline()
+    req = _make_request_batch(
+        "dummy run",
+        height=64,
+        width=64,
+        num_inference_steps=1,
+        guidance_scale=0.0,
+        guidance_scale_2=0.0,
+        output_type="latent",
+    )
+    req.is_dummy_run = lambda: True
+
+    pipeline.forward(req)
+
+    assert len(pipeline.transformer.timesteps) == 1
+    assert len(pipeline.processor.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "sampling_overrides",
+    [
+        {"guidance_scale": 0.0},
+        {"guidance_scale": 2.0},
+        {"guidance_scale_2": 2.0},
+        {"extra_args": {"empty_instruction_guidance_scale": 1.0}},
+    ],
+)
+def test_turbo_dmd_rejects_non_unit_guidance(sampling_overrides):
+    pipeline = _make_turbo_forward_pipeline()
+    req = _make_request_batch("a cat", height=64, width=64, **sampling_overrides)
+    with pytest.raises(ValueError, match="requires guidance_scale=1.0"):
+        pipeline.forward(req)
 
 
 # ---------------------------------------------------------------------------
@@ -1316,3 +1544,53 @@ def test_supports_request_batch_enabled():
     from vllm_omni.diffusion.models.boogu_image import BooguImagePipeline
 
     assert BooguImagePipeline.supports_request_batch is True
+
+
+def test_turbo_request_batching_disabled_and_fails_closed():
+    from vllm_omni.diffusion.models.boogu_image import BooguImageTurboPipeline
+
+    assert BooguImageTurboPipeline.supports_request_batch is False
+
+    pipeline = _make_turbo_forward_pipeline()
+    sampling = dict(height=64, width=64, num_inference_steps=4, guidance_scale=1.0, output_type="latent")
+    req = _wrap_request_batch(
+        [
+            ("a cat", _sampling(**sampling)),
+            ("a dog", _sampling(**sampling)),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="does not support request batching"):
+        pipeline.forward(req)
+
+
+def _make_turbo_edit_forward_pipeline():
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImageTurboPipeline
+
+    base_pipeline = _make_edit_forward_pipeline()
+    pipeline = object.__new__(BooguImageTurboPipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.__dict__.update(base_pipeline.__dict__)
+    pipeline.transformer = _RecordingDMDTransformer()
+    return pipeline
+
+
+def test_turbo_dmd_ti2i_keeps_reference_latents_and_uses_zero_conditioning_sigma():
+    pipeline = _make_turbo_edit_forward_pipeline()
+    req = _make_edit_request(
+        height=64,
+        width=64,
+        num_inference_steps=4,
+        guidance_scale=1.0,
+        output_type="latent",
+        generator=torch.Generator(device="cpu").manual_seed(3),
+    )
+    req.sampling_params.guidance_scale_provided = True
+
+    pipeline.forward(req)
+
+    assert len(pipeline.transformer.timesteps) == 4
+    assert pipeline.transformer.timesteps[0] == pytest.approx(0.0)
+    assert all(ref is not None for ref in pipeline.transformer.refs)
+    assert pipeline.scheduler.set_calls == 0
+    assert pipeline.scheduler.step_calls == 0

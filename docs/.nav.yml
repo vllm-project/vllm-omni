@@ -74,7 +74,7 @@ nav:
       - Video Output Transport: user_guide/diffusion/video_output_transport.md
       - CPU Offloading:
         - Overview: user_guide/diffusion/cpu_offload.md
-        - Model-Level: user_guide/diffusion/offloader/cpu_offload.md
+        - Model-Level: user_guide/diffusion/offloader/module_offload.md
         - Layerwise: user_guide/diffusion/offloader/layerwise_offload.md
         - Distributed Layerwise: user_guide/diffusion/offloader/distributed_layerwise_offload.md
       - Cache Acceleration:
@@ -153,7 +153,7 @@ nav:
           - Skip-Softmax: design/feature/skip_softmax.md
         - CPU Offloading:
           - Overview: design/feature/offloader/README.md
-          - Model-Level: design/feature/offloader/cpu_offload.md
+          - Model-Level: design/feature/offloader/module_offload.md
           - Layerwise: design/feature/offloader/layerwise_offload.md
           - Distributed Layerwise: design/feature/offloader/distributed_layerwise_offload.md
         - Cache-DiT: design/feature/cache_dit.md

@@ -52,6 +52,13 @@ from vllm_omni.diffusion.offloader import (
     remove_sequential_offload,
     sequential_offload_component,
 )
+from vllm_omni.diffusion.offloader.config import (
+    DIT_COMPONENT,
+    TEXT_ENCODER_COMPONENT,
+    OffloadStrategy,
+    resolve_offload,
+    should_offload_component,
+)
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
@@ -668,6 +675,7 @@ class MiniMaxH3Pipeline(
     _offload_plan: ClassVar[OffloadPlan] = OffloadPlan(
         offload_submodules={"token_refiner": "blocks"},
         resident_dit_paths=frozenset({"transformer"}),
+        encoder_component_types={"text_encoder": TEXT_ENCODER_COMPONENT},
         encoder_block_attrs={"text_encoder": ("vision.blocks", "text_model.layers")},
         on_demand_component_paths=frozenset({"text_encoder", "video_vae", "audio_vae"}),
     )
@@ -703,10 +711,13 @@ class MiniMaxH3Pipeline(
         self._lora_sigma_schedules.pop(lora_request.lora_int_id, None)
         od_config = getattr(self, "od_config", None)
         offload_modes = []
-        if getattr(od_config, "enable_cpu_offload", False):
-            offload_modes.append("model-level CPU offload (--enable-cpu-offload)")
-        if getattr(od_config, "enable_layerwise_offload", False):
-            offload_modes.append("layerwise offload (--enable-layerwise-offload)")
+        if od_config is not None:
+            resolved_offload = resolve_offload(od_config)
+            if resolved_offload.offloads(DIT_COMPONENT):
+                if resolved_offload.strategy is OffloadStrategy.MODEL_LEVEL:
+                    offload_modes.append("model-level CPU offload")
+                elif resolved_offload.strategy is OffloadStrategy.LAYER_WISE:
+                    offload_modes.append("layerwise offload")
         loaded = load_minimax_h3_turbo_lora(
             partition=self.partition,
             lora_request=lora_request,
@@ -1030,10 +1041,13 @@ class MiniMaxH3Pipeline(
             self.text_encoder_group = None
             self.text_encoder = None
             self._encoder_modules = []
-        stage_components = bool(
+        legacy_manual_components = getattr(od_config, "diffusion_offload_config", None) is None and bool(
             od_config.enable_layerwise_offload or getattr(od_config, "enable_distributed_layerwise_offload", False)
         )
-        component_load_device = torch.device("cpu") if stage_components else self.device
+        # Preserve the legacy MiniMax-H3 low-residency path. The compact API
+        # deliberately limits explicit component selection to dit/text_encoder,
+        # so VAEs stay resident for new configurations.
+        component_load_device = torch.device("cpu") if legacy_manual_components else self.device
         self.video_vae = MiniMaxH3VideoVAE(
             os.path.join(model_path, "video_vae"),
             device=self.device,
@@ -1048,14 +1062,19 @@ class MiniMaxH3Pipeline(
         self.vae = self.video_vae
 
         self._dlo_component_cache = None
-        if getattr(od_config, "enable_distributed_layerwise_offload", False):
+        offloads_text_encoder = should_offload_component(od_config, TEXT_ENCODER_COMPONENT)
+        needs_component_cache = legacy_manual_components or offloads_text_encoder
+        if getattr(od_config, "enable_distributed_layerwise_offload", False) and needs_component_cache:
             self._dlo_component_cache = BoundedAllocatorCache(self.device)
-            _register_dlo_component_cache(
-                self._dlo_component_cache,
-                self.text_encoder,
-                self.video_vae,
-                self.audio_vae,
-            )
+            if legacy_manual_components:
+                _register_dlo_component_cache(
+                    self._dlo_component_cache,
+                    self.text_encoder,
+                    self.video_vae,
+                    self.audio_vae,
+                )
+            elif offloads_text_encoder:
+                _register_dlo_component_cache(self._dlo_component_cache, self.text_encoder)
 
         self._quality_policy = MiniMaxH3QualityPolicy(od_config)
         self._cache_dit_runtime = RequestScopedCacheDiTRuntime(self)
@@ -1519,25 +1538,25 @@ class MiniMaxH3Pipeline(
             # swaps the resident DiT and encoder.
             return self.text_encoder(input_ids, **vision_kwargs)
 
-        if self.od_config.enable_layerwise_offload or getattr(
-            self.od_config, "enable_distributed_layerwise_offload", False
-        ):
-            # Layerwise DiT offload already provides the low-residency encoder
-            # phase used by the checkpoint reference.
+        if self._uses_manual_component_offload(self.text_encoder):
             with self._component_on_device(self.text_encoder):
                 return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
 
-        # Keep both Qwen and DiT resident across requests. Moving either model
-        # here makes encoder latency include a tens-of-gigabytes PCIe transfer,
-        # which defeats the no-offload contract.
+        # Keep Qwen resident when it is not selected for layerwise offload.
         self.text_encoder.load_to_device()
         return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
 
-    def _uses_manual_component_offload(self) -> bool:
+    def _uses_manual_component_offload(self, component: nn.Module) -> bool:
         od_config = getattr(self, "od_config", None)
-        return bool(
-            getattr(od_config, "enable_layerwise_offload", False)
-            or getattr(od_config, "enable_distributed_layerwise_offload", False)
+        if od_config is None:
+            return False
+        if getattr(od_config, "diffusion_offload_config", None) is None:
+            return bool(
+                getattr(od_config, "enable_layerwise_offload", False)
+                or getattr(od_config, "enable_distributed_layerwise_offload", False)
+            )
+        return component is getattr(self, "text_encoder", None) and should_offload_component(
+            od_config, TEXT_ENCODER_COMPONENT
         )
 
     def enable_omni_model_cpu_offload(
@@ -1546,6 +1565,7 @@ class MiniMaxH3Pipeline(
         device: torch.device,
         pin_memory: bool,
         use_hsdp: bool,
+        offload_components: frozenset[str] | None = None,
     ) -> None:
         if getattr(self, "_model_cpu_offload_modules", None):
             return
@@ -1554,19 +1574,32 @@ class MiniMaxH3Pipeline(
         dits = components.dits
         stages = [*components.encoders, *components.vaes]
         modules = [*dits, *stages]
+        selection_options: dict[str, Any] = {}
+        if offload_components is not None:
+            if DIT_COMPONENT in offload_components and not dits:
+                raise ValueError("MiniMax-H3 has no loaded DiT for selected module offload")
+            if TEXT_ENCODER_COMPONENT in offload_components and not components.encoders:
+                raise ValueError("MiniMax-H3 has no loaded text encoder for selected module offload")
+            selection_options = {
+                "offload_dit_modules": dits if DIT_COMPONENT in offload_components else (),
+                "offload_encoder_modules": (
+                    components.encoders if TEXT_ENCODER_COMPONENT in offload_components else ()
+                ),
+            }
         apply_sequential_offload(
             dit_modules=dits,
             encoder_modules=stages,
             device=device,
             pin_memory=pin_memory,
             use_hsdp=use_hsdp,
-            offload_initial_dits=True,
+            offload_initial_dits=offload_components is None or DIT_COMPONENT in offload_components,
+            **selection_options,
         )
 
         self._model_cpu_offload_modules = modules
         logger.info(
-            "MiniMax-H3 model-level CPU offload enabled for %d DiT(s), text encoder, video VAE, and audio VAE",
-            len(dits),
+            "MiniMax-H3 model-level CPU offload enabled for selected components: %s",
+            sorted(offload_components) if offload_components is not None else "legacy full topology",
         )
 
     def disable_omni_model_cpu_offload(self) -> None:
@@ -1582,7 +1615,7 @@ class MiniMaxH3Pipeline(
             with sequential_offload_component(component):
                 yield
             return
-        staged = self._uses_manual_component_offload()
+        staged = self._uses_manual_component_offload(component)
         try:
             if staged:
                 component.load_to_device()

@@ -16,6 +16,8 @@ Ported from the upstream ``boogu`` package
   CFG branches use vLLM-Omni's shared two-branch/N-branch parallel helpers.
 - Instruction rewriting, prompt tuning, and vision-token stripping are not
   ported.
+- ``BooguImagePipeline`` preserves the regular scheduler/CFG path, while
+  ``BooguImageTurboPipeline`` selects the upstream few-step DMD student path.
 """
 
 import json
@@ -44,6 +46,7 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
     BooguImageDoubleStreamRotaryPosEmbed,
     BooguImageTransformer2DModel,
+    RotaryFrequencyTables,
 )
 from vllm_omni.diffusion.models.boogu_image.image_processor import BooguImageProcessor
 from vllm_omni.diffusion.models.boogu_image.scheduling_flow_match_euler_discrete_time_shifting import (
@@ -218,6 +221,9 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
     """
 
     supports_request_batch = True
+    # Turbo subclasses select the upstream few-step DMD student loop. Base and
+    # Edit requests keep the regular scheduler and CFG path.
+    _is_turbo: ClassVar[bool] = False
 
     support_image_input: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
@@ -655,6 +661,108 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
             combined = self.cfg_normalize_function(positive_with_reference, combined)
         return combined
 
+    def _build_dmd_student_sigmas(
+        self,
+        num_inference_steps: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        conditioning_sigma: float,
+        timesteps: list[float] | torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Build the ascending sigma schedule used by Boogu's DMD student.
+
+        The upstream Turbo pipeline uses ``linspace(conditioning_sigma, 1,
+        steps + 1)[:-1]``.  Explicit schedules are accepted in either the
+        normalized [0, 1] form or the 0..1000 training-timestep form.
+        """
+        if timesteps is not None:
+            # Validate request metadata on CPU once. Keeping scalar extraction
+            # out of the denoise loop avoids a CUDA synchronization per step.
+            dmd_sigmas = torch.as_tensor(timesteps, device="cpu", dtype=torch.float32)
+            if dmd_sigmas.ndim != 1 or dmd_sigmas.numel() == 0:
+                raise ValueError("DMD sigmas must be a non-empty 1D sequence.")
+            if dmd_sigmas.max().item() > 1.0:
+                dmd_sigmas = dmd_sigmas / 1000.0
+            if (
+                not torch.isfinite(dmd_sigmas).all().item()
+                or (dmd_sigmas < 0).any().item()
+                or (dmd_sigmas > 1).any().item()
+            ):
+                raise ValueError("DMD sigmas must be finite values in [0, 1] (or 0..1000 timesteps).")
+            return dmd_sigmas.to(device=device, dtype=dtype)
+        else:
+            if num_inference_steps < 1:
+                raise ValueError("num_inference_steps must be >= 1 for DMD student inference.")
+            if not 0.0 <= conditioning_sigma <= 1.0:
+                raise ValueError(f"DMD conditioning sigma must be in [0, 1], got {conditioning_sigma}.")
+            dmd_sigmas = torch.linspace(
+                conditioning_sigma,
+                1.0,
+                num_inference_steps + 1,
+                device=device,
+                dtype=dtype,
+            )[:-1]
+            return dmd_sigmas
+
+    def _predict_dmd_student_step(
+        self,
+        latents: torch.Tensor,
+        sigma: torch.Tensor | float,
+        instruction_embeds: torch.Tensor,
+        freqs_real: RotaryFrequencyTables,
+        instruction_attention_mask: torch.Tensor,
+        ref_latents: list[list[torch.Tensor] | None] | None = None,
+    ) -> torch.Tensor:
+        """Predict x0 and apply the upstream DMD ``x + (1-sigma)*velocity``."""
+        sigma_tensor = torch.as_tensor(sigma, device=latents.device, dtype=latents.dtype).reshape(())
+        model_pred = self.predict(
+            sigma_tensor,
+            latents,
+            instruction_embeds,
+            freqs_real,
+            instruction_attention_mask,
+            ref_image_hidden_states=ref_latents,
+        )
+        sigma_expanded = sigma_tensor.reshape((1,) + (1,) * (latents.ndim - 1))
+        return latents + (1.0 - sigma_expanded) * model_pred
+
+    def _renoise_dmd_latents(
+        self,
+        latents: torch.Tensor,
+        sigma: torch.Tensor | float,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+    ) -> torch.Tensor:
+        """Renoise an intermediate DMD x0 with the next sigma and seeded RNG."""
+        sigma_tensor = torch.as_tensor(sigma, device=latents.device, dtype=latents.dtype).reshape(())
+        noise = randn_tensor(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
+        sigma_expanded = sigma_tensor.reshape((1,) + (1,) * (latents.ndim - 1))
+        return (1.0 - sigma_expanded) * noise + sigma_expanded * latents
+
+    def _decode_output(
+        self,
+        latents: torch.Tensor,
+        output_type: str,
+        dtype: torch.dtype,
+        height: int,
+        width: int,
+        ori_height: int,
+        ori_width: int,
+    ) -> DiffusionOutput:
+        if output_type == "latent":
+            image = latents
+        else:
+            latents = latents.to(dtype=dtype)
+            if self.vae.config.scaling_factor is not None:
+                latents = latents / self.vae.config.scaling_factor
+            if self.vae.config.shift_factor is not None:
+                latents = latents + self.vae.config.shift_factor
+            with self._vae_attention_context(latents.device):
+                image = self.vae.decode(latents, return_dict=False)[0]
+            if (ori_height, ori_width) != (height, width):
+                image = F.interpolate(image, size=(ori_height, ori_width), mode="bilinear")
+
+        return DiffusionOutput(output=image)
+
     def _encode_vae_image(self, img: torch.Tensor, generator=None) -> torch.Tensor:
         """Encode an image tensor into the VAE latent space (upstream ``encode_vae``).
 
@@ -758,6 +866,11 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         has_reference = any(img is not None for img in preprocessed_images)
         task_type = "ti2i" if has_reference else "t2i"
 
+        # Turbo-specific schedules and extra arguments are not all represented
+        # in the request-batch compatibility key, so Turbo stays at batch=1.
+        if self._is_turbo and req.num_reqs > 1:
+            raise RuntimeError("BooguImageTurboPipeline does not support request batching.")
+
         # Fail-closed: a batched ti2i must never reach here (it is gated to batch=1).
         if has_reference and req.num_reqs > 1:
             raise RuntimeError(
@@ -775,15 +888,25 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
 
         height = sp.height or self.default_sample_size * self.vae_scale_factor
         width = sp.width or self.default_sample_size * self.vae_scale_factor
-        num_inference_steps = sp.num_inference_steps or 50
+        num_inference_steps = (
+            (sp.num_inference_steps if sp.num_inference_steps is not None else 4)
+            if self._is_turbo
+            else (sp.num_inference_steps or 50)
+        )
         # Upstream default text guidance is 4.0; the engine coerces an unset
         # guidance_scale to 1.0, so only honor a caller-provided value.
-        text_guidance_scale = sp.guidance_scale if sp.guidance_scale_provided else 4.0
+        text_guidance_scale = (
+            (sp.guidance_scale if sp.guidance_scale is not None else 1.0)
+            if self._is_turbo
+            else (sp.guidance_scale if sp.guidance_scale_provided else 4.0)
+        )
         # Image guidance rides on ``guidance_scale_2`` (upstream default 1.0 =
         # off); only a caller-provided value enables the double-guidance path.
-        image_guidance_scale = sp.guidance_scale_2 if sp.guidance_scale_2_provided else 1.0
-        if not has_reference:
-            image_guidance_scale = 1.0
+        image_guidance_scale = (
+            (sp.guidance_scale_2 if sp.guidance_scale_2 is not None else 1.0)
+            if self._is_turbo
+            else (sp.guidance_scale_2 if sp.guidance_scale_2_provided else 1.0)
+        )
         num_images_per_prompt = sp.num_outputs_per_prompt if sp.num_outputs_per_prompt > 0 else 1
         # Per-request noise generators, collated into one flat list of length
         # batch_size * num_images_per_prompt (request-major, output-minor).
@@ -797,6 +920,26 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         max_sequence_length = sp.max_sequence_length or 1280
         output_type = sp.output_type or "pil"
         cfg_range = (0.0, 1.0)
+
+        extra_args = getattr(sp, "extra_args", None) or {}
+        empty_instruction_guidance_scale = float(extra_args.get("empty_instruction_guidance_scale", 0.0))
+        is_dummy_run = callable(getattr(req, "is_dummy_run", None)) and req.is_dummy_run()
+        if self._is_turbo and is_dummy_run:
+            # The engine's generic startup request uses guidance_scale=0.0.
+            # Turbo's equivalent no-CFG value is 1.0, so normalize only this
+            # internal warmup while keeping real request validation strict.
+            text_guidance_scale = 1.0
+            image_guidance_scale = 1.0
+            empty_instruction_guidance_scale = 0.0
+        if self._is_turbo and (
+            text_guidance_scale != 1.0 or image_guidance_scale != 1.0 or empty_instruction_guidance_scale != 0.0
+        ):
+            raise ValueError(
+                "Boogu-Image Turbo DMD inference requires guidance_scale=1.0, "
+                "guidance_scale_2=1.0, and empty_instruction_guidance_scale=0.0."
+            )
+        if not has_reference:
+            image_guidance_scale = 1.0
 
         # Negative instruction embeddings are needed whenever text guidance is
         # active (t2i text CFG, ti2i text-only, and ti2i double guidance).
@@ -851,6 +994,42 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
             self.transformer.axes_lens,
             theta=10000,
         )
+
+        # Turbo uses the standalone upstream DMD loop and deliberately bypasses
+        # the regular scheduler/CFG path.  Base/Edit continue below unchanged.
+        if self._is_turbo:
+            conditioning_sigma = float(extra_args.get("dmd_conditioning_sigma", 0.0 if has_reference else 0.001))
+            if sp.timesteps is not None and sp.sigmas is not None:
+                raise ValueError("Boogu-Image Turbo accepts only one of timesteps or sigmas.")
+            # ``timesteps`` mirrors the upstream Turbo API. ``sigmas`` is kept
+            # as the vLLM-native spelling for the same normalized DMD schedule.
+            dmd_timesteps = sp.timesteps if sp.timesteps is not None else sp.sigmas
+            dmd_sigmas = self._build_dmd_student_sigmas(
+                num_inference_steps,
+                device=device,
+                dtype=latents.dtype,
+                conditioning_sigma=conditioning_sigma,
+                timesteps=dmd_timesteps,
+            )
+            with self.progress_bar(total=len(dmd_sigmas)) as progress_bar:
+                for index, sigma in enumerate(dmd_sigmas):
+                    latents = self._predict_dmd_student_step(
+                        latents,
+                        sigma,
+                        instruction_embeds,
+                        freqs_real,
+                        instruction_attention_mask,
+                        ref_latents,
+                    ).to(dtype=dtype)
+                    if index + 1 < len(dmd_sigmas):
+                        latents = self._renoise_dmd_latents(latents, dmd_sigmas[index + 1], generator).to(dtype=dtype)
+                    progress_bar.update()
+            output = self._decode_output(latents, output_type, dtype, height, width, ori_height, ori_width)
+            return split_diffusion_output_by_request(
+                output,
+                req,
+                num_outputs_per_prompt=num_images_per_prompt,
+            )
 
         # 4. Timesteps (the ported scheduler consumes ``num_tokens``).
         num_tokens = latents.shape[-2] * latents.shape[-1]
@@ -963,21 +1142,16 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
                 progress_bar.update()
 
         # 6. Decode.
-        if output_type == "latent":
-            image = latents
-        else:
-            latents = latents.to(dtype=dtype)
-            if self.vae.config.scaling_factor is not None:
-                latents = latents / self.vae.config.scaling_factor
-            if self.vae.config.shift_factor is not None:
-                latents = latents + self.vae.config.shift_factor
-            with self._vae_attention_context(latents.device):
-                image = self.vae.decode(latents, return_dict=False)[0]
-            if (ori_height, ori_width) != (height, width):
-                image = F.interpolate(image, size=(ori_height, ori_width), mode="bilinear")
-
+        output = self._decode_output(latents, output_type, dtype, height, width, ori_height, ori_width)
         return split_diffusion_output_by_request(
-            DiffusionOutput(output=image),
+            output,
             req,
             num_outputs_per_prompt=num_images_per_prompt,
         )
+
+
+class BooguImageTurboPipeline(BooguImagePipeline):
+    """Boogu-Image Turbo pipeline using the upstream few-step DMD semantics."""
+
+    supports_request_batch = False
+    _is_turbo: ClassVar[bool] = True

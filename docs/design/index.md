@@ -66,7 +66,7 @@ The design contracts separate selection mechanics from backend algorithms:
 #### CPU offloading
 
 - [Overview and Shared Contracts](feature/offloader/README.md)
-- [Model-Level Offload](feature/offloader/cpu_offload.md)
+- [Model-Level Offload](feature/offloader/module_offload.md)
 - [Layerwise Offload](feature/offloader/layerwise_offload.md)
 - [Distributed Layerwise Offload](feature/offloader/distributed_layerwise_offload.md)
 
