@@ -42,6 +42,11 @@ V1 does not include:
 
 ## Motivation and use cases
 
+For investigating CPU memory retained by dependency tensor materialization,
+see the [standalone safetensors diagnostic](../../../benchmarks/host_weight_runtime/README.md).
+It distinguishes repeated dependency calls from reuse of cached views and does
+not establish per-request HWR leakage.
+
 Model loading can create the same final host representation repeatedly. This
 is especially expensive when loading performs checkpoint decoding, tensor
 renaming, TP slicing, quantization, packing, or scale construction before GPU
