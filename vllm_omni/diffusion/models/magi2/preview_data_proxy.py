@@ -570,18 +570,19 @@ class PackedModelInput:
     token_sequence: torch.Tensor
     time_token_sequence: torch.Tensor
     output_layout: SimplePackedData
-    sequence: Magi2SequenceLayout
     layout: Magi2PackedLayout
 
     @property
     def model_args(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, VarlenHandler, torch.Tensor, Magi2PackedLayout]:
+        sequence = self.layout.sequence
+        assert sequence is not None
         return (
             self.token_sequence,
-            self.sequence.coords_mapping,
-            self.sequence.modality_mapping,
-            self.sequence.varlen_handler,
+            sequence.coords_mapping,
+            sequence.modality_mapping,
+            sequence.varlen_handler,
             self.time_token_sequence,
             self.layout,
         )
@@ -703,10 +704,9 @@ class Magi2DataProxy:
 
         packed = SimplePackedData(items)
         layout = data.layout if data.layout is not None else Magi2PackedLayout()
-        sequence = layout.sequence
-        if sequence is None:
+        if layout.sequence is None:
             cu_seqlens = packed.cu_seqlen.to(device=data.x_t.device, dtype=torch.int32)
-            sequence = Magi2SequenceLayout(
+            layout.sequence = Magi2SequenceLayout(
                 coords_mapping=packed.coords_mapping,
                 modality_mapping=packed.modality_mapping,
                 varlen_handler=VarlenHandler(
@@ -716,12 +716,10 @@ class Magi2DataProxy:
                     max_seqlen_k=packed.max_seqlen,
                 ),
             )
-            layout.sequence = sequence
         return PackedModelInput(
             token_sequence=packed.token_sequence,
             time_token_sequence=packed.time_token_sequence,
             output_layout=packed,
-            sequence=sequence,
             layout=layout,
         )
 

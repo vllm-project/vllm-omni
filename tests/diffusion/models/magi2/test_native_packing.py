@@ -25,10 +25,12 @@ from vllm_omni.diffusion.models.magi2.sampler_magi2 import CFGConfig, Magi2Previ
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 
 
-def _tiny_config(params_dtype: torch.dtype = torch.float32) -> Magi2PreviewConfig:
-    # Layer 0 is multimodal with MoE, layer 1 is single-modality dense.
+def _tiny_config(params_dtype: torch.dtype = torch.float32, *, moe_layers: int = 1) -> Magi2PreviewConfig:
+    # The leading layers are multimodal with MoE, the rest single-modality
+    # dense, so every layer belongs to one of two kinds.
+    moe_indices = tuple(range(moe_layers))
     return Magi2PreviewConfig(
-        num_layers=2,
+        num_layers=2 * moe_layers,
         hidden_size=16,
         head_dim=8,
         num_query_groups=2,
@@ -36,7 +38,7 @@ def _tiny_config(params_dtype: torch.dtype = torch.float32) -> Magi2PreviewConfi
         audio_in_channels=4,
         text_in_channels=4,
         intermediate_factor=2,
-        multimodal_layers=(0,),
+        multimodal_layers=moe_indices,
         params_dtype=params_dtype,
         mhc=Magi2MHCConfig(num_streams=2),
         moe=Magi2MoEConfig(
@@ -46,13 +48,18 @@ def _tiny_config(params_dtype: torch.dtype = torch.float32) -> Magi2PreviewConfi
             expert_intermediate_size=8,
             shared_expert_intermediate_size=8,
             modality_shared_expert_intermediate_size=8,
-            layers=(0,),
+            layers=moe_indices,
         ),
     )
 
 
-def _tiny_model(seed: int = 11, params_dtype: torch.dtype = torch.float32) -> Magi2PreviewTransformer:
-    model = Magi2PreviewTransformer(_tiny_config(params_dtype))
+def _tiny_model(
+    seed: int = 11,
+    params_dtype: torch.dtype = torch.float32,
+    *,
+    moe_layers: int = 1,
+) -> Magi2PreviewTransformer:
+    model = Magi2PreviewTransformer(_tiny_config(params_dtype, moe_layers=moe_layers))
     generator = torch.Generator(device="cpu").manual_seed(seed)
     with torch.no_grad():
         for parameter in model.parameters():
@@ -78,6 +85,13 @@ def _sampler_tensors(seed: int) -> dict[str, torch.Tensor]:
         "txt_feat": torch.randn(1, 3, 4, generator=generator),
         "null_txt_feat": torch.randn(1, 2, 4, generator=generator),
     }
+
+
+def _longer_text_tensors(seed: int) -> dict[str, torch.Tensor]:
+    tensors = _sampler_tensors(seed)
+    generator = torch.Generator(device="cpu").manual_seed(seed + 100)
+    tensors["txt_feat"] = torch.randn(1, 4, 4, generator=generator)
+    return tensors
 
 
 def test_prepare_model_input_keeps_lengths_on_host() -> None:
@@ -115,6 +129,29 @@ def test_shared_layout_matches_fresh_packing_bitwise() -> None:
         assert torch.equal(video_a, video_b)
         assert torch.equal(audio_a, audio_b)
     assert not torch.equal(reused[0][0], reused[1][0])
+
+
+def test_new_request_layouts_match_fresh_packing_bitwise() -> None:
+    sampler = _tiny_sampler(_tiny_model())
+    t = torch.tensor([900.0])
+    requests = [
+        (_sampler_tensors(0), Magi2PackedLayout()),
+        (_sampler_tensors(1), Magi2PackedLayout()),
+        (_longer_text_tensors(2), Magi2PackedLayout()),
+    ]
+
+    with torch.no_grad():
+        for tensors, layout in requests:
+            fresh = sampler.forward(sampler.prepare_model_input(**tensors, t=t, cfg_config=CFGConfig()))
+            first = sampler.forward(sampler.prepare_model_input(**tensors, t=t, cfg_config=CFGConfig(), layout=layout))
+            second = sampler.forward(
+                sampler.prepare_model_input(**tensors, t=t / 2, cfg_config=CFGConfig(), layout=layout)
+            )
+            assert torch.equal(first[0], fresh[0])
+            assert torch.equal(first[1], fresh[1])
+            assert layout.tokens is not None
+            assert not torch.equal(second[0], first[0])
+    assert requests[2][1].tokens.rope.shape[0] != requests[0][1].tokens.rope.shape[0]
 
 
 def test_shared_layout_builds_token_metadata_once(monkeypatch: pytest.MonkeyPatch) -> None:
