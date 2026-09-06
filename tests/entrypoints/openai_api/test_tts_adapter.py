@@ -394,5 +394,35 @@ def test_higgs_audio_v2_validate_accepts_plain_text_and_paired_clone() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "spk_id_config,expected_default,expected_supported",
+    [
+        ({"charlie": 3, "alice": 1, "bob": 2}, "charlie", {"alice", "bob", "charlie"}),  # first, not alphabetical
+        ({"vivian": 1}, "vivian", {"vivian"}),  # single speaker
+        ({}, None, set()),  # no speakers configured
+        (None, None, set()),  # None config
+    ],
+)
+def test_default_speaker_is_first_in_config(spk_id_config, expected_default, expected_supported):
+    """Default speaker is the first from config order, not alphabetical (PR #5814)."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from vllm_omni.entrypoints.openai.tts_adapters.base import TTSModelAdapter
+
+    mock_ctx = Mock()
+    mock_ctx.engine_client.model_config.hf_config.talker_config = (
+        SimpleNamespace(spk_id=spk_id_config) if spk_id_config is not None else None
+    )
+
+    class TestAdapter(TTSModelAdapter):
+        MODEL_TYPE = "test"
+        def validate(self, request): return None
+        async def build(self, request, server): pass
+
+    caps = TestAdapter(mock_ctx).load_capabilities()
+    assert caps.default_speaker == expected_default
+    assert caps.supported_speakers == expected_supported
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

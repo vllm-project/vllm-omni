@@ -65,6 +65,6 @@ class MingFlashOmniTTSAdapter(ARTTSAdapter):
         prompt = server._build_ming_flash_omni_prompt(request)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="ming_flash_omni_tts")
 
-    def _load_supported_speakers(self) -> set[str]:
+    def _load_supported_speakers(self) -> list[str]:
         # Speaker selection is driven by caption JSON rather than a static table.
-        return set()
+        return []

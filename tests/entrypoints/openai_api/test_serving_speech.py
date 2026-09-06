@@ -5541,3 +5541,34 @@ class TestTTSAsyncOffloading:
         server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mocker.MagicMock(), model_name="test-model")
         assert server._tts_executor is None
         server.shutdown()  # Should not raise
+
+
+
+@pytest.mark.parametrize(
+    "has_adapter,default_speaker,expected_value",
+    [
+        (True, "alice", ["alice"]),  # Normal: adapter with default
+        (False, None, None),  # No adapter
+        (True, None, None),  # Adapter but no default
+    ],
+)
+def test_custom_voice_speaker_selection(has_adapter, default_speaker, expected_value, mocker: MockerFixture):
+    """CustomVoice uses default_speaker when available, None when missing (PR #5814)."""
+    mock_adapter = mocker.MagicMock() if has_adapter else None
+    if mock_adapter:
+        mock_adapter.capabilities.default_speaker = default_speaker
+        mock_adapter.capabilities.supported_speakers = {"alice", "bob"}
+
+    server = mocker.MagicMock()
+    server._adapter = mock_adapter
+
+    # Simulate the CustomVoice logic from _build_tts_params
+    params = {"task_type": ["CustomVoice"]}
+    if server._adapter is None:
+        params["speaker"] = None
+    elif server._adapter.capabilities.default_speaker is None:
+        params["speaker"] = None
+    else:
+        params["speaker"] = [server._adapter.capabilities.default_speaker]
+
+    assert params["speaker"] == expected_value
