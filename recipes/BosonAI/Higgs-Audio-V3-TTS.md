@@ -102,23 +102,28 @@ python examples/online_serving/text_to_speech/higgs_audio_v3/batch_speech_client
 - Key flags: `--trust-remote-code` and `--omni` are required.
 - Output: 24 kHz mono WAV.
 - Voice cloning: `ref_audio` accepts WAV/FLAC/MP3; `ref_text` is optional but improves fidelity.
+- Reference substitution diagnostics: temporarily set `VLLM_LOGGING_LEVEL=DEBUG`
+  before starting the server to see why reference audio substitution was skipped.
+  Count-mismatch messages report the batch-local request index, placeholder count,
+  and reference code row count without logging text or audio content. They do not
+  change the existing fallback behavior; legacy counts describe the current span.
 - Deploy config: `vllm_omni/deploy/higgs_multimodal_qwen3.yaml` (auto-discovered from `model_type`).
-  - `max_num_seqs=16` for both stages.
-  - Stage 0 and Stage 1 default to the same device (`0`) for single-GPU serving.
-  - Stage 0 intentionally keeps `enforce_eager=true`. This preserves the Higgs-specific local MLP CUDA graph path, which is the current high-throughput default.
-  - Stage 1 remains `enforce_eager=true` for the codec decoder.
+    - `max_num_seqs=16` for both stages.
+    - Stage 0 and Stage 1 default to the same device (`0`) for single-GPU serving.
+    - Stage 0 intentionally keeps `enforce_eager=true`. This preserves the Higgs-specific local MLP CUDA graph path, which is the current high-throughput default.
+    - Stage 1 remains `enforce_eager=true` for the codec decoder.
 - Deploy profiles:
-  - High throughput: `vllm_omni/deploy/higgs_multimodal_qwen3_high_throughput.yaml`.
+    - High throughput: `vllm_omni/deploy/higgs_multimodal_qwen3_high_throughput.yaml`.
     Use this for medium/high concurrency. The auto-discovered
     `higgs_multimodal_qwen3.yaml` is kept as a compatibility/default alias for
     this profile.
-  - Low latency: `vllm_omni/deploy/higgs_multimodal_qwen3_low_latency.yaml`.
+    - Low latency: `vllm_omni/deploy/higgs_multimodal_qwen3_low_latency.yaml`.
     Use this for low-concurrency serving (for example c1-c4). It sets Stage 0
     `enforce_eager=false` and enables vLLM `FULL_DECODE_ONLY` CUDA graph through
     YAML `compilation_config`; no environment variable is required.
-  - Profile details: `vllm_omni/deploy/README_higgs_audio_v3.md`.
+    - Profile details: `vllm_omni/deploy/README_higgs_audio_v3.md`.
 - Performance note:
-  - Do not switch the auto-discovered default Stage 0 profile to vLLM
+    - Do not switch the auto-discovered default Stage 0 profile to vLLM
     `FULL_DECODE_ONLY` CUDA graph without an end-to-end throughput and
     audio-quality revalidation. On the H20 SeedTTS c16/full-dataset benchmark,
     the eager Stage 0 path with Higgs local MLP CUDA graph reproduced
@@ -127,5 +132,5 @@ python examples/online_serving/text_to_speech/higgs_audio_v3/batch_speech_client
     capture fix showed lower c1/c4 latency, so the FULL_DECODE profile is kept
     as an explicit low-latency option rather than the throughput default.
 - Known limitations:
-  - Stage 1 (code2wav) must use `enforce_eager=true` (`@torch.inference_mode` incompatible with graph capture).
-  - Stage 0 full-decode CUDA graph is experimental; sampler, delay-state updates, staging, and request postprocess remain outside the graph.
+    - Stage 1 (code2wav) must use `enforce_eager=true` (`@torch.inference_mode` incompatible with graph capture).
+    - Stage 0 full-decode CUDA graph is experimental; sampler, delay-state updates, staging, and request postprocess remain outside the graph.
