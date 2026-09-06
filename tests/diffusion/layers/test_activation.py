@@ -19,6 +19,16 @@ def test_silu_and_mul_native_matches_packed_reference() -> None:
     torch.testing.assert_close(SiluAndMul().forward_native(packed), F.silu(gate) * up)
 
 
+@pytest.mark.cpu
+def test_silu_and_mul_npu_dispatch_falls_back_for_cpu_tensor() -> None:
+    packed = torch.randn(257, 256, dtype=torch.float32)
+
+    torch.testing.assert_close(
+        SiluAndMul().forward_npu(packed),
+        SiluAndMul().forward_native(packed),
+    )
+
+
 @hardware_test(res={"npu": "A3"}, num_cards=1)
 def test_silu_and_mul_npu_matches_packed_reference() -> None:
     packed = torch.randn(257, 256, device="npu", dtype=torch.bfloat16)
