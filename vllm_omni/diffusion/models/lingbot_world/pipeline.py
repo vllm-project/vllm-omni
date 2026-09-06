@@ -19,6 +19,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, UMT5EncoderModel
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -70,6 +71,8 @@ if TYPE_CHECKING:
         ARDiffusionKVState,
     )
 
+logger = init_logger(__name__)
+
 LINGBOT_DMD_TIMESTEPS = (1000, 750, 500, 250)
 _CAMERA_SPATIAL_FOLD = 8
 _MAX_PIXEL_AREA = 480 * 832
@@ -112,6 +115,68 @@ class _LingBotARSessionState:
     image_condition: torch.Tensor | None = None
     camera_tail: CameraTrajectory | None = None
     camera_pitch: float = 0.0
+
+
+def representable_step(tensor: torch.Tensor) -> float:
+    """One step of ``tensor``'s dtype at ``tensor``'s own magnitude.
+
+    A difference smaller than this cannot be expressed in the dtype the model
+    consumes, so it is not a difference the model can act on.
+    """
+    scale = float(tensor.detach().abs().max())
+    if not scale > 0.0:
+        return 0.0
+    return float(torch.finfo(tensor.dtype).eps) * 2.0 ** math.floor(math.log2(scale))
+
+
+def condition_steady_state_onset(condition: torch.Tensor, block_frames: int, *, atol: float) -> int | None:
+    """First latent frame from which the image condition stops changing.
+
+    The condition a tick receives is a ``block_frames``-wide slice of an encode
+    whose pixel input is the first frame followed by zeros. A causal VAE's
+    response to a constant input settles, so past some frame every slice is the
+    same slice and a session does not need the rest of the horizon stored -- it
+    needs that one block, and it can have it for as many ticks as it likes.
+
+    Returns the index of the first frame of the settled region, or ``None`` if
+    the condition is still moving when the tensor runs out, which means the
+    encode was too short to tell.
+
+    ``atol`` is keyword-only and has no default on purpose. Zero is the tempting
+    value and it is the one value that can never be right: measured on real
+    weights at 480x832 the residual falls 3.91 -> 0.44 -> 0.043 -> ... -> 0.0015
+    and is still moving at the end of the horizon, in float32 and bfloat16
+    alike. A caller that does not choose a tolerance gets "never settles" every
+    time, and the reuse this function exists to enable silently never happens.
+    """
+    if block_frames < 1:
+        raise ValueError(f"block_frames must be at least 1, got {block_frames}.")
+    if atol < 0.0:
+        raise ValueError(f"atol must not be negative, got {atol}.")
+    frames = condition.shape[2]
+    # An onset with no later block to compare against would come back settled
+    # having compared nothing, which is how an encode too short to show the
+    # settling reports a number instead of an answer. Two blocks minimum.
+    #
+    # The search steps by whole blocks rather than by frame. Frame precision is
+    # precision the caller cannot spend: _condition_latent_frames rounds the
+    # answer up to whole blocks anyway, so onsets 8 and 9 both mean "hold four
+    # blocks". What frame precision does buy is instability -- the encode is not
+    # bit-reproducible across processes, and an onset sitting on the tolerance
+    # boundary flips run to run. Observed directly: four runs on the same image
+    # printed byte-identical per-block residuals and returned 9, 8, 8, 9. Both
+    # values happened to round to the same twelve frames, so nothing downstream
+    # moved; a flip to 10 would have changed the held size with nothing to
+    # signal it. Stepping by blocks makes a flip require three frames of drift
+    # rather than one, which is the granularity the answer is used at.
+    for onset in range(0, frames - 2 * block_frames + 1, block_frames):
+        settled_block = condition[:, :, onset : onset + block_frames]
+        if all(
+            torch.allclose(settled_block, condition[:, :, start : start + block_frames], atol=atol, rtol=0.0)
+            for start in range(onset + block_frames, frames - block_frames + 1, block_frames)
+        ):
+            return onset
+    return None
 
 
 def _positive_finite_flow_shift(value: Any) -> float:
@@ -490,6 +555,12 @@ class LingBotWorldCausalDMDPipeline(
         self._ar_width = int(model_config.get("ar_diffusion_width", 832))
         self._ar_diffusion_kv_state: ARDiffusionKVState | None = None
         self._ar_sessions: dict[str, _LingBotARSessionState] = {}
+        # Where the image condition settles, read off a real encode and cached
+        # for the process. ``None`` before the first session has been encoded;
+        # a checkpoint whose condition never settles is remembered as measured
+        # rather than re-measured once per session.
+        self._measured_condition_onset: int | None = None
+        self._condition_onset_measured = False
         self.setup_diffusion_pipeline_profiler(
             profiler_targets=[
                 "vae.encode",
@@ -773,6 +844,76 @@ class LingBotWorldCausalDMDPipeline(
             dtype=reference.dtype,
         ).view(*shape)
         return latent_mean, latent_std
+
+    def _condition_horizon_latent_frames(self) -> int:
+        """Latent frames the fixed 117-pixel-frame horizon encodes to."""
+        return (_MAX_RAW_FRAMES - 1) // self.vae_scale_factor_temporal + 1
+
+    def _condition_latent_frames(self) -> int:
+        """Latent frames a session holds: the whole horizon.
+
+        An earlier version shrank this to the measured settling point, holding
+        twelve frames instead of thirty. That saving is withdrawn: the
+        measurement does not support it (see
+        :func:`condition_steady_state_onset`), and the ceiling this patch exists
+        to remove never needed it. Reuse past the horizon needs one settled
+        block; it does not need the buffer to stop at that block.
+
+        Holding the whole horizon also makes every tick up to the old ceiling
+        byte-identical to the unpatched pipeline, because each of them slices a
+        real encode rather than a reused tail.
+        """
+        return self._condition_horizon_latent_frames()
+
+    def _encode_session_condition(self, inputs: _LingBotRequestInputs, *, dtype: torch.dtype) -> torch.Tensor:
+        """Encode a session's image condition, and learn how much of it matters.
+
+        How far into the condition the response is still moving is a property of
+        the VAE and the checkpoint, so it is read off the encode rather than
+        configured. The first session pays for the full horizon exactly as
+        before; every session after it encodes only the prefix that turned out
+        to matter, which is safe because the VAE is causal -- latent frame ``t``
+        is a function of pixel frames up to ``t``, so a shorter encode
+        reproduces the longer one's prefix exactly.
+
+        A checkpoint whose condition never settles inside the horizon keeps
+        today's behaviour: the whole tensor, and the tick ceiling with it.
+        """
+        latent_frames = self._condition_latent_frames()
+        raw_frames = (latent_frames - 1) * self.vae_scale_factor_temporal + 1
+        condition = self._prepare_condition(
+            replace(inputs, num_frames=raw_frames, num_latent_frames=latent_frames),
+            dtype=dtype,
+        )
+        if self._condition_onset_measured:
+            return condition
+
+        self._condition_onset_measured = True
+        block_frames = int(self.transformer.config.num_frames_per_block)
+        # Two representable steps, and the factor is measured rather than
+        # chosen: at 480x832 the bfloat16 residual sits at exactly two steps
+        # from latent 9 through latent 26 and never moves, while the identical
+        # encode carried out in float32 is still decaying, 0.019 -> 0.0078 ->
+        # 0.0036 -> 0.0021 -> 0.0015 against a scale of 5.73. The plateau is the
+        # bfloat16 grid, not the condition.
+        onset = condition_steady_state_onset(condition, block_frames, atol=2.0 * representable_step(condition))
+        if onset is None:
+            logger.info(
+                "LingBot image condition is still changing at the end of its %d-frame horizon; "
+                "keeping the whole tensor and the tick ceiling that goes with it.",
+                condition.shape[2],
+            )
+            return condition
+        self._measured_condition_onset = onset
+        keep = self._condition_latent_frames()
+        logger.info(
+            "LingBot image condition settles at latent frame %d; a session now holds %d frames "
+            "instead of %d, and the tick horizon is unbounded.",
+            onset,
+            keep,
+            condition.shape[2],
+        )
+        return condition[:, :, :keep].contiguous()
 
     def _prepare_condition(self, inputs: _LingBotRequestInputs, *, dtype: torch.dtype) -> torch.Tensor:
         """Encode the first frame as ``[mask4, image_latent16]``."""
@@ -1121,16 +1262,6 @@ class LingBotWorldCausalDMDPipeline(
                     "fixed cache geometry "
                     f"{self._ar_height}x{self._ar_width}."
                 )
-            horizon_latent_frames = (_MAX_RAW_FRAMES - 1) // self.vae_scale_factor_temporal + 1
-            max_realtime_ticks = horizon_latent_frames // block_frames
-            if tick.chunk_index >= max_realtime_ticks:
-                raise ValueError(
-                    "LingBot realtime generation currently supports at most "
-                    f"{max_realtime_ticks} ticks per generation epoch "
-                    f"(chunk_index 0 through {max_realtime_ticks - 1}) because "
-                    f"the image-condition horizon is {_MAX_RAW_FRAMES} pixel "
-                    "frames; reset or create a session to start a new world."
-                )
             session_state = self._ar_sessions.setdefault(
                 tick.session_id,
                 _LingBotARSessionState(),
@@ -1156,20 +1287,19 @@ class LingBotWorldCausalDMDPipeline(
         else:
             assert session_state is not None
             if session_state.image_condition is None:
-                horizon_latent_frames = (_MAX_RAW_FRAMES - 1) // self.vae_scale_factor_temporal + 1
-                session_state.image_condition = self._prepare_condition(
-                    replace(
-                        inputs,
-                        num_frames=_MAX_RAW_FRAMES,
-                        num_latent_frames=horizon_latent_frames,
-                    ),
-                    dtype=dtype,
-                )
+                session_state.image_condition = self._encode_session_condition(inputs, dtype=dtype)
             block_frames = int(self.transformer.config.num_frames_per_block)
             condition_start = tick.chunk_index * block_frames
             condition_stop = condition_start + block_frames
-            if condition_stop > session_state.image_condition.shape[2]:
-                raise ValueError("LingBot chunk_index exceeds the configured causal image condition horizon.")
+            held_frames = session_state.image_condition.shape[2]
+            if condition_stop > held_frames:
+                # Past the horizon every tick reuses the encode's last block.
+                # That block is the one the condition has had the most frames to
+                # settle into, and it is a real slice of a real encode rather
+                # than an extrapolation. This is what makes the tick horizon
+                # unbounded and the per-session condition cost constant.
+                condition_start = held_frames - block_frames
+                condition_stop = held_frames
             condition = session_state.image_condition[
                 :,
                 :,
