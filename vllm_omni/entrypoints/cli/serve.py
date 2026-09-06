@@ -489,6 +489,15 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--diffusion-compile-reorder-comm-overlap",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Enable Inductor compute/communication overlap reordering "
+                "for generic diffusion compilation. Disabled by default."
+            ),
+        )
+        omni_config_group.add_argument(
             "--fa-deterministic",
             dest="fa_deterministic",
             action="store_true",

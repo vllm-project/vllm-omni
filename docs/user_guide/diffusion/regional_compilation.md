@@ -29,6 +29,23 @@ still contain graph breaks; it does not force one graph. It is rejected when
 HSDP, sequence parallelism, CPU offload, or layerwise offload is enabled. Use
 regional scope with those features.
 
+## Compute/Communication Overlap
+
+Inductor can reorder communication and compute within compiled regions to
+overlap collective operations with independent computation. This optimization
+is disabled by default. For default single-stage diffusion serving, enable it
+with:
+
+```bash
+vllm serve <model> --omni \
+  --diffusion-compile-reorder-comm-overlap
+```
+
+This setting applies to both regional and full generic compilation. It has no
+effect with `--enforce-eager` or pipelines that provide their own
+`setup_compile()` implementation. Models whose compiled graphs do not contain
+communication operations may see no benefit.
+
 These settings control the generic model-runner compilation path. Pipelines
 that provide their own `setup_compile()` implementation manage their compilation
 policy independently. Compilation is lazy, so backend or graph errors can first
