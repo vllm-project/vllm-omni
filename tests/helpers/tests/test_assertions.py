@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import io
+import wave
 from types import SimpleNamespace
 
 import pytest
@@ -10,9 +12,22 @@ from tests.helpers.assertions import (
     _assert_transcript_matches,
     _resolve_audio_transcript,
     assert_audio_speech_response,
+    assert_wav_audio_valid,
 )
+from tests.helpers.client import OmniResponse
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _make_wav_bytes(*, sample_value: int, frame_count: int = 32_000) -> bytes:
+    pcm_frame = sample_value.to_bytes(2, byteorder="little", signed=True) * 2
+    wav_buffer = io.BytesIO()
+    with wave.open(wav_buffer, "wb") as wav_file:
+        wav_file.setnchannels(2)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(32_000)
+        wav_file.writeframes(pcm_frame * frame_count)
+    return wav_buffer.getvalue()
 
 
 def test_short_transcript_repeat_passes_containment_fallback():
@@ -97,7 +112,7 @@ def test_speech_transcript_expected_text(monkeypatch, request_config, expected_t
         captured["expected_text"] = expected_text
 
     monkeypatch.setattr(assertions, "_assert_transcript_matches", capture_match)
-    response = SimpleNamespace(success=True, audio_bytes=b"fake-wav", audio_format="audio/wav")
+    response = OmniResponse(success=True, audio_bytes=b"fake-wav", audio_format="audio/wav")
     request_config["response_format"] = "wav"
 
     assert_audio_speech_response(
@@ -107,6 +122,43 @@ def test_speech_transcript_expected_text(monkeypatch, request_config, expected_t
     )
 
     assert captured["expected_text"] == expected_text
+
+
+def test_speech_transcript_expected_text_none_skips_transcription(monkeypatch):
+    def fail_if_transcribed(*_args, **_kwargs):
+        pytest.fail("Whisper should not run when transcript validation is disabled")
+
+    monkeypatch.setattr(assertions, "convert_audio_bytes_to_text", fail_if_transcribed)
+    response = OmniResponse(success=True, audio_bytes=b"fake-wav", audio_format="audio/wav")
+
+    assert_audio_speech_response(
+        response,
+        {
+            "input": "generative lyrics",
+            "response_format": "wav",
+            "transcript_expected_text": None,
+        },
+        "advanced_model",
+    )
+
+
+def test_wav_audio_valid_checks_format_duration_and_signal():
+    assert_wav_audio_valid(
+        _make_wav_bytes(sample_value=1_000),
+        sample_rate=32_000,
+        channels=2,
+        sample_width_bytes=2,
+        min_audio_bytes=100_000,
+    )
+
+    with pytest.raises(AssertionError, match="effectively silent"):
+        assert_wav_audio_valid(
+            _make_wav_bytes(sample_value=0),
+            sample_rate=32_000,
+            channels=2,
+            sample_width_bytes=2,
+            min_audio_bytes=100_000,
+        )
 
 
 def test_escalated_transcript_keeps_declared_language(monkeypatch):

@@ -513,6 +513,37 @@ def assert_audio_valid(
     )
 
 
+def assert_wav_audio_valid(
+    audio_bytes: bytes | None,
+    *,
+    sample_rate: int,
+    channels: int,
+    sample_width_bytes: int,
+    min_audio_bytes: int,
+    min_rms_dbfs: float = -60.0,
+) -> None:
+    """Assert that WAV bytes have the requested format, duration, and signal."""
+    assert audio_bytes is not None, "Expected WAV audio bytes"
+
+    with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
+        assert wav_file.getnchannels() == channels
+        assert wav_file.getsampwidth() == sample_width_bytes
+        assert wav_file.getframerate() == sample_rate
+        assert wav_file.getcomptype() == "NONE"
+
+        frame_count = wav_file.getnframes()
+        min_frames = min_audio_bytes // (channels * sample_width_bytes)
+        assert frame_count > min_frames, (
+            f"Audio is too short: {frame_count / sample_rate:.2f}s, expected more than {min_frames / sample_rate:.2f}s"
+        )
+        pcm = np.frombuffer(wav_file.readframes(frame_count), dtype="<i2")
+
+    assert pcm.size == frame_count * channels
+    rms = float(np.sqrt(np.mean(np.square(pcm.astype(np.float32)))))
+    rms_dbfs = 20.0 * np.log10(max(rms, 1.0) / np.iinfo(np.int16).max)
+    assert rms_dbfs > min_rms_dbfs, f"Generated audio is effectively silent: RMS={rms_dbfs:.1f} dBFS"
+
+
 def _load_gender_pipeline():
     global _GENDER_PIPELINE
     if _GENDER_PIPELINE is not None:
@@ -1100,4 +1131,5 @@ __all__ = [
     "assert_video_valid",
     "assert_video_audio_valid",
     "assert_audio_valid",
+    "assert_wav_audio_valid",
 ]
