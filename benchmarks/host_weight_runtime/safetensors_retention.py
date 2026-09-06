@@ -43,6 +43,9 @@ def sample(phase: str, iterations: int, loop_seconds: float) -> dict[str, object
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("get_tensor", "reuse"), required=True)
+    parser.add_argument(
+        "--tensor-elements", type=positive_int, default=64, help="Number of float32 elements in the synthetic tensor"
+    )
     parser.add_argument("--iterations", type=positive_int, default=1_000_000)
     parser.add_argument("--sample-every", type=positive_int, default=100_000)
     parser.add_argument("--warmup", type=positive_int, default=1000)
@@ -61,10 +64,10 @@ def main() -> None:
     samples = [sample("before_file", 0, 0.0)]
     with tempfile.TemporaryDirectory(prefix="safetensors-retention-") as directory:
         path = Path(directory) / "synthetic.safetensors"
-        save_file({"weight": torch.arange(16, dtype=torch.float32)}, str(path))
+        save_file({"weight": torch.arange(args.tensor_elements, dtype=torch.float32)}, str(path))
         with safe_open(path, framework="pt", device="cpu") as reader:
             cached = reader.get_tensor("weight")
-            assert torch.equal(cached, torch.arange(16, dtype=torch.float32))
+            assert torch.equal(cached, torch.arange(args.tensor_elements, dtype=torch.float32))
             for _ in range(args.warmup):
                 tensor = reader.get_tensor("weight") if args.mode == "get_tensor" else cached
                 del tensor
