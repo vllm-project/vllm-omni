@@ -845,6 +845,8 @@ async def build_async_omni_from_stage_config(
 
     try:
         kwargs = args.get_explicit_kwargs_dict()
+        # This controls only the API-process WebSocket and is not an AsyncOmni option.
+        kwargs.pop("robot_openpi_idle_timeout", None)
         model = kwargs.pop("model", None) or args.model
         kwargs.setdefault("log_stats", not args.disable_log_stats)
         async_omni = AsyncOmni(model=model, **kwargs)
@@ -1872,11 +1874,26 @@ async def realtime_robot_openpi(websocket: WebSocket):
 
     serving = getattr(websocket.app.state, "openai_serving_realtime_robot", None)
     if serving is None:
+        logger.warning(
+            "Rejecting robot OpenPI WebSocket: policy serving is disabled. "
+            "The diffusion stage must provide model_config.policy_server_config."
+        )
         await websocket.accept()
-        await websocket.send_json({"type": "error", "error": "Robot policy not available", "code": "unsupported"})
+        await websocket.send_json(
+            {
+                "type": "error",
+                "error": (
+                    "Robot policy not available: the diffusion stage did not provide model_config.policy_server_config"
+                ),
+                "code": "unsupported",
+            }
+        )
         await websocket.close()
         return
-    connection = RobotRealtimeConnection(websocket, serving)
+    state_args = getattr(websocket.app.state, "args", None)
+    configured_timeout = getattr(state_args, "robot_openpi_idle_timeout", 30.0)
+    idle_timeout = None if configured_timeout == 0 else configured_timeout
+    connection = RobotRealtimeConnection(websocket, serving, idle_timeout=idle_timeout)
     await connection.handle_connection()
 
 

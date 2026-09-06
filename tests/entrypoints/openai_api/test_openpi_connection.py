@@ -258,6 +258,29 @@ def test_handle_connection_closes_websocket_on_idle_timeout(monkeypatch):
     serving.infer.assert_not_called()
 
 
+def test_handle_connection_can_disable_idle_timeout(monkeypatch):
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+
+    async def fail_wait_for(*_args, **_kwargs):
+        pytest.fail("asyncio.wait_for should not be used when the idle timeout is disabled")
+
+    monkeypatch.setattr(openpi_connection.asyncio, "wait_for", fail_wait_for)
+    websocket = FakeWebSocket([{"type": "websocket.disconnect"}])
+    serving = _serving_mock()
+
+    asyncio.run(
+        openpi_connection.RobotRealtimeConnection(
+            websocket,
+            serving,
+            idle_timeout=None,
+        ).handle_connection()
+    )
+
+    assert websocket.accepted is True
+    assert websocket.closed is False
+    serving.infer.assert_not_called()
+
+
 def test_handle_connection_keeps_session_state_per_websocket(monkeypatch):
     monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
     requests = {
@@ -289,6 +312,73 @@ def test_handle_connection_keeps_session_state_per_websocket(monkeypatch):
     assert calls[0].kwargs == {"session_id": "session-a", "reset": True}
     assert calls[1].kwargs == {"session_id": "session-a", "reset": False}
     assert calls[2].kwargs == {"session_id": "session-b", "reset": True}
+
+
+def test_handle_connection_keeps_interleaved_parallel_session_state(monkeypatch):
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    requests = {
+        b"a1": {"prompt": "first-a", "session_id": "session-a"},
+        b"b1": {"prompt": "first-b", "session_id": "session-b"},
+        b"a2": {"prompt": "second-a", "session_id": "session-a"},
+        b"b2": {"prompt": "second-b", "session_id": "session-b"},
+    }
+    monkeypatch.setattr(openpi_connection, "_unpack", lambda data: dict(requests[data]))
+    serving = _serving_mock()
+    websocket = FakeWebSocket(
+        [{"type": "websocket.receive", "bytes": key} for key in (b"a1", b"b1", b"a2", b"b2")]
+        + [{"type": "websocket.disconnect"}]
+    )
+
+    asyncio.run(openpi_connection.RobotRealtimeConnection(websocket, serving).handle_connection())
+
+    assert [call.kwargs for call in serving.infer.await_args_list] == [
+        {"session_id": "session-a", "reset": True},
+        {"session_id": "session-b", "reset": True},
+        {"session_id": "session-a", "reset": False},
+        {"session_id": "session-b", "reset": False},
+    ]
+
+
+def test_handle_connection_bounds_tracked_sessions_without_resetting_live_ones(monkeypatch):
+    """A client may hold one socket across many episodes, minting a fresh
+    session id per episode and never sending ``reset`` (RoboLab does exactly
+    this). Session tracking must stay bounded, and evicting finished episodes
+    must not disturb the sessions that are still running.
+    """
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    monkeypatch.setattr(openpi_connection, "MAX_TRACKED_SESSIONS", 8)
+
+    # One long-lived session interleaved with far more short episodes than the cap.
+    episodes = 40
+    keys = []
+    requests = {}
+    for episode in range(episodes):
+        for session_id in (f"episode-{episode}", "live-env"):
+            key = f"{session_id}@{episode}".encode()
+            keys.append(key)
+            requests[key] = {"prompt": "pick", "session_id": session_id}
+
+    monkeypatch.setattr(openpi_connection, "_unpack", lambda data: dict(requests[data]))
+    serving = _serving_mock()
+    websocket = FakeWebSocket(
+        [{"type": "websocket.receive", "bytes": key} for key in keys] + [{"type": "websocket.disconnect"}]
+    )
+    connection = openpi_connection.RobotRealtimeConnection(websocket, serving)
+
+    asyncio.run(connection.handle_connection())
+
+    assert len(connection._seen_sessions) <= 8
+
+    resets_by_session: dict[str, list[bool]] = {}
+    for call in serving.infer.await_args_list:
+        resets_by_session.setdefault(call.kwargs["session_id"], []).append(call.kwargs["reset"])
+
+    # Each new episode resets exactly once, on its first observation.
+    for episode in range(episodes):
+        assert resets_by_session[f"episode-{episode}"] == [True]
+    # The continuously active session is never evicted, so it resets only once
+    # despite ``episodes`` other sessions churning past the cap.
+    assert resets_by_session["live-env"] == [True] + [False] * (episodes - 1)
 
 
 def test_handle_connection_reset_endpoint_resets_next_infer(monkeypatch):

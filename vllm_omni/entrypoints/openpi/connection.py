@@ -22,6 +22,7 @@ vLLM-native markers:
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from typing import Any
 
 import msgspec
@@ -38,10 +39,12 @@ logger = init_logger(__name__)
 _DEFAULT_IDLE_TIMEOUT = 30.0
 MAX_OPENPI_PAYLOAD_BYTES = 64 * 1024 * 1024
 _MISSING = object()
+# Upper bound on the per-connection set of seen session ids.
+MAX_TRACKED_SESSIONS = 1024
 
 
 def _pack_numpy(obj: Any) -> Any:
-    if isinstance(obj, (np.ndarray, np.generic)) and obj.dtype.kind in ("V", "O", "c"):
+    if isinstance(obj, np.ndarray | np.generic) and obj.dtype.kind in ("V", "O", "c"):
         raise ValueError(f"Unsupported dtype: {obj.dtype}")
     if isinstance(obj, np.ndarray):
         if not obj.flags.c_contiguous:
@@ -153,17 +156,38 @@ class RobotRealtimeConnection:
         self,
         websocket: WebSocket,
         serving: ServingRealtimeRobotOpenPI,
-        idle_timeout: float = _DEFAULT_IDLE_TIMEOUT,
+        idle_timeout: float | None = _DEFAULT_IDLE_TIMEOUT,
     ) -> None:
         self.websocket = websocket
         self.serving = serving
         self._idle_timeout = idle_timeout
         self._current_session_id: str | None = None
-        self._call_count = 0
+        # Session ids seen on this connection, most-recently-used last.
+        self._seen_sessions: OrderedDict[str, None] = OrderedDict()
 
     def reset(self) -> None:
         self._current_session_id = None
-        self._call_count = 0
+        self._seen_sessions.clear()
+
+    def _mark_session_seen(self, session_id: str) -> bool:
+        """Record ``session_id``; return True when it is the first sighting.
+
+        A session's first observation is the one that carries ``reset`` to the
+        policy, so this needs per-session memory.
+        """
+        if session_id in self._seen_sessions:
+            self._seen_sessions.move_to_end(session_id)
+            return False
+
+        self._seen_sessions[session_id] = None
+        if len(self._seen_sessions) > MAX_TRACKED_SESSIONS:
+            evicted, _ = self._seen_sessions.popitem(last=False)
+            logger.debug(
+                "Robot OpenPI connection is tracking more than %d sessions; dropped least-recently-used %s",
+                MAX_TRACKED_SESSIONS,
+                evicted,
+            )
+        return True
 
     async def _send_error(self, message: str) -> None:
         await self.websocket.send_bytes(_pack({"type": "error", "message": message}))
@@ -187,18 +211,22 @@ class RobotRealtimeConnection:
             await self.websocket.send_bytes(_pack(metadata))
 
             while True:
-                try:
-                    msg = await asyncio.wait_for(
-                        self.websocket.receive(),
-                        timeout=self._idle_timeout,
-                    )
-                except asyncio.TimeoutError:
-                    logger.info("Robot OpenPI connection idle timeout after %.1f seconds", self._idle_timeout)
+                idle_timeout = self._idle_timeout
+                if idle_timeout is None:
+                    msg = await self.websocket.receive()
+                else:
                     try:
-                        await self.websocket.close()
-                    except Exception:
-                        logger.debug("Failed to close idle robot OpenPI websocket", exc_info=True)
-                    return
+                        msg = await asyncio.wait_for(
+                            self.websocket.receive(),
+                            timeout=idle_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.info("Robot OpenPI connection idle timeout after %.1f seconds", idle_timeout)
+                        try:
+                            await self.websocket.close()
+                        except Exception:
+                            logger.debug("Failed to close idle robot OpenPI websocket", exc_info=True)
+                        return
 
                 if msg.get("type") == "websocket.disconnect":
                     break
@@ -233,13 +261,12 @@ class RobotRealtimeConnection:
                                     session_id,
                                 )
                             self._current_session_id = session_id
-                            self._call_count = 0
 
-                        self._call_count += 1
+                        reset = self._mark_session_seen(session_id)
                         actions = await self.serving.infer(
                             obs,
                             session_id=session_id,
-                            reset=self._call_count <= 1,
+                            reset=reset,
                         )
                         await self.websocket.send_bytes(_pack(actions))
                 except Exception:

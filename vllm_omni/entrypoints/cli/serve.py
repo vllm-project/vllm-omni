@@ -899,6 +899,15 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Disable Cosmos3 text/video safety guardrails for this server.",
         )
+        omni_config_group.add_argument(
+            "--robot-openpi-idle-timeout",
+            type=_nonneg_finite_float,
+            default=30.0,
+            help=(
+                "Seconds the /v1/realtime/robot/openpi endpoint waits for the next request "
+                "before closing an idle WebSocket (default: 30). Set to 0 to disable the timeout."
+            ),
+        )
 
         # Enable diffusion pipeline profiling
         omni_config_group.add_argument(
@@ -983,6 +992,8 @@ def run_headless(args: TrackingNamespace) -> None:
 
     # Filter down to a dict of things explicitly requested by the user
     args_dict = args.get_explicit_kwargs_dict()
+    # This controls only the API-process WebSocket and is not a stage-engine option.
+    args_dict.pop("robot_openpi_idle_timeout", None)
 
     # ``--replica-id`` is deprecated and ignored — replica ids are
     # auto-assigned by ``OmniMasterServer`` so headless processes carry

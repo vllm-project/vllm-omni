@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import asyncio
 import json
 import threading
@@ -12,6 +15,7 @@ from starlette.testclient import TestClient
 
 from vllm_omni.entrypoints.openpi import connection as openpi_connection
 from vllm_omni.entrypoints.openpi import serving as openpi_serving
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -174,6 +178,22 @@ def test_create_policy_server_returns_none_without_policy_config():
     assert serving is None
 
 
+def test_legacy_policy_request_defaults_key_no_longer_controls_serving():
+    od_config = SimpleNamespace(
+        model_config={
+            "policy_server_config": {},
+            "policy_request_defaults": "malformed legacy value",
+        }
+    )
+
+    serving = openpi_serving.ServingRealtimeRobotOpenPI.create_policy_server(
+        engine_client=SimpleNamespace(get_diffusion_od_config=lambda: od_config),
+        model_name="generic-policy",
+    )
+
+    assert serving is not None
+
+
 def test_policy_server_config_allows_explicit_empty_config():
     serving = openpi_serving.ServingRealtimeRobotOpenPI(
         engine_client=_engine_with_policy_config(policy_config={}),
@@ -218,6 +238,44 @@ def test_build_request_uses_unique_engine_request_id_per_inference():
     assert request_a.request_id != request_b.request_id
 
 
+def test_build_request_clones_stage_defaults_before_protocol_fields():
+    default_params = OmniDiffusionSamplingParams(
+        extra_args={
+            "format_prompt_as_json": True,
+            "session_id": "configured-session-must-not-win",
+            "reset": False,
+            "nested": {"values": []},
+        }
+    )
+    od_config = SimpleNamespace(model_config={"policy_server_config": {}})
+    engine_client = SimpleNamespace(
+        get_diffusion_od_config=lambda: od_config,
+        default_sampling_params_list=[default_params],
+    )
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(
+        engine_client=engine_client,
+        model_name="custom-policy",
+    )
+
+    request_a = serving._build_request(
+        {"prompt": "pick up the object"},
+        session_id="wire-session",
+        reset=True,
+    )
+    request_b = serving._build_request(
+        {"prompt": "pick up the object"},
+        session_id="wire-session",
+        reset=False,
+    )
+
+    assert request_a.sampling_params.extra_args["format_prompt_as_json"] is True
+    assert request_a.sampling_params.extra_args["session_id"] == "wire-session"
+    assert request_a.sampling_params.extra_args["reset"] is True
+    request_a.sampling_params.extra_args["nested"]["values"].append("request-a")
+    assert request_b.sampling_params.extra_args["nested"] == {"values": []}
+    assert default_params.extra_args["nested"] == {"values": []}
+
+
 def test_infer_keeps_session_state_but_uses_unique_engine_request_ids():
     engine = RecordingEngine()
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
@@ -240,6 +298,29 @@ def test_infer_keeps_session_state_but_uses_unique_engine_request_ids():
     assert sampling_params_b.extra_args["session_id"] == "session-a"
     assert sampling_params_a.extra_args["reset"] is True
     assert sampling_params_b.extra_args["reset"] is False
+
+
+def test_infer_yields_event_loop_while_engine_is_running():
+    class DelayedEngine(RecordingEngine):
+        def generate(self, *, prompt, request_id, sampling_params_list):
+            async def _generate():
+                await asyncio.sleep(0.03)
+                yield SimpleNamespace(multimodal_output={"actions": [0.0]})
+
+            return _generate()
+
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=DelayedEngine())
+
+    async def run_test():
+        infer_task = asyncio.create_task(serving.infer({"prompt": "pick"}, session_id="session-a", reset=True))
+        ticks = 0
+        while not infer_task.done():
+            await asyncio.sleep(0.005)
+            ticks += 1
+        await infer_task
+        return ticks
+
+    assert asyncio.run(run_test()) >= 2
 
 
 def test_two_websocket_clients_without_session_id_do_not_conflict(monkeypatch):
