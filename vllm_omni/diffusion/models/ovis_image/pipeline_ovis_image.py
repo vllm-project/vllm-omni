@@ -489,6 +489,7 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMi
             Denoised latents
         """
         self.scheduler.set_begin_index(0)
+        self.transformer.do_true_cfg = do_true_cfg
 
         for i, t in enumerate(timesteps):
             if self.interrupt:
