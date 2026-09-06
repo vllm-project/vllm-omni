@@ -18,6 +18,7 @@ import types
 from unittest import mock
 
 import pytest
+from pytest_mock import MockerFixture
 
 from vllm_omni.engine import stage_init_utils
 from vllm_omni.engine.stage_init_utils import (
@@ -203,7 +204,7 @@ def test_build_vllm_config_fails_before_engine_config_on_mismatch():
     get_class.assert_not_called()
 
 
-def test_build_vllm_config_proceeds_on_consistent_layout():
+def test_build_vllm_config_proceeds_on_consistent_layout(mocker: MockerFixture) -> None:
     """The guard must not false-positive: a consistent single-GPU stage flows past
     it and reaches ``create_engine_config`` / ``Executor.get_class`` as usual."""
     stage = _stage(1, devices="1")
@@ -212,18 +213,30 @@ def test_build_vllm_config_proceeds_on_consistent_layout():
         model_config=types.SimpleNamespace(hf_config=types.SimpleNamespace()),
     )
     sentinel_executor = object()
-    with (
-        mock.patch.object(
-            stage_init_utils.OmniEngineArgs, "create_engine_config", return_value=fake_config
-        ) as create_engine_config,
-        mock.patch.object(stage_init_utils.Executor, "get_class", return_value=sentinel_executor),
-        mock.patch.object(stage_init_utils.OmniINCConfig, "maybe_upgrade", side_effect=lambda quant: quant),
-    ):
-        vllm_config, executor_class = build_vllm_config(
-            stage,
-            model="dummy-model",
-            engine_args_dict={"tensor_parallel_size": 1},
-        )
+    captured_api_process_config: dict[str, int] = {}
+
+    def capture_create_engine_config(engine_args, *args, **kwargs):
+        captured_api_process_config["count"] = engine_args._api_process_count
+        captured_api_process_config["rank"] = engine_args._api_process_rank
+        return fake_config
+
+    create_engine_config = mocker.patch.object(
+        stage_init_utils.OmniEngineArgs,
+        "create_engine_config",
+        autospec=True,
+        side_effect=capture_create_engine_config,
+    )
+    mocker.patch.object(stage_init_utils.Executor, "get_class", return_value=sentinel_executor)
+    mocker.patch.object(stage_init_utils.OmniINCConfig, "maybe_upgrade", side_effect=lambda quant: quant)
+
+    vllm_config, executor_class = build_vllm_config(
+        stage,
+        model="dummy-model",
+        engine_args_dict={"tensor_parallel_size": 1},
+        api_process_count=3,
+        api_process_rank=2,
+    )
     create_engine_config.assert_called_once()
     assert vllm_config is fake_config
     assert executor_class is sentinel_executor
+    assert captured_api_process_config == {"count": 3, "rank": 2}

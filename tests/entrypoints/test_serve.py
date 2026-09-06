@@ -6,16 +6,46 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
 
 import pytest
 from pytest_mock import MockerFixture
+from vllm.v1.engine.utils import EngineZmqAddresses
 
+from vllm_omni.engine.stage_engine_startup import StageReplicaResources
+from vllm_omni.engine.stage_runtime import MultiApiStageEngineLaunch
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand, run_headless
 from vllm_omni.entrypoints.utils import parse_stage_overrides
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@dataclass(frozen=True)
+class _FakeProcess:
+    sentinel: str
+    exitcode: int | None
+    name: str
+    pid: int
+
+
+@dataclass
+class _FakeProcessOwner:
+    processes: list[_FakeProcess]
+
+
+@dataclass
+class _FakeStageEngineArgs:
+    async_chunk: bool
+    enable_sleep_mode: bool
+
+
+@dataclass
+class _FakeStageConfig:
+    stage_id: int
+    engine_args: _FakeStageEngineArgs
 
 
 def test_serve_parser_accepts_no_async_chunk_and_marks_it_explicit() -> None:
@@ -33,6 +63,8 @@ def test_serve_parser_accepts_no_async_chunk_and_marks_it_explicit() -> None:
     explicit = args.get_explicit_kwargs_dict()
     assert args.get_explicit_kwargs_dict()
     assert not explicit["async_chunk"]
+    assert (args.api_server_count or 1) == 1
+    assert "api_server_count" not in explicit
 
 
 def test_serve_parser_accepts_strategy_config() -> None:
@@ -58,6 +90,214 @@ def test_serve_parser_accepts_deploy_config() -> None:
 
     assert args.deploy_config == "/tmp/deploy.yaml"
     assert args.get_explicit_kwargs_dict()["deploy_config"] == "/tmp/deploy.yaml"
+
+
+def test_tracking_namespace_is_picklable_for_spawned_api_workers() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--api-server-count", "2"])
+    args._omni_stage_client_configs = [{"stage_addresses": {0: {0: {"input_address": "ipc://input"}}}}]
+
+    restored = ForkingPickler.loads(ForkingPickler.dumps(args))
+
+    assert restored.api_server_count == 2
+    assert restored.get_explicit_kwargs_dict()["api_server_count"] == 2
+    assert restored._omni_stage_client_configs == args._omni_stage_client_configs
+
+
+def test_serve_validate_rejects_multiple_api_servers_for_diffusion(mocker: MockerFixture) -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    cmd = OmniServeCommand()
+    cmd.subparser_init(subparsers)
+    args = parser.parse_args(["serve", "fake-diffusion-model", "--omni", "--api-server-count", "2"])
+
+    mocker.patch("vllm_omni.diffusion.utils.hf_utils.is_diffusion_model", return_value=True)
+    validate = mocker.patch("vllm_omni.entrypoints.cli.serve.validate_parsed_serve_args")
+
+    with pytest.raises(ValueError, match="not supported for diffusion"):
+        cmd.validate(args)
+
+    validate.assert_not_called()
+
+
+def test_serve_validate_rejects_sleep_mode_with_multiple_api_servers(mocker: MockerFixture) -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    cmd = OmniServeCommand()
+    cmd.subparser_init(subparsers)
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--api-server-count", "2", "--enable-sleep-mode"])
+
+    mocker.patch("vllm_omni.diffusion.utils.hf_utils.is_diffusion_model", return_value=False)
+    mocker.patch("vllm_omni.entrypoints.cli.serve.validate_parsed_serve_args")
+
+    with pytest.raises(ValueError, match="enable-sleep-mode"):
+        cmd.validate(args)
+
+
+def test_build_multi_api_stage_runtime_matches_current_constructor(mocker: MockerFixture) -> None:
+    from vllm_omni.entrypoints.cli import serve as serve_module
+
+    args = TrackingNamespace(
+        argparse.Namespace(
+            model="dummy-model",
+            model_tag=None,
+            stage_init_timeout=1,
+            tokenizer=None,
+            disable_log_stats=False,
+        ),
+        frozenset({"model"}),
+    )
+    stage_config = _FakeStageConfig(
+        stage_id=0,
+        engine_args=_FakeStageEngineArgs(async_chunk=False, enable_sleep_mode=False),
+    )
+    mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", return_value="dummy-model")
+    mocker.patch(
+        "vllm_omni.config.config_factory.with_trust_remote_code_override",
+        side_effect=lambda kwargs, _trust: kwargs,
+    )
+    mocker.patch("vllm_omni.entrypoints.utils.parse_stage_overrides", return_value={})
+    mocker.patch(
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
+        return_value=("dummy-config", [stage_config], None),
+    )
+
+    runtime = serve_module._build_multi_api_stage_runtime(args, 2)
+
+    assert runtime._client_count == 1
+    assert runtime._client_index == 0
+
+
+def test_build_multi_api_stage_runtime_rejects_sleep_enabled_in_stage_config(mocker: MockerFixture) -> None:
+    from vllm_omni.entrypoints.cli import serve as serve_module
+
+    args = TrackingNamespace(
+        argparse.Namespace(
+            model="dummy-model",
+            model_tag=None,
+            stage_init_timeout=1,
+            tokenizer=None,
+            disable_log_stats=False,
+        ),
+        frozenset({"model"}),
+    )
+    stage_config = _FakeStageConfig(
+        stage_id=3,
+        engine_args=_FakeStageEngineArgs(async_chunk=False, enable_sleep_mode=True),
+    )
+    mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", return_value="dummy-model")
+    mocker.patch(
+        "vllm_omni.config.config_factory.with_trust_remote_code_override",
+        side_effect=lambda kwargs, _trust: kwargs,
+    )
+    mocker.patch("vllm_omni.entrypoints.utils.parse_stage_overrides", return_value={})
+    mocker.patch(
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
+        return_value=("dummy-config", [stage_config], None),
+    )
+
+    with pytest.raises(ValueError, match=r"sleep mode.*stage\(s\) \[3\]"):
+        serve_module._build_multi_api_stage_runtime(args, 2)
+
+
+def test_run_multi_api_server_omni_starts_workers_after_shared_engine_launch(mocker: MockerFixture) -> None:
+    from vllm_omni.entrypoints.cli import serve as serve_module
+
+    args = TrackingNamespace(
+        argparse.Namespace(api_server_count=2, shutdown_timeout=1),
+        frozenset({"api_server_count", "shutdown_timeout"}),
+    )
+    socket = mocker.Mock()
+    primary_addresses = EngineZmqAddresses(
+        inputs=["ipc://input-0", "ipc://input-1"],
+        outputs=["ipc://output-0", "ipc://output-1"],
+    )
+    engine_launch = MultiApiStageEngineLaunch(
+        client_configs=[{"client_count": 2, "client_index": index, "stage_addresses": {}} for index in range(2)],
+        resources=[StageReplicaResources(addresses=primary_addresses)],
+    )
+    runtime = mocker.MagicMock()
+    runtime.launch_stage_engines.return_value.__enter__.return_value = engine_launch
+    runtime.launch_stage_engines.return_value.__exit__.return_value = False
+
+    manager = mocker.Mock()
+    manager.processes = [mocker.Mock()]
+    manager.gather_actual_addresses.return_value = (primary_addresses.inputs, primary_addresses.outputs)
+
+    mocker.patch.object(serve_module, "_build_multi_api_stage_runtime", return_value=runtime)
+    mocker.patch.object(serve_module, "_wait_for_multi_api_server_completion")
+    mocker.patch("signal.signal")
+    mocker.patch("vllm.entrypoints.openai.api_server.setup_server", return_value=("127.0.0.1:8000", socket))
+    mocker.patch("vllm.v1.metrics.prometheus.setup_multiprocess_prometheus")
+    start_manager = mocker.patch.object(serve_module, "_start_api_server_process_manager", return_value=manager)
+
+    serve_module.run_multi_api_server_omni(args)
+
+    assert args._omni_stage_client_configs is engine_launch.client_configs
+    start_manager.assert_called_once()
+    manager_kwargs = start_manager.call_args.kwargs
+    assert manager_kwargs["cleanup_timeout"] == 1
+    assert manager_kwargs["num_servers"] == 2
+    assert manager_kwargs["input_addresses"] == ["ipc://input-0", "ipc://input-1"]
+    assert manager_kwargs["target_server_fn"] is serve_module.run_omni_api_server_worker_proc
+    assert engine_launch.watched_frontend_processes == manager.processes
+    runtime.shutdown.assert_called_once_with()
+    socket.close.assert_called_once_with()
+
+
+def test_start_api_server_process_manager_cleans_up_partial_start(mocker: MockerFixture) -> None:
+    from vllm_omni.entrypoints.cli import serve as serve_module
+
+    first_process = mocker.Mock(name="first_process")
+    second_process = mocker.Mock(name="second_process")
+    first_process.pid = 1234
+    second_process.pid = None
+    second_process.start.side_effect = RuntimeError("spawn failed")
+    parent_pipes = [mocker.Mock(name="parent_pipe_0"), mocker.Mock(name="parent_pipe_1")]
+    child_pipes = [mocker.Mock(name="child_pipe_0"), mocker.Mock(name="child_pipe_1")]
+    spawn_context = mocker.Mock()
+    spawn_context.Process.side_effect = [first_process, second_process]
+    spawn_context.Pipe.side_effect = list(zip(parent_pipes, child_pipes))
+    mocker.patch("vllm.v1.utils.multiprocessing.get_context", return_value=spawn_context)
+    shutdown = mocker.patch("vllm.v1.utils.shutdown")
+
+    with pytest.raises(RuntimeError, match="spawn failed"):
+        serve_module._start_api_server_process_manager(
+            cleanup_timeout=1.5,
+            listen_address="127.0.0.1:8000",
+            sock=mocker.Mock(),
+            args=argparse.Namespace(),
+            num_servers=2,
+            input_addresses=["ipc://input-0", "ipc://input-1"],
+            output_addresses=["ipc://output-0", "ipc://output-1"],
+            target_server_fn=mocker.Mock(),
+        )
+
+    first_process.start.assert_called_once_with()
+    second_process.start.assert_called_once_with()
+    for pipe in parent_pipes:
+        pipe.close.assert_called_once_with()
+    shutdown.assert_called_once_with([first_process], timeout=1.5)
+
+
+def test_wait_for_multi_api_server_completion_rejects_engine_failure(
+    mocker: MockerFixture,
+) -> None:
+    from vllm_omni.entrypoints.cli import serve as serve_module
+
+    api_process = _FakeProcess(sentinel="api-0", exitcode=None, name="api-0", pid=10)
+    engine_process = _FakeProcess(sentinel="engine-0", exitcode=4, name="engine-0", pid=20)
+    manager = _FakeProcessOwner(processes=[api_process])
+    engine_launch = MultiApiStageEngineLaunch(
+        client_configs=[],
+        resources=[StageReplicaResources(manager=_FakeProcessOwner(processes=[engine_process]))],
+    )
+    mocker.patch("multiprocessing.connection.wait", return_value=["engine-0"])
+
+    with pytest.raises(RuntimeError, match=r"Shared stage engine process engine-0 .* exited with code 4"):
+        serve_module._wait_for_multi_api_server_completion(manager, engine_launch)
 
 
 def test_serve_parser_rejects_stage_configs_path() -> None:

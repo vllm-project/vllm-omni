@@ -89,6 +89,13 @@ This document owns offline API semantics, CLI and serve composition,
 supported OpenAI-compatible routes, request validation and normalization,
 response conversion, streaming/session behavior, and engine handoff.
 
+When `--api-server-count` is greater than one, the serve composition root
+starts the frontend process manager while a parent-owned `StageRuntime`
+launches the shared local stage engines. Each frontend receives only its own
+stage-client channel configuration and does not launch or retire backend
+processes. CLI validation rejects unsupported distributed, diffusion,
+fault-tolerant, elastic-EP, Ray, and runtime-LoRA combinations before startup.
+
 It does not own configuration precedence, cross-stage routing, stage
 placement, payload implementation, or semantic error classification.
 `entrypoints/openai/errors.py` is an explicit primary-path exception owned by
@@ -136,6 +143,9 @@ stage so `wake_up(stage_ids=[0])` does not skip a later `wake_up(stage_ids=[1])`
 Streaming input pumps take an admission slot immediately before each EngineCore
 ADD or update, not while waiting for the next client chunk. Frontend abort
 keeps `request_states` until `generate()` consumes the terminal output.
+Multi-API serving must preserve one client rank and one channel set per
+frontend, include every frontend in readiness/failure observation, and keep
+stage lifecycle ownership in the parent composition root.
 
 ## Promotion gate
 

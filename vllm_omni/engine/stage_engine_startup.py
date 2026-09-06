@@ -13,6 +13,7 @@ import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from multiprocessing import connection
+from multiprocessing.process import BaseProcess
 from types import SimpleNamespace
 from typing import Any
 
@@ -1134,6 +1135,8 @@ def launch_stage_replica(
     stage_visible_devices: str | None = None,
     spawn_device_lock: threading.Lock | None = None,
     omni_parallel_stage_init: bool = False,
+    num_api_servers: int = 1,
+    watched_frontend_processes: list[BaseProcess] | None = None,
 ) -> Iterator[StageReplicaResources]:
     """Launch a local LLM stage replica.
 
@@ -1144,6 +1147,8 @@ def launch_stage_replica(
     keep the same returned resource bundle.
     """
     if omni_master_server is not None:
+        if num_api_servers != 1:
+            raise ValueError("Multiple API servers are not supported with distributed stage launch")
         with _launch_omni_core_engines(
             vllm_config=vllm_config,
             executor_class=executor_class,
@@ -1169,7 +1174,16 @@ def launch_stage_replica(
 
     from vllm_omni.engine.stage_engine_core_proc_manager import StageEngineCoreProcManager
 
-    addresses = get_engine_zmq_addresses(vllm_config)
+    if num_api_servers > 1:
+        # Multi-API Omni is intentionally local-only. IPC paths avoid the
+        # bind-after-allocation race of tcp://host:0 and are stable for every
+        # stage, including stages that are not used by APIServerProcessManager.
+        addresses = EngineZmqAddresses(
+            inputs=[get_open_zmq_ipc_path() for _ in range(num_api_servers)],
+            outputs=[get_open_zmq_ipc_path() for _ in range(num_api_servers)],
+        )
+    else:
+        addresses = get_engine_zmq_addresses(vllm_config)
     handshake_address = get_open_zmq_ipc_path()
     engines_to_handshake = [CoreEngine(index=0, local=True)]
     with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock, stage_id=stage_id, replica_id=replica_id):
@@ -1193,18 +1207,21 @@ def launch_stage_replica(
             manager=engine_manager,
             addresses=addresses,
         )
+        engine_launch = CoreEngineLaunch(
+            engine_manager=engine_manager,
+            coordinator=None,
+            addresses=addresses,
+            tensor_queue=None,
+        )
+        if watched_frontend_processes is not None:
+            engine_launch.watched_frontend_processes = watched_frontend_processes
         wait_for_engine_startup(
             handshake_socket,
             engines_to_handshake,
             vllm_config.parallel_config,
             False,  # coordinated_dp
             vllm_config.cache_config,
-            CoreEngineLaunch(
-                engine_manager=engine_manager,
-                coordinator=None,
-                addresses=addresses,
-                tensor_queue=None,
-            ),
+            engine_launch,
         )
 
 

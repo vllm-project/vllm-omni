@@ -180,6 +180,9 @@ class OmniBase(PDDisaggregationMixin):
         stage_init_timeout = kwargs.pop("stage_init_timeout", 300)
         init_timeout = kwargs.pop("init_timeout", 600)
         log_stats = kwargs.pop("log_stats", False)
+        # Frontend process scaling is handled by the CLI parent. It is not a
+        # stage engine argument and must not participate in stage config merge.
+        kwargs.pop("api_server_count", None)
         self._enable_ar_profiler = kwargs.pop("enable_ar_profiler", False)
         # NOTE: read-only lookup — must NOT pop. Popping here drops the key
         # before it reaches ``StageConfigFactory._create_legacy_from_registry``, so

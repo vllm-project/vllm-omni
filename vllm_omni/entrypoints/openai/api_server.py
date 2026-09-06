@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import asyncio
 import base64
+import copy
 import dataclasses
 import io
 import json
@@ -11,6 +12,8 @@ import os
 
 # Image generation API imports
 import random
+import signal
+import socket
 import tempfile
 import time
 import uuid
@@ -24,6 +27,7 @@ from typing import Annotated, Any, Literal, cast
 
 import httpx
 import numpy as np
+import uvloop
 import vllm.envs as envs
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -98,7 +102,7 @@ from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils import random_uuid
-from vllm.utils.system_utils import decorate_logs
+from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.endpoint_policy import (
@@ -106,6 +110,8 @@ from vllm_omni.config.endpoint_policy import (
     shutdown_unsupported_routes,
 )
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
+from vllm_omni.engine.stage_init_utils import set_death_signal
+from vllm_omni.engine.stage_runtime import OmniClientConfig
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.duplex.capability import should_enable_duplex_endpoint
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
@@ -579,7 +585,53 @@ async def omni_run_server(args, **uvicorn_kwargs) -> None:
     await omni_run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
 
 
-async def omni_run_server_worker(listen_address, sock, args, client_config=None, **uvicorn_kwargs) -> None:
+def run_omni_api_server_worker_proc(
+    listen_address: str,
+    sock: socket.socket,
+    args: TrackingNamespace,
+    client_config: dict[str, Any] | None = None,
+    **uvicorn_kwargs: object,
+) -> None:
+    """Entrypoint used by vLLM's API server process manager."""
+    set_death_signal(signal.SIGTERM)
+    manager_config = client_config or {}
+    client_index = int(manager_config.get("client_index", 0))
+    all_client_configs = getattr(args, "_omni_stage_client_configs", None)
+    if not all_client_configs or not 0 <= client_index < len(all_client_configs):
+        raise RuntimeError(f"Missing Omni stage client configuration for API server {client_index}")
+
+    omni_client_config: OmniClientConfig = copy.deepcopy(all_client_configs[client_index])
+    omni_client_config["client_count"] = int(manager_config.get("client_count", 1))
+    omni_client_config["client_index"] = client_index
+
+    stage_addresses = omni_client_config["stage_addresses"]
+    first_stage_id = min(stage_addresses)
+    first_replica_id = min(stage_addresses[first_stage_id])
+    first_addresses = stage_addresses[first_stage_id][first_replica_id]
+    for key in ("input_address", "output_address", "actual_address_pipe", "tensor_queue"):
+        if key in manager_config:
+            first_addresses[key] = manager_config[key]
+
+    set_process_title("APIServer", str(client_index))
+    decorate_logs("APIServer", skip_if_decorated=True)
+    uvloop.run(
+        omni_run_server_worker(
+            listen_address,
+            sock,
+            args,
+            client_config=omni_client_config,
+            **uvicorn_kwargs,
+        )
+    )
+
+
+async def omni_run_server_worker(
+    listen_address: str,
+    sock: socket.socket,
+    args: TrackingNamespace,
+    client_config: OmniClientConfig | None = None,
+    **uvicorn_kwargs: object,
+) -> None:
     """Run a single API server worker."""
 
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
@@ -695,6 +747,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
                 if scope["type"] == "http":
                     scope.setdefault("state", {})
                     scope["state"]["request_timestamp"] = time.time()
+
                 await self._inner(scope, receive, send)
 
         # Startup duplex warmup (duplex_session.warmup_frames in the deploy
@@ -753,7 +806,7 @@ async def build_async_omni(
     args: TrackingNamespace,
     *,
     disable_frontend_multiprocessing: bool | None = None,
-    client_config: dict[str, Any] | None = None,
+    client_config: OmniClientConfig | None = None,
 ) -> AsyncIterator[EngineClient]:
     """Build an AsyncOmni instance from command-line arguments.
 
@@ -784,6 +837,7 @@ async def build_async_omni(
     async with build_async_omni_from_stage_config(
         args,
         disable_frontend_multiprocessing=disable_frontend_multiprocessing,
+        client_config=client_config,
     ) as async_omni:
         yield async_omni
 
@@ -793,6 +847,7 @@ async def build_async_omni_from_stage_config(
     args: TrackingNamespace,
     *,
     disable_frontend_multiprocessing: bool = False,
+    client_config: OmniClientConfig | None = None,
 ) -> AsyncIterator[EngineClient]:
     """Create AsyncOmni from stage configuration.
 
@@ -847,6 +902,8 @@ async def build_async_omni_from_stage_config(
         kwargs = args.get_explicit_kwargs_dict()
         model = kwargs.pop("model", None) or args.model
         kwargs.setdefault("log_stats", not args.disable_log_stats)
+        if client_config is not None:
+            kwargs["client_config"] = client_config
         async_omni = AsyncOmni(model=model, **kwargs)
 
         # # Don't keep the dummy data in memory
@@ -1633,6 +1690,20 @@ async def list_voices(raw_request: Request):
     return JSONResponse(content={"voices": speakers, "uploaded_voices": uploaded_speakers})
 
 
+def _reject_process_local_mutation_with_multiple_api_workers(raw_request: Request, operation: str) -> None:
+    """Reject control-plane mutations that are not synchronized across API workers."""
+    args = getattr(raw_request.app.state, "args", None)
+    api_server_count = int(getattr(args, "api_server_count", 1) or 1)
+    if api_server_count > 1:
+        raise HTTPException(
+            status_code=HTTPStatus.CONFLICT.value,
+            detail=(
+                f"{operation} is not supported with --api-server-count > 1 because "
+                "the operation uses process-local frontend state"
+            ),
+        )
+
+
 @router.post(
     "/v1/audio/voices",
     responses={
@@ -1678,6 +1749,7 @@ async def upload_voice(
     Returns:
         JSON response with voice information
     """
+    _reject_process_local_mutation_with_multiple_api_workers(raw_request, "Runtime voice upload")
     handler = Omnispeech(raw_request)
     if handler is None:
         return _create_speech_error_json_response(
@@ -1743,6 +1815,7 @@ async def delete_voice(name: str, raw_request: Request):
     Returns:
         JSON response indicating success or failure
     """
+    _reject_process_local_mutation_with_multiple_api_workers(raw_request, "Runtime voice deletion")
     handler = Omnispeech(raw_request)
     if handler is None:
         return _create_speech_error_json_response(
@@ -3936,6 +4009,7 @@ class OmniWakeupRequest(BaseModel):
 
 @router.post("/v1/omni/sleep")
 async def omni_sleep(request: OmniSleepRequest, raw_request: Request):
+    _reject_process_local_mutation_with_multiple_api_workers(raw_request, "Sleep")
     engine_client = raw_request.app.state.engine_client
     sleeping_set = raw_request.app.state.sleeping_stages
     if not hasattr(engine_client, "sleep"):
@@ -3948,6 +4022,7 @@ async def omni_sleep(request: OmniSleepRequest, raw_request: Request):
 
 @router.post("/v1/omni/wakeup")
 async def omni_wakeup(request: OmniWakeupRequest, raw_request: Request):
+    _reject_process_local_mutation_with_multiple_api_workers(raw_request, "Wakeup")
     engine_client = raw_request.app.state.engine_client
     sleeping_set = raw_request.app.state.sleeping_stages
     if not any(sid in sleeping_set for sid in request.stage_ids):
