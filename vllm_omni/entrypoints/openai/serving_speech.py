@@ -62,6 +62,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     resolve_adapter,
     tts_entry_stage_archs,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.omnivoice import OmniVoiceAdapter
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     build_fish_text_only_prompt_ids,
@@ -417,6 +418,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             allowed_media_domains=allowed_media_domains,
         )
         instance._tts_model_type = "omnivoice"
+        # Set adapter to OmniVoice as it is currently the only diffusion TTS model
+        # Temporary assignment until https://github.com/vllm-project/vllm-omni/issues/4327 is completed
+        instance._adapter = OmniVoiceAdapter(SpeechServingContext(server=instance, engine_client=None))
         instance._is_tts = False
         # Diffusion-only instances don't have a TTS stage; set None so any
         # ``_is_tts_model()`` / ``_tts_stage`` access doesn't raise AttributeError.
@@ -3451,6 +3455,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if not request.input or not request.input.strip():
                 raise ValueError("Input text cannot be empty")
 
+            # Assume that this will follow the same adapter pattern
+            # once all RFC is implemented
+            validation_error = self._adapter.validate(request)
+            if validation_error is not None:
+                raise ValueError(validation_error)
+
             if request.ref_audio is not None:
                 fmt_err = self._validate_ref_audio_format(request.ref_audio)
                 if fmt_err:
@@ -3464,20 +3474,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise ValueError(err)
 
             request_id = f"speech-{random_uuid()}"
-            prompt: dict[str, Any] = {"input": request.input}
-            if request.ref_audio:
-                wav, sr, _ = await self._resolve_ref_audio(request.ref_audio)
-                prompt["ref_audio"] = (np.asarray(wav, dtype=np.float32), sr)
-            if request.ref_text:
-                prompt["ref_text"] = request.ref_text
-            if request.voice:
-                if request.voice in self.uploaded_speakers and not has_inline_ref_audio:
-                    prompt["voice_name"] = request.voice
-                    prompt["voice_created_at"] = self._voice_created_at(request.voice)
-            if request.language:
-                prompt["lang"] = request.language
-            if request.instructions:
-                prompt["instruct"] = request.instructions
+            prepared_request = await self._adapter.build(
+                request, sampling_params_list=[], has_inline_ref_audio=has_inline_ref_audio
+            )
+            prompt = prepared_request.prompt
 
             logger.info(
                 "Diffusion TTS speech request %s: voice_clone=%s",

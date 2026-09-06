@@ -12,6 +12,7 @@ import os
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 import pytest
+from openai import BadRequestError as OpenAIBadRequestError
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
@@ -141,6 +142,114 @@ class TestOmniVoiceVoiceCloning:
             "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
         }
         online_client.send_audio_speech_request(request_config)
+
+
+@pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
+class TestOmniVoiceInstructions:
+    """E2E tests for OmniVoice instructions."""
+
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_english_instruction(self, omni_server, openai_client) -> None:
+        """Test valid english instruction"""
+        request_config = {
+            "model": omni_server.model,
+            "input": get_prompt("text"),
+            "response_format": "wav",
+            "timeout": 180.0,
+            "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
+            "instructions": "female, young adult, australian accent",
+        }
+        openai_client.send_audio_speech_request(request_config)
+
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_chinese_instruction(self, omni_server, openai_client) -> None:
+        """Test valid chinese instruction"""
+        # TODO ask a native speaker to provide an input and validate this case
+        request_config = {
+            "model": omni_server.model,
+            "input": get_prompt("text"),
+            "response_format": "wav",
+            "timeout": 180.0,
+            "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
+            "instructions": "男，儿童",
+        }
+        openai_client.send_audio_speech_request(request_config)
+
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_free_form_instruction(self, omni_server, openai_client) -> None:
+        """Test free form instruction rejected"""
+        request_config = {
+            "model": omni_server.model,
+            "input": get_prompt("text"),
+            "response_format": "wav",
+            "timeout": 180.0,
+            "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
+            "instructions": "happy little scottish boy",
+        }
+
+        with pytest.raises(OpenAIBadRequestError, match="Unsupported instruct items found") as exc_info:
+            openai_client.send_audio_speech_request(request_config)
+
+        assert exc_info.value.status_code == 400
+
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_conflicting_instruction(self, omni_server, openai_client) -> None:
+        """Test conflicting instructs from the same category"""
+        request_config = {
+            "model": omni_server.model,
+            "input": get_prompt("text"),
+            "response_format": "wav",
+            "timeout": 180.0,
+            "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
+            "instructions": "male, teenager, middle-aged",
+        }
+
+        with pytest.raises(
+            OpenAIBadRequestError, match="Conflicting instruct items within the same category"
+        ) as exc_info:
+            openai_client.send_audio_speech_request(request_config)
+
+        assert exc_info.value.status_code == 400
+
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_non_existent_instruction_english(self, omni_server, openai_client) -> None:
+        """Test non existent instruct rejected"""
+        request_config = {
+            "model": omni_server.model,
+            "input": get_prompt("text"),
+            "response_format": "wav",
+            "timeout": 180.0,
+            "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
+            "instructions": "male, english accent",
+        }
+
+        with pytest.raises(OpenAIBadRequestError, match="Unsupported instruct items found") as exc_info:
+            openai_client.send_audio_speech_request(request_config)
+
+        assert exc_info.value.status_code == 400
+
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_non_existent_instruction_chinese(self, omni_server, openai_client) -> None:
+        """Test non existent instruct rejected"""
+        # TODO ask a native speaker to provide and validate this case
+        return
+
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_mixed_dialect_accent_instruction(self, omni_server, openai_client) -> None:
+        """Test conflicting chinese dialect and english accent is handled"""
+        request_config = {
+            "model": omni_server.model,
+            "input": get_prompt("text"),
+            "response_format": "wav",
+            "timeout": 180.0,
+            "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
+            "instructions": "male, american accent, 河南话",
+        }
+
+        with pytest.raises(OpenAIBadRequestError, match="Cannot mix Chinese dialect and English accent") as exc_info:
+            openai_client.send_audio_speech_request(request_config)
+
+        assert exc_info.value.status_code == 400
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
