@@ -134,21 +134,28 @@ def test_runner_rejects_rank_local_config_for_different_layers() -> None:
         runner.set_kv_cache_config(config)
 
 
-def test_worker_selects_its_rank_local_config() -> None:
+def test_worker_selects_its_rank_local_config(monkeypatch) -> None:
     worker = object.__new__(DiffusionWorker)
     worker.rank = 1
     worker.od_config = SimpleNamespace(num_gpus=2)
     worker.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=None),
         cache_config=SimpleNamespace(num_gpu_blocks=None),
+        kv_transfer_config=SimpleNamespace(kv_connector="MooncakeConnector", engine_id="dit-engine-1"),
     )
     worker._maybe_get_memory_pool_context = lambda _tag: nullcontext()
     worker.model_runner = SimpleNamespace(set_kv_cache_config=lambda config: setattr(worker, "installed", config))
     configs = [SimpleNamespace(num_blocks=4), SimpleNamespace(num_blocks=8)]
+    ensure_initialized = Mock()
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_kv.kv_connector.ensure_kv_transfer_initialized",
+        ensure_initialized,
+    )
 
     worker.set_kv_cache_configs(configs, 64)
 
     assert worker.installed is configs[1]
+    ensure_initialized.assert_called_once_with(worker.vllm_config, configs[1])
     assert worker.vllm_config.model_config.max_model_len == 64
     assert worker.vllm_config.cache_config.num_gpu_blocks == 8
     with pytest.raises(ValueError, match="rank count mismatch"):

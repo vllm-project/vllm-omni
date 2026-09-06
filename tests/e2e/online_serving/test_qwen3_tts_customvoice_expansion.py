@@ -140,6 +140,23 @@ def test_voice_003(omni_server, online_client) -> None:
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+def test_sample_rate_001(omni_server, online_client) -> None:
+    """The speech API resamples Qwen3-TTS output from native 24 kHz to 8 kHz."""
+    request_config = {
+        "model": omni_server.model,
+        "input": "This response should be encoded as eight kilohertz audio.",
+        "stream": False,
+        "response_format": "wav",
+        "sample_rate": 8000,
+        "task_type": "CustomVoice",
+        "voice": "vivian",
+    }
+
+    online_client.send_audio_speech_request(request_config)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_language_001(omni_server, online_client) -> None:
     """
     Test text input processing and audio output via OpenAI API.

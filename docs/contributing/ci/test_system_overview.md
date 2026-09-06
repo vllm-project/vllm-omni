@@ -136,7 +136,7 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
         <a href="test_writing_guide.md#l4-level-testing-full-functionality-performance-and-documentation-testing">L4</a><br>
         L4: Purpose, Test Content, Directory Location, Example
       </td>
-      <td>Nightly</td>
+      <td>Nightly / Days before Release<br>(additional GPU SKUs)</td>
       <td>GPU</td>
     </tr>
     <tr>
@@ -174,6 +174,15 @@ Before entering specific testing levels, the project establishes two common spec
 2. ***CI Failure Explanation ([CI Failures](./failures.md))***: This document archives and explains common failure patterns in the Continuous Integration (CI) pipeline, error log interpretation, and preliminary troubleshooting steps. It helps developers and testers quickly diagnose the causes of automated test failures, improving problem-solving efficiency.
 
 ## Notes
+
+### L4 cadence (nightly and pre-release)
+
+CUDA **L4** (`full_model`) jobs are defined once in [`.buildkite/cuda/test-nightly.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml). That file is reused at two cadences:
+
+- **Nightly:** scheduled `main` builds with `NIGHTLY=1` (and PR labels such as `nightly-test` / `omni-test`). Default fleet is typically H100.
+- **Pre-release:** the same L4 suite runs again on extra GPU SKUs before a release (for example B200 via `MIRROR_HW=b200`), so `full_model` coverage is not limited to the nightly machine type.
+
+How count-form `mirror_hardwares` and `MIRROR_HW` pick a SKU: [CI Settings](./ci_settings.md).
 
 ### L2 / L3 diff-aware CI (CUDA)
 

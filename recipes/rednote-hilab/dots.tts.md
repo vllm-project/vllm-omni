@@ -1,20 +1,19 @@
 # dots.tts
 
-> Offline continuous-AR TTS at 48 kHz (rednote-hilab)
+> Continuous-AR TTS at 48 kHz (rednote-hilab)
 
 ## Summary
 
 - Vendor: rednote-hilab
-- Model: `rednote-hilab/dots.tts-soar`
+- Model: `dots-studio/dots.tts-soar`
 - Task: Text-to-speech, zero-shot synthesis only
-- Mode: Offline end-to-end example only (not yet wired for online serving —
-  see [Known limitations](#known-limitations))
+- Mode: Offline inference and OpenAI-compatible online serving
 - Maintainer: Community
 
 ## When to use this recipe
 
 Use this recipe as a known-good starting point for running
-`rednote-hilab/dots.tts-soar` offline on vLLM-Omni on consumer-class GPUs.
+`dots-studio/dots.tts-soar` on vLLM-Omni on consumer-class GPUs.
 dots.tts is a ~1.7B-parameter continuous-AR TTS model (Qwen2.5-1.5B base LM
 + 344M DiT flow-matching head + 180M AudioVAE) that emits 48 kHz mono audio.
 It follows the same "vLLM-native base LM + side-path computation" pattern as
@@ -23,8 +22,8 @@ VoxCPM2 — single-stage pipeline
 loopback → AudioVAE (streaming decode)` — with a plain Qwen2 backbone
 instead of MiniCPM4, and no FSQ / residual-LM stage.
 
-This is an early integration (see [Known limitations](#known-limitations)
-below before depending on it for anything beyond offline experimentation).
+This is an early integration; review the [Known limitations](#known-limitations)
+before deploying it in production.
 
 ## References
 
@@ -32,6 +31,8 @@ below before depending on it for anything beyond offline experimentation).
   [`examples/offline_inference/text_to_speech/dots_tts/end2end.py`](../../examples/offline_inference/text_to_speech/dots_tts/end2end.py)
 - Example guide:
   [`examples/offline_inference/text_to_speech/README.md`](../../examples/offline_inference/text_to_speech/README.md#dotstts)
+- Online serving guide:
+  [`examples/online_serving/text_to_speech/README.md`](../../examples/online_serving/text_to_speech/README.md#dotstts)
 - Default deploy config:
   [`vllm_omni/deploy/dots_tts.yaml`](../../vllm_omni/deploy/dots_tts.yaml)
 - Talker / pipeline source:
@@ -73,7 +74,7 @@ release runs `enforce_eager: true`, so it doesn't apply today).
 
 ```bash
 python examples/offline_inference/text_to_speech/dots_tts/end2end.py \
-    --model rednote-hilab/dots.tts-soar \
+    --model dots-studio/dots.tts-soar \
     --text "Hello, this is a test of dots TTS running on vLLM Omni."
 ```
 
@@ -88,7 +89,7 @@ Pass `--deploy-config <path>` to override.
 
 ```bash
 python examples/offline_inference/text_to_speech/dots_tts/end2end.py \
-    --model rednote-hilab/dots.tts-soar \
+    --model dots-studio/dots.tts-soar \
     --text "Hello, this is a test of dots TTS running on vLLM Omni."
 ```
 
@@ -106,10 +107,29 @@ Whisper transcription of the output matched the input text with no
 dropped leading word (confirms the streaming-vocoder patch-boundary fix
 described in [Known limitations](#known-limitations)).
 
+**T2 — online text-only synthesis**:
+
+```bash
+vllm serve dots-studio/dots.tts-soar --omni --trust-remote-code --port 8091
+```
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello, this is a test of dots TTS online serving.",
+        "voice": "default",
+        "response_format": "wav"
+    }' --output output.wav
+```
+
+The endpoint also supports raw streaming audio with `stream=true`,
+`stream_format="audio"`, and `response_format="pcm"`.
+
 #### Notes
 
 - Output: 48 kHz mono WAV.
-- Checkpoints: `rednote-hilab/dots.tts-soar` is the validated default
+- Checkpoints: `dots-studio/dots.tts-soar` is the validated default
   used throughout this recipe. `rednote-hilab/dots.tts-base` shares the
   same architecture but is unvalidated in this repo. `rednote-hilab/dots.tts-mf`
   (MeanFlow, 2-4 step) is not supported — see below.
@@ -123,17 +143,11 @@ described in [Known limitations](#known-limitations)).
 
 ## Known limitations
 
-- **No online serving yet.** dots.tts is not registered in
-  `vllm_omni/entrypoints/openai/tts_adapters/` (the framework other TTS
-  models in this repo use for `/v1/audio/speech`), so `vllm serve
-  rednote-hilab/dots.tts-soar --omni` will start but the OpenAI-compatible
-  speech endpoint does not know how to build request params for it yet.
-  Offline `Omni()` (as used in `end2end.py`) is the only supported path
-  today.
 - **Voice cloning is not wired.** The CAM++ x-vector speaker encoder
   weights load and are exercised by `load_weights()`, but nothing in the
-  prompt builder consumes a reference audio yet — generation is zero-shot
-  only. `end2end.py` has no `--ref-audio`/`--ref-text` flags.
+  prompt builder consumes reference audio or a precomputed speaker embedding
+  yet. Both offline and online generation are text-only; `ref_audio`,
+  `ref_text`, named voices, and speaker embeddings are not supported.
 - **`dots.tts-mf` (MeanFlow, 2-4 step) checkpoint is not supported.** Only
   the fixed 10-step Euler DiT sampler used by `dots.tts-soar` /
   `dots.tts-base` is implemented.

@@ -989,6 +989,89 @@ class TestDimensionValidation:
         # Since expected_dims=3 but tensor has 4 dims, should return original
         assert result.shape == tensor_4d.shape
 
+    def test_auto_pad_calls_attention_mask_capability(self, monkeypatch):
+        from vllm_omni.diffusion.attention import selector
+        from vllm_omni.diffusion.distributed import parallel_state
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+        from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelSplitHook
+
+        class NoMaskBackend:
+            @classmethod
+            def supports_attention_mask(cls, attention_spec=None):
+                del attention_spec
+                return False
+
+            @staticmethod
+            def get_name():
+                return "NO_MASK_BACKEND"
+
+        monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(selector, "get_attn_backend_for_capability", lambda **kwargs: NoMaskBackend)
+
+        hook = SequenceParallelSplitHook(
+            metadata={},
+            config=SequenceParallelConfig(ulysses_degree=2, ring_degree=1),
+        )
+        tensor = torch.randn(1, 3, 8)
+
+        with pytest.raises(ValueError, match="does not support attention_mask"):
+            hook._shard_with_auto_pad(tensor, dim=1)
+
+    def test_auto_pad_allows_explicit_cudnn(self, monkeypatch):
+        from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, OmniDiffusionConfig
+        from vllm_omni.diffusion.distributed import parallel_state
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+        from vllm_omni.diffusion.forward_context import set_forward_context
+        from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelSplitHook
+
+        monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(parallel_state, "get_sequence_parallel_rank", lambda: 0)
+        monkeypatch.setattr(parallel_state, "get_ring_parallel_world_size", lambda: 1)
+
+        hook = SequenceParallelSplitHook(
+            metadata={},
+            config=SequenceParallelConfig(ulysses_degree=2, ring_degree=1),
+        )
+        tensor = torch.randn(1, 3, 8)
+        od_config = OmniDiffusionConfig(
+            model="test",
+            dtype=torch.float32,
+            diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="CUDNN_ATTN")),
+        )
+
+        with set_forward_context(omni_diffusion_config=od_config):
+            result = hook._shard_with_auto_pad(tensor, dim=1)
+
+        # seq_len=3 padded to 4, then sharded by world_size=2 → rank 0 gets 2.
+        assert result.shape == (1, 2, 8)
+
+    def test_auto_pad_rejects_explicit_flashinfer_cute_on_blackwell(self, monkeypatch):
+        from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, OmniDiffusionConfig
+        from vllm_omni.diffusion.distributed import parallel_state
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+        from vllm_omni.diffusion.forward_context import set_forward_context
+        from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelSplitHook
+
+        monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(parallel_state, "get_sequence_parallel_rank", lambda: 0)
+        monkeypatch.setattr(parallel_state, "get_ring_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 0))
+
+        hook = SequenceParallelSplitHook(
+            metadata={},
+            config=SequenceParallelConfig(ulysses_degree=2, ring_degree=1),
+        )
+        tensor = torch.randn(1, 3, 8)
+        od_config = OmniDiffusionConfig(
+            model="test",
+            dtype=torch.float32,
+            diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="FLASHINFER_ATTN")),
+        )
+
+        with set_forward_context(omni_diffusion_config=od_config):
+            with pytest.raises(ValueError, match="does not support attention_mask"):
+                hook._shard_with_auto_pad(tensor, dim=1)
+
 
 @pytest.mark.cpu
 class TestStrictModeSplitValidation:

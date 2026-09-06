@@ -161,8 +161,26 @@ def benchmark_params(request):
     }
 
 
+def _resolve_num_warmups(params: dict[str, Any], *, default: int) -> int:
+    value = params.get("num_warmups")
+    if value is None:
+        return default
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError("num_warmups must be a non-negative integer")
+    return value
+
+
 def assert_result(result, params, num_prompt) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
+    if params.get("dataset_name") == "omniinteract":
+        summary = result.get("omniinteract")
+        assert isinstance(summary, dict), "OmniInteract summary is missing"
+        assert (summary.get("total"), summary.get("success"), summary.get("failed")) == (
+            num_prompt,
+            num_prompt,
+            0,
+        ), "OmniInteract requests did not all succeed"
+        assert summary.get("artifacts_complete") is True, "OmniInteract artifacts are incomplete"
     baseline = params.get("baseline")
     hardware = result.get("Hardware")
     hardware_baseline = baseline.get(hardware) if isinstance(baseline, dict) and isinstance(hardware, str) else None
@@ -235,6 +253,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
         "baseline",
         "num_prompts",
         "max_concurrency",
+        "num_warmups",
         "task",
         "enabled",
         "eval_phase",
@@ -278,6 +297,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
             random_input_len=params.get("random_input_len"),
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
+            num_warmups=_resolve_num_warmups(params, default=2),
         )
         assert_result(result, params, num_prompt)
 
@@ -295,6 +315,6 @@ def test_performance_benchmark(omni_server, benchmark_params):
             random_input_len=params.get("random_input_len"),
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
-            num_warmups=max(2, int(concurrency)),
+            num_warmups=_resolve_num_warmups(params, default=max(2, int(concurrency))),
         )
         assert_result(result, params, num_prompt)
