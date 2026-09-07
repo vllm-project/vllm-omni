@@ -909,20 +909,33 @@ def scoped_spawn_device_env(
     *,
     stage_id: int | None = None,
     replica_id: int | None = None,
+    runtime_cfg: Any = None,
 ) -> Iterator[None]:
-    """Briefly scope device visibility while spawning a stage subprocess."""
-    with _scoped_replica_compile_cache_env(stage_id, replica_id):
-        if stage_visible_devices is None or spawn_device_lock is None:
-            yield
-            return
+    """Scope stage runtime and device env while spawning a subprocess.
 
+    ``os.environ`` is process-global, so stage runtime values and device
+    visibility share the spawn lock. The child captures them in ``proc.start``;
+    the parent environment is restored immediately afterwards.
+    """
+    scope_devices = stage_visible_devices is not None and spawn_device_lock is not None
+    scope_runtime = stage_id is not None
+    if not scope_devices and not scope_runtime:
+        yield
+        return
+
+    lock_context = spawn_device_lock if spawn_device_lock is not None else contextlib.nullcontext()
+    runtime_context = (
+        stage_init_utils.stage_runtime_env(stage_id, runtime_cfg) if stage_id is not None else contextlib.nullcontext()
+    )
+    with lock_context, runtime_context, _scoped_replica_compile_cache_env(stage_id, replica_id):
         device_control_env = current_omni_platform.device_control_env_var
-        with spawn_device_lock:
-            previous_visible_devices = os.environ.get(device_control_env)
-            try:
+        previous_visible_devices = os.environ.get(device_control_env) if scope_devices else None
+        try:
+            if scope_devices:
                 current_omni_platform.set_device_control_env_var(stage_visible_devices)
-                yield
-            finally:
+            yield
+        finally:
+            if scope_devices:
                 if previous_visible_devices is None:
                     current_omni_platform.unset_device_control_env_var()
                 else:
@@ -959,6 +972,14 @@ def _scoped_replica_compile_cache_env(stage_id: int | None, replica_id: int | No
                 os.environ.pop("VLLM_CACHE_ROOT", None)
             else:
                 os.environ["VLLM_CACHE_ROOT"] = previous
+
+
+def _get_stage_runtime_cfg(stage_config: Any) -> Any:
+    if stage_config is None:
+        return None
+    if hasattr(stage_config, "get"):
+        return stage_config.get("runtime")
+    return getattr(stage_config, "runtime", None)
 
 
 @contextlib.contextmanager
@@ -1055,7 +1076,11 @@ def _launch_omni_core_engines(
                 from vllm_omni.engine.stage_engine_core_proc_manager import StageEngineCoreProcManager
 
                 with scoped_spawn_device_env(
-                    stage_visible_devices, spawn_device_lock, stage_id=stage_id, replica_id=replica_id
+                    stage_visible_devices,
+                    spawn_device_lock,
+                    stage_id=stage_id,
+                    replica_id=replica_id,
+                    runtime_cfg=_get_stage_runtime_cfg(stage_config),
                 ):
                     local_engine_manager: CoreEngineProcManager = StageEngineCoreProcManager(
                         local_engine_count=local_engine_count,
@@ -1084,7 +1109,11 @@ def _launch_omni_core_engines(
                         "run with the omni coordinator."
                     )
                 with scoped_spawn_device_env(
-                    stage_visible_devices, spawn_device_lock, stage_id=stage_id, replica_id=replica_id
+                    stage_visible_devices,
+                    spawn_device_lock,
+                    stage_id=stage_id,
+                    replica_id=replica_id,
+                    runtime_cfg=_get_stage_runtime_cfg(stage_config),
                 ):
                     local_engine_manager = CoreEngineProcManager(
                         local_engine_count=local_engine_count,
@@ -1172,7 +1201,13 @@ def launch_stage_replica(
     addresses = get_engine_zmq_addresses(vllm_config)
     handshake_address = get_open_zmq_ipc_path()
     engines_to_handshake = [CoreEngine(index=0, local=True)]
-    with scoped_spawn_device_env(stage_visible_devices, spawn_device_lock, stage_id=stage_id, replica_id=replica_id):
+    with scoped_spawn_device_env(
+        stage_visible_devices,
+        spawn_device_lock,
+        stage_id=stage_id,
+        replica_id=replica_id,
+        runtime_cfg=_get_stage_runtime_cfg(stage_config),
+    ):
         engine_manager = StageEngineCoreProcManager(
             local_engine_count=1,
             start_index=0,
@@ -1481,8 +1516,9 @@ def launch_headless_replica_group(
         for rep_idx in range(omni_dp_size_local):
             # EngineCore and its workers inherit the environment present when
             # their manager process is spawned.
-            with stage_init_utils.stage_runtime_env(stage_id, runtime_cfg), replica_device_env(
-                stage_id, per_replica_devices[rep_idx]
+            with (
+                stage_init_utils.stage_runtime_env(stage_id, runtime_cfg),
+                replica_device_env(stage_id, per_replica_devices[rep_idx]),
             ):
                 managers.append(launch_one(rep_idx))
         wait_for_replicas(managers)

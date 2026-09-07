@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import socket
+import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -28,11 +29,29 @@ from vllm_omni.engine.stage_engine_startup import (
     _launch_omni_core_engines,
     connect_remote_diffusion_proc,
     connect_remote_engine_cores,
+    scoped_spawn_device_env,
 )
 from vllm_omni.engine.stage_init_utils import LogicalStageInitPlan, ReplicaInitPlan
 from vllm_omni.engine.stage_runtime import DistStageRuntime, StageRuntime
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_scoped_spawn_device_env_applies_and_restores_stage_runtime_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_key = "VLLM_OMNI_TEST_LOCAL_STAGE_ENV"
+    monkeypatch.setenv(env_key, "global")
+
+    with scoped_spawn_device_env(
+        None,
+        threading.Lock(),
+        stage_id=1,
+        runtime_cfg={"env": {env_key: "stage-1"}},
+    ):
+        assert os.environ[env_key] == "stage-1"
+
+    assert os.environ[env_key] == "global"
 
 
 def _make_stage_cfg(stage_id: int, stage_type: str = "llm"):
@@ -1456,7 +1475,13 @@ class TestConnectRemoteEngineCoresCoordinator:
 
 
 class TestLaunchOmniCoreEngines:
-    def test_registers_stage_once_and_reuses_handshake_for_all_local_engines(self, mocker: MockerFixture):
+    def test_registers_stage_once_and_reuses_handshake_for_all_local_engines(
+        self,
+        mocker: MockerFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        env_key = "VLLM_OMNI_TEST_LOCAL_STAGE_ENV"
+        monkeypatch.setenv(env_key, "global")
         parallel_config = mocker.Mock(
             data_parallel_size_local=2,
             data_parallel_size=4,
@@ -1469,8 +1494,17 @@ class TestLaunchOmniCoreEngines:
         omni_master_server.port = 26000
         omni_master_server.get_allocation.return_value = mocker.Mock(handshake_bind_address="tcp://127.0.0.1:26001")
 
-        stage_config = {"stage_id": 7, "stage_type": "llm"}
+        stage_config = SimpleNamespace(
+            stage_id=7,
+            stage_type="llm",
+            runtime={"env": {env_key: "stage-7"}},
+        )
         local_engine_manager = mocker.Mock()
+        observed_env: list[str | None] = []
+
+        def create_manager(**_kwargs):
+            observed_env.append(os.environ.get(env_key))
+            return local_engine_manager
 
         @contextmanager
         def fake_socket_ctx(*args, **kwargs):
@@ -1489,7 +1523,7 @@ class TestLaunchOmniCoreEngines:
         mocker.patch("vllm_omni.engine.stage_engine_startup.zmq_socket_ctx", return_value=fake_socket_ctx())
         mock_manager_cls = mocker.patch(
             "vllm_omni.engine.stage_engine_startup.CoreEngineProcManager",
-            return_value=local_engine_manager,
+            side_effect=create_manager,
         )
         mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup")
         with _launch_omni_core_engines(
@@ -1520,6 +1554,8 @@ class TestLaunchOmniCoreEngines:
         assert manager_kwargs["start_index"] == 3
         assert manager_kwargs["local_start_index"] == 0
         assert manager_kwargs["handshake_address"] == "tcp://127.0.0.1:26001"
+        assert observed_env == ["stage-7"]
+        assert os.environ[env_key] == "global"
 
     def test_registers_stage_with_coordinator_when_started(self, mocker: MockerFixture):
         parallel_config = mocker.Mock(
