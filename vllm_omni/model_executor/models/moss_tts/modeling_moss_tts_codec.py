@@ -61,7 +61,7 @@ class _MossCodecStreamSession:
         self._cudagraph_wrapper: CUDAGraphStreamingDecoderWrapper | None = None
         batch_sizes = sorted({int(size) for size in (graph_batch_sizes or []) if 0 < int(size) <= self._state_capacity})
         frame_sizes = sorted({int(size) for size in (graph_frame_sizes or []) if int(size) > 0})
-        scratch_capacity = max(batch_sizes, default=0) if self._device.type in ("cuda", "npu") else 0
+        scratch_capacity = max(batch_sizes, default=0) if self._device.type == "cuda" else 0
         self._total_state_capacity = self._state_capacity + scratch_capacity
         self._state_slot_ids = torch.arange(
             self._total_state_capacity,
@@ -189,7 +189,7 @@ class _MossCodecStreamSession:
             # of a gather+writeback. None for B>1 (general gather path). Opt out
             # via MOSS_CODEC_SLICE=0.
             slot0: int | None = None
-            if len(slots) == 1 and os.environ.get("MOSS_CODEC_SLICE", "1") != "0":
+            if self._device.type == "npu" and len(slots) == 1 and os.environ.get("MOSS_CODEC_SLICE", "1") != "0":
                 slot0 = int(slots[0])
             result = self._codec.decode_streaming_batch(
                 codes_step,
