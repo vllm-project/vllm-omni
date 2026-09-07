@@ -56,6 +56,7 @@ def test_custom_cache_dit_enablers_are_registered_explicitly():
         "Wan22TI2VPipeline": cd_model_specific.enable_cache_for_wan22,
         "Wan22VACEPipeline": cd_model_specific.enable_cache_for_wan22,
         "Wan22S2VPipeline": cd_model_specific.enable_cache_for_wan22_s2v,
+        "SkyReelsV2Pipeline": cd_model_specific.enable_cache_for_wan22,
         "Cosmos3OmniDiffusersPipeline": cd_model_specific.enable_cache_for_cosmos3,
         "Cosmos3OmniPipeline": cd_model_specific.enable_cache_for_cosmos3,
         "Krea2Pipeline": cd_model_specific.enable_cache_for_krea2,
@@ -81,6 +82,10 @@ def init_fake_tp_group(mocker):
 
 def test_wan22_vace_uses_wan22_custom_cache_dit_enabler():
     assert cd_backend.CUSTOM_DIT_ENABLERS["Wan22VACEPipeline"] is cd_model_specific.enable_cache_for_wan22
+
+
+def test_skyreels_v2_uses_wan22_custom_cache_dit_enabler():
+    assert cd_backend.CUSTOM_DIT_ENABLERS["SkyReelsV2Pipeline"] is cd_model_specific.enable_cache_for_wan22
 
 
 @pytest.mark.parametrize(

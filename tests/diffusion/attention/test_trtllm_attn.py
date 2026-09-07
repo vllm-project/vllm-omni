@@ -204,6 +204,7 @@ def test_mask_free_allowlist_gates_trtllm_default():
 
     assert meta("WanPipeline").attention_mask_free is True
     assert meta("WanVACEPipeline").attention_mask_free is True
+    assert meta("SkyReelsV2Pipeline").attention_mask_free is True
     assert meta("MiniMaxH3Pipeline").attention_mask_free is True
     assert meta("FluxPipeline").attention_mask_free is False
     assert meta(None).attention_mask_free is False

@@ -68,6 +68,11 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         attention_mask_free=True,
         final_output_type="video",
     ),
+    # Diffusers SkyReels V2 T2V is Wan-family DiT; same serving metadata as Wan T2V.
+    "SkyReelsV2Pipeline": DiffusionModelMetadata(
+        attention_mask_free=True,
+        final_output_type="video",
+    ),
     "WanImageToVideoPipeline": DiffusionModelMetadata(
         attention_mask_free=True,
         final_output_type="video",
