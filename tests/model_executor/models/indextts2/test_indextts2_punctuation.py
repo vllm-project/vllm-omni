@@ -3,10 +3,17 @@
 
 """Tests for IndexTTS-2 Chinese punctuation normalisation.
 
-This test suite validates that ``normalize_text()`` (added to
-``front.py``) correctly maps Chinese punctuation to ASCII equivalents
-before BPE encoding, matching the behaviour of the official
-index-tts-vllm inference pipeline.
+This test suite validates that the *production* ``normalize_text()`` in
+``vllm_omni/model_executor/models/indextts2/utils/front.py`` correctly
+maps Chinese punctuation to ASCII equivalents before BPE encoding,
+matching the behaviour of the official index-tts-vllm inference pipeline.
+
+The tests import the shipped implementation (``normalize_text``,
+``tokenize_by_CJK_char``, ``TextTokenizer``) rather than a hand-copied
+duplicate, so regressions in the production code -- such as a removed
+``TextTokenizer.__init__`` -- are caught here.  The
+``SentencePieceProcessor`` and vocab-file access needed to construct a
+real tokenizer are mocked; no model weights or GPU are required.
 
 The tests cover two scenarios:
 
@@ -27,190 +34,27 @@ The tests cover two scenarios:
     each segment within the limit.  No warning is emitted.
 
 Usage:
-    # Run as a standalone script (no external deps needed):
-    python tests/model_executor/models/indextts2/test_indextts2_punctuation.py
-
-    # Run with pytest (requires full vllm-omni environment):
     pytest tests/model_executor/models/indextts2/test_indextts2_punctuation.py -v
 """
 
 from __future__ import annotations
 
-import re
 import warnings
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-# ====================================================================
-# Copy of the relevant production code from front.py & common.py
-# ====================================================================
-# This copy lets us run the tests without loading the full vllm-omni
-# package (which requires `vllm`, `sentencepiece`, etc.).
-# The actual production code being tested lives in:
-#   vllm_omni/model_executor/models/indextts2/utils/front.py
-
-# ---- from common.py ----
-
-
-def tokenize_by_CJK_char(line: str, do_upper_case: bool = True) -> str:
-    """Tokenise CJK characters, separating each with a space."""
-    cjk_pattern = re.compile(
-        r"([\u1100-\u11ff\u2e80-\ua4cf\ua840-\uD7AF"
-        r"\uF900-\uFAFF\uFE30-\uFE4F\uFF65-\uFFDC"
-        r"\U00020000-\U0002FFFF])"
-    )
-    tokens = re.split(cjk_pattern, line)
-    processed_tokens: list[str] = []
-    for token in tokens:
-        if re.match(cjk_pattern, token):
-            processed_tokens.extend(list(token))
-        else:
-            processed_tokens.append(token)
-    processed = " ".join(processed_tokens)
-    if do_upper_case:
-        processed = processed.upper()
-    processed = re.sub(r"\s+", " ", processed)
-    return processed
-
-
-# ---- from front.py ----
-
-
-_CHAR_REP_MAP: dict[str, str] = {
-    "\u3002": ".",  # 。
-    "\uff01": "!",  # ！
-    "\uff1f": "?",  # ？
-    "\uff1a": ",",  # ：
-    "\uff1b": ",",  # ；
-    "\uff0c": ",",  # ，
-    "\u201c": "'",  # "
-    "\u201d": "'",  # "
-    "\u2018": "'",  # '
-    "\u2019": "'",  # '
-    "\uff08": "'",  # （
-    "\uff09": "'",  # ）
-    "\u300a": "'",  # 《
-    "\u300b": "'",  # 》
-    "\u3010": "'",  # 【
-    "\u3011": "'",  # 】
-    "\u2014": " ",  # —
-    "\uff5e": " ",  # ～
-    "\u00b7": "-",  # ·
-    "\u3001": ",",  # 、
-    "\n": " ",
-    ";": ",",
-    ":": ",",
-}
-
-_CHAR_REP_PATTERN = re.compile("|".join(re.escape(p) for p in _CHAR_REP_MAP.keys()))
-
-
-def normalize_text(text: str) -> str:
-    """Normalise Chinese punctuation to ASCII equivalents.
-
-    This is a lightweight replacement for the ``TextNormalizer`` used in
-    the official index-tts-vllm pipeline.  It strips Chinese punctuation
-    marks and replaces them with the ASCII tokens the BPE model was
-    trained on.
-    """
-    return _CHAR_REP_PATTERN.sub(lambda m: _CHAR_REP_MAP[m.group()], text)
-
-
-punctuation_marks_tokens: list[str] = [
-    ".",
-    "!",
-    "?",
-    "▁.",
-    "▁?",
-    "▁...",
-]
-
-
-def split_segments_by_token(
-    tokenized_str: list[str],
-    split_tokens: list[str],
-    max_text_tokens_per_segment: int,
-    quick_streaming_tokens: int = 0,
-) -> list[list[str]]:
-    """Split a token sequence into segments at recognised punctuation."""
-    if len(tokenized_str) == 0:
-        return []
-    segments: list[list[str]] = []
-    current_segment: list[str] = []
-    current_segment_tokens_len = 0
-    i = 0
-    while i < len(tokenized_str):
-        token = tokenized_str[i]
-        current_segment.append(token)
-        current_segment_tokens_len += 1
-        if not ("," in split_tokens or "▁," in split_tokens) and ("," in current_segment or "▁," in current_segment):
-            sub_segments = split_segments_by_token(
-                current_segment,
-                [",", "▁,"],
-                max_text_tokens_per_segment=max_text_tokens_per_segment,
-                quick_streaming_tokens=quick_streaming_tokens,
-            )
-        elif "-" not in split_tokens and "-" in current_segment:
-            sub_segments = split_segments_by_token(
-                current_segment,
-                ["-"],
-                max_text_tokens_per_segment=max_text_tokens_per_segment,
-                quick_streaming_tokens=quick_streaming_tokens,
-            )
-        elif current_segment_tokens_len <= max_text_tokens_per_segment:
-            if token in split_tokens and current_segment_tokens_len > 2:
-                if i < len(tokenized_str) - 1:
-                    if tokenized_str[i + 1] in ["'", "▁'"]:
-                        current_segment.append(tokenized_str[i + 1])
-                        i += 1
-                segments.append(current_segment)
-                current_segment = []
-                current_segment_tokens_len = 0
-            i += 1
-            continue
-        else:
-            sub_segments = []
-            for j in range(0, len(current_segment), max_text_tokens_per_segment):
-                if j + max_text_tokens_per_segment < len(current_segment):
-                    sub_segments.append(current_segment[j : j + max_text_tokens_per_segment])
-                else:
-                    sub_segments.append(current_segment[j:])
-            warnings.warn(
-                f"The tokens length of segment exceeds limit: {max_text_tokens_per_segment}, "
-                f"Tokens in segment: {current_segment}."
-                "Maybe unexpected behavior",
-                RuntimeWarning,
-            )
-        segments.extend(sub_segments)
-        current_segment = []
-        current_segment_tokens_len = 0
-        i += 1
-    if current_segment_tokens_len > 0:
-        assert current_segment_tokens_len <= max_text_tokens_per_segment
-        segments.append(current_segment)
-    merged_segments: list[list[str]] = []
-    total_token = 0
-    for segment in segments:
-        total_token += len(segment)
-        if len(segment) == 0:
-            continue
-        if len(merged_segments) == 0:
-            merged_segments.append(segment)
-        elif (
-            len(merged_segments[-1]) + len(segment) <= max_text_tokens_per_segment
-            and total_token > quick_streaming_tokens
-        ):
-            merged_segments[-1] = merged_segments[-1] + segment
-        elif len(merged_segments[-1]) + len(segment) <= max_text_tokens_per_segment / 2:
-            merged_segments[-1] = merged_segments[-1] + segment
-        else:
-            merged_segments.append(segment)
-    return merged_segments
-
-
-# ====================================================================
-# TESTS
-# ====================================================================
+# Import the *shipped* production code so the regression test covers the
+# implementation that is actually merged.  See review feedback on #5590:
+# hand-copied duplicates let all cases pass while the real TextTokenizer
+# cannot be constructed.
+from vllm_omni.model_executor.models.indextts2.utils.common import (
+    tokenize_by_CJK_char,
+)
+from vllm_omni.model_executor.models.indextts2.utils.front import (
+    TextTokenizer,
+    normalize_text,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -224,30 +68,31 @@ class TestNormalizeText:
     def test_all_chinese_punctuation_mapped(self):
         """Every entry in _CHAR_REP_MAP produces the expected output."""
         cases: dict[str, str] = {
-            "\u3002": ".",
-            "\uff01": "!",
-            "\uff1f": "?",
-            "\uff0c": ",",
-            "\uff1a": ",",
-            "\uff1b": ",",
-            "\u3001": ",",
-            "\u201c": "'",
-            "\u201d": "'",
-            "\u2018": "'",
-            "\u2019": "'",
-            "\uff08": "'",
-            "\uff09": "'",
-            "\u300a": "'",
-            "\u300b": "'",
-            "\u3010": "'",
-            "\u3011": "'",
-            "\u2014": " ",
-            "\uff5e": " ",
-            "\u00b7": "-",
+            "\u3002": ".",  # 。
+            "\uff01": "!",  # ！
+            "\uff1f": "?",  # ？
+            "\uff0c": ",",  # ，
+            "\uff1a": ",",  # ：
+            "\uff1b": ",",  # ；
+            "\u3001": ",",  # 、
+            "\u201c": "'",  # "
+            "\u201d": "'",  # "
+            "\u2018": "'",  # '
+            "\u2019": "'",  # '
+            "\uff08": "'",  # （
+            "\uff09": "'",  # ）
+            "\u300a": "'",  # 《
+            "\u300b": "'",  # 》
+            "\u3010": "'",  # 【
+            "\u3011": "'",  # 】
+            "\u2014": "-",  # —  (hyphen, not space, so split_segments_by_token
+            "\uff5e": "-",  # ～  can use its hyphen fallback on long inputs)
+            "\u00b7": "-",  # ·
         }
         for chinese, expected in cases.items():
             assert normalize_text(chinese) == expected, (
-                f"{chinese!r} (U+{ord(chinese):04X}) -> {expected!r}, got {normalize_text(chinese)!r}"
+                f"{chinese!r} (U+{ord(chinese):04X}) -> {expected!r}, "
+                f"got {normalize_text(chinese)!r}"
             )
 
     def test_newline_replaced_with_space(self):
@@ -258,24 +103,39 @@ class TestNormalizeText:
         assert normalize_text(text) == text
 
     def test_mixed_chinese_ascii(self):
-        assert normalize_text("你好，今天天气真好！你吃饭了吗？") == "你好,今天天气真好!你吃饭了吗?"
+        assert normalize_text("你好，今天天气真好！你吃饭了吗？") == (
+            "你好,今天天气真好!你吃饭了吗?"
+        )
 
     def test_empty_string(self):
         assert normalize_text("") == ""
 
     def test_no_cjk_punctuation_remains(self):
         """After normalisation, no original Chinese punctuation chars remain."""
-        text = "，。！？：；“”‘’（）【】《》——～·"
+        text = "，。！？：；""''（）【】《》——～·"
         result = normalize_text(text)
-        all_cjk_punc = "\u3002\uff01\uff1f\uff0c\u201c\u201d\u2018\u2019\u300a\u300b\u3010\u3011\u2014\uff5e\u00b7"
+        all_cjk_punc = (
+            "\u3002\uff01\uff1f\uff0c\u201c\u201d\u2018\u2019"
+            "\u300a\u300b\u3010\u3011\u2014\uff5e\u00b7"
+        )
         for ch in all_cjk_punc:
-            assert ch not in result, f"{ch!r} (U+{ord(ch):04X}) should have been replaced"
+            assert ch not in result, (
+                f"{ch!r} (U+{ord(ch):04X}) should have been replaced"
+            )
 
     def test_book_title_marks(self):
         assert normalize_text("《红楼梦》") == "'红楼梦'"
 
     def test_newlines_and_periods(self):
         assert normalize_text("第一行。\n第二行。") == "第一行. 第二行."
+
+    def test_em_dash_maps_to_hyphen_not_space(self):
+        """U+2014 (—) and U+FF5E (～) must map to '-' so that
+        ``split_segments_by_token`` can use its hyphen fallback on long
+        inputs.  Mapping them to a space removes the boundary (see review
+        feedback on #5590)."""
+        assert normalize_text("\u2014") == "-"
+        assert normalize_text("\uff5e") == "-"
 
 
 # ---- 2. Interaction with the CJK pre-tokenizer ----
@@ -303,21 +163,21 @@ class TestPunctuationMarksTokens:
     punctuation which *is* in the list."""
 
     def test_ascii_period_is_split_token(self):
-        assert "." in punctuation_marks_tokens
+        assert "." in TextTokenizer.punctuation_marks_tokens
 
     def test_chinese_period_not_split_token(self):
-        assert "。" not in punctuation_marks_tokens
+        assert "。" not in TextTokenizer.punctuation_marks_tokens
 
     def test_chinese_exclamation_not_split_token(self):
-        assert "！" not in punctuation_marks_tokens
+        assert "！" not in TextTokenizer.punctuation_marks_tokens
 
     def test_chinese_question_not_split_token(self):
-        assert "？" not in punctuation_marks_tokens
+        assert "？" not in TextTokenizer.punctuation_marks_tokens
 
     def test_normalize_maps_period_to_split_token(self):
         """After ``normalize_text``, the period ``。`` becomes ``.``
         which IS a recognised split token."""
-        assert normalize_text("。") in punctuation_marks_tokens
+        assert normalize_text("。") in TextTokenizer.punctuation_marks_tokens
 
 
 # ---- 4. Long text warnings ----
@@ -334,7 +194,9 @@ class TestLongTextWarning:
         and trigger a RuntimeWarning."""
         long_tokens: list[str] = list("hello" + "。world" * 121)
         with pytest.warns(RuntimeWarning, match="exceeds limit"):
-            split_segments_by_token(long_tokens, punctuation_marks_tokens, 120)
+            TextTokenizer.split_segments_by_token(
+                long_tokens, TextTokenizer.punctuation_marks_tokens, 120
+            )
 
     def test_ascii_period_no_warning(self):
         """The same sequence with ASCII periods (.) splits properly
@@ -342,23 +204,41 @@ class TestLongTextWarning:
         long_tokens: list[str] = list("hello" + ".world" * 121)
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            split_segments_by_token(long_tokens, punctuation_marks_tokens, 120)
-            assert not any("exceeds limit" in str(msg.message).lower() for msg in w), (
-                "ASCII periods should split fine without warning"
+            TextTokenizer.split_segments_by_token(
+                long_tokens, TextTokenizer.punctuation_marks_tokens, 120
             )
+            assert not any(
+                "exceeds limit" in str(msg.message).lower() for msg in w
+            ), "ASCII periods should split fine without warning"
 
     def test_normalized_text_no_warning(self):
         """After ``normalize_text``, ``。`` becomes ``.`` so the same
         long Chinese text splits correctly without warnings."""
-        # Same as chinese_period_triggers_warning but with
-        # the normalised input
         long_tokens: list[str] = list("hello" + ".world" * 121)
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            split_segments_by_token(long_tokens, punctuation_marks_tokens, 120)
-            assert not any("exceeds limit" in str(msg.message).lower() for msg in w), (
-                "Normalised (。→.) text should split fine"
+            TextTokenizer.split_segments_by_token(
+                long_tokens, TextTokenizer.punctuation_marks_tokens, 120
             )
+            assert not any(
+                "exceeds limit" in str(msg.message).lower() for msg in w
+            ), "Normalised (。→.) text should split fine"
+
+    def test_em_dash_long_text_uses_hyphen_fallback(self):
+        """A long token sequence containing '-' (the normalised form of
+        — and ～) splits on the hyphen fallback in
+        ``split_segments_by_token`` and does NOT warn, because '-' is
+        not in ``punctuation_marks_tokens`` and triggers the hyphen
+        sub-split branch."""
+        long_tokens: list[str] = list("hello" + "-world" * 121)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            TextTokenizer.split_segments_by_token(
+                long_tokens, TextTokenizer.punctuation_marks_tokens, 120
+            )
+            assert not any(
+                "exceeds limit" in str(msg.message).lower() for msg in w
+            ), "Hyphen (from —/～) should split via the hyphen fallback"
 
 
 # ---- 5. End-to-end pipeline simulation ----
@@ -373,7 +253,9 @@ class TestEndToEndPipeline:
             text = normalize_text(text)
         cjk_tok = tokenize_by_CJK_char(text)
         tokens = cjk_tok.split()
-        return split_segments_by_token(tokens, punctuation_marks_tokens, 120)
+        return TextTokenizer.split_segments_by_token(
+            tokens, TextTokenizer.punctuation_marks_tokens, 120
+        )
 
     def test_normalized_long_text_within_limit(self):
         """With normalisation enabled, a long Chinese text with ``。``
@@ -388,3 +270,88 @@ class TestEndToEndPipeline:
         text = "今天天气真好。" + "好" * 119 + "再见。"
         with pytest.warns(RuntimeWarning, match="exceeds limit"):
             self._simulate(text, use_normalize=False)
+
+
+# ---- 6. TextTokenizer construction & encode path ----
+
+
+class TestTextTokenizerConstruction:
+    """Regression tests for the shipped ``TextTokenizer`` class.
+
+    Review feedback on #5590: a previous revision deleted
+    ``TextTokenizer.__init__`` while ``IndexTTS2Tokenizer.__init__`` still
+    called ``TextTokenizer(vocab_file)``, so every tokenizer load raised
+    ``TypeError: TextTokenizer() takes no arguments``.  These tests
+    construct the real ``TextTokenizer`` (mocking only SentencePiece and
+    the vocab file) and assert that ``encode`` runs ``normalize_text`` on
+    its input before hitting the BPE model.
+    """
+
+    def test_init_sets_sp_model_and_pre_tokenizers(self, tmp_path):
+        vocab_file = tmp_path / "bpe.model"
+        vocab_file.write_text("dummy")  # exists() must pass
+
+        with patch(
+            "vllm_omni.model_executor.models.indextts2.utils.front."
+            "SentencePieceProcessor"
+        ) as mock_spp_cls:
+            tok = TextTokenizer(str(vocab_file))
+
+        assert tok.vocab_file == str(vocab_file)
+        assert mock_spp_cls.called  # SentencePieceProcessor(model_file=...)
+        assert tok.sp_model is mock_spp_cls.return_value
+        assert tok.pre_tokenizers == [tokenize_by_CJK_char]
+
+    def test_init_raises_when_vocab_file_missing(self, tmp_path):
+        missing = str(tmp_path / "does_not_exist.model")
+        with pytest.raises(ValueError, match="does not exist"):
+            TextTokenizer(missing)
+
+    def test_init_raises_when_vocab_file_none(self):
+        with pytest.raises(ValueError, match="vocab_file is None"):
+            TextTokenizer(None)
+
+    def test_encode_runs_normalize_text_before_bpe(self, tmp_path):
+        """``encode`` must normalise Chinese punctuation to ASCII before
+        handing the text to the SentencePiece BPE model, otherwise the
+        model mispronounces it (e.g. ``。`` read as ``哦``)."""
+        vocab_file = tmp_path / "bpe.model"
+        vocab_file.write_text("dummy")
+
+        with patch(
+            "vllm_omni.model_executor.models.indextts2.utils.front."
+            "SentencePieceProcessor"
+        ) as mock_spp_cls:
+            mock_sp = mock_spp_cls.return_value
+            mock_sp.Encode.return_value = [1, 2, 3]
+            tok = TextTokenizer(str(vocab_file))
+
+            tok.encode("你好。今天好吗？")
+
+        # The BPE model should have received the normalised (ASCII) text,
+        # not the raw Chinese punctuation.
+        assert mock_sp.Encode.called
+        sent_text = mock_sp.Encode.call_args.args[0]
+        assert "。" not in sent_text
+        assert "？" not in sent_text
+        assert "." in sent_text
+        assert "?" in sent_text
+
+    def test_encode_skips_normalize_for_single_char(self, tmp_path):
+        """The single-character fast path must not break; it delegates
+        directly to ``sp_model.Encode``."""
+        vocab_file = tmp_path / "bpe.model"
+        vocab_file.write_text("dummy")
+
+        with patch(
+            "vllm_omni.model_executor.models.indextts2.utils.front."
+            "SentencePieceProcessor"
+        ) as mock_spp_cls:
+            mock_sp = mock_spp_cls.return_value
+            mock_sp.Encode.return_value = [42]
+            tok = TextTokenizer(str(vocab_file))
+
+            result = tok.encode("A")
+
+        assert result == [42]
+        assert mock_sp.Encode.called

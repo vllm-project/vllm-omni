@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import re
+import os
 import warnings
 from typing import overload
 
+import regex as re
+from sentencepiece import SentencePieceProcessor
+
 from vllm_omni.model_executor.models.indextts2.utils.common import (
     de_tokenized_by_CJK_char,
+    tokenize_by_CJK_char,
 )
 
 # Chinese punctuation → ASCII punctuation mapping used by the official
@@ -32,8 +36,8 @@ _CHAR_REP_MAP = {
     "\u300b": "'",  # 》
     "\u3010": "'",  # 【
     "\u3011": "'",  # 】
-    "\u2014": " ",  # —
-    "\uff5e": " ",  # ～
+    "\u2014": "-",  # —
+    "\uff5e": "-",  # ～
     "\u00b7": "-",  # ·
     "\u3001": ",",  # 、
     "\n": " ",
@@ -58,6 +62,16 @@ def normalize_text(text: str) -> str:
 
 
 class TextTokenizer:
+    def __init__(self, vocab_file: str):
+        self.vocab_file = vocab_file
+
+        if self.vocab_file is None:
+            raise ValueError("vocab_file is None")
+        if not os.path.exists(self.vocab_file):
+            raise ValueError(f"vocab_file {self.vocab_file} does not exist")
+        self.sp_model = SentencePieceProcessor(model_file=self.vocab_file)
+        self.pre_tokenizers = [tokenize_by_CJK_char]
+
     @property
     def vocab_size(self):
         return self.sp_model.GetPieceSize()
