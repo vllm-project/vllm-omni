@@ -244,14 +244,22 @@ Notes:
 
 ## MiniMax-H3 adapter-declared schedules
 
-MiniMax-H3 supports two few-step mechanisms that must not be conflated:
+MiniMax-H3 counts `num_inference_steps` as denoising updates: requesting `8`
+produces eight updates using nine sigma boundaries, including the terminal zero.
+Earlier uniform-schedule requests counted boundaries instead; to reproduce an
+old N-point schedule, request N-1 steps. This also changes Turbo requests from
+`5`/`9` to `4`/`8`, preserving their sampling grids. Checkpoint-pinned and native
+LoRA schedules already count updates and are unchanged.
+
+MiniMax-H3 supports the following few-step mechanisms:
 
 - **Checkpoint-pinned schedule**: a merged release writes `base_schedule` into
   `model_index.json`. Requests must pass `num_inference_steps` as the interval
   count (for example `4` for `[1.0, 0.7, 0.4, 0.15, 0.0]`).
 - **Runtime Turbo LoRA**: each LightX2V Turbo artifact carries its own contract,
-  read from its filename. A four-step artifact requests five sigma points and an
-  eight-step one requests nine; the 768p retrains enforce `flow_shift=6` and the
+  read from its filename. A four-step artifact requests `num_inference_steps=4`
+  and an eight-step one requests `8`; the scheduler adds the terminal sigma
+  boundary. The 768p retrains enforce `flow_shift=6` and the
   544p artifacts `flow_shift=12`. `audio_flow_shift=3` across the family. A
   request that does not match the loaded artifact is rejected by name. Alpha
   comes from the artifact's metadata, or 8 when it declares none. `ref2v`

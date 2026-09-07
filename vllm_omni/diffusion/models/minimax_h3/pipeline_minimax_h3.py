@@ -842,17 +842,16 @@ class MiniMaxH3Pipeline(
     def _validate_turbo_sampling(self, sampling: Any, spec: TurboSpec) -> None:
         """Hold a request to the contract of the artifact that is loaded.
 
-        Sigma-point count and both flow shifts vary across the Turbo family, so
+        Denoiser count and both flow shifts vary across the Turbo family, so
         each is checked against the adapter's own spec rather than a single
         published configuration.
         """
 
         extra = sampling.extra_args or {}
-        sigma_points = sampling.num_inference_steps
-        if sigma_points != spec.sigma_points:
+        if sampling.num_inference_steps != spec.denoise_steps:
             raise OmniClientError(
                 f"{spec.filename} is a {spec.denoise_steps}-step artifact and requires "
-                f"num_inference_steps={spec.sigma_points} "
+                f"num_inference_steps={spec.denoise_steps} "
                 f"({spec.sigma_points} sigma points produce {spec.denoise_steps} denoiser evaluations)"
             )
         try:

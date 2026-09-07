@@ -77,10 +77,10 @@ def _make_branch(*, text_len: int, latent_t: int, latent_h: int, latent_w: int, 
     return branch, video_rows, audio_rows
 
 
-def _sigmas(num_points: int, shift: float) -> list[float]:
+def _sigmas(num_steps: int, shift: float) -> list[float]:
     from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
 
-    return minimax_h3_time_shift_sigmas(num_steps=num_points, shift_scale=shift)
+    return minimax_h3_time_shift_sigmas(num_steps=num_steps, shift_scale=shift)
 
 
 def _make_state(request_id: str, model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio):
@@ -117,15 +117,16 @@ def _step_pipeline(model, *, packed_batch_supported: bool = True):
     return pipeline
 
 
-def test_step_execution_matches_request_mode_denoise_loop():
+@pytest.mark.parametrize("num_steps", [1, 8, 50])
+def test_step_execution_matches_request_mode_denoise_loop(num_steps, mocker):
     """Stepping through the contract must reproduce the request-mode loop."""
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
     from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
 
-    model = _SegmentMeanModel()
+    model = mocker.Mock(wraps=_SegmentMeanModel())
     branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=5)
-    sigmas_video = _sigmas(6, 12.0)
-    sigmas_audio = _sigmas(6, 3.0)
+    sigmas_video = _sigmas(num_steps, 12.0)
+    sigmas_audio = _sigmas(num_steps, 3.0)
 
     reference_video, reference_audio = minimax_h3_denoise_loop(
         model=model,
@@ -138,6 +139,8 @@ def test_step_execution_matches_request_mode_denoise_loop():
         device=torch.device("cpu"),
     )
 
+    assert model.call_count == num_steps
+    model.reset_mock()
     pipeline = _step_pipeline(model)
     state = _make_state("req-0", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio)
     input_batch = SimpleNamespace(states=(state,))
@@ -148,7 +151,8 @@ def test_step_execution_matches_request_mode_denoise_loop():
         pipeline.step_scheduler(state, noise_pred)
         steps += 1
 
-    assert steps == len(sigmas_video) - 1
+    assert steps == num_steps
+    assert model.call_count == num_steps
     assert state.total_steps == steps
     torch.testing.assert_close(state.latents, reference_video)
     torch.testing.assert_close(state.extra[mod._STEP_AUDIO_ROWS], reference_audio)
