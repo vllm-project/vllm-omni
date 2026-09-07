@@ -12,6 +12,7 @@ also gives tests a small-config entry point.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 
@@ -64,6 +65,9 @@ class Magi2PreviewConfig:
     attention_gating: bool = True
     mhc: Magi2MHCConfig = field(default_factory=Magi2MHCConfig)
     moe: Magi2MoEConfig = field(default_factory=Magi2MoEConfig)
+    # Applied to dense attention/MLP and shared-expert linears; the
+    # routed-expert path stays unquantized (overlaps M2's kernel, #7085).
+    quant_config: Any | None = None
 
     @property
     def num_attention_heads(self) -> int:

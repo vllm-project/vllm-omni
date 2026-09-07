@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -20,6 +21,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .parallel import Magi2ParallelGroup, get_magi2_tp_group
+
+# Self-contained (no vLLM LinearBase) since Magi2GroupedLinear's flattened
+# weight layout and TP hooks don't fit ColumnParallelLinear/RowParallelLinear.
+# `quant_config` is duck typed (`get_name()`) to avoid a hard vLLM import.
+# Weight-only, dequantized before every matmul, so no real int8/fp8 GEMM
+# kernel is needed for correctness. NVFP4 isn't implemented: it needs a real
+# block-scaled kernel this scheme doesn't provide (separate path, see #7085).
+WEIGHT_DTYPE_BY_QUANT_METHOD: dict[str, torch.dtype] = {
+    "int8": torch.int8,
+    "fp8": torch.float8_e4m3fn,
+}
+
+
+def _quant_weight_dtype(quant_config: Any | None) -> torch.dtype | None:
+    if quant_config is None:
+        return None
+    get_name = getattr(quant_config, "get_name", None)
+    if not callable(get_name):
+        return None
+    return WEIGHT_DTYPE_BY_QUANT_METHOD.get(get_name())
 
 
 def swiglu7(
@@ -84,6 +105,7 @@ class Magi2GroupedLinear(nn.Module):
         parallel_mode: str | None = None,
         qkv_splits: tuple[int, int, int] | None = None,
         tp_group: Magi2ParallelGroup | None = None,
+        quant_config: Any | None = None,
     ) -> None:
         super().__init__()
         if parallel_mode not in (None, "column", "row"):
@@ -130,6 +152,9 @@ class Magi2GroupedLinear(nn.Module):
             if self.bias is not None and parallel_mode == "column":
                 self.bias.checkpoint_weight_transform = self.shard_checkpoint_bias
 
+        self.quant_config = quant_config
+        self._quantized_dtype: torch.dtype | None = None
+
     def _column_slices(self) -> tuple[tuple[int, int], ...]:
         splits = self.qkv_splits or (self.out_features,)
         offsets: list[tuple[int, int]] = []
@@ -175,12 +200,40 @@ class Magi2GroupedLinear(nn.Module):
         shards = [grouped[:, start:end] for start, end in self._column_slices()]
         return torch.cat(shards, dim=1).reshape(-1)
 
+    def maybe_quantize_(self) -> None:
+        """Quantize the loaded weight to per-expert, per-output-channel int8
+        or fp8, per ``quant_config.get_name()``. Call once, after checkpoint
+        loading; a no-op if already quantized or the method is unsupported.
+        """
+        weight_dtype = _quant_weight_dtype(self.quant_config)
+        if self._quantized_dtype is not None or weight_dtype is None:
+            return
+        with torch.no_grad():
+            grouped = self.weight.data.view(self.num_experts, self.local_out_features, self.local_in_features)
+            if weight_dtype == torch.int8:
+                scale = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
+                quantized = (grouped / scale).round().clamp(-127, 127).to(torch.int8)
+            else:
+                finfo = torch.finfo(weight_dtype)
+                scale = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / finfo.max
+                quantized = (grouped / scale).clamp(finfo.min, finfo.max).to(weight_dtype)
+        del self._parameters["weight"]
+        self.register_buffer("weight_quantized", quantized)
+        self.register_buffer("weight_scale", scale.to(torch.float32))
+        self.weight = None
+        self._quantized_dtype = weight_dtype
+
+    def _grouped_weight(self, compute_dtype: torch.dtype) -> torch.Tensor:
+        if self._quantized_dtype is not None:
+            return self.weight_quantized.to(compute_dtype) * self.weight_scale.to(compute_dtype)
+        return self.weight.view(self.num_experts, self.local_out_features, self.local_in_features)
+
     def forward(
         self,
         tensor: torch.Tensor,
         modality_dispatcher: ModalityDispatcher | None = None,
     ) -> torch.Tensor:
-        weight = self.weight.view(self.num_experts, self.local_out_features, self.local_in_features)
+        weight = self._grouped_weight(tensor.dtype)
         bias_features = self.local_out_features if self.parallel_mode == "column" else self.out_features
         bias = self.bias.view(self.num_experts, bias_features) if self.bias is not None else None
         linear_bias = None if self.parallel_mode == "row" else bias
@@ -210,6 +263,55 @@ class Magi2GroupedLinear(nn.Module):
         return output
 
 
+class QuantizedLinear(nn.Module):
+    """Drop-in replacement for a plain ``nn.Linear`` with a quantized weight.
+
+    Same scheme as ``Magi2GroupedLinear.maybe_quantize_``, for models built
+    out of ordinary ``nn.Linear``s rather than grouped linears -- e.g. the
+    stock HF ``Qwen3_5TextModel`` text encoder.
+    """
+
+    def __init__(self, linear: nn.Linear, weight_dtype: torch.dtype) -> None:
+        super().__init__()
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+        with torch.no_grad():
+            weight = linear.weight.data
+            if weight_dtype == torch.int8:
+                scale = weight.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
+                quantized = (weight / scale).round().clamp(-127, 127).to(torch.int8)
+            else:
+                finfo = torch.finfo(weight_dtype)
+                scale = weight.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / finfo.max
+                quantized = (weight / scale).clamp(finfo.min, finfo.max).to(weight_dtype)
+        self.register_buffer("weight_quantized", quantized)
+        self.register_buffer("weight_scale", scale.to(torch.float32))
+        self.bias = linear.bias
+
+    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+        weight = self.weight_quantized.to(tensor.dtype) * self.weight_scale.to(tensor.dtype)
+        return F.linear(tensor, weight, self.bias)
+
+
+def quantize_linear_modules_(module: nn.Module, quant_config: Any | None) -> int:
+    """Replace every plain ``nn.Linear`` child of ``module`` in place with a
+    ``QuantizedLinear``, per ``quant_config.get_name()``. Returns the number of
+    linears quantized; a no-op (returns 0) when ``quant_config`` names a
+    method this scheme doesn't support (see ``WEIGHT_DTYPE_BY_QUANT_METHOD``).
+    """
+    weight_dtype = _quant_weight_dtype(quant_config)
+    if weight_dtype is None:
+        return 0
+    count = 0
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear):
+            setattr(module, name, QuantizedLinear(child, weight_dtype))
+            count += 1
+        else:
+            count += quantize_linear_modules_(child, quant_config)
+    return count
+
+
 def make_grouped_linear(
     in_features: int,
     out_features: int,
@@ -219,6 +321,7 @@ def make_grouped_linear(
     dtype: torch.dtype | None = None,
     parallel_mode: str | None = None,
     qkv_splits: tuple[int, int, int] | None = None,
+    quant_config: Any | None = None,
 ) -> Magi2GroupedLinear:
     return Magi2GroupedLinear(
         in_features,
@@ -228,6 +331,7 @@ def make_grouped_linear(
         dtype=dtype,
         parallel_mode=parallel_mode,
         qkv_splits=qkv_splits,
+        quant_config=quant_config,
     )
 
 
@@ -431,7 +535,9 @@ __all__ = [
     "Magi2GroupedLinear",
     "ModalityDispatcher",
     "MultiModalityRMSNorm",
+    "QuantizedLinear",
     "make_grouped_linear",
+    "quantize_linear_modules_",
     "sinkhorn_knopp",
     "swiglu7",
 ]

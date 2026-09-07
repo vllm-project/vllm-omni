@@ -20,6 +20,8 @@ import torch.nn as nn
 from tokenizers import Regex, pre_tokenizers
 from transformers import AutoTokenizer
 
+from .layers import quantize_linear_modules_
+
 
 def _strip_empty(obj: Any) -> Any:
     if isinstance(obj, dict):
@@ -224,6 +226,7 @@ class Magi2Qwen35TextEncoder(nn.Module):
         max_length: int = 7000,
         skip_layer: int = 2,
         local_files_only: bool = True,
+        quant_config: Any | None = None,
     ) -> None:
         super().__init__()
         self.max_length = max_length
@@ -251,6 +254,8 @@ class Magi2Qwen35TextEncoder(nn.Module):
             local_files_only=local_files_only,
         )
         self.text_model.eval().requires_grad_(False)
+        # No-op when quant_config is None or unsupported; see layers.py.
+        quantize_linear_modules_(self.text_model, quant_config)
 
     def _tokenize(self, prompt: str, *, offsets: bool = False):
         return self.tokenizer(
