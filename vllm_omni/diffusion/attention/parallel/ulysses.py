@@ -14,7 +14,11 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
-from vllm_omni.diffusion.forward_context import get_ulysses_mode
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    get_ulysses_mode,
+    is_forward_context_available,
+)
 
 logger = init_logger(__name__)
 
@@ -142,7 +146,7 @@ def _ulysses_all_to_all_any_qkv(
 
     input_split_sizes = [s_local] * world_size
     output_split_sizes = seq_lens
-    s_global = int(sum(output_split_sizes))
+    s_global = sum(output_split_sizes)
 
     out = torch.empty((s_global, bsz, head_cnt_local, head_dim), device=x.device, dtype=x.dtype)
     dist.all_to_all_single(
@@ -177,7 +181,7 @@ def _ulysses_all_to_all_any_o(
         return x
 
     bsz, s_global, head_cnt_local, head_dim = x.shape
-    s_local = int(local_seq_len)
+    s_local = local_seq_len
 
     # (B, S_global, H_local, D) -> (S_global, B, H_local, D)
     x_t = x.permute(1, 0, 2, 3).contiguous()
@@ -277,6 +281,15 @@ class UlyssesParallelAttention:
     ):
         mode = get_ulysses_mode(default="strict")
         ulysses_world_size = self._sp_group.ulysses_world_size
+        gate_compress = None
+        if attn_metadata is not None:
+            candidate = attn_metadata.extra.get("gate_compress")
+            if isinstance(candidate, torch.Tensor):
+                if candidate.shape != query.shape:
+                    raise ValueError(
+                        f"gate_compress must match pre-Ulysses query shape, got {candidate.shape} vs {query.shape}"
+                    )
+                gate_compress = candidate
 
         # advanced_uaa pads non-divisible head counts before the Ulysses
         # all-to-all. This also holds in hybrid Ulysses+Ring: Q is derived
@@ -402,9 +415,22 @@ class UlyssesParallelAttention:
                     f"(got scatter_idx={self._scatter_idx}, gather_idx={self._gather_idx})."
                 )
 
-            local_seq_len = int(query.shape[1])
-            seq_lens = _all_gather_int(self._ulysses_pg, local_seq_len, device=query.device)
-            s_global = int(sum(seq_lens))
+            if is_forward_context_available() and get_forward_context().sp_rank_local_seq_lens_equal:
+                # auto_pad already made every rank's shard the same length, so
+                # the lengths are known without a collective. Keep local_seq_len
+                # as a SymInt (no int()) so torch.compile(dynamic=True) does not
+                # specialize on it, and skip the host sync + graph break that
+                # _all_gather_int would introduce in every attention call.
+                local_seq_len = query.shape[1]
+                seq_lens = [local_seq_len] * ulysses_world_size
+            else:
+                local_seq_len = int(query.shape[1])
+                seq_lens = _all_gather_int(
+                    self._ulysses_pg,
+                    local_seq_len,
+                    device=query.device,
+                )
+            s_global = sum(seq_lens)
 
             # In hybrid Ulysses+Ring, Ring attention uses P2P send/recv with fixed-shape
             # buffers. This requires all ring ranks to have the same seq_len after the
@@ -471,6 +497,16 @@ class UlyssesParallelAttention:
                 use_sync=self._use_sync,
                 padded_head_cnt=padded_kv_head_cnt,
             )
+            if gate_compress is not None:
+                # gate_compress mirrors the query layout, so it must follow the
+                # same GQA-derived head padding as the query all-to-all.
+                gate_compress, _ = _ulysses_all_to_all_any_qkv(
+                    self._ulysses_pg,
+                    gate_compress,
+                    seq_lens=seq_lens,
+                    use_sync=self._use_sync,
+                    padded_head_cnt=padded_query_head_cnt,
+                )
         else:
             # Strict mode: fail fast with actionable errors for head divisibility.
             for name, t in (("query", query), ("key", key), ("value", value)):
@@ -496,6 +532,8 @@ class UlyssesParallelAttention:
                 query = ulysses_qkv_fwd(query, group_name, ulysses_world_size)
                 key = ulysses_qkv_fwd(key, group_name, ulysses_world_size)
                 value = ulysses_qkv_fwd(value, group_name, ulysses_world_size)
+                if gate_compress is not None:
+                    gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
             else:
                 query = SeqAllToAll4D.apply(
                     self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync
@@ -504,6 +542,10 @@ class UlyssesParallelAttention:
                 value = SeqAllToAll4D.apply(
                     self._ulysses_pg, value, self._scatter_idx, self._gather_idx, self._use_sync
                 )
+                if gate_compress is not None:
+                    gate_compress = SeqAllToAll4D.apply(
+                        self._ulysses_pg, gate_compress, self._scatter_idx, self._gather_idx, self._use_sync
+                    )
             seq_lens = []
             local_seq_len = 0
             orig_head_cnt = 0
@@ -531,6 +573,12 @@ class UlyssesParallelAttention:
                 key = torch.cat([key, joint_tensor_key], dim=1)
                 value = torch.cat([value, joint_tensor_value], dim=1)
 
+        if gate_compress is not None and attn_metadata is not None:
+            # The VSA compression gate follows the same S<->H all-to-all as
+            # Q/K/V so every rank sees the full packed sequence for its local
+            # head shard, matching FastVideo's DistributedAttention_VSA.
+            attn_metadata.extra["gate_compress"] = gate_compress
+
         ctx = _UlyssesCtx(
             name=self.name,
             ulysses_pg=self._ulysses_pg,
@@ -540,8 +588,8 @@ class UlyssesParallelAttention:
             joint_len=joint_len,
             joint_strategy=joint_strategy,
             use_uaa=(mode == "advanced_uaa"),
-            uaa_seq_lens=tuple(int(x) for x in seq_lens) if mode == "advanced_uaa" else (),
-            uaa_local_seq_len=int(local_seq_len) if mode == "advanced_uaa" else 0,
+            uaa_seq_lens=tuple(seq_lens) if mode == "advanced_uaa" else (),
+            uaa_local_seq_len=local_seq_len if mode == "advanced_uaa" else 0,
             orig_head_cnt=int(orig_head_cnt) if mode == "advanced_uaa" else 0,
             joint_orig_head_cnt=int(joint_orig_head_cnt) if mode == "advanced_uaa" else 0,
         )
@@ -558,6 +606,7 @@ class UlyssesParallelAttention:
                     attn_metadata.attn_mask = None
                 else:
                     if attn_metadata.attn_mask is None:
+                        assert attn_metadata.joint_attn_mask is not None
                         attn_metadata.attn_mask = torch.ones(
                             [query.shape[0], query.shape[1] - attn_metadata.joint_attn_mask.shape[1]],
                             dtype=torch.bool,

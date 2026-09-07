@@ -76,6 +76,8 @@ def get_model_parametrization(model_name: str, test_info: DiffusionModelTestOpts
             test_info.supported_tasks,
             test_info.check_multi_output and test_group is None,
             test_info.check_determinism and test_group is None,
+            # The divergence check compares generated outputs, which only the offline test does.
+            *([] if online else [test_info.check_i2v_t2v_divergence]),
             id=f"{model_name}[{'+'.join(test_group)}]" if test_group else model_name,
             marks=get_test_group_marks(model_name, test_group, test_info.marks),
         )

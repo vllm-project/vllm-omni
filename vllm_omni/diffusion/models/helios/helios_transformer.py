@@ -445,6 +445,12 @@ class HeliosCrossAttention(nn.Module):
             num_kv_heads=self.num_heads,
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
+            # Text K/V is replicated on every SP rank, so Ulysses must not be
+            # used here: its all-to-all would treat the per-rank replicas as
+            # sequence shards and ws-fold duplicate the keys. Sharded Q over
+            # full replicated K/V is correct locally and needs no
+            # communication (same as Wan2.2 cross-attn).
+            skip_sequence_parallel=True,
         )
 
     def project_kv(self, encoder_hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -640,14 +646,10 @@ class HeliosTransformer3DModel(nn.Module):
         on non-divisible history components (which use different patch
         sizes and thus produce different token counts).
 
-        Padding is applied per-component rather than via the framework's
-        ``sp_original_seq_len`` / ``sp_padding_size`` path: those are a
-        single global value meant for whole-sequence splits and cannot
-        describe the scattered per-component padding here.  Padded tokens
-        are sliced off the current component before unpatchify (see the
-        forward slice) and discarded from history by ``norm_out`` before
-        ``proj_out``, so their unmasked attention contribution is bounded
-        (``<= ws - 1`` per component) and negligible.
+        Residual caveat: the replicated padding tokens attend unmasked
+        in attn1 on the last rank (at most ws-1 replicas per component).
+        The impact is bounded, but this is the first place to look if
+        odd resolutions ever show quality drift.
         """
         from vllm_omni.diffusion.distributed.parallel_state import (
             get_sequence_parallel_rank,

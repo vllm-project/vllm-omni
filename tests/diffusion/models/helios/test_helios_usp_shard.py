@@ -3,9 +3,13 @@
 """Unit tests for Helios per-component sequence splitting.
 
 These tests verify the manual sharding logic that replaces the broken
-rope/blocks.0 hooks in the Helios ``_sp_plan``.  The split helper is
-replicated here (rather than imported from the model) so that the tests
-run on a plain CPU without the full vllm_omni / vllm dependency stack.
+rope/blocks.0 hooks in the Helios ``_sp_plan``.  They exercise the *real*
+``HeliosTransformer3DModel._sp_split_seq`` (the parallel-state getters it
+imports lazily inside the method body are monkeypatched), so the model-side
+helper cannot drift silently from what is tested.  For the multi-rank
+mechanism around the helper (manual ``_sp_shard_depth`` bump, attn1/attn2
+parallel strategy, ws=2 vs ws=1 output equivalence) see
+``test_helios_usp_2rank.py``.
 
 Coverage:
   1. USP disabled (ws == 1) returns the tensor unchanged.
@@ -14,34 +18,42 @@ Coverage:
   4. Per-component split: history + current tokens are distributed so
      that *both* ranks receive some current tokens (no mosaic regression).
   5. Edge cases: 1-D tensor, empty seq, 4-D tensor.
-  6. Multi-component non-divisible history (RuixiangMa crash scenario).
 """
+
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import pytest
 import torch
 
+import vllm_omni.diffusion.distributed.parallel_state as sp_parallel_state
+from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
+
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
-# ---------------------------------------------------------------------------
-# Copy of HeliosTransformer3DModel._sp_split_seq.
-# Keep in sync with
-# vllm_omni/diffusion/models/helios/helios_transformer.py
-# ---------------------------------------------------------------------------
+
+@contextmanager
+def _fake_sp_state(ws: int, rank: int) -> Iterator[None]:
+    """Patch the parallel-state getters used by the real helper.
+
+    ``_sp_split_seq`` imports these names from the module *inside* its
+    function body, so replacing the module attributes takes effect.
+    """
+    prev_ws = sp_parallel_state.get_sequence_parallel_world_size
+    prev_rank = sp_parallel_state.get_sequence_parallel_rank
+    sp_parallel_state.get_sequence_parallel_world_size = lambda: ws
+    sp_parallel_state.get_sequence_parallel_rank = lambda: rank
+    try:
+        yield
+    finally:
+        sp_parallel_state.get_sequence_parallel_world_size = prev_ws
+        sp_parallel_state.get_sequence_parallel_rank = prev_rank
 
 
 def _sp_split_seq(x: torch.Tensor, ws: int, rank: int) -> torch.Tensor:
-    """Split tensor along sequence dim (dim=1) for Ulysses SP."""
-    if ws > 1 and x.dim() >= 2 and x.shape[1] > 0:
-        seq_len = x.shape[1]
-        remainder = seq_len % ws
-        if remainder != 0:
-            pad = ws - remainder
-            last = x[:, -1:, ...].expand(-1, pad, *([-1] * (x.dim() - 2)))
-            x = torch.cat([x, last], dim=1)
-            seq_len = x.shape[1]
-        n = seq_len // ws
-        x = x[:, rank * n : (rank + 1) * n, ...].contiguous()
-    return x
+    """Call the real model-side helper without constructing a model."""
+    with _fake_sp_state(ws, rank):
+        return HeliosTransformer3DModel._sp_split_seq(None, x)
 
 
 # ---------------------------------------------------------------------------
@@ -211,36 +223,3 @@ class TestSpSplitSeqEdgeCases:
         x = torch.randn(1, 20, 8, 32)
         out = _sp_split_seq(x, ws=2, rank=1)
         assert out.shape == (1, 10, 8, 32)
-
-
-class TestSpSplitSeqMultiComponentNonDivisible:
-    """History components use different patch sizes -> different seq lengths,
-    some non-divisible. Reproduces RuixiangMa's crash scenario: a non-divisible
-    history component must not crash and both ranks must still receive current.
-    """
-
-    def test_non_divisible_history_does_not_crash(self):
-        current = torch.randn(1, 540, 64)    # 540 % 2 == 0
-        history = torch.randn(1, 3825, 64)  # 3825 % 2 == 1 -> pad to 3826
-        for rank in range(2):
-            cur_local = _sp_split_seq(current, ws=2, rank=rank)
-            hist_local = _sp_split_seq(history, ws=2, rank=rank)
-            assert cur_local.shape[1] == 270           # current unaffected
-            assert hist_local.shape[1] == 1913          # (3825 + 1) / 2
-            assert cur_local.shape[1] > 0               # no mosaic regression
-
-    def test_different_history_sizes_all_split_without_crash(self):
-        # short / mid / long history use different patch sizes -> different
-        # sequence lengths, several non-divisible by ws=4.
-        histories = [
-            torch.randn(1, 800, 64),    # 800  % 4 == 0 -> 200 per rank
-            torch.randn(1, 3825, 64),   # 3825 % 4 == 1 -> pad 3 -> 957 per rank
-            torch.randn(1, 1001, 64),   # 1001 % 4 == 1 -> pad 3 -> 251 per rank
-        ]
-        for rank in range(4):
-            for hist in histories:
-                out = _sp_split_seq(hist, ws=4, rank=rank)
-                assert out.shape[1] > 0
-        assert _sp_split_seq(histories[0], ws=4, rank=0).shape[1] == 200
-        assert _sp_split_seq(histories[1], ws=4, rank=0).shape[1] == 957
-        assert _sp_split_seq(histories[2], ws=4, rank=0).shape[1] == 251
