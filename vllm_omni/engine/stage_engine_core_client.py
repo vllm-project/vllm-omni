@@ -403,6 +403,10 @@ class StageEngineCoreClientBase(StageClientBase):
                 # stage's model config (e.g. a talker whose engine positions
                 # must cover a speaker-prompt prefill).
                 extra_kwargs["next_stage_hf_config"] = self._stage_hf_config
+            if "stage_client" in signature.parameters:
+                # Let a processor reach the stage client (tokenizer, model
+                # config) when it opts in by keyword.
+                extra_kwargs["stage_client"] = self
             # Match the context parameter by name, including the
             # underscore-prefixed spelling some processors use (e.g.
             # MiniCPM-o's ``llm2tts(..., _streaming_context)``), so bridge

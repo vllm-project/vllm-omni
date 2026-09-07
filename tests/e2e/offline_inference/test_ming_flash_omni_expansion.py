@@ -46,7 +46,9 @@ def get_eager_config():
 
 
 test_params_thinker = [(m, c) for m in models for c in [get_eager_config_thinker()]]
-test_params = [(m, c) for m in models for c in [get_eager_config()]]
+# First-time flashinfer MoE kernel compilation for the thinker takes ~9 min,
+# well past the default stage-init timeout.
+test_params = [(m, c, {"stage_init_timeout": 1800, "init_timeout": 2400}) for m in models for c in [get_eager_config()]]
 
 
 @pytest.mark.slow

@@ -232,7 +232,8 @@ Override the default text per case with `--text`, write to a custom path with `-
 
 ### Notes
 - Talker-only deployment — for the multimodal Ming-flash-omni example, see [`examples/offline_inference/ming_flash_omni/`](../../ming_flash_omni/).
-- Deploy config: `vllm_omni/deploy/ming_flash_omni_tts.yaml` (single GPU, `enforce_eager`, `max_num_seqs: 1`).
+- Deploy config: `vllm_omni/deploy/ming_flash_omni_tts.yaml` (single-GPU native paged talker,
+  `enforce_eager: false`, `max_num_seqs: 4`).
 - Decode defaults from the Ming cookbook: `max_decode_steps=200`, `cfg=2.0`, `sigma=0.25`, `temperature=0.0`, `use_zero_spk_emb=True`.
 
 ---

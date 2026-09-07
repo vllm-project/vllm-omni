@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -13,6 +14,13 @@ import torch
 from vllm.inputs import TextPrompt
 
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
+    DEFAULT_MAX_TEXT_LENGTH,
+    resolve_ming_prompt_fields,
+)
+from vllm_omni.model_executor.models.ming_flash_omni.text_processing import (
+    segment_and_normalize,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +38,225 @@ _DEFAULT_IMAGE_PATCH_TOKEN_ID = 157157
 # taken verbatim from Ming ``processing_bailingmm2.py::get_text_from_prompt``.
 _GLYPH_QUOTE_PATTERNS = [r"\"(.*?)\"", r"‘(.*?)’", r"“(.*?)”"]
 _GLYPH_REMOVE_KEYWORDS = ("remove", "delete", "erase")
+
+
+def _resolve_model_config(container: Any | None) -> Any | None:
+    """Resolve a vLLM model_config from a stage client, engine, or server."""
+    if container is None:
+        return None
+    tts_stage = getattr(container, "_tts_stage", None)
+    if tts_stage is not None and tts_stage is not container:
+        direct = _resolve_model_config(tts_stage)
+        if direct is not None:
+            return direct
+    direct = getattr(container, "model_config", None)
+    if direct is not None:
+        return direct
+    stage_vllm_config = getattr(container, "stage_vllm_config", None)
+    if stage_vllm_config is not None:
+        direct = getattr(stage_vllm_config, "model_config", None)
+        if direct is not None:
+            return direct
+    engine_client = getattr(container, "engine_client", None)
+    if engine_client is not None:
+        direct = getattr(engine_client, "model_config", None)
+        if direct is not None:
+            return direct
+    engine = getattr(container, "engine", None)
+    if engine is not None:
+        direct = getattr(engine, "model_config", None)
+        if direct is not None:
+            return direct
+    vllm_config = getattr(container, "vllm_config", None)
+    return getattr(vllm_config, "model_config", None)
+
+
+def get_ming_talker_tokenizer(container: Any | None) -> Any | None:
+    """Return a cached talker tokenizer from a stage/server container if possible."""
+    if container is None:
+        return None
+    cached = getattr(container, "_ming_talker_tokenizer", None)
+    if cached is not None:
+        return cached
+
+    model_config = _resolve_model_config(container)
+    tokenizer_path = getattr(model_config, "tokenizer", None) or getattr(model_config, "model", None)
+    if not tokenizer_path:
+        return None
+
+    from transformers import AutoTokenizer
+
+    tokenizer = None
+    if os.path.isdir(tokenizer_path):
+        for candidate in (
+            os.path.join(tokenizer_path, "talker", "llm"),
+            os.path.join(tokenizer_path, "llm"),
+            tokenizer_path,
+        ):
+            if not os.path.isdir(candidate):
+                continue
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(candidate, trust_remote_code=True)
+                break
+            except Exception:
+                continue
+    else:
+        for subfolder in ("talker/llm", "llm", None):
+            try:
+                kwargs = {"trust_remote_code": True}
+                if subfolder is not None:
+                    kwargs["subfolder"] = subfolder
+                tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **kwargs)
+                break
+            except Exception:
+                continue
+
+    if tokenizer is None:
+        logger.warning("Failed to resolve Ming talker tokenizer from %s", tokenizer_path)
+        return None
+
+    try:
+        setattr(container, "_ming_talker_tokenizer", tokenizer)
+    except Exception:
+        pass
+    return tokenizer
+
+
+def _infer_prompt_wav_len(additional_info: dict[str, Any]) -> int:
+    for key in ("native_talker_prompt_wav_len", "prompt_wav_len"):
+        raw_len = additional_info.get(key)
+        if raw_len is not None:
+            try:
+                return max(0, int(raw_len))
+            except (TypeError, ValueError):
+                pass
+
+    prompt_wav_emb = additional_info.get("prompt_wav_emb", None)
+    if prompt_wav_emb is None:
+        return 0
+    shape = getattr(prompt_wav_emb, "shape", None)
+    if shape is not None:
+        if len(shape) >= 3:
+            return max(0, int(shape[1]))
+        if len(shape) >= 2:
+            return max(0, int(shape[0]))
+        if len(shape) == 1:
+            return 1
+    if isinstance(prompt_wav_emb, (list, tuple)) and prompt_wav_emb:
+        first = prompt_wav_emb[0]
+        if isinstance(first, (list, tuple)) and first and isinstance(first[0], (list, tuple)):
+            return len(first)
+        return len(prompt_wav_emb)
+    return 0
+
+
+def _infer_spk_emb_count(spk_emb: Any, *, use_zero_spk_emb: bool) -> int:
+    if spk_emb is None:
+        return 1 if use_zero_spk_emb else 0
+    if isinstance(spk_emb, list):
+        if not spk_emb:
+            return 0
+        if isinstance(spk_emb[0], (int, float)):
+            return 1
+        return len(spk_emb)
+    return 1
+
+
+def _first_tts_segment(text: str, max_text_length: int) -> str:
+    segments = segment_and_normalize(text, max_length=max_text_length)
+    return segments[0] if segments else text
+
+
+def build_ming_talker_prompt_token_ids_for_info(
+    *,
+    text: str,
+    additional_info: dict[str, Any],
+    tokenizer: Any | None,
+) -> list[int] | None:
+    """Build exact Ming talker prompt slots from request metadata.
+
+    Returns ``None`` when no tokenizer is available.
+    """
+    if tokenizer is None:
+        return None
+
+    # Shared with the talker's _resolve_generation_params so the slot count
+    # and the prefill embeddings can never drift apart.
+    _, prompt, instruction, use_zero_spk_emb = resolve_ming_prompt_fields(additional_info)
+
+    max_text_length = int(additional_info.get("max_text_length", DEFAULT_MAX_TEXT_LENGTH))
+    segment = _first_tts_segment(str(text or ""), max_text_length)
+    from vllm_omni.model_executor.models.ming_flash_omni.talker_module import (
+        build_tts_prompt_token_ids,
+    )
+
+    # Preset metadata (see stamp_ming_talker_voice_meta) overrides the request
+    # fields so the slot count includes the preset's prompt_wav frames.
+    native_prompt_text = additional_info.get("native_talker_prompt_text")
+    prompt_text = native_prompt_text if native_prompt_text is not None else additional_info.get("prompt_text", None)
+    native_spk_count = additional_info.get("native_talker_spk_emb_count")
+    if native_spk_count is not None:
+        spk_emb_count = max(0, int(native_spk_count))
+    else:
+        spk_emb_count = _infer_spk_emb_count(additional_info.get("spk_emb", None), use_zero_spk_emb=use_zero_spk_emb)
+
+    return build_tts_prompt_token_ids(
+        tokenizer=tokenizer,
+        text=segment,
+        prompt=prompt,
+        spk_emb_count=spk_emb_count,
+        instruction=instruction,
+        prompt_text=prompt_text,
+        prompt_wav_len=_infer_prompt_wav_len(additional_info),
+    )
+
+
+def stamp_ming_talker_voice_meta(request_info: dict[str, Any], *, stage_client: Any | None) -> None:
+    """Record voice-preset prompt metadata onto the talker request.
+
+    On the native-paged path the input processor must reserve prompt-KV slots
+    covering the preset's prompt_wav frames, which ``resolve_voice_preset_meta``
+    derives from the manifest and wav headers. The stamps are also the signal
+    the talker uses to decide whether to inject the preset: if none resolves,
+    nothing is stamped and the talker falls back to no preset (matching slots).
+    """
+    if request_info.get("native_talker_prompt_wav_len") is not None:
+        return
+    # An explicitly provided reference voice is handled directly by both sides.
+    if request_info.get("spk_emb") is not None or request_info.get("prompt_wav_emb") is not None:
+        return
+    voice_name = request_info.get("voice_name")
+    if not voice_name:
+        return
+    model_config = _resolve_model_config(stage_client)
+    model_id = getattr(model_config, "model", None) if model_config is not None else None
+
+    from vllm_omni.model_executor.models.ming_flash_omni.voice_presets import resolve_voice_preset_meta
+
+    meta = resolve_voice_preset_meta(model_id).get(voice_name)
+    if not meta:
+        return
+    request_info["native_talker_prompt_wav_len"] = int(meta.get("prompt_wav_len", 0))
+    request_info["native_talker_spk_emb_count"] = int(meta.get("spk_emb_count", 0))
+    if request_info.get("prompt_text") is None and meta.get("prompt_text"):
+        request_info["native_talker_prompt_text"] = meta["prompt_text"]
+
+
+def _resolve_ming_talker_prompt_token_ids(
+    *,
+    text: str,
+    additional_info: dict[str, Any],
+    stage_client: Any | None,
+) -> list[int]:
+    prompt_ids = build_ming_talker_prompt_token_ids_for_info(
+        text=text,
+        additional_info=additional_info,
+        tokenizer=get_ming_talker_tokenizer(stage_client),
+    )
+    if prompt_ids is None:
+        logger.warning("Ming talker could not build exact prompt slots; falling back to one dummy token")
+        return [0]
+    return prompt_ids
 
 
 def _check_single_quotes(s: str) -> bool:
@@ -438,6 +665,7 @@ def thinker2imagegen(
 def _build_talker_inputs(
     source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | None = None,
+    stage_client: Any | None = None,
 ) -> list[OmniTokensPrompt]:
     if not isinstance(prompt, list):
         prompt = [prompt]
@@ -484,13 +712,18 @@ def _build_talker_inputs(
             "prompt_text": additional_info.get("prompt_text", None),
             "prompt_wav_lat": additional_info.get("prompt_wav_lat", None),
             "prompt_wav_emb": additional_info.get("prompt_wav_emb", None),
-            "max_text_length": additional_info.get("max_text_length", 50),
+            "max_text_length": additional_info.get("max_text_length", DEFAULT_MAX_TEXT_LENGTH),
         }
 
-        # Use dummy token IDs (talker builds its own embeddings from text)
+        stamp_ming_talker_voice_meta(talker_info, stage_client=stage_client)
+        prompt_token_ids = _resolve_ming_talker_prompt_token_ids(
+            text=generated_text,
+            additional_info={**additional_info, **talker_info},
+            stage_client=stage_client,
+        )
         talker_inputs.append(
             OmniTokensPrompt(
-                prompt_token_ids=[0],
+                prompt_token_ids=prompt_token_ids,
                 additional_information=talker_info,
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
@@ -504,9 +737,14 @@ def thinker2talker_token_only(
     source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | None = None,
     _requires_multimodal_data: bool = False,
+    stage_client: Any | None = None,
 ) -> list[OmniTokensPrompt]:
-    """Sync-side builder for the non-async-chunk thinker→talker path."""
-    return _build_talker_inputs(source_outputs, prompt)
+    """Sync-side builder for the non-async-chunk thinker→talker path.
+
+    Delegates to ``_build_talker_inputs``, threading ``stage_client`` so the
+    native-paged talker can resolve exact prompt-KV slot lengths.
+    """
+    return _build_talker_inputs(source_outputs, prompt, stage_client=stage_client)
 
 
 thinker2talker_token_only._is_sync_input = True
@@ -517,4 +755,7 @@ __all__ = [
     "expand_cfg_prompts",
     "thinker2imagegen",
     "thinker2talker_token_only",
+    "build_ming_talker_prompt_token_ids_for_info",
+    "get_ming_talker_tokenizer",
+    "stamp_ming_talker_voice_meta",
 ]
