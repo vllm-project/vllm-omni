@@ -22,11 +22,15 @@ A pipeline opts in by implementing `SupportsARDiffusionPipeline`. Its immutable
 - named fixed-length cross-attention KV, model-specific scratch geometry, and
   the pipeline's requested session-capacity upper bound.
 
-The runner binds an `ARDiffusionKVState` only around one `forward()` call. The
-pipeline may use it during that context but must not retain it. The session
-survives subsequent requests with the same `session_id`. Request reset, explicit
-close, LRU eviction, and forward exceptions all release runner-owned KV and call
-the pipeline's reset/close lifecycle hook. Cross-attention KV is allocated lazily
+The runner binds an `ARDiffusionKVState` only around one runner invocation
+(`execute_model` or `execute_stepwise`). The pipeline may use it during that
+context but must not retain it. Scratch and committed pages stay on the
+runner-owned session object, so unbinding does not drop an in-flight stepwise
+chunk. Tick-mode sessions survive subsequent requests with the same
+`session_id`. On the stepwise path the session id is the request id and is
+released when that request finishes or fails. Request reset, explicit close,
+LRU eviction, and forward exceptions all release runner-owned KV and call the
+pipeline's reset/close lifecycle hook. Cross-attention KV is allocated lazily
 per session and logical KV branch, and is released on the same path. A pipeline
 publishes one named cache transactionally by yielding exactly one `(k, v)` pair
 per layer:
@@ -48,11 +52,12 @@ successful forward. The runner also exposes `reset_session()` and
 
 ## Current execution limits
 
-The experimental runner supports request-mode execution with
-`max_num_seqs=1`. It rejects step execution and request-batch execution at load
-time, and its inherited batch/step entry points also fail explicitly. Supporting
-those paths requires a batch-aware state-binding contract rather than silently
-bypassing `bind_ar_diffusion_state()`.
+The experimental runner supports `max_num_seqs=1`. Request-batch execution is
+still rejected. Step execution is allowed only when the loaded pipeline
+implements `SupportsStepExecution`; other AR-Diffusion pipelines still fail at
+load if `step_execution=True`. Capable pipelines bind KV around each
+`execute_stepwise` invocation instead of inheriting the generic runner entry
+point unwrapped.
 
 The implementation may retain multiple sessions per model instance. It selects
 the largest feasible capacity up to the pipeline's `session_capacity`, based on

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU contracts for capability-driven AR-Diffusion sessions."""
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
@@ -114,6 +116,43 @@ class BatchCapablePipeline(CapablePipeline):
     supports_request_batch = True
 
 
+class StepCapablePipeline(CapablePipeline):
+    supports_step_execution = True
+
+    def prepare_encode(self, state, **kwargs):
+        del kwargs
+        return state
+
+    def denoise_step(self, input_batch, *, states=None, **kwargs):
+        del input_batch, states, kwargs
+        return None
+
+    def step_scheduler(self, state, noise_pred, **kwargs):
+        del state, noise_pred, kwargs
+
+    def post_decode(self, state, **kwargs):
+        del state, kwargs
+        from vllm_omni.diffusion.data import DiffusionOutput
+
+        return DiffusionOutput()
+
+
+def scheduler_output(
+    request_ids: tuple[str, ...] = ("req-1",),
+    *,
+    finished: tuple[str, ...] = (),
+) -> DiffusionSchedulerOutput:
+    """Build the real scheduler payload; stepwise requests arrive as cached rows."""
+    return DiffusionSchedulerOutput(
+        step_id=0,
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData(request_ids=list(request_ids)),
+        finished_req_ids=set(finished),
+        num_running_reqs=len(request_ids),
+        num_waiting_reqs=0,
+    )
+
+
 def make_runner(
     pipeline: object,
     *,
@@ -140,6 +179,7 @@ def make_runner(
     runner._sessions = OrderedDict()
     runner._session_capacity = 0
     runner._perf_e2e_times = []
+    runner._stepwise_chunk_started = {}
     runner._preallocate_kv_cache(available_bytes=available_bytes)
     return runner
 
@@ -395,12 +435,16 @@ def test_synchronize_exception_uses_forward_cleanup_path(monkeypatch):
         ctx.ensure_video_slots(torch.device("cpu"))
         return object()
 
-    def synchronize_boom(device):
+    def synchronize_boom():
         raise RuntimeError("asynchronous kernel failed")
 
     monkeypatch.setattr(DiffusionModelRunner, "execute_model", return_after_allocation)
-    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize_boom)
-    runner.device = torch.device("cuda")
+    # The runner defers the device barrier to the platform, so the failure is
+    # injected there rather than on a device-specific torch entry point.
+    monkeypatch.setattr(
+        "vllm_omni.experimental.ar_diffusion.runner.current_omni_platform",
+        SimpleNamespace(synchronize=synchronize_boom),
+    )
     request = SimpleNamespace(
         request_id="broken-request",
         sampling_params=SimpleNamespace(extra_args={"session_id": "broken"}),
@@ -424,12 +468,154 @@ def test_ar_runner_rejects_step_and_request_batch_modes():
         make_runner(BatchCapablePipeline(lingbot_like_spec()))
 
 
+def test_ar_runner_allows_step_execution_when_pipeline_implements_the_contract():
+    runner = make_runner(StepCapablePipeline(lingbot_like_spec()), step_execution=True)
+    assert runner.kv_cache is not None
+
+
 def test_ar_runner_defensively_rejects_inherited_batch_and_step_entrypoints():
     runner = object.__new__(ARDiffusionModelRunner)
     with pytest.raises(RuntimeError, match="request-batch execution"):
         runner.execute_model_batch(None, None)
     with pytest.raises(RuntimeError, match="step execution"):
         runner.execute_stepwise(None)
+
+
+def test_execute_stepwise_binds_request_id_session_and_unbinds_after_call(monkeypatch):
+    from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+
+    pipeline = StepCapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline, step_execution=True)
+    bound_during = []
+
+    def fake_execute(self, scheduler_output):
+        del self, scheduler_output
+        bound_during.append(pipeline.bound_state is not None)
+        return BatchRunnerOutput.from_list([RunnerOutput(request_id="req-1", finished=False)])
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_stepwise", fake_execute)
+    output = runner.execute_stepwise(scheduler_output())
+
+    assert bound_during == [True]
+    assert pipeline.bound_state is None
+    assert pipeline.binds == ["req-1"]
+    assert "req-1" in runner._sessions
+    assert output.get_request_output("req-1") is not None
+    assert not pipeline.closes
+
+
+def test_execute_stepwise_closes_session_when_request_finishes(monkeypatch):
+    from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+
+    pipeline = StepCapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline, step_execution=True)
+
+    def fake_execute(self, scheduler_output):
+        del self, scheduler_output
+        return BatchRunnerOutput.from_list([RunnerOutput(request_id="req-1", finished=True)])
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_stepwise", fake_execute)
+    runner.execute_stepwise(scheduler_output())
+
+    assert pipeline.bound_state is None
+    assert pipeline.closes == ["req-1"]
+    assert "req-1" not in runner._sessions
+
+
+def test_execute_stepwise_exception_releases_kv_and_does_not_resume_pages(monkeypatch):
+    pipeline = StepCapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline, step_execution=True)
+    first = runner._get_or_create_session("req-1")
+
+    def boom(self, scheduler_output):
+        del self, scheduler_output
+        raise RuntimeError("step failed")
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_stepwise", boom)
+    with pytest.raises(RuntimeError, match="step failed"):
+        runner.execute_stepwise(scheduler_output())
+
+    assert pipeline.bound_state is None
+    assert pipeline.closes == ["req-1"]
+    assert "req-1" not in runner._sessions
+    second = runner._get_or_create_session("req-1")
+    assert second is not first
+
+
+def test_execute_stepwise_closes_session_for_scheduler_aborted_request(monkeypatch):
+    from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
+
+    pipeline = StepCapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline, step_execution=True)
+    runner._get_or_create_session("req-1")
+
+    def fake_execute(self, scheduler_output):
+        del self, scheduler_output
+        return BatchRunnerOutput.from_list([])
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_stepwise", fake_execute)
+    # An aborted request is never scheduled again and never reports finished,
+    # so the retire path is the only thing that can free its KV.
+    runner.execute_stepwise(scheduler_output(request_ids=(), finished=("req-1",)))
+
+    assert "req-1" not in runner._sessions
+    assert pipeline.closes == ["req-1"]
+
+
+def test_execute_stepwise_times_once_per_chunk_not_once_per_step(monkeypatch):
+    from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+
+    pipeline = StepCapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline, step_execution=True)
+    results = [None, None, None, DiffusionOutput()]
+
+    def fake_execute(self, scheduler_output):
+        del self, scheduler_output
+        return BatchRunnerOutput.from_list([RunnerOutput(request_id="req-1", finished=False, result=results.pop(0))])
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_stepwise", fake_execute)
+    for _ in range(4):
+        runner.execute_stepwise(scheduler_output())
+
+    # Four denoise steps, one emitted AR block: one timing sample, matching the
+    # one-sample-per-block meaning request mode already has.
+    assert len(runner._perf_e2e_times) == 1
+    assert "req-1" not in runner._stepwise_chunk_started
+
+
+def test_execute_stepwise_synchronize_exception_fails_closed(monkeypatch):
+    """The chunk barrier is where an asynchronous device error surfaces. It must
+    clean up like an in-step failure instead of leaving the session, the cached
+    step state and the timing entry to the scheduler's next cycle."""
+    from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+
+    pipeline = StepCapablePipeline(lingbot_like_spec())
+    runner = make_runner(pipeline, step_execution=True)
+    runner.state_cache = {"req-1": object()}
+
+    def fake_execute(self, scheduler_output):
+        del self, scheduler_output
+        return BatchRunnerOutput.from_list([RunnerOutput(request_id="req-1", finished=False, result=object())])
+
+    def synchronize_boom():
+        raise RuntimeError("asynchronous kernel failed")
+
+    monkeypatch.setattr(DiffusionModelRunner, "execute_stepwise", fake_execute)
+    monkeypatch.setattr(
+        "vllm_omni.experimental.ar_diffusion.runner.current_omni_platform",
+        SimpleNamespace(synchronize=synchronize_boom),
+    )
+
+    with pytest.raises(RuntimeError, match="asynchronous kernel failed"):
+        runner.execute_stepwise(scheduler_output())
+
+    assert pipeline.bound_state is None
+    assert pipeline.closes == ["req-1"]
+    assert "req-1" not in runner._sessions
+    assert "req-1" not in runner.state_cache
+    assert "req-1" not in runner._stepwise_chunk_started
+    assert not runner._perf_e2e_times
 
 
 def test_model_specific_warmup_provider_is_consumed(monkeypatch):

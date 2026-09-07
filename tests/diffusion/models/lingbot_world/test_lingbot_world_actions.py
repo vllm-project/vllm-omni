@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from vllm_omni.diffusion.models.lingbot_world.actions import (
     LingBotCameraControlReducer,
     integrate_lingbot_camera_actions,
     parse_lingbot_camera_action_frames,
+    parse_lingbot_camera_action_script,
 )
 from vllm_omni.experimental.ar_diffusion.session import (
     ARDiffusionSession,
@@ -292,3 +294,8 @@ def test_session_reducer_keeps_prompt_and_actions_atomic_and_resets() -> None:
         assert consumer.ticks[1].controls[0].data["frames"] == ((), (), ())
 
     asyncio.run(exercise())
+
+
+def test_parse_camera_action_script_rejects_wrong_chunk_width() -> None:
+    with pytest.raises(ValueError, match="exactly 3 per-latent-frame"):
+        parse_lingbot_camera_action_script([[["w"], ["w"]]], frames_per_chunk=3)

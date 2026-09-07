@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Realtime keyboard controls for LingBot World 2.0."""
 
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeAlias
 
 import numpy as np
 import torch
@@ -42,7 +42,31 @@ def _normalize_actions(value: object, *, field: str) -> tuple[str, ...]:
     return tuple(action for action in _ACTION_ORDER if action in actions)
 
 
-def _normalize_frames(value: object, *, field: str) -> tuple[tuple[str, ...], ...]:
+#: Key states for one latent frame each, e.g. ``(("w",), ("w", "j"), ())`` for
+#: the three latent frames of one AR block.
+LingBotCameraActionFrames: TypeAlias = tuple[tuple[str, ...], ...]
+
+#: One :data:`LingBotCameraActionFrames` per generated chunk, carried on the
+#: request for the whole rollout.
+LingBotCameraActionScript: TypeAlias = tuple[LingBotCameraActionFrames, ...]
+
+
+def as_camera_action_frames(value: Iterable[Iterable[str]]) -> LingBotCameraActionFrames:
+    """Restore the tuple form of one chunk's per-latent-frame key states."""
+    return tuple(tuple(frame) for frame in value)
+
+
+def as_camera_action_script(value: Iterable[Iterable[Iterable[str]]]) -> LingBotCameraActionScript:
+    """Restore the tuple form of a whole request's script.
+
+    ``sampling_params.extra_args`` round-trips through JSON, so an already
+    validated script comes back as lists; this rebuilds the hashable tuple form
+    without re-running validation.
+    """
+    return tuple(as_camera_action_frames(chunk) for chunk in value)
+
+
+def _normalize_frames(value: object, *, field: str) -> LingBotCameraActionFrames:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         raise ValueError(f"{field} must be a sequence of per-frame action lists.")
     return tuple(_normalize_actions(actions, field=f"{field}[{index}]") for index, actions in enumerate(value))
@@ -52,7 +76,7 @@ def parse_lingbot_camera_action_frames(
     data: Mapping[str, Any],
     *,
     expected_frames: int,
-) -> tuple[tuple[str, ...], ...]:
+) -> LingBotCameraActionFrames:
     """Validate the chunk-sized payload emitted by the session reducer."""
 
     if data.get("mode") != "frames":
@@ -64,6 +88,30 @@ def parse_lingbot_camera_action_frames(
             f"latent frame; expected {expected_frames}, got {len(frames)}."
         )
     return frames
+
+
+def parse_lingbot_camera_action_script(
+    script: object,
+    *,
+    frames_per_chunk: int,
+) -> LingBotCameraActionScript:
+    """Validate a request-scoped list of per-chunk camera action frames."""
+
+    if not isinstance(script, Sequence) or isinstance(script, (str, bytes)):
+        raise ValueError("camera_action_script must be a sequence of per-chunk action lists.")
+    if not script:
+        raise ValueError("camera_action_script must contain at least one chunk.")
+    chunks: list[LingBotCameraActionFrames] = []
+    for index, chunk in enumerate(script):
+        frames = _normalize_frames(chunk, field=f"camera_action_script[{index}]")
+        if len(frames) != frames_per_chunk:
+            raise ValueError(
+                "camera_action_script chunks must contain exactly "
+                f"{frames_per_chunk} per-latent-frame action lists; "
+                f"chunk {index} has {len(frames)}."
+            )
+        chunks.append(frames)
+    return tuple(chunks)
 
 
 @dataclass(frozen=True)
