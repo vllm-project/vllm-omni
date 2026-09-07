@@ -32,6 +32,16 @@ class _SenderGeneration:
     def __init__(self) -> None:
         self.in_flight = False
         self.cancelled = False
+        # A request-terminal chunk is queued but not yet on the wire. The
+        # downstream stage has no other way to learn the stream ended -- it
+        # polls the connector and parks in WAITING_FOR_CHUNK until a chunk
+        # carrying ``finished`` arrives -- so cleanup must not discard it.
+        # See vllm-project/vllm-omni#6670.
+        self.terminal_pending = False
+        # ``cleanup_sender`` asked to reclaim this generation while the fence
+        # was up. The terminal task owes that cleanup once it is done with the
+        # connector -- on every exit path, including a failed or raising put.
+        self.cleanup_deferred = False
 
 
 class _LoadEntry:
@@ -329,6 +339,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         new_token_ids: Iterable[int] | None = None,
         confirmed_num_computed_tokens: int | None = None,
         segment_generation: int | None = None,
+        force_request_finished: bool = False,
     ):
         """Build and enqueue one chunk for asynchronous sending.
 
@@ -352,8 +363,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 before a streaming transition can mutate ``request``
             segment_generation: generation captured before a resumable stop
                 can apply a queued update to the mutable request
+            force_request_finished: send this chunk as the request terminal
+                even though ``request`` is not in a finished status yet. The
+                scheduler needs this when it ends a *parked* streaming session:
+                the terminal has to be enqueued before ``finish_requests``,
+                because ``finish_requests`` skips requests that already report
+                ``is_finished()``. See ``_finish_parked_streaming_session``.
         """
-        is_finished = request.is_finished() and not request.resumable
+        is_finished = force_request_finished or (request.is_finished() and not request.resumable)
         if not hasattr(self, "_segment_generation"):
             self._segment_generation = defaultdict(int)
         external_req_id = request.external_req_id
@@ -414,6 +431,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     self._sender_tokens[external_req_id] = sender_token
                 task["sender_token"] = sender_token
                 self._pending_save_reqs.append(task)
+                if is_finished:
+                    # Fence this generation against cleanup until the terminal
+                    # chunk has been handed to the connector (#6670).
+                    sender_token.terminal_pending = True
                 if is_segment_finished:
                     # The queued FIFO item now owns the old segment. Start the next
                     # segment's deduplication watermark before the worker sends it.
@@ -624,32 +645,71 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if sender_token is None:
             self._send_single_request_for_generation(task)
             return
+        is_terminal_task = bool(task.get("is_finished"))
         with self._sender_state_lock:
             is_current = self._sender_tokens.get(external_req_id) is sender_token
-            if is_current and not sender_token.cancelled:
+            # ``cancelled`` does not veto a terminal chunk. It is the
+            # downstream stage's only end-of-stream signal, so dropping it
+            # leaves that stage parked in WAITING_FOR_CHUNK until the input
+            # deadline -- the hang this fence exists to prevent (#6670).
+            # Losing ownership of the external id still vetoes: the state the
+            # chunk describes then belongs to a different generation.
+            if is_current and (is_terminal_task or not sender_token.cancelled):
                 sender_token.in_flight = True
             else:
                 is_current = False
         if not is_current:
             logger.debug("Discarding stale queued chunk for aborted request %s", external_req_id)
+            if is_terminal_task:
+                self._release_terminal_fence(external_req_id, sender_token)
             return
         try:
             self._send_single_request_for_generation(task, sender_token)
         finally:
+            if is_terminal_task:
+                # Drop the fence and run the cleanup it deferred, whether the
+                # put succeeded, reported failure, or raised. Until this runs,
+                # the block below must not reclaim the generation either.
+                self._release_terminal_fence(external_req_id, sender_token)
             with self._sender_state_lock:
                 if self._sender_tokens.get(external_req_id) is sender_token:
                     sender_token.in_flight = False
-                    if sender_token.cancelled:
+                    if sender_token.cancelled and not sender_token.terminal_pending:
                         self._sender_tokens.pop(external_req_id, None)
                         self._clear_sender_state_locked(external_req_id)
+
+    def _release_terminal_fence(self, external_req_id: str, sender_token: _SenderGeneration) -> None:
+        """Drop the terminal fence and run the cleanup it deferred.
+
+        Called on every exit path of a terminal task. ``cleanup_sender``
+        cannot reclaim a generation whose terminal chunk is still queued, so
+        it records the request on the token instead; without this the only
+        path that ever replayed it was a *successful* put, and a connector
+        failure leaked the whole per-request sender state (#6670).
+        """
+        with self._sender_state_lock:
+            sender_token.terminal_pending = False
+            deferred = sender_token.cleanup_deferred
+            sender_token.cleanup_deferred = False
+            # A generation that no longer owns the external id was already
+            # reclaimed by whoever replaced it; cleaning now would clear the
+            # successor's state.
+            still_current = self._sender_tokens.get(external_req_id) is sender_token
+        if deferred and still_current:
+            self.cleanup_sender(external_req_id)
 
     def _sender_generation_is_active(
         self,
         external_req_id: str,
         sender_token: _SenderGeneration,
+        *,
+        is_terminal: bool = False,
     ) -> bool:
         with self._sender_state_lock:
-            return self._sender_tokens.get(external_req_id) is sender_token and not sender_token.cancelled
+            if self._sender_tokens.get(external_req_id) is not sender_token:
+                return False
+            # Terminal chunks outlive cancellation -- see _send_single_request.
+            return is_terminal or not sender_token.cancelled
 
     def _send_single_request_for_generation(
         self,
@@ -712,7 +772,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if payload_data.meta.is_segment_finished is None:
             payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
 
-        if sender_token is not None and not self._sender_generation_is_active(external_req_id, sender_token):
+        if sender_token is not None and not self._sender_generation_is_active(
+            external_req_id, sender_token, is_terminal=is_finished
+        ):
             logger.debug("Skipping cancelled chunk for request %s before connector put", external_req_id)
             return
 
@@ -723,7 +785,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             data=payload_data,
         )
 
-        if sender_token is not None and not self._sender_generation_is_active(external_req_id, sender_token):
+        if sender_token is not None and not self._sender_generation_is_active(
+            external_req_id, sender_token, is_terminal=is_finished
+        ):
             # cleanup_sender() may cancel this generation while put() is
             # blocked. Do not let that stale completion recreate state for a
             # request whose cleanup is already in progress.
@@ -861,6 +925,18 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             sender_token = self._sender_tokens.get(external_req_id)
             if sender_token is None:
                 self._clear_sender_state_locked(external_req_id)
+                return
+            if sender_token.terminal_pending:
+                # A request-terminal chunk is still queued. Reclaiming the
+                # state now would drop it, and the downstream stage would sit
+                # in WAITING_FOR_CHUNK until VLLM_OMNI_INPUT_WAIT_TIMEOUT_S
+                # with no way to know the stream ended (#6670). Retire the
+                # generation anyway -- ``save_async`` rejects new chunks on
+                # ``cancelled``, which is what keeps a request reusing this
+                # external id from joining a generation that is going away --
+                # and hand the reclaim to the terminal task.
+                sender_token.cancelled = True
+                sender_token.cleanup_deferred = True
                 return
             sender_token.cancelled = True
             if sender_token.in_flight:
