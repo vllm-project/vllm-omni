@@ -228,7 +228,7 @@ def _assert_official_video(
     )
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=4)
 def test_minimax_h3_i2va_matches_official_reference(
     accuracy_artifact_root: Path,
 ) -> None:
@@ -304,7 +304,7 @@ def test_minimax_h3_i2va_matches_official_reference(
     )
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=4)
 def test_minimax_h3_ref2va_matches_official_reference(
     accuracy_artifact_root: Path,
 ) -> None:

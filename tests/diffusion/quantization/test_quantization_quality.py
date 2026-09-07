@@ -528,7 +528,7 @@ def test_ltx_quality_gate_uses_official_eager_defaults(monkeypatch):
     assert captured.sampling.guidance_scale is None
 
 
-_marks = hardware_marks(res={"cuda": "H100"})
+_marks = hardware_marks(res={"cuda": ["H100", "B200"]})
 _OUTPUT_DIR = Path(os.environ["VLLM_OMNI_QUALITY_OUTPUT_DIR"]) if "VLLM_OMNI_QUALITY_OUTPUT_DIR" in os.environ else None
 
 

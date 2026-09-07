@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """E2E test that follows the EXACT same flow as
 ``verl-omni/tests/workers/rollout/rollout_vllm/test_vllm_omni_generate.py``

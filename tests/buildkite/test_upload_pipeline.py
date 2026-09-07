@@ -22,6 +22,7 @@ from upload_pipeline import (  # noqa: E402
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 CUDA_BOOTSTRAP_STEPS = Path(".buildkite/cuda/bootstrap-upload-steps.yml")
+NIGHTLY_YAML = Path(".buildkite/cuda/test-nightly.yml")
 BOOTSTRAP_STEPS_TEMPLATE = """steps:
   - key: image-build
   - key: upload-ready-pipeline
@@ -310,6 +311,52 @@ def test_mirror_hardwares_inferred_missing_preset_is_rejected(monkeypatch: pytes
 def test_cpu_step_without_mirror_hardwares_is_unchanged() -> None:
     step = {"label": "CPU report", "commands": ["echo ok"], "agents": {"queue": "cpu_queue_premerge"}}
     assert _expand_mirror_hardwares(step) is step
+
+
+def _leaf_steps(steps: list) -> list[dict]:
+    leaves: list[dict] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        nested = step.get("steps")
+        if nested is not None:
+            leaves.extend(_leaf_steps(nested))
+        else:
+            leaves.append(step)
+    return leaves
+
+
+def test_nightly_yaml_infers_h100_l4_and_b200(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nightly GPU jobs omit string presets; H100/L4 nightly and B200 mirror share card counts."""
+    src = yaml.safe_load(NIGHTLY_YAML.read_text(encoding="utf-8"))
+    pytest_leaves = [step for step in _leaf_steps(src["steps"]) if "pytest" in str(step.get("commands"))]
+    assert pytest_leaves
+    for step in pytest_leaves:
+        assert "mirror_hardwares" not in step
+        assert "agents" not in step
+        assert "B200" in str(step.get("commands"))
+
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    default_leaves = _leaf_steps(_render_test_pipeline(src, changed_files=None)["steps"])
+    default_by_label = {step["label"]: step for step in default_leaves}
+
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "b200")
+    b200_src = yaml.safe_load(NIGHTLY_YAML.read_text(encoding="utf-8"))
+    b200_by_label = {
+        step["label"]: step for step in _leaf_steps(_render_test_pipeline(b200_src, changed_files=None)["steps"])
+    }
+
+    pytest_labels = {step["label"] for step in pytest_leaves}
+    assert pytest_labels <= set(default_by_label)
+    assert pytest_labels <= set(b200_by_label)
+    for label in pytest_labels:
+        default_step = default_by_label[label]
+        b200_step = b200_by_label[label]
+        assert default_step["agents"]["queue"] in {"mithril-h100-pool", "l4-k8s"}
+        assert b200_step["agents"]["queue"] == "b200-k8s"
+        assert _gpu_limit(default_step) == _gpu_limit(b200_step)
+
+    assert default_by_label[":email: Nightly Collection & Email"]["agents"]["queue"] == "cpu_queue_premerge"
 
 
 @pytest.mark.parametrize(("raw", "expected"), [("", ""), ("  ", ""), ("b200", "b200"), ("B200", "b200")])

@@ -110,7 +110,7 @@ def _daily_omni_hub_inline_media(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_qwen3_omni_daily_omni_accuracy_bench(omni_server) -> None:
     _require_vllm_cli()
@@ -122,7 +122,7 @@ def test_qwen3_omni_daily_omni_accuracy_bench(omni_server) -> None:
     assert _acc_bench.run_acc_benchmark(ns) == 0
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_qwen3_omni_seed_tts_wer_bench(omni_server) -> None:
     _require_vllm_cli()

@@ -109,7 +109,7 @@ def _generate_single_stage_image(
     return images, peak_mem
 
 
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": ["L4", "B200"]})
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize("model", [Z_IMAGE_CONFIG, FLUX_CONFIG], ids=["Z-Image-Turbo", "FLUX.2-klein"])
