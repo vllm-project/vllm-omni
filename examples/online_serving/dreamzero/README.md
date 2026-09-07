@@ -42,14 +42,18 @@ If you run the DROID client on Python < 3.12, also install `typing-extensions`.
 
 ### Configure TP and CFG parallelism
 
-The bundled DreamZero configs intentionally keep only:
+The bundled DreamZero configs are deliberately few:
 
 | Config | Purpose |
 |---|---|
 | `vllm_omni/deploy/dreamzero.yaml` | Default TP=1, CFG parallel disabled |
 | `vllm_omni/deploy/dreamzero_tp1_cfg2.yaml` | TP=1, CFG parallel size=2 |
+| `vllm_omni/deploy/dreamzero_tp4.yaml` | TP=4 denoise, TP=4 UMT5 text encoder |
+| `vllm_omni/deploy/dreamzero_tp8.yaml` | TP=8 denoise, TP=8 UMT5 text encoder |
 
 For other topologies, use CLI parallelism flags and update stage 0 `devices` with `--stage-overrides`. The number of listed devices must match `tensor_parallel_size * cfg_parallel_size`.
+
+The two TP configs also set `parallel_config.text_encoder_tp_size`, which shards the UMT5-XXL text encoder over the same ranks as the DiT instead of replicating it on every card. It must be either `1` (replicated Hugging Face UMT5, the default) or equal to `tensor_parallel_size`; anything in between is rejected at startup. At startup the log line `DreamZero text encoder: ...` reports which encoder was built.
 
 TP=2 with CFG parallel disabled:
 
