@@ -30,6 +30,36 @@ def test_pipeline_declares_layerwise_offload_components() -> None:
     assert Cosmos3OmniDiffusersPipeline._resident_modules == []
     assert hasattr(Cosmos3OmniDiffusersPipeline, "enable_omni_model_cpu_offload")
 
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
+        Cosmos3LanguageModel,
+        Cosmos3VFMTransformer,
+    )
+
+    assert Cosmos3LanguageModel._layerwise_offload_blocks_attrs == ["layers"]
+    assert Cosmos3VFMTransformer._layerwise_offload_blocks_attrs == ["gen_layers"]
+
+
+def test_component_selective_model_offload_fails_before_component_loading(monkeypatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3 as pipeline_module
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "get_local_device",
+        lambda: pytest.fail("component loading must not start for an unsupported selector"),
+    )
+    config = SimpleNamespace(
+        diffusion_offload_config={"mode": "module", "components": ["dit"]},
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=False,
+        dlo_use_allgather=True,
+        dlo_resident_layers=0,
+        pin_cpu_memory=True,
+    )
+
+    with pytest.raises(ValueError, match="does not support the dit/text_encoder component selector"):
+        pipeline_module.Cosmos3OmniDiffusersPipeline(od_config=config)
+
 
 class StubScheduler:
     def __init__(
@@ -1148,6 +1178,21 @@ def test_transfer_fps_matches_resolved_frame_rate_precedence() -> None:
     assert cfg is not None
     # edge has no preset fps default, so cfg.fps comes straight from fps resolution.
     assert cfg.fps == sp.resolved_frame_rate == 12.0
+
+
+@pytest.mark.parametrize("use_path", [False, True], ids=["image", "path"])
+def test_transfer_pil_conversion_returns_writable_array(tmp_path, use_path: bool) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    image = Image.new("RGB", (5, 4), "red")
+    value = image
+    if use_path:
+        value = tmp_path / "control.png"
+        image.save(value)
+
+    array = transfer._pil_to_uint8_rgb(value)
+
+    assert array.flags.writeable
 
 
 def test_transfer_vae_executor_requires_distributed_vae() -> None:

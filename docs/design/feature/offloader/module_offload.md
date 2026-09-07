@@ -2,7 +2,7 @@
 
 Model-level offload enforces mutual exclusion between pipeline component
 groups. For commands and model support, see the
-[model-level user guide](../../../user_guide/diffusion/offloader/cpu_offload.md).
+[model-level user guide](../../../user_guide/diffusion/offloader/module_offload.md).
 
 ## Generic hook path
 
@@ -10,9 +10,14 @@ groups. For commands and model support, see the
 makes encoders and VAEs device resident for initialization, then installs
 `SequentialOffloadHook` instances:
 
-- each DiT hook offloads all encoders and other DiTs before loading itself;
-- each encoder hook offloads every DiT before loading itself; and
+- each DiT hook offloads selected encoders and other selected DiTs before
+  loading itself;
+- each encoder hook offloads selected DiTs before loading itself; and
 - VAEs are not part of the mutual-exclusion hook set.
+
+All execution-stage modules still receive a hook so an unselected resident
+stage can evict a selected component before it runs. Only components listed in
+`diffusion_offload_config.components` are eligible to move to CPU.
 
 The hook moves parameters and buffers without recursively calling
 `module.to()`. This avoids recursion through modules that retain references to
@@ -36,7 +41,9 @@ contract:
 
 - only the executing component is device resident;
 - enable and disable are idempotent;
-- transfers use the supplied device, pinning, and HSDP settings; and
+- transfers use the supplied device, pinning, and HSDP settings;
+- explicit component selection is either honored or rejected before partial
+  setup; and
 - disabling removes all model-local offload hooks or contexts.
 
 The delegation is currently duck typed. If another independent implementation

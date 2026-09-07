@@ -85,7 +85,6 @@ def _runtime(parallel_stage_init: bool = False) -> StageRuntime:
         model="dummy",
         config_path="dummy",
         stage_init_timeout=5,
-        diffusion_batch_size=1,
         async_chunk=False,
         parallel_stage_init=parallel_stage_init,
     )

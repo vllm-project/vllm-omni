@@ -2190,24 +2190,28 @@ class HunyuanImage3Model(nn.Module):
         return torch.concat((q, k, v))
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        if _is_moe(self.config):
-            # Params for weights, fp8 weight scales, fp8 activation scales
-            # (param_name, weight_name, expert_id, shard_id)
-            fused_moe_expert_mapping = FusedMoE.make_expert_params_mapping(
-                self,
-                ckpt_gate_proj_name="gate_proj",
-                ckpt_down_proj_name="down_proj",
-                ckpt_up_proj_name="up_proj",
-                num_experts=self.config.num_experts,
-                num_redundant_experts=self.num_redundant_experts,
-            )
-            expert_weights_remapping = {
-                "gate_proj": ("gate_and_up_proj", 1, 2),
-                "up_proj": ("gate_and_up_proj", 0, 2),
-            }
-            return fused_moe_expert_mapping, expert_weights_remapping
-        else:
-            return [], {}
+        if not _is_moe(self.config):
+            return []
+
+        # Params for weights, fp8 weight scales, fp8 activation scales
+        # (param_name, weight_name, expert_id, shard_id)
+        return FusedMoE.make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+            num_redundant_experts=self.num_redundant_experts,
+        )
+
+    def _get_expert_weights_remapping(self) -> dict[str, tuple[str, int, int]]:
+        """Return the vLLM-Omni-local remapping for Hunyuan checkpoint weights."""
+        if not _is_moe(self.config):
+            return {}
+        return {
+            "gate_proj": ("gate_and_up_proj", 1, 2),
+            "up_proj": ("gate_and_up_proj", 0, 2),
+        }
 
     # rename for delay load
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
@@ -2243,7 +2247,8 @@ class HunyuanImage3Model(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
-        expert_params_mapping, expert_weights_remapping = self.get_expert_mapping()
+        expert_params_mapping = self.get_expert_mapping()
+        expert_weights_remapping = self._get_expert_weights_remapping()
 
         # List of unexpected keywords in weight names
         unexpected_keywords = [
