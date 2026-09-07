@@ -163,6 +163,13 @@ class OmniEngineArgs(EngineArgs):
     # Must be declared here so engine_args dict propagation does not silently
     # drop the value when constructing OmniEngineArgs from kwargs.
     active_stream_window: int = 0
+    # Multi-step decode window size for AR stages on async scheduling: one
+    # engine step replays this many decode steps for the whole batch,
+    # amortizing per-step host overhead.  0 (default) keeps the normal
+    # single-step loop.  Models must declare the contract via
+    # ``supports_multi_step_decode``; ineligible batches fall back to single
+    # steps automatically.
+    multi_step_decode_steps: int = 0
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
@@ -342,6 +349,7 @@ class OmniEngineArgs(EngineArgs):
             stage_id=self.stage_id,
             async_chunk=self.async_chunk,
             active_stream_window=self.active_stream_window,
+            multi_step_decode_steps=self.multi_step_decode_steps,
             model_stage=self.model_stage,
             model_arch=self.model_arch,
             worker_type=self.worker_type,
