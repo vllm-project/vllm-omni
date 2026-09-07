@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from vllm_omni.diffusion.prompt_update import prompt_update_versions
+from vllm_omni.diffusion.interaction.modality_handlers.prompt import prompt_update_versions
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
 
