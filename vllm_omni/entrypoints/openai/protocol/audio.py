@@ -194,6 +194,16 @@ class OpenAICreateSpeechRequest(BaseModel):
         ),
     )
 
+    guidance_scale: float | None = Field(
+        default=None,
+        description="Guidance scale for diffusion models",
+    )
+
+    num_inference_steps: int | None = Field(
+        default=None,
+        description="Number of inference steps",
+    )
+
     @field_validator("stream_format")
     @classmethod
     def validate_stream_format(cls, v: str) -> str:

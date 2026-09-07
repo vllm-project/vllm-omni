@@ -103,10 +103,34 @@ class StreamingAudioResampler:
 class AudioMixin:
     """Mixin class to add audio-related utilities."""
 
+    def _normalize_audio_tensor_for_output(self, audio_tensor) -> np.ndarray:
+        """Normalize mono/stereo audio into a shape soundfile can write reliably."""
+        audio_tensor = np.asarray(audio_tensor)
+
+        if audio_tensor.ndim == 0:
+            return audio_tensor.reshape(1)
+        if audio_tensor.ndim == 1:
+            return audio_tensor
+        if audio_tensor.ndim == 2:
+            if 1 in audio_tensor.shape:
+                return audio_tensor.reshape(-1)
+            return audio_tensor
+
+        # Higher-rank tensors (e.g. [1, 1, T] from diffusion outputs): squeeze
+        # trailing/leading singleton dims first — the historical behavior here
+        # was a plain .squeeze() — and only fail if the result is still not
+        # mono/stereo.
+        squeezed = audio_tensor.squeeze()
+        if squeezed.ndim <= 2:
+            return self._normalize_audio_tensor_for_output(squeezed)
+        raise ValueError(
+            f"Unsupported audio tensor dimension: {audio_tensor.ndim}. Only mono (1D) and stereo (2D) are supported."
+        )
+
     def create_audio(self, audio_obj: CreateAudio) -> AudioResponse:
         """Convert audio tensor to bytes in the specified format."""
 
-        audio_tensor = audio_obj.audio_tensor
+        audio_tensor = self._normalize_audio_tensor_for_output(audio_obj.audio_tensor)
         sample_rate = audio_obj.sample_rate
         response_format = audio_obj.response_format.lower()
         base64_encode = audio_obj.base64_encode

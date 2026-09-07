@@ -906,7 +906,6 @@ class TestTTSMethods:
         mock_engine_client.errored = False
         mock_engine_client.tts_max_instructions_length = None
 
-        # Simulate Qwen3-Omni: multiple stages, none in _TTS_MODEL_STAGES
         thinker = SimpleNamespace(engine_args=SimpleNamespace(model_stage="thinker"), tts_args={})
         talker = SimpleNamespace(engine_args=SimpleNamespace(model_stage="talker"), tts_args={})
         code2wav = SimpleNamespace(engine_args=SimpleNamespace(model_stage="code2wav"), tts_args={})
@@ -914,6 +913,7 @@ class TestTTSMethods:
 
         mock_models = mocker.MagicMock()
         mock_models.is_base_model.return_value = True
+
         server = OmniOpenAIServingSpeech(
             engine_client=mock_engine_client,
             models=mock_models,
@@ -925,6 +925,35 @@ class TestTTSMethods:
         with pytest.raises(ValueError, match="only supported for dedicated TTS models"):
             asyncio.run(server._prepare_speech_generation(request))
         server.shutdown()
+
+    def test_is_f5_tts_model_uses_registered_f5_model_ids(self, mocker: MockerFixture):
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.stage_configs = []
+        mock_engine_client.tts_max_instructions_length = None
+        mock_engine_client.model = "SWivid/F5-TTS/F5TTS_Base"
+        mock_engine_client.model_config = SimpleNamespace(
+            model_type=None,
+            model_class_name=None,
+            model="SWivid/F5-TTS/F5TTS_Base",
+            hf_config=SimpleNamespace(model_type=None, _name_or_path="SWivid/F5-TTS/F5TTS_Base"),
+        )
+
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+            model_name="SWivid/F5-TTS/F5TTS_Base",
+        )
+        server._diffusion_mode = True
+        # Production diffusion instances (for_diffusion) carry the model name
+        # in _diffusion_model_name, not model_name.
+        server._diffusion_model_name = "SWivid/F5-TTS/F5TTS_Base"
+
+        assert server._is_f5_tts_model() is True
 
     def test_estimate_prompt_len_fallback(self, speech_server):
         """Test prompt length estimation falls back to 2048 when model is unavailable."""
