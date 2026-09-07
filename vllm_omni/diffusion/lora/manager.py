@@ -104,6 +104,15 @@ class DiffusionLoRAManager:
         # Track the maximum LoRA rank we've allocated buffers for.
         self._max_lora_rank: int = 0
 
+        # Static adapter configured at startup (`--lora-path`). Requests that
+        # don't name an adapter fall back to it, so the static adapter acts as
+        # a resident default instead of being deactivated by the first plain
+        # request. `_static_lora_scale` records the startup `--lora-scale` so
+        # plain requests restore it instead of silently rebinding at the
+        # sampling-params default of 1.0.
+        self._static_lora_request: LoRARequest | None = None
+        self._static_lora_scale: float = 1.0
+
         logger.info(
             "Initializing DiffusionLoRAManager: device=%s, dtype=%s, max_cached_adapters=%d, static_lora_path=%s",
             device,
@@ -119,6 +128,8 @@ class DiffusionLoRAManager:
                 lora_int_id=stable_lora_int_id(lora_path),
                 lora_path=lora_path,
             )
+            self._static_lora_request = init_request
+            self._static_lora_scale = lora_scale
             self.set_active_adapter(init_request, lora_scale)
 
     def _compute_supported_lora_modules(self) -> set[str]:
@@ -225,9 +236,24 @@ class DiffusionLoRAManager:
         """Set the active LoRA adapter for the pipeline.
 
         Args:
-            lora_request: The LoRA request, or None to deactivate all adapters.
-            lora_scale: The external scale for the LoRA adapter.
+            lora_request: The LoRA request, or None to use the static default
+                adapter (deactivating all adapters when no static default was
+                configured).
+            lora_scale: The external scale for the LoRA adapter. When falling
+                back to the static startup adapter, the sampling-params
+                default of 1.0 is treated as "unspecified" and the startup
+                `--lora-scale` is restored instead; any other value (including
+                0, the explicit opt-out) is honored as a per-request override.
         """
+        if lora_request is None and self._static_lora_request is not None:
+            lora_request = self._static_lora_request
+            if math.isclose(lora_scale, 1.0):
+                # A plain request carries the sampling-params default scale,
+                # which is indistinguishable from an explicit scale=1.0.
+                # Restore the scale the static adapter was started with so a
+                # non-default (or zero) startup scale survives the fallback.
+                lora_scale = self._static_lora_scale
+
         if lora_request is None:
             if self._active_adapter_id is None:
                 logger.debug("No lora_request provided and adapters are already inactive")
@@ -405,15 +431,43 @@ class DiffusionLoRAManager:
         declared_components = tuple(getattr(self.pipeline, "_dit_modules", ()) or ())
         extra_components = tuple(getattr(self.pipeline, "_lora_components", ()) or ())
         component_names = dict.fromkeys((*default_components, *declared_components, *extra_components))
-        for component_name in component_names:
-            if not hasattr(self.pipeline, component_name):
-                continue
-            component = getattr(self.pipeline, component_name)
-            if not isinstance(component, nn.Module):
-                continue
 
+        components: list[tuple[str, nn.Module]] = []
+        for component_name in component_names:
+            component = getattr(self.pipeline, component_name, None)
+            if isinstance(component, nn.Module):
+                components.append((component_name, component))
+
+        # Pipelines may expose the same denoiser under several attributes
+        # (e.g. ``transformer`` aliasing ``language_model.model``). Scanning an
+        # inner alias first would register LoRA layers under names that adapter
+        # checkpoint keys (which follow the outer module path) can never match,
+        # so the adapter loads/activates but applies to zero layers. Keep only
+        # the outermost component for each module subtree.
+        outer_components: list[tuple[str, nn.Module]] = []
+        for i, (name_i, comp_i) in enumerate(components):
+            nested = False
+            for j, (name_j, comp_j) in enumerate(components):
+                if i == j:
+                    continue
+                if comp_i is comp_j and i < j:
+                    # Same module under two names; the first occurrence wins.
+                    continue
+                if any(comp_i is m for m in comp_j.modules()):
+                    logger.debug(
+                        "Skipping LoRA scan of component %s: it is a submodule of component %s",
+                        name_i,
+                        name_j,
+                    )
+                    nested = True
+                    break
+            if not nested:
+                outer_components.append((name_i, comp_i))
+
+        for component_name, component in outer_components:
             # Collect replacements first to avoid mutating the module tree
             # while iterating over named_modules().
+            replaced_before = len(self._lora_modules)
             pending_replacements: list[tuple[str, str, nn.Module, list[str]]] = []
 
             for module_name, module in component.named_modules(remove_duplicate=False):
@@ -466,6 +520,15 @@ class DiffusionLoRAManager:
                     replace_submodule(component, module_name, lora_layer)
                     self._lora_modules[full_module_name] = lora_layer
                     logger.debug("Replaced layer: %s -> %s", full_module_name, type(lora_layer).__name__)
+
+            replaced_now = len(self._lora_modules) - replaced_before
+            if replaced_now:
+                logger.info(
+                    "Component %s: replaced %d layers with LoRA wrappers (total: %d)",
+                    component_name,
+                    replaced_now,
+                    len(self._lora_modules),
+                )
 
     def _ensure_max_lora_rank(self, min_rank: int) -> None:
         """Ensure LoRA buffers can accommodate adapters up to `min_rank`.
@@ -547,7 +610,7 @@ class DiffusionLoRAManager:
         matches_scale = self._adapter_scales.get(adapter_id) == rounded_scale
         return is_active and matches_scale
 
-    def _bind_adapter_weights(self, lora_model: LoRAModel, scale: float) -> None:
+    def _bind_adapter_weights(self, lora_model: LoRAModel, scale: float) -> int:
         binding_validator = getattr(self.pipeline, "_validate_diffusion_lora_binding", None)
         lora_names_by_id = (
             {id(weights): name for name, weights in lora_model.loras.items()} if callable(binding_validator) else {}
@@ -560,6 +623,7 @@ class DiffusionLoRAManager:
                 bound_lora_names.add(name)
 
         # activate weights in each LoRA layer
+        applied_layers = 0
         for full_module_name, lora_layer in self._lora_modules.items():
             lora_weights = self._get_lora_weights(lora_model, full_module_name)
 
@@ -599,6 +663,7 @@ class DiffusionLoRAManager:
                         lora_b_list.append(sub_lora.lora_b * scale)
 
                     lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
+                    applied_layers += 1
                     for sub_lora in sub_loras:
                         if sub_lora is not None:
                             _record_bound(sub_lora)
@@ -620,6 +685,7 @@ class DiffusionLoRAManager:
                     for b in lora_weights.lora_b
                 ]
                 lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
+                applied_layers += 1
                 _record_bound(lora_weights)
                 logger.debug(
                     "Activated packed LoRA for %s (scale=%.2f)",
@@ -651,6 +717,7 @@ class DiffusionLoRAManager:
                 lora_a_list = [lora_weights.lora_a] * n_slices
                 lora_b_list = [b * scale for b in b_splits]
                 lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
+                applied_layers += 1
                 _record_bound(lora_weights)
                 logger.debug(
                     "Activated fused LoRA for packed layer %s (scale=%.2f)",
@@ -661,6 +728,7 @@ class DiffusionLoRAManager:
 
             scaled_lora_b = lora_weights.lora_b * scale
             lora_layer.set_lora(index=0, lora_a=lora_weights.lora_a, lora_b=scaled_lora_b)
+            applied_layers += 1
             _record_bound(lora_weights)
             logger.debug(
                 "Activated LoRA for %s: lora_a shape=%s, lora_b shape=%s, scale=%.2f",
@@ -675,6 +743,8 @@ class DiffusionLoRAManager:
                 lora_model=lora_model,
                 bound_lora_names=frozenset(bound_lora_names),
             )
+
+        return applied_layers
 
     def _reset_lora_layers(self) -> None:
         for lora_layer in self._lora_modules.values():
@@ -692,13 +762,29 @@ class DiffusionLoRAManager:
         # any set_lora() call or model validator fails.
         self._active_adapter_id = None
         try:
-            self._bind_adapter_weights(lora_model, scale)
+            applied_layers = self._bind_adapter_weights(lora_model, scale)
         except Exception:
             self._reset_lora_layers()
             raise
 
         self._active_adapter_id = adapter_id
         self._update_adapter_scale(adapter_id, scale)
+
+        if self._lora_modules and applied_layers == 0:
+            logger.warning(
+                "Adapter %d activated but matched no weights in any of the %d LoRA layers; "
+                "output will be identical to the base model. "
+                "Check that adapter module names match the pipeline component naming.",
+                adapter_id,
+                len(self._lora_modules),
+            )
+        else:
+            logger.info(
+                "Activated adapter %d on %d/%d LoRA layers",
+                adapter_id,
+                applied_layers,
+                len(self._lora_modules),
+            )
 
     def _deactivate_all_adapters(self) -> None:
         if self._active_adapter_id is None:
