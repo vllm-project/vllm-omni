@@ -107,8 +107,9 @@ from vllm_omni.config.endpoint_policy import (
 )
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.duplex.capability import should_enable_duplex_endpoint
+from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.openai.batch_serving import OmniOpenAIServingChatBatch
-from vllm_omni.entrypoints.openai.duplex_capability import should_enable_duplex_endpoint
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.image_api_utils import (
     SUPPORTED_LAYERED_RESOLUTIONS,
@@ -1287,8 +1288,6 @@ async def omni_init_app_state(
         state.stage_configs,
         config_path=getattr(args, "deploy_config", None),
     ):
-        from vllm_omni.experimental.fullduplex.openai.serving import OmniDuplexSessionHandler
-
         state.openai_serving_duplex = OmniDuplexSessionHandler(
             chat_service=state.openai_serving_chat,
             duplex_session_config=getattr(engine_client, "duplex_session_config", None),
@@ -3348,7 +3347,7 @@ async def _parse_video_form(
     width: int | None = Form(default=None),
     height: int | None = Form(default=None),
     num_frames: int | None = Form(default=None),
-    fps: int | None = Form(default=None),
+    fps: float | None = Form(default=None, ge=1, allow_inf_nan=False),
     aspect_ratio: str | None = Form(default=None),
     short_edge: int | None = Form(default=None, ge=1),
     num_outputs_per_prompt: int = Form(default=1, ge=1, le=10),

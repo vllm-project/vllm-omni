@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 
 import torch
@@ -13,9 +13,36 @@ from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig, SupportsModelCpuOffload
+from .config import DIT_COMPONENT, TEXT_ENCODER_COMPONENT
 from .module_collector import ModuleDiscovery
+from .offload_plan import get_offload_plan
 
 logger = init_logger(__name__)
+
+
+def _capture_tensor_devices(modules: Collection[nn.Module]) -> list[tuple[torch.Tensor, torch.device]]:
+    seen: set[int] = set()
+    devices: list[tuple[torch.Tensor, torch.device]] = []
+    for module in modules:
+        for tensor in (*module.parameters(), *module.buffers()):
+            if id(tensor) in seen:
+                continue
+            seen.add(id(tensor))
+            devices.append((tensor, tensor.device))
+    return devices
+
+
+def _restore_tensor_devices(devices: list[tuple[torch.Tensor, torch.device]]) -> None:
+    first_error: BaseException | None = None
+    for tensor, device in devices:
+        try:
+            if tensor.device != device:
+                tensor.data = tensor.data.to(device)
+        except BaseException as exc:
+            logger.exception("Failed to restore tensor placement to %s", device)
+            first_error = first_error or exc
+    if first_error is not None:
+        raise RuntimeError("Failed to restore one or more tensor placements") from first_error
 
 
 class SequentialOffloadHook(ModelHook):
@@ -34,12 +61,14 @@ class SequentialOffloadHook(ModelHook):
         device: torch.device,
         pin_memory: bool = True,
         use_hsdp: bool = False,
+        offload_after_context: bool = True,
     ):
         # Modules to offload to CPU before this module runs
         self.offload_targets = offload_targets
         self.device = device
         self.pin_memory = pin_memory
         self.use_hsdp = use_hsdp
+        self.offload_after_context = offload_after_context
 
     @staticmethod
     def _move_params(
@@ -48,7 +77,7 @@ class SequentialOffloadHook(ModelHook):
         *,
         non_blocking: bool = False,
         pin_memory: bool = False,
-    ) -> None:
+    ) -> bool:
         """Move module parameters and buffers to device.
 
         This cls method specifically prevents recursion device movement,
@@ -57,47 +86,38 @@ class SequentialOffloadHook(ModelHook):
         refer to
         https://github.com/vipshop/cache-dit/blob/v1.2.3/src/cache_dit/caching/cache_blocks/__init__.py#L83
         """
+        moved = False
         for p in module.parameters():
             if p.data.device != target_device:
                 data = p.data.to(target_device, non_blocking=non_blocking)
                 if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
                     data = data.pin_memory()
                 p.data = data
+                moved = True
         for b in module.buffers():
             if b.device != target_device:
                 data = b.data.to(target_device, non_blocking=non_blocking)
                 if pin_memory and target_device.type == "cpu" and not isinstance(data, DTensor):
                     data = data.pin_memory()
                 b.data = data
+                moved = True
+        return moved
 
     def _to_cpu(self, module: nn.Module) -> None:
-        try:
-            param = next(module.parameters())
-        except StopIteration:
-            return
-
-        if param.device.type == "cpu":
-            return
-
         # XPU's allocator doesn't respect stream dependencies in empty_cache,
         # so non-blocking copies can race with cache eviction. Use blocking
         # copies on XPU to avoid NULL pointer errors during DMA.
         non_blocking = not self.use_hsdp and not current_omni_platform.is_xpu()
-        self._move_params(
+        moved = self._move_params(
             module,
             torch.device("cpu"),
             non_blocking=non_blocking,
             pin_memory=self.pin_memory,
         )
-        current_omni_platform.empty_cache()
+        if moved:
+            current_omni_platform.empty_cache()
 
     def _to_gpu(self, module: nn.Module) -> None:
-        try:
-            if next(module.parameters()).device == self.device:
-                return
-        except StopIteration:
-            return
-
         self._move_params(module, self.device, non_blocking=False)
 
     def pre_forward(self, module: nn.Module, *args, **kwargs) -> tuple[tuple, dict]:
@@ -127,6 +147,8 @@ def apply_sequential_offload(
     pin_memory: bool = True,
     use_hsdp: bool = False,
     offload_initial_dits: bool = False,
+    offload_dit_modules: Collection[nn.Module] | None = None,
+    offload_encoder_modules: Collection[nn.Module] | None = None,
 ) -> None:
     """Apply sequential offloading hooks to DiT and encoder modules.
 
@@ -141,6 +163,10 @@ def apply_sequential_offload(
         pin_memory: Whether to pin CPU memory for faster transfers
         use_hsdp: Whether HSDP is enabled (affects non_blocking behavior)
         offload_initial_dits: Whether to begin with all DiT modules on CPU.
+        offload_dit_modules: DiT modules allowed to move to CPU. None selects
+            every DiT for backward compatibility.
+        offload_encoder_modules: Encoder/stage modules allowed to move to CPU.
+            None selects every supplied module for backward compatibility.
 
     Example:
         >>> apply_sequential_offload(
@@ -150,38 +176,59 @@ def apply_sequential_offload(
         ... )
         >>> # Modules of pipeline now automatically swap between CPU and GPU
     """
-    # Register hooks on DiT modules (offload encoders AND other DiTs when a DiT runs)
-    for i, dit_mod in enumerate(dit_modules):
-        other_dits = [d for j, d in enumerate(dit_modules) if j != i]
-        registry = HookRegistry.get_or_create(dit_mod)
-        hook = SequentialOffloadHook(
-            offload_targets=encoder_modules + other_dits,
-            device=device,
-            pin_memory=pin_memory,
-            use_hsdp=use_hsdp,
-        )
-        registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
-        logger.debug("Registered offload hook for %s", dit_mod.__class__.__name__)
+    selected_dit_ids = {id(module) for module in (dit_modules if offload_dit_modules is None else offload_dit_modules)}
+    selected_encoder_ids = {
+        id(module) for module in (encoder_modules if offload_encoder_modules is None else offload_encoder_modules)
+    }
 
-    # Register hooks on encoders (offload DiTs when encoder runs)
-    for enc in encoder_modules:
-        registry = HookRegistry.get_or_create(enc)
-        hook = SequentialOffloadHook(
-            offload_targets=dit_modules,
-            device=device,
-            pin_memory=pin_memory,
-            use_hsdp=use_hsdp,
-        )
-        registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
-        logger.debug("Registered offload hook for %s", enc.__class__.__name__)
+    all_modules = [*dit_modules, *encoder_modules]
+    initial_devices = _capture_tensor_devices(dit_modules) if offload_initial_dits else []
+    try:
+        selected_encoders = [encoder for encoder in encoder_modules if id(encoder) in selected_encoder_ids]
+        # Register hooks on DiT modules (offload selected encoders and other selected DiTs).
+        for i, dit_mod in enumerate(dit_modules):
+            other_dits = [d for j, d in enumerate(dit_modules) if j != i and id(d) in selected_dit_ids]
+            registry = HookRegistry.get_or_create(dit_mod)
+            hook = SequentialOffloadHook(
+                offload_targets=selected_encoders + other_dits,
+                device=device,
+                pin_memory=pin_memory,
+                use_hsdp=use_hsdp,
+                offload_after_context=id(dit_mod) in selected_dit_ids,
+            )
+            registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
+            logger.debug("Registered offload hook for %s", dit_mod.__class__.__name__)
 
-    if offload_initial_dits:
-        try:
+        # Register hooks on all execution stages so unselected resident modules can
+        # still evict selected DiTs before they run.
+        selected_dits = [dit for dit in dit_modules if id(dit) in selected_dit_ids]
+        for enc in encoder_modules:
+            registry = HookRegistry.get_or_create(enc)
+            hook = SequentialOffloadHook(
+                offload_targets=selected_dits,
+                device=device,
+                pin_memory=pin_memory,
+                use_hsdp=use_hsdp,
+                offload_after_context=id(enc) in selected_encoder_ids,
+            )
+            registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
+            logger.debug("Registered offload hook for %s", enc.__class__.__name__)
+
+        if offload_initial_dits:
             for dit_mod in dit_modules:
+                if id(dit_mod) not in selected_dit_ids:
+                    continue
                 _get_sequential_offload_hook(dit_mod)._to_cpu(dit_mod)
-        except Exception:
-            remove_sequential_offload([*dit_modules, *encoder_modules])
-            raise
+    except BaseException:
+        try:
+            remove_sequential_offload(all_modules)
+        except BaseException:
+            logger.exception("Failed to remove every sequential hook during rollback")
+        try:
+            _restore_tensor_devices(initial_devices)
+        except BaseException:
+            logger.exception("Failed to restore initial DiT placement during rollback")
+        raise
 
 
 def remove_sequential_offload(modules: list[nn.Module]) -> None:
@@ -194,11 +241,18 @@ def remove_sequential_offload(modules: list[nn.Module]) -> None:
         >>> all_modules = [*dit_modules, *encoder_modules]
         >>> remove_sequential_offload(all_modules)
     """
+    first_error: BaseException | None = None
     for module in modules:
-        registry: HookRegistry | None = getattr(module, "_hook_registry", None)
-        if registry is not None:
-            registry.remove_hook(SequentialOffloadHook._HOOK_NAME)
-            logger.debug("Removed offload hook from %s", module.__class__.__name__)
+        try:
+            registry: HookRegistry | None = getattr(module, "_hook_registry", None)
+            if registry is not None:
+                registry.remove_hook(SequentialOffloadHook._HOOK_NAME)
+                logger.debug("Removed offload hook from %s", module.__class__.__name__)
+        except BaseException as exc:
+            logger.exception("Failed to remove offload hook from %s", module.__class__.__name__)
+            first_error = first_error or exc
+    if first_error is not None:
+        raise RuntimeError("Failed to remove one or more sequential offload hooks") from first_error
 
 
 def _get_sequential_offload_hook(module: nn.Module) -> SequentialOffloadHook:
@@ -218,12 +272,14 @@ def sequential_offload_component(module: nn.Module) -> Iterator[None]:
         yield
     except BaseException:
         try:
-            hook._to_cpu(module)
+            if hook.offload_after_context:
+                hook._to_cpu(module)
         except Exception:
             logger.exception("Failed to release %s after component failure", module.__class__.__name__)
         raise
     else:
-        hook._to_cpu(module)
+        if hook.offload_after_context:
+            hook._to_cpu(module)
 
 
 class ModelLevelOffloadBackend(OffloadBackend):
@@ -245,11 +301,26 @@ class ModelLevelOffloadBackend(OffloadBackend):
         # Pipelines with non-forward component entry points own their complete
         # mutual-exclusion lifecycle. Delegate through the explicit protocol.
         if isinstance(pipeline, SupportsModelCpuOffload):
-            pipeline.enable_omni_model_cpu_offload(
-                device=self.device,
-                pin_memory=self.config.pin_cpu_memory,
-                use_hsdp=self.config.use_hsdp,
-            )
+            try:
+                if self.config.components is not None:
+                    pipeline.enable_omni_model_cpu_offload(
+                        device=self.device,
+                        pin_memory=self.config.pin_cpu_memory,
+                        use_hsdp=self.config.use_hsdp,
+                        offload_components=self.config.components,
+                    )
+                else:
+                    pipeline.enable_omni_model_cpu_offload(
+                        device=self.device,
+                        pin_memory=self.config.pin_cpu_memory,
+                        use_hsdp=self.config.use_hsdp,
+                    )
+            except BaseException:
+                try:
+                    pipeline.disable_omni_model_cpu_offload()
+                except BaseException:
+                    logger.exception("Model-level cleanup failed while handling an enable failure")
+                raise
             self._custom_pipeline = pipeline
             self.enabled = True
             logger.info(
@@ -259,44 +330,65 @@ class ModelLevelOffloadBackend(OffloadBackend):
             return
 
         modules = ModuleDiscovery.discover(pipeline)
+        plan = get_offload_plan(pipeline)
+        selected_encoders = [
+            encoder
+            for encoder, name in zip(modules.encoders, modules.encoder_names)
+            if self.config.should_offload_encoder(name, plan)
+        ]
+        if self.config.components is not None:
+            if not modules.dits:
+                raise ValueError("Component-selective model offload requires a DiT/transformer module")
+            if not modules.encoders:
+                raise ValueError("Component-selective model offload requires an encoder execution stage")
+            if self.config.offloads(TEXT_ENCODER_COMPONENT) and not selected_encoders:
+                raise ValueError("No text encoder modules found for selected text_encoder module offload")
 
-        # Move encoders to GPU
-        for enc in modules.encoders:
-            enc.to(self.device)
-
-        # Move VAE(s) to GPU if available
-        for vae in modules.vaes:
-            try:
+        all_modules = [
+            *modules.dits,
+            *modules.encoders,
+            *modules.vaes,
+            *modules.resident_modules,
+        ]
+        initial_devices = _capture_tensor_devices(all_modules)
+        try:
+            for encoder in modules.encoders:
+                encoder.to(self.device)
+            for vae in modules.vaes:
                 vae.to(self.device, non_blocking=True)
-            except Exception as exc:
-                logger.debug("Failed to move VAE to GPU: %s", exc)
+            for resident in modules.resident_modules:
+                resident.to(self.device)
 
-        # Pin resident modules on GPU (small hot submodules called inside the DiT loop).
-        for res, name in zip(modules.resident_modules, modules.resident_names):
+            if not modules.dits:
+                logger.warning("No DiT/transformer modules found, skipping model-level offloading")
+                return
+            if not modules.encoders:
+                for dit in modules.dits:
+                    dit.to(self.device)
+                logger.warning("No encoder modules found, skipping model-level offloading")
+                return
+
+            apply_sequential_offload(
+                dit_modules=modules.dits,
+                encoder_modules=modules.encoders,
+                device=self.device,
+                pin_memory=self.config.pin_cpu_memory,
+                use_hsdp=self.config.use_hsdp,
+                offload_dit_modules=(
+                    modules.dits if self.config.components is None or self.config.offloads(DIT_COMPONENT) else ()
+                ),
+                offload_encoder_modules=selected_encoders,
+            )
+        except BaseException:
             try:
-                res.to(self.device)
-            except Exception as exc:
-                logger.warning("Failed to move resident module '%s' to GPU: %s", name, exc)
-
-        if not modules.dits:
-            logger.warning("No DiT/transformer modules found, skipping model-level offloading")
-            return
-
-        if not modules.encoders:
-            # Nothing to swap against — move DiTs to GPU and skip hooks.
-            for dit in modules.dits:
-                dit.to(self.device)
-            logger.warning("No encoder modules found, skipping model-level offloading")
-            return
-
-        # Apply sequential offloading hooks
-        apply_sequential_offload(
-            dit_modules=modules.dits,
-            encoder_modules=modules.encoders,
-            device=self.device,
-            pin_memory=self.config.pin_cpu_memory,
-            use_hsdp=self.config.use_hsdp,
-        )
+                remove_sequential_offload([*modules.dits, *modules.encoders])
+            except BaseException:
+                logger.exception("Failed to remove every model-level hook during rollback")
+            try:
+                _restore_tensor_devices(initial_devices)
+            except BaseException:
+                logger.exception("Failed to restore model placement during rollback")
+            raise
 
         # Track modules for cleanup
         self._offload_modules = [*modules.dits, *modules.encoders]

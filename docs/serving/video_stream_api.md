@@ -36,7 +36,7 @@ WebSocket /v1/video/chat/stream
 ### Protocol
 
 | Direction | Type | Required fields | Description |
-|-----------|------|-----------------|-------------|
+| ----------- | ------ | ----------------- | ------------- |
 | Client -> Server | `session.config` | none | First message. Configures output modalities, frame sampling, EVS, and prompts. |
 | Client -> Server | `video.frame` | `data` | Base64 JPEG/PNG frame. |
 | Client -> Server | `audio.chunk` | `data` | Base64 PCM16 16 kHz mono audio bytes. |
@@ -53,7 +53,7 @@ WebSocket /v1/video/chat/stream
 ### `session.config` Fields
 
 | Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| ------- | ------ | --------- | ------------- |
 | `model` | string or null | null | Optional model name. Usually omitted because the server hosts one model. |
 | `modalities` | list[string] | `["text", "audio"]` | Output modalities. Use `["text"]`, `["audio"]`, or both. |
 | `num_frames` | integer, 1-128 | `4` | Number of buffered frames sampled for each query. |
@@ -69,7 +69,7 @@ WebSocket /v1/video/chat/stream
 The server accepts these legacy field names and rewrites them before validation. New clients should send the canonical names above.
 
 | Legacy field | Canonical field |
-|--------------|-----------------|
+| -------------- | ----------------- |
 | `num_sample_frames` | `num_frames` |
 | `evs_enabled` | `enable_frame_filter` |
 | `evs_threshold` | `frame_filter_threshold` |
@@ -77,7 +77,7 @@ The server accepts these legacy field names and rewrites them before validation.
 ### Environment Variables
 
 | Variable | Values | Default | Description |
-|----------|--------|---------|-------------|
+| -------- | ------ | ------- | ----------- |
 | `VLLM_VIDEO_ASYNC_CHUNK` | `on`, `off` | `on` | Wire-level streaming switch. `off` buffers server-side deltas and emits coalesced outputs at the end of a query. |
 | `VLLM_VIDEO_AUDIO_DELTA_MODE` | `fast`, `slow` | `fast` | Audio delta extraction strategy. `fast` emits only newly produced chunks; `slow` recomputes from accumulated audio and exists for A/B verification. |
 

@@ -52,7 +52,7 @@ from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_p
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
-from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRow
+from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import (
     merge_runtime_info,
     require_request_id,
@@ -497,7 +497,7 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 f"Nemotron VoiceChat duplex input sequence moved backwards: {source_input_seq} < {last_input_seq}"
             )
 
-        from vllm_omni.experimental.fullduplex.nemotron_voicechat.input import (
+        from vllm_omni.model_executor.models.nemotron_voicechat.duplex.input import (
             decode_pcm_f32le,
         )
 

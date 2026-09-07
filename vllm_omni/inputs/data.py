@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import copy
 import pprint
 from dataclasses import asdict, dataclass, field
@@ -251,7 +254,7 @@ class OmniDiffusionSamplingParams:
     # Original dimensions (before VAE scaling)
     height: int | None = None
     width: int | None = None
-    fps: int | None = None  # Integer FPS kept for request compatibility and output encoding.
+    fps: float | None = None  # Request/output-encoding FPS; fractional rates are supported.
     frame_rate: float | None = None  # Floating-point rate used by the diffusion model when it differs from `fps`.
     height_not_provided: bool = False
     width_not_provided: bool = False

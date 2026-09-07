@@ -98,10 +98,10 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
     --stage-overrides '{"0":{"max_num_seqs":4}}'
 ```
 
-BAGEL image requests use exactly `num_inference_steps` denoising updates,
-including one-step requests. The scheduler batches only requests with
-compatible effective image sizes and BAGEL CFG/renormalization settings.
-Sequence parallelism and diffusion cache backends such as TeaCache or
+BAGEL image requests require `num_inference_steps >= 2`: the original BAGEL
+schedule uses `num_inference_steps - 1` denoising updates. The scheduler batches
+only requests with compatible effective image sizes and BAGEL CFG/renormalization
+settings. Sequence parallelism and diffusion cache backends such as TeaCache or
 Cache-DiT are not currently supported together with BAGEL step execution.
 
 ### Tensor Parallelism (TP)
