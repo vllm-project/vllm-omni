@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Generate a LingBot-World v2 video from an image and camera trajectory.
 
 The official checkpoint is licensed separately under CC BY-NC-SA and is
@@ -33,7 +33,6 @@ _MODEL = "robbyant/lingbot-world-v2-14b-causal-fast-diffusers"
 _NUM_INFERENCE_STEPS = 4
 _MAX_SEQUENCE_LENGTH = 512
 _MAX_PIXEL_AREA = 480 * 832
-_MAX_RAW_FRAMES = 117
 _MAX_SOURCE_CAMERA_FRAMES = 4096
 _TEMPORAL_COMPRESSION = 4
 _LATENT_FRAMES_PER_BLOCK = 3
@@ -188,8 +187,6 @@ def build_request(
         raise ValueError("--height * --width must not exceed 480 * 832 pixels.")
     if args.num_frames <= 0:
         raise ValueError("--num-frames must be a positive integer.")
-    if args.num_frames > _MAX_RAW_FRAMES:
-        raise ValueError("--num-frames must not exceed 117 raw frames.")
     if args.num_frames > paths.camera_frames:
         raise ValueError("Camera arrays must contain at least --num-frames frames.")
     if (args.num_frames - 1) % _TEMPORAL_COMPRESSION:
