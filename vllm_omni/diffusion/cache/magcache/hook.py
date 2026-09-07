@@ -143,6 +143,11 @@ class MagCacheHeadHook(ModelHook):
         if not should_compute:
             res = state.previous_residual
 
+            if self._is_tail:
+                # Single-block configuration: this hook is also the tail, so
+                # the step schedule must advance on skipped steps too.
+                self._advance_step_head(state)
+
             if isinstance(res, tuple):
                 res = tuple(r.to(hidden_states.device) for r in res)
 
@@ -363,10 +368,11 @@ class MagCacheBlockHook(ModelHook):
         state: MagCacheState = self.state_manager.get_state()
 
         if not state.should_compute:
-            res = state.previous_residual
-            if res is None:
-                res = torch.zeros_like(args[0])
-
+            # The head hook already applied the cached residual, which is the
+            # residual of the whole block stack (tail output - head input).
+            # Non-head blocks must pass their inputs through unchanged on a
+            # skipped step; adding the residual here again would apply it once
+            # per hooked block.
             if hasattr(self._metadata, "hidden_states_argument_name"):
                 arg_name = self._metadata.hidden_states_argument_name
             else:
@@ -380,27 +386,15 @@ class MagCacheBlockHook(ModelHook):
                 encoder_hidden_states = self._metadata._get_parameter_from_args_kwargs(
                     "encoder_hidden_states", args, kwargs
                 )
-
-                if self._strategy is not None:
-                    out_hidden, enc_out = self._strategy.apply_residual_tuple(hidden_states, encoder_hidden_states, res)
-                else:
-                    out_hidden = hidden_states + res
-                    enc_out = encoder_hidden_states
-
                 max_idx = max(
                     self._metadata.return_hidden_states_index, self._metadata.return_encoder_hidden_states_index
                 )
                 ret_list = [None] * (max_idx + 1)
-                ret_list[self._metadata.return_hidden_states_index] = out_hidden
-                ret_list[self._metadata.return_encoder_hidden_states_index] = enc_out
+                ret_list[self._metadata.return_hidden_states_index] = hidden_states
+                ret_list[self._metadata.return_encoder_hidden_states_index] = encoder_hidden_states
                 return tuple(ret_list)
 
-            if self._strategy is not None:
-                output = self._strategy.apply_residual(hidden_states, res)
-            else:
-                output = hidden_states + res
-
-            return output
+            return hidden_states
 
         output = self.fn_ref.original_forward(*args, **kwargs)
 

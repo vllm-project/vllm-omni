@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 from vllm import SamplingParams
 
 from vllm_omni.entrypoints.openai.stage_params import (
@@ -11,6 +12,8 @@ from vllm_omni.entrypoints.openai.stage_params import (
     resolve_stage_sampling_params,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_resolve_stage_sampling_params_clones_stage_default():

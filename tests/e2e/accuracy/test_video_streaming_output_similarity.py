@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Online serving smoke test for streaming video output similarity.
 """
@@ -9,9 +12,9 @@ import pytest
 
 from tests.e2e.accuracy.helpers import assert_video_similarity_metrics, probe_video
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import DiffusionResponse, OmniServer, OpenAIClientHandler
+from tests.helpers.runtime import DiffusionResponse, OmniServer, OnlineOmniClient, get_model_prefix
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 MODEL = "BestWishYsh/Helios-Distilled"
 PROMPT = "A serene lakeside sunrise with mist over the water."
@@ -67,8 +70,8 @@ def _request_config(model: str, *, serialize_extra_params: bool) -> dict:
     }
 
 
-def _client_for(server: OmniServer, *, run_level: str) -> OpenAIClientHandler:
-    return OpenAIClientHandler(
+def _client_for(server: OmniServer, *, run_level: str) -> OnlineOmniClient:
+    return OnlineOmniClient(
         host=server.host,
         port=server.port,
         api_key="EMPTY",
@@ -95,12 +98,11 @@ def _write_video_artifact(response: DiffusionResponse, output_path: Path) -> Pat
 )
 def test_helios_streaming_output_matches_non_streaming(
     model: str,
-    model_prefix: str,
     run_level: str,
     tmp_path: Path,
     record_property,
 ):
-    model = model_prefix + model
+    model = get_model_prefix() + model
 
     with OmniServer(model, _server_args(streaming_output=True), use_omni=True) as server:
         client = _client_for(server, run_level=run_level)

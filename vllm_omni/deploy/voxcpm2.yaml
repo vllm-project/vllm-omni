@@ -8,16 +8,17 @@ dtype: bfloat16
 
 stages:
   - stage_id: 0
-    max_num_seqs: 32
+    max_num_seqs: 8
     gpu_memory_utilization: 0.9
     # Right-size the KV cache instead of letting it fill gpu_memory_utilization.
-    # max_num_seqs(32) * max_model_len(4096) ~= 131k tokens; 6 GiB holds ~175k
-    # (42x concurrency, above the 32-seq scheduler cap, so no throughput loss).
+    # max_num_seqs(8) * max_model_len(4096) ~= 32k tokens; 6 GiB leaves headroom
+    # for longer live requests while keeping VoxCPM2 TTS decode batches small
+    # enough to avoid the high ITL observed with large admission caps.
     # The remaining VRAM stays free for the VoxCPM2 diffusion side-path
     # (LocDiT / AudioVAE / code2wav + batch CUDA-graph pools), which allocates
     # outside vLLM's KV accounting during inference. Keeps peak ~13 GiB on any
     # card and avoids per-rebase OOM tuning on small CI GPUs.
-    # Assumes prefix caching off and max_num_seqs*max_model_len <= ~175k tokens;
+    # Assumes prefix caching off and typical live decode concurrency <= ~8;
     # raise this cap if either grows or enable_prefix_caching is turned on.
     kv_cache_memory_bytes: 6442450944  # 6 GiB
     enforce_eager: true
@@ -39,6 +40,9 @@ stages:
           enable_loc_dit_fused_mlp: true
           enable_loc_dit_zero_dt_cache: true
           enable_loc_dit_skip_qkv_contig: true
+          enable_loc_dit_reduce_overhead_no_cg: true
+          enable_unified_decode_graph: true
+          unified_decode_graph_max_batch_size: 8
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0

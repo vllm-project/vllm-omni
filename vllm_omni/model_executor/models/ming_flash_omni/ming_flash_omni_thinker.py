@@ -64,6 +64,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
+from vllm_omni.model_executor.model_loader.weight_utils import resolve_model_to_local_path
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.transformers_utils.configs.ming_flash_omni import BailingMM2Config
 from vllm_omni.transformers_utils.processors.ming import (
@@ -715,12 +716,8 @@ class MingFlashOmniThinkerForConditionalGeneration(
 
         p = Path(model_path) / "mlp" / "model.safetensors"
         if not p.exists() and not os.path.exists(model_path):
-            from vllm_omni.model_executor.model_loader.weight_utils import (
-                download_weights_from_hf_specific,
-            )
-
             try:
-                local_path = download_weights_from_hf_specific(model_path, None, ["mlp/*"])
+                local_path = resolve_model_to_local_path(model_path, allow_download=True, allow_patterns=["mlp/*"])
                 p = Path(local_path) / "mlp" / "model.safetensors"
             except Exception:
                 logger.exception("[MingFlashOmniThinker] failed to download mlp/ from %s", model_path)

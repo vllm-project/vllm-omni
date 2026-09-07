@@ -211,38 +211,39 @@ In sequential mode, each stage must wait for the previous stage to complete enti
 
 ## Configuration
 
-Enable async_chunk in stage configuration YAML:
+Enable async chunk mode in the deploy YAML:
 
 ```yaml
 async_chunk: true
-stage_args:
-  - stage_id: 0
-    engine_args:
-      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk
-  - stage_id: 1
-    engine_args:
-      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_async_chunk
 ```
 
-### Stage Configuration
+The registered `PipelineConfig` owns the async handoff processor functions.
+For Qwen3-Omni these are `thinker2talker_async_chunk` and
+`talker2code2wav_async_chunk`; deploy YAML only selects the mode and runtime
+sizing.
+
+### Configuration ownership
 
 - `async_chunk: bool`: Enable/disable async chunk mode
-- `custom_process_next_stage_input_func: str`: Path to custom chunk processing function; receives `(transfer_manager, pooling_output, request)`. For qwen3-omni: `thinker2talker_async_chunk`, `talker2code2wav_async_chunk`
-- `stage_connector_config: dict`: Connector configuration
-- `worker_type: str`: Model type, e.g. `"ar"` or `"generation"` (used by OmniChunkTransferAdapter for mode-specific payload handling)
+- `async_chunk_process_next_stage_input_func: str`: Pipeline-owned chunk processor path
+- `execution_type: StageExecutionType`: Pipeline-owned runtime family
+- `connectors: dict`: Deploy-owned connector definitions
 - `max_num_seqs: int`: Maximum number of sequences for concurrent processing in the stage
-
 
 ### Connector Configuration
 
 ```yaml
 connectors:
-  - from_stage: 0
-    to_stage: 1
-    spec:
-      name: SharedMemoryConnector
-      extra:
-        stage_id: 0
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+
+stages:
+  - stage_id: 0
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+  - stage_id: 1
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
 ```
 
 ### Code2Wav Batch Configuration
@@ -250,13 +251,10 @@ connectors:
 For optimal performance with async_chunk, the code2wav stage should be configured with batching:
 
 ```yaml
-stage_args:
+stages:
   - stage_id: 2  # code2wav stage
-    runtime:
-      devices: "1"
-    engine_args:
-      model_stage: code2wav
-      max_num_seqs: 64  # Enables batched audio generation
+    devices: "1"
+    max_num_seqs: 64  # Enables batched audio generation
 ```
 
 ## Related Files

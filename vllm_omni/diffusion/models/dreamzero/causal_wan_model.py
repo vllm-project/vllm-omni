@@ -37,6 +37,20 @@ from vllm_omni.diffusion.models.dreamzero.action_encoder import (
     MultiEmbodimentActionEncoder,
 )
 
+# AR-Diffusion paged self-attention (in-tree experimental engine). Import at
+# module level so the isinstance check + custom-op call trace cleanly inside
+# the fullgraph-compiled DiT block (an import inside the traced region would
+# graph-break). The model still works without the engine: the payload type is
+# only ever constructed by the AR-Diffusion runner.
+try:
+    from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
+        ARDiffusionPagedLayerInputs,
+        paged_write_attn,
+    )
+except ImportError:  # pragma: no cover - experimental package always ships in-tree
+    ARDiffusionPagedLayerInputs = None
+    paged_write_attn = None
+
 # ── RoPE utilities ──────────────────────────────────────────────────
 
 
@@ -510,7 +524,7 @@ class CausalWanSelfAttention(nn.Module):
         freqs_action: torch.Tensor,
         freqs_state: torch.Tensor,
         action_register_length: int | None,
-        kv_cache: torch.Tensor | None = None,
+        kv_cache: torch.Tensor | Any | None = None,
         current_start_frame: int = 0,
         is_tf: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -567,24 +581,44 @@ class CausalWanSelfAttention(nn.Module):
             action_v = v[:, -action_register_length:]
             v = v[:, :-action_register_length]
 
-        updated_k = kv_cache[0]
-        updated_v = kv_cache[1]
-        new_k = torch.cat([updated_k, roped_key], dim=1)
-        new_v = torch.cat([updated_v, v], dim=1)
-        new_k = new_k[:, -self.max_attention_size :]
-        new_v = new_v[:, -self.max_attention_size :]
-
-        if action_register_length is not None:
-            q_cat = torch.cat([roped_query, roped_action_query], dim=1)
-            k_cat = torch.cat([new_k, roped_action_key], dim=1)
-            v_cat = torch.cat([new_v, action_v], dim=1)
+        if ARDiffusionPagedLayerInputs is not None and isinstance(kv_cache, ARDiffusionPagedLayerInputs):
+            # Fused write+attend custom op: one opaque node in the compiled
+            # graph (slot writes + FlashAttention block-table kernel inside).
+            # Metadata tensors were prepared once per forward in _forward_blocks.
+            if action_register_length is not None:
+                q_cat = torch.cat([roped_query, roped_action_query], dim=1)
+                k_act, v_act = roped_action_key[0], action_v[0]
+            else:
+                q_cat = roped_query
+                k_act = v_act = None
+            x = paged_write_attn(
+                kv_cache,
+                q_cat[0],
+                roped_key[0],
+                v[0],
+                k_act,
+                v_act,
+                self.head_dim**-0.5,
+            ).unsqueeze(0)
         else:
-            q_cat = roped_query
-            k_cat = new_k
-            v_cat = new_v
+            updated_k = kv_cache[0]
+            updated_v = kv_cache[1]
+            new_k = torch.cat([updated_k, roped_key], dim=1)
+            new_v = torch.cat([updated_v, v], dim=1)
+            new_k = new_k[:, -self.max_attention_size :]
+            new_v = new_v[:, -self.max_attention_size :]
 
-        x = self.attn(q_cat, k_cat, v_cat)
-        updated_kv_cache = torch.stack([new_k, new_v], dim=0)
+            if action_register_length is not None:
+                q_cat = torch.cat([roped_query, roped_action_query], dim=1)
+                k_cat = torch.cat([new_k, roped_action_key], dim=1)
+                v_cat = torch.cat([new_v, action_v], dim=1)
+            else:
+                q_cat = roped_query
+                k_cat = new_k
+                v_cat = new_v
+
+            x = self.attn(q_cat, k_cat, v_cat)
+            updated_kv_cache = torch.stack([new_k, new_v], dim=0)
 
         x = x.flatten(2)
         x = self.o(x)
@@ -646,7 +680,7 @@ class CausalWanAttentionBlock(nn.Module):
         freqs_state: torch.Tensor,
         context: torch.Tensor,
         action_register_length: int | None = None,
-        kv_cache: torch.Tensor | None = None,
+        kv_cache: torch.Tensor | Any | None = None,
         crossattn_cache: dict | None = None,
         current_start_frame: int = 0,
         is_tf: bool = True,
@@ -925,10 +959,10 @@ class CausalWanModel(nn.Module):
         action: torch.Tensor | None,
         timestep_action: torch.Tensor | None,
         state: torch.Tensor | None,
-        kv_cache: list[torch.Tensor],
-        crossattn_cache: list[dict] | None,
+        kv_cache: list[Any],
         current_start_frame: int,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
+        crossattn_cache: list[dict] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor | None]]:
         x = x.flatten(start_dim=2).transpose(1, 2)
         B = x.shape[0]
         F_t = timestep.shape[1]
@@ -966,7 +1000,28 @@ class CausalWanModel(nn.Module):
             clip_embedding = self.img_emb(clip_feature)
             context = torch.cat([clip_embedding, context], dim=1)
 
-        updated_kv_caches: list[torch.Tensor] = []
+        # AR-Diffusion paged path: host-side prep ONCE per branch forward, outside
+        # the compiled blocks — allocate current video/action slots, build the
+        # padded block-table metadata all 40 layers share, and hand the compiled
+        # region plain tensors (ARDiffusionPagedLayerInputs) instead of a Python
+        # context object. Lazy-allocation contract preserved: only the branch this
+        # CFG-parallel rank executes reaches its _forward_blocks.
+        if kv_cache and getattr(kv_cache[0], "is_ar_diffusion_paged_context", False):
+            if B != 1:
+                raise RuntimeError("AR-Diffusion paged self-attention currently expects batch_size=1")
+            fctx = kv_cache[0].forward_ctx
+            if seq_len != fctx.seq_len:
+                raise RuntimeError(
+                    f"AR-Diffusion paged context seq_len={fctx.seq_len} but current video KV has {seq_len} tokens"
+                )
+            fctx.prepare(
+                device=x.device,
+                action_len=int(action_register_length or 0),
+                query_len=int(x.shape[1]),
+            )
+            kv_cache = [c.to_layer_inputs() for c in kv_cache]
+
+        updated_kv_caches: list[torch.Tensor | None] = []
         for block_index, block in enumerate(self.blocks):
             x, updated_kv_cache = block(
                 x=x,
@@ -1000,9 +1055,9 @@ class CausalWanModel(nn.Module):
         timestep: torch.Tensor,
         context: torch.Tensor,
         seq_len: int,
-        kv_cache: list[torch.Tensor],
-        crossattn_cache: list[torch.Tensor],
+        kv_cache: list[Any],
         current_start_frame: int,
+        crossattn_cache: list[dict] | None = None,
         y: torch.Tensor | None = None,
         clip_feature: torch.Tensor | None = None,
         action: torch.Tensor | None = None,

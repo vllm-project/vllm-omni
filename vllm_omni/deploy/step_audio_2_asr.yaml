@@ -1,0 +1,22 @@
+# Step-Audio2 ASR deploy: thinker only.
+pipeline: step_audio_2_asr
+async_chunk: false
+trust_remote_code: true
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    devices: "0,1"
+    tensor_parallel_size: 2
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.8
+    enforce_eager: true
+    async_scheduling: false
+    max_num_batched_tokens: 2048
+    default_sampling_params:
+      temperature: 0.7
+      top_p: 0.9
+      top_k: -1
+      max_tokens: 1024
+      seed: 42
+      repetition_penalty: 1.05

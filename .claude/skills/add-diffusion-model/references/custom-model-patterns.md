@@ -16,20 +16,22 @@ vllm_omni/diffusion/models/wan2_2/
 
 The transformer is loaded separately via `weights_sources` + `load_weights()`. Non-transformer components (VAE, text encoder) are loaded in `__init__` via `from_pretrained()`.
 
-### Custom model with external deps (e.g., DreamID-Omni)
+### External adapter (not native support)
 
 ```
-vllm_omni/diffusion/models/dreamid_omni/
+vllm_omni/diffusion/models/<name>/
 ├── __init__.py                    # Exports pipeline only
-├── pipeline_dreamid_omni.py       # Pipeline: loads ALL weights in __init__ via custom helpers
-├── fusion.py                      # Custom fusion architecture (video + audio cross-attention)
-└── wan2_2.py                      # Re-implemented Wan backbone with split API
+├── pipeline_<name>.py             # Pipeline: loads ALL weights in __init__ via custom helpers
+└── <backbone>.py                  # Custom transformer / fusion architecture
 
-examples/offline_inference/x_to_video_audio/
-└── download_dreamid_omni.py       # Downloads weights from 3 HF repos + clones code repo
+examples/offline_inference/<task>/
+└── download_<name>.py             # Downloads weights and/or clones code repo
 ```
 
-All weights loaded eagerly in `__init__`. `load_weights()` is a no-op. External dependency (`dreamid_omni` package) imported with try/except.
+All weights are loaded eagerly in `__init__`. `load_weights()` is a no-op. The
+external dependency is imported with try/except. Use this pattern only when the
+requested scope explicitly allows an adapter; it does not satisfy a request for
+a native vLLM-Omni implementation.
 
 ### Custom model with ported code (e.g., BAGEL)
 
@@ -76,7 +78,7 @@ self.weights_sources = [
 ]
 ```
 
-### Pattern 3: Fully custom loading (DreamID-Omni)
+### Pattern 3: Fully custom loading
 
 ```
 init → load ALL weights eagerly via custom helpers → load_weights() = no-op
@@ -87,7 +89,7 @@ init → load ALL weights eagerly via custom helpers → load_weights() = no-op
 - `load_weights()` is `pass`
 - Weights may come from multiple HF repos in different formats (`.pth`, `.safetensors`)
 
-Use this when:
+Use this only for an explicitly approved external adapter when:
 - The original model has complex, well-tested loading code you don't want to rewrite
 - Weights span multiple HF repos
 - Weight format is non-standard (e.g., a single `.pth` file, not sharded safetensors)
@@ -108,16 +110,23 @@ Standard diffusers `model_index.json`:
 Custom model `model_index.json` (minimal):
 ```json
 {
-    "_class_name": "DreamIDOmniPipeline",
-    "fusion": "DreamID-Omni/dreamid_omni.safetensors"
+    "_class_name": "YourCustomPipeline",
+    "fusion": "weights/model.safetensors"
 }
 ```
 
-The only **required** field is `_class_name` — it must match a key in `_DIFFUSION_MODELS` in `registry.py`. Other fields are model-specific and accessible via `od_config.model_config` dict.
+The only **required** field is `_class_name` — it must match a key in
+`_DIFFUSION_MODELS` in `registry.py`. Other fields are model-specific and
+accessible via `od_config.model_config`.
+
+When the released repository cannot be modified and contains neither this file
+nor a root `config.json`, use the generic native-checkpoint signature resolver.
+Match the exact Hub ID or a distinctive local file set; never infer support from
+a model-name substring.
 
 ## External Dependency Management
 
-### Git clone + .pth injection (DreamID-Omni pattern)
+### Git clone + .pth injection
 
 ```python
 def download_dependency():
@@ -142,6 +151,10 @@ def download_dependency():
 
 Copy essential files from the original repo into `vllm_omni/diffusion/models/<name>/`. Adapt imports to use vllm-omni utilities. Benefits: no external dependency, no git clone step. Drawback: must maintain the ported code.
 
+This is the default for native model support. Keep the reference repository at
+a pinned revision for architecture analysis and golden outputs, but do not
+import it from production code.
+
 ## Multi-Modal Input/Output Protocols
 
 Custom models that handle images, audio, or video I/O should implement protocol classes:
@@ -163,7 +176,7 @@ The engine checks `isinstance(pipeline, SupportImageInput)` at startup to config
 
 Diffusers models use `config.json` in each subfolder. Custom models often use:
 
-**Module-level config dicts** (DreamID-Omni):
+**Module-level config dicts**:
 ```python
 VIDEO_CONFIG = {
     "patch_size": [1, 2, 2], "model_type": "ti2v",
@@ -181,7 +194,7 @@ vae_cfg = bagel_cfg.get("vae_config", {})
 
 ## Custom Architecture Patterns
 
-### Split forward API (DreamID-Omni)
+### Split forward API
 
 When a fusion model needs to interleave blocks from two backbones:
 

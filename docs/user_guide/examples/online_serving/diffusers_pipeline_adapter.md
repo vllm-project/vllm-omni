@@ -16,6 +16,7 @@ implemented with clear Diffusers or vLLM-Omni behavior.
 - Sequence parallel execution
 - TeaCache / Cache-DiT acceleration
 - Step-wise execution (continuous batching)
+- Component-selective `diffusion_offload_config` (the legacy whole-pipeline CPU-offload options remain supported)
 
 For these features, it is recommended to use natively supported pipelines instead.
 
@@ -99,7 +100,7 @@ a native vLLM-Omni pipeline for those cases.
 ### Attention Backends
 
 The diffusers backend converts
-[vLLM-Omni standard of attention backend setting](../../../docs/user_guide/diffusion/attention_backends.md)
+[vLLM-Omni standard of attention backend setting](../../diffusion/attention_backends.md)
 to [diffusers standard](https://huggingface.co/docs/diffusers/optimization/attention_backends#available-backends).
 
 Specifically for `FLASH_ATTN`, it will first attempt to use FlashAttention-3 and then FlashAttention-2.

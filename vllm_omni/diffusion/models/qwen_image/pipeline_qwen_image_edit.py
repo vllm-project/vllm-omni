@@ -36,6 +36,7 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import calculate_
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
+from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -263,9 +264,8 @@ class QwenImageEditPipeline(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
         # ``from_pretrained_with_prefetch`` re-prefetches and retries on a
-        # half-written cache (missing-shard ``OSError`` *and* the default
-        # -config size-mismatch ``RuntimeError`` that ``retry_on_missing_shard``
-        # could not recover) instead of crashing the worker.
+        # half-written cache (missing-shard ``OSError`` and the default
+        # -config size-mismatch ``RuntimeError``) instead of crashing the worker.
         self.text_encoder = from_pretrained_with_prefetch(
             Qwen2_5_VLForConditionalGeneration.from_pretrained,
             model,
@@ -816,10 +816,8 @@ class QwenImageEditPipeline(
         if self.attention_kwargs is None:
             self._attention_kwargs = {}
 
-        txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
-        negative_txt_seq_lens = (
-            negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
-        )
+        txt_seq_lens = txt_seq_lens_from_embeds(prompt_embeds)
+        negative_txt_seq_lens = txt_seq_lens_from_embeds(negative_prompt_embeds)
 
         latents = self.diffuse(
             prompt_embeds,

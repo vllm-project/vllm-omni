@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for the Omni serve CLI helpers."""
 
 from __future__ import annotations
@@ -9,6 +12,7 @@ import pytest
 from pytest_mock import MockerFixture
 
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand, run_headless
+from vllm_omni.entrypoints.utils import parse_stage_overrides
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -31,6 +35,81 @@ def test_serve_parser_accepts_no_async_chunk_and_marks_it_explicit() -> None:
     assert not explicit["async_chunk"]
 
 
+def test_serve_parser_accepts_strategy_config() -> None:
+    """``--strategy-config`` must parse onto the ``strategy_config`` dest and be
+    forwarded as an explicit kwarg so the engine can overlay the strategy."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    cmd = OmniServeCommand()
+    cmd.subparser_init(subparsers)
+
+    argv = ["serve", "fake-model", "--omni", "--strategy-config", "/tmp/strategy.yaml"]
+    args = parser.parse_args(argv)
+    assert args.strategy_config == "/tmp/strategy.yaml"
+    assert args.get_explicit_kwargs_dict()["strategy_config"] == "/tmp/strategy.yaml"
+
+
+def test_serve_parser_accepts_deploy_config() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--deploy-config", "/tmp/deploy.yaml"])
+
+    assert args.deploy_config == "/tmp/deploy.yaml"
+    assert args.get_explicit_kwargs_dict()["deploy_config"] == "/tmp/deploy.yaml"
+
+
+def test_serve_parser_rejects_stage_configs_path() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "fake-model", "--omni", "--stage-configs-path", "/tmp/stages.yaml"])
+
+
+def test_serve_parser_accepts_four_way_cfg_parallelism() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--cfg-parallel-size", "4"])
+
+    assert args.cfg_parallel_size == 4
+
+
+def test_serve_parser_accepts_ulysses_a2a_permute() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--ulysses-a2a-permute"])
+
+    assert args.ulysses_a2a_permute is True
+    assert args.get_explicit_kwargs_dict()["ulysses_a2a_permute"] is True
+
+
+def test_serve_parser_accepts_diffusion_quantization_config() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+    expected = {"transformer": {"method": "torchao_float8_weight_only"}}
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Boogu/Boogu-Image-0.1-Base-fp8",
+            "--omni",
+            "--diffusion-quantization-config",
+            '{"transformer":{"method":"torchao_float8_weight_only"}}',
+        ]
+    )
+
+    assert args.diffusion_quantization_config == expected
+    assert args.get_explicit_kwargs_dict()["diffusion_quantization_config"] == expected
+
+
 def _make_headless_args(**kwargs) -> TrackingNamespace:
     defaults = {
         "model": "fake-model",
@@ -41,7 +120,6 @@ def _make_headless_args(**kwargs) -> TrackingNamespace:
         "omni_replica_address": None,
         "omni_dp_size_local": 1,
         "worker_backend": "multi_process",
-        "stage_configs_path": None,
         "deploy_config": None,
         "log_stats": False,
         "disable_log_stats": False,
@@ -80,13 +158,173 @@ def test_run_headless_rejects_non_multiprocess_worker_backend() -> None:
         run_headless(args)
 
 
+# ---------------------------------------------------------------------------
+# --stage-overrides parsing parity (headless vs standard path)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_stage_overrides_valid_json() -> None:
+    """A valid JSON string is parsed into the nested per-stage dict."""
+    parsed = parse_stage_overrides('{"0": {"devices": "0,1"}, "1": {"devices": "2"}}')
+    assert parsed == {"0": {"devices": "0,1"}, "1": {"devices": "2"}}
+
+
+def test_parse_stage_overrides_none_and_empty_return_none() -> None:
+    """No overrides (None / empty string) resolve to ``None``."""
+    assert parse_stage_overrides(None) is None
+    assert parse_stage_overrides("") is None
+
+
+def test_parse_stage_overrides_empty_dict_returns_none() -> None:
+    """An empty dict is falsy and must resolve to ``None``, locking in parity
+    with the original standard-path ``if stage_overrides_json:`` falsy check."""
+    assert parse_stage_overrides({}) is None
+
+
+def test_parse_stage_overrides_passes_through_non_str() -> None:
+    """An already-parsed mapping is returned unchanged (identity)."""
+    overrides = {"0": {"devices": "0"}}
+    assert parse_stage_overrides(overrides) is overrides
+
+
+def test_parse_stage_overrides_invalid_json_raises() -> None:
+    """Invalid JSON raises ValueError whose message matches the standard path
+    verbatim: the ``--stage-overrides is not valid JSON:`` prefix AND the
+    ``Got: <repr>`` suffix echoing the raw input."""
+    bad = "{not valid json}"
+    with pytest.raises(ValueError) as excinfo:
+        parse_stage_overrides(bad)
+    message = str(excinfo.value)
+    assert message.startswith("--stage-overrides is not valid JSON:")
+    assert f"Got: {bad!r}" in message
+
+
+def test_parse_stage_overrides_rejects_non_dict_top_level() -> None:
+    """Top-level must be a JSON object (dict). A list, scalar, or non-dict
+    mapping is rejected with a ValueError naming ``--stage-overrides`` and
+    pointing at the bad shape. Without this guard, ``json.loads`` happily
+    returns a list/scalar and the override silently never applies."""
+    for bad in ("[1, 2, 3]", '"oops"', "42"):
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            parse_stage_overrides(bad)
+
+
+def test_parse_stage_overrides_rejects_non_integer_stage_id() -> None:
+    """Stage-id keys must be non-negative ASCII integer strings. Letters,
+    signs, floats, Unicode digit classes, and integer (non-string) keys all
+    fail. ``str.isdigit() and str.isascii()`` is the minimal check: it
+    rejects ``"-1"``, ``"abc"``, ``"1.5"``, fullwidth ``"０"``, and bare ``1``.
+
+    Note: ``json.loads`` normalizes integer object keys (``{"1": {}}``) into
+    the string ``"1"`` and would pass our digit check, so the integer-key case
+    is exercised via the already-parsed-dict code path (``parse_stage_overrides({1: {}})``)."""
+    bad_string_keys = ('"abc"', '"-1"', '"1.5"', '"\uff10"')
+    for bad_key in bad_string_keys:
+        with pytest.raises(ValueError, match="non-negative integer stage ids"):
+            parse_stage_overrides("{" + bad_key + ": {}}")
+    # Integer (non-string) key: must reach the structural check, not the JSON
+    # parser, so pass an already-parsed mapping directly.
+    with pytest.raises(ValueError, match="non-negative integer stage ids"):
+        parse_stage_overrides({1: {}})
+
+
+def test_parse_stage_overrides_accepts_stage_merge_extras_and_engine_args() -> None:
+    """Three classes of keys pass through the shape-only parser:
+
+    - ``extras`` is read by the default-diffusion fallback
+      (``async_omni_engine.py``); registered pipelines carry it on
+      ``StagePipelineConfig.extras`` directly.
+    - Engine arguments (``kv_cache_dtype``, ``stage_connector_spec``, ...)
+      are forwarded as ``stage_<id>_<key>`` and applied via
+      ``OmniEngineArgs``.
+    - Unknown keys parse through and are dropped with a warning at
+      ``filter_dataclass_kwargs`` (see
+      ``tests/entrypoints/test_utils.py::TestFilterDataclassKwargs``).
+
+    ``typo_field_xyz`` in the payload exercises the third case.
+    """
+    parsed = parse_stage_overrides(
+        '{"0": {"extras": {"ltx2_use_conv_vae": true},'
+        ' "kv_cache_dtype": "fp8", "seed": 42,'
+        ' "stage_connector_spec": {"name": "SharedMemoryConnector", "extra": {}},'
+        ' "typo_field_xyz": 1}}'
+    )
+    assert parsed == {
+        "0": {
+            "extras": {"ltx2_use_conv_vae": True},
+            "kv_cache_dtype": "fp8",
+            "seed": 42,
+            "stage_connector_spec": {"name": "SharedMemoryConnector", "extra": {}},
+            "typo_field_xyz": 1,
+        },
+    }
+    # Already-parsed mapping path carries the same trust.
+    assert parse_stage_overrides(dict(parsed)) == parsed
+
+
+def test_parse_stage_overrides_accepts_empty_inner_dict() -> None:
+    """Per-stage overrides may be empty (``{}``): shape stays valid, every
+    stage simply receives no per-stage tweaks. Locks in the
+    ``not parsed`` -> ``None`` short-circuit's twin: an outer
+    non-empty dict with empty inner dicts is a valid no-op pass-through."""
+    parsed = parse_stage_overrides('{"0": {}, "1": {}}')
+    assert parsed == {"0": {}, "1": {}}
+
+
+def test_run_headless_parses_and_forwards_stage_overrides(mocker: MockerFixture) -> None:
+    """Regression: the headless path must parse ``--stage-overrides`` (a JSON
+    string) and forward the parsed dict to ``load_and_resolve_stage_configs``,
+    mirroring the standard engine path. Previously it was dropped entirely,
+    silently producing a different per-stage device layout."""
+    captured: dict = {}
+
+    def _fake_resolve(*args, **kwargs):
+        captured["args"] = args
+        captured.update(kwargs)
+        # Return a stage that does NOT match stage_id=0 so run_headless stops
+        # right after the resolver call (we only care about how it was called).
+        return ("/fake/stages.yaml", [SimpleNamespace(stage_id=99)], None)
+
+    mocker.patch(
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
+        side_effect=_fake_resolve,
+    )
+
+    args = _make_headless_args(
+        stage_id=0,
+        deploy_config="/tmp/deploy.yaml",
+        strategy_config="/tmp/strategy.yaml",
+        stage_overrides='{"0": {"devices": "0,1"}, "1": {"devices": "2"}}',
+    )
+    with pytest.raises(ValueError, match="No stage config found for stage_id=0"):
+        run_headless(args)
+
+    assert len(captured["args"]) == 2
+    assert captured["deploy_config_path"] == "/tmp/deploy.yaml"
+    assert captured["stage_overrides"] == {"0": {"devices": "0,1"}, "1": {"devices": "2"}}
+    assert captured["strategy_config_path"] == "/tmp/strategy.yaml"
+
+
+def test_run_headless_invalid_stage_overrides_raises(mocker: MockerFixture) -> None:
+    """Invalid ``--stage-overrides`` JSON in headless mode fails fast with the
+    shared ValueError instead of being silently ignored."""
+    mocker.patch(
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
+        return_value=("/fake/stages.yaml", [SimpleNamespace(stage_id=0)], None),
+    )
+
+    args = _make_headless_args(stage_id=0, stage_overrides="{not valid json}")
+    with pytest.raises(ValueError, match="--stage-overrides is not valid JSON"):
+        run_headless(args)
+
+
 def test_run_headless_raises_when_stage_id_not_in_configs(mocker: MockerFixture) -> None:
     """Headless looks up its assigned stage_id in the loaded deploy YAML and
     fails fast when the launcher's --stage-id doesn't match any entry."""
     other_stage = SimpleNamespace(stage_id=99)
     mocker.patch(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [other_stage]),
+        return_value=("/fake/stages.yaml", [other_stage], None),
     )
 
     args = _make_headless_args(stage_id=0)
@@ -123,6 +361,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     from vllm_omni.engine.stage_engine_startup import StageRegistrationResponse
 
     stage_cfg = _make_stage_cfg(0, stage_type="llm")
+    stage_cfg.engine_args["async_chunk"] = True
     parallel_config = SimpleNamespace(
         data_parallel_size_local=1,
         data_parallel_rank=0,
@@ -134,7 +373,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
 
     mocker.patch(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [stage_cfg]),
+        return_value=("/fake/stages.yaml", [stage_cfg], None),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
@@ -142,7 +381,10 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
         "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
         return_value=(None, None, None),
     )
-    mocker.patch("vllm_omni.engine.stage_init_utils.get_stage_connector_spec", return_value={})
+    mock_connector_spec = mocker.patch(
+        "vllm_omni.engine.stage_init_utils.get_stage_connector_spec",
+        return_value={},
+    )
     mocker.patch("vllm_omni.engine.stage_init_utils.build_engine_args_dict", return_value={})
     mocker.patch(
         "vllm_omni.engine.stage_init_utils.build_vllm_config",
@@ -178,6 +420,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     assert kwargs["omni_stage_config"] is stage_cfg
     assert kwargs["replica_id"] is None
     assert "socket_ownership" not in kwargs
+    assert mock_connector_spec.call_args.kwargs["async_chunk"] is True
 
     assert mock_manager_cls.call_count == 1
     mgr_kwargs = mock_manager_cls.call_args.kwargs
@@ -210,7 +453,7 @@ def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(mocker: Mo
 
     mocker.patch(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [stage_cfg]),
+        return_value=("/fake/stages.yaml", [stage_cfg], None),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
@@ -269,7 +512,7 @@ def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture)
 
     mocker.patch(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [stage_cfg]),
+        return_value=("/fake/stages.yaml", [stage_cfg], None),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
@@ -278,7 +521,7 @@ def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture)
         return_value=(None, None, None),
     )
     mocker.patch(
-        "vllm_omni.engine.stage_init_utils.extract_stage_metadata",
+        "vllm_omni.engine.stage_init_utils.extract_legacy_stage_metadata",
         return_value=SimpleNamespace(stage_id=1, stage_type="diffusion"),
     )
     mock_inject = mocker.patch("vllm_omni.engine.stage_init_utils.inject_kv_stage_info")
@@ -349,7 +592,7 @@ def test_run_headless_diffusion_raises_on_nonzero_proc_exit(mocker: MockerFixtur
 
     mocker.patch(
         "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [stage_cfg]),
+        return_value=("/fake/stages.yaml", [stage_cfg], None),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
@@ -358,7 +601,7 @@ def test_run_headless_diffusion_raises_on_nonzero_proc_exit(mocker: MockerFixtur
         return_value=(None, None, None),
     )
     mocker.patch(
-        "vllm_omni.engine.stage_init_utils.extract_stage_metadata",
+        "vllm_omni.engine.stage_init_utils.extract_legacy_stage_metadata",
         return_value=SimpleNamespace(stage_id=1, stage_type="diffusion"),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.inject_kv_stage_info")

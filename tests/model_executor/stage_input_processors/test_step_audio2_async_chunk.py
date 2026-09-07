@@ -5,7 +5,6 @@ from collections import defaultdict
 from types import SimpleNamespace
 
 import pytest
-import torch
 
 from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
     DEFAULT_STREAM_CONFIG,
@@ -43,14 +42,14 @@ def test_step_audio2_async_chunk_uses_decode_only_tokens_not_prompt_history():
 
     payload = thinker2token2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
     )
 
     assert payload is not None
-    assert payload["code_predictor_codes"] == [1, 2]
-    assert payload["left_context_size"] == 1
-    assert payload["finished"].item() is True
+    assert payload.codes.audio.tolist() == [1, 2]
+    assert payload.meta.left_context_size == 1
+    assert payload.meta.finished.item() is True
 
 
 def test_step_audio2_async_chunk_returns_none_when_not_enough_tokens():
@@ -68,7 +67,7 @@ def test_step_audio2_async_chunk_returns_none_when_not_enough_tokens():
 
     payload = thinker2token2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
     )
 
@@ -91,14 +90,14 @@ def test_step_audio2_async_chunk_emits_non_last_chunk_and_advances_consumed_by_c
 
     payload = thinker2token2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
     )
 
     assert payload is not None
-    assert payload["left_context_size"] == 0
-    assert payload["finished"].item() is False
-    assert payload["code_predictor_codes"] == list(range(required))
+    assert payload.meta.left_context_size == 0
+    assert payload.meta.finished.item() is False
+    assert payload.codes.audio.tolist() == list(range(required))
     assert transfer_manager.code_prompt_token_ids["rid-ready"] == list(range(chunk_size))
 
 
@@ -121,12 +120,11 @@ def test_step_audio2_async_chunk_emits_eof_when_finished_with_no_remaining_audio
 
     payload = thinker2token2wav_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
     )
 
-    assert payload == {
-        "code_predictor_codes": [],
-        "left_context_size": 1,
-        "finished": torch.tensor(True, dtype=torch.bool),
-    }
+    assert payload is not None
+    assert payload.codes.audio.numel() == 0
+    assert payload.meta.left_context_size == 1
+    assert payload.meta.finished.item() is True

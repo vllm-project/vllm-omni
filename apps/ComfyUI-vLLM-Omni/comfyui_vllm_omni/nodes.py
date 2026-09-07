@@ -10,7 +10,9 @@ from .utils.types import (
     AudioFormat,
     AutoregressionSamplingParams,
     DiffusionSamplingParams,
+    MiniMaxH3ModelSpecificParams,
     QwenTTSModelSpecificParams,
+    VideoReferences,
     WanModelSpecificParams,
 )
 from .utils.validators import (
@@ -163,7 +165,8 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
                 "num_frames": ("INT", {"default": 41, "min": 1}),
             },
             "optional": {
-                "image": ("IMAGE",),
+                "frame": ("IMAGE",),
+                "references": ("VIDEO_REFERENCES",),
                 "sampling_params": ("SAMPLING_PARAMS",),
                 "lora": ("REMOTE_LORA",),
                 "model_params": ("VIDEO_PARAMS",),
@@ -173,6 +176,15 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
     RETURN_TYPES = ("VIDEO",)
     RETURN_NAMES = ("video",)
     FUNCTION = "generate"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, url, model, frame=None, references=None, **_kwargs) -> str | Literal[True]:
+        base = super().VALIDATE_INPUTS(url, model)
+        if base is not True:
+            return base
+        if frame is not None and references is not None:
+            return "Provide only one of frame or references, not both."
+        return True
 
     async def generate(
         self,
@@ -184,7 +196,8 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         fps: int,
         num_frames: int,
         negative_prompt: str | None = None,
-        image: torch.Tensor | None = None,
+        frame: torch.Tensor | None = None,
+        references: dict | None = None,
         sampling_params: dict | list[dict] | None = None,
         model_params: dict | None = None,
         lora: dict | None = None,
@@ -207,14 +220,16 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
 
         if sampling_params is not None:
             sampling_params.pop("type", None)  # internal fields
-        if model_params is not None:
-            model_params.pop("type", None)  # internal fields
+        # model_params["type"] is also an internal field, but is used in api_client
+        # if model_params is not None:
+        #     model_params.pop("type", None)  # internal fields
 
         client = VLLMOmniClient(url)
         output = await client.generate_video(
             model=model,
             prompt=prompt,
-            image=image,  # image present => i2v, absent => t2v
+            frame=frame,  # frame present => fl2va / Wan I2V
+            references=references,
             width=width,
             height=height,
             num_frames=num_frames,
@@ -734,3 +749,78 @@ class VLLMOmniWanParams:
 
     def get_params(self, **kwargs):
         return (WanModelSpecificParams(kwargs),)
+
+
+class VLLMOmniMiniMaxH3Params:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio_flow_shift": (
+                    "FLOAT",
+                    {"default": 3.0, "min": 0.0, "max": 100.0, "step": 0.1},
+                ),
+                "flow_shift": (
+                    "FLOAT",
+                    {"default": 12.0, "min": 0.0, "max": 100.0, "step": 0.1},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("VIDEO_PARAMS",)
+    RETURN_NAMES = ("MiniMax-H3 video params",)
+    FUNCTION = "get_params"
+    CATEGORY = "vLLM-Omni/Video Params"
+
+    def get_params(self, **kwargs):
+        params = MiniMaxH3ModelSpecificParams(kwargs)
+        params["type"] = "minimax_h3"
+        return (params,)
+
+
+class VLLMOmniVideoReferences:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "optional": {
+                "image_1": ("IMAGE",),
+                "image_2": ("IMAGE",),
+                "audio_1": ("AUDIO",),
+                "audio_2": ("AUDIO",),
+                "video_1": ("VIDEO",),
+                "video_2": ("VIDEO",),
+            },
+        }
+
+    RETURN_TYPES = ("VIDEO_REFERENCES",)
+    RETURN_NAMES = ("references",)
+    FUNCTION = "get_references"
+    CATEGORY = "vLLM-Omni"
+
+    def get_references(
+        self,
+        image_1: torch.Tensor | None = None,
+        image_2: torch.Tensor | None = None,
+        audio_1: AudioInput | None = None,
+        audio_2: AudioInput | None = None,
+        video_1: VideoInput | None = None,
+        video_2: VideoInput | None = None,
+        **kwargs,
+    ):
+        if kwargs:
+            logger.info("Uncaught kwargs: %s", kwargs)
+        refs = VideoReferences()
+        if image_1 is not None:
+            refs["image_1"] = image_1
+        if image_2 is not None:
+            refs["image_2"] = image_2
+        if audio_1 is not None:
+            refs["audio_1"] = audio_1
+        if audio_2 is not None:
+            refs["audio_2"] = audio_2
+        if video_1 is not None:
+            refs["video_1"] = video_1
+        if video_2 is not None:
+            refs["video_2"] = video_2
+        return (refs,)

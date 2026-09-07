@@ -20,7 +20,6 @@ from .audio_prep import (
     _find_speaker_placeholder_positions,
     _initial_history,
     _take_scalar,
-    coerce_speaker_embeddings,
 )
 from .config_ming_tts import (
     AUDIO_START_TOKEN_ID,
@@ -33,13 +32,13 @@ from .config_ming_tts import (
     KEY_NEXT_EMBEDS,
     KEY_REQUEST_ID,
     KEY_SIGMA,
-    KEY_SPEAKER_EMBEDDING,
     KEY_TEMPERATURE,
     KEY_TEXT_MODE,
     MingTTSConfig,
 )
 from .patch_emission import MING_STOP_REASON_KEY
 from .prompt_encoder import _resolve_prompt_latents
+from .speaker_extractor import _resolve_speaker_embeddings
 
 
 class _ModelSampleAdapter(nn.Module):
@@ -64,8 +63,12 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
         self.requires_raw_input_tokens = False
         self.model_stage = vllm_config.model_config.model_stage
         self._prompt_encoder = None
+        self._speaker_extractor = None
 
         if self.model_stage == "llm":
+            from vllm_omni.utils.speaker_cache import get_speaker_cache
+
+            self._speaker_cache = get_speaker_cache()
             self.model = init_vllm_registered_model(vllm_config=vllm_config, architectures=["MingLLMModel"])
             self.has_preprocess = True
             self.has_postprocess = True
@@ -174,13 +177,7 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
         )
         update[KEY_LATENT_HISTORY] = history.detach().to("cpu").contiguous()
 
-        speaker_embedding = info_dict.get(KEY_SPEAKER_EMBEDDING, info_dict.get("speaker_embedding"))
-        speaker_embeddings = None
-        if speaker_embedding is not None:
-            speaker_embeddings = coerce_speaker_embeddings(
-                speaker_embedding,
-                use_zero_spk_emb=bool(info_dict.get("use_zero_spk_emb", False)),
-            )
+        speaker_embeddings = _resolve_speaker_embeddings(self, info_dict)
         if speaker_embeddings is not None and len(speaker_embeddings) > 0:
             speaker_slots = _find_speaker_placeholder_positions(input_ids, self.ming_config)
             if len(speaker_slots) < len(speaker_embeddings):

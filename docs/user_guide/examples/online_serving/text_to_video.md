@@ -191,7 +191,7 @@ curl -X POST http://localhost:8091/v1/videos \
 | `negative_prompt`     | str    | None    | Negative prompt                                  |
 | `width`               | int    | None    | Video width in pixels                            |
 | `height`              | int    | None    | Video height in pixels                           |
-| `num_frames`          | int    | None    | Number of frames to generate                     |
+| `num_frames`          | int    | 1       | Number of frames to generate; set explicitly for video generation |
 | `fps`                 | int    | None    | Frames per second for output video               |
 | `num_inference_steps` | int    | None    | Number of denoising steps                        |
 | `guidance_scale`      | float  | None    | CFG guidance scale (low-noise stage)             |
@@ -289,90 +289,12 @@ done
 
 ## LTX-2
 
-### Start Server
-
-#### Basic Start
-
 ```bash
-vllm serve Lightricks/LTX-2 --omni --port 8098 \
-    --enforce-eager --flow-shift 1.0 --boundary-ratio 1.0
+vllm serve Lightricks/LTX-2 --omni --port 8098
 ```
 
-For multi-GPU memory reduction, you can enable HSDP:
-
-```bash
-vllm serve Lightricks/LTX-2 --omni --port 8098 \
-    --enforce-eager --flow-shift 1.0 --boundary-ratio 1.0 \
-    --use-hsdp --hsdp-shard-size 2
-```
-
-#### Start with Optimization Presets
-
-Use the LTX-2 startup script with built-in optimization presets:
-
-```bash
-# Baseline (1 GPU, eager)
-bash run_server_ltx2.sh baseline
-
-# 4-GPU Ulysses sequence parallelism (lossless)
-bash run_server_ltx2.sh ulysses4
-
-# Cache-DiT lossy acceleration (1 GPU, ~1.4× speedup)
-bash run_server_ltx2.sh cache-dit
-
-# Best combo: 4-GPU Ulysses SP + Cache-DiT (~2.2× speedup)
-bash run_server_ltx2.sh best-combo
-```
-
-#### Optimization Benchmarks
-
-Benchmarked on H800, online serving (480×768, 41 frames, 20 steps, `seed=42`).
-"Inference" is the server-reported inference time; excludes HTTP/poll overhead.
-
-| Preset | Server Command | Inference (s) | Speedup | Type |
-|--------|---------------|---------------|---------|------|
-| `baseline` | `--enforce-eager` | 10.3 | 1.00× | — |
-| `compile` | *(default, no --enforce-eager)* | ~10.3 (warm) | ~1.00× | Lossless |
-| `ulysses4` | `--enforce-eager --usp 4` | ~10.3 | ~1.00× | Lossless |
-| `cache-dit` | `--enforce-eager --cache-backend cache_dit` | 7.4 avg | ~1.4× | Lossy |
-| `best-combo` | `--enforce-eager --usp 4 --cache-backend cache_dit` | 4.7 avg | **~2.2×** | Lossless + Lossy |
-
-**Observations**:
-- **torch.compile**: On H800, warm-request inference time matches the eager baseline (~10.3s).
-  The first request pays ~6s compilation overhead. Benefit depends on model architecture and GPU.
-- **Ulysses SP (4 GPU)**: No measurable speedup alone for 41-frame generation at this resolution.
-  Communication overhead outweighs gains at this sequence length.
-- **Cache-DiT**: Inference varies per request (6–10s) due to dynamic caching decisions.
-  Average is ~7.4s (~1.4× speedup) with slight quality tradeoff.
-- **Best combo**: 4-GPU Ulysses SP + Cache-DiT synergize well — Cache-DiT reduces per-step
-  computation, making the communication overhead of Ulysses SP worthwhile. Average ~4.7s
-  (~2.2× speedup).
-- **FP8 quantization**: Reduces VRAM but does not speed up LTX-2 on H800 (compute-bound).
-
-**Deployment Recommendations**:
-- For **production with quality priority**: use `baseline` with `--enforce-eager`
-- For **maximum throughput** (4 GPUs, quality tradeoff): use `best-combo` (~2.2× speedup)
-- For **single-GPU throughput**: use `cache-dit` (~1.4× speedup)
-- `--enforce-eager` is recommended to avoid torch.compile warmup latency on first request
-
-### Send Requests (curl)
-
-```bash
-# Using the provided script
-bash run_curl_ltx2.sh
-
-# Or directly
-curl -sS -X POST http://localhost:8098/v1/videos \
-  -H "Accept: application/json" \
-  -F "prompt=A serene lakeside sunrise with mist over the water." \
-  -F "width=768" \
-  -F "height=480" \
-  -F "num_frames=41" \
-  -F "fps=24" \
-  -F "num_inference_steps=20" \
-  -F "guidance_scale=3.0" \
-  -F "seed=42"
-```
+See the [LTX-2 recipe](../../../../recipes/LTX/LTX-2.md) for all checkpoints,
+pipeline selection, requests, defaults, and advanced options.
 
 ## Example materials
 

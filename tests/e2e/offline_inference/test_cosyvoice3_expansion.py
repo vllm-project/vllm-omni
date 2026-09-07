@@ -28,7 +28,6 @@ from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
-from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
 MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
@@ -127,7 +126,7 @@ def _build_reference_inputs(prompt_audio: tuple[np.ndarray, int]) -> list[dict[s
     ]
 
 
-# (model, stage_configs_path, extra_omni_kwargs) for ``@pytest.mark.parametrize("omni_runner", ..., indirect=True)``
+# (model, deploy_config_path, extra_omni_kwargs) for ``@pytest.mark.parametrize("omni_runner", ..., indirect=True)``
 _cosy_deployment = get_deploy_config_path("cosyvoice3.yaml")
 _cosy_model_path = str(_resolve_model_dir())
 _OMNI_RUNNER_PARAMS = [
@@ -176,12 +175,12 @@ def test_cosyvoice3_offline_reference_zero_shot(omni_runner: OmniRunner) -> None
     assert 2.8 <= duration_s <= 8.8, f"Unexpected duration={duration_s:.3f}s (samples={audio.size}, sr={sr})"
 
     # Code2wav is ``final_output`` (stage 1); ``Omni.generate`` yields its ``request_output`` / completions.
-    pipeline_out = OmniRequestOutput.unwrap_result(outputs[0])
+    pipeline_out = outputs[0]
     assert pipeline_out.stage_id == 1, f"expected final stage 1, got {pipeline_out.stage_id}"
     assert pipeline_out.final_output_type == "audio", (
         f"expected audio final_output_type, got {pipeline_out.final_output_type!r}"
     )
-    ro = pipeline_out.request_output
+    ro = pipeline_out
     assert ro is not None, "stage 1 should include request_output"
     completions = getattr(ro, "outputs", None) or []
     assert completions, "stage 1 request_output should include at least one completion"

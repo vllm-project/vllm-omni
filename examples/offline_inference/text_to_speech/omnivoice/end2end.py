@@ -34,7 +34,7 @@ def run_e2e():
         help="Model name or path (HuggingFace or local)",
     )
     parser.add_argument(
-        "--stage-config",
+        "--deploy-config",
         type=str,
         default="vllm_omni/deploy/omnivoice.yaml",
     )
@@ -87,14 +87,14 @@ def run_e2e():
     )
     args = parser.parse_args()
 
-    if not os.path.exists(args.stage_config):
-        raise FileNotFoundError(f"Stage config not found: {args.stage_config}")
+    if not os.path.exists(args.deploy_config):
+        raise FileNotFoundError(f"Deploy config not found: {args.deploy_config}")
 
     print(f"Initializing OmniVoice with model={args.model}")
 
     omni = Omni(
         model=args.model,
-        stage_configs_path=args.stage_config,
+        deploy_config=args.deploy_config,
         log_stats=True,
     )
 
@@ -135,7 +135,7 @@ def run_e2e():
     print(f"Received {len(outputs)} outputs.")
     for i, output in enumerate(outputs):
         try:
-            ro = output.request_output
+            ro = output
             if ro is None:
                 print("No request_output found.")
                 continue

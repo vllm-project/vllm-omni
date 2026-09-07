@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Single source of truth for vLLM-Omni Prometheus + bench CLI metric naming.
 
 Consumed by:
@@ -13,7 +16,9 @@ time-bearing metrics use the ``_s`` suffix (values in seconds), counters use
 
 import logging
 import os
-from typing import Any
+from collections.abc import Mapping, Sequence
+
+from vllm_omni.metrics.utils import resolve_int_by_sequential_keys
 
 # vllm_omni: namespace for omni-specific Prometheus families, distinct from
 # the upstream vllm:* families.
@@ -59,6 +64,7 @@ IMAGE_COUNT = "image_count"
 IMAGE_GENERATION = "image_generation"
 IMAGE_GENERATION_TIME_MS = f"{IMAGE_GENERATION}_time_ms"
 IMAGE_PIXELS = "image_pixels"
+DIFFUSION_SCHEDULER_WAITING_KEY = "scheduler_num_waiting_reqs"
 TOTAL_IMAGES = "total_images"
 IMAGE_THROUGHPUT = "image_throughput"
 AVERAGE_PIXELS_PER_IMAGE = "average_pixels_per_image"
@@ -89,6 +95,7 @@ POSTPROCESS_TIME_MS = f"{POSTPROCESS_TIME}_ms"
 POSTPROCESS_TIMES_MS = f"{POSTPROCESS_TIME}s_ms"
 OUTPUT_UNIT_COUNT = "output_unit_count"
 SERVING_TIME_TO_FIRST_OUTPUT_MS = "serving_time_to_first_output_ms"
+IMAGE_TIME_TO_FIRST_OUTPUT_MS = "image_time_to_first_output_ms"
 SERVING_TIME_TO_FIRST_OUTPUTS_MS = "serving_time_to_first_outputs_ms"
 TIME_PER_OUTPUT_UNIT_MS = "time_per_output_unit_ms"
 TIME_PER_OUTPUT_UNITS_MS = "time_per_output_units_ms"
@@ -133,12 +140,45 @@ AUDIO_SKIPPED_REQUESTS_METRIC = METRIC_PREFIX + AUDIO_SKIPPED_REQUESTS
 
 
 # ============================================================================
+# Diffusion family (per-stage + per-replica diffusion timing breakdowns)
+# ============================================================================
+DIFFUSION_EXEC_S = METRIC_PREFIX + "diffusion_exec_s"
+DIFFUSION_EXEC_PER_STEP_S = METRIC_PREFIX + "diffusion_exec_per_step_s"
+DIFFUSION_PREPROCESS_S = METRIC_PREFIX + "diffusion_preprocess_s"
+DIFFUSION_POSTPROCESS_S = METRIC_PREFIX + "diffusion_postprocess_s"
+
+
+# ============================================================================
 # Cross-stage Transfer family (per-physical-hop TX/RX/in-flight timings)
 # ============================================================================
 TRANSFER_SIZE_BYTES = METRIC_PREFIX + "transfer_size_bytes"
 TRANSFER_TX_S = METRIC_PREFIX + "transfer_tx_s"
 TRANSFER_RX_S = METRIC_PREFIX + "transfer_rx_s"
 TRANSFER_IN_FLIGHT_S = METRIC_PREFIX + "transfer_in_flight_s"
+
+
+# ============================================================================
+# Image / diffusion service-level families
+# ============================================================================
+STAGE_GEN_TIME_S = METRIC_PREFIX + "stage_gen_time_s"
+REQUEST_QUEUE_WAIT_S = METRIC_PREFIX + "request_queue_wait_s"
+STAGE_WAITING_REQUESTS = METRIC_PREFIX + "stage_waiting_requests"
+NUM_INFERENCE_STEPS = METRIC_PREFIX + "num_inference_steps"
+IMAGE_COUNT_METRIC = METRIC_PREFIX + IMAGE_COUNT
+IMAGE_PIXELS_METRIC = METRIC_PREFIX + IMAGE_PIXELS
+PEAK_MEMORY_MB = METRIC_PREFIX + "peak_memory_mb"
+REQUESTS_FAILED = METRIC_PREFIX + "requests_failed"
+KV_WAIT_S = METRIC_PREFIX + "kv_wait_s"
+DIFFUSION_FORWARD_S = METRIC_PREFIX + "diffusion_forward_s"
+DIFFUSION_EXEC_S = METRIC_PREFIX + "diffusion_exec_s"
+DIFFUSION_EXEC_PER_STEP_S = METRIC_PREFIX + "diffusion_exec_per_step_s"
+DIFFUSION_PREPROCESS_S = METRIC_PREFIX + "diffusion_preprocess_s"
+DIFFUSION_POSTPROCESS_S = METRIC_PREFIX + "diffusion_postprocess_s"
+VAE_DECODE_S = METRIC_PREFIX + "vae_decode_s"
+DENOISE_STEP_LATENCY_S = METRIC_PREFIX + DENOISE_STEP_LATENCY + "_s"
+DIFFUSION_KV_LOAD_S = METRIC_PREFIX + "diffusion_kv_load_s"
+IMAGE_TTFP_S = METRIC_PREFIX + "image_ttfp_s"
+STAGE_IN_QUEUE_S = METRIC_PREFIX + "stage_in_queue_s"
 
 
 # ============================================================================
@@ -151,6 +191,11 @@ SUCCESS_LABELS = ("model_name", "finished_reason")
 # OmniPrometheusStatLogger wrap which relabels upstream ``engine`` into
 # ``stage`` + ``replica``.
 STAGE_LABELS = ("model_name", "stage", "replica")
+
+STAGE_GEN_TIME_LABELS = ("model_name", "stage", "stage_type")
+DIFFUSION_LABELS = ("model_name", "stage")
+FAILED_LABELS = ("model_name", "reason")
+KV_WAIT_LABELS = ("model_name", "connector_type")
 
 # Audio continuity Counter carries an extra ``threshold_ms`` label so multiple
 # threshold buckets can be tracked simultaneously. The ``_ms`` suffix names a
@@ -243,8 +288,20 @@ BYTES_BUCKETS = (
 
 
 # ============================================================================
-# Audio-continuity defaults
+# Audio defaults (shared by server-side observe and bench-side calculation)
 # ============================================================================
+# Most common across vllm-omni talker variants (cosyvoice3, omnivoice,
+# qwen3_tts, mimo_audio). voxcpm2 uses 48000, stable_audio 44100,
+# ming_flash 16000 — these models surface a rate at runtime on one of
+# ``_SAMPLE_RATE_KEYS``, so DEFAULT_AUDIO_SAMPLE_RATE only applies when no
+# usable positive rate is found (and as the bench PCM default when env is unset).
+# Streamed OpenAI ``response_format=pcm`` is PCM_16 (s16le); sample width is fixed.
+DEFAULT_AUDIO_SAMPLE_RATE = 24000
+DEFAULT_AUDIO_CHANNELS = 1
+DEFAULT_AUDIO_SAMPLE_WIDTH = 2  # PCM s16le bytes per sample
+AUDIO_SAMPLE_RATE_ENV = "VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE"
+AUDIO_CHANNELS_ENV = "VLLM_OMNI_BENCH_AUDIO_CHANNELS"
+
 # Default underrun threshold — kept aligned with the bench-side default and
 # the commonly-cited "audible gap" threshold for streaming TTS.
 AUDIO_CONTINUITY_DEFAULT_THRESHOLD_S = 0.1
@@ -253,8 +310,8 @@ AUDIO_CONTINUITY_DEFAULT_THRESHOLD_S = 0.1
 # ============================================================================
 # Formula helpers (shared by server-side observe and bench-side calculation)
 # ============================================================================
-def compute_audio_rtf(stage_gen_time_s: float, audio_duration_s: float) -> float:
-    """RTF = stage_gen_time / audio_content_duration.
+def compute_audio_rtf(audio_generation_latency_s: float, audio_duration_s: float) -> float:
+    """RTF = audio_generation_latency / audio_content_duration.
 
     SLO red line < 1 — must generate faster than content plays back to stream.
     Returns 0.0 when audio_duration_s is non-positive (caller decides whether
@@ -262,56 +319,74 @@ def compute_audio_rtf(stage_gen_time_s: float, audio_duration_s: float) -> float
     """
     if audio_duration_s <= 0:
         return 0.0
-    return stage_gen_time_s / audio_duration_s
+    return audio_generation_latency_s / audio_duration_s
 
 
-def compute_denoise_step_latency(stage_gen_time: float, num_inference_steps: int) -> float:
-    """Mean denoise step latency = image stage generation time / step count.
+def compute_audio_frames(
+    pcm_nbytes: int,
+    *,
+    sample_width: int = DEFAULT_AUDIO_SAMPLE_WIDTH,
+    channels: int = DEFAULT_AUDIO_CHANNELS,
+) -> int:
+    """Convert a PCM byte length to sample/frame count.
 
-    The returned value uses the same time unit as ``stage_gen_time``.
+    ``pcm_nbytes`` is the raw byte size of interleaved PCM (e.g.
+    ``total_pcm_bytes`` or ``len(wav_pcm_buffer)``). Defaults match the
+    streamed s16le mono contract
+    (``DEFAULT_AUDIO_SAMPLE_WIDTH``, ``DEFAULT_AUDIO_CHANNELS``);
+    WAV callers should pass header values.
+
+    Returns 0 when the byte count or frame width (``sample_width * channels``)
+    is non-positive.
     """
-    if num_inference_steps <= 0:
-        return 0.0
-    return stage_gen_time / float(num_inference_steps)
+    frame_width = sample_width * channels
+    if pcm_nbytes <= 0 or frame_width <= 0:
+        return 0
+    return pcm_nbytes // frame_width
 
 
 # ============================================================================
 # Audio sample-rate resolution
 # ============================================================================
-# Most common across vllm-omni talker variants (cosyvoice3, omnivoice,
-# qwen3_tts, mimo_audio). voxcpm2 uses 48000, stable_audio 44100,
-# ming_flash 16000 — these models populate multimodal_output["audio_sample_rate"]
-# at runtime so this default only kicks in when the field is missing.
-DEFAULT_AUDIO_SAMPLE_RATE = 24000
-DEFAULT_AUDIO_CHANNELS = 1
-AUDIO_SAMPLE_RATE_ENV = "VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE"
-AUDIO_CHANNELS_ENV = "VLLM_OMNI_BENCH_AUDIO_CHANNELS"
-
 _SAMPLE_RATE_KEYS = ("output_sample_rate", "audio_sample_rate", "sample_rate", "sampling_rate", "sr")
 
 
-def resolve_audio_sample_rate(source: dict[str, Any] | Any | None) -> int:
-    """Extract audio sample_rate from a dict or config object, with fallbacks.
+def resolve_audio_sample_rate_or_none(
+    source: Sequence[Mapping[str, object] | object | None] | Mapping[str, object] | object | None,
+) -> int | None:
+    """Extract an explicitly configured audio sample rate, or ``None`` when absent.
 
-    Tries the same key chain as serving_chat.py's audio response path so
-    /metrics audio_duration_s = audio_frames / sample_rate stays consistent
-    with what the OpenAI streaming endpoint reports back to clients. Also
-    accepts config objects that expose the same values as attributes.
-    Returns DEFAULT_AUDIO_SAMPLE_RATE when no usable value is present.
+    ``source`` may be:
+
+    - a Mapping (e.g. ``multimodal_output`` / config dict)
+    - an object exposing the same fields as attributes
+    - a Sequence of the above (``str`` / ``bytes`` excluded); the first
+      positive rate found across items wins
     """
-    if not source:
-        return DEFAULT_AUDIO_SAMPLE_RATE
-    for key in _SAMPLE_RATE_KEYS:
-        raw = source.get(key) if isinstance(source, dict) else getattr(source, key, None)
-        if raw is None:
-            continue
-        try:
-            value = int(raw)
-        except (TypeError, ValueError):
-            continue
-        if value > 0:
-            return value
-    return DEFAULT_AUDIO_SAMPLE_RATE
+    if isinstance(source, Sequence) and not isinstance(source, (str, bytes, bytearray)):
+        for item in source:
+            rate = resolve_int_by_sequential_keys(item, _SAMPLE_RATE_KEYS)
+            if rate is not None:
+                return rate
+        return None
+    return resolve_int_by_sequential_keys(source, _SAMPLE_RATE_KEYS)
+
+
+def resolve_audio_sample_rate(
+    source: Sequence[Mapping[str, object] | object | None] | Mapping[str, object] | object | None,
+    default: int = DEFAULT_AUDIO_SAMPLE_RATE,
+) -> int:
+    """Extract audio sample rate from a dict, config object, or list thereof.
+
+    Delegates to :func:`resolve_audio_sample_rate_or_none` (same key chain and
+    coerce rules). Returns ``default`` (``DEFAULT_AUDIO_SAMPLE_RATE`` unless
+    overridden) when no usable positive rate is present.
+
+    Used so /metrics ``audio_duration_s = audio_frames / sample_rate`` stays
+    consistent with rates surfaced on multimodal outputs and stage configs.
+    """
+    rate = resolve_audio_sample_rate_or_none(source)
+    return rate if rate is not None else default
 
 
 def stream_pcm_format_from_env(

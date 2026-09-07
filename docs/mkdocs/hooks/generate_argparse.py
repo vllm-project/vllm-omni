@@ -123,6 +123,7 @@ def extract_omni_serve_subparser_init():
                         "TrackingNamespace": None,  # type annotation only
                         "make_arg_parser": lambda parser: parser,  # no-op for doc
                         "_ensure_vllm_platform": lambda: None,  # no-op for doc
+                        "_nonneg_finite_float": float,
                         "VLLM_SUBCMD_PARSER_EPILOG": "",
                         "logger": logger,
                         "DummySubparsers": DummySubparsers,

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Online serving E2E for NextStep-1.1 text-to-image (tensor parallel).
 """
@@ -10,7 +13,7 @@ from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import (
     OmniServer,
     OmniServerParams,
-    OpenAIClientHandler,
+    OnlineOmniClient,
     dummy_messages_from_mix_data,
 )
 
@@ -66,7 +69,7 @@ def _get_diffusion_feature_cases(model: str):
     _get_diffusion_feature_cases(model=os.environ.get("VLLM_TEST_NEXTSTEP_MODEL", _DEFAULT_MODEL)),
     indirect=True,
 )
-def test_nextstep_11(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_nextstep_11(omni_server: OmniServer, online_client: OnlineOmniClient):
     messages = dummy_messages_from_mix_data(content_text=POSITIVE_PROMPT)
     request_config = {
         "model": omni_server.model,
@@ -82,4 +85,4 @@ def test_nextstep_11(omni_server: OmniServer, openai_client: OpenAIClientHandler
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)

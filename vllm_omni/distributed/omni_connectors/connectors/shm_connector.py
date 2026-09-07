@@ -27,16 +27,11 @@ class SharedMemoryConnector(OmniConnectorBase):
     def __init__(self, config: dict[str, Any]):
         self.config = config
         self.stage_id = config.get("stage_id", -1)
-        self.device = config.get("device", "cuda:0")
-        self.threshold = int(config.get("shm_threshold_bytes", 65536))
-        self.inline_small_payloads = bool(config.get("inline_small_payloads", False))
         self._pending_keys: set[str] = set()
         self._metrics = {
             "puts": 0,
             "gets": 0,
             "bytes_transferred": 0,
-            "shm_writes": 0,
-            "inline_writes": 0,
         }
 
     def put(
@@ -47,33 +42,18 @@ class SharedMemoryConnector(OmniConnectorBase):
         data: Any,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         try:
-            # Always serialize first to check size (and for SHM writing)
-            # Note: For extremely large objects in "inline" mode (e.g. Ray),
-            # we might double-serialize if we're not careful, but here we assume
-            # if it's huge we use SHM, or if Ray, threshold is maxsize.
             payload = self.serialize_obj(data)
             size = len(payload)
 
-            # The legacy async-chunk adapter transfers only the connector key
-            # across stages; it cannot deliver inline metadata to the receiver.
-            # Keep key-addressed SHM as the default and only inline payloads
-            # when the caller explicitly enables the metadata-aware path.
-            if size >= self.threshold or not self.inline_small_payloads:
-                lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
-                with open(lock_file, "wb+") as lockf:
-                    fcntl.flock(lockf, fcntl.LOCK_EX)
-                    meta = shm_write_bytes(payload, name=put_key)
-                    fcntl.flock(lockf, fcntl.LOCK_UN)
+            lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
+            with open(lock_file, "wb+") as lockf:
+                fcntl.flock(lockf, fcntl.LOCK_EX)
+                meta = shm_write_bytes(payload, name=put_key)
+                fcntl.flock(lockf, fcntl.LOCK_UN)
 
-                # meta contains {'name': ..., 'size': ...}
-                metadata = {"shm": meta, "size": size}
-                self._pending_keys.add(put_key)
-                self._metrics["shm_writes"] += 1
-            else:
-                # Inline small payloads to avoid the mmap + file-lock overhead
-                # that dominates codec chunk transfers.
-                metadata = {"inline_bytes": payload, "size": size}
-                self._metrics["inline_writes"] += 1
+            # meta contains {'name': ..., 'size': ...}
+            metadata = {"shm": meta, "size": size}
+            self._pending_keys.add(put_key)
 
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += size
@@ -84,22 +64,26 @@ class SharedMemoryConnector(OmniConnectorBase):
             logger.error(f"SharedMemoryConnector put failed for req {put_key}: {e}")
             return False, 0, None
 
-    def _get_data_with_lock(self, lock_file: str, shm_handle: dict):
-        obj = None
+    def _get_data_with_lock(self, lock_file: str, shm_handle: dict[str, Any]) -> tuple[Any, int] | None:
+        deserialized = False
         try:
             with open(lock_file, "rb+") as lockf:
                 fcntl.flock(lockf, fcntl.LOCK_EX)
                 data_bytes = shm_read_bytes(shm_handle)
                 fcntl.flock(lockf, fcntl.LOCK_UN)
             obj = self.deserialize_obj(data_bytes)
-            return obj, int(shm_handle.get("size", 0))
+            result = (obj, int(shm_handle.get("size", 0)))
+            deserialized = True
+            return result
         except Exception as e:
             logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
             return None
         finally:
-            # If data has been received, delete lock_file.
-            if obj and os.path.exists(lock_file):
-                os.remove(lock_file)
+            if deserialized:
+                try:
+                    os.remove(lock_file)
+                except FileNotFoundError:
+                    pass
 
     def _get_by_key(self, get_key: str) -> tuple[Any, int] | None:
         """Read a SHM segment addressed purely by *get_key*."""
@@ -142,31 +126,21 @@ class SharedMemoryConnector(OmniConnectorBase):
             if isinstance(metadata, dict) and get_key in metadata:
                 metadata = metadata.get(get_key)
 
-            if not isinstance(metadata, dict):
-                return self._get_by_key(get_key)
-
-            if "inline_bytes" in metadata:
-                try:
-                    obj = self.deserialize_obj(metadata["inline_bytes"])
-                    self._pending_keys.discard(get_key)
-                    return obj, int(metadata.get("size", 0))
-                except Exception as e:
-                    logger.error(f"SharedMemoryConnector inline get failed for req {get_key}: {e}")
-                    return None
-
-            if "shm" in metadata:
+            if isinstance(metadata, dict) and "shm" in metadata:
                 shm_handle = metadata["shm"]
                 lock_file = f"/dev/shm/shm_{shm_handle['name']}_lockfile.lock"
                 result = self._get_data_with_lock(lock_file, shm_handle)
                 if result is not None:
                     self._pending_keys.discard(get_key)
-                return result
+            else:
+                # Missing or non-SHM metadata falls back to key-based lookup.
+                result = self._get_by_key(get_key)
+        else:
+            result = self._get_by_key(get_key)
 
-            # Metadata is a dict but has no SHM-specific handle (e.g. RDMA-
-            # style source_host/source_port).  Fall back to key-based read.
-            return self._get_by_key(get_key)
-
-        return self._get_by_key(get_key)
+        if result is not None:
+            self._metrics["gets"] += 1
+        return result
 
     def cleanup(self, request_id: str) -> None:
         """Best-effort cleanup of unconsumed SHM segments for *request_id*.
@@ -217,4 +191,4 @@ class SharedMemoryConnector(OmniConnectorBase):
         self._pending_keys.clear()
 
     def health(self) -> dict[str, Any]:
-        return {"status": "healthy", "threshold": self.threshold, **self._metrics}
+        return {"status": "healthy", **self._metrics}

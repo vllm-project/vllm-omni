@@ -835,12 +835,15 @@ def run_task(
     print(f"[unified] task={task} {width}x{height} frames={num_frames} cfg={cfg} steps={steps} seed={seed}", flush=True)
 
     outputs = list(omni.generate(prompts=formatted, sampling_params_list=params))
-    custom = getattr(outputs[0], "custom_output", None) or {}
-    # Lance/Bagel return text at outputs[0].output (string) or
-    # custom_output["text_output"].
+    multimodal_output = getattr(outputs[0], "multimodal_output", {}) or {}
+    metadata = multimodal_output.get("metadata", {}) if isinstance(multimodal_output, dict) else {}
+    text_metadata = metadata.get("text", {}) if isinstance(metadata, dict) else {}
     text_out = None
     if task in {"x2t_image", "x2t_video"}:
-        text_out = custom.get("text_output") or getattr(outputs[0], "output", None)
+        text_out = (multimodal_output.get("text") if isinstance(multimodal_output, dict) else None) or (
+            text_metadata.get("text_output") if isinstance(text_metadata, dict) else None
+        )
+        text_out = text_out or getattr(outputs[0], "output", None)
         if not isinstance(text_out, str):
             text_out = None
 
@@ -856,13 +859,11 @@ def run_task(
             gr.update(value=str(text_out or "(empty)"), visible=True),
         )
     if task in {"t2v", "i2v", "video_edit"}:
-        frames = custom.get("video_frames")
+        frames = getattr(outputs[0], "images", None)
         if frames is None:
             raise gr.Error("No video frames in output.")
         return (gr.update(visible=False), gr.update(value=_save_video(frames), visible=True), gr.update(visible=False))
-    # image tasks — orchestrator strips ``outputs[0].output`` across the
-    # IPC boundary but preserves ``custom_output``, so prefer the latter.
-    img_out = custom.get("image") or getattr(outputs[0], "output", None)
+    img_out = (getattr(outputs[0], "images", None) or [None])[0] or getattr(outputs[0], "output", None)
     if img_out is None:
         raise gr.Error("No image in output.")
     return (gr.update(value=_save_image(img_out), visible=True), gr.update(visible=False), gr.update(visible=False))

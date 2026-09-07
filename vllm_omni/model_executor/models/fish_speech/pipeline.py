@@ -20,6 +20,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.fish_speech"
 
 FISH_SPEECH_PIPELINE = PipelineConfig(
     model_type="fish_qwen3_omni",
+    default_deploy_config_name="fish_qwen3_omni.yaml",
     model_arch="FishSpeechSlowARForConditionalGeneration",
     stages=(
         StagePipelineConfig(

@@ -1,80 +1,56 @@
-# Full-duplex interaction framework
+# Experimental Full-Duplex (JoyVL)
 
-A model-agnostic framework for real-time, full-duplex (streaming-in / streaming-out)
-model interaction, plus the JoyVL implementation built on it.
+This package now contains the JoyVL framework and its example integration,
+plus two client-side helpers kept for the benchmark and e2e drivers:
 
-To **run the JoyVL model**, see the recipe:
+```text
+core/              generic duplex scaffold used by the JoyVL adapter
+joyvl/             JoyVL model-specific integration
+client.py          legacy Realtime probe client (RealtimeDuplexClient) used by
+                   the omniinteract / omni-duplex-eval benchmarks and the
+                   server-VAD and Nemotron e2e drivers; applications should use
+                   vllm_omni.clients.duplex.DuplexClient instead
+video_stacking.py  camera-frame tiling for omni duplex video input
+```
+
+To run JoyVL, see
 [`recipes/JD/JoyAI-VL-Interaction.md`](../../../recipes/JD/JoyAI-VL-Interaction.md).
-This README covers the framework itself and how to add a new model.
 
-## Layout
+The MiniCPM-o 4.5 and PersonaPlex native full-duplex runtimes graduated out
+of this package. They now live in the stable tree:
 
+```text
+vllm_omni/engine/duplex/                       engine control plane, sessions, leases
+vllm_omni/entrypoints/duplex/           WebSocket serving and Realtime projection
+vllm_omni/entrypoints/duplex_request_client.py request/output lifecycle
+vllm_omni/model_executor/models/minicpmo_4_5/duplex/  MiniCPM adapter
+vllm_omni/model_executor/models/personaplex/duplex/   PersonaPlex adapter
+vllm_omni/model_executor/models/nemotron_voicechat/duplex/  Nemotron VoiceChat adapter
+vllm_omni/model_executor/duplex_sampling.py    AR-runner sampling hook helper
+vllm_omni/outputs/duplex.py                    typed output decision envelope
 ```
-vllm_omni/experimental/fullduplex/
-  core/      generic full-duplex framework (model-agnostic): DuplexRuntime (event
-             loop + epoch barge-in), DuplexSession, DuplexAdapter (ABC), protocol
-  joyvl/     JoyVL implementation (model-specific):
-             adapter.py            JoyVLDuplexAdapter (implements core.DuplexAdapter)
-             decision/             policy + output_parser + prompts (speak/silence/delegate)
-             memory/               InteractionBrain — 3-tier summary memory (async)
-             serving/              OpenAI-compatible HTTP orchestrator
-             bridges/              model backend + delegation
-```
 
-`core/` is the only part shared across models; data planes differ by model and are
-intentionally not shared.
+For their architecture and validation scope, see
+[`docs/design/fullduplex.md`](../../../docs/design/fullduplex.md) and
+[`docs/design/fullduplex-personaplex.md`](../../../docs/design/fullduplex-personaplex.md).
+PersonaPlex's single-process demo tier (browser client, standalone Moshi-web
+server, `core/`-scaffold adapter) was demo-only and was removed rather than
+graduated; the production path serves through the generic `/v1/duplex` stack.
 
-## Scope
+## Adding a full-duplex model on the core contracts
 
-The runnable serving path is `joyvl/serving/` driving `decision/` + `memory/` directly.
-`joyvl/adapter.py` + `core/` are a **demonstration** of how a model plugs into the
-generic full-duplex framework (exercised by `tests/fullduplex/`), not the serving path
-the HTTP orchestrator currently uses — a fused-audio model (e.g. MiniCPM-o) is the case
-`core/` is built for.
+The seam is `core.DuplexAdapter`. `core/` owns the session lifecycle,
+epoch-based barge-in, playback cursor, and the event protocol; you implement
+only model policy.
 
-## Adding a full-duplex model
-
-The seam is `core.DuplexAdapter`. `core/` owns the session lifecycle, epoch-based
-barge-in, playback cursor, and the event protocol — you implement only model policy.
-
-1. Create a sibling package `vllm_omni/experimental/fullduplex/<model>/` next to `joyvl/`; keep
+1. Create a sibling package `vllm_omni/experimental/fullduplex/<model>/`; keep
    model-specific code there and do not touch `core/`.
-2. Implement one `DuplexAdapter` (three required methods; the rest have defaults):
+2. Implement one `DuplexAdapter` (`capabilities` / `on_input` / `respond`; the
+   rest have defaults). Turn-based models run through `core.DuplexRuntime`
+   unchanged.
+3. Promote a helper from a model package up into `core/` only once a second
+   model actually needs it.
 
-   ```python
-   from collections.abc import AsyncIterator
-   from vllm_omni.experimental.fullduplex.core.adapter import DuplexAdapter, DuplexCapability, OutputChunk
-   from vllm_omni.experimental.fullduplex.core.session import DuplexSession
-
-   class MyModelAdapter(DuplexAdapter):
-       def capabilities(self) -> DuplexCapability:
-           return DuplexCapability(
-               input_modalities=frozenset({"audio", "text"}),
-               output_modalities=frozenset({"audio", "text"}),
-               proactive=True,            # speak without being asked?
-           )
-
-       async def on_input(self, session: DuplexSession, modality: str, data) -> None:
-           ...                            # buffer/route an incoming chunk
-
-       async def respond(self, session: DuplexSession) -> AsyncIterator[OutputChunk]:
-           async for piece in self._model_stream(session):
-               yield OutputChunk(modality="audio", data=piece)   # runtime drops stale
-               #                                                   chunks after a barge-in
-
-       # optional: should_respond / on_barge_in / on_playback_ack
-   ```
-
-3. Run it through the shared runtime — no new control-plane code:
-
-   ```python
-   from vllm_omni.experimental.fullduplex.core.runtime import DuplexRuntime
-   from vllm_omni.experimental.fullduplex.core.session import DuplexSession, DuplexSessionConfig
-
-   rt = DuplexRuntime(DuplexSession("sid", DuplexSessionConfig()), MyModelAdapter())
-   await rt.run(input_events, emit)
-   ```
-
-`joyvl/adapter.py` is the worked demonstration (currently exercised by tests, not the
-HTTP serving path). Promote a helper from a model package up into `core/` only once a
-second model actually needs it.
+For production serving, prefer the stable plugin seams instead
+(`duplex_serving_adapter` / `duplex_runtime_extension` dotted strings in the
+model's `pipeline.py`), as MiniCPM-o 4.5 and PersonaPlex do.

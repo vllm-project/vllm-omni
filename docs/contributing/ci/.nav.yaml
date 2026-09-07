@@ -1,6 +1,6 @@
 nav:
-  - CI_5levels.md
+  - test_system_overview.md
+  - ci_settings.md
+  - test_writing_guide.md
   - failures.md
-  - test_guide.md
-  - test_markers.md
-  - test_style.md
+  - test_execution_guide.md

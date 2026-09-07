@@ -1,8 +1,373 @@
-from collections.abc import Callable
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import fields
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from prettytable import PrettyTable
+
+from vllm_omni.metrics import definitions as metric_defs
+
+if TYPE_CHECKING:
+    from vllm_omni.metrics.modality import OmniModalityMetrics
+    from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
+    from vllm_omni.metrics.stats import StageRequestStats
+
+FAILURE_REASONS = frozenset({"client_abort", "client_disconnect", "stage_error", "unknown"})
+DIFFUSION_METRICS_ONLY_REQUEST_ID = "__vllm_omni_diffusion_metrics__"
+
+
+def extract_queue_wait_s(pipeline_timings: Mapping[str, float] | None) -> float | None:
+    if pipeline_timings is None or "queue_wait_ms" not in pipeline_timings:
+        return None
+    return float(pipeline_timings["queue_wait_ms"] or 0.0) / 1000.0
+
+
+def observe_stage_workload_metrics(
+    prom_metrics: OmniPrometheusMetrics,
+    *,
+    stage_type: str,
+    stage_metrics: StageRequestStats,
+) -> None:
+    if stage_type == "diffusion":
+        prom_metrics.observe_num_inference_steps(stage_metrics.num_inference_steps)
+
+    if stage_metrics.output_unit_type == "image":
+        prom_metrics.observe_image_pixels(stage_metrics.image_pixels)
+        prom_metrics.inc_image_count(stage_metrics.output_unit_count)
+
+
+def observe_audio_finalize(
+    mod_metrics: OmniModalityMetrics,
+    *,
+    stage_id: int,
+    replica_id: int,
+    stage_metrics: Any,
+    engine_outputs: Any,
+) -> None:
+    stage_label = str(stage_id)
+    replica_label = str(replica_id)
+    gen_time_s = float(getattr(stage_metrics, "stage_gen_time_ms", 0.0)) / 1000.0
+    mm_out = extract_mm_output(engine_outputs)
+
+    sample_rate = metric_defs.resolve_audio_sample_rate(mm_out)
+    n_frames = int(getattr(stage_metrics, "audio_generated_frames", 0) or 0)
+    if n_frames == 0:
+        n_frames = count_audio_frames(mm_out)
+    mod_metrics.inc_audio_frames(stage_label, replica_label, n_frames)
+    duration_s = n_frames / sample_rate if sample_rate > 0 else 0.0
+    if duration_s > 0:
+        mod_metrics.observe_audio_duration(stage_label, replica_label, duration_s)
+        mod_metrics.observe_audio_rtf(
+            stage_label,
+            replica_label,
+            metric_defs.compute_audio_rtf(gen_time_s, duration_s),
+        )
+    else:
+        mod_metrics.inc_audio_skipped(stage_label, replica_label, "no_audio_data")
+
+
+def observe_diffusion_finalize(
+    mod_metrics: OmniModalityMetrics,
+    *,
+    stage_id: int,
+    replica_id: int,
+    stage_metrics: Any,
+) -> None:
+    diff_metrics = getattr(stage_metrics, "diffusion_metrics", None)
+    if not diff_metrics:
+        return
+
+    stage_label = str(stage_id)
+    replica_label = str(replica_id)
+
+    exec_s = diff_metrics.get("diffusion_engine_exec_time_s")
+    if exec_s is not None:
+        mod_metrics.observe_diffusion_exec(stage_label, replica_label, float(exec_s))
+        num_steps = int(
+            getattr(stage_metrics, "num_inference_steps", 0) or diff_metrics.get("num_inference_steps") or 0
+        )
+        if num_steps > 0:
+            mod_metrics.observe_diffusion_exec_per_step(stage_label, replica_label, float(exec_s) / num_steps)
+
+    pre_s = diff_metrics.get("preprocess_time_s")
+    if pre_s is not None:
+        mod_metrics.observe_diffusion_preprocess(stage_label, replica_label, float(pre_s))
+
+    post_s = diff_metrics.get("postprocess_time_s")
+    if post_s is not None:
+        mod_metrics.observe_diffusion_postprocess(stage_label, replica_label, float(post_s))
+
+    vae_s = diff_metrics.get("vae_decode_time_s")
+    if vae_s is not None:
+        mod_metrics.observe_vae_decode(stage_label, replica_label, float(vae_s))
+
+    forward_s = diff_metrics.get("forward_time_s")
+    if forward_s is not None:
+        mod_metrics.observe_diffusion_forward(stage_label, replica_label, float(forward_s))
+        num_steps = int(
+            getattr(stage_metrics, "num_inference_steps", 0) or diff_metrics.get("num_inference_steps") or 0
+        )
+        if num_steps > 0 and getattr(stage_metrics, "output_unit_type", None) == "image":
+            mod_metrics.observe_denoise_step_latency(stage_label, replica_label, float(forward_s) / num_steps)
+
+    kv_load_s = diff_metrics.get("kv_recv_time_s")
+    if kv_load_s is not None:
+        mod_metrics.observe_diffusion_kv_load(stage_label, replica_label, float(kv_load_s))
+
+
+def normalize_failure_reason(reason: str | None) -> str:
+    """Map request failure details to the bounded metrics taxonomy."""
+    return reason if reason in FAILURE_REASONS else "unknown"
+
+
+def diffusion_scheduler_waiting_metrics(n_waiting: int) -> dict[str, int]:
+    """Build the diffusion scheduler snapshot consumed by the orchestrator."""
+    return {metric_defs.DIFFUSION_SCHEDULER_WAITING_KEY: max(int(n_waiting), 0)}
+
+
+def diffusion_exception_metrics(exc: BaseException) -> dict[str, Any]:
+    """Return metrics attached to a terminal diffusion error."""
+    metrics = getattr(exc, "diffusion_metrics", None)
+    return dict(metrics) if isinstance(metrics, dict) else {}
+
+
+def sum_diffusion_stage_durations_ms(output: Any, suffix: str) -> float | None:
+    """Sum matching diffusion stage durations in milliseconds."""
+    durations = getattr(output, "stage_durations", None)
+    if not isinstance(durations, dict):
+        return None
+
+    total = 0.0
+    found = False
+    for key, value in durations.items():
+        if not key.endswith(suffix):
+            continue
+        try:
+            total += float(value)
+            found = True
+        except (TypeError, ValueError):
+            continue
+    return total * 1000.0 if found else None
+
+
+def extract_diffusion_vae_decode_ms(output: Any) -> float | None:
+    return sum_diffusion_stage_durations_ms(output, ".vae.decode")
+
+
+def extract_diffusion_denoise_ms(output: Any) -> float | None:
+    """Extract denoise-loop time (transformer and per-step scheduler)."""
+    return sum_diffusion_stage_durations_ms(output, ".diffuse")
+
+
+def coerce_positive_int_scalar(value: object) -> int | None:
+    """Coerce a value to a positive int without importing tensor libs.
+
+    Meant to pull positive integers such as sample rate out of the shapes
+    that show up across omni stage outputs / configs:
+
+    - plain ``int``: ``44100``
+    - ``torch.Tensor`` / numpy scalar: ``tensor(44100)`` (via ``.item()``)
+    - ``list`` / ``tuple`` wrap: ``[tensor(44100)]`` or ``[44100]``
+    - Mapping field values: ``{"sr": tensor(44100)}`` → coerce the field
+      value (key lookup is done by the caller, e.g.
+      :func:`resolve_int_by_sequential_keys`)
+
+    Returns ``None`` when the value is missing, unparsable, or not positive.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            coerced = coerce_positive_int_scalar(item)
+            if coerced is not None:
+                return coerced
+        return None
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            value = item()
+        except Exception:
+            return None
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def resolve_int_by_sequential_keys(
+    source: Mapping[str, object] | object | None,
+    keys: Sequence[str],
+) -> int | None:
+    """Return the first positive int found by trying ``keys`` in order.
+
+    For each key, looks up ``source[key]`` when ``source`` is a Mapping, otherwise
+    ``getattr(source, key, None)``. Values are coerced via :func:`coerce_positive_int_scalar`.
+    Returns ``None`` when ``source`` is empty/missing or no key yields a usable int.
+    """
+    if not source:
+        return None
+    for key in keys:
+        raw = source.get(key) if isinstance(source, Mapping) else getattr(source, key, None)
+        value = coerce_positive_int_scalar(raw)
+        if value is not None:
+            return value
+    return None
+
+
+def extract_mm_output(mm_source: object) -> Mapping[str, Any]:
+    """Return the first non-empty multimodal_output Mapping on ``mm_source``.
+
+    Lookup order:
+      1. ``mm_source.multimodal_output`` — top-level attribute / property
+      2. ``mm_source.outputs[0].multimodal_output`` — CompletionOutput nesting
+         (typical AR audio path)
+
+    Accepts both plain ``dict`` and ``MultimodalPayload`` (a ``Mapping``).
+    Returns ``{}`` when neither location yields a non-empty Mapping.
+
+    Args:
+        mm_source: Duck-typed container with optional ``multimodal_output`` and/or
+            ``outputs`` (e.g. vLLM ``RequestOutput`` or ``OmniRequestOutput``).
+
+    Returns:
+        The first non-empty multimodal Mapping found, or an empty ``dict``.
+    """
+    mm = getattr(mm_source, "multimodal_output", None)
+    if isinstance(mm, Mapping) and mm:
+        return mm
+    outs = getattr(mm_source, "outputs", None)
+    if outs:
+        nested = getattr(outs[0], "multimodal_output", None)
+        if isinstance(nested, Mapping) and nested:
+            return nested
+    return {}
+
+
+def iter_mm_outputs(mm_source: object) -> list[Mapping[str, Any]]:
+    """Collect all non-empty multimodal_output Mappings from ``mm_source``.
+
+    Lookup order:
+      1. ``mm_source.multimodal_output`` — top-level attribute / property
+      2. each ``mm_source.outputs[i].multimodal_output`` — every CompletionOutput
+         entry that carries a non-empty multimodal Mapping
+
+    Accepts both plain ``dict`` and ``MultimodalPayload`` (a ``Mapping``).
+    Used by stage-pool metrics aggregation that needs to visit every mm payload.
+
+    Args:
+        mm_source: Duck-typed container with optional ``multimodal_output`` and/or
+            ``outputs`` (e.g. vLLM ``RequestOutput`` or ``OmniRequestOutput``).
+
+    Returns:
+        A list of non-empty multimodal Mappings in discovery order. Empty when
+        none are present.
+    """
+    multimodal_outputs: list[Mapping[str, Any]] = []
+    outer_mm = getattr(mm_source, "multimodal_output", None)
+    if isinstance(outer_mm, Mapping) and outer_mm:
+        multimodal_outputs.append(outer_mm)
+    for output in getattr(mm_source, "outputs", None) or []:
+        inner_mm = getattr(output, "multimodal_output", None)
+        if isinstance(inner_mm, Mapping) and inner_mm:
+            multimodal_outputs.append(inner_mm)
+    return multimodal_outputs
+
+
+def count_audio_chunk_frames(audio_chunk: object) -> int:
+    """Count frames (samples) in one audio tensor / chunk.
+
+    Audio chunks are concatenated on dim=-1 in the output processor, so the
+    frame/sample axis is the last dim (e.g. ``[channels, frames]``). Keep this
+    aligned with serving_chat.py: audio tensors are consumed as ``(T,)``,
+    ``(C, T)``, or ``(B, C, T)``. Flattening would corrupt multi-channel audio.
+
+    Args:
+        audio_chunk: A single audio tensor/array-like, or a scalar-like value.
+
+    Returns:
+        Frame count for this chunk. Uses ``shape[-1]`` when shaped; otherwise
+        ``len(...)``; scalars / unlenable values count as ``1``.
+    """
+    shape = getattr(audio_chunk, "shape", None)
+    if shape is not None and len(shape) > 0:
+        return int(shape[-1])
+    try:
+        return len(audio_chunk)  # type: ignore[arg-type]
+    except TypeError:
+        return 1
+
+
+def count_audio_frames(mm_out: Mapping[str, Any]) -> int:
+    """Sum frame counts over all audio chunks in ``mm_out["audio"]`` or with other related keys.
+
+    For multi-dim tensors (e.g. shape ``[channels, samples]``) the last axis is
+    the sample dim; for 1-D tensors the only axis is the sample dim; scalars
+    count as 1. Missing or empty ``audio`` yields ``0``.
+
+    Args:
+        mm_out: A multimodal_output Mapping (plain ``dict`` or
+            ``MultimodalPayload``) that may contain an ``audio`` or related key whose value
+            is one chunk or a list of chunks.
+
+    Returns:
+        Total audio frames (samples) across all chunks.
+    """
+    audio_chunks = None
+    if isinstance(mm_out, Mapping):
+        for key in ("audio", "model_outputs"):
+            audio_chunks = mm_out.get(key)
+            if audio_chunks is not None:
+                break
+    if audio_chunks is None:
+        return 0
+    chunks = audio_chunks if isinstance(audio_chunks, list) else [audio_chunks]
+    return sum(count_audio_chunk_frames(chunk) for chunk in chunks)
+
+
+def count_image_pixels(value: object) -> int:
+    """Count pixels in one image value, or sum over a nested list/tuple.
+
+    Accepts PIL-like objects (``size=(W, H)``), tensors / arrays with a
+    ``shape`` attribute, and nested ``list`` / ``tuple`` containers.
+
+    Shape heuristics (aligned with StagePool image metrics):
+
+    - ``ndim >= 4`` (e.g. ``BCHW``): ``B * H * W`` via
+      ``dims[0] * dims[-2] * dims[-1]``
+    - ``ndim == 3`` and ``dims[0] in (1, 3, 4)``: CHW → ``H * W``
+    - ``ndim == 3`` and ``dims[-1] in (1, 3, 4)``: HWC → ``H * W``
+    - otherwise: ``dims[-2] * dims[-1]``
+
+    Returns ``0`` when ``value`` is missing or cannot be interpreted.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, (list, tuple)):
+        return sum(count_image_pixels(item) for item in value)
+
+    size = getattr(value, "size", None)
+    if isinstance(size, tuple) and len(size) >= 2:
+        try:
+            return int(size[0]) * int(size[1])
+        except (TypeError, ValueError):
+            return 0
+
+    shape = getattr(value, "shape", None)
+    if shape is None or len(shape) < 2:
+        return 0
+    dims = [int(dim) for dim in shape]
+    if len(dims) >= 4:
+        return dims[0] * dims[-2] * dims[-1]
+    if len(dims) == 3 and dims[0] in (1, 3, 4):
+        return dims[1] * dims[2]
+    if len(dims) == 3 and dims[-1] in (1, 3, 4):
+        return dims[0] * dims[1]
+    return dims[-2] * dims[-1]
 
 
 def _build_field_defs(

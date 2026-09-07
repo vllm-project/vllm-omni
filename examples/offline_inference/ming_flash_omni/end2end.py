@@ -347,7 +347,7 @@ def main(args):
         omni.start_profile(stages=args.profiler_stages)
 
     for stage_outputs in omni.generate(prompts, sampling_params_list):
-        output = stage_outputs.request_output
+        output = stage_outputs
         if stage_outputs.final_output_type == "text":
             request_id = output.request_id
             text_output = output.outputs[0].text

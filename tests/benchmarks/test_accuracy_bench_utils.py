@@ -42,7 +42,10 @@ from benchmarks.accuracy.text_to_image.gbench import (
     summarize_generated_records as summarize_gebench_generated_records,
     summarize_gebench_results,
 )
-from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import seed_tts_bench_argv
+from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
+    build_serve_common_argv,
+    seed_tts_bench_argv,
+)
 from tests.e2e.accuracy.qwen3_omni.run_qwen_omni_acc_benchmark import sync_dataset_env_from_ns
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import resolve_seed_tts_root
 
@@ -55,6 +58,25 @@ def test_seed_tts_bench_argv_preserves_hf_repo_id_from_env(monkeypatch):
 
     dataset_idx = argv.index("--dataset-path")
     assert argv[dataset_idx + 1] == "zhaochenyang20/seed-tts-eval"
+
+
+def test_build_serve_common_argv_accepts_realtime_seed_tts_route(tmp_path):
+    argv = build_serve_common_argv(
+        host="127.0.0.1",
+        port=8000,
+        model="openbmb/MiniCPM-o-4_5",
+        num_prompts=4,
+        max_concurrency=1,
+        num_warmups=0,
+        percentile_metrics="ttft,audio_ttfp,audio_rtf",
+        result_dir=tmp_path,
+        result_filename="result.json",
+        backend="openai-realtime-tts",
+        endpoint="/v1/realtime",
+    )
+
+    assert argv[argv.index("--backend") + 1] == "openai-realtime-tts"
+    assert argv[argv.index("--endpoint") + 1] == "/v1/realtime"
 
 
 def test_sync_dataset_env_preserves_seed_tts_hf_repo_id(monkeypatch):

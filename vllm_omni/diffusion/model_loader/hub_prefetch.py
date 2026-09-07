@@ -265,6 +265,7 @@ def prefetch_subfolders(
     subfolders: Iterable[str],
     *,
     local_files_only: bool | None = None,
+    revision: str | None = None,
     include_root_metadata: bool = True,
 ) -> None:
     """Materialise ``model``'s ``subfolders`` in the HF cache before loading.
@@ -278,6 +279,7 @@ def prefetch_subfolders(
         local_files_only: When ``True``, skip the prefetch entirely.
             When ``None`` (default), auto-detect: skip if *model* is a
             local directory, run otherwise.
+        revision: Optional Hub revision shared with component loaders.
         include_root_metadata: When True, also pull ``*.json`` at the repo
             root so ``model_index.json`` / ``config.json`` resolution during
             ``from_pretrained`` also hits a warm cache.
@@ -334,6 +336,7 @@ def prefetch_subfolders(
             with _repo_prefetch_lock(model):
                 snapshot_download(
                     repo_id=model,
+                    revision=revision,
                     allow_patterns=allow_patterns,
                 )
             logger.info("Prefetch complete for %s", model)
@@ -433,10 +436,7 @@ def from_pretrained_with_prefetch(
     ``factory`` is a bound ``SomeModel.from_pretrained`` (or any callable with
     the same ``(model, *, subfolder, local_files_only, **kwargs)`` signature).
 
-    This is a stronger sibling of :func:`retry_on_missing_shard`: that helper
-    only retries the missing-shard ``OSError`` and never re-prefetches, so it
-    cannot recover the second face of the same race. Two shapes of partial
-    -cache failure crash the diffusion server outright:
+    Two shapes of partial-cache failure crash the diffusion server outright:
 
     * ``OSError: <repo> does not appear to have a file named
       text_encoder/model-0000X-of-0000Y.safetensors`` - a shard is still under
@@ -453,6 +453,7 @@ def from_pretrained_with_prefetch(
     on the first failure exactly as before.
     """
     prefetch_list = list(prefetch_list)
+    revision = from_pretrained_kwargs.get("revision")
     can_heal = not local_files_only and bool(model) and not os.path.isdir(model)
     last_exc: BaseException | None = None
 
@@ -484,35 +485,7 @@ def from_pretrained_with_prefetch(
             # Force a fresh, verified snapshot of every component this pipeline
             # needs - not just ``subfolder`` - so a sibling component that was
             # also half-written gets repaired in the same pass.
-            prefetch_subfolders(model, prefetch_list, local_files_only=False)
+            prefetch_subfolders(model, prefetch_list, local_files_only=False, revision=revision)
 
     assert last_exc is not None  # loop only exits via return or a caught exc
     raise last_exc
-
-
-def retry_on_missing_shard(load_fn, *, max_retries: int = 3, base_delay: float = 5.0):
-    """Call *load_fn* with retry on the transformers v5 shard-resolution race.
-
-    When the prefetch lock cannot be acquired (e.g. flock unsupported on
-    the filesystem and dotfile lock times out), ``from_pretrained`` may
-    still hit the ``cached_files`` race. This wrapper retries with
-    exponential backoff when the OSError message matches the specific
-    "does not appear to have a file named" pattern.
-    """
-    for attempt in range(max_retries):
-        try:
-            return load_fn()
-        except OSError as exc:
-            if "does not appear to have a file" not in str(exc):
-                raise
-            if attempt == max_retries - 1:
-                raise
-            delay = base_delay * (attempt + 1)
-            logger.warning(
-                "from_pretrained failed with shard-resolution race (%s); retrying in %.1fs (attempt %d/%d)",
-                exc,
-                delay,
-                attempt + 1,
-                max_retries,
-            )
-            time.sleep(delay)

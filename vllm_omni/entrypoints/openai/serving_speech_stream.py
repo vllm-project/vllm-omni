@@ -1,28 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """WebSocket handler for streaming text input TTS.
 
 Accepts text incrementally via WebSocket, buffers it until input.done, and
 generates audio once for the buffered input using the existing TTS pipeline.
 
+input.done is a flush, not a close: it ends the current utterance and the
+connection stays open, so the next utterance reuses the same connection
+instead of paying another WebSocket handshake. A connection ends on
+session.close, on the idle timeout, or when the client closes the socket.
+The session config is sticky across flushes and can be replaced by sending
+another session.config between utterances.
+
+"Utterance" here names the flush unit rather than any linguistic unit: it is
+whatever text the client had buffered when it sent input.done, from a word to
+several paragraphs, synthesized as a single request.
+
 Protocol:
     Client -> Server:
-        {"type": "session.config", ...}   # Session config (sent once first)
+        {"type": "session.config", ...}   # Session config (first message; repeatable)
         {"type": "input.text", "text": "..."} # Text chunks
-        {"type": "input.done"}            # End of input
+        {"type": "input.done"}            # End of utterance, flush and keep connection open
+        {"type": "session.close"}         # End of connection
 
     Server -> Client (default, word_timestamps=false):
-        {"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "wav"}
+        {"type": "audio.start", "utterance_index": 0, "sentence_index": 0,
+         "sentence_text": "...", "format": "wav"}
         <binary frame: audio bytes>
         ...
-        {"type": "audio.done", "sentence_index": 0}
-        {"type": "session.done", "total_sentences": N}
+        {"type": "audio.done", "utterance_index": 0, "sentence_index": 0}
+        {"type": "session.done", "utterance_index": 0, "total_sentences": N}
         {"type": "error", "message": "..."}
+        # session.done ends the flushed utterance, not the connection. An
+        # utterance is just the flush unit: whatever text was buffered when
+        # input.done arrived, of any length. utterance_index counts those
+        # flushes across the connection, while sentence_index counts within
+        # one of them and so pairs with total_sentences.
 
     Server -> Client (when word_timestamps=true):
-        {"type": "audio.start", "sentence_index": 0, "sentence_text": "...", "format": "pcm"}
-        {"type": "audio.chunk", "sentence_index": 0, "chunk_id": 0, "audio_b64": "<base64 PCM>", "timestamps": null}
+        {"type": "audio.start", "utterance_index": 0, "sentence_index": 0,
+         "sentence_text": "...", "format": "pcm"}
+        {"type": "audio.chunk", "utterance_index": 0, "sentence_index": 0, "chunk_id": 0,
+         "audio_b64": "<base64 PCM>", "timestamps": null}
         ...
         {"type": "audio.chunk", "audio_b64": "", "timestamps": [{"word", "start_ms", "end_ms"}, ...]}
-        {"type": "audio.done", "sentence_index": 0}
+        {"type": "audio.done", "utterance_index": 0, "sentence_index": 0}
         # Audio is JSON base64 PCM (not binary). A trailing empty-audio chunk carries the
         # full sentence-relative alignment. timestamps: list = aligned, [] = silence, null = failed.
 """
@@ -41,8 +64,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     StreamingSpeechSessionConfig,
 )
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
-from vllm_omni.utils.forced_aligner import ForcedAlignerLoadError
-from vllm_omni.utils.forced_aligner import align as forced_align
+from vllm_omni.utils.forced_aligner import extract_word_timestamps
 
 logger = init_logger(__name__)
 
@@ -57,9 +79,11 @@ _MAX_INPUT_TEXT_MESSAGE_SIZE = 128 * 1024
 class OmniStreamingSpeechHandler:
     """Handles WebSocket sessions for streaming text-input TTS.
 
-    Each WebSocket connection is an independent session. Text arrives
-    incrementally, is buffered until input.done, and audio is generated once
-    for the buffered input using the existing OmniOpenAIServingSpeech pipeline.
+    A connection carries one or more utterances. Text arrives incrementally,
+    is buffered until input.done, and audio is generated once for the
+    buffered input using the existing OmniOpenAIServingSpeech pipeline. The
+    connection outlives each utterance so a client can keep synthesizing on
+    it without reconnecting.
 
     Args:
         speech_service: The existing TTS serving instance (reused for
@@ -79,54 +103,64 @@ class OmniStreamingSpeechHandler:
         self._config_timeout = config_timeout
 
     async def handle_session(self, websocket: WebSocket) -> None:
-        """Main session loop for a single WebSocket connection."""
+        """Main loop for a single WebSocket connection.
+
+        Serves any number of utterances: text is buffered until input.done,
+        which flushes it as one TTS request and then leaves the connection
+        open for the next one. Rejecting a message is only fatal before the
+        first valid session.config; afterwards the error is reported and the
+        connection survives.
+        """
         await websocket.accept()
 
+        config: StreamingSpeechSessionConfig | None = None
+        text_parts: list[str] = []
+        utterance_index = 0
+
         try:
-            # 1. Wait for session.config
-            config = await self._receive_config(websocket)
-            if config is None:
-                return  # Error already sent, connection closing
-
-            # Validate model if specified
-            if config.model and hasattr(self._speech_service, "_check_model"):
-                error = await self._speech_service._check_model(
-                    OpenAICreateSpeechRequest(input="ping", model=config.model)
-                )
-                if error is not None:
-                    await self._send_error(websocket, str(error))
-                    return
-
-            text_parts: list[str] = []
-
-            # 2. Receive text chunks until input.done
             while True:
                 try:
                     raw = await asyncio.wait_for(
                         websocket.receive_text(),
-                        timeout=self._idle_timeout,
+                        timeout=self._config_timeout if config is None else self._idle_timeout,
                     )
                 except asyncio.TimeoutError:
-                    await self._send_error(websocket, "Idle timeout: no message received")
+                    if config is None:
+                        await self._send_error(websocket, "Timeout waiting for session.config")
+                    else:
+                        await self._send_error(websocket, "Idle timeout: no message received")
                     return
 
-                if len(raw) > _MAX_INPUT_TEXT_MESSAGE_SIZE:
-                    await self._send_error(websocket, "input.text message too large")
-                    continue
-
-                try:
-                    msg = json.loads(raw)
-                except json.JSONDecodeError:
-                    await self._send_error(websocket, "Invalid JSON message")
-                    continue
-
-                if not isinstance(msg, dict):
-                    await self._send_error(websocket, "WebSocket messages must be JSON objects")
+                msg = await self._parse_message(websocket, raw)
+                if msg is None:
+                    if config is None:
+                        return  # Malformed handshake, connection closing
                     continue
 
                 msg_type = msg.get("type")
 
-                if msg_type == "input.text":
+                if msg_type == "session.config":
+                    if text_parts:
+                        await self._send_error(
+                            websocket,
+                            "session.config cannot be applied while input is buffered; send input.done first",
+                        )
+                        continue
+                    new_config = await self._build_config(websocket, msg)
+                    if new_config is None:
+                        if config is None:
+                            return  # Error already sent, connection closing
+                        continue  # Keep serving with the previous config
+                    config = new_config
+
+                elif config is None:
+                    await self._send_error(
+                        websocket,
+                        f"Expected session.config, got: {msg_type}",
+                    )
+                    return
+
+                elif msg_type == "input.text":
                     text = msg.get("text", "")
                     if not isinstance(text, str):
                         await self._send_error(websocket, "input.text requires a string value")
@@ -135,17 +169,31 @@ class OmniStreamingSpeechHandler:
 
                 elif msg_type == "input.done":
                     full_text = "".join(text_parts).strip()
+                    text_parts.clear()
                     total_sentences = 0
                     if full_text:
-                        await self._generate_and_send(websocket, config, full_text, 0)
+                        # However long the buffered text is, the pipeline takes
+                        # it as one request, so every flush is sentence 0 of 1.
+                        await self._generate_and_send(
+                            websocket,
+                            config,
+                            full_text,
+                            utterance_index=utterance_index,
+                            sentence_index=0,
+                        )
                         total_sentences = 1
 
                     await websocket.send_json(
                         {
                             "type": "session.done",
+                            "utterance_index": utterance_index,
                             "total_sentences": total_sentences,
                         }
                     )
+                    utterance_index += 1
+
+                elif msg_type == "session.close":
+                    await websocket.close()
                     return
 
                 else:
@@ -163,43 +211,49 @@ class OmniStreamingSpeechHandler:
             except Exception:
                 logger.debug("Failed to send error to streaming speech client", exc_info=True)
 
-    async def _receive_config(self, websocket: WebSocket) -> StreamingSpeechSessionConfig | None:
-        """Wait for and validate the session.config message."""
-        try:
-            raw = await asyncio.wait_for(
-                websocket.receive_text(),
-                timeout=self._config_timeout,
-            )
-        except asyncio.TimeoutError:
-            await self._send_error(websocket, "Timeout waiting for session.config")
-            return None
+    async def _parse_message(self, websocket: WebSocket, raw: str) -> dict | None:
+        """Decode one client message, or report why it was rejected.
 
-        if len(raw) > _MAX_CONFIG_MESSAGE_SIZE:
-            await self._send_error(websocket, "session.config message too large")
+        Size limits are per message type: session.config carries ref_audio
+        payloads and gets the larger budget.
+        """
+        if len(raw) > max(_MAX_CONFIG_MESSAGE_SIZE, _MAX_INPUT_TEXT_MESSAGE_SIZE):
+            await self._send_error(websocket, "WebSocket message too large")
             return None
 
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError:
-            await self._send_error(websocket, "Invalid JSON in session.config")
+            await self._send_error(websocket, "Invalid JSON message")
             return None
 
         if not isinstance(msg, dict):
-            await self._send_error(websocket, "session.config must be a JSON object")
+            await self._send_error(websocket, "WebSocket messages must be JSON objects")
             return None
 
-        if msg.get("type") != "session.config":
-            await self._send_error(
-                websocket,
-                f"Expected session.config, got: {msg.get('type')}",
-            )
+        if msg.get("type") == "session.config":
+            if len(raw) > _MAX_CONFIG_MESSAGE_SIZE:
+                await self._send_error(websocket, "session.config message too large")
+                return None
+        elif len(raw) > _MAX_INPUT_TEXT_MESSAGE_SIZE:
+            await self._send_error(websocket, "input.text message too large")
             return None
 
+        return msg
+
+    async def _build_config(self, websocket: WebSocket, msg: dict) -> StreamingSpeechSessionConfig | None:
+        """Validate a session.config message and its model."""
         try:
             config = StreamingSpeechSessionConfig(**{k: v for k, v in msg.items() if k != "type"})
         except ValidationError as e:
             await self._send_error(websocket, f"Invalid session config: {e}")
             return None
+
+        if config.model and hasattr(self._speech_service, "_check_model"):
+            error = await self._speech_service._check_model(OpenAICreateSpeechRequest(input="ping", model=config.model))
+            if error is not None:
+                await self._send_error(websocket, str(error))
+                return None
 
         return config
 
@@ -208,14 +262,20 @@ class OmniStreamingSpeechHandler:
         websocket: WebSocket,
         config: StreamingSpeechSessionConfig,
         sentence_text: str,
+        *,
+        utterance_index: int,
         sentence_index: int,
     ) -> None:
-        """Generate audio for a single sentence and send it over WebSocket."""
+        """Generate audio for a single sentence and send it over WebSocket.
+
+        ``utterance_index`` identifies the flush this sentence belongs to and
+        ``sentence_index`` its position inside that flush.
+        """
         response_format = config.response_format or "wav"
 
         # Reject unmet word-timestamps preconditions early with a clear reason.
         if config.word_timestamps:
-            if self._speech_service.forced_aligner_config is None:
+            if not self._speech_service.forced_aligner_enabled:
                 await self._send_error(
                     websocket,
                     "word_timestamps=true but the server was launched without "
@@ -227,7 +287,8 @@ class OmniStreamingSpeechHandler:
                 await self._send_error(
                     websocket,
                     "word_timestamps=true requires stream_audio=true and "
-                    "response_format='pcm' (the aligner consumes raw PCM).",
+                    "response_format='pcm' (timestamps ride the per-sentence "
+                    "PCM audio.chunk stream).",
                 )
                 return
 
@@ -253,6 +314,7 @@ class OmniStreamingSpeechHandler:
 
         start_payload = {
             "type": "audio.start",
+            "utterance_index": utterance_index,
             "sentence_index": sentence_index,
             "sentence_text": sentence_text,
             "format": response_format,
@@ -270,18 +332,26 @@ class OmniStreamingSpeechHandler:
         request_id = None
         try:
             if config.stream_audio:
-                request_id, generator, _ = await self._speech_service._prepare_speech_generation(request)
+                request_id, generator, tts_params = await self._speech_service._prepare_speech_generation(request)
                 if config.word_timestamps:
                     total_bytes = await self._stream_audio_with_alignments(
                         websocket=websocket,
                         request_id=request_id,
                         generator=generator,
                         sentence_text=sentence_text,
+                        utterance_index=utterance_index,
                         sentence_index=sentence_index,
                         language=config.language,
+                        tts_params=tts_params,
                     )
                 else:
-                    async with aclosing(self._speech_service._generate_pcm_chunks(generator, request_id)) as stream:
+                    async with aclosing(
+                        self._speech_service._generate_pcm_chunks(
+                            generator,
+                            request_id,
+                            tts_params=tts_params,
+                        )
+                    ) as stream:
                         async for chunk in stream:
                             total_bytes += len(chunk)
                             await websocket.send_bytes(chunk)
@@ -298,13 +368,23 @@ class OmniStreamingSpeechHandler:
             raise
         except Exception as e:
             generation_failed = True
-            logger.error("Generation failed for sentence %d: %s", sentence_index, e)
-            await self._send_error(websocket, f"Generation failed for sentence {sentence_index}: {e}")
+            logger.error(
+                "Generation failed for utterance %d, sentence %d: %s",
+                utterance_index,
+                sentence_index,
+                e,
+            )
+            await self._send_error(
+                websocket,
+                f"Generation failed for utterance {utterance_index}, sentence {sentence_index}: {e}",
+                partial_audio=total_bytes > 0,
+            )
         finally:
             try:
                 await websocket.send_json(
                     {
                         "type": "audio.done",
+                        "utterance_index": utterance_index,
                         "sentence_index": sentence_index,
                         "total_bytes": total_bytes,
                         "error": generation_failed,
@@ -320,24 +400,27 @@ class OmniStreamingSpeechHandler:
         request_id: str,
         generator,
         sentence_text: str,
+        utterance_index: int,
         sentence_index: int,
         language: str | None = None,
+        tts_params: dict | None = None,
     ) -> int:
         """Stream PCM as JSON ``audio.chunk`` frames, aligned per sentence.
 
-        Forward each PCM chunk live (``timestamps: null``) while buffering the
-        sentence audio, then run the forced aligner once over the whole
-        sentence and emit a final empty-audio ``audio.chunk`` with the word
-        timestamps. On aligner failure timestamps is ``null``; for silence it
-        is ``[]`` (audio always flows regardless).
+        Forward each PCM chunk live (``timestamps: null``). The forced-aligner
+        pipeline stage (appended when the server is launched with
+        ``--forced-aligner``) consumes the synthesized audio internally and its
+        pooling output rides the same generator, so once the audio finishes we
+        pull the word timestamps straight off that aligner output and emit a
+        final empty-audio ``audio.chunk`` carrying them. Timestamps is ``null``
+        when the aligner produced none; audio always flows regardless.
         """
-        aligner_config = self._speech_service.forced_aligner_config
-        assert aligner_config is not None  # gated by the precondition check
-
-        sentence_audio = bytearray()
+        audio_bytes_seen = 0
         total_bytes = 0
         sample_rate = _PCM_SAMPLE_RATE
         chunk_id = 0
+        # Receives the aligner stage's pooling output from the generator.
+        collect: dict = {}
 
         async def send_chunk(
             chunk: bytes,
@@ -350,6 +433,7 @@ class OmniStreamingSpeechHandler:
             await websocket.send_json(
                 {
                     "type": "audio.chunk",
+                    "utterance_index": utterance_index,
                     "sentence_index": sentence_index,
                     "chunk_id": chunk_id,
                     "chunk_start_ms": chunk_start_ms,
@@ -366,71 +450,41 @@ class OmniStreamingSpeechHandler:
                 generator,
                 request_id,
                 include_sample_rate=True,
+                tts_params=tts_params,
+                collect=collect,
             )
         ) as stream:
             async for chunk, chunk_sample_rate in stream:
                 sample_rate = chunk_sample_rate
-                chunk_start_ms = int(round((len(sentence_audio) / _BYTES_PER_SAMPLE / sample_rate) * 1000.0))
-                sentence_audio.extend(chunk)
-                chunk_end_ms = int(round((len(sentence_audio) / _BYTES_PER_SAMPLE / sample_rate) * 1000.0))
+                chunk_start_ms = int(round((audio_bytes_seen / _BYTES_PER_SAMPLE / sample_rate) * 1000.0))
+                audio_bytes_seen += len(chunk)
+                chunk_end_ms = int(round((audio_bytes_seen / _BYTES_PER_SAMPLE / sample_rate) * 1000.0))
                 total_bytes += len(chunk)
                 # Audio first, timestamps after the whole sentence is aligned.
                 await send_chunk(chunk, chunk_sample_rate, None, chunk_start_ms, chunk_end_ms)
 
-        # Single alignment pass over the full sentence, then emit timestamps.
-        # A load/config failure is permanent, so surface the reason once; audio
-        # has already streamed, so the trailing frame still carries null.
-        try:
-            timestamps_payload = await self._align_sentence(
-                audio=bytes(sentence_audio),
-                text=sentence_text,
-                sample_rate=sample_rate,
-                config=aligner_config,
-                language=language,
-            )
-        except ForcedAlignerLoadError as exc:
-            await self._send_error(websocket, f"forced aligner unavailable: {exc}")
-            timestamps_payload = None
-        sentence_end_ms = int(round((len(sentence_audio) / _BYTES_PER_SAMPLE / sample_rate) * 1000.0))
+        # Pull word timestamps off the aligner stage's pooling output (it rode
+        # the same generator); extract_word_timestamps re-segments the sentence
+        # text for the word strings when the aligner output doesn't carry them.
+        aligner_res = collect.get("aligner_res")
+        timestamps_payload = (
+            extract_word_timestamps(aligner_res, sentence_text, language) if aligner_res is not None else None
+        )
+        sentence_end_ms = int(round((audio_bytes_seen / _BYTES_PER_SAMPLE / sample_rate) * 1000.0))
         await send_chunk(b"", sample_rate, timestamps_payload, 0, sentence_end_ms)
 
         return total_bytes
 
     @staticmethod
-    async def _align_sentence(
-        *,
-        audio: bytes,
-        text: str,
-        sample_rate: int,
-        config,
-        language: str | None = None,
-    ) -> list[dict] | None:
-        """Convert a sentence alignment into JSON word-timestamp dicts.
-
-        Returns ``None`` on aligner failure, ``[]`` when it ran but produced no
-        tokens. Monotonic, non-overlapping bounds are guaranteed by the decoder.
-        ``language`` is forwarded to word segmentation.
-        """
-        aligned = await forced_align(
-            audio=audio,
-            text=text,
-            sample_rate=sample_rate,
-            config=config,
-            language=language,
-        )
-        if aligned is None:
-            return None
-        return [{"word": ts.word, "start_ms": ts.start_ms, "end_ms": ts.end_ms} for ts in aligned]
-
-    @staticmethod
-    async def _send_error(websocket: WebSocket, message: str) -> None:
+    async def _send_error(websocket: WebSocket, message: str, *, partial_audio: bool = False) -> None:
         """Send an error message to the client."""
         try:
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "message": message,
-                }
-            )
+            payload: dict[str, object] = {
+                "type": "error",
+                "message": message,
+            }
+            if partial_audio:
+                payload.update(partial_audio=True, action="discard")
+            await websocket.send_json(payload)
         except Exception:
             pass  # Connection may already be closed; safe to ignore

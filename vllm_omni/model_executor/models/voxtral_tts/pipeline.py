@@ -16,6 +16,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.voxtral_tts"
 
 VOXTRAL_TTS_PIPELINE = PipelineConfig(
     model_type="voxtral_tts",
+    default_deploy_config_name="voxtral_tts.yaml",
     model_arch="VoxtralTTSForConditionalGeneration",
     stages=(
         StagePipelineConfig(

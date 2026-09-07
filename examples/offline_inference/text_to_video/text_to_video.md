@@ -8,11 +8,19 @@ A unified script for text-to-video generation. Supports multiple models with mod
 |---|---|---|---|---|---|
 | `Wan-AI/Wan2.1-VACE-1.3B-diffusers` | 480x832 | 81 | 30 | 5.0 | ~20 GiB (RTX 5090, VAE tiling) |
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | 720x1280 | 81 | 40 | 4.0 | ~60 GiB |
-| `dg845/LTX-2.3-Diffusers` | 384x512 | 25 | 20 | 4.0 | 96GB-class GPU |
+| `robbyant/lingbot-video-dense-1.3b` / `robbyant/lingbot-video-moe-30b-a3b` | 192x320 | 9 | 2 | 3.0 | ~68 GiB (MoE smoke) |
+| `Lightricks/LTX-2` | 512x768 | 121 | 40 | video 3.0 / audio 7.0 | Model-dependent |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | 480x832 | 121 | 50 | 6.0 | 1×A100 80GB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
 | `nvidia/Cosmos3-Nano` | 720x1280 | 189 | 35 | 6.0 | ~46 GiB (peak, 720p) |
 | `BestWishYsh/Helios-Base` / `Helios-Mid` / `Helios-Distilled` | 384x640 | 99 | 50 | 5.0 / 5.0 / 1.0 | — |
+| `sand-ai/MAGI-2-preview` | 512x896 | 125 | 100 | Model-fixed | Native four-GPU TP/SP; resident SP4 default; DLO available |
+| `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | 480x832 | 81 | 50 | 6.0 | BF16 DiT + FP32 Wan VAE wrapper |
+| `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` | 704x1280 | 81 | 50 | 6.0 | BF16 DiT + LTX-2 Video VAE wrapper |
+
+MAGI-2 native Preview setup, four-GPU topology and DLO choices, request
+constraints, and eight-GPU validation status are documented in the
+[`MAGI-2 Preview L20X recipe`](../../../recipes/SandAI/MAGI-2-preview-L20X.md).
 
 ## Local CLI Usage
 
@@ -55,45 +63,45 @@ python text_to_video.py \
   --output vace_t2v_output.mp4
 ```
 
-LTX2 example:
+### LingBot-Video
+
+The shared runner recognizes the official dense and MoE checkpoint IDs, selects
+`LingBotVideoPipeline`, and builds the canonical video request envelope:
 
 ```bash
 python text_to_video.py \
-  --model "Lightricks/LTX-2" \
-  --prompt "A cinematic close-up of ocean waves at golden hour." \
-  --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
-  --height 512 \
-  --width 768 \
-  --num-frames 121 \
-  --num-inference-steps 40 \
-  --guidance-scale 4.0 \
-  --frame-rate 24 \
-  --output ltx2_out.mp4
+  --model robbyant/lingbot-video-dense-1.3b \
+  --prompt "a robotic arm picks up a red block" \
+  --height 192 --width 320 --num-frames 9 --num-inference-steps 2 \
+  --guidance-scale 3.0 --flow-shift 3.0 --fps 24 \
+  --output lingbot_t2v.mp4
 ```
 
-### LTX-2.3
+Use the same command with `robbyant/lingbot-video-moe-30b-a3b` for the MoE
+checkpoint. Requested frame counts are rounded upward to the causal
+VAE's `4n+1` grid. For a local checkpoint path whose name does not contain
+`lingbot`, pass `--model-class-name LingBotVideoPipeline`.
+
+LingBot-only options such as `batch_cfg` and `output_type` use the shared
+model-extra channel, for example:
 
 ```bash
 python text_to_video.py \
-  --model dg845/LTX-2.3-Diffusers \
-  --model-class-name LTX23Pipeline \
+  --model robbyant/lingbot-video-dense-1.3b \
+  --extra-body '{"batch_cfg": true, "output_type": "np"}'
+```
+
+### LTX-2
+
+```bash
+python text_to_video.py \
+  --model Lightricks/LTX-2 \
   --prompt "Cherry blossoms swaying gently in the breeze with synchronized ambient sound" \
-  --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
-  --height 384 \
-  --width 512 \
-  --num-frames 25 \
-  --num-inference-steps 20 \
-  --guidance-scale 4.0 \
-  --frame-rate 24 \
-  --fps 24 \
-  --audio-sample-rate 48000 \
-  --output ltx23_t2v_output.mp4
+  --output ltx2_output.mp4
 ```
 
-Use a Diffusers-format checkpoint such as `dg845/LTX-2.3-Diffusers`; the
-upstream `Lightricks/LTX-2.3` raw safetensors repo is not directly loadable by
-this pipeline. Pass `--model-class-name LTX23Pipeline` to select the LTX-2.3
-text-to-video pipeline explicitly.
+See the [LTX-2 recipe](../../../recipes/LTX/LTX-2.md) for all checkpoints,
+pipeline selection, I2V, defaults, and advanced options.
 
 ### HunyuanVideo-1.5 (480p)
 
@@ -149,6 +157,40 @@ python text_to_video.py \
   --flow-shift 5.0 \
   --output quick_test.mp4
 ```
+
+### SANA-Video-2B
+
+Select the native T2V pipeline explicitly:
+
+```bash
+python text_to_video.py \
+  --model Efficient-Large-Model/SANA-Video_2B_480p_diffusers \
+  --model-class-name SanaVideoPipeline \
+  --prompt "A cinematic tracking shot of a sailboat crossing the ocean at sunset." \
+  --height 480 \
+  --width 832 \
+  --num-frames 81 \
+  --num-inference-steps 50 \
+  --guidance-scale 6.0 \
+  --extra-body '{"motion_score": 30}' \
+  --fps 16 \
+  --output sana_video_480p.mp4
+```
+
+For the 720p checkpoint, switch the model to
+`Efficient-Large-Model/SANA-Video_2B_720p_diffusers`, use
+`--height 704 --width 1280`, and write to a different output path. Both native
+checkpoint variants are supported. The Diffusers adapter T2V compatibility
+path is also validated at both resolutions through online serving.
+
+The native 480p path uses vLLM-Omni's `DistributedAutoencoderKLWan` wrapper;
+the native 720p path uses `DistributedAutoencoderKLLTX2Video`. Both wrappers
+retain their underlying Diffusers autoencoders. The pipeline intentionally
+uses Diffusers' checkpoint-compatible `DPMSolverMultistepScheduler`.
+
+For image-to-video, use the shared
+[`image_to_video.py`](../image_to_video/README.md#sana-video-2b) example with
+`--model-class-name SanaImageToVideoPipeline` and `--image <path>`.
 
 ### Cosmos3
 
@@ -212,8 +254,7 @@ python text_to_video.py \
 ### Common
 
 - `--model`: Diffusers model ID or local path.
-- `--model-class-name`: Optional explicit pipeline class. Use `LTX23Pipeline`
-  for LTX-2.3 text-to-video.
+- `--model-class-name`: Optional explicit pipeline override.
 - `--prompt`: text description (string).
 - `--height/--width`: output resolution. Default depends on model.
 - `--num-frames`: number of frames. Default depends on model.
@@ -221,19 +262,21 @@ python text_to_video.py \
 - `--num-inference-steps`: sampling steps. Default depends on model.
 - `--fps`: frames per second for the saved MP4.
 - `--output`: path to save the generated video.
-- `--extra-body`: JSON dict of model-specific knobs (declared in `vllm_omni/model_extras/`), merged into sampling `extra_args`. See the Helios recipes above.
+- `--extra-body`: JSON object of model-specific generation knobs, filtered against the model's declared `extra_body_params` and merged into sampling `extra_args` (see the Helios and Cosmos3 examples above and [`vllm_omni/model_extras`](../../../vllm_omni/model_extras)).
 - `--vae-use-slicing`: enable VAE slicing for memory optimization.
 - `--vae-use-tiling`: enable VAE tiling for memory optimization.
 - `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](../../../docs/user_guide/diffusion/parallelism_acceleration.md#cfg-parallel).
 - `--tensor-parallel-size`: tensor parallel size (effective for models that support TP, e.g. LTX2).
 - `--enable-cpu-offload`: enable CPU offloading for diffusion models.
 - `--enable-layerwise-offload`: enable layerwise offloading on DiT modules.
+- `--diffusion-offload-config`: component-selective offload JSON; do not combine it with the legacy flags above.
 - `--frame-rate`: generation FPS for pipelines that require it (e.g., LTX2).
-- `--audio-sample-rate`: audio sample rate for embedded audio (when the
-  pipeline returns audio; LTX-2.3 outputs 48kHz audio).
-- `--quantization`: quantization method (`fp8` for FP8, `gguf` for GGUF).
+- `--audio-sample-rate`: fallback audio sample rate when the pipeline returns audio.
+- `--quantization`: quantization method (such as `fp8` for FP8).
 - `--flow-shift`: scheduler flow_shift parameter.
-- `--extra-body`: JSON object of model-specific generation params, filtered against the model's declared `extra_body_params` (see [`vllm_omni/model_extras`](../../../vllm_omni/model_extras)). Used by Cosmos3 (see above).
+- `--lora-path`: path to PEFT LoRA adapter folder or checkpoint file.
+- `--lora-scale`: scale factor for LoRA weights.
+- `--lora-backend`: backend for loading LoRA adapters. Default: peft. Available options: peft, distill.
 
 ### Wan2.2-specific
 
@@ -253,4 +296,6 @@ python text_to_video.py \
 | 720p I2V | 7.0 | 6.0 | 50 |
 | CFG-distilled | (same) | 1.0 | 50 |
 
-> If you encounter OOM errors, try `--vae-use-slicing`, `--vae-use-tiling`, `--enable-cpu-offload`, or `--quantization fp8`.
+> If you encounter OOM errors, try `--vae-use-slicing`, `--vae-use-tiling`,
+> module/layer offload through `--diffusion-offload-config`, or
+> `--quantization fp8`.
