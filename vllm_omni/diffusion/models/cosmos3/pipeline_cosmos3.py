@@ -109,7 +109,7 @@ from .transfer import (
     transfer_max_frames_from_extra_args,
     uint8_cthw_to_normalized_5d,
 )
-from .transformer_cosmos3 import Cosmos3VFMTransformer, _tf_config_get, resolve_sound_gen
+from .transformer_cosmos3 import Cosmos3VFMTransformer, _od_config_get, _tf_config_get, resolve_sound_gen
 from .transformer_cosmos3_edge import COSMOS3_EDGE_BACKBONE_TYPE, Cosmos3EdgeVFMTransformer
 from .utils import (
     COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION,
@@ -202,6 +202,20 @@ COSMOS3_DISTILLED_CHECKPOINT_SCHEDULER_CLASS = "FlowMatchEulerDiscreteScheduler"
 # UND pathway / GEN cross-attention cost for pathologically long prompts.
 COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
 COSMOS3_TRANSFER_REQUESTED_SIZE_KEY = "_cosmos3_transfer_requested_size"
+
+
+def _resolve_cosmos3_sampling_dtype(od_config: OmniDiffusionConfig) -> torch.dtype:
+    sampling_dtype = os.environ.get("COSMOS3_SAMPLING_DTYPE")
+    if sampling_dtype is None:
+        sampling_dtype = _od_config_get(od_config, "sampling_dtype", "model")
+    if not isinstance(sampling_dtype, str):
+        raise TypeError(f"Cosmos3 sampling_dtype must be a string, got {type(sampling_dtype)!r}.")
+    sampling_dtype = sampling_dtype.lower()
+    if sampling_dtype == "float32":
+        return torch.float32
+    if sampling_dtype == "model":
+        return od_config.dtype
+    raise ValueError(f"Cosmos3 sampling_dtype must be 'float32' or 'model', got {sampling_dtype!r}.")
 
 
 def _ceil_video_num_frames(num_frames: int, temporal_compression_factor: int) -> int:
@@ -937,6 +951,7 @@ class Cosmos3OmniDiffusersPipeline(
         self.od_config = od_config
         self.device = get_local_device()
         self.dtype = od_config.dtype
+        self.sampling_dtype = _resolve_cosmos3_sampling_dtype(od_config)
 
         model_path = od_config.model
         local_files_only = os.path.exists(model_path)
@@ -1279,24 +1294,53 @@ class Cosmos3OmniDiffusersPipeline(
         The transformer returns the raw prediction: video-only as a tensor,
         or a tuple in video, action, sound order for multimodal generation.
         """
+        def _to_model_dtype(value: Any) -> Any:
+            if isinstance(value, torch.Tensor):
+                return value.to(self.dtype)
+            if isinstance(value, list):
+                return [_to_model_dtype(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(_to_model_dtype(item) for item in value)
+            return value
+
+        def _to_sampling_dtype(
+            prediction: torch.Tensor | tuple[torch.Tensor, ...],
+        ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+            if isinstance(prediction, tuple):
+                return tuple(item.to(self.sampling_dtype) for item in prediction)
+            return prediction.to(self.sampling_dtype)
+
         cache_key = kwargs.pop("_cosmos3_cache_key", None)
         context_name = str(kwargs.pop("_sea_cache_context", "cond"))
+        for key in (
+            "hidden_states",
+            "action_latents",
+            "sound_latents",
+            "control_latents",
+            "noisy_frame_mask",
+            "action_noisy_mask",
+        ):
+            if key in kwargs and kwargs[key] is not None:
+                kwargs[key] = _to_model_dtype(kwargs[key])
+
         hook = getattr(self, "_sea_cache_hook", None)
         context_factory = getattr(hook, "cache_context", None)
         context = context_factory(context_name) if callable(context_factory) else nullcontext()
         with context:
             if cache_key is None:
-                return self.transformer(**kwargs)
-
-            branch_caches = self._cosmos3_branch_caches
-            if branch_caches is None:
-                return self.transformer(**kwargs)
-
-            cache_key = str(cache_key)
-            self.transformer.cached_kv, self.transformer.cached_freqs_gen = branch_caches.get(cache_key, (None, None))
-            prediction = self.transformer(**kwargs)
-            branch_caches[cache_key] = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
-            return prediction
+                prediction = self.transformer(**kwargs)
+            else:
+                branch_caches = self._cosmos3_branch_caches
+                if branch_caches is None:
+                    prediction = self.transformer(**kwargs)
+                else:
+                    cache_key = str(cache_key)
+                    self.transformer.cached_kv, self.transformer.cached_freqs_gen = branch_caches.get(
+                        cache_key, (None, None)
+                    )
+                    prediction = self.transformer(**kwargs)
+                    branch_caches[cache_key] = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
+        return _to_sampling_dtype(prediction)
 
     def combine_multi_branch_cfg_noise(
         self,
@@ -2046,7 +2090,7 @@ class Cosmos3OmniDiffusersPipeline(
             height // self.vae_scale_factor_spatial,
             width // self.vae_scale_factor_spatial,
         )
-        return randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
+        return randn_tensor(shape, generator=generator, device=self.device, dtype=self.sampling_dtype)
 
     def _prepare_sound_latents(
         self,
@@ -2078,7 +2122,7 @@ class Cosmos3OmniDiffusersPipeline(
             (1, sound_dim, latent_frames),
             generator=generator,
             device=self.device,
-            dtype=self.dtype,
+            dtype=self.sampling_dtype,
         )
         return latents, latent_frames
 
@@ -2315,7 +2359,7 @@ class Cosmos3OmniDiffusersPipeline(
         video = image_tensor.unsqueeze(2)
         latent = self.vae.encode(video).latent_dist.mode()
         latent = self._normalize_vae_latent(latent)
-        return latent[:, :, 0:1, :, :].to(self.dtype)
+        return latent[:, :, 0:1, :, :].to(self.sampling_dtype)
 
     def _latent_hw_from_image_size(self, image_size: Any | None) -> tuple[int, int] | None:
         if image_size is None:
@@ -2351,7 +2395,7 @@ class Cosmos3OmniDiffusersPipeline(
         latent = self.vae.encode(video).latent_dist.mode()
         latent = self._normalize_vae_latent(latent)
         latent = self._crop_latent_to_image_size(latent, image_size)
-        return latent.to(self.dtype)
+        return latent.to(self.sampling_dtype)
 
     def _prepare_latents_i2v(
         self,
@@ -2377,14 +2421,14 @@ class Cosmos3OmniDiffusersPipeline(
             (1, C, T_lat, H_lat, W_lat),
             generator=generator,
             device=self.device,
-            dtype=self.dtype,
+            dtype=self.sampling_dtype,
         )
 
         image_latent = self._encode_conditioning_image_latent(image_tensor)
         latents = noise
         latents[:, :, 0:1, :, :] = image_latent
 
-        velocity_mask = torch.ones(1, 1, T_lat, 1, 1, device=self.device, dtype=self.dtype)
+        velocity_mask = torch.ones(1, 1, T_lat, 1, 1, device=self.device, dtype=self.sampling_dtype)
         velocity_mask[:, :, 0, :, :] = 0.0
         return latents, velocity_mask, image_latent
 
@@ -2422,7 +2466,7 @@ class Cosmos3OmniDiffusersPipeline(
             (1, C, T_lat, H_lat, W_lat),
             generator=generator,
             device=self.device,
-            dtype=self.dtype,
+            dtype=self.sampling_dtype,
         )
         condition_pixel_frames = condition_pixel_frame_count(indexes, self.vae_scale_factor_temporal)
         condition_video = video_tensor[:, :, :condition_pixel_frames]
@@ -2443,7 +2487,7 @@ class Cosmos3OmniDiffusersPipeline(
                 f"encoded={tuple(cond_prefix_latent.shape)}, expected at least {expected_prefix}."
             )
 
-        condition_mask = torch.zeros(1, 1, T_lat, 1, 1, device=self.device, dtype=self.dtype)
+        condition_mask = torch.zeros(1, 1, T_lat, 1, 1, device=self.device, dtype=self.sampling_dtype)
         condition_latents = torch.zeros_like(noise)
         for index in indexes:
             condition_mask[:, :, index, :, :] = 1.0
@@ -2490,7 +2534,7 @@ class Cosmos3OmniDiffusersPipeline(
             (1, C, T_lat, H_lat, W_lat),
             generator=generator,
             device=self.device,
-            dtype=self.dtype,
+            dtype=self.sampling_dtype,
         )
         condition_indexes = vision_condition_indexes(mode, num_frames, self.vae_scale_factor_temporal)
         condition_video = video_tensor[:, :, :1] if condition_indexes == [0] else video_tensor
@@ -2515,7 +2559,7 @@ class Cosmos3OmniDiffusersPipeline(
             num_frames,
             self.vae_scale_factor_temporal,
             device=self.device,
-            dtype=self.dtype,
+            dtype=self.sampling_dtype,
         )
         latents = condition_mask * condition_latents + (1.0 - condition_mask) * noise
         velocity_mask = 1.0 - condition_mask
@@ -2568,26 +2612,26 @@ class Cosmos3OmniDiffusersPipeline(
         if raw_action_dim <= 0 or raw_action_dim > action_dim:
             raise ValueError(f"Cosmos3 raw_action_dim must be in [1, {action_dim}], got {raw_action_dim}.")
 
-        clean_action = clean_action.to(device=self.device, dtype=self.dtype).unsqueeze(0)
+        clean_action = clean_action.to(device=self.device, dtype=self.sampling_dtype).unsqueeze(0)
         if condition_indexes is None:
             condition_mask = build_action_condition_mask(
                 mode,
                 action_chunk_size,
                 device=self.device,
-                dtype=self.dtype,
+                dtype=self.sampling_dtype,
             )
         else:
             condition_mask = self._build_action_condition_mask_from_indexes(
                 condition_indexes,
                 action_chunk_size,
                 device=self.device,
-                dtype=self.dtype,
+                dtype=self.sampling_dtype,
             )
         noise = randn_tensor(
             (1, action_chunk_size, action_dim),
             generator=generator,
             device=self.device,
-            dtype=self.dtype,
+            dtype=self.sampling_dtype,
         )
         noise[:, :, raw_action_dim:] = 0
         clean_action[:, :, raw_action_dim:] = 0
@@ -2996,7 +3040,7 @@ class Cosmos3OmniDiffusersPipeline(
             condition_latents.shape,
             generator=generator,
             device=self.device,
-            dtype=self.dtype,
+            dtype=self.sampling_dtype,
         )
         condition_mask = torch.zeros(
             1,
@@ -3005,7 +3049,7 @@ class Cosmos3OmniDiffusersPipeline(
             1,
             1,
             device=self.device,
-            dtype=self.dtype,
+            dtype=self.sampling_dtype,
         )
         if current_conditional_frames > 0:
             latent_frames = (current_conditional_frames - 1) // self.vae_scale_factor_temporal + 1
