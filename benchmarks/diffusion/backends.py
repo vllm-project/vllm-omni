@@ -348,7 +348,12 @@ async def async_request_v1_videos(
 
     form = aiohttp.FormData()
     for k, v in files.items():
-        form.add_field(k, str(v))
+        if isinstance(v, str):
+            form.add_field(k, v)
+        elif isinstance(v, (dict, list)):
+            form.add_field(k, json.dumps(v))
+        else:
+            form.add_field(k, str(v))
 
     image_file = None
     if input.image_paths and input.video_paths:
