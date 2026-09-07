@@ -5194,8 +5194,9 @@ class TestTTSAsyncOffloading:
         assert prompt["additional_information"] is tts_params
         assert prompt["additional_information"]["non_streaming_mode"] == [True]
 
-    def test_qwen3_repeated_ref_audio_hot_path_sends_cache_key_without_waveform(self, qwen3_tts_server):
-        """After a ref artifact is marked ready, repeated requests avoid ref_audio payload IPC."""
+    def test_qwen3_inline_ref_audio_hot_path_does_not_use_named_speaker_cache(self, qwen3_tts_server, mocker):
+        """An OpenAI-compatible voice does not identify an inline voice clone."""
+        ignored_voice_log = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts.logger.info")
         wav_list = [0.0] * 48000
         artifact_key = "a" * 40
         ref_audio = "data:audio/wav;base64,same"
@@ -5218,6 +5219,7 @@ class TestTTSAsyncOffloading:
 
         request = OpenAICreateSpeechRequest(
             input="hello",
+            voice="voice-a",
             task_type="Base",
             ref_audio=ref_audio,
             ref_text="reference",
@@ -5227,7 +5229,14 @@ class TestTTSAsyncOffloading:
         )
 
         assert request_id == "req-hot"
+        assert request.voice == "voice-a"
+        ignored_voice_log.assert_called_once_with(
+            "Ignoring voice=%r for Qwen3-TTS Base request because inline ref_audio takes precedence",
+            "voice-a",
+        )
         assert "ref_audio" not in tts_params
+        assert "speaker" not in tts_params
+        assert "voice_created_at" not in tts_params
         assert tts_params["_qwen3_tts_ref_audio_cache_key"] == [artifact_key]
         assert tts_params["ref_code_length"] == [50]
         prompt = qwen3_tts_server.engine_client.generate.call_args.kwargs["prompt"]
