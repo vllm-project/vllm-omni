@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from transformers import PretrainedConfig
 from vllm.logger import init_logger
@@ -462,6 +462,7 @@ class StageDeployConfig:
     step_execution: bool | None = None
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None
+    vae_stack_tiling: Literal["auto", "true", "false"] | None = None
     boundary_ratio: float | None = None
     flow_shift: float | None = None
     diffusion_kv_cache_dtype: str | None = None

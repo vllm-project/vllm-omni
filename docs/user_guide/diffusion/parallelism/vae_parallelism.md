@@ -120,9 +120,17 @@ Additional requirements:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `vae_use_tiling` | bool | False | Must be set to `True` when using VAE patch parallelism. |
+| `vae_stack_tiling` | `"auto"` \| `"true"` \| `"false"` | `"false"` | For VAEs with native support (currently MiniMax H3), batch local decoder tiles into fewer model calls. `"auto"` enables it when the request has at least two tiles per VAE-parallel rank. |
 
 !!! note "Automatic VAE Tiling"
     When `vae_patch_parallel_size > 1` and the model has a distributed VAE (`DistributedVaeMixin`), the system automatically sets `vae_use_tiling=True` if not already enabled.
+
+!!! tip "MiniMax H3 stacked tiling"
+    MiniMax H3 supports lossless native stacked tiling. Enable it with
+    `--vae-stack-tiling auto` (or `true`) to batch each rank's spatial tiles
+    into one decoder call per temporal window. `auto` keeps the sequential
+    path for shapes that do not provide multiple tiles per rank, while
+    `false` remains the default to avoid increasing the VAE activation peak.
 
 ---
 
