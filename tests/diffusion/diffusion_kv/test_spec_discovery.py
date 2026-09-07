@@ -173,7 +173,7 @@ def test_worker_honors_explicit_kv_memory_budget(monkeypatch) -> None:
     profile_request = object()
 
     assert worker.determine_available_kv_memory(profile_request) == [4096]
-    worker.model_runner.profile_run.assert_called_once_with(profile_request)
+    worker.model_runner.profile_run.assert_not_called()
 
 
 def test_worker_treats_zero_kv_memory_budget_as_profiled_auto_sizing(monkeypatch) -> None:

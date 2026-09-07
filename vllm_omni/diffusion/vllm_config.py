@@ -151,6 +151,9 @@ class _DiffusionVllmModelConfig:
     def get_head_size(self) -> int:
         return self._require_attention_geometry()[2]
 
+    def get_total_num_kv_heads(self) -> int:
+        return self.hf_text_config.num_key_value_heads
+
     @property
     def is_diffusion(self) -> bool:
         # This config is also installed as the current VllmConfig for the
@@ -224,7 +227,10 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
         vllm_config.cache_config.kv_cache_memory_bytes = getattr(od_config, "kv_cache_memory_bytes", None)
         # Prefix hashes/publication are intentionally deferred to the next PR.
         vllm_config.cache_config.enable_prefix_caching = False
-        vllm_config.scheduler_config.max_num_seqs = int(od_config.max_num_seqs)
+        max_rows_per_request = getattr(od_config, "diffusion_kv_max_rows_per_request", None)
+        if type(max_rows_per_request) is not int or max_rows_per_request <= 0:
+            raise ValueError("paged_scheduler requires a positive diffusion_kv_max_rows_per_request")
+        vllm_config.scheduler_config.max_num_seqs = int(od_config.max_num_seqs) * max_rows_per_request
         max_num_batched_tokens = getattr(od_config, "max_num_batched_tokens", None)
         if max_num_batched_tokens is not None:
             vllm_config.scheduler_config.max_num_batched_tokens = int(max_num_batched_tokens)

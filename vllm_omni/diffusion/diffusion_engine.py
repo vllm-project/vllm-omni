@@ -54,7 +54,7 @@ from vllm_omni.diffusion.registry import (
 )
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
-from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
+from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus, DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -582,7 +582,11 @@ class DiffusionEngine:
 
                 self._wait_for_admission_if_needed_locked()
 
-                sched_output = self.scheduler.schedule()
+                try:
+                    sched_output = self.scheduler.schedule()
+                except Exception as exc:
+                    self._fail_engine(exc)
+                    return
                 self._scheduler_num_waiting_reqs = max(int(sched_output.num_waiting_reqs), 0)
 
             if sched_output.is_empty:
@@ -590,8 +594,17 @@ class DiffusionEngine:
                 continue
 
             try:
-                runner_output: BaseRunnerOutput = self.execute_fn(sched_output)  # pyright: ignore[reportAssignmentType]
+                self._prepare_kv_for_forward(sched_output)
+                runner_output: BaseRunnerOutput = (
+                    self.execute_fn(sched_output)
+                    if sched_output.scheduled_request_ids
+                    else BatchRunnerOutput.from_list([])
+                )
+                worker_execution_completed = True
             except Exception as exc:
+                if self._closed:
+                    return
+                worker_execution_completed = False
                 logger.error(
                     "Execution failed for diffusion requests %s", sched_output.scheduled_request_ids, exc_info=True
                 )
@@ -609,8 +622,17 @@ class DiffusionEngine:
 
             self._process_aborts_queue()
             self._process_rpc_queue()
-            finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
-            self._emit_outputs(finished_req_ids, sched_output.scheduled_request_ids, runner_output)
+            try:
+                finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
+                self._emit_outputs(
+                    finished_req_ids,
+                    sched_output.scheduled_request_ids,
+                    runner_output,
+                    worker_execution_completed=worker_execution_completed,
+                )
+            except Exception as exc:
+                self._fail_engine(exc)
+                return
 
         # Engine is stopping: fail any RPCs still queued so callers don't hang.
         self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
@@ -721,15 +743,50 @@ class DiffusionEngine:
             return
         unique_request_ids = list(dict.fromkeys(request_ids))
         if unique_request_ids:
-            self.executor.remove_diffusion_kv_requests(unique_request_ids)
+            scheduler = getattr(self, "scheduler", None)
+            target_builder = getattr(scheduler, "get_diffusion_kv_cleanup_targets", None)
+            cleanup_targets = target_builder(unique_request_ids) if target_builder is not None else unique_request_ids
+            try:
+                self.executor.remove_diffusion_kv_requests(cleanup_targets)
+            except Exception as exc:
+                self._fail_engine(exc)
+                raise
+
+    def _prepare_kv_for_forward(self, sched_output: DiffusionSchedulerOutput) -> None:
+        if getattr(sched_output, "kv_connector_metadata", None) is None:
+            return
+        try:
+            output = self.executor.prepare_kv_for_forward(sched_output)
+            self.scheduler.update_kv_connector_output(output)
+        except Exception as exc:
+            self._fail_engine(exc)
+            raise
+
+    def _fail_engine(self, exc: Exception) -> None:
+        if getattr(self, "_shutdown_complete", False):
+            return
+        logger.error("Diffusion engine failed; stopping workers before releasing KV pages", exc_info=exc)
+        with self._cv:
+            self._closed = True
+            if self.stop_event is not None:
+                self.stop_event.set()
+            streams = list(self._out_streams.values())
+            self._cv.notify_all()
+        for stream in streams:
+            self._put_queue_output(stream, DiffusionOutput.from_exception(exc))
+        self._fail_pending_rpcs(exc)
+        self.executor.shutdown()
+        self.scheduler.close()
+        self._shutdown_complete = True
 
     def _emit_finished_outputs(
         self,
         finished_ids: set[str],
         runner_output: BaseRunnerOutput | None = None,
         missing_result_error: str = "Diffusion execution finished without a final output",
+        worker_cleaned_ids: set[str] | None = None,
     ) -> None:
-        self._remove_diffusion_kv_requests(finished_ids)
+        self._remove_diffusion_kv_requests(finished_ids - (worker_cleaned_ids or set()))
         for rid in finished_ids:
             if runner_output is not None:
                 _output = runner_output.get_request_output(rid)
@@ -743,13 +800,21 @@ class DiffusionEngine:
         finished_ids: set[str],
         scheduled_request_ids: list[str],
         runner_output: BaseRunnerOutput,
+        *,
+        worker_execution_completed: bool = False,
     ) -> None:
         """Emit output chunks for every request through the unified output stream."""
+        finished_ids = set(finished_ids)
+        worker_cleaned_ids = finished_ids.intersection(scheduled_request_ids) if worker_execution_completed else set()
         if self.execution_mode != DiffusionExecutionMode.STEP_BATCH:
-            self._emit_finished_outputs(finished_ids, runner_output)
+            self._emit_finished_outputs(
+                finished_ids,
+                runner_output,
+                worker_cleaned_ids=worker_cleaned_ids,
+            )
             return
 
-        self._remove_diffusion_kv_requests(finished_ids)
+        self._remove_diffusion_kv_requests(finished_ids - worker_cleaned_ids)
 
         delivered_finished_req_ids: set[str] = set()
 
@@ -952,12 +1017,19 @@ class DiffusionEngine:
 
                 # NOTE: add_req_and_wait_for_response() is synchronous, will be only called
                 # within _dummy_run, only one request will be scheduled
-                request_id = sched_output.scheduled_request_ids[0]
+                request_id = target_request_id
                 try:
-                    runner_output: BaseRunnerOutput = self.execute_fn(sched_output)  # pyright: ignore[reportAssignmentType]
+                    self._prepare_kv_for_forward(sched_output)
+                    runner_output: BaseRunnerOutput = (
+                        self.execute_fn(sched_output)
+                        if sched_output.scheduled_request_ids
+                        else BatchRunnerOutput.from_list([])
+                    )
                 except EngineDeadError:
                     raise
                 except Exception as exc:
+                    if self._closed:
+                        raise
                     logger.error("Execution failed for diffusion request %s", request_id, exc_info=True)
                     runner_output = RunnerOutput(
                         request_id=request_id,
@@ -971,7 +1043,11 @@ class DiffusionEngine:
                 finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
 
                 # sync func should receive one result
-                if not isinstance(runner_output, RunnerOutput) and not len(runner_output) == 1:
+                if (
+                    sched_output.scheduled_request_ids
+                    and not isinstance(runner_output, RunnerOutput)
+                    and len(runner_output) != 1
+                ):
                     raise ValueError("Sync func should receive one result at one time")
                 if target_request_id in finished_req_ids:
                     self._remove_diffusion_kv_requests([target_request_id])
@@ -1066,7 +1142,8 @@ class DiffusionEngine:
         executes one request from the collective wave.
 
         Hunyuan is currently the only model integrated with
-        ``paged_scheduler``; 1024x1024, enabled CFG, and the maximum advertised
+        ``paged_scheduler``. The stage's configured default resolution (or
+        1024x1024 when absent), enabled CFG, and the maximum advertised
         reference-image count exercise its first-step activation peak.
         Admission compares each preprocessed request's CFG count and tokenized
         sequence/target shape with the resulting per-request profile envelope.
@@ -1083,9 +1160,12 @@ class DiffusionEngine:
         model_class_name = self.od_config.model_class_name
         if model_class_name is None:
             raise RuntimeError("Diffusion KV profiling requires a resolved model_class_name")
+        additional_config = getattr(self.od_config, "additional_config", {}) or {}
+        profile_height = additional_config.get("diffusion_kv_profile_height", 1024)
+        profile_width = additional_config.get("diffusion_kv_profile_width", 1024)
         request = self._make_dummy_request(
-            height=1024,
-            width=1024,
+            height=profile_height,
+            width=profile_width,
             guidance_scale=5.0,
             num_image_inputs=get_dummy_run_num_image_inputs(model_class_name),
         )
@@ -1301,7 +1381,11 @@ class DiffusionEngine:
 
     def _process_aborts_queue(self) -> None:
         with self._cv:
-            self._drain_abort_queue()
+            try:
+                self._drain_abort_queue()
+            except Exception as exc:
+                self._fail_engine(exc)
+                raise
 
     def _drain_abort_queue(self) -> None:
         if self.abort_queue.empty():

@@ -84,12 +84,14 @@ class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
         attention_config = vllm_config.attention_config
         previous_backend = attention_config.backend
         previous_backend_per_kind = attention_config.backend_per_kind
+        previous_pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
         try:
             # This is a portable vLLM backend request. The active platform
             # resolves it to its native implementation, such as FlashAttention
             # on CUDA or AscendAttentionBackend on NPU.
             attention_config.backend = AttentionBackendEnum.FLASH_ATTN
             attention_config.backend_per_kind = {}
+            vllm_config.parallel_config.prefill_context_parallel_size = 1
             with set_current_vllm_config(vllm_config):
                 attn_backend = get_attn_backend(
                     head_size=spec.head_size,
@@ -101,6 +103,7 @@ class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
         finally:
             attention_config.backend = previous_backend
             attention_config.backend_per_kind = previous_backend_per_kind
+            vllm_config.parallel_config.prefill_context_parallel_size = previous_pcp_size
         attn_backend = current_omni_platform.get_diffusion_paged_kv_attn_backend(
             attn_backend,
             ulysses_degree=ulysses_degree,
@@ -377,6 +380,67 @@ class DiffusionPagedAttentionAdapter:
         self._active_piecewise_native_metadata: tuple[dict[str, Any], ...] | None = None
         self._causal_by_group = self._resolve_group_causality()
         self._reorder_batch_threshold = self._resolve_reorder_batch_threshold()
+
+    def materialize_prefix_kv(self, layer_name: str) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        batch = self._active_batch
+        if batch is None:
+            raise RuntimeError("Paged prefix materialization requires an active prepared batch")
+        try:
+            layer = self.layers[layer_name]
+        except KeyError as exc:
+            raise KeyError(f"Unknown diffusion paged attention layer {layer_name!r}") from exc
+        cache = layer.kv_cache
+        if cache is None:
+            raise RuntimeError(f"Native KV cache is not bound for diffusion layer {layer_name!r}")
+
+        matching_groups = [
+            group_index
+            for group_index, group in enumerate(self.kv_cache_config.kv_cache_groups)
+            if layer_name in group.layer_names
+        ]
+        if len(matching_groups) != 1:
+            raise ValueError(
+                f"Diffusion paged layer {layer_name!r} must belong to exactly one cache group; found {matching_groups}"
+            )
+        group_index = matching_groups[0]
+        block_multiplier = int(self.block_tables.blocks_per_kv_block[group_index])
+        if block_multiplier != 1:
+            raise NotImplementedError(
+                "Dense prefix compatibility requires one native kernel block per Scheduler KV block"
+            )
+
+        block_size = int(layer.spec.block_size)
+        num_heads = int(layer.num_kv_heads)
+        head_size = int(layer.head_size)
+        expected_tail = (num_heads, block_size, 2 * head_size)
+        if cache.ndim != 4 or tuple(cache.shape[1:]) != expected_tail:
+            raise NotImplementedError(
+                "Dense prefix compatibility requires the native FlashAttention logical cache layout "
+                f"[blocks, heads, block, 2 * head_size]; got {tuple(cache.shape)}"
+            )
+
+        materialized: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for row in batch.rows:
+            prefix_len = row.kv_start_pos
+            if prefix_len == 0:
+                empty = cache.new_empty((0, num_heads, head_size))
+                materialized.append((empty, empty.clone()))
+                continue
+            binding = self.resolve_row(row.request_id, row.sequence_id, row.context_id)
+            block_ids = binding.block_ids[group_index]
+            required_blocks = cdiv(prefix_len, block_size)
+            if len(block_ids) < required_blocks:
+                raise ValueError(
+                    f"Paged prefix row {row.identity!r} has {len(block_ids)} blocks; "
+                    f"requires {required_blocks} for {prefix_len} tokens"
+                )
+            page_ids = torch.tensor(block_ids[:required_blocks], dtype=torch.long, device=cache.device)
+            packed = (
+                cache.index_select(0, page_ids).permute(0, 2, 1, 3).reshape(-1, num_heads, 2 * head_size)[:prefix_len]
+            )
+            key, value = packed.split(head_size, dim=-1)
+            materialized.append((key.contiguous(), value.contiguous()))
+        return materialized
 
     def _resolve_group_causality(self) -> dict[int, bool]:
         causal_by_group: dict[int, bool] = {}
