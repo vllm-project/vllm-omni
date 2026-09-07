@@ -17,6 +17,8 @@ import torch.nn as nn
 from PIL import Image
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
     DistributedVaeMixin,
@@ -26,9 +28,14 @@ from vllm_omni.diffusion.offloader.module_residency import (
     BoundedAllocatorCache,
     PinnedModuleStager,
 )
+from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
+from .vae_fp8 import (
+    H3_VAE_FP8_LINEAR_NAMES,
+    install_h3_vae_fp8_quantization,
+)
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
@@ -36,6 +43,39 @@ MINIMAX_H3_AUDIO_CHANNELS = 2
 
 
 logger = init_logger(__name__)
+
+
+def resolve_minimax_h3_video_vae_fp8_layers(
+    quant_config: QuantizationConfig | None,
+) -> frozenset[str] | None:
+    """Resolve an explicitly component-scoped generic FP8 config."""
+
+    if not isinstance(quant_config, ComponentQuantizationConfig):
+        return None
+
+    video_vae_config = quant_config.component_configs.get("video_vae")
+    if video_vae_config is None:
+        return None
+    if not isinstance(video_vae_config, Fp8Config):
+        raise ValueError(
+            f"MiniMax H3 video_vae only supports online fp8 component quantization, got {video_vae_config.get_name()!r}"
+        )
+    if (
+        video_vae_config.is_checkpoint_fp8_serialized
+        or video_vae_config.activation_scheme != "dynamic"
+        or video_vae_config.weight_block_size is not None
+        or video_vae_config.store_dtype is not None
+    ):
+        raise ValueError(
+            "MiniMax H3 video_vae requires online FP8 with dynamic activations, "
+            "no block size, and no store_dtype override"
+        )
+
+    ignored_layers = set(video_vae_config.ignored_layers)
+    unknown = ignored_layers - H3_VAE_FP8_LINEAR_NAMES
+    if unknown:
+        raise ValueError(f"MiniMax H3 video_vae FP8 does not recognize ignored_layers={sorted(unknown)}")
+    return H3_VAE_FP8_LINEAR_NAMES - ignored_layers
 
 
 def _load_component_config(component_path: str) -> dict[str, Any]:
@@ -121,6 +161,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         *,
         device: torch.device,
         load_device: torch.device | None = None,
+        fp8_layers: frozenset[str] | None = None,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -136,11 +177,20 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         initial_device = load_device or device
         self.remote.eval().to(device=initial_device, dtype=torch.float32)
         decoder = getattr(self.remote.model, "decoder", None)
+        if fp8_layers is not None and decoder is None:
+            raise ValueError("MiniMax H3 video-VAE FP8 requires a decoder module")
         if decoder is not None:
             install_h3_vae_optimizations(
                 decoder,
                 device=device,
             )
+            if fp8_layers is not None:
+                install_h3_vae_fp8_quantization(
+                    decoder,
+                    execution_device=device,
+                    storage_device=initial_device,
+                    layers=fp8_layers,
+                )
         self._stager = None
         if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
             self._stager = PinnedModuleStager(

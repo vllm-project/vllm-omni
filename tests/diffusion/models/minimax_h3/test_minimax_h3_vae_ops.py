@@ -124,12 +124,12 @@ def _make_decoder():
     class Attention(nn.Module):
         def __init__(self):
             super().__init__()
-            self.to_qkv = nn.Linear(8, 24)
-            self.to_out = nn.Linear(8, 8)
-            self.norm_q = nn.RMSNorm(8, elementwise_affine=False)
-            self.norm_k = nn.RMSNorm(8, elementwise_affine=False)
+            self.to_qkv = nn.Linear(16, 48)
+            self.to_out = nn.Linear(16, 16)
+            self.norm_q = nn.RMSNorm(16, elementwise_affine=False)
+            self.norm_k = nn.RMSNorm(16, elementwise_affine=False)
             self.spatial_parallel = False
-            self.dim_head = 8
+            self.dim_head = 16
 
         def perform_attention(self, query, _key, _value, _pack_info):
             return query
@@ -140,8 +140,8 @@ def _make_decoder():
     class FeedForward(nn.Module):
         def __init__(self):
             super().__init__()
-            self.w1 = nn.Linear(8, 32)
-            self.w2 = nn.Linear(16, 8)
+            self.w1 = nn.Linear(16, 64)
+            self.w2 = nn.Linear(32, 16)
             self.use_gated = True
             self.act_fn = nn.SiLU()
             self._compile_forward_enabled = False
@@ -158,10 +158,10 @@ def _make_decoder():
             super().__init__()
             self.attn = Attention()
             self.ff = FeedForward()
-            self.norm1 = nn.RMSNorm(8)
-            self.norm2 = nn.RMSNorm(8)
-            self.scale1 = nn.Parameter(torch.zeros(8))
-            self.scale2 = nn.Parameter(torch.zeros(8))
+            self.norm1 = nn.RMSNorm(16)
+            self.norm2 = nn.RMSNorm(16)
+            self.scale1 = nn.Parameter(torch.zeros(16))
+            self.scale2 = nn.Parameter(torch.zeros(16))
             self.use_scale = True
 
         def forward(self, hidden_states, rotary_pos_emb=None, pack_info=None):
@@ -169,7 +169,7 @@ def _make_decoder():
 
     decoder = nn.Module()
     decoder.transformer_blocks = nn.ModuleList([Block(), Block()])
-    decoder.proj_out = nn.Linear(8, 8)
+    decoder.proj_out = nn.Linear(16, 16)
     return decoder
 
 
@@ -216,6 +216,119 @@ def test_video_vae_installs_exact_optimizations(monkeypatch):
     )
 
 
+def test_video_vae_installs_requested_fp8_layers(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = torch.nn.Module()
+
+    class FakeRemote(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = FakeModel()
+
+    monkeypatch.setattr(
+        vae_module,
+        "_load_component_config",
+        lambda _path: {
+            "latent_channels": 1,
+            "latents_mean": [0.0],
+            "latents_std": [1.0],
+        },
+    )
+    monkeypatch.setattr(
+        vae_module,
+        "_load_remote_component",
+        lambda _path, _config: FakeRemote(),
+    )
+    install = Mock(return_value=True)
+    install_fp8 = Mock()
+    monkeypatch.setattr(vae_module, "install_h3_vae_optimizations", install)
+    monkeypatch.setattr(vae_module, "install_h3_vae_fp8_quantization", install_fp8)
+
+    vae_module.MiniMaxH3VideoVAE(
+        "unused",
+        device=torch.device("cpu"),
+        fp8_layers=frozenset({"attn.to_qkv", "ff.w1", "ff.w2"}),
+    )
+
+    install.assert_called_once()
+    assert isinstance(install.call_args.args[0], torch.nn.Module)
+    assert install.call_args.kwargs == {
+        "device": torch.device("cpu"),
+    }
+    install_fp8.assert_called_once()
+    assert install_fp8.call_args.args == install.call_args.args
+    assert install_fp8.call_args.kwargs == {
+        "execution_device": torch.device("cpu"),
+        "storage_device": torch.device("cpu"),
+        "layers": frozenset({"attn.to_qkv", "ff.w1", "ff.w2"}),
+    }
+
+
+def test_video_vae_fp8_config_requires_explicit_component_config():
+    from vllm_omni.diffusion.models.minimax_h3.vae import (
+        resolve_minimax_h3_video_vae_fp8_layers,
+    )
+    from vllm_omni.quantization import build_quant_config
+
+    assert resolve_minimax_h3_video_vae_fp8_layers(build_quant_config("fp8")) is None
+
+    disabled_config = build_quant_config(
+        {
+            "default": {"method": "fp8"},
+            "video_vae": None,
+        }
+    )
+    assert resolve_minimax_h3_video_vae_fp8_layers(disabled_config) is None
+
+    selective_config = build_quant_config(
+        {
+            "video_vae": {
+                "method": "fp8",
+                "ignored_layers": ["ff.w2"],
+            }
+        }
+    )
+    assert resolve_minimax_h3_video_vae_fp8_layers(selective_config) == frozenset({"attn.to_qkv", "ff.w1"})
+
+    aggressive_config = build_quant_config({"video_vae": {"method": "fp8"}})
+    assert resolve_minimax_h3_video_vae_fp8_layers(aggressive_config) == frozenset({"attn.to_qkv", "ff.w1", "ff.w2"})
+
+
+def test_video_vae_fp8_config_rejects_generic_component_fp8():
+    from vllm_omni.diffusion.models.minimax_h3.vae import (
+        resolve_minimax_h3_video_vae_fp8_layers,
+    )
+    from vllm_omni.quantization import ComponentQuantizationConfig
+
+    unsupported = Mock()
+    unsupported.get_name.return_value = "unsupported"
+    config = ComponentQuantizationConfig({"video_vae": unsupported})
+    with pytest.raises(ValueError, match="only supports online fp8"):
+        resolve_minimax_h3_video_vae_fp8_layers(config)
+
+
+@pytest.mark.parametrize(
+    "video_vae_config",
+    [
+        {"method": "fp8", "activation_scheme": "static"},
+        {"method": "fp8", "ignored_layers": ["attn.to_out"]},
+    ],
+)
+def test_video_vae_fp8_config_rejects_unsupported_policy(video_vae_config):
+    from vllm_omni.diffusion.models.minimax_h3.vae import (
+        resolve_minimax_h3_video_vae_fp8_layers,
+    )
+    from vllm_omni.quantization import build_quant_config
+
+    config = build_quant_config({"video_vae": video_vae_config})
+    with pytest.raises(ValueError, match="MiniMax H3 video_vae"):
+        resolve_minimax_h3_video_vae_fp8_layers(config)
+
+
 def test_h3_vae_install_precasts_only_block_linears(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3.ops import vae as vae_ops
 
@@ -247,6 +360,158 @@ def test_h3_vae_install_precasts_only_block_linears(monkeypatch):
     )
 
 
+def test_h3_vae_fp8_is_independent_from_eager_operator_dispatch(monkeypatch):
+    import vllm.model_executor.parameter as parameter_module
+    from vllm.model_executor.layers.linear import ReplicatedLinear
+    from vllm.model_executor.layers.quantization.online.fp8 import Fp8PtpcOnlineLinearMethod
+
+    from vllm_omni.diffusion.models.minimax_h3 import vae_fp8
+    from vllm_omni.diffusion.models.minimax_h3.ops import vae as vae_ops
+
+    resolver = Mock(side_effect=AssertionError("eager-op dispatch must not be used"))
+    monkeypatch.setattr(vae_ops, "resolve_h3_vae_operators", resolver)
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_world_size", lambda: 1)
+    device, _ = _selected_operators()
+    decoder = _make_decoder().to(device)
+
+    vae_fp8.install_h3_vae_fp8_quantization(
+        decoder,
+        execution_device=device,
+        storage_device=device,
+        layers=frozenset({"attn.to_qkv", "ff.w1", "ff.w2"}),
+    )
+    resolver.assert_not_called()
+
+    for block in decoder.transformer_blocks:
+        for linear in (
+            block.attn.to_qkv,
+            block.ff.w1,
+            block.ff.w2,
+        ):
+            assert isinstance(linear, ReplicatedLinear)
+            assert isinstance(linear.quant_method, Fp8PtpcOnlineLinearMethod)
+            assert linear.weight.dtype == current_omni_platform.fp8_dtype()
+            assert linear.weight_scale.dtype == torch.float32
+        assert not tuple(block.attn.to_out.buffers())
+
+
+def test_h3_vae_fp8_backend_preserves_linear_contract(monkeypatch):
+    import vllm.model_executor.parameter as parameter_module
+
+    from vllm_omni.diffusion.models.minimax_h3 import vae_fp8
+
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_world_size", lambda: 1)
+    device, _ = _selected_operators()
+    decoder = _make_decoder().to(device)
+    feed_forward = decoder.transformer_blocks[0].ff
+    hidden_states = torch.randn(37, 16, device=device, dtype=torch.float32)
+    with torch.inference_mode(), torch.autocast(device.type, dtype=torch.float16):
+        expected = feed_forward(hidden_states)
+
+    vae_fp8.install_h3_vae_fp8_quantization(
+        decoder,
+        execution_device=device,
+        storage_device=device,
+        layers=frozenset({"ff.w1", "ff.w2"}),
+    )
+    for linear in (feed_forward.w1, feed_forward.w2):
+        assert linear.quant_method.apply.__func__ is vae_fp8._H3VAEFp8LinearMethod.apply
+    with torch.inference_mode(), torch.autocast(device.type, dtype=torch.float16):
+        actual = feed_forward(hidden_states)
+
+    assert actual.shape == expected.shape
+    assert actual.dtype == torch.float16
+    relative_l2 = torch.linalg.vector_norm(actual.float() - expected.float()) / torch.linalg.vector_norm(
+        expected.float()
+    )
+    cosine = F.cosine_similarity(actual.float().flatten(), expected.float().flatten(), dim=0)
+    assert relative_l2 < 0.08
+    assert cosine > 0.995
+
+
+def test_h3_vae_fp8_is_not_processed_twice_by_model_finalizer(monkeypatch):
+    import vllm.model_executor.parameter as parameter_module
+    from vllm.model_executor.model_loader.reload import finalize_layerwise_processing
+
+    from vllm_omni.diffusion.models.minimax_h3 import vae_fp8
+
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_world_size", lambda: 1)
+    device, _ = _selected_operators()
+    decoder = _make_decoder().to(device)
+
+    vae_fp8.install_h3_vae_fp8_quantization(
+        decoder,
+        execution_device=device,
+        storage_device=device,
+        layers=frozenset({"ff.w1", "ff.w2"}),
+    )
+    weights_before = {
+        name: parameter.detach().clone()
+        for name, parameter in decoder.named_parameters()
+        if name.endswith(("ff.w1.weight", "ff.w2.weight"))
+    }
+
+    finalize_layerwise_processing(decoder, model_config=None)
+
+    for name, expected in weights_before.items():
+        assert torch.equal(dict(decoder.named_parameters())[name], expected)
+
+
+def test_h3_vae_fp8_backend_supports_cpu_storage(monkeypatch):
+    import vllm.model_executor.parameter as parameter_module
+
+    from vllm_omni.diffusion.models.minimax_h3 import vae_fp8
+
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_world_size", lambda: 1)
+    device, _ = _selected_operators()
+    decoder = _make_decoder().to(device)
+
+    vae_fp8.install_h3_vae_fp8_quantization(
+        decoder,
+        execution_device=device,
+        storage_device=torch.device("cpu"),
+        layers=frozenset({"ff.w1", "ff.w2"}),
+    )
+    for block in decoder.transformer_blocks:
+        assert block.ff.w1.weight.device.type == "cpu"
+        assert block.ff.w1.weight_scale.device.type == "cpu"
+        assert block.ff.w2.weight.device.type == "cpu"
+        assert block.ff.w2.weight_scale.device.type == "cpu"
+
+    decoder.to(device)
+    hidden_states = torch.randn(37, 16, device=device, dtype=torch.float32)
+    with torch.inference_mode(), torch.autocast(device.type, dtype=torch.float16):
+        output = decoder.transformer_blocks[0].ff(hidden_states)
+    assert output.shape == hidden_states.shape
+    assert torch.isfinite(output).all()
+
+
+def test_h3_vae_fp8_is_not_enabled_by_hardware_dispatch_alone(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.ops import vae as vae_ops
+
+    monkeypatch.setattr(
+        vae_ops,
+        "resolve_h3_vae_operators",
+        lambda _device: _operator_set(),
+    )
+    decoder = _make_decoder()
+
+    assert vae_ops.install_h3_vae_optimizations(
+        decoder,
+        device=torch.device("meta"),
+    )
+
+    for block in decoder.transformer_blocks:
+        assert not tuple(block.ff.w1.buffers())
+        assert not tuple(block.ff.w2.buffers())
+        assert block.ff.w1.forward.__func__.__name__ == "forward"
+        assert block.ff.w2.forward.__func__.__name__ == "forward"
+
+
 def test_h3_vae_install_accepts_remote_integer_parallel_flag(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3.ops import vae as vae_ops
 
@@ -270,7 +535,8 @@ def test_h3_vae_install_accepts_remote_integer_parallel_flag(monkeypatch):
 def test_h3_vae_swiglu_uses_post_linear_fp16_output(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3.ops import vae as vae_ops
 
-    device, operators = _selected_operators()
+    device, _ = _selected_operators()
+    operators = _operator_set()
     monkeypatch.setattr(vae_ops, "resolve_h3_vae_operators", lambda _device: operators)
     decoder = _make_decoder().to(device)
     feed_forward = decoder.transformer_blocks[0].ff
@@ -280,7 +546,7 @@ def test_h3_vae_swiglu_uses_post_linear_fp16_output(monkeypatch):
         device=device,
     )
 
-    hidden_states = torch.randn(4, 8, device=device, dtype=torch.float32)
+    hidden_states = torch.randn(4, 16, device=device, dtype=torch.float32)
     with torch.inference_mode(), torch.autocast(device.type, dtype=torch.float16):
         expected = reference_forward(feed_forward, hidden_states)
         actual = feed_forward(hidden_states)

@@ -491,6 +491,11 @@ To select a component, use `--diffusion-quantization-config` with
 `{"text_encoder":{"method":"fp8"}}` for text-decoder-only FP8. The two
 entries can be combined. The shorthand below enables both components.
 
+Video-VAE decoder FP8 is opt-in with `{"video_vae":{"method":"fp8"}}` in
+the same configuration. It quantizes eligible decoder Transformer linears and
+supports `ignored_layers` values `attn.to_qkv`, `ff.w1`, and `ff.w2`; plain
+`--quantization fp8` does not enable it.
+
 Add this option to an existing H3 server command:
 
 ```bash
