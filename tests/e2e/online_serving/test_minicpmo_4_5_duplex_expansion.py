@@ -15,6 +15,7 @@ import pytest
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     SERVER_PARAMS,
     SOFT_INTERRUPT_SHA256,
+    deploy_max_sessions,
     multi_session_args,
     realtime_url,
     resolve_ref_audio,
@@ -24,6 +25,7 @@ from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
 from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import (
     run_lifecycle_probes,
 )
+from tests.e2e.online_serving.run_minicpmo_realtime_duplex_server_vad import run_server_vad_interrupt
 from tests.e2e.online_serving.run_minicpmo_realtime_duplex_soft_interrupt import (
     run_soft_interrupt,
 )
@@ -46,7 +48,7 @@ def test_duplex_admission_and_expiry_reaper(omni_server, tmp_path: Path) -> None
     args.disconnect_session_index = None
     args.takeover_session_index = None
     args.expire_session_index = 0
-    args.verify_admission_limit = 2
+    args.verify_admission_limit = deploy_max_sessions()
     result = asyncio.run(run_lifecycle_probes(args))
 
     assert result["ok"] is True, json.dumps(result, ensure_ascii=False, indent=2)
@@ -91,3 +93,22 @@ def test_duplex_soft_interrupt(omni_server, tmp_path: Path) -> None:
     assert result["response_lifecycle_ok"] is True
     assert result["response_audio_contract_ok"] is True
     assert result["followup_response_transcript_ok"] is True
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+def test_duplex_server_vad_hard_interrupt(omni_server) -> None:
+    result = asyncio.run(
+        run_server_vad_interrupt(
+            SimpleNamespace(
+                url=realtime_url(omni_server),
+                model=omni_server.model,
+                input_wav=str(validated_input_wav()),
+                interrupt_wav=str(validated_soft_interrupt_wav()),
+                ref_audio=str(resolve_ref_audio()),
+                chunk_ms=200,
+                timeout_s=180.0,
+            )
+        )
+    )
+    assert result["ok"] is True, json.dumps(result, ensure_ascii=False, indent=2)

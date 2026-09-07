@@ -83,6 +83,7 @@ depends on the installed kernels and model path.
 | `SPEAKER_SAMPLES_DIR` | Filesystem path; default `~/.cache/vllm-omni/speakers` | Speech server; read when speaker storage initializes | Environment-only setting. The directory is created; filesystem errors propagate. | Stable |
 | `SPEAKER_MAX_UPLOADED` | Integer; default `1000` | Speech server; read when speaker storage initializes | Environment-only setting. A non-integer logs a warning and uses `1000`; range is not otherwise validated. | Stable |
 | `VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT` | Float seconds; default `600` | Diffusion engine async-output wait in `step_streaming`; resolved per call on the request path, not at import | Environment-only setting. A non-float or `<=0` value warns once and uses the default. | Experimental |
+| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | `1`, `true`, `yes` or `on` enables; default `0` (off) | Orchestration loop and the serving-side final-output drain; read once when the `Orchestrator` is constructed | Environment-only setting. Values are stripped and case-normalized; any unrecognized value leaves the legacy poll loop selected. | Experimental |
 | `VLLM_OMNI_INPUT_WAIT_TIMEOUT_S` | Float seconds; default `600`; `<=0` disables | Full-payload input coordinator, not async-chunk transfer; read when the scheduler module imports in each worker | Environment-only setting. A non-float logs a warning and uses `600`. | Stable operational control |
 | `VLLM_OMNI_ORCH_MONITOR_PATH` | Filesystem path; default `<current-working-directory>/vllm_omni_orch_monitor_<timestamp>.json` | Orchestrator monitor enabled by `--enable-orch-monitor`; read when the monitor is created | Environment-only path override. Parent directories are created; write errors are logged. | Diagnostic |
 | `VLLM_OMNI_VIDEO_SYNC_TIMEOUT` | Float seconds; default `600` | Synchronous Videos API; read when the API server module imports | Environment-only setting. A non-float raises `ValueError` during import. | Experimental |
@@ -150,7 +151,7 @@ their keys only.
 ## Inherited vLLM variables
 
 vLLM-Omni also reads variables through its aligned vLLM dependency. Refer to
-the [vLLM 0.26 environment-variable reference](https://docs.vllm.ai/en/v0.26.0/configuration/env_vars.html)
+the [vLLM 0.28 environment-variable reference](https://docs.vllm.ai/en/v0.28.0/configuration/env_vars.html)
 for their definitions. This includes vLLM launch, cache, logging, plugin, ROCm,
 XPU, ModelScope, and FlashInfer workspace settings.
 
@@ -178,7 +179,7 @@ collection, examples, bug reports, or logs.
 
 ## Model-specific variables
 
-The audit found 56 variables read by a single model or pipeline family. They are
+The audit found 58 variables read by a single model or pipeline family. They are
 not listed as public usage options here because doing so would turn implementation
 escape hatches into an accidental compatibility contract.
 
@@ -187,7 +188,7 @@ Every audited model-specific name has a migration disposition in the
 
 | Disposition | Count | Required outcome |
 | --- | ---: | --- |
-| Promote | 33 | Move a stable setting into typed stage or model configuration. |
+| Promote | 35 | Move a stable setting into typed stage or model configuration. |
 | Request scope | 6 | Move request-varying behavior into a declared request-option schema. |
 | External | 0 | Retain only when a supported third-party library owns the contract. |
 | Internalize | 11 | Keep a debug or diagnostic switch out of public documentation and configuration. |

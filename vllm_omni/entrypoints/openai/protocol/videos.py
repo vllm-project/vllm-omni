@@ -55,7 +55,13 @@ class VideoParams(BaseModel):
     width: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Video width in pixels")
     height: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Video height in pixels")
     num_frames: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Number of frames")
-    fps: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Frames per second for output video")
+    fps: float | None = Field(
+        default=None,
+        ge=1,
+        le=_INT64_MAX,
+        allow_inf_nan=False,
+        description="Frames per second for output video",
+    )
 
     @property
     def size(self) -> str | None:
@@ -146,7 +152,13 @@ class VideoGenerationRequest(BaseModel):
     # Video-specific fields (top-level for OpenAI-style compatibility)
     width: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Video width in pixels")
     height: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Video height in pixels")
-    fps: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Frames per second for output video")
+    fps: float | None = Field(
+        default=None,
+        ge=1,
+        le=_INT64_MAX,
+        allow_inf_nan=False,
+        description="Frames per second for output video",
+    )
     num_frames: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Number of frames to generate")
     aspect_ratio: str | None = Field(
         default=None,
@@ -279,7 +291,17 @@ class VideoGenerationRequest(BaseModel):
         description=("Optional model-specific parameters passed directly to the model's extra_args. "),
     )
 
-    def resolve_video_params(self) -> VideoParams:
+    def resolve_video_params(
+        self,
+        *,
+        default_fps: float | None = DEFAULT_FPS,
+        default_num_frames: int | None = None,
+    ) -> VideoParams:
+        """Resolve explicit fields with optional model-owned defaults.
+
+        Callers that know the active diffusion pipeline can supply its native
+        frame contract. Other callers retain the generic 24 fps behavior.
+        """
         vp = VideoParams(width=self.width, height=self.height, fps=self.fps, num_frames=self.num_frames)
 
         if self.video_params is not None:
@@ -292,10 +314,13 @@ class VideoGenerationRequest(BaseModel):
             vp.width, vp.height = parse_size(self.size)
 
         if vp.fps is None:
-            vp.fps = DEFAULT_FPS
+            vp.fps = default_fps
 
-        if vp.num_frames is None and self.seconds is not None:
-            vp.num_frames = int(self.seconds) * int(vp.fps)
+        if vp.num_frames is None:
+            if default_num_frames is not None:
+                vp.num_frames = default_num_frames
+            elif self.seconds is not None and vp.fps is not None:
+                vp.num_frames = int(float(self.seconds) * float(vp.fps))
 
         return vp
 

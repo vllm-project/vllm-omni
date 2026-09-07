@@ -49,7 +49,7 @@ vLLM-Omni's `pre-commit` hooks will now run automatically every time you commit.
     `--all-files` run stays green while historical debt is cleaned up. The
     current `SKIP` list in
     [`.github/workflows/pre-commit.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.github/workflows/pre-commit.yml)
-    is `check-test-ci-coverage`, `markdownlint-cli2`, `shellcheck`,
+    is `check-mark`, `markdownlint-cli2`, `shellcheck`,
     `check-spdx-header`, and `mypy-3.10`. Those hooks still run on **your
     commit** for changed files. A passing GitHub pre-commit check does not mean
     they passed locally. Hooks **not** on that list (forbidden imports,
@@ -66,7 +66,7 @@ already there). `check-pickle-imports` is gone: pickle is now one rule inside
 | `markdownlint-cli2` | Markdown in `docs/`, `recipes/`, `README.md`, `CONTRIBUTING.md` (not `.claude/` / `.cursor/` / `CLAUDE.md`) | skipped |
 | `mypy-3.10` | Type-check changed `vllm_omni/` files (model trees excluded). `tests/` uses `--follow-imports skip` | skipped |
 | `mypy-3.11` / `3.12` / `3.13` | Same checker, extra Python versions | not installed; `pre-commit run --hook-stage manual mypy-3.12` |
-| `check-test-ci-coverage` | Every `tests/**/test_*.py` has a CI level mark and a hardware mark/helper | skipped |
+| `check-mark` | Every `tests/**/test_*.py` has a CI level mark and a hardware platform mark or helper; no direct `pytest.mark.H100` / SKU | skipped |
 | `check-tts-adapter-migration` | `self._tts_model_type` branches in `serving_speech.py` must not increase | runs |
 | `shellcheck` | `*.sh` quoting / undefined vars | skipped |
 | `check-spdx-header` | Omni SPDX header on `.py` / `.pyi` / `.sh` / `.rs` / `.proto` | skipped |
@@ -144,11 +144,13 @@ pre-commit run --hook-stage manual mypy-3.12
 
 #### Test CI marks
 
-`check-test-ci-coverage` requires each collected test module under `tests/` to
+`check-mark` requires each collected test module under `tests/` to
 have at least one CI **level** mark (`core_model`, `advanced_model`,
-`full_model`, `local_model`, or `slow`) and a **hardware** mark (`cpu`, `cuda`,
-`H100`, …) or helper (`hardware_test(` / `hardware_marks(`). GitHub Actions
-skips this hook; local commit does not. See the
+`full_model`, `local_model`, or `slow`) and a **hardware** platform mark
+(`cpu`, `cuda`, …) or helper (`hardware_test(` / `hardware_marks(`). SKU marks
+(`H100`, `L4`, …) must come from those helpers so `cards_{n}` is attached;
+direct `pytest.mark.H100` is rejected. GitHub Actions skips this hook; local
+commit does not. See the
 [test writing guide](./ci/test_writing_guide.md).
 
 #### TTS adapter ratchet

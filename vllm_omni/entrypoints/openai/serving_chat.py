@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import base64
 import json
@@ -19,8 +22,10 @@ from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
     ConversationMessage,
-    get_history_tool_calls_cnt,
     make_tool_call_id,
+)
+from vllm.parser.utils import (
+    count_chat_history_tool_calls as get_history_tool_calls_cnt,
 )
 
 from vllm_omni.diffusion.utils.param_utils import apply_declared_extra_args
@@ -37,6 +42,7 @@ from vllm_omni.metrics.modality import (
     observe_audio_first_packet,
     observe_audio_streaming_finalize,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
 from vllm_omni.model_extras import (
     get_extra_body_params,
     get_extra_output_params,
@@ -86,14 +92,7 @@ from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.multimodal.media.connector import MediaConnector
 from vllm.outputs import RequestOutput
-
-try:
-    from vllm.parser.mistral import MistralToolCall
-except ImportError:
-    # Accelerator images can lag the core vLLM release by one version.
-    from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
-
-
+from vllm.parser.mistral import MistralToolCall
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import BaseRenderer, merge_kwargs
 from vllm.renderers.inputs import TokPrompt
@@ -250,6 +249,44 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if model_arch == "MiniCPMO45OmniForConditionalGeneration":
                 return True
         return False
+
+    async def _attach_minicpmo45_reference_audio(
+        self,
+        engine_prompt: TokPrompt,
+        request: ChatLikeRequest | ResponsesRequest,
+    ) -> None:
+        if not self._has_minicpmo45_stage():
+            return
+
+        reference_audio_source = getattr(request, "ref_audio", None)
+        extra_body = getattr(request, "extra_body", None)
+        model_extra = getattr(request, "model_extra", None)
+        if reference_audio_source is None and isinstance(extra_body, dict):
+            reference_audio_source = extra_body.get("ref_audio")
+        if reference_audio_source is None and isinstance(model_extra, dict):
+            nested_extra_body = model_extra.get("extra_body")
+            if isinstance(nested_extra_body, dict):
+                reference_audio_source = nested_extra_body.get("ref_audio")
+            if reference_audio_source is None:
+                reference_audio_source = model_extra.get("ref_audio")
+        if reference_audio_source is None:
+            return
+        if not isinstance(reference_audio_source, str):
+            raise ValueError("MiniCPM-o 4.5 chat ref_audio must be a URI string")
+
+        model_config = self.model_config
+        media_connector = MediaConnector(
+            media_io_kwargs=getattr(request, "media_io_kwargs", None),
+            allowed_local_media_path=getattr(model_config, "allowed_local_media_path", "") or "",
+            allowed_media_domains=getattr(model_config, "allowed_media_domains", None),
+        )
+        reference_waveform, reference_sample_rate = await media_connector.fetch_audio_async(reference_audio_source)
+        # The renderer keeps processed Stage-0 features, not the source waveform.
+        # Keep the decoded audio only on the original prompt for the downstream bridge.
+        cast(dict[str, object], engine_prompt)[MINICPMO45_REFERENCE_AUDIO_KEY] = (
+            reference_waveform,
+            reference_sample_rate,
+        )
 
     def _fix_minicpmo45_audio_stream_output_kinds(
         self,
@@ -942,6 +979,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if deferred_multi_modal_data:
             prompt_additional_information = self._ensure_prompt_additional_information(engine_prompt)
             prompt_additional_information["deferred_multi_modal_data"] = deferred_multi_modal_data
+
+        await self._attach_minicpmo45_reference_audio(engine_prompt, request)
 
         speaker = getattr(request, "voice", None) or getattr(request, "speaker", None)
         normalized = validate_requested_speaker(speaker, self._get_supported_speakers())

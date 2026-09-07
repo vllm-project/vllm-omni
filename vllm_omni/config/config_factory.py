@@ -29,8 +29,10 @@ from vllm_omni.config.stage_config import (
     build_stage_runtime_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
+    normalize_pipeline_cli_overrides,
 )
 from vllm_omni.config.yaml_util import create_config
+from vllm_omni.diffusion.io_support import get_diffusion_output_type
 from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
 logger = init_logger(__name__)
@@ -69,31 +71,14 @@ def _materialize_object_storage_configs(model: str) -> str:
 
 
 def _name_match_candidate(model: str) -> str:
-    """Model-name component of a model reference, used for name-based matching.
+    """Last path component of a model reference, used for name-based matching.
 
     Object-storage URIs and HF repo ids carry non-model segments (bucket name,
     organization) that must not participate in substring matching; e.g. a
     bucket named ``qwen3-tts-models`` holding a ``Qwen3-Omni`` checkpoint must
-    not resolve to the ``qwen3_tts`` pipeline. Usually that means the last
-    path component.
-
-    A resolved HF hub cache snapshot path is the exception: it ends in
-    ``models--<org>--<name>/snapshots/<revision>`` (or ``models--<name>`` for
-    legacy un-namespaced repos such as ``gpt2``), so its basename is a bare
-    revision hash with no model identity (models with an empty ``config.json``
-    such as CosyVoice3 then lose their only detection route). Recover ``name``
-    from the repo segment; the organization still stays out of the match. The
-    two forms are exhaustive because hub validation rejects ``--`` inside repo
-    ids; anything else keeps the plain basename.
+    not resolve to the ``qwen3_tts`` pipeline.
     """
-    parts = [part for part in str(model).rstrip("/").split("/") if part]
-    if not parts:
-        return ""
-    if len(parts) >= 3 and parts[-2] == "snapshots":
-        repo_dir = parts[-3].split("--")
-        if repo_dir[0] == "models" and len(repo_dir) in (2, 3) and all(repo_dir):
-            return repo_dir[-1]
-    return parts[-1]
+    return model.rstrip("/").rsplit("/", 1)[-1]
 
 
 def with_trust_remote_code_override(
@@ -453,6 +438,7 @@ class StageConfigFactory:
         load-balancer policy (``None`` when no strategy set one) travels with the
         stages instead of through a mutable out-param.
         """
+        cli_overrides = normalize_pipeline_cli_overrides(pipeline_cfg, cli_overrides)
         deploy_cfg: DeployConfig | None
         if user_deploy_config is not None:
             deploy_cfg = user_deploy_config
@@ -645,6 +631,7 @@ class StageConfigFactory:
             engine_args["dtype"] = str(engine_args["dtype"])
 
         engine_args.setdefault("max_num_seqs", 1)
+        model_class_name = engine_args.get("model_class_name")
 
         config_dict: dict[str, Any] = {
             "stage_id": 0,
@@ -655,7 +642,7 @@ class StageConfigFactory:
             },
             "engine_args": create_config(engine_args),
             "final_output": True,
-            "final_output_type": "image",
+            "final_output_type": get_diffusion_output_type(model_class_name),
         }
 
         return [config_dict]

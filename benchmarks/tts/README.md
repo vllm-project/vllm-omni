@@ -2,7 +2,7 @@
 
 A model-agnostic serving benchmark for TTS models in vllm-omni. One CLI
 (`bench_tts.py`) + one YAML registry (`model_configs.yaml`) drive perf and
-quality runs for every registered checkpoint: **Qwen3-TTS** (Base / CustomVoice)
+quality runs for every registered checkpoint: **Qwen3-TTS** (Base / CustomVoice / VoiceDesign)
 and **VoxCPM2** today, more to come.
 
 The same three task types — `voice_clone`, `default_voice`, `voice_design` —
@@ -20,6 +20,11 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni --port 8000
 The server auto-loads its Deploy YAML from `vllm_omni/deploy/qwen3_tts.yaml`
 (Pipeline + Deploy schema introduced in #2383). No explicit `--deploy-config`
 flag is needed for a registered model.
+
+Start the checkpoint that matches the benchmark task below: `-Base` for
+`voice_clone`, `-CustomVoice` for `default_voice`, or `-VoiceDesign` for
+`voice_design`. Restart the server with the matching checkpoint when switching
+tasks; changing only the benchmark's `--model` does not reload the server.
 
 ### 2. Run the benchmark (`vllm bench serve --omni`)
 
@@ -62,12 +67,12 @@ vllm bench serve --omni \
     --save-result --result-dir ./results
 ```
 
-#### voice_design (Qwen3-TTS-CustomVoice, bundled seed_tts_design)
+#### voice_design (Qwen3-TTS-VoiceDesign, bundled seed_tts_design)
 
 ```bash
 vllm bench serve --omni \
     --host 127.0.0.1 --port 8000 \
-    --model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
     --backend openai-audio-speech \
     --endpoint /v1/audio/speech \
     --dataset-name seed-tts-design \
@@ -180,11 +185,11 @@ Outputs TTFP / RTF / throughput curves (and a markdown table) for every
 
 ## Task types
 
-| Task            | Dataset           | Request body                                        | Checkpoints that support it              |
-|-----------------|-------------------|-----------------------------------------------------|------------------------------------------|
-| `voice_clone`   | `seed-tts`        | `ref_audio` + `ref_text` + `task_type=Base`         | `Qwen3-TTS-*-Base`, `VoxCPM2`            |
-| `default_voice` | `seed-tts-text`   | `voice=Vivian` + `task_type=CustomVoice`            | `Qwen3-TTS-*-CustomVoice`                |
-| `voice_design`  | `seed-tts-design` | `instructions=<natural-language description>` + `task_type=VoiceDesign` | `Qwen3-TTS-*-CustomVoice` |
+| Task            | Dataset           | Request body                                                            | Checkpoints that support it   |
+| --------------- | ----------------- | ----------------------------------------------------------------------- | ----------------------------- |
+| `voice_clone`   | `seed-tts`        | `ref_audio` + `ref_text` + `task_type=Base`                             | `Qwen3-TTS-*-Base`, `VoxCPM2` |
+| `default_voice` | `seed-tts-text`   | `voice=Vivian` + `task_type=CustomVoice`                                | `Qwen3-TTS-*-CustomVoice`     |
+| `voice_design`  | `seed-tts-design` | `instructions=<natural-language description>` + `task_type=VoiceDesign` | `Qwen3-TTS-*-VoiceDesign`     |
 
 **`-CustomVoice` checkpoints do NOT ship `speaker_encoder` weights**, so
 voice_clone requests raise `ValueError` at model runtime. Use `-Base` for
@@ -210,12 +215,12 @@ Then add the model's Deploy YAML under `vllm_omni/deploy/<model>.yaml`
 
 ## Datasets
 
-| Dataset            | Bundled? | Format            | Source                                                         |
-|--------------------|----------|-------------------|----------------------------------------------------------------|
-| `seed-tts-design`  | ✅       | 5-field meta.lst  | `benchmarks/build_dataset/seed_tts_design/en/meta.lst` (20 prompts) |
-| `seed_tts_smoke`   | ✅       | 4-field meta.lst  | `benchmarks/build_dataset/seed_tts_smoke/en/meta.lst` (20 text-only) |
-| `seed-tts`         | ❌       | 4-field meta.lst + WAVs | Google-Drive: [BytedanceSpeech/seed-tts-eval][seedtts] (~1.2 GB) |
-| `seed-tts-text`    | ❌       | 4-field meta.lst  | Same archive as `seed-tts` (wav column unused)                 |
+| Dataset           | Bundled? | Format                  | Source                                                               |
+| ----------------- | -------- | ----------------------- | -------------------------------------------------------------------- |
+| `seed-tts-design` | ✅       | 5-field meta.lst        | `benchmarks/build_dataset/seed_tts_design/en/meta.lst` (20 prompts)  |
+| `seed_tts_smoke`  | ✅       | 4-field meta.lst        | `benchmarks/build_dataset/seed_tts_smoke/en/meta.lst` (20 text-only) |
+| `seed-tts`        | ❌       | 4-field meta.lst + WAVs | Google-Drive: [BytedanceSpeech/seed-tts-eval][seedtts] (~1.2 GB)     |
+| `seed-tts-text`   | ❌       | 4-field meta.lst        | Same archive as `seed-tts` (wav column unused)                       |
 
 [seedtts]: https://github.com/BytedanceSpeech/seed-tts-eval
 
@@ -227,11 +232,11 @@ For manual voice_clone / default_voice runs against the full corpus, follow
 
 `tests/dfx/perf/tests/test_tts.json` wires three perf regimes plus quality:
 
-| eval_phase    | concurrency | purpose                                                 | Baseline metrics                        |
-|---------------|-------------|---------------------------------------------------------|-----------------------------------------|
-| `latency`     | 1           | Single-request TTFP / RTF SLO                           | `median_audio_ttfp_ms`, `median_audio_rtf` |
-| `throughput`  | 8           | Codec-batching cliff sentinel (PDF #272 concurrency≥8)  | `median_audio_ttfp_ms`, `median_audio_rtf` |
-| `quality`     | 4           | WER / SIM / UTMOS regression (disabled in CI by default)| `mean_audio_rtf`                        |
+| eval_phase   | concurrency | purpose                                                  | Baseline metrics                           |
+| ------------ | ----------- | -------------------------------------------------------- | ------------------------------------------ |
+| `latency`    | 1           | Single-request TTFP / RTF SLO                            | `median_audio_ttfp_ms`, `median_audio_rtf` |
+| `throughput` | 8           | Codec-batching cliff sentinel (PDF #272 concurrency≥8)   | `median_audio_ttfp_ms`, `median_audio_rtf` |
+| `quality`    | 4           | WER / SIM / UTMOS regression (disabled in CI by default) | `mean_audio_rtf`                           |
 
 Why `median_*` for latency/throughput and `mean_*` for quality: latency
 distributions have cold-start tails that drag the mean; quality aggregates
@@ -245,10 +250,15 @@ PR #2558 — quality runs are manual / release-validation, not nightly).
 
 Observed on H20-3e, Qwen3-TTS-1.7B (measured pre-merge on this branch):
 
-| Task          | Model         | c=1    | c=4    | **c=8**    | c=16   | c=32   |
-|---------------|---------------|--------|--------|------------|--------|--------|
-| voice_clone   | 1.7B-Base     | RTF 0.15 / TTFP 165ms | 0.28 / 412ms | **0.49 / 1701ms** | 0.72 / 3355ms | 0.77 / 3772ms |
-| voice_design  | 1.7B-CustomVoice | RTF 0.08 / TTFP 53ms  | 0.11 / 154ms | **0.21 / 872ms**  | 0.33 / 1801ms | 0.38 / 1989ms |
+| Task         | Model            | c=1                   | c=4          | **c=8**           | c=16          | c=32          |
+| ------------ | ---------------- | --------------------- | ------------ | ----------------- | ------------- | ------------- |
+| voice_clone  | 1.7B-Base        | RTF 0.15 / TTFP 165ms | 0.28 / 412ms | **0.49 / 1701ms** | 0.72 / 3355ms | 0.77 / 3772ms |
+| voice_design | 1.7B-CustomVoice | RTF 0.08 / TTFP 53ms  | 0.11 / 154ms | **0.21 / 872ms**  | 0.33 / 1801ms | 0.38 / 1989ms |
+
+The historical `voice_design` row above lists a CustomVoice checkpoint, which
+current task validation rejects for VoiceDesign requests. It does not establish
+a VoiceDesign checkpoint baseline; rerun with `Qwen3-TTS-12Hz-1.7B-VoiceDesign`
+before comparing performance.
 
 Both models show a **4–6× TTFP jump from c=4 to c=8** while audio throughput
 saturates around c=4–8 — the codec-bs=1 bottleneck documented in
@@ -257,7 +267,7 @@ sentinel for regressions in this area.
 
 ## File layout
 
-```
+```text
 benchmarks/tts/
 ├── README.md                  (this file)
 ├── bench_tts.py               CLI — serve-mode benchmark driver

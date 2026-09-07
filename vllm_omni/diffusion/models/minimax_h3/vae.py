@@ -27,6 +27,7 @@ from vllm_omni.diffusion.offloader.module_residency import (
     PinnedModuleStager,
 )
 
+from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
@@ -35,6 +36,27 @@ MINIMAX_H3_AUDIO_CHANNELS = 2
 
 
 logger = init_logger(__name__)
+
+
+@contextmanager
+def _minimax_h3_keyframe_encode_context(
+    device: torch.device,
+) -> Iterator[None]:
+    if device.type != "cuda":
+        yield
+        return
+
+    # The official keyframe latent uses cuDNN's TF32 convolution path. The
+    # default non-deterministic algorithm can select numerically different
+    # reductions on H100s, and the difference is amplified by the denoiser.
+    # Pin both the algorithm and math mode for this sensitive encode only.
+    with torch.backends.cudnn.flags(
+        enabled=True,
+        benchmark=False,
+        deterministic=True,
+        allow_tf32=True,
+    ):
+        yield
 
 
 def _load_component_config(component_path: str) -> dict[str, Any]:
@@ -128,11 +150,18 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             component_path,
             self.config_dict,
         )
-        # Match the reference loader contract: video VAE weights stay FP32.
-        # Keyframe encoding is numerically sensitive to first casting the
-        # checkpoint through FP16; decode still runs under FP16 autocast.
+        # Match the reference loader contract before installing inference-only
+        # decoder fast paths. Keyframe encoding remains FP32; decoder Linear
+        # weights may be materialized in FP16 because reference decode casts
+        # those same tensors through CUDA autocast on every tile.
         initial_device = load_device or device
         self.remote.eval().to(device=initial_device, dtype=torch.float32)
+        decoder = getattr(self.remote.model, "decoder", None)
+        if decoder is not None:
+            install_h3_vae_optimizations(
+                decoder,
+                device=device,
+            )
         self._stager = None
         if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
             self._stager = PinnedModuleStager(
@@ -272,10 +301,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 for device in devices:
                     with self.device_module.device(device):
                         self.device_module.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
-                latent = self.model.encode_images(
-                    image,
-                    use_fp16_latent=True,
-                )[0]
+                with _minimax_h3_keyframe_encode_context(parameter.device):
+                    latent = self.model.encode_images(
+                        image,
+                        use_fp16_latent=True,
+                    )[0]
         finally:
             self.model.parallel_tiling = previous_parallel
             if previous_dtype != torch.float32:

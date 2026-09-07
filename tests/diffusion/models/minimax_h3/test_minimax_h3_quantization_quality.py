@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from pathlib import Path
 
@@ -187,6 +187,7 @@ def test_minimax_h3_quantization_quality(config: QualityTestConfig):
         "model": model_ref,
         "enforce_eager": True,
         "tensor_parallel_size": 2,
+        # The fused BF16 baseline only fits on H100-80GB with encoder TP.
         "text_encoder_tp_size": 2,
         "vae_use_tiling": True,
     }

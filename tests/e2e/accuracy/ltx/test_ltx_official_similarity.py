@@ -3,9 +3,8 @@
 
 """E2E accuracy guard against a pinned Lightricks LTX pipeline revision.
 
-The original reduced one-stage guards remain unchanged. Four complementary
-default-shape cases cover both model versions, both two-stage weight families,
-and T2V/I2V without expanding every combination into a duplicate golden.
+Four complementary default-shape cases cover both model versions, both
+two-stage weight families, and T2V/I2V without duplicating one-stage coverage.
 """
 
 from __future__ import annotations
@@ -69,25 +68,23 @@ class LTXAccuracyThresholds:
     video_ssim_mean: float
     video_ssim_min: float
     video_psnr_mean_db: float
-    # Zero disables gating for waveform-sensitive audio that is not expected
-    # to align with the official output.
     audio_relative_l2: float
     audio_cosine_similarity: float
 
 
 STRICT_THRESHOLDS = LTXAccuracyThresholds(
-    video_ssim_mean=0.95,
-    video_ssim_min=0.90,
-    video_psnr_mean_db=30.0,
-    audio_relative_l2=0.20,
-    audio_cosine_similarity=0.95,
+    video_ssim_mean=0.99,
+    video_ssim_min=0.99,
+    video_psnr_mean_db=40.0,
+    audio_relative_l2=0.10,
+    audio_cosine_similarity=0.99,
 )
 
 
 @dataclass(frozen=True)
 class LTXAccuracyCase:
     name: str
-    pipeline_kind: Literal["one_stage", "distilled", "two_stage"]
+    pipeline_kind: Literal["distilled", "two_stage"]
     model_id: str
     model_revision: str
     model_env: str
@@ -99,8 +96,6 @@ class LTXAccuracyCase:
     num_inference_steps: int
     seed: int
     stg_block: int | None
-    thresholds: LTXAccuracyThresholds
-    prompt: str = PROMPT
     gemma_model_id: str | None = None
     gemma_model_revision: str | None = None
     gemma_model_env: str | None = None
@@ -168,59 +163,6 @@ I2V_IMAGE = LTXArtifact(
 )
 
 
-LEGACY_CASES = (
-    LTXAccuracyCase(
-        name="ltx2",
-        pipeline_kind="one_stage",
-        model_id="Lightricks/LTX-2",
-        model_revision=LTX2_REVISION,
-        model_env="VLLM_TEST_LTX2_MODEL",
-        model_class_name="LTX2Pipeline",
-        checkpoint=LTX2_CHECKPOINT,
-        width=512,
-        height=384,
-        num_frames=25,
-        num_inference_steps=20,
-        seed=42,
-        stg_block=29,
-        thresholds=STRICT_THRESHOLDS,
-    ),
-    LTXAccuracyCase(
-        name="ltx2_3",
-        pipeline_kind="one_stage",
-        model_id="diffusers/LTX-2.3-Diffusers",
-        model_revision="8eee8edcf067e838b843f926ec4d4cc9b2be1aaf",
-        model_env="VLLM_TEST_LTX23_MODEL",
-        model_class_name="LTX2Pipeline",
-        checkpoint=LTX23_CHECKPOINT,
-        width=512,
-        height=384,
-        num_frames=25,
-        num_inference_steps=20,
-        seed=42,
-        stg_block=28,
-        thresholds=STRICT_THRESHOLDS,
-    ),
-    LTXAccuracyCase(
-        name="ltx2_3_i2v",
-        pipeline_kind="one_stage",
-        model_id="diffusers/LTX-2.3-Diffusers",
-        model_revision="8eee8edcf067e838b843f926ec4d4cc9b2be1aaf",
-        model_env="VLLM_TEST_LTX23_MODEL",
-        model_class_name="LTX2Pipeline",
-        checkpoint=LTX23_CHECKPOINT,
-        width=512,
-        height=384,
-        num_frames=25,
-        num_inference_steps=20,
-        seed=42,
-        stg_block=28,
-        thresholds=STRICT_THRESHOLDS,
-        image=I2V_IMAGE,
-    ),
-)
-
-
 TWO_STAGE_CASES = (
     LTXAccuracyCase(
         name="ltx2_distilled_t2v",
@@ -240,7 +182,6 @@ TWO_STAGE_CASES = (
         gemma_model_id="Lightricks/LTX-2",
         gemma_model_revision=LTX2_REVISION,
         gemma_model_env="VLLM_TEST_LTX2_MODEL",
-        thresholds=STRICT_THRESHOLDS,
     ),
     LTXAccuracyCase(
         name="ltx23_distilled_i2v",
@@ -260,7 +201,6 @@ TWO_STAGE_CASES = (
         gemma_model_id="diffusers/LTX-2.3-Diffusers",
         gemma_model_revision="8eee8edcf067e838b843f926ec4d4cc9b2be1aaf",
         gemma_model_env="VLLM_TEST_LTX23_MODEL",
-        thresholds=STRICT_THRESHOLDS,
         image=I2V_IMAGE,
     ),
     LTXAccuracyCase(
@@ -280,7 +220,6 @@ TWO_STAGE_CASES = (
         seed=10,
         stg_block=29,
         enable_layerwise_offload=True,
-        thresholds=STRICT_THRESHOLDS,
     ),
     LTXAccuracyCase(
         name="ltx23_two_stage_layer_fused_i2v",
@@ -299,12 +238,11 @@ TWO_STAGE_CASES = (
         seed=10,
         stg_block=28,
         enable_layerwise_offload=True,
-        thresholds=STRICT_THRESHOLDS,
         image=I2V_IMAGE,
     ),
 )
 
-CASES = (*LEGACY_CASES, *TWO_STAGE_CASES)
+WEEKLY_CASES = TWO_STAGE_CASES
 
 
 def _run(command: list[str], *, env: dict[str, str], timeout: int = 1800) -> None:
@@ -460,10 +398,49 @@ def _resolve_image(case: LTXAccuracyCase) -> Path | None:
     return _resolve_artifact(case.image)
 
 
+def _omni_model_with_pinned_artifacts(
+    model: Path,
+    output_root: Path,
+    artifacts: tuple[Path | None, ...],
+) -> Path:
+    """Expose the already-resolved sidecars to Omni without copying the model."""
+    resolved_artifacts = tuple(artifact for artifact in artifacts if artifact is not None)
+    if not resolved_artifacts:
+        return model
+
+    overlay = output_root / "omni-model"
+    overlay.mkdir()
+    for source in model.iterdir():
+        (overlay / source.name).symlink_to(source.resolve(), target_is_directory=source.is_dir())
+    for artifact in resolved_artifacts:
+        target = overlay / artifact.name
+        if target.exists():
+            assert target.samefile(artifact), f"Model sidecar does not match pinned artifact: {target} != {artifact}"
+        else:
+            target.symlink_to(artifact.resolve())
+    return overlay
+
+
+def test_omni_model_overlay_pins_artifacts(tmp_path: Path) -> None:
+    model = tmp_path / "model"
+    model.mkdir()
+    component = model / "model_index.json"
+    component.write_text("{}\n")
+    artifact = tmp_path / "sidecar.safetensors"
+    artifact.write_bytes(b"pinned")
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+
+    overlay = _omni_model_with_pinned_artifacts(model, output_root, (artifact,))
+
+    assert (overlay / component.name).samefile(component)
+    assert (overlay / artifact.name).samefile(artifact)
+
+
 def _request(case: LTXAccuracyCase, image: Path | None) -> dict[str, object]:
     request: dict[str, object] = {
         "pipeline_kind": case.pipeline_kind,
-        "prompt": case.prompt,
+        "prompt": PROMPT,
         "negative_prompt": "" if case.pipeline_kind == "distilled" else NEGATIVE_PROMPT,
         "width": case.width,
         "height": case.height,
@@ -473,14 +450,17 @@ def _request(case: LTXAccuracyCase, image: Path | None) -> dict[str, object]:
         "seed": case.seed,
     }
     if case.pipeline_kind != "distilled":
-        assert case.stg_block is not None
         request.update(
             video_cfg_scale=3.0,
             audio_cfg_scale=7.0,
-            video_stg_scale=1.0,
-            audio_stg_scale=1.0,
             video_modality_scale=3.0,
             audio_modality_scale=3.0,
+        )
+    if case.pipeline_kind == "two_stage":
+        assert case.stg_block is not None
+        request.update(
+            video_stg_scale=1.0,
+            audio_stg_scale=1.0,
             video_rescale_scale=0.7,
             audio_rescale_scale=0.7,
             video_stg_blocks=[case.stg_block],
@@ -543,7 +523,7 @@ def _audio_metrics(reference: np.ndarray, prediction: np.ndarray) -> dict[str, f
     }
 
 
-@pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
+@pytest.mark.parametrize("case", WEEKLY_CASES, ids=lambda case: case.name)
 @pytest.mark.slow
 @pytest.mark.benchmark
 @pytest.mark.diffusion
@@ -561,9 +541,11 @@ def test_ltx_matches_official(case: LTXAccuracyCase, accuracy_artifact_root: Pat
     checkpoint = _resolve_artifact(case.checkpoint, model)
     spatial_upsampler = _resolve_artifact(case.spatial_upsampler, model) if case.spatial_upsampler is not None else None
     distilled_lora = _resolve_artifact(case.distilled_lora, model) if case.distilled_lora is not None else None
+    omni_model = _omni_model_with_pinned_artifacts(model, output_root, (spatial_upsampler, distilled_lora))
     image = _resolve_image(case)
+    request = _request(case, image)
     request_path = output_root / "request.json"
-    request_path.write_text(json.dumps(_request(case, image), indent=2) + "\n")
+    request_path.write_text(json.dumps(request, indent=2) + "\n")
 
     runner = Path(__file__).with_name("run_ltx_reference.py")
     runner_args = [
@@ -619,7 +601,7 @@ def test_ltx_matches_official(case: LTXAccuracyCase, accuracy_artifact_root: Pat
             "--output-dir",
             str(omni_output),
             "--model",
-            str(model),
+            str(omni_model),
             "--model-class-name",
             case.model_class_name,
         ]
@@ -651,18 +633,16 @@ def test_ltx_matches_official(case: LTXAccuracyCase, accuracy_artifact_root: Pat
         "spatial_upsampler_revision": (case.spatial_upsampler.revision if case.spatial_upsampler is not None else None),
         "distilled_lora_revision": case.distilled_lora.revision if case.distilled_lora is not None else None,
         "enable_layerwise_offload": enable_layerwise_offload,
-        "thresholds": asdict(case.thresholds),
-        "request": _request(case, image),
+        "thresholds": asdict(STRICT_THRESHOLDS),
+        "request": request,
         "video": video_metrics,
         "audio": audio_metrics,
     }
     (output_root / "metrics.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))
 
-    assert video_metrics["ssim_mean"] >= case.thresholds.video_ssim_mean
-    assert video_metrics["ssim_min"] >= case.thresholds.video_ssim_min
-    assert video_metrics["psnr_mean_db"] >= case.thresholds.video_psnr_mean_db
-    if case.thresholds.audio_relative_l2 > 0:
-        assert audio_metrics["relative_l2"] <= case.thresholds.audio_relative_l2
-    if case.thresholds.audio_cosine_similarity > 0:
-        assert audio_metrics["cosine_similarity"] >= case.thresholds.audio_cosine_similarity
+    assert video_metrics["ssim_mean"] >= STRICT_THRESHOLDS.video_ssim_mean
+    assert video_metrics["ssim_min"] >= STRICT_THRESHOLDS.video_ssim_min
+    assert video_metrics["psnr_mean_db"] >= STRICT_THRESHOLDS.video_psnr_mean_db
+    assert audio_metrics["relative_l2"] <= STRICT_THRESHOLDS.audio_relative_l2
+    assert audio_metrics["cosine_similarity"] >= STRICT_THRESHOLDS.audio_cosine_similarity

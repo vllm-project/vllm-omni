@@ -52,8 +52,8 @@ Always attach markers deliberately:
   - `tts` — speech synthesis / TTS-only models (`/v1/audio/speech`, voice clone, etc.)
   - `diffusion` — generative diffusion models (image / audio / text / video from noise)
 - **Cross-cutting area** (when relevant): `parallel`, `cache`, `example`, `benchmark`
-- **Hardware**: `cpu`, `gpu`, `cuda`, `rocm`, `npu`, `L4`, `H100`, `distributed_cuda`, …
-- Optional: `slow`, distributed markers when multi-card is required
+- **Hardware**: `cpu`, `gpu`, `cuda`, `rocm`, `npu`, …; SKU (`H100`, `L4`, …) and `cards_{n}` via `@hardware_test(...)` / `hardware_marks(...)` only — never `pytest.mark.H100` (`check-mark` rejects it)
+- Optional: `slow`. Multi-card: `num_cards=N` on the helper (filter with `cards_N` / `not cards_1`)
 
 **Baseline smoke (L2 + L3):** The simplest e2e case per model — default deploy, minimal request — should usually carry **both** `@pytest.mark.core_model` and `@pytest.mark.advanced_model` on the **same** test function so `test-ready.yml` and `test-merge.yml` share one test. `send_*_request` picks validation depth from `--run-level`. References: `test_voxcpm2_tts.py::test_text_to_audio_001`, `test_qwen3_tts_customvoice.py::test_text_to_audio_001`. Heavier scenarios use **`advanced_model` only**; L4 expansion uses **`full_model`**.
 
@@ -274,7 +274,7 @@ def test_text_to_video_001(omni_server, online_client) -> None:
 
 **3. Cross-cutting rules**
 
-- New `.py` files need the Omni SPDX header (`Copyright contributors to the vLLM-Omni project`, not `vLLM project`). `tests/` may keep stdlib `re`/`base64`; pickle is still banned unless the file is already on the pickle allowlist. Every collected `tests/**/test_*.py` needs a CI **level** mark and a **hardware** mark/helper (`check-test-ci-coverage` runs locally; GHA skips it). Do not grow `allowed_files` to land a test. Policy: [docs/contributing/README.md](../../../docs/contributing/README.md#linting).
+- New `.py` files need the Omni SPDX header (`Copyright contributors to the vLLM-Omni project`, not `vLLM project`). `tests/` may keep stdlib `re`/`base64`; pickle is still banned unless the file is already on the pickle allowlist. Every collected `tests/**/test_*.py` needs a CI **level** mark and a **hardware** platform mark/helper (`check-mark` runs locally; GHA skips it). Do not write `pytest.mark.H100` / `pytest.mark.L4`; use the helpers so `cards_{n}` is attached. Do not grow `allowed_files` to land a test. Policy: [docs/contributing/README.md](../../../docs/contributing/README.md#linting).
 - Reuse existing fixtures for the chosen scenario; do not mix “online client” assumptions into offline `OmniRunner` tests without a clear reason.
 - Avoid external network dependency in assertions unless the scenario is explicitly “online serving” or doc examples that require a model hub (then align with CI secrets/cache).
 - Keep **one test function = one intent** (one modality combo, one endpoint contract, or one acceleration combo).

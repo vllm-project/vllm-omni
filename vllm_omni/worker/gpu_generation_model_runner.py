@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Code2Wav GPU Model Runner for vLLM-Omni.
 
 Handles direct conversion from codec codes to audio waveforms for Qwen3 Omni MoE Code2Wav.
@@ -39,6 +42,7 @@ from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_payload_list
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.mixins import maybe_unpad_input_ids
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
@@ -192,9 +196,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
-            logits_indices, spec_decode_metadata = self._prepare_inputs(
-                scheduler_output,
-                num_scheduled_tokens_np,
+            logits_indices, spec_decode_metadata, max_num_sampled_tokens = self._prepare_inputs(
+                scheduler_output, num_scheduled_tokens_np
             )
 
             cascade_attn_prefix_lens = None
@@ -278,6 +281,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 max_query_len=max_num_scheduled_tokens,
                 ubatch_slices=ubatch_slices_attn,
                 logits_indices=logits_indices,
+                max_num_sampled_tokens=max_num_sampled_tokens,
                 use_spec_decode=use_spec_decode,
                 num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                 cascade_attn_prefix_lens=cascade_attn_prefix_lens,
@@ -304,18 +308,13 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 num_tokens_padded,
                 intermediate_tensors,
             )
+            # [Omni] Exact-shape models need input_ids at its real token count (#6712).
+            input_ids = maybe_unpad_input_ids(self.model, input_ids, num_tokens_unpadded)
+
             # [Omni] Pass token counts per request for code2wav output slicing
             model_kwargs["seq_token_counts"] = tokens
             if getattr(self.model, "requires_request_ids", False):
                 model_kwargs["request_ids"] = list(req_ids)
-
-        # Set cudagraph mode to none if calc_kv_scales is true.
-        # KV scales calculation involves dynamic operations that are incompatible
-        # with CUDA graph capture.
-        if self.calculate_kv_scales:
-            cudagraph_mode = CUDAGraphMode.NONE
-            # Mark KV scales as calculated after the first forward pass
-            self.calculate_kv_scales = False
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -797,9 +796,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None
 
-            # Some generation-stage models require model-specific runtime
-            # information (such as image size and conditioning embeddings)
-            # even during the dummy profiling run that vLLM uses to
+            # Some generation-stage models (e.g. MammothModa2DiTPipeline) require
+            # model-specific runtime information (such as image size and conditioning
+            # embeddings) even during the dummy profiling run that vLLM uses to
             # estimate KV-cache capacity.  get_dummy_runtime_additional_information
             # provides placeholder values of the correct shape so that the profiling
             # run does not raise an error due to missing inputs.

@@ -210,7 +210,7 @@ def mux_av_video_audio_bytes(
     audio_waveform: np.ndarray | None = None,
     *,
     fps: float = 25.0,
-    audio_sample_rate: int = 44100,
+    audio_sample_rate: int | None = None,
     video_codec: str = "h264",
     audio_codec: str = "aac",
     crf: str = "18",
@@ -236,6 +236,7 @@ def mux_av_video_audio_bytes(
         samples: np.ndarray | None = None
         layout: str | None = None
         if audio_waveform is not None:
+            effective_audio_sample_rate = 44100 if audio_sample_rate is None else audio_sample_rate
             samples = audio_waveform.astype(np.float32)
             if samples.ndim == 1:
                 samples = samples.reshape(1, -1)
@@ -243,7 +244,7 @@ def mux_av_video_audio_bytes(
                 samples = np.ascontiguousarray(samples.T)
             num_channels = samples.shape[0]
             layout = "stereo" if num_channels >= 2 else "mono"
-            a_stream = cast(av.AudioStream, container.add_stream(audio_codec, rate=audio_sample_rate))
+            a_stream = cast(av.AudioStream, container.add_stream(audio_codec, rate=effective_audio_sample_rate))
             a_stream.layout = layout
 
         for frame in video_frames:
@@ -256,12 +257,12 @@ def mux_av_video_audio_bytes(
             if samples is None or layout is None:
                 raise ValueError("Audio samples were not prepared for muxing.")
             audio_frame = av.AudioFrame.from_ndarray(samples, format="fltp", layout=layout)
-            audio_frame.sample_rate = audio_sample_rate
+            audio_frame.sample_rate = effective_audio_sample_rate
             # AAC has a one-frame encoder delay. Mark the input waveform as
             # starting at t=0 so the MP4 muxer writes the corresponding negative
             # priming timestamp instead of exposing the delay as leading silence.
             audio_frame.pts = 0
-            audio_frame.time_base = Fraction(1, audio_sample_rate)
+            audio_frame.time_base = Fraction(1, effective_audio_sample_rate)
             for packet in a_stream.encode(audio_frame):
                 container.mux(packet)
             for packet in a_stream.encode():

@@ -1,10 +1,11 @@
 # Distributed Layerwise Offload
 
 This document describes distributed layerwise offload (DLO) for diffusion
-models. DLO keeps only a small number of DiT blocks on the accelerator and
-streams the remaining blocks from host memory. The distributed backend can
-either shard those host-side weights across an existing parallel group or keep
-complete rank-local block sources and avoid an additional collective.
+models. DLO keeps only a small number of selected DiT or text-encoder blocks
+on the accelerator and streams the remaining blocks from host memory. The
+distributed backend can either shard those host-side weights across an
+existing parallel group or keep complete rank-local block sources and avoid
+an additional collective.
 
 For user-facing commands, see the
 [distributed layerwise offloading guide](../../../user_guide/diffusion/offloader/distributed_layerwise_offload.md)
@@ -26,6 +27,8 @@ Legend: ✅ supported, ⚠️ compatibility path or limited validation, ❌ unsu
 | **TP > 1** | ⚠️ Ordinary TP-aware loader only; no direct checkpoint mmap. | ⚠️ Ordinary TP-aware loader only; no direct checkpoint mmap. |
 | **HSDP** | ❌ Rejected to avoid double-sharding parameters. | ⚠️ Limited end-to-end coverage. |
 | **Per-tensor online FP8 linears** | ✅ Ordinary loader finalizes weights and scales before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
+| **Online INT8 linears** | ✅ Ordinary loader finalizes the int8 weight (contiguous or transposed view) and fp32 scale before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
+| **Online MXFP8 linears** | ✅ Ordinary loader finalizes the fp8 weight (contiguous) and e8m0 block scale (contiguous or transposed view) before DLO sharding. | ✅ Ordinary loader retains complete rank-local tensors. |
 | **Other online quantization methods** | ❌ Rejected until runtime packing and scale layouts are validated. | ⚠️ Allowed through the ordinary loader; validation is method-specific. |
 | **Model-level or standard layerwise CPU offload** | ❌ Disabled because DLO takes priority. | ❌ Disabled because DLO takes priority. |
 | **Resident leading layers** | ❌ Rejected. | ✅ Requires eligible resident paths in the model's `OffloadPlan`. |
@@ -36,10 +39,11 @@ detailed contracts and validation boundaries.
 
 ## Status
 
-DLO is implemented for multi-device diffusion execution. The default
-AllGather path is the primary path for DP and SP deployments. The
-`--dlo-no-use-allgather` path streams complete blocks independently and adds no
-DLO weight collective.
+DLO is implemented for multi-device diffusion execution. The default public
+transfer is `rank-local`; setting a selected component's
+`layer_options.NAME.weight_transfer` to `allgather` enables weight sharding across a
+compatible DP or SP group. Transfers are configured independently for `dit`
+and `text_encoder`.
 
 Host storage is selected separately from the transfer protocol. The loader can
 produce a direct-checkpoint mmap plan for a proven-compatible runtime layout;
@@ -107,7 +111,7 @@ checkpoint adapter beside the ordinary loader.
 
 ### AllGather path
 
-With the default `dlo_use_allgather=True`, each rank stores approximately
+For a component configured with `weight_transfer="allgather"`, each rank stores approximately
 `1 / group_size` of each streamable block in pinned host memory. The next
 block's shard is copied to a device buffer and reconstructed with
 `all_gather_into_tensor` on a communication stream while the current block is
@@ -130,9 +134,8 @@ source used to prepare each rank's persistent shard. They can be closed after
 shard preparation. Across the AllGather group, those private shards total
 approximately one runtime model copy.
 
-An effective DLO group size of one performs no collective, even when
-`dlo_use_allgather=True`; it follows the rank-local transfer path described
-below.
+An effective DLO group size of one performs no collective; it follows the
+rank-local transfer path described below.
 
 When DP is greater than one, the engine can process one request per DP rank in
 the same denoising wave. Because AllGather is a collective, all participating
@@ -140,9 +143,10 @@ requests must take the same execution path at every denoising step.
 
 ### Rank-local path without DLO AllGather
 
-With `--dlo-no-use-allgather`, DLO forces its internal offload shard size to
-one and streams complete blocks using H2D copies only. The host backing may be
-either a loader-approved checkpoint mapping or ordinary runtime tensors.
+With `weight_transfer="rank-local"`, DLO forces the affected component's internal
+offload shard size to one and streams complete blocks using H2D copies only.
+The host backing may be either a loader-approved checkpoint mapping or
+ordinary runtime tensors.
 
 For direct mmap, each process retains immutable safetensors views and uses two
 bounded pinned host staging slots. Processes on the same node that map the same
@@ -202,7 +206,7 @@ adopt it.
 > optimizations without changing AllGather behavior.
 
 Final-layout Host Weight Runtime (HWR) backing is opt-in and currently applies
-only to no-AllGather DLO. Enable it with
+only to a selected rank-local DiT. Enable it with
 `--host-weight-runtime-mode preferred` (or `required`) and
 `--host-weight-runtime-root <node-local-root>`.
 
@@ -220,9 +224,15 @@ model revision and parallel layout with `required`. TP coordinates have distinct
 identities, while equivalent DP replicas share them.
 
 The current producer/consumer boundary is the model-declared final-layout BF16
-contract (MiniMax H3 today). It supports ordinary-loader final layouts for TP1
-and TP2 rank identities plus SP layout identities; online quantization, HSDP,
-LoRA/adapted weights, and non-default load formats remain ineligible. HWR mode
+contract (MiniMax H3 and `black-forest-labs/FLUX.2-klein-4B`). The FLUX.2-klein
+contract covers both transformer block stacks, constructor-stable packed QKV
+mapping state, BF16 parameters, and any persistent loader-owned `beta`/`eps`
+buffers. The shared HWR machinery supports ordinary-loader final layouts for
+TP1 and TP2 rank identities plus SP layout identities. FLUX.2-klein evidence
+in this change is TP1-only; its TP2/SP layouts rely on the existing
+per-coordinate identity mechanics and remain unmeasured. Online quantization,
+HSDP, LoRA/adapted weights, and non-default load formats remain ineligible.
+HWR mode
 `disabled`, DLO-disabled, and DLO AllGather configurations stop before source
 identity or store construction and retain the existing checkpoint-mmap or
 ordinary-loader path.
@@ -414,8 +424,8 @@ failure.
   collective. When the model declares the final-layout contract, HWR keys the
   reusable artifact by TP rank/size and SP layout.
 - **HSDP + SP:** the general parallel configuration permits HSDP over SP, but
-  DLO must use `--dlo-no-use-allgather`. HSDP remains responsible for weight
-  materialization and synchronization.
+  each selected component must use `weight_transfer="rank-local"`. HSDP remains
+  responsible for weight materialization and synchronization.
 - **HSDP + DP or TP:** rejected independently by the diffusion parallel
   configuration.
 
@@ -432,11 +442,16 @@ requirements.
 
 Direct checkpoint mmap can back either transfer path. It is currently limited
 to proven TP1, non-HSDP, non-online-quantized layouts. Other layouts use the
-ordinary loader. Per-tensor online FP8 linears can use DLO AllGather after the
-ordinary loader finalizes their runtime weights and scales; DLO then shards and
-reconstructs those tensors with their recorded layouts. Other online methods
-must use `--dlo-no-use-allgather` or disable online quantization until their
-runtime layouts are validated.
+ordinary loader. Per-tensor online FP8, online INT8, and online MXFP8 linears
+can use DLO AllGather after the ordinary loader finalizes their runtime
+weights and scales; DLO then shards and reconstructs those tensors with their
+recorded layouts (they all keep plain 1-byte dtypes over ordinary strided
+views: online INT8 has an int8 weight plus fp32 scale, online MXFP8 has an
+fp8 weight plus e8m0 block scale, each with a contiguous or transposed-view
+finalized tensor, all covered by the same physical-order packing as online
+FP8). Other online methods must set
+`layer_options.dit.weight_transfer="rank-local"` or disable online quantization
+until their runtime layouts are validated.
 
 The Host Weight Runtime representation, publication, and no-AllGather consumer
 contracts are merged; see
@@ -453,8 +468,8 @@ Current source-level validation includes:
 - HSDP + DLO without AllGather acceptance at configuration level;
 - loader preflight fallback for TP, HSDP, online quantization, unknown custom
   loaders, missing keys, and shape/dtype mismatches;
-- ordinary-loader fallback for per-tensor online FP8 linears followed by DLO
-  sharding of finalized weights and scales;
+- ordinary-loader fallback for per-tensor online FP8, online INT8, and online
+  MXFP8 linears followed by DLO sharding of finalized weights and scales;
 - exact loader-to-backend plan transfer and ordinary-loader fallback;
 - ordered publication hashing, overlapped durability, unordered parallel
   checksum fallback, and node-local source-digest reuse/invalidation;

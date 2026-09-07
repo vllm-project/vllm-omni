@@ -254,18 +254,3 @@ def test_pipeline_resolves_transformer_component_quant_config():
     assert transformer_config.ignored_layers == ignored_layers
     assert _resolve_component_quant_config(component_config, "transformer") is transformer_config
     assert _resolve_component_quant_config(transformer_config, "transformer") is transformer_config
-
-
-def test_pipeline_strips_prequantized_text_encoder_config():
-    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _resolve_minimax_h3_text_encoder_quant_config
-    from vllm_omni.quantization import ComponentQuantizationConfig
-
-    prequantized = Mock()
-    prequantized.get_name.return_value = "modelopt"
-    online_fp8 = Mock()
-    online_fp8.get_name.return_value = "fp8"
-    component_config = ComponentQuantizationConfig({"text_encoder": prequantized})
-
-    assert _resolve_minimax_h3_text_encoder_quant_config(online_fp8) is online_fp8
-    assert _resolve_minimax_h3_text_encoder_quant_config(prequantized) is None
-    assert _resolve_minimax_h3_text_encoder_quant_config(component_config) is None

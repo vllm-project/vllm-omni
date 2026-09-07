@@ -79,7 +79,7 @@ E2E (L2+) should not rely on mocks unless documenting a rare exception; prefer r
    - `full_model` — L4 nightly (`test-nightly.yml`); some expansion tests still carry both `advanced_model` and `full_model` during migration
 2. **Model type** (pick one): `omni`, `tts`, or `diffusion`
 3. **Cross-cutting** when relevant: `parallel`, `cache`, `example`, `benchmark`
-4. **Hardware**: `cpu`, `cuda`, `rocm`, `npu`, `L4`, `H100`, `distributed_cuda`, …
+4. **Hardware**: `cpu`, `cuda`, `rocm`, `npu`, `L4`, `H100`, `cards_1`, …
 5. Multi-card: `@hardware_test(...)` in `tests/helpers/mark.py`
 
 ## Command Templates
@@ -244,7 +244,7 @@ pytest -s -v dfx/reliability/invalid_param_test/test_invalid_image_generation.py
 
 ```bash
 cd tests
-pytest -s -v -m "core_model and distributed_cuda and L4" --run-level=core_model
+pytest -s -v -m "core_model and L4 and not cards_1" --run-level=core_model
 ```
 
 ### Concrete e2e paths (common in-tree)

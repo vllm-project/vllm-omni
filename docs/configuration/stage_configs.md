@@ -59,7 +59,7 @@ The new deploy schema lives under `vllm_omni/deploy/` and is paired with a froze
 | `edges` | list | optional | `null` | Explicit edge list for the KV transfer graph. Auto-derived from stage inputs if omitted. |
 | `stages` | list | optional | `[]` | Per-stage runtime overrides matched by `stage_id`. Pipeline stages are still created from `PipelineConfig` when this list is empty. |
 | `platforms` | dict | optional | `null` | Keyed by `npu` / `rocm` / `xpu`, each contains a `stages:` list with per-platform overrides applied on top of the CUDA defaults. |
-| `pipeline` | str | optional | `null` | Override the auto-detected pipeline registry key (used for structural variants like `qwen2_5_omni_thinker_only`). |
+| `pipeline` | str | optional | `null` | Override the auto-detected pipeline registry key (used for structural variants like `qwen2_5_omni_thinker_only` / `qwen3_omni_moe_thinker_only`). |
 | `trust_remote_code` | bool \| null | optional | `null` | **Pipeline-wide.** Trust HF remote code on model load; applies to every stage when specified. |
 | `distributed_executor_backend` | str \| null | optional | `null` | **Pipeline-wide.** Distributed executor backend forwarded to vLLM (`"mp"`, `"ray"`, `"external_launcher"`). If omitted, vLLM auto-selects backend from runtime topology. |
 | `dtype` | str \| null | optional | `null` | **Pipeline-wide.** Model dtype for every stage. |
@@ -94,11 +94,13 @@ Each entry under `stages:` accepts any `StageDeployConfig` field directly (no ne
 | `max_num_batched_tokens` | int \| null | optional | `null` | Per-stage prefill/token budget; also contributes to the native maximum in-flight token limit. |
 | `max_model_len` | int \| null | optional | `null` | Per-sequence context or KV length; `-1` enables native cache-capacity auto-fitting, while values above the HF default auto-set `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`. |
 | `async_scheduling` | bool \| null | optional | `null` | Per-stage async scheduling toggle. |
-| `devices` | str \| null | optional | `null` | Device list assigned to this stage. |
+| `devices` | str \| null | optional | `null` | Device list assigned to this stage. The number of device ids must equal this stage's local world size (`tensor_parallel_size` × local data-parallel size × `pipeline_parallel_size`, or `num_replicas` × that product for a replica pool); a mismatch fails early — see the note below. |
 | `output_connectors` | dict \| null | optional | `null` | Keyed by `to_stage_<n>`; values are names registered under top-level `connectors:`. |
 | `input_connectors` | dict \| null | optional | `null` | Keyed by `from_stage_<n>`; values are names registered under top-level `connectors:`. |
 | `default_sampling_params` | dict \| null | optional | `null` | Baseline sampling params. Deep-merged with pipeline `sampling_constraints` (pipeline wins). |
 | `engine_extras` | dict | optional | `{}` | Catch-all for engine fields not listed above; deep-merged across overlays and forwarded to the stage engine. |
+
+**Note:** a stage's `devices` count must equal its local world size (`tensor_parallel_size` × `data_parallel_size_local` × `pipeline_parallel_size`, falling back to global `data_parallel_size` when the local size is unset), or `num_replicas` × that product for a replica pool. A mismatch fails early and names the offending stage. A top-level `--tensor-parallel-size` is broadcast to every stage, so it can make a single-GPU stage violate this contract ([issue #5003](gh-issue:5003)); fix that case with `--stage-overrides` (set `tensor_parallel_size` and `devices` together per stage) or set TP only on the multi-GPU stage.
 
 ### Connector schema
 

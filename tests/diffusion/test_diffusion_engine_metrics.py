@@ -172,12 +172,29 @@ class TestMetricKeys:
         assert ".cancel(" not in abort_branch
 
     def test_orchestrator_consumes_metrics_only_output_without_routing(self) -> None:
+        """A metrics-only sentinel contributes its queue depth and is not routed.
+
+        Absorption lives in ``_absorb_diffusion_metrics`` rather than inline in a
+        loop, so both orchestration loops share one implementation. The ordering
+        is asserted where it now lives: the snapshot inside the helper, and the
+        absorb-before-route guard inside every loop that polls diffusion output.
+        """
         source = _read_source(_ORCHESTRATOR_PATH)
-        loop_source = _get_function_source(source, "Orchestrator", "_orchestration_loop")
-        snapshot_pos = loop_source.index("_update_stage_replica_waiting(")
-        sentinel_pos = loop_source.index("diffusion_output.request_id == DIFFUSION_METRICS_ONLY_REQUEST_ID")
-        route_pos = loop_source.index("pool.record_output_timestamps([diffusion_output])")
-        assert snapshot_pos < sentinel_pos < route_pos
+
+        # Snapshot before the verdict, so a sentinel still reports its waiting
+        # depth on the way out instead of being dropped unaccounted.
+        absorb_source = _get_function_source(source, "Orchestrator", "_absorb_diffusion_metrics")
+        snapshot_pos = absorb_source.index("_update_stage_replica_waiting(")
+        sentinel_pos = absorb_source.index("diffusion_output.request_id == DIFFUSION_METRICS_ONLY_REQUEST_ID")
+        assert snapshot_pos < sentinel_pos
+
+        # Absorb before routing, or a sentinel reaches the downstream consumer
+        # as if it were a real request output.
+        for loop_name in ("_orchestration_loop", "_orchestration_loop_event_driven"):
+            loop_source = _get_function_source(source, "Orchestrator", loop_name)
+            absorb_pos = loop_source.index("self._absorb_diffusion_metrics(")
+            route_pos = loop_source.index("record_output_timestamps(")
+            assert absorb_pos < route_pos, loop_name
 
 
 class TestVaeDecodeEmit:

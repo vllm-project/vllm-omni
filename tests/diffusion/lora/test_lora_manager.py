@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from vllm.lora.lora_weights import LoRALayerWeights
@@ -28,14 +30,38 @@ class _DummyLoRALayer:
             tuple[list[torch.Tensor | None] | torch.Tensor, list[torch.Tensor | None] | torch.Tensor]
         ] = []
         self.reset_calls: int = 0
+        self.suspend_calls: int = 0
+        self.resume_calls: int = 0
+        self.active_slices: tuple[bool, ...] = ()
+        self.suspended_slices: tuple[bool, ...] | None = None
 
     def set_lora(self, index: int, lora_a, lora_b):
         assert index == 0
         self.set_calls.append((lora_a, lora_b))
+        if isinstance(lora_b, list):
+            self.active_slices = tuple(b is not None for b in lora_b)
+        else:
+            self.active_slices = (True,)
+        self.suspended_slices = None
 
     def reset_lora(self, index: int):
         assert index == 0
         self.reset_calls += 1
+        self.active_slices = ()
+        self.suspended_slices = None
+
+    def suspend_lora(self) -> None:
+        if self.suspended_slices is not None:
+            return
+        self.suspended_slices = self.active_slices
+        self.active_slices = (False,) * len(self.active_slices)
+        self.suspend_calls += 1
+
+    def resume_lora(self) -> None:
+        if self.suspended_slices is not None:
+            self.active_slices = self.suspended_slices
+            self.suspended_slices = None
+        self.resume_calls += 1
 
 
 # Aliases for backward compatibility within this file
@@ -141,6 +167,37 @@ def test_lora_manager_replace_layers_does_not_rewrap_base_layer(monkeypatch):
     # Only the top-level layer should have been replaced; nested ".base_layer"
     # must be skipped to avoid nesting LoRA wrappers.
     assert replace_calls == ["foo"]
+
+
+def test_lora_manager_keeps_dlo_lora_buffers_on_compute_device(monkeypatch):
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    class _DLOLoRALayer(DummyBaseLayerWithLoRA):
+        lora_buffer_device = None
+
+        def _set_diffusion_lora_buffer_device(self, device):
+            self.lora_buffer_device = device
+
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DLOLoRALayer)
+    monkeypatch.setattr(
+        manager_mod,
+        "from_layer_diffusion",
+        lambda *, layer, **_kwargs: _DLOLoRALayer(layer),
+    )
+
+    pipeline = torch.nn.Module()
+    pipeline.od_config = SimpleNamespace(enable_distributed_layerwise_offload=True)
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.foo = _FakeLinearBase()
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    manager._replace_layers_with_lora(type("_PH", (), {"r": 1})())
+
+    assert pipeline.transformer.foo.lora_buffer_device == torch.device("cpu")
 
 
 def test_lora_manager_replaces_packed_layer_when_targeting_sublayers(monkeypatch):
@@ -690,3 +747,104 @@ def test_lora_manager_discovers_unet_component(monkeypatch):
     assert "unet.down_block.proj" in manager._lora_modules
     # Verify the module was actually replaced in the tree (not just recorded)
     assert isinstance(pipeline.unet.down_block.proj, _DummyBaseLayerWithLoRA)
+
+
+def _suspend_harness(monkeypatch, adapter_id: int = 7, rank: int = 2):
+    """Manager wired to a single dummy layer, ready to activate `adapter_id`."""
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
+
+    lora_model = _DummyLM(rank=rank)
+    manager = DiffusionLoRAManager(
+        pipeline=_DummyPipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    monkeypatch.setattr(manager, "_load_adapter", lambda _req: (lora_model, type("PH", (), {"r": rank})()))
+    manager._registered_adapters = {adapter_id: lora_model}
+    manager._lora_modules = {"transformer.foo": lora_model.transformer.foo}
+    return manager, lora_model.transformer.foo
+
+
+def test_reactivating_same_adapter_resumes_without_rebinding(monkeypatch):
+    """activate -> deactivate -> activate at the same scale must re-arm the
+    saved mask instead of re-uploading every layer."""
+    adapter_id = 7
+    req = _dummy_lora_request(adapter_id)
+    manager, layer = _suspend_harness(monkeypatch, adapter_id)
+
+    manager.set_active_adapter(req, lora_scale=0.5)
+    assert len(layer.set_calls) == 1
+    assert layer.active_slices == (True,)
+
+    manager.set_active_adapter(None)
+    assert manager._suspended_adapter_id == adapter_id
+    assert layer.suspend_calls == 1
+    assert layer.active_slices == (False,)
+    # Suspending must not tear the upload down.
+    assert layer.reset_calls == 0
+
+    manager.set_active_adapter(req, lora_scale=0.5)
+    assert layer.resume_calls == 1
+    assert len(layer.set_calls) == 1, "resume must not rebind"
+    assert layer.active_slices == (True,)
+    assert manager._active_adapter_id == adapter_id
+    assert manager._suspended_adapter_id is None
+
+
+@pytest.mark.parametrize("second_scale", [0.5, 0.25])
+def test_scale_or_adapter_change_forces_rebind(monkeypatch, second_scale):
+    """A different scale, or a different adapter, must take the full bind
+    path rather than re-arming a stale mask."""
+    adapter_id = 7
+    manager, layer = _suspend_harness(monkeypatch, adapter_id)
+
+    manager.set_active_adapter(_dummy_lora_request(adapter_id), lora_scale=0.5)
+    manager.set_active_adapter(None)
+    assert manager._suspended_adapter_id == adapter_id
+
+    # Same id at a new scale, or a different id entirely.
+    other_id = adapter_id if second_scale != 0.5 else adapter_id + 1
+    if other_id != adapter_id:
+        manager._registered_adapters[other_id] = manager._registered_adapters[adapter_id]
+
+    manager.set_active_adapter(_dummy_lora_request(other_id), lora_scale=second_scale)
+    assert len(layer.set_calls) == 2, "must rebind"
+    assert manager._suspended_adapter_id is None
+    assert manager._active_adapter_id == other_id
+
+
+def test_partial_packed_mask_survives_suspend_resume(monkeypatch):
+    """A packed layer where only some slices carry LoRA must come back with
+    the same mask, not an all-True one."""
+    adapter_id = 7
+    manager, layer = _suspend_harness(monkeypatch, adapter_id)
+
+    # Emulate a packed bind that left slice 1 empty.
+    layer.set_lora(0, [torch.ones(2, 2), None], [torch.ones(2, 2), None])
+    manager._active_adapter_id = adapter_id
+    manager._update_adapter_scale(adapter_id, 0.5)
+    assert layer.active_slices == (True, False)
+
+    manager.set_active_adapter(None)
+    assert layer.active_slices == (False, False)
+
+    manager.set_active_adapter(_dummy_lora_request(adapter_id), lora_scale=0.5)
+    assert layer.active_slices == (True, False), "mask must survive unchanged"
+
+
+def test_removing_suspended_adapter_drops_the_upload(monkeypatch):
+    """A removed adapter can never be resumed, so its weights must not stay
+    in the stacked buffers."""
+    adapter_id = 7
+    manager, layer = _suspend_harness(monkeypatch, adapter_id)
+
+    manager.set_active_adapter(_dummy_lora_request(adapter_id), lora_scale=0.5)
+    manager.set_active_adapter(None)
+    assert manager._suspended_adapter_id == adapter_id
+
+    manager.remove_adapter(adapter_id)
+    assert manager._suspended_adapter_id is None
+    assert layer.reset_calls == 1, "the upload must be torn down"
+    assert layer.suspended_slices is None

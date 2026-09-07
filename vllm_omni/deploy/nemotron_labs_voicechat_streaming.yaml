@@ -9,9 +9,12 @@
 # seam-free. First audio arrives after ~codec_chunk_frames thinker steps
 # instead of after the whole pipeline completes.
 #
-# The non-streaming yaml remains the parity-acceptance path (bit-exact WAV);
-# streamed audio is validated by ASR/WER instead (prefix decodes are not
-# bit-identical to the one-shot decode of the final stack).
+# The default is the FAST profile (TTFP 1.47 s / RTF 0.33 on the 196-frame
+# fixture, 1x H100): bf16 + CUDA-graph thinker, CUDA-graph EAR-TTS talker
+# step, and incremental codec decode. Every fast setting is marked with a
+# "PARITY:" comment; apply those edits for the eager fp32 reference
+# execution. Streamed audio is validated by ASR/WER, not bit parity (prefix
+# decodes are not bit-identical to the one-shot decode of the final stack).
 pipeline: nemotron_voicechat
 async_chunk: true
 
@@ -21,19 +24,25 @@ connectors:
     extra:
       shm_threshold_bytes: 65536
       # Streaming cadence for talker -> code2wav: emit a chunk once this many
-      # NEW frames (80 ms each) have accumulated; ~1 s of audio per chunk.
-      codec_chunk_frames: 13
+      # NEW frames (80 ms each) have accumulated (5 frames = 0.4 s of audio).
+      # Small chunks are cheap because the incremental codec cache decodes
+      # only each chunk's new frames; on the 196-frame fixture 5-frame chunks
+      # cut TTFP by ~0.4 s vs 13-frame chunks at unchanged total time.
+      # PARITY: 13 (~1 s per chunk) was the reference cadence.
+      codec_chunk_frames: 5
 
 stages:
   - stage_id: 0  # thinker: speech -> frame-locked text (final text output)
     max_num_seqs: 1
     gpu_memory_utilization: 0.62
-    enforce_eager: true
+    # PARITY: set enforce_eager: true and dtype: float32 for the fp32
+    # reference thinker (greedy text can legitimately diverge under bf16).
+    enforce_eager: false
     enable_prefix_caching: false
     async_scheduling: false
     max_num_batched_tokens: 8192
     max_model_len: 8192
-    dtype: float32
+    dtype: bfloat16
     mamba_ssm_cache_dtype: float32
     devices: "0"
     output_connectors:
@@ -54,6 +63,12 @@ stages:
     max_model_len: 16384
     dtype: float32
     devices: "0"
+    hf_overrides:
+      # Capture the vendored per-frame EAR-TTS step (backbone + MoG, CFG
+      # batch layout) into CUDA graphs (~3x per-frame). PARITY: delete this
+      # block for the eager reference step (bit-exact vs NeMo).
+      use_talker_cuda_graphs: true
+      talker_graph_max_cache_len: 4096
     input_connectors:
       from_stage_0: connector_of_shared_memory
     output_connectors:
@@ -75,6 +90,12 @@ stages:
     max_num_batched_tokens: 65536
     max_model_len: 65536
     devices: "0"
+    hf_overrides:
+      # Decode only each chunk's NEW frames with a per-request causal-conv
+      # cache (NVIDIA's S2S_USE_CODEC_CACHE path) instead of re-decoding the
+      # cumulative prefix per chunk (O(T^2) in the reply length).
+      # PARITY: delete this block for the prefix re-decode reference.
+      use_incremental_codec_cache: true
     input_connectors:
       from_stage_1: connector_of_shared_memory
     default_sampling_params:
