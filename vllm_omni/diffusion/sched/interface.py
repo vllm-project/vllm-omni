@@ -12,6 +12,8 @@ from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+
     from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 
 
@@ -72,6 +74,15 @@ class StepBatchSamplingParamsKey:
     # Request-scoped execution policy. A batch must use one quality mode
     # because model acceleration hooks are shared by the whole worker batch.
     quality: str | None = None
+
+    # Step-mode engines can admit a model-specific full-forward fallback. Do
+    # not mix it with state-driven denoising in one scheduler wave.
+    use_step_execution: bool = True
+
+    # Pipeline-specific structure populated during preprocessing. This keeps
+    # model-owned settings that must be homogeneous (for example BAGEL CFG
+    # scales and renormalization) out of the generic sampling-params schema.
+    condition_key: tuple[Any, ...] | None = None
 
     # Output count. Requests with different num_outputs_per_prompt produce
     # differently shaped outputs and cannot share a batch.
@@ -242,6 +253,9 @@ class DiffusionSchedulerOutput:
     num_waiting_reqs: int
     # next request to background-prefetch KV
     kv_prefetch_job: KVPrefetchJob | None = None
+    # Opaque metadata emitted by a future Scheduler-role connector. PR0 keeps
+    # the input port but does not build or consume it.
+    kv_connector_metadata: KVConnectorMetadata | None = None
 
     @cached_property
     def scheduled_request_ids(self) -> list[str]:

@@ -26,6 +26,7 @@ from vllm_omni.config.yaml_util import create_config, load_yaml_config
 from vllm_omni.diffusion.utils.hf_utils import (
     _looks_like_dreamzero,
     get_diffusion_model_index,
+    resolve_native_diffusion_model_class,
 )
 from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.inputs.data import OmniSamplingParams
@@ -294,7 +295,10 @@ def resolve_model_config_path(model: str) -> str | None:
         model_type = hf_config.model_type
     except (ValueError, Exception):
         # If standard transformers format fails, try diffusers format
-        if get_diffusion_model_index(config_source) is not None:
+        native_model_class = resolve_native_diffusion_model_class(config_source)
+        if native_model_class is not None:
+            model_type = native_model_class
+        elif get_diffusion_model_index(config_source) is not None:
             model_type = _try_get_class_name_from_diffusers_config(config_source)
             if model_type is None:
                 raise ValueError(
@@ -544,17 +548,62 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
     ``value`` may be a raw JSON string (as supplied on the CLI) or an
     already-parsed mapping. Returns ``None`` when no overrides are given.
 
+    Only the **shape** of the override mapping is validated here:
+
+    - top-level must be a dict
+    - keys must be non-negative ASCII integer strings (stage ids)
+    - values must be dicts
+
+    Field-name / type / range validation is intentionally not done at this
+    layer. The downstream resolver forwards every surviving key as
+    ``stage_<id>_<key>`` into ``cli_overrides`` (see
+    ``load_stage_configs_from_model``); field semantics live in
+    ``StageConfigFactory`` for registered pipelines, and the
+    default-diffusion fallback in ``async_omni_engine.py`` reads
+    ``stage_zero_overrides["extras"]`` for unregistered ones. Unknown
+    engine-arg keys that don't match ``OmniEngineArgs`` are dropped with
+    a warning at ``filter_dataclass_kwargs`` rather than failing here,
+    so a typo surfaces in the log instead of being silently lost.
+
     Raises:
-        ValueError: when ``value`` is a string that is not valid JSON.
+        ValueError: when ``value`` is not a valid per-stage override
+            mapping (invalid JSON, non-dict top level, non-ASCII-digit
+            stage id, non-dict value).
     """
     if not value:
         return None
     if isinstance(value, str):
         try:
-            return json.loads(value)
+            parsed = json.loads(value)
         except json.JSONDecodeError as exc:
             raise ValueError(f"--stage-overrides is not valid JSON: {exc}. Got: {value!r}") from exc
-    return value
+    else:
+        parsed = value
+
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"--stage-overrides must be a JSON object mapping stage_id -> overrides, "
+            f"got {type(parsed).__name__}: {parsed!r}"
+        )
+    if not parsed:
+        return None
+
+    for stage_id_str, overrides in parsed.items():
+        # ``str.isdigit()`` accepts Unicode digit classes (e.g. fullwidth
+        # ``"０"``); downstream's ``_STAGE_OVERRIDE_PATTERN`` is ASCII-only
+        # (``^stage_(\d+)_(.+)$``), so a non-ASCII-digit key would parse
+        # here and silently misroute as a global key. ``isascii()`` closes
+        # that hole.
+        if not isinstance(stage_id_str, str) or not stage_id_str.isdigit() or not stage_id_str.isascii():
+            raise ValueError(
+                f"--stage-overrides keys must be non-negative integer stage ids (as strings), got {stage_id_str!r}"
+            )
+        if not isinstance(overrides, dict):
+            raise ValueError(
+                f"--stage-overrides[{stage_id_str!r}] must be an object, got {type(overrides).__name__}: {overrides!r}"
+            )
+
+    return parsed
 
 
 def load_and_resolve_stage_configs(
@@ -721,6 +770,11 @@ def filter_dataclass_kwargs(cls: Any, kwargs: dict) -> dict:
     filtered_kwargs = {}
     for k, v in kwargs.items():
         if k not in valid_fields:
+            logger.warning(
+                "Dropping unknown %s field %r (not declared on the dataclass)",
+                cls.__name__,
+                k,
+            )
             continue
         field = valid_fields[k]
         filtered_kwargs[k] = _filter_value(v, field.type)

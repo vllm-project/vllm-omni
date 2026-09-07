@@ -392,52 +392,31 @@ def test_encode_audio_skips_unshard_reshard_when_not_fsdp():
     assert "audio_emb" in result
 
 
-def test_s2v_pipeline_skips_cpu_offload_when_hsdp_enabled():
-    """Test that transformer.to('cpu') is NOT called when HSDP is active."""
-    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v import Wan22S2VPipeline
-
+@pytest.mark.parametrize(
+    ("components", "use_hsdp", "expected"),
+    [
+        (None, False, True),
+        (["dit"], False, True),
+        (["text_encoder"], False, False),
+        (["dit"], True, False),
+    ],
+)
+def test_s2v_dit_release_honors_component_selection(components, use_hsdp, expected):
     pipeline = object.__new__(Wan22S2VPipeline)
     nn.Module.__init__(pipeline)
+    compact = None if components is None else {"mode": "module", "components": components}
+    pipeline.od_config = SimpleNamespace(
+        diffusion_offload_config=compact,
+        enable_cpu_offload=True,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=False,
+        dlo_use_allgather=True,
+        dlo_resident_layers=0,
+        pin_cpu_memory=True,
+        parallel_config=SimpleNamespace(use_hsdp=use_hsdp),
+    )
 
-    od_config = MagicMock()
-    od_config.enable_cpu_offload = True
-    parallel_config = MagicMock()
-    parallel_config.use_hsdp = True
-    od_config.parallel_config = parallel_config
-    pipeline.od_config = od_config
-
-    mock_transformer = MagicMock()
-    pipeline.transformer = mock_transformer
-
-    # Simulate the offload decision from the forward loop
-    if pipeline.od_config.enable_cpu_offload and not getattr(pipeline.od_config.parallel_config, "use_hsdp", False):
-        pipeline.transformer.to("cpu")
-
-    mock_transformer.to.assert_not_called()
-
-
-def test_s2v_pipeline_allows_cpu_offload_when_hsdp_disabled():
-    """Test that transformer.to('cpu') IS called when HSDP is not active."""
-    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v import Wan22S2VPipeline
-
-    pipeline = object.__new__(Wan22S2VPipeline)
-    nn.Module.__init__(pipeline)
-
-    od_config = MagicMock()
-    od_config.enable_cpu_offload = True
-    parallel_config = MagicMock()
-    parallel_config.use_hsdp = False
-    od_config.parallel_config = parallel_config
-    pipeline.od_config = od_config
-
-    mock_transformer = MagicMock()
-    pipeline.transformer = mock_transformer
-
-    # Simulate the offload decision from the forward loop
-    if pipeline.od_config.enable_cpu_offload and not getattr(pipeline.od_config.parallel_config, "use_hsdp", False):
-        pipeline.transformer.to("cpu")
-
-    mock_transformer.to.assert_called_once_with("cpu")
+    assert pipeline._should_release_dit_before_decode() is expected
 
 
 def test_s2v_pipeline_hsdp_forward_complete_process():

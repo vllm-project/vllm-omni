@@ -22,7 +22,7 @@ Future work: read ``llm_config.json`` during ``from_pretrained`` so a
 checkpoint with a different LM shape works without editing this file.
 
 Upstream reference:
-  https://huggingface.co/rednote-hilab/dots.tts-soar/blob/main/llm_config.json
+  https://huggingface.co/dots-studio/dots.tts-soar/blob/main/llm_config.json
 """
 
 from __future__ import annotations

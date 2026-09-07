@@ -1,0 +1,41 @@
+# LingBot-World 2.0 stepwise deploy: single diffusion stage for WS /v1/realtime/video.
+#
+# One AsyncOmni request is one rollout: prepare_encode runs once, then every
+# four DMD steps stream one AR block. Step execution keeps AR-Diffusion paged KV
+# on ARDiffusionModelRunner, so this stage must stay at max_num_seqs=1.
+#
+# The cache geometry is fixed at load time, so ar_diffusion_height/width must
+# match the height/width a client asks for.
+
+pipeline: lingbot_world
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: LingBotWorldCausalDMDPipeline
+    # LingBot runs on the AR-Diffusion engine (engine-level paged KV cache).
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    # One request, many streamed chunks. streaming_output implies step_execution,
+    # but both are stated here so the topology is readable on its own.
+    step_execution: true
+    streaming_output: true
+    # num_inference_steps is for the step scheduler, not the pipeline: it sizes a
+    # request's step budget before the pipeline is reached, so a served request
+    # does not have to carry it. The pipeline itself pins the causal-fast
+    # checkpoint's four-step DMD schedule and rejects any other count.
+    default_sampling_params:
+      num_inference_steps: 4
+      output_type: pil
+      extra_args:
+        flow_shift: 5.0
+    model_config:
+      ar_diffusion_height: 480
+      ar_diffusion_width: 832
+      ar_diffusion_kv_config:
+        gpu_memory_fraction: 0.6
+        warmup_cudagraph: true

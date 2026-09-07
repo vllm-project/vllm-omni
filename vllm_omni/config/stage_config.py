@@ -7,7 +7,7 @@ from __future__ import annotations
 import functools
 import re
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
@@ -159,6 +159,28 @@ def _apply_diffusion_parallel_runtime_overrides(
 
     if parallel_config_dict is not None:
         engine_args["parallel_config"] = parallel_config_dict
+
+
+def reconcile_diffusion_attention_overrides(
+    engine_args: dict[str, Any],
+    runtime_overrides: Mapping[str, Any],
+) -> None:
+    """Apply CLI precedence across the two diffusion attention representations.
+
+    ``diffusion_attention_backend`` and ``diffusion_attention_config.default``
+    express the same setting and are rejected downstream when both are set, so
+    a CLI value in one form replaces the YAML value in the other.
+    """
+    if runtime_overrides.get("diffusion_attention_backend") is not None:
+        yaml_config = engine_args.get("diffusion_attention_config")
+        if isinstance(yaml_config, Mapping) and yaml_config.get("default") is not None:
+            remaining = {k: v for k, v in yaml_config.items() if k != "default"}
+            if remaining:
+                engine_args["diffusion_attention_config"] = remaining
+            else:
+                engine_args.pop("diffusion_attention_config")
+    if runtime_overrides.get("diffusion_attention_config") is not None:
+        engine_args.pop("diffusion_attention_backend", None)
 
 
 class StageType(str, Enum):
@@ -450,6 +472,9 @@ class StageDeployConfig:
     # Runtime optimizations used by diffusion loading/execution.
     enable_multithread_weight_load: bool | None = None
     num_weight_load_threads: int | None = None
+    diffusion_offload_config: dict[str, Any] | None = None
+    # Compatibility aliases for existing callers and model-specific stage
+    # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool | None = None
     enable_layerwise_offload: bool | None = None
 
@@ -484,6 +509,11 @@ class DuplexSessionRuntimeConfig:
     max_pending_turns_per_session: int = 4
     max_sessions: int = 1
     completed_append_cache_size: int = 256
+    # Startup warmup: run this many silent 80 ms-style frames through a
+    # throwaway realtime session before real clients are admitted, so
+    # one-time costs (kernel JIT, first prefill/decode paths, codec caches)
+    # never land on the first user. 0 disables the warmup.
+    warmup_frames: int = 0
 
     def __post_init__(self) -> None:
         positive = {
@@ -1092,6 +1122,7 @@ class StageConfig:
 
         if StageType(self.stage_type) == StageType.DIFFUSION:
             _apply_diffusion_parallel_runtime_overrides(engine_args, runtime_overrides)
+            reconcile_diffusion_attention_overrides(engine_args, runtime_overrides)
 
         # CLI overrides take precedence over YAML defaults
         for key, value in runtime_overrides.items():

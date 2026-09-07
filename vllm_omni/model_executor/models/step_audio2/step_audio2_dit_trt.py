@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """TensorRT acceleration for the Step-Audio2 / CosyVoice2 flow DiT estimator.
 
 Ports stepfun-ai/Step-Audio2#70 into vLLM-Omni. The upstream PR patches
@@ -24,8 +24,13 @@ Differences from the upstream PR:
 
 from __future__ import annotations
 
+import contextlib
 import os
+import stat
+import uuid
+from collections.abc import Callable
 from pathlib import Path
+from typing import BinaryIO
 
 import torch
 import torch.nn as nn
@@ -34,6 +39,52 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _TRT_CACHE_ENV = "MINICPMO_TOKEN2WAV_TRT_CACHE"
+
+
+def _publish_atomically(
+    path: Path,
+    writer: Callable[[Path, BinaryIO], None],
+    *,
+    requires_path_write: bool = False,
+) -> None:
+    """Publish an artifact through an exclusively owned same-directory temp."""
+    temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    stream = temporary.open("xb")
+    published = False
+    try:
+        original_mode: int | None = None
+        mode_adjusted = False
+        write_completed = False
+        try:
+            if requires_path_write:
+                original_mode = stat.S_IMODE(os.fstat(stream.fileno()).st_mode)
+                mode_adjusted = not original_mode & stat.S_IWUSR
+                if mode_adjusted:
+                    os.fchmod(stream.fileno(), original_mode | stat.S_IWUSR)
+            writer(temporary, stream)
+            stream.flush()
+            if mode_adjusted:
+                os.fchmod(stream.fileno(), original_mode)
+            write_completed = True
+        finally:
+            if not stream.closed:
+                if not write_completed and mode_adjusted and original_mode is not None:
+                    with contextlib.suppress(OSError):
+                        os.fchmod(stream.fileno(), original_mode)
+                if write_completed:
+                    stream.close()
+                else:
+                    with contextlib.suppress(OSError):
+                        stream.close()
+        os.replace(temporary, path)
+        published = True
+    finally:
+        if not published:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                with contextlib.suppress(Exception):
+                    logger.warning("Failed to remove temporary StepAudio2 build artifact %s", temporary, exc_info=True)
 
 
 class _DiTChunkWrapper(nn.Module):
@@ -131,24 +182,22 @@ def export_dit_chunk_onnx(
     logger.info("Exporting DiT chunk ONNX to %s", onnx_path)
     onnx_path = Path(onnx_path)
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
-    # Process-unique temp name + atomic rename, so concurrent first builds on
-    # a shared cache dir never see (or clobber) a partially written file.
-    tmp = onnx_path.with_suffix(f".tmp.{os.getpid()}")
-    try:
+
+    def write_onnx(temporary: Path, stream: BinaryIO) -> None:
+        del stream
         with torch.no_grad():
             torch.onnx.export(
                 wrapper,
                 sample,
-                str(tmp),
+                str(temporary),
                 input_names=input_names,
                 output_names=output_names,
                 dynamic_axes=dynamic_axes,
                 opset_version=17,
                 dynamo=False,
             )
-        os.replace(tmp, onnx_path)
-    finally:
-        tmp.unlink(missing_ok=True)
+
+    _publish_atomically(onnx_path, write_onnx, requires_path_write=True)
 
 
 def convert_onnx_to_trt(
@@ -212,16 +261,12 @@ def convert_onnx_to_trt(
         raise RuntimeError("TensorRT engine build failed")
     plan_path = Path(plan_path)
     plan_path.parent.mkdir(parents=True, exist_ok=True)
-    # Process-unique temp name: concurrent first builds (multiple ranks on a
-    # shared cache dir) must not clobber each other's partial writes; the
-    # final os.replace stays atomic and last-writer-wins with equal content.
-    tmp = plan_path.with_suffix(f".tmp.{os.getpid()}")
-    try:
-        with open(tmp, "wb") as f:
-            f.write(engine_bytes)
-        os.replace(tmp, plan_path)
-    finally:
-        tmp.unlink(missing_ok=True)
+
+    def write_plan(temporary: Path, stream: BinaryIO) -> None:
+        del temporary
+        stream.write(engine_bytes)
+
+    _publish_atomically(plan_path, write_plan)
     logger.info("DiT TRT engine written to %s", plan_path)
 
 
