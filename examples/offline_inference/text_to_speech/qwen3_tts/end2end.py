@@ -6,6 +6,7 @@ tasks, then runs Omni generation and saves output wav files.
 
 import asyncio
 import logging
+import math
 import os
 import time
 from typing import Any, NamedTuple
@@ -26,6 +27,68 @@ class QueryResult(NamedTuple):
 
     inputs: dict
     model_name: str
+
+
+def _load_codec_frame_rate(model_name: str) -> float | None:
+    try:
+        import json
+
+        from transformers.utils import cached_file
+
+        st_config_path = os.path.join(model_name, "speech_tokenizer", "config.json")
+        if not os.path.exists(st_config_path):
+            st_config_path = cached_file(model_name, "speech_tokenizer/config.json")
+
+        if st_config_path and os.path.exists(st_config_path):
+            with open(st_config_path) as f:
+                st_config = json.load(f)
+
+            output_sr = st_config.get("output_sample_rate")
+            downsample = st_config.get("encode_downsample_rate")
+            if output_sr and downsample and downsample > 0:
+                return float(output_sr) / float(downsample)
+    except Exception as e:
+        logger.warning("Failed to load codec frame rate: %s", e)
+
+    return None
+
+
+def _resolve_ref_audio(ref_audio: object) -> tuple[Any, int] | None:
+    item = ref_audio
+    while isinstance(item, list) and item:
+        if len(item) == 2 and isinstance(item[1], (int, float)):
+            break
+        item = item[0]
+
+    if isinstance(item, (list, tuple)) and len(item) == 2:
+        wav, sr = item
+        return wav, int(sr)
+
+    if not isinstance(item, str) or not item.strip():
+        return None
+
+    try:
+        from urllib.parse import urlparse
+
+        def _is_url(path: str) -> bool:
+            parsed = urlparse(path)
+            if parsed.scheme in ("http", "https"):
+                return bool(parsed.netloc)
+            return parsed.scheme in ("file", "data")
+
+        if _is_url(item):
+            from vllm.multimodal.media import MediaConnector
+
+            connector = MediaConnector(allowed_local_media_path="/")
+            wav, sr = connector.fetch_audio(item)
+        else:
+            from vllm.multimodal.media.audio import load_audio
+
+            wav, sr = load_audio(item, sr=None, mono=True)
+
+        return wav, int(sr)
+    except Exception:
+        return None
 
 
 def _estimate_prompt_len(
@@ -51,74 +114,42 @@ def _estimate_prompt_len(
             tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side="left")
             cfg = Qwen3TTSConfig.from_pretrained(model_name, trust_remote_code=True)
 
-            # Load speech tokenizer (codec encoder) for exact ref_code_len.
-            speech_tok = None
-            try:
-                import os
+            codec_frame_rate = _load_codec_frame_rate(model_name)
+            _cache[model_name] = (tok, getattr(cfg, "talker_config", None), codec_frame_rate)
 
-                from transformers.utils import cached_file
-
-                from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_tokenizer import Qwen3TTSTokenizer
-
-                st_cfg_path = cached_file(model_name, "speech_tokenizer/config.json")
-                if st_cfg_path:
-                    speech_tok = Qwen3TTSTokenizer.from_pretrained(
-                        os.path.dirname(st_cfg_path), torch_dtype=torch.bfloat16
-                    )
-                    logger.info("Loaded speech tokenizer for exact ref_code_len estimation")
-            except Exception as e:
-                logger.debug("Could not load speech tokenizer: %s", e)
-
-            _cache[model_name] = (tok, getattr(cfg, "talker_config", None), speech_tok)
-
-        tok, tcfg, speech_tok = _cache[model_name]
+        tok, tcfg, codec_frame_rate = _cache[model_name]
         task_type = (additional_information.get("task_type") or ["CustomVoice"])[0]
 
         def _estimate_ref_code_len(ref_audio: object) -> int | None:
-            """Encode ref_audio with the actual codec to get exact frame count."""
-            if not isinstance(ref_audio, (str, list)):
-                return None
-            audio_path = ref_audio[0] if isinstance(ref_audio, list) else ref_audio
-            if not isinstance(audio_path, str) or not audio_path.strip():
+            """Estimate ref_code length from ref_audio waveform without running the codec.
+
+            The codec produces one frame per (output_sample_rate / encode_downsample_rate)
+            audio samples, so ref_code_len = ceil(duration_seconds * codec_frame_rate).
+            """
+            if codec_frame_rate is None:
                 return None
             try:
-                from urllib.parse import urlparse
-
-                import numpy as np
-
-                def _is_url(path: str) -> bool:
-                    try:
-                        parsed = urlparse(path)
-                        if parsed.scheme in ("http", "https"):
-                            return bool(parsed.netloc)
-                        return parsed.scheme in ("file", "data")
-                    except Exception:
-                        return False
-
-                if _is_url(audio_path):
-                    from vllm.multimodal.media import MediaConnector
-
-                    connector = MediaConnector(allowed_local_media_path="/")
-                    audio, sr = connector.fetch_audio(audio_path)
+                # ref_audio comes from tts_params as [[wav_array, sr]] or similar nested structure
+                item = _resolve_ref_audio(ref_audio)
+                if item is None:
+                    return None
+                wav, sr = item
+                sr = int(sr)
+                if hasattr(wav, "shape"):
+                    shape = wav.shape
+                    if len(shape) == 1:
+                        n_samples = int(shape[0])
+                    else:
+                        # Using max(shape) to handle multichannel audio as deliberate hardening over online path
+                        n_samples = int(max(shape))
+                elif hasattr(wav, "__len__"):
+                    n_samples = len(wav)
                 else:
-                    from vllm.multimodal.media.audio import load_audio
-
-                    audio, sr = load_audio(audio_path, sr=None, mono=True)
-
-                wav_np = np.asarray(audio, dtype=np.float32)
-
-                if speech_tok is not None:
-                    enc = speech_tok.encode(wav_np, sr=int(sr), return_dict=True)
-                    ref_code = getattr(enc, "audio_codes", None)
-                    if isinstance(ref_code, list):
-                        ref_code = ref_code[0] if ref_code else None
-                    if ref_code is not None and hasattr(ref_code, "shape"):
-                        shape = ref_code.shape
-                        return int(shape[0]) if len(shape) == 2 else int(shape[1]) if len(shape) == 3 else None
-
-                # Fallback: estimate from duration
-                codec_hz = getattr(tcfg, "codec_frame_rate", None) or 12
-                return int(len(audio) / sr * codec_hz)
+                    return None
+                if sr <= 0 or n_samples <= 0:
+                    return None
+                duration = n_samples / sr
+                return math.ceil(duration * codec_frame_rate)
             except Exception:
                 return None
 
