@@ -1268,6 +1268,17 @@ class AsyncOmniEngine:
         strategy_config_path = kwargs.pop("strategy_config", None)
         stage_overrides_json = kwargs.pop("stage_overrides", None)
 
+        # ``diffusion_streaming_output`` is the public AsyncOmni/serve kwarg;
+        # stage configs know the field as ``streaming_output``. The unregistered
+        # single-stage fallback translates it in
+        # ``_create_default_diffusion_stage_cfg``, but a registered pipeline
+        # resolves through StageConfigFactory, which only passes through keys the
+        # stage schema recognizes — so mirror the translation here. Only a truthy
+        # value is mirrored: the serve CLI always carries the flag's ``False``
+        # default, which must not override a deploy YAML's ``streaming_output``.
+        if kwargs.get("diffusion_streaming_output") and kwargs.get("streaming_output") is None:
+            kwargs["streaming_output"] = True
+
         # Parse --stage-overrides JSON string if provided
         stage_overrides = parse_stage_overrides(stage_overrides_json)
 
