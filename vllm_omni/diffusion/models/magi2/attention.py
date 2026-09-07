@@ -22,9 +22,11 @@ import torch.nn as nn
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.utils.fa import (
+    flash_attn_3_varlen,
     resolve_vllm_flash_attn_version,
     vllm_flash_attn_varlen_with_lse,
 )
+from vllm_omni.platforms import current_omni_platform
 
 from .parallel import (
     Magi2ParallelGroup,
@@ -44,6 +46,40 @@ def _resolve_flash_attn_version() -> int:
     version = resolve_vllm_flash_attn_version(requested)
     logger.info("MAGI-2 selected FlashAttention %d", version)
     return version
+
+
+def _magi2_mate_flash_attn_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softcap: float,
+    sink: torch.Tensor | None,
+) -> torch.Tensor | None:
+    if os.environ.get("MAGI2_USE_MATE_FA", "1") != "1":
+        return None
+    if sink is not None and sink.shape[0] != 1:
+        logger.warning("FlashAttention-3 sink adapter supports one sink token; using Torch fallback")
+        return None
+    sinks = None if sink is None else sink[0].to(device=q.device, dtype=q.dtype).contiguous()
+    return flash_attn_3_varlen(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=q.shape[-1] ** -0.5,
+        causal=False,
+        softcap=max(0.0, softcap),
+        sinks=sinks,
+        deterministic=os.environ.get("MAGI2_DETERMINISTIC", "0") == "1",
+    )
 
 
 @dataclass(frozen=True)
@@ -93,6 +129,22 @@ def apply_rotary_emb(
     rotary_dim = cos.shape[-1] * 2
     if rotary_dim > x.shape[-1]:
         raise ValueError(f"RoPE dimension {rotary_dim} exceeds head dimension {x.shape[-1]}")
+    # MAGI-2 uses the released non-interleaved layout.  Avoid materializing
+    # duplicated cosine/sine tables and the temporary rotate_half tensor on
+    # MUSA; the arithmetic order remains the same pairwise rotation.
+    if (
+        not interleaved
+        # This pairwise MUSA path is numerically equivalent and is the
+        # validated performance default; set MAGI2_FAST_ROPE=0 to roll back.
+        and os.environ.get("MAGI2_FAST_ROPE", "1") == "1"
+        and x.device.type in {"musa", "privateuseone"}
+    ):
+        cos = cos.to(dtype=x.dtype).unsqueeze(-2)
+        sin = sin.to(dtype=x.dtype).unsqueeze(-2)
+        x_rot = x[..., :rotary_dim]
+        x1, x2 = x_rot.chunk(2, dim=-1)
+        rotated = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+        return torch.cat((rotated, x[..., rotary_dim:]), dim=-1)
     if interleaved:
         cos = cos.unsqueeze(-2).repeat_interleave(2, dim=-1)
         sin = sin.unsqueeze(-2).repeat_interleave(2, dim=-1)
@@ -160,21 +212,34 @@ def torch_varlen_attention_with_sink(
         raise ValueError("query and key cumulative-length arrays must contain the same batch count")
     output = torch.empty_like(q)
     scale = q.shape[-1] ** -0.5
+    # Materializing a full [heads, q_tokens, k_tokens] score tensor is
+    # prohibitive for MAGI-2 at 272p/540p on the MUSA Torch fallback. Process
+    # query rows in chunks instead; each row's softmax is independent, so this
+    # is numerically equivalent up to the reduction order. Tune for available
+    # workspace with MAGI2_TORCH_ATTN_Q_CHUNK (512 is a conservative default).
+    try:
+        q_chunk_size = max(1, int(os.environ.get("MAGI2_TORCH_ATTN_Q_CHUNK", "512")))
+    except ValueError:
+        q_chunk_size = 512
     for batch_idx in range(cu_seqlens_q.numel() - 1):
         q_start, q_end = (int(v) for v in cu_seqlens_q[batch_idx : batch_idx + 2].tolist())
         k_start, k_end = (int(v) for v in cu_seqlens_k[batch_idx : batch_idx + 2].tolist())
         q_part = q[q_start:q_end].float()
         k_part = _repeat_kv_heads(k[k_start:k_end], q.shape[1]).float()
         v_part = _repeat_kv_heads(v[k_start:k_end], q.shape[1]).float()
-        scores = torch.einsum("qhd,khd->hqk", q_part, k_part) * scale
-        if softcap > 0:
-            scores = softcap * torch.tanh(scores / softcap)
-        if sink is not None and sink.numel() > 0:
-            sink_scores = sink.float().transpose(0, 1).unsqueeze(1).expand(-1, q_part.shape[0], -1)
-            probabilities = torch.softmax(torch.cat((scores, sink_scores), dim=-1), dim=-1)[..., : k_part.shape[0]]
-        else:
-            probabilities = torch.softmax(scores, dim=-1)
-        output[q_start:q_end] = torch.einsum("hqk,khd->qhd", probabilities, v_part).to(output.dtype)
+        for q_offset in range(0, q_part.shape[0], q_chunk_size):
+            q_chunk = q_part[q_offset : q_offset + q_chunk_size]
+            scores = torch.einsum("qhd,khd->hqk", q_chunk, k_part) * scale
+            if softcap > 0:
+                scores = softcap * torch.tanh(scores / softcap)
+            if sink is not None and sink.numel() > 0:
+                sink_scores = sink.float().transpose(0, 1).unsqueeze(1).expand(-1, q_chunk.shape[0], -1)
+                probabilities = torch.softmax(torch.cat((scores, sink_scores), dim=-1), dim=-1)[..., : k_part.shape[0]]
+            else:
+                probabilities = torch.softmax(scores, dim=-1)
+            output[q_start + q_offset : q_start + q_offset + q_chunk.shape[0]] = torch.einsum(
+                "hqk,khd->qhd", probabilities, v_part
+            ).to(output.dtype)
     return output
 
 
@@ -192,7 +257,10 @@ def packed_attention_with_sink(
     cu_q, cu_k, max_q, max_k = varlen.resolved(q.shape[0], k.shape[0])
     cu_q = cu_q.to(device=q.device, dtype=torch.int32).contiguous()
     cu_k = cu_k.to(device=q.device, dtype=torch.int32).contiguous()
-    if q.is_cuda:
+    # The bundled vLLM FlashAttention extension is CUDA-only. MUSA keeps the
+    # exact Torch reference path until a MATE/FA3 adapter is explicitly
+    # selected and validated on the target runtime.
+    if current_omni_platform.is_cuda() and q.device.type == "cuda":
         out, lse = vllm_flash_attn_varlen_with_lse(
             q,
             k,
@@ -206,6 +274,25 @@ def packed_attention_with_sink(
             fa_version=_resolve_flash_attn_version(),
         )
         return correct_out_lse_with_sink(out, lse, sink)[0]
+    is_musa_tensor = bool(getattr(q, "is_musa", False)) or q.device.type == "musa"
+    if current_omni_platform.is_musa() and is_musa_tensor:
+        try:
+            mate_out = _magi2_mate_flash_attn_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_k,
+                max_seqlen_q=max_q,
+                max_seqlen_k=max_k,
+                softcap=softcap,
+                sink=sink,
+            )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            logger.warning("MATE MAGI-2 attention failed; falling back to chunked Torch attention: %s", exc)
+            mate_out = None
+        if mate_out is not None:
+            return mate_out
     return torch_varlen_attention_with_sink(
         q,
         k,

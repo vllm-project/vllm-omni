@@ -151,6 +151,77 @@ class Magi2PreviewSampler(CFGParallelMixin):
         return self.forward(model_input)
 
     @torch.inference_mode()
+    def denoise_step(
+        self,
+        *,
+        sampler_input: SamplerInput,
+        latent: torch.Tensor,
+        audio_latent: torch.Tensor,
+        timestep: torch.Tensor,
+        video_cfg: float,
+        audio_cfg: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Execute exactly one joint video/audio denoising step.
+
+        Keeping the loop body in a named method gives the diffusion pipeline
+        profiler a real per-step boundary.  The returned tensors are the next
+        scheduler states, and no model placement is changed here.
+        """
+        model_input = self.prepare_model_input(
+            latent=latent,
+            audio_latent=audio_latent,
+            txt_feat=sampler_input.txt_feat,
+            null_txt_feat=sampler_input.null_txt_feat,
+            ref_audio_feat=sampler_input.ref_audio_feat,
+            ref_video_feat=sampler_input.ref_video_feat,
+            ref_image_feat=sampler_input.ref_image_feat,
+            ref_image_feat_len=sampler_input.ref_image_feat_len,
+            ref_image_special_token_embedding=sampler_input.ref_image_special_token_embedding,
+            t=timestep,
+            cfg_config=sampler_input.cfg_config,
+        )
+        if get_classifier_free_guidance_world_size() > 1:
+            positive_input, negative_input = self._split_cfg_model_input(model_input)
+            guided = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=True,
+                true_cfg_scale=1.0,
+                positive_kwargs={"model_input": positive_input},
+                negative_kwargs={"model_input": negative_input},
+                cfg_normalize=False,
+                kwargs={
+                    "video_txt_guidance_scale": video_cfg,
+                    "audio_txt_guidance_scale": audio_cfg,
+                    "cfg_config": sampler_input.cfg_config,
+                    "latent": latent,
+                    "audio_latent": audio_latent,
+                },
+            )
+            if not isinstance(guided, tuple) or len(guided) != 2:
+                raise RuntimeError("MAGI-2 CFG parallel combine must return video and audio predictions")
+            return self._step_guided(
+                guided,
+                latent,
+                audio_latent,
+                sampler_input.video_scheduler,
+                sampler_input.audio_scheduler,
+                timestep,
+            )
+
+        model_pred = self.forward(model_input)
+        latent, audio_latent, _, _ = self.step(
+            model_pred,
+            latent,
+            audio_latent,
+            video_cfg,
+            audio_cfg,
+            sampler_input.video_scheduler,
+            sampler_input.audio_scheduler,
+            timestep,
+            cfg_config=sampler_input.cfg_config,
+        )
+        return latent, audio_latent
+
+    @torch.inference_mode()
     def sample(self, sampler_input: SamplerInput) -> tuple[torch.Tensor, torch.Tensor]:
         video_timesteps = list(sampler_input.video_t_list)
         audio_timesteps = list(sampler_input.audio_t_list)
@@ -174,58 +245,14 @@ class Magi2PreviewSampler(CFGParallelMixin):
             audio_cfgs,
             strict=True,
         ):
-            model_input = self.prepare_model_input(
+            latent, audio_latent = self.denoise_step(
+                sampler_input=sampler_input,
                 latent=latent,
                 audio_latent=audio_latent,
-                txt_feat=sampler_input.txt_feat,
-                null_txt_feat=sampler_input.null_txt_feat,
-                ref_audio_feat=sampler_input.ref_audio_feat,
-                ref_video_feat=sampler_input.ref_video_feat,
-                ref_image_feat=sampler_input.ref_image_feat,
-                ref_image_feat_len=sampler_input.ref_image_feat_len,
-                ref_image_special_token_embedding=(sampler_input.ref_image_special_token_embedding),
-                t=timestep,
-                cfg_config=sampler_input.cfg_config,
+                timestep=timestep,
+                video_cfg=video_cfg,
+                audio_cfg=audio_cfg,
             )
-            if get_classifier_free_guidance_world_size() > 1:
-                positive_input, negative_input = self._split_cfg_model_input(model_input)
-                guided = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=True,
-                    true_cfg_scale=1.0,
-                    positive_kwargs={"model_input": positive_input},
-                    negative_kwargs={"model_input": negative_input},
-                    cfg_normalize=False,
-                    kwargs={
-                        "video_txt_guidance_scale": video_cfg,
-                        "audio_txt_guidance_scale": audio_cfg,
-                        "cfg_config": sampler_input.cfg_config,
-                        "latent": latent,
-                        "audio_latent": audio_latent,
-                    },
-                )
-                if not isinstance(guided, tuple) or len(guided) != 2:
-                    raise RuntimeError("MAGI-2 CFG parallel combine must return video and audio predictions")
-                latent, audio_latent = self._step_guided(
-                    guided,
-                    latent,
-                    audio_latent,
-                    sampler_input.video_scheduler,
-                    sampler_input.audio_scheduler,
-                    timestep,
-                )
-            else:
-                model_pred = self.forward(model_input)
-                latent, audio_latent, _, _ = self.step(
-                    model_pred,
-                    latent,
-                    audio_latent,
-                    video_cfg,
-                    audio_cfg,
-                    sampler_input.video_scheduler,
-                    sampler_input.audio_scheduler,
-                    timestep,
-                    cfg_config=sampler_input.cfg_config,
-                )
 
         return latent, audio_latent
 
