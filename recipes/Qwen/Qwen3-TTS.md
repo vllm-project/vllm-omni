@@ -166,6 +166,7 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py --query-ty
 - Key flags: `--omni` is required. `--deploy-config` points to the bundled two-stage pipeline config.
 - Async chunking: Enabled by default in `qwen3_tts.yaml` for streaming-friendly first-audio latency. Raw audio streaming requires `stream=true`, `stream_format="audio"`, and `response_format="pcm"`.
 - Task/model matching: Each task type requires its matching model checkpoint. Using a CustomVoice model for a Base (voice clone) request will fail.
+- Stored voices: Uploaded and precomputed voices use the Base task and require a Base checkpoint. Built-in preset speakers remain CustomVoice voices.
 - Base codec termination: Base requests without an explicit `max_new_tokens`
   use a text-scaled safety ceiling (at least 192 codec frames and no more than
   the configured model limit). If the Talker reaches that ceiling without

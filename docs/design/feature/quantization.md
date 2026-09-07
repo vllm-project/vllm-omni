@@ -84,8 +84,8 @@ dictionary narrows this global scope through runtime layer-prefix routing.
 
 The factory uses Omni-specific overrides for methods whose diffusion behavior
 or platform dispatch is not provided by the vLLM registry. The current override
-set includes INT8, BitsAndBytes, MXFP8, MXFP4, MXFP4 dual-scale, and INC/
-AutoRound. Other methods, such as FP8, GGUF, and ModelOpt, are resolved through
+set includes INT8, BitsAndBytes, MXFP8, MXFP4, MXFP4 dual-scale, INC/AutoRound,
+and TorchAO. Other methods, such as FP8, GGUF, and ModelOpt, are resolved through
 vLLM's registry when their configuration is compatible.
 
 ## Per-component routing

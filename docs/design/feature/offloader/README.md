@@ -5,23 +5,27 @@ The three strategies have separate user and design pages:
 
 | Strategy | User guide | Design contract |
 | --- | --- | --- |
-| Model-level | [Guide](../../../user_guide/diffusion/offloader/cpu_offload.md) | [Design](cpu_offload.md) |
+| Model-level | [Guide](../../../user_guide/diffusion/offloader/module_offload.md) | [Design](module_offload.md) |
 | Layerwise | [Guide](../../../user_guide/diffusion/offloader/layerwise_offload.md) | [Design](layerwise_offload.md) |
 | Distributed layerwise | [Guide](../../../user_guide/diffusion/offloader/distributed_layerwise_offload.md) | [Design](distributed_layerwise_offload.md) |
 
 ## Strategy selection
 
 `OffloadConfig.from_od_config()` converts diffusion configuration into one
-`OffloadStrategy`. If callers set multiple flags, selection is deterministic:
+`OffloadStrategy`. The public config separates component selection from
+policy:
 
-1. `DISTRIBUTED_LAYERWISE`;
-2. `LAYERWISE`;
-3. `MODEL_LEVEL`; and
-4. `NONE`.
+- `mode="module"` selects model-level offload;
+- `mode="layer"` with rank-local transfers selects ordinary layerwise
+  offload; and
+- AllGather transfer or resident layers selects the distributed layerwise
+  backend that implements those capabilities.
 
-The factory logs when a higher-priority strategy disables another. It derives
-parallel and HSDP state from `DiffusionParallelConfig`; callers do not provide
-a separate offload group size.
+The compatibility boolean flags retain their historical priority (distributed
+layerwise, layerwise, then model-level). A compact config rejects a conflicting
+legacy strategy or non-default legacy DLO tuning. The factory derives parallel
+and HSDP state from `DiffusionParallelConfig`; callers do not provide a
+separate offload group size.
 
 `get_offload_backend()` then validates platform offload support, resolves the
 device, and creates exactly one backend. Returning `None` means offloading is
@@ -39,6 +43,11 @@ Every backend implements `OffloadBackend`:
 `disable()` does not promise to restore the pipeline's original device
 placement. The caller owns any subsequent rematerialization.
 
+An enable failure must remove every partially installed hook. Rank-local
+backends restore ordinary tensors so the pipeline can be retried. A failed
+multi-rank AllGather startup must not enter unmatched recovery collectives;
+that worker is safely discarded after local resource cleanup.
+
 Hooks are registered through `HookRegistry` and `ModelHook`; offload backends
 must use distinct hook names and remove only hooks they own.
 
@@ -55,13 +64,13 @@ Dotted paths are supported. Legacy pipelines may use the fallback scan of
 well-known attribute names, but new integrations should declare components
 explicitly.
 
-Ordinary layerwise offload obtains topology from declared
-`_layerwise_offload_blocks_attrs` (with a deprecated singular-name
-compatibility path). Distributed layerwise offload may instead use a pipeline
-`OffloadPlan`, then falls back to declared block attributes and its documented
-compatibility discovery. Discovery metadata describes structure only; the
-backend remains responsible for transfer, synchronization, and storage
-ownership.
+Both layerwise backends first consume pipeline `OffloadPlan` metadata. A
+plan's `block_attrs` maps each DiT path to its ordered block containers, while
+`encoder_block_attrs` declares streamable encoder stacks. DiTs absent from the
+plan fall back to `_layerwise_offload_blocks_attrs` (including the deprecated
+singular-name compatibility path). Discovery metadata describes structure
+only; the backend remains responsible for transfer, synchronization, and
+storage ownership.
 
 ## Cross-strategy invariants
 

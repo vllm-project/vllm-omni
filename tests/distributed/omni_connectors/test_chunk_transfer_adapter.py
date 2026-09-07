@@ -142,7 +142,7 @@ def test_streaming_prompt_rejects_invalid_generation_reserve(
         construct_next_stage_streaming_input_prompt(payload, request, max_model_len=4096)
 
 
-def test_capacity_managed_streaming_prompt_at_limit_still_appends(mocker: MockerFixture) -> None:
+def test_capacity_managed_streaming_window_at_limit_still_appends(mocker: MockerFixture) -> None:
     request = _streaming_request(mocker, num_computed_tokens=4060)
     payload = {
         "ids": {"prompt": [1]},
@@ -152,11 +152,51 @@ def test_capacity_managed_streaming_prompt_at_limit_still_appends(mocker: Mocker
         },
     }
 
-    replaced = construct_next_stage_streaming_input_prompt(payload, request, max_model_len=4096)
+    replaced = construct_next_stage_streaming_input_prompt(
+        payload,
+        request,
+        max_model_len=4096,
+        previous_condition_len=10,
+        previous_condition_seq=0,
+        condition_seq=1,
+        recompute_previous_chunks=1,
+        recompute_on_capacity=True,
+    )
 
     assert replaced is False
     assert request.num_computed_tokens == 4060
     assert request.num_prompt_tokens == 4070
+
+
+def test_capacity_managed_streaming_prompt_appends_from_declared_length_without_ids_prompt(
+    mocker: MockerFixture,
+) -> None:
+    request = _streaming_request(mocker, num_computed_tokens=20)
+    payload = {
+        "ids": {"tts": [1, 2, 3]},
+        "hidden_states": {"tts": [[0.1], [0.2], [0.3]]},
+        "meta": {
+            "next_stage_prompt_len": 4,
+            "next_stage_generation_tokens": 26,
+        },
+    }
+
+    replaced = construct_next_stage_streaming_input_prompt(
+        payload,
+        request,
+        max_model_len=4096,
+        previous_condition_len=4,
+        previous_condition_seq=0,
+        condition_seq=1,
+        recompute_previous_chunks=1,
+        recompute_on_capacity=True,
+    )
+
+    assert replaced is False
+    assert request.num_computed_tokens == 20
+    assert request.num_prompt_tokens == 24
+    assert request.prompt_token_ids == [0] * 24
+    request.update_block_hashes.assert_called_once_with()
 
 
 def test_streaming_window_builds_one_chunk_recompute_recipe(mocker: MockerFixture) -> None:
@@ -203,13 +243,41 @@ def test_streaming_window_builds_one_chunk_recompute_recipe(mocker: MockerFixtur
     request.update_block_hashes.assert_called_once_with()
 
 
-def test_streaming_window_recomputes_each_condition_without_accumulating(mocker: MockerFixture) -> None:
+def test_capacity_policy_turn_start_replacement_does_not_require_generation_reserve(
+    mocker: MockerFixture,
+) -> None:
+    request = _streaming_request(mocker, num_computed_tokens=4064)
+    payload = {
+        "ids": {"prompt": [1]},
+        "meta": {
+            "replace_streaming_prompt": True,
+            "next_stage_prompt_len": 10,
+        },
+    }
+
+    replaced = construct_next_stage_streaming_input_prompt(
+        payload,
+        request,
+        max_model_len=4096,
+        previous_condition_len=10,
+        previous_condition_seq=7,
+        condition_seq=8,
+        recompute_previous_chunks=1,
+        recompute_on_capacity=True,
+    )
+
+    assert replaced is True
+    assert request.num_computed_tokens == 0
+    assert request.num_prompt_tokens == 10
+
+
+def test_streaming_window_appends_until_capacity_then_recomputes(mocker: MockerFixture) -> None:
     request = SimpleNamespace(
-        _all_token_ids=[0] * 10 + [101, 102],
+        _all_token_ids=[0] * 4000 + [101, 102],
         _output_token_ids=[101, 102],
-        prompt_token_ids=[0] * 10,
-        num_computed_tokens=12,
-        num_prompt_tokens=10,
+        prompt_token_ids=[0] * 4000,
+        num_computed_tokens=4002,
+        num_prompt_tokens=4000,
         num_output_placeholders=0,
         update_block_hashes=mocker.Mock(),
     )
@@ -221,7 +289,7 @@ def test_streaming_window_recomputes_each_condition_without_accumulating(mocker:
         },
     }
 
-    assert construct_next_stage_streaming_input_prompt(
+    assert not construct_next_stage_streaming_input_prompt(
         second,
         request,
         max_model_len=4096,
@@ -229,17 +297,20 @@ def test_streaming_window_recomputes_each_condition_without_accumulating(mocker:
         previous_condition_seq=0,
         condition_seq=1,
         recompute_previous_chunks=1,
+        recompute_on_capacity=True,
     )
-    assert request.num_prompt_tokens == 24
-    assert second["ids"]["streaming_prompt_previous_codes"] == [101, 102]
+    assert request.num_computed_tokens == 4002
+    assert request.num_prompt_tokens == 4014
+    assert "streaming_prompt_previous_codes" not in second["ids"]
+    assert second["meta"]["streaming_prompt_recompute"] is False
 
     request._all_token_ids.extend([201, 202, 203])
     request._output_token_ids.extend([201, 202, 203])
-    request.num_computed_tokens = 27
+    request.num_computed_tokens = 4017
     third = {
         "ids": {"prompt": [2]},
         "meta": {
-            "next_stage_prompt_len": 8,
+            "next_stage_prompt_len": 60,
             "next_stage_generation_tokens": 26,
         },
     }
@@ -252,10 +323,38 @@ def test_streaming_window_recomputes_each_condition_without_accumulating(mocker:
         previous_condition_seq=1,
         condition_seq=2,
         recompute_previous_chunks=1,
+        recompute_on_capacity=True,
     )
-    assert request.num_prompt_tokens == 23
+    assert request.num_prompt_tokens == 75
+    assert request.num_computed_tokens == 0
     assert third["ids"]["streaming_prompt_previous_codes"] == [201, 202, 203]
     assert third["meta"]["streaming_condition_seq"] == 2
+
+    request._all_token_ids.extend([301])
+    request._output_token_ids.extend([301])
+    request.num_computed_tokens = 76
+    fourth = {
+        "ids": {"prompt": [3]},
+        "meta": {
+            "next_stage_prompt_len": 8,
+            "next_stage_generation_tokens": 26,
+            "streaming_condition_seq": 3,
+        },
+    }
+
+    assert not construct_next_stage_streaming_input_prompt(
+        fourth,
+        request,
+        max_model_len=4096,
+        previous_condition_len=60,
+        previous_condition_seq=2,
+        condition_seq=3,
+        recompute_previous_chunks=1,
+        recompute_on_capacity=True,
+    )
+    assert request.num_computed_tokens == 76
+    assert request.num_prompt_tokens == 84
+    assert fourth["meta"]["streaming_prompt_recompute"] is False
 
 
 def test_capacity_rollover_requires_explicit_window_contract(mocker: MockerFixture) -> None:
@@ -353,13 +452,14 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         )
 
         hf_config = SimpleNamespace(
-            model_type="minicpmtts",
+            model_type="conditional_chattts",
             max_position_embeddings=tts_max_model_len,
             attention_type=tts_attention_type,
         )
         if not flat_tts_config:
             hf_config = SimpleNamespace(
                 tts_config=SimpleNamespace(
+                    model_type="minicpmtts",
                     max_position_embeddings=tts_max_model_len,
                     attention_type=tts_attention_type,
                 )
@@ -369,6 +469,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             max_num_seqs=max_num_seqs,
             max_model_len=max_model_len,
             hf_config=hf_config,
+            hf_config_name="tts_config" if stage_id == 1 else None,
             active_stream_window=active_stream_window,
             stage_connector_config={
                 "name": "SharedMemoryConnector",
@@ -396,13 +497,24 @@ def _dequeue_load_entry(adapter, request):
 
 
 @pytest.mark.parametrize(
-    ("attention_type", "expected_previous_chunks"),
-    [("full_attention", 0), ("sliding_recompute", 1)],
+    ("attention_type", "expected_previous_chunks", "expected_capacity_trigger"),
+    [("full_attention", 1, True), ("sliding_recompute", 1, False), ("other", 0, False)],
 )
-def test_talker_attention_policy_controls_streaming_recompute(build_adapter, attention_type, expected_previous_chunks):
+def test_talker_attention_policy_controls_streaming_recompute(
+    build_adapter, attention_type, expected_previous_chunks, expected_capacity_trigger
+):
     adapter, _ = build_adapter(tts_attention_type=attention_type)
 
     assert adapter._streaming_prompt_previous_chunks == expected_previous_chunks
+    assert adapter._streaming_prompt_recompute_on_capacity is expected_capacity_trigger
+
+
+@pytest.mark.parametrize("stage_id", [0, 2])
+def test_talker_streaming_policy_is_scoped_to_tts_stage(build_adapter, stage_id: int) -> None:
+    adapter, _ = build_adapter(stage_id=stage_id, tts_attention_type="full_attention")
+
+    assert adapter._streaming_prompt_previous_chunks == 0
+    assert adapter._streaming_prompt_recompute_on_capacity is False
 
 
 @pytest.mark.parametrize(
@@ -570,23 +682,23 @@ def test_load_poll_ar_requeues_explicitly_replaced_running_prompt(build_adapter)
 
 
 @pytest.mark.parametrize("flat_tts_config", [False, True])
-def test_load_poll_ar_recomputes_native_duplex_prompt_each_condition(build_adapter, flat_tts_config):
+def test_load_poll_ar_recomputes_native_duplex_prompt_over_capacity(build_adapter, flat_tts_config):
     adapter, connector = build_adapter(
         stage_id=1,
         model_mode="ar",
         max_model_len=8192,
         tts_max_model_len=4096,
-        tts_attention_type="sliding_recompute",
+        tts_attention_type="full_attention",
         flat_tts_config=flat_tts_config,
     )
     request = _req("req-rollover", RequestStatus.RUNNING, external_req_id="external-rollover")
     request.resumable = True
     previous_codes = list(range(25))
-    request.prompt_token_ids = [0] * 10
-    request._all_token_ids = [0] * 10 + previous_codes
+    request.prompt_token_ids = [0] * 4039
+    request._all_token_ids = [0] * 4039 + previous_codes
     request._output_token_ids = previous_codes.copy()
-    request.num_prompt_tokens = 10
-    request.num_computed_tokens = 35
+    request.num_prompt_tokens = 4039
+    request.num_computed_tokens = 4064
     request.num_output_placeholders = 0
     request.update_block_hashes = Mock()
     adapter.get_req_chunk[request.request_id] = 1
@@ -626,6 +738,35 @@ def test_load_poll_ar_recomputes_native_duplex_prompt_each_condition(build_adapt
     assert waiting_queue == [request]
 
 
+def test_load_poll_ar_keeps_generic_prompt_extension_for_non_tts_stage(build_adapter) -> None:
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req("req-generic-extension", RequestStatus.RUNNING)
+    request.resumable = True
+    request.prompt_token_ids = [1, 2, 3]
+    request._all_token_ids = [1, 2, 3, 7]
+    request._output_token_ids = [7]
+    request.num_prompt_tokens = 3
+    request.num_computed_tokens = 4
+    request.update_block_hashes = Mock()
+    adapter.get_req_chunk[request.request_id] = 1
+    connector.get.return_value = (
+        {
+            "ids": {"prompt": [1]},
+            "meta": {"next_stage_prompt_len": 2},
+        },
+        1,
+    )
+
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
+    adapter.requests_with_ready_chunks.add(request.request_id)
+    adapter._apply_pending_ar_prompt_updates({request.request_id: request})
+
+    assert request.num_computed_tokens == 4
+    assert request.prompt_token_ids == [1, 2, 3, 7, 0, 0]
+    assert request._all_token_ids == [1, 2, 3, 7, 0, 0]
+    assert request.num_prompt_tokens == 6
+
+
 def test_window_condition_sequence_ignores_control_only_chunks(build_adapter) -> None:
     adapter, connector = build_adapter(
         stage_id=1,
@@ -644,6 +785,7 @@ def test_window_condition_sequence_ignores_control_only_chunks(build_adapter) ->
 
     first = receive(
         {
+            "native_duplex": True,
             "ids": {"prompt": [1]},
             "meta": {"next_stage_prompt_len": 10},
         }
@@ -657,6 +799,7 @@ def test_window_condition_sequence_ignores_control_only_chunks(build_adapter) ->
 
     second = receive(
         {
+            "native_duplex": True,
             "ids": {"prompt": [2]},
             "meta": {"next_stage_prompt_len": 12},
         }
@@ -676,6 +819,7 @@ def test_load_poll_ar_reports_invalid_capacity_metadata(build_adapter):
             "meta": {
                 "next_stage_prompt_len": 4096,
                 "next_stage_generation_tokens": 26,
+                "replace_streaming_prompt": True,
                 "finished": False,
             },
         },

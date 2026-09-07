@@ -418,7 +418,7 @@ The public interfaces map onto the same engine and stage boundaries:
 flowchart LR
     offline["Offline Python<br/>Omni.generate()"] --> engine["AsyncOmniEngine"]
     online["OpenAI-compatible serving<br/>vllm serve ... --omni"] --> engine
-    duplex["Experimental duplex WebSocket<br/>/v1/duplex or realtime duplex"] --> engine
+    duplex["Duplex WebSocket<br/>/v1/realtime?duplex=1 or /v1/duplex"] --> engine
     engine --> stages["Configured AR and diffusion stages"]
     stages --> result["Streaming or final multimodal output"]
 ```

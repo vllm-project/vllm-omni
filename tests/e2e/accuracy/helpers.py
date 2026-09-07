@@ -10,8 +10,9 @@ import sys
 import time
 from abc import ABC, abstractmethod
 from base64 import b64decode, b64encode
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from fractions import Fraction
 from hashlib import sha1
 from io import BytesIO
@@ -79,6 +80,59 @@ def model_output_dir(parent_dir: Path, model: str) -> Path:
     path = parent_dir / safe_model_name
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+DEFAULT_DEVICE_PROFILE = "default"
+
+
+@dataclass(frozen=True, slots=True)
+class SimilarityThresholds:
+    """SSIM/PSNR floors for accuracy comparisons."""
+
+    ssim: float
+    psnr: float
+
+
+def resolve_device_profile(
+    device_name: str | None = None,
+    *,
+    profiles: Mapping[str, Any],
+) -> str:
+    """Map a device marketing name to a key in *profiles*.
+
+    When *device_name* is omitted, uses ``current_omni_platform.get_device_name()``.
+    Non-``default`` keys are matched as substrings; unmatched devices use ``default``.
+    """
+    if device_name is None:
+        try:
+            from vllm_omni.platforms import current_omni_platform
+
+            device_name = current_omni_platform.get_device_name()
+        except Exception:
+            return DEFAULT_DEVICE_PROFILE
+
+    if not device_name:
+        return DEFAULT_DEVICE_PROFILE
+
+    for profile in profiles:
+        if profile == DEFAULT_DEVICE_PROFILE:
+            continue
+        if profile in device_name:
+            return profile
+    return DEFAULT_DEVICE_PROFILE
+
+
+def resolve_similarity_thresholds(
+    table: Mapping[str, SimilarityThresholds],
+    device_profile: str | None = None,
+    *,
+    device_name: str | None = None,
+) -> SimilarityThresholds:
+    """Pick SSIM/PSNR thresholds from *table* for the current (or given) device profile."""
+    if DEFAULT_DEVICE_PROFILE not in table:
+        raise ValueError("threshold table must include a 'default' entry")
+    profile = device_profile or resolve_device_profile(device_name, profiles=table)
+    return table.get(profile, table[DEFAULT_DEVICE_PROFILE])
 
 
 _SSIM_RE = re.compile(r"All:(?P<score>[0-9.]+)")

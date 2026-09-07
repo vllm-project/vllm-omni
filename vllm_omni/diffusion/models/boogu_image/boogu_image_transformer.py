@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Native vLLM-Omni port of the Boogu-Image transformer.
 #
@@ -16,6 +16,7 @@
 
 import itertools
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -34,20 +35,40 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.platforms import current_omni_platform
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 logger = init_logger(__name__)
 
+RotaryEmbedding = tuple[torch.Tensor, torch.Tensor]
+RotaryFrequencyTables = list[RotaryEmbedding]
 
-def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    """Apply rotary embeddings in complex form (upstream `use_real=False` path).
+
+def _join_prefix(prefix: str, name: str) -> str:
+    return f"{prefix}.{name}" if prefix else name
+
+
+def apply_rotary_emb(x: torch.Tensor, rotary_emb: RotaryEmbedding) -> torch.Tensor:
+    """Apply rotary embeddings with real-valued cosine and sine tensors.
 
     Args:
         x: Query or key tensor of shape [B, S, H, D].
-        freqs_cis: Complex frequency tensor of shape [B, S, D // 2].
+        rotary_emb: Cosine and sine tensors, each shaped [B, S, D].
     """
-    x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], x.shape[-1] // 2, 2))
-    freqs_cis = freqs_cis.unsqueeze(2)
-    x_out = torch.view_as_real(x_rotated * freqs_cis).flatten(3)
+    freqs_cos, freqs_sin = rotary_emb
+    freqs_cos = freqs_cos.unsqueeze(2)
+    freqs_sin = freqs_sin.unsqueeze(2)
+
+    # The frequency values are repeated for each adjacent channel pair. This
+    # is the real-valued equivalent of multiplying view_as_complex(x) by cis.
+    x_float = x.float()
+    x_even = x_float[..., ::2]
+    x_odd = x_float[..., 1::2]
+    cos = freqs_cos[..., ::2]
+    sin = freqs_sin[..., ::2]
+    x_out = torch.stack((x_even * cos - x_odd * sin, x_even * sin + x_odd * cos), dim=-1).flatten(3)
     return x_out.type_as(x)
 
 
@@ -69,10 +90,23 @@ class TimestepEmbedding(nn.Module):
 class LuminaRMSNormZero(nn.Module):
     """AdaRMS modulation: projects `temb` into scale/gate terms."""
 
-    def __init__(self, embedding_dim: int, norm_eps: float) -> None:
+    def __init__(
+        self,
+        embedding_dim: int,
+        norm_eps: float,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         self.silu = nn.SiLU()
-        self.linear = nn.Linear(min(embedding_dim, 1024), 4 * embedding_dim, bias=True)
+        self.linear = ReplicatedLinear(
+            min(embedding_dim, 1024),
+            4 * embedding_dim,
+            bias=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "linear"),
+        )
         self.norm = RMSNorm(embedding_dim, eps=norm_eps)
 
     def forward(
@@ -95,12 +129,32 @@ class LuminaLayerNormContinuous(nn.Module):
         eps: float = 1e-5,
         bias: bool = True,
         out_dim: int | None = None,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.silu = nn.SiLU()
-        self.linear_1 = nn.Linear(conditioning_embedding_dim, embedding_dim, bias=bias)
+        self.linear_1 = ReplicatedLinear(
+            conditioning_embedding_dim,
+            embedding_dim,
+            bias=bias,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "linear_1"),
+        )
         self.norm = nn.LayerNorm(embedding_dim, eps, elementwise_affine, bias)
-        self.linear_2 = nn.Linear(embedding_dim, out_dim, bias=bias) if out_dim is not None else None
+        self.linear_2 = (
+            ReplicatedLinear(
+                embedding_dim,
+                out_dim,
+                bias=bias,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=_join_prefix(prefix, "linear_2"),
+            )
+            if out_dim is not None
+            else None
+        )
 
     def forward(self, x: torch.Tensor, conditioning_embedding: torch.Tensor) -> torch.Tensor:
         scale = self.linear_1(self.silu(conditioning_embedding).to(x.dtype))
@@ -119,15 +173,35 @@ class LuminaFeedForward(nn.Module):
         inner_dim: int,
         multiple_of: int = 256,
         ffn_dim_multiplier: float | None = None,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         if ffn_dim_multiplier is not None:
             inner_dim = int(ffn_dim_multiplier * inner_dim)
         inner_dim = multiple_of * ((inner_dim + multiple_of - 1) // multiple_of)
 
-        self.linear_1 = ColumnParallelLinear(dim, inner_dim, bias=False)  # gate
-        self.linear_3 = ColumnParallelLinear(dim, inner_dim, bias=False)  # input
-        self.linear_2 = RowParallelLinear(inner_dim, dim, bias=False)
+        self.linear_1 = ColumnParallelLinear(
+            dim,
+            inner_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "linear_1"),
+        )  # gate
+        self.linear_3 = ColumnParallelLinear(
+            dim,
+            inner_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "linear_3"),
+        )  # input
+        self.linear_2 = RowParallelLinear(
+            inner_dim,
+            dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "linear_2"),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h1, _ = self.linear_1(x)
@@ -173,7 +247,7 @@ class Lumina2CombinedTimestepCaptionEmbedding(nn.Module):
 
 
 class BooguImageDoubleStreamRotaryPosEmbed(nn.Module):
-    """3-axis RoPE producing per-segment frequency tensors.
+    """3-axis RoPE producing real-valued per-segment embeddings.
 
     Returns separate frequency tensors for instruction tokens, reference-image
     tokens, noise-image tokens, the full joint sequence, and the combined
@@ -194,31 +268,54 @@ class BooguImageDoubleStreamRotaryPosEmbed(nn.Module):
         self.patch_size = patch_size
 
     @staticmethod
-    def get_freqs_cis(
+    def get_freqs_real(
         axes_dim: tuple[int, int, int], axes_lens: tuple[int, int, int], theta: int
-    ) -> list[torch.Tensor]:
-        freqs_cis = []
-        freqs_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
+    ) -> RotaryFrequencyTables:
+        freqs_real = []
+        # Ascend supports real-valued gather but float32 avoids routing the
+        # entire RoPE path through slower and less broadly supported float64
+        # kernels. MPS also requires float32 because it does not support
+        # float64. Other platforms retain the previous precision where valid.
+        freqs_dtype = (
+            torch.float32
+            if (
+                current_omni_platform.is_npu()
+                or not current_omni_platform.supports_float64()
+                or torch.backends.mps.is_available()
+            )
+            else torch.float64
+        )
         for d, e in zip(axes_dim, axes_lens):
-            emb = get_1d_rotary_pos_embed(d, e, theta=theta, freqs_dtype=freqs_dtype)
-            freqs_cis.append(emb)
-        return freqs_cis
+            freqs_cos, freqs_sin = get_1d_rotary_pos_embed(
+                d,
+                e,
+                theta=theta,
+                use_real=True,
+                repeat_interleave_real=True,
+                freqs_dtype=freqs_dtype,
+            )
+            freqs_real.append((freqs_cos, freqs_sin))
+        return freqs_real
 
-    def _get_freqs_cis(self, freqs_cis: list[torch.Tensor], ids: torch.Tensor) -> torch.Tensor:
+    def _get_freqs_real(self, freqs_real: RotaryFrequencyTables, ids: torch.Tensor) -> RotaryEmbedding:
         device = ids.device
         if ids.device.type == "mps":
             ids = ids.to("cpu")
 
-        result = []
+        cos_result = []
+        sin_result = []
         for i in range(len(self.axes_dim)):
-            freqs = freqs_cis[i].to(ids.device)
-            index = ids[:, :, i : i + 1].repeat(1, 1, freqs.shape[-1]).to(torch.int64)
-            result.append(torch.gather(freqs.unsqueeze(0).repeat(index.shape[0], 1, 1), dim=1, index=index))
-        return torch.cat(result, dim=-1).to(device)
+            freqs_cos, freqs_sin = freqs_real[i]
+            freqs_cos = freqs_cos.to(ids.device)
+            freqs_sin = freqs_sin.to(ids.device)
+            index = ids[:, :, i : i + 1].repeat(1, 1, freqs_cos.shape[-1]).to(torch.int64)
+            cos_result.append(torch.gather(freqs_cos.unsqueeze(0).repeat(index.shape[0], 1, 1), dim=1, index=index))
+            sin_result.append(torch.gather(freqs_sin.unsqueeze(0).repeat(index.shape[0], 1, 1), dim=1, index=index))
+        return torch.cat(cos_result, dim=-1).to(device), torch.cat(sin_result, dim=-1).to(device)
 
     def forward(
         self,
-        freqs_cis: list[torch.Tensor],
+        freqs_real: RotaryFrequencyTables,
         attention_mask: torch.Tensor,
         l_effective_ref_img_len: list[list[int]],
         l_effective_img_len: list[int],
@@ -286,47 +383,52 @@ class BooguImageDoubleStreamRotaryPosEmbed(nn.Module):
             position_ids[i, pe_shift_len:seq_len, 1] = row_ids
             position_ids[i, pe_shift_len:seq_len, 2] = col_ids
 
-        freqs_cis = self._get_freqs_cis(freqs_cis, position_ids)
+        freqs_cos, freqs_sin = self._get_freqs_real(freqs_real, position_ids)
 
-        cap_freqs_cis = torch.zeros(
-            batch_size, encoder_seq_len, freqs_cis.shape[-1], device=device, dtype=freqs_cis.dtype
-        )
-        ref_img_freqs_cis = torch.zeros(
-            batch_size, max_ref_img_len, freqs_cis.shape[-1], device=device, dtype=freqs_cis.dtype
-        )
-        img_freqs_cis = torch.zeros(batch_size, max_img_len, freqs_cis.shape[-1], device=device, dtype=freqs_cis.dtype)
+        def empty_rotary_emb(seq_len: int) -> RotaryEmbedding:
+            shape = (batch_size, seq_len, freqs_cos.shape[-1])
+            return (
+                torch.zeros(shape, device=device, dtype=freqs_cos.dtype),
+                torch.zeros(shape, device=device, dtype=freqs_sin.dtype),
+            )
+
+        cap_rotary_emb = empty_rotary_emb(encoder_seq_len)
+        ref_img_rotary_emb = empty_rotary_emb(max_ref_img_len)
+        img_rotary_emb = empty_rotary_emb(max_img_len)
 
         combined_img_seq_lengths = [
             sum(ref_img_len) + img_len for ref_img_len, img_len in zip(l_effective_ref_img_len, l_effective_img_len)
         ]
         max_combined_img_len = max(combined_img_seq_lengths)
 
-        combined_img_freqs_cis = torch.zeros(
-            batch_size, max_combined_img_len, freqs_cis.shape[-1], device=device, dtype=freqs_cis.dtype
-        )
+        combined_img_rotary_emb = empty_rotary_emb(max_combined_img_len)
 
         for i, (cap_seq_len, ref_img_len, img_len, seq_len) in enumerate(
             zip(l_effective_cap_len, l_effective_ref_img_len, l_effective_img_len, seq_lengths)
         ):
-            cap_freqs_cis[i, :cap_seq_len] = freqs_cis[i, :cap_seq_len]
-            ref_img_freqs_cis[i, : sum(ref_img_len)] = freqs_cis[i, cap_seq_len : cap_seq_len + sum(ref_img_len)]
-            img_freqs_cis[i, :img_len] = freqs_cis[
-                i, cap_seq_len + sum(ref_img_len) : cap_seq_len + sum(ref_img_len) + img_len
-            ]
-
-            combined_img_freqs_cis[i, : sum(ref_img_len)] = freqs_cis[i, cap_seq_len : cap_seq_len + sum(ref_img_len)]
-            combined_img_freqs_cis[i, sum(ref_img_len) : sum(ref_img_len) + img_len] = freqs_cis[
-                i, cap_seq_len + sum(ref_img_len) : cap_seq_len + sum(ref_img_len) + img_len
-            ]
+            ref_len = sum(ref_img_len)
+            img_start = cap_seq_len + ref_len
+            for source, cap_target, ref_target, img_target, combined_target in zip(
+                (freqs_cos, freqs_sin),
+                cap_rotary_emb,
+                ref_img_rotary_emb,
+                img_rotary_emb,
+                combined_img_rotary_emb,
+            ):
+                cap_target[i, :cap_seq_len] = source[i, :cap_seq_len]
+                ref_target[i, :ref_len] = source[i, cap_seq_len:img_start]
+                img_target[i, :img_len] = source[i, img_start : img_start + img_len]
+                combined_target[i, :ref_len] = source[i, cap_seq_len:img_start]
+                combined_target[i, ref_len : ref_len + img_len] = source[i, img_start : img_start + img_len]
 
         return (
-            cap_freqs_cis,
-            ref_img_freqs_cis,
-            img_freqs_cis,
-            freqs_cis,
+            cap_rotary_emb,
+            ref_img_rotary_emb,
+            img_rotary_emb,
+            (freqs_cos, freqs_sin),
             l_effective_cap_len,
             seq_lengths,
-            combined_img_freqs_cis,
+            combined_img_rotary_emb,
             combined_img_seq_lengths,
         )
 
@@ -379,24 +481,55 @@ def _split_instruction_image_features(
 
 
 class BooguImageSelfAttention(nn.Module):
-    """GQA self-attention with QK RMSNorm and complex RoPE.
+    """GQA self-attention with QK RMSNorm and real-valued RoPE.
 
     Replaces the upstream diffusers `Attention` + Boogu attention processors;
     the vLLM-Omni `Attention` layer picks the kernel backend and handles
     SP/KV-cache concerns.
     """
 
-    def __init__(self, dim: int, num_attention_heads: int, num_kv_heads: int) -> None:
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        num_kv_heads: int,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         self.head_dim = dim // num_attention_heads
         kv_dim = self.head_dim * num_kv_heads
 
-        self.to_q = ColumnParallelLinear(dim, dim, bias=False)
-        self.to_k = ColumnParallelLinear(dim, kv_dim, bias=False)
-        self.to_v = ColumnParallelLinear(dim, kv_dim, bias=False)
+        self.to_q = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "to_q"),
+        )
+        self.to_k = ColumnParallelLinear(
+            dim,
+            kv_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "to_k"),
+        )
+        self.to_v = ColumnParallelLinear(
+            dim,
+            kv_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "to_v"),
+        )
         self.norm_q = RMSNorm(self.head_dim, eps=1e-5)
         self.norm_k = RMSNorm(self.head_dim, eps=1e-5)
-        self.to_out = RowParallelLinear(dim, dim, bias=False)
+        self.to_out = RowParallelLinear(
+            dim,
+            dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "to_out"),
+        )
 
         self.num_local_heads = self.to_q.output_size_per_partition // self.head_dim
         self.num_local_kv_heads = self.to_k.output_size_per_partition // self.head_dim
@@ -413,7 +546,7 @@ class BooguImageSelfAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None,
-        rotary_emb: torch.Tensor | None,
+        rotary_emb: RotaryEmbedding | None,
     ) -> torch.Tensor:
         dtype = hidden_states.dtype
 
@@ -451,28 +584,89 @@ class BooguImageJointAttention(nn.Module):
     `img_instruct_attn.to_out[0]`.
     """
 
-    def __init__(self, dim: int, num_attention_heads: int, num_kv_heads: int) -> None:
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        num_kv_heads: int,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         self.head_dim = dim // num_attention_heads
         kv_dim = self.head_dim * num_kv_heads
 
-        self.img_to_q = ColumnParallelLinear(dim, dim, bias=False)
-        self.img_to_k = ColumnParallelLinear(dim, kv_dim, bias=False)
-        self.img_to_v = ColumnParallelLinear(dim, kv_dim, bias=False)
+        self.img_to_q = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "img_to_q"),
+        )
+        self.img_to_k = ColumnParallelLinear(
+            dim,
+            kv_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "img_to_k"),
+        )
+        self.img_to_v = ColumnParallelLinear(
+            dim,
+            kv_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "img_to_v"),
+        )
 
-        self.instruct_to_q = ColumnParallelLinear(dim, dim, bias=False)
-        self.instruct_to_k = ColumnParallelLinear(dim, kv_dim, bias=False)
-        self.instruct_to_v = ColumnParallelLinear(dim, kv_dim, bias=False)
+        self.instruct_to_q = ColumnParallelLinear(
+            dim,
+            dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "instruct_to_q"),
+        )
+        self.instruct_to_k = ColumnParallelLinear(
+            dim,
+            kv_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "instruct_to_k"),
+        )
+        self.instruct_to_v = ColumnParallelLinear(
+            dim,
+            kv_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "instruct_to_v"),
+        )
 
         self.norm_q = RMSNorm(self.head_dim, eps=1e-5)
         self.norm_k = RMSNorm(self.head_dim, eps=1e-5)
 
         # Per-stream output projections (attention output is head-sharded
         # under TP, hence row-parallel).
-        self.instruct_out = RowParallelLinear(dim, dim, bias=False)
-        self.img_out = RowParallelLinear(dim, dim, bias=False)
+        self.instruct_out = RowParallelLinear(
+            dim,
+            dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "instruct_out"),
+        )
+        self.img_out = RowParallelLinear(
+            dim,
+            dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "img_out"),
+        )
         # Final joint projection applied to the merged full-dim sequence.
-        self.to_out = ReplicatedLinear(dim, dim, bias=False)
+        self.to_out = ReplicatedLinear(
+            dim,
+            dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "to_out"),
+        )
 
         self.num_local_heads = self.img_to_q.output_size_per_partition // self.head_dim
         self.num_local_kv_heads = self.img_to_k.output_size_per_partition // self.head_dim
@@ -490,7 +684,7 @@ class BooguImageJointAttention(nn.Module):
         img_hidden_states: torch.Tensor,
         instruct_hidden_states: torch.Tensor,
         joint_attention_mask: torch.Tensor | None,
-        rotary_emb: torch.Tensor | None,
+        rotary_emb: RotaryEmbedding | None,
         encoder_seq_lengths: list[int],
         seq_lengths: list[int],
     ) -> torch.Tensor:
@@ -553,21 +747,36 @@ class BooguImageTransformerBlock(nn.Module):
         ffn_dim_multiplier: float | None,
         norm_eps: float,
         modulation: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.head_dim = dim // num_attention_heads
         self.modulation = modulation
 
-        self.attn = BooguImageSelfAttention(dim, num_attention_heads, num_kv_heads)
+        self.attn = BooguImageSelfAttention(
+            dim,
+            num_attention_heads,
+            num_kv_heads,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "attn"),
+        )
         self.feed_forward = LuminaFeedForward(
             dim=dim,
             inner_dim=4 * dim,
             multiple_of=multiple_of,
             ffn_dim_multiplier=ffn_dim_multiplier,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "feed_forward"),
         )
 
         if modulation:
-            self.norm1 = LuminaRMSNormZero(embedding_dim=dim, norm_eps=norm_eps)
+            self.norm1 = LuminaRMSNormZero(
+                embedding_dim=dim,
+                norm_eps=norm_eps,
+                quant_config=quant_config,
+                prefix=_join_prefix(prefix, "norm1"),
+            )
         else:
             self.norm1 = RMSNorm(dim, eps=norm_eps)
 
@@ -579,7 +788,7 @@ class BooguImageTransformerBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None,
-        image_rotary_emb: torch.Tensor | None,
+        image_rotary_emb: RotaryEmbedding | None,
         temb: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.modulation:
@@ -630,6 +839,8 @@ class BooguImageDoubleStreamTransformerBlock(nn.Module):
         ffn_dim_multiplier: float | None,
         norm_eps: float,
         modulation: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.head_dim = dim // num_attention_heads
@@ -637,21 +848,50 @@ class BooguImageDoubleStreamTransformerBlock(nn.Module):
         self.modulation = modulation
         self.hidden_size = dim
 
-        self.img_instruct_attn = BooguImageJointAttention(dim, num_attention_heads, num_kv_heads)
-        self.img_self_attn = BooguImageSelfAttention(dim, num_attention_heads, num_kv_heads)
+        self.img_instruct_attn = BooguImageJointAttention(
+            dim,
+            num_attention_heads,
+            num_kv_heads,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "img_instruct_attn"),
+        )
+        self.img_self_attn = BooguImageSelfAttention(
+            dim,
+            num_attention_heads,
+            num_kv_heads,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "img_self_attn"),
+        )
 
         self.img_feed_forward = LuminaFeedForward(
             dim=dim,
             inner_dim=4 * dim,
             multiple_of=multiple_of,
             ffn_dim_multiplier=ffn_dim_multiplier,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "img_feed_forward"),
         )
 
         if modulation:
             # Image modulation terms: cross-attn, MLP, self-attn.
-            self.img_norm1 = LuminaRMSNormZero(embedding_dim=dim, norm_eps=norm_eps)
-            self.img_norm2 = LuminaRMSNormZero(embedding_dim=dim, norm_eps=norm_eps)
-            self.img_norm3 = LuminaRMSNormZero(embedding_dim=dim, norm_eps=norm_eps)
+            self.img_norm1 = LuminaRMSNormZero(
+                embedding_dim=dim,
+                norm_eps=norm_eps,
+                quant_config=quant_config,
+                prefix=_join_prefix(prefix, "img_norm1"),
+            )
+            self.img_norm2 = LuminaRMSNormZero(
+                embedding_dim=dim,
+                norm_eps=norm_eps,
+                quant_config=quant_config,
+                prefix=_join_prefix(prefix, "img_norm2"),
+            )
+            self.img_norm3 = LuminaRMSNormZero(
+                embedding_dim=dim,
+                norm_eps=norm_eps,
+                quant_config=quant_config,
+                prefix=_join_prefix(prefix, "img_norm3"),
+            )
         else:
             self.img_norm1 = RMSNorm(dim, eps=norm_eps)
             self.img_norm2 = RMSNorm(dim, eps=norm_eps)
@@ -667,12 +907,24 @@ class BooguImageDoubleStreamTransformerBlock(nn.Module):
             inner_dim=4 * dim,
             multiple_of=multiple_of,
             ffn_dim_multiplier=ffn_dim_multiplier,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "instruct_feed_forward"),
         )
 
         if modulation:
             # Instruction modulation terms: cross-attn, MLP.
-            self.instruct_norm1 = LuminaRMSNormZero(embedding_dim=dim, norm_eps=norm_eps)
-            self.instruct_norm2 = LuminaRMSNormZero(embedding_dim=dim, norm_eps=norm_eps)
+            self.instruct_norm1 = LuminaRMSNormZero(
+                embedding_dim=dim,
+                norm_eps=norm_eps,
+                quant_config=quant_config,
+                prefix=_join_prefix(prefix, "instruct_norm1"),
+            )
+            self.instruct_norm2 = LuminaRMSNormZero(
+                embedding_dim=dim,
+                norm_eps=norm_eps,
+                quant_config=quant_config,
+                prefix=_join_prefix(prefix, "instruct_norm2"),
+            )
         else:
             self.instruct_norm1 = RMSNorm(dim, eps=norm_eps)
             self.instruct_norm2 = RMSNorm(dim, eps=norm_eps)
@@ -687,8 +939,8 @@ class BooguImageDoubleStreamTransformerBlock(nn.Module):
         instruct_hidden_states: torch.Tensor,  # [B, L_instruct, D]
         img_attention_mask: torch.Tensor | None,  # [B, L_img]
         joint_attention_mask: torch.Tensor | None,  # [B, L_total]
-        image_rotary_emb: torch.Tensor | None,  # [B, L_img, head_dim // 2]
-        rotary_emb: torch.Tensor | None,  # [B, L_total, head_dim // 2]
+        image_rotary_emb: RotaryEmbedding | None,  # Each tensor is [B, L_img, head_dim].
+        rotary_emb: RotaryEmbedding | None,  # Each tensor is [B, L_total, head_dim].
         temb: torch.Tensor | None = None,
         encoder_seq_lengths: list[int] | None = None,
         seq_lengths: list[int] | None = None,
@@ -818,7 +1070,12 @@ class BooguImageTransformer2DModel(nn.Module):
     ]
     _layerwise_offload_blocks_attrs = ["single_stream_layers", "double_stream_layers"]
 
-    def __init__(self, od_config: OmniDiffusionConfig) -> None:
+    def __init__(
+        self,
+        od_config: OmniDiffusionConfig,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         self.od_config = od_config
         cfg = od_config.tf_model_config
@@ -905,8 +1162,10 @@ class BooguImageTransformer2DModel(nn.Module):
                     ffn_dim_multiplier,
                     norm_eps,
                     modulation=True,
+                    quant_config=quant_config,
+                    prefix=_join_prefix(prefix, f"noise_refiner.{i}"),
                 )
-                for _ in range(num_refiner_layers)
+                for i in range(num_refiner_layers)
             ]
         )
 
@@ -920,8 +1179,10 @@ class BooguImageTransformer2DModel(nn.Module):
                     ffn_dim_multiplier,
                     norm_eps,
                     modulation=True,
+                    quant_config=quant_config,
+                    prefix=_join_prefix(prefix, f"ref_image_refiner.{i}"),
                 )
-                for _ in range(num_refiner_layers)
+                for i in range(num_refiner_layers)
             ]
         )
 
@@ -935,8 +1196,10 @@ class BooguImageTransformer2DModel(nn.Module):
                     ffn_dim_multiplier,
                     norm_eps,
                     modulation=False,
+                    quant_config=quant_config,
+                    prefix=_join_prefix(prefix, f"context_refiner.{i}"),
                 )
-                for _ in range(num_refiner_layers)
+                for i in range(num_refiner_layers)
             ]
         )
 
@@ -951,8 +1214,10 @@ class BooguImageTransformer2DModel(nn.Module):
                     ffn_dim_multiplier,
                     norm_eps,
                     modulation=True,
+                    quant_config=quant_config,
+                    prefix=_join_prefix(prefix, f"double_stream_layers.{i}"),
                 )
-                for _ in range(num_double_stream_layers)
+                for i in range(num_double_stream_layers)
             ]
         )
 
@@ -966,8 +1231,10 @@ class BooguImageTransformer2DModel(nn.Module):
                     ffn_dim_multiplier,
                     norm_eps,
                     modulation=True,
+                    quant_config=quant_config,
+                    prefix=_join_prefix(prefix, f"single_stream_layers.{i}"),
                 )
-                for _ in range(self.num_single_stream_layers)
+                for i in range(self.num_single_stream_layers)
             ]
         )
 
@@ -978,6 +1245,8 @@ class BooguImageTransformer2DModel(nn.Module):
             eps=1e-6,
             bias=True,
             out_dim=patch_size * patch_size * self.out_channels,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "norm_out"),
         )
 
         # Distinguish multiple reference images (max 5).
@@ -1103,15 +1372,15 @@ class BooguImageTransformer2DModel(nn.Module):
 
     def img_patch_embed_and_refine(
         self,
-        hidden_states,
-        ref_image_hidden_states,
-        padded_img_mask,
-        padded_ref_img_mask,
-        noise_rotary_emb,
-        ref_img_rotary_emb,
-        l_effective_ref_img_len,
-        l_effective_img_len,
-        temb,
+        hidden_states: torch.Tensor,
+        ref_image_hidden_states: torch.Tensor,
+        padded_img_mask: torch.Tensor,
+        padded_ref_img_mask: torch.Tensor,
+        noise_rotary_emb: RotaryEmbedding,
+        ref_img_rotary_emb: RotaryEmbedding,
+        l_effective_ref_img_len: list[list[int]],
+        l_effective_img_len: list[int],
+        temb: torch.Tensor,
     ):
         """Embed image patches and run the refiner blocks.
 
@@ -1148,8 +1417,19 @@ class BooguImageTransformer2DModel(nn.Module):
             batch_ref_image_hidden_states = ref_image_hidden_states.new_zeros(
                 num_ref_images, max_ref_img_len, self.hidden_size
             )
-            batch_ref_img_rotary_emb = hidden_states.new_zeros(
-                num_ref_images, max_ref_img_len, ref_img_rotary_emb.shape[-1], dtype=ref_img_rotary_emb.dtype
+            batch_ref_img_rotary_emb: RotaryEmbedding = (
+                hidden_states.new_zeros(
+                    num_ref_images,
+                    max_ref_img_len,
+                    ref_img_rotary_emb[0].shape[-1],
+                    dtype=ref_img_rotary_emb[0].dtype,
+                ),
+                hidden_states.new_zeros(
+                    num_ref_images,
+                    max_ref_img_len,
+                    ref_img_rotary_emb[1].shape[-1],
+                    dtype=ref_img_rotary_emb[1].dtype,
+                ),
             )
             batch_temb = temb.new_zeros(num_ref_images, *temb.shape[1:], dtype=temb.dtype)
 
@@ -1162,7 +1442,8 @@ class BooguImageTransformer2DModel(nn.Module):
                     batch_ref_image_hidden_states[idx, :ref_img_len] = ref_image_hidden_states[
                         i, shift : shift + ref_img_len
                     ]
-                    batch_ref_img_rotary_emb[idx, :ref_img_len] = ref_img_rotary_emb[i, shift : shift + ref_img_len]
+                    for batch_freqs, ref_freqs in zip(batch_ref_img_rotary_emb, ref_img_rotary_emb):
+                        batch_freqs[idx, :ref_img_len] = ref_freqs[i, shift : shift + ref_img_len]
                     batch_temb[idx] = temb[i]
                     shift += ref_img_len
                     idx += 1
@@ -1195,7 +1476,7 @@ class BooguImageTransformer2DModel(nn.Module):
         hidden_states: torch.Tensor | list[torch.Tensor],
         timestep: torch.Tensor,
         instruction_hidden_states: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        freqs_real: RotaryFrequencyTables,
         instruction_attention_mask: torch.Tensor,
         ref_image_hidden_states: list[list[torch.Tensor]] | None = None,
     ) -> torch.Tensor:
@@ -1243,7 +1524,7 @@ class BooguImageTransformer2DModel(nn.Module):
             combined_img_rotary_emb,
             combined_img_seq_lengths,
         ) = self.rope_embedder(
-            freqs_cis,
+            freqs_real,
             instruction_attention_mask,
             l_effective_ref_img_len,
             l_effective_img_len,

@@ -91,7 +91,7 @@ if __name__ == "__main__":
 
 For more usages, please refer to [offline inference](../user_guide/examples/offline_inference/qwen2_5_omni.md)
 
-## Online Serving with OpenAI-Completions API
+## Online Serving with the API Server
 
 Text-to-image generation quickstart with vLLM-Omni:
 
@@ -100,20 +100,16 @@ vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8091
 ```
 
 ```bash
-curl -s http://localhost:8091/v1/chat/completions \
+curl -s http://localhost:8091/v1/images/generations \
   -H "Content-Type: application/json" \
   -d '{
-    "messages": [
-      {"role": "user", "content": "a cup of coffee on the table"}
-    ],
-    "extra_body": {
-      "height": 1024,
-      "width": 1024,
-      "num_inference_steps": 50,
-      "guidance_scale": 4.0,
-      "seed": 42
-    }
-  }' | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2 | base64 -d > coffee.png
+    "prompt": "a cup of coffee on the table",
+    "size": "1024x1024",
+    "response_format": "b64_json",
+    "seed": 42
+  }' | jq -r '.data[0].b64_json' | base64 -d > coffee.png
 ```
 
-For more details, please refer to [online serving](../user_guide/examples/online_serving/text_to_image.md).
+See the [API Server guide](../serving/README.md) to choose an endpoint. For
+model-specific details, refer to the [text-to-image online serving
+example](../user_guide/examples/online_serving/text_to_image.md).

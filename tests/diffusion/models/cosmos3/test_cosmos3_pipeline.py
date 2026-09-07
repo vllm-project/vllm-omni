@@ -30,6 +30,36 @@ def test_pipeline_declares_layerwise_offload_components() -> None:
     assert Cosmos3OmniDiffusersPipeline._resident_modules == []
     assert hasattr(Cosmos3OmniDiffusersPipeline, "enable_omni_model_cpu_offload")
 
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import (
+        Cosmos3LanguageModel,
+        Cosmos3VFMTransformer,
+    )
+
+    assert Cosmos3LanguageModel._layerwise_offload_blocks_attrs == ["layers"]
+    assert Cosmos3VFMTransformer._layerwise_offload_blocks_attrs == ["gen_layers"]
+
+
+def test_component_selective_model_offload_fails_before_component_loading(monkeypatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3 as pipeline_module
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "get_local_device",
+        lambda: pytest.fail("component loading must not start for an unsupported selector"),
+    )
+    config = SimpleNamespace(
+        diffusion_offload_config={"mode": "module", "components": ["dit"]},
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=False,
+        dlo_use_allgather=True,
+        dlo_resident_layers=0,
+        pin_cpu_memory=True,
+    )
+
+    with pytest.raises(ValueError, match="does not support the dit/text_encoder component selector"):
+        pipeline_module.Cosmos3OmniDiffusersPipeline(od_config=config)
+
 
 class StubScheduler:
     def __init__(
@@ -1148,6 +1178,72 @@ def test_transfer_fps_matches_resolved_frame_rate_precedence() -> None:
     assert cfg is not None
     # edge has no preset fps default, so cfg.fps comes straight from fps resolution.
     assert cfg.fps == sp.resolved_frame_rate == 12.0
+
+
+def test_transfer_vae_executor_requires_distributed_vae() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    pipeline = object.__new__(Cosmos3OmniDiffusersPipeline)
+    executor = object()
+    pipeline.vae = SimpleNamespace(distributed_executor=executor, is_distributed_enabled=lambda: True)
+    assert pipeline._transfer_vae_executor() is executor
+
+    pipeline.vae = SimpleNamespace(distributed_executor=executor, is_distributed_enabled=lambda: False)
+    assert pipeline._transfer_vae_executor() is None
+
+
+def test_sync_transfer_overlap_slices_output_rank_and_broadcasts() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    class RecordingExecutor:
+        rank = 0
+
+        def __init__(self) -> None:
+            self.value = None
+
+        def broadcast_tensor(self, value):
+            self.value = value
+            return value
+
+    pipeline = object.__new__(Cosmos3OmniDiffusersPipeline)
+    output = torch.arange(1 * 3 * 5 * 2 * 2).reshape(1, 3, 5, 2, 2)
+    executor = RecordingExecutor()
+
+    overlap = pipeline._sync_transfer_overlap(
+        output,
+        overlap_frames=2,
+        reference_video=output,
+        vae_executor=executor,
+    )
+
+    assert overlap is not None
+    torch.testing.assert_close(overlap, output[:, :, -2:])
+    assert executor.value is overlap
+
+
+def test_sync_transfer_overlap_allocates_receive_buffer_on_non_output_rank() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    class ReceivingExecutor:
+        rank = 1
+
+        def broadcast_tensor(self, value):
+            assert value.shape == (1, 3, 2, 4, 5)
+            return torch.ones_like(value)
+
+    pipeline = SimpleNamespace(device=torch.device("cpu"), vae=SimpleNamespace(dtype=torch.float32))
+    reference = torch.zeros(1, 3, 6, 4, 5)
+
+    overlap = Cosmos3OmniDiffusersPipeline._sync_transfer_overlap(
+        pipeline,
+        torch.empty(0),
+        overlap_frames=2,
+        reference_video=reference,
+        vae_executor=ReceivingExecutor(),
+    )
+
+    assert overlap is not None
+    assert torch.equal(overlap, torch.ones_like(overlap))
 
 
 def test_transfer_edge_uses_rgb_canny(monkeypatch: pytest.MonkeyPatch) -> None:

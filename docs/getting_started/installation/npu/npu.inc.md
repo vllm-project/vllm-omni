@@ -9,8 +9,8 @@ The recommended way to use vLLM-Omni on NPU is through the vLLM-Ascend pre-built
 
 ```bash
 # vLLM-Ascend image
-# Atlas A2: quay.io/atlas-ci/vllm-ascend:v0.26.0
-# Atlas A3: quay.io/atlas-ci/vllm-ascend:v0.26.0-a3
+# Atlas A2: quay.io/atlas-ci/vllm-ascend:v0.28.0
+# Atlas A3: quay.io/atlas-ci/vllm-ascend:v0.28.0-a3
 docker run --rm \
     --name vllm-omni-npu \
     --shm-size=1g \
@@ -28,11 +28,11 @@ docker run --rm \
     -v /etc/ascend_install.info:/etc/ascend_install.info \
     -v /root/.cache:/root/.cache \
     -p 8000:8000 \
-    -it quay.io/atlas-ci/vllm-ascend:v0.26.0-a3 bash
+    -it quay.io/atlas-ci/vllm-ascend:v0.28.0-a3 bash
 
 # Inside the container, install vLLM-Omni from source
 cd /vllm-workspace
-git clone -b v0.26.0 https://github.com/vllm-project/vllm-omni.git
+git clone -b v0.28.0 https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
 pip install -v -e . --no-build-isolation
 # or VLLM_OMNI_TARGET_DEVICE=npu pip install -v -e .
@@ -50,21 +50,11 @@ We are keeping [issue #886](https://github.com/vllm-project/vllm-omni/issues/886
 
 # --8<-- [start:installation-main]
 
-You can also build vLLM-Omni from the latest main branch if you want to use the latest features or bug fixes. (But sometimes it will break for a while. You can check [issue #886](https://github.com/vllm-project/vllm-omni/issues/886) for the status of the latest commit of vLLM-Omni main branch on NPU.)
+You can also install vLLM-Omni from the latest main branch if you want to use the latest features or bug fixes. Use the aligned vLLM-Ascend v0.28.0 image described above, and check [issue #886](https://github.com/vllm-project/vllm-omni/issues/886) for the status of the latest vLLM-Omni commit on NPU.
 
 ```bash
-# Pin vLLM and vLLM-Ascend to the v0.26 release line
-git clone -b v0.26.0 https://github.com/vllm-project/vllm.git
-cd vllm
-VLLM_TARGET_DEVICE=empty pip install -v -e .
-cd ..
-
-git clone -b releases/v0.26.0rc https://github.com/vllm-project/vllm-ascend.git
-cd vllm-ascend
-pip install -v -e .
-cd ..
-
-# Install vLLM-Omni from the latest main branch
+# Inside the vLLM-Ascend v0.28.0 container, install vLLM-Omni from main
+cd /vllm-workspace
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
 pip install -v -e . --no-build-isolation
@@ -88,8 +78,8 @@ Supported images as following.
 Here's an example deployment command that has been verified on 4 x NPUs:
 
 ```bash
-# Atlas A2: quay.io/ascend/vllm-omni:v0.26.0
-# Atlas A3: quay.io/ascend/vllm-omni:v0.26.0-a3
+# Atlas A2: quay.io/ascend/vllm-omni:v0.28.0
+# Atlas A3: quay.io/ascend/vllm-omni:v0.28.0-a3
 docker run --rm \
     --name vllm-omni-a3 \
     --shm-size=4g \
@@ -114,7 +104,7 @@ docker run --rm \
     -v /etc/ascend_install.info:/etc/ascend_install.info \
     -v ~/.cache:/root/.cache \
     -p 8091:8091 \
-    -it quay.io/ascend/vllm-omni:v0.26.0-a3 bash
+    -it quay.io/ascend/vllm-omni:v0.28.0-a3 bash
 ```
 
 !!! tip

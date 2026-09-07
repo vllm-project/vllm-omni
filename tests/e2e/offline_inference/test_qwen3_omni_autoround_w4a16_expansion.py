@@ -78,7 +78,7 @@ quant_params = [(QUANTIZED_MODEL, stage_config)]
 
 
 @_SKIP_ISSUE_5652
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_text_to_text(omni_runner, offline_client):
     """Text input → text output with W4A16 quantized Qwen3-Omni."""
@@ -97,7 +97,7 @@ def test_text_to_text(omni_runner, offline_client):
 
 
 @_SKIP_ISSUE_5652
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_audio_to_text(omni_runner, offline_client):
     """Audio input → text output with W4A16 quantized Qwen3-Omni."""
@@ -121,7 +121,7 @@ def test_audio_to_text(omni_runner, offline_client):
 
 
 @_SKIP_ISSUE_5652
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_image_to_text(omni_runner, offline_client):
     """Image input → text output with W4A16 quantized Qwen3-Omni."""
@@ -143,7 +143,7 @@ def test_image_to_text(omni_runner, offline_client):
 
 
 @_SKIP_ISSUE_5652
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_video_to_text(omni_runner, offline_client):
     """Video input → text output with W4A16 quantized Qwen3-Omni."""
@@ -165,7 +165,7 @@ def test_video_to_text(omni_runner, offline_client):
 
 
 @_SKIP_ISSUE_5652
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_video_to_audio(omni_runner, offline_client):
     """Video input → audio output with W4A16 quantized Qwen3-Omni."""
@@ -186,7 +186,7 @@ def test_video_to_audio(omni_runner, offline_client):
 
 
 @_SKIP_ISSUE_5652
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_mix_to_audio(omni_runner, offline_client):
     """Mixed-modality input → audio output with W4A16 quantized Qwen3-Omni."""
