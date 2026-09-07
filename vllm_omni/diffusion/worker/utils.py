@@ -12,6 +12,10 @@ import torch
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.interaction.types import (
+        InteractionChunkMetadata,
+        InteractionSession,
+    )
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 
@@ -99,6 +103,10 @@ class StepRequestState:
     step_in_chunk: int = 0
     total_chunks: int = 1
     chunk_num_steps: int | None = None
+
+    # ── Optional interaction information in streaming output mode ──
+    interaction_sessions: dict[str, InteractionSession] = field(default_factory=dict)  # Modality -> transition progress
+    interaction_chunk_metadata: InteractionChunkMetadata | None = None  # Acknowledging completion of each interaction
 
     # ── Per-request scheduler instance (set once by prepare_encode) ──
     scheduler: Any | None = None
