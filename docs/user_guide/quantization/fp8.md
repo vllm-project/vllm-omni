@@ -17,7 +17,7 @@ in deep DiT blocks.
 ## Hardware Support
 
 | Device | Support |
-|--------|---------|
+| -------- | --------- |
 | NVIDIA Blackwell GPU (SM 100+) | ✅ |
 | NVIDIA Ada/Hopper GPU (SM 89+) | ✅ |
 | NVIDIA Ampere GPU (SM 80+) | ✅ |
@@ -83,7 +83,7 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 ### Diffusion Models
 
 | Model | HF models | Online | Pre-calibrated | Recommendation | `ignored_layers` | Text-Encoder quantization |
-|-------|-----------|:-------:|:------:|----------------|------------------|------------------|
+| ------- | ----------- | :-------: | :------: | ---------------- | ------------------ | ------------------ |
 | Qwen-Image | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes | Yes | Skip sensitive image-stream MLPs when quality regresses | `img_mlp` | |
 | Wan2.2 | Wan2.2 diffusion pipelines | Not validated | Not validated | Validate against BF16 before documenting as supported | TBD | |
 | LTX-2 | `Lightricks/LTX-2`, `rootonchair/LTX-2-19b-distilled` | Yes | Not validated | Transformer only; use dynamic phase LoRA for ordinary two-stage | None | |
@@ -100,7 +100,7 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 
 | Model | Scope | Format | Status |
-|-------|-------|--------|--------|
+| ----- | ----- | ------ | ------ |
 | Qwen3-Omni | Thinker language-model stage | [ModelOpt](modelopt.md) `quant_algo=FP8` | Tested for thinker memory reduction |
 | Qwen3-TTS | TTS language-model stage | Checkpoint config | Not validated |
 
@@ -110,9 +110,23 @@ model-specific guide says otherwise.
 ### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
 
 | Model | Scope | Status | Notes |
-|-------|-------|--------|-------|
-| BAGEL | Stage-specific transformer or DiT module | Not validated | Route FP8 to the intended stage before enabling |
+| ----- | ----- | ------ | ----- |
+| BAGEL | Diffusion-stage MoT transformer + connector | Validated for online FP8 | Stage-0 Thinker stays BF16 |
 | GLM-Image | Stage-specific transformer or DiT module | Not validated | Validate quality against BF16 baseline |
+
+For BAGEL, set `diffusion_quantization_config="fp8"` so only the diffusion
+stage is quantized. Online FP8 covers text and `gen_exp` MoT linears plus the
+connector; VAE, ViT, time embed, and `lm_head` remain BF16. Ampere may use a
+weight-only / Marlin path — treat Tensor Core speedups as Hopper/Ada-class only.
+
+```python
+from vllm_omni import Omni
+
+omni = Omni(
+    model="ByteDance-Seed/BAGEL-7B-MoT",
+    diffusion_quantization_config="fp8",
+)
+```
 
 ## Configuration
 
@@ -151,7 +165,7 @@ For a pipeline that exposes both a transformer and a quantization-aware text
 encoder, the scope is:
 
 | Configuration | Transformer | Text encoder | Components without supported quantizable layers |
-|---------------|-------------|--------------|-------------------------------------------------|
+| --------------- | ------------- | -------------- | ------------------------------------------------- |
 | `quantization="fp8"` | FP8 | FP8 | checkpoint precision |
 | `{"transformer": {"method": "fp8"}}` | FP8 | checkpoint precision | checkpoint precision |
 | `{"text_encoder": {"method": "fp8"}}` | checkpoint precision | FP8 | checkpoint precision |
@@ -200,7 +214,7 @@ does not fit the workload.
 ## Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `method` | str | - | Quantization method (`"fp8"`) |
 | `ignored_layers` | list[str] | `[]` | Layer name patterns to keep in BF16 |
 | `activation_scheme` | str | `"dynamic"` | `"dynamic"` selects online activation scaling, or `"static"` when scales are available |
