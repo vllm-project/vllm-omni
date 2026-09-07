@@ -133,10 +133,18 @@ class StreamingExecutionContext:
 
     ``state_slot_ids`` and ``valid_rows`` both have shape ``(B_execution,)``.
     CUDA Graph padding rows use dedicated scratch slots and ``valid_rows=False``.
+
+    ``slot0`` (B==1, eager single-stream only) is the single active slot as a
+    Python int, set once per decode by ``decode_streaming_tensors``. It lets
+    ``RingKVCache.complete`` take a contiguous *view* of the cache instead of a
+    gather+writeback, cutting slot-indirection overhead at B==1. ``None``
+    during graph capture (a python int would be baked into the captured graph)
+    and for B>1.
     """
 
     state_slot_ids: torch.Tensor
     valid_rows: torch.Tensor
+    slot0: int | None = None
 
     def validate(self, *, batch_size: int, state_capacity: int, device: torch.device) -> None:
         if self.state_slot_ids.shape != (batch_size,):
@@ -533,6 +541,39 @@ class RingKVCache:
                 raise RuntimeError("Dynamic state-slot execution does not support weights_per_step attention.")
             slots = execution_context.state_slot_ids
             valid_rows = execution_context.valid_rows
+
+            # B==1 eager single-stream fast path: contiguous *views* of the
+            # cache and end_offset for the single active slot, scatter_ in
+            # place -- no index_select (gather) / index_copy_ (writeback).
+            # Numerically identical to the general path (same ops, views vs
+            # copies). slot0 is None during graph capture and for B>1.
+            slot0 = execution_context.slot0
+            if B == 1 and slot0 is not None:
+                end_offset = self.end_offset[slot0 : slot0 + 1]
+                keys = self.cache[0, slot0 : slot0 + 1]
+                values = self.cache[1, slot0 : slot0 + 1]
+
+                indexes = torch.arange(T, device=end_offset.device, dtype=end_offset.dtype)
+                indexes = (indexes + end_offset.view(-1, 1)) % self.capacity
+                scatter_indexes = indexes.view(1, 1, T, 1).expand(-1, H, T, D)
+                keys.scatter_(2, scatter_indexes, k)
+                values.scatter_(2, scatter_indexes, v)
+
+                cache_indexes = torch.arange(self.capacity, device=end_offset.device, dtype=torch.long)
+                last_offset = end_offset.view(-1, 1) + T - 1
+                end_index = last_offset % self.capacity
+                delta = cache_indexes - end_index
+                positions = torch.where(
+                    delta <= 0,
+                    last_offset + delta,
+                    last_offset + delta - self.capacity,
+                )
+                next_offset = torch.where(valid_rows, end_offset + T, end_offset)
+                self.end_offset[slot0 : slot0 + 1] = next_offset
+                invalid = cache_indexes >= next_offset.view(-1, 1)
+                positions = torch.where(invalid, torch.full_like(positions, -1), positions)
+                return KVCacheResult(keys, values, positions)
+
             end_offset = self.end_offset.index_select(0, slots)
             row_cache = self.cache.index_select(1, slots)
 
@@ -1751,10 +1792,11 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         codes_lengths: torch.Tensor,
         state_slot_ids: torch.Tensor,
         valid_rows: torch.Tensor,
+        slot0: int | None = None,
     ) -> MossAudioTokenizerDecoderOutput:
         if not self._streaming_modules:
             raise RuntimeError("MOSS Audio Tokenizer decoder state pool is not initialized.")
-        execution_context = StreamingExecutionContext(state_slot_ids=state_slot_ids, valid_rows=valid_rows)
+        execution_context = StreamingExecutionContext(state_slot_ids=state_slot_ids, valid_rows=valid_rows, slot0=slot0)
         execution_context.validate(
             batch_size=int(codes.shape[1]),
             state_capacity=self._decoder_state_capacity,
@@ -1765,6 +1807,7 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
             codes_lengths,
             state_slot_ids,
             valid_rows,
+            slot0=slot0,
         )
         return MossAudioTokenizerDecoderOutput(audio=audio, audio_lengths=audio_lengths)
 
@@ -1774,11 +1817,18 @@ class MossAudioTokenizerModel(MossAudioTokenizerPreTrainedModel):
         codes_lengths: torch.Tensor,
         state_slot_ids: torch.Tensor,
         valid_rows: torch.Tensor,
+        slot0: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Tensor-only streaming decode boundary for vLLM compilation."""
+        # B==1 slice fast path: ``slot0`` is the single active slot as a python
+        # int (the session passes slots[0] directly -- NO .item(), so no host
+        # sync, async-safe at concurrency too). RingKVCache.complete takes a
+        # contiguous *view* of the cache instead of a gather+writeback. None for
+        # B>1. Opt out via MOSS_CODEC_SLICE=0 (session sets slot0=None).
         execution_context = StreamingExecutionContext(
             state_slot_ids=state_slot_ids,
             valid_rows=valid_rows,
+            slot0=slot0,
         )
         return self._decode_frame_tensors(codes, codes_lengths, execution_context=execution_context)
 
