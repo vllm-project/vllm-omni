@@ -52,7 +52,7 @@ from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_p
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
-from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRow
+from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import (
     merge_runtime_info,
     require_request_id,
@@ -61,43 +61,74 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
 
+# Mel columns kept ahead of the earliest column a perception chunk consumes,
+# so reflect-pad / preemphasis boundary effects at the trimmed rolling-window
+# head (which only reach the first ~2 columns) never touch a consumed column.
+_DUPLEX_MEL_MARGIN_COLS = 8
+
 _LM_ARCHITECTURE = "NemotronHForCausalLM"
 
 
-def slice_perception_streaming_mel(
-    processed_signal: torch.Tensor,
+def _streaming_cfg_at(value: Any, index: int) -> int:
+    return int(value[index] if isinstance(value, list | tuple) else value)
+
+
+def perception_chunk_geometry(
     frame_idx: int,
+    stream_total_cols: int,
     streaming_cfg: Any,
-) -> tuple[torch.Tensor, int]:
-    """Slice one 80 ms mel chunk using NeMo's cache-manager geometry."""
-
-    def _at(value: Any, index: int) -> int:
-        return int(value[index] if isinstance(value, list | tuple) else value)
-
-    chunk_size_first = _at(streaming_cfg.chunk_size, 0)
-    chunk_size = _at(streaming_cfg.chunk_size, 1)
-    shift_size_first = _at(streaming_cfg.shift_size, 0)
-    shift_size = _at(streaming_cfg.shift_size, 1)
-    pre_encode_first = _at(streaming_cfg.pre_encode_cache_size, 0)
-    pre_encode_size = _at(streaming_cfg.pre_encode_cache_size, 1)
-
-    if frame_idx == 0:
-        mel_chunk = processed_signal[:, :, :chunk_size_first]
-        if pre_encode_first > 0:
-            mel_chunk = torch.nn.functional.pad(mel_chunk, (pre_encode_first, 0))
-        return mel_chunk, 0
+) -> tuple[int, int, int]:
+    """Stream-global (cache_start, chunk_start, chunk_end) mel columns for ``frame_idx > 0``."""
+    chunk_size = _streaming_cfg_at(streaming_cfg.chunk_size, 1)
+    shift_size_first = _streaming_cfg_at(streaming_cfg.shift_size, 0)
+    shift_size = _streaming_cfg_at(streaming_cfg.shift_size, 1)
+    pre_encode_size = _streaming_cfg_at(streaming_cfg.pre_encode_cache_size, 1)
 
     chunk_start = shift_size_first + (frame_idx - 1) * shift_size
     chunk_end = chunk_start + chunk_size
     # Match NeMo's tail-boundary rule.  With one 80 ms frame per call this
     # normally leaves the expected trailing STFT columns unused.
     offset = chunk_size - shift_size_first
-    if chunk_end > processed_signal.shape[-1] - offset:
-        chunk_end = processed_signal.shape[-1] - offset
+    if chunk_end > stream_total_cols - offset:
+        chunk_end = stream_total_cols - offset
         chunk_start = chunk_end - chunk_size
-    main_chunk = processed_signal[:, :, chunk_start:chunk_end]
     cache_start = max(0, chunk_start - pre_encode_size)
-    cache_mel = processed_signal[:, :, cache_start:chunk_start]
+    return cache_start, chunk_start, chunk_end
+
+
+def slice_perception_streaming_mel(
+    processed_signal: torch.Tensor,
+    frame_idx: int,
+    streaming_cfg: Any,
+    *,
+    window_col0: int = 0,
+) -> tuple[torch.Tensor, int]:
+    """Slice one 80 ms mel chunk using NeMo's cache-manager geometry.
+
+    ``processed_signal`` may be the mel of a trailing window of the stream
+    instead of the full history; ``window_col0`` is the stream-global column
+    index of its first column (the window must end at the stream tail).
+    """
+    chunk_size_first = _streaming_cfg_at(streaming_cfg.chunk_size, 0)
+    pre_encode_first = _streaming_cfg_at(streaming_cfg.pre_encode_cache_size, 0)
+    pre_encode_size = _streaming_cfg_at(streaming_cfg.pre_encode_cache_size, 1)
+
+    if frame_idx == 0:
+        if window_col0 != 0:
+            raise ValueError("perception stream start requires an untrimmed mel window")
+        mel_chunk = processed_signal[:, :, :chunk_size_first]
+        if pre_encode_first > 0:
+            mel_chunk = torch.nn.functional.pad(mel_chunk, (pre_encode_first, 0))
+        return mel_chunk, 0
+
+    stream_total_cols = window_col0 + int(processed_signal.shape[-1])
+    cache_start, chunk_start, chunk_end = perception_chunk_geometry(frame_idx, stream_total_cols, streaming_cfg)
+    if cache_start < window_col0:
+        raise ValueError(
+            f"perception mel window starts at column {window_col0} but frame {frame_idx} needs column {cache_start}"
+        )
+    main_chunk = processed_signal[:, :, chunk_start - window_col0 : chunk_end - window_col0]
+    cache_mel = processed_signal[:, :, cache_start - window_col0 : chunk_start - window_col0]
     if cache_mel.shape[-1] < pre_encode_size:
         cache_mel = torch.nn.functional.pad(
             cache_mel,
@@ -300,12 +331,14 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
 
         # Stateful per-request execution is only validated at batch size 1
         # (the shipped offline scope); fail fast on silent multi-request use.
+        # Multi-session batching: all per-request state (audio frames, fused
+        # prefill embeds, function-token feedback) lives in _sessions keyed by
+        # request id; the runner drives preprocess per request and hands
+        # postprocess each request's own hidden-state slice, and the NemotronH
+        # backbone batches natively on paged KV. Validated at max_num_seqs<=4.
         max_num_seqs = int(getattr(vllm_config.scheduler_config, "max_num_seqs", 1))
-        if max_num_seqs != 1:
-            raise NotImplementedError(
-                f"NemotronVoiceChat thinker supports max_num_seqs=1 only (got {max_num_seqs}); "
-                "multi-request batching of the per-request fusion state is not implemented."
-            )
+        if max_num_seqs > 1:
+            logger.info("NemotronVoiceChat thinker: multi-session batching enabled (max_num_seqs=%d)", max_num_seqs)
 
         # request_id -> per-request state (audio frames, prefill embeds, counters).
         self._sessions: dict[str, dict[str, Any]] = {}
@@ -367,11 +400,16 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
         multimodal_outputs: dict[str, torch.Tensor] = {}
-        if self._use_function_head and model_outputs.numel():
+        info_dicts = kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information")
+        single_request = isinstance(info_dicts, list) and len(info_dicts) == 1
+        if self._use_function_head and model_outputs.numel() and single_request:
+            # Only a single-request batch can attribute the batch's last row
+            # to a request.  With several concurrent requests this key is
+            # omitted and postprocess computes each request's token from its
+            # own hidden-state slice instead (and applies any forced token).
             with torch.inference_mode():
                 function_token = self.function_head(model_outputs[-1:, :].to(self._dtype)).argmax(dim=-1)
-            info_dicts = kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information")
-            info = info_dicts[0] if isinstance(info_dicts, list) and len(info_dicts) == 1 else None
+            info = info_dicts[0]
             request_id = info.get("request_id") if isinstance(info, dict) else None
             session = self._sessions.get(request_id) if isinstance(request_id, str) else None
             forced_token = session.get("forced_function_token") if isinstance(session, dict) else None
@@ -459,7 +497,7 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 f"Nemotron VoiceChat duplex input sequence moved backwards: {source_input_seq} < {last_input_seq}"
             )
 
-        from vllm_omni.experimental.fullduplex.nemotron_voicechat.input import (
+        from vllm_omni.model_executor.models.nemotron_voicechat.duplex.input import (
             decode_pcm_f32le,
         )
 
@@ -474,25 +512,51 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 )
             audio = torch.cat([audio, frame_audio])
         else:
+            # Stream start.  A session normally starts at input sequence 1;
+            # seeing a later sequence means model-side session state was
+            # dropped mid-stream (request abort racing an already-queued step,
+            # or a stage-request re-open).  Restart perception from this frame
+            # instead of failing the engine step.
             if source_input_seq != 1:
-                raise ValueError(
-                    f"Nemotron VoiceChat cache-aware perception must start at input sequence 1, got {source_input_seq}"
+                logger.warning(
+                    "Nemotron VoiceChat perception session reset mid-stream; restarting at input sequence %d.",
+                    source_input_seq,
                 )
+            session["duplex_seq_base"] = source_input_seq - 1
+            session["duplex_window_col0"] = 0
             audio = frame_audio
+
+        frame_idx = source_input_seq - 1 - int(session.get("duplex_seq_base", 0))
 
         encoder = self.perception.encoder
         streaming_cfg = encoder.streaming_cfg
+        window_col0 = int(session.get("duplex_window_col0", 0))
+        if frame_idx > 0:
+            # Bound the rolling audio window: each mel column is local (STFT
+            # centered on hop-aligned samples, no cross-stream normalization),
+            # so only the columns the chunk slice consumes need to exist.
+            # Keep a margin ahead of cache_start so reflect-pad/preemphasis
+            # boundary effects at the trimmed window head never reach a
+            # consumed column.
+            hop = int(getattr(self._streaming_preprocessor.featurizer, "hop_length", 160))
+            total_samples = window_col0 * hop + int(audio.numel())
+            stream_total_cols = total_samples // hop + 1
+            cache_start, _, _ = perception_chunk_geometry(frame_idx, stream_total_cols, streaming_cfg)
+            desired_col0 = max(0, cache_start - _DUPLEX_MEL_MARGIN_COLS)
+            if desired_col0 > window_col0:
+                audio = audio[(desired_col0 - window_col0) * hop :]
+                window_col0 = desired_col0
         with torch.inference_mode():
             processed_signal, _ = self._streaming_preprocessor(
                 input_signal=audio.unsqueeze(0),
                 length=torch.tensor([audio.numel()], device=device, dtype=torch.long),
             )
 
-            frame_idx = source_input_seq - 1
             mel_chunk, drop_extra_pre_encoded = slice_perception_streaming_mel(
                 processed_signal,
                 frame_idx,
                 streaming_cfg,
+                window_col0=window_col0,
             )
             if frame_idx == 0:
                 caches = encoder.get_initial_cache_state(
@@ -538,6 +602,7 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
             )
         stable = stable[0].to(self._dtype)
         session["duplex_audio"] = audio
+        session["duplex_window_col0"] = window_col0
         session["perception_cache_last_channel"] = cache_channel
         session["perception_cache_last_time"] = cache_time
         session["perception_cache_last_channel_len"] = cache_channel_len
@@ -599,12 +664,14 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
 
         self._sync_forced_function_response(session, runtime_config)
 
-        if source_input_seq <= 1:
-            offset = max(0, int(info.get("_omni_num_computed_tokens", 0) or 0))
-            prefill = session["prefill_embeds"]
-            span = int(input_ids.shape[0])
-            if offset + span > int(prefill.shape[0]):
-                raise ValueError("Nemotron VoiceChat duplex first append exceeds its fused prompt")
+        offset = max(0, int(info.get("_omni_num_computed_tokens", 0) or 0))
+        span = int(input_ids.shape[0])
+        prefill = session["prefill_embeds"]
+        if offset + span <= int(prefill.shape[0]):
+            # Engine positions inside the fused prompt prefill (possibly
+            # chunked).  The position decides, not the duplex input sequence:
+            # after a mid-stream session reset the re-opened request prefills
+            # its prompt again at a sequence far beyond 1.
             return (
                 input_ids,
                 prefill[offset : offset + span].to(self._dtype),
@@ -887,14 +954,18 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         if isinstance(request_id, str):
             session = self._sessions.get(request_id)
             if session is not None:
-                # StreamingUpdate replaces the runner payload at each append;
-                # retain the function channel in model-owned session state.
-                session["func_token"] = int(token.item())
                 forced = session.pop("forced_function_token", None)
                 if isinstance(forced, int):
                     queue = session.get("forced_function_tokens")
                     if not isinstance(queue, list) or not queue or queue.pop(0) != forced:
                         raise RuntimeError("Nemotron VoiceChat forced function-token queue lost alignment")
+                    # Apply the override here too: with several concurrent
+                    # requests make_omni_output omits the shared token, so the
+                    # token above is this request's own computed one.
+                    token = torch.full_like(token, forced)
+                # StreamingUpdate replaces the runner payload at each append;
+                # retain the function channel in model-owned session state.
+                session["func_token"] = int(token.item())
         update: dict[str, Any] = {"nvc_prev_function_token": token}
         if os.environ.get("NEMOTRON_VOICECHAT_DEBUG_FUNCTION_TIMELINE", "0") == "1":
             existing = kwargs.get("nvc_function_tokens")

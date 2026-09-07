@@ -59,10 +59,8 @@ def pytorch_attn_forward(
     k shape (bs, seqlen, nhead, hs)
     v shape (bs, seqlen, nhead, hs)
     """
-    # Fallback logic: Flash Attention does not support float32.
-    # If op_type is 'flash' but dtype is float32, force 'efficient'.
     if op_type == "flash" and q.dtype == torch.float32:
-        op_type = "efficient"
+        raise ValueError("The explicitly requested Flash ring kernel does not support float32.")
 
     # Volta (V100, sm70) does not have native bf16 support for the efficient
     # SDPA kernel. When running Ring attention in bf16 on such GPUs, the
@@ -123,6 +121,7 @@ def pytorch_attn_forward(
     # Keep LSE in fp32 for numerical stability when accumulating across ring
     # steps (update_out_and_lse uses sigmoid/logsigmoid on LSE diffs).
     # Casting LSE down to fp16/bf16 can introduce NaNs on some GPUs/shapes.
+    # PyTorch SDPA returns LSE as (B, H, S).
     lse = lse.to(torch.float32)
 
     if out.dtype != orig_dtype:
@@ -173,6 +172,7 @@ def flash_attn_forward(
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax,
         )
+    # FA2 softmax_lse is (B, H, S), optionally padded on S.
     return block_out, block_lse
 
 
@@ -198,6 +198,7 @@ def fa3_forward(q, k, v, dropout_p, softmax_scale, causal, window_size, softcap,
         softcap=softcap if softcap else 0.0,
     )
 
+    # FA3 softmax_lse is (B, H, S).
     return out, softmax_lse
 
 
@@ -236,6 +237,7 @@ def flash_attn4_func_forward(
         softcap=softcap or 0.0,
         return_lse=True,
     )
+    # FA4 CuTe softmax_lse is (B, H, S).
     return out, softmax_lse
 
 
@@ -264,6 +266,7 @@ def flash_attn_forward_aiter(
         return_lse=True,
     )
 
+    # Aiter softmax_lse is (B, H, S), matching FA2.
     return block_out, block_lse
 
 
@@ -293,7 +296,7 @@ def flashinfer_attn_forward(
             window_left=window_size[0],
             return_lse=True,
         )
-        lse = lse.transpose(0, 1)
+        # FlashInfer unbatched LSE is (H, S). Canonical ring layout is (B, H, S).
         out, lse = out.unsqueeze(0), lse.unsqueeze(0)
     elif q.ndim == 3:
         out, lse = single_prefill_with_kv_cache(
@@ -306,7 +309,7 @@ def flashinfer_attn_forward(
             window_left=window_size[0],
             return_lse=True,
         )
-        lse = lse.transpose(0, 1)
+        # Unbatched (H, S) matches canonical heads-major layout without a batch dim.
     else:
         raise ValueError(f"Invalid input shape: {q.shape}")
     lse = lse / _LOG2_E

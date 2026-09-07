@@ -30,7 +30,6 @@
         "vae-patch-parallel-size": 4,
         "vae-parallel-mode": "tile",
         "vae-use-tiling": true,
-        "diffusion-attention-backend": "FLASH_ATTN",
         "stage-init-timeout": 1800,
         "init-timeout": 1800,
         "enable-diffusion-pipeline-profiler": true
@@ -102,7 +101,6 @@
         "vae-patch-parallel-size": 4,
         "vae-parallel-mode": "tile",
         "vae-use-tiling": true,
-        "diffusion-attention-backend": "FLASH_ATTN",
         "stage-init-timeout": 1800,
         "init-timeout": 1800,
         "enable-diffusion-pipeline-profiler": true
@@ -175,7 +173,6 @@
         "vae-patch-parallel-size": 4,
         "vae-parallel-mode": "tile",
         "vae-use-tiling": true,
-        "diffusion-attention-backend": "FLASH_ATTN",
         "stage-init-timeout": 1800,
         "init-timeout": 1800,
         "enable-diffusion-pipeline-profiler": true
@@ -247,7 +244,6 @@
         "vae-patch-parallel-size": 4,
         "vae-parallel-mode": "tile",
         "vae-use-tiling": true,
-        "diffusion-attention-backend": "FLASH_ATTN",
         "stage-init-timeout": 1800,
         "init-timeout": 1800,
         "enable-diffusion-pipeline-profiler": true,

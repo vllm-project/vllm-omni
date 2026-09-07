@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -139,8 +139,9 @@ def apply_hsdp_to_model(
     # hsdp_config.param_dtype (typically bfloat16). FP8 GEMM kernels expect
     # FP8 inputs; an implicit FP8 -> bf16 cast would silently break them.
     has_fp8_params = any(p.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) for p in model.parameters())
+    preserve_parameter_dtypes = bool(getattr(model, "_hsdp_preserve_parameter_dtypes", False))
     mp_policy = MixedPrecisionPolicy(
-        param_dtype=None if has_fp8_params else hsdp_config.param_dtype,
+        param_dtype=None if has_fp8_params or preserve_parameter_dtypes else hsdp_config.param_dtype,
         reduce_dtype=hsdp_config.reduce_dtype,
         output_dtype=hsdp_config.output_dtype,
         cast_forward_inputs=False,
@@ -182,8 +183,9 @@ def apply_hsdp_to_model(
             "the ignored modules can be placed on the worker's execution device."
         )
     for mod_name in ignored_module_names:
-        sub_mod = getattr(model, mod_name, None)
-        if sub_mod is None:
+        try:
+            sub_mod = model.get_submodule(mod_name)
+        except AttributeError:
             logger.warning("_hsdp_ignored_modules entry %r not found on model", mod_name)
             continue
         sub_mod.to(target_device)

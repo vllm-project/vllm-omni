@@ -704,29 +704,40 @@ class OmniServeCommand(CLISubcommand):
 
         # diffusion model offload parameters
         omni_config_group.add_argument(
+            "--diffusion-offload-config",
+            type=json.loads,
+            default=None,
+            help="Diffusion CPU-offload config as JSON. "
+            "Set mode to module or layer, list dit and/or text_encoder in "
+            "components, and put layer-only tuning under layer_options. "
+            "Layer settings are weight_transfer (rank-local or allgather) and "
+            "resident_layers (DiT only).",
+        )
+        omni_config_group.add_argument(
             "--enable-cpu-offload",
             action="store_true",
-            help="Enable CPU offloading for diffusion models.",
+            help="Compatibility alias for model-level CPU offload. New integrations should use "
+            "--diffusion-offload-config with mode=module and explicit components.",
         )
         omni_config_group.add_argument(
             "--enable-layerwise-offload",
             action="store_true",
-            help="Enable layerwise (blockwise) offloading on DiT modules.",
+            help="Compatibility alias for layerwise CPU offload. New integrations should use "
+            "--diffusion-offload-config with mode=layer and explicit components.",
         )
         omni_config_group.add_argument(
             "--enable-distributed-layerwise-offload",
             action="store_true",
-            help="Enable distributed layerwise offloading with H2D + AllGather overlap. "
-            "Shards weights across DP ranks, stores only 1/DP_size on each host, "
-            "and overlaps H2D transfers and AllGather with computation. "
-            "DP size is automatically derived from the parallel configuration.",
+            help="Compatibility alias for distributed layerwise CPU offload. "
+            "New integrations should use mode=layer and configure weight transfer per component.",
         )
         omni_config_group.add_argument(
             "--dlo-use-allgather",
             dest="dlo_use_allgather",
             action="store_true",
             default=True,
-            help="Use shard + AllGather for weight reconstruction (default: True). "
+            help="Compatibility option; use component weight_transfer=allgather in new configurations. "
+            "Use shard + AllGather for weight reconstruction (default: True). "
             "When disabled (--dlo-no-use-allgather), each rank streams the "
             "standard loader's rank-local tensors via H2D only — no additional "
             "DP sharding, no AllGather, and no concurrent-request requirement.",
@@ -736,6 +747,7 @@ class OmniServeCommand(CLISubcommand):
             dest="dlo_use_allgather",
             action="store_false",
             help=(
+                "Compatibility option; use component weight_transfer=rank-local in new configurations. "
                 "Disable AllGather and stream standard-loader rank-local weights "
                 "independently (including existing TP shards)."
             ),
@@ -744,8 +756,7 @@ class OmniServeCommand(CLISubcommand):
             "--dlo-resident-layers",
             type=int,
             default=0,
-            help="Keep this many leading main-DiT blocks resident on the device "
-            "while distributed layerwise offload streams the remaining blocks.",
+            help="Compatibility option; use layer_options.dit.resident_layers in new configurations.",
         )
         omni_config_group.add_argument(
             "--host-weight-runtime-mode",

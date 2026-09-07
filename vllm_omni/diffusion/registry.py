@@ -296,6 +296,11 @@ _DIFFUSION_MODELS = {
         "pipeline_sana_video_i2v",
         "SanaImageToVideoPipeline",
     ),
+    "Magi2Pipeline": (
+        "magi2",
+        "pipeline_magi2",
+        "Magi2Pipeline",
+    ),
     "OmniVoicePipeline": (
         "omnivoice",
         "pipeline_omnivoice",
@@ -588,6 +593,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LingBotVideoPipeline": "get_lingbot_video_post_process_func",
     "SanaVideoPipeline": "get_sana_video_post_process_func",
     "SanaImageToVideoPipeline": "get_sana_video_i2v_post_process_func",
+    "Magi2Pipeline": "get_magi2_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
@@ -611,6 +617,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     # arch: pre_process_func
     # `pre_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
+    "BagelPipeline": "get_bagel_pre_process_func",
     "GlmImagePipeline": "get_glm_image_pre_process_func",
     "BooguImagePipeline": "get_boogu_image_pre_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",

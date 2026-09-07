@@ -94,8 +94,16 @@ validating a model or debugging correctness, then increase it for
 multi-request throughput.
 
 Step execution is capability-based, not a generic switch for every diffusion
-model. Qwen-Image supports step-wise continuous batching. HunyuanImage3 also
-supports it, but only when its resolved self-attention backend is `TORCH_SDPA`;
+model. Qwen-Image supports step-wise continuous batching. BAGEL supports
+step-wise continuous batching for image generation with `bagel.yaml`,
+`bagel_think.yaml`, and `bagel_single_stage.yaml`. In the two-stage topologies,
+only the diffusion stage uses step execution; the autoregressive Thinker is
+unchanged. Explicit text-output requests in the single-stage topology retain
+the complete-request path. Use at least two inference steps for BAGEL image
+requests because BAGEL schedules `num_inference_steps - 1` denoising updates.
+BAGEL step execution does not currently support sequence parallelism or a
+diffusion cache backend. HunyuanImage3 also supports step execution, but only
+when its resolved self-attention backend is `TORCH_SDPA`;
 set `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA` or configure
 `diffusion_attention_config.default.backend=TORCH_SDPA` before using
 `--max-num-seqs >1`. See the

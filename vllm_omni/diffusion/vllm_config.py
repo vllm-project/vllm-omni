@@ -6,10 +6,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import torch
-from vllm.config import CompilationConfig, DeviceConfig, VllmConfig
+from vllm.config import CompilationConfig, DeviceConfig, KVTransferConfig, VllmConfig
 from vllm.transformers_utils.config import get_hf_text_config
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -229,6 +229,10 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
         if max_num_batched_tokens is not None:
             vllm_config.scheduler_config.max_num_batched_tokens = int(max_num_batched_tokens)
         current_omni_platform.configure_diffusion_vllm_config(vllm_config, od_config)
+
+    kv_transfer_config = getattr(od_config, "kv_transfer_config", None)
+    if kv_transfer_config is not None:
+        vllm_config.kv_transfer_config = cast(KVTransferConfig, kv_transfer_config)
     return vllm_config
 
 

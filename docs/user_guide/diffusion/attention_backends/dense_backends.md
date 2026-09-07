@@ -1,8 +1,9 @@
 # Dense Attention Backends
 
-Use these backends when you want dense attention without backend-specific
-sparsity. Start with `TORCH_SDPA` for correctness comparisons, then benchmark
-the fastest compatible kernel for your model, shape, and hardware.
+Use these backends to run dense attention. Optional quantized or sparse modes
+remain inactive unless they are explicitly configured. Start with
+`TORCH_SDPA` for correctness comparisons, then benchmark the fastest compatible
+kernel for your model, shape, and hardware.
 
 For selection precedence and per-role configuration, see the
 [attention backend overview](../attention_backends.md).
@@ -20,10 +21,11 @@ vllm-omni serve <model> --diffusion-attention-backend TORCH_SDPA
 ## `FLASH_ATTN`
 
 `FLASH_ATTN` uses the installed FlashAttention implementation. On Blackwell it
-prefers the CuTe-based FlashAttention 4 path and falls back to
-FlashAttention 3 or 2 when that path is unavailable. On Hopper, Ada, and
-Ampere it is the preferred automatic route when a compatible package is
-installed.
+is FA4 only (`flash_attn.cute` / `vllm-omni[fa4]`). If FA4 is unavailable,
+explicit `FLASH_ATTN` is rejected and automatic selection continues to another
+compatible Blackwell backend. Hopper-only FA2/FA3 wheels are not used, even if
+they import. On Hopper, Ada, and Ampere it is the preferred automatic route
+when a compatible package is installed.
 
 ```bash
 vllm-omni serve <model> --diffusion-attention-backend FLASH_ATTN
@@ -38,8 +40,25 @@ pip install 'vllm-omni[fa4]'
 ```
 
 Version `4.0.0b18` is required; earlier beta wheels had known JIT failures on
-Blackwell. If the CuTe path is unavailable, the backend falls back to the
-compatible FlashAttention 3 or 2 path.
+Blackwell. On Blackwell, `FLASH_ATTN` is FA4 only: Hopper-only FA2/FA3
+wheels are not used, even if they import. If FA4 is missing, explicit
+`FLASH_ATTN` is rejected and automatic selection continues to other
+Blackwell backends.
+
+## `TRTLLM_ATTN`
+
+`TRTLLM_ATTN` runs FlashInfer's trtllm-gen FMHA kernels and is the platform
+default on datacenter Blackwell for models that declare a compatible attention
+path. Selected without a `quant` or `skip_softmax` block, it runs dense BF16
+attention at FA4-level performance.
+
+```bash
+vllm serve <model> --omni \
+  --diffusion-attention-backend TRTLLM_ATTN
+```
+
+See [TRTLLM Attention](trtllm.md) for its requirements and for the optional
+SAGE quantization and Skip-Softmax modes.
 
 ## `CUDNN_ATTN`
 
@@ -72,6 +91,13 @@ DIFFUSION_ATTENTION_BACKEND=FLASHINFER_ATTN \
 `FLASHINFER_ATTN` uses FlashInfer's batch-prefill wrapper. It is an explicit
 option on CUDA platforms and an automatic Blackwell fallback when FlashInfer
 is installed but cuDNN is too old for `CUDNN_ATTN`.
+
+On Blackwell, `auto` resolves to FlashInfer cute-dsl, which cannot run a
+nontrivial custom mask. Automatic selection may fall back to SDPA for those
+masks. An explicit `FLASHINFER_ATTN` selection does not: sequence-parallel
+auto-padding that would create a padding mask is rejected at capability
+preflight. Use `TORCH_SDPA`, pin `quant.flashinfer_backend` to `fa2`/`fa3`
+where those kernels exist, or choose a mask-capable backend.
 
 ```bash
 vllm-omni serve <model> --diffusion-attention-backend FLASHINFER_ATTN

@@ -21,6 +21,7 @@ def _output(
     latent: torch.Tensor,
     multimodal_output: dict | None = None,
     token_list: list[int] | None = None,
+    request_id: str = "req-1",
 ):
     mm_output = dict(multimodal_output or {})
     mm_output["latent"] = latent
@@ -30,7 +31,7 @@ def _output(
         multimodal_output=mm_output,
     )
     return SimpleNamespace(
-        request_id="req-1",
+        request_id=request_id,
         prompt_token_ids=prompt_ids,
         outputs=[completion],
     )
@@ -193,21 +194,47 @@ def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:
     )
 
     first_input = llm2tts([first], prompt=[{}], _streaming_context=context)[0]
+    replayed_inputs = llm2tts([first], prompt=[{}], _streaming_context=context)
     second_input = llm2tts([second], prompt=[{}], _streaming_context=context)[0]
     context.bridge_states["duplex"]["model_turn_id"] = 8
     third_input = llm2tts([third], prompt=[{}], _streaming_context=context)[0]
+    restarted_input = llm2tts(
+        [
+            _output(
+                prompt_ids=prompt_ids,
+                output_ids=first_ids,
+                latent=torch.arange(24, dtype=torch.float32).reshape(6, 4),
+                multimodal_output={
+                    "duplex_prompt_token_ids": prompt_ids,
+                    "meta": token_ids,
+                },
+                request_id="req-2",
+            )
+        ],
+        prompt=[{}],
+        _streaming_context=context,
+    )[0]
 
     assert first_input["model_intermediate_buffer"]["ids"]["tts"] == [21, 22]
+    assert replayed_inputs == []
     assert second_input["model_intermediate_buffer"]["ids"]["tts"] == [23, 24]
     assert third_input["model_intermediate_buffer"]["ids"]["tts"] == [25, 26]
     assert first_input["model_intermediate_buffer"]["meta"]["turn_start"] is True
     assert second_input["model_intermediate_buffer"]["meta"]["turn_start"] is False
     assert third_input["model_intermediate_buffer"]["meta"]["turn_start"] is True
+    assert first_input["model_intermediate_buffer"]["meta"]["streaming_condition_seq"] == 0
+    assert second_input["model_intermediate_buffer"]["meta"]["streaming_condition_seq"] == 1
+    # A new turn keeps the same stage request, so its condition sequence stays
+    # monotonic; a new request/incarnation starts again from zero.
+    assert third_input["model_intermediate_buffer"]["meta"]["streaming_condition_seq"] == 2
+    assert restarted_input["model_intermediate_buffer"]["meta"]["streaming_condition_seq"] == 0
     assert first_input["model_intermediate_buffer"]["meta"]["replace_streaming_prompt"] is True
     assert "replace_streaming_prompt" not in second_input["model_intermediate_buffer"]["meta"]
     assert third_input["model_intermediate_buffer"]["meta"]["replace_streaming_prompt"] is True
     assert second_input["model_intermediate_buffer"]["meta"]["next_stage_prompt_len"] == 3
+    assert first_input["model_intermediate_buffer"]["meta"]["next_stage_generation_tokens"] == 26
     assert second_input["model_intermediate_buffer"]["meta"]["next_stage_generation_tokens"] == 26
+    assert third_input["model_intermediate_buffer"]["meta"]["next_stage_generation_tokens"] == 26
     assert second_input["prompt_token_ids"] == [0, 0, 0]
 
 
