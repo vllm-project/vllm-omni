@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import argparse
 import json
+
+import os
 from dataclasses import dataclass
 from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
@@ -147,6 +149,32 @@ def test_omni_rejects_untyped_watermark_config() -> None:
     """Ensure direct Omni use rejects transport mappings before startup."""
     with pytest.raises(TypeError, match="watermark_config must be a WatermarkConfig"):
         OmniBase("fake-model", watermark_config={"audio": {"algorithm": "audioseal"}})  # type: ignore[arg-type]
+
+def test_headless_replica_group_applies_and_restores_stage_runtime_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_omni.engine.stage_engine_startup import launch_headless_replica_group
+
+    env_key = "VLLM_OMNI_TEST_STAGE_RUNTIME_ENV"
+    monkeypatch.setenv(env_key, "parent")
+    observed: list[str | None] = []
+    manager = SimpleNamespace(shutdown=lambda: None)
+
+    def launch_one(_: int):
+        observed.append(os.environ.get(env_key))
+        return manager
+
+    launch_headless_replica_group(
+        stage_id=0,
+        omni_dp_size_local=1,
+        per_replica_devices=[None],
+        launch_one=launch_one,
+        wait_for_replicas=lambda _: None,
+        runtime_cfg={"env": {env_key: "stage"}},
+    )
+
+    assert observed == ["stage"]
+    assert os.environ[env_key] == "parent"
 
 
 def test_serve_parser_accepts_no_async_chunk_and_marks_it_explicit() -> None:
