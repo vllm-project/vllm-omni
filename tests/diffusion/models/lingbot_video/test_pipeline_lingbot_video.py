@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -24,6 +24,7 @@ def _make_pipeline():
     pipeline.device = torch.device("cpu")
     pipeline.default_negative_prompt = "default negative"
     pipeline.default_image_negative_prompt = "default image negative"
+    pipeline.prompt_rewriter = None
     pipeline.img_prompt_template = "<image>"
     pipeline.od_config = SimpleNamespace(flow_shift=None)
     return pipeline
@@ -292,6 +293,44 @@ def test_forward_prefers_shift_over_flow_shift_and_defaults_negative_prompt():
 
     assert calls[0]["shift"] == 5.0
     assert calls[0]["negative_prompt"] == "default negative"
+
+
+def test_forward_rewrites_prompt_and_negative_before_generation():
+    pipeline = _make_pipeline()
+    rewrite_calls = []
+    generate_calls = []
+
+    class FakeRewriter:
+        def rewrite_request(self, **kwargs):
+            rewrite_calls.append(kwargs)
+            return '{"caption":"rewritten"}', '{"negative":"rewritten"}'
+
+    def fake_generate(**kwargs):
+        generate_calls.append(kwargs)
+        return torch.zeros(5, 192, 192, 3)
+
+    pipeline.prompt_rewriter = FakeRewriter()
+    pipeline._generate = fake_generate
+    req = _make_request_batch(
+        {"prompt": "a robot arm", "modalities": ["video"]},
+        height=192,
+        width=192,
+        num_frames=5,
+        num_inference_steps=2,
+        guidance_scale=1.0,
+        seed=42,
+    )
+
+    pipeline.forward(req)
+
+    assert len(rewrite_calls) == 1
+    assert rewrite_calls[0]["prompt"] == "a robot arm"
+    assert rewrite_calls[0]["negative_prompt"] == "default negative"
+    assert rewrite_calls[0]["mode"].value == "t2v"
+    assert rewrite_calls[0]["num_frames"] == 5
+    assert rewrite_calls[0]["fps"] == 24
+    assert generate_calls[0]["prompt"] == '{"caption":"rewritten"}'
+    assert generate_calls[0]["negative_prompt"] == '{"negative":"rewritten"}'
 
 
 @pytest.mark.parametrize(
