@@ -239,3 +239,25 @@ def test_wake_up_forwards_tags_to_allocator(monkeypatch):
 
     assert OmniGPUWorkerBase.wake_up(worker, tags=["weights"]) is True
     assert calls["tags"] == ["weights"]
+
+
+def test_cuda_profiler_is_wired_for_omni_worker(monkeypatch):
+    import vllm.profiler.wrapper as profiler_wrapper
+
+    def fake_gpu_worker_init(worker, *args, **kwargs):
+        worker.vllm_config = SimpleNamespace(profiler_config=SimpleNamespace(profiler="cuda"))
+        worker.local_rank = 0
+        worker.rank = 0
+        worker.profiler = None
+
+    class FakeCudaProfiler:
+        def __init__(self, profiler_config):
+            self.profiler_config = profiler_config
+
+    monkeypatch.setattr(base.GPUWorker, "__init__", fake_gpu_worker_init)
+    monkeypatch.setattr(profiler_wrapper, "CudaProfilerWrapper", FakeCudaProfiler)
+
+    worker = OmniGPUWorkerBase()
+
+    assert isinstance(worker.profiler, FakeCudaProfiler)
+    assert worker.profiler.profiler_config.profiler == "cuda"
