@@ -12,7 +12,7 @@ import os
 import tempfile
 import threading
 from collections import deque
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
@@ -30,6 +30,7 @@ from vllm.multimodal.video import (
     VideoTargetMetadata,
 )
 
+from vllm_omni.entrypoints.openai import video_stream_envs
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.protocol.videos import (
     FileImageReference,
@@ -39,6 +40,8 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     UrlVideoReference,
     VideoReference,
 )
+from vllm_omni.entrypoints.openai.video_stream_envs import VIDEO_ENCODE_CODEC_CHOICES
+from vllm_omni.errors import OmniClientError
 
 if TYPE_CHECKING:
     import av
@@ -48,6 +51,44 @@ logger = init_logger(__name__)
 
 
 DEFAULT_AUDIO_SAMPLE_RATE = 24_000
+
+_DEFAULT_CPU_VIDEO_CODEC_OPTIONS = {"preset": "ultrafast", "threads": "0"}
+
+
+def _nvenc_video_codecs() -> frozenset[str]:
+    """Lazily expose media_utils.NVENC_VIDEO_CODECS without an eager av import."""
+    from vllm_omni.diffusion.utils.media_utils import NVENC_VIDEO_CODECS
+
+    return NVENC_VIDEO_CODECS
+
+
+def resolve_video_response_codec(extra_params: Mapping[str, Any] | None) -> tuple[str, dict[str, str]]:
+    """Resolve the response video codec and encoder options for one request.
+
+    The codec defaults to ``VLLM_VIDEO_ENCODE_CODEC`` and both values can be
+    overridden per request via ``extra_params["video_codec"]`` and
+    ``extra_params["video_codec_options"]``. The *_nvenc codecs are encoded on
+    GPU through torchcodec's NVENC backend and fall back to CPU H.264 when
+    torchcodec or CUDA is unavailable.
+    """
+    codec = video_stream_envs.VLLM_VIDEO_ENCODE_CODEC
+    options: dict[str, str] | None = None
+    if isinstance(extra_params, Mapping):
+        raw_codec = extra_params.get("video_codec")
+        if raw_codec is not None:
+            codec = str(raw_codec).strip().lower()
+        raw_options = extra_params.get("video_codec_options")
+        if isinstance(raw_options, Mapping):
+            options = {str(key): str(value) for key, value in raw_options.items()}
+    if codec not in VIDEO_ENCODE_CODEC_CHOICES:
+        raise OmniClientError(
+            f"Unsupported video_codec {codec!r}; supported codecs: {', '.join(VIDEO_ENCODE_CODEC_CHOICES)}"
+        )
+    if options is None:
+        # Encoder options are codec-specific: the libx264-style defaults do
+        # not apply to the NVENC encoders (which default to preset p4).
+        options = {} if codec in _nvenc_video_codecs() else dict(_DEFAULT_CPU_VIDEO_CODEC_OPTIONS)
+    return codec, options
 
 
 VideoInput: TypeAlias = torch.Tensor | np.ndarray | list[torch.Tensor | np.ndarray | Image.Image]
@@ -750,6 +791,7 @@ def _encode_prepared_video_bytes_legacy(
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
+    video_codec: str = "h264",
 ) -> bytes:
     """Encode validated frames through the compatibility path used before planar encoding."""
     from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
@@ -760,6 +802,7 @@ def _encode_prepared_video_bytes_legacy(
         audio_np,
         fps=float(fps),
         audio_sample_rate=audio_sample_rate or DEFAULT_AUDIO_SAMPLE_RATE,
+        video_codec=video_codec,
         video_codec_options=video_codec_options,
     )
 
@@ -770,6 +813,7 @@ def _encode_video_bytes_legacy(
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
+    video_codec: str = "h264",
 ) -> bytes:
     """Encode through the compatibility path used before planar encoding."""
     frames, frame_shape, common_dtype = _prepare_video_frames(video)
@@ -781,6 +825,7 @@ def _encode_video_bytes_legacy(
         audio=audio,
         audio_sample_rate=_resolve_audio_sample_rate(audio, audio_sample_rate),
         video_codec_options=video_codec_options,
+        video_codec=video_codec,
     )
 
 
@@ -790,15 +835,47 @@ def _encode_video_bytes(
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
+    video_codec: str = "h264",
     frame_converter: _PlanarFrameConverter | None = None,
 ) -> bytes:
-    """Encode a video payload through the direct planar or legacy path."""
+    """Encode a video payload through the direct planar, NVENC, or legacy path."""
     from vllm_omni.diffusion.utils.media_utils import mux_av_video_audio_bytes
 
-    # Prepare once so validation is shared by both paths and malformed common
+    # Prepare once so validation is shared by all paths and malformed common
     # input is reported before any muxer is opened.
     frames, frame_shape, common_dtype = _prepare_video_frames(video)
     effective_audio_sample_rate = _resolve_audio_sample_rate(audio, audio_sample_rate) if audio is not None else None
+
+    if video_codec in _nvenc_video_codecs():
+        from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes_nvenc
+
+        try:
+            _log_video_encoding_path(
+                selected_path="torchcodec_nvenc",
+                frames=frames,
+                frame_shape=frame_shape,
+                common_dtype=common_dtype,
+                fps=fps,
+                audio=audio,
+                audio_sample_rate=effective_audio_sample_rate,
+                effective_frame_conversion_workers=0,
+            )
+            return mux_video_audio_bytes_nvenc(
+                _coerce_prepared_video_to_uint8_frames(frames, frame_shape, common_dtype),
+                _coerce_audio_to_numpy(audio) if audio is not None else None,
+                fps=float(fps),
+                audio_sample_rate=effective_audio_sample_rate or DEFAULT_AUDIO_SAMPLE_RATE,
+                video_codec=video_codec,
+                video_codec_options=video_codec_options,
+            )
+        except Exception as exc:
+            logger.warning_once(
+                "NVENC video encoding with %s failed (%s); falling back to CPU h264 encoding.",
+                video_codec,
+                exc,
+            )
+            video_codec = "h264"
+
     fallback_reason = _direct_planar_fallback_reason(
         frames,
         frame_shape,
@@ -825,6 +902,7 @@ def _encode_video_bytes(
             audio=audio,
             audio_sample_rate=effective_audio_sample_rate,
             video_codec_options=video_codec_options,
+            video_codec=video_codec,
         )
 
     owns_frame_converter = frame_converter is None
@@ -849,6 +927,7 @@ def _encode_video_bytes(
             audio_waveform=audio_np,
             fps=float(fps),
             audio_sample_rate=effective_audio_sample_rate,
+            video_codec=video_codec,
             video_codec_options=video_codec_options,
         )
     finally:
@@ -912,6 +991,7 @@ def encode_video_base64(
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
+    video_codec: str = "h264",
     frame_converter: _PlanarFrameConverter | None = None,
 ) -> str:
     """Encode a video (frames/array/tensor) to base64 MP4."""
@@ -921,6 +1001,7 @@ def encode_video_base64(
         audio=audio,
         audio_sample_rate=audio_sample_rate,
         video_codec_options=video_codec_options,
+        video_codec=video_codec,
         frame_converter=frame_converter,
     )
     return base64.b64encode(video_bytes).decode("utf-8")

@@ -3,6 +3,7 @@
 """Unit tests for OpenAI-compatible video API encoding helpers."""
 
 import base64
+import importlib.util
 import threading
 from io import BytesIO
 from typing import Any
@@ -19,6 +20,7 @@ from vllm_omni.diffusion.postprocess import rife_interpolator
 from vllm_omni.diffusion.utils import media_utils
 from vllm_omni.entrypoints.openai import video_api_utils
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
+from vllm_omni.errors import OmniClientError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -123,7 +125,9 @@ async def test_decode_image_url_keeps_data_urls_local(monkeypatch):
 
 
 def _install_fake_video_mux(monkeypatch, mux_calls):
-    def _fake_mux_video_audio_bytes(frames, audio, fps, audio_sample_rate, video_codec_options=None):
+    def _fake_mux_video_audio_bytes(
+        frames, audio, fps, audio_sample_rate, video_codec_options=None, video_codec="h264"
+    ):
         mux_calls.append(
             {
                 "frames": frames,
@@ -131,6 +135,7 @@ def _install_fake_video_mux(monkeypatch, mux_calls):
                 "fps": fps,
                 "audio_sample_rate": audio_sample_rate,
                 "video_codec_options": video_codec_options,
+                "video_codec": video_codec,
             }
         )
         return b"fake-video"
@@ -1047,3 +1052,148 @@ def test_frame_interpolator_uses_platform_device_when_tensor_is_cpu(monkeypatch)
     assert chosen_devices == [torch.device("cuda")]
     assert multiplier == 2
     assert output_video.shape == (1, 3, 3, 32, 32)
+
+
+def test_resolve_video_response_codec_defaults(monkeypatch):
+    monkeypatch.delenv("VLLM_VIDEO_ENCODE_CODEC", raising=False)
+
+    codec, options = video_api_utils.resolve_video_response_codec(None)
+
+    assert codec == "h264"
+    assert options == {"preset": "ultrafast", "threads": "0"}
+
+
+def test_resolve_video_response_codec_uses_env_default(monkeypatch):
+    monkeypatch.setenv("VLLM_VIDEO_ENCODE_CODEC", "h264_nvenc")
+
+    codec, options = video_api_utils.resolve_video_response_codec(None)
+
+    assert codec == "h264_nvenc"
+    # libx264-style defaults must not leak into the NVENC encoder options.
+    assert options == {}
+
+
+def test_resolve_video_response_codec_request_overrides_env(monkeypatch):
+    monkeypatch.setenv("VLLM_VIDEO_ENCODE_CODEC", "h264_nvenc")
+
+    codec, options = video_api_utils.resolve_video_response_codec(
+        {"video_codec": "hevc_nvenc", "video_codec_options": {"preset": "p7", "cq": "20"}}
+    )
+
+    assert codec == "hevc_nvenc"
+    assert options == {"preset": "p7", "cq": "20"}
+
+
+def test_resolve_video_response_codec_rejects_unknown_codec():
+    with pytest.raises(OmniClientError, match="Unsupported video_codec"):
+        video_api_utils.resolve_video_response_codec({"video_codec": "vp9"})
+
+
+def test_encode_video_bytes_routes_nvenc_to_torchcodec(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    def fake_nvenc_mux(
+        video_frames, audio_waveform=None, *, fps, audio_sample_rate, video_codec, video_codec_options=None
+    ):
+        captured.update(
+            frames=video_frames,
+            fps=fps,
+            audio=audio_waveform,
+            audio_sample_rate=audio_sample_rate,
+            codec=video_codec,
+            options=video_codec_options,
+        )
+        return b"nvenc-video"
+
+    monkeypatch.setattr(media_utils, "mux_video_audio_bytes_nvenc", fake_nvenc_mux)
+    monkeypatch.setattr(
+        media_utils,
+        "mux_av_video_audio_bytes",
+        lambda *args, **kwargs: pytest.fail("NVENC requests must not reach the PyAV muxer"),
+    )
+
+    video = np.zeros((3, 4, 6, 3), dtype=np.float32)
+    audio = np.zeros((2, 100), dtype=np.float32)
+    encoded = video_api_utils._encode_video_bytes(
+        video,
+        fps=12,
+        audio=audio,
+        audio_sample_rate=16000,
+        video_codec="h264_nvenc",
+        video_codec_options={"preset": "p4"},
+    )
+
+    assert encoded == b"nvenc-video"
+    assert captured["frames"].dtype == np.uint8
+    assert captured["frames"].shape == (3, 4, 6, 3)
+    assert captured["frames"].flags.c_contiguous
+    assert captured["fps"] == 12.0
+    assert captured["audio"].shape == (2, 100)
+    assert captured["audio_sample_rate"] == 16000
+    assert captured["codec"] == "h264_nvenc"
+    assert captured["options"] == {"preset": "p4"}
+
+
+def test_encode_video_bytes_nvenc_falls_back_to_cpu_on_error(monkeypatch):
+    warnings = []
+
+    def fail_nvenc(*args, **kwargs):
+        raise RuntimeError("NVENC unavailable")
+
+    monkeypatch.setattr(media_utils, "mux_video_audio_bytes_nvenc", fail_nvenc)
+    monkeypatch.setattr(
+        video_api_utils.logger,
+        "warning_once",
+        lambda message, *args, **kwargs: warnings.append(message % args),
+    )
+
+    video = np.zeros((2, 8, 8, 3), dtype=np.float32)
+    encoded = video_api_utils._encode_video_bytes(video, fps=12, video_codec="h264_nvenc")
+
+    assert any("falling back to CPU h264" in warning for warning in warnings)
+    with av.open(BytesIO(encoded), format="mp4") as container:
+        stream = container.streams.video[0]
+        assert stream.codec_context.name == "h264"
+        decoded = [frame for frame in container.decode(stream)]
+    assert len(decoded) == 2
+
+
+def _nvenc_runtime_available() -> bool:
+    """Preflight a tiny NVENC encode; some GPUs (e.g. GB200) have no NVENC hardware."""
+    if importlib.util.find_spec("torchcodec") is None or not torch.cuda.is_available():
+        return False
+    try:
+        from torchcodec.encoders import Encoder
+
+        frames = torch.zeros(2, 3, 64, 64, dtype=torch.uint8, device="cuda")
+        encoder = Encoder()
+        video_stream = encoder.add_video(height=64, width=64, frame_rate=24.0, device="cuda", codec="h264_nvenc")
+        with encoder.open_file_like(BytesIO(), format="mp4"):
+            video_stream.add_frames(frames)
+    except Exception:
+        return False
+    return True
+
+
+def test_encode_video_bytes_nvenc_end_to_end(monkeypatch):
+    if not _nvenc_runtime_available():
+        pytest.skip("NVENC encoder is not available on this device")
+    warnings = []
+    monkeypatch.setattr(
+        video_api_utils.logger,
+        "warning_once",
+        lambda message, *args, **kwargs: warnings.append(message % args),
+    )
+
+    rng = np.random.default_rng(0)
+    frames = rng.integers(0, 255, size=(4, 64, 64, 3), dtype=np.uint8)
+    encoded = video_api_utils._encode_video_bytes(frames, fps=24, video_codec="h264_nvenc")
+
+    assert not warnings, f"NVENC path unexpectedly fell back to CPU: {warnings}"
+    with av.open(BytesIO(encoded), format="mp4") as container:
+        stream = container.streams.video[0]
+        assert stream.codec_context.name == "h264"
+        decoded = [frame for frame in container.decode(stream)]
+    assert len(decoded) == 4
+    assert decoded[0].width == 64
+    assert decoded[0].height == 64
