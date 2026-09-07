@@ -14,6 +14,7 @@ from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
 from vllm_omni.model_executor.models.cosyvoice3.utils import extract_text_token
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+from vllm_omni.utils.profiler import add_profiler_config_arg
 
 # Upstream zero-shot reference clip
 ZERO_SHOT_PROMPT_URL = "https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/asset/zero_shot_prompt.wav"
@@ -45,6 +46,7 @@ def run_e2e():
         help="Override the deploy config path. If unset, auto-loads "
         "vllm_omni/deploy/cosyvoice3.yaml based on the HF model_type.",
     )
+    add_profiler_config_arg(parser)
     parser.add_argument("--text", type=str, default="Hello, this is a test of the CosyVoice system capability.")
     parser.add_argument(
         "--prompt-text",
@@ -79,6 +81,7 @@ def run_e2e():
         deploy_config=args.deploy_config,
         tokenizer=args.tokenizer,
         log_stats=True,
+        profiler_config=args.profiler_config,
     )
 
     sampling_cfg = {"top_p": 0.8, "top_k": 25, "eos_token_id": 6561 + 1}
@@ -149,8 +152,8 @@ def run_e2e():
 
     sampling_params_list = [gpt_sampling, s2mel_sampling]
 
-    # Start profiling (requires VLLM_TORCH_PROFILER_DIR env var)
-    if os.environ.get("VLLM_TORCH_PROFILER_DIR"):
+    profiler_enabled = args.profiler_config is not None
+    if profiler_enabled:
         print("Starting profiler...")
         omni.start_profile()
 
@@ -158,7 +161,7 @@ def run_e2e():
     outputs = list(omni.generate(prompts, sampling_params_list=sampling_params_list[:2]))
 
     # Stop profiling and get results
-    if os.environ.get("VLLM_TORCH_PROFILER_DIR"):
+    if profiler_enabled:
         print("Stopping profiler...")
         profile_results = omni.stop_profile()
         print(f"Profile traces saved to: {profile_results}")
