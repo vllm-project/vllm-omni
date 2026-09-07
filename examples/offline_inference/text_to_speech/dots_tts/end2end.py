@@ -1,7 +1,7 @@
 """Offline dots.tts inference example (single-stage native AR pipeline).
 
 Uses the single-stage native AR config (vllm_omni/deploy/dots_tts.yaml).
-Reference checkpoint: rednote-hilab/dots.tts-soar.
+Reference checkpoint: dots-studio/dots.tts-soar.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ def parse_args():
     parser.add_argument(
         "--model",
         type=str,
-        default="rednote-hilab/dots.tts-soar",
+        default="dots-studio/dots.tts-soar",
         help="dots.tts model path or HuggingFace repo ID.",
     )
     parser.add_argument(

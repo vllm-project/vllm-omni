@@ -490,3 +490,22 @@ def test_prepare_lora_delta_unchanged_for_existing_fused_layouts(fused, shards):
     delta, used_keys = _prepare_lora_delta(state_dict, base_key, param_to_weight_names)
     assert delta.shape == (len(shards) * HEAD_DIM, HEAD_DIM)
     assert len(used_keys) == 2 * len(shards)
+
+
+def test_lora_loader_mixin_lora_is_fused_property(mocker: MockerFixture):
+    pipeline = DummyQwenImagePipeline(1, HEAD_DIM)
+    assert pipeline.lora_is_fused is False
+
+    lora_state_dict = make_lora_state_dict_for_module(pipeline.transformer)
+    mocker.patch(
+        "vllm_omni.diffusion.lora.loader.get_converter_by_pipeline",
+        return_value=_convert_non_diffusers_qwen_lora_to_diffusers,
+    )
+    pipeline.load_lora_weights(lora_state_dict, "adapter0")
+    assert pipeline.lora_is_fused is True
+
+    # Test explicit setter
+    pipeline2 = DummyQwenImagePipeline(1, HEAD_DIM)
+    assert pipeline2.lora_is_fused is False
+    pipeline2.lora_is_fused = True
+    assert pipeline2.lora_is_fused is True

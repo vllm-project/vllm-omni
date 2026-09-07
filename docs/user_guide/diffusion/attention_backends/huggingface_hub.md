@@ -12,7 +12,7 @@ implementations to reduce numerical drift and sampling divergence.
 ## Installation
 
 ```bash
-pip install kernels==0.14.1
+pip install kernels==0.15.2
 ```
 
 If `kernels` is unavailable, an explicit `FLASH_ATTN_HUB` or

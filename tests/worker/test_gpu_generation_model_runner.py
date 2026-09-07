@@ -1,9 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import contextlib
 from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.config import CacheConfig
+from vllm.config import CacheConfig, CUDAGraphMode
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 
 import vllm_omni.worker.gpu_generation_model_runner as gen_runner_module
@@ -13,6 +16,10 @@ from vllm_omni.worker.gpu_generation_model_runner import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+class _StopExecutionError(Exception):
+    """Halts execute_model at the model boundary."""
 
 
 class _DummyInputBatch:
@@ -98,6 +105,9 @@ class _StubSchedulerOutput:
         self.num_scheduled_tokens = {"req-1": total_num_scheduled_tokens}
         self.finished_req_ids = set()
         self.kv_connector_metadata = None
+        self.scheduled_encoder_inputs = {}
+        self.scheduled_spec_decode_tokens = {}
+        self.num_common_prefix_blocks = 0
 
 
 def _make_guard_runner():
@@ -109,6 +119,7 @@ def _make_guard_runner():
     runner.speculative_config = None
     runner.model_config = SimpleNamespace(async_chunk=False)
     runner.cache_config = CacheConfig()
+    runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[])
     runner.input_batch = _DummyInputBatch()
     runner.model = object()
     runner.parallel_config = SimpleNamespace(
@@ -236,3 +247,74 @@ class TestSampleTokensBatched:
 
         with pytest.raises(ValueError, match="length 1 .* 2 requests"):
             GPUGenerationModelRunner.sample_tokens(runner)
+
+
+@pytest.mark.parametrize("exact_shape, expected_len", [(True, 3), (False, 4)])
+def test_exact_shape_models_receive_unpadded_input_ids(monkeypatch, exact_shape, expected_len):
+    """#6712: the cudagraph dispatcher rounds a 3-token batch up to a capture
+    size of 4, so ``_preprocess`` returns a 4-element ``input_ids`` while
+    ``seq_token_counts`` stays ``[3]``. Models opting into
+    ``requires_exact_input_shape`` must receive the trimmed view; everything
+    else must keep the padded buffer.
+    """
+    monkeypatch.setattr(gen_runner_module, "has_ec_transfer", lambda: False)
+    monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: False)
+
+    runner = _make_guard_runner()
+    runner.model = SimpleNamespace(
+        has_preprocess=True,
+        requires_request_ids=False,
+        requires_exact_input_shape=exact_shape,
+    )
+    runner.cascade_attn_enabled = False
+    runner.num_prompt_logprobs = None
+    runner.vllm_config = None
+    runner.parallel_config = SimpleNamespace(
+        distributed_executor_backend=None,
+        data_parallel_size=1,
+        use_ubatching=False,
+        num_ubatches=1,
+    )
+
+    monkeypatch.setattr(GPUGenerationModelRunner, "_prepare_inputs", lambda self, so, nst: (None, None, 1))
+    monkeypatch.setattr(
+        GPUGenerationModelRunner,
+        "_determine_batch_execution_and_padding",
+        lambda self, **kw: (
+            CUDAGraphMode.PIECEWISE,
+            SimpleNamespace(num_tokens=4, num_reqs=1),
+            False,
+            None,
+            None,
+        ),
+    )
+    monkeypatch.setattr(GPUGenerationModelRunner, "_get_slot_mappings", lambda self, **kw: (None, None))
+    monkeypatch.setattr(GPUGenerationModelRunner, "_build_attention_metadata", lambda self, **kw: (None, None))
+    monkeypatch.setattr(
+        GPUGenerationModelRunner,
+        "_maybe_attach_attention_metadata_extensions",
+        lambda self, **kw: None,
+    )
+    monkeypatch.setattr(gen_runner_module, "set_forward_context", lambda *a, **kw: contextlib.nullcontext())
+
+    def _fake_preprocess(self, so, num_input_tokens, itensors=None):
+        return (torch.zeros(num_input_tokens, dtype=torch.int32), None, None, None, {}, None)
+
+    monkeypatch.setattr(GPUGenerationModelRunner, "_preprocess", _fake_preprocess)
+
+    seen = {}
+
+    def _capture(self, **kwargs):
+        seen["input_ids"] = kwargs["input_ids"]
+        seen["counts"] = kwargs["model_kwargs"]["seq_token_counts"]
+        raise _StopExecutionError
+
+    monkeypatch.setattr(GPUGenerationModelRunner, "_run_generation_model", _capture)
+
+    with pytest.raises(_StopExecutionError):
+        GPUGenerationModelRunner.execute_model(runner, _StubSchedulerOutput(3))
+
+    assert seen["input_ids"].numel() == expected_len
+    assert seen["counts"] == [3]
+    if exact_shape:
+        assert sum(seen["counts"]) == seen["input_ids"].numel()

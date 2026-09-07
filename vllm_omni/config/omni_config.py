@@ -18,10 +18,11 @@ from inspect import Parameter, signature
 from pathlib import Path
 from typing import Any, Literal, TypeAlias, TypedDict, cast
 
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 from typing_extensions import Self
 from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
+from vllm.config import KVTransferConfig
 from vllm.config import LoadConfig as VllmLoadConfig
 from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
@@ -328,9 +329,11 @@ def _stage_cli_overrides(
 ) -> dict[str, Any]:
     runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
     global_stage_fields = _global_stage_cli_fields()
+    owned_fields = None if execution_type is None else _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
     result: dict[str, Any] = {}
     for key, value in runtime_overrides.items():
-        if key in global_stage_fields or f"stage_{stage_id}_{key}" in cli_overrides:
+        stage_specific = f"stage_{stage_id}_{key}" in cli_overrides
+        if stage_specific or (key in global_stage_fields and (owned_fields is None or key in owned_fields)):
             result[key] = _copy_value(value)
 
     # step_execution is a diffusion execution protocol, not an LLM engine
@@ -338,6 +341,25 @@ def _stage_cli_overrides(
     if execution_type is not None and execution_type is not StageExecutionType.DIFFUSION:
         result.pop("step_execution", None)
     return result
+
+
+def _validate_global_stage_cli_ownership(
+    pipeline: PipelineConfig,
+    cli_overrides: Mapping[str, Any],
+) -> None:
+    """Reject global stage arguments that no stage in the pipeline owns."""
+    explicit_global_fields = {
+        key for key, value in cli_overrides.items() if value is not None and key in _global_stage_cli_fields()
+    }
+    owned_fields = {
+        field for stage in pipeline.stages for field in _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[stage.execution_type]
+    }
+    unowned_fields = explicit_global_fields - owned_fields
+    if unowned_fields:
+        names = ", ".join(sorted(unowned_fields))
+        raise ValueError(
+            f"Pipeline {pipeline.model_type!r} has explicit engine argument(s) with no structured config owner: {names}"
+        )
 
 
 def _resolve_deploy_path(deploy_config_path: str) -> Path:
@@ -707,6 +729,9 @@ class _DiffusionConfigProjection:
     lora_backend: str = "peft"
     max_cpu_loras: int | None = None
     output_type: str = "pil"
+    diffusion_offload_config: dict[str, Any] | None = None
+    # Compatibility aliases for existing callers and model-specific stage
+    # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
@@ -751,16 +776,28 @@ class _DiffusionConfigProjection:
     worker_extension_cls: str | None = None
     custom_pipeline_args: dict[str, Any] | None = None
     additional_config: dict[str, Any] = field(default_factory=dict)
+    kv_transfer_config: KVTransferConfig | None = None
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
     quantization_config: _QuantizationConfigType = None
     extras: dict[str, Any] = field(default_factory=dict)
 
+    @field_validator("kv_transfer_config", mode="before")
+    @classmethod
+    def _normalize_kv_transfer_config(cls, value: Any) -> Any:
+        from vllm_omni.diffusion.diffusion_kv.kv_connector import parse_kv_transfer_config
+
+        return parse_kv_transfer_config(value)
+
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> _DiffusionConfigProjection:
         from vllm_omni.diffusion.data import normalize_omni_diffusion_kwargs
+        from vllm_omni.diffusion.offloader.config import parse_diffusion_offload_config
 
         normalized_kwargs = normalize_omni_diffusion_kwargs(kwargs)
+        # Validate before stage construction while retaining the raw mapping
+        # needed by dataclass/config serialization across process boundaries.
+        parse_diffusion_offload_config(normalized_kwargs.get("diffusion_offload_config"))
         valid_fields = {f.name for f in fields(cast(Any, cls))}
         return cls(**{k: v for k, v in normalized_kwargs.items() if k in valid_fields})
 
@@ -1299,6 +1336,12 @@ class VllmOmniOrchestratorConfig:
     omni_lb_policy: str = "random"
     omni_heartbeat_timeout: float = Field(default=30.0, gt=0.0)
     batch_timeout: int = Field(default=10, ge=0)
+    # When True, stages sharing a physical GPU initialize concurrently, guarded
+    # by pre-launch admission control + engine-core-held SH/EX device locks
+    # (see stage_admission / stage_phase_lock). Default False keeps the legacy
+    # per-device LOCK_EX serialization. Enable only when the GPU is dedicated to
+    # this deployment (see rfc_parallel_stage_init).
+    parallel_stage_init: bool = False
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
@@ -1859,6 +1902,7 @@ class VllmOmniConfig:
         if cli_overrides is None:
             cli_overrides = {}
         cli_overrides = normalize_pipeline_cli_overrides(pipeline_cfg, cli_overrides)
+        _validate_global_stage_cli_ownership(pipeline_cfg, cli_overrides)
 
         deploy, loaded_deploy_config_path = _get_deploy_config(
             pipeline_cfg,

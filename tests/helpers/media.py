@@ -31,6 +31,8 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+_MIN_FREE_VRAM = 16 * 1024**3
+
 
 _synthetic_media_fallback_dir: Path | None = None
 
@@ -600,7 +602,7 @@ def concat_audio(audio_val) -> np.ndarray:
 def preprocess_text(text):
     import opencc
 
-    word_to_num = {
+    word_normalizations = {
         "zero": "0",
         "one": "1",
         "two": "2",
@@ -612,10 +614,11 @@ def preprocess_text(text):
         "eight": "8",
         "nine": "9",
         "ten": "10",
+        "kilohertz": "khz",
     }
-    for word, num in word_to_num.items():
+    for word, replacement in word_normalizations.items():
         pattern = r"\b" + re.escape(word) + r"\b"
-        text = re.sub(pattern, num, text, flags=re.IGNORECASE)
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
 
     text = re.sub(r"[^\w\s]", "", text)
     text = re.sub(r"\s+", " ", text)
@@ -710,12 +713,16 @@ def _select_whisper_device() -> str:
 
     if current_omni_platform.is_available():
         n = current_omni_platform.get_device_count()
-        # Single-GPU runners (e.g. the L4 nightly): the model server already
-        # occupies device 0, and a Whisper model resident there competes with
-        # it for VRAM and OOMs. Only borrow an accelerator when a spare device
-        # exists; otherwise validate on CPU.
-        if n > 1:
-            device_index = n - 1
+        # Prefer the highest-index device with enough room for Whisper. The
+        # 16 GiB floor protects low-memory single-GPU runners such as the L4
+        # nightly, where the model server already occupies device 0, from the
+        # server-plus-Whisper OOM fixed in #3822. Keep the CPU fallback when no
+        # device has enough room.
+        for candidate_index in range(n - 1, -1, -1):
+            candidate_device = current_omni_platform.get_torch_device(candidate_index)
+            if current_omni_platform.get_free_memory(candidate_device) >= _MIN_FREE_VRAM:
+                device_index = candidate_index
+                break
 
     if device_index is None:
         return "cpu"

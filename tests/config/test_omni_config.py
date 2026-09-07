@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import fields
 from inspect import Parameter, signature
+from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 
 import msgspec
@@ -1268,6 +1269,10 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
                 "    fa_deterministic: true",
                 "    diffusion_kv_mode: paged_scheduler",
                 "    diffusion_kv_max_rows_per_request: 2",
+                "    kv_transfer_config:",
+                "      kv_connector: MooncakeConnector",
+                "      kv_role: kv_consumer",
+                "      engine_id: dit-engine-1",
             ]
         )
     )
@@ -1282,6 +1287,14 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
     assert stage.diffusion_config.fa_deterministic is True
     assert stage.diffusion_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
     assert stage.diffusion_config.diffusion_kv_max_rows_per_request == 2
+    assert stage.diffusion_config.kv_transfer_config.engine_id == "dit-engine-1"
+
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+    od_config = OmniDiffusionConfig.from_kwargs(**engine_args)
+    assert od_config.kv_transfer_config.engine_id == "dit-engine-1"
 
 
 def test_from_pipeline_config_forwards_fastvideo_vsa_topk(tmp_path, monkeypatch):
@@ -1390,3 +1403,62 @@ def test_diffusion_quantization_mapping_reaches_terminal_config(monkeypatch):
 
     assert cfg.quantization_config is not None
     assert cfg.quantization_config.get_name() == "int8"
+
+
+def test_compact_offload_config_reaches_terminal_config(monkeypatch):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
+
+    compact_config = {
+        "mode": "layer",
+        "components": ["dit", "text_encoder"],
+        "layer_options": {
+            "dit": {"weight_transfer": "rank-local", "resident_layers": 12},
+            "text_encoder": {"weight_transfer": "allgather"},
+        },
+    }
+    cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(
+        diffusion_offload_config=compact_config,
+    )
+
+    monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda _self: 29500)
+    monkeypatch.setattr(OmniDiffusionConfig, "enrich_config", lambda _self: None)
+    cfg.enrich_config()
+
+    assert cfg.diffusion_offload_config == compact_config
+    assert cfg.extras == {}
+    assert resolve_offload_strategy(cfg) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+    restored = ForkingPickler.loads(ForkingPickler.dumps(cfg))
+    assert resolve_offload_strategy(restored) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
+
+
+def test_global_diffusion_offload_config_targets_only_diffusion_stages():
+    compact_config = {"mode": "layer", "components": ["dit"]}
+
+    config = _from_pipeline_key(
+        "minimax_h3_disaggregated",
+        cli_overrides={"diffusion_offload_config": compact_config},
+    )
+
+    assert not hasattr(config.stage_by_id(0), "diffusion_config")
+    assert config.stage_by_id(1).diffusion_config.diffusion_offload_config == compact_config
+
+
+def test_explicit_llm_stage_diffusion_offload_override_is_rejected():
+    with pytest.raises(ValueError, match="no structured config owner: diffusion_offload_config"):
+        _from_pipeline_key(
+            "minimax_h3_disaggregated",
+            cli_overrides={
+                "stage_0_diffusion_offload_config": {"mode": "layer", "components": ["dit"]},
+            },
+        )
+
+
+def test_compact_offload_config_is_validated_during_projection():
+    with pytest.raises(ValueError, match="Unknown diffusion offload mode"):
+        omni_config_module._DiffusionConfigProjection.from_kwargs(
+            diffusion_offload_config={
+                "mode": "layerwise",
+                "components": ["dit"],
+            }
+        )

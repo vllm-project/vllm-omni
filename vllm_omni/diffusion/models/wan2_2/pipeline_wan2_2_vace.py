@@ -16,7 +16,7 @@ determined by which inputs are provided (no explicit mode flag):
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import replace
+from copy import copy
 
 import PIL.Image
 import torch
@@ -198,7 +198,10 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
     ):
         # VACE defaults to flow_shift=3.0 for 480p (base WAN T2V uses 5.0 for 720p)
         if od_config.flow_shift is None:
-            od_config = replace(od_config, flow_shift=3.0)
+            # Preserve runtime-only config provenance (including compact
+            # offload aliases) instead of rerunning dataclass __post_init__.
+            od_config = copy(od_config)
+            od_config.flow_shift = 3.0
 
         super().__init__(od_config=od_config, prefix=prefix)
 
