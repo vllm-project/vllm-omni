@@ -222,6 +222,16 @@ __all__ = ["Qwen3OmniMoeForConditionalGeneration"]
 
 ## Key Components
 
+### Preprocess phase metadata
+
+Models with `has_preprocess=True`, including out-of-tree plugins, can rely on
+the runner's stable `_omni_is_prefill`, `_omni_prompt_len`, and
+`_omni_num_computed_tokens` fields. Use request progress to distinguish prompt
+prefill from decode: a one-token span can still be a prefill tail. See the
+[runner-to-model phase contract](../../design/feature/preprocess_phase_contract.md)
+for types, batched-hook semantics, MTP routing guarantees, and the correctness
+workaround for vLLM-Omni 0.20.x and earlier.
+
 ### 1. Model Interfaces
 
 Your model should implement the appropriate interfaces:
