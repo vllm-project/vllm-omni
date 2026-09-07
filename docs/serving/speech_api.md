@@ -752,6 +752,10 @@ Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` ne
 | ------- | ------------- |
 | `k2-fsa/OmniVoice` | Pure-diffusion TTS. Supports voice cloning via `ref_audio` (with optional `ref_text`); no built-in voice presets. |
 
+OmniVoice uses packed variable-length attention for batched generator execution. The attention operator accepts FP16 and BF16 inputs, so its query,
+key, and value tensors are evaluated in BF16 even when the stage is configured with `dtype: float32`; the attention output is converted back to the model's
+hidden-state dtype before the output projection. Consequently, a float32 stage configuration does not imply FP32 attention arithmetic.
+
 ### VoxCPM2
 
 | Model | Description |
