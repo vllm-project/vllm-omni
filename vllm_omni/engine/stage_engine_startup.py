@@ -1329,6 +1329,7 @@ def launch_headless_llm_replicas(
             omni_dp_size_local=omni_dp_size_local,
             per_replica_devices=per_replica_devices,
             launch_one=_launch_one,
+            runtime_cfg=getattr(stage_config, "runtime", None),
         )
     finally:
         if coordinator is not None:
@@ -1472,12 +1473,17 @@ def launch_headless_replica_group(
     per_replica_devices: list[str | None],
     launch_one: Callable[[int], Any],
     wait_for_replicas: Callable[[list[Any]], None] = wait_for_manager_liveness,
+    runtime_cfg: Any = None,
 ) -> None:
     """Launch, monitor, and clean up a group of local headless replicas."""
     managers: list[Any] = []
     try:
         for rep_idx in range(omni_dp_size_local):
-            with replica_device_env(stage_id, per_replica_devices[rep_idx]):
+            # EngineCore and its workers inherit the environment present when
+            # their manager process is spawned.
+            with stage_init_utils.stage_runtime_env(stage_id, runtime_cfg), replica_device_env(
+                stage_id, per_replica_devices[rep_idx]
+            ):
                 managers.append(launch_one(rep_idx))
         wait_for_replicas(managers)
     finally:
@@ -1553,6 +1559,7 @@ def launch_headless_diffusion_replicas(
         per_replica_devices=per_replica_devices,
         launch_one=_launch_one,
         wait_for_replicas=wait_for_diffusion_manager_liveness,
+        runtime_cfg=getattr(stage_cfg, "runtime", None),
     )
 
 

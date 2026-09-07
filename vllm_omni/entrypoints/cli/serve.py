@@ -972,6 +972,7 @@ def run_headless(args: TrackingNamespace) -> None:
         inject_omni_kv_connector_config,
         load_omni_transfer_config_for_model,
         prepare_engine_environment,
+        stage_runtime_env,
     )
 
     model = args.model
@@ -1107,8 +1108,9 @@ def run_headless(args: TrackingNamespace) -> None:
             head_node_address,
         )
 
-        executor = MultiprocExecutor(vllm_config, monitor_workers=False)
-        executor.start_worker_monitor(inline=True)
+        with stage_runtime_env(stage_id, getattr(stage_cfg, "runtime", None)):
+            executor = MultiprocExecutor(vllm_config, monitor_workers=False)
+            executor.start_worker_monitor(inline=True)
         return
 
     log_stats = bool(args.log_stats)
