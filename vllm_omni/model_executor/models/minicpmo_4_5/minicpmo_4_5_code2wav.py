@@ -143,6 +143,7 @@ class MiniCPMO45Code2Wav(nn.Module):
     replace_runtime_additional_information = True
     requires_raw_input_tokens = True
     requires_request_ids = True
+    requires_exact_input_shape = True
     has_preprocess = False
     has_postprocess = False
 

@@ -1,10 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import pytest
 import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.fixture(autouse=True)
+def _init_distributed(monkeypatch):
+    """The native transformer uses vLLM parallel linear layers, which require a
+    tensor-parallel group; initialize a single-process group for CPU tests."""
+    from vllm.distributed.parallel_state import (
+        cleanup_dist_env_and_memory,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.model_executor.layers.utils import default_unquantized_gemm
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
+        lambda: default_unquantized_gemm,
+    )
+    os.environ.setdefault("MASTER_ADDR", "localhost")
+    os.environ.setdefault("MASTER_PORT", "29501")
+    init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
+    initialize_model_parallel()
+    yield
+    cleanup_dist_env_and_memory()
+
 
 _TINY_CONFIG = {
     "in_channels": 4,
@@ -323,6 +349,7 @@ def test_tiny_transformer_matches_diffusers_and_frozen_output():
     from vllm_omni.diffusion.attention.layer import Attention
     from vllm_omni.diffusion.models.sana_video import SanaVideoTransformer3DModel
     from vllm_omni.diffusion.models.sana_video.transformer_sana_video import (
+        SanaDistributedRMSNorm,
         SanaLinearAttention,
         SanaRMSNorm,
         SanaVideoTransformerConfig,
@@ -342,10 +369,10 @@ def test_tiny_transformer_matches_diffusers_and_frozen_output():
     assert isinstance(block.attn1, SanaLinearAttention)
     assert isinstance(block.attn2.attn, Attention)
     assert block.attn2.attn.role == "cross"
-    assert isinstance(block.attn1.norm_q, SanaRMSNorm)
-    assert isinstance(block.attn1.norm_k, SanaRMSNorm)
-    assert isinstance(block.attn2.norm_q, SanaRMSNorm)
-    assert isinstance(block.attn2.norm_k, SanaRMSNorm)
+    assert isinstance(block.attn1.norm_q, SanaDistributedRMSNorm)
+    assert isinstance(block.attn1.norm_k, SanaDistributedRMSNorm)
+    assert isinstance(block.attn2.norm_q, SanaDistributedRMSNorm)
+    assert isinstance(block.attn2.norm_k, SanaDistributedRMSNorm)
     assert isinstance(model.caption_norm, SanaRMSNorm)
 
     torch.manual_seed(11)

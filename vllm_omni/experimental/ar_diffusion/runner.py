@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 import dataclasses
 import gc
 import time
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 
 import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
@@ -76,6 +79,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self._available_memory_budget: int | None = None
         self._dynamic_capacity_validated = False
         self._cache_failure: Exception | None = None
+        # Wall-clock start of each request's in-flight stepwise chunk, so
+        # ``_perf_e2e_times`` keeps one entry per AR block in both execution
+        # modes instead of one entry per denoise step.
+        self._stepwise_chunk_started: dict[str, float] = {}
 
     @staticmethod
     def _require_capability(pipeline: object) -> SupportsARDiffusionPipeline:
@@ -167,7 +174,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         spec_override: ARDiffusionKVCacheSpec | None = None,
     ) -> None:
         """Build pools solely from the pipeline capability and runner config."""
-        if bool(getattr(self.od_config, "step_execution", False)):
+        if bool(getattr(self.od_config, "step_execution", False)) and not supports_step_execution(self.pipeline):
             raise ValueError(
                 "ARDiffusionModelRunner currently supports request-mode execution only; "
                 "step_execution=True would bypass per-request AR session binding."
@@ -384,6 +391,72 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             return tick.session_id, extra_args, tick
         return str(extra_args.get("session_id") or "default"), extra_args, None
 
+    @contextmanager
+    def _bound_ar_session(
+        self,
+        session_id: str,
+        *,
+        description: str,
+        synchronize: bool = True,
+        geometry_key: object | None = None,
+    ) -> Iterator[None]:
+        """Bind runner-owned KV for one runner invocation and fail closed.
+
+        The pipeline sees the state only inside this context. Execution failures
+        release the session before propagating, so a later request cannot resume
+        half-written pages. Side-effect-free admission rejections retain it.
+        """
+        capability = self._ar_diffusion_capability
+        if capability is None:
+            raise RuntimeError("AR-Diffusion capability missing after KV cache initialization")
+        state = self._get_or_create_session(session_id, geometry_key)
+        try:
+            with capability.bind_ar_diffusion_state(session_id, state):
+                yield
+            if synchronize:
+                current_omni_platform.synchronize()
+        except ARDiffusionRequestRejectedError:
+            # Admission rejection is guaranteed to occur before any session or
+            # KV mutation, so retain the paid-for history for a corrected retry.
+            logger.info(
+                "AR-Diffusion %s rejected at admission for session=%s; session state retained",
+                description,
+                session_id,
+            )
+            raise
+        except Exception:
+            self._release_session(
+                session_id,
+                reset_model=False,
+                reason="forward_exception",
+                suppress_errors=True,
+            )
+            logger.warning(
+                "AR-Diffusion %s failed for session=%s; KV and model state were released",
+                description,
+                session_id,
+            )
+            raise
+
+    def _release_scheduler_finished_sessions(self, scheduler_output: DiffusionSchedulerOutput) -> None:
+        """Close sessions the scheduler retired, including aborted requests.
+
+        A stepwise request that runs to completion is closed as soon as its
+        final chunk is emitted; an aborted one never produces that output, so
+        its KV would otherwise linger until LRU eviction. Session ids equal
+        request ids on this path, and tick sessions are keyed by their own ids,
+        so the membership check leaves them untouched.
+        """
+        for request_id in getattr(scheduler_output, "finished_req_ids", None) or ():
+            self._stepwise_chunk_started.pop(request_id, None)
+            if request_id in self._sessions:
+                self._release_session(
+                    request_id,
+                    reset_model=False,
+                    reason="close",
+                    suppress_errors=True,
+                )
+
     def execute_model(
         self,
         req: OmniDiffusionRequest,
@@ -428,34 +501,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             self._rebuild_for_spec(requested_spec)
         elif reset:
             self.reset_session(session_id)
-        state = self._get_or_create_session(session_id, geometry_key)
         started = time.perf_counter()
-        try:
-            with capability.bind_ar_diffusion_state(session_id, state):
-                output = super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
-            if self.device is not None and torch.device(self.device).type == "cuda":
-                torch.accelerator.synchronize(self.device)
-        except ARDiffusionRequestRejectedError:
-            # Admission rejection: the pipeline guarantees no session state or
-            # KV content changed. Keep the session so the client can retry a
-            # corrected request (or reset explicitly) without losing history.
-            logger.info(
-                "AR-Diffusion request rejected at admission for session=%s; session state retained",
-                session_id,
-            )
-            raise
-        except Exception:
-            self._release_session(
-                session_id,
-                reset_model=False,
-                reason="forward_exception",
-                suppress_errors=True,
-            )
-            logger.warning(
-                "AR-Diffusion forward failed for session=%s; KV and model state were released",
-                session_id,
-            )
-            raise
+        with self._bound_ar_session(session_id, description="forward", geometry_key=geometry_key):
+            output = super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
         self._perf_e2e_times.append(time.perf_counter() - started)
         if close_session:
             self.close_session(session_id)
@@ -472,10 +520,81 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         )
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
-        """Reject step execution until step-aware AR state binding exists."""
-        raise RuntimeError(
-            "ARDiffusionModelRunner does not support step execution; use request mode with step_execution=False."
-        )
+        """Bind runner-owned KV for one stepwise invocation, then inherit the step loop."""
+        pipeline = getattr(self, "pipeline", None)
+        if pipeline is None or not supports_step_execution(pipeline):
+            raise RuntimeError(
+                "ARDiffusionModelRunner does not support step execution; use request mode with step_execution=False."
+            )
+        if self.kv_cache is None:
+            return super().execute_stepwise(scheduler_output)
+        if self._ar_diffusion_capability is None:
+            raise RuntimeError("AR-Diffusion capability missing after KV cache initialization")
+        # Retire sessions the scheduler dropped before serving this cycle: a
+        # completed request is closed when its final chunk is emitted, an
+        # aborted one only here.
+        self._release_scheduler_finished_sessions(scheduler_output)
+        request_ids = list(getattr(scheduler_output, "scheduled_request_ids", ()))
+        if not request_ids:
+            return super().execute_stepwise(scheduler_output)
+        if len(request_ids) != 1:
+            raise RuntimeError(
+                "AR-Diffusion step execution supports one request at a time; "
+                f"got {len(request_ids)} scheduled requests."
+            )
+        request_id = request_ids[0]
+        session_id = request_id
+        chunk_started = self._stepwise_chunk_started.setdefault(request_id, time.perf_counter())
+        try:
+            # Denoise steps inside one chunk need no device barrier; the chunk
+            # boundary below is the meaningful one, and syncing per step would
+            # cost one synchronize per denoise step instead of per AR block.
+            with self._bound_ar_session(session_id, description="stepwise", synchronize=False):
+                output = super().execute_stepwise(scheduler_output)
+            runner_output = output.get_request_output(request_id)
+            finished = bool(runner_output is not None and runner_output.finished)
+            result = None if runner_output is None else runner_output.result
+            errored = bool(result is not None and getattr(result, "error", None))
+            chunk_emitted = result is not None or finished or errored
+            if chunk_emitted:
+                # The barrier is where an asynchronous device error surfaces, so
+                # it must sit inside the same fail-closed scope as the step
+                # itself rather than leave cleanup to the scheduler's next cycle.
+                current_omni_platform.synchronize()
+        except Exception:
+            self._fail_closed_stepwise(request_id)
+            raise
+        # One entry per emitted AR block keeps ``_perf_e2e_times`` comparable
+        # with request mode, where one execute_model() is one block.
+        if chunk_emitted:
+            self._perf_e2e_times.append(time.perf_counter() - chunk_started)
+            self._stepwise_chunk_started.pop(request_id, None)
+        if finished or errored:
+            self._release_session(
+                session_id,
+                reset_model=False,
+                reason="forward_exception" if errored else "close",
+                suppress_errors=True,
+            )
+        return output
+
+    def _fail_closed_stepwise(self, request_id: str) -> None:
+        """Drop everything a failed stepwise invocation left behind.
+
+        A failure inside the step is already released by ``_bound_ar_session``;
+        a failure at the chunk barrier happens after that context closed, so the
+        session is still present and is released here.
+        """
+        self._stepwise_chunk_started.pop(request_id, None)
+        state_cache = getattr(self, "state_cache", None)
+        if isinstance(state_cache, dict):
+            state_cache.pop(request_id, None)
+        if request_id in self._sessions:
+            self._release_session(request_id, reset_model=False, reason="forward_exception", suppress_errors=True)
+            logger.warning(
+                "AR-Diffusion stepwise chunk barrier failed for session=%s; KV and model state were released",
+                request_id,
+            )
 
     def _warmup_ar_rollout(self) -> None:
         """Run model-provided warmup requests, or safely skip when absent."""

@@ -143,8 +143,17 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             # LoRA shrink & expand as in add_lora_linear():
             #   buffer = (x @ A.T)
             #   y += buffer @ B.T
-            delta = (x_flat @ A.t()) @ B.t()
-            y_flat[:, offset : offset + slice_size] = y_flat[:, offset : offset + slice_size] + delta
+            buffer = x_flat @ A.t()
+            y_slice = y_flat[:, offset : offset + slice_size]
+
+            # In inference, accumulate the expand GEMM directly into the base
+            # output. This avoids materializing both a full-width delta and the
+            # result of the following elementwise addition. ``out=`` does not
+            # support autograd, so training keeps the functional fallback.
+            if not torch.is_grad_enabled() and y_slice.dtype == buffer.dtype == B.dtype:
+                torch.addmm(y_slice, buffer, B.t(), out=y_slice)
+            else:
+                y_slice[:] = y_slice + buffer @ B.t()
             offset += slice_size
 
         return y_flat.view(original_shape)

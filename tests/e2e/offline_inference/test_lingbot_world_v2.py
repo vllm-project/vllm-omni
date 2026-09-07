@@ -62,7 +62,6 @@ def test_lingbot_world_v2_tp1_one_block(omni_runner_handler: OmniRunnerHandler) 
                 height=480,
                 width=832,
                 num_frames=9,
-                num_inference_steps=4,
                 max_sequence_length=512,
                 seed=42,
                 fps=16,

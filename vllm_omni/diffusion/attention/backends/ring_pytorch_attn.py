@@ -116,7 +116,7 @@ class RingAttentionFunc(torch.autograd.Function):
                     causal=is_causal and step == 0,
                     op_type=op_type,
                 )
-                out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+                out, lse = update_out_and_lse(out, lse, block_out, block_lse, lse_layout="bhs")
 
             if step + 1 != comm.world_size:
                 comm.wait()

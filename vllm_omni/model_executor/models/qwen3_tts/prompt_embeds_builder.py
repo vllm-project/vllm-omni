@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Stand-alone builder for Qwen3-TTS AR talker prompt embeddings.
 
 Factors the prompt-construction logic out of
@@ -1239,6 +1242,15 @@ class Qwen3TTSPromptEmbedsBuilder:
             else:
                 wav_np, sr = _get_ref_audio()
                 speaker_embed = self.extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
+
+            expected_speaker_dim = int(self._talker_config.hidden_size)
+            actual_speaker_dim = int(speaker_embed.shape[-1])
+            if actual_speaker_dim != expected_speaker_dim:
+                raise ValueError(
+                    "Qwen3-TTS speaker embedding dimension mismatch: "
+                    f"got {actual_speaker_dim}, but the talker requires {expected_speaker_dim}. "
+                    "Use a matching Base checkpoint or a compatible precomputed speaker embedding."
+                )
 
             # Cache miss: store extraction result in the speaker cache.
             if _speaker_cache_key is not None and speaker_embed is not None and self._speaker_cache is not None:

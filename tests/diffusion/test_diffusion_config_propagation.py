@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests that parallel_config survives the create_default_diffusion roundtrip.
 
 Regression tests for https://github.com/vllm-project/vllm-omni/issues/1862
@@ -136,6 +136,15 @@ class TestCreateDefaultDiffusion:
     def test_cache_backend_defaults_to_none(self):
         stages = StageConfigFactory.create_default_diffusion({"model": "x"})
         assert stages[0]["engine_args"]["cache_backend"] == "none"
+
+    def test_explicit_none_cache_backend_canonicalizes_to_none(self):
+        """Regression for #7032: ``cache_backend=None`` (e.g. an example CLI default)
+        must reach the pipeline as the canonical ``"none"`` string."""
+        od = _roundtrip_diffusion_config(model="x", cache_backend=None)
+        assert od.cache_backend == "none"
+
+        od = OmniDiffusionConfig.from_kwargs(model="x", cache_backend=None)
+        assert od.cache_backend == "none"
 
     def test_single_gpu_default_devices(self):
         stages = StageConfigFactory.create_default_diffusion({"model": "x"})

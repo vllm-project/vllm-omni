@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -111,6 +112,66 @@ def test_h3_model_cpu_offload_registers_direct_vae_stages(monkeypatch):
     remove_offload.assert_called_once_with([*dits, *stages])
 
 
+def test_h3_model_cpu_offload_keeps_unselected_vaes_resident(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = torch.nn.Linear(2, 2)
+    pipeline.transformers_ref = torch.nn.Linear(2, 2)
+    pipeline.text_encoder = torch.nn.Linear(2, 2)
+    pipeline.video_vae = torch.nn.Linear(2, 2)
+    pipeline.audio_vae = torch.nn.Linear(2, 2)
+    apply_offload = Mock()
+    monkeypatch.setattr(module, "apply_sequential_offload", apply_offload)
+
+    pipeline.enable_omni_model_cpu_offload(
+        device=torch.device("cpu"),
+        pin_memory=False,
+        use_hsdp=False,
+        offload_components=frozenset({"dit", "text_encoder"}),
+    )
+
+    dits = [pipeline.transformer, pipeline.transformers_ref]
+    stages = [pipeline.text_encoder, pipeline.video_vae, pipeline.audio_vae]
+    apply_offload.assert_called_once_with(
+        dit_modules=dits,
+        encoder_modules=stages,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        use_hsdp=False,
+        offload_initial_dits=True,
+        offload_dit_modules=dits,
+        offload_encoder_modules=[pipeline.text_encoder],
+    )
+
+
+def test_h3_model_cpu_offload_rejects_unloaded_selected_encoder(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = torch.nn.Linear(2, 2)
+    pipeline.transformers_ref = torch.nn.Linear(2, 2)
+    pipeline.text_encoder = None
+    pipeline.video_vae = torch.nn.Linear(2, 2)
+    pipeline.audio_vae = torch.nn.Linear(2, 2)
+    apply_offload = Mock()
+    monkeypatch.setattr(module, "apply_sequential_offload", apply_offload)
+
+    with pytest.raises(ValueError, match="no loaded text encoder"):
+        pipeline.enable_omni_model_cpu_offload(
+            device=torch.device("cpu"),
+            pin_memory=False,
+            use_hsdp=False,
+            offload_components=frozenset({"text_encoder"}),
+        )
+
+    apply_offload.assert_not_called()
+
+
 @pytest.mark.parametrize("decode_fails", [False, True])
 def test_h3_model_cpu_offload_scopes_direct_vae_call(monkeypatch, decode_fails):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
@@ -119,7 +180,7 @@ def test_h3_model_cpu_offload_scopes_direct_vae_call(monkeypatch, decode_fails):
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
     component = torch.nn.Linear(2, 2)
-    events = []
+    events: list[tuple[Any, ...]] = []
 
     @contextmanager
     def record_component(value):
@@ -262,7 +323,7 @@ def test_h3_model_cpu_offload_shares_embedded_and_standalone_audio_scope(monkeyp
     torch.nn.Module.__init__(pipeline)
     pipeline.audio_vae = Mock()
     pipeline._model_cpu_offload_modules = [pipeline.audio_vae]
-    events = []
+    events: list[tuple[Any, ...]] = []
 
     @contextmanager
     def record_component(value):

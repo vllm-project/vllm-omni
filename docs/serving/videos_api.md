@@ -41,7 +41,7 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 ### Endpoints
 
 | Endpoint | Method | Description |
-|----------|--------|-------------|
+| ---------- | -------- | ------------- |
 | `/v1/videos` | `POST` | Create an asynchronous video generation job |
 | `/v1/videos/sync` | `POST` | Generate a video synchronously and return raw video bytes |
 | `/v1/videos/{video_id}` | `GET` | Retrieve job status and metadata |
@@ -56,7 +56,7 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 #### OpenAI-style fields
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `prompt` | string | **required** | Text prompt for video generation |
 | `model` | string | server's model | Optional model name |
 | `seconds` | string | null | Requested clip duration in seconds |
@@ -66,8 +66,10 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 #### vLLM-Omni extension fields
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `input_reference` | file | null | Uploaded reference image or video for image-to-video/video-to-video requests |
+| `control_reference` | file | null | Optional uploaded image/video control, up to 512 MiB, for models that declare control-upload support |
+| `control_type` | string | null | Model control name associated with `control_reference`; currently Cosmos3 supports `edge`, `blur`, `depth`, `seg`, and `wsm` |
 | `image_reference` | string | null | JSON-encoded reference image payload; do not combine with `input_reference` or `video_reference` |
 | `video_reference` | string | null | JSON-encoded reference video payload; do not combine with `input_reference` or `image_reference` |
 | `audio_reference` | string | null | JSON-encoded audio reference for speech-to-video: `{"audio_url": "..."}` — supports HTTP(s) URLs or base64 data URLs |
@@ -177,6 +179,23 @@ corresponding addition. `negative_metadata_mode` accepts `same`, `inverse`, or
 `none` and defaults to `same` for transfer. See the Cosmos3 recipe for complete
 examples.
 
+A client that cannot place the control on the server filesystem can upload one
+control with `control_reference` and identify it with `control_type`. The API
+streams the upload to request-scoped storage, supplies its path to the model,
+and removes it after synchronous or asynchronous generation completes. Other
+options for the selected control can remain in `extra_params`; do not also set
+`control` or `control_path` there. Uploads larger than 512 MiB are rejected.
+
+```bash
+curl -s http://localhost:8091/v1/videos/sync \
+  -F "prompt=Preserve the scene while following the world-state control" \
+  -F "input_reference=@input.mp4;type=video/mp4" \
+  -F "control_reference=@wsm.mp4;type=video/mp4" \
+  -F "control_type=wsm" \
+  -F 'extra_params={"wsm":{"control_weight":1.0}}' \
+  -o output.mp4
+```
+
 HTTP redirects for `image_reference.image_url` follow vLLM's
 `VLLM_MEDIA_URL_ALLOW_REDIRECTS` setting. Before starting the server, set it to
 `1` (the default) to allow redirects or `0` to reject them. A redirect target
@@ -202,7 +221,6 @@ curl -s http://localhost:8091/v1/videos \
   -F "guidance_scale=4.5" \
   -F "fps=16"
 ```
-
 
 ### Synchronous Generation
 

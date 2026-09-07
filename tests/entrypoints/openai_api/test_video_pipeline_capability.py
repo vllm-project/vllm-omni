@@ -57,10 +57,25 @@ def test_video_pipeline_rejects_non_video_final_outputs(stage_configs):
     [
         "LTX2TwoStagePipeline",
         "LTX2DistilledOneStagePipeline",
+        "LTX2DistilledTwoStagePipeline",
         "WanDMDPipeline",
         "LingBotWorldCausalDMDPipeline",
         "LongCatVideoAvatarPipeline",
+        "SanaVideoPipeline",
+        "SanaImageToVideoPipeline",
+        "SanaWmPipeline",
     ],
 )
 def test_registered_video_aliases_declare_video_output(model_class_name):
+    assert get_diffusion_output_type(model_class_name) == "video"
+
+
+@pytest.mark.parametrize(
+    "model_class_name",
+    [
+        "SanaVideoPipeline",
+        "SanaImageToVideoPipeline",
+    ],
+)
+def test_sana_video_pipelines_declare_video_output(model_class_name):
     assert get_diffusion_output_type(model_class_name) == "video"

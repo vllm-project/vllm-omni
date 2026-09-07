@@ -34,6 +34,7 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_z
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention, WanTransformer3DModel
+from vllm_omni.diffusion.offloader import OffloadPlan
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -308,6 +309,13 @@ def get_wan22_pre_process_func(
     return pre_process_func
 
 
+_WAN_TEXT_ENCODER_OFFLOAD_PLAN = OffloadPlan(
+    encoder_component_types={"text_encoder": "text_encoder"},
+    encoder_block_attrs={"text_encoder": ("encoder.block",)},
+    encoder_dlo_weight_replication=frozenset({"text_encoder"}),
+)
+
+
 class Wan22Pipeline(
     nn.Module,
     PipelineParallelMixin,
@@ -322,6 +330,7 @@ class Wan22Pipeline(
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    _offload_plan = _WAN_TEXT_ENCODER_OFFLOAD_PLAN
 
     def __init__(
         self,

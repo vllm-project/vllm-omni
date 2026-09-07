@@ -26,6 +26,9 @@ self-check.
 
 - [`add-diffusion-model`](add-diffusion-model/SKILL.md): guides integration of
   a new diffusion model into `vllm-omni`
+- [`add-recipe`](add-recipe/SKILL.md): creates or updates in-repository model
+  recipes with verified task/input/output contracts, concrete hardware,
+  shared feature-guide links, exact commands, and qualification evidence
 - [`add-tts-model`](add-tts-model/SKILL.md): covers integration of new TTS
   models and related serving workflows
 - [`diffusion-perf-opt`](diffusion-perf-opt/SKILL.md): guides diffusion model
@@ -37,6 +40,10 @@ self-check.
 - [`precheck-pr`](precheck-pr/SKILL.md): self-checks a branch before creating a
   PR by validating title format, dead code, simplification opportunities,
   accuracy and performance claims, and merge readiness
+- [`production-add-diffusion-model`](production-add-diffusion-model/SKILL.md):
+  takes a working Day-0 diffusion integration through API/limit parity,
+  feature-combination evidence, quantization/offload, performance, production
+  serving, hardware recipes, and CI readiness
 - [`quantization`](quantization/SKILL.md): guides quantization method selection,
   model integration, checkpoint loading, and quality/performance validation
   for vLLM-Omni

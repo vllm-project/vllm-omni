@@ -786,7 +786,7 @@ def _encode_video_bytes_legacy(
 
 def _encode_video_bytes(
     video: Any,
-    fps: int,
+    fps: int | float,
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,
@@ -908,7 +908,7 @@ def create_streaming_video_encoder(
 
 def encode_video_base64(
     video: Any,
-    fps: int,
+    fps: int | float,
     audio: Any | None = None,
     audio_sample_rate: int | None = None,
     video_codec_options: dict[str, str] | None = None,

@@ -22,7 +22,7 @@ from vllm.inputs import TokensPrompt
 
 from tests.helpers.clean import wait_for_gpu_memory_to_clear
 from tests.helpers.mark import hardware_test
-from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.platforms import current_omni_platform
 
@@ -52,26 +52,7 @@ def _colocate_async_deploy() -> str:
     CI yaml plus CuMem on every stage fails engine-core startup in the L3
     merge job: Stage 1 resolves ``devices: "1"`` while only GPU 0 is visible.
     """
-    return modify_stage_config(
-        get_deploy_config_path("qwen3_omni_moe_thinking.yaml"),
-        updates={
-            "stages": {
-                0: {
-                    "enable_sleep_mode": True,
-                    "enforce_eager": True,
-                    "trust_remote_code": True,
-                    "tensor_parallel_size": 1,
-                    "devices": "0",
-                    "gpu_memory_utilization": 0.9,
-                    "max_num_seqs": 1,
-                    "max_model_len": 8192,
-                    "max_num_batched_tokens": 8192,
-                    "enable_prefix_caching": False,
-                    "skip_mm_profiling": True,
-                },
-            },
-        },
-    )
+    return get_deploy_config_path("ci/qwen3_omni_moe_colocate_async.yaml")
 
 
 @pytest.mark.advanced_model

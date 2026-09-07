@@ -9,6 +9,7 @@ from PIL import Image
 from torch import nn
 
 from tests.diffusion.models.wan2_2.conftest import StubScheduler, StubTransformer, StubVAE, noop_progress_bar
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import _WAN_TEXT_ENCODER_OFFLOAD_PLAN
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v import (
     Wan22I2VPipeline,
     get_wan22_i2v_post_process_func,
@@ -28,6 +29,10 @@ def test_wan22_i2v_postprocess_honors_request_output_type() -> None:
     )
 
     assert output is video
+
+
+def test_i2v_pipeline_declares_text_encoder_offload_blocks() -> None:
+    assert Wan22I2VPipeline._offload_plan is _WAN_TEXT_ENCODER_OFFLOAD_PLAN
 
 
 def _make_i2v_pipeline(*, expand_timesteps: bool) -> Wan22I2VPipeline:

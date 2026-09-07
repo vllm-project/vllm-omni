@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import sys
 import types
@@ -9,18 +9,13 @@ import torch
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
-from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.platforms import current_omni_platform
 
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_kernels_hub_platform_fallback(monkeypatch: pytest.MonkeyPatch):
-    """Test that when kernels package is not available, the platform fallback logic
-
-    routes to local FLASH_ATTN.
-    """
+def test_explicit_kernels_hub_selection_does_not_fallback(monkeypatch: pytest.MonkeyPatch):
     from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
 
     # Temporarily hide/remove kernels module if present
@@ -38,19 +33,73 @@ def test_kernels_hub_platform_fallback(monkeypatch: pytest.MonkeyPatch):
     )
     monkeypatch.setattr(PACKAGES_CHECKER, "get_packages_info", lambda: {"has_flash_attn": True})
 
-    # Test FLASH_ATTN_HUB falls back to FLASH_ATTN when kernels is unavailable
-    backend_path = CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN_HUB", head_size=64)
-    assert backend_path == DiffusionAttentionBackendEnum.FLASH_ATTN.get_path()
+    with pytest.raises(ImportError, match="explicitly selected"):
+        CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN_HUB", head_size=64)
+    with pytest.raises(ImportError, match="explicitly selected"):
+        CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN_3_HUB", head_size=64)
 
-    # Test FLASH_ATTN_3_HUB falls back to FLASH_ATTN when kernels is unavailable
-    backend_path = CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN_3_HUB", head_size=64)
-    assert backend_path == DiffusionAttentionBackendEnum.FLASH_ATTN.get_path()
-
-    # Test FLASH_ATTN_3_HUB falls back to FLASH_ATTN_HUB on pre-Hopper GPUs
     kernels_module = types.ModuleType("kernels")
     monkeypatch.setitem(sys.modules, "kernels", kernels_module)
-    backend_path = CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN_3_HUB", head_size=64)
-    assert backend_path == DiffusionAttentionBackendEnum.FLASH_ATTN_HUB.get_path()
+    with pytest.raises(ValueError, match="require.*Hopper GPU"):
+        CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN_3_HUB", head_size=64)
+
+    monkeypatch.setattr(
+        CudaOmniPlatform,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(10, 3)),
+    )
+    with pytest.raises(ValueError, match="current FA2 kernels require"):
+        CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN_HUB", head_size=64)
+    with pytest.raises(ValueError, match="require.*Hopper GPU"):
+        CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN_3_HUB", head_size=64)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_explicit_flash_attention_unavailable_does_not_fallback(monkeypatch: pytest.MonkeyPatch):
+    from vllm.platforms.interface import DeviceCapability
+
+    from vllm_omni.diffusion.envs import PACKAGES_CHECKER
+    from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
+
+    monkeypatch.setattr(
+        CudaOmniPlatform,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(8, 0)),
+    )
+    monkeypatch.setattr(PACKAGES_CHECKER, "get_packages_info", lambda: {"has_flash_attn": False})
+
+    with pytest.raises(ValueError, match="explicitly selected but is unsupported"):
+        CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN", head_size=64)
+
+    monkeypatch.setattr(
+        CudaOmniPlatform,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(10, 3)),
+    )
+    monkeypatch.setattr(PACKAGES_CHECKER, "get_packages_info", lambda: {"has_flash_attn": True})
+    monkeypatch.setattr(CudaOmniPlatform, "has_flash_attn_4", classmethod(lambda cls: False))
+    with pytest.raises(ValueError, match="requires CuTe FlashAttention-4"):
+        CudaOmniPlatform.get_diffusion_attn_backend_cls("FLASH_ATTN", head_size=64)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_explicit_sage_attention_unsupported_arch_does_not_reach_kernel(monkeypatch: pytest.MonkeyPatch):
+    from vllm.platforms.interface import DeviceCapability
+
+    from vllm_omni.diffusion.envs import PACKAGES_CHECKER
+    from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
+
+    monkeypatch.setattr(
+        CudaOmniPlatform,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(10, 3)),
+    )
+    monkeypatch.setattr(PACKAGES_CHECKER, "get_packages_info", lambda: {"has_flash_attn": False})
+
+    with pytest.raises(ValueError, match="does not provide a kernel for sm_103"):
+        CudaOmniPlatform.get_diffusion_attn_backend_cls("SAGE_ATTN", head_size=64)
 
 
 @pytest.mark.core_model

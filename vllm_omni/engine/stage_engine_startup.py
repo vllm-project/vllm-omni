@@ -974,6 +974,7 @@ def _launch_omni_core_engines(
     omni_coordinator_address: str | None = None,
     stage_visible_devices: str | None = None,
     spawn_device_lock: threading.Lock | None = None,
+    omni_parallel_stage_init: bool = False,
 ) -> Iterator[tuple[CoreEngineProcManager, DPCoordinator | None, EngineZmqAddresses]]:
     """Launch local engine cores using the omni registration flow.
 
@@ -1068,8 +1069,20 @@ def _launch_omni_core_engines(
                         omni_stage_id=stage_id,
                         omni_coordinator_address=omni_coordinator_address,
                         omni_replica_base_id=replica_id,
+                        omni_parallel_stage_init=omni_parallel_stage_init,
                     )
             else:
+                if omni_parallel_stage_init:
+                    # The upstream CoreEngineProcManager targets EngineCoreProc.run_engine_core,
+                    # which does NOT install the SH/EX phase-lock executor wrapper. Since the
+                    # orchestrator skips its own device lock when parallel_stage_init is on,
+                    # running here would leave same-device init unguarded. Fail closed.
+                    raise RuntimeError(
+                        f"parallel_stage_init is enabled but stage {stage_id} would launch via the "
+                        "upstream CoreEngineProcManager (no omni coordinator), which cannot install "
+                        "the phase-lock guard. Disable parallel_stage_init for this deployment or "
+                        "run with the omni coordinator."
+                    )
                 with scoped_spawn_device_env(
                     stage_visible_devices, spawn_device_lock, stage_id=stage_id, replica_id=replica_id
                 ):
@@ -1120,6 +1133,7 @@ def launch_stage_replica(
     omni_coordinator_address: str | None = None,
     stage_visible_devices: str | None = None,
     spawn_device_lock: threading.Lock | None = None,
+    omni_parallel_stage_init: bool = False,
 ) -> Iterator[StageReplicaResources]:
     """Launch a local LLM stage replica.
 
@@ -1141,6 +1155,7 @@ def launch_stage_replica(
             omni_coordinator_address=omni_coordinator_address,
             stage_visible_devices=stage_visible_devices,
             spawn_device_lock=spawn_device_lock,
+            omni_parallel_stage_init=omni_parallel_stage_init,
         ) as resources:
             engine_manager, coordinator, addresses = resources
             yield StageReplicaResources(
@@ -1170,6 +1185,7 @@ def launch_stage_replica(
             omni_stage_id=stage_id,
             omni_coordinator_address=omni_coordinator_address,
             omni_replica_base_id=replica_id,
+            omni_parallel_stage_init=omni_parallel_stage_init,
         )
 
     with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
@@ -1546,7 +1562,6 @@ def launch_diffusion_stage_replica(
     stage_config: Any,
     metadata: Any,
     stage_init_timeout: int,
-    batch_size: int,
     use_inline: bool,
     replica_id: int = 0,
     omni_master_server: OmniMasterServer | None = None,
@@ -1565,7 +1580,6 @@ def launch_diffusion_stage_replica(
             stage_config,
             metadata,
             stage_init_timeout=stage_init_timeout,
-            batch_size=batch_size,
             use_inline=use_inline,
         )
         return client, StageReplicaResources()
@@ -1624,7 +1638,6 @@ def launch_diffusion_stage_replica(
             request_address=proc_manager.addresses.inputs[0],
             response_address=proc_manager.addresses.outputs[0],
             proc_manager=proc_manager,
-            batch_size=batch_size,
         )
         return client, StageReplicaResources(
             manager=proc_manager,

@@ -75,6 +75,7 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
         omni_replica_base_id: int = 0,
         client_handshake_address: str | None = None,
         tensor_queue: Queue | None = None,
+        omni_parallel_stage_init: bool = False,
     ) -> None:
         # NOTE: we intentionally do not call ``super().__init__`` — the
         # parent's body hardcodes the wrong target. We re-implement it here
@@ -92,6 +93,7 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
             "tensor_queue": tensor_queue,
             "omni_stage_id": int(omni_stage_id),
             "omni_coordinator_address": omni_coordinator_address,
+            "omni_parallel_stage_init": bool(omni_parallel_stage_init),
         }
 
         if client_handshake_address:

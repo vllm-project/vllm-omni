@@ -23,7 +23,6 @@ Easy, fast, and cheap omni-modality model serving for everyone
 <a class="github-button" href="https://github.com/vllm-project/vllm-omni/fork" data-show-count="true" data-icon="octicon-repo-forked" data-size="large" aria-label="Fork">Fork</a>
 </p>
 
-
 ## About
 
 [vLLM](https://github.com/vllm-project/vllm) was originally designed to support large language models for text-based autoregressive generation tasks. vLLM-Omni is a framework that extends its support for omni-modality model inference and serving:
@@ -52,14 +51,14 @@ vLLM-Omni is flexible and easy to use with:
 - Tensor, pipeline, data and expert parallelism support for distributed inference
 - Streaming outputs
 - OpenAI-compatible API server
-- Full-duplex realtime serving with streaming audio input and output (experimental)
+- [Full-duplex realtime serving](serving/realtime_duplex_api.md) with streaming audio input and output
 
 vLLM-Omni seamlessly supports most popular open-source models on HuggingFace, including:
 
 - Omni-modality models (e.g. Qwen3-Omni, MiniCPM-o 4.5, Cosmos3, HunyuanImage, BAGEL)
-- TTS models (e.g. Qwen3-TTS, VoxCPM2, Ming-Omni-TTS, CosyVoice3)
-- Diffusion models — image, video, and audio generation (e.g. MiniMax H3, Qwen-Image, Wan2.2, FLUX)
-- Robot-policy and action models (e.g. GR00T-N1.7, DreamZero-DROID, InternVLA-A1, Cosmos3 action policy)
+- TTS models (e.g. Qwen3-TTS, IndexTTS 2.5, dots.tts, CosyVoice3)
+- Diffusion models — image, video, and audio generation (e.g. MiniMax H3, LTX-2.5, SANA-Video, Wan2.2)
+- Robot-policy and action models (e.g. π0, GR00T-N1.7, DreamZero-DROID, InternVLA-A1)
 
 For more information, checkout the following:
 

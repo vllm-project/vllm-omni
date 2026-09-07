@@ -458,8 +458,8 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             info_dicts = kwargs.get("runtime_additional_information")
 
         if inputs_embeds is None:
-            # Mask -100 placeholders to 0 before embedding. Use torch.where
-            # (no Python data-dependent branch) so this is CUDA-graph safe.
+            # Keep legacy/offline negative sentinels safe before embedding.
+            # Online serving submits vocab-valid IDs plus explicit positions.
             safe_ids = torch.where(input_ids < 0, torch.zeros_like(input_ids), input_ids)
             hidden_states = self.model.embed_tokens(safe_ids)
         else:
@@ -502,8 +502,8 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 and not self._is_single_token_decode_step(int(hidden_states.shape[0]))
             )
         if is_prefill and info_dicts:
-            # Voice clone: replace -100 placeholder positions with ref audio embeddings
-            hidden_states = self._apply_ref_audio_substitution(hidden_states, input_ids, info_dicts)
+            # Voice clone: replace marked prompt positions with ref audio embeddings.
+            hidden_states = self._apply_ref_audio_substitution(hidden_states, input_ids, positions, info_dicts)
 
         # Audio feedback at decode: replace continuation token embeddings
         if input_ids is not None and inputs_embeds is None:
@@ -644,24 +644,24 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
+        positions: torch.Tensor,
         info_dicts: list[dict[str, Any]] | None,
     ) -> torch.Tensor:
-        """Replace -100 placeholder positions with fused multi-codebook embeddings
-        of the delay-pattern-encoded reference audio codes.
+        """Inject fused reference-audio embeddings at marked prompt positions.
 
         Called at prefill to inject voice clone reference. ``info_dicts`` is a
         list of per-request dicts from ``model_intermediate_buffer``, each
         containing ``audio_input_ids`` ([T, N] delayed codes) and
-            ``audio_input_ids_mask`` ([T] bool mask).
+        ``audio_input_ids_mask`` ([T] bool mask). New callers also provide
+        ``audio_placeholder_positions`` ([T] absolute prompt positions). Legacy
+        callers that still submit -100 token IDs remain supported.
         """
         if not info_dicts:
             return hidden_states
 
-        PLACEHOLDER = -100
         flat_ids = input_ids.reshape(-1)
-        placeholder_mask = flat_ids == PLACEHOLDER
-        if not placeholder_mask.any():
-            return hidden_states
+        flat_positions = positions.reshape(-1)
+        legacy_placeholder_mask = flat_ids == -100
 
         # Use query_start_loc to map placeholders to per-request spans
         q_start = self._last_step_query_start_loc
@@ -681,12 +681,15 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
 
             codes = info.get("audio_input_ids")
             mask = info.get("audio_input_ids_mask")
+            placeholder_positions = info.get("audio_placeholder_positions")
 
             # Handle msgspec serialization (may be list-wrapped)
             if isinstance(codes, list):
                 codes = codes[0] if codes else None
             if isinstance(mask, list):
                 mask = mask[0] if mask else None
+            if isinstance(placeholder_positions, list):
+                placeholder_positions = placeholder_positions[0] if placeholder_positions else None
             if not isinstance(codes, torch.Tensor):
                 continue
 
@@ -696,29 +699,54 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             if codes.ndim != 2:
                 continue
 
+            if isinstance(placeholder_positions, torch.Tensor):
+                if placeholder_positions.ndim == 2:
+                    placeholder_positions = placeholder_positions[0]
+                placeholder_positions = placeholder_positions.reshape(-1)
+
             if isinstance(mask, torch.Tensor):
                 if mask.ndim == 2:
                     mask = mask[0]
-                codes = codes[mask.to(dtype=torch.bool)]
+                mask = mask.reshape(-1).to(dtype=torch.bool)
+                codes = codes[mask.to(device=codes.device)]
+                if isinstance(placeholder_positions, torch.Tensor) and placeholder_positions.numel() == mask.numel():
+                    placeholder_positions = placeholder_positions[mask.to(device=placeholder_positions.device)]
 
             if codes.numel() == 0:
                 continue
 
-            # Find placeholder positions in this request's span
             s = int(q_start_list[i])
             e = int(q_start_list[i + 1])
-            if e - s <= 1:
-                continue  # Decode step, skip
+            if e <= s:
+                continue
 
-            span_mask = placeholder_mask[s:e]
-            placeholders = span_mask.nonzero(as_tuple=True)[0]
-            n_codes = int(codes.shape[0])
-
-            if int(placeholders.numel()) < n_codes:
-                continue  # Mismatch
+            if isinstance(placeholder_positions, torch.Tensor):
+                if placeholder_positions.numel() == 0 or placeholder_positions.numel() != codes.shape[0]:
+                    continue
+                request_positions = flat_positions[s:e]
+                ref_positions = placeholder_positions.to(
+                    device=request_positions.device,
+                    dtype=request_positions.dtype,
+                )
+                code_rows = torch.searchsorted(ref_positions, request_positions)
+                in_range = code_rows < ref_positions.numel()
+                bounded_rows = code_rows.clamp(max=ref_positions.numel() - 1)
+                matches = in_range & (ref_positions[bounded_rows] == request_positions)
+                if not matches.any():
+                    continue
+                target = matches.nonzero(as_tuple=True)[0] + s
+                codes = codes.index_select(0, code_rows[matches].to(device=codes.device))
+            else:
+                if e - s <= 1:
+                    continue  # Legacy decode step, skip
+                span_mask = legacy_placeholder_mask[s:e]
+                placeholders = span_mask.nonzero(as_tuple=True)[0]
+                n_codes = int(codes.shape[0])
+                if int(placeholders.numel()) < n_codes:
+                    continue
+                target = placeholders[:n_codes] + s
 
             # Embed delayed codes via fused multi-codebook embedding
-            target = placeholders[:n_codes] + s
             codes_device = codes.to(device=hidden_states.device, dtype=torch.long)
             embeds = self.multimodal_embedding(codes_device)  # [n_codes, hidden]
 

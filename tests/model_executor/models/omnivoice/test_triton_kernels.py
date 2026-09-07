@@ -15,6 +15,7 @@ import torch
 
 pytestmark = [
     pytest.mark.core_model,
+    pytest.mark.cuda,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
 ]
 
@@ -48,7 +49,9 @@ def _ref_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Te
 
 
 def _ref_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-    # Kernel: gate → float32, silu, cast to up.dtype, mul up
+    # Kernel: gate → float32, silu, cast to up.dtype, mul up.
+    # It now reads both halves out of one packed [..., 2 * cols] activation, so
+    # the tests concatenate what they used to pass as two tensors.
     gate_f32 = gate.float()
     silu = gate_f32 * torch.sigmoid(gate_f32)
     return silu.to(up.dtype) * up
@@ -124,7 +127,7 @@ def test_swiglu_float32(rows, cols):
     up = torch.randn(rows, cols, device=DEVICE)
 
     ref = _ref_swiglu(gate, up)
-    out = triton_swiglu(gate, up)
+    out = triton_swiglu(torch.cat([gate, up], dim=-1))
 
     torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
 
@@ -136,7 +139,7 @@ def test_swiglu_negative_gate():
     up = torch.ones(4, 64, device=DEVICE)
 
     ref = _ref_swiglu(gate, up)
-    out = triton_swiglu(gate, up)
+    out = triton_swiglu(torch.cat([gate, up], dim=-1))
 
     torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
     assert not torch.isnan(out).any()
@@ -146,7 +149,7 @@ def test_swiglu_negative_gate():
 def test_swiglu_output_shape_preserved():
     gate = torch.randn(3, 8, 512, device=DEVICE)
     up = torch.randn(3, 8, 512, device=DEVICE)
-    out = triton_swiglu(gate, up)
+    out = triton_swiglu(torch.cat([gate, up], dim=-1))
     assert out.shape == gate.shape
 
 

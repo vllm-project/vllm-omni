@@ -351,7 +351,7 @@ def test_router_openapi_paths_cover_http_manifest() -> None:
 async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_router(monkeypatch) -> None:
     """Lock worker assembly: override, mount, storage, handlers, full census.
 
-    Fails if assembly stops replacing upstream chat/batch/models/profiler,
+    Fails if assembly stops replacing upstream chat/batch/models/health/profiler,
     deletes unrelated upstream routes, forgets Omni/profiler mounts, skips
     storage start, or drops Omni ``EngineDeadError`` / ``EngineGenerateError``
     handlers.
@@ -371,6 +371,10 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
 
         @app.get("/v1/models")
         async def upstream_models():
+            return {"owner": "upstream"}
+
+        @app.get("/health")
+        async def upstream_health():
             return {"owner": "upstream"}
 
         @app.post("/start_profile")
@@ -454,6 +458,7 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
         is api_server.create_batch_chat_completion
     )
     assert _single_http_route(routes, "GET", "/v1/models").endpoint is api_server.show_available_models
+    assert _single_http_route(routes, "GET", "/health").endpoint is api_server.health
     assert _single_http_route(routes, "POST", "/start_profile").endpoint is api_server.start_profile
     assert _single_http_route(routes, "POST", "/stop_profile").endpoint is api_server.stop_profile
 

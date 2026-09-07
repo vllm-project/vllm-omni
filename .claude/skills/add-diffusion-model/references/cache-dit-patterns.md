@@ -9,7 +9,9 @@ Three caching strategies:
 - **TaylorSeer**: Calibration-based prediction using Taylor expansion to estimate block outputs
 - **SCM** (Step Computation Masking): Dynamic step skipping based on configurable policies
 
-**Typical speedup**: 1.5-2.5x depending on model and configuration.
+Speedup is model-, step-, and policy-dependent. Treat a cache-enabled run as
+integration evidence until logs or a focused test show real hits and repeated
+timings show an improvement over the uncached baseline.
 
 **Official docs**: https://docs.vllm.ai/projects/vllm-omni/en/latest/design/feature/cache_dit
 
@@ -243,8 +245,10 @@ vllm serve your-model --omni --port 8098 \
 
 **Verification checklist**:
 1. Logs show "Cache-dit enabled successfully on xxx"
-2. Performance: 1.5-2x speedup vs no cache
-3. Quality: compare output with `cache_backend=None`
+2. A focused test or summary confirms at least one real cache hit
+3. Quality is compared with `cache_backend=None`
+4. Performance uses a realistic step count, repeated timings, and a policy
+   whose warmup does not consume the whole run
 
 ## Excluded Models
 

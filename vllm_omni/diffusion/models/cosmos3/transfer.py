@@ -439,9 +439,9 @@ def uint8_cthw_to_normalized_5d(frames: torch.Tensor, *, dtype: torch.dtype) -> 
 
 def _pil_to_uint8_rgb(value: Any) -> np.ndarray:
     if isinstance(value, PIL.Image.Image):
-        return np.asarray(value.convert("RGB"), dtype=np.uint8)
+        return np.array(value.convert("RGB"), dtype=np.uint8, copy=True)
     if isinstance(value, str | Path):
-        return np.asarray(PIL.Image.open(value).convert("RGB"), dtype=np.uint8)
+        return np.array(PIL.Image.open(value).convert("RGB"), dtype=np.uint8, copy=True)
     if isinstance(value, torch.Tensor):
         tensor = value.detach().cpu()
         if tensor.ndim == 3 and tensor.shape[0] in (3, 4):

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E offline inference tests for the Gepard-1.0 single-stage native-AR TTS.
 
 Zero-shot only (the model's default learned voice). These tests need a GPU and

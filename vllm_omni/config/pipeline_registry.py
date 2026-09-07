@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Pipeline registry and factory for vllm-omni.
 
 ``OMNI_PIPELINES`` maps each ``model_type`` to either a ``PipelineConfig``
@@ -70,6 +70,7 @@ from vllm_omni.model_executor.models.indextts2.pipeline import (
     INDEXTTS25_PIPELINE,
 )
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
+from vllm_omni.model_executor.models.lingbot_world.pipeline import LINGBOT_WORLD_PIPELINE
 from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
     MAMMOTH_MODA2_AR_PIPELINE,
     MAMMOTH_MODA2_PIPELINE,
@@ -143,6 +144,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "lance": LANCE_PIPELINE,
     "cosmos_dreams": COSMOS_DREAMS_PIPELINE,
     "dreamzero": DREAMZERO_PIPELINE,
+    "lingbot_world": LINGBOT_WORLD_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
     "pi0": PI0_PIPELINE,
     "gepard": GEPARD_PIPELINE,
@@ -198,18 +200,13 @@ def register_pipeline(pipeline: PipelineConfig | PipelineResolverFunc, model_typ
     since resolvers can return multiple different PipelineConfigs depending on the
     consumed config.
     """
-    errors: list[str] = []
     if isinstance(pipeline, PipelineConfig):
-        errors = pipeline.validate()
         model_type = model_type if model_type is not None else pipeline.model_type
-    else:
-        if model_type is None:
-            raise ValueError("Model type must be explicitly provided when registering a pipeline resolver")
+    elif model_type is None:
+        raise ValueError("Model type must be explicitly provided when registering a pipeline resolver")
 
     if model_type in OMNI_PIPELINES:
-        errors.append(f"Model type {model_type} is already registered; the old mapping will be clobbered")
-    if errors:
-        logger.warning("Registration for pipeline of type %s produced the following issues: %s", model_type, errors)
+        logger.warning(f"Model type {model_type} is already registered; the old mapping will be clobbered")
     OMNI_PIPELINES[model_type] = pipeline
 
 

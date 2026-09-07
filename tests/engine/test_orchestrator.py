@@ -21,6 +21,20 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.engine.duplex.control_plane import DuplexControlPlane
+from vllm_omni.engine.duplex.messages import (
+    AppendDuplexInputMessage,
+    CloseDuplexSessionMessage,
+    DuplexFence,
+    OpenDuplexSessionMessage,
+    SignalDuplexTurnMessage,
+)
+from vllm_omni.engine.duplex.runtime import (
+    DuplexInputMode,
+    DuplexRuntimeCapabilities,
+    DuplexSessionRuntimeState,
+    duplex_resource_request_id,
+)
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AbortResultMessage,
@@ -39,22 +53,8 @@ from vllm_omni.engine.orchestrator import (
     _build_terminal_empty_output,
 )
 from vllm_omni.engine.stage_pool import StagePool
-from vllm_omni.experimental.fullduplex.engine.duplex_control_plane import DuplexControlPlane
-from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
-    DuplexInputMode,
-    DuplexRuntimeCapabilities,
-    DuplexSessionRuntimeState,
-    duplex_resource_request_id,
-)
-from vllm_omni.experimental.fullduplex.engine.messages import (
-    AppendDuplexInputMessage,
-    CloseDuplexSessionMessage,
-    DuplexFence,
-    OpenDuplexSessionMessage,
-    SignalDuplexTurnMessage,
-)
-from vllm_omni.experimental.fullduplex.minicpmo45.runtime import MiniCPMO45DuplexRuntimeExtension
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_executor.models.minicpmo_4_5.duplex.runtime import MiniCPMO45DuplexRuntimeExtension
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

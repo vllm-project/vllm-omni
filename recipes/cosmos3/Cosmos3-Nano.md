@@ -207,6 +207,18 @@ curl -sS -X POST http://localhost:8000/v1/videos/sync \
   -F 'extra_params={"depth":{"control_path":"/path/to/depth_control.mp4"},"max_frames":121,"resolution":"720","num_video_frames_per_chunk":121}' \
   -o cosmos3_transfer_depth.mp4
 
+# The same transfer control can be uploaded by a remote client instead of
+# being placed on the server filesystem. Uploads are limited to 512 MiB.
+curl -sS -X POST http://localhost:8000/v1/videos/sync \
+  -H "Accept: video/mp4" \
+  -F "model=nvidia/Cosmos3-Nano" \
+  -F "prompt=Generate a realistic scene following the provided world-state control." \
+  -F "input_reference=@/path/to/input.mp4;type=video/mp4" \
+  -F "control_reference=@/path/to/wsm.mp4;type=video/mp4" \
+  -F "control_type=wsm" \
+  -F 'extra_params={"wsm":{"control_weight":1.0},"max_frames":121,"resolution":"720","num_video_frames_per_chunk":121}' \
+  -o cosmos3_transfer_wsm.mp4
+
 # Text-to-video-with-sound
 curl -sS -X POST http://localhost:8000/v1/videos/sync \
   -H "Accept: video/mp4" \
