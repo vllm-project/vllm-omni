@@ -712,6 +712,7 @@ class AsyncOmni(EngineClient, OmniBase):
         self._validate_streaming_input_sampling_params(stage0_params)
         req_state = self.request_states[request_id]
         has_submitted_first_chunk = False
+        input_error_reported = False
 
         # NOTE: InputProcessor in vLLM should generally do this too, but for
         # now we do it defensively. TODO (Alex) ensure clones/copying are optimized
@@ -722,6 +723,21 @@ class AsyncOmni(EngineClient, OmniBase):
         def _mark_first_chunk_submitted() -> None:
             if first_chunk_submitted is not None and not first_chunk_submitted.done():
                 first_chunk_submitted.set_result(None)
+
+        async def _report_input_error(error: Exception) -> None:
+            nonlocal input_error_reported
+            if input_error_reported:
+                return
+            input_error_reported = True
+            status_code, error_type = client_error_metadata(error)
+            await req_state.queue.put(
+                ErrorMessage(
+                    request_id=request_id,
+                    error=str(error),
+                    status_code=status_code,
+                    error_type=error_type,
+                )
+            )
 
         async def handle_inputs() -> None:
             nonlocal has_submitted_first_chunk
@@ -768,15 +784,7 @@ class AsyncOmni(EngineClient, OmniBase):
             except (asyncio.CancelledError, GeneratorExit):
                 cancelled = True
             except Exception as error:
-                status_code, error_type = client_error_metadata(error)
-                await req_state.queue.put(
-                    ErrorMessage(
-                        request_id=request_id,
-                        error=str(error),
-                        status_code=status_code,
-                        error_type=error_type,
-                    )
-                )
+                await _report_input_error(error)
             finally:
                 try:
                     if not cancelled:
@@ -815,9 +823,11 @@ class AsyncOmni(EngineClient, OmniBase):
                                 )
                             )
                             has_submitted_first_chunk = True
+                except Exception as error:
+                    await _report_input_error(error)
                 finally:
                     # Unblock generate() even on cancel / empty stream / submit
-                    # failure so it can observe a terminal abort or empty result.
+                    # failure so it can observe the queued terminal result or error.
                     _mark_first_chunk_submitted()
 
         input_stream_task = asyncio.create_task(handle_inputs())
