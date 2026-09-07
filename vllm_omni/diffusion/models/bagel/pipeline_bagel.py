@@ -1091,8 +1091,6 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
             gen_params.num_timesteps,
             gen_params.timestep_shift,
         )
-        if len(timesteps) == 0:
-            raise ValueError("BAGEL step execution requires num_inference_steps >= 1.")
 
         # Keep request-local scheduler progress while sharing immutable config
         # and tensor buffers with the pipeline scheduler.

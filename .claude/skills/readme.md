@@ -26,6 +26,9 @@ self-check.
 
 - [`add-diffusion-model`](add-diffusion-model/SKILL.md): guides integration of
   a new diffusion model into `vllm-omni`
+- [`add-recipe`](add-recipe/SKILL.md): creates or updates in-repository model
+  recipes with verified task/input/output contracts, concrete hardware,
+  shared feature-guide links, exact commands, and qualification evidence
 - [`add-tts-model`](add-tts-model/SKILL.md): covers integration of new TTS
   models and related serving workflows
 - [`diffusion-perf-opt`](diffusion-perf-opt/SKILL.md): guides diffusion model

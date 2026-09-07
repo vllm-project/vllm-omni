@@ -6,8 +6,8 @@
 import gc
 import json
 import weakref
-from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -17,7 +17,15 @@ from torch import nn
 from torch.distributed.tensor import DeviceMesh, DTensor, Replicate
 
 import vllm_omni.diffusion.offloader.distributed_layerwise_backend as dist_backend_module
-from tests.helpers.runtime import get_distributed_init_method
+from tests.diffusion.offloader.helpers import (
+    DummyStream,
+    _DummyBlock,
+    _PlainEncoder,
+    _SingleBlockModel,
+    _StagedEncoder,
+    _StagedVAE,
+    patch_offload_runtime,
+)
 from vllm_omni.diffusion.data import validate_dlo_host_registration_options
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
@@ -51,53 +59,9 @@ from vllm_omni.platforms import current_omni_platform
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 
 
-class DummyStream:
-    def wait_stream(self, _stream) -> None:
-        return None
-
-    def wait_event(self, _event) -> None:
-        return None
-
-
-class DummyEvent:
-    def record(self, _stream) -> None:
-        return None
-
-    def synchronize(self) -> None:
-        return None
-
-
-@contextmanager
-def dummy_stream(_stream):
-    yield None
-
-
-def _cleanup_distributed() -> None:
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-    gc.collect()
-    if current_omni_platform.is_available():
-        current_omni_platform.empty_cache()
-        current_omni_platform.synchronize()
-
-
-@pytest.fixture(scope="module")
-def dist_group():
-    dist.init_process_group("gloo", rank=0, world_size=1, init_method=get_distributed_init_method())
-    try:
-        yield
-    finally:
-        _cleanup_distributed()
-
-
 @pytest.fixture
 def patched_offload_runtime(monkeypatch):
-    monkeypatch.setattr(dist_backend_module.current_omni_platform, "Stream", DummyStream)
-    monkeypatch.setattr(dist_backend_module.current_omni_platform, "Event", DummyEvent)
-    monkeypatch.setattr(dist_backend_module.current_omni_platform, "current_stream", lambda: DummyStream())
-    monkeypatch.setattr(dist_backend_module.current_omni_platform, "stream", dummy_stream)
-    monkeypatch.setattr(dist_backend_module.current_omni_platform, "synchronize", lambda: None)
+    patch_offload_runtime(monkeypatch, dist_backend_module.current_omni_platform, synchronize=True)
 
 
 class TinyBlock(nn.Module):
@@ -113,6 +77,93 @@ def _make_values(start: float) -> torch.Tensor:
 
 
 class TestDistributedLayerwiseOffloadHook:
+    def test_buffer_only_block_reports_offloaded_state(self, patched_offload_runtime):
+        current_block = nn.Module()
+        current_block.register_buffer("state", torch.ones(2))
+        next_block = nn.Module()
+        next_block.register_buffer("state", torch.ones(2))
+        hook = DistributedLayerwiseOffloadHook(
+            next_block=next_block,
+            device=torch.device("cpu"),
+            dp_group=None,
+            dp_size=1,
+            rank=0,
+            pin_memory=False,
+        )
+        hook.initialize_hook(current_block)
+
+        assert hook.is_materialized
+        hook.offload_layer()
+        assert not hook.is_materialized
+
+    def test_initialize_failure_keeps_next_block_materialized(self, monkeypatch):
+        current_block = nn.Linear(2, 2)
+        next_block = nn.Linear(2, 2)
+        expected = {name: tensor.detach().clone() for name, tensor in next_block.state_dict().items()}
+        hook = DistributedLayerwiseOffloadHook(
+            next_block=next_block,
+            device=torch.device("cpu"),
+            dp_group=None,
+            dp_size=1,
+            rank=0,
+            pin_memory=False,
+        )
+
+        def fail_buffer_allocation():
+            raise RuntimeError("injected buffer allocation failure")
+
+        monkeypatch.setattr(hook, "_allocate_device_buffers", fail_buffer_allocation)
+
+        with pytest.raises(RuntimeError, match="buffer allocation failure"):
+            hook.initialize_hook(current_block)
+
+        for name, tensor in next_block.state_dict().items():
+            torch.testing.assert_close(tensor, expected[name])
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"dp_size": 0, "rank": 0}, "dp_size must be a positive integer"),
+            ({"dp_size": 2, "rank": 2, "dp_group": object()}, "rank must satisfy"),
+            ({"dp_size": 2, "rank": 0}, "dp_group is required"),
+            (
+                {"dp_size": 2, "rank": 0, "dp_group": object(), "rank_local_mmap": True},
+                "rank_local_mmap requires dp_size=1",
+            ),
+        ],
+    )
+    def test_constructor_rejects_invalid_transport_topology(self, kwargs, message):
+        options = {"dp_group": None, "dp_size": 1, "rank": 0, **kwargs}
+
+        with pytest.raises(ValueError, match=message):
+            DistributedLayerwiseOffloadHook(
+                next_block=nn.Linear(2, 2),
+                device=torch.device("cpu"),
+                pin_memory=False,
+                **options,
+            )
+
+    def test_ring_probes_are_captured_before_any_block_is_cleared(self, patched_offload_runtime):
+        blocks = nn.ModuleList([nn.Linear(2, 2, bias=False) for _ in range(3)])
+        expected_middle = blocks[1].weight.detach().clone()
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dlo_use_allgather=False,
+            ),
+            torch.device("cpu"),
+        )
+
+        hooks = backend._install_hook_group(blocks, "dit")
+        shared_buffers = backend._allocate_shared_buffers(hooks)
+        for hook in hooks:
+            hook.gpu_buffers = shared_buffers
+
+        assert all(not hook.is_materialized for hook in hooks)
+        hooks[2].pre_forward(blocks[1])
+        torch.testing.assert_close(blocks[1].weight, expected_middle)
+
     def test_shard_and_pin_single_rank(self, dist_group, patched_offload_runtime):
         """With dp_size=1, the shard should equal the full weights."""
         current_block = TinyBlock(_make_values(1.0))
@@ -511,7 +562,7 @@ class TestDistributedLayerwiseOffloadHook:
         hook = DistributedLayerwiseOffloadHook(
             next_block=next_block,
             device=torch.device("cpu"),
-            dp_group=None,
+            dp_group=object(),
             dp_size=4,
             rank=1,
             pin_memory=False,
@@ -537,7 +588,7 @@ class TestDistributedLayerwiseOffloadHook:
         hook0 = DistributedLayerwiseOffloadHook(
             next_block=next_block,
             device=torch.device("cpu"),
-            dp_group=None,
+            dp_group=object(),
             dp_size=2,
             rank=0,
             pin_memory=False,
@@ -559,7 +610,7 @@ class TestDistributedLayerwiseOffloadHook:
         hook1 = DistributedLayerwiseOffloadHook(
             next_block=next_block1,
             device=torch.device("cpu"),
-            dp_group=None,
+            dp_group=object(),
             dp_size=2,
             rank=1,
             pin_memory=False,
@@ -583,7 +634,7 @@ class TestDistributedLayerwiseOffloadHook:
         hook = DistributedLayerwiseOffloadHook(
             next_block=next_block,
             device=torch.device("cpu"),
-            dp_group=None,
+            dp_group=object(),
             dp_size=2,
             rank=0,
             pin_memory=False,
@@ -602,7 +653,7 @@ class TestDistributedLayerwiseOffloadHook:
         hook = DistributedLayerwiseOffloadHook(
             next_block=next_block,
             device=torch.device("cpu"),
-            dp_group=None,
+            dp_group=object(),
             dp_size=2,
             rank=0,
             pin_memory=False,
@@ -689,6 +740,32 @@ class TestDistributedLayerwiseOffloadHook:
 
 
 class TestPinnedResidentLayerGroup:
+    def test_constructor_failure_leaves_every_block_materialized(self, monkeypatch):
+        blocks = [nn.Linear(2, 2), nn.Linear(2, 2)]
+        expected = [block.weight.detach().clone() for block in blocks]
+        shard_and_pin = DistributedLayerwiseOffloadHook._shard_and_pin
+        calls = 0
+
+        def fail_second_block(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected resident setup failure")
+            return shard_and_pin(*args, **kwargs)
+
+        monkeypatch.setattr(DistributedLayerwiseOffloadHook, "_shard_and_pin", fail_second_block)
+
+        with pytest.raises(RuntimeError, match="resident setup failure"):
+            PinnedResidentLayerGroup(
+                blocks,
+                device=torch.device("cpu"),
+                copy_stream=DummyStream(),
+                pin_memory=False,
+            )
+
+        for block, weight in zip(blocks, expected, strict=True):
+            torch.testing.assert_close(block.weight, weight)
+
     def test_load_offload_reuses_pinned_master_weights(self, patched_offload_runtime):
         blocks = [nn.Linear(2, 2), nn.Linear(2, 2)]
         expected = []
@@ -841,20 +918,6 @@ class TestPinnedModuleStager:
         assert torch.equal(module.weight, expected_weight)
         assert torch.equal(module.bias, expected_bias)
         stager.offload()
-
-
-class _DummyBlock(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.weight = nn.Parameter(torch.randn(10, 10))
-
-
-class _SingleBlockModel(nn.Module):
-    _layerwise_offload_blocks_attrs = ["blocks"]
-
-    def __init__(self, num_blocks: int = 3):
-        super().__init__()
-        self.blocks = nn.ModuleList([_DummyBlock() for _ in range(num_blocks)])
 
 
 class _HWRPipeline(nn.Module):
@@ -1285,6 +1348,31 @@ class TestMmapWeightLoading:
         backend.disable()
         assert lease.closed
 
+        backend.enable(pipeline)
+        assert backend.host_weight_plan is None
+        assert backend.enabled
+        backend.disable()
+
+    def test_rank_local_disable_drains_pending_transfers(self, patched_offload_runtime, monkeypatch):
+        pipeline = _HWRPipeline()
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=1,
+                dlo_use_allgather=False,
+            ),
+            torch.device("cpu"),
+        )
+        backend.enable(pipeline)
+        backend._all_hook_groups[0][0].prefetch_layer(0)
+        synchronize = Mock()
+        monkeypatch.setattr(current_omni_platform, "synchronize", synchronize)
+
+        backend.disable()
+
+        synchronize.assert_called()
+
     def test_hwr_registration_failure_falls_back_to_bounded_staging(
         self,
         monkeypatch,
@@ -1563,6 +1651,7 @@ class TestOffloadPlan:
         assert plan.block_attrs == {}
         assert plan.offload_submodules == {}
         assert plan.resident_dit_paths == frozenset()
+        assert plan.encoder_dlo_weight_replication == frozenset()
 
     def test_offload_plan_is_frozen(self):
         """OffloadPlan should be immutable (frozen=True)."""
@@ -1595,6 +1684,7 @@ class TestOffloadPlan:
                 self.transformer = Transformer()
 
         pipeline = Pipeline()
+        expected_parameters = {name: parameter.detach().clone() for name, parameter in pipeline.named_parameters()}
         backend = DistributedLayerwiseOffloadBackend(
             OffloadConfig(
                 strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
@@ -1610,9 +1700,21 @@ class TestOffloadPlan:
         assert len(backend._resident_blocks) == 2
         assert len(backend._all_hook_groups) == 1
         assert len(backend._all_hook_groups[0]) == 2
+        assert pipeline._dlo_residency_controller is backend
         assert backend.enabled
 
         backend.disable()
+
+        assert pipeline._dlo_residency_controller is None
+
+        for name, parameter in pipeline.named_parameters():
+            torch.testing.assert_close(parameter, expected_parameters[name])
+
+        backend.enable(pipeline)
+        assert len(backend._resident_blocks) == 2
+        backend.disable()
+        for name, parameter in pipeline.named_parameters():
+            torch.testing.assert_close(parameter, expected_parameters[name])
 
 
 class TestMmapValidation:
@@ -2024,8 +2126,8 @@ class TestConfigValidation:
             (2, 1, 1, True, 2),
             (1, 4, 1, True, 4),
             (2, 2, 2, True, 2),
-            (2, 2, 2, False, 1),
-            (1, 4, 2, False, 1),
+            (2, 2, 2, False, 2),
+            (1, 4, 2, False, 4),
         ],
     )
     def test_dlo_group_selection_covers_dp_sp_tp_matrix(
@@ -2199,7 +2301,7 @@ class TestConfigValidation:
             model = "/fake/path"
 
         config = OffloadConfig.from_od_config(FakeODConfig())
-        assert config.dp_size == 1  # forced to 1 when no AllGather
+        assert config.dp_size == 2  # topology is retained; the hook selects group size 1
         assert config.dlo_resident_layers == 20
 
     def test_resident_layers_with_allgather_rejected(self):
@@ -2218,95 +2320,8 @@ class TestConfigValidation:
             parallel_config = FakePC()
             model = "/fake/path"
 
-        with pytest.raises(ValueError, match="requires --dlo-no-use-allgather"):
+        with pytest.raises(ValueError, match="requires the DiT DLO transfer to be rank-local"):
             OffloadConfig.from_od_config(FakeODConfig())
-
-    def test_num_inference_steps_none_rejected(self):
-        """DP multi-concurrency should reject None num_inference_steps."""
-        from types import SimpleNamespace
-
-        # Mock requests with None steps
-        reqs = [
-            SimpleNamespace(
-                req=SimpleNamespace(
-                    request_id=f"req-{i}",
-                    sampling_params=SimpleNamespace(num_inference_steps=None),
-                )
-            )
-            for i in range(2)
-        ]
-
-        # We can't easily instantiate the full executor, but we can test
-        # the validation logic by checking that the code path raises.
-        # The validation is in execute_request, which needs self._ensure_open().
-        # Instead, test the validation logic directly:
-        step_counts = {
-            r.req.sampling_params.num_inference_steps
-            for r in reqs
-            if r.req.sampling_params.num_inference_steps is not None
-        }
-        has_none = any(r.req.sampling_params.num_inference_steps is None for r in reqs)
-        assert has_none, "Test setup: should have None steps"
-        assert len(step_counts) == 0, "Test setup: no explicit steps"
-
-        # The validation condition: (len(step_counts) > 1) or has_none → should reject
-        should_reject = (len(step_counts) > 1) or has_none
-        assert should_reject, "None steps should trigger rejection"
-
-    def test_num_inference_steps_same_explicit_allowed(self):
-        """DP multi-concurrency should allow same explicit num_inference_steps."""
-        from types import SimpleNamespace
-
-        reqs = [
-            SimpleNamespace(
-                req=SimpleNamespace(
-                    request_id=f"req-{i}",
-                    sampling_params=SimpleNamespace(num_inference_steps=35),
-                )
-            )
-            for i in range(4)
-        ]
-
-        step_counts = {
-            r.req.sampling_params.num_inference_steps
-            for r in reqs
-            if r.req.sampling_params.num_inference_steps is not None
-        }
-        has_none = any(r.req.sampling_params.num_inference_steps is None for r in reqs)
-
-        should_reject = (len(step_counts) > 1) or has_none
-        assert not should_reject, "Same explicit steps should be allowed"
-        assert step_counts == {35}
-
-    def test_num_inference_steps_different_explicit_rejected(self):
-        """DP multi-concurrency should reject different explicit steps."""
-        from types import SimpleNamespace
-
-        reqs = [
-            SimpleNamespace(
-                req=SimpleNamespace(
-                    request_id="req-0",
-                    sampling_params=SimpleNamespace(num_inference_steps=35),
-                )
-            ),
-            SimpleNamespace(
-                req=SimpleNamespace(
-                    request_id="req-1",
-                    sampling_params=SimpleNamespace(num_inference_steps=30),
-                )
-            ),
-        ]
-
-        step_counts = {
-            r.req.sampling_params.num_inference_steps
-            for r in reqs
-            if r.req.sampling_params.num_inference_steps is not None
-        }
-        has_none = any(r.req.sampling_params.num_inference_steps is None for r in reqs)
-
-        should_reject = (len(step_counts) > 1) or has_none
-        assert should_reject, "Different steps should trigger rejection"
-        assert len(step_counts) == 2
 
 
 class TestDynamicSlotTracking:
@@ -2472,3 +2487,344 @@ class TestDynamicSlotTracking:
         # pre_forward should override to slot 1
         hook_b.pre_forward(block_b)
         assert hook_b.current_slot == 1, "pre_forward should read _prev_hook._prefetched_slot=1, not keep initial 0"
+
+
+class _DistributedComponentPipeline(nn.Module):
+    _offload_plan = OffloadPlan(
+        encoder_component_types={"text_encoder": "text_encoder"},
+        encoder_block_attrs={"text_encoder": ("vision.blocks", "text_model.layers")},
+        on_demand_component_paths=frozenset({"text_encoder", "vae"}),
+    )
+
+    def __init__(self):
+        super().__init__()
+        self.transformer = _SingleBlockModel(num_blocks=2)
+        self.text_encoder = _StagedEncoder()
+        self.vae = _StagedVAE()
+
+
+class _GenericDistributedEncoderPipeline(nn.Module):
+    _offload_plan = OffloadPlan(
+        encoder_component_types={"text_encoder": "text_encoder"},
+        encoder_block_attrs={"text_encoder": ("encoder.block",)},
+        encoder_dlo_weight_replication=frozenset({"text_encoder"}),
+    )
+
+    def __init__(self):
+        super().__init__()
+        self.transformer = _SingleBlockModel(num_blocks=2)
+        self.text_encoder = _PlainEncoder()
+
+
+class TestDistributedComponentSelection:
+    def test_on_demand_only_encoder_cannot_claim_allgather(self, patched_offload_runtime):
+        class Pipeline(nn.Module):
+            _offload_plan = OffloadPlan(
+                encoder_component_types={"text_encoder": "text_encoder"},
+                on_demand_component_paths=frozenset({"text_encoder"}),
+                encoder_dlo_weight_replication=frozenset({"text_encoder"}),
+            )
+
+            def __init__(self):
+                super().__init__()
+                self.text_encoder = _StagedEncoder()
+
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=2,
+                components=frozenset({"text_encoder"}),
+                dlo_transfers={"dit": "rank-local", "text_encoder": "allgather"},
+            ),
+            torch.device("cpu"),
+        )
+        backend.dp_group = object()
+
+        with pytest.raises(ValueError, match="cannot use AllGather without.*streamable block plan"):
+            backend.enable(Pipeline())
+
+    def test_explicit_single_block_dit_is_rejected(self, patched_offload_runtime):
+        pipeline = nn.Module()
+        pipeline.transformer = _SingleBlockModel(num_blocks=1)
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                components=frozenset({"dit"}),
+            ),
+            torch.device("cpu"),
+        )
+
+        with pytest.raises(ValueError, match="leaves only one streaming block"):
+            backend.enable(pipeline)
+
+    def test_enable_defers_collectives_until_first_forward(self, patched_offload_runtime, monkeypatch):
+        pipeline = _GenericDistributedEncoderPipeline()
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=2,
+                components=frozenset({"dit", "text_encoder"}),
+                dlo_transfers={"dit": "allgather", "text_encoder": "rank-local"},
+            ),
+            torch.device("cpu"),
+        )
+        backend.dp_group = object()
+
+        def reject_startup_collective(*_args, **_kwargs):
+            raise AssertionError("enable() entered a rank-asymmetric collective")
+
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", reject_startup_collective)
+
+        backend.enable(pipeline)
+
+        assert all(hook._prefetched_slot is None for group in backend._all_hook_groups for hook in group)
+        encoder_hook = pipeline.text_encoder.encoder.block[0]._hook_registry.get_hook("distributed_layerwise_offload")
+        dit_hook = pipeline.transformer.blocks[0]._hook_registry.get_hook("distributed_layerwise_offload")
+        assert encoder_hook.gpu_shard_buffers == [None, None]
+        assert all(buffer is not None for buffer in dit_hook.gpu_shard_buffers)
+
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_gather_into_tensor",
+            lambda output, local, group: output.copy_(local.repeat(2)),
+        )
+        backend.disable()
+
+    def test_partial_dit_enable_failure_restores_weights_and_hooks(
+        self,
+        patched_offload_runtime,
+        monkeypatch,
+    ):
+        pipeline = _DistributedComponentPipeline()
+        expected_weights = [block.weight.detach().clone() for block in pipeline.transformer.blocks]
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dlo_use_allgather=False,
+                components=frozenset({"dit"}),
+            ),
+            torch.device("cpu"),
+        )
+        original_apply = dist_backend_module.apply_distributed_block_hook
+        calls = 0
+
+        def fail_second_hook(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected DLO hook failure")
+            return original_apply(*args, **kwargs)
+
+        monkeypatch.setattr(dist_backend_module, "apply_distributed_block_hook", fail_second_hook)
+
+        with pytest.raises(RuntimeError, match="injected DLO hook failure"):
+            backend.enable(pipeline)
+
+        assert not backend.enabled
+        for block, expected in zip(pipeline.transformer.blocks, expected_weights, strict=True):
+            registry = getattr(block, "_hook_registry", None)
+            assert registry is None or registry.get_hook("distributed_layerwise_offload") is None
+            torch.testing.assert_close(block.weight, expected)
+
+    def test_multirank_enable_failure_cleanup_skips_restore_collective(self, monkeypatch, mocker):
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=2,
+                dlo_use_allgather=True,
+                components=frozenset({"dit"}),
+            ),
+            torch.device("cpu"),
+        )
+        monkeypatch.setattr(backend, "_enable", mocker.Mock(side_effect=RuntimeError("injected startup failure")))
+        cleanup = mocker.Mock()
+        monkeypatch.setattr(backend, "_disable", cleanup)
+
+        with pytest.raises(RuntimeError, match="injected startup failure"):
+            backend.enable(_DistributedComponentPipeline())
+
+        cleanup.assert_called_once_with(restore_allgather_weights=False)
+
+    def test_multirank_failure_restores_only_rank_local_hooks(self, patched_offload_runtime):
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=2,
+                components=frozenset({"dit", "text_encoder"}),
+                dlo_transfers={"dit": "allgather", "text_encoder": "rank-local"},
+            ),
+            torch.device("cpu"),
+        )
+        allgather_hook = Mock(dp_size=2, next_block=nn.Linear(1, 1))
+        rank_local_hook = Mock(dp_size=1, next_block=nn.Linear(1, 1))
+        backend._all_hook_groups = [[allgather_hook], [rank_local_hook]]
+
+        backend._disable(restore_allgather_weights=False)
+
+        allgather_hook.restore_next_block_to_cpu.assert_not_called()
+        rank_local_hook.restore_next_block_to_cpu.assert_called_once_with()
+
+        with pytest.raises(RuntimeError, match="recreate the backend and reload the pipeline"):
+            backend.enable(nn.Module())
+
+    def test_disable_runs_collectives_before_best_effort_local_cleanup(
+        self,
+        patched_offload_runtime,
+        monkeypatch,
+    ):
+        events: list[str] = []
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=2,
+            ),
+            torch.device("cpu"),
+        )
+        rank_local_hook = Mock(dp_size=1, next_block=nn.Linear(1, 1))
+        allgather_hook = Mock(dp_size=2, next_block=nn.Linear(1, 1))
+        allgather_hook.restore_next_block_to_cpu.side_effect = lambda: events.append("allgather")
+
+        def fail_rank_local_restore():
+            events.append("rank-local")
+            raise RuntimeError("injected rank-local restore failure")
+
+        rank_local_hook.restore_next_block_to_cpu.side_effect = fail_rank_local_restore
+        backend._all_hook_groups = [[rank_local_hook], [allgather_hook]]
+        backend._blocks = [[nn.Module()]]
+        backend.enabled = True
+        monkeypatch.setattr(
+            dist_backend_module,
+            "remove_distributed_block_hook",
+            lambda _block: events.append("remove"),
+        )
+        monkeypatch.setattr(backend, "_release_registered_mmap", lambda: events.append("unregister"))
+        release_handles = Mock()
+        monkeypatch.setattr(backend, "_release_mmap_handles", release_handles)
+
+        with pytest.raises(RuntimeError, match="injected rank-local restore failure"):
+            backend.disable()
+
+        assert events == ["allgather", "rank-local", "remove", "unregister"]
+        release_handles.assert_not_called()
+        assert backend.enabled
+        assert backend._all_hook_groups
+
+    def test_all_streams_encoder_and_keeps_vae_resident(self, patched_offload_runtime, monkeypatch):
+        pipeline = _DistributedComponentPipeline()
+        move_non_block_state = Mock()
+        monkeypatch.setattr(dist_backend_module, "move_non_block_state_to_device", move_non_block_state)
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dlo_use_allgather=False,
+                components=frozenset({"dit", "text_encoder"}),
+            ),
+            torch.device("cpu"),
+        )
+
+        backend.enable(pipeline)
+
+        assert pipeline.text_encoder._omni_layerwise_enabled
+        assert len(pipeline.text_encoder._omni_layerwise_hooks) == 4
+        # The pipeline-owned stage lifecycle releases the encoder's non-block
+        # state after DLO has installed blockwise hooks.
+        assert pipeline.text_encoder.offload_calls == 1
+        assert pipeline.vae.offload_calls == 0
+        assert pipeline.vae.to_calls == 1
+        move_non_block_state.assert_not_called()
+
+        backend.disable()
+
+        assert not pipeline.text_encoder._omni_layerwise_enabled
+        encoder_blocks = [
+            *pipeline.text_encoder.vision.blocks,
+            *pipeline.text_encoder.text_model.layers,
+        ]
+        assert all(block._hook_registry.get_hook("distributed_layerwise_offload") is None for block in encoder_blocks)
+
+    def test_dit_and_encoder_choose_transfer_independently(self, patched_offload_runtime, monkeypatch):
+        pipeline = _GenericDistributedEncoderPipeline()
+        expected_parameters = {name: parameter.detach().clone() for name, parameter in pipeline.named_parameters()}
+        full_weights_by_rank_zero_shard = {
+            tuple(parameter.flatten()[: (parameter.numel() + 1) // 2].tolist()): parameter.flatten()
+            for parameter in expected_parameters.values()
+            if parameter.numel() > 4
+        }
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=2,
+                components=frozenset({"dit", "text_encoder"}),
+                dlo_transfers={"dit": "rank-local", "text_encoder": "allgather"},
+            ),
+            torch.device("cpu"),
+        )
+        backend.dp_group = object()
+
+        def fake_allgather(output, local, group):
+            del group
+            output.copy_(full_weights_by_rank_zero_shard[tuple(local.tolist())])
+
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_gather_into_tensor",
+            fake_allgather,
+        )
+
+        backend.enable(pipeline)
+
+        encoder_hook = pipeline.text_encoder.encoder.block[0]._hook_registry.get_hook("distributed_layerwise_offload")
+        dit_hook = pipeline.transformer.blocks[0]._hook_registry.get_hook("distributed_layerwise_offload")
+        assert encoder_hook.dp_size == 2
+        assert dit_hook.dp_size == 1
+        assert all(buffer is not None for buffer in encoder_hook.gpu_shard_buffers)
+        assert dit_hook.gpu_shard_buffers == [None, None]
+
+        backend.disable()
+        actual_parameters = dict(pipeline.named_parameters())
+        for name, expected in expected_parameters.items():
+            torch.testing.assert_close(actual_parameters[name], expected)
+
+    def test_encoder_allgather_rejects_undeclared_replication(self, patched_offload_runtime):
+        pipeline = _DistributedComponentPipeline()
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=2,
+                components=frozenset({"text_encoder"}),
+                dlo_transfers={"dit": "rank-local", "text_encoder": "allgather"},
+            ),
+            torch.device("cpu"),
+        )
+        backend.dp_group = object()
+
+        with pytest.raises(ValueError, match="not declared replicated"):
+            backend.enable(pipeline)
+
+    def test_encoder_allgather_rejects_stub_rank_before_block_discovery(self):
+        """Every rank must reject an unsafe encoder group, including stub ranks."""
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=2,
+                components=frozenset({"text_encoder"}),
+                dlo_transfers={"dit": "rank-local", "text_encoder": "allgather"},
+            ),
+            torch.device("cpu"),
+        )
+        backend.dp_group = object()
+        stub_plan = OffloadPlan(encoder_block_attrs={"text_encoder": ("missing.blocks",)})
+
+        with pytest.raises(ValueError, match="not declared replicated"):
+            backend._try_layerwise_offload_encoder(nn.Module(), "text_encoder", stub_plan)

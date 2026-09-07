@@ -8,6 +8,7 @@ import pytest
 import torch
 from vllm.model_executor.models.qwen3_vl import Qwen3VLForConditionalGeneration
 
+from vllm_omni.model_executor.models.minimax_h3.conditioning import MiniMaxH3TextConditioning
 from vllm_omni.model_executor.models.minimax_h3.text_encoder import MiniMaxH3TextEncoder
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -51,12 +52,15 @@ def test_invalid_output_length_consumes_token_tags():
 def test_make_omni_output_uses_shared_stage_payload_fields():
     model = _model_without_weights()
     model._token_tags = torch.tensor([1, 0])
-    hidden = torch.zeros(2, 5120)
+    hidden = torch.zeros(2, 5120, dtype=torch.bfloat16)
 
     output = model.make_omni_output(hidden)
 
     assert output.multimodal_outputs is not None
+    conditioning = MiniMaxH3TextConditioning.from_omni_payload(output.multimodal_outputs)
     assert torch.equal(output.multimodal_outputs["hidden_states"]["output"], hidden)
     assert torch.equal(output.multimodal_outputs["meta"]["token_role_ids"], torch.tensor([[1], [0]]))
+    assert torch.equal(conditioning.hidden_states, hidden)
+    assert torch.equal(conditioning.token_tags, torch.tensor([1, 0]))
     assert "encoder_hidden_states" not in output.multimodal_outputs
     assert "token_tags" not in output.multimodal_outputs

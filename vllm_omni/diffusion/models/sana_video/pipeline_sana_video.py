@@ -333,6 +333,9 @@ class SanaVideoPipeline(
     _encoder_modules = ["text_encoder"]
     _vae_modules = ["vae"]
     supports_step_execution = False
+    # Warmup must yield >= 4 latent frames on both VAE variants (temporal /4
+    # and /8) so every allowed SP degree has one frame per rank.
+    dummy_run_num_frames = 25
     default_num_inference_steps = 50
 
     def __init__(

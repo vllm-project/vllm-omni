@@ -199,6 +199,7 @@ def _fake_ltx_parallel_attention():
     layer.attention = SimpleNamespace(forward=run("native"))
     layer.sdpa_fallback = SimpleNamespace(forward=run("sdpa"))
     layer.backend_pref = "FLASH_ATTN"
+    layer._has_custom_attention = False
     return layer, calls
 
 

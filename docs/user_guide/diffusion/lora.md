@@ -249,8 +249,14 @@ MiniMax-H3 supports two few-step mechanisms that must not be conflated:
 - **Checkpoint-pinned schedule**: a merged release writes `base_schedule` into
   `model_index.json`. Requests must pass `num_inference_steps` as the interval
   count (for example `4` for `[1.0, 0.7, 0.4, 0.15, 0.0]`).
-- **Runtime Turbo LoRA**: LightX2V Turbo artifacts request five sigma points and
-  enforce `flow_shift=6`, `audio_flow_shift=3`.
+- **Runtime Turbo LoRA**: each LightX2V Turbo artifact carries its own contract,
+  read from its filename. A four-step artifact requests five sigma points and an
+  eight-step one requests nine; the 768p retrains enforce `flow_shift=6` and the
+  544p artifacts `flow_shift=12`. `audio_flow_shift=3` across the family. A
+  request that does not match the loaded artifact is rejected by name. Alpha
+  comes from the artifact's metadata, or 8 when it declares none. `ref2v`
+  artifacts require `--task-type ref2va`; `fl2v` artifacts serve T2VA and FL2VA.
+  The ComfyUI exports use a fused-QKV layout and are not supported.
 - **Runtime native LoRA**: FlashGen-style artifacts declare
   `key_format=minimax-h3-native` and embed `base_schedule` in safetensors
   metadata. When active, the adapter schedule overrides the base checkpoint and

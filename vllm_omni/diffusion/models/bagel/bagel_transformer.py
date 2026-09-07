@@ -1256,10 +1256,12 @@ class Bagel(CFGParallelMixin, nn.Module):
     config_class = BagelConfig
     base_model_prefix = "bagel"
 
-    # Include the terminal t=0 sample so ``num_timesteps`` means exactly
-    # ``num_timesteps`` Euler updates. Subclasses may override this for a
-    # model-specific schedule convention.
-    _denoise_schedule_extra_step: bool = True
+    # Flow-matching denoise schedule convention. Official BAGEL samples
+    # ``num_timesteps`` points over [1, 0] and drops the terminal t=0, yielding
+    # ``num_timesteps - 1`` Euler steps. Lance samples one extra point
+    # (``num_timesteps + 1``) for ``num_timesteps`` steps; ``LanceBagel`` flips
+    # this on. See https://github.com/vllm-project/vllm-omni/issues/4470.
+    _denoise_schedule_extra_step: bool = False
 
     def prepare_denoise_schedule(
         self,
@@ -1268,6 +1270,8 @@ class Bagel(CFGParallelMixin, nn.Module):
         timestep_shift: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build BAGEL's flow-matching timesteps and per-step deltas."""
+        if num_timesteps < 2 and not self._denoise_schedule_extra_step:
+            raise ValueError("BAGEL image generation requires num_inference_steps >= 2.")
         num_sample_points = num_timesteps + 1 if self._denoise_schedule_extra_step else num_timesteps
         schedule = torch.linspace(1, 0, num_sample_points, device=x_t.device)
         schedule = timestep_shift * schedule / (1 + (timestep_shift - 1) * schedule)
@@ -1834,7 +1838,9 @@ class Bagel(CFGParallelMixin, nn.Module):
             frame_condition_token_indexes = frame_condition_token_indexes.to(x_t.device).long()
             pinned_x_t = x_t[frame_condition_token_indexes].clone()
 
-        # Build ``num_timesteps`` flow-matching Euler updates over [1, 0].
+        # Build the flow-matching schedule. BAGEL drops the terminal t=0 for
+        # ``num_timesteps - 1`` Euler steps; Lance keeps it for ``num_timesteps``.
+        # ``_denoise_schedule_extra_step`` (overridden by ``LanceBagel``) selects which.
         timesteps, dts = Bagel.prepare_denoise_schedule(self, x_t, num_timesteps, timestep_shift)
 
         # Optional trajectory recording for RL rollout data collection

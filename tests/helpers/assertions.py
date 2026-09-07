@@ -269,7 +269,9 @@ def assert_video_diffusion_response(
                 "height": ...,
                 "fps": ...,
                 ...
-            }
+            },
+            "expected_audio": {"sample_rate": 44100, "channels": 2},
+            "fps_tolerance": 0.01,
         }
     """
     form_data = request_config.get("form_data", {})
@@ -280,7 +282,8 @@ def assert_video_diffusion_response(
     expected_frames = _maybe_int(form_data.get("num_frames"))
     expected_width = _maybe_int(form_data.get("width"))
     expected_height = _maybe_int(form_data.get("height"))
-    expected_fps = _maybe_int(form_data.get("fps"))
+    expected_fps = _maybe_float(form_data.get("fps"))
+    expected_audio = request_config.get("expected_audio")
 
     # Skip num_frames assertion for Helios models because they round up frames
     model = request_config.get("model", "")
@@ -294,7 +297,19 @@ def assert_video_diffusion_response(
             width=expected_width,
             height=expected_height,
             fps=expected_fps,
+            fps_tolerance=request_config.get("fps_tolerance", 1.0),
         )
+        if expected_audio is not None:
+            assert isinstance(expected_audio, dict), "expected_audio must be an object"
+            sample_rate = _maybe_int(expected_audio.get("sample_rate"))
+            channels = _maybe_int(expected_audio.get("channels"))
+            assert sample_rate is not None, "expected_audio.sample_rate is required"
+            assert channels is not None, "expected_audio.channels is required"
+            assert_video_audio_valid(
+                vid_bytes,
+                sample_rate=sample_rate,
+                channels=channels,
+            )
 
 
 def assert_video_first_frame_matches(
@@ -346,6 +361,12 @@ def _maybe_int(value: Any) -> int | None:
     return int(value)
 
 
+def _maybe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
 def assert_image_valid(image: Path | Image.Image, *, width: int | None = None, height: int | None = None):
     """Assert the file is a loadable image with optional exact dimensions."""
     if isinstance(image, Path):
@@ -367,12 +388,14 @@ def assert_video_valid(
     width: int | None = None,
     height: int | None = None,
     fps: float | None = None,
+    fps_tolerance: float = 1.0,
 ) -> dict[str, int | float]:
     """Assert the MP4 has the expected resolution and frame count.
 
     For several diffusion backends, encoded MP4 frame count follows a codec-aligned
     convention (e.g. request `num_frames=8` can produce 9 encoded frames). Keep
     this compatibility behavior to avoid false negatives in online-serving tests.
+    Fixed-rate models can request a stricter ``fps_tolerance`` in frames/second.
     """
     temp_path = None
     cap = None
@@ -408,8 +431,9 @@ def assert_video_valid(
             assert actual_width == width, f"Expected width={width}, got {actual_width}"
         if height is not None:
             assert actual_height == height, f"Expected height={height}, got {actual_height}"
-        if fps is not None and actual_fps:
-            assert abs(actual_fps - float(fps)) < 1.0, f"Expected fps~={fps}, got {actual_fps}"
+        if fps is not None:
+            assert math.isfinite(actual_fps) and actual_fps > 0, f"Invalid video fps: {actual_fps}"
+            assert abs(actual_fps - float(fps)) < fps_tolerance, f"Expected fps~={fps}, got {actual_fps}"
         if num_frames is not None:
             expected_frames = (int(num_frames) // 4) * 4 + 1
             assert actual_frames == expected_frames, f"Expected frames={expected_frames}, got {actual_frames}"
@@ -431,6 +455,33 @@ def assert_video_valid(
                 temp_path.unlink()
             except OSError:
                 pass
+
+
+def assert_video_audio_valid(
+    video: Path | bytes | BytesIO,
+    *,
+    sample_rate: int,
+    channels: int,
+) -> None:
+    """Assert that an encoded video carries an audio stream with the requested format."""
+    if isinstance(video, Path):
+        source: str | BytesIO = str(video)
+    elif isinstance(video, bytes):
+        source = BytesIO(video)
+    elif isinstance(video, BytesIO):
+        video.seek(0)
+        source = video
+    else:
+        raise TypeError(f"Unsupported video type: {type(video)}")
+
+    with av.open(source) as container:
+        audio_streams = list(container.streams.audio)
+        assert audio_streams, "Video response does not contain an audio stream"
+        audio_stream = audio_streams[0]
+        actual_sample_rate = int(audio_stream.rate or 0)
+        actual_channels = int(audio_stream.channels or 0)
+        assert actual_sample_rate == sample_rate, f"Expected audio sample rate={sample_rate}, got {actual_sample_rate}"
+        assert actual_channels == channels, f"Expected audio channels={channels}, got {actual_channels}"
 
 
 def assert_audio_valid(
@@ -1047,5 +1098,6 @@ __all__ = [
     "assert_omni_response",
     "assert_video_diffusion_response",
     "assert_video_valid",
+    "assert_video_audio_valid",
     "assert_audio_valid",
 ]

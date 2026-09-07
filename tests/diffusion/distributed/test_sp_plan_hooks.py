@@ -1114,6 +1114,120 @@ class TestStrictModeSplitValidation:
 
 
 @pytest.mark.cpu
+class TestEqualPadContract:
+    """The stack of per-boundary auto_pad flags that lets attention skip a gather.
+
+    A boundary is recorded as equal-length only when the framework padded it,
+    because only then is every rank's shard guaranteed the same size.
+    """
+
+    def _split_hook(self, *, auto_pad: bool, monkeypatch):
+        from vllm_omni.diffusion.attention import selector
+        from vllm_omni.diffusion.distributed import parallel_state, sp_sharding
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+        from vllm_omni.diffusion.hooks.sequence_parallel import (
+            SequenceParallelSplitHook,
+        )
+
+        class MaskBackend:
+            supports_attention_mask = True
+
+            @staticmethod
+            def get_name():
+                return "test"
+
+        monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(parallel_state, "get_sequence_parallel_rank", lambda: 1)
+        monkeypatch.setattr(parallel_state, "get_ring_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(selector, "get_attn_backend_for_role", lambda **_: (MaskBackend(), None))
+        # sp_shard, used by the manual path, binds these at import time.
+        monkeypatch.setattr(sp_sharding, "get_sequence_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(sp_sharding, "get_sequence_parallel_rank", lambda: 1)
+
+        hook = SequenceParallelSplitHook(
+            {
+                0: SequenceParallelInput(
+                    split_dim=1,
+                    expected_dims=3,
+                    split_output=True,
+                    auto_pad=auto_pad,
+                )
+            },
+            SequenceParallelConfig(ulysses_degree=2),
+        )
+        hook.initialize_hook(nn.Identity())
+        return hook
+
+    def test_auto_pad_split_claims_equal_rank_lengths(self, monkeypatch):
+        from vllm_omni.diffusion.forward_context import (
+            get_forward_context,
+            set_forward_context,
+        )
+
+        hook = self._split_hook(auto_pad=True, monkeypatch=monkeypatch)
+        with set_forward_context():
+            hook.pre_forward(nn.Identity())
+            shard = hook.post_forward(nn.Identity(), torch.arange(5).reshape(1, 5, 1))
+            ctx = get_forward_context()
+
+            # 5 tokens padded to 6, so both ranks hold 3.
+            assert shard.shape[1] == 3
+            assert ctx._sp_equal_pad_stack == [True]
+            assert ctx.sp_rank_local_seq_lens_equal
+
+    def test_manual_split_does_not_claim_equal_rank_lengths(self, monkeypatch):
+        from vllm_omni.diffusion.forward_context import (
+            get_forward_context,
+            set_forward_context,
+        )
+
+        hook = self._split_hook(auto_pad=False, monkeypatch=monkeypatch)
+        with set_forward_context():
+            hook.pre_forward(nn.Identity())
+            hook.post_forward(nn.Identity(), torch.arange(6).reshape(1, 6, 1))
+            ctx = get_forward_context()
+
+            assert ctx._sp_equal_pad_stack == [False]
+            assert not ctx.sp_rank_local_seq_lens_equal
+
+    def test_gather_pops_only_its_own_boundary(self, monkeypatch):
+        """A stack, not a counter: the gather must not resurrect the contract.
+
+        With one auto_pad and one manual boundary open, a counter could not
+        tell which one a gather closes and would wrongly report equal lengths.
+        """
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+        from vllm_omni.diffusion.forward_context import (
+            get_forward_context,
+            set_forward_context,
+        )
+        from vllm_omni.diffusion.hooks import sequence_parallel
+        from vllm_omni.diffusion.hooks.sequence_parallel import (
+            SequenceParallelGatherHook,
+        )
+
+        monkeypatch.setattr(
+            sequence_parallel,
+            "sp_gather",
+            lambda tensor, dim, validate: torch.cat([tensor, tensor], dim=dim),
+        )
+        hook = SequenceParallelGatherHook(
+            SequenceParallelOutput(gather_dim=1, expected_dims=3),
+            SequenceParallelConfig(ulysses_degree=2),
+        )
+
+        with set_forward_context():
+            ctx = get_forward_context()
+            ctx._sp_shard_depth = 2
+            ctx._sp_equal_pad_stack.extend([False, True])
+            hook.post_forward(nn.Identity(), torch.zeros(1, 3, 4))
+
+            assert ctx._sp_shard_depth == 1
+            assert ctx._sp_equal_pad_stack == [False]
+            assert not ctx.sp_rank_local_seq_lens_equal
+
+
+@pytest.mark.cpu
 class TestSequenceParallelConfig:
     """Test SequenceParallelConfig dataclass."""
 

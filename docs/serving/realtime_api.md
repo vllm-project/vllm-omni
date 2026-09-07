@@ -5,7 +5,7 @@ receive incremental transcription and synthesized response audio. This is a
 turn-based streaming API: it starts one generation over an audio stream and
 finishes after the client closes that input stream.
 
-For a model that listens while it is already speaking, use the experimental
+For a model that listens while it is already speaking, use the
 [Full-Duplex API](full_duplex_api.md) instead.
 
 ## Quick Start
@@ -35,7 +35,7 @@ Messages in both directions are JSON text frames. Audio carried inside an
 event is base64-encoded raw PCM16.
 
 | Direction | Event | Purpose |
-|-----------|-------|---------|
+| ----------- | ------- | --------- |
 | Server to client | `session.created` | Confirms that the WebSocket connection is ready |
 | Client to server | `session.update` | Selects and validates the served model |
 | Client to server | `input_audio_buffer.commit` with `final: false` | Starts generation over the incoming stream |
