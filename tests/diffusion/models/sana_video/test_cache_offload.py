@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -153,6 +153,11 @@ def test_cache_offload_distributed_combinations_fail_closed(feature_flags, paral
 def test_sana_video_rejects_unvalidated_cache_backends():
     with pytest.raises(NotImplementedError, match="Cache backend 'tea_cache' is not supported"):
         _validate_cache_offload_parallelism(OmniDiffusionConfig(cache_backend="tea_cache"))
+
+
+def test_sana_video_accepts_none_cache_backend():
+    """An explicit ``cache_backend=None`` means "no cache", same as ``"none"``."""
+    _validate_cache_offload_parallelism(OmniDiffusionConfig(cache_backend=None))
 
 
 def test_sana_video_rejects_cache_dit_with_distributed_layerwise_offload():

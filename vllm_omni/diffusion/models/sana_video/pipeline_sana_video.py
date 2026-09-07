@@ -273,7 +273,8 @@ def retrieve_timesteps(
 
 
 def _validate_cache_offload_parallelism(od_config: OmniDiffusionConfig) -> None:
-    cache_backend = od_config.cache_backend
+    # Treat None like "none", matching the other pipelines' cache checks.
+    cache_backend = od_config.cache_backend or "none"
     if cache_backend not in ("none", "cache_dit"):
         raise NotImplementedError(
             f"Cache backend {cache_backend!r} is not supported by the native SANA-Video pipeline; "
