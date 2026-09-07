@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -13,7 +14,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from vllm.logger import init_logger
-from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
 
 from vllm_omni.diffusion.cache.cachedit import (
     CacheDiTBackend,
@@ -354,7 +355,6 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
-        del prefix
         self.od_config = od_config
         self.device = get_local_device()
         self.config = _build_mammoth_config(od_config)
@@ -365,7 +365,11 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             raise ValueError("Mammothmoda2Config.gen_vae_config / gen_dit_config must not be None")
 
         self.gen_vae = AutoencoderKL.from_config(self.config.gen_vae_config)
-        self.gen_transformer = Transformer2DModel.from_config(self.config.gen_dit_config)
+        self.gen_transformer = Transformer2DModel.from_config(
+            self.config.gen_dit_config,
+            quant_config=od_config.quantization_config,
+            prefix=maybe_prefix(prefix, "gen_transformer"),
+        )
 
         # llm_config is a Mammothmoda2Qwen2_5_VLConfig which has nested text_config
         llm_hidden_size = 0
