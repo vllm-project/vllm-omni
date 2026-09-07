@@ -51,7 +51,7 @@ def test_empty_debug_override_uses_normal_selection():
     ) == ("merge",)
 
 
-@pytest.mark.parametrize("value", ["ready,ready", "nightly", ", ,"])
+@pytest.mark.parametrize("value", ["ready,ready", "nightly", ", ,", " \t"])
 def test_invalid_debug_override(value):
     with pytest.raises(ValueError):
         SELECTOR.select_amd_test_suites(

@@ -33,7 +33,8 @@ if [[ -z "${AMD_MIRROR_HW:-}" ]]; then
 fi
 
 PR_LABELS=""
-if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]]; then
+# Explicit debug suites do not depend on PR labels.
+if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -z "${DEBUG_TEST_YAML:-}" ]]; then
     if ! PR_LABELS=$(curl -fsSL \
         "https://api.github.com/repos/vllm-project/vllm-omni/pulls/$BUILDKITE_PULL_REQUEST" \
         | jq -r '.labels[].name'); then

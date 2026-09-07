@@ -43,7 +43,7 @@ def select_amd_test_suites(
 ) -> tuple[str, ...]:
     """Return ordered suite names while preserving legacy unlabeled PRs."""
 
-    if debug_test_yaml.strip():
+    if debug_test_yaml:
         return _parse_debug_suites(debug_test_yaml)
     if branch == "main":
         return ("merge",)
@@ -73,7 +73,7 @@ def main() -> int:
         parser.error(str(exc))
 
     label_set = {label.strip() for label in labels if label.strip()}
-    if args.branch != "main" and not ({"ready", "merge-test"} & label_set):
+    if not args.debug_test_yaml and args.branch != "main" and not ({"ready", "merge-test"} & label_set):
         print(
             "No AMD L2/L3 tier label found; preserving the legacy ready-suite fallback.",
             file=sys.stderr,
