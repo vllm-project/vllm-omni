@@ -18,6 +18,9 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.model_executor.models.qwen3_omni.quantization import (
+    Qwen3OmniNestedSupportsQuant,
+)
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_code_predictor_mtp import (
     Qwen3OmniMoeTalkerCodePredictor,
 )
@@ -32,6 +35,7 @@ logger = init_logger(__name__)
 class Qwen3OmniMoeTalkerForConditionalGeneration(
     nn.Module,
     SupportsPP,
+    Qwen3OmniNestedSupportsQuant,
 ):
     """
     Qwen3 Omni MoE Talker - Converts text to audio codec codes.

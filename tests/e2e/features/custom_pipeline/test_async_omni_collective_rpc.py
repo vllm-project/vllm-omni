@@ -166,8 +166,8 @@ async def test_sleep_memory_reclaimed_custom_pipeline():
 
     The fix moves custom_pipeline init outside the CUDA context so all weights
     go through the caching allocator and are therefore fully reclaimed by
-    sleep(level=1).  A non-zero ``CuMemAllocator.get_current_usage()`` after
-    sleep is the direct signal that the bypass is still occurring.
+    sleep(level=1). The tracked allocations must transition to the allocator's
+    asleep state and report physical reclamation.
     """
     with ExitStack() as after:
         engine = AsyncOmni(
@@ -187,62 +187,72 @@ async def test_sleep_memory_reclaimed_custom_pipeline():
         free_before, total = torch.cuda.mem_get_info()
         used_before_gib = (total - free_before) / 1024**3
 
-        # Measure CuMemAllocator-tracked usage before sleep.  In inline mode
-        # the worker runs in a thread pool inside this process, so the allocator
-        # singleton is shared and can be read directly.
+        # Measure CuMemAllocator-tracked usage before sleep.  In inline / uni
+        # mode the worker runs in this process, so the allocator singleton is
+        # shared and can be read directly.
         allocator = None
         tracked_before = 0
+        tracked_ptrs: set[int] = set()
         try:
             from vllm.device_allocator.cumem import CuMemAllocator
 
             allocator = CuMemAllocator.get_instance()
-            tracked_before = allocator.get_current_usage()
+            tracked_ptrs = {ptr for ptr, data in allocator.pointer_to_data.items() if not data.is_asleep}
+            tracked_before = sum(allocator.pointer_to_data[ptr].handle[1] for ptr in tracked_ptrs)
         except Exception:
             pass
 
-        # Put the engine to sleep; all weights should be offloaded via the pool.
-        acks = await engine.sleep(level=1)
-        await asyncio.sleep(0.5)  # allow the CUDA driver to settle
-        torch.accelerator.synchronize()
+        slept = False
+        try:
+            # Put the engine to sleep; this engine's weights should be
+            # offloaded via the pool.
+            acks = await engine.sleep(level=1)
+            slept = True
+            await asyncio.sleep(0.5)  # allow the CUDA driver to settle
+            torch.accelerator.synchronize()
 
-        # Measure after sleep.
-        free_after, _ = torch.cuda.mem_get_info()
-        used_after_gib = (total - free_after) / 1024**3
-        drop_gib = used_before_gib - used_after_gib
+            # Measure after sleep.
+            free_after, _ = torch.cuda.mem_get_info()
+            used_after_gib = (total - free_after) / 1024**3
+            drop_gib = used_before_gib - used_after_gib
 
-        # --- Primary assertion: allocator reports zero tracked memory. ---
-        # If this fails it means weights were allocated outside the CuMem pool
-        # (safetensors direct-to-GPU bypass) — the exact regression this test
-        # is designed to catch.
-        if allocator is not None:
-            tracked_after = allocator.get_current_usage()
-            assert tracked_after == 0, (
-                f"CuMemAllocator still tracks {tracked_after / 1024**3:.3f} GiB "
-                f"after sleep(level=1) on custom_pipeline path "
-                f"(was {tracked_before / 1024**3:.3f} GiB before sleep). "
-                "Weights were allocated outside the CuMem pool via the "
-                "safetensors direct-to-GPU fast path — loader-context fix "
-                "may not be applied."
+            # get_current_usage() includes unmapped sleeping handles, so it
+            # does not decrease on sleep. Verify that allocations mapped
+            # before the call instead transitioned to the asleep state.
+            if allocator is not None:
+                assert tracked_before > 0, (
+                    "Expected custom_pipeline weights to use the CuMem pool, "
+                    "but no mapped allocations were tracked before sleep."
+                )
+                still_awake = [
+                    ptr
+                    for ptr in tracked_ptrs
+                    if ptr in allocator.pointer_to_data and not allocator.pointer_to_data[ptr].is_asleep
+                ]
+                assert not still_awake, (
+                    f"{len(still_awake)} CuMem allocation(s) remained mapped "
+                    "after sleep(level=1) on the custom_pipeline path."
+                )
+
+            # Physical VRAM or ACK freed_bytes confirms reclamation at the
+            # driver level.
+            total_freed_bytes = sum(
+                (ack.freed_bytes if hasattr(ack, "freed_bytes") else ack.get("freed_bytes", 0))
+                for ack in acks
+                if ack is not None
+            )
+            freed_gib = total_freed_bytes / 1024**3
+            assert freed_gib > 0 or drop_gib > 0, (
+                f"Expected GPU memory to be reclaimed after sleep(level=1) on "
+                f"custom_pipeline + enable_sleep_mode=True. "
+                f"CuMemAllocator tracked before={tracked_before / 1024**3:.3f} GiB, "
+                f"ACK freed={freed_gib:.3f} GiB, global VRAM drop={drop_gib:.3f} GiB."
             )
 
-        # --- Secondary assertion: physical VRAM or ACK freed_bytes confirms
-        # reclamation at the driver level.
-        total_freed_bytes = sum(
-            (ack.freed_bytes if hasattr(ack, "freed_bytes") else ack.get("freed_bytes", 0))
-            for ack in acks
-            if ack is not None
-        )
-        freed_gib = total_freed_bytes / 1024**3
-        assert freed_gib > 0 or drop_gib > 0, (
-            f"Expected GPU memory to be reclaimed after sleep(level=1) on "
-            f"custom_pipeline + enable_sleep_mode=True. "
-            f"CuMemAllocator tracked before={tracked_before / 1024**3:.3f} GiB, "
-            f"ACK freed={freed_gib:.3f} GiB, global VRAM drop={drop_gib:.3f} GiB."
-        )
-
-        # Engine must report it is sleeping.
-        assert await engine.is_sleeping()
-
-        # Wake up and confirm the engine is functional again.
-        await engine.wake_up()
-        assert not await engine.is_sleeping()
+            assert await engine.is_sleeping()
+            await engine.wake_up()
+            slept = False
+            assert not await engine.is_sleeping()
+        finally:
+            if slept:
+                await engine.wake_up()

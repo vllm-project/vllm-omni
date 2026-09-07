@@ -42,6 +42,7 @@ from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
     iter_custom_voice_profiles,
     load_validated_profile_tensors,
+    validate_voxcpm2_profile,
 )
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 
@@ -963,7 +964,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         loaded = 0
         for profile in iter_custom_voice_profiles(custom_voice_dir, expected_model_type="voxcpm2"):
-            tensors = load_validated_profile_tensors(profile, expected_model_type="voxcpm2")
+            tensors = load_validated_profile_tensors(
+                profile,
+                expected_model_type="voxcpm2",
+                validate_profile=validate_voxcpm2_profile,
+            )
             if tensors is None:
                 continue
 

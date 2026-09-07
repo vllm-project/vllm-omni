@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Unit tests for the shared LTX pipeline runtime and public contracts."""
 
@@ -8,9 +8,12 @@ import os
 import tempfile
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 
+import numpy as np
 import pytest
 import torch
+from diffusers.video_processor import VideoProcessor
 
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.ltx2 import (
@@ -64,7 +67,10 @@ from vllm_omni.diffusion.models.ltx2.ltx2_request import (
     validate_ltx_checkpoint,
     validate_pipeline_request,
 )
-from vllm_omni.diffusion.models.ltx2.ltx2_runtime import LTXRuntime
+from vllm_omni.diffusion.models.ltx2.ltx2_runtime import (
+    LTXRuntime,
+    _prepare_ltx2_video_output,
+)
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import (
     LTX2DistilledOneStagePipeline,
     LTX2I2VDMD2Pipeline,
@@ -122,6 +128,103 @@ def _resolve_request_inputs_for_test(
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("do_normalize", [True, False])
+def test_ltx_device_uint8_output_stays_within_one_level_of_legacy_rounding(dtype, do_normalize):
+    processor = VideoProcessor(vae_scale_factor=8, do_normalize=do_normalize)
+    source = torch.linspace(
+        -1.2 if do_normalize else 0.0,
+        1.2 if do_normalize else 1.0,
+        2 * 3 * 4 * 5 * 7,
+        dtype=torch.float32,
+    ).reshape(2, 3, 4, 5, 7)
+    source = source.to(dtype)
+
+    legacy = processor.postprocess_video(source.clone(), output_type="np")
+    if do_normalize:
+        expected = np.clip(legacy, 0.0, 1.0)
+    else:
+        # With normalization disabled, VideoProcessor's contract is already-[0, 1] input.
+        np.testing.assert_array_less(legacy, 1.0 + np.finfo(np.float32).eps)
+        np.testing.assert_array_less(-np.finfo(np.float32).eps, legacy)
+        expected = legacy
+    expected = np.rint(expected * 255.0).astype(np.uint8)
+
+    prepared = _prepare_ltx2_video_output(
+        source.clone(),
+        do_normalize=do_normalize,
+    )
+
+    assert prepared.shape == (2, 4, 5, 7, 3)
+    assert prepared.dtype == torch.uint8
+    assert prepared.is_contiguous()
+    delta = np.abs(prepared.numpy().astype(np.int16) - expected.astype(np.int16))
+    assert delta.max() <= (0 if dtype == torch.float32 else 1)
+
+
+@pytest.mark.parametrize(
+    ("video", "error"),
+    [
+        (torch.zeros(1, 3, 4, 5), "BCTHW"),
+        (torch.zeros(1, 4, 2, 4, 5), "RGB"),
+        (torch.zeros(1, 3, 2, 4, 5, dtype=torch.uint8), "floating-point"),
+    ],
+)
+def test_ltx_device_uint8_output_rejects_invalid_contract(video, error):
+    with pytest.raises(ValueError, match=error):
+        _prepare_ltx2_video_output(video, do_normalize=True)
+
+
+def test_ltx_profiler_covers_video_output_transport(tmp_path, monkeypatch):
+    from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
+
+    (tmp_path / "model_index.json").write_text(json.dumps({"vocoder": ["ltx2", "LTX2Vocoder"]}))
+
+    def stub_components(pipe, od_config):
+        pipe.od_config = od_config
+        pipe.vae_spatial_compression_ratio = 32
+
+    profiler_setup: dict[str, Any] = {}
+
+    def capture_profiler_setup(_pipe, **kwargs):
+        profiler_setup.update(kwargs)
+        _pipe.enable_diffusion_pipeline_profiler = False
+
+    monkeypatch.setattr(ltx2_runtime, "initialize_pipeline_components", stub_components)
+    monkeypatch.setattr(LTXRuntime, "setup_diffusion_pipeline_profiler", capture_profiler_setup)
+
+    LTX2Pipeline(od_config=SimpleNamespace(model=str(tmp_path), enable_diffusion_pipeline_profiler=False))
+
+    assert "video_processor.postprocess_video" in profiler_setup["profiler_targets"]
+    assert "_prepare_video_output_for_transport" in profiler_setup["profiler_targets"]
+
+
+def test_ltx_i2v_rewraps_replaced_video_processor_for_profiler(tmp_path, monkeypatch):
+    from vllm_omni.diffusion.models.ltx2 import ltx2_conditioning, ltx2_runtime
+
+    (tmp_path / "model_index.json").write_text(json.dumps({"vocoder": ["ltx2", "LTX2Vocoder"]}))
+
+    def stub_components(pipe, od_config):
+        pipe.od_config = od_config
+        pipe.vae_spatial_compression_ratio = 32
+
+    def enable_profiler(pipe, **_kwargs):
+        pipe.enable_diffusion_pipeline_profiler = True
+
+    wrapped: list[tuple[Any, list[str]]] = []
+    monkeypatch.setattr(ltx2_runtime, "initialize_pipeline_components", stub_components)
+    monkeypatch.setattr(LTXRuntime, "setup_diffusion_pipeline_profiler", enable_profiler)
+    monkeypatch.setattr(
+        ltx2_conditioning,
+        "wrap_methods_by_paths",
+        lambda pipe, paths: wrapped.append((pipe.video_processor, paths)),
+    )
+
+    pipe = LTX2Pipeline(od_config=SimpleNamespace(model=str(tmp_path), enable_diffusion_pipeline_profiler=True))
+
+    assert wrapped == [(pipe.video_processor, ["video_processor.postprocess_video"])]
+
+
 def test_ltx_public_entries_share_runtime_and_keep_recipe_boundaries():
     from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import (
         DistributedAutoencoderKLLTX2Video,
@@ -165,7 +268,19 @@ def test_ltx_checkpoint_version_detection_uses_metadata(tmp_path):
     assert detect_ltx_model_version(str(tmp_path)) == "2"
 
 
-def test_ltx_artifact_falls_back_to_unpinned_hub_download(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("model", "repo_id", "expected_revision"),
+    [
+        ("Lightricks/test", "Lightricks/test", "model-revision"),
+        ("Lightricks/test-Diffusers", "Lightricks/test", "artifact-revision"),
+    ],
+)
+def test_ltx_artifact_uses_source_revision_and_hub_fallback(
+    monkeypatch,
+    model,
+    repo_id,
+    expected_revision,
+):
     filename = "ltx-sidecar.safetensors"
     calls = []
 
@@ -176,9 +291,22 @@ def test_ltx_artifact_falls_back_to_unpinned_hub_download(tmp_path, monkeypatch)
     monkeypatch.setattr(ltx2_components, "hf_hub_download", fake_download)
 
     assert (
-        resolve_ltx_artifact(str(tmp_path / "model"), "Lightricks/test", filename) == "/cache/ltx-sidecar.safetensors"
+        resolve_ltx_artifact(
+            model,
+            repo_id,
+            filename,
+            model_revision="model-revision",
+            artifact_revision="artifact-revision",
+        )
+        == "/cache/ltx-sidecar.safetensors"
     )
-    assert calls == [{"repo_id": "Lightricks/test", "filename": filename}]
+    assert calls == [
+        {
+            "repo_id": repo_id,
+            "filename": filename,
+            "revision": expected_revision,
+        }
+    ]
 
 
 def test_ltx_artifact_prefers_model_root(tmp_path, monkeypatch):
@@ -187,7 +315,41 @@ def test_ltx_artifact_prefers_model_root(tmp_path, monkeypatch):
     expected.write_bytes(b"sidecar")
     monkeypatch.setattr(ltx2_components, "hf_hub_download", lambda **_kwargs: pytest.fail("unexpected Hub lookup"))
 
-    assert resolve_ltx_artifact(str(tmp_path), "Lightricks/test", filename) == str(expected)
+    assert resolve_ltx_artifact(
+        str(tmp_path),
+        "Lightricks/test",
+        filename,
+        model_revision="unused-model-revision",
+        artifact_revision="unused-artifact-revision",
+    ) == str(expected)
+
+
+def test_ltx_artifact_local_model_missing_sidecar_falls_back_to_hub(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_download(**kwargs):
+        calls.append(kwargs)
+        return "/cache/ltx-sidecar.safetensors"
+
+    monkeypatch.setattr(ltx2_components, "hf_hub_download", fake_download)
+
+    assert (
+        resolve_ltx_artifact(
+            str(tmp_path),
+            "Lightricks/test",
+            "ltx-sidecar.safetensors",
+            model_revision="local-model-revision",
+            artifact_revision="artifact-revision",
+        )
+        == "/cache/ltx-sidecar.safetensors"
+    )
+    assert calls == [
+        {
+            "repo_id": "Lightricks/test",
+            "filename": "ltx-sidecar.safetensors",
+            "revision": "artifact-revision",
+        }
+    ]
 
 
 @pytest.mark.parametrize(
@@ -900,7 +1062,7 @@ def test_ltx_two_stage_executes_declarative_i2v_phase_plan(pipeline_cls):
         max_sequence_length=16,
     )
     prompt_context = object()
-    phase_calls = []
+    phase_calls: list[Any] = []
 
     def resolve_request_inputs(req, **kwargs):
         return request_inputs
@@ -959,7 +1121,7 @@ def test_ltx_two_stage_executes_declarative_i2v_phase_plan(pipeline_cls):
     pipeline.vae_spatial_compression_ratio = 32
     pipeline.vae_temporal_compression_ratio = 8
     pipeline.latent_upsampler = FakeUpsampler()
-    activated_slots = []
+    activated_slots: list[Any] = []
     if pipeline_cls is LTX2TwoStagePipeline:
         pipeline._phase_adapter = SimpleNamespace(activate=activated_slots.append)
     object.__setattr__(pipeline, "_resolve_request_inputs", resolve_request_inputs)
@@ -1133,6 +1295,59 @@ def test_ltx_two_stage_recipe_rejects_sigmas():
         )
 
 
+def test_ltx_request_applies_diffvae_minimum_spatial_size_only_when_requested():
+    request = LTXRequestInputs(
+        prompt="prompt",
+        negative_prompt="",
+        height=128,
+        width=128,
+        num_frames=9,
+        frame_rate=24.0,
+        num_inference_steps=30,
+        guidance=LTX2_ONE_STAGE_RECIPE.request_guidance,
+        num_videos_per_prompt=1,
+        generator=None,
+        latents=None,
+        audio_latents=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        prompt_attention_mask=None,
+        negative_prompt_attention_mask=None,
+        decode_timestep=0.0,
+        decode_noise_scale=None,
+        output_type="np",
+        max_sequence_length=16,
+    )
+
+    with pytest.raises(ValueError, match="DiffVAE requires video latent spatial dimensions of at least 7x7"):
+        validate_pipeline_request(
+            request,
+            pipeline_recipe=LTX2_ONE_STAGE_RECIPE,
+            vae_spatial_compression_ratio=32,
+            vae_temporal_compression_ratio=8,
+            pipeline_name="LTX2Pipeline",
+            min_video_latent_spatial_size=(7, 7),
+        )
+
+    # ConvVAE does not use NATTEN, so its existing 128x128 boundary remains valid.
+    validate_pipeline_request(
+        request,
+        pipeline_recipe=LTX2_ONE_STAGE_RECIPE,
+        vae_spatial_compression_ratio=32,
+        vae_temporal_compression_ratio=8,
+        pipeline_name="LTX2Pipeline",
+    )
+
+    validate_pipeline_request(
+        replace(request, height=256, width=256),
+        pipeline_recipe=LTX2_ONE_STAGE_RECIPE,
+        vae_spatial_compression_ratio=32,
+        vae_temporal_compression_ratio=8,
+        pipeline_name="LTX2Pipeline",
+        min_video_latent_spatial_size=(7, 7),
+    )
+
+
 @pytest.mark.parametrize(
     ("direct_kwargs", "sampling_kwargs", "error"),
     [
@@ -1284,7 +1499,7 @@ def test_ltx_official_two_stage_recipes_only_vary_by_model_defaults(recipe, step
 
 
 def test_ltx_two_stage_entries_select_the_official_adapter_slots():
-    phase_switches = []
+    phase_switches: list[Any] = []
     ordinary_pipeline = object.__new__(LTX2TwoStagePipeline)
     ordinary_pipeline._phase_adapter = SimpleNamespace(activate=phase_switches.append)
     for phase in LTX2_TWO_STAGE_RECIPE.phases:
@@ -2026,6 +2241,12 @@ class TestPostProcessFunction:
             assert "video" in result
             assert "audio" in result
             assert result["audio_sample_rate"] == 48000
+
+            prepared_video = torch.zeros(1, 4, 64, 64, 3, dtype=torch.uint8)
+            prepared_result = func((prepared_video, audio))
+            assert isinstance(prepared_result["video"], np.ndarray)
+            assert prepared_result["video"].shape == (1, 4, 64, 64, 3)
+            assert prepared_result["video"].dtype == np.uint8
 
     def test_post_process_without_vocoder_config(self):
         """Post-process func should work without vocoder config (no audio_sample_rate key)."""

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -20,9 +22,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _DummyLoRALayer:
-    def __init__(self, n_slices: int, output_slices: tuple[int, ...]):
+    def __init__(self, n_slices: int, output_slices: tuple[int, ...], tp_size: int = 1):
         self.n_slices = n_slices
         self.output_slices = output_slices
+        self.tp_size = tp_size
         self.set_calls: list[
             tuple[list[torch.Tensor | None] | torch.Tensor, list[torch.Tensor | None] | torch.Tensor]
         ] = []
@@ -142,6 +145,37 @@ def test_lora_manager_replace_layers_does_not_rewrap_base_layer(monkeypatch):
     assert replace_calls == ["foo"]
 
 
+def test_lora_manager_keeps_dlo_lora_buffers_on_compute_device(monkeypatch):
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    class _DLOLoRALayer(DummyBaseLayerWithLoRA):
+        lora_buffer_device = None
+
+        def _set_diffusion_lora_buffer_device(self, device):
+            self.lora_buffer_device = device
+
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DLOLoRALayer)
+    monkeypatch.setattr(
+        manager_mod,
+        "from_layer_diffusion",
+        lambda *, layer, **_kwargs: _DLOLoRALayer(layer),
+    )
+
+    pipeline = torch.nn.Module()
+    pipeline.od_config = SimpleNamespace(enable_distributed_layerwise_offload=True)
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.foo = _FakeLinearBase()
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    manager._replace_layers_with_lora(type("_PH", (), {"r": 1})())
+
+    assert pipeline.transformer.foo.lora_buffer_device == torch.device("cpu")
+
+
 def test_lora_manager_replaces_packed_layer_when_targeting_sublayers(monkeypatch):
     import vllm_omni.diffusion.lora.manager as manager_mod
 
@@ -236,6 +270,14 @@ def test_lora_manager_activates_fused_lora_on_packed_layer():
 
 def test_lora_manager_activates_packed_lora_from_sublayers():
     pipeline = torch.nn.Module()
+    bound_names = None
+
+    def validate_binding(*, lora_model, bound_lora_names):
+        nonlocal bound_names
+        assert lora_model.id == 1
+        bound_names = bound_lora_names
+
+    pipeline._validate_diffusion_lora_binding = validate_binding
     pipeline.stacked_params_mapping = [
         (".to_qkv", ".to_q", "q"),
         (".to_qkv", ".to_k", "k"),
@@ -279,6 +321,70 @@ def test_lora_manager_activates_packed_lora_from_sublayers():
     assert torch.allclose(lora_b_list[0], torch.ones((2, rank)) * 3 * 2.0)
     assert torch.allclose(lora_b_list[1], torch.ones((1, rank)) * 4 * 2.0)
     assert torch.allclose(lora_b_list[2], torch.ones((1, rank)) * 4 * 2.0)
+    assert bound_names == frozenset(loras)
+
+
+def test_lora_manager_rolls_back_all_layers_when_activation_fails():
+    class _FailingLoRALayer(_DummyLoRALayer):
+        fail = False
+
+        def set_lora(self, index: int, lora_a, lora_b):
+            if self.fail:
+                raise RuntimeError("bind failed")
+            super().set_lora(index, lora_a, lora_b)
+
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=2,
+    )
+    first = _DummyLoRALayer(n_slices=1, output_slices=(2,))
+    second = _FailingLoRALayer(n_slices=1, output_slices=(2,))
+    manager._lora_modules = {
+        "transformer.first": first,
+        "transformer.second": second,
+    }
+
+    def adapter(adapter_id: int):
+        loras = {
+            name: LoRALayerWeights(
+                module_name=name,
+                rank=2,
+                lora_alpha=2,
+                lora_a=torch.full((2, 2), float(adapter_id)),
+                lora_b=torch.full((2, 2), float(adapter_id)),
+            )
+            for name in manager._lora_modules
+        }
+        return type(
+            "LM",
+            (),
+            {
+                "id": adapter_id,
+                "loras": loras,
+                "get_lora": lambda self, key: self.loras.get(key),
+            },
+        )()
+
+    manager._registered_adapters = {1: adapter(1), 2: adapter(2)}
+    manager._activate_adapter(1, scale=1.0)
+    first_calls_after_success = len(first.set_calls)
+
+    second.fail = True
+    with pytest.raises(RuntimeError, match="bind failed"):
+        manager._activate_adapter(2, scale=1.0)
+
+    assert manager._active_adapter_id is None
+    assert first.reset_calls == 1
+    assert second.reset_calls == 1
+
+    # The failed activation must not leave the old adapter eligible for the
+    # fast path: reactivating it binds every layer again.
+    second.fail = False
+    manager._activate_adapter(1, scale=1.0)
+    assert manager._active_adapter_id == 1
+    assert len(first.set_calls) == first_calls_after_success + 2
 
 
 def _dummy_lora_request(adapter_id: int) -> LoRARequest:

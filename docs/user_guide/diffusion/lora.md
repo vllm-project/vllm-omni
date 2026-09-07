@@ -263,6 +263,44 @@ Notes:
 - Output quality and speed depend on the replacement checkpoints and sampling params you choose.
 - If you only need to fuse distilled LoRAs into a Wan2.2 checkpoint at load time (without the full LightX2V convert + assemble pipeline), you can instead pass them directly via `--lora-backend distill --lora-path <high>.safetensors <low>.safetensors`. See the [Distill backend](#distill-backend-fuse-distilled-lora-at-init) section above.
 
+## MiniMax-H3 adapter-declared schedules
+
+MiniMax-H3 supports two few-step mechanisms that must not be conflated:
+
+- **Checkpoint-pinned schedule**: a merged release writes `base_schedule` into
+  `model_index.json`. Requests must pass `num_inference_steps` as the interval
+  count (for example `4` for `[1.0, 0.7, 0.4, 0.15, 0.0]`).
+- **Runtime Turbo LoRA**: each LightX2V Turbo artifact carries its own contract,
+  read from its filename. A four-step artifact requests five sigma points and an
+  eight-step one requests nine; the 768p retrains enforce `flow_shift=6` and the
+  544p artifacts `flow_shift=12`. `audio_flow_shift=3` across the family. A
+  request that does not match the loaded artifact is rejected by name. Alpha
+  comes from the artifact's metadata, or 8 when it declares none. `ref2v`
+  artifacts require `--task-type ref2va`; `fl2v` artifacts serve T2VA and FL2VA.
+  The ComfyUI exports use a fused-QKV layout and are not supported.
+- **Runtime native LoRA**: FlashGen-style artifacts declare
+  `key_format=minimax-h3-native` and embed `base_schedule` in safetensors
+  metadata. When active, the adapter schedule overrides the base checkpoint and
+  requests must use the interval-count contract (`num_inference_steps=4`).
+  Request-mode generation may omit the field and take the count from the adapter
+  schedule; step execution requires it explicitly, because the step scheduler
+  derives the total step count from the request before the adapter schedule is
+  known.
+
+Native artifacts also declare `qkv_layout=grouped`. The H3 loader reorders fused
+`qkv_proj` LoRA rows with the same `_reorder_grouped_qkv_to_qkv` helper used for
+base-weight loading, then binds the packed Q/K/V slices through the legacy PEFT
+manager without modifying `DiffusionLoRAManager`.
+
+Both runtime adapters run with distributed layerwise offload in request-mode
+generation, where the manager keeps the LoRA A/B buffers resident on the compute
+device while DLO streams the base blocks. MiniMax-H3 step execution still
+rejects DLO, so `--step-execution` cannot be combined with
+`--enable-distributed-layerwise-offload`. Model-level CPU offload and standard
+layerwise offload are rejected in every mode, because the dynamic LoRA tensors
+are neither parameters nor registered buffers and therefore do not participate
+in those weight lifecycles.
+
 ## See Also
 
 - [Text-to-Image Offline Example](../examples/offline_inference/text_to_image.md#lora) - Complete offline LoRA example

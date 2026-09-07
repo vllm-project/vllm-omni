@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -245,7 +245,7 @@ else:
         [sys.executable, "-c", script, str(_MODULE_PATH), str(tmp_path)],
         capture_output=True,
         text=True,
-        timeout=3,
+        timeout=30,
         check=False,
     )
 

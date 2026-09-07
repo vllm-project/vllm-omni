@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniCPM-o 4.5 Daily-Omni + Seed-TTS accuracy regression coverage.
 
 Daily-Omni settings follow the MiniCPM interleaved AV recipe that reaches
@@ -21,13 +22,25 @@ from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
     build_acc_benchmark_cli_argv,
     find_vllm_cli,
 )
-from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import SERVER_PARAMS as DUPLEX_TEST_PARAMS
+from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
+    DEPLOY_CONFIG as _DUPLEX_DEPLOY_CONFIG,
+)
+from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
+    SERVER_PARAMS as DUPLEX_TEST_PARAMS,
+)
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
-from tests.helpers.stage_config import get_deploy_config_path
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 _MODEL = os.environ.get("VLLM_TEST_MINICPMO_4_5_MODEL", "openbmb/MiniCPM-o-4_5")
 _DEPLOY_CONFIG = get_deploy_config_path("minicpmo_4_5.yaml")
+_DUPLEX_BF16_DEPLOY_CONFIG = modify_stage_config(
+    _DUPLEX_DEPLOY_CONFIG,
+    updates={
+        "base_config": _DEPLOY_CONFIG,
+        "connectors.connector_of_shared_memory.extra.code2wav_bfloat16_attention_cache": True,
+    },
+)
 _RESULT_DIR = Path(
     os.environ.get(
         "ACC_BENCH_RESULT_DIR",
@@ -88,6 +101,20 @@ seed_test_params = [
         stage_config_path=_DEPLOY_CONFIG,
         server_args=list(_SEED_TTS_SERVER_ARGS),
     )
+]
+
+
+duplex_accuracy_test_params = [
+    *DUPLEX_TEST_PARAMS,
+    pytest.param(
+        OmniServerParams(
+            model=_MODEL,
+            stage_config_path=_DUPLEX_BF16_DEPLOY_CONFIG,
+            use_stage_cli=False,
+            server_args=list(_SEED_TTS_SERVER_ARGS),
+        ),
+        id="three-stage-single-gpu-bf16-attention-cache",
+    ),
 ]
 
 
@@ -174,7 +201,7 @@ def test_minicpmo_4_5_seed_tts_wer_bench(omni_server) -> None:
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", DUPLEX_TEST_PARAMS, indirect=True)
+@pytest.mark.parametrize("omni_server", duplex_accuracy_test_params, indirect=True)
 def test_minicpmo_4_5_duplex_seed_tts_wer_bench(omni_server) -> None:
     """Gate Seed-TTS WER through the explicit Realtime TTS contract."""
     _require_vllm_cli()

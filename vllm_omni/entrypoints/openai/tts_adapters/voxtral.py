@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
+from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_supported_speakers
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -32,8 +33,9 @@ class VoxtralTTSAdapter(ARTTSAdapter):
 
         if request.voice is not None:
             request.voice = request.voice.lower()
-            if server.supported_speakers and request.voice not in server.supported_speakers:
-                return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(server.supported_speakers))}"
+            available_speakers = server._get_available_speakers()
+            if available_speakers and request.voice not in available_speakers:
+                return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(available_speakers))}"
 
         if request.max_new_tokens is not None:
             if request.max_new_tokens < self.max_new_tokens_min:
@@ -48,6 +50,10 @@ class VoxtralTTSAdapter(ARTTSAdapter):
     ) -> PreparedRequest:
         prompt = await self.ctx.server._build_voxtral_prompt_async(request)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="voxtral_tts")
+
+    def _load_supported_speakers(self) -> set[str]:
+        config = self.ctx.engine_client.model_config.hf_config.audio_config
+        return load_supported_speakers(self.ctx.engine_client, config)
 
     def apply_sampling_overrides(
         self,

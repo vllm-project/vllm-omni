@@ -2,10 +2,13 @@
 
 This section lists the most common options for running vLLM-Omni.
 
-For options within a vLLM Engine, please refer to the [vLLM 0.26 configuration guide](https://docs.vllm.ai/en/v0.26.0/configuration/index.html).
+For options within a vLLM Engine, please refer to the [vLLM 0.28 configuration guide](https://docs.vllm.ai/en/v0.28.0/configuration/index.html).
 
 Each model defines fixed topology in a registered `PipelineConfig` and runtime
 overrides in a deploy YAML.
+
+For process-level settings shared by the CLI, deploy YAML, workers, and model
+integrations, see [Environment Variables](./environment_variables.md).
 
 For a specific example, see the [Qwen2.5-Omni deploy config](gh-file:vllm_omni/deploy/qwen2_5_omni.yaml). The matching frozen pipeline topology lives at [vllm_omni/model_executor/models/qwen2_5_omni/pipeline.py](gh-file:vllm_omni/model_executor/models/qwen2_5_omni/pipeline.py).
 

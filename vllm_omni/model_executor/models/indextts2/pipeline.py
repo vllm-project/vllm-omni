@@ -45,6 +45,7 @@ INDEXTTS2_PIPELINE = PipelineConfig(
             sync_process_input_func=f"{_PROC}.talker2s2mel_token_only",
             extras={"skip_tokenizer_init": True},
             sampling_constraints={"detokenize": True},
+            requires_full_payload_input=True,
         ),
     ),
 )
@@ -81,6 +82,7 @@ INDEXTTS25_PIPELINE = PipelineConfig(
             sync_process_input_func=f"{_PROC}.talker2s2mel_token_only",
             extras={"skip_tokenizer_init": True},
             sampling_constraints={"detokenize": True},
+            requires_full_payload_input=True,
         ),
     ),
 )

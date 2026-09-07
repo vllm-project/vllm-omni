@@ -16,6 +16,9 @@ logger = init_logger(__name__)
 
 @register_tts_adapter
 class MingFlashOmniTTSAdapter(ARTTSAdapter):
+    # Ming-flash-omni drives speaker selection via the caption JSON
+    # (audio_sequence[0]["说话人"]) rather than a spk_id table, so there
+    # is no static speaker list to surface here.
     stage_keys = frozenset({"ming_tts"})
     name = "ming_flash_omni_tts"
 
@@ -61,3 +64,7 @@ class MingFlashOmniTTSAdapter(ARTTSAdapter):
         server = self.ctx.server
         prompt = server._build_ming_flash_omni_prompt(request)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="ming_flash_omni_tts")
+
+    def _load_supported_speakers(self) -> set[str]:
+        # Speaker selection is driven by caption JSON rather than a static table.
+        return set()

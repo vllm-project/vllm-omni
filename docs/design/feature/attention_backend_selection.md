@@ -61,7 +61,8 @@ unstructured keyword dictionaries:
 - `quant` is consumed by FlashInfer and TRTLLM with backend-specific value
   validation;
 - `skip_softmax` is consumed by TRTLLM; and
-- `block_sparse` is consumed by block-sparse backends such as RainFusion.
+- `block_sparse` is consumed by block-sparse backends such as RainFusion; and
+- `fastvideo_vsa_topk` is consumed by FastVideo VSA.
 
 A backend reads only the fields it owns and rejects incompatible values. New
 options should be added to a shared typed spec only when more than one backend
@@ -87,3 +88,19 @@ An implementation change is complete only when it:
    corresponding user guide; and
 6. updates the overview matrix without moving algorithm details back into the
    landing page.
+
+## FastVideo VSA model metadata
+
+FastVideo VSA support is scoped to `FastVideo/FastWan2.2-TI2V-5B-Diffusers`, whose text-to-video and image-to-video modes both use `Wan22Pipeline`. It operates on a flattened DiT sequence but partitions tokens in
+the original latent video grid. Wan integrations therefore attach the
+post-patch `(T, H, W)` shape as `vsa_dit_seq_shape` attention metadata. The
+backend validates that `T * H * W` equals the sequence length, derives the
+runtime block count, and selects the configured top-k key/value blocks for
+each query block.
+
+Checkpoint-specific compensation remains model-owned. Wan layers pass an
+optional learned `gate_compress` projection through attention metadata when
+the checkpoint contains those weights. Checkpoints without the projection do
+not allocate or execute it. When top-k selects every block, native checkpoints
+route to SDPA, while FastVideo DMD checkpoints preserve the VSA all-block path
+to retain checkpoint semantics.

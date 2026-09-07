@@ -8,7 +8,7 @@ distributed_executor_backend: mp
 stages:
   - stage_id: 0
     devices: "0"
-    max_num_seqs: 1
+    max_num_seqs: 4  # in-flight request batch width (CLI: --max-num-seqs)
     tensor_parallel_size: 1
     enforce_eager: true
     # Keep VAE tiling on by default for higher resolutions / longer clips.

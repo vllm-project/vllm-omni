@@ -23,8 +23,7 @@ TALKER_CODEC_END_TOKEN_ID = 8294
 # ============================================================================
 # Worker-connector data plane (non-async-chunk path).
 # Both transitions ship payloads via the worker connector
-# (registered in ``_FULL_PAYLOAD_INPUT_STAGES`` in
-# omni_scheduling_coordinator):
+# (requires_full_payload_input=True in the pipeline topology):
 # - thinker->talker reads accumulated ``pooling_output["hidden"]`` and
 #   packs an OmniPayload-shaped dict (embed.prefill /
 #   hidden_states.output / ids.prompt / ids.output) for the talker, which
@@ -155,9 +154,9 @@ def thinker2talker_token_only(
     ``thinker2talker_full_payload`` via the worker connector and lands
     in ``model_intermediate_buffer`` before the talker's forward() runs.
 
-    Consumer-wait gating is whitelist-driven via
-    ``_FULL_PAYLOAD_INPUT_STAGES`` (see the mixin
-    ``should_accumulate_full_payload_output`` docstring).
+    Consumer-wait gating is driven by
+    ``requires_full_payload_input=True`` in the pipeline topology
+    (see the mixin ``should_accumulate_full_payload_output`` docstring).
     """
     thinker_outputs = source_outputs
     talker_inputs = []

@@ -9,6 +9,9 @@ import torch
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
 from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
@@ -344,7 +347,41 @@ class TestTalkerVisualRouting:
 
 
 # ===================================================================
-# 4. ComponentQuantizationConfig.resolve
+# 4. ComponentQuantizationConfig.apply_vllm_mapper
+# ===================================================================
+
+
+class TestComponentApplyVllmMapper:
+    def test_maps_compressed_tensors_component_and_default(self):
+        thinker = CompressedTensorsConfig(
+            target_scheme_map={},
+            ignore=["thinker.model.layers.0.mlp.gate"],
+            quant_format="pack-quantized",
+        )
+        default = CompressedTensorsConfig(
+            target_scheme_map={},
+            ignore=["talker.model.layers.0.mlp.gate"],
+            quant_format="pack-quantized",
+        )
+        config = ComponentQuantizationConfig(
+            component_configs={"thinker": thinker, "code2wav": None},
+            default_config=default,
+        )
+        mapper = WeightsMapper(
+            orig_to_new_prefix={
+                "thinker.model": "thinker.language_model.model",
+                "talker.model": "talker.language_model.model",
+            }
+        ).get_unstacked_mapper()
+
+        config.apply_vllm_mapper(mapper)
+
+        assert thinker.ignore == ["thinker.language_model.model.layers.0.mlp.gate"]
+        assert default.ignore == ["talker.language_model.model.layers.0.mlp.gate"]
+
+
+# ===================================================================
+# 5. ComponentQuantizationConfig.resolve
 # ===================================================================
 
 

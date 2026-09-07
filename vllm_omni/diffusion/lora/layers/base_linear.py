@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -22,6 +22,19 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
     is inherited from vLLM's BaseLinearLayerWithLoRA.
     """
 
+    lora_a_stacked: tuple[torch.Tensor, ...]
+    lora_b_stacked: tuple[torch.Tensor, ...]
+
+    def _move_lora_buffers(self, device: torch.device) -> None:
+        self.lora_a_stacked = tuple(tensor.to(device=device) for tensor in self.lora_a_stacked)
+        self.lora_b_stacked = tuple(tensor.to(device=device) for tensor in self.lora_b_stacked)
+
+    def _set_diffusion_lora_buffer_device(self, device: torch.device) -> None:
+        """Keep dynamic LoRA sidecars resident on the compute device."""
+
+        self._diffusion_lora_buffer_device = device
+        self._move_lora_buffers(device)
+
     def create_lora_weights(
         self,
         max_loras: int,
@@ -29,6 +42,9 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         model_config=None,
     ) -> None:
         super().create_lora_weights(max_loras, lora_config, model_config)
+        buffer_device = getattr(self, "_diffusion_lora_buffer_device", None)
+        if buffer_device is not None:
+            self._move_lora_buffers(buffer_device)
         # Keep a direct reference for attribute forwarding: `base_layer` is a
         # registered submodule (stored under `_modules`), so direct access via
         # `object.__getattribute__` will not find it. We stash a ref in
@@ -127,8 +143,17 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             # LoRA shrink & expand as in add_lora_linear():
             #   buffer = (x @ A.T)
             #   y += buffer @ B.T
-            delta = (x_flat @ A.t()) @ B.t()
-            y_flat[:, offset : offset + slice_size] = y_flat[:, offset : offset + slice_size] + delta
+            buffer = x_flat @ A.t()
+            y_slice = y_flat[:, offset : offset + slice_size]
+
+            # In inference, accumulate the expand GEMM directly into the base
+            # output. This avoids materializing both a full-width delta and the
+            # result of the following elementwise addition. ``out=`` does not
+            # support autograd, so training keeps the functional fallback.
+            if not torch.is_grad_enabled() and y_slice.dtype == buffer.dtype == B.dtype:
+                torch.addmm(y_slice, buffer, B.t(), out=y_slice)
+            else:
+                y_slice[:] = y_slice + buffer @ B.t()
             offset += slice_size
 
         return y_flat.view(original_shape)

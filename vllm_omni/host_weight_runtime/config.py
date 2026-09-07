@@ -117,8 +117,6 @@ class ProductionPolicy:
     def __post_init__(self) -> None:
         if not isinstance(self.allow_local_build, bool) or not isinstance(self.allow_post_load_publish, bool):
             raise ValueError("production switches must be booleans")
-        if self.allow_post_load_publish:
-            raise ValueError("post-load publication is not implemented")
 
 
 @dataclass(frozen=True)

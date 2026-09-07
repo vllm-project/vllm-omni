@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/parallel_state.py
 # Copyright 2023 The vLLM team.
 # Adapted from
@@ -59,6 +60,8 @@ _SP: SequenceParallelGroupCoordinator | None = None
 _PP: PipelineGroupCoordinator | None = None
 _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
+_FS: GroupCoordinator | None = None  # Fully Sharded (HSDP shard dimension)
+_HSDP_REPLICATE: GroupCoordinator | None = None  # HSDP replica dimension
 
 # Rank-layout metadata for expert parallelism. This is not a process group;
 # it is reused by platform-specific runtimes that must build companion groups
@@ -319,6 +322,11 @@ def is_pipeline_last_stage():
 
 
 # CFG
+def is_cfg_group_initialized() -> bool:
+    """Return whether the classifier-free-guidance group has been created."""
+    return _CFG is not None
+
+
 def get_cfg_group() -> GroupCoordinator:
     assert _CFG is not None, "classifier_free_guidance parallel group is not initialized"
     return _CFG
@@ -348,6 +356,17 @@ def get_data_parallel_world_size():
 def get_data_parallel_rank():
     """Return my rank for the data parallel group."""
     return get_dp_group().rank_in_group
+
+
+# FS (Fully Shard / HSDP shard dimension)
+def get_fs_group() -> GroupCoordinator:
+    assert _FS is not None, "fully shard group is not initialized"
+    return _FS
+
+
+def get_hsdp_replicate_group() -> GroupCoordinator:
+    assert _HSDP_REPLICATE is not None, "HSDP replicate group is not initialized"
+    return _HSDP_REPLICATE
 
 
 def is_dp_last_group():
@@ -445,6 +464,7 @@ def init_model_parallel_group(
         "expert",
         "sequence",
         "classifier_free_guidance",
+        "fully_shard",
     ], f"parallel_mode {parallel_mode} is not supported"
     if parallel_mode == "pipeline":
         return PipelineGroupCoordinator(
@@ -679,10 +699,13 @@ def _initialize_model_parallel(
     allgather_degree: int = 1,
     tensor_parallel_size: int = 1,
     pipeline_parallel_size: int = 1,
+    fully_shard_degree: int = 1,
     enable_expert_parallel: bool = False,
     use_hsdp: bool = False,
     backend: str | None = None,
 ) -> None:
+    global _FS, _HSDP_REPLICATE
+
     if backend is None:
         backend = current_omni_platform.dist_backend
     """
@@ -700,6 +723,7 @@ def _initialize_model_parallel(
             (causal=False only). Mutually exclusive with ulysses/ring in v1.
         tensor_parallel_size: number of GPUs used for tensor parallelism.
         pipeline_parallel_size: number of GPUs used for pipeline parallelism.
+        fully_shard_degree: number of GPUs used for the HSDP shard dimension.
         backend: distributed backend of pytorch collective comm.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
@@ -763,6 +787,12 @@ def _initialize_model_parallel(
             raise ValueError("HSDP (FSDP2) requires data_parallel_size to be 1")
         if non_dp_size not in (1, world_size):
             raise ValueError(f"HSDP non-DP parallel size must be 1 or WORLD size ({world_size}), but got {non_dp_size}")
+        if fully_shard_degree <= 0:
+            raise ValueError(f"fully_shard_degree must be positive, got {fully_shard_degree}")
+        if world_size % fully_shard_degree != 0:
+            raise ValueError(
+                f"WORLD size ({world_size}) must be divisible by fully_shard_degree ({fully_shard_degree})"
+            )
         data_parallel_size = 1
     else:
         inferred_data_parallel_size = world_size // non_dp_size
@@ -881,6 +911,32 @@ def _initialize_model_parallel(
             group_name="dp",
         )
 
+    if use_hsdp:
+        assert _FS is None, "fully shard group is already initialized"
+        # HSDP builds its mesh from arange(world_size).reshape(replicate, shard),
+        # so each consecutive rank run is one fully-sharded group.
+        fs_group_ranks = [
+            list(range(start, start + fully_shard_degree)) for start in range(0, world_size, fully_shard_degree)
+        ]
+        _FS = init_model_parallel_group(
+            group_ranks=fs_group_ranks,
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            parallel_mode="fully_shard",
+        )
+        if world_size > fully_shard_degree:
+            # The HSDP mesh's columns are replica groups: each column contains
+            # the same shard position across all replica rows.
+            hsdp_replicate_group_ranks = [
+                list(range(offset, world_size, fully_shard_degree)) for offset in range(fully_shard_degree)
+            ]
+            _HSDP_REPLICATE = init_model_parallel_group(
+                group_ranks=hsdp_replicate_group_ranks,
+                local_rank=get_world_group().local_rank,
+                backend=backend,
+                parallel_mode="fully_shard",
+            )
+
     global _EXPERT_PARALLEL_GROUP_RANKS
     _EXPERT_PARALLEL_GROUP_RANKS = get_rank_groups("tp-sp-cfg-dp")
     if use_moe_parallel_mapping:
@@ -902,6 +958,7 @@ def initialize_model_parallel(
     allgather_degree: int = 1,
     tensor_parallel_size: int = 1,
     pipeline_parallel_size: int = 1,
+    fully_shard_degree: int = 1,
     enable_expert_parallel: bool = False,
     use_hsdp: bool = False,
     backend: str | None = None,
@@ -916,6 +973,8 @@ def initialize_model_parallel(
         "cfg": _CFG,
         "sp": _SP,
         "pp": _PP,
+        "fs": _FS,
+        "hsdp_replicate": _HSDP_REPLICATE,
         "vllm_tp": vllm_parallel_state._TP,
         "vllm_dp": vllm_parallel_state._DP,
         "vllm_pp": vllm_parallel_state._PP,
@@ -937,6 +996,7 @@ def initialize_model_parallel(
             allgather_degree=allgather_degree,
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
+            fully_shard_degree=fully_shard_degree,
             enable_expert_parallel=enable_expert_parallel,
             use_hsdp=use_hsdp,
             backend=backend,
@@ -948,7 +1008,7 @@ def initialize_model_parallel(
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    global _DP, _CFG, _SP, _PP, _EXPERT_PARALLEL_GROUP_RANKS
+    global _DP, _CFG, _SP, _PP, _FS, _HSDP_REPLICATE, _EXPERT_PARALLEL_GROUP_RANKS
 
     if vllm_parallel_state._DP and vllm_parallel_state._DP is not _DP:
         vllm_parallel_state._DP.destroy()
@@ -957,6 +1017,14 @@ def destroy_model_parallel():
     if _DP:
         _DP.destroy()
     _DP = None
+
+    if _FS:
+        _FS.destroy()
+    _FS = None
+
+    if _HSDP_REPLICATE:
+        _HSDP_REPLICATE.destroy()
+    _HSDP_REPLICATE = None
 
     if _CFG:
         _CFG.destroy()

@@ -1,14 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import io
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-import librosa  # noqa: TID251
 import numpy as np
 import onnxruntime
 import s3tokenizer
-import soundfile as sf
 import torch
 import torch.nn as nn
 import torchaudio
@@ -23,6 +24,8 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import WeightsMapper
+from vllm.multimodal.audio import AudioResampler
+from vllm.multimodal.media.audio import load_audio
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -39,6 +42,14 @@ from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
 )
 
 logger = init_logger(__name__)
+
+
+def _get_left_context_size(info: dict[str, Any]) -> Any | None:
+    """Return the async-chunk marker from a nested metadata payload."""
+    meta = info.get("meta")
+    if not isinstance(meta, dict):
+        return None
+    return meta.get("left_context_size")
 
 
 def fade_in_out(
@@ -231,19 +242,11 @@ class StepAudio2Token2WavCore(nn.Module):
 
     def _prepare_prompt(self, prompt_wav: str):
         """Prepare prompt audio for conditioning"""
-        # Prefer soundfile/librosa path to avoid torchaudio->torchcodec runtime coupling.
-        try:
-            audio_np_raw, sample_rate = sf.read(prompt_wav, dtype="float32", always_2d=False)
-        except Exception:
-            audio_np_raw, sample_rate = librosa.load(prompt_wav, sr=None, mono=True)
-        if isinstance(audio_np_raw, np.ndarray) and audio_np_raw.ndim > 1:
-            audio_np_raw = np.mean(audio_np_raw, axis=-1)
+        audio_np_raw, sample_rate = load_audio(prompt_wav, sr=None, mono=True)
         sample_rate = int(sample_rate)
 
         # 16 kHz branch: s3tokenizer + speaker embedding
-        audio_16k = audio_np_raw.astype(np.float32)
-        if sample_rate != 16000:
-            audio_16k = librosa.resample(y=audio_16k, orig_sr=sample_rate, target_sr=16000)
+        audio_16k = AudioResampler(target_sr=16000).resample(audio_np_raw.astype(np.float32), orig_sr=sample_rate)
         audio = torch.from_numpy(audio_16k)
         mels = s3tokenizer.log_mel_spectrogram(audio)
         mels, mels_lens = s3tokenizer.padding([mels])
@@ -257,9 +260,7 @@ class StepAudio2Token2WavCore(nn.Module):
 
         # 24 kHz branch: mel spectrogram for flow model conditioning
         # Must resample from the ORIGINAL audio, not the 16 kHz version.
-        audio_24k = audio_np_raw.astype(np.float32)
-        if sample_rate != 24000:
-            audio_24k = librosa.resample(y=audio_24k, orig_sr=sample_rate, target_sr=24000)
+        audio_24k = AudioResampler(target_sr=24000).resample(audio_np_raw.astype(np.float32), orig_sr=sample_rate)
         audio_24k_t = torch.from_numpy(audio_24k).unsqueeze(0)  # [1, T]
         prompt_mel = (
             mel_spectrogram(
@@ -547,7 +548,8 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
             additional: Additional information dict (deprecated)
             runtime_additional_information: Per-request dicts from the
                 async_chunk processor.  Each dict contains ``audio_tokens``
-                (list[int]) and ``last_chunk`` (bool).
+                (list[int]) and ``meta.left_context_size`` as the
+                last-chunk marker (0 = non-final, 1 = final).
             **kwargs: Other kwargs
 
         Returns:
@@ -560,7 +562,7 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         # [{}]), so a bare truthiness check would incorrectly enter this
         # branch in synchronous mode.
         if runtime_additional_information and any(
-            "left_context_size" in info for info in runtime_additional_information
+            _get_left_context_size(info) is not None for info in runtime_additional_information
         ):
             return self._forward_async_chunk(input_ids, runtime_additional_information, **kwargs)
 
@@ -629,15 +631,15 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         async_chunk payload to ``request.additional_information``).
         """
         # --- batch=1 guard ---
-        batch_size = sum(1 for info in runtime_additional_information if "left_context_size" in info)
+        batch_size = sum(1 for info in runtime_additional_information if _get_left_context_size(info) is not None)
         if batch_size != 1:
             raise RuntimeError(
                 f"Token2Wav async_chunk only supports batch=1, got {batch_size}. "
                 "Batch>1 requires framework support for batch_req_ids."
             )
 
-        info = next(info for info in runtime_additional_information if "left_context_size" in info)
-        last_chunk = info.get("left_context_size", 0) == 1
+        info = next(info for info in runtime_additional_information if _get_left_context_size(info) is not None)
+        last_chunk = _get_left_context_size(info) == 1
 
         # --- Manage single stream state ---
         # If the previous request was preempted (setup_done but not finished),

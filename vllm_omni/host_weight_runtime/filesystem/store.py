@@ -8,13 +8,14 @@ import contextlib
 import errno
 import hashlib
 import json
+import logging
 import os
 import shutil
 import stat
 import time
 import uuid
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Protocol
 
@@ -38,6 +39,8 @@ from ..protocols import BuildRequest, CoordinationScope, WeightProducer
 from .locks import FileLock, FileLockTimeoutError, lock_is_active
 from .writer import FilesystemArtifactWriter
 
+logger = logging.getLogger(__name__)
+
 _DOMAIN_FILE = "domain.json"
 _DOMAIN_POLICY_FILE = "domain-policy.json"
 _MANIFEST_FILE = "manifest.json"
@@ -45,6 +48,17 @@ _READY_FILE = "READY.json"
 _MAX_METADATA_BYTES = 64 * 1024**2
 _FILE_HASH_CHUNK_BYTES = 8 * 1024**2
 _ARTIFACT_KEY_RE = re.compile(r"[0-9a-f]{64}")
+_ARTIFACT_INVALIDATION_MODE = stat.S_ISVTX
+_ARTIFACT_STRUCTURE_ERRNOS = frozenset(
+    {
+        errno.EACCES,
+        errno.EISDIR,
+        errno.ELOOP,
+        errno.ENOENT,
+        errno.ENOTDIR,
+        errno.EPERM,
+    }
+)
 _LOCAL_DISK_FILESYSTEM_TYPES = frozenset(
     {
         "aufs",
@@ -135,6 +149,153 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+def _storage_io_failure(
+    exc: OSError,
+    *,
+    operation: str,
+    details: object | None = None,
+) -> HostWeightFailure:
+    if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+        return _failure(
+            ResolutionStage.CAPACITY,
+            FailureCode.ENOSPC,
+            f"{operation}: {exc}",
+            retryable=True,
+            details=details,
+        )
+    return _failure(
+        ResolutionStage.DOMAIN,
+        FailureCode.DOMAIN_UNAVAILABLE,
+        f"{operation}: {exc}",
+        retryable=True,
+        details=details,
+    )
+
+
+def _path_exists_without_following(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _os_error_details(exc: OSError) -> dict[str, object]:
+    return {
+        "exception_type": type(exc).__name__,
+        "errno": exc.errno,
+        "message": str(exc),
+    }
+
+
+@contextlib.contextmanager
+def _release_lock_after_authoritative_commit(
+    lock: FileLock,
+    *,
+    key: str,
+    committed: Callable[[], bool],
+) -> Iterator[None]:
+    try:
+        yield
+    finally:
+        try:
+            lock.close()
+        except OSError as exc:
+            if not committed():
+                raise
+            logger.warning(
+                "artifact %s was authoritative before its build-lock release error: %s",
+                key,
+                exc,
+            )
+
+
+def _harden_open_directory(fd: int, path: Path, mode: int) -> None:
+    """Remove write bits from an open directory and make that change durable."""
+    try:
+        os.fchmod(fd, mode)
+    except OSError as fd_error:
+        try:
+            os.chmod(path, mode, follow_symlinks=False)
+        except OSError as path_error:
+            raise path_error from fd_error
+    actual_mode = stat.S_IMODE(os.fstat(fd).st_mode)
+    if actual_mode != mode:
+        raise OSError(
+            errno.EIO,
+            f"artifact directory {path} has mode {actual_mode:#o}, expected {mode:#o}",
+        )
+    os.fsync(fd)
+
+
+def _artifact_has_invalidation_marker(path: Path) -> bool:
+    return bool(path.stat(follow_symlinks=False).st_mode & _ARTIFACT_INVALIDATION_MODE)
+
+
+def _mark_open_artifact_invalidated(fd: int, path: Path) -> tuple[int, int]:
+    """Persist a fail-closed marker and return the open inode identity."""
+    marked_mode = stat.S_IMODE(os.fstat(fd).st_mode) | _ARTIFACT_INVALIDATION_MODE
+    os.fchmod(fd, marked_mode)
+    marked_stat = os.fstat(fd)
+    if not marked_stat.st_mode & _ARTIFACT_INVALIDATION_MODE:
+        raise OSError(errno.EIO, f"artifact directory {path} was not marked invalid")
+    os.fsync(fd)
+    return marked_stat.st_dev, marked_stat.st_ino
+
+
+def _mark_artifact_invalidated(path: Path) -> tuple[int, int]:
+    """Persist a fail-closed marker without allocating a new directory entry."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        return _mark_open_artifact_invalidated(fd, path)
+    finally:
+        os.close(fd)
+
+
+def _move_artifact_locked(source: Path, destination: Path) -> None:
+    """Move an artifact directory while its exclusive artifact lock is held.
+
+    Supported local filesystems may reject renaming the mode-0555 directory
+    used for a READY artifact. Widen the inode only while the lock excludes
+    readers, then restore an immutable mode through the same open descriptor.
+    """
+    source_stat = source.lstat()
+    if stat.S_ISDIR(source_stat.st_mode):
+        fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            original_mode = stat.S_IMODE(os.fstat(fd).st_mode)
+            source_immutable_mode = original_mode & ~0o222
+            transition_immutable_mode = source_immutable_mode | _ARTIFACT_INVALIDATION_MODE
+            destination_immutable_mode = source_immutable_mode & ~_ARTIFACT_INVALIDATION_MODE
+            writable_mode = transition_immutable_mode | stat.S_IWUSR
+            current_path = source
+            try:
+                _harden_open_directory(fd, source, transition_immutable_mode)
+                os.fchmod(fd, writable_mode)
+                os.replace(source, destination)
+                current_path = destination
+            except BaseException as move_error:
+                try:
+                    _harden_open_directory(fd, current_path, source_immutable_mode)
+                except BaseException as hardening_error:
+                    raise hardening_error from move_error
+                raise
+            # Keep the invalidation marker durable until both directory
+            # entries are durable. If either parent fsync fails (or the
+            # process crashes first), a rename rollback must not expose an
+            # authoritative artifact with the marker already cleared.
+            _harden_open_directory(fd, destination, transition_immutable_mode)
+            _fsync_directory(source.parent)
+            _fsync_directory(destination.parent)
+            _harden_open_directory(fd, destination, destination_immutable_mode)
+        finally:
+            os.close(fd)
+    else:
+        os.replace(source, destination)
+        _fsync_directory(source.parent)
+        _fsync_directory(destination.parent)
+
+
 def _write_atomic_json(path: Path, value: object, *, mode: int = 0o444) -> None:
     data = canonical_json(value)
     temporary = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
@@ -206,7 +367,7 @@ def _sha256_fd(fd: int, size: int) -> str:
     while offset < size:
         chunk = os.pread(fd, min(_FILE_HASH_CHUNK_BYTES, size - offset), offset)
         if not chunk:
-            raise OSError(errno.EIO, "artifact file ended while hashing")
+            raise ManifestValidationError("artifact file ended while hashing")
         digest.update(chunk)
         offset += len(chunk)
     return digest.hexdigest()
@@ -532,10 +693,22 @@ class FilesystemHostWeightStore:
             )
 
         entry_path = self._entry_path(identity.key)
-        if not entry_path.exists():
+        try:
+            entry_exists = _path_exists_without_following(entry_path)
+            deny_exists = entry_exists and _path_exists_without_following(self._deny_path(identity.key))
+        except OSError as exc:
+            artifact_lock.close()
+            return StoreResult(
+                StoreStatus.FAILED,
+                failure=_storage_io_failure(
+                    exc,
+                    operation=f"failed to inspect artifact state for {identity.key}",
+                ),
+            )
+        if not entry_exists:
             artifact_lock.close()
             return StoreResult(StoreStatus.MISS)
-        if self._deny_path(identity.key).exists():
+        if deny_exists:
             artifact_lock.close()
             return StoreResult(
                 StoreStatus.INVALID,
@@ -547,7 +720,14 @@ class FilesystemHostWeightStore:
             )
         try:
             lease = self._open_lease(identity, entry_path, artifact_lock, validation)
-            if self._deny_path(identity.key).exists():
+            try:
+                denied_during_lookup = _path_exists_without_following(
+                    self._deny_path(identity.key)
+                ) or _artifact_has_invalidation_marker(entry_path)
+            except OSError:
+                lease.close()
+                raise
+            if denied_during_lookup:
                 lease.close()
                 return StoreResult(
                     StoreStatus.INVALID,
@@ -559,26 +739,49 @@ class FilesystemHostWeightStore:
                 )
             return StoreResult(StoreStatus.HIT, lease=lease)
         except HostWeightError as exc:
-            try:
-                if record_invalid:
-                    with contextlib.suppress(OSError):
-                        self._write_deny(identity.key, exc.failure)
-            finally:
+            failure = exc.failure
+        except OSError as exc:
+            if exc.errno not in _ARTIFACT_STRUCTURE_ERRNOS:
                 artifact_lock.close()
-            return StoreResult(StoreStatus.INVALID, failure=exc.failure)
-        except (OSError, SafetensorError, ValueError, ManifestValidationError) as exc:
+                return StoreResult(
+                    StoreStatus.FAILED,
+                    failure=_storage_io_failure(
+                        exc,
+                        operation=f"failed to read or validate artifact {identity.key}",
+                    ),
+                )
             failure = _failure(
                 ResolutionStage.VALIDATION,
                 FailureCode.MANIFEST_CORRUPT,
                 f"artifact {identity.key} failed validation: {exc}",
             )
-            try:
-                if record_invalid:
-                    with contextlib.suppress(OSError):
-                        self._write_deny(identity.key, failure)
-            finally:
-                artifact_lock.close()
-            return StoreResult(StoreStatus.INVALID, failure=failure)
+        except (SafetensorError, ValueError, ManifestValidationError) as exc:
+            failure = _failure(
+                ResolutionStage.VALIDATION,
+                FailureCode.MANIFEST_CORRUPT,
+                f"artifact {identity.key} failed validation: {exc}",
+            )
+
+        try:
+            if record_invalid:
+                self._write_deny(identity.key, failure)
+        except OSError as exc:
+            containment = self._contain_invalid_after_deny_failure(
+                identity.key,
+                artifact_lock,
+                deadline=deadline,
+            )
+            return StoreResult(
+                StoreStatus.FAILED,
+                failure=_storage_io_failure(
+                    exc,
+                    operation=f"failed to deny invalid artifact {identity.key}",
+                    details={"containment": containment},
+                ),
+            )
+        finally:
+            artifact_lock.close()
+        return StoreResult(StoreStatus.INVALID, failure=failure)
 
     def _open_lease(
         self,
@@ -592,6 +795,14 @@ class FilesystemHostWeightStore:
             entry_fd = os.open(entry_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
             resources.append(_make_fd_closer(entry_fd))
             entry_stat = os.fstat(entry_fd)
+            if entry_stat.st_mode & _ARTIFACT_INVALIDATION_MODE:
+                raise HostWeightError(
+                    _failure(
+                        ResolutionStage.LOOKUP,
+                        FailureCode.ARTIFACT_DENIED,
+                        f"artifact {identity.key} is marked invalid pending quarantine",
+                    )
+                )
             if self.integrity_policy.require_trusted_permissions and (
                 entry_stat.st_uid != os.geteuid() or entry_stat.st_mode & 0o222
             ):
@@ -820,17 +1031,25 @@ class FilesystemHostWeightStore:
                 failure=_failure(ResolutionStage.DOMAIN, FailureCode.DOMAIN_UNAVAILABLE, str(exc), retryable=True),
             )
 
-        with build_lock:
+        ready_outcome_authoritative = False
+        with _release_lock_after_authoritative_commit(
+            build_lock,
+            key=identity.key,
+            committed=lambda: ready_outcome_authoritative,
+        ):
             recheck = self.lookup(identity, validation=validation, deadline=deadline)
             if recheck.status is StoreStatus.HIT:
+                ready_outcome_authoritative = True
                 return StoreResult(StoreStatus.JOINED, lease=recheck.lease)
             if recheck.status in {StoreStatus.TIMEOUT, StoreStatus.FAILED}:
                 return recheck
 
             try:
                 with FileLock(self._artifact_lock_path(identity.key), exclusive=True, deadline=deadline):
-                    if self._entry_path(identity.key).exists():
+                    self._repair_quarantine_transitions_locked(identity.key)
+                    if _path_exists_without_following(self._entry_path(identity.key)):
                         self._quarantine_locked(identity.key, reason="validation_failure")
+                    self._remove_cleanup_tombstones_locked(identity.key)
                     self._remove_deny_locked(identity.key)
                     self._remove_stale_temps_locked(identity.key)
             except FileLockTimeoutError as exc:
@@ -850,20 +1069,26 @@ class FilesystemHostWeightStore:
                         ResolutionStage.LIFECYCLE,
                         FailureCode.QUARANTINE_FAILED,
                         f"failed to prepare artifact rebuild: {exc}",
+                        retryable=True,
                     ),
                 )
 
             staging = self.tmp_dir / f"{identity.key}.{os.getpid()}.{uuid.uuid4().hex}"
             writer: FilesystemArtifactWriter | None = None
             manifest: WeightManifest | None = None
+            producer_completed = False
             try:
                 staging.mkdir(mode=0o700)
                 writer = FilesystemArtifactWriter(staging, capacity_check=self._check_capacity)
                 metadata = producer.produce(writer)
+                producer_completed = True
                 manifest, _ = writer.finalize(identity, metadata)
                 artifact_bytes = self._tree_bytes(staging)
                 self._check_capacity(artifact_bytes, 0)
-                os.chmod(staging, 0o555)
+                # Keep staging writable for the atomic rename. The sticky bit
+                # is an internal invalidation marker until publication hardens
+                # the destination.
+                os.chmod(staging, 0o755 | _ARTIFACT_INVALIDATION_MODE)
                 _fsync_directory(staging)
             except HostWeightError as exc:
                 if writer is not None:
@@ -877,7 +1102,7 @@ class FilesystemHostWeightStore:
                 if exc.errno in (errno.ENOSPC, errno.EDQUOT):
                     code = FailureCode.ENOSPC
                     stage = ResolutionStage.CAPACITY
-                elif writer is None:
+                elif writer is None or producer_completed:
                     code = FailureCode.DOMAIN_UNAVAILABLE
                     stage = ResolutionStage.DOMAIN
                 else:
@@ -889,7 +1114,7 @@ class FilesystemHostWeightStore:
                         stage,
                         code,
                         f"artifact production failed: {exc}",
-                        retryable=stage is ResolutionStage.CAPACITY,
+                        retryable=stage in {ResolutionStage.CAPACITY, ResolutionStage.DOMAIN},
                     ),
                 )
             except Exception as exc:
@@ -906,11 +1131,20 @@ class FilesystemHostWeightStore:
                 )
 
             assert manifest is not None
+            publication_error: OSError | None = None
+            publication_containment: dict[str, object] | None = None
+            outcome_uncertain_error: OSError | None = None
+            competing_entry_error: OSError | None = None
             try:
                 with FileLock(self._artifact_lock_path(identity.key), exclusive=True, deadline=None):
                     entry_path = self._entry_path(identity.key)
-                    if entry_path.exists():
-                        existing = WeightManifest.from_dict(_read_json_file(entry_path / _MANIFEST_FILE))
+                    if _path_exists_without_following(entry_path):
+                        try:
+                            existing_document = _read_json_file(entry_path / _MANIFEST_FILE)
+                        except OSError as exc:
+                            competing_entry_error = exc
+                            raise
+                        existing = WeightManifest.from_dict(existing_document)
                         same_semantic_content = (
                             existing.identity.canonical_bytes == manifest.identity.canonical_bytes
                             and existing.artifact_content_sha256 == manifest.artifact_content_sha256
@@ -920,9 +1154,7 @@ class FilesystemHostWeightStore:
                         )
                         if not same_semantic_content:
                             collision = self.quarantine_dir / f"{identity.key}.identity-collision.{uuid.uuid4().hex}"
-                            os.replace(staging, collision)
-                            _fsync_directory(self.quarantine_dir)
-                            _fsync_directory(self.tmp_dir)
+                            _move_artifact_locked(staging, collision)
                             return StoreResult(
                                 StoreStatus.FAILED,
                                 failure=_failure(
@@ -931,22 +1163,73 @@ class FilesystemHostWeightStore:
                                     "the same semantic identity produced different artifact content",
                                 ),
                             )
+                        ready_outcome_authoritative = True
                         self._remove_tree(staging)
+                        self._remove_deny_locked(identity.key)
                     else:
-                        os.replace(staging, entry_path)
-                        _fsync_directory(self.artifacts_dir)
-                        _fsync_directory(self.tmp_dir)
-                    self._remove_deny_locked(identity.key)
+                        published = False
+                        try:
+                            os.replace(staging, entry_path)
+                            published = True
+                            os.chmod(entry_path, 0o555)
+                            _fsync_directory(entry_path)
+                            _fsync_directory(self.tmp_dir)
+                            self._remove_deny_locked(identity.key)
+                            # The destination-parent sync is the filesystem
+                            # publication commit.
+                            _fsync_directory(self.artifacts_dir)
+                            ready_outcome_authoritative = True
+                        except OSError as exc:
+                            publication_error = exc
+                            if published:
+                                try:
+                                    publication_containment = self._contain_failed_publication_locked(identity.key)
+                                except OSError as containment_error:
+                                    outcome_uncertain_error = containment_error
+                                    raise
+                            raise
             except (OSError, ValueError, ManifestValidationError) as exc:
+                if not ready_outcome_authoritative:
+                    self._discard_temp(identity.key, staging)
+                    if competing_entry_error is not None:
+                        return StoreResult(
+                            StoreStatus.FAILED,
+                            failure=_storage_io_failure(
+                                competing_entry_error,
+                                operation=f"failed to inspect competing publication {identity.key}",
+                                details={
+                                    "outcome_uncertain": True,
+                                    "competing_entry": "preserved",
+                                },
+                            ),
+                        )
+                    if outcome_uncertain_error is not None:
+                        assert publication_error is not None
+                        return StoreResult(
+                            StoreStatus.FAILED,
+                            failure=_storage_io_failure(
+                                outcome_uncertain_error,
+                                operation=f"failed to contain outcome-uncertain publication {identity.key}",
+                                details={
+                                    "outcome_uncertain": True,
+                                    "publication_error": _os_error_details(publication_error),
+                                    "containment_error": _os_error_details(outcome_uncertain_error),
+                                },
+                            ),
+                        )
+                    return StoreResult(
+                        StoreStatus.FAILED,
+                        failure=_failure(
+                            ResolutionStage.LIFECYCLE,
+                            FailureCode.PUBLICATION_FAILED,
+                            f"atomic artifact publication failed: {exc}",
+                            details={"containment": publication_containment}
+                            if publication_containment is not None
+                            else None,
+                        ),
+                    )
+                logger.warning("artifact %s was authoritative before a post-authority error: %s", identity.key, exc)
                 self._discard_temp(identity.key, staging)
-                return StoreResult(
-                    StoreStatus.FAILED,
-                    failure=_failure(
-                        ResolutionStage.LIFECYCLE,
-                        FailureCode.PUBLICATION_FAILED,
-                        f"atomic artifact publication failed: {exc}",
-                    ),
-                )
 
             opened = self.lookup(identity, validation=validation, deadline=deadline)
             if opened.status is not StoreStatus.HIT:
@@ -1012,24 +1295,141 @@ class FilesystemHostWeightStore:
 
     def _remove_deny_locked(self, key: str) -> None:
         path = self._deny_path(key)
-        if path.exists():
+        if _path_exists_without_following(path):
             path.unlink()
             _fsync_directory(self.deny_dir)
 
     def _quarantine_locked(self, key: str, *, reason: str) -> Path | None:
         entry = self._entry_path(key)
-        if not entry.exists():
+        if not _path_exists_without_following(entry):
             return None
         destination = self.quarantine_dir / f"{key}.{reason}.{uuid.uuid4().hex}"
-        os.replace(entry, destination)
-        _fsync_directory(self.artifacts_dir)
-        _fsync_directory(self.quarantine_dir)
+        _move_artifact_locked(entry, destination)
         return destination
+
+    def _contain_failed_publication_locked(self, key: str) -> dict[str, object]:
+        """Keep an outcome-uncertain publication from becoming a later HIT."""
+        containment: dict[str, object] = {}
+        marker_error: OSError | None = None
+        try:
+            _mark_artifact_invalidated(self._entry_path(key))
+        except OSError as exc:
+            marker_error = exc
+            containment["invalidation_marker_error"] = _os_error_details(exc)
+        else:
+            containment["invalidation_marker"] = "durable"
+        try:
+            destination = self._quarantine_locked(key, reason="publication_failure")
+        except OSError as quarantine_error:
+            containment["quarantine"] = "failed"
+            containment["quarantine_error"] = _os_error_details(quarantine_error)
+            if marker_error is not None:
+                raise quarantine_error from marker_error
+        else:
+            containment["quarantine"] = "already_absent" if destination is None else "completed"
+        return containment
+
+    def _contain_invalid_after_deny_failure(
+        self,
+        key: str,
+        artifact_lock: FileLock,
+        *,
+        deadline: float | None,
+    ) -> dict[str, object]:
+        """Attempt persistent exclusion when deny-marker publication fails."""
+        containment: dict[str, object] = {}
+
+        entry = self._entry_path(key)
+        entry_fd: int | None = None
+        invalidated_inode: tuple[int, int] | None = None
+        try:
+            entry_fd = os.open(entry, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            entry_stat = os.fstat(entry_fd)
+            invalidated_inode = (entry_stat.st_dev, entry_stat.st_ino)
+            _mark_open_artifact_invalidated(entry_fd, entry)
+        except OSError as exc:
+            containment["invalidation_marker_error"] = _os_error_details(exc)
+        else:
+            containment["invalidation_marker"] = "durable"
+
+        try:
+            try:
+                artifact_lock.close()
+            except OSError as exc:
+                containment["shared_lock_release_error"] = _os_error_details(exc)
+
+            try:
+                exclusive_lock = FileLock(
+                    self._artifact_lock_path(key),
+                    exclusive=True,
+                    deadline=deadline,
+                    nonblocking=deadline is None,
+                )
+            except FileLockTimeoutError as exc:
+                containment["quarantine"] = "deferred_for_active_lease"
+                containment["exclusive_lock_error"] = _os_error_details(exc)
+                return containment
+            except OSError as exc:
+                containment["quarantine"] = "deferred_for_lock_error"
+                containment["exclusive_lock_error"] = _os_error_details(exc)
+                return containment
+
+            try:
+                with exclusive_lock:
+                    if not _path_exists_without_following(entry):
+                        containment["quarantine"] = "already_absent"
+                    elif invalidated_inode is None:
+                        containment["quarantine"] = "deferred_for_unverified_artifact"
+                    else:
+                        current_stat = entry.lstat()
+                        current_inode = (current_stat.st_dev, current_stat.st_ino)
+                        if current_inode != invalidated_inode:
+                            containment["quarantine"] = "already_replaced"
+                        else:
+                            destination = self._quarantine_locked(key, reason="validation_failure")
+                            containment["quarantine"] = "already_absent" if destination is None else "completed"
+            except OSError as exc:
+                containment["quarantine"] = "failed"
+                containment["quarantine_error"] = _os_error_details(exc)
+            return containment
+        finally:
+            if entry_fd is not None:
+                try:
+                    os.close(entry_fd)
+                except OSError as exc:
+                    containment["artifact_fd_close_error"] = _os_error_details(exc)
 
     def _remove_stale_temps_locked(self, key: str) -> None:
         for path in self.tmp_dir.glob(f"{key}.*"):
             self._remove_tree(path)
         _fsync_directory(self.tmp_dir)
+
+    def _remove_cleanup_tombstones_locked(self, key: str) -> None:
+        tombstones = tuple(self.quarantine_dir.glob(f"{key}.cleanup.*"))
+        for tombstone in tombstones:
+            self._remove_tree(tombstone)
+        if tombstones:
+            _fsync_directory(self.quarantine_dir)
+
+    def _repair_quarantine_transitions_locked(self, key: str) -> None:
+        repaired = False
+        for path in self.quarantine_dir.glob(f"{key}.*"):
+            path_stat = path.lstat()
+            if not stat.S_ISDIR(path_stat.st_mode) or not path_stat.st_mode & _ARTIFACT_INVALIDATION_MODE:
+                continue
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            try:
+                mode = stat.S_IMODE(os.fstat(fd).st_mode)
+                _harden_open_directory(
+                    fd,
+                    path,
+                    mode & ~0o222 & ~_ARTIFACT_INVALIDATION_MODE,
+                )
+            finally:
+                os.close(fd)
+            repaired = True
+        if repaired:
+            _fsync_directory(self.quarantine_dir)
 
     def _discard_temp(self, key: str, path: Path) -> None:
         with contextlib.suppress(OSError, FileLockTimeoutError):
@@ -1041,7 +1441,7 @@ class FilesystemHostWeightStore:
     def _remove_tree(path: Path) -> None:
         if path.is_symlink() or path.is_file():
             path.unlink(missing_ok=True)
-        elif path.exists():
+        elif _path_exists_without_following(path):
             for directory, subdirectories, _ in os.walk(path, topdown=False, followlinks=False):
                 for name in subdirectories:
                     child = Path(directory) / name
@@ -1069,23 +1469,9 @@ class FilesystemHostWeightStore:
     def cleanup(self, identity: WeightArtifactIdentity) -> HostWeightFailure | None:
         """Explicitly remove an inactive artifact without waiting for leases."""
         try:
-            build_lock = FileLock(
-                self._build_lock_path(identity.key),
-                exclusive=True,
-                deadline=None,
-                nonblocking=True,
-            )
-        except FileLockTimeoutError:
-            return _failure(
-                ResolutionStage.LIFECYCLE,
-                FailureCode.ACTIVE_BUILD_TIMEOUT,
-                f"artifact {identity.key} has an active builder",
-                retryable=True,
-            )
-        with build_lock:
             try:
-                artifact_lock = FileLock(
-                    self._artifact_lock_path(identity.key),
+                build_lock = FileLock(
+                    self._build_lock_path(identity.key),
                     exclusive=True,
                     deadline=None,
                     nonblocking=True,
@@ -1093,19 +1479,37 @@ class FilesystemHostWeightStore:
             except FileLockTimeoutError:
                 return _failure(
                     ResolutionStage.LIFECYCLE,
-                    FailureCode.ACTIVE_LEASE,
-                    f"artifact {identity.key} has an active lease",
+                    FailureCode.ACTIVE_BUILD_TIMEOUT,
+                    f"artifact {identity.key} has an active builder",
                     retryable=True,
                 )
-            with artifact_lock:
-                entry = self._entry_path(identity.key)
-                if entry.exists():
-                    removal = self.quarantine_dir / f"{identity.key}.cleanup.{uuid.uuid4().hex}"
-                    os.replace(entry, removal)
-                    _fsync_directory(self.artifacts_dir)
-                    self._remove_tree(removal)
-                    _fsync_directory(self.quarantine_dir)
-                self._remove_deny_locked(identity.key)
+            with build_lock:
+                try:
+                    artifact_lock = FileLock(
+                        self._artifact_lock_path(identity.key),
+                        exclusive=True,
+                        deadline=None,
+                        nonblocking=True,
+                    )
+                except FileLockTimeoutError:
+                    return _failure(
+                        ResolutionStage.LIFECYCLE,
+                        FailureCode.ACTIVE_LEASE,
+                        f"artifact {identity.key} has an active lease",
+                        retryable=True,
+                    )
+                with artifact_lock:
+                    self._repair_quarantine_transitions_locked(identity.key)
+                    self._quarantine_locked(identity.key, reason="cleanup")
+                    self._remove_cleanup_tombstones_locked(identity.key)
+                    self._remove_deny_locked(identity.key)
+        except OSError as exc:
+            return _failure(
+                ResolutionStage.LIFECYCLE,
+                FailureCode.QUARANTINE_FAILED,
+                f"failed to clean up artifact {identity.key}: {exc}",
+                retryable=True,
+            )
         return None
 
     def inspect_domain(self) -> DomainInspection:

@@ -1,36 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import gc
+from typing import Any
+
 import numpy as np
 import pytest
 import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
-from tests.helpers.env import DeviceMemoryMonitor
 from tests.helpers.mark import hardware_test
+from tests.helpers.monitor import DeviceMemoryMonitor
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
-AUDIO_MODEL = {
-    "stabilityai/stable-audio-open-1.0": {"cuda": 1500, "rocm": 1500},
+AUDIO_MODEL: dict[str, dict[str, int | None]] = {
+    # The inference peak includes backend workspaces as well as model weights.
+    # On ROCm, large MIOpen workspaces and allocator fragmentation can mask the
+    # resident-weight reduction, so use a conservative floor that still catches
+    # a disabled/no-op layerwise offloader.
+    "stabilityai/stable-audio-open-1.0": {"cuda": 1500, "rocm": 512},
 }
 
-IMAGE_VIDEO_MODELS = {
+IMAGE_VIDEO_MODELS: dict[str, dict[str, int | None]] = {
     "riverclouds/qwen_image_random": {"cuda": 4500, "rocm": None},
     # "Wan-AI/Wan2.2-T2V-A14B-Diffusers": {"cuda": 45000, "rocm": None},
 }
 
-MODELS = {**AUDIO_MODEL, **IMAGE_VIDEO_MODELS}
+MODELS: dict[str, dict[str, int | None]] = {**AUDIO_MODEL, **IMAGE_VIDEO_MODELS}
 
 MODEL_MARKS = {
     "riverclouds/qwen_image_random": pytest.mark.core_model,
     "stabilityai/stable-audio-open-1.0": pytest.mark.full_model,
 }
 
-AUDIO_MODEL_PARAMS = {
+AUDIO_MODEL_PARAMS: dict[str, dict[str, Any]] = {
     "runner_params": {},
     "sampler_params": {},
 }
 
-IMAGE_VIDEO_MODELS_PARAMS = {
+IMAGE_VIDEO_MODELS_PARAMS: dict[str, dict[str, Any]] = {
     "runner_params": {"boundary_ratio": 0.875, "flow_shift": 5.0},
     "sampler_params": {"height": 480, "width": 640, "num_frames": 5},
 }
@@ -55,11 +65,12 @@ def run_inference(
     model_name: str,
     layerwise_offload: bool = False,
     num_inference_steps: int = 3,
-) -> float:
+) -> tuple[float, Any]:
     current_omni_platform.empty_cache()
     device_index = current_omni_platform.current_device()
-    monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
-    monitor.start()
+    with current_omni_platform.device(device_index):
+        free_bytes, total_bytes = current_omni_platform.mem_get_info()
+    initial_used_mb = (total_bytes - free_bytes) / (1024**2)
 
     if model_name in AUDIO_MODEL:
         params = AUDIO_MODEL_PARAMS
@@ -73,22 +84,37 @@ def run_inference(
         # cache_backend="cache_dit",
         **params["runner_params"],
     ) as runner:
+        # Measure steady-state inference memory, not model construction. Enabling
+        # layerwise offload first loads the model and then replaces each block's
+        # device storage with CPU-backed weights.  Monitoring that transition
+        # captures both the original model and temporary staging allocations,
+        # which is not representative of layerwise-offloaded inference.
+        monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
         current_omni_platform.reset_peak_memory_stats()
+        monitor.start()
 
-        # Refer to tests/e2e/offline_inference/test_wan22.py
-        # Use minimal settings for testing
-        output = runner.omni.generate(
-            "A cat sitting on a table",
-            OmniDiffusionSamplingParams(
-                generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(42),
-                guidance_scale=1.0,
-                num_inference_steps=num_inference_steps,
-                **params["sampler_params"],
-            ),
-        )
+        try:
+            # Refer to tests/e2e/offline_inference/test_wan22.py
+            # Use minimal settings for testing
+            output = runner.omni.generate(
+                "A cat sitting on a table",
+                OmniDiffusionSamplingParams(
+                    generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(42),
+                    guidance_scale=1.0,
+                    num_inference_steps=num_inference_steps,
+                    **params["sampler_params"],
+                ),
+            )
+        finally:
+            monitor.stop()
 
-    peak = monitor.peak_used_mb
-    monitor.stop()
+    # DeviceMemoryMonitor reports absolute device usage. Subtract this run's
+    # starting usage so process-wide compiler/workspace caches retained from a
+    # previous run do not make the second measurement order-dependent.
+    peak = max(0.0, monitor.peak_used_mb - initial_used_mb)
+
+    gc.collect()
+    current_omni_platform.empty_cache()
 
     return peak, output
 
@@ -140,10 +166,13 @@ def test_layerwise_offload_diffusion_model(model_name: str):
 
     if expected_saved_memory is None:
         pytest.skip(f"Threshold not defined for {platform} on {model_name}")
+    assert expected_saved_memory is not None
 
     # Verify that layerwise offloading significantly reduces memory usage
-    # Passes only if the actual savings exceeds the expected savings
-    assert layerwise_offload_peak_memory + expected_saved_memory < no_offload_peak_memory, (
+    # Passes only if the actual savings meets the expected savings
+    actual_saved_memory = no_offload_peak_memory - layerwise_offload_peak_memory
+    assert layerwise_offload_peak_memory + expected_saved_memory <= no_offload_peak_memory, (
         f"Layerwise offload peak memory {layerwise_offload_peak_memory} MB "
-        f"should be significantly less than no offload peak memory {no_offload_peak_memory} MB"
+        f"should be at least {expected_saved_memory} MB less than no offload peak memory "
+        f"{no_offload_peak_memory} MB (actual savings: {actual_saved_memory} MB)"
     )

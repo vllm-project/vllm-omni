@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Typed store and end-to-end resolution outcomes."""
+"""Typed store, resolution, and post-load publication outcomes."""
 
 from __future__ import annotations
 
@@ -60,6 +60,17 @@ class ResolutionOutcome(str, Enum):
     FAILED = "failed"
 
 
+class PostLoadPublicationOutcome(str, Enum):
+    """Terminal outcome for one explicit post-load publication attempt."""
+
+    RUNTIME_DISABLED = "runtime_disabled"
+    POLICY_DISABLED = "policy_disabled"
+    ALREADY_PRESENT = "already_present"
+    PUBLISHED = "published"
+    JOINED = "joined"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True)
 class ResolutionAttempt:
     stage: ResolutionStage
@@ -108,9 +119,38 @@ class HostWeightResolution:
             raise ValueError("resolution outcome has inconsistent lease ownership")
 
 
+@dataclass(frozen=True)
+class PostLoadPublicationReport:
+    operation_id: str
+    outcome: PostLoadPublicationOutcome
+    identity_digest: str | None
+    elapsed_seconds: float
+    failure: HostWeightFailure | None = None
+
+    def __post_init__(self) -> None:
+        if not self.operation_id:
+            raise ValueError("post-load publication report requires an operation_id")
+        if not isinstance(self.outcome, PostLoadPublicationOutcome):
+            raise ValueError("post-load publication outcome must use PostLoadPublicationOutcome")
+        if self.identity_digest is not None and not self.identity_digest:
+            raise ValueError("post-load publication identity digest must not be empty")
+        requires_identity = self.outcome not in {
+            PostLoadPublicationOutcome.RUNTIME_DISABLED,
+            PostLoadPublicationOutcome.POLICY_DISABLED,
+        }
+        if requires_identity != (self.identity_digest is not None):
+            raise ValueError("post-load publication identity ownership is inconsistent")
+        if not math.isfinite(self.elapsed_seconds) or self.elapsed_seconds < 0:
+            raise ValueError("post-load publication elapsed_seconds must be finite and non-negative")
+        if (self.outcome is PostLoadPublicationOutcome.FAILED) != (self.failure is not None):
+            raise ValueError("post-load publication failure ownership is inconsistent")
+
+
 __all__ = [
     "AttemptResult",
     "HostWeightResolution",
+    "PostLoadPublicationOutcome",
+    "PostLoadPublicationReport",
     "ResolutionAttempt",
     "ResolutionOutcome",
     "ResolutionReport",

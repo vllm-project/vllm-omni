@@ -124,8 +124,8 @@ When `execute_model_batch` returns a `COMPUTE_DONE` with a single `async_output_
 1. **Drain Before Memory Release (`drain_async_outputs` / `_ASYNC_OUTPUT_DRAIN_TIMEOUT_S`)**:
    When workers transition into sleep states (`handle_sleep_task`) or invoke memory-releasing methods, `WorkerProc.drain_async_outputs()` blocks up to `_ASYNC_OUTPUT_DRAIN_TIMEOUT_S` (10.0s) until all in-flight background D2H/SHM packing tasks finish. This acts as a synchronization barrier preventing worker sleep cycles from releasing device tensors while the side CUDA stream is still actively reading them. Draining typically completes within 10–50 ms under normal operation.
 
-2. **Timeout Diagnostics (`_ASYNC_OUTPUT_TIMEOUT`)**:
-   The engine waits for `wait_output_ready()` with a timeout of `_ASYNC_OUTPUT_TIMEOUT` (30.0s). If a timeout occurs, the executor logs detailed diagnostic bookkeeping (pending futures, cached outputs, and batch split maps) to identify whether the stall occurred in the worker, pump, or waiter.
+2. **Timeout Diagnostics (`_async_output_timeout()`)**:
+   The engine waits for `wait_output_ready()` with a timeout of `_async_output_timeout()` — 600.0s by default, overridable per run with the `VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT` environment variable (a non-numeric or non-positive value is ignored with a warning and the default applies, since this resolves on the request path). If a timeout occurs, the executor logs detailed diagnostic bookkeeping (pending futures, cached outputs, and batch split maps) to identify whether the stall occurred in the worker, pump, or waiter. The packing itself takes milliseconds, but the wait is queued behind the step's GPU work, so its wall-clock duration tracks step time; the bound is generous because a hung engine is surfaced by the worker monitor and `check_health()`, not by this timeout.
 
 3. **Queue Serialization & Atomic Future Resolution**:
    - `result_mq` writes are serialized with `_result_mq_lock` to protect the single-writer `MessageQueue` against concurrent writes from the worker main loop (`COMPUTE_DONE`) and background thread (`OUTPUT_READY`).

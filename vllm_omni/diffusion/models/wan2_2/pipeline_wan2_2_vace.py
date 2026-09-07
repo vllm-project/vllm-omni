@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 VACE (Video Creation and Editing) Pipeline for WAN models.
@@ -16,18 +16,18 @@ determined by which inputs are provided (no explicit mode flag):
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import replace
+from copy import copy
 
 import PIL.Image
 import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     Wan22Pipeline,
+    load_wan_weights_with_optional_gate,
     retrieve_latents,
 )
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
@@ -198,7 +198,10 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
     ):
         # VACE defaults to flow_shift=3.0 for 480p (base WAN T2V uses 5.0 for 720p)
         if od_config.flow_shift is None:
-            od_config = replace(od_config, flow_shift=3.0)
+            # Preserve runtime-only config provenance (including compact
+            # offload aliases) instead of rerunning dataclass __post_init__.
+            od_config = copy(od_config)
+            od_config.flow_shift = 3.0
 
         super().__init__(od_config=od_config, prefix=prefix)
 
@@ -747,6 +750,4 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights using AutoWeightsLoader for vLLM integration."""
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return load_wan_weights_with_optional_gate(self, weights)

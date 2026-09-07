@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from functools import partial
@@ -35,6 +35,7 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_sampler import random_sample
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
@@ -566,8 +567,8 @@ class CosyVoice3Model(
         return float(value)
 
     @staticmethod
-    def _multinomial_sample(probs: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
-        return torch.multinomial(probs, 1, replacement=True, generator=generator).reshape(())
+    def _random_sample_one(probs: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
+        return random_sample(probs.unsqueeze(0), {} if generator is None else {0: generator}).reshape(())
 
     @classmethod
     def _nucleus_sample_one(
@@ -602,7 +603,7 @@ class CosyVoice3Model(
         # First token always passes (cum_before[0] = 0 < top_p for any top_p > 0),
         # so ``weights`` is guaranteed to have at least one nonzero entry. The
         # final ``.item()`` is the ONLY D2H sync per call.
-        sample_idx = torch.multinomial(weights, 1, replacement=True, generator=generator)
+        sample_idx = cls._random_sample_one(weights, generator=generator)
         return int(sorted_idx[sample_idx].item())
 
     @classmethod
@@ -632,9 +633,14 @@ class CosyVoice3Model(
             rep_num = int((recent == top_id).sum().item())
             if rep_num >= win_size * tau_r:
                 weighted_scores = weighted_scores.clone()
+                original_score = weighted_scores[top_id].clone()
                 weighted_scores[top_id] = float("-inf")
-                fallback_probs = weighted_scores.softmax(dim=0)
-                top_id = int(cls._multinomial_sample(fallback_probs, generator=generator).item())
+                weighted_scores[top_id] = torch.where(
+                    torch.isfinite(weighted_scores).any(),
+                    weighted_scores[top_id],
+                    original_score,
+                )
+                top_id = int(cls._random_sample_one(weighted_scores.softmax(dim=0), generator=generator).item())
         return top_id
 
     def _cosyvoice3_ras_enabled(self, sampling_metadata: SamplingMetadata) -> bool:
@@ -677,6 +683,10 @@ class CosyVoice3Model(
             logits.masked_fill_(sampling_metadata.allowed_token_ids_mask, float("-inf"))
         for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
             logits = processor.apply(logits)
+        finite_logits = torch.isfinite(logits)
+        if not finite_logits.any(dim=-1).all().item():
+            raise ValueError("CosyVoice3 sampling received a row with no finite logits")
+        logits.masked_fill_(~finite_logits, float("-inf"))
 
         sampling_cfg = dict(self.config.llm.get("sampling", {}))
         default_top_p = float(sampling_cfg.get("top_p", 0.8))

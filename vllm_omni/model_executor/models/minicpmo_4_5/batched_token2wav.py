@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Strict, state-explicit batching for MiniCPM-o 4.5 Token2wav."""
 
 from __future__ import annotations
@@ -7,7 +7,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -94,6 +94,17 @@ def _autocast_disabled(device: torch.device):
         return nullcontext()
 
 
+def _token2wav_sdpa_context(device: torch.device):
+    if device.type != "npu":
+        return nullcontext()
+
+    from vllm_omni.platforms.npu.models.step_audio2_token2wav import (
+        npu_token2wav_sdpa_context,
+    )
+
+    return npu_token2wav_sdpa_context()
+
+
 def tensor_signature(value: torch.Tensor) -> tuple[tuple[int, ...], str, str]:
     return tuple(value.shape), str(value.dtype), value.device.type
 
@@ -152,6 +163,7 @@ class BatchedToken2Wav(nn.Module):
         connector_config: Mapping[str, int] | None = None,
         hift_graph_config: Mapping[str, Any] | None = None,
         cfm_graph_config: Mapping[str, Any] | None = None,
+        bfloat16_attention_cache: bool = False,
     ):
         super().__init__()
         self._token2wav = token2wav
@@ -185,6 +197,10 @@ class BatchedToken2Wav(nn.Module):
             del speech, source
             torch.accelerator.empty_cache()
         self.float16 = bool(token2wav.float16)
+        self._estimator_att_compute_dtype = torch.float16 if self.float16 else torch.float32
+        self._estimator_att_cache_dtype = (
+            torch.bfloat16 if bfloat16_attention_cache else self._estimator_att_compute_dtype
+        )
         self.n_timesteps = int(token2wav.n_timesteps)
         self.mel_cache_len = int(token2wav.mel_cache_len)
         self.source_cache_len = int(token2wav.source_cache_len)
@@ -310,9 +326,7 @@ class BatchedToken2Wav(nn.Module):
         return max(1, int(stride)) if stride is not None else 2
 
     def _max_encode_token_frames(self, states: list[BatchedToken2WavState]) -> int:
-        att = None
-        if states:
-            att = self._stack_flow_cache(states).get("conformer_att_cache")
+        att = states[0].flow_cache.get("conformer_att_cache") if states else None
         offset1 = int(att.shape[3] // 2) if att is not None else 0
         lookahead = self._pre_lookahead_len() or 0
         return relpos_encode_token_budget(
@@ -382,8 +396,10 @@ class BatchedToken2Wav(nn.Module):
         cond: torch.Tensor,
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
+        attn_mask: torch.Tensor | None = None,
+        valid_lengths: list[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self._trt_stepper is not None:
+        if self._trt_stepper is not None and valid_lengths is None:
             out, new_cnn, new_att = self._trt_stepper.step(
                 x=x,
                 mu=mu,
@@ -399,31 +415,138 @@ class BatchedToken2Wav(nn.Module):
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
         estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
         cnn_out, att_out = self._estimator_buffers(estimator, estimator_input, att_cache)
-        if self._cfm_graph_wrapper is not None:
-            if cnn_cache is None:
-                cnn_cache = torch.zeros_like(cnn_out)
-            if att_cache is None:
-                att_cache = estimator_input.new_zeros(att_out.shape[:3] + (0,) + att_out.shape[4:])
+        old_cnn: Any = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
+        old_att: Any = att_cache if att_cache is not None else [None] * len(estimator.blocks)
+        if isinstance(old_att, torch.Tensor) and old_att.dtype != estimator_input.dtype:
+            old_att = old_att.to(dtype=estimator_input.dtype)
+        if self._cfm_graph_wrapper is not None and valid_lengths is None:
+            graph_cnn = torch.zeros_like(cnn_out) if cnn_cache is None else cnn_cache
+            graph_att = (
+                estimator_input.new_zeros(att_out.shape[:3] + (0,) + att_out.shape[4:])
+                if att_cache is None
+                else old_att
+            )
             return self._cfm_graph_wrapper.replay(
                 estimator_input,
                 time_embedding,
-                cnn_cache,
-                att_cache,
+                graph_cnn,
+                graph_att,
                 cnn_out,
                 att_out,
             )
-        old_cnn: Any = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
-        old_att: Any = att_cache if att_cache is not None else [None] * len(estimator.blocks)
-        result = estimator.blocks_forward_chunk(
-            estimator_input,
-            time_embedding,
-            None,
-            old_cnn,
-            old_att,
-            cnn_out,
-            att_out,
-        )
+        if valid_lengths is not None:
+            if not hasattr(estimator, "in_proj"):
+                raise RuntimeError('MiniCPMO45Code2WavBatchError {"reason":"ragged_kernel_unavailable"}')
+            result = self._blocks_forward_chunk_ragged(
+                estimator,
+                estimator_input,
+                time_embedding,
+                attn_mask,
+                old_cnn,
+                old_att,
+                cnn_out,
+                att_out,
+                valid_lengths,
+            )
+        else:
+            result = estimator.blocks_forward_chunk(
+                estimator_input,
+                time_embedding,
+                attn_mask,
+                old_cnn,
+                old_att,
+                cnn_out,
+                att_out,
+            )
         return result, cnn_out, att_out
+
+    @staticmethod
+    def _gather_causal_cache(
+        history: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        width: int,
+    ) -> torch.Tensor:
+        indices = valid_lengths[:, None] + torch.arange(width, device=history.device)[None, :]
+        return history.gather(
+            2,
+            indices[:, None, :].expand(-1, int(history.shape[1]), -1),
+        )
+
+    def _blocks_forward_chunk_ragged(
+        self,
+        estimator: nn.Module,
+        estimator_input: torch.Tensor,
+        time_embedding: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+        cnn_cache: Any,
+        att_cache: Any,
+        cnn_cache_buffer: torch.Tensor,
+        att_cache_buffer: torch.Tensor,
+        valid_lengths: list[int],
+    ) -> torch.Tensor:
+        """Run one padded DiT batch while capturing exact per-row CNN state."""
+        lengths = torch.tensor(
+            (*valid_lengths, *valid_lengths),
+            device=estimator_input.device,
+            dtype=torch.long,
+        )
+        x = estimator.in_proj(estimator_input.transpose(1, 2))
+        for block_index, block in enumerate(estimator.blocks):
+            (
+                shift_msa,
+                scale_msa,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+                shift_conv,
+                scale_conv,
+                gate_conv,
+            ) = block.adaLN_modulation(time_embedding).chunk(9, dim=-1)
+
+            normalized = block.norm1(x) * (1 + scale_msa) + shift_msa
+            x_att, new_att = block.attn.forward_chunk(
+                normalized,
+                att_cache[block_index],
+                attn_mask,
+            )
+            x = x + gate_msa * x_att
+
+            conv_input = block.norm3(x) * (1 + scale_conv) + shift_conv
+            old_cnn = cnn_cache[block_index]
+            if old_cnn is None:
+                width = int(block.conv.block[1].causal_padding[0])
+                old_cnn = conv_input.new_zeros(
+                    (
+                        int(conv_input.shape[0]),
+                        int(block.conv.in_channels + block.conv.out_channels),
+                        width,
+                    )
+                )
+            old_cnn1, old_cnn2 = old_cnn.split((block.conv.in_channels, block.conv.out_channels), dim=1)
+
+            conv1_input = block.conv.block[0](conv_input)
+            conv1_output, _ = block.conv.block[1].forward_chunk(conv1_input, old_cnn1)
+            new_cnn1 = self._gather_causal_cache(
+                torch.cat((old_cnn1, conv1_input), dim=2),
+                lengths,
+                int(old_cnn1.shape[2]),
+            )
+
+            conv2_input = block.conv.block[2:6](conv1_output)
+            conv2_output, _ = block.conv.block[6].forward_chunk(conv2_input, old_cnn2)
+            new_cnn2 = self._gather_causal_cache(
+                torch.cat((old_cnn2, conv2_input), dim=2),
+                lengths,
+                int(old_cnn2.shape[2]),
+            )
+            x = x + gate_conv * block.conv.block[7](conv2_output)
+            x = x + gate_mlp * block.mlp(block.norm2(x) * (1 + scale_mlp) + shift_mlp)
+
+            cnn_cache_buffer[block_index].copy_(torch.cat((new_cnn1, new_cnn2), dim=1))
+            att_cache_buffer[block_index][:, :, : int(new_att.shape[2]), :].copy_(new_att)
+
+        return estimator.final_layer(x, time_embedding).transpose(1, 2)
 
     def _decode_cfm(
         self,
@@ -433,7 +556,12 @@ class BatchedToken2Wav(nn.Module):
         *,
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        valid_lengths: list[int] | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | list[torch.Tensor],
+    ]:
         decoder = self.flow.decoder
         estimator = decoder.estimator
         batch_size = int(mu.shape[0])
@@ -458,36 +586,114 @@ class BatchedToken2Wav(nn.Module):
         mu_cfg = torch.cat((mu, torch.zeros_like(mu)), dim=0)
         speakers_cfg = torch.cat((speakers, torch.zeros_like(speakers)), dim=0)
         cond_cfg = torch.cat((cond, torch.zeros_like(cond)), dim=0)
-        next_cnn: list[torch.Tensor] = []
-        next_att: list[torch.Tensor] = []
-        dt = timeline[1] - timeline[0]
-        for step in range(self.n_timesteps):
-            old_cnn = cnn_cache[step] if cnn_cache is not None else None
-            old_att = att_cache[step] if att_cache is not None else None
-            estimate, step_cnn, step_att = self._estimator_step(
-                estimator,
-                x=torch.cat((x, x), dim=0),
-                mu=mu_cfg,
-                time=torch.cat((time, time), dim=0),
-                speakers=speakers_cfg,
-                cond=cond_cfg,
-                cnn_cache=old_cnn,
-                att_cache=old_att,
+        attn_mask = None
+        if valid_lengths is not None:
+            if len(valid_lengths) != batch_size:
+                raise ValueError(f"valid length count {len(valid_lengths)} != batch {batch_size}")
+            cfg_lengths = torch.tensor(
+                (*valid_lengths, *valid_lengths),
+                device=mu.device,
             )
-            conditional, unconditional = estimate.split(batch_size, dim=0)
-            velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional
-            x = x + dt * velocity
-            time = time + dt
-            if step + 1 < self.n_timesteps:
-                dt = timeline[step + 2] - time[0]
-            next_cnn.append(step_cnn)
-            next_att.append(step_att)
-        return x, torch.stack(next_cnn), torch.stack(next_att)
+            positions = torch.arange(int(mu.shape[2]), device=mu.device)
+            valid_queries = positions.unsqueeze(0) < cfg_lengths.unsqueeze(1)
+            current_keys = valid_queries.unsqueeze(1).expand(-1, int(mu.shape[2]), -1)
+            old_keys = torch.ones(
+                (2 * batch_size, int(mu.shape[2]), offset),
+                dtype=torch.bool,
+                device=mu.device,
+            )
+            attn_mask = valid_queries.unsqueeze(2) & torch.cat((current_keys, old_keys), dim=2)
+        next_cnn: list[torch.Tensor] = []
+        next_att_cache: torch.Tensor | None = None
+        ragged_att_cache: list[torch.Tensor] | None = None
+        dt = timeline[1] - timeline[0]
+        with _token2wav_sdpa_context(mu.device):
+            for step in range(self.n_timesteps):
+                old_cnn = cnn_cache[step] if cnn_cache is not None else None
+                old_att = att_cache[step] if att_cache is not None else None
+                estimate, step_cnn, step_att = self._estimator_step(
+                    estimator,
+                    x=torch.cat((x, x), dim=0),
+                    mu=mu_cfg,
+                    time=torch.cat((time, time), dim=0),
+                    speakers=speakers_cfg,
+                    cond=cond_cfg,
+                    cnn_cache=old_cnn,
+                    att_cache=old_att,
+                    attn_mask=attn_mask,
+                    valid_lengths=valid_lengths,
+                )
+                conditional, unconditional = estimate.split(batch_size, dim=0)
+                velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional
+                x = x + dt * velocity
+                time = time + dt
+                if step + 1 < self.n_timesteps:
+                    dt = timeline[step + 2] - time[0]
+                next_cnn.append(step_cnn)
+                if valid_lengths is not None:
+                    if ragged_att_cache is None:
+                        ragged_att_cache = [
+                            torch.empty(
+                                (
+                                    self.n_timesteps,
+                                    int(step_att.shape[0]),
+                                    2,
+                                    int(step_att.shape[2]),
+                                    valid_length + offset,
+                                    int(step_att.shape[4]),
+                                ),
+                                device=step_att.device,
+                                dtype=self._estimator_att_cache_dtype,
+                            )
+                            for valid_length in valid_lengths
+                        ]
+                    current_width = int(mu.shape[2])
+                    for row, (valid_length, row_cache) in enumerate(zip(valid_lengths, ragged_att_cache, strict=True)):
+                        for cfg_row, source_row in enumerate((row, batch_size + row)):
+                            row_cache[step, :, cfg_row, :, :valid_length].copy_(
+                                step_att[:, source_row, :, :valid_length]
+                            )
+                            if offset:
+                                row_cache[step, :, cfg_row, :, valid_length:].copy_(
+                                    step_att[:, source_row, :, current_width:]
+                                )
+                    del step_att
+                    continue
+                if next_att_cache is None:
+                    next_att_cache = torch.empty(
+                        (self.n_timesteps, *step_att.shape),
+                        device=step_att.device,
+                        dtype=self._estimator_att_cache_dtype,
+                    )
+                next_att_cache[step].copy_(step_att)
+                del step_att
+        if ragged_att_cache is not None:
+            return x, torch.stack(next_cnn), ragged_att_cache
+        assert next_att_cache is not None
+        return x, torch.stack(next_cnn), next_att_cache
 
-    @staticmethod
-    def _split_flow_cache(cache: dict[str, torch.Tensor], batch_size: int) -> list[dict[str, torch.Tensor]]:
+    def _split_flow_cache(self, cache: dict[str, torch.Tensor], batch_size: int) -> list[dict[str, torch.Tensor]]:
         result: list[dict[str, torch.Tensor]] = []
         for row in range(batch_size):
+            estimator_att = cache["estimator_att_cache"]
+            if estimator_att.dtype == self._estimator_att_cache_dtype:
+                request_att = torch.cat(
+                    (
+                        estimator_att[:, :, row : row + 1],
+                        estimator_att[:, :, batch_size + row : batch_size + row + 1],
+                    ),
+                    dim=2,
+                ).detach()
+            else:
+                request_shape = list(estimator_att.shape)
+                request_shape[2] = 2
+                request_att = torch.empty(
+                    request_shape,
+                    device=estimator_att.device,
+                    dtype=self._estimator_att_cache_dtype,
+                )
+                request_att[:, :, 0:1].copy_(estimator_att[:, :, row : row + 1])
+                request_att[:, :, 1:2].copy_(estimator_att[:, :, batch_size + row : batch_size + row + 1])
             result.append(
                 {
                     "conformer_cnn_cache": cache["conformer_cnn_cache"][row : row + 1].detach().clone(),
@@ -499,29 +705,23 @@ class BatchedToken2Wav(nn.Module):
                         ),
                         dim=2,
                     ).detach(),
-                    "estimator_att_cache": torch.cat(
-                        (
-                            cache["estimator_att_cache"][:, :, row : row + 1],
-                            cache["estimator_att_cache"][:, :, batch_size + row : batch_size + row + 1],
-                        ),
-                        dim=2,
-                    ).detach(),
+                    "estimator_att_cache": request_att,
                 }
             )
         return result
 
-    @staticmethod
-    def _stack_flow_cache(states: list[BatchedToken2WavState]) -> dict[str, torch.Tensor]:
+    def _stack_flow_cache(self, states: list[BatchedToken2WavState]) -> dict[str, torch.Tensor]:
         flows = [state.flow_cache for state in states]
         conditional_cnn = [flow["estimator_cnn_cache"][:, :, 0:1] for flow in flows]
         unconditional_cnn = [flow["estimator_cnn_cache"][:, :, 1:2] for flow in flows]
         conditional_att = [flow["estimator_att_cache"][:, :, 0:1] for flow in flows]
         unconditional_att = [flow["estimator_att_cache"][:, :, 1:2] for flow in flows]
+        estimator_att = torch.cat((*conditional_att, *unconditional_att), dim=2)
         return {
             "conformer_cnn_cache": torch.cat([flow["conformer_cnn_cache"] for flow in flows], dim=0),
             "conformer_att_cache": torch.cat([flow["conformer_att_cache"] for flow in flows], dim=1),
             "estimator_cnn_cache": torch.cat((*conditional_cnn, *unconditional_cnn), dim=2),
-            "estimator_att_cache": torch.cat((*conditional_att, *unconditional_att), dim=2),
+            "estimator_att_cache": estimator_att,
         }
 
     def setup_batch(
@@ -729,3 +929,188 @@ class BatchedToken2Wav(nn.Module):
         ]
         audios = [emitted[row].reshape(-1).to(dtype=torch.float32) for row in range(batch_size)]
         return audios, next_states
+
+    @staticmethod
+    def _require_complete_ragged_outputs(
+        audios: list[torch.Tensor | None],
+        next_states: list[BatchedToken2WavState | None],
+    ) -> tuple[list[torch.Tensor], list[BatchedToken2WavState]]:
+        missing_audio_rows = [row for row, audio in enumerate(audios) if audio is None]
+        missing_state_rows = [row for row, state in enumerate(next_states) if state is None]
+        if missing_audio_rows or missing_state_rows:
+            raise RuntimeError(
+                "MiniCPMO45Code2WavBatchError "
+                f'{{"reason":"incomplete_ragged_output","audio_rows":{missing_audio_rows},'
+                f'"state_rows":{missing_state_rows}}}'
+            )
+        return (
+            cast(list[torch.Tensor], audios),
+            cast(list[BatchedToken2WavState], next_states),
+        )
+
+    def decode_ragged_batch(
+        self,
+        tokens: list[torch.Tensor],
+        features: PromptFeatures,
+        states: list[BatchedToken2WavState],
+        *,
+        last_chunks: list[bool],
+    ) -> tuple[list[torch.Tensor], list[BatchedToken2WavState]]:
+        batch_size = len(tokens)
+        if batch_size != len(states) or batch_size != len(last_chunks):
+            raise ValueError("ragged token, state, and final-flag batches must have the same size")
+        if batch_size == 0:
+            return [], []
+
+        lookahead = self._pre_lookahead_len()
+        for row, (row_tokens, last_chunk) in enumerate(zip(tokens, last_chunks, strict=True)):
+            num_frames = int(row_tokens.numel())
+            if lookahead is not None and not last_chunk and num_frames <= lookahead:
+                raise RuntimeError(
+                    "MiniCPMO45Code2WavBatchError "
+                    f'{{"reason":"chunk_below_lookahead_window","row":{row},'
+                    f'"frames":{num_frames},"minimum":{lookahead + 1}}}'
+                )
+
+        max_frames = self._max_encode_token_frames(states)
+        if any(int(row_tokens.numel()) > max_frames for row_tokens in tokens):
+            # decode_batch owns the RelPos-safe encoder slicing used by
+            # non-async Talker dumps. Preserve that path for overlong rows;
+            # ordinary short duplex chunks continue through one padded DiT.
+            exact_groups: dict[tuple[int, bool], list[int]] = {}
+            for row, (row_tokens, last_chunk) in enumerate(zip(tokens, last_chunks, strict=True)):
+                exact_groups.setdefault((int(row_tokens.numel()), last_chunk), []).append(row)
+            audios: list[torch.Tensor | None] = [None] * batch_size
+            next_states: list[BatchedToken2WavState | None] = [None] * batch_size
+            for (_, last_chunk), rows in exact_groups.items():
+                group_audio, group_states = self.decode_batch(
+                    torch.stack([tokens[row] for row in rows], dim=0),
+                    features,
+                    [states[row] for row in rows],
+                    last_chunk=last_chunk,
+                )
+                for group_row, row in enumerate(rows):
+                    audios[row] = group_audio[group_row]
+                    next_states[row] = group_states[group_row]
+            return self._require_complete_ragged_outputs(audios, next_states)
+        encoder_groups: dict[tuple[int, bool], list[int]] = {}
+        for row, (row_tokens, last_chunk) in enumerate(zip(tokens, last_chunks, strict=True)):
+            encoder_groups.setdefault((int(row_tokens.numel()), last_chunk), []).append(row)
+
+        hidden_rows: list[torch.Tensor | None] = [None] * batch_size
+        conformer_cnn_rows: list[torch.Tensor | None] = [None] * batch_size
+        conformer_att_rows: list[torch.Tensor | None] = [None] * batch_size
+        for (_, last_chunk), rows in encoder_groups.items():
+            group_states = [states[row] for row in rows]
+            group_cache = self._stack_flow_cache(group_states)
+            group_tokens = torch.stack([tokens[row] for row in rows], dim=0)
+            with self._autocast(group_tokens.device):
+                hidden, conformer_cnn, conformer_att = self._encode_chunk(
+                    group_tokens,
+                    last_chunk=last_chunk,
+                    cnn_cache=group_cache["conformer_cnn_cache"],
+                    att_cache=group_cache["conformer_att_cache"],
+                )
+            for group_row, row in enumerate(rows):
+                hidden_rows[row] = hidden[group_row : group_row + 1]
+                conformer_cnn_rows[row] = conformer_cnn[group_row : group_row + 1]
+                conformer_att_rows[row] = conformer_att[:, group_row : group_row + 1]
+
+        missing_hidden_rows = [row for row, value in enumerate(hidden_rows) if value is None]
+        if missing_hidden_rows:
+            raise RuntimeError(
+                f'MiniCPMO45Code2WavBatchError {{"reason":"incomplete_encoder_output","rows":{missing_hidden_rows}}}'
+            )
+        resolved_hidden = cast(list[torch.Tensor], hidden_rows)
+        hidden_lengths = [int(value.shape[1]) for value in resolved_hidden]
+        max_hidden_length = max(hidden_lengths)
+        padded_hidden = resolved_hidden[0].new_zeros((batch_size, max_hidden_length, int(resolved_hidden[0].shape[2])))
+        for row, hidden in enumerate(resolved_hidden):
+            padded_hidden[row, : int(hidden.shape[1])].copy_(hidden[0])
+
+        flow_cache = self._stack_flow_cache(states)
+        speakers = features.speaker_embedding.expand(batch_size, -1)
+        with self._autocast(padded_hidden.device):
+            projected_speakers = self.flow.spk_embed_affine_layer(F.normalize(speakers, dim=1))
+            cond = torch.zeros_like(padded_hidden).transpose(1, 2).contiguous()
+            chunk_mel, estimator_cnn, estimator_att = self._decode_cfm(
+                padded_hidden.transpose(1, 2).contiguous(),
+                projected_speakers,
+                cond,
+                cnn_cache=flow_cache["estimator_cnn_cache"],
+                att_cache=flow_cache["estimator_att_cache"],
+                valid_lengths=hidden_lengths,
+            )
+
+        prompt_len = int(features.mels.shape[1])
+        assert isinstance(estimator_att, list)
+        new_flow: list[dict[str, torch.Tensor]] = []
+        for row, row_estimator_att in enumerate(estimator_att):
+            conformer_cnn = conformer_cnn_rows[row]
+            conformer_att = conformer_att_rows[row]
+            assert conformer_cnn is not None and conformer_att is not None
+            if row_estimator_att.shape[4] > prompt_len + 100:
+                row_estimator_att = torch.cat(
+                    (
+                        row_estimator_att[..., :prompt_len, :],
+                        row_estimator_att[..., -100:, :],
+                    ),
+                    dim=4,
+                )
+            if conformer_att.shape[3] > prompt_len + 100:
+                conformer_att = torch.cat(
+                    (
+                        conformer_att[..., :prompt_len, :],
+                        conformer_att[..., -100:, :],
+                    ),
+                    dim=3,
+                )
+            new_flow.append(
+                {
+                    "conformer_cnn_cache": conformer_cnn.detach().clone(),
+                    "conformer_att_cache": conformer_att.detach().clone(),
+                    "estimator_cnn_cache": torch.cat(
+                        (
+                            estimator_cnn[:, :, row : row + 1],
+                            estimator_cnn[:, :, batch_size + row : batch_size + row + 1],
+                        ),
+                        dim=2,
+                    ).detach(),
+                    "estimator_att_cache": row_estimator_att,
+                }
+            )
+
+        audios: list[torch.Tensor | None] = [None] * batch_size
+        next_states: list[BatchedToken2WavState | None] = [None] * batch_size
+        vocoder_groups: dict[tuple[int, bool], list[int]] = {}
+        for row, last_chunk in enumerate(last_chunks):
+            vocoder_groups.setdefault((hidden_lengths[row], last_chunk), []).append(row)
+        for (hidden_length, last_chunk), rows in vocoder_groups.items():
+            old_mel = torch.cat([states[row].hift_cache["mel"] for row in rows], dim=0)
+            old_source = torch.cat([states[row].hift_cache["source"] for row in rows], dim=0)
+            old_speech = torch.cat([states[row].hift_cache["speech"] for row in rows], dim=0)
+            group_mel = torch.cat(
+                [chunk_mel[row : row + 1, :, :hidden_length] for row in rows],
+                dim=0,
+            )
+            mel = torch.cat((old_mel, group_mel), dim=2)
+            speech, source = self._hift_inference(mel, old_source)
+            if old_speech.shape[-1] > 0:
+                window = self.speech_window.to(device=speech.device, dtype=speech.dtype)
+                speech = self._fade_in_out(speech, old_speech, window)
+            next_hift = {
+                "mel": mel[..., -self.mel_cache_len :].detach(),
+                "source": source[..., -self.source_cache_len :].detach(),
+                "speech": speech[..., -self.source_cache_len :].detach(),
+            }
+            emitted = speech if last_chunk else speech[..., : -self.source_cache_len]
+            for group_row, row in enumerate(rows):
+                audios[row] = emitted[group_row].reshape(-1).to(dtype=torch.float32)
+                next_states[row] = BatchedToken2WavState(
+                    flow_cache=new_flow[row],
+                    hift_cache={
+                        name: value[group_row : group_row + 1].detach().clone() for name, value in next_hift.items()
+                    },
+                )
+
+        return self._require_complete_ragged_outputs(audios, next_states)

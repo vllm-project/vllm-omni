@@ -27,6 +27,7 @@ from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
     iter_custom_voice_profiles,
     load_validated_profile_tensors,
+    validate_qwen3_tts_profile,
 )
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
@@ -527,7 +528,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             tensors = load_validated_profile_tensors(
                 profile,
                 expected_model_type="qwen3_tts",
-                qwen3_embedding_dim=expected_dim,
+                validate_profile=lambda profile, tensors: validate_qwen3_tts_profile(
+                    profile,
+                    tensors,
+                    expected_embedding_dim=expected_dim,
+                ),
             )
             if tensors is None:
                 continue

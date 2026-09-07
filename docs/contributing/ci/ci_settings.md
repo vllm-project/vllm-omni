@@ -8,7 +8,7 @@ For CI levels (L1–L5) and triggers, see [Test System Overview](./test_system_o
 
 Canonical layout (prefer these paths for new changes):
 
-```
+```text
 .buildkite/
 ├── common/                          # Shared across platforms
 │   ├── scripts/
@@ -48,7 +48,7 @@ Canonical layout (prefer these paths for new changes):
     └── scripts/
 ```
 
-**Placement rules**
+### Placement rules
 
 | Rule | Detail |
 | ---- | ------ |
@@ -57,13 +57,11 @@ Canonical layout (prefer these paths for new changes):
 | Bootstrap vs test YAML | **Bootstrap** (`pipeline*.yml`) builds images and uploads **child** test pipelines. **Test** YAML (`test-*.yml`) lists pytest steps only. |
 | Register CI YAML in `skip_ci.py` | If you add a new whitelisted test pipeline file, update `L2_YAML_FILES`, `L3_YAML_FILES`, or `L45_YAML_FILES` in `.buildkite/common/scripts/skip_ci.py` so skip-ci paths stay correct. |
 
-There are still **legacy copies** at `.buildkite/*.yaml` (without the `cuda/` prefix). Treat `.buildkite/cuda/*` as source of truth.
-
 ## Platform comparison
 
 | Platform | Bootstrap entry | Test job files | Upload mechanism | Job hardware in YAML |
 | -------- | ---------------- | -------------- | ---------------- | -------------------- |
-| **CUDA** | `cuda/pipeline.yml` | `test-ready.yml`, `test-merge.yml`, `test-nightly.yml`, `test-weekly.yml` | `upload_pipeline.py --upload` (expands uploader-only keys) | `mirror_hardwares: <preset>` (string) |
+| **CUDA** | `cuda/pipeline.yml` | `test-ready.yml`, `test-merge.yml`, `test-nightly.yml`, `test-weekly.yml` | `upload_pipeline.py --upload` (expands uploader-only keys) | omit `mirror_hardwares` (from `-m`) / preset string + `MIRROR_HW` |
 | **NPU** | `npu/pipeline-npu.yml` | `test-npu-ready.yml`, `test-npu-nightly.yml` | `upload_pipeline.py --upload` | `mirror_hardwares: a2b3_npu_1` / `a2b3_npu_4` / `a3_npu_2` |
 | **AMD** | `amd/scripts/bootstrap-amd-omni.sh` | `test-amd-ready.yml`, `test-amd-merge.yml` | Jinja (`test-template-amd-omni.j2`) → `pipeline upload` | `agent_pool` + `mirror_hardwares: [amdproduction]` (array, template filter) |
 | **Intel** | `intel/scripts/bootstrap-intel-omni.sh` | `intel/pipeline-intel.yml` (steps inline) | Direct `pipeline upload` | Inline `agents.queue` on each step |
@@ -81,11 +79,34 @@ There are still **legacy copies** at `.buildkite/*.yaml` (without the `cuda/` pr
     | L2 | `cuda/test-ready.yml` | `ready` label |
     | L3 | `cuda/test-merge.yml` | `merge-test` label / main merge |
     | L4 | `cuda/test-nightly.yml` | `nightly-test` label or `NIGHTLY=1` |
-    | L5 | `cuda/test-weekly.yml` | `weekly-test` label or `WEEKLY=1` |
+    | L5 | `cuda/test-weekly.yml` | `weekly-test` label, `WEEKLY=1`, or `NON_CRITICAL=1` (see step `if`s below) |
+
+    On scheduled `main` builds, `test-weekly.yml` is uploaded when **`WEEKLY=1` or `NON_CRITICAL=1`**. Inside that file:
+
+    - **Reliability** / **Perf Test** / **Simple · CPU Coverage Test** → `WEEKLY=1` (or PR label `weekly-test` for Reliability/Perf). Pipeline upload for scheduled env vars still requires `main`.
+    - **E2E Tests** group (slow Omni/TTS/Diffusion sweeps) → `NON_CRITICAL=1`
+
+    **`--e2e`:** when uploading ready/merge on `main` with **`WEEKLY=1`**, bootstrap passes `--e2e` so only the **E2E Test** group is kept (same flag `run_cov_split.sh` uses to enable per-model coverage).
 
     **Upload:** `upload_pipeline.py --upload` expands uploader-only keys before Buildkite upload.
 
-    **Hardware in YAML:** `mirror_hardwares: <preset>` (string)—preset names in [`common/ci_mirror_hardwares.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/common/ci_mirror_hardwares.yml). Do **not** set `agents` / `plugins` on the same step.
+    **Hardware in YAML:** omit `mirror_hardwares` to compose `{chip}_{n}` from pytest `-m` (SKU + `cards_n`). Several positive `cards_*` take the **max** n (`cards_2 and cards_3` → `{chip}_3`). `not cards_1` with no positive `cards_*` uses that chip's **highest existing** preset in `ci_mirror_hardwares.yml` (L4 → `l4_4`, H100 → `h100_4`, B200 → `b200_4`). Set a **preset string** to force a pool (marks are ignored). Do **not** set `agents` / `plugins` on the same step as `mirror_hardwares`. `MIRROR_HW=b200` remaps inferred jobs whose `-m` includes `B200`, and omits CUDA `h100_*` / `l4_*` strings. Jobs whose `-m` does not match (unset: no H100/L4; set: no B200) are **skipped**.
+
+    ```yaml
+    # inferred: H100+B200 + cards_2 → h100_2, or b200_2 when MIRROR_HW=b200
+    commands:
+      - pytest -sv tests/e2e -m "full_model and H100 and B200 and omni and cards_2"
+    # no mirror_hardwares
+
+    # inferred: not cards_1 (no positive cards_*) → that chip's highest pool (l4_4 / h100_4 / b200_4)
+    commands:
+      - pytest -sv tests/e2e -m "full_model and diffusion and L4 and not cards_1"
+
+    # forced preset (ignores -m SKU/cards for pool selection)
+    mirror_hardwares: h100_1
+    ```
+
+    Inferred form: unset/`empty` `MIRROR_HW` matches `H100` or `L4` in `-m` (both present → H100); no match skips the step. `MIRROR_HW=b200` must appear in `-m` or the step is skipped. The uploader does **not** rewrite pytest `-m`; B200 collection comes from the YAML expression and from tests that declare `B200` in `hardware_test` / `hardware_marks` (for example `res={"cuda": ["H100", "B200"]}`). `MIRROR_HW` must be empty or `b200` (case-insensitive); unknown values (for example `b20o`) **fail the upload**. A CUDA preset string such as `mirror_hardwares: h100_4` is skipped when `MIRROR_HW=b200`. Unset `MIRROR_HW` keeps string presets. NPU presets ignore `MIRROR_HW`. A `mirror_hardwares` name that is not a key in `ci_mirror_hardwares.yml` **fails the upload**.
 
     **Conventions**
 
@@ -96,9 +117,9 @@ There are still **legacy copies** at `.buildkite/*.yaml` (without the `cuda/` pr
 
     **Adding a job**
 
-    1. Pick the level file (ready / merge / nightly / weekly).
+    1. Pick the level file (`test-ready.yml` / `test-merge.yml` / `test-nightly.yml` / `test-weekly.yml`).
     2. Add a step under the right **group** (usually **E2E Test** for model pytest).
-    3. Set `label`, `commands`, `mirror_hardwares`, `depends_on: upload-<level>-pipeline`.
+    3. Set `label`, `commands`, `mirror_hardwares`, `depends_on: upload-ready-pipeline` (or `upload-merge-pipeline` / `upload-nightly-pipeline` / `upload-weekly-pipeline`).
     4. For L2/L3 E2E, add `source_file_dependencies` (pytest + model + deploy YAML prefixes).
     5. Dry-run:
 
@@ -111,6 +132,8 @@ There are still **legacy copies** at `.buildkite/*.yaml` (without the `cuda/` pr
     **Bootstrap:** [`npu/pipeline-npu.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/pipeline-npu.yml) + [`npu/bootstrap-upload-steps.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/npu/bootstrap-upload-steps.yml)—same split as CUDA; builds A2/B3 and A3 CI images, then uploads child test pipelines.
 
     **Test YAML:** `npu/test-npu-ready.yml` (L2), `test-npu-nightly.yml` (L4).
+
+    **L2 trigger:** PR label `ready` (CUDA/AMD L2). PR labels `ready` + `npu-test` trigger NPU CI only.
 
     **Upload:** same as CUDA—`upload_pipeline.py --upload`.
 
@@ -204,15 +227,15 @@ Label triggers (`ready`, `merge-test`) are unchanged—diff-aware logic only red
 | Diff shape | Path | Default L2/L3 |
 | --- | --- | --- |
 | Product code / non-whitelisted paths | normal CI | all on |
-| Docs and/or qualifying skip-mark only | `skip_all` | all off (scheduled `main` NIGHTLY/WEEKLY exceptions below) |
+| Docs and/or qualifying skip-mark only | `skip_all` | all off (scheduled `main` NIGHTLY/WEEKLY/`NON_CRITICAL` exceptions below) |
 | Whitelisted CI YAML only | yaml-gated (`skip_l2_l3`) | per platform/level matrix |
 | Docs/skip-mark **+** whitelisted CI YAML | yaml-gated (`skip_l2_l3`) | same as CI-YAML-only (does **not** widen to normal CI) |
 | Non-qualifying skip-mark and no CI YAML | normal CI | all on |
 | Diff unavailable | normal CI | all on |
 
-**`skip_all` exceptions (CUDA/NPU bootstrap only):** PR labels (`nightly-test`, `merge-test`, `npu-test`, `weekly-test`, …) do **not** revive jobs. On `main`, scheduled `NIGHTLY=1` still builds the image and uploads L4 plus L2/L3 (with `--e2e`); `WEEKLY=1` still builds the image and uploads L5 (CUDA).
+**`skip_all` exceptions (CUDA/NPU bootstrap only):** PR labels (`nightly-test`, `merge-test`, `weekly-test`, `ready`, …) do **not** revive jobs under `skip_all`. On `main`, scheduled `NIGHTLY=1` still builds the image and uploads L4; `WEEKLY=1` or `NON_CRITICAL=1` still builds the image and uploads L5 (CUDA). `WEEKLY=1` on `main` also uploads L2/L3 with `--e2e`.
 
-**Yaml-gated nightly/weekly:** L4/L5 upload steps keep their normal label / `NIGHTLY` / `WEEKLY` conditions (for example PR `nightly-test` still uploads nightly). Only L2/L3 upload steps are matrix-gated.
+**Yaml-gated nightly/weekly:** L4/L5 upload steps keep their normal label / `NIGHTLY` / `WEEKLY` / `NON_CRITICAL` conditions (for example PR `nightly-test` still uploads nightly). Only L2/L3 upload steps are matrix-gated.
 
 ##### Whitelisted CI YAML → platform
 
@@ -285,12 +308,12 @@ CUDA **L2** (`.buildkite/cuda/test-ready.yml`) and **L3** (`.buildkite/cuda/test
 | `source_file_dependencies` | List of path **prefixes**. If any changed file equals a prefix or starts with `prefix/`, keep the step (or group); otherwise omit it. |
 | `mirror_hardwares` | Expand to `agents` + `plugins` (+ optional `image`) from `ci_mirror_hardwares.yml`. |
 
-**Policy**
+### Policy
 
 - **Always uploaded** (no key): groups outside **E2E Test**—Simple Test, Diffusion unit tests, Engine/Model Executor, Distributed, Custom Pipeline, Entrypoints (L2), LoRA / Entrypoints (L3).
 - **Diff-gated**: every **E2E Test** leaf job. List the smallest prefix set per step—pytest file(s), model code under `vllm_omni/model_executor/models/` or `vllm_omni/diffusion/models/`, plus `stage_input_processors/` and `vllm_omni/deploy/*.yaml` when applicable. A **group** may define the key instead; the whole group drops if no prefix matches.
 
-**YAML examples**
+### YAML examples
 
 ```yaml
       - label: "Diffusion · Qwen Image Test"
@@ -312,7 +335,7 @@ CUDA **L2** (`.buildkite/cuda/test-ready.yml`) and **L3** (`.buildkite/cuda/test
         mirror_hardwares: l4_4
 ```
 
-**Local dry-run**
+### Local dry-run
 
 ```bash
 python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/cuda/test-ready.yml
@@ -324,18 +347,19 @@ On PR builds, `upload_pipeline.py` logs `skip '…' (no changes under …)` for 
 
 ### Labels and grouping
 
-- Use **groups** for dashboard readability; keep **E2E Test** as the group name CUDA diff filtering expects for `--e2e` nightly runs on main.
+- Use **groups** for dashboard readability; keep **E2E Test** as the group name CUDA diff filtering expects for `--e2e` weekly runs on main (`WEEKLY=1`).
 - Prefix labels by model domain: **Omni ·**, **TTS ·**, **Diffusion ·**, **Simple ·**, etc., matching existing steps.
 
 ### Per-model coverage
 
 Pilot (v1): one Merge-tier (L3) job in `.buildkite/cuda/test-merge.yml` uploads
 per-model, per-entry-mode coverage as Buildkite artifacts — "TTS · Qwen3-TTS Base
-Test". It runs on a single GPU so the pilot is cheap to reproduce. (A second
-diffusion pilot, "Diffusion · Bagel Test", was retired from merge; reintroduce
-another diffusion coverage job if a second pilot is needed again.) This is a
-pilot, not a rollout: no dashboard/visualization lives in this repo, and nothing
-is gated on coverage.
+Test". Coverage + artifact upload run only when bootstrap uploaded that job with
+`--e2e` (`WEEKLY=1` and `BUILDKITE_BRANCH=main`, via `run_cov_split.sh`); otherwise
+the same job runs plain pytest without `--cov`. It runs on a single GPU so the
+pilot is cheap to reproduce.
+
+**L1 package coverage (CPU):** ready/merge Simple Test jobs run without `--cov`. Scheduled weekly on `main` with `WEEKLY=1` runs **Simple · CPU Coverage Test** in `.buildkite/cuda/test-weekly.yml` (`pytest -m 'core_model and cpu'` + Cobertura XML artifact).
 
 **Naming convention**: `coverage-<model_id>-<mode>-<step_id>.xml.gz`, where
 `<model_id>` is the model's directory name under
@@ -354,8 +378,8 @@ imported. A run covering zero lines produces the same 7 MB. gzip takes it to
 roughly 410 KB and changes nothing about the data.
 
 `<step_id>` is what keeps two steps that cover the same model apart. Artifacts are
-scoped to the build, and a nightly build carries the ready, merge and nightly tiers
-at once, so several same-model steps land in one namespace — `qwen3_tts` already has
+scoped to the build, and a weekly build can carry ready/merge (with `--e2e`) and
+weekly tiers at once, so several same-model steps land in one namespace — `qwen3_tts` already has
 both a Base and a CustomVoice job, and `minicpmo_4_5` a base and a duplex one. Two
 uploads on one path do not fail loudly: an exact-name download can report the path
 as ambiguous, and a glob download fetches every match concurrently and renames each
@@ -392,7 +416,7 @@ loads the model once per mode.
 Before splitting, confirm each half actually collects at least one test under the job's forwarded filters — pytest exits with code 5 ("no tests collected") if a half is empty, which the script reports as a failure, red-ing a job that used to pass as one combined invocation.
 
 Also check the tests' `num_cards` against the job's `mirror_hardwares` preset.
-`cuda_marks` turns `num_cards > 1` into `skipif(device_count() < num_cards)`, so a
+`_cuda_marks` turns `num_cards > 1` into `skipif(device_count() < num_cards)`, so a
 test asking for more GPUs than the preset provides is silently skipped and its
 coverage artifact comes back empty. Splitting such a job produces a file that
 looks fine and measures nothing — "Diffusion · Z Image Test" is the current
@@ -404,10 +428,12 @@ settings in `pyproject.toml`: online tests launch the server with
 `subprocess.Popen` and stop it with SIGTERM, and without those settings the XML
 reflects only the pytest parent process, not the server's code paths.
 
-The upload depends on `buildkite-agent` being callable inside the container. The
-`kubernetes` presets (`h100_*`, `*_npu_*`) provide it; the `docker` ones (`l4_*`)
-only do because they set `mount-buildkite-agent: true`. A new docker preset that
-runs a coverage job needs the same.
+The upload depends on `buildkite-agent` being callable inside the container.
+CUDA (`l4_*`, `h100_*`) and NPU (`*_npu_*`) presets all use the `kubernetes`
+plugin, which provides the agent. `l4_*` jobs run on the EKS `l4-k8s` queue
+(agent-stack-k8s); they no longer use the docker plugin or
+`mount-buildkite-agent`. A new **docker** preset that runs a coverage job
+still needs `mount-buildkite-agent: true`.
 
 List both `run_cov_split.sh` and `pyproject.toml` in every opted-in job's
 `source_file_dependencies` — both change what the job measures, so without them a
@@ -425,7 +451,7 @@ just confirming both files exist.
 | Check | Command / location |
 | ----- | ------------------ |
 | CUDA render | `python3 .buildkite/common/scripts/upload_pipeline.py .buildkite/cuda/test-<level>.yml` |
-| No leaked uploader keys | `… \| grep -E 'mirror_hardwares|source_file_dependencies'` → empty |
+| No leaked uploader keys | Pipe the render into `grep -E 'mirror_hardwares\|source_file_dependencies'` — expect empty |
 | Skip-ci / upload unit tests | `pytest tests/buildkite/` |
 | Local job replay (CUDA L2+) | `tools/run_ready_jobs.sh`, `tools/run_merge_jobs.sh`, `tools/nightly/run_nightly_jobs.sh` (read YAML from `cuda/`) |
 
