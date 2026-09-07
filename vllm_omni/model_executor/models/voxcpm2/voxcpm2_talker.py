@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """VoxCPM2 AR talker — PagedAttention pipeline with per-request state.
 
 Architecture:
@@ -46,6 +46,7 @@ from vllm_omni.utils.speaker_cache import (
 )
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 
+from .lora import merge_voxcpm2_lora
 from .minicpm4_paged import MiniCPM4PagedForVoxCPM2, MiniCPM4PagedResidualLM
 from .runtime_config import _VoxCPM2RuntimeConfig
 from .voxcpm2_import_utils import import_voxcpm2_core
@@ -834,6 +835,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self.vllm_config = vllm_config
         self.config = vllm_config.model_config.hf_config
         self._runtime_config = _VoxCPM2RuntimeConfig.from_vllm_config(vllm_config)
+        self._startup_lora_applied = False
+        if self._runtime_config.startup_lora_path and vllm_config.load_config.load_format == "dummy":
+            raise ValueError("VoxCPM2 startup LoRA requires real base weights; load_format=dummy is unsupported")
         global _ENABLE_NVTX_PROFILE
         _ENABLE_NVTX_PROFILE = self._runtime_config.enable_nvtx_profile
 
@@ -3284,6 +3288,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"base_lm.": "model."})
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if self._startup_lora_applied:
+            raise ValueError("Reloading VoxCPM2 weights with a startup LoRA is unsupported; restart the server")
+
         def _base_lm_only(ws):
             for name, tensor in ws:
                 if name.startswith("base_lm."):
@@ -3297,6 +3304,13 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         # params as loaded so AutoWeightsLoader's strict check doesn't flag
         # them as missing from the checkpoint.
         loaded |= {name for name, _ in self.named_parameters() if name.startswith(("_tts.", "residual_model."))}
+
+        if adapter_path := self._runtime_config.startup_lora_path:
+            merged = merge_voxcpm2_lora(
+                adapter_path, base_lm=self.model, residual_lm=self.residual_model, tts=self._tts
+            )
+            self._startup_lora_applied = True
+            logger.info("Merged VoxCPM2 startup LoRA from %s into %d linear layers", adapter_path, merged)
 
         logger.info(
             "Loaded VoxCPM2 (patch=%d, feat_dim=%d, dtype=%s)", self._patch_size, self._feat_dim, self._side_dtype
