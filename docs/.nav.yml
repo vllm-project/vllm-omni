@@ -38,7 +38,7 @@ nav:
       - Image-To-Video: user_guide/examples/online_serving/image_to_video.md
       - Speech-To-Video: user_guide/examples/online_serving/speech_to_video.md
       - Text-To-Image: user_guide/examples/online_serving/text_to_image.md
-      - Text-To-Speech: user_guide/examples/online_serving/text_to_speech.md
+      - Text-To-Speech (Online Serving): user_guide/examples/online_serving/text_to_speech.md
       - Text-To-Video: user_guide/examples/online_serving/text_to_video.md
   - General:
     - usage/*
@@ -130,6 +130,8 @@ nav:
         - Prefill/Decode Phase Contract: design/feature/preprocess_phase_contract.md
         - Automatic Prefix Caching: design/feature/prefix_caching.md
         - Realtime AR-Diffusion: design/feature/realtime_ar_diffusion.md
+      - Model-Specific Capabilities:
+        - MiniMax H3 Temporal VAE Chunks: design/feature/minimax_h3_temporal_vae_chunks.md
       - Communication:
         - OmniConnector Implementations:
           - Mooncake Store Connector: design/feature/omni_connectors/mooncake_store_connector.md

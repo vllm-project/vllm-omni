@@ -28,6 +28,10 @@ implementation contract; it is not, by itself, a general support claim.
 - [Automatic Prefix Caching in Omni Models](feature/prefix_caching.md)
 - [Realtime AR-Diffusion Sessions](feature/realtime_ar_diffusion.md)
 
+### Model-specific capabilities
+
+- [MiniMax H3 Temporal VAE Chunks](feature/minimax_h3_temporal_vae_chunks.md)
+
 ### Communication
 
 #### OmniConnector implementations

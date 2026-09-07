@@ -1258,3 +1258,4 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
 - [Diffusion parallelism](../../docs/user_guide/diffusion/parallelism/overview.md)
+- [Temporal VAE chunk callback design](../../docs/design/feature/minimax_h3_temporal_vae_chunks.md)

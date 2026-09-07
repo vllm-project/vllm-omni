@@ -57,3 +57,10 @@ cross-stage routing.
 
 Test registry selection, checkpoint loading, minimal inference, input and output
 contracts, and every declared optional capability.
+
+## Model-specific capability documents
+
+- [MiniMax H3 temporal VAE chunk callback](../../feature/minimax_h3_temporal_vae_chunks.md)
+  defines the source-gated producer seam and its boundary with future runtime
+  media transport. It is an internal opt-in capability, not a public serving
+  feature.

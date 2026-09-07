@@ -170,6 +170,10 @@ because the user-visible output is diffusion media rather than a token stream.
 The
 [MiniMax-H3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md)
 contains the hardware-specific profiles and warmup requirements.
+The internal, opt-in
+[temporal VAE chunk callback](feature/minimax_h3_temporal_vae_chunks.md)
+documents the narrower released-source contract for publishing committed video
+frames during decode. It does not change the complete-output serving topology.
 
 ### Cosmos3: unified MoT reasoner and generator
 

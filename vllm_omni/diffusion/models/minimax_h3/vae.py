@@ -21,12 +21,22 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
     DistributedVaeMixin,
 )
-from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_data_parallel_world_size,
+    get_world_group,
+    model_parallel_is_initialized,
+)
 from vllm_omni.diffusion.offloader.module_residency import (
     BoundedAllocatorCache,
     PinnedModuleStager,
 )
 
+from .chunked_decode import (
+    MiniMaxH3ChunkCallbackPeerError,
+    MiniMaxH3ChunkedDecodeUnsupportedError,
+    MiniMaxH3VideoChunkCallback,
+    _MiniMaxH3ChunkDecodeCoordinator,
+)
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
 
@@ -153,6 +163,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.use_slicing = False
         self.parallel_size = 1
         self.device_module = torch.get_device_module()
+        self._chunk_decode_coordinator: _MiniMaxH3ChunkDecodeCoordinator | None = None
 
     def load_to_device(self) -> None:
         if self._stager is not None:
@@ -265,6 +276,59 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     def is_distributed_enabled(self) -> bool:
         return self.parallel_size > 1 and dist.is_initialized()
 
+    def _denormalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        channels = int(self.config_dict["latent_channels"])
+        mean = torch.tensor(
+            self.config_dict["latents_mean"],
+            device=latent.device,
+            dtype=latent.dtype,
+        ).view(1, channels, 1, 1, 1)
+        std = torch.tensor(
+            self.config_dict["latents_std"],
+            device=latent.device,
+            dtype=latent.dtype,
+        ).view(1, channels, 1, 1, 1)
+        return latent * std + mean
+
+    def _decode_tiling_context(self, latent: torch.Tensor) -> AbstractContextManager:
+        # The checkpoint hands rank r the tiles ``range(r, num_tiles, sp_size)``
+        # and then rejects an empty share inside the gather. A rank with no
+        # tiles raises and leaves the collective while the others block in it
+        # forever, so too few tiles hangs the whole stage rather than failing
+        # it. Tile count depends only on the latent shape, so every rank takes
+        # this branch together.
+        num_tiles = self._decoder_tile_count(latent)
+        if self.parallel_size > 1 and num_tiles < self.parallel_size:
+            logger.warning_once(
+                "MiniMax-H3 VAE decode splits into %d tile(s) but the tile group has "
+                "%d ranks; decoding rank-locally for this shape instead, which is "
+                "slower but avoids ranks without tiles hanging the collective.",
+                num_tiles,
+                self.parallel_size,
+            )
+            return self._rank_local_tiling()
+        return nullcontext()
+
+    def _normalize_decoded_frames(self, decoded: torch.Tensor) -> torch.Tensor:
+        frames = self.model.processor.revert_tensor(decoded)
+        if frames.ndim == 4:
+            frames = frames.unsqueeze(0).transpose(1, 2)
+        if frames.ndim != 5:
+            raise ValueError(f"unexpected decoded video shape {tuple(frames.shape)}")
+        return frames.float()
+
+    def _chunk_process_group(self) -> dist.ProcessGroup | None:
+        if not self.is_distributed_enabled():
+            return None
+        if model_parallel_is_initialized() and get_data_parallel_world_size() > 1:
+            raise MiniMaxH3ChunkedDecodeUnsupportedError(
+                "MiniMax-H3 temporal chunks do not yet support combining data parallelism with VAE patch parallelism"
+            )
+        group = self._native_parallel_state().get("sp_process_group")
+        if group is None or dist.get_world_size(group) != self.parallel_size:
+            raise RuntimeError("MiniMax-H3 VAE chunk decode has an invalid spatial-parallel group")
+        return group
+
     @torch.inference_mode()
     def encode_image(self, image: Image.Image) -> torch.Tensor:
         previous_parallel = self.model.parallel_tiling
@@ -357,44 +421,40 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
 
     @torch.inference_mode()
     def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
-        channels = int(self.config_dict["latent_channels"])
-        mean = torch.tensor(
-            self.config_dict["latents_mean"],
-            device=latent.device,
-            dtype=latent.dtype,
-        ).view(1, channels, 1, 1, 1)
-        std = torch.tensor(
-            self.config_dict["latents_std"],
-            device=latent.device,
-            dtype=latent.dtype,
-        ).view(1, channels, 1, 1, 1)
-        # The checkpoint hands rank r the tiles ``range(r, num_tiles, sp_size)``
-        # and then rejects an empty share inside the gather. A rank with no
-        # tiles raises and leaves the collective while the others block in it
-        # forever, so too few tiles hangs the whole stage rather than failing
-        # it. Tile count depends only on the latent shape, so every rank takes
-        # this branch together.
-        num_tiles = self._decoder_tile_count(latent)
-        if self.parallel_size > 1 and num_tiles < self.parallel_size:
-            logger.warning_once(
-                "MiniMax-H3 VAE decode splits into %d tile(s) but the tile group has "
-                "%d ranks; decoding rank-locally for this shape instead, which is "
-                "slower but avoids ranks without tiles hanging the collective.",
-                num_tiles,
-                self.parallel_size,
-            )
-            tiling_context: AbstractContextManager = self._rank_local_tiling()
-        else:
-            tiling_context = nullcontext()
+        with self._decode_tiling_context(latent):
+            decoded = self.model.decode_base(self._denormalize_latent(latent))
+        return self._normalize_decoded_frames(decoded)
 
-        with tiling_context:
-            decoded = self.model.decode_base(latent * std + mean)
-        frames = self.model.processor.revert_tensor(decoded)
-        if frames.ndim == 4:
-            frames = frames.unsqueeze(0).transpose(1, 2)
-        if frames.ndim != 5:
-            raise ValueError(f"unexpected decoded video shape {tuple(frames.shape)}")
-        return frames.float()
+    @torch.inference_mode()
+    def decode_latent_with_chunks(
+        self,
+        latent: torch.Tensor,
+        chunk_callback: MiniMaxH3VideoChunkCallback | None,
+    ) -> torch.Tensor:
+        """Decode a video while publishing committed temporal chunks.
+
+        Every rank collaborating in the configured H3 VAE tile group must call
+        this method, with ``chunk_callback`` supplied only on group rank 0. A
+        callback failure is deferred until the compatibility decoder finishes its
+        remaining collectives, then propagated to every group rank. With
+        ``parallel_size=1`` the runtime designates each request's output owner
+        by supplying a callback there and ``None`` on replica peers.
+
+        This is a model-local producer seam before the typed media boundary in
+        RFC #6541 / PR #6615. Representation conversion, transport,
+        presentation policy, and encoding remain runtime-owned. Chunks retain
+        the VAE canvas dimensions; a runtime consumer must apply the same
+        requested-size crop as the complete H3 pipeline output.
+        """
+
+        if self._chunk_decode_coordinator is None:
+            self._chunk_decode_coordinator = _MiniMaxH3ChunkDecodeCoordinator()
+        return self._chunk_decode_coordinator.decode(
+            self,
+            latent,
+            chunk_callback,
+            group=self._chunk_process_group(),
+        )
 
 
 class MiniMaxH3AudioVAE(nn.Module):
@@ -516,4 +576,10 @@ class MiniMaxH3AudioVAE(nn.Module):
         return waveform.permute(1, 0, 2).contiguous().float()
 
 
-__all__ = ["MiniMaxH3AudioVAE", "MiniMaxH3VideoVAE"]
+__all__ = [
+    "MiniMaxH3AudioVAE",
+    "MiniMaxH3ChunkCallbackPeerError",
+    "MiniMaxH3ChunkedDecodeUnsupportedError",
+    "MiniMaxH3VideoChunkCallback",
+    "MiniMaxH3VideoVAE",
+]
