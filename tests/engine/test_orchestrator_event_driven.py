@@ -19,7 +19,10 @@ import pytest
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import ShutdownRequestMessage
-from vllm_omni.engine.orchestrator import _event_driven_orch_enabled
+from vllm_omni.engine.orchestrator import (
+    _event_driven_orch_default_for_pipeline,
+    _event_driven_orch_enabled,
+)
 
 from . import test_orchestrator as legacy
 from . import test_orchestrator_error_handling as legacy_errors
@@ -123,6 +126,19 @@ def test_flag_parsing(monkeypatch) -> None:
     for value in ("0", "false", "off", ""):
         monkeypatch.setenv("VLLM_OMNI_EVENT_DRIVEN_ORCH", value)
         assert _event_driven_orch_enabled() is False
+
+
+def test_only_qwen3_tts_has_a_pipeline_default() -> None:
+    assert _event_driven_orch_default_for_pipeline("qwen3_tts") is True
+    for model_type in (None, "qwen3_omni_moe", "minicpmo_4_5", "moss_tts_delay"):
+        assert _event_driven_orch_default_for_pipeline(model_type) is False
+
+
+def test_explicit_event_driven_value_overrides_pipeline_default(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_EVENT_DRIVEN_ORCH", raising=False)
+    assert _event_driven_orch_enabled(default=True) is True
+    monkeypatch.setenv("VLLM_OMNI_EVENT_DRIVEN_ORCH", "0")
+    assert _event_driven_orch_enabled(default=True) is False
 
 
 def test_default_is_legacy_loop(monkeypatch) -> None:

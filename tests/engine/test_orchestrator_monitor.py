@@ -45,6 +45,8 @@ def test_note_loop_and_flush_json(tmp_path, monkeypatch):
     monitor.register_replica(0, 0)
 
     monitor.note_loop(idle=False)
+    monitor.set_dispatch_queue_size(9)
+    monitor.set_dispatch_queue_size(7)
     monitor.note_loop(idle=True)
 
     now[0] = 1.5
@@ -54,6 +56,8 @@ def test_note_loop_and_flush_json(tmp_path, monkeypatch):
     assert payload["configured_window_s"] == monitor_mod._WINDOW_S
     assert payload["windows"]["loop_idle"] == [1]
     assert payload["windows"]["loop_active"] == [1]
+    assert payload["windows"]["dispatch_queue_size"] == [7]
+    assert payload["windows"]["dispatch_queue_high_water"] == [9]
     assert payload["replicas"]["stage=0,replica=0"]["outputs_queue_size"] == [5]
     assert payload["replicas"]["stage=0,replica=0"]["inflight"] == [10]
 
