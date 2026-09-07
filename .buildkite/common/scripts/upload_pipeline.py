@@ -252,28 +252,27 @@ def _load_mirror_hardwares() -> dict[str, dict[str, Any]]:
     return presets
 
 
-def _flatten_dep_paths(value: Any, *, key: str) -> list[str]:
-    """Flatten YAML-anchor nested lists into a de-duplicated prefix list."""
-    if isinstance(value, str):
-        if not value.strip():
-            raise ValueError(f"empty path in source_file_dependencies[{key!r}]")
-        return [value]
-    if isinstance(value, list):
-        flattened: list[str] = []
-        seen: set[str] = set()
-        for item in value:
-            for path in _flatten_dep_paths(item, key=key):
-                if path not in seen:
-                    seen.add(path)
-                    flattened.append(path)
-        return flattened
-    raise ValueError(
-        f"source_file_dependencies[{key!r}] must be a list of path prefixes, got {type(value).__name__}",
-    )
-
-
 @lru_cache(maxsize=1)
 def _load_source_file_dependencies() -> dict[str, list[str]]:
+    def flatten(value: Any, *, key: str) -> list[str]:
+        """Flatten YAML-anchor nested lists into a de-duplicated prefix list."""
+        if isinstance(value, str):
+            if not value.strip():
+                raise ValueError(f"empty path in source_file_dependencies[{key!r}]")
+            return [value]
+        if isinstance(value, list):
+            flattened: list[str] = []
+            seen: set[str] = set()
+            for item in value:
+                for path in flatten(item, key=key):
+                    if path not in seen:
+                        seen.add(path)
+                        flattened.append(path)
+            return flattened
+        raise ValueError(
+            f"source_file_dependencies[{key!r}] must be a list of path prefixes, got {type(value).__name__}",
+        )
+
     if not CI_SOURCE_FILE_DEPENDENCIES_PATH.is_file():
         raise FileNotFoundError(
             f"missing CI source_file_dependencies registry: {CI_SOURCE_FILE_DEPENDENCIES_PATH}",
@@ -290,33 +289,16 @@ def _load_source_file_dependencies() -> dict[str, list[str]]:
             raise ValueError(
                 f"source_file_dependencies keys must be non-empty strings in {CI_SOURCE_FILE_DEPENDENCIES_PATH}",
             )
-        loaded[key] = _flatten_dep_paths(value, key=key)
+        loaded[key] = flatten(value, key=key)
     return loaded
 
 
 _REGISTRY_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
-
-
-def _looks_like_registry_key(item: str) -> bool:
-    """Preset names are snake_case identifiers; path prefixes contain ``/`` or ``.``."""
-    return bool(_REGISTRY_KEY_RE.fullmatch(item))
-
-
-def _lookup_dep_key(key: str, step: dict[str, Any]) -> list[str]:
-    registry = _load_source_file_dependencies()
-    paths = registry.get(key)
-    if paths is None:
-        known = ", ".join(sorted(registry))
-        raise ValueError(
-            f"unknown source_file_dependencies {key!r} in step {_get_step_label(step)!r}; known: {known}",
-        )
-    return list(paths)
-
-
 _TEST_PATH_RE = re.compile(r"(?:^|[\s='\"])(?P<path>tests/[A-Za-z0-9_./\-]+)")
 
 
-def _collect_command_text(step: dict[str, Any]) -> str:
+def _parse_command_text(step: dict[str, Any]) -> str:
+    """Parse step ``commands`` / ``command`` into a single string."""
     raw = step.get("commands", step.get("command"))
     if raw is None:
         return ""
@@ -327,9 +309,9 @@ def _collect_command_text(step: dict[str, Any]) -> str:
     return str(raw)
 
 
-def _extract_pytest_targets(step: dict[str, Any]) -> list[str]:
-    """Collect ``tests/`` paths from pytest / run_cov_split commands (not ``--ignore``)."""
-    text = _collect_command_text(step)
+def _parse_pytest_targets(step: dict[str, Any]) -> list[str]:
+    """Parse ``tests/`` paths from pytest / run_cov_split commands (not ``--ignore``)."""
+    text = _parse_command_text(step)
     found: list[str] = []
     seen: set[str] = set()
     for match in _TEST_PATH_RE.finditer(text):
@@ -343,33 +325,43 @@ def _extract_pytest_targets(step: dict[str, Any]) -> list[str]:
     return found
 
 
-def _dedupe_paths(*groups: list[str]) -> list[str]:
-    merged: list[str] = []
-    seen: set[str] = set()
-    for group in groups:
-        for path in group:
-            if path not in seen:
-                seen.add(path)
-                merged.append(path)
-    return merged
-
-
 def _resolve_source_file_dependencies(step: dict[str, Any]) -> list[str] | None:
     """Expand a registry key (or list of keys), then append pytest targets from commands."""
     deps = step.get("source_file_dependencies")
     if deps is None:
         return None
+
+    def dedupe(*groups: list[str]) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            for path in group:
+                if path not in seen:
+                    seen.add(path)
+                    merged.append(path)
+        return merged
+
+    def lookup(key: str) -> list[str]:
+        registry = _load_source_file_dependencies()
+        paths = registry.get(key)
+        if paths is None:
+            known = ", ".join(sorted(registry))
+            raise ValueError(
+                f"unknown source_file_dependencies {key!r} in step {_get_step_label(step)!r}; known: {known}",
+            )
+        return list(paths)
+
     prefixes: list[str]
     if isinstance(deps, str):
-        prefixes = _lookup_dep_key(deps, step) if _looks_like_registry_key(deps) else [deps]
+        prefixes = lookup(deps) if _REGISTRY_KEY_RE.fullmatch(deps) else [deps]
     elif isinstance(deps, list):
         if not all(isinstance(item, str) for item in deps):
             raise ValueError(
                 f"source_file_dependencies must be a string key or list of strings in step {_get_step_label(step)!r}",
             )
-        keyish = [_looks_like_registry_key(item) for item in deps]
+        keyish = [bool(_REGISTRY_KEY_RE.fullmatch(item)) for item in deps]
         if deps and all(keyish):
-            prefixes = _dedupe_paths(*(_lookup_dep_key(key, step) for key in deps))
+            prefixes = dedupe(*(lookup(key) for key in deps))
         elif any(keyish):
             raise ValueError(
                 f"source_file_dependencies in step {_get_step_label(step)!r} mixes registry keys and path prefixes",
@@ -380,7 +372,7 @@ def _resolve_source_file_dependencies(step: dict[str, Any]) -> list[str] | None:
         raise ValueError(
             f"source_file_dependencies must be a string key or list in step {_get_step_label(step)!r}",
         )
-    return _dedupe_paths(_extract_pytest_targets(step), prefixes)
+    return dedupe(_parse_pytest_targets(step), prefixes)
 
 
 @lru_cache(maxsize=1)
@@ -397,7 +389,7 @@ def _cuda_mirror_chips() -> tuple[str, ...]:
     return tuple(sorted(chips, key=lambda chip: (-len(chip), chip)))
 
 
-def _read_cards_marks(expr: str) -> tuple[set[int], bool]:
+def _parse_cards_marks(expr: str) -> tuple[set[int], bool]:
     """Parse registered ``cards_n`` / ``not cards_n`` from a pytest ``-m`` expr.
 
     Returns positive card counts and whether any ``not cards_*`` is present.
@@ -414,8 +406,8 @@ def _read_cards_marks(expr: str) -> tuple[set[int], bool]:
     return positives, has_not_cards
 
 
-def _read_hardware_marks(expr: str) -> set[str]:
-    """Return lowercase positive CUDA SKUs that have a mirror preset.
+def _parse_hardware_marks(expr: str) -> set[str]:
+    """Parse lowercase positive CUDA SKUs that have a mirror preset.
 
     ``not H100`` is ignored. SKUs with no ``{chip}_*`` preset (e.g. H200) are dropped.
     """
@@ -457,36 +449,22 @@ def _get_mirror_hw_selector() -> str:
     return selector
 
 
-def _read_pytest_marks(commands: Any) -> tuple[set[str], int | Literal["max"] | None]:
-    """Read pytest ``-m`` from step commands: CUDA SKU chips and cards count.
+def _parse_pytest_marks(step: dict[str, Any]) -> tuple[set[str], int | Literal["max"] | None]:
+    """Parse pytest ``-m`` from step commands: CUDA SKU chips and cards count.
 
     *chips* are lowercase SKUs from positive markers (``not H100`` is ignored).
     *cards* is the max positive ``cards_n``, ``"max"`` when only ``not cards_*``
     is present, or ``None``.
     """
-    chunks: list[str] = []
-
-    def _collect(value: Any) -> None:
-        if value is None:
-            return
-        if isinstance(value, str):
-            chunks.append(value)
-        elif isinstance(value, list):
-            for part in value:
-                _collect(part)
-        else:
-            chunks.append(str(value))
-
-    _collect(commands)
-    text = "\n".join(chunks)
+    text = _parse_command_text(step)
 
     chips: set[str] = set()
     positives: set[int] = set()
     has_not_cards = False
     for match in _PYTEST_MARKER_ARG.finditer(text):
         expr = match.group(1) or match.group(2) or match.group(3) or ""
-        chips |= _read_hardware_marks(expr)
-        card_counts, not_cards = _read_cards_marks(expr)
+        chips |= _parse_hardware_marks(expr)
+        card_counts, not_cards = _parse_cards_marks(expr)
         positives.update(card_counts)
         has_not_cards = has_not_cards or not_cards
 
@@ -603,7 +581,7 @@ def _expand_mirror_hardwares(step: dict[str, Any]) -> dict[str, Any] | None:
     if "mirror_hardwares" not in step:
         if has_pool:
             return step
-        chips, cards = _read_pytest_marks(step.get("commands"))
+        chips, cards = _parse_pytest_marks(step)
         if not chips and cards is None:
             return step
         preset_name = _compose_mirror_hardware_name(chips, cards, step_label=step_label)
