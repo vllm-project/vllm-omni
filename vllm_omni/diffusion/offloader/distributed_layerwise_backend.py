@@ -1080,6 +1080,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         lease = self._host_weight_lease
         if lease is None:
             return False
+        if self.config.dlo_host_registration_mode == "disabled":
+            logger.info("HWR mmap registration disabled by transport policy; using bounded host staging")
+            return False
         if not self.config.pin_cpu_memory:
             logger.info("HWR mmap registration disabled by pin_cpu_memory=False; using bounded host staging")
             return False
@@ -1089,6 +1092,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         limit_gib = self.config.dlo_host_registration_limit_gib
         max_bytes = int(limit_gib * 1024**3) if limit_gib > 0 else None
+        logger.info(
+            "Starting HWR mmap registration on %s: %d source range(s), budget_bytes=%s",
+            self.device,
+            len(lease.mapped_regions),
+            max_bytes,
+        )
         started = time.perf_counter()
         try:
             registration = register_host_mappings(

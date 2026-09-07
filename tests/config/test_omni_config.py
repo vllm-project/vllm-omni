@@ -193,6 +193,39 @@ def test_resolve_execution_mode_rejects_unknown_execution_type():
         omni_config_module._resolve_execution_mode("unknown_execution_type")
 
 
+@pytest.mark.parametrize("registration_mode", ["auto", "disabled"])
+def test_hwr_registration_policy_reaches_offloader(tmp_path: Path, registration_mode: str):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.offloader.base import OffloadConfig
+
+    options = {
+        "enable_distributed_layerwise_offload": True,
+        "dlo_use_allgather": False,
+        "host_weight_runtime_mode": "preferred",
+        "host_weight_runtime_root": str(tmp_path / "unused-store"),
+        "dlo_host_registration_mode": registration_mode,
+    }
+    config = _from_pipeline_key("dreamzero", deploy_config_path="dreamzero_tp1_cfg2", cli_overrides=options)
+    stage = config.stage_by_id(0)
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.diffusion_config.dlo_host_registration_mode == registration_mode
+    offline = OmniDiffusionConfig(**options)
+    transport = OffloadConfig.from_od_config(offline)
+    assert transport.dlo_host_registration_mode == registration_mode
+    assert transport.pin_cpu_memory
+    assert transport.dlo_host_registration_limit_gib == 0.0
+    assert not (tmp_path / "unused-store").exists()
+
+
+@pytest.mark.parametrize("registration_mode", ["unknown", None, "disabled"])
+def test_hwr_registration_policy_rejects_invalid_or_ineligible_config(registration_mode):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    for config_class in (OmniDiffusionConfig, omni_config_module._DiffusionConfigProjection):
+        with pytest.raises(ValueError, match="dlo_host_registration_mode"):
+            config_class(dlo_host_registration_mode=registration_mode)
+
+
 def test_from_pipeline_config_preserves_current_pipeline_config_object():
     omni_config = _from_pipeline_key("minicpmo_4_5")
     pipeline = _resolve_pipeline_or_skip("minicpmo_4_5")

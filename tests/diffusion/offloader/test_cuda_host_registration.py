@@ -124,6 +124,33 @@ def test_registration_rejects_writable_or_over_budget_before_cuda(monkeypatch: p
     assert runtime.registered == []
 
 
+@pytest.mark.parametrize("second_result", [0, 7])
+def test_registration_logs_entry_before_each_runtime_call(monkeypatch: pytest.MonkeyPatch, second_result: int) -> None:
+    runtime = _FakeRuntime([0, second_result])
+    messages: list[str] = []
+    monkeypatch.setattr(registration_module.logger, "info", lambda message, *args: messages.append(message % args))
+    original_register = runtime.cudaHostRegister
+
+    def register(pointer: int, size: int, flags: int) -> int:
+        ordinal = len(runtime.registered) + 1
+        assert messages[-1] == f"Registering HWR host range {ordinal}/2: {size} bytes"
+        return original_register(pointer, size, flags)
+
+    monkeypatch.setattr(runtime, "cudaHostRegister", register)
+    monkeypatch.setattr(registration_module.torch.cuda, "cudart", lambda: runtime)
+    monkeypatch.setattr(registration_module, "_consume_last_cuda_error", lambda _runtime, _error: None)
+    regions = (_region("first", 0x1000, 4096), _region("second", 0x3000, 4096))
+    if second_result:
+        with pytest.raises(HostRegistrationError, match="error-7"):
+            CudaHostRegistration.create(regions, max_bytes=None)
+        assert runtime.unregistered == [0x1000]
+    else:
+        registration = CudaHostRegistration.create(regions, max_bytes=None)
+        assert registration.close() == ()
+    assert sum(message.startswith("Registering ") for message in messages) == 2
+    assert sum(message.startswith("Registered ") for message in messages) == (1 if second_result else 2)
+
+
 def test_registration_requires_read_only_capability(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = _FakeRuntime([0], read_only_supported=False)
     monkeypatch.setattr(registration_module.torch.cuda, "cudart", lambda: runtime)

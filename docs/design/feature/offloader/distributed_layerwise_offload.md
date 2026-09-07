@@ -289,12 +289,27 @@ store, tensor ownership, or H2D payload. On success, each tensor view copies
 directly into the existing rotating HBM block buffers and the two private host
 staging slots are not allocated.
 
+`--dlo-host-registration-mode` defaults to `auto`, preserving this behavior.
+Select `disabled` to bypass HWR mapping registration and use bounded host staging
+regardless of mapping size or budget. This leaves the existing pin-memory policy
+for staging buffers unchanged. The equivalent offline/stage configuration field
+is `dlo_host_registration_mode`; an explicit disable requires enabled HWR with
+no-AllGather DLO.
+
 `--dlo-host-registration-limit-gib` is an optional per-worker preflight ceiling
 over page-aligned registered bytes. Zero adds no ceiling. A disabled pinned
 memory policy, unsupported platform/capability, over-budget mapping, or fully
 rolled-back registration error selects the existing two-slot staging path. A
 partial registration that cannot be rolled back aborts startup because closing
 the lease would unmap memory still owned by the platform.
+
+Automatic registration logs its entry with device and budget, then each CUDA
+region's ordinal/total and byte size before calling `cudaHostRegister`. A
+completion message follows each successful call. These identify the last
+entered boundary if progress stops; they do not impose a timeout. A synchronous
+CUDA call cannot be safely cancelled by a Python timer, and a stuck process
+still requires external supervision. The explicit disable option avoids this
+registration path; it does not repair the underlying driver hang.
 
 Direct checkpoint mmap remains unchanged and continues to use staging. It may
 require loader-owned per-block transforms, while the HWR artifact already

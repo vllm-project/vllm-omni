@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import ctypes
 import mmap
+import time
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_omni.host_weight_runtime import MappedHostRegion
 
@@ -20,6 +22,8 @@ from .host_registration import (
     HostRegistrationCleanupError,
     HostRegistrationError,
 )
+
+logger = init_logger(__name__)
 
 _CUDA_HOST_REGISTER_READ_ONLY = 0x08
 _CUDA_DEVICE_ATTRIBUTE_HOST_REGISTER_READ_ONLY_SUPPORTED = 113
@@ -187,7 +191,9 @@ class CudaHostRegistration:
 
         registered: list[_AddressRange] = []
         try:
-            for region in mapped:
+            for index, region in enumerate(mapped, start=1):
+                logger.info("Registering HWR host range %d/%d: %d bytes", index, len(mapped), region.size)
+                started = time.perf_counter()
                 error = runtime.cudaHostRegister(region.start, region.size, _CUDA_HOST_REGISTER_READ_ONLY)
                 if int(error) != 0:
                     raise HostRegistrationError(
@@ -195,6 +201,9 @@ class CudaHostRegistration:
                         f"[{region.start:#x}, {region.end:#x}): {_handled_error_message(runtime, error)}"
                     )
                 registered.append(region)
+                logger.info(
+                    "Registered HWR host range %d/%d in %.3f s", index, len(mapped), time.perf_counter() - started
+                )
         except Exception as exc:
             rollback_errors: list[str] = []
             rollback_failed: list[_AddressRange] = []
