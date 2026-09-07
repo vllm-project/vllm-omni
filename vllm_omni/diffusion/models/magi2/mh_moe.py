@@ -13,6 +13,7 @@ whole-token :class:`FusedMoE` primitive.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from dataclasses import dataclass
@@ -26,6 +27,8 @@ from vllm.triton_utils import tl, triton
 from vllm_omni.platforms import current_omni_platform
 
 from .parallel import Magi2ParallelGroup, ep_dispatch, ep_undispatch, get_magi2_ep_group
+
+logger = logging.getLogger(__name__)
 
 RoutingScore = Literal["softmax", "sigmoid"]
 
@@ -286,15 +289,41 @@ def _deterministic_scatter(
     return output.view_as(reference)
 
 
-def _select_block_config() -> tuple[int, int, int, int, int]:
-    """Return the reference kernel config, capped for pre-Blackwell GPUs."""
+# Candidate ``(block_t, block_dh, block_de, num_stages, num_warps)`` tilings,
+# most preferred first.  Whether the largest tile is constructible is not a
+# property of the device capability alone: on Blackwell ``tl.dot`` accumulates
+# in tensor memory, ``output_acc`` is ``[block_t, d_head]``, and the resulting
+# column count therefore depends on the expert dimensions and on how the
+# installed Triton allocates TMEM.  With the released d_head=256 bank on a B200
+# under Triton 3.7.1 every block_t=128 variant asks for 528 of the 512
+# available columns, so the kernel has to be able to step down.
+_BLACKWELL_BLOCK_CONFIGS = (
+    (128, 64, 32, 2, 8),
+    (64, 64, 32, 2, 8),
+    (64, 64, 32, 2, 4),
+)
+# BLOCK_T=128 needs 122,880 bytes of shared memory and is not safe on the
+# qualified L20X path.  This is the reference kernel's portable config.
+_PORTABLE_BLOCK_CONFIGS = ((64, 64, 32, 2, 4),)
+
+# Resolved once per (d_head, d_expert): compiling a tile that does not fit
+# costs a Triton compile, and nothing about the answer changes afterwards.
+_RESOLVED_BLOCK_CONFIG: dict[tuple[int, int], tuple[int, int, int, int, int]] = {}
+
+
+def _block_config_candidates() -> tuple[tuple[int, int, int, int, int], ...]:
+    """Return the tilings to try for this device, most preferred first."""
 
     capability = current_omni_platform.get_device_capability()
     if capability is not None and capability.major >= 10:  # Blackwell
-        return (128, 64, 32, 2, 8)
-    # BLOCK_T=128 needs 122,880 bytes of shared memory and is not safe on the
-    # qualified L20X path.  This is the reference kernel's portable config.
-    return (64, 64, 32, 2, 4)
+        return _BLACKWELL_BLOCK_CONFIGS
+    return _PORTABLE_BLOCK_CONFIGS
+
+
+def _select_block_config() -> tuple[int, int, int, int, int]:
+    """Return the preferred kernel config for this device."""
+
+    return _block_config_candidates()[0]
 
 
 def triton_mh_moe_forward(
@@ -314,64 +343,86 @@ def triton_mh_moe_forward(
     if routed_tokens == 0:
         return torch.zeros_like(x)
     d_head, d_expert = x.shape[-1], w_down.shape[1]
-    block_t, block_dh, block_de, num_stages, num_warps = _select_block_config()
-    if d_head % block_dh or d_expert % block_de:
-        return torch_mh_moe_forward(x, gather_ids, probs, expert_offsets, w_gate, w_up, w_down)
-
-    if deterministic:
-        output = torch.empty((routed_tokens, 1, d_head), device=x.device, dtype=x.dtype)
-    else:
-        output = torch.zeros_like(x)
+    log2_experts = max(1, math.ceil(math.log2(max(expert_offsets.numel() - 1, 1) + 1)))
     num_flat_experts = expert_offsets.numel() - 1
-    expert_tiles = (torch.diff(expert_offsets) + block_t - 1) // block_t
-    cumulative_tiles = torch.cat(
-        (torch.zeros(1, dtype=torch.int32, device=x.device), expert_tiles.cumsum(0, dtype=torch.int32))
-    )
-    # Match the reference launch bound.  Empty/excess programs return after
-    # comparing against ``cumulative_tiles[-1]`` inside the kernel.
-    grid = ((routed_tokens + block_t - 1) // block_t + num_flat_experts,)
-    log2_experts = max(1, math.ceil(math.log2(max(num_flat_experts, 1) + 1)))
-    _mh_moe_kernel[grid](
-        x,
-        w_gate,
-        w_up,
-        w_down,
-        output,
-        gather_ids,
-        probs,
-        expert_offsets,
-        cumulative_tiles,
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),
-        w_gate.stride(0),
-        w_gate.stride(1),
-        w_gate.stride(2),
-        w_up.stride(0),
-        w_up.stride(1),
-        w_up.stride(2),
-        w_down.stride(0),
-        w_down.stride(1),
-        w_down.stride(2),
-        output.stride(0),
-        output.stride(1),
-        output.stride(2),
-        d_head,
-        d_expert,
-        x.shape[1],
-        num_flat_experts,
-        log2_experts,
-        block_t,
-        block_dh,
-        block_de,
-        tl.float32,
-        deterministic,
-        num_stages=num_stages,
-        num_warps=num_warps,
-    )
-    if deterministic:
-        return _deterministic_scatter(output.view(routed_tokens, d_head), x, gather_ids, expert_offsets)
-    return output
+
+    resolved = _RESOLVED_BLOCK_CONFIG.get((d_head, d_expert))
+    candidates = (resolved,) if resolved is not None else _block_config_candidates()
+    for candidate in candidates:
+        block_t, block_dh, block_de, num_stages, num_warps = candidate
+        if d_head % block_dh or d_expert % block_de:
+            continue
+
+        if deterministic:
+            output = torch.empty((routed_tokens, 1, d_head), device=x.device, dtype=x.dtype)
+        else:
+            output = torch.zeros_like(x)
+        expert_tiles = (torch.diff(expert_offsets) + block_t - 1) // block_t
+        cumulative_tiles = torch.cat(
+            (torch.zeros(1, dtype=torch.int32, device=x.device), expert_tiles.cumsum(0, dtype=torch.int32))
+        )
+        # Match the reference launch bound.  Empty/excess programs return after
+        # comparing against ``cumulative_tiles[-1]`` inside the kernel.
+        grid = ((routed_tokens + block_t - 1) // block_t + num_flat_experts,)
+        try:
+            _mh_moe_kernel[grid](
+                x,
+                w_gate,
+                w_up,
+                w_down,
+                output,
+                gather_ids,
+                probs,
+                expert_offsets,
+                cumulative_tiles,
+                x.stride(0),
+                x.stride(1),
+                x.stride(2),
+                w_gate.stride(0),
+                w_gate.stride(1),
+                w_gate.stride(2),
+                w_up.stride(0),
+                w_up.stride(1),
+                w_up.stride(2),
+                w_down.stride(0),
+                w_down.stride(1),
+                w_down.stride(2),
+                output.stride(0),
+                output.stride(1),
+                output.stride(2),
+                d_head,
+                d_expert,
+                x.shape[1],
+                num_flat_experts,
+                log2_experts,
+                block_t,
+                block_dh,
+                block_de,
+                tl.float32,
+                deterministic,
+                num_stages=num_stages,
+                num_warps=num_warps,
+            )
+        except triton.runtime.errors.OutOfResources as error:
+            # Raised while building the kernel handle, before anything is
+            # enqueued, so ``output`` is untouched and the next tile can retry.
+            logger.warning(
+                "MAGI-2 expert tile %s does not fit on this device for d_head=%d d_expert=%d (%s); "
+                "falling back to a smaller tile.",
+                candidate,
+                d_head,
+                d_expert,
+                error,
+            )
+            continue
+
+        if resolved is None:
+            _RESOLVED_BLOCK_CONFIG[(d_head, d_expert)] = candidate
+        if deterministic:
+            return _deterministic_scatter(output.view(routed_tokens, d_head), x, gather_ids, expert_offsets)
+        return output
+
+    return torch_mh_moe_forward(x, gather_ids, probs, expert_offsets, w_gate, w_up, w_down)
 
 
 @dataclass(frozen=True)
