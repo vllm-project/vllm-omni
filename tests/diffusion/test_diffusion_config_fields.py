@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Ensure diffusion stage YAML configs only use valid OmniDiffusionConfig fields.
 
 Regression test for https://github.com/vllm-project/vllm-omni/issues/2563
@@ -66,3 +66,57 @@ def test_diffusion_stage_configs_only_contain_valid_fields():
     assert not invalid_entries, "Diffusion stage configs contain fields not in OmniDiffusionConfig:\n" + "\n".join(
         f"  {name}: {sorted(bad)}" for name, bad in invalid_entries
     )
+
+
+@pytest.mark.skipif(
+    OmniDiffusionConfig is None,
+    reason="OmniDiffusionConfig could not be imported (missing torch?)",
+)
+class TestAttnChunkingValidation:
+    """Chunking knobs must fail fast when they cannot take effect.
+
+    Built via ``__new__`` with only the attributes _validate_attn_chunking
+    reads: the full __post_init__ (port probing, HF metadata) is unrelated
+    to this validation.
+    """
+
+    @staticmethod
+    def _bare(**overrides):
+        config = OmniDiffusionConfig.__new__(OmniDiffusionConfig)
+        config.diffusion_kv_cache_dtype = None
+        config.diffusion_attn_q_chunk = 1
+        config.diffusion_attn_head_chunk = 0
+        config.diffusion_attn_head_chunk_min_kv = 50000
+        for key, value in overrides.items():
+            setattr(config, key, value)
+        return config
+
+    def test_defaults_pass(self):
+        self._bare()._validate_attn_chunking()  # no raise
+
+    def test_chunking_with_fp8_passes(self):
+        self._bare(
+            diffusion_kv_cache_dtype="fp8", diffusion_attn_q_chunk=8, diffusion_attn_head_chunk=2
+        )._validate_attn_chunking()  # no raise
+
+    def test_chunking_without_fp8_is_rejected(self):
+        with pytest.raises(ValueError, match="require.*diffusion_kv_cache_dtype='fp8'"):
+            self._bare(diffusion_attn_q_chunk=8)._validate_attn_chunking()
+
+        with pytest.raises(ValueError, match="require.*diffusion_kv_cache_dtype='fp8'"):
+            self._bare(diffusion_attn_head_chunk=2)._validate_attn_chunking()
+
+        with pytest.raises(ValueError, match="require.*diffusion_kv_cache_dtype='fp8'"):
+            self._bare(diffusion_attn_head_chunk_min_kv=60000)._validate_attn_chunking()
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("diffusion_attn_q_chunk", 0),
+            ("diffusion_attn_head_chunk", -1),
+            ("diffusion_attn_head_chunk_min_kv", -1),
+        ],
+    )
+    def test_out_of_range_values_are_rejected(self, field: str, value: int):
+        with pytest.raises(ValueError, match=field.replace("diffusion_attn_", "")):
+            self._bare(diffusion_kv_cache_dtype="fp8", **{field: value})._validate_attn_chunking()

@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+from vllm_omni.diffusion.attention.chunking import AttnChunkingOptions
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
@@ -250,6 +251,9 @@ class Attention(nn.Module):
         self._kv_cache_dtype: str | None = None
         self._kv_cache_skip_steps: set[int] | None = None
         self._kv_cache_skip_layers: set[int] | None = None
+        # Chunked-call scheduling options (None = single wide attention call);
+        # only meaningful together with an active kv_cache_dtype.
+        self._attn_chunking: AttnChunkingOptions | None = None
         # Per-layer opt-out from KV-cache quantization (set by model author).
         self._disable_kv_quant: bool = disable_kv_quant
         self._init_kv_cache_quantization(config)
@@ -313,6 +317,15 @@ class Attention(nn.Module):
         self._kv_cache_dtype = dtype
         self._kv_cache_skip_steps = getattr(config, "diffusion_kv_cache_skip_step_indices", None)
         self._kv_cache_skip_layers = getattr(config, "diffusion_kv_cache_skip_layer_indices", None)
+        if dtype is not None:
+            options = AttnChunkingOptions(
+                q_chunk=getattr(config, "diffusion_attn_q_chunk", 1),
+                head_chunk=getattr(config, "diffusion_attn_head_chunk", 0),
+                head_chunk_min_kv=getattr(config, "diffusion_attn_head_chunk_min_kv", 50000),
+            )
+            # Inert defaults stay None so backends never see a "chunking" key
+            # they cannot honor.
+            self._attn_chunking = options if options.active else None
 
     def _should_apply_kv_cache_quant(self) -> bool:
         skip_steps = self._kv_cache_skip_steps
@@ -329,16 +342,26 @@ class Attention(nn.Module):
     def _with_kv_cache_dtype(self, attn_metadata: AttentionMetadata | None) -> AttentionMetadata | None:
         kv_cache_dtype = self._kv_cache_dtype
         if kv_cache_dtype is None or self._disable_kv_quant or not self._should_apply_kv_cache_quant():
-            if attn_metadata is None or "kv_cache_dtype" not in attn_metadata.extra:
+            if attn_metadata is None or not (
+                "kv_cache_dtype" in attn_metadata.extra or "attn_chunking" in attn_metadata.extra
+            ):
                 return attn_metadata
             extra = dict(attn_metadata.extra)
             extra.pop("kv_cache_dtype", None)
+            extra.pop("attn_chunking", None)
             return replace(attn_metadata, extra=extra)
 
-        if attn_metadata is None:
-            return AttentionMetadata(extra={"kv_cache_dtype": kv_cache_dtype})
-        extra = dict(attn_metadata.extra)
+        extra = {"kv_cache_dtype": kv_cache_dtype} if attn_metadata is None else dict(attn_metadata.extra)
         extra["kv_cache_dtype"] = kv_cache_dtype
+        # Chunking rides along only when quantization is active for this step
+        # and layer; the skip-step/skip-layer/disable gates above pop both
+        # keys together, so backends never see chunking without a dtype.
+        if self._attn_chunking is not None:
+            extra["attn_chunking"] = self._attn_chunking
+        else:
+            extra.pop("attn_chunking", None)
+        if attn_metadata is None:
+            return AttentionMetadata(extra=extra)
         return replace(attn_metadata, extra=extra)
 
     def forward(

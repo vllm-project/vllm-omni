@@ -588,6 +588,11 @@ class OrchestratorArgs:
     diffusion_kv_cache_dtype: str | None = None
     diffusion_kv_cache_skip_steps: str | None = None
     diffusion_kv_cache_skip_layers: str | None = None
+    # Attention call chunking (power-envelope mitigation; see
+    # vllm_omni/diffusion/attention/chunking.py). Requires the fp8 kv dtype.
+    diffusion_attn_q_chunk: int = 1
+    diffusion_attn_head_chunk: int = 0
+    diffusion_attn_head_chunk_min_kv: int = 50000
     cfg_parallel_size: int = 1
     vae_patch_parallel_size: int = 1
     vae_parallel_mode: str = "tile"
