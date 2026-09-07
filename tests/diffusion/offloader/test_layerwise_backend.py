@@ -206,6 +206,51 @@ class _NoAttrsModel(nn.Module):
         self.blocks = nn.ModuleList([_DummyBlock() for _ in range(num_blocks)])
 
 
+class _CountingBlocksParent(nn.Module):
+    def __init__(self, num_blocks: int):
+        super().__init__()
+        self.layers = nn.ModuleList([_DummyBlock() for _ in range(num_blocks)])
+        self.to_calls = 0
+
+    def to(self, *args, **kwargs):
+        self.to_calls += 1
+        return super().to(*args, **kwargs)
+
+
+class _CountingBlocks(nn.ModuleList):
+    def __init__(self, num_blocks: int):
+        super().__init__([_DummyBlock() for _ in range(num_blocks)])
+        self.to_calls = 0
+
+    def to(self, *args, **kwargs):
+        self.to_calls += 1
+        return super().to(*args, **kwargs)
+
+
+class _NestedBlocksModel(nn.Module):
+    """Streamed blocks live under a registered parent and are exposed through a property."""
+
+    _layerwise_offload_blocks_attrs = ["layers"]
+
+    def __init__(self, num_blocks: int = 2):
+        super().__init__()
+        self.embed = nn.Linear(4, 4)
+        self.block = _CountingBlocksParent(num_blocks)
+
+    @property
+    def layers(self) -> nn.ModuleList:
+        return self.block.layers
+
+
+class _DirectBlocksModel(nn.Module):
+    _layerwise_offload_blocks_attrs = ["blocks"]
+
+    def __init__(self, num_blocks: int = 2):
+        super().__init__()
+        self.embed = nn.Linear(4, 4)
+        self.blocks = _CountingBlocks(num_blocks)
+
+
 class TestGetBlocksFromDit:
     def test_get_blocks_from_dit_single_block_attr(self):
         model = _SingleBlockModel(num_blocks=3)
@@ -622,6 +667,29 @@ def _offload_od_config(**overrides):
 
 def _resolve_offload_config(public=None, **overrides) -> OffloadConfig:
     return OffloadConfig.from_od_config(_offload_od_config(diffusion_offload_config=public, **overrides))
+
+
+class TestLayerwiseResidentState:
+    @pytest.mark.parametrize(
+        ("model_cls", "owner_attr"),
+        [(_NestedBlocksModel, "block"), (_DirectBlocksModel, "blocks")],
+    )
+    def test_enable_streams_blocks_without_moving_their_owner(self, patched_offload_runtime, model_cls, owner_attr):
+        pipeline = nn.Module()
+        pipeline.transformer = model_cls()
+        _, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(pipeline.transformer)
+        expected_weights = [block.weight.detach().clone() for block in blocks]
+        backend = _layer_backend()
+
+        backend.enable(pipeline)
+
+        assert getattr(pipeline.transformer, owner_attr).to_calls == 0
+        assert all(hasattr(block, "_hook_registry") for block in blocks)
+
+        backend.disable()
+
+        for block, expected in zip(blocks, expected_weights, strict=True):
+            torch.testing.assert_close(block.weight, expected)
 
 
 class TestLayerwiseComponentConfig:
