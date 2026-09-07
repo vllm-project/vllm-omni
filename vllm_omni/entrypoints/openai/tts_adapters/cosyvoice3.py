@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CosyVoice3 TTS serving adapter."""
 
 import os
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
@@ -14,11 +16,45 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Without this delimiter the talker re-speaks the reference transcript instead
+# of emitting target-only speech (issue #4644). Matches the offline example and
+# upstream demo.
+_PROMPT_DELIMITER = "<|endofprompt|>"
+_PROMPT_PREFIX = f"You are a helpful assistant.{_PROMPT_DELIMITER}"
+
 
 @register_tts_adapter
 class CosyVoice3Adapter(ARTTSAdapter):
     stage_keys = frozenset({"cosyvoice3_talker"})
     name = "cosyvoice3"
+
+    def __init__(self, ctx) -> None:
+        super().__init__(ctx)
+        # Cache the resolved Qwen tokenizer used for dynamic-token sizing.
+        # Rebuilding it would repeat snapshot resolution and add ~100 ms to the
+        # TTFP-critical sampling override on every request.
+        self._tokenizer = None
+
+    async def _build_prompt(
+        self, request: "OpenAICreateSpeechRequest", *, has_inline_ref_audio: bool = False
+    ) -> dict[str, Any]:
+        """Build the multimodal CosyVoice3 voice-cloning prompt."""
+        server = self.ctx.server
+        wav_samples, sr, _ = await server._resolve_ref_audio(request.ref_audio)
+        ref_text = request.ref_text or ""
+        if _PROMPT_DELIMITER not in ref_text:
+            ref_text = f"{_PROMPT_PREFIX}{ref_text}"
+        mm_kwargs: dict[str, Any] = {"prompt_text": ref_text, "sample_rate": sr}
+        if request.voice:
+            voice_lower = request.voice.lower()
+            if voice_lower in server.uploaded_speakers and not has_inline_ref_audio:
+                mm_kwargs["voice_name"] = voice_lower
+                mm_kwargs["voice_created_at"] = server._voice_created_at(voice_lower)
+        return {
+            "prompt": request.input,
+            "multi_modal_data": {"audio": (np.asarray(wav_samples, dtype=np.float32), sr)},
+            "mm_processor_kwargs": mm_kwargs,
+        }
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         """Validate CosyVoice3 request parameters. Returns error message or None."""
@@ -51,7 +87,7 @@ class CosyVoice3Adapter(ARTTSAdapter):
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
-        prompt = await self.ctx.server._build_cosyvoice3_prompt(request, has_inline_ref_audio=has_inline_ref_audio)
+        prompt = await self._build_prompt(request, has_inline_ref_audio=has_inline_ref_audio)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="cosyvoice3")
 
     def apply_sampling_overrides(
@@ -76,7 +112,7 @@ class CosyVoice3Adapter(ARTTSAdapter):
         hf_cfg = server.model_config.hf_config
         # Build the Qwen tokenizer once per process (resolving the model dir via
         # snapshot_download at most once) and reuse it across requests.
-        tokenizer = server._cosyvoice3_tokenizer
+        tokenizer = self._tokenizer
         if tokenizer is None:
             model_path = server.engine_client.model_config.model
             if not os.path.isdir(model_path):
@@ -88,7 +124,7 @@ class CosyVoice3Adapter(ARTTSAdapter):
                 skip_special_tokens=hf_cfg.skip_special_tokens,
                 version=hf_cfg.version,
             )
-            server._cosyvoice3_tokenizer = tokenizer
+            self._tokenizer = tokenizer
         _, text_token_len = extract_text_token(
             request.input,
             tokenizer,

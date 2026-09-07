@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MingFlashOmniTTS serving adapter."""
 
 from typing import TYPE_CHECKING
 
+from vllm.inputs import tokens_input
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import parse_ming_instruction_fields
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -61,8 +64,36 @@ class MingFlashOmniTTSAdapter(ARTTSAdapter):
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
+        """Build the standalone Ming Flash TTS prompt."""
+        from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
+            DEFAULT_PROMPT,
+            create_instruction,
+        )
+
         server = self.ctx.server
-        prompt = server._build_ming_flash_omni_prompt(request)
+        # ``instructions`` accepts either plain style text or a JSON object.
+        # Unknown caption keys are filtered by ``create_instruction``.
+        caption_fields = parse_ming_instruction_fields(server, request) or {}
+        has_spk_emb = request.speaker_embedding is not None
+        # Standalone TTS uses the Ming ``instruct`` task. ``voice_name`` lets
+        # the talker resolve registered presets such as DB30.
+        info = {
+            "ming_task": "instruct",
+            "prompt": DEFAULT_PROMPT,
+            "text": request.input,
+            "instruction": create_instruction(caption_fields),
+            "voice_name": request.voice or None,
+            "use_zero_spk_emb": not has_spk_emb,
+            "max_decode_steps": request.max_new_tokens or self.max_new_tokens_max,
+            "cfg": 2.0,
+            "sigma": 0.25,
+            "temperature": 0.0,
+        }
+        if has_spk_emb:
+            # Keep embeddings as plain floats for EngineCore serialization.
+            info["spk_emb"] = list(request.speaker_embedding)
+        prompt = tokens_input(prompt_token_ids=[0])
+        prompt["additional_information"] = info
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="ming_flash_omni_tts")
 
     def _load_supported_speakers(self) -> set[str]:
