@@ -9,11 +9,11 @@ import sys
 from pathlib import Path
 
 import pytest
-import torch
 
 from tests.e2e.accuracy.helpers import (
     assert_video_metadata,
     assert_video_similarity_metrics,
+    is_npu_available,
     probe_binary,
     probe_video,
     send_video_request_with_timeout,
@@ -35,6 +35,7 @@ FLOW_SHIFT = 5.0
 SEED = 42
 SSIM_THRESHOLD = 0.94
 PSNR_THRESHOLD = 28.0
+
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 WORKSPACE_ROOT = REPO_ROOT.parent
@@ -78,7 +79,7 @@ def _artifact_paths() -> tuple[Path, Path]:
 
 
 def _build_offline_command(*, output_path: Path) -> list[str]:
-    return [
+    cmd = [
         sys.executable,
         str(RUNNER_PATH),
         "--model",
@@ -101,9 +102,21 @@ def _build_offline_command(*, output_path: Path) -> list[str]:
         str(FPS),
         "--seed",
         str(SEED),
-        "--output",
-        str(output_path),
     ]
+
+    # Add parallel args only on NPU (detected via torch_npu availability)
+    if is_npu_available():
+        cmd.extend(
+            [
+                "--tensor-parallel-size",
+                "2",
+                "--vae-patch-parallel-size",
+                "2",
+            ]
+        )
+
+    cmd.extend(["--output", str(output_path)])
+    return cmd
 
 
 def _generate_offline_video() -> Path:
@@ -144,11 +157,8 @@ def _generate_online_video(*, omni_server, online_client, timeout_seconds: int) 
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards={"cuda": 1, "npu": 2})
 def test_hunyuanvideo15_t2v_diffusers_offline_generates_video() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("HunyuanVideo-1.5 T2V offline accuracy test requires CUDA.")
-
     probe_binary("ffprobe")
     if not RUNNER_PATH.exists():
         raise AssertionError(f"Offline runner does not exist: {RUNNER_PATH}")
@@ -160,16 +170,13 @@ def test_hunyuanvideo15_t2v_diffusers_offline_generates_video() -> None:
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards={"cuda": 1, "npu": 2})
 @pytest.mark.parametrize("omni_server", SERVER_CASES, indirect=True)
 def test_hunyuanvideo15_t2v_online_serving_generates_video(
     omni_server,
     online_client,
     hunyuanvideo15_online_timeout_seconds: int,
 ) -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("HunyuanVideo-1.5 T2V online accuracy test requires CUDA.")
-
     probe_binary("ffprobe")
     online_path = _generate_online_video(
         omni_server=omni_server,
@@ -182,11 +189,8 @@ def test_hunyuanvideo15_t2v_online_serving_generates_video(
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards={"cuda": 1, "npu": 2})
 def test_hunyuanvideo15_t2v_serving_matches_offline_video_similarity() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("HunyuanVideo-1.5 T2V video similarity test requires CUDA.")
-
     probe_binary("ffmpeg")
     probe_binary("ffprobe")
     online_path, offline_path = _artifact_paths()
