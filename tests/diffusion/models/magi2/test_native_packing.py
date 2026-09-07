@@ -14,6 +14,10 @@ from vllm_omni.diffusion.models.magi2.configuration_magi2 import (
 from vllm_omni.diffusion.models.magi2.layers import MultiModalityRMSNorm
 from vllm_omni.diffusion.models.magi2.mh_moe import Magi2MultiHeadMoE
 from vllm_omni.diffusion.models.magi2.modeling_magi2 import Magi2PreviewTransformer
+from vllm_omni.diffusion.models.magi2.preview_data_proxy import (
+    Magi2DataProxy,
+    Magi2PreviewDataProxyConfig,
+)
 from vllm_omni.diffusion.models.magi2.sampler_magi2 import CFGConfig, Magi2PreviewSampler
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
@@ -67,6 +71,10 @@ def _tiny_model(
     return model
 
 
+def _tiny_sampler(model: torch.nn.Module) -> Magi2PreviewSampler:
+    return Magi2PreviewSampler(model, Magi2DataProxy(Magi2PreviewDataProxyConfig(time_channel_dim=8)))
+
+
 def _sampler_tensors(seed: int) -> dict[str, torch.Tensor]:
     generator = torch.Generator(device="cpu").manual_seed(seed)
     return {
@@ -75,6 +83,13 @@ def _sampler_tensors(seed: int) -> dict[str, torch.Tensor]:
         "txt_feat": torch.randn(1, 3, 4, generator=generator),
         "null_txt_feat": torch.randn(1, 2, 4, generator=generator),
     }
+
+
+def _longer_text_tensors(seed: int) -> dict[str, torch.Tensor]:
+    tensors = _sampler_tensors(seed)
+    generator = torch.Generator(device="cpu").manual_seed(seed + 100)
+    tensors["txt_feat"] = torch.randn(1, 4, 4, generator=generator)
+    return tensors
 
 
 def test_prepare_model_input_keeps_lengths_on_host() -> None:
@@ -94,11 +109,10 @@ def test_prepare_model_input_keeps_lengths_on_host() -> None:
 def test_pre_adapter_embeds_directly_in_checkpoint_dtype() -> None:
     model = _tiny_model(params_dtype=torch.bfloat16)
     packed = torch.randn(6, 4)
-    coords = torch.ones(6, 9)
     indices = torch.tensor([0, 1]), torch.tensor([2, 3]), torch.tensor([4, 5])
 
     with torch.no_grad():
-        hidden, _ = model.pre_adapter(packed, coords, *indices)
+        hidden = model.pre_adapter(packed, *indices)
 
     assert hidden.dtype == torch.bfloat16
     assert hidden.shape == (6, model.config.virtual_width)
